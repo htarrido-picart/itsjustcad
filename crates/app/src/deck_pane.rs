@@ -33,6 +33,7 @@ pub struct DeckPane {
     messages: Vec<ChatMessage>,
     rx: Option<UnboundedReceiver<DeckDelta>>,
     turn_task: Option<tokio::task::JoinHandle<()>>,
+    turn_started: Option<std::time::Instant>,
     extractor: Extractor,
     current_response: String,
     /// Streaming chat text of the in-flight deck turn (display only).
@@ -53,6 +54,7 @@ impl Default for DeckPane {
             messages: Vec::new(),
             rx: None,
             turn_task: None,
+            turn_started: None,
             extractor: Extractor::default(),
             current_response: String::new(),
             streaming_chat: String::new(),
@@ -141,6 +143,7 @@ impl DeckPane {
         self.streaming_chat.clear();
         self.errors_this_turn.clear();
         self.turn_task = Some(handle.spawn(async move { deck.stream_chat(req, tx).await }));
+        self.turn_started = Some(std::time::Instant::now());
     }
 
     fn stop_turn(&mut self) {
@@ -148,6 +151,7 @@ impl DeckPane {
             task.abort();
         }
         self.rx = None;
+        self.turn_started = None;
         self.retries = MAX_RETRIES; // no auto-retry after a manual stop
         if !self.current_response.is_empty() {
             self.messages.push(ChatMessage {
@@ -243,6 +247,7 @@ impl DeckPane {
                 DeckDelta::Error(e) => {
                     self.transcript.push(Entry::Status(format!("deck error: {e}")));
                     self.rx = None;
+                    self.turn_started = None;
                     return;
                 }
             }
@@ -255,6 +260,13 @@ impl DeckPane {
             let events = self.extractor.finish();
             self.handle_extract_events(events, session);
             self.rx = None;
+            let elapsed = self
+                .turn_started
+                .take()
+                .map(|t| t.elapsed().as_secs_f32())
+                .unwrap_or(0.0);
+            self.transcript
+                .push(Entry::Status(format!("turn done in {elapsed:.1}s")));
             self.finish_turn(session, handle);
         }
     }
@@ -399,6 +411,24 @@ impl DeckPane {
                 }
                 if !self.streaming_chat.trim().is_empty() {
                     ui.label(self.streaming_chat.trim());
+                }
+                // Live turn feedback: waiting → thinking dots + elapsed;
+                // streaming → received char count.
+                if self.busy() {
+                    let elapsed = self
+                        .turn_started
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0);
+                    let received = self.current_response.len();
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        let status = if received == 0 {
+                            format!("waiting for model… {elapsed}s")
+                        } else {
+                            format!("streaming… {received} chars, {elapsed}s")
+                        };
+                        ui.label(egui::RichText::new(status).weak().italics());
+                    });
                 }
             });
 
