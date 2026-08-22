@@ -5,7 +5,7 @@ mod renderer;
 mod snapshot;
 mod viewport_callback;
 
-pub use camera::OrbitCamera;
+pub use camera::{OrbitCamera, StandardView};
 pub use renderer::{CameraUniform, SceneData, SceneRenderer};
 pub use snapshot::{snapshot, Theme};
 pub use viewport_callback::ViewportCallback;

@@ -1,14 +1,16 @@
 use mydrafter_commands::Session;
-use mydrafter_render::{OrbitCamera, SceneRenderer, ViewportCallback};
+use mydrafter_render::{OrbitCamera, SceneRenderer, StandardView, ViewportCallback};
 
 use crate::command_line::CommandLine;
 use crate::deck_pane::DeckPane;
+use crate::draw_tool::DrawTool;
 use crate::scene;
 
 pub struct App {
     session: Session,
     command_line: CommandLine,
     deck_pane: DeckPane,
+    draw_tool: DrawTool,
     tokio: tokio::runtime::Handle,
     camera: OrbitCamera,
     /// Generation of the last GPU upload; compare with `session.doc.generation`.
@@ -47,6 +49,7 @@ impl App {
             session: Session::default(),
             command_line: CommandLine::default(),
             deck_pane: DeckPane::default(),
+            draw_tool: DrawTool::default(),
             tokio,
             camera: OrbitCamera::default(),
             uploaded_generation: None,
@@ -79,10 +82,34 @@ impl App {
             Some("save") => self.save(words.next().map(Into::into)),
             Some("open") => self.open(words.next().map(Into::into)),
             Some("ze" | "zoomextents") => self.zoom_extents(),
+            Some(view @ ("top" | "bottom" | "front" | "back" | "left" | "right" | "persp"
+            | "perspective")) => {
+                self.set_view(view);
+                self.command_line.push_line(format!("view: {view}"));
+            }
             _ => {
+                if self.draw_tool.try_start(line) {
+                    if let Some(prompt) = self.draw_tool.prompt() {
+                        self.command_line.push_line(prompt);
+                    }
+                    return;
+                }
                 self.command_line.execute(&mut self.session, line);
             }
         }
+    }
+
+    fn set_view(&mut self, name: &str) {
+        let view = match name {
+            "top" => StandardView::Top,
+            "bottom" => StandardView::Bottom,
+            "front" => StandardView::Front,
+            "back" => StandardView::Back,
+            "left" => StandardView::Left,
+            "right" => StandardView::Right,
+            _ => StandardView::Perspective,
+        };
+        self.camera.set_view(view);
     }
 
     fn zoom_extents(&mut self) {
@@ -224,7 +251,12 @@ impl App {
                 self.camera.dolly(scroll);
             }
         }
-        if response.clicked()
+        let aspect = rect.width() / rect.height().max(1.0);
+        let view_proj = self.camera.view_proj(aspect);
+
+        if self.draw_tool.active() {
+            self.drawing_input(ui, rect, &response, view_proj);
+        } else if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
             let additive = ui.input(|i| i.modifiers.shift);
@@ -245,16 +277,107 @@ impl App {
             scene::snapshot(&self.session.doc, theme)
         });
 
-        let aspect = rect.width() / rect.height().max(1.0);
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
             ViewportCallback {
-                view_proj: self.camera.view_proj(aspect),
+                view_proj,
                 eye: self.camera.eye(),
                 generation,
                 scene,
             },
         ));
+
+        self.view_toolbar(ui, rect);
+    }
+
+    /// Interactive drawing: picks on the ground plane, ghost preview, prompt.
+    fn drawing_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        response: &egui::Response,
+        view_proj: glam::Mat4,
+    ) {
+        let (esc, enter) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        if esc {
+            self.draw_tool.cancel();
+            self.command_line.push_line("drawing cancelled");
+            return;
+        }
+        if enter && let Some(cmd) = self.draw_tool.on_enter() {
+            self.execute_line(cmd);
+            return;
+        }
+
+        let cursor_world = response
+            .hover_pos()
+            .or_else(|| response.interact_pointer_pos())
+            .and_then(|pos| ground_point(view_proj, rect, pos));
+
+        if response.clicked() && let Some(world) = cursor_world {
+            if let Some(cmd) = self.draw_tool.on_click(world) {
+                self.execute_line(cmd);
+                return;
+            } else if let Some(prompt) = self.draw_tool.prompt() {
+                self.command_line.push_line(prompt);
+            }
+        }
+
+        // Ghost preview + prompt overlay
+        let painter = ui.painter_at(rect);
+        let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 160, 255));
+        for strip in self.draw_tool.preview(cursor_world) {
+            for pair in strip.windows(2) {
+                if let (Some(a), Some(b)) = (
+                    project(view_proj, rect, pair[0]),
+                    project(view_proj, rect, pair[1]),
+                ) {
+                    painter.line_segment([a, b], stroke);
+                }
+            }
+        }
+        if let Some(prompt) = self.draw_tool.prompt() {
+            painter.text(
+                rect.center_top() + egui::vec2(0.0, 28.0),
+                egui::Align2::CENTER_TOP,
+                prompt,
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().strong_text_color(),
+            );
+        }
+        ui.ctx().request_repaint(); // live rubber-band
+    }
+
+    fn view_toolbar(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        egui::Area::new(egui::Id::new("view_toolbar"))
+            .fixed_pos(rect.left_top() + egui::vec2(8.0, 8.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (label, name) in [
+                            ("Persp", "persp"),
+                            ("Top", "top"),
+                            ("Front", "front"),
+                            ("Right", "right"),
+                            ("Left", "left"),
+                            ("Back", "back"),
+                            ("Bottom", "bottom"),
+                        ] {
+                            if ui.small_button(label).clicked() {
+                                self.set_view(name);
+                            }
+                        }
+                        if ui.small_button("ZE").on_hover_text("zoom extents").clicked() {
+                            self.zoom_extents();
+                        }
+                    });
+                });
+            });
     }
 }
 
@@ -273,6 +396,39 @@ fn save_zoom(zoom: f32) {
         let _ = std::fs::create_dir_all(path.parent().expect("has parent"));
         let _ = std::fs::write(path, format!("{{\n  \"zoom\": {zoom}\n}}\n"));
     }
+}
+
+/// Screen position -> point on the z=0 ground plane.
+fn ground_point(view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> Option<glam::DVec3> {
+    let inv = view_proj.inverse();
+    let ndc = glam::Vec2::new(
+        (pos.x - rect.left()) / rect.width() * 2.0 - 1.0,
+        1.0 - (pos.y - rect.top()) / rect.height() * 2.0,
+    );
+    let unproject = |z: f32| {
+        let p = inv * glam::Vec4::new(ndc.x, ndc.y, z, 1.0);
+        (p.truncate() / p.w).as_dvec3()
+    };
+    let origin = unproject(0.0);
+    let dir = unproject(1.0) - origin;
+    if dir.z.abs() < 1e-12 {
+        return None;
+    }
+    let t = -origin.z / dir.z;
+    (t > 0.0).then(|| origin + dir * t)
+}
+
+/// World point -> screen position (None when behind the camera).
+fn project(view_proj: glam::Mat4, rect: egui::Rect, world: glam::DVec3) -> Option<egui::Pos2> {
+    let clip = view_proj * glam::Vec4::new(world.x as f32, world.y as f32, world.z as f32, 1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    Some(egui::pos2(
+        rect.left() + (ndc.x + 1.0) * 0.5 * rect.width(),
+        rect.top() + (1.0 - ndc.y) * 0.5 * rect.height(),
+    ))
 }
 
 fn ray_aabb(origin: glam::DVec3, dir: glam::DVec3, min: glam::DVec3, max: glam::DVec3) -> Option<f64> {

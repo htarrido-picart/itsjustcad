@@ -1,9 +1,17 @@
 use mydrafter_commands::{parse, Session};
 use mydrafter_deck::{
-    make_deck, system_prompt, ChatMessage, ChatRequest, DeckDelta, DecksFile, ExtractEvent,
+    make_deck, probe, system_prompt, ChatMessage, ChatRequest, DeckDelta, DecksFile, ExtractEvent,
     Extractor, Role,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::oneshot;
+
+enum ProbeState {
+    Unknown,
+    Checking(oneshot::Receiver<Result<String, String>>),
+    Ready(String),
+    Unavailable(String),
+}
 
 const MAX_RETRIES: u8 = 2;
 
@@ -30,6 +38,9 @@ pub struct DeckPane {
     streaming_chat: String,
     errors_this_turn: Vec<String>,
     retries: u8,
+    /// Deck is disabled until the active cassette probes healthy.
+    probe: ProbeState,
+    probed_deck: Option<usize>,
 }
 
 impl Default for DeckPane {
@@ -45,6 +56,8 @@ impl Default for DeckPane {
             streaming_chat: String::new(),
             errors_this_turn: Vec::new(),
             retries: 0,
+            probe: ProbeState::Unknown,
+            probed_deck: None,
         }
     }
 }
@@ -52,6 +65,42 @@ impl Default for DeckPane {
 impl DeckPane {
     pub fn busy(&self) -> bool {
         self.rx.is_some()
+    }
+
+    fn ready(&self) -> bool {
+        matches!(self.probe, ProbeState::Ready(_))
+    }
+
+    fn start_probe(&mut self, handle: &tokio::runtime::Handle) {
+        let Some(config) = self.decks.decks.get(self.decks.active).cloned() else {
+            self.probe = ProbeState::Unavailable("no deck configured".into());
+            return;
+        };
+        self.probed_deck = Some(self.decks.active);
+        let (tx, rx) = oneshot::channel();
+        self.probe = ProbeState::Checking(rx);
+        handle.spawn(async move {
+            let _ = tx.send(probe(&config).await);
+        });
+    }
+
+    fn poll_probe(&mut self, handle: &tokio::runtime::Handle) {
+        // Re-probe when the cassette changed or nothing has been probed yet.
+        if self.probed_deck != Some(self.decks.active)
+            || matches!(self.probe, ProbeState::Unknown)
+        {
+            self.start_probe(handle);
+        }
+        if let ProbeState::Checking(rx) = &mut self.probe {
+            match rx.try_recv() {
+                Ok(Ok(detail)) => self.probe = ProbeState::Ready(detail),
+                Ok(Err(reason)) => self.probe = ProbeState::Unavailable(reason),
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.probe = ProbeState::Unavailable("probe task died".into());
+                }
+            }
+        }
     }
 
     pub fn turns_completed(&self) -> bool {
@@ -199,7 +248,8 @@ impl DeckPane {
         handle: &tokio::runtime::Handle,
     ) {
         self.drain(session, handle);
-        if self.busy() {
+        self.poll_probe(handle);
+        if self.busy() || matches!(self.probe, ProbeState::Checking(_)) {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -242,6 +292,34 @@ impl DeckPane {
                 self.messages.clear();
             }
         });
+        match &self.probe {
+            ProbeState::Ready(detail) => {
+                ui.label(
+                    egui::RichText::new(format!("● {detail}"))
+                        .color(egui::Color32::from_rgb(70, 160, 90))
+                        .small(),
+                );
+            }
+            ProbeState::Unavailable(reason) => {
+                let reason = reason.clone();
+                let mut retry = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("● {reason}"))
+                            .color(egui::Color32::from_rgb(200, 80, 70))
+                            .small(),
+                    );
+                    retry = ui.small_button("retry").clicked();
+                });
+                if retry {
+                    self.probe = ProbeState::Unknown;
+                }
+            }
+            ProbeState::Checking(_) => {
+                ui.label(egui::RichText::new("● checking deck…").weak().small());
+            }
+            ProbeState::Unknown => {}
+        }
         ui.separator();
 
         let input_height = 64.0;
@@ -280,12 +358,17 @@ impl DeckPane {
             });
 
         ui.separator();
+        let hint = if self.ready() {
+            "describe what to draw… (Enter sends, Shift+Enter newline)"
+        } else {
+            "deck unavailable — fix the connection above"
+        };
         let response = ui.add_enabled(
-            !self.busy(),
+            !self.busy() && self.ready(),
             egui::TextEdit::multiline(&mut self.input)
                 .desired_rows(2)
                 .desired_width(f32::INFINITY)
-                .hint_text("describe what to draw… (Enter sends, Shift+Enter newline)"),
+                .hint_text(hint),
         );
         let enter = response.has_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);

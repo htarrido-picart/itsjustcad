@@ -33,7 +33,10 @@ impl OrbitCamera {
 
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         self.yaw -= dx * 0.01;
-        self.pitch = (self.pitch + dy * 0.01).clamp(-1.55, 1.55);
+        self.pitch = (self.pitch + dy * 0.01).clamp(
+            -std::f32::consts::FRAC_PI_2,
+            std::f32::consts::FRAC_PI_2,
+        );
     }
 
     /// Pan in screen space; keeps the point under the cursor roughly fixed.
@@ -51,8 +54,37 @@ impl OrbitCamera {
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
-        let view = Mat4::look_at_rh(self.eye(), self.target, Vec3::Z);
+        // Straight-down/up views degenerate with a Z up-vector; fall back to Y.
+        let up = if self.pitch.abs() > 1.55 { Vec3::Y } else { Vec3::Z };
+        let view = Mat4::look_at_rh(self.eye(), self.target, up);
         let proj = Mat4::perspective_rh(self.fov_y, aspect.max(1e-3), 0.05, 5.0e4);
         proj * view
     }
+
+    /// Rhino-style standard views. Keeps target and distance.
+    pub fn set_view(&mut self, view: StandardView) {
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+        let (yaw, pitch) = match view {
+            StandardView::Top => (-FRAC_PI_2, FRAC_PI_2),
+            StandardView::Bottom => (-FRAC_PI_2, -FRAC_PI_2),
+            StandardView::Front => (-FRAC_PI_2, 0.0),
+            StandardView::Back => (FRAC_PI_2, 0.0),
+            StandardView::Right => (0.0, 0.0),
+            StandardView::Left => (PI, 0.0),
+            StandardView::Perspective => (-FRAC_PI_4, 0.5),
+        };
+        self.yaw = yaw;
+        self.pitch = pitch;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandardView {
+    Top,
+    Bottom,
+    Front,
+    Back,
+    Left,
+    Right,
+    Perspective,
 }
