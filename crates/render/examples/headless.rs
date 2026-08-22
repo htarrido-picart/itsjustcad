@@ -1,7 +1,7 @@
-//! Headless smoke render: draws the scene to an offscreen texture and writes a
+//! Headless smoke render: draws a scene to an offscreen texture and writes a
 //! PNG. Lets CI (and agent sessions without a WindowServer) verify pixels.
 //!
-//! Usage: cargo run -p mydrafter-render --example headless [-- out.png]
+//! Usage: cargo run -p mydrafter-render --example headless [-- out.png [scene.mydrafter.json]]
 
 use glam::DVec3;
 use mydrafter_render::{OrbitCamera, SceneRenderer, ViewportCallback, DEPTH_FORMAT};
@@ -21,12 +21,25 @@ fn main() {
 
     let mut renderer = SceneRenderer::new(&device, FORMAT);
 
-    let camera = OrbitCamera::default();
-    let meshes = vec![(
-        kernel_mesh::make_box(DVec3::new(-2.5, -2.5, 0.0), DVec3::new(5.0, 5.0, 3.0)).to_render(),
-        [0.72, 0.73, 0.78, 1.0f32],
-    )];
-    renderer.set_meshes(&device, &meshes, 0);
+    let mut camera = OrbitCamera::default();
+    if let Some(scene_path) = std::env::args().nth(2) {
+        let session = mydrafter_commands::io::load_file(std::path::Path::new(&scene_path))
+            .expect("load scene");
+        let scene = mydrafter_render::snapshot(&session.doc);
+        renderer.set_scene(&device, &scene, 0);
+        if let Some(bb) = session.doc.scene_aabb() {
+            let center = bb.center();
+            camera.target = glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32);
+            camera.distance = (bb.size().length() as f32 * 1.2).max(5.0);
+        }
+    } else {
+        let meshes = vec![(
+            kernel_mesh::make_box(DVec3::new(-2.5, -2.5, 0.0), DVec3::new(5.0, 5.0, 3.0))
+                .to_render(),
+            [0.72, 0.73, 0.78, 1.0f32],
+        )];
+        renderer.set_meshes(&device, &meshes, 0);
+    }
 
     let aspect = W as f32 / H as f32;
     let view_proj = camera.view_proj(aspect);

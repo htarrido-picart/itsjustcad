@@ -1,1 +1,16 @@
-//! LLM deck: cassette-player providers behind one trait. Ollama, Kimi, Claude, any OpenAI-compatible.
+//! LLM deck: cassette-player providers behind one trait. Ollama, Kimi, Claude,
+//! any OpenAI-compatible endpoint. The deck emits plain-text commands in
+//! ```draft fenced blocks — the same language humans type — extracted by a
+//! streaming state machine and executed by the app against the one Session.
+
+mod anthropic;
+mod config;
+mod deck;
+mod extract;
+mod openai_compat;
+mod prompt;
+
+pub use config::{DeckConfig, DeckKind, DecksFile};
+pub use deck::{make_deck, ChatMessage, ChatRequest, DeckDelta, DeckError, LlmDeck, Role};
+pub use extract::{Extractor, ExtractEvent};
+pub use prompt::system_prompt;

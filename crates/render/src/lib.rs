@@ -2,10 +2,12 @@
 
 mod camera;
 mod renderer;
+mod snapshot;
 mod viewport_callback;
 
 pub use camera::OrbitCamera;
 pub use renderer::{CameraUniform, SceneData, SceneRenderer};
+pub use snapshot::{snapshot, CURVE_COLOR, CURVE_SELECTED, MESH_COLOR, MESH_SELECTED};
 pub use viewport_callback::ViewportCallback;
 
 pub fn camera_uniform(view_proj: glam::Mat4, eye: glam::Vec3) -> CameraUniform {

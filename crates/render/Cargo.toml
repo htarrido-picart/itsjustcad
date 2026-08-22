@@ -15,5 +15,6 @@ glam.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+mydrafter-commands.workspace = true
 pollster = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }

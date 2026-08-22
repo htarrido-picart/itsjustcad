@@ -2042,6 +2042,7 @@ dependencies = [
  "image",
  "kernel-curve",
  "kernel-mesh",
+ "mydrafter-commands",
  "mydrafter-doc",
  "pollster",
  "wgpu",

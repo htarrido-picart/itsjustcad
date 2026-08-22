@@ -2,11 +2,14 @@ use mydrafter_commands::Session;
 use mydrafter_render::{OrbitCamera, SceneRenderer, ViewportCallback};
 
 use crate::command_line::CommandLine;
+use crate::deck_pane::DeckPane;
 use crate::scene;
 
 pub struct App {
     session: Session,
     command_line: CommandLine,
+    deck_pane: DeckPane,
+    tokio: tokio::runtime::Handle,
     camera: OrbitCamera,
     /// Generation of the last GPU upload; compare with `session.doc.generation`.
     uploaded_generation: Option<u64>,
@@ -14,11 +17,14 @@ pub struct App {
     shot_path: Option<String>,
     /// Dev scripting: MYDRAFTER_RUN="cmd;cmd;..." executes on startup.
     startup_script: Option<String>,
+    /// Dev scripting: MYDRAFTER_DECK_RUN="prompt" sends one deck message on
+    /// startup; with MYDRAFTER_SHOT set, the shot waits for the turn to end.
+    deck_script: Option<String>,
     frame_count: u64,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, tokio: tokio::runtime::Handle) -> Self {
         let rs = cc
             .wgpu_render_state
             .as_ref()
@@ -30,10 +36,13 @@ impl App {
         Self {
             session: Session::default(),
             command_line: CommandLine::default(),
+            deck_pane: DeckPane::default(),
+            tokio,
             camera: OrbitCamera::default(),
             uploaded_generation: None,
             shot_path: std::env::var("MYDRAFTER_SHOT").ok(),
             startup_script: std::env::var("MYDRAFTER_RUN").ok(),
+            deck_script: std::env::var("MYDRAFTER_DECK_RUN").ok(),
             frame_count: 0,
         }
     }
@@ -43,6 +52,10 @@ impl App {
             for cmd in script.split(';') {
                 self.execute_line(cmd.to_string());
             }
+        }
+        if let Some(prompt) = self.deck_script.take() {
+            self.deck_pane
+                .send_text(&prompt, &self.session, &self.tokio);
         }
     }
 
@@ -98,8 +111,16 @@ impl App {
             return;
         };
         ctx.request_repaint(); // keep frames flowing until the shot lands
-        self.frame_count += 1;
+        // With a deck script, wait for the LLM turn(s) to finish before shooting.
+        let deck_ready =
+            std::env::var("MYDRAFTER_DECK_RUN").is_err() || self.deck_pane.turns_completed();
+        if deck_ready {
+            self.frame_count += 1;
+        }
         if self.frame_count == 20 {
+            if let Ok(path) = std::env::var("MYDRAFTER_SAVE") {
+                self.save(Some(path.into()));
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         }
         let image = ctx.input(|i| {
@@ -186,6 +207,13 @@ impl eframe::App for App {
                 if let Some(line) = self.command_line.ui(ui) {
                     self.execute_line(line);
                 }
+            });
+
+        egui::Panel::right("deck")
+            .resizable(true)
+            .default_size(340.0)
+            .show(ui, |ui| {
+                self.deck_pane.ui(ui, &mut self.session, &self.tokio);
             });
 
         egui::CentralPanel::default()
