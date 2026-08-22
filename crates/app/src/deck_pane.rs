@@ -1,15 +1,15 @@
 use mydrafter_commands::{parse, Session};
 use mydrafter_deck::{
     make_deck, probe, system_prompt, ChatMessage, ChatRequest, DeckDelta, DecksFile, ExtractEvent,
-    Extractor, Role,
+    Extractor, ProbeInfo, Role,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::sync::oneshot;
 
 enum ProbeState {
     Unknown,
-    Checking(oneshot::Receiver<Result<String, String>>),
-    Ready(String),
+    Checking(oneshot::Receiver<Result<ProbeInfo, String>>),
+    Ready(ProbeInfo),
     Unavailable(String),
 }
 
@@ -32,6 +32,7 @@ pub struct DeckPane {
     /// Conversation as sent to the API (assistant turns keep the raw fenced text).
     messages: Vec<ChatMessage>,
     rx: Option<UnboundedReceiver<DeckDelta>>,
+    turn_task: Option<tokio::task::JoinHandle<()>>,
     extractor: Extractor,
     current_response: String,
     /// Streaming chat text of the in-flight deck turn (display only).
@@ -51,6 +52,7 @@ impl Default for DeckPane {
             transcript: Vec::new(),
             messages: Vec::new(),
             rx: None,
+            turn_task: None,
             extractor: Extractor::default(),
             current_response: String::new(),
             streaming_chat: String::new(),
@@ -138,7 +140,23 @@ impl DeckPane {
         self.current_response.clear();
         self.streaming_chat.clear();
         self.errors_this_turn.clear();
-        handle.spawn(async move { deck.stream_chat(req, tx).await });
+        self.turn_task = Some(handle.spawn(async move { deck.stream_chat(req, tx).await }));
+    }
+
+    fn stop_turn(&mut self) {
+        if let Some(task) = self.turn_task.take() {
+            task.abort();
+        }
+        self.rx = None;
+        self.retries = MAX_RETRIES; // no auto-retry after a manual stop
+        if !self.current_response.is_empty() {
+            self.messages.push(ChatMessage {
+                role: Role::Assistant,
+                content: std::mem::take(&mut self.current_response),
+            });
+        }
+        self.streaming_chat.clear();
+        self.transcript.push(Entry::Status("stopped".into()));
     }
 
     fn send(&mut self, session: &Session, handle: &tokio::runtime::Handle) {
@@ -284,8 +302,35 @@ impl DeckPane {
                         }
                     }
                 });
+            // Model picker fed by the probe's model list (Ollama: installed
+            // models; Anthropic: available models).
+            let probe_models = match &self.probe {
+                ProbeState::Ready(info) => info.models.clone(),
+                _ => Vec::new(),
+            };
+            if !probe_models.is_empty()
+                && let Some(config) = self.decks.decks.get_mut(self.decks.active)
+            {
+                let mut model = config.model.clone();
+                egui::ComboBox::from_id_salt("model_select")
+                    .selected_text(&model)
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for m in &probe_models {
+                            ui.selectable_value(&mut model, m.clone(), m);
+                        }
+                    });
+                if model != config.model {
+                    config.model = model;
+                    self.decks.save();
+                    self.probe = ProbeState::Unknown; // re-probe with new model
+                }
+            }
             if self.busy() {
                 ui.spinner();
+                if ui.small_button("stop").clicked() {
+                    self.stop_turn();
+                }
             }
             if ui.small_button("clear").clicked() {
                 self.transcript.clear();
@@ -293,9 +338,9 @@ impl DeckPane {
             }
         });
         match &self.probe {
-            ProbeState::Ready(detail) => {
+            ProbeState::Ready(info) => {
                 ui.label(
-                    egui::RichText::new(format!("● {detail}"))
+                    egui::RichText::new(format!("● {}", info.detail))
                         .color(egui::Color32::from_rgb(70, 160, 90))
                         .small(),
                 );

@@ -14,5 +14,5 @@ mod prompt;
 pub use config::{DeckConfig, DeckKind, DecksFile};
 pub use deck::{make_deck, ChatMessage, ChatRequest, DeckDelta, DeckError, LlmDeck, Role};
 pub use extract::{Extractor, ExtractEvent};
-pub use probe::probe;
+pub use probe::{probe, ProbeInfo};
 pub use prompt::system_prompt;

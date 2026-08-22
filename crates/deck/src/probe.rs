@@ -2,9 +2,16 @@ use serde_json::Value;
 
 use crate::config::{DeckConfig, DeckKind};
 
+#[derive(Clone, Debug)]
+pub struct ProbeInfo {
+    pub detail: String,
+    /// Models available on the endpoint (drives the model picker).
+    pub models: Vec<String>,
+}
+
 /// Check whether a cassette is actually usable before enabling the deck UI:
 /// endpoint reachable, key present/valid, model available.
-pub async fn probe(config: &DeckConfig) -> Result<String, String> {
+pub async fn probe(config: &DeckConfig) -> Result<ProbeInfo, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -29,9 +36,13 @@ pub async fn probe(config: &DeckConfig) -> Result<String, String> {
                 ));
             }
             let body: Value = response.json().await.map_err(|e| e.to_string())?;
-            let models: Vec<&str> = body["data"]
+            let models: Vec<String> = body["data"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|m| m["id"].as_str()).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m["id"].as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             if !models.is_empty() && !models.iter().any(|m| *m == config.model) {
                 return Err(format!(
@@ -40,7 +51,10 @@ pub async fn probe(config: &DeckConfig) -> Result<String, String> {
                     models.join(", ")
                 ));
             }
-            Ok(format!("ready — {} @ {base}", config.model))
+            Ok(ProbeInfo {
+                detail: format!("ready — {} @ {base}", config.model),
+                models,
+            })
         }
         DeckKind::Anthropic => {
             let Some(key) = config.resolved_key() else {
@@ -62,7 +76,19 @@ pub async fn probe(config: &DeckConfig) -> Result<String, String> {
             if !response.status().is_success() {
                 return Err(format!("{base} answered {}", response.status()));
             }
-            Ok(format!("ready — {} @ {base}", config.model))
+            let body: Value = response.json().await.map_err(|e| e.to_string())?;
+            let models: Vec<String> = body["data"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m["id"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(ProbeInfo {
+                detail: format!("ready — {} @ {base}", config.model),
+                models,
+            })
         }
     }
 }
