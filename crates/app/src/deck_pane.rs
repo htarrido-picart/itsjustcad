@@ -1,7 +1,7 @@
 use mydrafter_commands::{parse, Session};
 use mydrafter_deck::{
-    make_deck, probe, system_prompt, ChatMessage, ChatRequest, DeckDelta, DecksFile, ExtractEvent,
-    Extractor, ProbeInfo, Role,
+    make_deck, probe, system_prompt, warm_model, ChatMessage, ChatRequest, DeckDelta, DecksFile,
+    ExtractEvent, Extractor, ProbeInfo, Role, WarmOutcome,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::sync::oneshot;
@@ -11,6 +11,17 @@ enum ProbeState {
     Checking(oneshot::Receiver<Result<ProbeInfo, String>>),
     Ready(ProbeInfo),
     Unavailable(String),
+}
+
+enum WarmState {
+    Idle,
+    Warming {
+        rx: oneshot::Receiver<Result<WarmOutcome, String>>,
+        started: std::time::Instant,
+    },
+    Warm,
+    NotApplicable,
+    Failed(String),
 }
 
 const MAX_RETRIES: u8 = 2;
@@ -118,6 +129,9 @@ pub struct DeckPane {
     /// Deck is disabled until the active cassette probes healthy.
     probe: ProbeState,
     probed_deck: Option<usize>,
+    /// Background model preload (Ollama cold-load tax).
+    warm: WarmState,
+    warmed_model: Option<String>,
 }
 
 impl Default for DeckPane {
@@ -137,6 +151,8 @@ impl Default for DeckPane {
             retries: 0,
             probe: ProbeState::Unknown,
             probed_deck: None,
+            warm: WarmState::Idle,
+            warmed_model: None,
         }
     }
 }
@@ -146,8 +162,53 @@ impl DeckPane {
         self.rx.is_some()
     }
 
+    /// Chat is enabled only when the endpoint probes healthy AND the model is
+    /// resident in memory (or warm-up doesn't apply, e.g. cloud APIs).
     fn ready(&self) -> bool {
         matches!(self.probe, ProbeState::Ready(_))
+            && matches!(self.warm, WarmState::Warm | WarmState::NotApplicable)
+    }
+
+    fn start_warm(&mut self, handle: &tokio::runtime::Handle) {
+        let Some(config) = self.decks.decks.get(self.decks.active).cloned() else {
+            return;
+        };
+        self.warmed_model = Some(config.model.clone());
+        let (tx, rx) = oneshot::channel();
+        self.warm = WarmState::Warming {
+            rx,
+            started: std::time::Instant::now(),
+        };
+        handle.spawn(async move {
+            let _ = tx.send(warm_model(&config).await);
+        });
+    }
+
+    fn poll_warm(&mut self, handle: &tokio::runtime::Handle) {
+        // (Re)warm when the endpoint is healthy and the model changed.
+        if matches!(self.probe, ProbeState::Ready(_)) {
+            let current = self
+                .decks
+                .decks
+                .get(self.decks.active)
+                .map(|c| c.model.clone());
+            let stale = self.warmed_model != current
+                || matches!(self.warm, WarmState::Idle | WarmState::Failed(_));
+            if stale && !matches!(self.warm, WarmState::Warming { .. }) {
+                self.start_warm(handle);
+            }
+        }
+        if let WarmState::Warming { rx, .. } = &mut self.warm {
+            match rx.try_recv() {
+                Ok(Ok(WarmOutcome::Warm)) => self.warm = WarmState::Warm,
+                Ok(Ok(WarmOutcome::NotApplicable)) => self.warm = WarmState::NotApplicable,
+                Ok(Err(e)) => self.warm = WarmState::Failed(e),
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.warm = WarmState::Failed("warm-up task died".into());
+                }
+            }
+        }
     }
 
     fn start_probe(&mut self, handle: &tokio::runtime::Handle) {
@@ -358,7 +419,11 @@ impl DeckPane {
     ) {
         self.drain(session, handle);
         self.poll_probe(handle);
-        if self.busy() || matches!(self.probe, ProbeState::Checking(_)) {
+        self.poll_warm(handle);
+        if self.busy()
+            || matches!(self.probe, ProbeState::Checking(_))
+            || matches!(self.warm, WarmState::Warming { .. })
+        {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -430,11 +495,45 @@ impl DeckPane {
         });
         match &self.probe {
             ProbeState::Ready(info) => {
-                ui.label(
-                    egui::RichText::new(format!("● {}", info.detail))
-                        .color(egui::Color32::from_rgb(70, 160, 90))
-                        .small(),
-                );
+                match &self.warm {
+                    WarmState::Warming { started, .. } => {
+                        // Ollama exposes no load progress — pseudo-progress
+                        // asymptotic to 95% keeps the bar honest but alive.
+                        let t = started.elapsed().as_secs_f32();
+                        let progress = 0.95 * (1.0 - (-t / 25.0).exp());
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "loading model into memory… {:.0}s (first use of a model takes 30-60s)",
+                                t
+                            ))
+                            .small(),
+                        );
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .desired_height(6.0)
+                                .animate(true),
+                        );
+                    }
+                    WarmState::Failed(e) => {
+                        ui.label(
+                            egui::RichText::new(format!("● model load failed: {e}"))
+                                .color(egui::Color32::from_rgb(200, 80, 70))
+                                .small(),
+                        );
+                    }
+                    _ => {
+                        let warm_tag = if matches!(self.warm, WarmState::Warm) {
+                            " · model warm"
+                        } else {
+                            ""
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("● {}{warm_tag}", info.detail))
+                                .color(egui::Color32::from_rgb(70, 160, 90))
+                                .small(),
+                        );
+                    }
+                }
             }
             ProbeState::Unavailable(reason) => {
                 let reason = reason.clone();
@@ -531,6 +630,8 @@ impl DeckPane {
         ui.separator();
         let hint = if self.ready() {
             "describe what to draw… (Enter sends, Shift+Enter newline)"
+        } else if matches!(self.warm, WarmState::Warming { .. }) {
+            "loading model — chat enables when warm"
         } else {
             "deck unavailable — fix the connection above"
         };
