@@ -1,17 +1,16 @@
 use egui_wgpu::CallbackTrait;
 use glam::Mat4;
-use kernel_mesh::RenderMesh;
 
-use crate::renderer::{CameraUniform, SceneRenderer};
+use crate::renderer::{CameraUniform, SceneData, SceneRenderer};
 
 /// Per-frame paint callback for the 3D viewport. Uploads the camera, rebuilds
-/// mesh buffers when the document generation changed, then draws the scene.
+/// scene buffers when the document generation changed, then draws the scene.
 pub struct ViewportCallback {
     pub view_proj: Mat4,
     pub eye: glam::Vec3,
     pub generation: u64,
     /// Present only on frames where `generation` differs from the GPU copy.
-    pub meshes: Option<Vec<(RenderMesh, [f32; 4])>>,
+    pub scene: Option<SceneData>,
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -30,10 +29,10 @@ impl CallbackTrait for ViewportCallback {
             eye: [self.eye.x, self.eye.y, self.eye.z, 1.0],
         };
         renderer.write_camera(queue, &cam);
-        if let Some(meshes) = &self.meshes
+        if let Some(scene) = &self.scene
             && renderer.generation != self.generation
         {
-            renderer.set_meshes(device, meshes, self.generation);
+            renderer.set_scene(device, scene, self.generation);
         }
         Vec::new()
     }

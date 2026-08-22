@@ -1,4 +1,6 @@
 mod app;
+mod command_line;
+mod scene;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();

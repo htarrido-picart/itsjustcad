@@ -1,0 +1,372 @@
+use glam::DVec3;
+
+use crate::error::ParseError;
+use crate::registry::registry;
+use crate::{Command, Selector};
+
+/// Hand-rolled `verb arg arg...` parser. Chosen over a combinator library
+/// because error message quality feeds the LLM retry loop.
+pub fn parse(input: &str) -> Result<Command, ParseError> {
+    let mut tokens = input.split_whitespace();
+    let verb = tokens.next().ok_or(ParseError::Empty)?.to_lowercase();
+    let args: Vec<&str> = tokens.collect();
+
+    match verb.as_str() {
+        "box" => {
+            let [corner, size] = take::<2>("box", "a corner point and a size", &args)?;
+            Ok(Command::Box {
+                id: None,
+                corner: point(corner)?,
+                size: point(size)?,
+            })
+        }
+        "extrude" => {
+            let [sel, height] = take::<2>("extrude", "a selector and a height", &args)?;
+            Ok(Command::Extrude {
+                id: None,
+                profile: selector_one(sel)?,
+                height: number(height)?,
+            })
+        }
+        "line" => {
+            let [a, b] = take::<2>("line", "two points", &args)?;
+            Ok(Command::Line {
+                id: None,
+                a: point(a)?,
+                b: point(b)?,
+            })
+        }
+        "polyline" | "pline" => {
+            let (closed, pts) = match args.split_last() {
+                Some((&"closed", rest)) => (true, rest),
+                _ => (false, &args[..]),
+            };
+            if pts.len() < 2 {
+                return wrong("polyline", "at least 2 points", &args);
+            }
+            Ok(Command::Polyline {
+                id: None,
+                points: pts.iter().map(|p| point(p)).collect::<Result<_, _>>()?,
+                closed,
+            })
+        }
+        "rect" | "rectangle" => {
+            let [corner, w, h] = take::<3>("rect", "a corner point, width and height", &args)?;
+            Ok(Command::Rectangle {
+                id: None,
+                corner: point(corner)?,
+                width: number(w)?,
+                height: number(h)?,
+            })
+        }
+        "circle" => {
+            let [center, r] = take::<2>("circle", "a center point and a radius", &args)?;
+            Ok(Command::Circle {
+                id: None,
+                center: point(center)?,
+                radius: number(r)?,
+            })
+        }
+        "arc" => {
+            let [center, r, s, e] =
+                take::<4>("arc", "center, radius, start and end angles (deg)", &args)?;
+            Ok(Command::Arc {
+                id: None,
+                center: point(center)?,
+                radius: number(r)?,
+                start_deg: number(s)?,
+                end_deg: number(e)?,
+            })
+        }
+        "ellipse" => {
+            let [center, rx, ry] = take::<3>("ellipse", "a center point, rx and ry", &args)?;
+            Ok(Command::Ellipse {
+                id: None,
+                center: point(center)?,
+                rx: number(rx)?,
+                ry: number(ry)?,
+            })
+        }
+        "polygon" => {
+            let [center, r, sides] = take::<3>("polygon", "a center point, radius and side count", &args)?;
+            Ok(Command::Polygon {
+                id: None,
+                center: point(center)?,
+                radius: number(r)?,
+                sides: sides
+                    .parse()
+                    .map_err(|_| ParseError::BadNumber(sides.to_string()))?,
+            })
+        }
+        "curve" => {
+            // Optional trailing: degree N
+            let (degree, pts) = match args.as_slice() {
+                [rest @ .., "degree", d] => (
+                    d.parse::<u32>()
+                        .map_err(|_| ParseError::BadNumber(d.to_string()))?,
+                    rest,
+                ),
+                _ => (3, &args[..]),
+            };
+            if pts.len() < 2 {
+                return wrong("curve", "at least 2 control points", &args);
+            }
+            Ok(Command::Curve {
+                id: None,
+                points: pts.iter().map(|p| point(p)).collect::<Result<_, _>>()?,
+                degree,
+            })
+        }
+        "move" => {
+            let (sel, rest) = selector(&args, "move")?;
+            let [delta] = take::<1>("move", "a delta point after the selector", rest)?;
+            Ok(Command::Move {
+                targets: sel,
+                delta: point(delta)?,
+            })
+        }
+        "copy" => {
+            let (sel, rest) = selector(&args, "copy")?;
+            let [delta] = take::<1>("copy", "a delta point after the selector", rest)?;
+            Ok(Command::Copy {
+                ids: None,
+                targets: sel,
+                delta: point(delta)?,
+            })
+        }
+        "delete" | "del" => {
+            let (sel, rest) = selector(&args, "delete")?;
+            expect_empty("delete", rest, &args)?;
+            Ok(Command::Delete { targets: sel })
+        }
+        "name" => {
+            let (sel, rest) = selector(&args, "name")?;
+            let [name] = take::<1>("name", "a name after the selector", rest)?;
+            Ok(Command::Name {
+                targets: sel,
+                name: name.to_string(),
+            })
+        }
+        "select" => {
+            let (sel, rest) = selector(&args, "select")?;
+            expect_empty("select", rest, &args)?;
+            Ok(Command::Select { targets: sel })
+        }
+        "selectnone" | "deselect" => Ok(Command::SelectNone),
+        "undo" => Ok(Command::Undo),
+        "redo" => Ok(Command::Redo),
+        other => Err(ParseError::UnknownCommand {
+            name: other.to_string(),
+            suggestion: closest_command(other),
+        }),
+    }
+}
+
+fn take<'a, const N: usize>(
+    command: &'static str,
+    expected: &'static str,
+    args: &[&'a str],
+) -> Result<[&'a str; N], ParseError> {
+    <[&str; N]>::try_from(args.to_vec()).map_err(|_| wrong_err(command, expected, args))
+}
+
+fn wrong<T>(command: &'static str, expected: &'static str, args: &[&str]) -> Result<T, ParseError> {
+    Err(wrong_err(command, expected, args))
+}
+
+fn wrong_err(command: &'static str, expected: &'static str, args: &[&str]) -> ParseError {
+    let usage = registry()
+        .iter()
+        .find(|s| s.name == command)
+        .map(|s| s.usage)
+        .unwrap_or("");
+    ParseError::WrongArgs {
+        command,
+        expected,
+        got: if args.is_empty() {
+            "nothing".to_string()
+        } else {
+            format!("'{}'", args.join(" "))
+        },
+        usage,
+    }
+}
+
+fn expect_empty(command: &'static str, rest: &[&str], args: &[&str]) -> Result<(), ParseError> {
+    if rest.is_empty() {
+        Ok(())
+    } else {
+        wrong(command, "only a selector", args)
+    }
+}
+
+/// Numbers accept unit suffixes; bare numbers are meters.
+pub fn number(s: &str) -> Result<f64, ParseError> {
+    let (num, factor) = if let Some(v) = s.strip_suffix("mm") {
+        (v, 0.001)
+    } else if let Some(v) = s.strip_suffix("cm") {
+        (v, 0.01)
+    } else if let Some(v) = s.strip_suffix('m') {
+        (v, 1.0)
+    } else {
+        (s, 1.0)
+    };
+    num.parse::<f64>()
+        .map(|v| v * factor)
+        .map_err(|_| ParseError::BadNumber(s.to_string()))
+}
+
+/// `x,y` (z=0) or `x,y,z`, each component with optional units.
+pub fn point(s: &str) -> Result<DVec3, ParseError> {
+    let parts: Vec<&str> = s.split(',').collect();
+    let bad = || ParseError::BadPoint(s.to_string());
+    match parts.as_slice() {
+        [x, y] => Ok(DVec3::new(
+            number(x).map_err(|_| bad())?,
+            number(y).map_err(|_| bad())?,
+            0.0,
+        )),
+        [x, y, z] => Ok(DVec3::new(
+            number(x).map_err(|_| bad())?,
+            number(y).map_err(|_| bad())?,
+            number(z).map_err(|_| bad())?,
+        )),
+        _ => Err(bad()),
+    }
+}
+
+/// Parse a selector from the front of `args`, returning the rest.
+fn selector<'a>(
+    args: &'a [&'a str],
+    command: &'static str,
+) -> Result<(Selector, &'a [&'a str]), ParseError> {
+    let (&first, rest) = args
+        .split_first()
+        .ok_or_else(|| wrong_err(command, "a selector", args))?;
+    match first {
+        "last" => {
+            // optional count: last 3
+            if let Some((&count, rest2)) = rest.split_first()
+                && let Ok(n) = count.parse::<usize>()
+            {
+                return Ok((Selector::Last { n }, rest2));
+            }
+            Ok((Selector::Last { n: 1 }, rest))
+        }
+        "all" => Ok((Selector::All, rest)),
+        "sel" | "selected" => Ok((Selector::Selected, rest)),
+        name if name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '#') => Ok((
+            Selector::Named {
+                name: name.trim_start_matches('#').to_string(),
+            },
+            rest,
+        )),
+        other => Err(ParseError::BadSelector(other.to_string())),
+    }
+}
+
+fn selector_one(s: &str) -> Result<Selector, ParseError> {
+    let args = [s];
+    selector(&args, "extrude").map(|(sel, _)| sel)
+}
+
+fn closest_command(input: &str) -> Option<String> {
+    registry()
+        .iter()
+        .map(|s| s.name)
+        .min_by_key(|name| levenshtein(input, name))
+        .filter(|name| levenshtein(input, name) <= 2)
+        .map(String::from)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        curr[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_box() {
+        let cmd = parse("box 0,0,0 5,5,3").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Box {
+                id: None,
+                corner: DVec3::ZERO,
+                size: DVec3::new(5.0, 5.0, 3.0)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_units() {
+        assert_eq!(number("250cm").unwrap(), 2.5);
+        assert_eq!(number("500mm").unwrap(), 0.5);
+        assert_eq!(number("3m").unwrap(), 3.0);
+        assert_eq!(number("4.5").unwrap(), 4.5);
+    }
+
+    #[test]
+    fn parse_2d_point_z_zero() {
+        assert_eq!(point("3,4").unwrap(), DVec3::new(3.0, 4.0, 0.0));
+    }
+
+    #[test]
+    fn parse_selectors() {
+        assert!(matches!(
+            parse("delete last").unwrap(),
+            Command::Delete { targets: Selector::Last { n: 1 } }
+        ));
+        assert!(matches!(
+            parse("move last 3 1,0,0").unwrap(),
+            Command::Move { targets: Selector::Last { n: 3 }, .. }
+        ));
+        assert!(matches!(
+            parse("delete all").unwrap(),
+            Command::Delete { targets: Selector::All }
+        ));
+        assert!(matches!(
+            parse("delete tower-a").unwrap(),
+            Command::Delete { targets: Selector::Named { .. } }
+        ));
+    }
+
+    #[test]
+    fn parse_polyline_closed() {
+        let cmd = parse("polyline 0,0 5,0 5,5 closed").unwrap();
+        assert!(matches!(cmd, Command::Polyline { closed: true, ref points, .. } if points.len() == 3));
+    }
+
+    #[test]
+    fn parse_curve_with_degree() {
+        let cmd = parse("curve 0,0 2,4 6,4 8,0 degree 2").unwrap();
+        assert!(matches!(cmd, Command::Curve { degree: 2, ref points, .. } if points.len() == 4));
+    }
+
+    #[test]
+    fn typo_suggestion() {
+        let err = parse("bxo 0,0,0 1,1,1").unwrap_err();
+        assert!(err.to_string().contains("box"), "{err}");
+    }
+
+    #[test]
+    fn command_json_roundtrip() {
+        let cmd = parse("polyline 0,0 5,0 5,5 closed").unwrap();
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+}

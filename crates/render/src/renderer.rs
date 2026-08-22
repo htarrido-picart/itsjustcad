@@ -24,14 +24,30 @@ struct GpuMesh {
     object_bind_group: wgpu::BindGroup,
 }
 
+struct GpuLine {
+    vertex_buf: wgpu::Buffer,
+    vertex_count: u32,
+    object_bind_group: wgpu::BindGroup,
+}
+
+/// CPU-side scene snapshot handed to the renderer when the document changes.
+pub struct SceneData {
+    pub meshes: Vec<(RenderMesh, [f32; 4])>,
+    /// Line strips: consecutive points, `closed` handled by repeating the seam
+    /// point on the CPU side.
+    pub lines: Vec<(Vec<[f32; 3]>, [f32; 4])>,
+}
+
 /// Owns all wgpu resources; lives in egui-wgpu's `CallbackResources` type map.
 pub struct SceneRenderer {
     grid_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
+    curve_pipeline: wgpu::RenderPipeline,
     camera_buf: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     object_layout: wgpu::BindGroupLayout,
     meshes: Vec<GpuMesh>,
+    lines: Vec<GpuLine>,
     /// Document generation the GPU buffers were built from.
     pub generation: u64,
 }
@@ -171,13 +187,58 @@ impl SceneRenderer {
             cache: None,
         });
 
+        let curve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("curve_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/curve.wgsl").into()),
+        });
+        let curve_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("curve_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: wgpu::VertexState {
+                module: &curve_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &curve_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineStrip,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             grid_pipeline,
             mesh_pipeline,
+            curve_pipeline,
             camera_buf,
             camera_bind_group,
             object_layout,
             meshes: Vec::new(),
+            lines: Vec::new(),
             generation: u64::MAX,
         }
     }
@@ -236,6 +297,46 @@ impl SceneRenderer {
         self.generation = generation;
     }
 
+    fn object_bind_group(&self, device: &wgpu::Device, color: [f32; 4]) -> wgpu::BindGroup {
+        use wgpu::util::DeviceExt as _;
+        let params = ObjectParams { color };
+        let object_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("object_ubo"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("object_bg"),
+            layout: &self.object_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: object_buf.as_entire_binding(),
+            }],
+        })
+    }
+
+    /// Rebuild all GPU buffers from a scene snapshot.
+    pub fn set_scene(&mut self, device: &wgpu::Device, scene: &SceneData, generation: u64) {
+        use wgpu::util::DeviceExt as _;
+        self.set_meshes(device, &scene.meshes, generation);
+        self.lines.clear();
+        for (points, color) in &scene.lines {
+            if points.len() < 2 {
+                continue;
+            }
+            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("curve_vb"),
+                contents: bytemuck::cast_slice(points),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            self.lines.push(GpuLine {
+                vertex_buf,
+                vertex_count: points.len() as u32,
+                object_bind_group: self.object_bind_group(device, *color),
+            });
+        }
+    }
+
     pub fn paint(&self, render_pass: &mut wgpu::RenderPass<'static>) {
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
@@ -245,6 +346,13 @@ impl SceneRenderer {
             render_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
             render_pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+
+        render_pass.set_pipeline(&self.curve_pipeline);
+        for line in &self.lines {
+            render_pass.set_bind_group(1, &line.object_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, line.vertex_buf.slice(..));
+            render_pass.draw(0..line.vertex_count, 0..1);
         }
 
         // Grid last: blends over background, depth-tested against meshes.
