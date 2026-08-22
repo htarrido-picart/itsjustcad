@@ -15,6 +15,79 @@ enum ProbeState {
 
 const MAX_RETRIES: u8 = 2;
 
+/// Render a raw model stream with structure: prose as normal text, fenced
+/// ```draft blocks as code cards with the command verb highlighted.
+fn render_raw(ui: &mut egui::Ui, text: &str) {
+    let accent = egui::Color32::from_rgb(90, 160, 255);
+    let mut in_fence = false;
+    let mut prose: Vec<&str> = Vec::new();
+    let mut code: Vec<&str> = Vec::new();
+
+    let flush_prose = |ui: &mut egui::Ui, prose: &mut Vec<&str>| {
+        let joined = prose.join("\n");
+        let trimmed = joined.trim();
+        if !trimmed.is_empty() {
+            ui.add(egui::Label::new(trimmed).wrap());
+        }
+        prose.clear();
+    };
+    let flush_code = |ui: &mut egui::Ui, code: &mut Vec<&str>| {
+        if code.is_empty() {
+            return;
+        }
+        ui.label(egui::RichText::new("draft").small().weak().color(accent));
+        egui::Frame::group(ui.style())
+            .fill(ui.visuals().code_bg_color)
+            .inner_margin(egui::Margin::same(6))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                for line in code.iter() {
+                    let mut job = egui::text::LayoutJob::default();
+                    let font = egui::TextStyle::Monospace.resolve(ui.style());
+                    let (verb, rest) = line.split_once(' ').unwrap_or((line, ""));
+                    job.append(
+                        verb,
+                        0.0,
+                        egui::TextFormat::simple(font.clone(), accent),
+                    );
+                    if !rest.is_empty() {
+                        job.append(
+                            &format!(" {rest}"),
+                            0.0,
+                            egui::TextFormat::simple(
+                                font,
+                                ui.visuals().text_color(),
+                            ),
+                        );
+                    }
+                    ui.label(job);
+                }
+            });
+        code.clear();
+    };
+
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("```") {
+            if in_fence {
+                flush_code(ui, &mut code);
+                in_fence = false;
+            } else {
+                flush_prose(ui, &mut prose);
+                in_fence = true;
+            }
+        } else if in_fence {
+            if !t.is_empty() {
+                code.push(t);
+            }
+        } else {
+            prose.push(line);
+        }
+    }
+    flush_code(ui, &mut code);
+    flush_prose(ui, &mut prose);
+}
+
 enum Entry {
     User(String),
     Deck(String),
@@ -398,14 +471,7 @@ impl DeckPane {
                             )
                             .id_salt(("raw", i))
                             .default_open(false)
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(text.trim()).monospace().small(),
-                                    )
-                                    .wrap(),
-                                );
-                            });
+                            .show(ui, |ui| render_raw(ui, text));
                         }
                         Entry::User(t) => {
                             ui.label(egui::RichText::new(format!("you: {t}")).strong());
@@ -457,16 +523,7 @@ impl DeckPane {
                         )
                         .id_salt("raw_live")
                         .default_open(false)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(self.current_response.trim())
-                                        .monospace()
-                                        .small(),
-                                )
-                                .wrap(),
-                            );
-                        });
+                        .show(ui, |ui| render_raw(ui, &self.current_response));
                     }
                 }
             });
