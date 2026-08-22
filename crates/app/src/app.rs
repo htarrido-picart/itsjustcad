@@ -41,8 +41,55 @@ impl App {
     fn run_startup_script(&mut self) {
         if let Some(script) = self.startup_script.take() {
             for cmd in script.split(';') {
-                self.command_line.execute(&mut self.session, cmd);
+                self.execute_line(cmd.to_string());
             }
+        }
+    }
+
+    /// App-level verbs (save/open, file dialogs) wrap the command substrate.
+    fn execute_line(&mut self, line: String) {
+        let line = line.trim();
+        let mut words = line.split_whitespace();
+        match words.next() {
+            Some("save") => self.save(words.next().map(Into::into)),
+            Some("open") => self.open(words.next().map(Into::into)),
+            _ => {
+                self.command_line.execute(&mut self.session, line);
+            }
+        }
+    }
+
+    fn save(&mut self, path: Option<std::path::PathBuf>) {
+        let path = path.or_else(|| {
+            rfd::FileDialog::new()
+                .add_filter("mydrafter", &["mydrafter.json", "json"])
+                .set_file_name("untitled.mydrafter.json")
+                .save_file()
+        });
+        let Some(path) = path else { return };
+        match mydrafter_commands::io::save_file(&self.session, &path) {
+            Ok(()) => self
+                .command_line
+                .push_line(format!("saved {}", path.display())),
+            Err(e) => self.command_line.push_line(format!("error: {e}")),
+        }
+    }
+
+    fn open(&mut self, path: Option<std::path::PathBuf>) {
+        let path = path.or_else(|| {
+            rfd::FileDialog::new()
+                .add_filter("mydrafter", &["mydrafter.json", "json"])
+                .pick_file()
+        });
+        let Some(path) = path else { return };
+        match mydrafter_commands::io::load_file(&path) {
+            Ok(session) => {
+                self.session = session;
+                self.uploaded_generation = None;
+                self.command_line
+                    .push_line(format!("opened {} ({} objects)", path.display(), self.session.doc.len()));
+            }
+            Err(e) => self.command_line.push_line(format!("error: {e}")),
         }
     }
 
@@ -120,11 +167,24 @@ impl eframe::App for App {
         self.run_startup_script();
         self.handle_dev_screenshot(ui.ctx());
 
+        let (save_key, open_key) = ui.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::O),
+            )
+        });
+        if save_key {
+            self.save(None);
+        }
+        if open_key {
+            self.open(None);
+        }
+
         egui::Panel::bottom("command_line")
             .resizable(false)
             .show(ui, |ui| {
                 if let Some(line) = self.command_line.ui(ui) {
-                    self.command_line.execute(&mut self.session, &line);
+                    self.execute_line(line);
                 }
             });
 

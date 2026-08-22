@@ -133,6 +133,6 @@ fn main() {
         view_proj,
         eye,
         generation: 0,
-        meshes: None,
+        scene: None,
     };
 }

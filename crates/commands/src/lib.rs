@@ -5,6 +5,7 @@
 mod command;
 mod error;
 mod exec;
+pub mod io;
 mod parse;
 mod registry;
 
