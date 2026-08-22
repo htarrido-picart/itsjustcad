@@ -21,6 +21,8 @@ enum Entry {
     CommandOk(String, String),
     CommandErr(String, String),
     Status(String),
+    /// Raw model output for one turn, shown as a collapsed nested view.
+    Raw(String),
 }
 
 /// The LLM companion pane. Streams commands out of the active deck and runs
@@ -206,9 +208,13 @@ impl DeckPane {
             self.transcript
                 .push(Entry::Deck(std::mem::take(&mut self.streaming_chat)));
         }
+        let raw = std::mem::take(&mut self.current_response);
+        if !raw.trim().is_empty() {
+            self.transcript.push(Entry::Raw(raw.clone()));
+        }
         self.messages.push(ChatMessage {
             role: Role::Assistant,
-            content: std::mem::take(&mut self.current_response),
+            content: raw,
         });
         if !self.errors_this_turn.is_empty() && self.retries < MAX_RETRIES {
             self.retries += 1;
@@ -384,8 +390,23 @@ impl DeckPane {
             .stick_to_bottom(true)
             .max_height(ui.available_height() - input_height)
             .show(ui, |ui| {
-                for entry in &self.transcript {
+                for (i, entry) in self.transcript.iter().enumerate() {
                     match entry {
+                        Entry::Raw(text) => {
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new("raw stream").weak().small(),
+                            )
+                            .id_salt(("raw", i))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(text.trim()).monospace().small(),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        }
                         Entry::User(t) => {
                             ui.label(egui::RichText::new(format!("you: {t}")).strong());
                         }
@@ -429,6 +450,24 @@ impl DeckPane {
                         };
                         ui.label(egui::RichText::new(status).weak().italics());
                     });
+                    if received > 0 {
+                        // Live nested raw stream — expand to watch tokens land.
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new("raw stream (live)").weak().small(),
+                        )
+                        .id_salt("raw_live")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(self.current_response.trim())
+                                        .monospace()
+                                        .small(),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    }
                 }
             });
 
