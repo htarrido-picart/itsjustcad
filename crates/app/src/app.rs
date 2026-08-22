@@ -15,6 +15,8 @@ pub struct App {
     uploaded_generation: Option<u64>,
     /// Theme of the last GPU upload; theme flips force a re-upload.
     uploaded_theme: Option<scene::Theme>,
+    /// Last zoom factor written to ui.json (avoid rewriting every frame).
+    saved_zoom: f32,
     /// Dev self-verification: MYDRAFTER_SHOT=<path.png> captures a frame and exits.
     shot_path: Option<String>,
     /// Dev scripting: MYDRAFTER_RUN="cmd;cmd;..." executes on startup.
@@ -35,6 +37,12 @@ impl App {
             .write()
             .callback_resources
             .insert(SceneRenderer::new(&rs.device, rs.target_format));
+
+        // Accessibility: readable default text size, persisted across runs.
+        // Cmd+= / Cmd+- / Cmd+0 also work (egui built-in zoom).
+        let zoom = load_zoom().unwrap_or(1.3);
+        cc.egui_ctx.set_zoom_factor(zoom);
+
         Self {
             session: Session::default(),
             command_line: CommandLine::default(),
@@ -43,6 +51,7 @@ impl App {
             camera: OrbitCamera::default(),
             uploaded_generation: None,
             uploaded_theme: None,
+            saved_zoom: zoom,
             shot_path: std::env::var("MYDRAFTER_SHOT").ok(),
             startup_script: std::env::var("MYDRAFTER_RUN").ok(),
             deck_script: std::env::var("MYDRAFTER_DECK_RUN").ok(),
@@ -249,6 +258,23 @@ impl App {
     }
 }
 
+fn ui_config_path() -> Option<std::path::PathBuf> {
+    Some(dirs::home_dir()?.join(".config").join("mydrafter").join("ui.json"))
+}
+
+fn load_zoom() -> Option<f32> {
+    let json = std::fs::read_to_string(ui_config_path()?).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    value["zoom"].as_f64().map(|z| (z as f32).clamp(0.5, 3.0))
+}
+
+fn save_zoom(zoom: f32) {
+    if let Some(path) = ui_config_path() {
+        let _ = std::fs::create_dir_all(path.parent().expect("has parent"));
+        let _ = std::fs::write(path, format!("{{\n  \"zoom\": {zoom}\n}}\n"));
+    }
+}
+
 fn ray_aabb(origin: glam::DVec3, dir: glam::DVec3, min: glam::DVec3, max: glam::DVec3) -> Option<f64> {
     let inv = dir.recip();
     let t1 = (min - origin) * inv;
@@ -270,6 +296,13 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.run_startup_script();
         self.handle_dev_screenshot(ui.ctx());
+
+        // Persist zoom changes from any source (buttons or Cmd+=/Cmd+-).
+        let zoom = ui.ctx().zoom_factor();
+        if (zoom - self.saved_zoom).abs() > 0.01 {
+            self.saved_zoom = zoom;
+            save_zoom(zoom);
+        }
 
         let (save_key, open_key) = ui.input_mut(|i| {
             (

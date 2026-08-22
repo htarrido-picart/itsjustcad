@@ -206,6 +206,15 @@ impl DeckPane {
 
         ui.horizontal(|ui| {
             egui::widgets::global_theme_preference_switch(ui);
+            let zoom = ui.ctx().zoom_factor();
+            if ui.button("A−").on_hover_text("smaller text (Cmd -)").clicked() {
+                ui.ctx().set_zoom_factor((zoom - 0.1).max(0.5));
+            }
+            if ui.button("A+").on_hover_text("bigger text (Cmd =)").clicked() {
+                ui.ctx().set_zoom_factor((zoom + 0.1).min(3.0));
+            }
+            ui.label(format!("{:.0}%", zoom * 100.0));
+            ui.separator();
             ui.label("deck:");
             let names: Vec<String> = self.decks.decks.iter().map(|d| d.name.clone()).collect();
             egui::ComboBox::from_id_salt("deck_select")

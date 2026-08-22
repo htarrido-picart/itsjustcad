@@ -1971,6 +1971,7 @@ name = "mydrafter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "eframe",
  "egui",
  "egui-wgpu",
@@ -1982,6 +1983,7 @@ dependencies = [
  "mydrafter-doc",
  "mydrafter-render",
  "rfd",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
