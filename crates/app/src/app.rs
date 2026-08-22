@@ -59,17 +59,66 @@ impl App {
         }
     }
 
-    /// App-level verbs (save/open, file dialogs) wrap the command substrate.
+    /// App-level verbs (save/open, camera) wrap the command substrate.
     fn execute_line(&mut self, line: String) {
         let line = line.trim();
         let mut words = line.split_whitespace();
         match words.next() {
             Some("save") => self.save(words.next().map(Into::into)),
             Some("open") => self.open(words.next().map(Into::into)),
+            Some("ze" | "zoomextents") => self.zoom_extents(),
             _ => {
                 self.command_line.execute(&mut self.session, line);
             }
         }
+    }
+
+    fn zoom_extents(&mut self) {
+        if let Some(bb) = self.session.doc.scene_aabb() {
+            let center = bb.center();
+            self.camera.target =
+                glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32);
+            self.camera.distance = (bb.size().length() as f32 * 1.2).max(5.0);
+        }
+    }
+
+    /// Click-select: ray through the clicked pixel vs object AABBs.
+    fn pick(&mut self, rect: egui::Rect, pos: egui::Pos2, additive: bool) {
+        let aspect = rect.width() / rect.height().max(1.0);
+        let view_proj = self.camera.view_proj(aspect);
+        let inv = view_proj.inverse();
+        let ndc = glam::Vec2::new(
+            (pos.x - rect.left()) / rect.width() * 2.0 - 1.0,
+            1.0 - (pos.y - rect.top()) / rect.height() * 2.0,
+        );
+        let unproject = |z: f32| {
+            let p = inv * glam::Vec4::new(ndc.x, ndc.y, z, 1.0);
+            (p.truncate() / p.w).as_dvec3()
+        };
+        let origin = unproject(0.0);
+        let dir = (unproject(1.0) - origin).normalize();
+
+        let mut best: Option<(f64, mydrafter_doc::ObjectId)> = None;
+        for obj in self.session.doc.objects() {
+            let bb = obj.geometry.aabb();
+            if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
+                && best.is_none_or(|(bt, _)| t < bt)
+            {
+                best = Some((t, obj.id));
+            }
+        }
+        let doc = &mut self.session.doc;
+        if !additive {
+            doc.selection.clear();
+        }
+        if let Some((_, id)) = best {
+            if additive && doc.selection.contains(&id) {
+                doc.selection.remove(&id);
+            } else {
+                doc.selection.insert(id);
+            }
+        }
+        doc.generation += 1; // recolor selection
     }
 
     fn save(&mut self, path: Option<std::path::PathBuf>) {
@@ -163,6 +212,12 @@ impl App {
                 self.camera.dolly(scroll);
             }
         }
+        if response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let additive = ui.input(|i| i.modifiers.shift);
+            self.pick(rect, pos, additive);
+        }
 
         let generation = self.session.doc.generation;
         let scene = (self.uploaded_generation != Some(generation)).then(|| {
@@ -181,6 +236,15 @@ impl App {
             },
         ));
     }
+}
+
+fn ray_aabb(origin: glam::DVec3, dir: glam::DVec3, min: glam::DVec3, max: glam::DVec3) -> Option<f64> {
+    let inv = dir.recip();
+    let t1 = (min - origin) * inv;
+    let t2 = (max - origin) * inv;
+    let t_min = t1.min(t2).max_element();
+    let t_max = t1.max(t2).min_element();
+    (t_max >= t_min.max(0.0)).then_some(t_min.max(0.0))
 }
 
 impl eframe::App for App {
