@@ -1,0 +1,15 @@
+[package]
+name = "mydrafter-commands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mydrafter-doc.workspace = true
+kernel-mesh.workspace = true
+kernel-curve.workspace = true
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true

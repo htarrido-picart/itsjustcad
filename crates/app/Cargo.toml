@@ -1,0 +1,23 @@
+[package]
+name = "mydrafter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mydrafter"
+path = "src/main.rs"
+
+[dependencies]
+mydrafter-doc.workspace = true
+mydrafter-commands.workspace = true
+mydrafter-deck.workspace = true
+mydrafter-render.workspace = true
+egui.workspace = true
+eframe.workspace = true
+glam.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rfd.workspace = true

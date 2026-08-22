@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/kernel-mesh",
+    "crates/kernel-curve",
+    "crates/kernel-brep",
+    "crates/doc",
+    "crates/commands",
+    "crates/deck",
+    "crates/render",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/htarrido/mydrafter"
+
+[workspace.dependencies]
+# eframe 0.35 requires wgpu ^29 — do NOT bump wgpu to 30 until an eframe release supports it,
+# a stray newer wgpu causes type mismatches with egui-wgpu.
+egui = "0.35"
+eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui-wgpu = "0.35"
+wgpu = "29"
+glam = { version = "0.30", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+futures = "0.3"
+async-trait = "0.1"
+rfd = "0.15"
+dirs = "6"
+truck-geometry = "0.6"
+
+# internal crates
+kernel-mesh = { path = "crates/kernel-mesh" }
+kernel-curve = { path = "crates/kernel-curve" }
+kernel-brep = { path = "crates/kernel-brep" }
+mydrafter-doc = { path = "crates/doc" }
+mydrafter-commands = { path = "crates/commands" }
+mydrafter-deck = { path = "crates/deck" }
+mydrafter-render = { path = "crates/render" }
