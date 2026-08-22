@@ -12,6 +12,10 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 fn main() {
     let out = std::env::args().nth(1).unwrap_or("/tmp/mydrafter_headless.png".into());
+    let theme = match std::env::var("MYDRAFTER_THEME").as_deref() {
+        Ok("light") => mydrafter_render::Theme::Light,
+        _ => mydrafter_render::Theme::Dark,
+    };
 
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
@@ -25,7 +29,7 @@ fn main() {
     if let Some(scene_path) = std::env::args().nth(2) {
         let session = mydrafter_commands::io::load_file(std::path::Path::new(&scene_path))
             .expect("load scene");
-        let scene = mydrafter_render::snapshot(&session.doc);
+        let scene = mydrafter_render::snapshot(&session.doc, theme);
         renderer.set_scene(&device, &scene, 0);
         if let Some(bb) = session.doc.scene_aabb() {
             let center = bb.center();
@@ -78,7 +82,10 @@ fn main() {
                 view: &color_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.13, g: 0.14, b: 0.16, a: 1.0 }),
+                    load: wgpu::LoadOp::Clear({
+                        let [r, g, b, a] = theme.background();
+                        wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: a as f64 }
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,

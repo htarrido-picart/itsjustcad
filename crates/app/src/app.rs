@@ -13,6 +13,8 @@ pub struct App {
     camera: OrbitCamera,
     /// Generation of the last GPU upload; compare with `session.doc.generation`.
     uploaded_generation: Option<u64>,
+    /// Theme of the last GPU upload; theme flips force a re-upload.
+    uploaded_theme: Option<scene::Theme>,
     /// Dev self-verification: MYDRAFTER_SHOT=<path.png> captures a frame and exits.
     shot_path: Option<String>,
     /// Dev scripting: MYDRAFTER_RUN="cmd;cmd;..." executes on startup.
@@ -40,6 +42,7 @@ impl App {
             tokio,
             camera: OrbitCamera::default(),
             uploaded_generation: None,
+            uploaded_theme: None,
             shot_path: std::env::var("MYDRAFTER_SHOT").ok(),
             startup_script: std::env::var("MYDRAFTER_RUN").ok(),
             deck_script: std::env::var("MYDRAFTER_DECK_RUN").ok(),
@@ -219,10 +222,18 @@ impl App {
             self.pick(rect, pos, additive);
         }
 
+        let theme = if ui.visuals().dark_mode {
+            scene::Theme::Dark
+        } else {
+            scene::Theme::Light
+        };
         let generation = self.session.doc.generation;
-        let scene = (self.uploaded_generation != Some(generation)).then(|| {
+        let stale = self.uploaded_generation != Some(generation)
+            || self.uploaded_theme != Some(theme);
+        let scene = stale.then(|| {
             self.uploaded_generation = Some(generation);
-            scene::snapshot(&self.session.doc)
+            self.uploaded_theme = Some(theme);
+            scene::snapshot(&self.session.doc, theme)
         });
 
         let aspect = rect.width() / rect.height().max(1.0);
@@ -248,6 +259,14 @@ fn ray_aabb(origin: glam::DVec3, dir: glam::DVec3, min: glam::DVec3, max: glam::
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if visuals.dark_mode {
+            scene::Theme::Dark.background()
+        } else {
+            scene::Theme::Light.background()
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.run_startup_script();
         self.handle_dev_screenshot(ui.ctx());

@@ -205,6 +205,7 @@ impl DeckPane {
         }
 
         ui.horizontal(|ui| {
+            egui::widgets::global_theme_preference_switch(ui);
             ui.label("deck:");
             let names: Vec<String> = self.decks.decks.iter().map(|d| d.name.clone()).collect();
             egui::ComboBox::from_id_salt("deck_select")

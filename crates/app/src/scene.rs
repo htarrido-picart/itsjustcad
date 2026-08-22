@@ -1,6 +1,6 @@
 use mydrafter_doc::{Document, Geometry};
 
-pub use mydrafter_render::snapshot;
+pub use mydrafter_render::{snapshot, Theme};
 
 /// Compact scene description for the LLM system prompt.
 pub fn digest(doc: &Document) -> String {
