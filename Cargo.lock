@@ -1973,7 +1973,10 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui",
+ "egui-wgpu",
  "glam",
+ "image",
+ "kernel-mesh",
  "mydrafter-commands",
  "mydrafter-deck",
  "mydrafter-doc",
@@ -2036,9 +2039,11 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "glam",
+ "image",
  "kernel-curve",
  "kernel-mesh",
  "mydrafter-doc",
+ "pollster",
  "wgpu",
 ]
 
