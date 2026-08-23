@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mydrafter_doc::{HatchPattern, ObjectId, PaperSize, Units, ViewDirection};
+use mydrafter_doc::{HatchPattern, NamedView, ObjectId, PaperSize, Units, ViewDirection};
 use serde::{Deserialize, Serialize};
 
 /// Object selector. `Last(n)` ("last", "last 3") is the workhorse for both the
@@ -329,6 +329,21 @@ pub enum Command {
     Export {
         path: String,
     },
+    // -- named views --
+    /// Save the active viewport camera under a name. `camera` is `None` when
+    /// typed; the app fills it before apply and it is written back into the
+    /// logged op, so replay restores identical views.
+    ViewSave {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        camera: Option<NamedView>,
+    },
+    /// Restore a named view into the active viewport. Display-only: not logged.
+    ViewRestore {
+        name: String,
+    },
+    /// List saved views (query, never logged).
+    ViewList,
     Select {
         targets: Selector,
     },
@@ -362,6 +377,8 @@ impl Command {
             self,
             Command::Select { .. }
                 | Command::SelectNone
+                | Command::ViewRestore { .. }
+                | Command::ViewList
                 | Command::Print { .. }
                 | Command::Export { .. }
                 | Command::Distance { .. }

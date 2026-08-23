@@ -6,6 +6,7 @@ mod document;
 mod object;
 mod sheet;
 mod units;
+mod view;
 
 pub use document::Document;
 pub use object::{
@@ -15,3 +16,4 @@ pub use sheet::{PaperSize, Sheet, SheetView, ViewDirection};
 pub use units::{
     format_area, format_length, format_volume, Units, METERS_PER_FOOT, METERS_PER_INCH,
 };
+pub use view::NamedView;

@@ -259,6 +259,11 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Report the combined bounding box (min, max, size) of objects (query only). Example: bbox all",
         },
         CommandSpec {
+            name: "view",
+            usage: "view save <name> | view <name> | view list",
+            summary: "Named views: save the active viewport camera, restore it later, or list saved views. Example: view save entry then view entry",
+        },
+        CommandSpec {
             name: "select",
             usage: "select <selector>",
             summary: "Set the selection. Example: select all",

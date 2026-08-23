@@ -471,6 +471,15 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let [path] = take::<1>("export", "an output path (.dxf)", &args)?;
             Ok(Command::Export { path: path.to_string() })
         }
+        "view" => match args.as_slice() {
+            ["save", name] => Ok(Command::ViewSave {
+                name: (*name).to_string(),
+                camera: None,
+            }),
+            ["list"] => Ok(Command::ViewList),
+            [name] if *name != "save" => Ok(Command::ViewRestore { name: (*name).to_string() }),
+            _ => wrong("view", "'save <name>', a saved view name, or 'list'", &args),
+        },
         "select" => {
             let (sel, rest) = selector(&args, "select")?;
             expect_empty("select", rest, &args)?;
@@ -806,6 +815,22 @@ mod tests {
             point("12ft,6in").unwrap(),
             DVec3::new(12.0 * METERS_PER_FOOT, 6.0 * METERS_PER_INCH, 0.0)
         );
+    }
+
+    #[test]
+    fn parse_view_commands() {
+        assert_eq!(
+            parse("view save entry").unwrap(),
+            Command::ViewSave { name: "entry".to_string(), camera: None }
+        );
+        assert_eq!(
+            parse("view entry").unwrap(),
+            Command::ViewRestore { name: "entry".to_string() }
+        );
+        assert_eq!(parse("view list").unwrap(), Command::ViewList);
+        assert!(parse("view").unwrap_err().to_string().contains("save"));
+        assert!(parse("view save").unwrap_err().to_string().contains("save"));
+        assert!(parse("view save a b").is_err());
     }
 
     #[test]

@@ -141,6 +141,44 @@ mod tests {
     }
 
     #[test]
+    fn save_load_preserves_named_views() {
+        let mut s = Session::default();
+        s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        let v = mydrafter_doc::NamedView {
+            target: [4.5, -2.0, 1.25],
+            distance: 27.5,
+            yaw: -0.75,
+            pitch: 1.2,
+            fov_y: 45f32.to_radians(),
+            ortho: false,
+        };
+        s.run(crate::Command::ViewSave { name: "entry".to_string(), camera: Some(v) })
+            .unwrap();
+        let json = to_json(&s);
+        assert!(json.contains("view_save"), "{json}");
+        let loaded = from_json(&json).unwrap();
+        assert_eq!(loaded.doc.named_views, s.doc.named_views);
+        assert_eq!(loaded.doc.named_views["entry"], v);
+        assert_eq!(to_json(&loaded), json, "replay-stable");
+    }
+
+    #[test]
+    fn pre_named_views_file_loads_with_no_views() {
+        // Old files have no view ops; they load with an empty view table.
+        let json = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "box",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "size": [2.0, 2.0, 2.0]}
+            ]
+        }"#;
+        let s = from_json(json).unwrap();
+        assert!(s.doc.named_views.is_empty());
+        assert!(s.doc.pending_view.is_none());
+    }
+
+    #[test]
     fn rejects_future_version() {
         let Err(err) = from_json(r#"{"mydrafter": 99, "ops": []}"#) else {
             panic!("expected version error");

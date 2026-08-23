@@ -169,6 +169,20 @@ impl App {
                 self.set_view(view);
                 self.command_line.push_line(format!("view: {view}"));
             }
+            // `view save` captures the active camera — only the app can; the
+            // parser leaves `camera: None`. Other `view ...` forms parse as-is.
+            Some("view") => {
+                if let ["save", name] = words.collect::<Vec<_>>().as_slice() {
+                    let camera = named_view_of(self.active_camera());
+                    let cmd = mydrafter_commands::Command::ViewSave {
+                        name: (*name).to_string(),
+                        camera: Some(camera),
+                    };
+                    self.command_line.execute_command(&mut self.session, line, cmd);
+                } else {
+                    self.command_line.execute(&mut self.session, line);
+                }
+            }
             _ => {
                 if self.draw_tool.try_start(line) {
                     if let Some(prompt) = self.draw_tool.prompt() {
@@ -1174,8 +1188,35 @@ impl eframe::App for App {
                 self.deck_pane.ui(ui, &mut self.session, &self.tokio);
             });
 
+        // A `view <name>` restore (command line, deck or script) parks the
+        // saved camera in the document mailbox; drive the active viewport.
+        if let Some(view) = self.session.doc.pending_view.take() {
+            apply_named_view(self.active_camera(), &view);
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.viewport(ui));
     }
+}
+
+/// Snapshot the orbit camera as document-storable named-view parameters.
+fn named_view_of(cam: &OrbitCamera) -> mydrafter_doc::NamedView {
+    mydrafter_doc::NamedView {
+        target: cam.target.to_array(),
+        distance: cam.distance,
+        yaw: cam.yaw,
+        pitch: cam.pitch,
+        fov_y: cam.fov_y,
+        ortho: cam.ortho,
+    }
+}
+
+fn apply_named_view(cam: &mut OrbitCamera, view: &mydrafter_doc::NamedView) {
+    cam.target = glam::Vec3::from_array(view.target);
+    cam.distance = view.distance;
+    cam.yaw = view.yaw;
+    cam.pitch = view.pitch;
+    cam.fov_y = view.fov_y;
+    cam.ortho = view.ortho;
 }

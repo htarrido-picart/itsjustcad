@@ -1,4 +1,4 @@
-use mydrafter_commands::{parse, registry, Session};
+use mydrafter_commands::{parse, registry, Command, Session};
 
 /// Rhino-style command line: single input row + scrollback, up/down history.
 pub struct CommandLine {
@@ -59,6 +59,24 @@ impl CommandLine {
                     false
                 }
             },
+            Err(e) => {
+                self.push_line(format!("error: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Run a pre-built command, echoing `line` like a typed input. Used when
+    /// the app fills fields the parser cannot (e.g. the viewport camera for
+    /// `view save`). Returns true when the document changed.
+    pub fn execute_command(&mut self, session: &mut Session, line: &str, cmd: Command) -> bool {
+        self.recall.push(line.to_string());
+        self.push_line(format!("> {line}"));
+        match session.run(cmd) {
+            Ok(outcome) => {
+                self.push_line(outcome.message);
+                true
+            }
             Err(e) => {
                 self.push_line(format!("error: {e}"));
                 false

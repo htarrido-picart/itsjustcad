@@ -3,7 +3,7 @@ use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
 use mydrafter_doc::{
     format_area, format_length, format_volume, Annotation, Document, Geometry, LayerStyle,
-    ObjectId, SceneObject, Units,
+    NamedView, ObjectId, SceneObject, Units,
 };
 
 use crate::error::ExecError;
@@ -65,6 +65,11 @@ enum Inverse {
     LayerStyle { layer: String, prev: LayerStyle },
     /// `units`: restore the previous display unit.
     Units { prev: Units },
+    /// `view save`: restore the previously saved view of that name (if any).
+    ViewSaved {
+        name: String,
+        prev: Option<NamedView>,
+    },
     /// `sheet`: drop the sheet this command created.
     RemoveSheet(String),
     /// `sheetview`: drop the view most recently added to a sheet.
@@ -185,6 +190,13 @@ impl Session {
             }
             Inverse::Units { prev } => {
                 self.doc.units = *prev;
+                self.doc.generation += 1;
+            }
+            Inverse::ViewSaved { name, prev } => {
+                match prev {
+                    Some(view) => self.doc.named_views.insert(name.clone(), *view),
+                    None => self.doc.named_views.remove(name),
+                };
                 self.doc.generation += 1;
             }
             Inverse::RemoveSheet(name) => {
@@ -1799,6 +1811,66 @@ fn apply_forward(
                 },
             ))
         }
+        Command::ViewSave { name, camera } => {
+            let Some(camera) = camera else {
+                // Only the app can capture the live viewport; parse leaves None.
+                return Err(ExecError::Invalid(format!(
+                    "view save needs the live viewport camera — run 'view save {name}' from the app command line"
+                )));
+            };
+            let prev = doc.named_views.insert(name.clone(), camera);
+            doc.generation += 1;
+            let verb = if prev.is_some() { "updated" } else { "saved" };
+            Ok((
+                Command::ViewSave { name: name.clone(), camera: Some(camera) },
+                Inverse::ViewSaved { name: name.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "view '{name}' {verb} ({} saved view(s))",
+                        doc.named_views.len()
+                    ),
+                },
+            ))
+        }
+        Command::ViewRestore { name } => {
+            let Some(view) = doc.named_views.get(&name).copied() else {
+                let known = if doc.named_views.is_empty() {
+                    "none".to_string()
+                } else {
+                    doc.named_views.keys().cloned().collect::<Vec<_>>().join(", ")
+                };
+                return Err(ExecError::Invalid(format!(
+                    "no saved view '{name}' (saved: {known}; save one with: view save {name})"
+                )));
+            };
+            // The camera lives in the UI, not the document: park the view in
+            // the mailbox for the app to apply to the active viewport.
+            doc.pending_view = Some(view);
+            Ok((
+                Command::ViewRestore { name: name.clone() },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("view: {name}"),
+                },
+            ))
+        }
+        Command::ViewList => {
+            let names: Vec<&str> = doc.named_views.keys().map(String::as_str).collect();
+            Ok((
+                Command::ViewList,
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: if names.is_empty() {
+                        "no saved views (save one with: view save <name>)".to_string()
+                    } else {
+                        format!("saved views: {}", names.join(", "))
+                    },
+                },
+            ))
+        }
         Command::Select { targets } => {
             let ids = resolve(doc, &targets)?;
             doc.selection = ids.iter().copied().collect();
@@ -1983,6 +2055,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::SheetView { .. } => "sheetview",
         Command::Print { .. } => "print",
         Command::Export { .. } => "export",
+        Command::ViewSave { .. } => "view save",
+        Command::ViewRestore { .. } => "view",
+        Command::ViewList => "view list",
         Command::Select { .. } => "select",
         Command::SelectNone => "selectnone",
         Command::Distance { .. } => "distance",
@@ -2001,6 +2076,74 @@ mod tests {
 
     fn run(s: &mut Session, line: &str) -> ApplyOutcome {
         s.run(parse(line).unwrap()).unwrap()
+    }
+
+    fn sample_view(distance: f32) -> NamedView {
+        NamedView {
+            target: [1.0, 2.0, 3.0],
+            distance,
+            yaw: 0.25,
+            pitch: 0.5,
+            fov_y: 45f32.to_radians(),
+            ortho: true,
+        }
+    }
+
+    #[test]
+    fn view_save_restore_list_undo_redo() {
+        let mut s = Session::default();
+        let v = sample_view(12.0);
+        s.run(Command::ViewSave { name: "entry".to_string(), camera: Some(v) })
+            .unwrap();
+        assert_eq!(s.doc.named_views.get("entry"), Some(&v));
+
+        // Restore parks the saved camera in the mailbox for the UI.
+        assert_eq!(s.doc.pending_view, None);
+        let out = run(&mut s, "view entry");
+        assert_eq!(out.message, "view: entry");
+        assert_eq!(s.doc.pending_view, Some(v));
+
+        let out = run(&mut s, "view list");
+        assert!(out.message.contains("entry"), "{}", out.message);
+
+        // Unknown views error, listing what exists.
+        let err = s.run(parse("view nope").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("entry"), "{err}");
+
+        // Overwrite; undo steps back to the previous view, then to none.
+        let v2 = sample_view(50.0);
+        s.run(Command::ViewSave { name: "entry".to_string(), camera: Some(v2) })
+            .unwrap();
+        assert_eq!(s.doc.named_views["entry"], v2);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.named_views["entry"], v);
+        run(&mut s, "undo");
+        assert!(s.doc.named_views.is_empty());
+        run(&mut s, "redo");
+        assert_eq!(s.doc.named_views["entry"], v);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.named_views["entry"], v2);
+    }
+
+    #[test]
+    fn view_save_without_camera_errors() {
+        // The parser leaves camera None; only the app can capture it.
+        let mut s = Session::default();
+        let err = s.run(parse("view save a").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("viewport camera"), "{err}");
+        assert!(s.doc.named_views.is_empty());
+    }
+
+    #[test]
+    fn view_restore_and_list_are_not_logged() {
+        let mut s = Session::default();
+        s.run(Command::ViewSave { name: "a".to_string(), camera: Some(sample_view(9.0)) })
+            .unwrap();
+        run(&mut s, "view a");
+        run(&mut s, "view list");
+        let log = s.save_log();
+        assert_eq!(log.len(), 1, "only the save is logged");
+        assert!(matches!(log[0], Command::ViewSave { .. }));
     }
 
     #[test]

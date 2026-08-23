@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_mesh::Aabb;
 
-use crate::{LayerStyle, ObjectId, SceneObject, Sheet, Units, DEFAULT_LAYER};
+use crate::{LayerStyle, NamedView, ObjectId, SceneObject, Sheet, Units, DEFAULT_LAYER};
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
 #[derive(Clone, Debug)]
@@ -21,6 +21,12 @@ pub struct Document {
     /// Display unit for lengths (geometry always stores meters). Set via the
     /// logged `units` command, so saved files carry their unit through replay.
     pub units: Units,
+    /// Named viewport cameras, saved via the logged `view save` command so
+    /// replayed files keep them. Mutators bump `generation` (exec does).
+    pub named_views: BTreeMap<String, NamedView>,
+    /// Mailbox: a `view <name>` restore waiting for the UI to drive the active
+    /// viewport camera. The app takes it each frame; never persisted.
+    pub pending_view: Option<NamedView>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -35,6 +41,8 @@ impl Default for Document {
             current_layer: DEFAULT_LAYER.to_string(),
             sheets: Vec::new(),
             units: Units::default(),
+            named_views: BTreeMap::new(),
+            pending_view: None,
             generation: 0,
         }
     }
