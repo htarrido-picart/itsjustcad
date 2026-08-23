@@ -9,6 +9,7 @@ mod keymap;
 mod osnap;
 mod precise;
 mod scene;
+mod statusbar;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();

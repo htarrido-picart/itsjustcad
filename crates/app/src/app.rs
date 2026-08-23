@@ -48,6 +48,11 @@ pub struct App {
     journal: Option<Journal>,
     /// Doc generation of the last journal sync (skip serializing every frame).
     journaled_generation: Option<u64>,
+    /// Cursor ground-plane position in the active pane, for the status bar
+    /// (written during the viewport pass, read next frame by the strip).
+    status_cursor: Option<glam::DVec3>,
+    /// Snap kind currently hit by the draw tool, for the status bar.
+    status_snap: Option<&'static str>,
 }
 
 impl App {
@@ -107,6 +112,8 @@ impl App {
             box_drag: None,
             journal,
             journaled_generation: None,
+            status_cursor: None,
+            status_snap: None,
         }
     }
 
@@ -403,6 +410,9 @@ impl App {
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
         let full = ui.available_rect_before_wrap();
+        if !self.draw_tool.active() {
+            self.status_snap = None; // no tool, no snap marker to report
+        }
         if self.active_pane >= self.layout.pane_count() {
             self.active_pane = 0;
         }
@@ -454,6 +464,13 @@ impl App {
             }
             let aspect = rect.width() / rect.height().max(1.0);
             let view_proj = self.cameras[cam_idx].view_proj(aspect);
+
+            // Status-bar cursor readout follows the active pane's hover.
+            if pane == self.active_pane {
+                self.status_cursor = response
+                    .hover_pos()
+                    .and_then(|pos| ground_point(view_proj, rect, pos));
+            }
 
             if self.draw_tool.active() {
                 // Draw/osnap only in the active pane; one prompt, one ghost.
@@ -852,6 +869,7 @@ impl App {
             cursor_world = Some(crate::precise::ortho_lock(last, c));
             snap_hit = None;
         }
+        self.status_snap = snap_hit.map(|(_, kind)| kind.label());
 
         if enter {
             let buffer = self.draw_tool.take_input();
@@ -929,6 +947,29 @@ impl App {
             );
         }
         ui.ctx().request_repaint(); // live rubber-band
+    }
+
+    /// Bottom strip: cursor coords, active layer, counts, snap state, view.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let doc = &self.session.doc;
+        let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
+        ui.horizontal(|ui| {
+            ui.monospace(crate::statusbar::format_cursor(doc.units, self.status_cursor));
+            ui.separator();
+            ui.label(format!("layer: {}", doc.current_layer));
+            ui.separator();
+            ui.label(crate::statusbar::format_counts(doc.selection.len(), doc.len()));
+            ui.separator();
+            ui.label(crate::statusbar::snap_label(
+                self.draw_tool.active(),
+                self.status_snap,
+            ));
+            ui.separator();
+            ui.label(format!(
+                "view: {}",
+                crate::statusbar::view_label(cam.yaw, cam.pitch, cam.ortho)
+            ));
+        });
     }
 
     fn view_toolbar(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -1172,6 +1213,12 @@ impl eframe::App for App {
                 self.execute_line(line);
             }
         }
+
+        // Status strip sits below the command line (first bottom panel is
+        // outermost); all strings come from the pure fns in `statusbar`.
+        egui::Panel::bottom("statusbar")
+            .resizable(false)
+            .show(ui, |ui| self.status_bar(ui));
 
         egui::Panel::bottom("command_line")
             .resizable(false)
