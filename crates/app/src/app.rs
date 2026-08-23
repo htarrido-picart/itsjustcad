@@ -375,6 +375,55 @@ impl App {
 
         self.view_toolbar(ui, full);
         self.layers_panel(ui, full, theme);
+        self.history_panel(ui, full);
+    }
+
+    /// Undo history: op list newest-last, current position highlighted.
+    /// Clicking an entry jumps there by running undo/redo through the
+    /// session, so the op-log stays the single source of truth.
+    fn history_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let (entries, cursor) = self.session.history();
+        let mut jump: Option<usize> = None;
+        egui::Area::new(egui::Id::new("history_panel"))
+            .fixed_pos(rect.left_top() + egui::vec2(8.0, 48.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(130.0);
+                    egui::CollapsingHeader::new(format!("History ({})", entries.len()))
+                        .id_salt("history_panel_header")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(260.0)
+                                .show(ui, |ui| {
+                                    if ui.selectable_label(cursor == 0, "(start)").clicked() {
+                                        jump = Some(0);
+                                    }
+                                    for (i, name) in entries.iter().enumerate() {
+                                        let step = i + 1; // state after op i
+                                        let label = format!("{step}. {name}");
+                                        let text = if step > cursor {
+                                            egui::RichText::new(label).weak() // undone
+                                        } else {
+                                            egui::RichText::new(label)
+                                        };
+                                        if ui.selectable_label(step == cursor, text).clicked() {
+                                            jump = Some(step);
+                                        }
+                                    }
+                                });
+                        });
+                });
+            });
+        if let Some(step) = jump {
+            match self.session.jump_to(step) {
+                Ok(moved) if moved > 0 => self
+                    .command_line
+                    .push_line(format!("history: jumped to step {step} ({moved} op(s))")),
+                Ok(_) => {}
+                Err(e) => self.command_line.push_line(format!("error: {e}")),
+            }
+        }
     }
 
     /// Layers panel: visibility toggle, color swatch, current-layer switch.

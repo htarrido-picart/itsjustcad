@@ -171,6 +171,31 @@ impl Session {
         Ok(outcome)
     }
 
+    /// Read-only view for the history panel: one describe() entry per logged
+    /// op (oldest first) plus the cursor. Step N = state after the first N ops.
+    pub fn history(&self) -> (Vec<String>, usize) {
+        (
+            self.log.iter().map(|a| describe(&a.op).to_string()).collect(),
+            self.cursor,
+        )
+    }
+
+    /// Move the cursor to `step` by running undo/redo through `run` — no new
+    /// mutation path, so the log stays consistent. Returns ops executed.
+    pub fn jump_to(&mut self, step: usize) -> Result<usize, ExecError> {
+        let step = step.min(self.log.len());
+        let mut moved = 0usize;
+        while self.cursor > step {
+            self.run(Command::Undo)?;
+            moved += 1;
+        }
+        while self.cursor < step {
+            self.run(Command::Redo)?;
+            moved += 1;
+        }
+        Ok(moved)
+    }
+
     /// Effective forward log (up to the undo cursor) — this is the file format.
     pub fn save_log(&self) -> Vec<Command> {
         self.log[..self.cursor].iter().map(|a| a.op.clone()).collect()
@@ -1358,6 +1383,80 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(s.doc.layers, replayed.doc.layers);
         assert_eq!(s.doc.current_layer, replayed.doc.current_layer);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
+    }
+
+    #[test]
+    fn history_lists_ops_and_cursor() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "move last 1,0,0");
+        run(&mut s, "circle 5,0,0 1");
+        let (entries, cursor) = s.history();
+        assert_eq!(entries, ["box", "move", "circle"]);
+        assert_eq!(cursor, 3);
+
+        run(&mut s, "undo");
+        let (entries, cursor) = s.history();
+        assert_eq!(entries, ["box", "move", "circle"], "undo keeps the list");
+        assert_eq!(cursor, 2);
+
+        // undo/redo themselves never appear in history
+        run(&mut s, "redo");
+        assert_eq!(s.history().0.len(), 3);
+    }
+
+    #[test]
+    fn jump_reproduces_exact_documents() {
+        let mut s = Session::default();
+        let lines = [
+            "box 0,0,0 5,5,3",
+            "move last 1,2,0",
+            "circle 10,0,0 2",
+            "extrude last 4",
+            "delete last",
+        ];
+        let mut snapshots: Vec<Vec<SceneObject>> = vec![Vec::new()];
+        for line in lines {
+            run(&mut s, line);
+            snapshots.push(s.doc.objects().cloned().collect());
+        }
+
+        // jump backwards and forwards, comparing full object state each time
+        for step in [2usize, 0, 4, 1, 5, 3] {
+            let expected_moves = step.abs_diff(s.history().1);
+            let moved = s.jump_to(step).unwrap();
+            assert_eq!(moved, expected_moves);
+            assert_eq!(s.history().1, step);
+            let objs: Vec<_> = s.doc.objects().cloned().collect();
+            assert_eq!(objs, snapshots[step], "step {step}");
+        }
+        // clamped past the end
+        assert_eq!(s.jump_to(99).unwrap(), 2);
+        assert_eq!(s.history().1, 5);
+        // no-op jump
+        assert_eq!(s.jump_to(5).unwrap(), 0);
+    }
+
+    #[test]
+    fn jump_is_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 5,5,3");
+        run(&mut s, "box 3,3,-1 4,4,5");
+        run(&mut s, "difference last 2 last");
+        run(&mut s, "circle 10,0,0 2");
+        s.jump_to(1).unwrap();
+        s.jump_to(3).unwrap(); // redo through the boolean
+
+        let log = s.save_log();
+        assert_eq!(log.len(), 3);
+        let replayed = Session::replay(log.clone()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
         assert_eq!(
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap()
