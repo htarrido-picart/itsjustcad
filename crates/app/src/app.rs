@@ -314,10 +314,24 @@ impl App {
             return;
         }
 
-        let cursor_world = response
+        // Snap resolution: nearest object point within the screen-space
+        // radius wins; empty space falls back to the ground-plane 10cm grid.
+        let cursor_px = response
             .hover_pos()
-            .or_else(|| response.interact_pointer_pos())
-            .and_then(|pos| ground_point(view_proj, rect, pos));
+            .or_else(|| response.interact_pointer_pos());
+        let snap_hit = cursor_px.and_then(|pos| {
+            crate::osnap::resolve(
+                &crate::osnap::candidates(&self.session.doc),
+                pos,
+                crate::osnap::SNAP_RADIUS_PX,
+                |w| project(view_proj, rect, w),
+            )
+        });
+        let cursor_world = snap_hit.map(|(p, _)| p).or_else(|| {
+            cursor_px
+                .and_then(|pos| ground_point(view_proj, rect, pos))
+                .map(crate::osnap::grid_snap)
+        });
 
         if response.clicked() && let Some(world) = cursor_world {
             if let Some(cmd) = self.draw_tool.on_click(world) {
@@ -340,6 +354,25 @@ impl App {
                     painter.line_segment([a, b], stroke);
                 }
             }
+        }
+        // Osnap marker: square on the snapped point + kind label (Rhino look).
+        if let Some((world, kind)) = snap_hit
+            && let Some(screen) = project(view_proj, rect, world)
+        {
+            let color = egui::Color32::from_rgb(255, 200, 60);
+            painter.rect_stroke(
+                egui::Rect::from_center_size(screen, egui::vec2(9.0, 9.0)),
+                0.0,
+                egui::Stroke::new(1.5, color),
+                egui::StrokeKind::Middle,
+            );
+            painter.text(
+                screen + egui::vec2(8.0, -8.0),
+                egui::Align2::LEFT_BOTTOM,
+                kind.label(),
+                egui::TextStyle::Small.resolve(ui.style()),
+                color,
+            );
         }
         if let Some(prompt) = self.draw_tool.prompt() {
             painter.text(

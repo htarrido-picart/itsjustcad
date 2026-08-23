@@ -2055,6 +2055,7 @@ dependencies = [
  "egui_commonmark",
  "glam",
  "image",
+ "kernel-curve",
  "kernel-mesh",
  "mydrafter-commands",
  "mydrafter-deck",

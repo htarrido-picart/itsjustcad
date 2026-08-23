@@ -15,16 +15,17 @@ pub struct DrawTool {
     state: Option<(Verb, Vec<DVec3>)>,
 }
 
-/// Snap picks to 10cm so emitted commands stay clean.
-fn snap(p: DVec3) -> DVec3 {
-    (p * 10.0).round() / 10.0
+/// Millimeter rounding for emitted command strings — points arrive already
+/// resolved (osnap hit or grid snap), this only strips float noise.
+fn num(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
 }
 
 fn fmt(p: DVec3) -> String {
     if p.z.abs() < 1e-9 {
-        format!("{},{}", p.x, p.y)
+        format!("{},{}", num(p.x), num(p.y))
     } else {
-        format!("{},{},{}", p.x, p.y, p.z)
+        format!("{},{},{}", num(p.x), num(p.y), num(p.z))
     }
 }
 
@@ -72,10 +73,10 @@ impl DrawTool {
         })
     }
 
-    /// Register a canvas pick. Returns the finished command string when the
-    /// shape is complete.
+    /// Register a canvas pick. `world` must already be snap-resolved by the
+    /// caller (osnap hit or grid). Returns the finished command string when
+    /// the shape is complete.
     pub fn on_click(&mut self, world: DVec3) -> Option<String> {
-        let world = snap(world);
         let (verb, mut points) = self.state.take()?;
         match verb {
             Verb::Line => {
@@ -101,7 +102,7 @@ impl DrawTool {
                         self.state = Some((verb, points));
                         return None;
                     }
-                    Some(format!("rect {} {} {}", fmt(corner), size.x, size.y))
+                    Some(format!("rect {} {} {}", fmt(corner), num(size.x), num(size.y)))
                 }
             }
             Verb::Circle => {
@@ -110,7 +111,7 @@ impl DrawTool {
                     self.state = Some((verb, points));
                     None
                 } else {
-                    let r = points[0].distance(world);
+                    let r = num(points[0].distance(world));
                     if r < 1e-9 {
                         self.state = Some((verb, points));
                         return None;
@@ -144,12 +145,11 @@ impl DrawTool {
     }
 
     /// Ghost geometry to overlay: polylines in world space, given the current
-    /// cursor position on the ground plane.
+    /// (already snap-resolved) cursor position.
     pub fn preview(&self, cursor: Option<DVec3>) -> Vec<Vec<DVec3>> {
         let Some((verb, points)) = &self.state else {
             return Vec::new();
         };
-        let cursor = cursor.map(snap);
         match verb {
             Verb::Line | Verb::Polyline => {
                 let mut strip = points.clone();
@@ -198,10 +198,21 @@ mod tests {
     fn rect_two_clicks() {
         let mut t = DrawTool::default();
         assert!(t.try_start("rect"));
-        assert!(t.on_click(DVec3::new(6.02, 4.01, 0.0)).is_none());
+        // Caller resolves snapping; tool only strips float noise (mm rounding).
+        assert!(t.on_click(DVec3::new(6.0000004, 4.0, 0.0)).is_none());
         let cmd = t.on_click(DVec3::new(0.0, 0.0, 0.0)).unwrap();
-        assert_eq!(cmd, "rect 0,0 6 4"); // normalized to min corner, snapped
+        assert_eq!(cmd, "rect 0,0 6 4"); // normalized to min corner
         assert!(!t.active());
+    }
+
+    #[test]
+    fn osnap_precision_survives_mm() {
+        // An osnap hit on a midpoint like 2.05 must NOT get grid-rounded away.
+        let mut t = DrawTool::default();
+        t.try_start("line");
+        t.on_click(DVec3::new(2.05, 3.15, 0.0));
+        let cmd = t.on_click(DVec3::new(7.125, 0.0, 0.0)).unwrap();
+        assert_eq!(cmd, "line 2.05,3.15 7.125,0");
     }
 
     #[test]
