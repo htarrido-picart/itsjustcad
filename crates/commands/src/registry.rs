@@ -89,6 +89,11 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Scale objects uniformly or per-axis (default: about their bounding-box center). Example: scale last 2 · scale last 1,1,2",
         },
         CommandSpec {
+            name: "offset",
+            usage: "offset <selector> <distance>",
+            summary: "Offset a curve in the XY plane; original kept. Closed curves: positive = outward, negative = inward (walls from centerlines: offset both ways, extrude). Example: offset last 0.2",
+        },
+        CommandSpec {
             name: "mirror",
             usage: "mirror <selector> <xy|yz|xz | point normal>",
             summary: "Mirror objects across a plane. Example: mirror last yz · mirror last 0,5,0 0,1,0",

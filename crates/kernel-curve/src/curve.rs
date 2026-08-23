@@ -172,6 +172,49 @@ impl Curve {
         }
     }
 
+    /// Offset the curve in the XY plane by `dist`, returning a new curve.
+    ///
+    /// Closed curves: positive `dist` offsets outward, negative inward.
+    /// Open curves: positive `dist` offsets to the left of travel direction.
+    /// Arcs stay exact (radius change); ellipses and NURBS tessellate at `tol`.
+    /// Returns `None` when the offset collapses the curve (inward past its
+    /// radius, or a degenerate result).
+    pub fn offset(&self, dist: f64, tol: f64) -> Option<Curve> {
+        match self {
+            Curve::Line { a, b } => {
+                let d = (*b - *a).truncate().normalize_or_zero();
+                if d == glam::DVec2::ZERO {
+                    return None;
+                }
+                let n = DVec3::new(-d.y, d.x, 0.0) * dist; // left of travel
+                Some(Curve::Line { a: *a + n, b: *b + n })
+            }
+            Curve::Arc { center, radius, start, end } => {
+                // Positive = outward = larger radius.
+                let r = radius + dist;
+                (r > 1e-9).then_some(Curve::Arc {
+                    center: *center,
+                    radius: r,
+                    start: *start,
+                    end: *end,
+                })
+            }
+            Curve::Polyline { points, closed } => {
+                offset_polyline(points, *closed, dist).map(|points| Curve::Polyline {
+                    points,
+                    closed: *closed,
+                })
+            }
+            Curve::Ellipse { .. } | Curve::Nurbs { .. } => {
+                let pts = self.tessellate(tol);
+                offset_polyline(&pts, self.is_closed(), dist).map(|points| Curve::Polyline {
+                    points,
+                    closed: self.is_closed(),
+                })
+            }
+        }
+    }
+
     pub fn points_bound(&self) -> Vec<DVec3> {
         // Cheap bound-defining points (control points bound NURBS by convex hull).
         match self {
@@ -188,6 +231,67 @@ impl Curve {
             Curve::Nurbs { control, .. } => control.clone(),
         }
     }
+}
+
+/// Miter-join polyline offset in the XY plane (z carried from each vertex).
+///
+/// Closed loops are normalized so positive `dist` is outward regardless of
+/// winding; open runs treat positive as left-of-travel. Returns `None` when
+/// the offset collapses the loop (area sign flips or vanishes). Local
+/// self-intersections of tight inward offsets are NOT cleaned up.
+fn offset_polyline(points: &[DVec3], closed: bool, dist: f64) -> Option<Vec<DVec3>> {
+    if points.len() < 2 {
+        return None;
+    }
+    // Signed area (shoelace) decides winding; for closed loops flip the
+    // left-normal offset so positive dist always grows the loop.
+    let area: f64 = points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(p, q)| p.x * q.y - q.x * p.y)
+        .sum::<f64>()
+        / 2.0;
+    let d = if closed && area > 0.0 { -dist } else { dist };
+
+    let n = points.len();
+    let seg_normal = |i: usize| -> glam::DVec2 {
+        let dir = (points[(i + 1) % n] - points[i]).truncate().normalize_or_zero();
+        glam::DVec2::new(-dir.y, dir.x) // left of travel
+    };
+    let segs = if closed { n } else { n - 1 };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let (prev, next) = if closed {
+            (seg_normal((i + n - 1) % n), seg_normal(i % n))
+        } else {
+            // Endpoints use their single adjacent segment.
+            (
+                seg_normal(i.saturating_sub(1).min(segs - 1)),
+                seg_normal(i.min(segs - 1)),
+            )
+        };
+        // Miter: average of adjacent normals, scaled to keep segment distance.
+        let m = prev + next;
+        let len_sq = m.length_squared();
+        let shift = if len_sq < 1e-18 {
+            prev // 180° spike: fall back to the incoming normal
+        } else {
+            m * (2.0 / len_sq) // = m_hat / cos(theta/2)
+        };
+        out.push(points[i] + (shift * d).extend(0.0));
+    }
+    // Collapse detection: an offset past the local core reverses at least one
+    // segment's direction (area sign alone misses loops that re-emerge with
+    // the original winding).
+    for i in 0..segs {
+        let old_dir = (points[(i + 1) % n] - points[i]).truncate();
+        let new_dir = (out[(i + 1) % n] - out[i]).truncate();
+        if old_dir.dot(new_dir) <= 0.0 {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 /// Fallback for transforms an Arc/Ellipse cannot represent: sample the curve,
@@ -313,6 +417,109 @@ mod tests {
         let mut p = Curve::Polyline { points: vec![DVec3::ZERO, DVec3::X, DVec3::Y], closed: true };
         assert!(p.transform(&m, 0.01));
         assert!(p.is_closed());
+    }
+
+    fn shoelace(points: &[DVec3]) -> f64 {
+        points
+            .iter()
+            .zip(points.iter().cycle().skip(1))
+            .take(points.len())
+            .map(|(p, q)| p.x * q.y - q.x * p.y)
+            .sum::<f64>()
+            / 2.0
+    }
+
+    #[test]
+    fn offset_square_outward_and_inward() {
+        // 4x4 CCW square at z=1.
+        let sq = |s: f64| Curve::Polyline {
+            points: vec![
+                DVec3::new(-s, -s, 1.0),
+                DVec3::new(s, -s, 1.0),
+                DVec3::new(s, s, 1.0),
+                DVec3::new(-s, s, 1.0),
+            ],
+            closed: true,
+        };
+        let out = sq(2.0).offset(1.0, 0.01).unwrap();
+        let Curve::Polyline { ref points, .. } = out else { panic!() };
+        assert!((shoelace(points).abs() - 36.0).abs() < 1e-9); // grew to 6x6
+        assert!(points.iter().all(|p| (p.z - 1.0).abs() < 1e-12)); // z kept
+
+        let inw = sq(2.0).offset(-1.0, 0.01).unwrap();
+        let Curve::Polyline { ref points, .. } = inw else { panic!() };
+        assert!((shoelace(points).abs() - 4.0).abs() < 1e-9); // shrank to 2x2
+
+        // CW winding: outward must still grow.
+        let cw = Curve::Polyline {
+            points: vec![
+                DVec3::new(-2.0, -2.0, 0.0),
+                DVec3::new(-2.0, 2.0, 0.0),
+                DVec3::new(2.0, 2.0, 0.0),
+                DVec3::new(2.0, -2.0, 0.0),
+            ],
+            closed: true,
+        };
+        let out = cw.offset(1.0, 0.01).unwrap();
+        let Curve::Polyline { ref points, .. } = out else { panic!() };
+        assert!((shoelace(points).abs() - 36.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn offset_collapse_returns_none() {
+        let sq = Curve::Polyline {
+            points: vec![
+                DVec3::new(-1.0, -1.0, 0.0),
+                DVec3::new(1.0, -1.0, 0.0),
+                DVec3::new(1.0, 1.0, 0.0),
+                DVec3::new(-1.0, 1.0, 0.0),
+            ],
+            closed: true,
+        };
+        assert!(sq.offset(-1.5, 0.01).is_none());
+    }
+
+    #[test]
+    fn offset_circle_exact_radius() {
+        let c = Curve::Arc {
+            center: DVec3::ZERO,
+            radius: 3.0,
+            start: 0.0,
+            end: std::f64::consts::TAU,
+        };
+        let Some(Curve::Arc { radius, .. }) = c.offset(0.5, 0.01) else { panic!() };
+        assert!((radius - 3.5).abs() < 1e-12);
+        assert!(c.offset(-3.0, 0.01).is_none()); // collapses to a point
+    }
+
+    #[test]
+    fn offset_line_left_of_travel() {
+        let l = Curve::Line { a: DVec3::ZERO, b: DVec3::new(10.0, 0.0, 0.0) };
+        let Some(Curve::Line { a, b }) = l.offset(2.0, 0.01) else { panic!() };
+        assert!((a - DVec3::new(0.0, 2.0, 0.0)).length() < 1e-12);
+        assert!((b - DVec3::new(10.0, 2.0, 0.0)).length() < 1e-12);
+    }
+
+    #[test]
+    fn offset_open_polyline_l_shape() {
+        // L along +x then +y; offset left of travel puts the copy inside the L.
+        let l = Curve::Polyline {
+            points: vec![DVec3::ZERO, DVec3::new(4.0, 0.0, 0.0), DVec3::new(4.0, 4.0, 0.0)],
+            closed: false,
+        };
+        let Some(Curve::Polyline { points, .. }) = l.offset(1.0, 0.01) else { panic!() };
+        assert!((points[0] - DVec3::new(0.0, 1.0, 0.0)).length() < 1e-9);
+        assert!((points[1] - DVec3::new(3.0, 1.0, 0.0)).length() < 1e-9); // miter corner
+        assert!((points[2] - DVec3::new(3.0, 4.0, 0.0)).length() < 1e-9);
+    }
+
+    #[test]
+    fn offset_ellipse_tessellates() {
+        let e = Curve::Ellipse { center: DVec3::ZERO, rx: 4.0, ry: 2.0 };
+        let Some(Curve::Polyline { closed, .. }) = e.offset(0.5, 0.01) else {
+            panic!("expected polyline")
+        };
+        assert!(closed);
     }
 
     #[test]

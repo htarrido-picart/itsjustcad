@@ -643,6 +643,48 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Offset { id, target, distance } => {
+            let ids = resolve(doc, &target)?;
+            if ids.len() != 1 {
+                return Err(ExecError::Invalid(format!(
+                    "offset selector matched {} objects, expected exactly 1",
+                    ids.len()
+                )));
+            }
+            let src = doc.get(ids[0]).expect("resolved");
+            let Geometry::Curve(curve) = &src.geometry else {
+                return Err(ExecError::Invalid(
+                    "offset works on curves; meshes cannot be offset".into(),
+                ));
+            };
+            let offset = curve.offset(distance, PROFILE_TOL).ok_or_else(|| {
+                ExecError::Invalid(format!(
+                    "offset by {distance} collapses the curve — use a smaller inward distance"
+                ))
+            })?;
+            let exact = !matches!(
+                (curve, &offset),
+                (Curve::Ellipse { .. } | Curve::Nurbs { .. }, Curve::Polyline { .. })
+            );
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                id,
+                name: None,
+                geometry: Geometry::Curve(offset),
+            });
+            Ok((
+                Command::Offset { id: Some(id), target, distance },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "offset {} by {distance} -> {id} (original kept{})",
+                        ids[0],
+                        if exact { "" } else { ", result tessellated to a polyline" }
+                    ),
+                },
+            ))
+        }
         Command::Copy { ids, targets, delta } => {
             let src = resolve(doc, &targets)?;
             // Reuse logged ids on replay; mint new ones live.
@@ -746,6 +788,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Rotate { .. } => "rotate",
         Command::Scale { .. } => "scale",
         Command::Mirror { .. } => "mirror",
+        Command::Offset { .. } => "offset",
         Command::Copy { .. } => "copy",
         Command::Delete { .. } => "delete",
         Command::Name { .. } => "name",
@@ -1004,6 +1047,44 @@ mod tests {
         run(&mut s, "mirror last yz");
         run(&mut s, "circle 10,0,0 2");
         run(&mut s, "scale last 2,1,1"); // ellipse-ish: circle tessellates? (circle is Arc; non-uniform → polyline)
+        let log = s.save_log();
+        let replayed = Session::replay(log).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn offset_walls_from_centerline() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "offset last 0.2"); // outward
+        assert_eq!(s.doc.len(), 2); // original kept
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+        run(&mut s, "offset last -0.2"); // inward
+        let bb = s.doc.scene_aabb().unwrap();
+        // inner offset shrinks the overall bounds only via the new curve? no —
+        // original rect still bounds the scene at 10x6
+        assert_eq!(bb.size().truncate(), glam::DVec2::new(10.0, 6.0));
+
+        // collapse errors, doc untouched
+        let err = s.run(parse("offset last -5").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("collapses"), "{err}");
+
+        // meshes rejected
+        run(&mut s, "box 20,0,0 1,1,1");
+        let err = s.run(parse("offset last 1").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("curves"), "{err}");
+    }
+
+    #[test]
+    fn offset_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0,0 3");
+        run(&mut s, "name last centerline");
+        run(&mut s, "offset centerline 0.5");
+        run(&mut s, "offset centerline -0.5");
         let log = s.save_log();
         let replayed = Session::replay(log).unwrap();
         let a: Vec<_> = s.doc.objects().collect();

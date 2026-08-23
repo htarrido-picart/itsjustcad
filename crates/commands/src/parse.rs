@@ -176,6 +176,15 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let center = about(rest, "scale", args)?;
             Ok(Command::Scale { targets: sel, factors, center })
         }),
+        "offset" => with_last_backtrack(&args, "offset", |sel, rest, args| {
+            let [dist] = take::<1>("offset", "a distance after the selector", rest)
+                .map_err(|_| wrong_err("offset", "a distance after the selector", args))?;
+            Ok(Command::Offset {
+                id: None,
+                target: sel,
+                distance: number(dist)?,
+            })
+        }),
         "mirror" => {
             let (sel, rest) = selector(&args, "mirror")?;
             let plane = match rest {
@@ -486,6 +495,16 @@ mod tests {
         ));
         // scale rejects garbage after the center clause
         assert!(parse("scale last 2 about 0,0,0 extra").is_err());
+        // offset: bare number after 'last' is the distance (backtrack), and
+        // negative distances parse
+        assert!(matches!(
+            parse("offset last 0.2").unwrap(),
+            Command::Offset { distance, target: Selector::Last { n: 1 }, .. } if distance == 0.2
+        ));
+        assert!(matches!(
+            parse("offset walls -0.5").unwrap(),
+            Command::Offset { distance, .. } if distance == -0.5
+        ));
         // rotate needs an angle
         let err = parse("rotate last").unwrap_err();
         assert!(err.to_string().contains("angle"), "{err}");

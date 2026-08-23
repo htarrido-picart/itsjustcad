@@ -140,6 +140,13 @@ pub enum Command {
         targets: Selector,
         plane: MirrorPlane,
     },
+    /// Offset a curve in the XY plane; the original is kept.
+    Offset {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        target: Selector,
+        distance: f64,
+    },
     Copy {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
