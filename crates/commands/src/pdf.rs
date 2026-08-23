@@ -132,7 +132,7 @@ fn render_view(
     // Project all visible geometry, scale to mm, center in the rect.
     let mut segments = Vec::new();
     for obj in doc.objects() {
-        if doc.layer_visible(&obj.layer) {
+        if obj.visible && doc.layer_visible(&obj.layer) {
             geometry_segments(&obj.geometry, &mut segments);
         }
     }

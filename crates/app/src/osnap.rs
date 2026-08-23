@@ -35,6 +35,9 @@ pub fn grid_snap(p: DVec3) -> DVec3 {
 pub fn candidates(doc: &Document) -> Vec<(DVec3, SnapKind)> {
     let mut out = Vec::new();
     for obj in doc.objects() {
+        if !obj.visible || !doc.layer_visible(&obj.layer) {
+            continue; // invisible geometry must not attract the cursor
+        }
         match &obj.geometry {
             Geometry::Curve(c) => curve_candidates(c, &mut out),
             Geometry::Mesh(m) => {
@@ -122,6 +125,7 @@ mod tests {
     fn doc_with(geometry: Geometry) -> Document {
         let mut doc = Document::default();
         doc.insert(SceneObject {
+            visible: true,
             id: ObjectId::new(),
             name: None,
             layer: mydrafter_doc::DEFAULT_LAYER.to_string(),

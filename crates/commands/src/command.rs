@@ -303,6 +303,14 @@ pub enum Command {
     Show {
         layer: String,
     },
+    // -- per-object visibility --
+    /// Hide individual objects (they stay in the model and the op-log).
+    HideObj {
+        targets: Selector,
+    },
+    ShowObj {
+        targets: Selector,
+    },
     /// Set the document display unit. Logged so replayed files keep their
     /// unit; geometry always stores meters regardless.
     Units {

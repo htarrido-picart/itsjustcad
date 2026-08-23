@@ -63,6 +63,8 @@ enum Inverse {
     },
     /// `layercolor`/`hide`/`show`: restore the previous layer style.
     LayerStyle { layer: String, prev: LayerStyle },
+    /// `hideobj`/`showobj`: restore each object's previous visible flag.
+    ObjectVisibility(Vec<(ObjectId, bool)>),
     /// `units`: restore the previous display unit.
     Units { prev: Units },
     /// `view save`: restore the previously saved view of that name (if any).
@@ -188,6 +190,13 @@ impl Session {
                 }
                 self.doc.generation += 1;
             }
+            Inverse::ObjectVisibility(prev) => {
+                for (id, visible) in prev.clone() {
+                    if let Some(obj) = self.doc.get_mut(id) {
+                        obj.visible = visible;
+                    }
+                }
+            }
             Inverse::Units { prev } => {
                 self.doc.units = *prev;
                 self.doc.generation += 1;
@@ -305,6 +314,7 @@ fn insert_curve(
 ) -> (ObjectId, ApplyOutcome) {
     let id = id.unwrap_or_default();
     doc.insert(SceneObject {
+        visible: true,
         id,
         name: None,
         layer: doc.current_layer.clone(),
@@ -420,6 +430,7 @@ fn replace_with_result(
     }
     let id = id.unwrap_or_default();
     doc.insert(SceneObject {
+        visible: true,
         id,
         name,
         layer,
@@ -503,6 +514,7 @@ fn section_meshes(
     });
     for (points, id) in loops.into_iter().zip(&new_ids) {
         doc.insert(SceneObject {
+            visible: true,
             id: *id,
             name: None,
             layer: SECTIONS_LAYER.to_string(),
@@ -566,6 +578,7 @@ fn apply_forward(
             }
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
+                visible: true,
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
@@ -602,6 +615,7 @@ fn apply_forward(
             let profile2d: Vec<glam::DVec2> = pts3.iter().map(|p| p.truncate()).collect();
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
+                visible: true,
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
@@ -644,6 +658,7 @@ fn apply_forward(
             );
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
+                visible: true,
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
@@ -679,6 +694,7 @@ fn apply_forward(
             let mesh = kernel_mesh::loft_profiles(&profiles);
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
+                visible: true,
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
@@ -714,6 +730,7 @@ fn apply_forward(
             let mesh = kernel_mesh::sweep_profile(&profile_pts, &rail_pts);
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
+                visible: true,
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
@@ -860,6 +877,7 @@ fn apply_forward(
             }
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
+                visible: true,
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
@@ -883,6 +901,7 @@ fn apply_forward(
             }
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
+                visible: true,
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
@@ -928,6 +947,7 @@ fn apply_forward(
             let boundary = curve.tessellate(PROFILE_TOL);
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
+                visible: true,
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
@@ -1171,6 +1191,7 @@ fn apply_forward(
             let (obj, index) = doc.remove(tid).expect("resolved");
             for (piece, pid) in pieces.into_iter().zip(&new_ids) {
                 doc.insert(SceneObject {
+                    visible: true,
                     id: *pid,
                     name: obj.name.clone(),
                     layer: obj.layer.clone(),
@@ -1237,6 +1258,7 @@ fn apply_forward(
             let id = id.unwrap_or_default();
             let (obj, index) = doc.remove(tid).expect("resolved");
             doc.insert(SceneObject {
+                visible: true,
                 id,
                 name: obj.name.clone(),
                 layer: obj.layer.clone(),
@@ -1316,7 +1338,7 @@ fn apply_forward(
                 }
             }
             let id = id.unwrap_or_default();
-            doc.insert(SceneObject { id, name, layer, geometry: Geometry::Curve(joined) });
+            doc.insert(SceneObject { id, name, layer, visible: true, geometry: Geometry::Curve(joined) });
             Ok((
                 Command::Join { id: Some(id), targets },
                 Inverse::Replace { created: vec![id], consumed },
@@ -1368,6 +1390,7 @@ fn apply_forward(
             }
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
+                visible: true,
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
@@ -1410,6 +1433,7 @@ fn apply_forward(
             );
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
+                visible: true,
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
@@ -1698,6 +1722,40 @@ fn apply_forward(
                 ApplyOutcome {
                     created: Vec::new(),
                     message: format!("layer '{layer}' shown"),
+                },
+            ))
+        }
+        Command::HideObj { targets } => {
+            let ids = resolve(doc, &targets)?;
+            let mut prev = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let obj = doc.get_mut(*id).expect("resolved");
+                prev.push((*id, obj.visible));
+                obj.visible = false;
+            }
+            Ok((
+                Command::HideObj { targets },
+                Inverse::ObjectVisibility(prev),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("hid {} object(s)", ids.len()),
+                },
+            ))
+        }
+        Command::ShowObj { targets } => {
+            let ids = resolve(doc, &targets)?;
+            let mut prev = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let obj = doc.get_mut(*id).expect("resolved");
+                prev.push((*id, obj.visible));
+                obj.visible = true;
+            }
+            Ok((
+                Command::ShowObj { targets },
+                Inverse::ObjectVisibility(prev),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("showed {} object(s)", ids.len()),
                 },
             ))
         }
@@ -2050,6 +2108,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LayerColor { .. } => "layercolor",
         Command::Hide { .. } => "hide",
         Command::Show { .. } => "show",
+        Command::HideObj { .. } => "hideobj",
+        Command::ShowObj { .. } => "showobj",
         Command::Units { .. } => "units",
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
@@ -3063,6 +3123,53 @@ mod tests {
             assert!(err.to_string().contains("no layer 'ghost'"), "{line}: {err}");
             assert!(err.to_string().contains("layer ghost"), "hint present: {err}");
         }
+    }
+
+    #[test]
+    fn hideobj_showobj_undo_redo() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "box 5,0,0 1,1,1");
+        let vis = |s: &Session| -> Vec<bool> { s.doc.objects().map(|o| o.visible).collect() };
+        assert_eq!(vis(&s), [true, true]);
+
+        let out = run(&mut s, "hideobj last");
+        assert_eq!(out.message, "hid 1 object(s)");
+        assert_eq!(vis(&s), [true, false]);
+
+        run(&mut s, "showobj all");
+        assert_eq!(vis(&s), [true, true]);
+
+        run(&mut s, "undo"); // un-show: second box hidden again
+        assert_eq!(vis(&s), [true, false]);
+        run(&mut s, "undo"); // un-hide
+        assert_eq!(vis(&s), [true, true]);
+        run(&mut s, "redo");
+        assert_eq!(vis(&s), [true, false]);
+        run(&mut s, "redo");
+        assert_eq!(vis(&s), [true, true]);
+    }
+
+    #[test]
+    fn hideobj_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "box 5,0,0 1,1,1");
+        run(&mut s, "name last cube");
+        run(&mut s, "hideobj cube");
+        run(&mut s, "showobj cube");
+        run(&mut s, "hideobj last 2");
+
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+        assert!(replayed.doc.objects().all(|o| !o.visible));
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
     }
 
     #[test]

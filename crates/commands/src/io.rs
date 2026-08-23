@@ -113,6 +113,32 @@ mod tests {
     }
 
     #[test]
+    fn hideobj_round_trips_and_old_files_default_visible() {
+        let mut s = Session::default();
+        for line in ["box 0,0,0 1,1,1", "box 5,0,0 1,1,1", "hideobj last"] {
+            s.run(parse(line).unwrap()).unwrap();
+        }
+        let json = to_json(&s);
+        assert!(json.contains("hide_obj"), "{json}");
+        let loaded = from_json(&json).unwrap();
+        let vis: Vec<bool> = loaded.doc.objects().map(|o| o.visible).collect();
+        assert_eq!(vis, [true, false]);
+        assert_eq!(to_json(&loaded), json, "replay-stable");
+
+        // Old files have no visibility ops; everything loads visible.
+        let old = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "box",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "size": [2.0, 2.0, 2.0]}
+            ]
+        }"#;
+        let s = from_json(old).unwrap();
+        assert!(s.doc.objects().all(|o| o.visible));
+    }
+
+    #[test]
     fn pre_units_file_defaults_to_meters() {
         // Old files have no units op; they load as meters.
         let json = r#"{

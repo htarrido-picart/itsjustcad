@@ -46,8 +46,9 @@ pub fn digest(doc: &Document) -> String {
         } else {
             format!(" layer '{}'", obj.layer)
         };
+        let hidden = if obj.visible { "" } else { " (hidden)" };
         out.push_str(&format!(
-            "- {kind} {id}{name}{layer} bbox [{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}]\n",
+            "- {kind} {id}{name}{layer}{hidden} bbox [{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}]\n",
             bb.min.x, bb.min.y, bb.min.z, bb.max.x, bb.max.y, bb.max.z,
             id = obj.id,
         ));

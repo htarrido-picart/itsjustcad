@@ -161,6 +161,7 @@ mod tests {
             vec![[0, 1, 2]],
         );
         SceneObject {
+            visible: true,
             id: ObjectId::new(),
             name: name.map(str::to_string),
             layer: DEFAULT_LAYER.to_string(),

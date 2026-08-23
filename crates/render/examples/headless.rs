@@ -103,7 +103,7 @@ fn main() {
             multiview_mask: None,
         });
         let mut pass = pass.forget_lifetime();
-        renderer.paint(&mut pass, 0);
+        renderer.paint(&mut pass, 0, mydrafter_render::DisplayMode::Shaded);
     }
 
     let bytes_per_row = (W * 4).next_multiple_of(256);
@@ -155,5 +155,6 @@ fn main() {
         generation: 0,
         scene: None,
         viewport: 0,
+        mode: mydrafter_render::DisplayMode::Shaded,
     };
 }

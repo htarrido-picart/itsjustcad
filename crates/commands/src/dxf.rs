@@ -10,29 +10,9 @@ use mydrafter_doc::{Annotation, Document, Geometry};
 /// Chord tolerance for tessellating curves R12 cannot represent (meters).
 const EXPORT_TOL: f64 = 0.005;
 
-/// Feature edges of a mesh: boundary edges plus edges where the adjacent
-/// face normals differ (skips diagonals across flat quads). Shared with the
-/// PDF exporter.
-pub(crate) fn mesh_feature_edges(mesh: &kernel_mesh::Mesh) -> Vec<(DVec3, DVec3)> {
-    use std::collections::BTreeMap;
-    let mut edges: BTreeMap<(u32, u32), Vec<DVec3>> = BTreeMap::new();
-    let pos = mesh.positions();
-    for face in mesh.faces() {
-        let [a, b, c] = face.map(|i| pos[i as usize]);
-        let n = (b - a).cross(c - a).normalize_or_zero();
-        for (i, j) in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
-            edges.entry((i.min(j), i.max(j))).or_default().push(n);
-        }
-    }
-    let mut out = Vec::new();
-    for ((i, j), normals) in edges {
-        let flat = normals.len() == 2 && normals[0].dot(normals[1]) > 1.0 - 1e-9;
-        if !flat {
-            out.push((pos[i as usize], pos[j as usize]));
-        }
-    }
-    out
-}
+/// Feature edges of a mesh (see [`kernel_mesh::feature_edges`]). Shared with
+/// the PDF exporter; the viewport wireframe uses the kernel function directly.
+pub(crate) use kernel_mesh::feature_edges as mesh_feature_edges;
 
 /// Tag writer: one "group code, value" pair per call, each on its own line.
 struct Tags(String);

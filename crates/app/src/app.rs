@@ -1,5 +1,7 @@
 use mydrafter_commands::Session;
-use mydrafter_render::{OrbitCamera, SceneRenderer, StandardView, ViewportCallback, ViewportLayout};
+use mydrafter_render::{
+    DisplayMode, OrbitCamera, SceneRenderer, StandardView, ViewportCallback, ViewportLayout,
+};
 
 use crate::command_line::CommandLine;
 use crate::deck_pane::DeckPane;
@@ -18,6 +20,9 @@ pub struct App {
     tokio: tokio::runtime::Handle,
     /// Camera slots shared across layouts: 0 Persp, 1 Top, 2 Front, 3 Right.
     cameras: [OrbitCamera; 4],
+    /// Display mode per camera slot (view state, follows the camera across
+    /// layout switches; never logged).
+    display_modes: [DisplayMode; 4],
     layout: ViewportLayout,
     /// Last hovered pane; view commands and tools target its camera.
     active_pane: usize,
@@ -97,6 +102,7 @@ impl App {
                 cams[3].set_view(StandardView::Right);
                 cams
             },
+            display_modes: [DisplayMode::default(); 4],
             layout: ViewportLayout::Single,
             active_pane: 0,
             uploaded_generation: None,
@@ -158,6 +164,18 @@ impl App {
             Some("open") => self.open(words.next().map(Into::into)),
             Some("recover") => self.recover(),
             Some("ze" | "zoomextents") => self.zoom_extents(),
+            // Display mode of the active viewport. View state, never logged.
+            Some("display") => match words.next().and_then(DisplayMode::parse) {
+                Some(mode) => {
+                    self.display_modes[self.layout.camera_index(self.active_pane)] = mode;
+                    self.command_line
+                        .push_line(format!("display: {}", mode.label().to_lowercase()));
+                }
+                None => {
+                    self.command_line
+                        .push_line("usage: display shaded|wireframe|xray|ghosted");
+                }
+            },
             Some("viewports" | "vp") => {
                 match words.next() {
                     Some("1") => self.set_layout(ViewportLayout::Single),
@@ -240,8 +258,8 @@ impl App {
 
         let mut best: Option<(f64, mydrafter_doc::ObjectId)> = None;
         for obj in self.session.doc.objects() {
-            if !self.session.doc.layer_visible(&obj.layer) {
-                continue; // hidden layers are unpickable
+            if !obj.visible || !self.session.doc.layer_visible(&obj.layer) {
+                continue; // hidden objects/layers are unpickable
             }
             let bb = obj.geometry.aabb();
             if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
@@ -278,7 +296,7 @@ impl App {
             .session
             .doc
             .objects()
-            .filter(|obj| self.session.doc.layer_visible(&obj.layer))
+            .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
             .filter_map(|obj| {
                 let bb = obj.geometry.aabb();
                 Some((obj.id, projected_rect(view_proj, rect, bb.min, bb.max)?))
@@ -535,6 +553,7 @@ impl App {
                     generation,
                     scene: scene.take(),
                     viewport: pane,
+                    mode: self.display_modes[cam_idx],
                 },
             ));
 
@@ -581,7 +600,7 @@ impl App {
         let painter = ui.painter_at(rect);
         let doc = &self.session.doc;
         for obj in doc.objects() {
-            if !doc.layer_visible(&obj.layer) {
+            if !obj.visible || !doc.layer_visible(&obj.layer) {
                 continue;
             }
             let Geometry::Annotation(ann) = &obj.geometry else {
@@ -994,6 +1013,20 @@ impl App {
                         if ui.small_button("ZE").on_hover_text("zoom extents").clicked() {
                             self.zoom_extents();
                         }
+                        ui.separator();
+                        // Display mode of the active pane's camera slot.
+                        let slot = self.layout.camera_index(self.active_pane);
+                        egui::ComboBox::from_id_salt("display_mode")
+                            .selected_text(self.display_modes[slot].label())
+                            .show_ui(ui, |ui| {
+                                for mode in DisplayMode::ALL {
+                                    ui.selectable_value(
+                                        &mut self.display_modes[slot],
+                                        mode,
+                                        mode.label(),
+                                    );
+                                }
+                            });
                         ui.separator();
                         for (label, layout) in [
                             ("1", ViewportLayout::Single),

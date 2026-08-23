@@ -8,7 +8,7 @@ mod viewport_callback;
 
 pub use camera::{OrbitCamera, StandardView};
 pub use layout::ViewportLayout;
-pub use renderer::{CameraUniform, SceneData, SceneRenderer};
+pub use renderer::{CameraUniform, DisplayMode, SceneData, SceneRenderer};
 pub use snapshot::{snapshot, Theme};
 pub use viewport_callback::ViewportCallback;
 
@@ -17,6 +17,7 @@ pub fn camera_uniform(view_proj: glam::Mat4, eye: glam::Vec3) -> CameraUniform {
         view_proj: view_proj.to_cols_array_2d(),
         inv_view_proj: view_proj.inverse().to_cols_array_2d(),
         eye: [eye.x, eye.y, eye.z, 1.0],
+        misc: [1.0, 0.0, 0.0, 0.0],
     }
 }
 

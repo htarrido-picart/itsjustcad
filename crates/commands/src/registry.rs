@@ -214,6 +214,16 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Show a hidden layer. Example: show walls",
         },
         CommandSpec {
+            name: "hideobj",
+            usage: "hideobj <selector>",
+            summary: "Hide individual objects (they stay in the model, invisible and unpickable). Example: hideobj last 2",
+        },
+        CommandSpec {
+            name: "showobj",
+            usage: "showobj <selector>",
+            summary: "Show hidden objects ('showobj all' reveals everything). Example: showobj all",
+        },
+        CommandSpec {
             name: "units",
             usage: "units <m|cm|mm|ft|in|ftin>",
             summary: "Set the display unit for dimensions and readouts (geometry stays meters internally). Number suffixes work everywhere regardless: 500mm, 2.5m, 12ft, 6in, and feet-inches typed as 12ft6in (shown as 12'-6\"). Example: units ftin",

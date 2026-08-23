@@ -437,6 +437,16 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let [layer] = take::<1>("show", "a layer name", &args)?;
             Ok(Command::Show { layer: layer.to_string() })
         }
+        "hideobj" => {
+            let (sel, rest) = selector(&args, "hideobj")?;
+            expect_empty("hideobj", rest, &args)?;
+            Ok(Command::HideObj { targets: sel })
+        }
+        "showobj" => {
+            let (sel, rest) = selector(&args, "showobj")?;
+            expect_empty("showobj", rest, &args)?;
+            Ok(Command::ShowObj { targets: sel })
+        }
         "units" => {
             let [u] = take::<1>("units", "a unit: m, cm, mm, ft, in or ftin", &args)?;
             let units = Units::parse(u)
@@ -1266,6 +1276,16 @@ mod tests {
         assert_eq!(color, [1.0, 0.0, 128.0 / 255.0]);
         assert_eq!(parse("hide walls").unwrap(), Command::Hide { layer: "walls".into() });
         assert_eq!(parse("show walls").unwrap(), Command::Show { layer: "walls".into() });
+        assert_eq!(
+            parse("hideobj last 2").unwrap(),
+            Command::HideObj { targets: Selector::Last { n: 2 } }
+        );
+        assert_eq!(
+            parse("hideobj tower").unwrap(),
+            Command::HideObj { targets: Selector::Named { name: "tower".into() } }
+        );
+        assert_eq!(parse("showobj all").unwrap(), Command::ShowObj { targets: Selector::All });
+        assert!(parse("hideobj").unwrap_err().to_string().contains("selector"));
         // errors carry usage / color hints
         assert!(parse("layer").unwrap_err().to_string().contains("layer name"));
         let err = parse("layercolor walls red").unwrap_err();
@@ -1282,6 +1302,8 @@ mod tests {
             "layercolor walls 0.5,0.5,0.5",
             "hide walls",
             "show walls",
+            "hideobj last 2",
+            "showobj all",
         ] {
             let cmd = parse(line).unwrap();
             let json = serde_json::to_string(&cmd).unwrap();

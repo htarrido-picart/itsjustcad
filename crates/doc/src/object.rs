@@ -167,5 +167,9 @@ pub struct SceneObject {
     /// Serde default keeps pre-layer JSON loading.
     #[serde(default = "default_layer")]
     pub layer: String,
+    /// Per-object display flag (`hideobj`/`showobj`); serde default keeps
+    /// pre-visibility JSON loading.
+    #[serde(default = "default_visible")]
+    pub visible: bool,
     pub geometry: Geometry,
 }

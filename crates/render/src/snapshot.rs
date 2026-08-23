@@ -50,8 +50,12 @@ pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
     let mut scene = SceneData {
         meshes: Vec::new(),
         lines: Vec::new(),
+        edges: Vec::new(),
     };
     for obj in doc.objects() {
+        if !obj.visible {
+            continue; // hidden object (hideobj)
+        }
         let style = doc.layers.get(&obj.layer);
         if style.is_some_and(|s| !s.visible) {
             continue; // hidden layer
@@ -67,6 +71,18 @@ pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
                     layer_color.unwrap_or(theme.mesh())
                 };
                 scene.meshes.push((mesh.to_render(), color));
+                // Feature edges for the wireframe/x-ray/ghosted display modes.
+                let edge_color = if selected { theme.selected() } else { theme.curve() };
+                let segments: Vec<[f32; 3]> = kernel_mesh::feature_edges(mesh)
+                    .iter()
+                    .flat_map(|(a, b)| {
+                        [
+                            [a.x as f32, a.y as f32, a.z as f32],
+                            [b.x as f32, b.y as f32, b.z as f32],
+                        ]
+                    })
+                    .collect();
+                scene.edges.push((segments, edge_color));
             }
             Geometry::Curve(curve) => {
                 let color = if selected {
@@ -184,6 +200,7 @@ mod tests {
             vec![[0, 1, 2]],
         );
         let obj = SceneObject {
+            visible: true,
             id: ObjectId::new(),
             name: None,
             layer: layer.to_string(),
@@ -205,6 +222,37 @@ mod tests {
         insert_tri(&mut doc, "hidden");
         let scene = snapshot(&doc, Theme::Dark);
         assert_eq!(scene.meshes.len(), 1);
+    }
+
+    #[test]
+    fn hidden_objects_are_skipped() {
+        let mut doc = Document::default();
+        insert_tri(&mut doc, "default");
+        let id = insert_tri(&mut doc, "default");
+        doc.get_mut(id).unwrap().visible = false;
+        let scene = snapshot(&doc, Theme::Dark);
+        assert_eq!(scene.meshes.len(), 1);
+        assert_eq!(scene.edges.len(), 1, "hidden mesh contributes no edges");
+    }
+
+    #[test]
+    fn box_snapshot_carries_12_feature_edges() {
+        let mut doc = Document::default();
+        doc.insert(SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: "default".into(),
+            geometry: Geometry::Mesh(kernel_mesh::make_box(
+                DVec3::ZERO,
+                DVec3::new(2.0, 1.0, 3.0),
+            )),
+        });
+        let scene = snapshot(&doc, Theme::Dark);
+        assert_eq!(scene.edges.len(), 1);
+        // 12 feature edges (flat quad diagonals excluded) = 24 endpoints.
+        assert_eq!(scene.edges[0].0.len(), 24);
+        assert_eq!(scene.edges[0].1, Theme::Dark.curve());
     }
 
     #[test]
@@ -237,6 +285,7 @@ mod tests {
         ];
         let mut doc = Document::default();
         doc.insert(SceneObject {
+            visible: true,
             id: ObjectId::new(),
             name: None,
             layer: "default".into(),
@@ -251,6 +300,7 @@ mod tests {
 
         let mut doc = Document::default();
         doc.insert(SceneObject {
+            visible: true,
             id: ObjectId::new(),
             name: None,
             layer: "default".into(),
@@ -272,6 +322,7 @@ mod tests {
     fn dim_and_text_are_overlay_only() {
         let mut doc = Document::default();
         doc.insert(SceneObject {
+            visible: true,
             id: ObjectId::new(),
             name: None,
             layer: "default".into(),
@@ -282,6 +333,7 @@ mod tests {
             }),
         });
         doc.insert(SceneObject {
+            visible: true,
             id: ObjectId::new(),
             name: None,
             layer: "default".into(),

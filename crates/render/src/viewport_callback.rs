@@ -1,7 +1,7 @@
 use egui_wgpu::CallbackTrait;
 use glam::Mat4;
 
-use crate::renderer::{CameraUniform, SceneData, SceneRenderer};
+use crate::renderer::{CameraUniform, DisplayMode, SceneData, SceneRenderer};
 
 /// Per-frame paint callback for the 3D viewport. Uploads the camera, rebuilds
 /// scene buffers when the document generation changed, then draws the scene.
@@ -14,6 +14,8 @@ pub struct ViewportCallback {
     /// Pane index — selects the per-viewport camera UBO so multiple panes in
     /// one frame do not clobber each other's camera during `prepare`.
     pub viewport: usize,
+    /// Display mode of this pane (shaded/wireframe/x-ray/ghosted).
+    pub mode: DisplayMode,
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -30,6 +32,7 @@ impl CallbackTrait for ViewportCallback {
             view_proj: self.view_proj.to_cols_array_2d(),
             inv_view_proj: self.view_proj.inverse().to_cols_array_2d(),
             eye: [self.eye.x, self.eye.y, self.eye.z, 1.0],
+            misc: [self.mode.fill_alpha(), 0.0, 0.0, 0.0],
         };
         renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene
@@ -47,6 +50,6 @@ impl CallbackTrait for ViewportCallback {
         resources: &egui_wgpu::CallbackResources,
     ) {
         let renderer: &SceneRenderer = resources.get().expect("SceneRenderer registered");
-        renderer.paint(render_pass, self.viewport);
+        renderer.paint(render_pass, self.viewport, self.mode);
     }
 }

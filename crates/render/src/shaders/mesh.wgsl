@@ -4,6 +4,8 @@ struct Camera {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     eye: vec4<f32>,
+    // x = fill alpha multiplier (display mode), yzw spare
+    misc: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -40,5 +42,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let l = normalize(camera.eye.xyz - in.world); // headlight
     let lambert = max(dot(n, l), 0.0);
     let shade = 0.35 + 0.65 * lambert;
-    return vec4(object.color.rgb * shade, object.color.a);
+    return vec4(object.color.rgb * shade, object.color.a * camera.misc.x);
 }
