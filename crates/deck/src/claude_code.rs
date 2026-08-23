@@ -27,35 +27,57 @@ impl ClaudeCodeDeck {
         req: ChatRequest,
         tx: &UnboundedSender<DeckDelta>,
     ) -> Result<(), DeckError> {
-        // The CLI takes one prompt; flatten the conversation into turns.
-        let mut prompt = String::new();
-        for m in &req.messages {
-            let tag = match m.role {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-            };
-            prompt.push_str(&format!("{tag}: {}\n\n", m.content));
-        }
-        prompt.push_str("Assistant:");
+        // With a session to resume, send only the newest message — the CLI
+        // holds the conversation server-side (and keeps the prompt cache warm).
+        // Otherwise flatten the transcript into one prompt.
+        let prompt = if req.session_id.is_some() {
+            req.messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User)
+                .map(|m| m.content.clone())
+                .unwrap_or_default()
+        } else {
+            let mut p = String::new();
+            for m in &req.messages {
+                let tag = match m.role {
+                    Role::User => "User",
+                    Role::Assistant => "Assistant",
+                };
+                p.push_str(&format!("{tag}: {}\n\n", m.content));
+            }
+            p.push_str("Assistant:");
+            p
+        };
 
         let model = if req.model.is_empty() { &self.model } else { &req.model };
+        let mut args: Vec<String> = vec![
+            "-p".into(),
+            prompt,
+            "--system-prompt".into(),
+            req.system.clone(),
+            "--model".into(),
+            model.clone(),
+            "--output-format".into(),
+            "stream-json".into(),
+            "--verbose".into(),
+            "--include-partial-messages".into(),
+            "--max-turns".into(),
+            "1".into(),
+            "--settings".into(),
+            r#"{"disableAllHooks":true}"#.into(),
+            // Do not load the user's MCP servers (e.g. Serena spawns a
+            // dashboard window on every session).
+            "--strict-mcp-config".into(),
+            "--mcp-config".into(),
+            r#"{"mcpServers":{}}"#.into(),
+        ];
+        if let Some(session) = &req.session_id {
+            args.push("--resume".into());
+            args.push(session.clone());
+        }
         let mut child = tokio::process::Command::new("claude")
-            .args([
-                "-p",
-                &prompt,
-                "--system-prompt",
-                &req.system,
-                "--model",
-                model,
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--include-partial-messages",
-                "--max-turns",
-                "1",
-                "--settings",
-                r#"{"disableAllHooks":true}"#,
-            ])
+            .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -71,6 +93,11 @@ impl ClaudeCodeDeck {
                 continue;
             };
             match value["type"].as_str() {
+                Some("system") if value["subtype"].as_str() == Some("init") => {
+                    if let Some(sid) = value["session_id"].as_str() {
+                        let _ = tx.send(DeckDelta::Session(sid.to_string()));
+                    }
+                }
                 Some("stream_event") => {
                     let delta = &value["event"]["delta"];
                     // Forward text; skip thinking deltas.

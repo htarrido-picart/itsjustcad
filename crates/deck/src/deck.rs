@@ -22,12 +22,18 @@ pub struct ChatRequest {
     pub model: String,
     pub max_tokens: u32,
     pub temperature: f32,
+    /// Provider-side conversation handle (claude-code sessions). When set,
+    /// the adapter may send only the newest message instead of the full
+    /// transcript. HTTP adapters ignore it.
+    pub session_id: Option<String>,
 }
 
 /// Streaming events from a deck to the UI.
 #[derive(Debug)]
 pub enum DeckDelta {
     Text(String),
+    /// Provider-side session handle to reuse on the next turn.
+    Session(String),
     Done,
     Error(String),
 }

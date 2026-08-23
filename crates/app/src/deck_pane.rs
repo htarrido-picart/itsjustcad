@@ -132,6 +132,8 @@ pub struct DeckPane {
     /// Background model preload (Ollama cold-load tax).
     warm: WarmState,
     warmed_model: Option<String>,
+    /// Provider-side conversation handle (claude-code sessions).
+    session_id: Option<String>,
 }
 
 impl Default for DeckPane {
@@ -153,6 +155,7 @@ impl Default for DeckPane {
             probed_deck: None,
             warm: WarmState::Idle,
             warmed_model: None,
+            session_id: None,
         }
     }
 }
@@ -271,6 +274,7 @@ impl DeckPane {
             model: String::new(),
             max_tokens: 4096,
             temperature: 0.2,
+            session_id: self.session_id.clone(),
         };
         let (tx, rx) = unbounded_channel();
         self.rx = Some(rx);
@@ -380,6 +384,9 @@ impl DeckPane {
                     self.current_response.push_str(&text);
                     batch.push(text);
                 }
+                DeckDelta::Session(sid) => {
+                    self.session_id = Some(sid);
+                }
                 DeckDelta::Done => {
                     tracing::info!("deck turn done");
                     done = true;
@@ -457,6 +464,7 @@ impl DeckPane {
                             .clicked()
                         {
                             self.decks.save();
+                            self.session_id = None;
                         }
                     }
                 });
@@ -493,6 +501,7 @@ impl DeckPane {
             if ui.small_button("clear").clicked() {
                 self.transcript.clear();
                 self.messages.clear();
+                self.session_id = None;
             }
         });
         match &self.probe {
