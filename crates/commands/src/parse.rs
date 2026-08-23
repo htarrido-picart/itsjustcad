@@ -1,5 +1,7 @@
 use glam::DVec3;
-use mydrafter_doc::{HatchPattern, PaperSize, ViewDirection};
+use mydrafter_doc::{
+    HatchPattern, PaperSize, Units, ViewDirection, METERS_PER_FOOT, METERS_PER_INCH,
+};
 
 use crate::error::ParseError;
 use crate::registry::registry;
@@ -299,6 +301,12 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let [layer] = take::<1>("show", "a layer name", &args)?;
             Ok(Command::Show { layer: layer.to_string() })
         }
+        "units" => {
+            let [u] = take::<1>("units", "a unit: m, cm, mm, ft, in or ftin", &args)?;
+            let units = Units::parse(u)
+                .ok_or_else(|| wrong_err("units", "one of m, cm, mm, ft, in, ftin", &args))?;
+            Ok(Command::Units { units })
+        }
         "sheet" => {
             let (name, paper) = match args.as_slice() {
                 [name] => (*name, PaperSize::A3),
@@ -420,8 +428,25 @@ fn about(
     }
 }
 
-/// Numbers accept unit suffixes; bare numbers are meters.
+/// Numbers accept unit suffixes (mm, cm, m, ft, in, and feet-inches as
+/// "12ft6in"); bare numbers are meters. Results are always meters.
 pub fn number(s: &str) -> Result<f64, ParseError> {
+    let bad = || ParseError::BadNumber(s.to_string());
+    let val = |v: &str| v.parse::<f64>().map_err(|_| bad());
+    if let Some(body) = s.strip_suffix("in") {
+        // "6in", or feet-inches "12ft6in" (sign applies to the whole length).
+        if let Some((ft, inches)) = body.split_once("ft") {
+            let (sign, ft) = match ft.strip_prefix('-') {
+                Some(rest) => (-1.0, rest),
+                None => (1.0, ft),
+            };
+            return Ok(sign * (val(ft)? * 12.0 + val(inches)?) * METERS_PER_INCH);
+        }
+        return Ok(val(body)? * METERS_PER_INCH);
+    }
+    if let Some(v) = s.strip_suffix("ft") {
+        return Ok(val(v)? * METERS_PER_FOOT);
+    }
     let (num, factor) = if let Some(v) = s.strip_suffix("mm") {
         (v, 0.001)
     } else if let Some(v) = s.strip_suffix("cm") {
@@ -431,9 +456,7 @@ pub fn number(s: &str) -> Result<f64, ParseError> {
     } else {
         (s, 1.0)
     };
-    num.parse::<f64>()
-        .map(|v| v * factor)
-        .map_err(|_| ParseError::BadNumber(s.to_string()))
+    val(num).map(|v| v * factor)
 }
 
 /// `x,y` (z=0) or `x,y,z`, each component with optional units.
@@ -593,6 +616,58 @@ mod tests {
         assert_eq!(number("500mm").unwrap(), 0.5);
         assert_eq!(number("3m").unwrap(), 3.0);
         assert_eq!(number("4.5").unwrap(), 4.5);
+    }
+
+    #[test]
+    fn parse_imperial_suffixes() {
+        assert_eq!(number("12ft").unwrap(), 12.0 * METERS_PER_FOOT);
+        assert_eq!(number("6in").unwrap(), 6.0 * METERS_PER_INCH);
+        assert_eq!(number("0.5ft").unwrap(), 0.5 * METERS_PER_FOOT);
+        assert_eq!(number("-3ft").unwrap(), -3.0 * METERS_PER_FOOT);
+        // feet-inches: 12ft6in = 150 inches; sign applies to the whole length
+        assert_eq!(number("12ft6in").unwrap(), 150.0 * METERS_PER_INCH);
+        assert_eq!(number("12ft6.5in").unwrap(), 150.5 * METERS_PER_INCH);
+        assert_eq!(number("-12ft6in").unwrap(), -150.0 * METERS_PER_INCH);
+        assert!(number("ft").is_err());
+        assert!(number("12ftin").is_err());
+        assert!(number("12ft6").is_err());
+        // points accept imperial components
+        assert_eq!(
+            point("12ft,6in").unwrap(),
+            DVec3::new(12.0 * METERS_PER_FOOT, 6.0 * METERS_PER_INCH, 0.0)
+        );
+    }
+
+    #[test]
+    fn parse_units_command() {
+        for (arg, units) in [
+            ("m", Units::M),
+            ("cm", Units::Cm),
+            ("mm", Units::Mm),
+            ("ft", Units::Ft),
+            ("in", Units::In),
+            ("ftin", Units::FtIn),
+        ] {
+            assert_eq!(
+                parse(&format!("units {arg}")).unwrap(),
+                Command::Units { units },
+                "{arg}"
+            );
+        }
+        assert!(parse("units furlongs").unwrap_err().to_string().contains("ftin"));
+        assert!(parse("units").unwrap_err().to_string().contains("unit"));
+        // logged so files carry their unit through replay
+        assert!(parse("units ft").unwrap().is_logged());
+    }
+
+    #[test]
+    fn units_command_json_roundtrip() {
+        for line in ["units m", "units ftin", "units ft"] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
     }
 
     #[test]

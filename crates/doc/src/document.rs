@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_mesh::Aabb;
 
-use crate::{LayerStyle, ObjectId, SceneObject, Sheet, DEFAULT_LAYER};
+use crate::{LayerStyle, ObjectId, SceneObject, Sheet, Units, DEFAULT_LAYER};
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
 #[derive(Clone, Debug)]
@@ -18,6 +18,9 @@ pub struct Document {
     pub current_layer: String,
     /// Paper layouts, in creation order. Mutators bump `generation` (exec does).
     pub sheets: Vec<Sheet>,
+    /// Display unit for lengths (geometry always stores meters). Set via the
+    /// logged `units` command, so saved files carry their unit through replay.
+    pub units: Units,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -31,6 +34,7 @@ impl Default for Document {
             layers: BTreeMap::from([(DEFAULT_LAYER.to_string(), LayerStyle::default())]),
             current_layer: DEFAULT_LAYER.to_string(),
             sheets: Vec::new(),
+            units: Units::default(),
             generation: 0,
         }
     }

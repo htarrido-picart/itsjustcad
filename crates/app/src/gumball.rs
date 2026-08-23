@@ -235,7 +235,7 @@ impl Gumball {
                 painter.text(
                     pos + egui::vec2(14.0, -14.0),
                     egui::Align2::LEFT_BOTTOM,
-                    drag_readout(drag),
+                    drag_readout(drag, doc.units),
                     egui::TextStyle::Small.resolve(ui.style()),
                     egui::Color32::from_rgb(255, 210, 80),
                 );
@@ -326,11 +326,12 @@ fn pending_matrix(drag: &DragState) -> DMat4 {
     }
 }
 
-fn drag_readout(drag: &DragState) -> String {
+fn drag_readout(drag: &DragState, units: mydrafter_doc::Units) -> String {
+    let d = || mydrafter_doc::format_length(units, drag.current - drag.start);
     match drag.handle {
-        Handle::MoveX => format!("dx {:.3}", drag.current - drag.start),
-        Handle::MoveY => format!("dy {:.3}", drag.current - drag.start),
-        Handle::MoveZ => format!("dz {:.3}", drag.current - drag.start),
+        Handle::MoveX => format!("dx {}", d()),
+        Handle::MoveY => format!("dy {}", d()),
+        Handle::MoveZ => format!("dz {}", d()),
         Handle::RotZ => format!(
             "{:.1}°",
             wrap_angle_deg((drag.current - drag.start).to_degrees())

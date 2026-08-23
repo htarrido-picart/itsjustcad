@@ -112,7 +112,7 @@ fn text(t: &mut Tags, layer: &str, pos: DVec3, height: f64, content: &str) {
 }
 
 /// One document object -> zero or more entities. Returns entities written.
-fn entity(t: &mut Tags, layer: &str, geometry: &Geometry) -> usize {
+fn entity(t: &mut Tags, layer: &str, geometry: &Geometry, units: mydrafter_doc::Units) -> usize {
     match geometry {
         Geometry::Curve(curve) => match curve {
             kernel_curve::Curve::Line { a, b } => {
@@ -161,7 +161,7 @@ fn entity(t: &mut Tags, layer: &str, geometry: &Geometry) -> usize {
                 let left = DVec3::new(-dir.y, dir.x, 0.0) * *offset;
                 line(t, layer, *a + left, *b + left);
                 let mid = (*a + *b) / 2.0 + left;
-                text(t, layer, mid, 0.2, &format!("{:.2}", (*b - *a).length()));
+                text(t, layer, mid, 0.2, &mydrafter_doc::format_length(units, (*b - *a).length()));
                 2
             }
             Annotation::Text { pos, text: s, height } => {
@@ -208,7 +208,7 @@ pub fn document_dxf(doc: &Document) -> (String, usize) {
     t.tag(2, "ENTITIES");
     let mut count = 0usize;
     for obj in doc.objects() {
-        count += entity(&mut t, &dxf_layer(&obj.layer), &obj.geometry);
+        count += entity(&mut t, &dxf_layer(&obj.layer), &obj.geometry, doc.units);
     }
     t.tag(0, "ENDSEC");
     t.tag(0, "EOF");
@@ -322,7 +322,7 @@ mod tests {
         let (dxf, count) = document_dxf(&s.doc);
         assert_eq!(count, 2);
         assert_eq!(scan_entities(&dxf), vec!["LINE", "TEXT"]);
-        assert!(dxf.contains("1\n10.00\n"), "measured value as TEXT content");
+        assert!(dxf.contains("1\n10.00 m\n"), "measured value as TEXT content");
     }
 
     #[test]

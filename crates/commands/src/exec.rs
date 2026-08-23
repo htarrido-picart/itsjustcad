@@ -1,7 +1,9 @@
 use glam::DVec3;
 use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
-use mydrafter_doc::{Annotation, Document, Geometry, LayerStyle, ObjectId, SceneObject};
+use mydrafter_doc::{
+    format_length, Annotation, Document, Geometry, LayerStyle, ObjectId, SceneObject, Units,
+};
 
 use crate::error::ExecError;
 use crate::{Command, MirrorPlane, Selector};
@@ -49,6 +51,8 @@ enum Inverse {
     },
     /// `layercolor`/`hide`/`show`: restore the previous layer style.
     LayerStyle { layer: String, prev: LayerStyle },
+    /// `units`: restore the previous display unit.
+    Units { prev: Units },
     /// `sheet`: drop the sheet this command created.
     RemoveSheet(String),
     /// `sheetview`: drop the view most recently added to a sheet.
@@ -146,6 +150,10 @@ impl Session {
                 if let Some(style) = self.doc.layers.get_mut(layer) {
                     *style = prev.clone();
                 }
+                self.doc.generation += 1;
+            }
+            Inverse::Units { prev } => {
+                self.doc.units = *prev;
                 self.doc.generation += 1;
             }
             Inverse::RemoveSheet(name) => {
@@ -605,7 +613,7 @@ fn apply_forward(
                 Inverse::DeleteCreated(vec![id]),
                 ApplyOutcome {
                     created: vec![id],
-                    message: format!("dim {id} ({length:.2} m)"),
+                    message: format!("dim {id} ({})", format_length(doc.units, length)),
                 },
             ))
         }
@@ -1038,6 +1046,23 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Units { units } => {
+            let prev = doc.units;
+            doc.units = units;
+            doc.generation += 1;
+            Ok((
+                Command::Units { units },
+                Inverse::Units { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "units: {} (e.g. {})",
+                        units.label(),
+                        format_length(units, 12.5)
+                    ),
+                },
+            ))
+        }
         Command::Sheet { name, paper } => {
             if doc.sheet(&name).is_some() {
                 return Err(ExecError::Invalid(format!(
@@ -1190,6 +1215,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LayerColor { .. } => "layercolor",
         Command::Hide { .. } => "hide",
         Command::Show { .. } => "show",
+        Command::Units { .. } => "units",
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
         Command::Print { .. } => "print",
@@ -1286,6 +1312,45 @@ mod tests {
             assert_eq!(x, y);
         }
         // and the log itself is stable across replay
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
+    }
+
+    #[test]
+    fn units_exec_undo_redo_and_dim_message() {
+        let mut s = Session::default();
+        assert_eq!(s.doc.units, Units::M);
+        // dim message respects the document unit
+        let out = run(&mut s, "dim 0,0 12ft,0 -2");
+        assert!(out.message.contains("3.66 m"), "{}", out.message);
+
+        let out = run(&mut s, "units ftin");
+        assert_eq!(s.doc.units, Units::FtIn);
+        assert!(out.message.contains("ftin"), "{}", out.message);
+        let out = run(&mut s, "dim 0,0 12ft6in,0 -2");
+        assert!(out.message.contains("12'-6\""), "{}", out.message);
+
+        run(&mut s, "undo"); // un-dim
+        run(&mut s, "undo"); // un-units
+        assert_eq!(s.doc.units, Units::M);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.units, Units::FtIn);
+    }
+
+    #[test]
+    fn units_replay_stability() {
+        let mut s = Session::default();
+        run(&mut s, "units ft");
+        run(&mut s, "box 0,0,0 12ft,12ft,9ft");
+        run(&mut s, "dim 0,0 12ft,0 -2");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(replayed.doc.units, Units::Ft);
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
         assert_eq!(
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap()

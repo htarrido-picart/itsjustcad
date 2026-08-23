@@ -452,8 +452,9 @@ impl App {
                         painter.line_segment([p - tick, p + tick], stroke);
                         painter.line_segment([q - tick, q + tick], stroke);
                         let mid = egui::pos2((p.x + q.x) * 0.5, (p.y + q.y) * 0.5);
-                        // Measured value: meters with cm precision, derived.
-                        let label = format!("{:.2}", (*b - *a).length());
+                        // Measured value: derived, formatted in document units.
+                        let label =
+                            mydrafter_doc::format_length(doc.units, (*b - *a).length());
                         let size = px_height((a2 + b2) * 0.5, 0.2);
                         painter.text(
                             mid,

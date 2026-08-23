@@ -113,6 +113,34 @@ mod tests {
     }
 
     #[test]
+    fn pre_units_file_defaults_to_meters() {
+        // Old files have no units op; they load as meters.
+        let json = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "box",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "size": [2.0, 2.0, 2.0]}
+            ]
+        }"#;
+        let s = from_json(json).unwrap();
+        assert_eq!(s.doc.units, mydrafter_doc::Units::M);
+    }
+
+    #[test]
+    fn save_load_preserves_units() {
+        let mut s = Session::default();
+        for line in ["units ftin", "box 0,0,0 12ft,12ft,9ft"] {
+            s.run(parse(line).unwrap()).unwrap();
+        }
+        let json = to_json(&s);
+        assert!(json.contains("\"units\""), "{json}");
+        let loaded = from_json(&json).unwrap();
+        assert_eq!(loaded.doc.units, mydrafter_doc::Units::FtIn);
+        assert_eq!(to_json(&loaded), json);
+    }
+
+    #[test]
     fn rejects_future_version() {
         let Err(err) = from_json(r#"{"mydrafter": 99, "ops": []}"#) else {
             panic!("expected version error");

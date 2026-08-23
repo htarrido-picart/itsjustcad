@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mydrafter_doc::{HatchPattern, ObjectId, PaperSize, ViewDirection};
+use mydrafter_doc::{HatchPattern, ObjectId, PaperSize, Units, ViewDirection};
 use serde::{Deserialize, Serialize};
 
 /// Object selector. `Last(n)` ("last", "last 3") is the workhorse for both the
@@ -204,6 +204,11 @@ pub enum Command {
     },
     Show {
         layer: String,
+    },
+    /// Set the document display unit. Logged so replayed files keep their
+    /// unit; geometry always stores meters regardless.
+    Units {
+        units: Units,
     },
     // -- sheets / layouts --
     /// Create a named paper sheet (landscape).
