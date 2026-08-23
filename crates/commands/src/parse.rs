@@ -241,6 +241,44 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 distance: number(dist)?,
             })
         }),
+        "split" => {
+            let (sel, rest) = selector(&args, "split")?;
+            let [p] = take::<1>("split", "a point after the selector", rest)
+                .map_err(|_| wrong_err("split", "a point after the selector", &args))?;
+            Ok(Command::Split { ids: None, target: sel, point: point(p)? })
+        }
+        "trim" => {
+            let (target, rest) = selector(&args, "trim")?;
+            let (cutter, rest) = selector(rest, "trim")?;
+            let [keep] = take::<1>("trim", "a keep point after the two selectors", rest)
+                .map_err(|_| wrong_err("trim", "a keep point after the two selectors", &args))?;
+            Ok(Command::Trim { id: None, target, cutter, keep: point(keep)? })
+        }
+        "extend" => with_last_backtrack(&args, "extend", |sel, rest, args| {
+            let [dist] = take::<1>("extend", "a distance after the selector", rest)
+                .map_err(|_| wrong_err("extend", "a distance after the selector", args))?;
+            Ok(Command::Extend { targets: sel, distance: number(dist)? })
+        }),
+        "join" => {
+            let (sel, rest) = selector(&args, "join")?;
+            expect_empty("join", rest, &args)?;
+            Ok(Command::Join { id: None, targets: sel })
+        }
+        "fillet" => {
+            let (a, rest) = selector(&args, "fillet")?;
+            match rest {
+                // "fillet last 2 0.5": one selector naming both curves.
+                [r] => Ok(Command::Fillet { id: None, a: a.clone(), b: a, radius: number(r)? }),
+                _ => {
+                    let (b, rest) = selector(rest, "fillet")?;
+                    let [r] = take::<1>("fillet", "a radius after the selectors", rest)
+                        .map_err(|_| {
+                            wrong_err("fillet", "a radius after the selectors", &args)
+                        })?;
+                    Ok(Command::Fillet { id: None, a, b, radius: number(r)? })
+                }
+            }
+        }
         "mirror" => {
             let (sel, rest) = selector(&args, "mirror")?;
             let plane = match rest {
@@ -753,6 +791,75 @@ mod tests {
         // rotate needs an angle
         let err = parse("rotate last").unwrap_err();
         assert!(err.to_string().contains("angle"), "{err}");
+    }
+
+    #[test]
+    fn parse_curve_edit_commands() {
+        assert!(matches!(
+            parse("split last 5,0").unwrap(),
+            Command::Split { ids: None, target: Selector::Last { n: 1 }, point }
+                if point == DVec3::new(5.0, 0.0, 0.0)
+        ));
+        assert!(matches!(
+            parse("trim wall slab 1,1").unwrap(),
+            Command::Trim {
+                id: None,
+                target: Selector::Named { .. },
+                cutter: Selector::Named { .. },
+                keep,
+            } if keep == DVec3::new(1.0, 1.0, 0.0)
+        ));
+        // extend: backtrack makes "last 2" read as last + distance 2
+        assert!(matches!(
+            parse("extend last 2").unwrap(),
+            Command::Extend { targets: Selector::Last { n: 1 }, distance } if distance == 2.0
+        ));
+        assert!(matches!(
+            parse("extend last 2 0.5").unwrap(),
+            Command::Extend { targets: Selector::Last { n: 2 }, distance } if distance == 0.5
+        ));
+        assert!(matches!(
+            parse("join last 3").unwrap(),
+            Command::Join { id: None, targets: Selector::Last { n: 3 } }
+        ));
+        // fillet: two selectors + radius, or one selector naming both curves
+        assert!(matches!(
+            parse("fillet l1 l2 0.5").unwrap(),
+            Command::Fillet { a: Selector::Named { .. }, b: Selector::Named { .. }, radius, .. }
+                if radius == 0.5
+        ));
+        assert!(matches!(
+            parse("fillet last 2 0.5").unwrap(),
+            Command::Fillet { a: Selector::Last { n: 2 }, b: Selector::Last { n: 2 }, radius, .. }
+                if radius == 0.5
+        ));
+        // unit suffixes work
+        assert!(matches!(
+            parse("fillet last 2 50cm").unwrap(),
+            Command::Fillet { radius, .. } if radius == 0.5
+        ));
+        // errors carry hints
+        assert!(parse("split last").unwrap_err().to_string().contains("point"));
+        assert!(parse("trim last").unwrap_err().to_string().contains("selector"));
+        assert!(parse("extend last").unwrap_err().to_string().contains("distance"));
+        assert!(parse("join").unwrap_err().to_string().contains("selector"));
+        assert!(parse("fillet last").unwrap_err().to_string().contains("radius"));
+    }
+
+    #[test]
+    fn curve_edit_command_json_roundtrip() {
+        for line in [
+            "split last 5,0",
+            "trim wall slab 1,1",
+            "extend last 0.5",
+            "join last 3",
+            "fillet last 2 0.5",
+        ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
     }
 
     #[test]

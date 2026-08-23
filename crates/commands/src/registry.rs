@@ -104,6 +104,31 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Scale objects uniformly or per-axis (default: about their bounding-box center). Example: scale last 2 · scale last 1,1,2",
         },
         CommandSpec {
+            name: "split",
+            usage: "split <selector> <point x,y>",
+            summary: "Split a curve in two at the nearest point on it to the given point; the original is replaced by the pieces. Example: split last 5,0",
+        },
+        CommandSpec {
+            name: "trim",
+            usage: "trim <target selector> <cutter selector> <keep point x,y>",
+            summary: "Cut a curve where it crosses the cutter curve(s) and keep only the piece nearest the keep point; the rest is removed. Example: trim wall slab 1,1",
+        },
+        CommandSpec {
+            name: "extend",
+            usage: "extend <selector> <distance>",
+            summary: "Extend both open ends of curves by a distance (lines/polylines tangentially, arcs along their circle). Example: extend last 0.5",
+        },
+        CommandSpec {
+            name: "join",
+            usage: "join <selector>",
+            summary: "Join end-touching curves (1e-6 gap tolerance) into one polyline; inputs are consumed, arcs are tessellated. Example: join last 3",
+        },
+        CommandSpec {
+            name: "fillet",
+            usage: "fillet <a selector> <b selector> <radius> | fillet <selector matching 2> <radius>",
+            summary: "Round the corner between two lines with a tangent arc, trimming both lines to the tangency points. Example: fillet last 2 0.5",
+        },
+        CommandSpec {
             name: "offset",
             usage: "offset <selector> <distance>",
             summary: "Offset a curve in the XY plane; original kept. Closed curves: positive = outward, negative = inward (walls from centerlines: offset both ways, extrude). Example: offset last 0.2",

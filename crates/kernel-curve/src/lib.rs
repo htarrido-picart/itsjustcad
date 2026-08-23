@@ -5,6 +5,10 @@
 
 mod curve;
 mod nurbs;
+mod ops;
 
 pub use curve::{clamped_uniform_knots, Curve};
 pub use nurbs::nurbs_point;
+pub use ops::{
+    closest_point, extend, fillet_lines, intersections, join_curves, split_at_points, JOIN_TOL,
+};

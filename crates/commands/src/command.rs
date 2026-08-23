@@ -164,6 +164,42 @@ pub enum Command {
         targets: Selector,
         plane: MirrorPlane,
     },
+    /// Split a curve at the nearest point on it to `point`; the original is
+    /// replaced by the pieces.
+    Split {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        target: Selector,
+        point: DVec3,
+    },
+    /// Trim a curve at its intersections with cutter curves, keeping only the
+    /// piece nearest `keep`; the rest is removed.
+    Trim {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        target: Selector,
+        cutter: Selector,
+        keep: DVec3,
+    },
+    /// Extend both open ends of curves tangentially by `distance`.
+    Extend {
+        targets: Selector,
+        distance: f64,
+    },
+    /// Join end-touching curves into one polyline; inputs are consumed.
+    Join {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        targets: Selector,
+    },
+    /// Fillet two lines with a tangent arc, trimming both to tangency.
+    Fillet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        a: Selector,
+        b: Selector,
+        radius: f64,
+    },
     /// Offset a curve in the XY plane; the original is kept.
     Offset {
         #[serde(default, skip_serializing_if = "Option::is_none")]

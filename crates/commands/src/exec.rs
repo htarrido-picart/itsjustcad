@@ -38,6 +38,11 @@ enum Inverse {
     /// Transforms: write back pre-transform geometry snapshots. Exact —
     /// inverse matrices drift and cannot un-tessellate an arc.
     SetGeometry(Vec<(ObjectId, Geometry)>),
+    /// `fillet`: delete the created arc, restore the trimmed curves.
+    CreatedAndGeometry {
+        created: Vec<ObjectId>,
+        snapshots: Vec<(ObjectId, Geometry)>,
+    },
     /// `layer`: restore the previous current layer, dropping the layer this
     /// command created (if any).
     LayerCurrent {
@@ -121,6 +126,16 @@ impl Session {
                 }
             }
             Inverse::SetGeometry(snapshots) => {
+                for (id, geometry) in snapshots.clone() {
+                    if let Some(obj) = self.doc.get_mut(id) {
+                        obj.geometry = geometry;
+                    }
+                }
+            }
+            Inverse::CreatedAndGeometry { created, snapshots } => {
+                for id in created.clone() {
+                    self.doc.remove(id);
+                }
                 for (id, geometry) in snapshots.clone() {
                     if let Some(obj) = self.doc.get_mut(id) {
                         obj.geometry = geometry;
@@ -405,6 +420,31 @@ fn layer_style_mut<'a>(
         )));
     }
     Ok(doc.layers.get_mut(layer).expect("checked above"))
+}
+
+/// Resolve a selector to exactly one curve object.
+fn one_curve<'a>(
+    doc: &'a Document,
+    sel: &Selector,
+    verb: &str,
+) -> Result<(ObjectId, &'a Curve), ExecError> {
+    let ids = resolve(doc, sel)?;
+    if ids.len() != 1 {
+        return Err(ExecError::Invalid(format!(
+            "{verb} selector matched {} objects, expected exactly 1",
+            ids.len()
+        )));
+    }
+    curve_of(doc, ids[0], verb).map(|c| (ids[0], c))
+}
+
+fn curve_of<'a>(doc: &'a Document, id: ObjectId, verb: &str) -> Result<&'a Curve, ExecError> {
+    match &doc.get(id).expect("resolved").geometry {
+        Geometry::Curve(c) => Ok(c),
+        _ => Err(ExecError::Invalid(format!(
+            "{verb} works on curves; '{id}' is not a curve"
+        ))),
+    }
 }
 
 /// Apply a (non-undo) command. Returns the op with ids filled for the log.
@@ -851,6 +891,243 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Split { ids, target, point } => {
+            let (tid, curve) = one_curve(doc, &target, "split")?;
+            let cp = kernel_curve::closest_point(curve, point, PROFILE_TOL);
+            let pieces = kernel_curve::split_at_points(curve, &[cp], kernel_curve::JOIN_TOL)
+                .ok_or_else(|| {
+                    ExecError::Invalid(
+                        "cannot split this curve: closed curves need 2+ cuts (use trim), \
+                         and NURBS/ellipse splitting is not supported yet"
+                            .into(),
+                    )
+                })?;
+            if pieces.len() < 2 {
+                return Err(ExecError::Invalid(
+                    "split point falls on the curve's end — nothing to split".into(),
+                ));
+            }
+            let new_ids: Vec<ObjectId> = match ids {
+                Some(ids) if ids.len() == pieces.len() => ids,
+                _ => pieces.iter().map(|_| ObjectId::new()).collect(),
+            };
+            let (obj, index) = doc.remove(tid).expect("resolved");
+            for (piece, pid) in pieces.into_iter().zip(&new_ids) {
+                doc.insert(SceneObject {
+                    id: *pid,
+                    name: obj.name.clone(),
+                    layer: obj.layer.clone(),
+                    geometry: Geometry::Curve(piece),
+                });
+            }
+            let listed: Vec<String> = new_ids.iter().map(|i| i.to_string()).collect();
+            Ok((
+                Command::Split { ids: Some(new_ids.clone()), target, point },
+                Inverse::Replace { created: new_ids.clone(), consumed: vec![(obj, index)] },
+                ApplyOutcome {
+                    message: format!("split {tid} -> {}", listed.join(", ")),
+                    created: new_ids,
+                },
+            ))
+        }
+        Command::Trim { id, target, cutter, keep } => {
+            let cutter_ids = resolve(doc, &cutter)?;
+            // Cutters win overlaps, so "trim last 2 last <point>" reads
+            // naturally: target = the older of the two most recent curves.
+            let target_ids: Vec<ObjectId> = resolve(doc, &target)?
+                .into_iter()
+                .filter(|tid| !cutter_ids.contains(tid))
+                .collect();
+            let [tid] = target_ids[..] else {
+                return Err(ExecError::Invalid(format!(
+                    "trim target selector matched {} objects (excluding cutters), expected exactly 1",
+                    target_ids.len()
+                )));
+            };
+            let curve = curve_of(doc, tid, "trim")?;
+            let mut cuts = Vec::new();
+            for cid in &cutter_ids {
+                let cut_curve = curve_of(doc, *cid, "trim (cutter)")?;
+                cuts.extend(kernel_curve::intersections(curve, cut_curve, PROFILE_TOL));
+            }
+            if cuts.is_empty() {
+                return Err(ExecError::Invalid(
+                    "target and cutter curves do not intersect — nothing to trim".into(),
+                ));
+            }
+            let pieces = kernel_curve::split_at_points(curve, &cuts, kernel_curve::JOIN_TOL)
+                .ok_or_else(|| {
+                    ExecError::Invalid(
+                        "cannot trim this curve: closed curves need 2+ intersections, \
+                         and NURBS/ellipse trimming is not supported yet"
+                            .into(),
+                    )
+                })?;
+            if pieces.len() < 2 {
+                return Err(ExecError::Invalid(
+                    "the cutter only touches the curve's ends — nothing to trim".into(),
+                ));
+            }
+            let count = pieces.len();
+            let kept = pieces
+                .into_iter()
+                .min_by(|a, b| {
+                    let da = kernel_curve::closest_point(a, keep, PROFILE_TOL).distance(keep);
+                    let db = kernel_curve::closest_point(b, keep, PROFILE_TOL).distance(keep);
+                    da.partial_cmp(&db).expect("finite distances")
+                })
+                .expect("count >= 2");
+            let id = id.unwrap_or_default();
+            let (obj, index) = doc.remove(tid).expect("resolved");
+            doc.insert(SceneObject {
+                id,
+                name: obj.name.clone(),
+                layer: obj.layer.clone(),
+                geometry: Geometry::Curve(kept),
+            });
+            Ok((
+                Command::Trim { id: Some(id), target, cutter, keep },
+                Inverse::Replace { created: vec![id], consumed: vec![(obj, index)] },
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "trimmed {tid} -> {id} (kept 1 of {count} pieces)"
+                    ),
+                },
+            ))
+        }
+        Command::Extend { targets, distance } => {
+            if distance <= 0.0 {
+                return Err(ExecError::Invalid("extend distance must be positive".into()));
+            }
+            let ids = resolve(doc, &targets)?;
+            // Compute every extension first so a failure leaves the doc untouched.
+            let mut extended = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let curve = curve_of(doc, *id, "extend")?;
+                let new = kernel_curve::extend(curve, distance).ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "'{id}' cannot be extended — only open lines, polylines and arcs can"
+                    ))
+                })?;
+                extended.push((*id, new));
+            }
+            let mut snapshots = Vec::with_capacity(ids.len());
+            for (id, new) in extended {
+                let obj = doc.get_mut(id).expect("resolved");
+                snapshots.push((id, obj.geometry.clone()));
+                obj.geometry = Geometry::Curve(new);
+            }
+            Ok((
+                Command::Extend { targets, distance },
+                Inverse::SetGeometry(snapshots),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("extended {} curve(s) by {distance}", ids.len()),
+                },
+            ))
+        }
+        Command::Join { id, targets } => {
+            let ids = resolve(doc, &targets)?;
+            if ids.len() < 2 {
+                return Err(ExecError::Invalid(
+                    "join needs at least 2 curves (selector matched 1)".into(),
+                ));
+            }
+            let curves: Vec<Curve> = ids
+                .iter()
+                .map(|cid| curve_of(doc, *cid, "join").cloned())
+                .collect::<Result<_, _>>()?;
+            let joined =
+                kernel_curve::join_curves(&curves, kernel_curve::JOIN_TOL, PROFILE_TOL)
+                    .ok_or_else(|| {
+                        ExecError::Invalid(
+                            "curves do not touch end-to-end (1e-6 tolerance) or a closed \
+                             curve was selected — nothing to join"
+                                .into(),
+                        )
+                    })?;
+            let closed = joined.is_closed();
+            let mut consumed = Vec::new();
+            let (name, layer) = {
+                let first = doc.get(ids[0]).expect("resolved");
+                (first.name.clone(), first.layer.clone())
+            };
+            for cid in &ids {
+                if let Some(pair) = doc.remove(*cid) {
+                    consumed.push(pair);
+                }
+            }
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject { id, name, layer, geometry: Geometry::Curve(joined) });
+            Ok((
+                Command::Join { id: Some(id), targets },
+                Inverse::Replace { created: vec![id], consumed },
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "joined {} curve(s) -> {id} ({} polyline)",
+                        ids.len(),
+                        if closed { "closed" } else { "open" }
+                    ),
+                },
+            ))
+        }
+        Command::Fillet { id, a, b, radius } => {
+            if radius <= 0.0 {
+                return Err(ExecError::Invalid("fillet radius must be positive".into()));
+            }
+            let mut ids = resolve(doc, &a)?;
+            for bid in resolve(doc, &b)? {
+                if !ids.contains(&bid) {
+                    ids.push(bid);
+                }
+            }
+            if ids.len() != 2 {
+                return Err(ExecError::Invalid(format!(
+                    "fillet needs exactly 2 curves, selectors matched {}",
+                    ids.len()
+                )));
+            }
+            let line_of = |cid: ObjectId| -> Result<(DVec3, DVec3), ExecError> {
+                match curve_of(doc, cid, "fillet")? {
+                    Curve::Line { a, b } => Ok((*a, *b)),
+                    _ => Err(ExecError::Invalid(format!(
+                        "fillet works on lines for now; '{cid}' is not a line"
+                    ))),
+                }
+            };
+            let (la, lb) = (line_of(ids[0])?, line_of(ids[1])?);
+            let (ta, arc, tb) = kernel_curve::fillet_lines(la, lb, radius).ok_or_else(|| {
+                ExecError::Invalid(format!(
+                    "cannot fillet: lines are parallel or radius {radius} does not fit"
+                ))
+            })?;
+            let mut snapshots = Vec::with_capacity(2);
+            for (cid, trimmed) in [(ids[0], ta), (ids[1], tb)] {
+                let obj = doc.get_mut(cid).expect("resolved");
+                snapshots.push((cid, obj.geometry.clone()));
+                obj.geometry = Geometry::Curve(trimmed);
+            }
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                geometry: Geometry::Curve(arc),
+            });
+            Ok((
+                Command::Fillet { id: Some(id), a, b, radius },
+                Inverse::CreatedAndGeometry { created: vec![id], snapshots },
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "filleted {} + {} r={radius} -> arc {id} (lines trimmed to tangency)",
+                        ids[0], ids[1]
+                    ),
+                },
+            ))
+        }
         Command::Offset { id, target, distance } => {
             let ids = resolve(doc, &target)?;
             if ids.len() != 1 {
@@ -1206,6 +1483,11 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Rotate { .. } => "rotate",
         Command::Scale { .. } => "scale",
         Command::Mirror { .. } => "mirror",
+        Command::Split { .. } => "split",
+        Command::Trim { .. } => "trim",
+        Command::Extend { .. } => "extend",
+        Command::Join { .. } => "join",
+        Command::Fillet { .. } => "fillet",
         Command::Offset { .. } => "offset",
         Command::Copy { .. } => "copy",
         Command::Delete { .. } => "delete",
@@ -1557,6 +1839,214 @@ mod tests {
         let a: Vec<_> = s.doc.objects().collect();
         let b: Vec<_> = replayed.doc.objects().collect();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn split_replaces_curve_with_pieces_and_undoes() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        let original = s.doc.objects().next().unwrap().clone();
+        let out = run(&mut s, "split last 4,3"); // nearest point on curve = 4,0
+        assert_eq!(out.created.len(), 2);
+        assert_eq!(s.doc.len(), 2);
+        let lens: Vec<f64> = s
+            .doc
+            .objects()
+            .map(|o| {
+                let Geometry::Curve(Curve::Line { a, b }) = &o.geometry else { panic!() };
+                (*b - *a).length()
+            })
+            .collect();
+        assert_eq!(lens, [4.0, 6.0]);
+
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+        assert_eq!(s.doc.objects().next().unwrap(), &original);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 2);
+
+        // closed curves and meshes refuse
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0 2");
+        let err = s.run(parse("split last 2,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+        run(&mut s, "box 5,0,0 1,1,1");
+        let err = s.run(parse("split last 5,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("curves"), "{err}");
+    }
+
+    #[test]
+    fn trim_keeps_piece_nearest_keep_point() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last wall");
+        run(&mut s, "line 4,-1 4,1");
+        let out = run(&mut s, "trim wall last 0,0"); // keep the left piece
+        assert!(out.message.contains("kept 1 of 2"), "{}", out.message);
+        assert_eq!(s.doc.len(), 2);
+        let kept = s.doc.find_named("wall");
+        assert_eq!(kept.len(), 1, "trimmed piece keeps the name");
+        let Geometry::Curve(Curve::Line { a, b }) = &s.doc.get(kept[0]).unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!(a.distance(DVec3::ZERO) < 1e-9);
+        assert!(b.distance(DVec3::new(4.0, 0.0, 0.0)) < 1e-9);
+
+        run(&mut s, "undo");
+        let Geometry::Curve(Curve::Line { b, .. }) =
+            &s.doc.get(s.doc.find_named("wall")[0]).unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!(b.distance(DVec3::new(10.0, 0.0, 0.0)) < 1e-9, "undo restores full line");
+
+        // circle trimmed by a crossing line keeps the arc nearest the keep point
+        run(&mut s, "circle 20,0 2");
+        run(&mut s, "line 20,-5 20,5");
+        run(&mut s, "trim last 2 last 17,0"); // keep the left arc
+        let arcs: Vec<_> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(c @ Curve::Arc { .. }) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(arcs.len(), 1);
+        let Curve::Arc { start, end, .. } = arcs[0] else { panic!() };
+        assert!((end - start - std::f64::consts::PI).abs() < 1e-9, "half circle kept");
+
+        // no intersections → error, doc untouched
+        let n = s.doc.len();
+        run(&mut s, "line 100,0 110,0");
+        run(&mut s, "line 100,5 110,5");
+        let err = s.run(parse("trim last 2 last 100,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("do not intersect"), "{err}");
+        assert_eq!(s.doc.len(), n + 2);
+    }
+
+    #[test]
+    fn extend_open_curves_and_undo() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "extend last 2");
+        let Geometry::Curve(Curve::Line { a, b }) = &s.doc.objects().next().unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!(a.distance(DVec3::new(-2.0, 0.0, 0.0)) < 1e-9);
+        assert!(b.distance(DVec3::new(12.0, 0.0, 0.0)) < 1e-9);
+        run(&mut s, "undo");
+        let Geometry::Curve(Curve::Line { a, .. }) = &s.doc.objects().next().unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!(a.distance(DVec3::ZERO) < 1e-9);
+
+        // closed curve refuses, doc untouched; negative distance refuses
+        run(&mut s, "circle 20,0 2");
+        let err = s.run(parse("extend last 1").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("open"), "{err}");
+        let err = s.run(parse("extend last -1").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("positive"), "{err}");
+    }
+
+    #[test]
+    fn join_consumes_curves_into_polyline() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 4,0");
+        run(&mut s, "line 4,0 4,4");
+        run(&mut s, "line 4,4 0,4");
+        run(&mut s, "line 0,4 0,0");
+        let out = run(&mut s, "join last 4");
+        assert!(out.message.contains("closed"), "{}", out.message);
+        assert_eq!(s.doc.len(), 1);
+        let Geometry::Curve(c) = &s.doc.objects().next().unwrap().geometry else { panic!() };
+        assert!(c.is_closed());
+        // a joined closed square extrudes
+        run(&mut s, "extrude last 3");
+        assert_eq!(s.doc.len(), 2);
+        run(&mut s, "undo"); // un-extrude
+        run(&mut s, "undo"); // un-join → four lines restored
+        assert_eq!(s.doc.len(), 4);
+
+        // disjoint curves refuse
+        run(&mut s, "line 100,0 104,0");
+        run(&mut s, "line 200,0 204,0");
+        let err = s.run(parse("join last 2").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("touch"), "{err}");
+    }
+
+    #[test]
+    fn fillet_trims_lines_and_adds_arc() {
+        let mut s = Session::default();
+        run(&mut s, "line -2,0 8,0");
+        run(&mut s, "line 0,-2 0,8");
+        let out = run(&mut s, "fillet last 2 2");
+        assert!(out.message.contains("arc"), "{}", out.message);
+        assert_eq!(s.doc.len(), 3); // two trimmed lines + arc
+        let arc = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Curve(c @ Curve::Arc { .. }) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("fillet arc present");
+        let Curve::Arc { center, radius, .. } = arc else { panic!() };
+        assert!(center.distance(DVec3::new(2.0, 2.0, 0.0)) < 1e-9);
+        assert!((radius - 2.0).abs() < 1e-9);
+
+        run(&mut s, "undo"); // arc gone, lines restored exactly
+        assert_eq!(s.doc.len(), 2);
+        let Geometry::Curve(Curve::Line { a, .. }) = &s.doc.objects().next().unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!(a.distance(DVec3::new(-2.0, 0.0, 0.0)) < 1e-9);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
+
+        // parallel lines refuse; non-lines refuse
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 5,0");
+        run(&mut s, "line 0,1 5,1");
+        let err = s.run(parse("fillet last 2 0.5").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("parallel"), "{err}");
+        run(&mut s, "circle 10,0 1");
+        let err = s.run(parse("fillet last 2 0.5").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("line"), "{err}");
+    }
+
+    #[test]
+    fn curve_edit_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "line -2,0 8,0");
+        run(&mut s, "line 0,-2 0,8");
+        run(&mut s, "fillet last 2 2");
+        run(&mut s, "line 20,0 30,0");
+        run(&mut s, "split last 24,1");
+        run(&mut s, "extend last 0.5");
+        run(&mut s, "line 40,0 44,0");
+        run(&mut s, "line 44,0 44,4");
+        run(&mut s, "join last 2");
+        run(&mut s, "line 50,0 60,0");
+        run(&mut s, "name last wall");
+        run(&mut s, "line 55,-1 55,1");
+        run(&mut s, "trim wall last 50,0");
+        run(&mut s, "undo");
+        run(&mut s, "redo");
+
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
     }
 
     #[test]
