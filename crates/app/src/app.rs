@@ -4,6 +4,7 @@ use mydrafter_render::{OrbitCamera, SceneRenderer, StandardView, ViewportCallbac
 use crate::command_line::CommandLine;
 use crate::deck_pane::DeckPane;
 use crate::draw_tool::DrawTool;
+use crate::gumball::Gumball;
 use crate::scene;
 
 pub struct App {
@@ -11,6 +12,7 @@ pub struct App {
     command_line: CommandLine,
     deck_pane: DeckPane,
     draw_tool: DrawTool,
+    gumball: Gumball,
     tokio: tokio::runtime::Handle,
     /// Camera slots shared across layouts: 0 Persp, 1 Top, 2 Front, 3 Right.
     cameras: [OrbitCamera; 4],
@@ -57,6 +59,7 @@ impl App {
             command_line: CommandLine::default(),
             deck_pane: DeckPane::default(),
             draw_tool: DrawTool::default(),
+            gumball: Gumball::default(),
             tokio,
             cameras: {
                 let mut cams = [OrbitCamera::default(); 4];
@@ -162,17 +165,7 @@ impl App {
 
     /// Click-select: ray through the clicked pixel vs object AABBs.
     fn pick(&mut self, view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2, additive: bool) {
-        let inv = view_proj.inverse();
-        let ndc = glam::Vec2::new(
-            (pos.x - rect.left()) / rect.width() * 2.0 - 1.0,
-            1.0 - (pos.y - rect.top()) / rect.height() * 2.0,
-        );
-        let unproject = |z: f32| {
-            let p = inv * glam::Vec4::new(ndc.x, ndc.y, z, 1.0);
-            (p.truncate() / p.w).as_dvec3()
-        };
-        let origin = unproject(0.0);
-        let dir = (unproject(1.0) - origin).normalize();
+        let (origin, dir) = screen_ray(view_proj, rect, pos);
 
         let mut best: Option<(f64, mydrafter_doc::ObjectId)> = None;
         for obj in self.session.doc.objects() {
@@ -328,11 +321,30 @@ impl App {
                 if pane == self.active_pane {
                     self.drawing_input(ui, rect, &response, view_proj);
                 }
-            } else if response.clicked()
-                && let Some(pos) = response.interact_pointer_pos()
-            {
-                let additive = ui.input(|i| i.modifiers.shift);
-                self.pick(view_proj, rect, pos, additive);
+            } else {
+                // Gumball on the selection (active pane only). A completed
+                // drag emits ONE substrate command through Session::run so
+                // the op-log stays the single source of truth.
+                let mut consumed = false;
+                if pane == self.active_pane {
+                    let out =
+                        self.gumball
+                            .ui(ui, rect, &response, view_proj, &self.session.doc);
+                    consumed = out.consumed;
+                    if let Some(cmd) = out.command {
+                        match self.session.run(cmd) {
+                            Ok(outcome) => self.command_line.push_line(outcome.message),
+                            Err(e) => self.command_line.push_line(format!("error: {e}")),
+                        }
+                    }
+                }
+                if !consumed
+                    && response.clicked()
+                    && let Some(pos) = response.interact_pointer_pos()
+                {
+                    let additive = ui.input(|i| i.modifiers.shift);
+                    self.pick(view_proj, rect, pos, additive);
+                }
             }
 
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
@@ -592,8 +604,12 @@ fn save_zoom(zoom: f32) {
     }
 }
 
-/// Screen position -> point on the z=0 ground plane.
-fn ground_point(view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> Option<glam::DVec3> {
+/// Screen position -> world-space pick ray (origin on the near plane).
+pub(crate) fn screen_ray(
+    view_proj: glam::Mat4,
+    rect: egui::Rect,
+    pos: egui::Pos2,
+) -> (glam::DVec3, glam::DVec3) {
     let inv = view_proj.inverse();
     let ndc = glam::Vec2::new(
         (pos.x - rect.left()) / rect.width() * 2.0 - 1.0,
@@ -604,7 +620,13 @@ fn ground_point(view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> Opt
         (p.truncate() / p.w).as_dvec3()
     };
     let origin = unproject(0.0);
-    let dir = unproject(1.0) - origin;
+    let dir = (unproject(1.0) - origin).normalize();
+    (origin, dir)
+}
+
+/// Screen position -> point on the z=0 ground plane.
+fn ground_point(view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> Option<glam::DVec3> {
+    let (origin, dir) = screen_ray(view_proj, rect, pos);
     if dir.z.abs() < 1e-12 {
         return None;
     }
@@ -613,7 +635,7 @@ fn ground_point(view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> Opt
 }
 
 /// World point -> screen position (None when behind the camera).
-fn project(view_proj: glam::Mat4, rect: egui::Rect, world: glam::DVec3) -> Option<egui::Pos2> {
+pub(crate) fn project(view_proj: glam::Mat4, rect: egui::Rect, world: glam::DVec3) -> Option<egui::Pos2> {
     let clip = view_proj * glam::Vec4::new(world.x as f32, world.y as f32, world.z as f32, 1.0);
     if clip.w <= 0.0 {
         return None;
