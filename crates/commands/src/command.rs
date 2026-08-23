@@ -349,6 +349,13 @@ pub enum Command {
     Export {
         path: String,
     },
+    /// Import a DXF file: each supported entity becomes its own logged
+    /// substrate op (Line/Polyline/Circle/Arc/Text, plus Layer switches), so
+    /// the op-log — not the DXF file — is the record. Import itself is never
+    /// logged; replaying a saved file needs no access to the imported DXF.
+    Import {
+        path: String,
+    },
     // -- named views --
     /// Save the active viewport camera under a name. `camera` is `None` when
     /// typed; the app fills it before apply and it is written back into the
@@ -408,6 +415,7 @@ impl Command {
                 | Command::ViewList
                 | Command::Print { .. }
                 | Command::Export { .. }
+                | Command::Import { .. }
                 | Command::Distance { .. }
                 | Command::Area { .. }
                 | Command::Volume { .. }

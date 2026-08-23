@@ -259,6 +259,11 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Export the whole document as DXF R12 (lines, polylines, circles, arcs, text; meshes as feature edges). Example: export /tmp/model.dxf",
         },
         CommandSpec {
+            name: "import",
+            usage: "import <path.dxf>",
+            summary: "Import a DXF file (R12 and later): LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC and TEXT entities become objects on their layers, each logged as its own op; unknown entities are skipped. Example: import /tmp/site.dxf",
+        },
+        CommandSpec {
             name: "distance",
             usage: "distance <a x,y,z> <b x,y,z>",
             summary: "Measure the distance between two points (query only, nothing is created). Example: distance 0,0,0 3,4,0",

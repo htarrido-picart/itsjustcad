@@ -196,6 +196,211 @@ pub fn document_dxf(doc: &Document) -> (String, usize) {
     (t.0, count)
 }
 
+// ---------- import ----------
+
+/// Entities scanned from a DXF ENTITIES section: one substrate command per
+/// supported entity, tagged with its (lowercased) layer name, plus the count
+/// of entities skipped because their kind is unsupported or their record is
+/// malformed.
+pub struct DxfEntities {
+    pub entities: Vec<(String, crate::Command)>,
+    pub skipped: usize,
+}
+
+/// Parse DXF text (R12 and later — extra 2000+ codes like handles and 100
+/// subclass markers are ignored) into substrate commands. Supported: LINE,
+/// LWPOLYLINE, POLYLINE/VERTEX/SEQEND, CIRCLE, ARC, TEXT. Everything else is
+/// skipped silently and counted.
+pub fn parse_dxf(text: &str) -> Result<DxfEntities, String> {
+    // The whole file is "group code line, value line" pairs.
+    let mut pairs: Vec<(i32, &str)> = Vec::new();
+    let mut lines = text.lines();
+    while let Some(code) = lines.next() {
+        let code = code.trim();
+        if code.is_empty() && lines.clone().next().is_none() {
+            break; // tolerate a trailing blank line
+        }
+        let Some(value) = lines.next() else {
+            return Err("truncated DXF: group code without a value line".to_string());
+        };
+        let code: i32 = code
+            .parse()
+            .map_err(|_| format!("not a DXF: expected an integer group code, got '{code}'"))?;
+        pairs.push((code, value.trim()));
+    }
+
+    // Cut the ENTITIES section into records: each starts at a 0 code.
+    let mut records: Vec<(&str, Vec<(i32, &str)>)> = Vec::new();
+    let mut in_entities = false;
+    let mut awaiting_section_name = false;
+    for &(code, value) in &pairs {
+        match code {
+            0 if value == "SECTION" => awaiting_section_name = true,
+            2 if awaiting_section_name => {
+                in_entities = value == "ENTITIES";
+                awaiting_section_name = false;
+            }
+            0 if value == "ENDSEC" => in_entities = false,
+            0 if in_entities => records.push((value, Vec::new())),
+            _ if in_entities => {
+                if let Some((_, fields)) = records.last_mut() {
+                    fields.push((code, value));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Fold records into commands; VERTEX/SEQEND attach to the open POLYLINE.
+    let mut out = DxfEntities { entities: Vec::new(), skipped: 0 };
+    let mut open_poly: Option<(String, bool, Vec<DVec3>)> = None; // layer, closed, points
+    for (name, fields) in records {
+        if let Some((layer, closed, points)) = &mut open_poly {
+            match name {
+                "VERTEX" => {
+                    if let Some(p) = record_point(&fields, 10) {
+                        points.push(p);
+                    }
+                    continue;
+                }
+                "SEQEND" => {
+                    let (layer, closed, points) =
+                        (layer.clone(), *closed, std::mem::take(points));
+                    open_poly = None;
+                    if points.len() >= 2 {
+                        out.entities.push((
+                            layer,
+                            crate::Command::Polyline { id: None, points, closed },
+                        ));
+                    } else {
+                        out.skipped += 1;
+                    }
+                    continue;
+                }
+                // Unterminated POLYLINE: drop it, fall through to `name`.
+                _ => {
+                    open_poly = None;
+                    out.skipped += 1;
+                }
+            }
+        }
+        match record_entity(name, &fields, &mut open_poly) {
+            RecordOutcome::Entity(layer, cmd) => out.entities.push((layer, cmd)),
+            RecordOutcome::PolyOpened => {}
+            RecordOutcome::Skipped => out.skipped += 1,
+        }
+    }
+    if open_poly.is_some() {
+        out.skipped += 1; // POLYLINE never closed by SEQEND before EOF
+    }
+    Ok(out)
+}
+
+enum RecordOutcome {
+    Entity(String, crate::Command),
+    PolyOpened,
+    Skipped,
+}
+
+/// One non-VERTEX record -> command (or open a POLYLINE / skip it).
+fn record_entity(
+    name: &str,
+    fields: &[(i32, &str)],
+    open_poly: &mut Option<(String, bool, Vec<DVec3>)>,
+) -> RecordOutcome {
+    use crate::Command;
+    let layer = record_layer(fields);
+    let cmd = match name {
+        "LINE" => match (record_point(fields, 10), record_point(fields, 11)) {
+            (Some(a), Some(b)) => Some(Command::Line { id: None, a, b }),
+            _ => None,
+        },
+        "CIRCLE" => match (record_point(fields, 10), record_num(fields, 40)) {
+            (Some(center), Some(radius)) if radius > 0.0 => {
+                Some(Command::Circle { id: None, center, radius })
+            }
+            _ => None,
+        },
+        "ARC" => match (
+            record_point(fields, 10),
+            record_num(fields, 40),
+            record_num(fields, 50),
+            record_num(fields, 51),
+        ) {
+            (Some(center), Some(radius), Some(start), Some(mut end)) if radius > 0.0 => {
+                if end <= start {
+                    end += 360.0; // DXF arcs run CCW from 50 to 51
+                }
+                Some(Command::Arc { id: None, center, radius, start_deg: start, end_deg: end })
+            }
+            _ => None,
+        },
+        "TEXT" => match (record_point(fields, 10), record_num(fields, 40)) {
+            (Some(pos), Some(height)) if height > 0.0 => {
+                fields.iter().find(|(c, _)| *c == 1).map(|(_, v)| Command::Text {
+                    id: None,
+                    pos,
+                    text: (*v).to_string(),
+                    height,
+                })
+            }
+            _ => None,
+        },
+        "LWPOLYLINE" => {
+            // Vertices are repeated 10/20 pairs in order; 38 = elevation (z).
+            let z = record_num(fields, 38).unwrap_or(0.0);
+            let mut points = Vec::new();
+            let mut x: Option<f64> = None;
+            for (code, value) in fields {
+                match (code, value.parse::<f64>()) {
+                    (10, Ok(v)) => x = Some(v),
+                    (20, Ok(y)) => {
+                        if let Some(x) = x.take() {
+                            points.push(DVec3::new(x, y, z));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let closed = record_num(fields, 70).unwrap_or(0.0) as i64 & 1 != 0;
+            (points.len() >= 2).then_some(Command::Polyline { id: None, points, closed })
+        }
+        "POLYLINE" => {
+            let closed = record_num(fields, 70).unwrap_or(0.0) as i64 & 1 != 0;
+            *open_poly = Some((layer, closed, Vec::new()));
+            return RecordOutcome::PolyOpened;
+        }
+        _ => None,
+    };
+    match cmd {
+        Some(cmd) => RecordOutcome::Entity(layer, cmd),
+        None => RecordOutcome::Skipped,
+    }
+}
+
+/// Layer (code 8), lowercased to match the document's naming style — our own
+/// exporter uppercases, so export -> import round-trips layer names.
+fn record_layer(fields: &[(i32, &str)]) -> String {
+    fields
+        .iter()
+        .find(|(c, _)| *c == 8)
+        .map(|(_, v)| v.to_ascii_lowercase())
+        .unwrap_or_else(|| "0".to_string())
+}
+
+fn record_num(fields: &[(i32, &str)], code: i32) -> Option<f64> {
+    fields.iter().find(|(c, _)| *c == code).and_then(|(_, v)| v.parse().ok())
+}
+
+/// Point at `base`/(base+10)/(base+20); a missing z reads as 0 (2D files).
+fn record_point(fields: &[(i32, &str)], base: i32) -> Option<DVec3> {
+    Some(DVec3::new(
+        record_num(fields, base)?,
+        record_num(fields, base + 10)?,
+        record_num(fields, base + 20).unwrap_or(0.0),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +526,221 @@ mod tests {
         assert_eq!(dxf_layer("walls"), "WALLS");
         assert_eq!(dxf_layer("ground floor/α"), "GROUND_FLOOR__");
         assert_eq!(dxf_layer(""), "0");
+    }
+
+    // ---------- import ----------
+
+    use crate::Command;
+    use mydrafter_doc::Geometry as G;
+
+    fn curve_of(obj: &mydrafter_doc::SceneObject) -> &kernel_curve::Curve {
+        match &obj.geometry {
+            G::Curve(c) => c,
+            other => panic!("expected a curve, got {other:?}"),
+        }
+    }
+
+    /// Structural equality with tolerance: arc angles pass through
+    /// degrees<->radians on the way out and back.
+    fn assert_curve_close(a: &kernel_curve::Curve, b: &kernel_curve::Curve) {
+        use kernel_curve::Curve::*;
+        match (a, b) {
+            (Line { a: a1, b: b1 }, Line { a: a2, b: b2 }) => {
+                assert!((*a1 - *a2).length() < 1e-9 && (*b1 - *b2).length() < 1e-9);
+            }
+            (
+                Polyline { points: p1, closed: c1 },
+                Polyline { points: p2, closed: c2 },
+            ) => {
+                assert_eq!(c1, c2);
+                assert_eq!(p1.len(), p2.len());
+                for (q1, q2) in p1.iter().zip(p2) {
+                    assert!((*q1 - *q2).length() < 1e-9, "{q1} vs {q2}");
+                }
+            }
+            (
+                Arc { center: c1, radius: r1, start: s1, end: e1 },
+                Arc { center: c2, radius: r2, start: s2, end: e2 },
+            ) => {
+                assert!((*c1 - *c2).length() < 1e-9);
+                assert!((r1 - r2).abs() < 1e-9);
+                assert!((s1 - s2).abs() < 1e-9, "start {s1} vs {s2}");
+                assert!((e1 - e2).abs() < 1e-9, "end {e1} vs {e2}");
+            }
+            other => panic!("curve kinds differ: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_round_trips_our_export() {
+        // Courtyard (outer + inner rects) plus one of every exact curve kind.
+        let mut s = Session::default();
+        run(&mut s, "layer courtyard");
+        run(&mut s, "rect 0,0,0 10 8");
+        run(&mut s, "rect 3,3,0 4 2");
+        run(&mut s, "layer site");
+        run(&mut s, "line 0,0,0 10,0,3");
+        run(&mut s, "circle 20,0,0 2.5");
+        run(&mut s, "arc 30,0,0 5 30 120");
+        run(&mut s, "text 5,3,0 hello 0.3");
+        let path = std::env::temp_dir().join("mydrafter_import_roundtrip.dxf");
+        run(&mut s, &format!("export {}", path.display()));
+
+        let mut s2 = Session::default();
+        let out = s2
+            .run(Command::Import { path: path.display().to_string() })
+            .unwrap();
+        assert!(out.message.contains("imported 6 entities"), "{}", out.message);
+        assert!(out.message.contains("(0 skipped)"), "{}", out.message);
+        assert_eq!(out.created.len(), 6);
+        assert_eq!(s2.doc.len(), s.doc.len());
+        assert_eq!(s2.doc.current_layer, mydrafter_doc::DEFAULT_LAYER);
+
+        // Same order, same layers (lowercased round-trip), same geometry.
+        for (a, b) in s.doc.objects().zip(s2.doc.objects()) {
+            assert_eq!(a.layer, b.layer);
+            match (&a.geometry, &b.geometry) {
+                (G::Curve(ca), G::Curve(cb)) => assert_curve_close(ca, cb),
+                (
+                    G::Annotation(Annotation::Text { pos, text, height }),
+                    G::Annotation(Annotation::Text { pos: p2, text: t2, height: h2 }),
+                ) => {
+                    assert!((*pos - *p2).length() < 1e-9);
+                    assert_eq!(text, t2);
+                    assert!((height - h2).abs() < 1e-9);
+                }
+                other => panic!("geometry kinds differ: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn imported_session_saves_and_replays_stably() {
+        let mut s = Session::default();
+        run(&mut s, "layer walls");
+        run(&mut s, "polyline 0,0 5,0 5,5 closed");
+        run(&mut s, "circle 8,0,0 1.5");
+        let path = std::env::temp_dir().join("mydrafter_import_replay.dxf");
+        run(&mut s, &format!("export {}", path.display()));
+
+        let mut s2 = Session::default();
+        run(&mut s2, &format!("import {}", path.display()));
+        // The log holds plain entity + layer ops — never the import itself —
+        // so replay needs no access to the DXF file.
+        let json = crate::io::to_json(&s2);
+        assert!(!json.contains("\"cmd\": \"import\""), "{json}");
+        let loaded = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&loaded), json, "replay-stable");
+        let ids: Vec<_> = s2.doc.objects().map(|o| o.id).collect();
+        let loaded_ids: Vec<_> = loaded.doc.objects().map(|o| o.id).collect();
+        assert_eq!(ids, loaded_ids, "identical objects after replay");
+    }
+
+    #[test]
+    fn unknown_entities_skipped_silently() {
+        // 2000+-style noise (handles, subclass markers) around one LINE, plus
+        // entity kinds we do not import.
+        let text = "0\nSECTION\n2\nENTITIES\n\
+            0\nSPLINE\n8\nA\n70\n8\n\
+            0\nLINE\n5\n1AF\n100\nAcDbEntity\n8\nWALLS\n100\nAcDbLine\n\
+            10\n0\n20\n0\n30\n0\n11\n5\n21\n1\n31\n0\n\
+            0\nPOINT\n10\n1\n20\n1\n\
+            0\nINSERT\n2\nCHAIR\n10\n0\n20\n0\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        assert_eq!(parsed.skipped, 3);
+        assert_eq!(parsed.entities.len(), 1);
+        let (layer, cmd) = &parsed.entities[0];
+        assert_eq!(layer, "walls");
+        assert_eq!(
+            *cmd,
+            Command::Line {
+                id: None,
+                a: DVec3::new(0.0, 0.0, 0.0),
+                b: DVec3::new(5.0, 1.0, 0.0),
+            }
+        );
+    }
+
+    #[test]
+    fn lwpolyline_reads_vertices_flags_and_elevation() {
+        let text = "0\nSECTION\n2\nENTITIES\n\
+            0\nLWPOLYLINE\n8\nDECK\n90\n3\n70\n1\n38\n2.5\n\
+            10\n0\n20\n0\n10\n5\n20\n0\n10\n5\n20\n5\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        assert_eq!(parsed.skipped, 0);
+        let (layer, cmd) = &parsed.entities[0];
+        assert_eq!(layer, "deck");
+        assert_eq!(
+            *cmd,
+            Command::Polyline {
+                id: None,
+                points: vec![
+                    DVec3::new(0.0, 0.0, 2.5),
+                    DVec3::new(5.0, 0.0, 2.5),
+                    DVec3::new(5.0, 5.0, 2.5),
+                ],
+                closed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn full_circle_and_wrapped_arc_import() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0,0 3");
+        run(&mut s, "arc 10,0,0 2 300 60"); // wraps through 0 degrees
+        let path = std::env::temp_dir().join("mydrafter_import_arcs.dxf");
+        run(&mut s, &format!("export {}", path.display()));
+        let mut s2 = Session::default();
+        run(&mut s2, &format!("import {}", path.display()));
+        assert_eq!(s2.doc.len(), 2);
+        let objs: Vec<_> = s2.doc.objects().collect();
+        assert!(curve_of(objs[0]).is_closed(), "circle imports closed");
+        match curve_of(objs[1]) {
+            kernel_curve::Curve::Arc { start, end, .. } => {
+                // 300..60 reads back as 300..420: same CCW sweep.
+                assert!((start.to_degrees() - 300.0).abs() < 1e-9);
+                assert!((end.to_degrees() - 420.0).abs() < 1e-9);
+            }
+            other => panic!("expected arc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mesh_feature_edges_import_as_lines_one_op_each() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2");
+        let path = std::env::temp_dir().join("mydrafter_import_box.dxf");
+        run(&mut s, &format!("export {}", path.display()));
+        let mut s2 = Session::default();
+        run(&mut s2, &format!("import {}", path.display()));
+        // 1 entity = 1 op: 12 edges land as 12 line objects and 12 logged ops
+        // (no layer switches — everything is on the default layer).
+        assert_eq!(s2.doc.len(), 12);
+        assert_eq!(s2.save_log().len(), 12);
+        assert!(s2
+            .doc
+            .objects()
+            .all(|o| matches!(curve_of(o), kernel_curve::Curve::Line { .. })));
+        // Entities undo one at a time.
+        run(&mut s2, "undo");
+        assert_eq!(s2.doc.len(), 11);
+    }
+
+    #[test]
+    fn import_errors_are_friendly() {
+        let mut s = Session::default();
+        let err = s.run(parse("import /nonexistent/nope.dxf").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("cannot read"), "{err}");
+
+        let path = std::env::temp_dir().join("mydrafter_not_a_dxf.txt");
+        std::fs::write(&path, "hello\nworld\nagain\n").unwrap();
+        let err = s
+            .run(Command::Import { path: path.display().to_string() })
+            .unwrap_err();
+        assert!(err.to_string().contains("group code"), "{err}");
+        assert_eq!(s.doc.len(), 0, "failed import leaves nothing behind");
     }
 }

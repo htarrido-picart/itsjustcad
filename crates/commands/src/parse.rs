@@ -495,6 +495,10 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let [path] = take::<1>("export", "an output path (.dxf)", &args)?;
             Ok(Command::Export { path: path.to_string() })
         }
+        "import" => {
+            let [path] = take::<1>("import", "an input path (.dxf)", &args)?;
+            Ok(Command::Import { path: path.to_string() })
+        }
         "view" => match args.as_slice() {
             ["save", name] => Ok(Command::ViewSave {
                 name: (*name).to_string(),
@@ -1552,6 +1556,18 @@ mod tests {
         // errors carry hints
         assert!(parse("export").unwrap_err().to_string().contains("path"));
         assert!(parse("export a b").unwrap_err().to_string().contains("path"));
+    }
+
+    #[test]
+    fn import_parses_and_roundtrips() {
+        let cmd = parse("import /tmp/site.dxf").unwrap();
+        assert_eq!(cmd, Command::Import { path: "/tmp/site.dxf".into() });
+        assert!(!cmd.is_logged());
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+        assert!(parse("import").unwrap_err().to_string().contains("path"));
+        assert!(parse("import a b").unwrap_err().to_string().contains("path"));
     }
 
     #[test]

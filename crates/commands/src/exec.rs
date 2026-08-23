@@ -100,6 +100,7 @@ impl Session {
             Command::Undo => self.undo(),
             Command::Redo => self.redo(),
             Command::Amend { step, with } => self.amend(step, *with),
+            Command::Import { path } => self.import(path),
             cmd => {
                 let logged = cmd.is_logged();
                 let (op, inverse, outcome) = apply_forward(&mut self.doc, cmd)?;
@@ -330,6 +331,37 @@ impl Session {
             message: format!(
                 "amended step {step} to '{}'; replayed {count} op(s)",
                 describe(&self.log[step].op)
+            ),
+        })
+    }
+
+    /// Import a DXF file by expanding it into ordinary substrate commands run
+    /// one by one: each entity is its own logged op (plus `layer` switches),
+    /// so a large DXF makes a large op-log — the cost of keeping the op-log,
+    /// not the DXF file, as the record. Each entity undoes individually. On a
+    /// mid-import failure the entities already applied stay logged.
+    fn import(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let parsed = crate::dxf::parse_dxf(&text)
+            .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+        let prev_layer = self.doc.current_layer.clone();
+        let total = parsed.entities.len();
+        let mut created = Vec::new();
+        for (layer, cmd) in parsed.entities {
+            if self.doc.current_layer != layer {
+                self.run(Command::Layer { name: layer })?;
+            }
+            created.extend(self.run(cmd)?.created);
+        }
+        if self.doc.current_layer != prev_layer {
+            self.run(Command::Layer { name: prev_layer })?;
+        }
+        Ok(ApplyOutcome {
+            created,
+            message: format!(
+                "imported {total} entities from {path} ({} skipped) — one logged op each",
+                parsed.skipped
             ),
         })
     }
@@ -2166,7 +2198,7 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Undo | Command::Redo | Command::Amend { .. } => {
+        Command::Undo | Command::Redo | Command::Amend { .. } | Command::Import { .. } => {
             unreachable!("handled in Session::run")
         }
     }
@@ -2224,6 +2256,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::SheetView { .. } => "sheetview",
         Command::Print { .. } => "print",
         Command::Export { .. } => "export",
+        Command::Import { .. } => "import",
         Command::ViewSave { .. } => "view save",
         Command::ViewRestore { .. } => "view",
         Command::ViewList => "view list",
