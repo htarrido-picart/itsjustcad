@@ -255,8 +255,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "export",
-            usage: "export <path.dxf>",
-            summary: "Export the whole document as DXF R12 (lines, polylines, circles, arcs, text; meshes as feature edges). Example: export /tmp/model.dxf",
+            usage: "export <path.{dxf|stl|obj|gltf|glb}>",
+            summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), or OBJ (meshes plus curves as polylines). Example: export /tmp/model.glb",
         },
         CommandSpec {
             name: "import",

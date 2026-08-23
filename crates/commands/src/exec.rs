@@ -1991,18 +1991,25 @@ fn apply_forward(
             ))
         }
         Command::Export { path } => {
-            let (text, entities) = crate::dxf::document_dxf(doc);
-            let size = text.len();
-            std::fs::write(&path, text)
+            let is_dxf = path.rsplit('.').next().is_some_and(|e| e.eq_ignore_ascii_case("dxf"));
+            let (bytes, detail): (Vec<u8>, String) = if is_dxf {
+                let (text, entities) = crate::dxf::document_dxf(doc);
+                (text.into_bytes(), format!("DXF, {entities} entities"))
+            } else {
+                let (bytes, count) = crate::mesh_export::export(doc, &path)
+                    .map_err(ExecError::Invalid)?;
+                let label = path.rsplit('.').next().unwrap_or("").to_ascii_uppercase();
+                (bytes, format!("{label}, {count}"))
+            };
+            let size = bytes.len();
+            std::fs::write(&path, bytes)
                 .map_err(|e| ExecError::Invalid(format!("cannot write '{path}': {e}")))?;
             Ok((
                 Command::Export { path: path.clone() },
                 Inverse::Rename(Vec::new()), // never logged; inverse unused
                 ApplyOutcome {
                     created: Vec::new(),
-                    message: format!(
-                        "exported DXF -> {path} ({entities} entities, {size} bytes)"
-                    ),
+                    message: format!("exported {detail} -> {path} ({size} bytes)"),
                 },
             ))
         }

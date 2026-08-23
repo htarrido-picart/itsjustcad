@@ -492,7 +492,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             })
         }
         "export" => {
-            let [path] = take::<1>("export", "an output path (.dxf)", &args)?;
+            let [path] = take::<1>("export", "an output path (.dxf/.stl/.obj/.gltf/.glb)", &args)?;
             Ok(Command::Export { path: path.to_string() })
         }
         "import" => {

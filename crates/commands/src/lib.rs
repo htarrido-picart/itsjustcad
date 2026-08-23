@@ -7,6 +7,7 @@ pub mod dxf;
 mod error;
 mod exec;
 pub mod io;
+pub mod mesh_export;
 mod parse;
 pub mod pdf;
 mod registry;
