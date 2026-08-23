@@ -222,6 +222,10 @@ pub enum Command {
         sheet: String,
         path: String,
     },
+    /// Export the whole document as DXF R12. Not logged, like Print.
+    Export {
+        path: String,
+    },
     Select {
         targets: Selector,
     },
@@ -238,6 +242,7 @@ impl Command {
             Command::Select { .. }
                 | Command::SelectNone
                 | Command::Print { .. }
+                | Command::Export { .. }
                 | Command::Undo
                 | Command::Redo
         )

@@ -3,6 +3,7 @@
 //! replay all derive from it.
 
 mod command;
+pub mod dxf;
 mod error;
 mod exec;
 pub mod io;

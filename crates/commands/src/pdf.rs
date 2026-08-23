@@ -52,24 +52,7 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
             }
         }
         Geometry::Mesh(mesh) => {
-            // Feature edges: boundary edges plus edges where the adjacent
-            // face normals differ (skips diagonals across flat quads).
-            use std::collections::BTreeMap;
-            let mut edges: BTreeMap<(u32, u32), Vec<DVec3>> = BTreeMap::new();
-            let pos = mesh.positions();
-            for face in mesh.faces() {
-                let [a, b, c] = face.map(|i| pos[i as usize]);
-                let n = (b - a).cross(c - a).normalize_or_zero();
-                for (i, j) in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
-                    edges.entry((i.min(j), i.max(j))).or_default().push(n);
-                }
-            }
-            for ((i, j), normals) in edges {
-                let flat = normals.len() == 2 && normals[0].dot(normals[1]) > 1.0 - 1e-9;
-                if !flat {
-                    out.push((pos[i as usize], pos[j as usize]));
-                }
-            }
+            out.extend(crate::dxf::mesh_feature_edges(mesh));
         }
         // Annotations are screen-styled (arrows, glyphs); skipped in PDF v1.
         Geometry::Annotation(_) => {}

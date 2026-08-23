@@ -1115,6 +1115,22 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Export { path } => {
+            let (text, entities) = crate::dxf::document_dxf(doc);
+            let size = text.len();
+            std::fs::write(&path, text)
+                .map_err(|e| ExecError::Invalid(format!("cannot write '{path}': {e}")))?;
+            Ok((
+                Command::Export { path: path.clone() },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "exported DXF -> {path} ({entities} entities, {size} bytes)"
+                    ),
+                },
+            ))
+        }
         Command::Select { targets } => {
             let ids = resolve(doc, &targets)?;
             doc.selection = ids.iter().copied().collect();
@@ -1177,6 +1193,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
         Command::Print { .. } => "print",
+        Command::Export { .. } => "export",
         Command::Select { .. } => "select",
         Command::SelectNone => "selectnone",
         Command::Undo => "undo",
@@ -1845,6 +1862,37 @@ mod tests {
         assert!(err.to_string().contains("no views"), "{err}");
         let err = s.run(parse("print ghost /tmp/x.pdf").unwrap()).unwrap_err();
         assert!(err.to_string().contains("no sheet"), "{err}");
+    }
+
+    #[test]
+    fn export_writes_dxf_and_is_not_logged() {
+        let dir = std::env::temp_dir().join("mydrafter-dxf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.dxf");
+        let _ = std::fs::remove_file(&path);
+
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "circle 5,3,0 1.5");
+        run(&mut s, "box 20,0,0 2,2,2");
+        let out = run(&mut s, &format!("export {}", path.display()));
+        assert!(out.message.contains("exported DXF"), "{}", out.message);
+        assert!(out.message.contains("14 entities"), "{}", out.message); // 1+1+12
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("ENTITIES"));
+        assert!(text.contains("EOF"));
+
+        // export is not logged: no Export ops in the save file, nothing to undo
+        assert!(s.save_log().iter().all(|c| !matches!(c, Command::Export { .. })));
+        assert_eq!(s.history().0.len(), 3);
+
+        // unwritable path errors cleanly, doc untouched
+        let err = s
+            .run(parse("export /nonexistent-dir/x.dxf").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot write"), "{err}");
+        assert_eq!(s.doc.len(), 3);
     }
 
     #[test]

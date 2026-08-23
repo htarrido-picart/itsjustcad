@@ -169,6 +169,11 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Export a sheet as a vector PDF at its views' scales. Example: print plan /tmp/plan.pdf",
         },
         CommandSpec {
+            name: "export",
+            usage: "export <path.dxf>",
+            summary: "Export the whole document as DXF R12 (lines, polylines, circles, arcs, text; meshes as feature edges). Example: export /tmp/model.dxf",
+        },
+        CommandSpec {
             name: "select",
             usage: "select <selector>",
             summary: "Set the selection. Example: select all",

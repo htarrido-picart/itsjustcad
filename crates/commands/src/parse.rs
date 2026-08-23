@@ -323,6 +323,10 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 path: path.to_string(),
             })
         }
+        "export" => {
+            let [path] = take::<1>("export", "an output path (.dxf)", &args)?;
+            Ok(Command::Export { path: path.to_string() })
+        }
         "select" => {
             let (sel, rest) = selector(&args, "select")?;
             expect_empty("select", rest, &args)?;
@@ -894,6 +898,19 @@ mod tests {
             let back: Command = serde_json::from_str(&json).unwrap();
             assert_eq!(cmd, back, "{line}");
         }
+    }
+
+    #[test]
+    fn export_parses_and_roundtrips() {
+        let cmd = parse("export /tmp/model.dxf").unwrap();
+        assert_eq!(cmd, Command::Export { path: "/tmp/model.dxf".into() });
+        assert!(!cmd.is_logged());
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+        // errors carry hints
+        assert!(parse("export").unwrap_err().to_string().contains("path"));
+        assert!(parse("export a b").unwrap_err().to_string().contains("path"));
     }
 
     #[test]
