@@ -535,6 +535,118 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Revolve { id, profile, axis_point, axis_dir, angle_deg } => {
+            let (src_id, curve) = one_curve(doc, &profile, "revolve")?;
+            if !curve.is_closed() {
+                return Err(ExecError::BadProfile(
+                    "curve is not closed (close it or use 'polyline ... closed')".into(),
+                ));
+            }
+            let axis_pt = axis_point.unwrap_or(DVec3::ZERO);
+            let dir = axis_dir.unwrap_or(DVec3::Z);
+            if dir.length() < 1e-9 {
+                return Err(ExecError::Invalid("revolve axis direction cannot be zero".into()));
+            }
+            let angle = angle_deg.unwrap_or(360.0);
+            if !(angle > 0.0 && angle <= 360.0) {
+                return Err(ExecError::Invalid(format!(
+                    "revolve angle must be in (0, 360] degrees, got {angle}"
+                )));
+            }
+            let pts = curve.tessellate(PROFILE_TOL);
+            let mesh = kernel_mesh::revolve_profile(
+                &pts,
+                axis_pt,
+                dir.normalize(),
+                angle.to_radians(),
+                PROFILE_TOL,
+            );
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                geometry: Geometry::Mesh(mesh),
+            });
+            Ok((
+                Command::Revolve { id: Some(id), profile, axis_point, axis_dir, angle_deg },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("revolved {src_id} -> {id} ({angle} deg)"),
+                },
+            ))
+        }
+        Command::Loft { id, targets } => {
+            let ids = resolve(doc, &targets)?;
+            if ids.len() < 2 {
+                return Err(ExecError::BadProfile(format!(
+                    "loft needs at least 2 closed curves, selector matched {}",
+                    ids.len()
+                )));
+            }
+            let mut profiles = Vec::with_capacity(ids.len());
+            for oid in &ids {
+                let curve = curve_of(doc, *oid, "loft")?;
+                if !curve.is_closed() {
+                    return Err(ExecError::BadProfile(format!(
+                        "'{oid}' is not closed; loft needs closed curves"
+                    )));
+                }
+                profiles.push(curve.tessellate(PROFILE_TOL));
+            }
+            let mesh = kernel_mesh::loft_profiles(&profiles);
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                geometry: Geometry::Mesh(mesh),
+            });
+            Ok((
+                Command::Loft { id: Some(id), targets },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("lofted {} profiles -> {id}", ids.len()),
+                },
+            ))
+        }
+        Command::Sweep { id, profile, rail } => {
+            let (profile_id, profile_curve) = one_curve(doc, &profile, "sweep")?;
+            if !profile_curve.is_closed() {
+                return Err(ExecError::BadProfile(
+                    "sweep profile is not closed (close it or use 'polyline ... closed')".into(),
+                ));
+            }
+            let profile_pts = profile_curve.tessellate(PROFILE_TOL);
+            let (rail_id, rail_curve) = one_curve(doc, &rail, "sweep")?;
+            if rail_curve.is_closed() {
+                return Err(ExecError::Invalid(
+                    "closed rails are not supported yet — use an open rail curve".into(),
+                ));
+            }
+            let rail_pts = rail_curve.tessellate(PROFILE_TOL);
+            if rail_pts.len() < 2 {
+                return Err(ExecError::Invalid("rail is degenerate (needs 2+ points)".into()));
+            }
+            let mesh = kernel_mesh::sweep_profile(&profile_pts, &rail_pts);
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                geometry: Geometry::Mesh(mesh),
+            });
+            Ok((
+                Command::Sweep { id: Some(id), profile, rail },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("swept {profile_id} along {rail_id} -> {id}"),
+                },
+            ))
+        }
         Command::Line { id, a, b } => {
             let (id, outcome) = insert_curve(doc, id, Curve::Line { a, b }, "line");
             Ok((
@@ -1718,6 +1830,9 @@ fn describe(cmd: &Command) -> &'static str {
     match cmd {
         Command::Box { .. } => "box",
         Command::Extrude { .. } => "extrude",
+        Command::Revolve { .. } => "revolve",
+        Command::Loft { .. } => "loft",
+        Command::Sweep { .. } => "sweep",
         Command::Line { .. } => "line",
         Command::Polyline { .. } => "polyline",
         Command::Rectangle { .. } => "rect",
@@ -1948,6 +2063,132 @@ mod tests {
         run(&mut s, "line 0,0,0 5,0,0");
         let err = s.run(parse("extrude last 3").unwrap()).unwrap_err();
         assert!(err.to_string().contains("closed"), "{err}");
+    }
+
+    fn mesh_volume(s: &Session) -> f64 {
+        let obj = s.doc.objects().last().unwrap();
+        let Geometry::Mesh(m) = &obj.geometry else { panic!("expected mesh") };
+        kernel_mesh::signed_volume(m)
+    }
+
+    #[test]
+    fn revolve_profile_full_circle_undo_redo() {
+        let mut s = Session::default();
+        // r=1 h=2 rectangle in the xz plane, touching the z axis
+        run(&mut s, "polyline 0,0,0 1,0,0 1,0,2 0,0,2 closed");
+        let out = run(&mut s, "revolve last");
+        assert!(out.message.contains("360"), "{}", out.message);
+        assert_eq!(s.doc.len(), 2); // profile kept + solid
+        assert!((mesh_volume(&s) - 2.0 * std::f64::consts::PI).abs() < 0.1);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 2);
+    }
+
+    #[test]
+    fn revolve_partial_angle_and_axis() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 1,0,0 1,0,2 0,0,2 closed");
+        run(&mut s, "name last prof");
+        run(&mut s, "revolve prof 0,0,0 0,0,1 180");
+        assert!((mesh_volume(&s) - std::f64::consts::PI).abs() < 0.05);
+
+        // bad inputs leave the doc untouched
+        let n = s.doc.len();
+        let err = s.run(parse("revolve prof 400").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("(0, 360]"), "{err}");
+        let err = s.run(parse("revolve prof 0,0,0 0,0,0 90").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("zero"), "{err}");
+        assert_eq!(s.doc.len(), n);
+    }
+
+    #[test]
+    fn revolve_rejects_open_curve() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 5,0,0");
+        let err = s.run(parse("revolve last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+    }
+
+    #[test]
+    fn loft_two_rects_is_prism_undo_redo() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 2 2");
+        run(&mut s, "rect 0,0,3 2 2");
+        run(&mut s, "loft last 2");
+        assert_eq!(s.doc.len(), 3); // profiles kept + solid
+        assert!((mesh_volume(&s) - 12.0).abs() < 1e-9);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
+
+        // needs 2+ closed curves
+        let err = s.run(parse("loft last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("at least 2"), "{err}");
+        run(&mut s, "line 0,0,0 1,0,0");
+        let err = s.run(parse("loft all").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("closed") || err.to_string().contains("curves"), "{err}");
+    }
+
+    #[test]
+    fn sweep_square_along_line_undo_redo() {
+        let mut s = Session::default();
+        run(&mut s, "rect -0.5,-0.5,0 1 1");
+        run(&mut s, "name last prof");
+        run(&mut s, "line 0,0,0 0,0,4");
+        run(&mut s, "name last rail");
+        run(&mut s, "sweep prof rail");
+        assert_eq!(s.doc.len(), 3);
+        assert!((mesh_volume(&s) - 4.0).abs() < 1e-9);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
+
+        // open profile / closed rail are rejected
+        let err = s.run(parse("sweep rail rail").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+        run(&mut s, "circle 10,0,0 1");
+        run(&mut s, "name last loop");
+        let err = s.run(parse("sweep prof loop").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("open rail"), "{err}");
+    }
+
+    #[test]
+    fn solids_replay_stability() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0.2,0,0 1,0,0 0.8,0,1.5 0.3,0,2 0.2,0,2 closed");
+        run(&mut s, "revolve last 300");
+        run(&mut s, "rect 4,0,0 2 2");
+        run(&mut s, "rect 4.5,0.5,2 1 1");
+        run(&mut s, "loft last 2");
+        run(&mut s, "rect -8.5,-0.5,0 1 1");
+        run(&mut s, "name last prof");
+        run(&mut s, "line -8,0,0 -8,0,3");
+        run(&mut s, "name last rail");
+        run(&mut s, "sweep prof rail");
+        run(&mut s, "undo");
+        run(&mut s, "redo");
+
+        let log = s.save_log();
+        // logged ops carry minted ids
+        assert!(matches!(&log[1], Command::Revolve { id: Some(_), .. }));
+        assert!(matches!(&log[4], Command::Loft { id: Some(_), .. }));
+        assert!(log.iter().any(|c| matches!(c, Command::Sweep { id: Some(_), .. })));
+        let replayed = Session::replay(log.clone()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
+        // and the file format round-trips byte-identically
+        let json1 = crate::io::to_json(&s);
+        let json2 = crate::io::to_json(&crate::io::from_json(&json1).unwrap());
+        assert_eq!(json1, json2);
     }
 
     #[test]

@@ -31,6 +31,43 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 height: number(height)?,
             })
         }
+        "revolve" => {
+            // Exactly one profile, so 'last' never takes a count: a bare
+            // number after it is the angle, not an object count.
+            let (sel, rest) = match args.split_first() {
+                Some((&"last", rest)) => (Selector::Last { n: 1 }, rest),
+                _ => selector(&args, "revolve")?,
+            };
+            let (axis_point, axis_dir, rest) = match rest {
+                [p, d, rest2 @ ..] if p.contains(',') && d.contains(',') => {
+                    (Some(point(p)?), Some(point(d)?), rest2)
+                }
+                _ => (None, None, rest),
+            };
+            let angle_deg = match rest {
+                [] => None,
+                [a] => Some(number(a)?),
+                _ => {
+                    return wrong(
+                        "revolve",
+                        "optionally an axis point, axis direction and an angle",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::Revolve { id: None, profile: sel, axis_point, axis_dir, angle_deg })
+        }
+        "loft" => {
+            let (sel, rest) = selector(&args, "loft")?;
+            expect_empty("loft", rest, &args)?;
+            Ok(Command::Loft { id: None, targets: sel })
+        }
+        "sweep" => {
+            let (profile, rest) = selector(&args, "sweep")?;
+            let (rail, rest) = selector(rest, "sweep")?;
+            expect_empty("sweep", rest, &args)?;
+            Ok(Command::Sweep { id: None, profile, rail })
+        }
         "line" => {
             let [a, b] = take::<2>("line", "two points", &args)?;
             Ok(Command::Line {
@@ -1012,6 +1049,76 @@ mod tests {
             "extend last 0.5",
             "join last 3",
             "fillet last 2 0.5",
+        ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
+    }
+
+    #[test]
+    fn parse_solid_commands() {
+        // revolve: everything optional after the selector
+        assert_eq!(
+            parse("revolve last").unwrap(),
+            Command::Revolve {
+                id: None,
+                profile: Selector::Last { n: 1 },
+                axis_point: None,
+                axis_dir: None,
+                angle_deg: None,
+            }
+        );
+        // bare number after 'last' is the angle, never an object count
+        assert!(matches!(
+            parse("revolve last 180").unwrap(),
+            Command::Revolve { profile: Selector::Last { n: 1 }, angle_deg: Some(a), .. }
+                if a == 180.0
+        ));
+        assert!(matches!(
+            parse("revolve vase 0,0,0 0,0,1 270").unwrap(),
+            Command::Revolve {
+                profile: Selector::Named { .. },
+                axis_point: Some(DVec3::ZERO),
+                axis_dir: Some(d),
+                angle_deg: Some(a),
+                ..
+            } if d == DVec3::Z && a == 270.0
+        ));
+        assert!(matches!(
+            parse("revolve last 5,0,0 0,0,1").unwrap(),
+            Command::Revolve { axis_point: Some(p), axis_dir: Some(d), angle_deg: None, .. }
+                if p == DVec3::new(5.0, 0.0, 0.0) && d == DVec3::Z
+        ));
+        assert!(matches!(
+            parse("loft last 3").unwrap(),
+            Command::Loft { id: None, targets: Selector::Last { n: 3 } }
+        ));
+        assert!(matches!(
+            parse("sweep prof rail").unwrap(),
+            Command::Sweep {
+                id: None,
+                profile: Selector::Named { .. },
+                rail: Selector::Named { .. },
+            }
+        ));
+        // errors carry hints
+        assert!(parse("revolve").unwrap_err().to_string().contains("selector"));
+        assert!(parse("revolve last 0,0,0 0,0,1 90 extra").unwrap_err().to_string().contains("axis"));
+        assert!(parse("loft").unwrap_err().to_string().contains("selector"));
+        assert!(parse("sweep prof").unwrap_err().to_string().contains("selector"));
+        assert!(parse("loft last 2 extra").is_err());
+    }
+
+    #[test]
+    fn solid_command_json_roundtrip() {
+        for line in [
+            "revolve last",
+            "revolve last 180",
+            "revolve vase 0,0,0 0,0,1 270",
+            "loft last 3",
+            "sweep prof rail",
         ] {
             let cmd = parse(line).unwrap();
             let json = serde_json::to_string(&cmd).unwrap();

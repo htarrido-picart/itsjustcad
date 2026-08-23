@@ -44,6 +44,32 @@ pub enum Command {
         profile: Selector,
         height: f64,
     },
+    /// Revolve a closed profile curve about an axis (default: z axis through
+    /// the origin, full circle). Partial angles are capped.
+    Revolve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        profile: Selector,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        axis_point: Option<DVec3>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        axis_dir: Option<DVec3>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        angle_deg: Option<f64>,
+    },
+    /// Skin 2+ closed curves (in creation order) into one capped solid.
+    Loft {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        targets: Selector,
+    },
+    /// Sweep a closed profile curve along an open rail curve, capped.
+    Sweep {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        profile: Selector,
+        rail: Selector,
+    },
     // -- 2D primitives (create Curve objects) --
     Line {
         #[serde(default, skip_serializing_if = "Option::is_none")]

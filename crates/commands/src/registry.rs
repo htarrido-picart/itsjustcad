@@ -19,6 +19,21 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Extrude a closed profile curve upward. Example: extrude last 3",
         },
         CommandSpec {
+            name: "revolve",
+            usage: "revolve <selector> [axis point x,y,z] [axis dir x,y,z] [angle deg]",
+            summary: "Revolve one closed profile curve into a solid (default: full circle about the z axis through the origin; partial angles are capped). Draw the profile beside the axis, e.g. in the xz plane with x,0,z points. Example: revolve last · revolve vase 0,0,0 0,0,1 270",
+        },
+        CommandSpec {
+            name: "loft",
+            usage: "loft <selector>",
+            summary: "Skin 2+ closed curves (stacked in creation order) into one capped solid; profiles are resampled to matching point counts. Example: loft last 3",
+        },
+        CommandSpec {
+            name: "sweep",
+            usage: "sweep <profile selector> <rail selector>",
+            summary: "Sweep one closed profile curve along an open rail curve (profile centered on the rail, no-twist frames, capped ends). Example: sweep prof rail",
+        },
+        CommandSpec {
             name: "line",
             usage: "line <a x,y,z> <b x,y,z>",
             summary: "Line segment. Example: line 0,0,0 10,0,0",
