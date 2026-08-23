@@ -18,12 +18,14 @@ async fn main() {
         model: String::new(),
         max_tokens: 2048,
         temperature: 0.2,
+        session_id: None,
     };
     tokio::spawn(async move { deck.stream_chat(req, tx).await });
 
     while let Some(delta) = rx.recv().await {
         match delta {
             DeckDelta::Text(t) => print!("{t}"),
+            DeckDelta::Session(sid) => eprintln!("session: {sid}"),
             DeckDelta::Done => {
                 println!("\n--- done");
                 break;

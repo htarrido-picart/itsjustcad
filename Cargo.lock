@@ -2061,6 +2061,7 @@ dependencies = [
  "mydrafter-doc",
  "mydrafter-render",
  "rfd",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

@@ -1,5 +1,6 @@
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use mydrafter_commands::{parse, Session};
+use serde::{Deserialize, Serialize};
 use mydrafter_deck::{
     make_deck, probe, system_prompt, warm_model, ChatMessage, ChatRequest, DeckDelta, DecksFile,
     ExtractEvent, Extractor, ProbeInfo, Role, WarmOutcome,
@@ -26,13 +27,18 @@ enum WarmState {
 }
 
 const MAX_RETRIES: u8 = 2;
+/// Hard cap on one deck turn. A wedged CLI subprocess is killed (kill_on_drop)
+/// instead of idling for hours; the session revives on the next send.
+const TURN_TIMEOUT_SECS: u64 = 600;
 
+#[derive(Serialize, Deserialize)]
 struct ExecutedCommand {
     line: String,
     /// Ok: outcome message; Err: error text.
     result: Result<String, String>,
 }
 
+#[derive(Serialize, Deserialize)]
 enum Entry {
     User(String),
     Deck(String),
@@ -40,6 +46,52 @@ enum Entry {
     /// All commands of one turn — rendered as a card; clicking opens the
     /// command detail child pane.
     Commands(Vec<ExecutedCommand>),
+}
+
+/// Chat state that survives app restarts — the provider-side session handle
+/// plus the local transcript. The `claude` CLI keeps its session on disk, so
+/// `--resume session_id` revives the conversation (and its prompt cache) even
+/// after the subprocess and this app have both exited.
+#[derive(Default, Deserialize)]
+struct SavedChat {
+    session_id: Option<String>,
+    messages: Vec<ChatMessage>,
+    transcript: Vec<Entry>,
+}
+
+/// Borrowed mirror of [`SavedChat`] so saving never clones the transcript.
+#[derive(Serialize)]
+struct SavedChatRef<'a> {
+    session_id: &'a Option<String>,
+    messages: &'a [ChatMessage],
+    transcript: &'a [Entry],
+}
+
+fn saved_chat_path() -> Option<std::path::PathBuf> {
+    Some(
+        dirs::home_dir()?
+            .join(".config")
+            .join("mydrafter")
+            .join("deck_chat.json"),
+    )
+}
+
+impl SavedChat {
+    fn load() -> Self {
+        saved_chat_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+}
+
+impl SavedChatRef<'_> {
+    fn save(&self) {
+        let Some(path) = saved_chat_path() else { return };
+        let _ = std::fs::create_dir_all(path.parent().expect("has parent"));
+        let _ = std::fs::write(path, serde_json::to_string_pretty(self).expect("serializes"));
+    }
 }
 
 /// Deck pane navigation: chat, or a full-pane command detail with a back button.
@@ -157,11 +209,19 @@ pub struct DeckPane {
 
 impl Default for DeckPane {
     fn default() -> Self {
+        let saved = SavedChat::load();
+        let mut transcript = saved.transcript;
+        if let Some(sid) = &saved.session_id {
+            transcript.push(Entry::Status(format!(
+                "revived session {}",
+                &sid[..sid.len().min(8)]
+            )));
+        }
         Self {
             decks: DecksFile::load_or_default(),
             input: String::new(),
-            transcript: Vec::new(),
-            messages: Vec::new(),
+            transcript,
+            messages: saved.messages,
             rx: None,
             turn_task: None,
             turn_started: None,
@@ -175,7 +235,7 @@ impl Default for DeckPane {
             probed_deck: None,
             warm: WarmState::Idle,
             warmed_model: None,
-            session_id: None,
+            session_id: saved.session_id,
             view: PaneView::Chat,
             markdown: CommonMarkCache::default(),
         }
@@ -185,6 +245,16 @@ impl Default for DeckPane {
 impl DeckPane {
     pub fn busy(&self) -> bool {
         self.rx.is_some()
+    }
+
+    /// Snapshot the chat to disk so an idle/quit/crash can be revived later.
+    fn persist_chat(&self) {
+        SavedChatRef {
+            session_id: &self.session_id,
+            messages: &self.messages,
+            transcript: &self.transcript,
+        }
+        .save();
     }
 
     /// Chat is enabled only when the endpoint probes healthy AND the model is
@@ -324,6 +394,7 @@ impl DeckPane {
         }
         self.streaming_chat.clear();
         self.transcript.push(Entry::Status("stopped".into()));
+        self.persist_chat();
     }
 
     fn send(&mut self, session: &Session, handle: &tokio::runtime::Handle) {
@@ -338,6 +409,7 @@ impl DeckPane {
             role: Role::User,
             content: text.to_string(),
         });
+        self.persist_chat();
         self.start_turn(session, handle);
     }
 
@@ -398,12 +470,14 @@ impl DeckPane {
             });
             self.start_turn(session, handle);
         }
+        self.persist_chat();
     }
 
     /// Poll streaming deltas; returns whether the document may have changed.
     fn drain(&mut self, session: &mut Session, handle: &tokio::runtime::Handle) {
         let Some(rx) = &mut self.rx else { return };
         let mut done = false;
+        let mut session_changed = false;
         let mut batch = Vec::new();
         while let Ok(delta) = rx.try_recv() {
             match delta {
@@ -413,6 +487,7 @@ impl DeckPane {
                 }
                 DeckDelta::Session(sid) => {
                     self.session_id = Some(sid);
+                    session_changed = true;
                 }
                 DeckDelta::Done => {
                     tracing::info!("deck turn done");
@@ -421,12 +496,27 @@ impl DeckPane {
                 }
                 DeckDelta::Error(e) => {
                     tracing::warn!("deck error: {e}");
+                    // The CLI garbage-collects old sessions; if ours is gone,
+                    // drop the handle so the next turn starts fresh from the
+                    // locally persisted transcript.
+                    if self.session_id.is_some() && e.contains("No conversation found") {
+                        self.session_id = None;
+                        self.transcript.push(Entry::Status(
+                            "provider session expired — next turn resends the transcript".into(),
+                        ));
+                    }
                     self.transcript.push(Entry::Status(format!("deck error: {e}")));
                     self.rx = None;
                     self.turn_started = None;
+                    self.persist_chat();
                     return;
                 }
             }
+        }
+        if session_changed {
+            // Persist immediately: even if this turn (or the app) dies, the
+            // session handle survives for revival.
+            self.persist_chat();
         }
         for text in batch {
             let events = self.extractor.push(&text);
@@ -454,6 +544,15 @@ impl DeckPane {
         handle: &tokio::runtime::Handle,
     ) {
         self.drain(session, handle);
+        if self.busy()
+            && let Some(started) = self.turn_started
+            && started.elapsed().as_secs() > TURN_TIMEOUT_SECS
+        {
+            self.stop_turn();
+            self.transcript.push(Entry::Status(format!(
+                "turn killed after {TURN_TIMEOUT_SECS}s — subprocess was stuck"
+            )));
+        }
         self.poll_probe(handle);
         self.poll_warm(handle);
         if self.busy()
@@ -492,6 +591,7 @@ impl DeckPane {
                         {
                             self.decks.save();
                             self.session_id = None;
+                            self.persist_chat();
                         }
                     }
                 });
@@ -529,6 +629,7 @@ impl DeckPane {
                 self.transcript.clear();
                 self.messages.clear();
                 self.session_id = None;
+                self.persist_chat();
             }
         });
         match &self.probe {
