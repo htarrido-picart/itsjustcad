@@ -99,14 +99,58 @@ fn render_raw(ui: &mut egui::Ui, text: &str) {
     flush_prose(ui, &mut prose);
 }
 
+struct ExecutedCommand {
+    line: String,
+    /// Ok: outcome message; Err: error text.
+    result: Result<String, String>,
+}
+
 enum Entry {
     User(String),
     Deck(String),
-    CommandOk(String, String),
-    CommandErr(String, String),
     Status(String),
+    /// All commands of one turn, shown as a collapsed nested view — the chat
+    /// itself stays prose-only.
+    Commands(Vec<ExecutedCommand>),
     /// Raw model output for one turn, shown as a collapsed nested view.
     Raw(String),
+}
+
+fn render_commands(ui: &mut egui::Ui, commands: &[ExecutedCommand]) {
+    for cmd in commands {
+        match &cmd.result {
+            Ok(msg) => {
+                ui.monospace(
+                    egui::RichText::new(format!("✓ {}   ({msg})", cmd.line))
+                        .color(egui::Color32::from_rgb(70, 160, 90))
+                        .small(),
+                );
+            }
+            Err(e) => {
+                ui.monospace(
+                    egui::RichText::new(format!("✗ {}\n  {e}", cmd.line))
+                        .color(egui::Color32::from_rgb(200, 80, 70))
+                        .small(),
+                );
+            }
+        }
+    }
+}
+
+fn commands_header(commands: &[ExecutedCommand]) -> egui::RichText {
+    let failed = commands.iter().filter(|c| c.result.is_err()).count();
+    if failed > 0 {
+        egui::RichText::new(format!(
+            "⚠ {} command(s), {failed} failed",
+            commands.len()
+        ))
+        .color(egui::Color32::from_rgb(200, 80, 70))
+        .small()
+    } else {
+        egui::RichText::new(format!("✓ {} command(s) drawn", commands.len()))
+            .color(egui::Color32::from_rgb(70, 160, 90))
+            .small()
+    }
 }
 
 /// The LLM companion pane. Streams commands out of the active deck and runs
@@ -125,6 +169,8 @@ pub struct DeckPane {
     /// Streaming chat text of the in-flight deck turn (display only).
     streaming_chat: String,
     errors_this_turn: Vec<String>,
+    /// Commands executed during the in-flight turn.
+    current_commands: Vec<ExecutedCommand>,
     retries: u8,
     /// Deck is disabled until the active cassette probes healthy.
     probe: ProbeState,
@@ -150,6 +196,7 @@ impl Default for DeckPane {
             current_response: String::new(),
             streaming_chat: String::new(),
             errors_this_turn: Vec::new(),
+            current_commands: Vec::new(),
             retries: 0,
             probe: ProbeState::Unknown,
             probed_deck: None,
@@ -282,6 +329,7 @@ impl DeckPane {
         self.current_response.clear();
         self.streaming_chat.clear();
         self.errors_this_turn.clear();
+        self.current_commands.clear();
         self.turn_task = Some(handle.spawn(async move { deck.stream_chat(req, tx).await }));
         self.turn_started = Some(std::time::Instant::now());
     }
@@ -326,16 +374,13 @@ impl DeckPane {
                     let result = parse(&line)
                         .map_err(|e| e.to_string())
                         .and_then(|cmd| session.run(cmd).map_err(|e| e.to_string()));
-                    match result {
-                        Ok(outcome) => self
-                            .transcript
-                            .push(Entry::CommandOk(line, outcome.message)),
-                        Err(e) => {
-                            self.errors_this_turn
-                                .push(format!("`{line}` failed: {e}"));
-                            self.transcript.push(Entry::CommandErr(line, e));
-                        }
+                    if let Err(e) = &result {
+                        self.errors_this_turn.push(format!("`{line}` failed: {e}"));
                     }
+                    self.current_commands.push(ExecutedCommand {
+                        line,
+                        result: result.map(|o| o.message),
+                    });
                 }
             }
         }
@@ -345,6 +390,10 @@ impl DeckPane {
         if !self.streaming_chat.trim().is_empty() {
             self.transcript
                 .push(Entry::Deck(std::mem::take(&mut self.streaming_chat)));
+        }
+        if !self.current_commands.is_empty() {
+            self.transcript
+                .push(Entry::Commands(std::mem::take(&mut self.current_commands)));
         }
         let raw = std::mem::take(&mut self.current_response);
         if !raw.trim().is_empty() {
@@ -589,17 +638,11 @@ impl DeckPane {
                         Entry::Deck(t) => {
                             ui.label(t.trim());
                         }
-                        Entry::CommandOk(cmd, msg) => {
-                            ui.monospace(
-                                egui::RichText::new(format!("✓ {cmd}   ({msg})"))
-                                    .color(egui::Color32::from_rgb(70, 160, 90)),
-                            );
-                        }
-                        Entry::CommandErr(cmd, e) => {
-                            ui.monospace(
-                                egui::RichText::new(format!("✗ {cmd}\n  {e}"))
-                                    .color(egui::Color32::from_rgb(200, 80, 70)),
-                            );
+                        Entry::Commands(commands) => {
+                            egui::CollapsingHeader::new(commands_header(commands))
+                                .id_salt(("cmds", i))
+                                .default_open(false)
+                                .show(ui, |ui| render_commands(ui, commands));
                         }
                         Entry::Status(t) => {
                             ui.label(egui::RichText::new(t).weak().italics());
@@ -612,6 +655,13 @@ impl DeckPane {
                 // Live turn feedback: waiting → thinking dots + elapsed;
                 // streaming → received char count.
                 if self.busy() {
+                    // Commands land here live, collapsed — expand for detail.
+                    if !self.current_commands.is_empty() {
+                        egui::CollapsingHeader::new(commands_header(&self.current_commands))
+                            .id_salt("cmds_live")
+                            .default_open(false)
+                            .show(ui, |ui| render_commands(ui, &self.current_commands));
+                    }
                     let elapsed = self
                         .turn_started
                         .map(|t| t.elapsed().as_secs())
