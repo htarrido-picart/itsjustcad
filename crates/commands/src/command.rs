@@ -213,6 +213,26 @@ pub enum Command {
         targets: Selector,
         delta: DVec3,
     },
+    /// Rectangular grid of copies; the originals occupy cell (0,0,0).
+    Array {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        targets: Selector,
+        counts: [u32; 3],
+        delta: DVec3,
+    },
+    /// Circular array of copies about the z axis through `center` (default:
+    /// targets' AABB center). Default sweep is a full circle.
+    PolarArray {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        targets: Selector,
+        count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        center: Option<DVec3>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_angle_deg: Option<f64>,
+    },
     Delete {
         targets: Selector,
     },

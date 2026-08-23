@@ -1193,6 +1193,127 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Array { ids, targets, counts, delta } => {
+            let [nx, ny, nz] = counts;
+            if nx == 0 || ny == 0 || nz == 0 {
+                return Err(ExecError::Invalid(format!(
+                    "array counts must be at least 1, got {nx},{ny},{nz}"
+                )));
+            }
+            let cells = nx as usize * ny as usize * nz as usize - 1;
+            if cells == 0 {
+                return Err(ExecError::Invalid(
+                    "array 1,1,1 makes no copies — raise a count".into(),
+                ));
+            }
+            let src = resolve(doc, &targets)?;
+            let total = src.len() * cells;
+            // Reuse logged ids on replay; mint new ones live.
+            let new_ids: Vec<ObjectId> = match ids {
+                Some(ids) if ids.len() == total => ids,
+                _ => (0..total).map(|_| ObjectId::new()).collect(),
+            };
+            let mut idx = 0;
+            for src_id in &src {
+                let base = doc.get(*src_id).expect("resolved").clone();
+                for k in 0..nz {
+                    for j in 0..ny {
+                        for i in 0..nx {
+                            if i == 0 && j == 0 && k == 0 {
+                                continue; // the original occupies this cell
+                            }
+                            let mut obj = base.clone();
+                            obj.id = new_ids[idx];
+                            idx += 1;
+                            obj.geometry.translate(DVec3::new(
+                                f64::from(i) * delta.x,
+                                f64::from(j) * delta.y,
+                                f64::from(k) * delta.z,
+                            ));
+                            doc.insert(obj);
+                        }
+                    }
+                }
+            }
+            Ok((
+                Command::Array { ids: Some(new_ids.clone()), targets, counts, delta },
+                Inverse::DeleteCreated(new_ids.clone()),
+                ApplyOutcome {
+                    message: format!(
+                        "arrayed {} object(s) into a {nx}x{ny}x{nz} grid ({total} copies)",
+                        src.len()
+                    ),
+                    created: new_ids,
+                },
+            ))
+        }
+        Command::PolarArray { ids, targets, count, center, total_angle_deg } => {
+            if count < 2 {
+                return Err(ExecError::Invalid(
+                    "polar array count must be at least 2".into(),
+                ));
+            }
+            let src = resolve(doc, &targets)?;
+            let center_pt = center.unwrap_or_else(|| {
+                let mut bb = doc.get(src[0]).expect("resolved").geometry.aabb();
+                for id in &src[1..] {
+                    bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+                }
+                bb.center()
+            });
+            // Full circles divide evenly; partial sweeps land the last copy
+            // exactly at the total angle.
+            let step = match total_angle_deg {
+                None => 360.0 / f64::from(count),
+                Some(total) => total / f64::from(count - 1),
+            };
+            let copies = (count - 1) as usize;
+            let total_new = src.len() * copies;
+            let new_ids: Vec<ObjectId> = match ids {
+                Some(ids) if ids.len() == total_new => ids,
+                _ => (0..total_new).map(|_| ObjectId::new()).collect(),
+            };
+            let mut tessellated = 0usize;
+            let mut idx = 0;
+            for src_id in &src {
+                let base = doc.get(*src_id).expect("resolved").clone();
+                for k in 1..count {
+                    let m = glam::DMat4::from_translation(center_pt)
+                        * glam::DMat4::from_axis_angle(
+                            DVec3::Z,
+                            (f64::from(k) * step).to_radians(),
+                        )
+                        * glam::DMat4::from_translation(-center_pt);
+                    let mut obj = base.clone();
+                    obj.id = new_ids[idx];
+                    idx += 1;
+                    if !obj.geometry.transform(&m, PROFILE_TOL) {
+                        tessellated += 1;
+                    }
+                    doc.insert(obj);
+                }
+            }
+            Ok((
+                Command::PolarArray {
+                    ids: Some(new_ids.clone()),
+                    targets,
+                    count,
+                    center,
+                    total_angle_deg,
+                },
+                Inverse::DeleteCreated(new_ids.clone()),
+                ApplyOutcome {
+                    message: format!(
+                        "polar array: {} object(s) x {count} about {:.2},{:.2}{}",
+                        src.len(),
+                        center_pt.x,
+                        center_pt.y,
+                        tessellation_note(tessellated)
+                    ),
+                    created: new_ids,
+                },
+            ))
+        }
         Command::Delete { targets } => {
             let ids = resolve(doc, &targets)?;
             let mut removed = Vec::new();
@@ -1490,6 +1611,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Fillet { .. } => "fillet",
         Command::Offset { .. } => "offset",
         Command::Copy { .. } => "copy",
+        Command::Array { .. } => "array",
+        Command::PolarArray { .. } => "polararray",
         Command::Delete { .. } => "delete",
         Command::Name { .. } => "name",
         Command::Layer { .. } => "layer",
@@ -1553,6 +1676,124 @@ mod tests {
         // the copy inherits the name, so 'base' now matches both
         run(&mut s, "delete base");
         assert_eq!(s.doc.len(), 0);
+    }
+
+    #[test]
+    fn array_grid_counts_positions_undo() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 0.4,0.4,3");
+        let out = run(&mut s, "array last 5,3,1 3,4,0");
+        assert_eq!(out.created.len(), 14); // 5*3*1 - 1 copies
+        assert_eq!(s.doc.len(), 15);
+        let bb = s.doc.scene_aabb().unwrap();
+        // grid spans 4 bays x 3m and 2 bays x 4m plus the 0.4 column
+        assert!((bb.min - DVec3::ZERO).length() < 1e-9);
+        assert!((bb.max - DVec3::new(12.4, 8.4, 3.0)).length() < 1e-9);
+        // every cell center is occupied
+        for j in 0..3 {
+            for i in 0..5 {
+                let want = DVec3::new(0.2 + 3.0 * f64::from(i), 0.2 + 4.0 * f64::from(j), 1.5);
+                assert!(
+                    s.doc
+                        .objects()
+                        .any(|o| (o.geometry.aabb().center() - want).length() < 1e-9),
+                    "missing cell {i},{j}"
+                );
+            }
+        }
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1, "undo deletes all copies");
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 15);
+
+        // multi-target arrays copy every source
+        run(&mut s, "undo");
+        run(&mut s, "circle 20,0,0 1");
+        let out = run(&mut s, "array last 2 2,2,1 30,30,0");
+        assert_eq!(out.created.len(), 6); // 2 objects x 3 new cells
+        assert_eq!(s.doc.len(), 8);
+
+        // errors leave the doc untouched
+        let n = s.doc.len();
+        let err = s.run(parse("array last 0,2 1,0,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "{err}");
+        let err = s.run(parse("array last 1,1,1 1,0,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no copies"), "{err}");
+        assert_eq!(s.doc.len(), n);
+    }
+
+    #[test]
+    fn polar_array_positions_and_undo() {
+        let mut s = Session::default();
+        // box centered at 10,0 — default center is its own AABB center, so
+        // give an explicit center at the origin for a real orbit
+        run(&mut s, "box 9,-1,0 2,2,1");
+        let out = run(&mut s, "polararray last 4 0,0,0");
+        assert_eq!(out.created.len(), 3);
+        assert_eq!(s.doc.len(), 4);
+        // full circle: copies at 90° steps land at (0,10), (-10,0), (0,-10)
+        for want in [
+            DVec3::new(10.0, 0.0, 0.5),
+            DVec3::new(0.0, 10.0, 0.5),
+            DVec3::new(-10.0, 0.0, 0.5),
+            DVec3::new(0.0, -10.0, 0.5),
+        ] {
+            assert!(
+                s.doc
+                    .objects()
+                    .any(|o| (o.geometry.aabb().center() - want).length() < 1e-9),
+                "missing instance at {want}"
+            );
+        }
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 4);
+
+        // partial sweep: last copy lands exactly at the total angle
+        let mut s = Session::default();
+        run(&mut s, "box 9,-1,0 2,2,1");
+        run(&mut s, "polararray last 3 0,0,0 180");
+        let centers: Vec<DVec3> =
+            s.doc.objects().map(|o| o.geometry.aabb().center()).collect();
+        assert!(centers.iter().any(|c| (*c - DVec3::new(0.0, 10.0, 0.5)).length() < 1e-9));
+        assert!(centers.iter().any(|c| (*c - DVec3::new(-10.0, 0.0, 0.5)).length() < 1e-9));
+
+        // default center = targets' AABB center: copies coincide about itself
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2");
+        run(&mut s, "polararray last 4");
+        assert_eq!(s.doc.len(), 4);
+        let bb = s.doc.scene_aabb().unwrap();
+        assert!((bb.center() - DVec3::new(1.0, 1.0, 1.0)).length() < 1e-9);
+
+        // count < 2 refuses
+        let err = s.run(parse("polararray last 1").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("at least 2"), "{err}");
+    }
+
+    #[test]
+    fn array_replay_reuses_ids() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 0.4,0.4,3");
+        run(&mut s, "array last 3,2,1 3,4,0");
+        run(&mut s, "circle 20,0,0 1");
+        run(&mut s, "polararray last 6 25,0,0");
+        run(&mut s, "undo");
+        run(&mut s, "redo");
+
+        let log = s.save_log();
+        // logged ops carry the minted ids
+        assert!(matches!(&log[1], Command::Array { ids: Some(ids), .. } if ids.len() == 5));
+        assert!(matches!(&log[3], Command::PolarArray { ids: Some(ids), .. } if ids.len() == 5));
+        let replayed = Session::replay(log.clone()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
     }
 
     #[test]

@@ -144,6 +144,16 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Duplicate objects with an offset. Example: copy last 6,0,0",
         },
         CommandSpec {
+            name: "array",
+            usage: "array <selector> <nx,ny,nz> <dx,dy,dz>",
+            summary: "Grid of copies at the given spacings; the originals fill cell 0,0,0 (nx,ny works too, nz=1). Example: box 0,0,0 0.4,0.4,3 then array last 5,3,1 3,4,0 makes a 5x3 column grid at 3m x 4m bays",
+        },
+        CommandSpec {
+            name: "polararray",
+            usage: "polararray <selector> <count> [center x,y,z] [total angle deg]",
+            summary: "Circular array of copies about the z axis (default: full circle about the targets' bounding-box center; count includes the original). Example: polararray last 8 · polararray col 6 0,0,0 180",
+        },
+        CommandSpec {
             name: "delete",
             usage: "delete <selector>",
             summary: "Delete objects. Example: delete last",

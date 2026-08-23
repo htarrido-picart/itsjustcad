@@ -206,6 +206,50 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 delta: point(delta)?,
             })
         }
+        "array" => {
+            let (sel, rest) = selector(&args, "array")?;
+            let [counts, delta] =
+                take::<2>("array", "counts nx,ny,nz and a delta dx,dy,dz", rest)
+                    .map_err(|_| {
+                        wrong_err("array", "counts nx,ny,nz and a delta dx,dy,dz", &args)
+                    })?;
+            Ok(Command::Array {
+                ids: None,
+                targets: sel,
+                counts: counts3(counts)?,
+                delta: point(delta)?,
+            })
+        }
+        "polararray" | "parray" => with_last_backtrack(&args, "polararray", |sel, rest, args| {
+            let (&count, rest) = rest
+                .split_first()
+                .ok_or_else(|| wrong_err("polararray", "a copy count", args))?;
+            let count = count
+                .parse::<u32>()
+                .map_err(|_| ParseError::BadNumber(count.to_string()))?;
+            let (center, rest) = match rest.first() {
+                Some(t) if t.contains(',') => (Some(point(t)?), &rest[1..]),
+                _ => (None, rest),
+            };
+            let total_angle_deg = match rest {
+                [] => None,
+                [a] => Some(number(a)?),
+                _ => {
+                    return Err(wrong_err(
+                        "polararray",
+                        "optionally a center point and a total angle",
+                        args,
+                    ))
+                }
+            };
+            Ok(Command::PolarArray {
+                ids: None,
+                targets: sel,
+                count,
+                center,
+                total_angle_deg,
+            })
+        }),
         "rotate" => with_last_backtrack(&args, "rotate", |sel, rest, args| {
             let (&angle, rest) = rest
                 .split_first()
@@ -516,6 +560,21 @@ pub fn point(s: &str) -> Result<DVec3, ParseError> {
     }
 }
 
+/// Array counts `nx,ny,nz` (or `nx,ny` with nz=1) as whole numbers.
+fn counts3(s: &str) -> Result<[u32; 3], ParseError> {
+    let bad = || ParseError::BadNumber(s.to_string());
+    let parts: Vec<u32> = s
+        .split(',')
+        .map(|p| p.parse::<u32>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| bad())?;
+    match parts.as_slice() {
+        [x, y] => Ok([*x, *y, 1]),
+        [x, y, z] => Ok([*x, *y, *z]),
+        _ => Err(bad()),
+    }
+}
+
 /// `r,g,b` color; values above 1 are read as a 0-255 byte triple.
 fn color3(s: &str) -> Result<[f32; 3], ParseError> {
     let bad = || ParseError::BadColor(s.to_string());
@@ -791,6 +850,86 @@ mod tests {
         // rotate needs an angle
         let err = parse("rotate last").unwrap_err();
         assert!(err.to_string().contains("angle"), "{err}");
+    }
+
+    #[test]
+    fn parse_array_commands() {
+        assert_eq!(
+            parse("array last 5,3,1 3,4,0").unwrap(),
+            Command::Array {
+                ids: None,
+                targets: Selector::Last { n: 1 },
+                counts: [5, 3, 1],
+                delta: DVec3::new(3.0, 4.0, 0.0),
+            }
+        );
+        // 2-component counts default nz=1; selector counts still work
+        assert!(matches!(
+            parse("array last 2 4,2 6,6,0").unwrap(),
+            Command::Array { targets: Selector::Last { n: 2 }, counts: [4, 2, 1], .. }
+        ));
+        // spacings accept unit suffixes
+        assert!(matches!(
+            parse("array cols 3,3 3m,400cm").unwrap(),
+            Command::Array { counts: [3, 3, 1], delta, .. }
+                if delta == DVec3::new(3.0, 4.0, 0.0)
+        ));
+        assert!(parse("array last").unwrap_err().to_string().contains("counts"));
+        assert!(parse("array last 5,3,1").unwrap_err().to_string().contains("delta"));
+        assert!(parse("array last 1.5,3 1,0,0").is_err()); // counts are whole numbers
+
+        // polararray: backtrack makes "last 8" read as last + count 8
+        assert_eq!(
+            parse("polararray last 8").unwrap(),
+            Command::PolarArray {
+                ids: None,
+                targets: Selector::Last { n: 1 },
+                count: 8,
+                center: None,
+                total_angle_deg: None,
+            }
+        );
+        assert!(matches!(
+            parse("polararray last 2 6").unwrap(),
+            Command::PolarArray { targets: Selector::Last { n: 2 }, count: 6, .. }
+        ));
+        assert!(matches!(
+            parse("parray col 6 0,0,0 180").unwrap(),
+            Command::PolarArray {
+                targets: Selector::Named { .. },
+                count: 6,
+                center: Some(DVec3::ZERO),
+                total_angle_deg: Some(total),
+                ..
+            } if total == 180.0
+        ));
+        assert!(matches!(
+            parse("polararray col 4 90").unwrap(),
+            Command::PolarArray { count: 4, center: None, total_angle_deg: Some(total), .. }
+                if total == 90.0
+        ));
+        // greedy selector wins the ambiguous "last 4 90": 4 objects, 90 copies
+        assert!(matches!(
+            parse("polararray last 4 90").unwrap(),
+            Command::PolarArray { targets: Selector::Last { n: 4 }, count: 90, .. }
+        ));
+        assert!(parse("polararray last").unwrap_err().to_string().contains("count"));
+        assert!(parse("polararray last 4 0,0 90 extra").is_err());
+    }
+
+    #[test]
+    fn array_command_json_roundtrip() {
+        for line in [
+            "array last 5,3,1 3,4,0",
+            "array last 2 4,2 6,6,0",
+            "polararray last 8",
+            "parray col 6 0,0,0 180",
+        ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
     }
 
     #[test]
