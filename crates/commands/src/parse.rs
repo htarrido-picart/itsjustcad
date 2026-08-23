@@ -531,6 +531,18 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }
         "undo" => Ok(Command::Undo),
         "redo" => Ok(Command::Redo),
+        "amend" => match &args[..] {
+            [step, rest @ ..] if !rest.is_empty() => {
+                let step = step
+                    .parse::<usize>()
+                    .map_err(|_| wrong_err("amend", "a step number then a command", &args))?;
+                Ok(Command::Amend {
+                    step,
+                    with: Box::new(parse(&rest.join(" "))?),
+                })
+            }
+            _ => wrong("amend", "a step number then a command", &args),
+        },
         other => Err(ParseError::UnknownCommand {
             name: other.to_string(),
             suggestion: closest_command(other),
@@ -811,6 +823,28 @@ mod tests {
                 size: DVec3::new(5.0, 5.0, 3.0)
             }
         );
+    }
+
+    #[test]
+    fn parse_amend_wraps_inner_command() {
+        let cmd = parse("amend 0 box 0,0,0 8,8,3").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Amend {
+                step: 0,
+                with: Box::new(Command::Box {
+                    id: None,
+                    corner: DVec3::ZERO,
+                    size: DVec3::new(8.0, 8.0, 3.0)
+                })
+            }
+        );
+        // Inner parse errors surface with their own hints.
+        assert!(parse("amend 0 bax 0,0,0 1,1,1").is_err());
+        // Missing step or missing command.
+        assert!(matches!(parse("amend"), Err(ParseError::WrongArgs { .. })));
+        assert!(matches!(parse("amend 2"), Err(ParseError::WrongArgs { .. })));
+        assert!(matches!(parse("amend x box 0,0,0 1,1,1"), Err(ParseError::WrongArgs { .. })));
     }
 
     #[test]

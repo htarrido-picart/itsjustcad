@@ -388,6 +388,13 @@ pub enum Command {
     },
     Undo,
     Redo,
+    /// Rewrite history: replace the logged op at `step` (0-based) and rebuild
+    /// the document by replaying the whole log. Never itself logged — the
+    /// edited log IS the record.
+    Amend {
+        step: usize,
+        with: Box<Command>,
+    },
 }
 
 impl Command {
@@ -407,6 +414,7 @@ impl Command {
                 | Command::Bbox { .. }
                 | Command::Undo
                 | Command::Redo
+                | Command::Amend { .. }
         )
     }
 }

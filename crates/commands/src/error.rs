@@ -53,4 +53,12 @@ pub enum ExecError {
     NothingToUndo,
     #[error("nothing to redo")]
     NothingToRedo,
+    #[error("no step {step} to amend; history has {len} step(s), numbered from 0")]
+    BadAmendStep { step: usize, len: usize },
+    #[error("amend aborted: replay failed at step {step} ({op}): {source}. Prior state kept")]
+    AmendReplay {
+        step: usize,
+        op: String,
+        source: Box<ExecError>,
+    },
 }

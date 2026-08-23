@@ -743,6 +743,8 @@ impl App {
                                         }
                                     }
                                 });
+                            ui.separator();
+                            ui.weak("amend <op#> <command> rewrites a step\n(first op is 0, e.g. amend 0 box 0,0,0 8,8,3)");
                         });
                 });
             });

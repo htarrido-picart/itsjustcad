@@ -75,6 +75,25 @@ mod tests {
     }
 
     #[test]
+    fn amended_session_saves_and_replays_stably() {
+        let mut s = Session::default();
+        for line in ["box 0,0,0 5,5,3", "box 1,1,-1 2,2,5", "difference last 2 last"] {
+            s.run(parse(line).unwrap()).unwrap();
+        }
+        s.run(parse("amend 0 box 0,0,0 8,8,3").unwrap()).unwrap();
+
+        // The amend itself never lands in the log — only the edited ops do.
+        let json1 = to_json(&s);
+        assert!(!json1.contains("amend"), "{json1}");
+        let loaded = from_json(&json1).unwrap();
+        assert_eq!(to_json(&loaded), json1, "replay-stable");
+        assert_eq!(loaded.doc.len(), s.doc.len());
+        let ids: Vec<_> = s.doc.objects().map(|o| o.id).collect();
+        let loaded_ids: Vec<_> = loaded.doc.objects().map(|o| o.id).collect();
+        assert_eq!(ids, loaded_ids, "identical objects after replay");
+    }
+
+    #[test]
     fn pre_layer_file_loads_onto_default_layer() {
         // Hand-written v1 file from before layers existed: no layer ops,
         // no layer fields anywhere.

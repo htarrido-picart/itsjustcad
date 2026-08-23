@@ -303,6 +303,11 @@ pub fn registry() -> &'static [CommandSpec] {
             usage: "redo",
             summary: "Redo",
         },
+        CommandSpec {
+            name: "amend",
+            usage: "amend <step> <command...>",
+            summary: "Rewrite history: replace the op at <step> (0 = first op) with a new command and replay the whole log; later ops rebuild against the change. On failure nothing changes. Example: amend 0 box 0,0,0 8,8,3",
+        },
     ]
 }
 

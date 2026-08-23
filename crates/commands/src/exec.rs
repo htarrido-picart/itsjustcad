@@ -99,6 +99,7 @@ impl Session {
         match cmd {
             Command::Undo => self.undo(),
             Command::Redo => self.redo(),
+            Command::Amend { step, with } => self.amend(step, *with),
             cmd => {
                 let logged = cmd.is_logged();
                 let (op, inverse, outcome) = apply_forward(&mut self.doc, cmd)?;
@@ -289,6 +290,48 @@ impl Session {
             moved += 1;
         }
         Ok(moved)
+    }
+
+    /// Replace the op at `step` (0-based, within the effective log) with
+    /// `new_cmd` and rebuild by replaying every op through the normal apply
+    /// path. Downstream ops resolve against the rebuilt state, so positional
+    /// selectors ('last', 'all') follow the change. On any replay failure the
+    /// session is left exactly as it was and the failing step is reported.
+    pub fn amend(&mut self, step: usize, new_cmd: Command) -> Result<ApplyOutcome, ExecError> {
+        if !new_cmd.is_logged() {
+            return Err(ExecError::Invalid(format!(
+                "'{}' is not a geometry command and cannot be amended into history",
+                describe(&new_cmd)
+            )));
+        }
+        let mut log = self.save_log();
+        if step >= log.len() {
+            return Err(ExecError::BadAmendStep { step, len: log.len() });
+        }
+        log[step] = new_cmd;
+        let mut fresh = Session::default();
+        for (i, cmd) in log.into_iter().enumerate() {
+            let op = describe(&cmd).to_string();
+            if let Err(e) = fresh.run(cmd) {
+                return Err(ExecError::AmendReplay {
+                    step: i,
+                    op,
+                    source: Box::new(e),
+                });
+            }
+        }
+        // Strictly advance the generation so GPU/journal caches keyed on the
+        // old document never mistake the rebuilt one for it.
+        fresh.doc.generation = fresh.doc.generation.max(self.doc.generation) + 1;
+        let count = fresh.log.len();
+        *self = fresh;
+        Ok(ApplyOutcome {
+            created: Vec::new(),
+            message: format!(
+                "amended step {step} to '{}'; replayed {count} op(s)",
+                describe(&self.log[step].op)
+            ),
+        })
     }
 
     /// Effective forward log (up to the undo cursor) — this is the file format.
@@ -2123,7 +2166,9 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Undo | Command::Redo => unreachable!("handled in Session::run"),
+        Command::Undo | Command::Redo | Command::Amend { .. } => {
+            unreachable!("handled in Session::run")
+        }
     }
 }
 
@@ -2190,6 +2235,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Bbox { .. } => "bbox",
         Command::Undo => "undo",
         Command::Redo => "redo",
+        Command::Amend { .. } => "amend",
     }
 }
 
@@ -2793,6 +2839,80 @@ mod tests {
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap()
         );
+    }
+
+    #[test]
+    fn amend_box_size_rebuilds_downstream_boolean() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 5,5,3");
+        run(&mut s, "box 1,1,-1 2,2,5");
+        run(&mut s, "difference last 2 last");
+        assert_eq!(s.doc.len(), 1);
+        assert!((mesh_volume(&s) - (75.0 - 12.0)).abs() < 1e-6); // 5*5*3 - 2*2*3
+
+        let out = run(&mut s, "amend 0 box 0,0,0 8,8,3");
+        assert!(out.message.contains("amended step 0"), "{}", out.message);
+        assert_eq!(s.doc.len(), 1);
+        // Bigger slab, same hole: the downstream difference re-resolved.
+        assert!((mesh_volume(&s) - (192.0 - 12.0)).abs() < 1e-6); // 8*8*3 - 2*2*3
+        let (entries, cursor) = s.history();
+        assert_eq!(entries, ["box", "box", "difference"]);
+        assert_eq!(cursor, 3);
+
+        // The rebuilt log is still undoable.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        run(&mut s, "redo");
+        assert!((mesh_volume(&s) - 180.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn failed_amend_restores_prior_state() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 5,5,3");
+        run(&mut s, "box 1,1,-1 2,2,5");
+        run(&mut s, "difference last 2 last");
+        let json_before = crate::io::to_json(&s);
+        let vol_before = mesh_volume(&s);
+
+        // A line cannot feed the boolean: replay fails at the difference step.
+        let err = s.run(parse("amend 1 line 0,0,0 1,0,0").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("step 2") && msg.contains("difference"), "{msg}");
+
+        // Session untouched: same objects, same log, still fully usable.
+        assert_eq!(crate::io::to_json(&s), json_before);
+        assert!((mesh_volume(&s) - vol_before).abs() < 1e-12);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+    }
+
+    #[test]
+    fn amend_rejects_bad_step_and_unlogged_command() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        let err = s.run(parse("amend 3 box 0,0,0 2,2,2").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("history has 1 step(s)"), "{err}");
+        let err = s.run(parse("amend 0 undo").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("not a geometry command"), "{err}");
+        assert_eq!(s.doc.len(), 1);
+        assert_eq!(s.save_log().len(), 1);
+    }
+
+    #[test]
+    fn amend_only_touches_the_effective_log() {
+        // An undone tail beyond the cursor is dropped by amend, exactly like
+        // running any new command would drop it.
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "box 5,0,0 1,1,1");
+        run(&mut s, "undo");
+        run(&mut s, "amend 0 box 0,0,0 3,3,3");
+        assert_eq!(s.doc.len(), 1);
+        assert!((mesh_volume(&s) - 27.0).abs() < 1e-9);
+        assert_eq!(s.save_log().len(), 1);
+        let err = s.run(Command::Redo).unwrap_err();
+        assert_eq!(err, ExecError::NothingToRedo);
     }
 
     #[test]
