@@ -4,8 +4,10 @@
 
 mod document;
 mod object;
+mod sheet;
 
 pub use document::Document;
 pub use object::{
     Annotation, Geometry, HatchPattern, LayerStyle, ObjectId, SceneObject, DEFAULT_LAYER,
 };
+pub use sheet::{PaperSize, Sheet, SheetView, ViewDirection};

@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mydrafter_doc::{HatchPattern, ObjectId};
+use mydrafter_doc::{HatchPattern, ObjectId, PaperSize, ViewDirection};
 use serde::{Deserialize, Serialize};
 
 /// Object selector. `Last(n)` ("last", "last 3") is the workhorse for both the
@@ -205,6 +205,23 @@ pub enum Command {
     Show {
         layer: String,
     },
+    // -- sheets / layouts --
+    /// Create a named paper sheet (landscape).
+    Sheet {
+        name: String,
+        paper: PaperSize,
+    },
+    /// Add a scaled ortho view to a sheet. `scale` is the denominator (1:100 -> 100).
+    SheetView {
+        sheet: String,
+        direction: ViewDirection,
+        scale: f64,
+    },
+    /// Export a sheet as a vector PDF. Not logged: printing is I/O, not model state.
+    Print {
+        sheet: String,
+        path: String,
+    },
     Select {
         targets: Selector,
     },
@@ -218,7 +235,11 @@ impl Command {
     pub fn is_logged(&self) -> bool {
         !matches!(
             self,
-            Command::Select { .. } | Command::SelectNone | Command::Undo | Command::Redo
+            Command::Select { .. }
+                | Command::SelectNone
+                | Command::Print { .. }
+                | Command::Undo
+                | Command::Redo
         )
     }
 }

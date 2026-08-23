@@ -154,6 +154,21 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Show a hidden layer. Example: show walls",
         },
         CommandSpec {
+            name: "sheet",
+            usage: "sheet <name> [a4|a3|a2|a1|a0]",
+            summary: "Create a named paper sheet, landscape (default a3). Example: sheet plan a1",
+        },
+        CommandSpec {
+            name: "sheetview",
+            usage: "sheetview <sheet> <top|front|right|persp> <scale>",
+            summary: "Add a scaled ortho view to a sheet; scale is 1:100 or 100 (1m = 10mm at 1:100). Example: sheetview plan top 1:100",
+        },
+        CommandSpec {
+            name: "print",
+            usage: "print <sheet> <path.pdf>",
+            summary: "Export a sheet as a vector PDF at its views' scales. Example: print plan /tmp/plan.pdf",
+        },
+        CommandSpec {
             name: "select",
             usage: "select <selector>",
             summary: "Set the selection. Example: select all",

@@ -26,6 +26,12 @@ pub enum ParseError {
     BadSelector(String),
     #[error("'{0}' is not a color; write r,g,b with 0-1 or 0-255 values (example: 0.8,0.2,0.2)")]
     BadColor(String),
+    #[error("'{0}' is not a paper size; use a4, a3, a2, a1 or a0")]
+    BadPaperSize(String),
+    #[error("'{0}' is not a view direction; use top, front, right or persp")]
+    BadViewDirection(String),
+    #[error("'{0}' is not a scale; write 1:100 or just 100")]
+    BadScale(String),
 }
 
 fn suggest(s: &Option<String>) -> String {

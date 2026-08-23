@@ -7,6 +7,7 @@ mod error;
 mod exec;
 pub mod io;
 mod parse;
+pub mod pdf;
 mod registry;
 
 pub use command::{Command, MirrorPlane, Selector};

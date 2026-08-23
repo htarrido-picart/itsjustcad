@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_mesh::Aabb;
 
-use crate::{LayerStyle, ObjectId, SceneObject, DEFAULT_LAYER};
+use crate::{LayerStyle, ObjectId, SceneObject, Sheet, DEFAULT_LAYER};
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
 #[derive(Clone, Debug)]
@@ -16,6 +16,8 @@ pub struct Document {
     pub layers: BTreeMap<String, LayerStyle>,
     /// Layer newly created objects are placed on.
     pub current_layer: String,
+    /// Paper layouts, in creation order. Mutators bump `generation` (exec does).
+    pub sheets: Vec<Sheet>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -28,6 +30,7 @@ impl Default for Document {
             selection: BTreeSet::new(),
             layers: BTreeMap::from([(DEFAULT_LAYER.to_string(), LayerStyle::default())]),
             current_layer: DEFAULT_LAYER.to_string(),
+            sheets: Vec::new(),
             generation: 0,
         }
     }
@@ -111,6 +114,14 @@ impl Document {
             .expect("creation_order consistent with objects");
         self.creation_order.remove(index);
         Some((obj, index))
+    }
+
+    pub fn sheet(&self, name: &str) -> Option<&Sheet> {
+        self.sheets.iter().find(|s| s.name == name)
+    }
+
+    pub fn sheet_mut(&mut self, name: &str) -> Option<&mut Sheet> {
+        self.sheets.iter_mut().find(|s| s.name == name)
     }
 
     pub fn scene_aabb(&self) -> Option<Aabb> {

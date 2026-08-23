@@ -49,6 +49,10 @@ enum Inverse {
     },
     /// `layercolor`/`hide`/`show`: restore the previous layer style.
     LayerStyle { layer: String, prev: LayerStyle },
+    /// `sheet`: drop the sheet this command created.
+    RemoveSheet(String),
+    /// `sheetview`: drop the view most recently added to a sheet.
+    PopSheetView(String),
 }
 
 /// Owns the document plus its op-log; the single mutation path for both the
@@ -141,6 +145,17 @@ impl Session {
             Inverse::LayerStyle { layer, prev } => {
                 if let Some(style) = self.doc.layers.get_mut(layer) {
                     *style = prev.clone();
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::RemoveSheet(name) => {
+                self.doc.sheets.retain(|s| &s.name != name);
+                self.doc.generation += 1;
+            }
+            Inverse::PopSheetView(sheet) => {
+                let sheet = sheet.clone();
+                if let Some(s) = self.doc.sheet_mut(&sheet) {
+                    s.views.pop();
                 }
                 self.doc.generation += 1;
             }
@@ -1023,6 +1038,83 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Sheet { name, paper } => {
+            if doc.sheet(&name).is_some() {
+                return Err(ExecError::Invalid(format!(
+                    "sheet '{name}' already exists (add views with: sheetview {name} top 1:100)"
+                )));
+            }
+            let (w, h) = paper.landscape_mm();
+            doc.sheets.push(mydrafter_doc::Sheet {
+                name: name.clone(),
+                paper,
+                views: Vec::new(),
+            });
+            doc.generation += 1;
+            Ok((
+                Command::Sheet { name: name.clone(), paper },
+                Inverse::RemoveSheet(name.clone()),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("sheet '{name}' ({} landscape, {w}x{h}mm)", paper.label()),
+                },
+            ))
+        }
+        Command::SheetView { sheet, direction, scale } => {
+            if scale <= 0.0 {
+                return Err(ExecError::Invalid("view scale must be positive".into()));
+            }
+            let known: Vec<String> = doc.sheets.iter().map(|s| s.name.clone()).collect();
+            let Some(s) = doc.sheet_mut(&sheet) else {
+                return Err(ExecError::Invalid(format!(
+                    "no sheet '{sheet}' (sheets: {}; create one with: sheet {sheet})",
+                    known.join(", ")
+                )));
+            };
+            s.views.push(mydrafter_doc::SheetView { direction, scale });
+            let count = s.views.len();
+            doc.generation += 1;
+            Ok((
+                Command::SheetView { sheet: sheet.clone(), direction, scale },
+                Inverse::PopSheetView(sheet.clone()),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "added {} view @ 1:{scale} to '{sheet}' ({count} view(s))",
+                        direction.label()
+                    ),
+                },
+            ))
+        }
+        Command::Print { sheet, path } => {
+            let Some(s) = doc.sheet(&sheet) else {
+                let known: Vec<String> = doc.sheets.iter().map(|s| s.name.clone()).collect();
+                return Err(ExecError::Invalid(format!(
+                    "no sheet '{sheet}' (sheets: {})",
+                    known.join(", ")
+                )));
+            };
+            if s.views.is_empty() {
+                return Err(ExecError::Invalid(format!(
+                    "sheet '{sheet}' has no views (add one with: sheetview {sheet} top 1:100)"
+                )));
+            }
+            let (bytes, drawn) = crate::pdf::sheet_pdf(doc, s);
+            let size = bytes.len();
+            std::fs::write(&path, bytes).map_err(|e| {
+                ExecError::Invalid(format!("cannot write '{path}': {e}"))
+            })?;
+            Ok((
+                Command::Print { sheet: sheet.clone(), path: path.clone() },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "printed '{sheet}' -> {path} ({drawn} lines, {size} bytes)"
+                    ),
+                },
+            ))
+        }
         Command::Select { targets } => {
             let ids = resolve(doc, &targets)?;
             doc.selection = ids.iter().copied().collect();
@@ -1082,6 +1174,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LayerColor { .. } => "layercolor",
         Command::Hide { .. } => "hide",
         Command::Show { .. } => "show",
+        Command::Sheet { .. } => "sheet",
+        Command::SheetView { .. } => "sheetview",
+        Command::Print { .. } => "print",
         Command::Select { .. } => "select",
         Command::SelectNone => "selectnone",
         Command::Undo => "undo",
@@ -1666,6 +1761,90 @@ mod tests {
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap()
         );
+    }
+
+    #[test]
+    fn sheet_create_view_undo_redo() {
+        use mydrafter_doc::{PaperSize, ViewDirection};
+        let mut s = Session::default();
+        let out = run(&mut s, "sheet plan a1");
+        assert!(out.message.contains("841x594mm"), "{}", out.message);
+        run(&mut s, "sheetview plan top 1:100");
+        run(&mut s, "sheetview plan front 50");
+        let sheet = s.doc.sheet("plan").unwrap();
+        assert_eq!(sheet.paper, PaperSize::A1);
+        assert_eq!(sheet.views.len(), 2);
+        assert_eq!(sheet.views[1].direction, ViewDirection::Front);
+        assert_eq!(sheet.views[1].scale, 50.0);
+
+        run(&mut s, "undo"); // pop front view
+        assert_eq!(s.doc.sheet("plan").unwrap().views.len(), 1);
+        run(&mut s, "undo"); // pop top view
+        run(&mut s, "undo"); // remove sheet
+        assert!(s.doc.sheets.is_empty());
+        run(&mut s, "redo");
+        run(&mut s, "redo");
+        run(&mut s, "redo");
+        assert_eq!(s.doc.sheet("plan").unwrap().views.len(), 2);
+
+        // duplicate sheet and missing sheet both error with hints
+        let err = s.run(parse("sheet plan").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        let err = s.run(parse("sheetview ghost top 100").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no sheet 'ghost'"), "{err}");
+    }
+
+    #[test]
+    fn sheet_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 5,5,3");
+        run(&mut s, "sheet plan a3");
+        run(&mut s, "sheetview plan top 1:100");
+        run(&mut s, "sheet detail a4");
+        run(&mut s, "sheetview detail persp 1:50");
+        run(&mut s, "undo"); // drop the persp view
+
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(s.doc.sheets, replayed.doc.sheets);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
+    }
+
+    #[test]
+    fn print_writes_vector_pdf() {
+        let dir = std::env::temp_dir().join("mydrafter-pdf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plan.pdf");
+        let _ = std::fs::remove_file(&path);
+
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "extrude last 3");
+        run(&mut s, "circle 5,3,0 1.5");
+        run(&mut s, "sheet plan a3");
+        run(&mut s, "sheetview plan top 1:100");
+        run(&mut s, "sheetview plan persp 1:100");
+        let out = run(&mut s, &format!("print plan {}", path.display()));
+        assert!(out.message.contains("printed"), "{}", out.message);
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"%PDF"), "PDF header present");
+        assert!(bytes.len() > 1024, "nonempty file, got {} bytes", bytes.len());
+
+        // print is not logged: replaying a saved file must not rewrite PDFs
+        assert!(s.save_log().iter().all(|c| !matches!(c, Command::Print { .. })));
+
+        // printing before any views / a missing sheet errors cleanly
+        run(&mut s, "sheet empty");
+        let err = s
+            .run(parse(&format!("print empty {}", path.display())).unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("no views"), "{err}");
+        let err = s.run(parse("print ghost /tmp/x.pdf").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no sheet"), "{err}");
     }
 
     #[test]

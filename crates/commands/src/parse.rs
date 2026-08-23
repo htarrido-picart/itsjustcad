@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mydrafter_doc::HatchPattern;
+use mydrafter_doc::{HatchPattern, PaperSize, ViewDirection};
 
 use crate::error::ParseError;
 use crate::registry::registry;
@@ -299,6 +299,30 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let [layer] = take::<1>("show", "a layer name", &args)?;
             Ok(Command::Show { layer: layer.to_string() })
         }
+        "sheet" => {
+            let (name, paper) = match args.as_slice() {
+                [name] => (*name, PaperSize::A3),
+                [name, size] => (*name, paper_size(size)?),
+                _ => return wrong("sheet", "a name and an optional paper size", &args),
+            };
+            Ok(Command::Sheet { name: name.to_string(), paper })
+        }
+        "sheetview" => {
+            let [sheet, dir, scale] =
+                take::<3>("sheetview", "a sheet name, a direction and a scale", &args)?;
+            Ok(Command::SheetView {
+                sheet: sheet.to_string(),
+                direction: view_direction(dir)?,
+                scale: scale_denominator(scale)?,
+            })
+        }
+        "print" => {
+            let [sheet, path] = take::<2>("print", "a sheet name and an output path", &args)?;
+            Ok(Command::Print {
+                sheet: sheet.to_string(),
+                path: path.to_string(),
+            })
+        }
         "select" => {
             let (sel, rest) = selector(&args, "select")?;
             expect_empty("select", rest, &args)?;
@@ -447,6 +471,40 @@ fn color3(s: &str) -> Result<[f32; 3], ParseError> {
         (g / scale) as f32,
         (b / scale) as f32,
     ])
+}
+
+fn paper_size(s: &str) -> Result<PaperSize, ParseError> {
+    match s.to_lowercase().as_str() {
+        "a4" => Ok(PaperSize::A4),
+        "a3" => Ok(PaperSize::A3),
+        "a2" => Ok(PaperSize::A2),
+        "a1" => Ok(PaperSize::A1),
+        "a0" => Ok(PaperSize::A0),
+        _ => Err(ParseError::BadPaperSize(s.to_string())),
+    }
+}
+
+fn view_direction(s: &str) -> Result<ViewDirection, ParseError> {
+    match s.to_lowercase().as_str() {
+        "top" | "plan" => Ok(ViewDirection::Top),
+        "front" => Ok(ViewDirection::Front),
+        "right" | "side" => Ok(ViewDirection::Right),
+        "persp" | "iso" | "axo" => Ok(ViewDirection::Iso),
+        _ => Err(ParseError::BadViewDirection(s.to_string())),
+    }
+}
+
+/// Drawing scale as a denominator: "1:100", "100" or "1/50" all work.
+fn scale_denominator(s: &str) -> Result<f64, ParseError> {
+    let denom = s
+        .strip_prefix("1:")
+        .or_else(|| s.strip_prefix("1/"))
+        .unwrap_or(s);
+    denom
+        .parse::<f64>()
+        .ok()
+        .filter(|d| *d > 0.0)
+        .ok_or_else(|| ParseError::BadScale(s.to_string()))
 }
 
 /// Parse a selector from the front of `args`, returning the rest.
@@ -775,6 +833,61 @@ mod tests {
             "text 5,3 living room 0.3",
             "hatch last lines 45 0.25",
             "hatch last",
+        ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
+    }
+
+    #[test]
+    fn parse_sheet_commands() {
+        use mydrafter_doc::{PaperSize, ViewDirection};
+        assert_eq!(
+            parse("sheet plan").unwrap(),
+            Command::Sheet { name: "plan".into(), paper: PaperSize::A3 }
+        );
+        assert_eq!(
+            parse("sheet plan a1").unwrap(),
+            Command::Sheet { name: "plan".into(), paper: PaperSize::A1 }
+        );
+        assert_eq!(
+            parse("sheetview plan top 1:100").unwrap(),
+            Command::SheetView {
+                sheet: "plan".into(),
+                direction: ViewDirection::Top,
+                scale: 100.0,
+            }
+        );
+        // bare denominator and persp alias
+        assert!(matches!(
+            parse("sheetview plan persp 50").unwrap(),
+            Command::SheetView { direction: ViewDirection::Iso, scale, .. } if scale == 50.0
+        ));
+        assert!(matches!(
+            parse("sheetview plan front 1:20").unwrap(),
+            Command::SheetView { direction: ViewDirection::Front, scale, .. } if scale == 20.0
+        ));
+        assert_eq!(
+            parse("print plan /tmp/plan.pdf").unwrap(),
+            Command::Print { sheet: "plan".into(), path: "/tmp/plan.pdf".into() }
+        );
+        // errors carry hints
+        assert!(parse("sheet plan b5").unwrap_err().to_string().contains("a4"));
+        assert!(parse("sheetview plan back 100").unwrap_err().to_string().contains("top"));
+        assert!(parse("sheetview plan top 1:0").unwrap_err().to_string().contains("1:100"));
+        assert!(parse("sheet").unwrap_err().to_string().contains("name"));
+        assert!(parse("print plan").unwrap_err().to_string().contains("path"));
+    }
+
+    #[test]
+    fn sheet_command_json_roundtrip() {
+        for line in [
+            "sheet plan a1",
+            "sheetview plan top 1:100",
+            "sheetview plan persp 200",
+            "print plan /tmp/x.pdf",
         ] {
             let cmd = parse(line).unwrap();
             let json = serde_json::to_string(&cmd).unwrap();
