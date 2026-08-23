@@ -693,10 +693,17 @@ impl App {
         response: &egui::Response,
         view_proj: glam::Mat4,
     ) {
-        let (esc, enter) = ui.input(|i| {
+        // The canvas owns the keyboard while picking: typed digits build the
+        // precise-input buffer, so no text field may hold focus underneath.
+        if let Some(id) = ui.ctx().memory(|m| m.focused()) {
+            ui.ctx().memory_mut(|m| m.surrender_focus(id));
+        }
+
+        let (esc, enter, shift) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Enter),
+                i.modifiers.shift,
             )
         });
         if esc {
@@ -704,9 +711,36 @@ impl App {
             self.command_line.push_line("drawing cancelled");
             return;
         }
-        if enter && let Some(cmd) = self.draw_tool.on_enter() {
-            self.execute_line(cmd);
-            return;
+        // Typed characters feed the numeric buffer; Backspace edits it
+        // (keymap keeps delete-selection off while drawing).
+        let typed: Vec<egui::Event> = ui.input(|i| {
+            i.events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Text(_)
+                            | egui::Event::Key {
+                                key: egui::Key::Backspace,
+                                pressed: true,
+                                ..
+                            }
+                    )
+                })
+                .cloned()
+                .collect()
+        });
+        for event in typed {
+            match event {
+                egui::Event::Text(t) => {
+                    for c in t.chars() {
+                        self.draw_tool.push_input(c);
+                    }
+                }
+                _ => {
+                    self.draw_tool.pop_input();
+                }
+            }
         }
 
         // Snap resolution: nearest object point within the screen-space
@@ -714,7 +748,7 @@ impl App {
         let cursor_px = response
             .hover_pos()
             .or_else(|| response.interact_pointer_pos());
-        let snap_hit = cursor_px.and_then(|pos| {
+        let mut snap_hit = cursor_px.and_then(|pos| {
             crate::osnap::resolve(
                 &crate::osnap::candidates(&self.session.doc),
                 pos,
@@ -722,11 +756,42 @@ impl App {
                 |w| project(view_proj, rect, w),
             )
         });
-        let cursor_world = snap_hit.map(|(p, _)| p).or_else(|| {
+        let mut cursor_world = snap_hit.map(|(p, _)| p).or_else(|| {
             cursor_px
                 .and_then(|pos| ground_point(view_proj, rect, pos))
                 .map(crate::osnap::grid_snap)
         });
+        // Shift = ortho lock: 0°/90° from the last picked point overrides
+        // osnap (marker off, the constrained point is what a click commits).
+        if shift && let (Some(last), Some(c)) = (self.draw_tool.last_point(), cursor_world) {
+            cursor_world = Some(crate::precise::ortho_lock(last, c));
+            snap_hit = None;
+        }
+
+        if enter {
+            let buffer = self.draw_tool.take_input();
+            if !buffer.is_empty() {
+                // Precise input: resolve the typed point, feed it as a pick.
+                match crate::precise::resolve_input(
+                    &buffer,
+                    self.draw_tool.last_point(),
+                    cursor_world,
+                ) {
+                    Ok(world) => {
+                        if let Some(cmd) = self.draw_tool.on_click(world) {
+                            self.execute_line(cmd);
+                            return;
+                        } else if let Some(prompt) = self.draw_tool.prompt() {
+                            self.command_line.push_line(prompt);
+                        }
+                    }
+                    Err(e) => self.command_line.push_line(format!("error: {e}")),
+                }
+            } else if let Some(cmd) = self.draw_tool.on_enter() {
+                self.execute_line(cmd);
+                return;
+            }
+        }
 
         if response.clicked() && let Some(world) = cursor_world {
             if let Some(cmd) = self.draw_tool.on_click(world) {

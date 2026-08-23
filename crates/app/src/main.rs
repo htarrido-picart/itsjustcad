@@ -6,6 +6,7 @@ mod gumball;
 mod journal;
 mod keymap;
 mod osnap;
+mod precise;
 mod scene;
 
 fn main() -> eframe::Result<()> {

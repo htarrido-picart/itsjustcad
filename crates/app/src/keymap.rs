@@ -26,7 +26,10 @@ pub fn keymap(key: Key, mods: Modifiers, ctx: KeyContext<'_>) -> Option<String> 
     let cmd_shift = mods.command && mods.shift && !mods.alt;
     let bare = mods.is_none();
     let line: &str = match key {
-        Key::Delete | Key::Backspace if bare && ctx.has_selection => "delete sel",
+        // Not while drawing: Backspace edits the numeric input buffer there.
+        Key::Delete | Key::Backspace if bare && ctx.has_selection && !ctx.draw_active => {
+            "delete sel"
+        }
         Key::Z if cmd_shift => "redo",
         Key::Z if cmd => "undo",
         Key::A if cmd => "select all",
@@ -91,6 +94,10 @@ mod tests {
         assert_eq!(keymap(Key::Delete, NONE, none), None);
         // modified delete is not ours
         assert_eq!(keymap(Key::Delete, CMD, ctx()), None);
+        // while drawing, Backspace belongs to the numeric input buffer
+        let drawing = KeyContext { draw_active: true, ..ctx() };
+        assert_eq!(keymap(Key::Backspace, NONE, drawing), None);
+        assert_eq!(keymap(Key::Delete, NONE, drawing), None);
     }
 
     #[test]

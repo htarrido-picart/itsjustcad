@@ -11,8 +11,12 @@ enum Verb {
     Circle,
 }
 
+#[derive(Default)]
 pub struct DrawTool {
     state: Option<(Verb, Vec<DVec3>)>,
+    /// Typed numeric buffer for precise input ("5.2,3", "@2,3", "5"); shown
+    /// in the prompt overlay, resolved by the app layer on Enter.
+    input: String,
 }
 
 /// Millimeter rounding for emitted command strings — points arrive already
@@ -26,12 +30,6 @@ fn fmt(p: DVec3) -> String {
         format!("{},{}", num(p.x), num(p.y))
     } else {
         format!("{},{},{}", num(p.x), num(p.y), num(p.z))
-    }
-}
-
-impl Default for DrawTool {
-    fn default() -> Self {
-        Self { state: None }
     }
 }
 
@@ -50,16 +48,44 @@ impl DrawTool {
             _ => return false,
         };
         self.state = Some((verb, Vec::new()));
+        self.input.clear();
         true
     }
 
     pub fn cancel(&mut self) {
         self.state = None;
+        self.input.clear();
+    }
+
+    /// Last picked point — anchor for relative/distance/ortho input.
+    pub fn last_point(&self) -> Option<DVec3> {
+        self.state.as_ref()?.1.last().copied()
+    }
+
+    /// Feed one typed character to the numeric buffer. Returns true when
+    /// consumed (tool active and the char is numeric-input material).
+    pub fn push_input(&mut self, c: char) -> bool {
+        if self.state.is_some() && crate::precise::accepts_char(c) {
+            self.input.push(c);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Backspace: returns true when it ate a buffered char.
+    pub fn pop_input(&mut self) -> bool {
+        self.input.pop().is_some()
+    }
+
+    /// Take (and clear) the typed buffer; empty when nothing was typed.
+    pub fn take_input(&mut self) -> String {
+        std::mem::take(&mut self.input)
     }
 
     pub fn prompt(&self) -> Option<String> {
         let (verb, points) = self.state.as_ref()?;
-        Some(match (verb, points.len()) {
+        let base = match (verb, points.len()) {
             (Verb::Line, 0) => "line: pick start point (Esc cancels)".into(),
             (Verb::Line, _) => "line: pick end point".into(),
             (Verb::Rect, 0) => "rect: pick first corner (Esc cancels)".into(),
@@ -70,6 +96,11 @@ impl DrawTool {
             (Verb::Polyline, n) => format!(
                 "polyline: pick next point ({n} so far — Enter finishes, click near start closes)"
             ),
+        };
+        Some(if self.input.is_empty() {
+            base
+        } else {
+            format!("{base}  |  typed: {}_", self.input)
         })
     }
 
@@ -245,6 +276,37 @@ mod tests {
         t.on_click(DVec3::new(0.0, 0.0, 0.0));
         t.on_click(DVec3::new(3.0, 0.0, 0.0));
         assert_eq!(t.on_enter().unwrap(), "polyline 0,0 3,0");
+    }
+
+    #[test]
+    fn input_buffer_filters_edits_and_clears() {
+        let mut t = DrawTool::default();
+        assert!(!t.push_input('5'), "inactive tool consumes nothing");
+        t.try_start("line");
+        for c in "5.2,3".chars() {
+            assert!(t.push_input(c));
+        }
+        assert!(!t.push_input('x'), "letters are not numeric input");
+        assert!(t.prompt().unwrap().contains("typed: 5.2,3_"));
+        assert!(t.pop_input());
+        assert_eq!(t.take_input(), "5.2,");
+        assert!(!t.pop_input(), "buffer already empty");
+        // buffer never leaks across tool runs
+        t.push_input('7');
+        t.cancel();
+        t.try_start("rect");
+        assert_eq!(t.take_input(), "");
+    }
+
+    #[test]
+    fn last_point_tracks_picks() {
+        let mut t = DrawTool::default();
+        assert_eq!(t.last_point(), None);
+        t.try_start("polyline");
+        assert_eq!(t.last_point(), None);
+        t.on_click(DVec3::new(1.0, 2.0, 0.0));
+        t.on_click(DVec3::new(4.0, 2.0, 0.0));
+        assert_eq!(t.last_point(), Some(DVec3::new(4.0, 2.0, 0.0)));
     }
 
     #[test]
