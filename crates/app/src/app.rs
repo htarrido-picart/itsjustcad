@@ -5,6 +5,7 @@ use crate::command_line::CommandLine;
 use crate::deck_pane::DeckPane;
 use crate::draw_tool::DrawTool;
 use crate::gumball::Gumball;
+use crate::journal::{self, Journal};
 use crate::scene;
 
 pub struct App {
@@ -36,6 +37,10 @@ pub struct App {
     /// Layer color being edited in the panel; the `layercolor` command is
     /// issued once, when the mouse is released (avoids one op per drag frame).
     pending_layer_color: Option<(String, [f32; 3])>,
+    /// Crash-recovery journal mirroring the op-log; deleted on save/clean exit.
+    journal: Option<Journal>,
+    /// Doc generation of the last journal sync (skip serializing every frame).
+    journaled_generation: Option<u64>,
 }
 
 impl App {
@@ -54,9 +59,21 @@ impl App {
         let zoom = load_zoom().unwrap_or(1.3);
         cc.egui_ctx.set_zoom_factor(zoom);
 
+        let journal = Journal::open_default();
+        let mut command_line = CommandLine::default();
+        // Leftover journals mean a crashed session; offer recovery up front.
+        if let (Some(dir), Some(j)) = (journal::default_dir(), &journal) {
+            let n = journal::recoverable(&dir, j.path()).len();
+            if n > 0 {
+                command_line.push_line(format!(
+                    "{n} crash journal(s) found — type 'recover' to restore the latest"
+                ));
+            }
+        }
+
         Self {
             session: Session::default(),
-            command_line: CommandLine::default(),
+            command_line,
             deck_pane: DeckPane::default(),
             draw_tool: DrawTool::default(),
             gumball: Gumball::default(),
@@ -78,6 +95,8 @@ impl App {
             deck_script: std::env::var("MYDRAFTER_DECK_RUN").ok(),
             frame_count: 0,
             pending_layer_color: None,
+            journal,
+            journaled_generation: None,
         }
     }
 
@@ -100,6 +119,7 @@ impl App {
         match words.next() {
             Some("save") => self.save(words.next().map(Into::into)),
             Some("open") => self.open(words.next().map(Into::into)),
+            Some("recover") => self.recover(),
             Some("ze" | "zoomextents") => self.zoom_extents(),
             Some("viewports" | "vp") => {
                 match words.next() {
@@ -202,9 +222,46 @@ impl App {
         });
         let Some(path) = path else { return };
         match mydrafter_commands::io::save_file(&self.session, &path) {
-            Ok(()) => self
-                .command_line
-                .push_line(format!("saved {}", path.display())),
+            Ok(()) => {
+                // Ops are safe in the file now; drop the crash journal.
+                if let Some(j) = &mut self.journal {
+                    j.discard();
+                }
+                self.journaled_generation = Some(self.session.doc.generation);
+                self.command_line
+                    .push_line(format!("saved {}", path.display()));
+            }
+            Err(e) => self.command_line.push_line(format!("error: {e}")),
+        }
+    }
+
+    /// Replay the newest crash journal from another session into this one.
+    fn recover(&mut self) {
+        let (Some(dir), Some(own)) = (
+            journal::default_dir(),
+            self.journal.as_ref().map(|j| j.path().to_path_buf()),
+        ) else {
+            self.command_line.push_line("error: no journal directory");
+            return;
+        };
+        let Some(path) = journal::recoverable(&dir, &own).into_iter().next() else {
+            self.command_line.push_line("no crash journal to recover");
+            return;
+        };
+        match journal::load(&path) {
+            Ok(session) => {
+                self.session = session;
+                self.uploaded_generation = None;
+                // The recovered ops now live in THIS session's journal (next
+                // sync writes them); the crashed one has served its purpose.
+                let _ = std::fs::remove_file(&path);
+                self.journaled_generation = None;
+                self.command_line.push_line(format!(
+                    "recovered {} op(s) from {}",
+                    self.session.save_log().len(),
+                    path.display()
+                ));
+            }
             Err(e) => self.command_line.push_line(format!("error: {e}")),
         }
     }
@@ -817,8 +874,26 @@ impl eframe::App for App {
         }
     }
 
+    fn on_exit(&mut self) {
+        // Clean exit: nothing crashed, nothing to recover.
+        if let Some(j) = &mut self.journal {
+            j.discard();
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.run_startup_script();
+
+        // Mirror the op-log to the crash journal. One hook covers every
+        // mutation path (command line, gumball, deck, history jumps); the
+        // generation check keeps idle frames free.
+        if self.journaled_generation != Some(self.session.doc.generation) {
+            self.journaled_generation = Some(self.session.doc.generation);
+            if let Some(j) = &mut self.journal {
+                j.sync(&self.session);
+            }
+        }
+
         self.handle_dev_screenshot(ui.ctx());
 
         // Persist zoom changes from any source (buttons or Cmd+=/Cmd+-).

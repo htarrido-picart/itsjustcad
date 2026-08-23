@@ -3,6 +3,7 @@ mod command_line;
 mod deck_pane;
 mod draw_tool;
 mod gumball;
+mod journal;
 mod osnap;
 mod scene;
 
