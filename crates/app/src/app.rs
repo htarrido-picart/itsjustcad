@@ -27,6 +27,9 @@ pub struct App {
     /// startup; with MYDRAFTER_SHOT set, the shot waits for the turn to end.
     deck_script: Option<String>,
     frame_count: u64,
+    /// Layer color being edited in the panel; the `layercolor` command is
+    /// issued once, when the mouse is released (avoids one op per drag frame).
+    pending_layer_color: Option<(String, [f32; 3])>,
 }
 
 impl App {
@@ -59,6 +62,7 @@ impl App {
             startup_script: std::env::var("MYDRAFTER_RUN").ok(),
             deck_script: std::env::var("MYDRAFTER_DECK_RUN").ok(),
             frame_count: 0,
+            pending_layer_color: None,
         }
     }
 
@@ -139,6 +143,9 @@ impl App {
 
         let mut best: Option<(f64, mydrafter_doc::ObjectId)> = None;
         for obj in self.session.doc.objects() {
+            if !self.session.doc.layer_visible(&obj.layer) {
+                continue; // hidden layers are unpickable
+            }
             let bb = obj.geometry.aabb();
             if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
                 && best.is_none_or(|(bt, _)| t < bt)
@@ -288,6 +295,79 @@ impl App {
         ));
 
         self.view_toolbar(ui, rect);
+        self.layers_panel(ui, rect, theme);
+    }
+
+    /// Layers panel: visibility toggle, color swatch, current-layer switch.
+    /// Every edit goes through the command substrate so it is logged/undoable.
+    fn layers_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect, theme: scene::Theme) {
+        let mut lines: Vec<String> = Vec::new();
+        egui::Area::new(egui::Id::new("layers_panel"))
+            .fixed_pos(rect.right_top() + egui::vec2(-190.0, 8.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(170.0);
+                    egui::CollapsingHeader::new("Layers")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            let layers: Vec<(String, mydrafter_doc::LayerStyle)> = self
+                                .session
+                                .doc
+                                .layers
+                                .iter()
+                                .map(|(n, s)| (n.clone(), s.clone()))
+                                .collect();
+                            let current = self.session.doc.current_layer.clone();
+                            for (name, style) in layers {
+                                ui.horizontal(|ui| {
+                                    let mut visible = style.visible;
+                                    if ui
+                                        .checkbox(&mut visible, "")
+                                        .on_hover_text("visible")
+                                        .changed()
+                                    {
+                                        let verb = if visible { "show" } else { "hide" };
+                                        lines.push(format!("{verb} {name}"));
+                                    }
+                                    let fallback = theme.mesh();
+                                    let mut rgb = self
+                                        .pending_layer_color
+                                        .as_ref()
+                                        .filter(|(n, _)| *n == name)
+                                        .map(|(_, c)| *c)
+                                        .or_else(|| style.color.map(|c| [c[0], c[1], c[2]]))
+                                        .unwrap_or([fallback[0], fallback[1], fallback[2]]);
+                                    if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                        self.pending_layer_color = Some((name.clone(), rgb));
+                                    }
+                                    let is_current = name == current;
+                                    if ui
+                                        .selectable_label(is_current, &name)
+                                        .on_hover_text("set current layer")
+                                        .clicked()
+                                        && !is_current
+                                    {
+                                        lines.push(format!("layer {name}"));
+                                    }
+                                });
+                            }
+                        });
+                });
+            });
+        // Commit the color edit once the mouse is released — one logged op
+        // per edit instead of one per drag frame.
+        if let Some((name, c)) = self.pending_layer_color.clone()
+            && !ui.input(|i| i.pointer.any_down())
+        {
+            lines.push(format!(
+                "layercolor {name} {:.3},{:.3},{:.3}",
+                c[0], c[1], c[2]
+            ));
+            self.pending_layer_color = None;
+        }
+        for line in lines {
+            self.execute_line(line);
+        }
     }
 
     /// Interactive drawing: picks on the ground plane, ghost preview, prompt.

@@ -24,6 +24,8 @@ pub enum ParseError {
     BadPoint(String),
     #[error("'{0}' is not a selector; use 'last', 'last N', 'all', 'sel', or an object name")]
     BadSelector(String),
+    #[error("'{0}' is not a color; write r,g,b with 0-1 or 0-255 values (example: 0.8,0.2,0.2)")]
+    BadColor(String),
 }
 
 fn suggest(s: &Option<String>) -> String {

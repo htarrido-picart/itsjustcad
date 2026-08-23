@@ -160,6 +160,27 @@ pub enum Command {
         targets: Selector,
         name: String,
     },
+    // -- layers --
+    /// Create (if needed) and switch the current layer for new objects.
+    Layer {
+        name: String,
+    },
+    /// Move objects onto a layer (created if needed).
+    ToLayer {
+        targets: Selector,
+        layer: String,
+    },
+    /// Set a layer's display color (rgb 0..1).
+    LayerColor {
+        layer: String,
+        color: [f32; 3],
+    },
+    Hide {
+        layer: String,
+    },
+    Show {
+        layer: String,
+    },
     Select {
         targets: Selector,
     },

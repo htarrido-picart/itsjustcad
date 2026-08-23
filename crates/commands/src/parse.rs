@@ -218,6 +218,33 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 name: name.to_string(),
             })
         }
+        "layer" => {
+            let [name] = take::<1>("layer", "a layer name", &args)?;
+            Ok(Command::Layer { name: name.to_string() })
+        }
+        "tolayer" => {
+            let (sel, rest) = selector(&args, "tolayer")?;
+            let [layer] = take::<1>("tolayer", "a layer name after the selector", rest)?;
+            Ok(Command::ToLayer {
+                targets: sel,
+                layer: layer.to_string(),
+            })
+        }
+        "layercolor" => {
+            let [layer, c] = take::<2>("layercolor", "a layer name and an r,g,b color", &args)?;
+            Ok(Command::LayerColor {
+                layer: layer.to_string(),
+                color: color3(c)?,
+            })
+        }
+        "hide" => {
+            let [layer] = take::<1>("hide", "a layer name", &args)?;
+            Ok(Command::Hide { layer: layer.to_string() })
+        }
+        "show" => {
+            let [layer] = take::<1>("show", "a layer name", &args)?;
+            Ok(Command::Show { layer: layer.to_string() })
+        }
         "select" => {
             let (sel, rest) = selector(&args, "select")?;
             expect_empty("select", rest, &args)?;
@@ -339,6 +366,28 @@ pub fn point(s: &str) -> Result<DVec3, ParseError> {
         )),
         _ => Err(bad()),
     }
+}
+
+/// `r,g,b` color; values above 1 are read as a 0-255 byte triple.
+fn color3(s: &str) -> Result<[f32; 3], ParseError> {
+    let bad = || ParseError::BadColor(s.to_string());
+    let parts: Vec<f64> = s
+        .split(',')
+        .map(|p| p.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| bad())?;
+    let [r, g, b] = parts.as_slice() else {
+        return Err(bad());
+    };
+    if [r, g, b].iter().any(|&&v| !(0.0..=255.0).contains(&v)) {
+        return Err(bad());
+    }
+    let scale = if *r > 1.0 || *g > 1.0 || *b > 1.0 { 255.0 } else { 1.0 };
+    Ok([
+        (r / scale) as f32,
+        (g / scale) as f32,
+        (b / scale) as f32,
+    ])
 }
 
 /// Parse a selector from the front of `args`, returning the rest.
@@ -539,6 +588,56 @@ mod tests {
         // missing tool selector → usage in the error
         let err = parse("difference last").unwrap_err();
         assert!(err.to_string().contains("selector"), "{err}");
+    }
+
+    #[test]
+    fn parse_layer_commands() {
+        assert_eq!(
+            parse("layer walls").unwrap(),
+            Command::Layer { name: "walls".into() }
+        );
+        assert!(matches!(
+            parse("tolayer last 2 walls").unwrap(),
+            Command::ToLayer { targets: Selector::Last { n: 2 }, ref layer } if layer == "walls"
+        ));
+        assert!(matches!(
+            parse("tolayer slab structure").unwrap(),
+            Command::ToLayer { targets: Selector::Named { .. }, ref layer } if layer == "structure"
+        ));
+        assert_eq!(
+            parse("layercolor walls 0.8,0.2,0.1").unwrap(),
+            Command::LayerColor { layer: "walls".into(), color: [0.8, 0.2, 0.1] }
+        );
+        // byte triples scale down
+        let Command::LayerColor { color, .. } = parse("layercolor walls 255,0,128").unwrap()
+        else {
+            panic!("expected layercolor")
+        };
+        assert_eq!(color, [1.0, 0.0, 128.0 / 255.0]);
+        assert_eq!(parse("hide walls").unwrap(), Command::Hide { layer: "walls".into() });
+        assert_eq!(parse("show walls").unwrap(), Command::Show { layer: "walls".into() });
+        // errors carry usage / color hints
+        assert!(parse("layer").unwrap_err().to_string().contains("layer name"));
+        let err = parse("layercolor walls red").unwrap_err();
+        assert!(err.to_string().contains("r,g,b"), "{err}");
+        assert!(parse("layercolor walls 300,0,0").is_err());
+        assert!(parse("layercolor walls 1,2").is_err());
+    }
+
+    #[test]
+    fn layer_command_json_roundtrip() {
+        for line in [
+            "layer walls",
+            "tolayer last walls",
+            "layercolor walls 0.5,0.5,0.5",
+            "hide walls",
+            "show walls",
+        ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
     }
 
     #[test]

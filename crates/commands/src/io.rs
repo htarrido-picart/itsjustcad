@@ -75,6 +75,44 @@ mod tests {
     }
 
     #[test]
+    fn pre_layer_file_loads_onto_default_layer() {
+        // Hand-written v1 file from before layers existed: no layer ops,
+        // no layer fields anywhere.
+        let json = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "box",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "size": [2.0, 2.0, 2.0]},
+                {"cmd": "move", "targets": {"sel": "last", "n": 1},
+                 "delta": [1.0, 0.0, 0.0]}
+            ]
+        }"#;
+        let s = from_json(json).unwrap();
+        assert_eq!(s.doc.len(), 1);
+        assert_eq!(s.doc.current_layer, mydrafter_doc::DEFAULT_LAYER);
+        assert!(s.doc.objects().all(|o| o.layer == mydrafter_doc::DEFAULT_LAYER));
+        assert_eq!(s.doc.layers.len(), 1);
+    }
+
+    #[test]
+    fn save_load_preserves_layers() {
+        let mut s = Session::default();
+        for line in [
+            "layer walls",
+            "layercolor walls 0.9,0.1,0.1",
+            "box 0,0,0 1,1,1",
+            "hide walls",
+        ] {
+            s.run(parse(line).unwrap()).unwrap();
+        }
+        let loaded = from_json(&to_json(&s)).unwrap();
+        assert_eq!(loaded.doc.layers, s.doc.layers);
+        assert_eq!(loaded.doc.current_layer, "walls");
+        assert_eq!(to_json(&loaded), to_json(&s));
+    }
+
+    #[test]
     fn rejects_future_version() {
         let Err(err) = from_json(r#"{"mydrafter": 99, "ops": []}"#) else {
             panic!("expected version error");

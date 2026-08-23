@@ -117,7 +117,12 @@ mod tests {
 
     fn doc_with(geometry: Geometry) -> Document {
         let mut doc = Document::default();
-        doc.insert(SceneObject { id: ObjectId::new(), name: None, geometry });
+        doc.insert(SceneObject {
+            id: ObjectId::new(),
+            name: None,
+            layer: mydrafter_doc::DEFAULT_LAYER.to_string(),
+            geometry,
+        });
         doc
     }
 

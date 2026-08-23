@@ -1,7 +1,7 @@
 use glam::DVec3;
 use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
-use mydrafter_doc::{Document, Geometry, ObjectId, SceneObject};
+use mydrafter_doc::{Document, Geometry, LayerStyle, ObjectId, SceneObject};
 
 use crate::error::ExecError;
 use crate::{Command, MirrorPlane, Selector};
@@ -36,6 +36,19 @@ enum Inverse {
     /// Transforms: write back pre-transform geometry snapshots. Exact —
     /// inverse matrices drift and cannot un-tessellate an arc.
     SetGeometry(Vec<(ObjectId, Geometry)>),
+    /// `layer`: restore the previous current layer, dropping the layer this
+    /// command created (if any).
+    LayerCurrent {
+        prev: String,
+        created: Option<String>,
+    },
+    /// `tolayer`: put objects back on their previous layers.
+    ObjectLayers {
+        prev: Vec<(ObjectId, String)>,
+        created: Option<String>,
+    },
+    /// `layercolor`/`hide`/`show`: restore the previous layer style.
+    LayerStyle { layer: String, prev: LayerStyle },
 }
 
 /// Owns the document plus its op-log; the single mutation path for both the
@@ -105,6 +118,31 @@ impl Session {
                         obj.geometry = geometry;
                     }
                 }
+            }
+            Inverse::LayerCurrent { prev, created } => {
+                if let Some(name) = created {
+                    self.doc.layers.remove(name);
+                }
+                self.doc.current_layer = prev.clone();
+                self.doc.generation += 1;
+            }
+            Inverse::ObjectLayers { prev, created } => {
+                let created = created.clone();
+                for (id, layer) in prev.clone() {
+                    if let Some(obj) = self.doc.get_mut(id) {
+                        obj.layer = layer;
+                    }
+                }
+                if let Some(name) = created {
+                    self.doc.layers.remove(&name);
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::LayerStyle { layer, prev } => {
+                if let Some(style) = self.doc.layers.get_mut(layer) {
+                    *style = prev.clone();
+                }
+                self.doc.generation += 1;
             }
             Inverse::Replace { created, consumed } => {
                 let created = created.clone();
@@ -178,6 +216,7 @@ fn insert_curve(
     doc.insert(SceneObject {
         id,
         name: None,
+        layer: doc.current_layer.clone(),
         geometry: Geometry::Curve(curve),
     });
     let outcome = ApplyOutcome {
@@ -262,6 +301,7 @@ fn replace_with_result(
     input_ids: &[ObjectId],
     result: kernel_mesh::Mesh,
     name: Option<String>,
+    layer: String,
     what: &str,
 ) -> Result<(ObjectId, Inverse, String), ExecError> {
     if result.faces().is_empty() {
@@ -288,6 +328,7 @@ fn replace_with_result(
     doc.insert(SceneObject {
         id,
         name,
+        layer,
         geometry: Geometry::Mesh(result),
     });
     Ok((
@@ -298,6 +339,21 @@ fn replace_with_result(
             input_ids.len()
         ),
     ))
+}
+
+/// Look up a layer for style edits; missing layers get an actionable error.
+fn layer_style_mut<'a>(
+    doc: &'a mut Document,
+    layer: &str,
+) -> Result<&'a mut LayerStyle, ExecError> {
+    if !doc.layers.contains_key(layer) {
+        let known: Vec<&str> = doc.layers.keys().map(String::as_str).collect();
+        return Err(ExecError::Invalid(format!(
+            "no layer '{layer}' (layers: {}; create one with: layer {layer})",
+            known.join(", ")
+        )));
+    }
+    Ok(doc.layers.get_mut(layer).expect("checked above"))
 }
 
 /// Apply a (non-undo) command. Returns the op with ids filled for the log.
@@ -316,6 +372,7 @@ fn apply_forward(
             doc.insert(SceneObject {
                 id,
                 name: None,
+                layer: doc.current_layer.clone(),
                 geometry: Geometry::Mesh(kernel_mesh::make_box(corner, size)),
             });
             Ok((
@@ -351,6 +408,7 @@ fn apply_forward(
             doc.insert(SceneObject {
                 id,
                 name: None,
+                layer: doc.current_layer.clone(),
                 geometry: Geometry::Mesh(extrude_profile(&profile2d, base_z, height)),
             });
             Ok((
@@ -494,8 +552,10 @@ fn apply_forward(
             }
             let meshes = boolean_inputs(doc, &ids)?;
             let result = fold_csg(meshes, kernel_mesh::csg_union);
+            // The result inherits the first input's layer.
+            let layer = doc.get(ids[0]).expect("resolved").layer.clone();
             let (id, inverse, message) =
-                replace_with_result(doc, id, &ids, result, None, "union")?;
+                replace_with_result(doc, id, &ids, result, None, layer, "union")?;
             Ok((
                 Command::Union { id: Some(id), targets },
                 inverse,
@@ -525,11 +585,13 @@ fn apply_forward(
             }
             let tool = fold_csg(iter.collect(), kernel_mesh::csg_union);
             let result = kernel_mesh::csg_difference(&base, &tool);
-            // The result keeps the target's name — natural for the LLM
-            // ("tower" with a hole is still "tower").
-            let name = doc.get(target_ids[0]).expect("resolved").name.clone();
+            // The result keeps the target's name and layer — natural for the
+            // LLM ("tower" with a hole is still "tower").
+            let target_obj = doc.get(target_ids[0]).expect("resolved");
+            let name = target_obj.name.clone();
+            let layer = target_obj.layer.clone();
             let (id, inverse, message) =
-                replace_with_result(doc, id, &all_ids, result, name, "difference")?;
+                replace_with_result(doc, id, &all_ids, result, name, layer, "difference")?;
             Ok((
                 Command::Difference { id: Some(id), target, tools },
                 inverse,
@@ -545,8 +607,9 @@ fn apply_forward(
             }
             let meshes = boolean_inputs(doc, &ids)?;
             let result = fold_csg(meshes, kernel_mesh::csg_intersection);
+            let layer = doc.get(ids[0]).expect("resolved").layer.clone();
             let (id, inverse, message) =
-                replace_with_result(doc, id, &ids, result, None, "intersection")?;
+                replace_with_result(doc, id, &ids, result, None, layer, "intersection")?;
             Ok((
                 Command::Intersect { id: Some(id), targets },
                 inverse,
@@ -670,6 +733,7 @@ fn apply_forward(
             doc.insert(SceneObject {
                 id,
                 name: None,
+                layer: doc.current_layer.clone(),
                 geometry: Geometry::Curve(offset),
             });
             Ok((
@@ -741,6 +805,102 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Layer { name } => {
+            let prev = doc.current_layer.clone();
+            let created = !doc.layers.contains_key(&name);
+            if created {
+                doc.layers.insert(name.clone(), LayerStyle::default());
+            }
+            doc.current_layer = name.clone();
+            doc.generation += 1;
+            Ok((
+                Command::Layer { name: name.clone() },
+                Inverse::LayerCurrent {
+                    prev,
+                    created: created.then(|| name.clone()),
+                },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "current layer: '{name}'{}",
+                        if created { " (created)" } else { "" }
+                    ),
+                },
+            ))
+        }
+        Command::ToLayer { targets, layer } => {
+            let ids = resolve(doc, &targets)?;
+            let created = !doc.layers.contains_key(&layer);
+            if created {
+                doc.layers.insert(layer.clone(), LayerStyle::default());
+            }
+            let mut prev = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let obj = doc.get_mut(*id).expect("resolved");
+                prev.push((*id, obj.layer.clone()));
+                obj.layer = layer.clone();
+            }
+            Ok((
+                Command::ToLayer { targets, layer: layer.clone() },
+                Inverse::ObjectLayers {
+                    prev,
+                    created: created.then(|| layer.clone()),
+                },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "moved {} object(s) to layer '{layer}'{}",
+                        ids.len(),
+                        if created { " (created)" } else { "" }
+                    ),
+                },
+            ))
+        }
+        Command::LayerColor { layer, color } => {
+            let style = layer_style_mut(doc, &layer)?;
+            let prev = style.clone();
+            style.color = Some([color[0], color[1], color[2], 1.0]);
+            doc.generation += 1;
+            Ok((
+                Command::LayerColor { layer: layer.clone(), color },
+                Inverse::LayerStyle { layer: layer.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "layer '{layer}' color set to {:.2},{:.2},{:.2}",
+                        color[0], color[1], color[2]
+                    ),
+                },
+            ))
+        }
+        Command::Hide { layer } => {
+            let style = layer_style_mut(doc, &layer)?;
+            let prev = style.clone();
+            style.visible = false;
+            doc.generation += 1;
+            Ok((
+                Command::Hide { layer: layer.clone() },
+                Inverse::LayerStyle { layer: layer.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("layer '{layer}' hidden"),
+                },
+            ))
+        }
+        Command::Show { layer } => {
+            let style = layer_style_mut(doc, &layer)?;
+            let prev = style.clone();
+            style.visible = true;
+            doc.generation += 1;
+            Ok((
+                Command::Show { layer: layer.clone() },
+                Inverse::LayerStyle { layer: layer.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("layer '{layer}' shown"),
+                },
+            ))
+        }
         Command::Select { targets } => {
             let ids = resolve(doc, &targets)?;
             doc.selection = ids.iter().copied().collect();
@@ -792,6 +952,11 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Copy { .. } => "copy",
         Command::Delete { .. } => "delete",
         Command::Name { .. } => "name",
+        Command::Layer { .. } => "layer",
+        Command::ToLayer { .. } => "tolayer",
+        Command::LayerColor { .. } => "layercolor",
+        Command::Hide { .. } => "hide",
+        Command::Show { .. } => "show",
         Command::Select { .. } => "select",
         Command::SelectNone => "selectnone",
         Command::Undo => "undo",
@@ -1090,6 +1255,113 @@ mod tests {
         let a: Vec<_> = s.doc.objects().collect();
         let b: Vec<_> = replayed.doc.objects().collect();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn layer_switch_creates_and_assigns_new_objects() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        assert_eq!(s.doc.objects().next().unwrap().layer, "default");
+
+        let out = run(&mut s, "layer walls");
+        assert!(out.message.contains("created"), "{}", out.message);
+        assert_eq!(s.doc.current_layer, "walls");
+        run(&mut s, "box 5,0,0 1,1,1");
+        let layers: Vec<_> = s.doc.objects().map(|o| o.layer.clone()).collect();
+        assert_eq!(layers, ["default", "walls"]);
+
+        run(&mut s, "undo"); // un-create second box
+        run(&mut s, "undo"); // un-switch: layer removed, current back to default
+        assert_eq!(s.doc.current_layer, "default");
+        assert!(!s.doc.layers.contains_key("walls"));
+        run(&mut s, "redo");
+        assert_eq!(s.doc.current_layer, "walls");
+        assert!(s.doc.layers.contains_key("walls"));
+    }
+
+    #[test]
+    fn tolayer_moves_objects_and_undoes() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "circle 5,0,0 1");
+        run(&mut s, "tolayer last 2 structure");
+        assert!(s.doc.layers.contains_key("structure"));
+        assert!(s.doc.objects().all(|o| o.layer == "structure"));
+        assert_eq!(s.doc.current_layer, "default", "tolayer does not switch");
+
+        run(&mut s, "undo");
+        assert!(s.doc.objects().all(|o| o.layer == "default"));
+        assert!(!s.doc.layers.contains_key("structure"), "created layer dropped");
+        run(&mut s, "redo");
+        assert!(s.doc.objects().all(|o| o.layer == "structure"));
+    }
+
+    #[test]
+    fn layercolor_hide_show_undo() {
+        let mut s = Session::default();
+        run(&mut s, "layer walls");
+        run(&mut s, "layercolor walls 0.8,0.2,0.1");
+        let style = &s.doc.layers["walls"];
+        assert_eq!(style.color, Some([0.8, 0.2, 0.1, 1.0]));
+        assert!(style.visible);
+
+        run(&mut s, "hide walls");
+        assert!(!s.doc.layers["walls"].visible);
+        run(&mut s, "show walls");
+        assert!(s.doc.layers["walls"].visible);
+
+        run(&mut s, "undo"); // un-show
+        assert!(!s.doc.layers["walls"].visible);
+        run(&mut s, "undo"); // un-hide
+        assert!(s.doc.layers["walls"].visible);
+        run(&mut s, "undo"); // un-color
+        assert_eq!(s.doc.layers["walls"].color, None);
+    }
+
+    #[test]
+    fn layer_style_commands_require_existing_layer() {
+        let mut s = Session::default();
+        for line in ["layercolor ghost 1,0,0", "hide ghost", "show ghost"] {
+            let err = s.run(parse(line).unwrap()).unwrap_err();
+            assert!(err.to_string().contains("no layer 'ghost'"), "{line}: {err}");
+            assert!(err.to_string().contains("layer ghost"), "hint present: {err}");
+        }
+    }
+
+    #[test]
+    fn boolean_result_keeps_target_layer() {
+        let mut s = Session::default();
+        run(&mut s, "layer structure");
+        run(&mut s, "box 0,0,0 10,10,3");
+        run(&mut s, "layer default");
+        run(&mut s, "box 3,3,-1 4,4,5");
+        run(&mut s, "difference last 2 last");
+        assert_eq!(s.doc.objects().next().unwrap().layer, "structure");
+    }
+
+    #[test]
+    fn layer_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "layer walls");
+        run(&mut s, "layercolor walls 0.2,0.6,0.9");
+        run(&mut s, "box 5,0,0 1,1,1");
+        run(&mut s, "tolayer last 2 slab");
+        run(&mut s, "hide slab");
+        run(&mut s, "show slab");
+        run(&mut s, "hide walls");
+
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+        assert_eq!(s.doc.layers, replayed.doc.layers);
+        assert_eq!(s.doc.current_layer, replayed.doc.current_layer);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
     }
 
     #[test]

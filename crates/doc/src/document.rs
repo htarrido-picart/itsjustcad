@@ -2,20 +2,43 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_mesh::Aabb;
 
-use crate::{ObjectId, SceneObject};
+use crate::{LayerStyle, ObjectId, SceneObject, DEFAULT_LAYER};
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Document {
     objects: BTreeMap<ObjectId, SceneObject>,
     /// Creation order of live objects; drives `last N` selectors.
     creation_order: Vec<ObjectId>,
     pub selection: BTreeSet<ObjectId>,
+    /// Layer table; always contains at least `DEFAULT_LAYER`. Mutators must
+    /// bump `generation` themselves (exec does).
+    pub layers: BTreeMap<String, LayerStyle>,
+    /// Layer newly created objects are placed on.
+    pub current_layer: String,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
 
+impl Default for Document {
+    fn default() -> Self {
+        Self {
+            objects: BTreeMap::new(),
+            creation_order: Vec::new(),
+            selection: BTreeSet::new(),
+            layers: BTreeMap::from([(DEFAULT_LAYER.to_string(), LayerStyle::default())]),
+            current_layer: DEFAULT_LAYER.to_string(),
+            generation: 0,
+        }
+    }
+}
+
 impl Document {
+    /// Visibility of the layer an object sits on (unknown layers are visible).
+    pub fn layer_visible(&self, layer: &str) -> bool {
+        self.layers.get(layer).is_none_or(|l| l.visible)
+    }
+
     pub fn objects(&self) -> impl Iterator<Item = &SceneObject> {
         // Iterate in creation order so rendering and digests are stable.
         self.creation_order
@@ -117,8 +140,40 @@ mod tests {
         SceneObject {
             id: ObjectId::new(),
             name: name.map(str::to_string),
+            layer: DEFAULT_LAYER.to_string(),
             geometry: Geometry::Mesh(mesh),
         }
+    }
+
+    #[test]
+    fn default_document_has_default_layer() {
+        let doc = Document::default();
+        assert_eq!(doc.current_layer, DEFAULT_LAYER);
+        let style = doc.layers.get(DEFAULT_LAYER).expect("default layer exists");
+        assert_eq!(*style, LayerStyle::default());
+        assert!(style.visible);
+        assert!(style.color.is_none());
+        assert!(doc.layer_visible(DEFAULT_LAYER));
+        assert!(doc.layer_visible("never-created"), "unknown layers read visible");
+    }
+
+    #[test]
+    fn scene_object_json_without_layer_field_loads() {
+        // Pre-layer save files serialize objects without a "layer" key.
+        let obj = obj_at(Some("a"), DVec3::ZERO);
+        let mut v: serde_json::Value = serde_json::to_value(&obj).unwrap();
+        v.as_object_mut().unwrap().remove("layer");
+        let back: SceneObject = serde_json::from_value(v).unwrap();
+        assert_eq!(back.layer, DEFAULT_LAYER);
+        assert_eq!(back, obj);
+    }
+
+    #[test]
+    fn layer_style_json_defaults() {
+        let style: LayerStyle = serde_json::from_str("{}").unwrap();
+        assert_eq!(style, LayerStyle::default());
+        let hidden: LayerStyle = serde_json::from_str(r#"{"visible": false}"#).unwrap();
+        assert!(!hidden.visible);
     }
 
     #[test]

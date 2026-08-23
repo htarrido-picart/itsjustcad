@@ -66,9 +66,39 @@ impl Geometry {
     }
 }
 
+/// Name of the layer every document starts with; objects land here unless the
+/// current layer was switched.
+pub const DEFAULT_LAYER: &str = "default";
+
+fn default_layer() -> String {
+    DEFAULT_LAYER.to_string()
+}
+
+fn default_visible() -> bool {
+    true
+}
+
+/// Per-layer display style. `color: None` means "use the theme default".
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LayerStyle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 4]>,
+    #[serde(default = "default_visible")]
+    pub visible: bool,
+}
+
+impl Default for LayerStyle {
+    fn default() -> Self {
+        Self { color: None, visible: true }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SceneObject {
     pub id: ObjectId,
     pub name: Option<String>,
+    /// Serde default keeps pre-layer JSON loading.
+    #[serde(default = "default_layer")]
+    pub layer: String,
     pub geometry: Geometry,
 }

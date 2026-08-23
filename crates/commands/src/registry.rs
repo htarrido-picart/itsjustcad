@@ -114,6 +114,31 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Name objects for later reference. Example: name last tower-a",
         },
         CommandSpec {
+            name: "layer",
+            usage: "layer <name>",
+            summary: "Create (if needed) and switch the current layer; new objects land on it. Example: layer walls",
+        },
+        CommandSpec {
+            name: "tolayer",
+            usage: "tolayer <selector> <name>",
+            summary: "Move objects onto a layer (created if needed). Example: tolayer last 2 structure",
+        },
+        CommandSpec {
+            name: "layercolor",
+            usage: "layercolor <layer> <r,g,b>",
+            summary: "Set a layer's display color, 0-1 or 0-255 values. Example: layercolor walls 0.8,0.2,0.1",
+        },
+        CommandSpec {
+            name: "hide",
+            usage: "hide <layer>",
+            summary: "Hide a layer (objects stay in the model, invisible). Example: hide walls",
+        },
+        CommandSpec {
+            name: "show",
+            usage: "show <layer>",
+            summary: "Show a hidden layer. Example: show walls",
+        },
+        CommandSpec {
             name: "select",
             usage: "select <selector>",
             summary: "Set the selection. Example: select all",
