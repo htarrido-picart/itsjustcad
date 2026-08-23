@@ -1,4 +1,5 @@
 mod app;
+mod boxsel;
 mod command_line;
 mod deck_pane;
 mod draw_tool;

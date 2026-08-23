@@ -42,6 +42,8 @@ pub struct App {
     last_line: Option<String>,
     /// Cmd+C pressed with a selection; Cmd+V then runs `copy sel 1,1,0`.
     clipboard_armed: bool,
+    /// In-progress drag-box selection: anchor position of the drag.
+    box_drag: Option<egui::Pos2>,
     /// Crash-recovery journal mirroring the op-log; deleted on save/clean exit.
     journal: Option<Journal>,
     /// Doc generation of the last journal sync (skip serializing every frame).
@@ -102,6 +104,7 @@ impl App {
             pending_layer_color: None,
             last_line: None,
             clipboard_armed: false,
+            box_drag: None,
             journal,
             journaled_generation: None,
         }
@@ -238,6 +241,44 @@ impl App {
             }
         }
         doc.generation += 1; // recolor selection
+    }
+
+    /// Apply a finished drag-box: project visible object AABBs to screen
+    /// rects, run the pure window/crossing test, update the selection.
+    fn box_select(
+        &mut self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        drag: egui::Rect,
+        mode: crate::boxsel::BoxMode,
+        additive: bool,
+    ) {
+        let items: Vec<(mydrafter_doc::ObjectId, egui::Rect)> = self
+            .session
+            .doc
+            .objects()
+            .filter(|obj| self.session.doc.layer_visible(&obj.layer))
+            .filter_map(|obj| {
+                let bb = obj.geometry.aabb();
+                Some((obj.id, projected_rect(view_proj, rect, bb.min, bb.max)?))
+            })
+            .collect();
+        let ids = crate::boxsel::box_select(&items, drag, mode);
+        let doc = &mut self.session.doc;
+        if !additive {
+            doc.selection.clear();
+        }
+        let n = ids.len();
+        for id in ids {
+            doc.selection.insert(id);
+        }
+        doc.generation += 1; // recolor selection
+        let kind = match mode {
+            crate::boxsel::BoxMode::Window => "window",
+            crate::boxsel::BoxMode::Crossing => "crossing",
+        };
+        self.command_line
+            .push_line(format!("{kind} select: {n} object(s)"));
     }
 
     fn save(&mut self, path: Option<std::path::PathBuf>) {
@@ -429,6 +470,30 @@ impl App {
                     let additive = ui.input(|i| i.modifiers.shift);
                     self.pick(view_proj, rect, pos, additive);
                 }
+                // Drag-box selection (no tool, gumball idle): left→right is a
+                // window (solid box, fully-inside only), right→left a crossing
+                // (dashed box, touch counts). Shift adds to the selection.
+                if !consumed
+                    && pane == self.active_pane
+                    && response.drag_started_by(egui::PointerButton::Primary)
+                    && let Some(pos) = response.interact_pointer_pos()
+                {
+                    self.box_drag = Some(pos);
+                }
+                if pane == self.active_pane
+                    && let Some(start) = self.box_drag
+                    && let Some(pos) = response.interact_pointer_pos()
+                {
+                    let mode = crate::boxsel::mode(start, pos);
+                    let drag_rect = egui::Rect::from_two_pos(start, pos);
+                    draw_rubber_box(&ui.painter_at(rect), drag_rect, mode, ui.visuals());
+                    if response.drag_stopped_by(egui::PointerButton::Primary) {
+                        self.box_drag = None;
+                        let additive = ui.input(|i| i.modifiers.shift);
+                        self.box_select(view_proj, rect, drag_rect, mode, additive);
+                    }
+                    ui.ctx().request_repaint(); // live rubber box
+                }
             }
 
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
@@ -459,6 +524,12 @@ impl App {
                     egui::StrokeKind::Inside,
                 );
             }
+        }
+
+        // Safety net: a drag that ends without a pointer position (or in
+        // another pane) must not leave a stale rubber box behind.
+        if self.box_drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            self.box_drag = None;
         }
 
         self.view_toolbar(ui, full);
@@ -946,6 +1017,57 @@ pub(crate) fn project(view_proj: glam::Mat4, rect: egui::Rect, world: glam::DVec
         rect.left() + (ndc.x + 1.0) * 0.5 * rect.width(),
         rect.top() + (1.0 - ndc.y) * 0.5 * rect.height(),
     ))
+}
+
+/// World AABB -> covering screen rect; None when any corner sits behind the
+/// camera (the object is then skipped rather than mis-boxed).
+fn projected_rect(
+    view_proj: glam::Mat4,
+    rect: egui::Rect,
+    min: glam::DVec3,
+    max: glam::DVec3,
+) -> Option<egui::Rect> {
+    let mut out: Option<egui::Rect> = None;
+    for i in 0..8 {
+        let corner = glam::DVec3::new(
+            if i & 1 == 0 { min.x } else { max.x },
+            if i & 2 == 0 { min.y } else { max.y },
+            if i & 4 == 0 { min.z } else { max.z },
+        );
+        let p = project(view_proj, rect, corner)?;
+        out = Some(match out {
+            Some(r) => r.union(egui::Rect::from_min_max(p, p)),
+            None => egui::Rect::from_min_max(p, p),
+        });
+    }
+    out
+}
+
+/// Rubber box: solid stroke for a window drag, dashed for a crossing drag.
+fn draw_rubber_box(
+    painter: &egui::Painter,
+    drag: egui::Rect,
+    mode: crate::boxsel::BoxMode,
+    visuals: &egui::Visuals,
+) {
+    let stroke = egui::Stroke::new(1.0, visuals.selection.stroke.color);
+    match mode {
+        crate::boxsel::BoxMode::Window => {
+            painter.rect_stroke(drag, 0.0, stroke, egui::StrokeKind::Middle);
+        }
+        crate::boxsel::BoxMode::Crossing => {
+            let corners = [
+                drag.left_top(),
+                drag.right_top(),
+                drag.right_bottom(),
+                drag.left_bottom(),
+                drag.left_top(),
+            ];
+            for pair in corners.windows(2) {
+                painter.extend(egui::Shape::dashed_line(pair, stroke, 4.0, 4.0));
+            }
+        }
+    }
 }
 
 fn ray_aabb(origin: glam::DVec3, dir: glam::DVec3, min: glam::DVec3, max: glam::DVec3) -> Option<f64> {

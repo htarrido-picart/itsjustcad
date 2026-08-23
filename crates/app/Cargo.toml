@@ -29,3 +29,6 @@ serde.workspace = true
 serde_json.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 egui_commonmark = "0.24"
+
+[dev-dependencies]
+uuid.workspace = true
