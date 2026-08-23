@@ -4,6 +4,7 @@ mod deck_pane;
 mod draw_tool;
 mod gumball;
 mod journal;
+mod keymap;
 mod osnap;
 mod scene;
 

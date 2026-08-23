@@ -6,6 +6,7 @@ use crate::deck_pane::DeckPane;
 use crate::draw_tool::DrawTool;
 use crate::gumball::Gumball;
 use crate::journal::{self, Journal};
+use crate::keymap;
 use crate::scene;
 
 pub struct App {
@@ -37,6 +38,10 @@ pub struct App {
     /// Layer color being edited in the panel; the `layercolor` command is
     /// issued once, when the mouse is released (avoids one op per drag frame).
     pending_layer_color: Option<(String, [f32; 3])>,
+    /// Last executed command line; Enter/Space on the canvas repeats it.
+    last_line: Option<String>,
+    /// Cmd+C pressed with a selection; Cmd+V then runs `copy sel 1,1,0`.
+    clipboard_armed: bool,
     /// Crash-recovery journal mirroring the op-log; deleted on save/clean exit.
     journal: Option<Journal>,
     /// Doc generation of the last journal sync (skip serializing every frame).
@@ -95,6 +100,8 @@ impl App {
             deck_script: std::env::var("MYDRAFTER_DECK_RUN").ok(),
             frame_count: 0,
             pending_layer_color: None,
+            last_line: None,
+            clipboard_armed: false,
             journal,
             journaled_generation: None,
         }
@@ -115,9 +122,29 @@ impl App {
     /// App-level verbs (save/open, camera) wrap the command substrate.
     fn execute_line(&mut self, line: String) {
         let line = line.trim();
+        if !line.is_empty() {
+            self.last_line = Some(line.to_string()); // Enter/Space repeat
+        }
         let mut words = line.split_whitespace();
         match words.next() {
             Some("save") => self.save(words.next().map(Into::into)),
+            Some("copyselection") => {
+                let n = self.session.doc.selection.len();
+                if n == 0 {
+                    self.command_line.push_line("nothing selected to copy");
+                } else {
+                    self.clipboard_armed = true;
+                    self.command_line
+                        .push_line(format!("copied {n} object(s) — Cmd+V pastes with offset"));
+                }
+            }
+            Some("pasteselection") => {
+                if self.clipboard_armed {
+                    self.command_line.execute(&mut self.session, "copy sel 1,1,0");
+                } else {
+                    self.command_line.push_line("nothing to paste");
+                }
+            }
             Some("open") => self.open(words.next().map(Into::into)),
             Some("recover") => self.recover(),
             Some("ze" | "zoomextents") => self.zoom_extents(),
@@ -903,17 +930,46 @@ impl eframe::App for App {
             save_zoom(zoom);
         }
 
-        let (save_key, open_key) = ui.input_mut(|i| {
-            (
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::O),
-            )
-        });
-        if save_key {
-            self.save(None);
-        }
+        let open_key =
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O));
         if open_key {
             self.open(None);
+        }
+
+        // Canvas shortcuts: pure keymap resolves each key press to a command
+        // line; nothing fires while a text field owns the keyboard.
+        let typing = ui.ctx().memory(|m| m.focused().is_some());
+        let pressed: Vec<(egui::Key, egui::Modifiers)> = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } => Some((*key, *modifiers)),
+                    _ => None,
+                })
+                .collect()
+        });
+        for (key, mods) in pressed {
+            // Context is rebuilt per key: an earlier press this frame may have
+            // started a tool or changed the selection.
+            let line = keymap::keymap(
+                key,
+                mods,
+                keymap::KeyContext {
+                    typing,
+                    draw_active: self.draw_tool.active(),
+                    has_selection: !self.session.doc.selection.is_empty(),
+                    last_command: self.last_line.as_deref(),
+                },
+            );
+            if let Some(line) = line {
+                self.execute_line(line);
+            }
         }
 
         egui::Panel::bottom("command_line")
