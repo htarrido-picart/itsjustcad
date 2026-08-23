@@ -328,6 +328,26 @@ pub enum Command {
     Units {
         units: Units,
     },
+    // -- underlay (raster reference image on the ground plane) --
+    /// Place a raster image (PNG) on the ground plane. `height` is `None` when
+    /// typed/emitted; exec fills it from the image's aspect ratio (width /
+    /// aspect) and writes it back into the logged op, so replay reproduces the
+    /// same placement even if the file later goes missing.
+    Underlay {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        corner: Option<DVec3>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<f64>,
+    },
+    /// Set the underlay's blend opacity (0..1).
+    UnderlayOpacity {
+        opacity: f32,
+    },
+    /// Remove the underlay.
+    UnderlayOff,
     // -- sheets / layouts --
     /// Create a named paper sheet (landscape).
     Sheet {

@@ -30,7 +30,7 @@ fn main() {
         let session = mydrafter_commands::io::load_file(std::path::Path::new(&scene_path))
             .expect("load scene");
         let scene = mydrafter_render::snapshot(&session.doc, theme);
-        renderer.set_scene(&device, &scene, 0);
+        renderer.set_scene(&device, &queue, &scene, 0);
         if let Some(bb) = session.doc.scene_aabb() {
             let center = bb.center();
             camera.target = glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32);

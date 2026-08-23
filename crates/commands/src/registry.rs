@@ -239,6 +239,21 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Set the display unit for dimensions and readouts (geometry stays meters internally). Number suffixes work everywhere regardless: 500mm, 2.5m, 12ft, 6in, and feet-inches typed as 12ft6in (shown as 12'-6\"). Example: units ftin",
         },
         CommandSpec {
+            name: "underlay",
+            usage: "underlay <path.png> [corner x,y] [width]",
+            summary: "Place a raster image (PNG) flat on the ground plane to trace over; corner is the lower-left in meters (default 0,0), width in meters (default 10, height follows the image aspect). Example: underlay /tmp/site.png 0,0 20",
+        },
+        CommandSpec {
+            name: "underlayopacity",
+            usage: "underlayopacity <0..1>",
+            summary: "Set the underlay's blend opacity. Example: underlayopacity 0.4",
+        },
+        CommandSpec {
+            name: "underlayoff",
+            usage: "underlayoff",
+            summary: "Remove the underlay image",
+        },
+        CommandSpec {
             name: "sheet",
             usage: "sheet <name> [a4|a3|a2|a1|a0]",
             summary: "Create a named paper sheet, landscape (default a3). Example: sheet plan a1",

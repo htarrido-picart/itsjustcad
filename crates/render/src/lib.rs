@@ -8,7 +8,7 @@ mod viewport_callback;
 
 pub use camera::{OrbitCamera, StandardView};
 pub use layout::ViewportLayout;
-pub use renderer::{CameraUniform, DisplayMode, SceneData, SceneRenderer};
+pub use renderer::{CameraUniform, DisplayMode, SceneData, SceneRenderer, UnderlayData};
 pub use snapshot::{snapshot, Theme};
 pub use viewport_callback::ViewportCallback;
 

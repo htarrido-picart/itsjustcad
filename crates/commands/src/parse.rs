@@ -467,6 +467,43 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 .ok_or_else(|| wrong_err("units", "one of m, cm, mm, ft, in, ftin", &args))?;
             Ok(Command::Units { units })
         }
+        "underlay" => match args.as_slice() {
+            [path] => Ok(Command::Underlay {
+                path: (*path).to_string(),
+                corner: None,
+                width: None,
+                height: None,
+            }),
+            [path, corner] => Ok(Command::Underlay {
+                path: (*path).to_string(),
+                corner: Some(point(corner)?),
+                width: None,
+                height: None,
+            }),
+            [path, corner, width] => Ok(Command::Underlay {
+                path: (*path).to_string(),
+                corner: Some(point(corner)?),
+                width: Some(number(width)?),
+                height: None,
+            }),
+            _ => wrong(
+                "underlay",
+                "an image path and an optional corner x,y and width",
+                &args,
+            ),
+        },
+        "underlayopacity" => {
+            let [o] = take::<1>("underlayopacity", "an opacity 0..1", &args)?;
+            let opacity = number(o)? as f32;
+            if !(0.0..=1.0).contains(&opacity) {
+                return wrong("underlayopacity", "an opacity between 0 and 1", &args);
+            }
+            Ok(Command::UnderlayOpacity { opacity })
+        }
+        "underlayoff" => {
+            expect_empty("underlayoff", &args, &args)?;
+            Ok(Command::UnderlayOff)
+        }
         "sheet" => {
             let (name, paper) = match args.as_slice() {
                 [name] => (*name, PaperSize::A3),
@@ -920,6 +957,60 @@ mod tests {
     #[test]
     fn units_command_json_roundtrip() {
         for line in ["units m", "units ftin", "units ft"] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
+    }
+
+    #[test]
+    fn parse_underlay_variants() {
+        assert_eq!(
+            parse("underlay site.png").unwrap(),
+            Command::Underlay {
+                path: "site.png".into(),
+                corner: None,
+                width: None,
+                height: None,
+            }
+        );
+        assert_eq!(
+            parse("underlay /tmp/a.png 1,2").unwrap(),
+            Command::Underlay {
+                path: "/tmp/a.png".into(),
+                corner: Some(DVec3::new(1.0, 2.0, 0.0)),
+                width: None,
+                height: None,
+            }
+        );
+        assert_eq!(
+            parse("underlay /tmp/a.png 1,2 20").unwrap(),
+            Command::Underlay {
+                path: "/tmp/a.png".into(),
+                corner: Some(DVec3::new(1.0, 2.0, 0.0)),
+                width: Some(20.0),
+                height: None,
+            }
+        );
+        // all logged so files carry the underlay through replay
+        assert!(parse("underlay a.png").unwrap().is_logged());
+    }
+
+    #[test]
+    fn parse_underlay_opacity_and_off() {
+        assert_eq!(
+            parse("underlayopacity 0.4").unwrap(),
+            Command::UnderlayOpacity { opacity: 0.4 }
+        );
+        assert!(parse("underlayopacity 2").unwrap_err().to_string().contains("between 0 and 1"));
+        assert_eq!(parse("underlayoff").unwrap(), Command::UnderlayOff);
+        assert!(parse("underlayoff junk").is_err());
+    }
+
+    #[test]
+    fn underlay_json_roundtrip() {
+        for line in ["underlay a.png", "underlay a.png 1,2 5", "underlayopacity 0.3", "underlayoff"] {
             let cmd = parse(line).unwrap();
             let json = serde_json::to_string(&cmd).unwrap();
             let back: Command = serde_json::from_str(&json).unwrap();

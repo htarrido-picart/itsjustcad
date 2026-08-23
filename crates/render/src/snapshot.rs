@@ -51,6 +51,9 @@ pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
         meshes: Vec::new(),
         lines: Vec::new(),
         edges: Vec::new(),
+        // The underlay image is decoded app-side (the app owns the `image`
+        // dependency) and attached to the returned scene.
+        underlay: None,
     };
     for obj in doc.objects() {
         if !obj.visible {

@@ -1,6 +1,7 @@
 use mydrafter_commands::Session;
 use mydrafter_render::{
-    DisplayMode, OrbitCamera, SceneRenderer, StandardView, ViewportCallback, ViewportLayout,
+    DisplayMode, OrbitCamera, SceneRenderer, StandardView, UnderlayData, ViewportCallback,
+    ViewportLayout,
 };
 
 use crate::command_line::CommandLine;
@@ -58,6 +59,9 @@ pub struct App {
     status_cursor: Option<glam::DVec3>,
     /// Snap kind currently hit by the draw tool, for the status bar.
     status_snap: Option<&'static str>,
+    /// Decoded underlay pixels cached by path, so a scene rebuild (any doc
+    /// change) does not re-decode the image every time.
+    underlay_cache: Option<(String, std::sync::Arc<(Vec<u8>, u32, u32)>)>,
 }
 
 impl App {
@@ -120,6 +124,7 @@ impl App {
             journaled_generation: None,
             status_cursor: None,
             status_snap: None,
+            underlay_cache: None,
         }
     }
 
@@ -223,6 +228,54 @@ impl App {
     fn set_layout(&mut self, layout: ViewportLayout) {
         self.layout = layout;
         self.active_pane = 0;
+    }
+
+    /// Decode the document's underlay image into GPU-ready `UnderlayData`,
+    /// reusing the cached pixels when the path is unchanged. A missing or
+    /// unreadable file drops the texture (the placement math still stands, it
+    /// just won't render an image) — no error, matching the "warning not error"
+    /// contract on open.
+    fn decode_underlay(&mut self) -> Option<UnderlayData> {
+        let u = self.session.doc.underlay.as_ref()?;
+        let cached = match &self.underlay_cache {
+            Some((path, pixels)) if *path == u.path => pixels.clone(),
+            _ => {
+                let img = match image::open(&u.path) {
+                    Ok(img) => img.to_rgba8(),
+                    Err(e) => {
+                        // Surface once per path change, then forget it so we do
+                        // not spam the command line every frame.
+                        if self.underlay_cache.as_ref().map(|(p, _)| p != &u.path).unwrap_or(true) {
+                            self.command_line
+                                .push_line(format!("underlay image not shown: {} ({e})", u.path));
+                        }
+                        self.underlay_cache = Some((u.path.clone(), std::sync::Arc::new((Vec::new(), 0, 0))));
+                        return None;
+                    }
+                };
+                let (w, h) = img.dimensions();
+                let pixels = std::sync::Arc::new((img.into_raw(), w, h));
+                self.underlay_cache = Some((u.path.clone(), pixels.clone()));
+                pixels
+            }
+        };
+        let (rgba, w, h) = (&cached.0, cached.1, cached.2);
+        if rgba.is_empty() || w == 0 || h == 0 {
+            return None; // previously-failed decode cached as empty
+        }
+        let c = u.quad_corners();
+        Some(UnderlayData {
+            rgba: rgba.clone(),
+            width_px: w,
+            height_px: h,
+            corners: [
+                [c[0].x as f32, c[0].y as f32, 0.0],
+                [c[1].x as f32, c[1].y as f32, 0.0],
+                [c[2].x as f32, c[2].y as f32, 0.0],
+                [c[3].x as f32, c[3].y as f32, 0.0],
+            ],
+            opacity: u.opacity,
+        })
     }
 
     /// Camera of the active (last hovered) pane.
@@ -473,11 +526,15 @@ impl App {
             || self.uploaded_theme != Some(theme);
         // Scene is uploaded once (renderer shared); only the first pane's
         // callback carries the snapshot, the rest just set their camera.
-        let mut scene = stale.then(|| {
+        let mut scene = if stale {
             self.uploaded_generation = Some(generation);
             self.uploaded_theme = Some(theme);
-            scene::snapshot(&self.session.doc, theme)
-        });
+            let mut s = scene::snapshot(&self.session.doc, theme);
+            s.underlay = self.decode_underlay();
+            Some(s)
+        } else {
+            None
+        };
 
         let panes = self.layout.split(full);
         for (pane, rect) in panes.iter().copied().enumerate() {

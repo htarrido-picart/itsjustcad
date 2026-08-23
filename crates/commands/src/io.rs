@@ -224,6 +224,40 @@ mod tests {
     }
 
     #[test]
+    fn pre_underlay_file_loads_with_no_underlay() {
+        // Old files have no underlay op; they load with none.
+        let json = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "box",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "size": [2.0, 2.0, 2.0]}
+            ]
+        }"#;
+        let s = from_json(json).unwrap();
+        assert!(s.doc.underlay.is_none());
+    }
+
+    #[test]
+    fn save_load_preserves_underlay() {
+        // The height is carried on the logged op, so no image file is needed.
+        let mut s = Session::default();
+        s.run(Command::Underlay {
+            path: "site.png".into(),
+            corner: Some(glam::DVec3::new(1.0, 2.0, 0.0)),
+            width: Some(20.0),
+            height: Some(10.0),
+        })
+        .unwrap();
+        s.run(parse("underlayopacity 0.4").unwrap()).unwrap();
+        let json = to_json(&s);
+        assert!(json.contains("\"underlay\""), "{json}");
+        let loaded = from_json(&json).unwrap();
+        assert_eq!(loaded.doc.underlay, s.doc.underlay);
+        assert_eq!(to_json(&loaded), json, "replay-stable");
+    }
+
+    #[test]
     fn rejects_future_version() {
         let Err(err) = from_json(r#"{"mydrafter": 99, "ops": []}"#) else {
             panic!("expected version error");

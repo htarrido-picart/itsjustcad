@@ -205,8 +205,13 @@ fn make_renderer(
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
     renderer.set_meshes(&ctx.device, &meshes, 0);
     if !lines.is_empty() {
-        let data = mydrafter_render::SceneData { meshes: vec![], lines, edges: vec![] };
-        renderer.set_scene(&ctx.device, &data, 0);
+        let data = mydrafter_render::SceneData {
+            meshes: vec![],
+            lines,
+            edges: vec![],
+            underlay: None,
+        };
+        renderer.set_scene(&ctx.device, &ctx.queue, &data, 0);
     }
     let aspect = W as f32 / H as f32;
     let vp = camera.view_proj(aspect);
@@ -262,6 +267,58 @@ fn golden_two_boxes_light() {
     let renderer = make_renderer(&ctx, meshes, vec![], &camera);
     let img = render_to_image(&ctx, &renderer, theme);
     check_or_bless(&img, "two-boxes-light");
+}
+
+/// Scene 4: a raster underlay on the ground plane, viewed top-down, dark theme.
+/// A 4x4 red/blue checkerboard placed at corner (-5,-5), 10 m square; the grid
+/// blends over it. Proves the textured quad renders under the grid at depth.
+#[test]
+#[ignore = "golden"]
+fn golden_underlay_dark() {
+    let ctx = GpuContext::new();
+    let theme = Theme::Dark;
+    let mut camera = OrbitCamera::default();
+    camera.target = glam::Vec3::ZERO;
+    camera.distance = 20.0;
+    camera.yaw = 0.0;
+    camera.pitch = 1.4; // near top-down
+
+    // 4x4 checkerboard, 64x64 px.
+    let n = 64u32;
+    let mut rgba = Vec::with_capacity((n * n * 4) as usize);
+    for y in 0..n {
+        for x in 0..n {
+            let cell = ((x / 16) + (y / 16)) % 2 == 0;
+            let c = if cell { [220, 60, 60, 255] } else { [60, 90, 220, 255] };
+            rgba.extend_from_slice(&c);
+        }
+    }
+    let underlay = mydrafter_render::UnderlayData {
+        rgba,
+        width_px: n,
+        height_px: n,
+        corners: [
+            [-5.0, -5.0, 0.0],
+            [5.0, -5.0, 0.0],
+            [5.0, 5.0, 0.0],
+            [-5.0, 5.0, 0.0],
+        ],
+        opacity: 0.8,
+    };
+    let data = mydrafter_render::SceneData {
+        meshes: vec![],
+        lines: vec![],
+        edges: vec![],
+        underlay: Some(underlay),
+    };
+    let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
+    renderer.set_scene(&ctx.device, &ctx.queue, &data, 0);
+    let aspect = W as f32 / H as f32;
+    let cam = mydrafter_render::camera_uniform(camera.view_proj(aspect), camera.eye());
+    renderer.write_camera(&ctx.device, &ctx.queue, 0, &cam);
+
+    let img = render_to_image(&ctx, &renderer, theme);
+    check_or_bless(&img, "underlay-dark");
 }
 
 /// Scene 3: empty scene (no geometry), dark theme — verifies clear-color only.

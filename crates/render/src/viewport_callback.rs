@@ -38,7 +38,7 @@ impl CallbackTrait for ViewportCallback {
         if let Some(scene) = &self.scene
             && renderer.generation != self.generation
         {
-            renderer.set_scene(device, scene, self.generation);
+            renderer.set_scene(device, queue, scene, self.generation);
         }
         Vec::new()
     }

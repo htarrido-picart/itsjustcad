@@ -3,7 +3,7 @@ use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
 use mydrafter_doc::{
     format_area, format_length, format_volume, Annotation, Document, Geometry, LayerStyle,
-    NamedView, ObjectId, SceneObject, Units,
+    NamedView, ObjectId, SceneObject, Underlay, Units,
 };
 
 use crate::error::ExecError;
@@ -11,6 +11,13 @@ use crate::{Command, MirrorPlane, Selector};
 
 /// Chord tolerance used when tessellating profile curves for extrusion.
 const PROFILE_TOL: f64 = 0.01;
+
+/// Pixel aspect ratio (width / height) of a raster file, or `None` if it can't
+/// be read. Only the header is decoded, so this is cheap.
+fn image_aspect(path: &str) -> Option<f64> {
+    let (w, h) = image::image_dimensions(path).ok()?;
+    (h > 0).then(|| w as f64 / h as f64)
+}
 
 #[derive(Debug)]
 pub struct ApplyOutcome {
@@ -67,6 +74,8 @@ enum Inverse {
     ObjectVisibility(Vec<(ObjectId, bool)>),
     /// `units`: restore the previous display unit.
     Units { prev: Units },
+    /// `underlay`/`underlayopacity`/`underlayoff`: restore the previous underlay.
+    Underlay { prev: Option<Underlay> },
     /// `view save`: restore the previously saved view of that name (if any).
     ViewSaved {
         name: String,
@@ -208,6 +217,10 @@ impl Session {
             }
             Inverse::Units { prev } => {
                 self.doc.units = *prev;
+                self.doc.generation += 1;
+            }
+            Inverse::Underlay { prev } => {
+                self.doc.underlay = prev.clone();
                 self.doc.generation += 1;
             }
             Inverse::ViewSaved { name, prev } => {
@@ -1913,6 +1926,83 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Underlay { path, corner, width, height } => {
+            let prev = doc.underlay.clone();
+            let corner = corner.unwrap_or(DVec3::ZERO);
+            let width = width.unwrap_or(10.0);
+            if width <= 0.0 {
+                return Err(ExecError::Invalid("underlay width must be positive".into()));
+            }
+            // height carried on a replayed op wins (the file need not exist);
+            // otherwise derive it from the image's pixel aspect ratio. A
+            // missing/unreadable file is a warning, not an error: fall back to
+            // a square so the placement still lands and replays.
+            let (height, note) = match height {
+                Some(h) => (h, ""),
+                None => match image_aspect(&path) {
+                    Some(aspect) if aspect > 0.0 => (width / aspect, ""),
+                    _ => (width, " (image unreadable, assumed square)"),
+                },
+            };
+            // Keep the previous opacity when swapping the image; new underlays
+            // start fully opaque.
+            let opacity = prev.as_ref().map_or(1.0, |u| u.opacity);
+            doc.underlay = Some(Underlay {
+                path: path.clone(),
+                corner: corner.truncate(),
+                width,
+                height,
+                opacity,
+            });
+            doc.generation += 1;
+            Ok((
+                Command::Underlay {
+                    path,
+                    corner: Some(corner),
+                    width: Some(width),
+                    height: Some(height),
+                },
+                Inverse::Underlay { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("underlay {width:.2} x {height:.2} m{note}"),
+                },
+            ))
+        }
+        Command::UnderlayOpacity { opacity } => {
+            let prev = doc.underlay.clone();
+            let opacity = opacity.clamp(0.0, 1.0);
+            let Some(u) = doc.underlay.as_mut() else {
+                return Err(ExecError::Invalid(
+                    "no underlay to set opacity on (place one with: underlay <path>)".into(),
+                ));
+            };
+            u.opacity = opacity;
+            doc.generation += 1;
+            Ok((
+                Command::UnderlayOpacity { opacity },
+                Inverse::Underlay { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("underlay opacity {opacity:.2}"),
+                },
+            ))
+        }
+        Command::UnderlayOff => {
+            let prev = doc.underlay.take();
+            if prev.is_none() {
+                return Err(ExecError::Invalid("no underlay to remove".into()));
+            }
+            doc.generation += 1;
+            Ok((
+                Command::UnderlayOff,
+                Inverse::Underlay { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: "underlay removed".into(),
+                },
+            ))
+        }
         Command::Sheet { name, paper } => {
             if doc.sheet(&name).is_some() {
                 return Err(ExecError::Invalid(format!(
@@ -2259,6 +2349,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::HideObj { .. } => "hideobj",
         Command::ShowObj { .. } => "showobj",
         Command::Units { .. } => "units",
+        Command::Underlay { .. } => "underlay",
+        Command::UnderlayOpacity { .. } => "underlayopacity",
+        Command::UnderlayOff => "underlayoff",
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
         Command::Print { .. } => "print",
@@ -3919,5 +4012,109 @@ mod tests {
         run(&mut s, "undo");
         let log = s.save_log();
         assert_eq!(log.len(), 1); // only the surviving box
+    }
+
+    /// Write a `w`x`h` PNG to a temp path and return it.
+    fn temp_png(w: u32, h: u32, tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("mydrafter_underlay_{tag}_{w}x{h}.png"));
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([200, 100, 50, 255]));
+        img.save(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn underlay_places_with_image_aspect_and_fills_height() {
+        let png = temp_png(200, 100, "aspect"); // aspect 2:1
+        let mut s = Session::default();
+        let out = run(&mut s, &format!("underlay {} 1,2 20", png.display()));
+        let u = s.doc.underlay.as_ref().expect("underlay set");
+        assert_eq!(u.corner, glam::DVec2::new(1.0, 2.0));
+        assert_eq!(u.width, 20.0);
+        assert_eq!(u.height, 10.0, "height = width / aspect");
+        assert_eq!(u.opacity, 1.0);
+        assert!(out.message.contains("20.00 x 10.00"), "{}", out.message);
+
+        // The logged op carries the resolved height so replay needs no file.
+        let log = s.save_log();
+        assert!(matches!(
+            &log[0],
+            Command::Underlay { height: Some(h), width: Some(w), .. }
+                if (*h - 10.0).abs() < 1e-9 && (*w - 20.0).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn underlay_missing_file_is_a_warning_not_an_error() {
+        let mut s = Session::default();
+        let out = run(&mut s, "underlay /no/such/file.png 0,0 8");
+        let u = s.doc.underlay.as_ref().unwrap();
+        assert_eq!(u.width, 8.0);
+        assert_eq!(u.height, 8.0, "unreadable image assumed square");
+        assert!(out.message.contains("unreadable"), "{}", out.message);
+    }
+
+    #[test]
+    fn underlay_opacity_and_off_with_undo() {
+        let png = temp_png(100, 100, "opac");
+        let mut s = Session::default();
+        run(&mut s, &format!("underlay {} 0,0 10", png.display()));
+        run(&mut s, "underlayopacity 0.3");
+        assert_eq!(s.doc.underlay.as_ref().unwrap().opacity, 0.3);
+
+        run(&mut s, "underlayoff");
+        assert!(s.doc.underlay.is_none());
+
+        // undo off -> opacity 0.3 underlay is back
+        run(&mut s, "undo");
+        assert_eq!(s.doc.underlay.as_ref().unwrap().opacity, 0.3);
+        // undo opacity -> back to 1.0
+        run(&mut s, "undo");
+        assert_eq!(s.doc.underlay.as_ref().unwrap().opacity, 1.0);
+        // undo placement -> gone
+        run(&mut s, "undo");
+        assert!(s.doc.underlay.is_none());
+        // redo placement
+        run(&mut s, "redo");
+        assert_eq!(s.doc.underlay.as_ref().unwrap().opacity, 1.0);
+    }
+
+    #[test]
+    fn underlay_opacity_without_underlay_errors() {
+        let mut s = Session::default();
+        assert!(s.run(parse("underlayopacity 0.5").unwrap()).is_err());
+        assert!(s.run(parse("underlayoff").unwrap()).is_err());
+    }
+
+    #[test]
+    fn underlay_replaces_and_keeps_opacity() {
+        let a = temp_png(200, 100, "a");
+        let b = temp_png(100, 200, "b");
+        let mut s = Session::default();
+        run(&mut s, &format!("underlay {} 0,0 10", a.display()));
+        run(&mut s, "underlayopacity 0.5");
+        run(&mut s, &format!("underlay {} 0,0 10", b.display()));
+        let u = s.doc.underlay.as_ref().unwrap();
+        assert_eq!(u.height, 20.0, "new image aspect 1:2");
+        assert_eq!(u.opacity, 0.5, "opacity carried across image swap");
+    }
+
+    #[test]
+    fn underlay_replay_reproduces_placement_without_file() {
+        let png = temp_png(300, 100, "replay");
+        let mut s = Session::default();
+        run(&mut s, &format!("underlay {} 2,3 30", png.display()));
+        run(&mut s, "underlayopacity 0.4");
+        let before = s.doc.underlay.clone();
+
+        // Delete the file: replay must still reproduce the exact placement.
+        std::fs::remove_file(&png).unwrap();
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(replayed.doc.underlay, before);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "replay-stable log"
+        );
     }
 }

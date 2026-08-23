@@ -2075,6 +2075,7 @@ name = "mydrafter-commands"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "image",
  "kernel-curve",
  "kernel-mesh",
  "mydrafter-doc",

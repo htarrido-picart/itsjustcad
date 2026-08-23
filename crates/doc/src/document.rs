@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_mesh::Aabb;
 
-use crate::{LayerStyle, NamedView, ObjectId, SceneObject, Sheet, Units, DEFAULT_LAYER};
+use crate::{LayerStyle, NamedView, ObjectId, SceneObject, Sheet, Underlay, Units, DEFAULT_LAYER};
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
 #[derive(Clone, Debug)]
@@ -31,6 +31,9 @@ pub struct Document {
     /// Mailbox: a `view <name>` restore waiting for the UI to drive the active
     /// viewport camera. The app takes it each frame; never persisted.
     pub pending_view: Option<NamedView>,
+    /// Optional raster reference image on the ground plane. Set via the logged
+    /// `underlay` command; a missing file on open is a warning, not an error.
+    pub underlay: Option<Underlay>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -48,6 +51,7 @@ impl Default for Document {
             named_views: BTreeMap::new(),
             groups: BTreeMap::new(),
             pending_view: None,
+            underlay: None,
             generation: 0,
         }
     }
