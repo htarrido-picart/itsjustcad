@@ -26,79 +26,6 @@ enum WarmState {
 
 const MAX_RETRIES: u8 = 2;
 
-/// Render a raw model stream with structure: prose as normal text, fenced
-/// ```draft blocks as code cards with the command verb highlighted.
-fn render_raw(ui: &mut egui::Ui, text: &str) {
-    let accent = egui::Color32::from_rgb(90, 160, 255);
-    let mut in_fence = false;
-    let mut prose: Vec<&str> = Vec::new();
-    let mut code: Vec<&str> = Vec::new();
-
-    let flush_prose = |ui: &mut egui::Ui, prose: &mut Vec<&str>| {
-        let joined = prose.join("\n");
-        let trimmed = joined.trim();
-        if !trimmed.is_empty() {
-            ui.add(egui::Label::new(trimmed).wrap());
-        }
-        prose.clear();
-    };
-    let flush_code = |ui: &mut egui::Ui, code: &mut Vec<&str>| {
-        if code.is_empty() {
-            return;
-        }
-        ui.label(egui::RichText::new("draft").small().weak().color(accent));
-        egui::Frame::group(ui.style())
-            .fill(ui.visuals().code_bg_color)
-            .inner_margin(egui::Margin::same(6))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                for line in code.iter() {
-                    let mut job = egui::text::LayoutJob::default();
-                    let font = egui::TextStyle::Monospace.resolve(ui.style());
-                    let (verb, rest) = line.split_once(' ').unwrap_or((line, ""));
-                    job.append(
-                        verb,
-                        0.0,
-                        egui::TextFormat::simple(font.clone(), accent),
-                    );
-                    if !rest.is_empty() {
-                        job.append(
-                            &format!(" {rest}"),
-                            0.0,
-                            egui::TextFormat::simple(
-                                font,
-                                ui.visuals().text_color(),
-                            ),
-                        );
-                    }
-                    ui.label(job);
-                }
-            });
-        code.clear();
-    };
-
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with("```") {
-            if in_fence {
-                flush_code(ui, &mut code);
-                in_fence = false;
-            } else {
-                flush_prose(ui, &mut prose);
-                in_fence = true;
-            }
-        } else if in_fence {
-            if !t.is_empty() {
-                code.push(t);
-            }
-        } else {
-            prose.push(line);
-        }
-    }
-    flush_code(ui, &mut code);
-    flush_prose(ui, &mut prose);
-}
-
 struct ExecutedCommand {
     line: String,
     /// Ok: outcome message; Err: error text.
@@ -109,48 +36,91 @@ enum Entry {
     User(String),
     Deck(String),
     Status(String),
-    /// All commands of one turn, shown as a collapsed nested view — the chat
-    /// itself stays prose-only.
+    /// All commands of one turn — rendered as a card; clicking opens the
+    /// command detail child pane.
     Commands(Vec<ExecutedCommand>),
-    /// Raw model output for one turn, shown as a collapsed nested view.
-    Raw(String),
 }
 
-fn render_commands(ui: &mut egui::Ui, commands: &[ExecutedCommand]) {
-    for cmd in commands {
-        match &cmd.result {
-            Ok(msg) => {
-                ui.monospace(
-                    egui::RichText::new(format!("✓ {}   ({msg})", cmd.line))
-                        .color(egui::Color32::from_rgb(70, 160, 90))
-                        .small(),
-                );
-            }
-            Err(e) => {
-                ui.monospace(
-                    egui::RichText::new(format!("✗ {}\n  {e}", cmd.line))
-                        .color(egui::Color32::from_rgb(200, 80, 70))
-                        .small(),
-                );
-            }
-        }
-    }
+/// Deck pane navigation: chat, or a full-pane command detail with a back button.
+enum PaneView {
+    Chat,
+    /// Detail of a finished turn (index into the transcript).
+    Detail(usize),
+    /// Detail of the in-flight turn.
+    LiveDetail,
 }
+
+const OK_COLOR: egui::Color32 = egui::Color32::from_rgb(70, 160, 90);
+const ERR_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 80, 70);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(90, 160, 255);
 
 fn commands_header(commands: &[ExecutedCommand]) -> egui::RichText {
     let failed = commands.iter().filter(|c| c.result.is_err()).count();
     if failed > 0 {
-        egui::RichText::new(format!(
-            "⚠ {} command(s), {failed} failed",
-            commands.len()
-        ))
-        .color(egui::Color32::from_rgb(200, 80, 70))
-        .small()
+        egui::RichText::new(format!("⚠ {} command(s), {failed} failed", commands.len()))
+            .color(ERR_COLOR)
     } else {
-        egui::RichText::new(format!("✓ {} command(s) drawn", commands.len()))
-            .color(egui::Color32::from_rgb(70, 160, 90))
-            .small()
+        egui::RichText::new(format!("✓ {} command(s) drawn", commands.len())).color(OK_COLOR)
     }
+}
+
+/// Clickable summary card in the chat flow.
+fn commands_card(ui: &mut egui::Ui, commands: &[ExecutedCommand]) -> bool {
+    let failed = commands.iter().filter(|c| c.result.is_err()).count();
+    let (text, color) = if failed > 0 {
+        (
+            format!("⚠ {} command(s), {failed} failed  ›", commands.len()),
+            ERR_COLOR,
+        )
+    } else {
+        (format!("✓ {} command(s) drawn  ›", commands.len()), OK_COLOR)
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).color(color))
+            .min_size(egui::vec2(ui.available_width(), 30.0)),
+    )
+    .on_hover_text("show the drafted commands")
+    .clicked()
+}
+
+/// Full formatted code view for the detail pane.
+fn render_command_code(ui: &mut egui::Ui, commands: &[ExecutedCommand]) {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    egui::Frame::group(ui.style())
+        .fill(ui.visuals().code_bg_color)
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            for cmd in commands {
+                let ok = cmd.result.is_ok();
+                let mut job = egui::text::LayoutJob::default();
+                let (verb, rest) = cmd.line.split_once(' ').unwrap_or((cmd.line.as_str(), ""));
+                job.append(
+                    if ok { "✓ " } else { "✗ " },
+                    0.0,
+                    egui::TextFormat::simple(font.clone(), if ok { OK_COLOR } else { ERR_COLOR }),
+                );
+                job.append(verb, 0.0, egui::TextFormat::simple(font.clone(), ACCENT));
+                if !rest.is_empty() {
+                    job.append(
+                        &format!(" {rest}"),
+                        0.0,
+                        egui::TextFormat::simple(font.clone(), ui.visuals().text_color()),
+                    );
+                }
+                ui.label(job);
+                match &cmd.result {
+                    Ok(msg) => {
+                        ui.label(egui::RichText::new(format!("   {msg}")).weak().small());
+                    }
+                    Err(e) => {
+                        ui.label(
+                            egui::RichText::new(format!("   {e}")).color(ERR_COLOR).small(),
+                        );
+                    }
+                }
+            }
+        });
 }
 
 /// The LLM companion pane. Streams commands out of the active deck and runs
@@ -180,6 +150,7 @@ pub struct DeckPane {
     warmed_model: Option<String>,
     /// Provider-side conversation handle (claude-code sessions).
     session_id: Option<String>,
+    view: PaneView,
 }
 
 impl Default for DeckPane {
@@ -203,6 +174,7 @@ impl Default for DeckPane {
             warm: WarmState::Idle,
             warmed_model: None,
             session_id: None,
+            view: PaneView::Chat,
         }
     }
 }
@@ -392,16 +364,19 @@ impl DeckPane {
                 .push(Entry::Deck(std::mem::take(&mut self.streaming_chat)));
         }
         if !self.current_commands.is_empty() {
+            // If the user is watching the live detail, follow it to the
+            // finished entry; otherwise stay where they are.
+            if matches!(self.view, PaneView::LiveDetail) {
+                self.view = PaneView::Detail(self.transcript.len());
+            }
             self.transcript
                 .push(Entry::Commands(std::mem::take(&mut self.current_commands)));
-        }
-        let raw = std::mem::take(&mut self.current_response);
-        if !raw.trim().is_empty() {
-            self.transcript.push(Entry::Raw(raw.clone()));
+        } else if matches!(self.view, PaneView::LiveDetail) {
+            self.view = PaneView::Chat;
         }
         self.messages.push(ChatMessage {
             role: Role::Assistant,
-            content: raw,
+            content: std::mem::take(&mut self.current_response),
         });
         if !self.errors_this_turn.is_empty() && self.retries < MAX_RETRIES {
             self.retries += 1;
@@ -617,6 +592,34 @@ impl DeckPane {
         }
         ui.separator();
 
+        // Child pane: full command code view with a back button.
+        if let Some(commands_view) = match self.view {
+            PaneView::Detail(index) => match self.transcript.get(index) {
+                Some(Entry::Commands(commands)) => Some(commands.as_slice()),
+                _ => None,
+            },
+            PaneView::LiveDetail => Some(self.current_commands.as_slice()),
+            PaneView::Chat => None,
+        } {
+            let mut back = false;
+            ui.horizontal(|ui| {
+                back = ui.button("← back").clicked();
+                ui.label(commands_header(commands_view));
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                render_command_code(ui, commands_view);
+            });
+            if back {
+                self.view = PaneView::Chat;
+            }
+            return;
+        }
+        if !matches!(self.view, PaneView::Chat) {
+            self.view = PaneView::Chat; // stale index — fall back
+        }
+
+        let mut open_detail: Option<PaneView> = None;
         let input_height = 64.0;
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
@@ -624,14 +627,6 @@ impl DeckPane {
             .show(ui, |ui| {
                 for (i, entry) in self.transcript.iter().enumerate() {
                     match entry {
-                        Entry::Raw(text) => {
-                            egui::CollapsingHeader::new(
-                                egui::RichText::new("raw stream").weak().small(),
-                            )
-                            .id_salt(("raw", i))
-                            .default_open(false)
-                            .show(ui, |ui| render_raw(ui, text));
-                        }
                         Entry::User(t) => {
                             ui.label(egui::RichText::new(format!("you: {t}")).strong());
                         }
@@ -639,10 +634,9 @@ impl DeckPane {
                             ui.label(t.trim());
                         }
                         Entry::Commands(commands) => {
-                            egui::CollapsingHeader::new(commands_header(commands))
-                                .id_salt(("cmds", i))
-                                .default_open(false)
-                                .show(ui, |ui| render_commands(ui, commands));
+                            if commands_card(ui, commands) {
+                                open_detail = Some(PaneView::Detail(i));
+                            }
                         }
                         Entry::Status(t) => {
                             ui.label(egui::RichText::new(t).weak().italics());
@@ -652,15 +646,12 @@ impl DeckPane {
                 if !self.streaming_chat.trim().is_empty() {
                     ui.label(self.streaming_chat.trim());
                 }
-                // Live turn feedback: waiting → thinking dots + elapsed;
-                // streaming → received char count.
+                // Live turn feedback: waiting → elapsed; streaming → char count.
                 if self.busy() {
-                    // Commands land here live, collapsed — expand for detail.
-                    if !self.current_commands.is_empty() {
-                        egui::CollapsingHeader::new(commands_header(&self.current_commands))
-                            .id_salt("cmds_live")
-                            .default_open(false)
-                            .show(ui, |ui| render_commands(ui, &self.current_commands));
+                    if !self.current_commands.is_empty()
+                        && commands_card(ui, &self.current_commands)
+                    {
+                        open_detail = Some(PaneView::LiveDetail);
                     }
                     let elapsed = self
                         .turn_started
@@ -676,17 +667,11 @@ impl DeckPane {
                         };
                         ui.label(egui::RichText::new(status).weak().italics());
                     });
-                    if received > 0 {
-                        // Live nested raw stream — expand to watch tokens land.
-                        egui::CollapsingHeader::new(
-                            egui::RichText::new("raw stream (live)").weak().small(),
-                        )
-                        .id_salt("raw_live")
-                        .default_open(false)
-                        .show(ui, |ui| render_raw(ui, &self.current_response));
-                    }
                 }
             });
+        if let Some(view) = open_detail {
+            self.view = view;
+        }
 
         ui.separator();
         let hint = if self.ready() {
