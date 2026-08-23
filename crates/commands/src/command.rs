@@ -291,6 +291,24 @@ pub enum Command {
         targets: Selector,
     },
     SelectNone,
+    // -- measure (queries; read-only, never logged) --
+    /// Distance between two points, reported in the document unit.
+    Distance {
+        a: DVec3,
+        b: DVec3,
+    },
+    /// Area of closed curves (shoelace) and mesh surfaces (summed faces).
+    Area {
+        targets: Selector,
+    },
+    /// Signed volume of closed meshes.
+    Volume {
+        targets: Selector,
+    },
+    /// Combined axis-aligned bounding box of the targets.
+    Bbox {
+        targets: Selector,
+    },
     Undo,
     Redo,
 }
@@ -304,6 +322,10 @@ impl Command {
                 | Command::SelectNone
                 | Command::Print { .. }
                 | Command::Export { .. }
+                | Command::Distance { .. }
+                | Command::Area { .. }
+                | Command::Volume { .. }
+                | Command::Bbox { .. }
                 | Command::Undo
                 | Command::Redo
         )

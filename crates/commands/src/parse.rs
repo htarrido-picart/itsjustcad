@@ -423,6 +423,25 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             Ok(Command::Select { targets: sel })
         }
         "selectnone" | "deselect" => Ok(Command::SelectNone),
+        "distance" | "dist" => {
+            let [a, b] = take::<2>("distance", "two points", &args)?;
+            Ok(Command::Distance { a: point(a)?, b: point(b)? })
+        }
+        "area" => {
+            let (sel, rest) = selector(&args, "area")?;
+            expect_empty("area", rest, &args)?;
+            Ok(Command::Area { targets: sel })
+        }
+        "volume" | "vol" => {
+            let (sel, rest) = selector(&args, "volume")?;
+            expect_empty("volume", rest, &args)?;
+            Ok(Command::Volume { targets: sel })
+        }
+        "bbox" => {
+            let (sel, rest) = selector(&args, "bbox")?;
+            expect_empty("bbox", rest, &args)?;
+            Ok(Command::Bbox { targets: sel })
+        }
         "undo" => Ok(Command::Undo),
         "redo" => Ok(Command::Redo),
         other => Err(ParseError::UnknownCommand {
@@ -1232,6 +1251,54 @@ mod tests {
         // errors carry hints
         assert!(parse("export").unwrap_err().to_string().contains("path"));
         assert!(parse("export a b").unwrap_err().to_string().contains("path"));
+    }
+
+    #[test]
+    fn parse_measure_commands() {
+        assert_eq!(
+            parse("distance 0,0,0 3,4,0").unwrap(),
+            Command::Distance { a: DVec3::ZERO, b: DVec3::new(3.0, 4.0, 0.0) }
+        );
+        // dist alias and unit suffixes
+        assert!(matches!(
+            parse("dist 0,0 12ft,0").unwrap(),
+            Command::Distance { b, .. } if (b.x - 12.0 * METERS_PER_FOOT).abs() < 1e-12
+        ));
+        assert!(matches!(
+            parse("area last").unwrap(),
+            Command::Area { targets: Selector::Last { n: 1 } }
+        ));
+        assert!(matches!(
+            parse("volume last 2").unwrap(),
+            Command::Volume { targets: Selector::Last { n: 2 } }
+        ));
+        assert!(matches!(
+            parse("vol slab").unwrap(),
+            Command::Volume { targets: Selector::Named { .. } }
+        ));
+        assert!(matches!(
+            parse("bbox all").unwrap(),
+            Command::Bbox { targets: Selector::All }
+        ));
+        // queries are never logged
+        for line in ["distance 0,0 1,1", "area last", "volume last", "bbox all"] {
+            assert!(!parse(line).unwrap().is_logged(), "{line}");
+        }
+        // errors carry hints
+        assert!(parse("distance 0,0").unwrap_err().to_string().contains("points"));
+        assert!(parse("area").unwrap_err().to_string().contains("selector"));
+        assert!(parse("volume").unwrap_err().to_string().contains("selector"));
+        assert!(parse("bbox").unwrap_err().to_string().contains("selector"));
+    }
+
+    #[test]
+    fn measure_command_json_roundtrip() {
+        for line in ["distance 0,0,0 3,4,0", "area last", "volume last 2", "bbox all"] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
     }
 
     #[test]

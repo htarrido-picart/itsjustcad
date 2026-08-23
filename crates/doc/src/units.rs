@@ -42,6 +42,18 @@ impl Units {
             Units::FtIn => "ftin",
         }
     }
+
+    /// Display units per meter plus the symbol used for derived quantities
+    /// (areas, volumes). FtIn reads best in decimal feet there.
+    pub fn per_meter(self) -> (f64, &'static str) {
+        match self {
+            Units::M => (1.0, "m"),
+            Units::Cm => (100.0, "cm"),
+            Units::Mm => (1000.0, "mm"),
+            Units::Ft | Units::FtIn => (1.0 / METERS_PER_FOOT, "ft"),
+            Units::In => (1.0 / METERS_PER_INCH, "in"),
+        }
+    }
 }
 
 /// Format a length stored in meters for display in the document's unit.
@@ -55,6 +67,18 @@ pub fn format_length(units: Units, meters: f64) -> String {
         Units::In => format!("{:.1}\"", meters / METERS_PER_INCH),
         Units::FtIn => format_feet_inches(meters),
     }
+}
+
+/// Format an area stored in square meters for display in the document's unit.
+pub fn format_area(units: Units, sq_meters: f64) -> String {
+    let (per_m, label) = units.per_meter();
+    format!("{:.2} {label}²", sq_meters * per_m * per_m)
+}
+
+/// Format a volume stored in cubic meters for display in the document's unit.
+pub fn format_volume(units: Units, cu_meters: f64) -> String {
+    let (per_m, label) = units.per_meter();
+    format!("{:.2} {label}³", cu_meters * per_m * per_m * per_m)
 }
 
 /// Architectural feet-and-inches: 12'-6", inches to the nearest 1/16.
@@ -111,6 +135,23 @@ mod tests {
         assert_eq!(format_length(Units::M, 12.5), "12.50 m");
         assert_eq!(format_length(Units::Cm, 0.255), "25.5 cm");
         assert_eq!(format_length(Units::Mm, 0.5), "500 mm");
+    }
+
+    #[test]
+    fn format_area_and_volume() {
+        assert_eq!(format_area(Units::M, 12.5), "12.50 m²");
+        assert_eq!(format_area(Units::Cm, 0.5), "5000.00 cm²");
+        assert_eq!(format_volume(Units::M, 75.0), "75.00 m³");
+        assert_eq!(format_volume(Units::Mm, 1e-6), "1000.00 mm³");
+        // 1 ft = 0.3048 m, so 1 m² = ~10.7639 ft²; ftin falls back to decimal feet
+        assert_eq!(
+            format_area(Units::FtIn, METERS_PER_FOOT * METERS_PER_FOOT),
+            "1.00 ft²"
+        );
+        assert_eq!(
+            format_volume(Units::Ft, METERS_PER_FOOT.powi(3) * 27.0),
+            "27.00 ft³"
+        );
     }
 
     #[test]

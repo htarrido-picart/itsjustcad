@@ -2,7 +2,8 @@ use glam::DVec3;
 use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
 use mydrafter_doc::{
-    format_length, Annotation, Document, Geometry, LayerStyle, ObjectId, SceneObject, Units,
+    format_area, format_length, format_volume, Annotation, Document, Geometry, LayerStyle,
+    ObjectId, SceneObject, Units,
 };
 
 use crate::error::ExecError;
@@ -405,6 +406,29 @@ fn replace_with_result(
             input_ids.len()
         ),
     ))
+}
+
+/// Enclosed XY area of a closed loop by the shoelace formula. `points` must
+/// not repeat the first point at the end (tessellate() guarantees this).
+fn shoelace_area(points: &[DVec3]) -> f64 {
+    let mut sum = 0.0;
+    for (i, p) in points.iter().enumerate() {
+        let q = &points[(i + 1) % points.len()];
+        sum += p.x * q.y - q.x * p.y;
+    }
+    sum.abs() / 2.0
+}
+
+/// Total surface area of a mesh (sum of triangle areas).
+fn mesh_surface_area(mesh: &kernel_mesh::Mesh) -> f64 {
+    let pos = mesh.positions();
+    mesh.faces()
+        .iter()
+        .map(|f| {
+            let (a, b, c) = (pos[f[0] as usize], pos[f[1] as usize], pos[f[2] as usize]);
+            (b - a).cross(c - a).length() / 2.0
+        })
+        .sum()
 }
 
 /// Look up a layer for style edits; missing layers get an actionable error.
@@ -1578,6 +1602,114 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Distance { a, b } => {
+            let d = b - a;
+            let u = doc.units;
+            Ok((
+                Command::Distance { a, b },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "distance: {} (dx {}, dy {}, dz {})",
+                        format_length(u, d.length()),
+                        format_length(u, d.x),
+                        format_length(u, d.y),
+                        format_length(u, d.z)
+                    ),
+                },
+            ))
+        }
+        Command::Area { targets } => {
+            let ids = resolve(doc, &targets)?;
+            let mut total = 0.0;
+            for id in &ids {
+                total += match &doc.get(*id).expect("resolved").geometry {
+                    Geometry::Curve(c) if c.is_closed() => {
+                        shoelace_area(&c.tessellate(PROFILE_TOL))
+                    }
+                    Geometry::Curve(_) => {
+                        return Err(ExecError::Invalid(format!(
+                            "'{id}' is an open curve — area needs a closed curve or a mesh"
+                        )))
+                    }
+                    Geometry::Mesh(m) => mesh_surface_area(m),
+                    Geometry::Annotation(_) => {
+                        return Err(ExecError::Invalid(format!(
+                            "'{id}' is an annotation — area needs a closed curve or a mesh"
+                        )))
+                    }
+                };
+            }
+            Ok((
+                Command::Area { targets },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "area of {} object(s): {}",
+                        ids.len(),
+                        format_area(doc.units, total)
+                    ),
+                },
+            ))
+        }
+        Command::Volume { targets } => {
+            let ids = resolve(doc, &targets)?;
+            let mut total = 0.0;
+            for id in &ids {
+                match &doc.get(*id).expect("resolved").geometry {
+                    Geometry::Mesh(m) => total += kernel_mesh::signed_volume(m),
+                    Geometry::Curve(_) => {
+                        return Err(ExecError::Invalid(format!(
+                            "'{id}' is a curve; volume needs meshes — extrude it first"
+                        )))
+                    }
+                    Geometry::Annotation(_) => {
+                        return Err(ExecError::Invalid(format!(
+                            "'{id}' is an annotation; volume needs meshes"
+                        )))
+                    }
+                }
+            }
+            Ok((
+                Command::Volume { targets },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "volume of {} object(s): {}",
+                        ids.len(),
+                        format_volume(doc.units, total)
+                    ),
+                },
+            ))
+        }
+        Command::Bbox { targets } => {
+            let ids = resolve(doc, &targets)?;
+            let mut bb = doc.get(ids[0]).expect("resolved").geometry.aabb();
+            for id in &ids[1..] {
+                bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+            }
+            let (per_m, label) = doc.units.per_meter();
+            let v = |p: DVec3| {
+                format!("{:.2},{:.2},{:.2}", p.x * per_m, p.y * per_m, p.z * per_m)
+            };
+            Ok((
+                Command::Bbox { targets },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "bbox of {} object(s) ({label}): min {} max {} size {}",
+                        ids.len(),
+                        v(bb.min),
+                        v(bb.max),
+                        v(bb.size())
+                    ),
+                },
+            ))
+        }
         Command::Undo | Command::Redo => unreachable!("handled in Session::run"),
     }
 }
@@ -1627,6 +1759,10 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Export { .. } => "export",
         Command::Select { .. } => "select",
         Command::SelectNone => "selectnone",
+        Command::Distance { .. } => "distance",
+        Command::Area { .. } => "area",
+        Command::Volume { .. } => "volume",
+        Command::Bbox { .. } => "bbox",
         Command::Undo => "undo",
         Command::Redo => "redo",
     }
@@ -2689,6 +2825,104 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("cannot write"), "{err}");
         assert_eq!(s.doc.len(), 3);
+    }
+
+    #[test]
+    fn measure_distance_in_doc_units() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1"); // any content; distance ignores it
+        let out = run(&mut s, "distance 0,0,0 3,4,0");
+        assert!(out.message.contains("distance: 5.00 m"), "{}", out.message);
+        assert!(out.message.contains("dx 3.00 m"), "{}", out.message);
+        run(&mut s, "units mm");
+        let out = run(&mut s, "distance 0,0,0 3,4,0");
+        assert!(out.message.contains("5000 mm"), "{}", out.message);
+    }
+
+    #[test]
+    fn measure_area_curves_and_meshes() {
+        let mut s = Session::default();
+        // closed 10x6 rect: shoelace = 60
+        run(&mut s, "rect 0,0,0 10 6");
+        let out = run(&mut s, "area last");
+        assert!(out.message.contains("60.00 m²"), "{}", out.message);
+        // circle r=2: tessellated shoelace ≈ pi*4
+        run(&mut s, "circle 20,0,0 2");
+        let out = run(&mut s, "area last");
+        let area: f64 = out
+            .message
+            .split_whitespace()
+            .filter_map(|w| w.parse().ok())
+            .last()
+            .unwrap_or_else(|| panic!("no number in '{}'", out.message));
+        // inscribed-polygon tessellation underestimates slightly
+        assert!((area - std::f64::consts::PI * 4.0).abs() < 0.1, "{area}");
+        // mesh: 2x3x4 box surface = 2*(6+8+12) = 52; multi-target sums
+        run(&mut s, "box 30,0,0 2,3,4");
+        let out = run(&mut s, "area last");
+        assert!(out.message.contains("52.00 m²"), "{}", out.message);
+        let out = run(&mut s, "area last 3");
+        let total: f64 = out
+            .message
+            .split_whitespace()
+            .filter_map(|w| w.parse::<f64>().ok())
+            .last()
+            .unwrap();
+        assert!((total - (60.0 + std::f64::consts::PI * 4.0 + 52.0)).abs() < 0.1);
+        // open curves and annotations refuse with hints
+        run(&mut s, "line 40,0 50,0");
+        let err = s.run(parse("area last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("open curve"), "{err}");
+        run(&mut s, "text 0,0 hi");
+        let err = s.run(parse("area last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("annotation"), "{err}");
+    }
+
+    #[test]
+    fn measure_volume_and_bbox() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 5,5,3");
+        let out = run(&mut s, "volume last");
+        assert!(out.message.contains("75.00 m³"), "{}", out.message);
+        // multi-target volumes sum
+        run(&mut s, "box 10,0,0 2,2,2");
+        let out = run(&mut s, "volume last 2");
+        assert!(out.message.contains("83.00 m³"), "{}", out.message);
+        // curves refuse with the extrude hint
+        run(&mut s, "circle 20,0,0 1");
+        let err = s.run(parse("volume last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("extrude it first"), "{err}");
+
+        let out = run(&mut s, "bbox all");
+        // the circle spans y -1..1, so the combined min dips below zero
+        assert!(out.message.contains("min 0.00,-1.00,0.00"), "{}", out.message);
+        assert!(out.message.contains("max 21.00,5.00,3.00"), "{}", out.message);
+        assert!(out.message.contains("size 21.00,6.00,3.00"), "{}", out.message);
+        assert!(out.message.contains("(m)"), "{}", out.message);
+        // bbox respects the doc unit
+        run(&mut s, "units cm");
+        let out = run(&mut s, "bbox last");
+        assert!(out.message.contains("(cm)"), "{}", out.message);
+        assert!(out.message.contains("max 2100.00,100.00,0.00"), "{}", out.message);
+    }
+
+    #[test]
+    fn measure_queries_not_logged_and_leave_doc_untouched() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 5,5,3");
+        let before: Vec<SceneObject> = s.doc.objects().cloned().collect();
+        run(&mut s, "distance 0,0 1,1");
+        run(&mut s, "area last");
+        run(&mut s, "volume last");
+        run(&mut s, "bbox all");
+        let after: Vec<SceneObject> = s.doc.objects().cloned().collect();
+        assert_eq!(before, after);
+        assert_eq!(s.save_log().len(), 1, "queries never enter the op-log");
+        assert_eq!(s.history().0, ["box"]);
+        // replaying the saved log still reproduces the document
+        let replayed = Session::replay(s.save_log()).unwrap();
+        let b: Vec<_> = replayed.doc.objects().cloned().collect();
+        assert_eq!(after, b);
     }
 
     #[test]

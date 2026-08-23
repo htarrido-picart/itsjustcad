@@ -214,6 +214,26 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Export the whole document as DXF R12 (lines, polylines, circles, arcs, text; meshes as feature edges). Example: export /tmp/model.dxf",
         },
         CommandSpec {
+            name: "distance",
+            usage: "distance <a x,y,z> <b x,y,z>",
+            summary: "Measure the distance between two points (query only, nothing is created). Example: distance 0,0,0 3,4,0",
+        },
+        CommandSpec {
+            name: "area",
+            usage: "area <selector>",
+            summary: "Measure area: closed curves report the enclosed XY area, meshes their total surface area (query only). Example: area last",
+        },
+        CommandSpec {
+            name: "volume",
+            usage: "volume <selector>",
+            summary: "Measure the volume of solid meshes (query only). Example: volume last",
+        },
+        CommandSpec {
+            name: "bbox",
+            usage: "bbox <selector>",
+            summary: "Report the combined bounding box (min, max, size) of objects (query only). Example: bbox all",
+        },
+        CommandSpec {
             name: "select",
             usage: "select <selector>",
             summary: "Set the selection. Example: select all",
