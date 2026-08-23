@@ -4,6 +4,7 @@
 //! streaming state machine and executed by the app against the one Session.
 
 mod anthropic;
+mod claude_code;
 mod config;
 mod deck;
 mod extract;

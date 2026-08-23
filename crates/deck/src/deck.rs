@@ -55,5 +55,6 @@ pub fn make_deck(config: &DeckConfig) -> Box<dyn LlmDeck> {
     match config.kind {
         DeckKind::OpenaiCompat => Box::new(crate::openai_compat::OpenAiCompatDeck::new(config)),
         DeckKind::Anthropic => Box::new(crate::anthropic::AnthropicDeck::new(config)),
+        DeckKind::ClaudeCode => Box::new(crate::claude_code::ClaudeCodeDeck::new(config)),
     }
 }

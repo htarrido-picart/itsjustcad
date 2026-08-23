@@ -75,6 +75,24 @@ pub async fn probe(config: &DeckConfig) -> Result<ProbeInfo, String> {
     let base = config.base_url.trim_end_matches('/');
 
     match config.kind {
+        DeckKind::ClaudeCode => {
+            let output = tokio::process::Command::new("claude")
+                .arg("--version")
+                .output()
+                .await
+                .map_err(|_| {
+                    "claude CLI not found — install Claude Code (https://claude.com/claude-code)"
+                        .to_string()
+                })?;
+            if !output.status.success() {
+                return Err("claude CLI errored on --version".to_string());
+            }
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(ProbeInfo {
+                detail: format!("ready — {} via {version} (subscription)", config.model),
+                models: vec!["sonnet".into(), "opus".into(), "haiku".into()],
+            })
+        }
         DeckKind::OpenaiCompat => {
             let mut request = client.get(format!("{base}/models"));
             if let Some(key) = config.resolved_key() {

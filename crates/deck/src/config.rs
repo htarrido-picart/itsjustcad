@@ -6,6 +6,8 @@ pub enum DeckKind {
     /// Ollama, Kimi/Moonshot, DeepSeek, vLLM, OpenAI — one adapter covers all.
     OpenaiCompat,
     Anthropic,
+    /// Local `claude` CLI subprocess — Claude subscription auth, no API key.
+    ClaudeCode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -42,6 +44,13 @@ impl Default for DecksFile {
     fn default() -> Self {
         Self {
             decks: vec![
+                DeckConfig {
+                    name: "claude-code".into(),
+                    kind: DeckKind::ClaudeCode,
+                    base_url: String::new(),
+                    model: "sonnet".into(),
+                    api_key: None,
+                },
                 DeckConfig {
                     name: "ollama".into(),
                     kind: DeckKind::OpenaiCompat,
