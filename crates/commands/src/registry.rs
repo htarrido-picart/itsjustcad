@@ -59,9 +59,39 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "NURBS curve by control points (default degree 3). Example: curve 0,0 2,4 6,4 8,0",
         },
         CommandSpec {
+            name: "union",
+            usage: "union <selector>",
+            summary: "Merge 2+ meshes into one solid; inputs are consumed. Example: union last 2",
+        },
+        CommandSpec {
+            name: "difference",
+            usage: "difference <target selector> <tool selector>",
+            summary: "Subtract tool meshes from target meshes (cut holes, courtyards); inputs are consumed and tools win overlapping selectors. Make the tool slightly taller/deeper than the target for clean through-cuts. Examples: difference tower core · difference last 2 last",
+        },
+        CommandSpec {
+            name: "intersect",
+            usage: "intersect <selector>",
+            summary: "Keep only the shared volume of 2+ meshes; inputs are consumed. Example: intersect last 2",
+        },
+        CommandSpec {
             name: "move",
             usage: "move <selector> <delta x,y,z>",
             summary: "Translate objects. Example: move last 5,0,0",
+        },
+        CommandSpec {
+            name: "rotate",
+            usage: "rotate <selector> <angle deg> [x|y|z] [about <x,y,z>]",
+            summary: "Rotate objects (default: about z through their bounding-box center). Example: rotate last 45 · rotate all 90 x about 0,0,0",
+        },
+        CommandSpec {
+            name: "scale",
+            usage: "scale <selector> <factor | fx,fy,fz> [about <x,y,z>]",
+            summary: "Scale objects uniformly or per-axis (default: about their bounding-box center). Example: scale last 2 · scale last 1,1,2",
+        },
+        CommandSpec {
+            name: "mirror",
+            usage: "mirror <selector> <xy|yz|xz | point normal>",
+            summary: "Mirror objects across a plane. Example: mirror last yz · mirror last 0,5,0 0,1,0",
         },
         CommandSpec {
             name: "copy",

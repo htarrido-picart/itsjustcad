@@ -94,6 +94,48 @@ impl SavedChatRef<'_> {
     }
 }
 
+#[cfg(test)]
+mod saved_chat_tests {
+    use super::*;
+
+    #[test]
+    fn saved_chat_roundtrip() {
+        let entries = vec![
+            Entry::User("make a slab".into()),
+            Entry::Deck("done".into()),
+            Entry::Status("turn done in 1.0s".into()),
+            Entry::Commands(vec![ExecutedCommand {
+                line: "box 0,0,0 5,5,3".into(),
+                result: Ok("box abc123".into()),
+            }]),
+        ];
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            content: "make a slab".into(),
+        }];
+        let session_id = Some("sess-1".to_string());
+        let json = serde_json::to_string(&SavedChatRef {
+            session_id: &session_id,
+            messages: &messages,
+            transcript: &entries,
+        })
+        .unwrap();
+        let back: SavedChat = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(back.messages.len(), 1);
+        assert_eq!(back.transcript.len(), 4);
+        assert!(matches!(&back.transcript[3], Entry::Commands(c) if c.len() == 1));
+    }
+
+    #[test]
+    fn saved_chat_tolerates_missing_file_shape() {
+        // Old/corrupt files must fall back to default, not crash the app.
+        assert!(serde_json::from_str::<SavedChat>("{bad json").is_err());
+        let empty: SavedChat = serde_json::from_str("{}").unwrap_or_default();
+        assert!(empty.session_id.is_none() && empty.transcript.is_empty());
+    }
+}
+
 /// Deck pane navigation: chat, or a full-pane command detail with a back button.
 enum PaneView {
     Chat,

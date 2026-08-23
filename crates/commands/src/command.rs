@@ -14,6 +14,16 @@ pub enum Selector {
     Selected,
 }
 
+/// Mirror plane: a canonical plane through the origin, or point + normal.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "plane", rename_all = "snake_case")]
+pub enum MirrorPlane {
+    Xy,
+    Yz,
+    Xz,
+    PointNormal { point: DVec3, normal: DVec3 },
+}
+
 /// The shared command language. `id`/`ids` fields are `None` when typed or
 /// emitted; they are filled at apply time and written back into the logged op
 /// so replay reproduces identical ids.
@@ -89,10 +99,46 @@ pub enum Command {
         points: Vec<DVec3>,
         degree: u32,
     },
+    // -- booleans (mesh CSG; inputs are consumed, one result mesh replaces them) --
+    Union {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        targets: Selector,
+    },
+    Difference {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        target: Selector,
+        tools: Selector,
+    },
+    Intersect {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        targets: Selector,
+    },
     // -- edit --
     Move {
         targets: Selector,
         delta: DVec3,
+    },
+    /// Rotate about an axis through `center` (default: targets' AABB center).
+    Rotate {
+        targets: Selector,
+        angle_deg: f64,
+        axis: DVec3,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        center: Option<DVec3>,
+    },
+    /// Scale by per-axis factors about `center` (default: targets' AABB center).
+    Scale {
+        targets: Selector,
+        factors: DVec3,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        center: Option<DVec3>,
+    },
+    Mirror {
+        targets: Selector,
+        plane: MirrorPlane,
     },
     Copy {
         #[serde(default, skip_serializing_if = "Option::is_none")]

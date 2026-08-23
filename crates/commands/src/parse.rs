@@ -2,7 +2,7 @@ use glam::DVec3;
 
 use crate::error::ParseError;
 use crate::registry::registry;
-use crate::{Command, Selector};
+use crate::{Command, MirrorPlane, Selector};
 
 /// Hand-rolled `verb arg arg...` parser. Chosen over a combinator library
 /// because error message quality feeds the LLM retry loop.
@@ -117,6 +117,22 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 degree,
             })
         }
+        "union" => {
+            let (sel, rest) = selector(&args, "union")?;
+            expect_empty("union", rest, &args)?;
+            Ok(Command::Union { id: None, targets: sel })
+        }
+        "difference" | "diff" | "subtract" => {
+            let (target, rest) = selector(&args, "difference")?;
+            let (tools, rest) = selector(rest, "difference")?;
+            expect_empty("difference", rest, &args)?;
+            Ok(Command::Difference { id: None, target, tools })
+        }
+        "intersect" | "intersection" => {
+            let (sel, rest) = selector(&args, "intersect")?;
+            expect_empty("intersect", rest, &args)?;
+            Ok(Command::Intersect { id: None, targets: sel })
+        }
         "move" => {
             let (sel, rest) = selector(&args, "move")?;
             let [delta] = take::<1>("move", "a delta point after the selector", rest)?;
@@ -133,6 +149,52 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 targets: sel,
                 delta: point(delta)?,
             })
+        }
+        "rotate" => with_last_backtrack(&args, "rotate", |sel, rest, args| {
+            let (&angle, rest) = rest
+                .split_first()
+                .ok_or_else(|| wrong_err("rotate", "an angle in degrees", args))?;
+            let angle_deg = number(angle)?;
+            let (axis, rest) = match rest.split_first() {
+                Some((&"x", r)) => (DVec3::X, r),
+                Some((&"y", r)) => (DVec3::Y, r),
+                Some((&"z", r)) => (DVec3::Z, r),
+                _ => (DVec3::Z, rest),
+            };
+            let center = about(rest, "rotate", args)?;
+            Ok(Command::Rotate { targets: sel, angle_deg, axis, center })
+        }),
+        "scale" => with_last_backtrack(&args, "scale", |sel, rest, args| {
+            let (&factor, rest) = rest
+                .split_first()
+                .ok_or_else(|| wrong_err("scale", "a factor or fx,fy,fz", args))?;
+            let factors = if factor.contains(',') {
+                point(factor)?
+            } else {
+                DVec3::splat(number(factor)?)
+            };
+            let center = about(rest, "scale", args)?;
+            Ok(Command::Scale { targets: sel, factors, center })
+        }),
+        "mirror" => {
+            let (sel, rest) = selector(&args, "mirror")?;
+            let plane = match rest {
+                ["xy"] => MirrorPlane::Xy,
+                ["yz"] => MirrorPlane::Yz,
+                ["xz"] => MirrorPlane::Xz,
+                [p, n] => MirrorPlane::PointNormal {
+                    point: point(p)?,
+                    normal: point(n)?,
+                },
+                _ => {
+                    return wrong(
+                        "mirror",
+                        "a plane: xy, yz, xz, or <point> <normal>",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::Mirror { targets: sel, plane })
         }
         "delete" | "del" => {
             let (sel, rest) = selector(&args, "delete")?;
@@ -197,6 +259,41 @@ fn expect_empty(command: &'static str, rest: &[&str], args: &[&str]) -> Result<(
         Ok(())
     } else {
         wrong(command, "only a selector", args)
+    }
+}
+
+/// Parse "<selector> <numeric args...>" where a bare number follows the
+/// selector. "last 90" is ambiguous (last-90-objects vs last + angle 90):
+/// try the greedy selector first, and when the numeric tail fails to parse,
+/// retry with `last` meaning one object so the count becomes the number.
+fn with_last_backtrack(
+    args: &[&str],
+    command: &'static str,
+    build: impl Fn(Selector, &[&str], &[&str]) -> Result<Command, ParseError>,
+) -> Result<Command, ParseError> {
+    let (sel, rest) = selector(args, command)?;
+    match build(sel, rest, args) {
+        Ok(cmd) => Ok(cmd),
+        Err(e) => {
+            if args.first() == Some(&"last") && args.len() >= 2 {
+                build(Selector::Last { n: 1 }, &args[1..], args).map_err(|_| e)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Optional trailing `about <point>` clause for rotate/scale.
+fn about(
+    rest: &[&str],
+    command: &'static str,
+    args: &[&str],
+) -> Result<Option<DVec3>, ParseError> {
+    match rest {
+        [] => Ok(None),
+        ["about", p] => Ok(Some(point(p)?)),
+        _ => Err(wrong_err(command, "optionally 'about <point>' at the end", args)),
     }
 }
 
@@ -354,6 +451,75 @@ mod tests {
     fn parse_curve_with_degree() {
         let cmd = parse("curve 0,0 2,4 6,4 8,0 degree 2").unwrap();
         assert!(matches!(cmd, Command::Curve { degree: 2, ref points, .. } if points.len() == 4));
+    }
+
+    #[test]
+    fn parse_transforms() {
+        assert!(matches!(
+            parse("rotate last 45").unwrap(),
+            Command::Rotate { angle_deg, axis: DVec3::Z, center: None, .. } if angle_deg == 45.0
+        ));
+        assert!(matches!(
+            parse("rotate all 90 x about 0,0,0").unwrap(),
+            Command::Rotate {
+                targets: Selector::All,
+                axis: DVec3::X,
+                center: Some(DVec3::ZERO),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse("scale last 2").unwrap(),
+            Command::Scale { factors, center: None, .. } if factors == DVec3::splat(2.0)
+        ));
+        assert!(matches!(
+            parse("scale last 1,1,2").unwrap(),
+            Command::Scale { factors, .. } if factors == DVec3::new(1.0, 1.0, 2.0)
+        ));
+        assert!(matches!(
+            parse("mirror last yz").unwrap(),
+            Command::Mirror { plane: MirrorPlane::Yz, .. }
+        ));
+        assert!(matches!(
+            parse("mirror last 0,5,0 0,1,0").unwrap(),
+            Command::Mirror { plane: MirrorPlane::PointNormal { .. }, .. }
+        ));
+        // scale rejects garbage after the center clause
+        assert!(parse("scale last 2 about 0,0,0 extra").is_err());
+        // rotate needs an angle
+        let err = parse("rotate last").unwrap_err();
+        assert!(err.to_string().contains("angle"), "{err}");
+    }
+
+    #[test]
+    fn parse_booleans() {
+        assert!(matches!(
+            parse("union last 2").unwrap(),
+            Command::Union { targets: Selector::Last { n: 2 }, .. }
+        ));
+        assert!(matches!(
+            parse("difference tower core").unwrap(),
+            Command::Difference {
+                target: Selector::Named { .. },
+                tools: Selector::Named { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse("diff last 2 last").unwrap(),
+            Command::Difference {
+                target: Selector::Last { n: 2 },
+                tools: Selector::Last { n: 1 },
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse("intersect all").unwrap(),
+            Command::Intersect { targets: Selector::All, .. }
+        ));
+        // missing tool selector → usage in the error
+        let err = parse("difference last").unwrap_err();
+        assert!(err.to_string().contains("selector"), "{err}");
     }
 
     #[test]

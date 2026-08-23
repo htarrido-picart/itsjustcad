@@ -63,6 +63,64 @@ impl Curve {
         }
     }
 
+    /// Apply an affine transform. Returns `true` when the curve type survived
+    /// exactly; `false` when an Arc/Ellipse could not represent the result and
+    /// was tessellated to a closed polyline at `tol`.
+    ///
+    /// Point-based curves (Line, Polyline, Nurbs) are always exact. Arc
+    /// survives translation + Z-rotation + uniform XY scale; Ellipse survives
+    /// translation + axis-aligned scale (its type cannot store a rotation).
+    pub fn transform(&mut self, m: &glam::DMat4, tol: f64) -> bool {
+        const EPS: f64 = 1e-9;
+        let lx = m.transform_vector3(DVec3::X);
+        let ly = m.transform_vector3(DVec3::Y);
+        match self {
+            Curve::Line { a, b } => {
+                *a = m.transform_point3(*a);
+                *b = m.transform_point3(*b);
+                true
+            }
+            Curve::Polyline { points, .. } | Curve::Nurbs { control: points, .. } => {
+                points.iter_mut().for_each(|p| *p = m.transform_point3(*p));
+                true
+            }
+            Curve::Arc { center, radius, start, end } => {
+                // Preserved when XY maps to XY as rotation × uniform scale
+                // without flipping orientation.
+                let planar = lx.z.abs() < EPS && ly.z.abs() < EPS;
+                let uniform = (lx.length() - ly.length()).abs() < EPS;
+                let orthogonal = lx.dot(ly).abs() < EPS * lx.length_squared().max(1.0);
+                let keeps_ccw = lx.cross(ly).z > EPS;
+                if planar && uniform && orthogonal && keeps_ccw {
+                    let angle = lx.y.atan2(lx.x);
+                    *center = m.transform_point3(*center);
+                    *radius *= lx.length();
+                    *start += angle;
+                    *end += angle;
+                    true
+                } else {
+                    *self = tessellated_polyline(self, m, tol);
+                    false
+                }
+            }
+            Curve::Ellipse { center, rx, ry } => {
+                // Preserved only under axis-aligned scaling (the type cannot
+                // store a rotation); axis flips are fine by symmetry.
+                let diagonal = lx.y.abs() < EPS && lx.z.abs() < EPS
+                    && ly.x.abs() < EPS && ly.z.abs() < EPS;
+                if diagonal {
+                    *center = m.transform_point3(*center);
+                    *rx *= lx.x.abs();
+                    *ry *= ly.y.abs();
+                    true
+                } else {
+                    *self = tessellated_polyline(self, m, tol);
+                    false
+                }
+            }
+        }
+    }
+
     /// Tessellate to a polyline with roughly `tol` max chord deviation.
     /// For closed curves the first point is NOT repeated at the end.
     pub fn tessellate(&self, tol: f64) -> Vec<DVec3> {
@@ -132,6 +190,20 @@ impl Curve {
     }
 }
 
+/// Fallback for transforms an Arc/Ellipse cannot represent: sample the curve,
+/// transform the samples, return a polyline (closed if the source was).
+fn tessellated_polyline(curve: &Curve, m: &glam::DMat4, tol: f64) -> Curve {
+    let points = curve
+        .tessellate(tol)
+        .into_iter()
+        .map(|p| m.transform_point3(p))
+        .collect();
+    Curve::Polyline {
+        points,
+        closed: curve.is_closed(),
+    }
+}
+
 fn segments_for_arc(radius: f64, sweep: f64, tol: f64) -> usize {
     if radius <= tol {
         return 8;
@@ -172,6 +244,75 @@ mod tests {
         for p in &pts {
             assert!((p.length() - 5.0).abs() < 0.02);
         }
+    }
+
+    #[test]
+    fn transform_arc_z_rotation_exact() {
+        let mut c = Curve::Arc {
+            center: DVec3::new(2.0, 0.0, 1.0),
+            radius: 3.0,
+            start: 0.0,
+            end: 1.0,
+        };
+        let m = glam::DMat4::from_rotation_z(std::f64::consts::FRAC_PI_2);
+        assert!(c.transform(&m, 0.01));
+        let Curve::Arc { center, radius, start, .. } = c else { panic!() };
+        assert!((center - DVec3::new(0.0, 2.0, 1.0)).length() < 1e-9);
+        assert!((radius - 3.0).abs() < 1e-12);
+        assert!((start - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn transform_arc_uniform_scale_exact() {
+        let mut c = Curve::Arc {
+            center: DVec3::ZERO,
+            radius: 2.0,
+            start: 0.0,
+            end: 1.0,
+        };
+        assert!(c.transform(&glam::DMat4::from_scale(DVec3::splat(2.5)), 0.01));
+        let Curve::Arc { radius, .. } = c else { panic!() };
+        assert!((radius - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn transform_arc_nonuniform_tessellates() {
+        let mut c = Curve::Arc {
+            center: DVec3::ZERO,
+            radius: 2.0,
+            start: 0.0,
+            end: std::f64::consts::TAU,
+        };
+        let exact = c.transform(&glam::DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0)), 0.01);
+        assert!(!exact);
+        let Curve::Polyline { closed, ref points } = c else { panic!("expected polyline") };
+        assert!(closed);
+        // stretched to an ellipse: x extent 4, y extent 2
+        let max_x = points.iter().map(|p| p.x.abs()).fold(0.0, f64::max);
+        let max_y = points.iter().map(|p| p.y.abs()).fold(0.0, f64::max);
+        assert!((max_x - 4.0).abs() < 0.05 && (max_y - 2.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn transform_ellipse_axis_scale_exact_rotation_tessellates() {
+        let mut e = Curve::Ellipse { center: DVec3::ZERO, rx: 4.0, ry: 2.0 };
+        assert!(e.transform(&glam::DMat4::from_scale(DVec3::new(2.0, 3.0, 1.0)), 0.01));
+        let Curve::Ellipse { rx, ry, .. } = e else { panic!() };
+        assert_eq!((rx, ry), (8.0, 6.0));
+
+        let mut e = Curve::Ellipse { center: DVec3::ZERO, rx: 4.0, ry: 2.0 };
+        assert!(!e.transform(&glam::DMat4::from_rotation_z(0.5), 0.01));
+        assert!(matches!(e, Curve::Polyline { closed: true, .. }));
+    }
+
+    #[test]
+    fn transform_polyline_and_line_exact() {
+        let m = glam::DMat4::from_rotation_z(0.7) * glam::DMat4::from_translation(DVec3::X);
+        let mut l = Curve::Line { a: DVec3::ZERO, b: DVec3::X };
+        assert!(l.transform(&m, 0.01));
+        let mut p = Curve::Polyline { points: vec![DVec3::ZERO, DVec3::X, DVec3::Y], closed: true };
+        assert!(p.transform(&m, 0.01));
+        assert!(p.is_closed());
     }
 
     #[test]

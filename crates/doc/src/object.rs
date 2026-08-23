@@ -46,6 +46,18 @@ impl Geometry {
         }
     }
 
+    /// Apply an affine transform. Returns `false` when a curve had to be
+    /// tessellated to represent the result (see [`Curve::transform`]).
+    pub fn transform(&mut self, m: &glam::DMat4, tol: f64) -> bool {
+        match self {
+            Geometry::Mesh(mesh) => {
+                mesh.transform(*m);
+                true
+            }
+            Geometry::Curve(c) => c.transform(m, tol),
+        }
+    }
+
     pub fn aabb(&self) -> Aabb {
         match self {
             Geometry::Mesh(m) => m.aabb(),

@@ -4,7 +4,7 @@ use kernel_mesh::extrude_profile;
 use mydrafter_doc::{Document, Geometry, ObjectId, SceneObject};
 
 use crate::error::ExecError;
-use crate::{Command, Selector};
+use crate::{Command, MirrorPlane, Selector};
 
 /// Chord tolerance used when tessellating profile curves for extrusion.
 const PROFILE_TOL: f64 = 0.01;
@@ -28,6 +28,14 @@ enum Inverse {
     MoveBack { ids: Vec<ObjectId>, delta: DVec3 },
     Restore(Vec<(SceneObject, usize)>),
     Rename(Vec<(ObjectId, Option<String>)>),
+    /// Booleans: delete the result, restore the consumed inputs.
+    Replace {
+        created: Vec<ObjectId>,
+        consumed: Vec<(SceneObject, usize)>,
+    },
+    /// Transforms: write back pre-transform geometry snapshots. Exact —
+    /// inverse matrices drift and cannot un-tessellate an arc.
+    SetGeometry(Vec<(ObjectId, Geometry)>),
 }
 
 /// Owns the document plus its op-log; the single mutation path for both the
@@ -89,6 +97,22 @@ impl Session {
                     if let Some(obj) = self.doc.get_mut(*id) {
                         obj.name = name.clone();
                     }
+                }
+            }
+            Inverse::SetGeometry(snapshots) => {
+                for (id, geometry) in snapshots.clone() {
+                    if let Some(obj) = self.doc.get_mut(id) {
+                        obj.geometry = geometry;
+                    }
+                }
+            }
+            Inverse::Replace { created, consumed } => {
+                let created = created.clone();
+                for id in created {
+                    self.doc.remove(id);
+                }
+                for (obj, index) in consumed.iter().rev() {
+                    self.doc.restore(obj.clone(), *index);
                 }
             }
         }
@@ -161,6 +185,119 @@ fn insert_curve(
         message: format!("{what} {id}"),
     };
     (id, outcome)
+}
+
+/// Apply `linear` about `center` (targets' combined AABB center when `None`)
+/// to every resolved target, snapshotting geometry for exact undo.
+fn apply_about_center(
+    doc: &mut Document,
+    ids: &[ObjectId],
+    center: Option<DVec3>,
+    linear: glam::DMat4,
+) -> (Inverse, usize) {
+    let center = center.unwrap_or_else(|| {
+        let mut bb = doc.get(ids[0]).expect("resolved").geometry.aabb();
+        for id in &ids[1..] {
+            bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+        }
+        bb.center()
+    });
+    let m = glam::DMat4::from_translation(center) * linear
+        * glam::DMat4::from_translation(-center);
+    let mut snapshots = Vec::with_capacity(ids.len());
+    let mut tessellated = 0usize;
+    for id in ids {
+        let obj = doc.get_mut(*id).expect("resolved");
+        snapshots.push((*id, obj.geometry.clone()));
+        if !obj.geometry.transform(&m, PROFILE_TOL) {
+            tessellated += 1;
+        }
+    }
+    (Inverse::SetGeometry(snapshots), tessellated)
+}
+
+/// "…, 2 curve(s) tessellated to polylines" suffix when a transform degraded
+/// arcs/ellipses.
+fn tessellation_note(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!(", {count} curve(s) tessellated to polylines")
+    }
+}
+
+/// Collect mesh clones for a boolean; curves are rejected with a hint the
+/// LLM can act on.
+fn boolean_inputs(
+    doc: &Document,
+    ids: &[ObjectId],
+) -> Result<Vec<kernel_mesh::Mesh>, ExecError> {
+    ids.iter()
+        .map(|id| {
+            let obj = doc.get(*id).expect("resolved id exists");
+            match &obj.geometry {
+                Geometry::Mesh(m) => Ok(m.clone()),
+                Geometry::Curve(_) => Err(ExecError::Invalid(format!(
+                    "'{id}' is a curve; booleans need meshes — extrude it first"
+                ))),
+            }
+        })
+        .collect()
+}
+
+fn fold_csg(
+    meshes: Vec<kernel_mesh::Mesh>,
+    op: fn(&kernel_mesh::Mesh, &kernel_mesh::Mesh) -> kernel_mesh::Mesh,
+) -> kernel_mesh::Mesh {
+    let mut iter = meshes.into_iter();
+    let first = iter.next().expect("callers guarantee at least one mesh");
+    iter.fold(first, |acc, m| op(&acc, &m))
+}
+
+/// Consume the input objects and insert the boolean result. Errors (leaving
+/// the document untouched) when the result is empty.
+fn replace_with_result(
+    doc: &mut Document,
+    id: Option<ObjectId>,
+    input_ids: &[ObjectId],
+    result: kernel_mesh::Mesh,
+    name: Option<String>,
+    what: &str,
+) -> Result<(ObjectId, Inverse, String), ExecError> {
+    if result.faces().is_empty() {
+        let boxes: Vec<String> = input_ids
+            .iter()
+            .map(|id| {
+                let bb = doc.get(*id).expect("resolved").geometry.aabb();
+                format!("{id}: {:.2}..{:.2}", bb.min, bb.max)
+            })
+            .collect();
+        return Err(ExecError::Invalid(format!(
+            "{what} is empty: the objects do not overlap. Check their positions ({})",
+            boxes.join("; ")
+        )));
+    }
+    let volume = kernel_mesh::signed_volume(&result);
+    let mut consumed = Vec::new();
+    for id in input_ids {
+        if let Some(pair) = doc.remove(*id) {
+            consumed.push(pair);
+        }
+    }
+    let id = id.unwrap_or_default();
+    doc.insert(SceneObject {
+        id,
+        name,
+        geometry: Geometry::Mesh(result),
+    });
+    Ok((
+        id,
+        Inverse::Replace { created: vec![id], consumed },
+        format!(
+            "{what} of {} object(s) -> {id} (volume {volume:.2})",
+            input_ids.len()
+        ),
+    ))
 }
 
 /// Apply a (non-undo) command. Returns the op with ids filled for the log.
@@ -348,6 +485,74 @@ fn apply_forward(
                 outcome,
             ))
         }
+        Command::Union { id, targets } => {
+            let ids = resolve(doc, &targets)?;
+            if ids.len() < 2 {
+                return Err(ExecError::Invalid(
+                    "union needs at least 2 meshes (selector matched 1)".into(),
+                ));
+            }
+            let meshes = boolean_inputs(doc, &ids)?;
+            let result = fold_csg(meshes, kernel_mesh::csg_union);
+            let (id, inverse, message) =
+                replace_with_result(doc, id, &ids, result, None, "union")?;
+            Ok((
+                Command::Union { id: Some(id), targets },
+                inverse,
+                ApplyOutcome { created: vec![id], message },
+            ))
+        }
+        Command::Difference { id, target, tools } => {
+            let tool_ids = resolve(doc, &tools)?;
+            // Tools win overlaps, so "difference last 2 last" reads naturally:
+            // targets = the two most recent minus the tool = the older one.
+            let target_ids: Vec<ObjectId> = resolve(doc, &target)?
+                .into_iter()
+                .filter(|id| !tool_ids.contains(id))
+                .collect();
+            if target_ids.is_empty() {
+                return Err(ExecError::Invalid(
+                    "difference target selector matched only the tools".into(),
+                ));
+            }
+            let mut all_ids = target_ids.clone();
+            all_ids.extend(&tool_ids);
+            let meshes = boolean_inputs(doc, &all_ids)?;
+            let mut iter = meshes.into_iter();
+            let mut base = iter.next().expect("target present");
+            for _ in 1..target_ids.len() {
+                base = kernel_mesh::csg_union(&base, &iter.next().expect("counted"));
+            }
+            let tool = fold_csg(iter.collect(), kernel_mesh::csg_union);
+            let result = kernel_mesh::csg_difference(&base, &tool);
+            // The result keeps the target's name — natural for the LLM
+            // ("tower" with a hole is still "tower").
+            let name = doc.get(target_ids[0]).expect("resolved").name.clone();
+            let (id, inverse, message) =
+                replace_with_result(doc, id, &all_ids, result, name, "difference")?;
+            Ok((
+                Command::Difference { id: Some(id), target, tools },
+                inverse,
+                ApplyOutcome { created: vec![id], message },
+            ))
+        }
+        Command::Intersect { id, targets } => {
+            let ids = resolve(doc, &targets)?;
+            if ids.len() < 2 {
+                return Err(ExecError::Invalid(
+                    "intersect needs at least 2 meshes (selector matched 1)".into(),
+                ));
+            }
+            let meshes = boolean_inputs(doc, &ids)?;
+            let result = fold_csg(meshes, kernel_mesh::csg_intersection);
+            let (id, inverse, message) =
+                replace_with_result(doc, id, &ids, result, None, "intersection")?;
+            Ok((
+                Command::Intersect { id: Some(id), targets },
+                inverse,
+                ApplyOutcome { created: vec![id], message },
+            ))
+        }
         Command::Move { targets, delta } => {
             let ids = resolve(doc, &targets)?;
             for id in &ids {
@@ -359,6 +564,82 @@ fn apply_forward(
                 ApplyOutcome {
                     created: Vec::new(),
                     message: format!("moved {} object(s) by {delta}", ids.len()),
+                },
+            ))
+        }
+        Command::Rotate { targets, angle_deg, axis, center } => {
+            let ids = resolve(doc, &targets)?;
+            let axis_n = axis.normalize_or_zero();
+            if axis_n == DVec3::ZERO {
+                return Err(ExecError::Invalid("rotate axis must be non-zero".into()));
+            }
+            let linear = glam::DMat4::from_axis_angle(axis_n, angle_deg.to_radians());
+            let (inverse, tessellated) = apply_about_center(doc, &ids, center, linear);
+            Ok((
+                Command::Rotate { targets, angle_deg, axis, center },
+                inverse,
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "rotated {} object(s) {angle_deg}°{}",
+                        ids.len(),
+                        tessellation_note(tessellated)
+                    ),
+                },
+            ))
+        }
+        Command::Scale { targets, factors, center } => {
+            if factors.x.abs() < 1e-12 || factors.y.abs() < 1e-12 || factors.z.abs() < 1e-12 {
+                return Err(ExecError::Invalid(format!(
+                    "scale factors must be non-zero, got {factors}"
+                )));
+            }
+            let ids = resolve(doc, &targets)?;
+            let linear = glam::DMat4::from_scale(factors);
+            let (inverse, tessellated) = apply_about_center(doc, &ids, center, linear);
+            Ok((
+                Command::Scale { targets, factors, center },
+                inverse,
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "scaled {} object(s) by {factors}{}",
+                        ids.len(),
+                        tessellation_note(tessellated)
+                    ),
+                },
+            ))
+        }
+        Command::Mirror { targets, plane } => {
+            let ids = resolve(doc, &targets)?;
+            let (point, normal) = match &plane {
+                MirrorPlane::Xy => (DVec3::ZERO, DVec3::Z),
+                MirrorPlane::Yz => (DVec3::ZERO, DVec3::X),
+                MirrorPlane::Xz => (DVec3::ZERO, DVec3::Y),
+                MirrorPlane::PointNormal { point, normal } => (*point, *normal),
+            };
+            let n = normal.normalize_or_zero();
+            if n == DVec3::ZERO {
+                return Err(ExecError::Invalid("mirror normal must be non-zero".into()));
+            }
+            // Householder reflection I - 2nnᵀ across the plane through `point`.
+            let h = glam::DMat4::from_cols(
+                (DVec3::X - 2.0 * n.x * n).extend(0.0),
+                (DVec3::Y - 2.0 * n.y * n).extend(0.0),
+                (DVec3::Z - 2.0 * n.z * n).extend(0.0),
+                glam::DVec4::W,
+            );
+            let (inverse, tessellated) = apply_about_center(doc, &ids, Some(point), h);
+            Ok((
+                Command::Mirror { targets, plane },
+                inverse,
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "mirrored {} object(s){}",
+                        ids.len(),
+                        tessellation_note(tessellated)
+                    ),
                 },
             ))
         }
@@ -458,7 +739,13 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Ellipse { .. } => "ellipse",
         Command::Polygon { .. } => "polygon",
         Command::Curve { .. } => "curve",
+        Command::Union { .. } => "union",
+        Command::Difference { .. } => "difference",
+        Command::Intersect { .. } => "intersect",
         Command::Move { .. } => "move",
+        Command::Rotate { .. } => "rotate",
+        Command::Scale { .. } => "scale",
+        Command::Mirror { .. } => "mirror",
         Command::Copy { .. } => "copy",
         Command::Delete { .. } => "delete",
         Command::Name { .. } => "name",
@@ -558,6 +845,170 @@ mod tests {
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap()
         );
+    }
+
+    #[test]
+    fn difference_consumes_inputs_and_undoes() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 10,10,3");
+        run(&mut s, "name last slab");
+        run(&mut s, "box 3,3,-1 4,4,5");
+        run(&mut s, "difference slab last");
+        assert_eq!(s.doc.len(), 1);
+        let obj = s.doc.objects().next().unwrap();
+        assert_eq!(obj.name.as_deref(), Some("slab")); // result inherits target name
+        let Geometry::Mesh(m) = &obj.geometry else { panic!("expected mesh") };
+        assert!((kernel_mesh::signed_volume(m) - (300.0 - 48.0)).abs() < 1e-6);
+
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2); // both inputs restored
+        let result_id = {
+            run(&mut s, "redo");
+            assert_eq!(s.doc.len(), 1);
+            s.doc.objects().next().unwrap().id
+        };
+        // redo reproduces the same result id
+        run(&mut s, "undo");
+        run(&mut s, "redo");
+        assert_eq!(s.doc.objects().next().unwrap().id, result_id);
+    }
+
+    #[test]
+    fn union_and_intersect() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2");
+        run(&mut s, "box 1,1,1 2,2,2");
+        run(&mut s, "union last 2");
+        assert_eq!(s.doc.len(), 1);
+        let Geometry::Mesh(m) = &s.doc.objects().next().unwrap().geometry else {
+            panic!("expected mesh")
+        };
+        assert!((kernel_mesh::signed_volume(m) - 15.0).abs() < 1e-6);
+
+        run(&mut s, "undo");
+        run(&mut s, "intersect last 2");
+        let Geometry::Mesh(m) = &s.doc.objects().next().unwrap().geometry else {
+            panic!("expected mesh")
+        };
+        assert!((kernel_mesh::signed_volume(m) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn boolean_rejects_curves_and_disjoint_intersect() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "circle 5,5,0 1");
+        let err = s.run(parse("union last 2").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("extrude it first"), "{err}");
+
+        run(&mut s, "delete last"); // drop the circle
+        run(&mut s, "box 10,10,10 1,1,1");
+        let err = s.run(parse("intersect last 2").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("do not overlap"), "{err}");
+        assert_eq!(s.doc.len(), 2); // failed boolean leaves the doc untouched
+    }
+
+    #[test]
+    fn boolean_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 10,10,3");
+        run(&mut s, "box 3,3,-1 4,4,5");
+        run(&mut s, "difference last 2 last");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rotate_about_center_and_undo() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,2,1");
+        let bb0 = s.doc.scene_aabb().unwrap();
+        run(&mut s, "rotate last 90"); // about own center, z axis
+        let bb1 = s.doc.scene_aabb().unwrap();
+        // 4x2 footprint becomes 2x4 around the same center
+        assert!((bb1.size() - glam::DVec3::new(2.0, 4.0, 1.0)).length() < 1e-9);
+        assert!((bb1.center() - bb0.center()).length() < 1e-9);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.scene_aabb().unwrap().min, bb0.min);
+    }
+
+    #[test]
+    fn scale_per_axis_about_point() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2");
+        run(&mut s, "scale last 1,1,3 about 0,0,0");
+        let bb = s.doc.scene_aabb().unwrap();
+        assert_eq!(bb.size(), glam::DVec3::new(2.0, 2.0, 6.0));
+        assert_eq!(bb.min, glam::DVec3::ZERO); // anchored at origin
+
+        let err = s.run(parse("scale last 0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("non-zero"), "{err}");
+    }
+
+    #[test]
+    fn mirror_keeps_volume_positive() {
+        let mut s = Session::default();
+        run(&mut s, "box 1,0,0 2,2,2");
+        run(&mut s, "mirror last yz");
+        let bb = s.doc.scene_aabb().unwrap();
+        assert_eq!(bb.min.x, -3.0); // reflected across x=0
+        let Geometry::Mesh(m) = &s.doc.objects().next().unwrap().geometry else {
+            panic!("expected mesh")
+        };
+        // winding flipped back → outward normals → positive volume
+        assert!((kernel_mesh::signed_volume(m) - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rotate_arc_stays_arc_mirror_tessellates() {
+        let mut s = Session::default();
+        run(&mut s, "arc 0,0,0 5 0 90");
+        run(&mut s, "rotate last 90 z about 0,0,0");
+        let Geometry::Curve(c) = &s.doc.objects().next().unwrap().geometry else {
+            panic!("expected curve")
+        };
+        assert!(matches!(c, kernel_curve::Curve::Arc { .. }));
+
+        let out = run(&mut s, "mirror last xz");
+        assert!(out.message.contains("tessellated"), "{}", out.message);
+        let Geometry::Curve(c) = &s.doc.objects().next().unwrap().geometry else {
+            panic!("expected curve")
+        };
+        assert!(matches!(c, kernel_curve::Curve::Polyline { .. }));
+
+        run(&mut s, "undo"); // back to the rotated arc, exactly
+        let Geometry::Curve(c) = &s.doc.objects().next().unwrap().geometry else {
+            panic!("expected curve")
+        };
+        assert!(matches!(c, kernel_curve::Curve::Arc { .. }));
+    }
+
+    #[test]
+    fn extrude_after_rotate_works() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 4 6");
+        run(&mut s, "rotate last 45");
+        run(&mut s, "extrude last 3");
+        assert_eq!(s.doc.len(), 2);
+    }
+
+    #[test]
+    fn transform_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,2,1");
+        run(&mut s, "rotate last 30");
+        run(&mut s, "scale last 2 about 0,0,0");
+        run(&mut s, "mirror last yz");
+        run(&mut s, "circle 10,0,0 2");
+        run(&mut s, "scale last 2,1,1"); // ellipse-ish: circle tessellates? (circle is Arc; non-uniform → polyline)
+        let log = s.save_log();
+        let replayed = Session::replay(log).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
     }
 
     #[test]

@@ -37,6 +37,13 @@ impl Mesh {
         for p in &mut self.positions {
             *p = m.transform_point3(*p);
         }
+        // Reflections (mirror, negative scale) flip triangle winding; reverse
+        // the faces so normals keep pointing outward.
+        if m.determinant() < 0.0 {
+            for f in &mut self.faces {
+                f.swap(1, 2);
+            }
+        }
     }
 
     pub fn aabb(&self) -> Aabb {

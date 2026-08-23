@@ -9,7 +9,7 @@ pub mod io;
 mod parse;
 mod registry;
 
-pub use command::{Command, Selector};
+pub use command::{Command, MirrorPlane, Selector};
 pub use error::{ExecError, ParseError};
 pub use exec::{ApplyOutcome, Session};
 pub use parse::parse;
