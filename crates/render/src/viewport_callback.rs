@@ -11,6 +11,9 @@ pub struct ViewportCallback {
     pub generation: u64,
     /// Present only on frames where `generation` differs from the GPU copy.
     pub scene: Option<SceneData>,
+    /// Pane index — selects the per-viewport camera UBO so multiple panes in
+    /// one frame do not clobber each other's camera during `prepare`.
+    pub viewport: usize,
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -28,7 +31,7 @@ impl CallbackTrait for ViewportCallback {
             inv_view_proj: self.view_proj.inverse().to_cols_array_2d(),
             eye: [self.eye.x, self.eye.y, self.eye.z, 1.0],
         };
-        renderer.write_camera(queue, &cam);
+        renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene
             && renderer.generation != self.generation
         {
@@ -44,6 +47,6 @@ impl CallbackTrait for ViewportCallback {
         resources: &egui_wgpu::CallbackResources,
     ) {
         let renderer: &SceneRenderer = resources.get().expect("SceneRenderer registered");
-        renderer.paint(render_pass);
+        renderer.paint(render_pass, self.viewport);
     }
 }

@@ -1,11 +1,13 @@
 //! Viewport rendering: wgpu pipelines inside egui paint callbacks.
 
 mod camera;
+mod layout;
 mod renderer;
 mod snapshot;
 mod viewport_callback;
 
 pub use camera::{OrbitCamera, StandardView};
+pub use layout::ViewportLayout;
 pub use renderer::{CameraUniform, SceneData, SceneRenderer};
 pub use snapshot::{snapshot, Theme};
 pub use viewport_callback::ViewportCallback;

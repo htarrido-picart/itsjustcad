@@ -49,7 +49,7 @@ fn main() {
     let view_proj = camera.view_proj(aspect);
     let eye = camera.eye();
     let cam = mydrafter_render::camera_uniform(view_proj, eye);
-    renderer.write_camera(&queue, &cam);
+    renderer.write_camera(&device, &queue, 0, &cam);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("headless_color"),
@@ -103,7 +103,7 @@ fn main() {
             multiview_mask: None,
         });
         let mut pass = pass.forget_lifetime();
-        renderer.paint(&mut pass);
+        renderer.paint(&mut pass, 0);
     }
 
     let bytes_per_row = (W * 4).next_multiple_of(256);
@@ -154,5 +154,6 @@ fn main() {
         eye,
         generation: 0,
         scene: None,
+        viewport: 0,
     };
 }

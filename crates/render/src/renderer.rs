@@ -43,8 +43,11 @@ pub struct SceneRenderer {
     grid_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
     curve_pipeline: wgpu::RenderPipeline,
-    camera_buf: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
+    camera_layout: wgpu::BindGroupLayout,
+    /// One camera UBO + bind group per viewport pane. egui-wgpu runs every
+    /// callback's `prepare` before any `paint`, so panes must not share a
+    /// single camera buffer — the last write would win for all of them.
+    cameras: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     object_layout: wgpu::BindGroupLayout,
     meshes: Vec<GpuMesh>,
     lines: Vec<GpuLine>,
@@ -78,21 +81,6 @@ impl SceneRenderer {
                     min_binding_size: None,
                 },
                 count: None,
-            }],
-        });
-
-        let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("camera_ubo"),
-            size: std::mem::size_of::<CameraUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera_bind_group"),
-            layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buf.as_entire_binding(),
             }],
         });
 
@@ -234,8 +222,8 @@ impl SceneRenderer {
             grid_pipeline,
             mesh_pipeline,
             curve_pipeline,
-            camera_buf,
-            camera_bind_group,
+            camera_layout,
+            cameras: Vec::new(),
             object_layout,
             meshes: Vec::new(),
             lines: Vec::new(),
@@ -243,8 +231,32 @@ impl SceneRenderer {
         }
     }
 
-    pub fn write_camera(&self, queue: &wgpu::Queue, cam: &CameraUniform) {
-        queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(cam));
+    /// Upload the camera for one viewport pane, growing the slot list on demand.
+    pub fn write_camera(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        viewport: usize,
+        cam: &CameraUniform,
+    ) {
+        while self.cameras.len() <= viewport {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("camera_ubo"),
+                size: std::mem::size_of::<CameraUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("camera_bind_group"),
+                layout: &self.camera_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf.as_entire_binding(),
+                }],
+            });
+            self.cameras.push((buf, bind_group));
+        }
+        queue.write_buffer(&self.cameras[viewport].0, 0, bytemuck::bytes_of(cam));
     }
 
     /// Rebuild all mesh buffers. Called when the document generation changes;
@@ -337,8 +349,11 @@ impl SceneRenderer {
         }
     }
 
-    pub fn paint(&self, render_pass: &mut wgpu::RenderPass<'static>) {
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+    pub fn paint(&self, render_pass: &mut wgpu::RenderPass<'static>, viewport: usize) {
+        let Some((_, camera_bind_group)) = self.cameras.get(viewport) else {
+            return; // paint before any prepare for this pane — nothing to draw yet
+        };
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
 
         render_pass.set_pipeline(&self.mesh_pipeline);
         for mesh in &self.meshes {

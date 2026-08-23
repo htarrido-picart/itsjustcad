@@ -1,5 +1,5 @@
 use mydrafter_commands::Session;
-use mydrafter_render::{OrbitCamera, SceneRenderer, StandardView, ViewportCallback};
+use mydrafter_render::{OrbitCamera, SceneRenderer, StandardView, ViewportCallback, ViewportLayout};
 
 use crate::command_line::CommandLine;
 use crate::deck_pane::DeckPane;
@@ -12,7 +12,11 @@ pub struct App {
     deck_pane: DeckPane,
     draw_tool: DrawTool,
     tokio: tokio::runtime::Handle,
-    camera: OrbitCamera,
+    /// Camera slots shared across layouts: 0 Persp, 1 Top, 2 Front, 3 Right.
+    cameras: [OrbitCamera; 4],
+    layout: ViewportLayout,
+    /// Last hovered pane; view commands and tools target its camera.
+    active_pane: usize,
     /// Generation of the last GPU upload; compare with `session.doc.generation`.
     uploaded_generation: Option<u64>,
     /// Theme of the last GPU upload; theme flips force a re-upload.
@@ -54,7 +58,15 @@ impl App {
             deck_pane: DeckPane::default(),
             draw_tool: DrawTool::default(),
             tokio,
-            camera: OrbitCamera::default(),
+            cameras: {
+                let mut cams = [OrbitCamera::default(); 4];
+                cams[1].set_view(StandardView::Top);
+                cams[2].set_view(StandardView::Front);
+                cams[3].set_view(StandardView::Right);
+                cams
+            },
+            layout: ViewportLayout::Single,
+            active_pane: 0,
             uploaded_generation: None,
             uploaded_theme: None,
             saved_zoom: zoom,
@@ -86,6 +98,19 @@ impl App {
             Some("save") => self.save(words.next().map(Into::into)),
             Some("open") => self.open(words.next().map(Into::into)),
             Some("ze" | "zoomextents") => self.zoom_extents(),
+            Some("viewports" | "vp") => {
+                match words.next() {
+                    Some("1") => self.set_layout(ViewportLayout::Single),
+                    Some("2") => self.set_layout(ViewportLayout::Two),
+                    Some("4") => self.set_layout(ViewportLayout::Four),
+                    _ => {
+                        self.command_line.push_line("usage: viewports 1|2|4");
+                        return;
+                    }
+                }
+                self.command_line
+                    .push_line(format!("viewports: {}", self.layout.pane_count()));
+            }
             Some(view @ ("top" | "bottom" | "front" | "back" | "left" | "right" | "persp"
             | "perspective")) => {
                 self.set_view(view);
@@ -103,6 +128,16 @@ impl App {
         }
     }
 
+    fn set_layout(&mut self, layout: ViewportLayout) {
+        self.layout = layout;
+        self.active_pane = 0;
+    }
+
+    /// Camera of the active (last hovered) pane.
+    fn active_camera(&mut self) -> &mut OrbitCamera {
+        &mut self.cameras[self.layout.camera_index(self.active_pane)]
+    }
+
     fn set_view(&mut self, name: &str) {
         let view = match name {
             "top" => StandardView::Top,
@@ -113,22 +148,20 @@ impl App {
             "right" => StandardView::Right,
             _ => StandardView::Perspective,
         };
-        self.camera.set_view(view);
+        self.active_camera().set_view(view);
     }
 
     fn zoom_extents(&mut self) {
         if let Some(bb) = self.session.doc.scene_aabb() {
             let center = bb.center();
-            self.camera.target =
-                glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32);
-            self.camera.distance = (bb.size().length() as f32 * 1.2).max(5.0);
+            let cam = self.active_camera();
+            cam.target = glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32);
+            cam.distance = (bb.size().length() as f32 * 1.2).max(5.0);
         }
     }
 
     /// Click-select: ray through the clicked pixel vs object AABBs.
-    fn pick(&mut self, rect: egui::Rect, pos: egui::Pos2, additive: bool) {
-        let aspect = rect.width() / rect.height().max(1.0);
-        let view_proj = self.camera.view_proj(aspect);
+    fn pick(&mut self, view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2, additive: bool) {
         let inv = view_proj.inverse();
         let ndc = glam::Vec2::new(
             (pos.x - rect.left()) / rect.width() * 2.0 - 1.0,
@@ -237,37 +270,15 @@ impl App {
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
-        let (rect, response) =
-            ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-
-        // Rhino muscle memory: RMB orbit, Shift+RMB pan, scroll dolly.
-        if response.dragged_by(egui::PointerButton::Secondary)
-            || response.dragged_by(egui::PointerButton::Middle)
-        {
-            let delta = response.drag_delta();
-            let shift = ui.input(|i| i.modifiers.shift);
-            if shift {
-                self.camera.pan(delta.x, delta.y);
-            } else {
-                self.camera.orbit(delta.x, delta.y);
-            }
+        let full = ui.available_rect_before_wrap();
+        if self.active_pane >= self.layout.pane_count() {
+            self.active_pane = 0;
         }
-        if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                self.camera.dolly(scroll);
-            }
-        }
-        let aspect = rect.width() / rect.height().max(1.0);
-        let view_proj = self.camera.view_proj(aspect);
-
-        if self.draw_tool.active() {
-            self.drawing_input(ui, rect, &response, view_proj);
-        } else if response.clicked()
-            && let Some(pos) = response.interact_pointer_pos()
+        // Active viewport = last hovered: tools and view commands follow the cursor.
+        if let Some(pos) = ui.ctx().pointer_latest_pos()
+            && let Some(pane) = self.layout.pane_at(full, pos)
         {
-            let additive = ui.input(|i| i.modifiers.shift);
-            self.pick(rect, pos, additive);
+            self.active_pane = pane;
         }
 
         let theme = if ui.visuals().dark_mode {
@@ -278,24 +289,80 @@ impl App {
         let generation = self.session.doc.generation;
         let stale = self.uploaded_generation != Some(generation)
             || self.uploaded_theme != Some(theme);
-        let scene = stale.then(|| {
+        // Scene is uploaded once (renderer shared); only the first pane's
+        // callback carries the snapshot, the rest just set their camera.
+        let mut scene = stale.then(|| {
             self.uploaded_generation = Some(generation);
             self.uploaded_theme = Some(theme);
             scene::snapshot(&self.session.doc, theme)
         });
 
-        ui.painter().add(egui_wgpu::Callback::new_paint_callback(
-            rect,
-            ViewportCallback {
-                view_proj,
-                eye: self.camera.eye(),
-                generation,
-                scene,
-            },
-        ));
+        let panes = self.layout.split(full);
+        for (pane, rect) in panes.iter().copied().enumerate() {
+            let cam_idx = self.layout.camera_index(pane);
+            let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
-        self.view_toolbar(ui, rect);
-        self.layers_panel(ui, rect, theme);
+            // Rhino muscle memory: RMB orbit, Shift+RMB pan, scroll dolly.
+            if response.dragged_by(egui::PointerButton::Secondary)
+                || response.dragged_by(egui::PointerButton::Middle)
+            {
+                let delta = response.drag_delta();
+                let shift = ui.input(|i| i.modifiers.shift);
+                if shift {
+                    self.cameras[cam_idx].pan(delta.x, delta.y);
+                } else {
+                    self.cameras[cam_idx].orbit(delta.x, delta.y);
+                }
+            }
+            if response.hovered() {
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0 {
+                    self.cameras[cam_idx].dolly(scroll);
+                }
+            }
+            let aspect = rect.width() / rect.height().max(1.0);
+            let view_proj = self.cameras[cam_idx].view_proj(aspect);
+
+            if self.draw_tool.active() {
+                // Draw/osnap only in the active pane; one prompt, one ghost.
+                if pane == self.active_pane {
+                    self.drawing_input(ui, rect, &response, view_proj);
+                }
+            } else if response.clicked()
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let additive = ui.input(|i| i.modifiers.shift);
+                self.pick(view_proj, rect, pos, additive);
+            }
+
+            ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+                rect,
+                ViewportCallback {
+                    view_proj,
+                    eye: self.cameras[cam_idx].eye(),
+                    generation,
+                    scene: scene.take(),
+                    viewport: pane,
+                },
+            ));
+
+            if panes.len() > 1 {
+                let color = if pane == self.active_pane {
+                    ui.visuals().selection.stroke.color
+                } else {
+                    ui.visuals().weak_text_color()
+                };
+                ui.painter().rect_stroke(
+                    rect.shrink(0.5),
+                    0.0,
+                    egui::Stroke::new(1.0, color),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+
+        self.view_toolbar(ui, full);
+        self.layers_panel(ui, full, theme);
     }
 
     /// Layers panel: visibility toggle, color swatch, current-layer switch.
@@ -487,6 +554,20 @@ impl App {
                         }
                         if ui.small_button("ZE").on_hover_text("zoom extents").clicked() {
                             self.zoom_extents();
+                        }
+                        ui.separator();
+                        for (label, layout) in [
+                            ("1", ViewportLayout::Single),
+                            ("2", ViewportLayout::Two),
+                            ("4", ViewportLayout::Four),
+                        ] {
+                            if ui
+                                .selectable_label(self.layout == layout, label)
+                                .on_hover_text(format!("{label} viewport(s)"))
+                                .clicked()
+                            {
+                                self.set_layout(layout);
+                            }
                         }
                     });
                 });
