@@ -1,37 +1,60 @@
 # mydrafter
 
-A CAD program for architects, rethought for the LLM era. Rhino-style command
-line, 3D viewport, and an LLM drafting companion **inside** the app — not an
-external plugin poking at it.
+FOSS Rust CAD for architects — Rhino-style command line, 3D viewport, and an
+LLM drafting companion **inside** the app, not bolted on as an external plugin.
 
-The core bet: **one command substrate**. The human command line and the LLM
-emit the same commands. The document *is* the op-log of those commands — undo,
-the file format, and replay all derive from it. Every session doubles as a
-training transcript.
+AGPLv3. Pure Rust (egui + wgpu + glam). Cross-platform (Linux / macOS / Windows).
 
-Pure Rust. AGPLv3. Cross-platform (winit + wgpu + egui).
+![viewport screenshot](docs/shot-viewport.png)
+
+## The one-command substrate
+
+The central bet: **one command substrate**. The human command line and the LLM
+deck emit the same `Command` enum. The document *is* the ordered op-log of
+those commands — undo, the file format, and replay all derive from it
+automatically. Every session doubles as a training transcript.
+
+```
+human types "extrude last 3"
+      │
+LLM emits   {"cmd":"extrude","profile":{"sel":"last","n":1},"height":3.0}
+      │
+      ▼
+   parse → Command::Extrude { … }
+      ↓
+   apply  (fills id, writes it back)
+      ↓
+   op-log (the saved file)
+```
 
 ## Status
 
-MVP: "box on screen, two ways."
+MVP: geometry on screen, two ways — command line and LLM.
 
-- Perspective viewport: infinite grid, Z-up orbit camera (RMB orbit,
-  Shift+RMB pan, scroll dolly), click-select, `ze` zoom extents
-- Command line: `box`, `extrude`, `line`, `polyline`, `rect`, `circle`, `arc`,
-  `ellipse`, `polygon`, `curve` (NURBS), `move`, `copy`, `delete`, `name`,
-  `select`, `undo`/`redo` — units (`5`, `250cm`, `500mm`), selectors
-  (`last`, `last 3`, `all`, `sel`, names)
-- LLM deck pane: describe what to draw; commands stream out of the model and
-  execute live; failed commands are fed back for correction automatically
-- Save/load: op-log JSON (`save scene.mydrafter.json`, `open …`, Cmd+S/O)
+- Perspective viewport: infinite grid, Z-up orbit camera, click-select, `ze`
+  zoom extents
+- Command language: `box`, `extrude`, `revolve`, `loft`, `sweep`, `line`,
+  `polyline`, `rect`, `circle`, `arc`, `ellipse`, `polygon`, `curve` (NURBS),
+  `union`, `difference`, `intersect`, `section`, `plan`, `dim`, `text`,
+  `hatch`, `move`, `copy`, `array`, `polar_array`, `rotate`, `scale`,
+  `mirror`, `split`, `trim`, `extend`, `join`, `fillet`, `offset`, `delete`,
+  `name`, `group`, `layer`, `units`, `sheet`, `print`, `export`, `undo`,
+  `redo`, and more
+- LLM deck: describe what to draw; commands stream out and execute live;
+  failed commands are fed back automatically
+- Save / load: op-log JSON (`save scene.mydrafter.json`, `open …`, Cmd+S/O)
 
-## Run
+## Build
+
+Requires Rust stable (see `rust-toolchain.toml`).
 
 ```sh
+git clone https://github.com/htarrido/mydrafter
+cd mydrafter
 cargo run -p mydrafter
 ```
 
-Try in the command line (bottom):
+Try in the command line (bottom bar):
 
 ```
 rect 0,0,0 6 4
@@ -41,7 +64,14 @@ extrude last 8
 ze
 ```
 
-Or tell the deck (right pane): *"make three 4x4x3 towers in a row, 6m apart"*.
+Or tell the deck (right pane): *"make three 4×4×3 towers in a row, 6 m apart"*.
+
+Run tests:
+
+```sh
+cargo test --workspace
+cargo clippy --workspace -- -D warnings
+```
 
 ## LLM decks ("cassette player")
 
@@ -51,12 +81,12 @@ Any OpenAI-compatible endpoint or Anthropic. Configure
 ```json
 {
   "decks": [
-    { "name": "ollama", "kind": "openai_compat",
+    { "name": "ollama",  "kind": "openai_compat",
       "base_url": "http://localhost:11434/v1", "model": "gpt-oss:20b" },
-    { "name": "claude", "kind": "anthropic",
+    { "name": "claude",  "kind": "anthropic",
       "base_url": "https://api.anthropic.com",
-      "model": "claude-sonnet-4-6", "api_key": "env:ANTHROPIC_API_KEY" },
-    { "name": "kimi", "kind": "openai_compat",
+      "model": "claude-sonnet-4-5", "api_key": "env:ANTHROPIC_API_KEY" },
+    { "name": "kimi",    "kind": "openai_compat",
       "base_url": "https://api.moonshot.ai/v1",
       "model": "kimi-k2-0905-preview", "api_key": "env:MOONSHOT_API_KEY" }
   ],
@@ -64,41 +94,46 @@ Any OpenAI-compatible endpoint or Anthropic. Configure
 }
 ```
 
-`api_key` is a literal or `env:VAR`. Swap cassettes with the combo box in the
-deck pane. The model receives the command registry and a scene digest — it
-never touches raw geometry; the kernel does the math.
+`api_key` is a literal or `env:VAR`. Swap decks with the combo box in the deck
+pane. The model receives the command registry and a scene digest; it never
+touches raw geometry.
 
 ## Architecture
 
 ```
 crates/
-  kernel-mesh/   f64 face-vertex meshes, primitives, extrusion, ear clipping
-  kernel-curve/  line/polyline/arc/ellipse + NURBS (own de Boor), tessellation
-  kernel-brep/   stub — truck-based BREP planned
-  doc/           scene state; knows nothing about how it is mutated
-  commands/      THE substrate: Command enum, parser, registry, Session
-                 (op-log + inverse-op undo + replay), file io
-  deck/          LlmDeck trait, OpenAI-compat + Anthropic SSE adapters,
-                 streaming ```draft extractor, system prompt builder
-  render/        wgpu pipelines in egui paint callbacks, grid shader,
-                 orbit camera, headless renderer
-  app/           shell: viewport, command line, deck pane
+  kernel-mesh/    f64 face-vertex meshes, primitives, extrusion, BSP CSG
+  kernel-curve/   line/polyline/arc/ellipse/NURBS (own de Boor), tessellation
+  kernel-brep/    stub — truck-based BREP planned
+  doc/            scene state; knows nothing about how it is mutated
+  commands/       THE substrate: Command enum, parser, registry, Session
+                  (op-log + inverse-op undo + replay), file io
+  deck/           LlmDeck trait, OpenAI-compat + Anthropic SSE adapters,
+                  streaming ```draft extractor, system prompt builder
+  render/         wgpu pipelines in egui paint callbacks, grid shader,
+                  orbit camera, headless renderer
+  app/            shell: viewport, command line, deck pane
 ```
 
-Dev hooks (used by agents and CI):
+File format: see [`FORMAT.md`](FORMAT.md).
+Contributing: see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Dev hooks (CI / agents)
 
 ```sh
-# render a scene file without a window
+# render a scene headlessly (no window needed)
 cargo run -p mydrafter-render --example headless -- out.png scene.mydrafter.json
-# stream one prompt through the active deck in the terminal
-cargo run -p mydrafter-deck --example chat -- "make a 6m cube"
-# scripted app run: commands, a deck prompt, a save, a screenshot
+
+# scripted app run: commands + screenshot
 MYDRAFTER_RUN="rect 0,0,0 6 4;extrude last 3" \
-MYDRAFTER_DECK_RUN="add a tower behind it" \
-MYDRAFTER_SAVE=/tmp/scene.json MYDRAFTER_SHOT=/tmp/shot.png cargo run -p mydrafter
+MYDRAFTER_SHOT=/tmp/shot.png cargo run -p mydrafter
+
+# golden-image regression test (requires blessed PNGs in tests/golden/)
+cargo test --workspace -- --ignored golden
 ```
 
 ## License
 
-AGPL-3.0-or-later. Dependency licenses are enforced with
-`cargo deny check licenses`.
+AGPL-3.0-or-later. See [`LICENSE`](LICENSE).
+
+Dependency licenses enforced with `cargo deny check licenses`.
