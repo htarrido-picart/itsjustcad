@@ -226,6 +226,23 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("intersect", rest, &args)?;
             Ok(Command::Intersect { id: None, targets: sel })
         }
+        "section" => {
+            let (sel, rest) = selector(&args, "section")?;
+            let [p, n] = take::<2>("section", "a plane point and a normal after the selector", rest)
+                .map_err(|_| {
+                    wrong_err("section", "a plane point and a normal after the selector", &args)
+                })?;
+            Ok(Command::Section {
+                ids: None,
+                targets: sel,
+                point: point(p)?,
+                normal: point(n)?,
+            })
+        }
+        "plan" => {
+            let [h] = take::<1>("plan", "a cut height", &args)?;
+            Ok(Command::Plan { ids: None, height: number(h)? })
+        }
         "move" => {
             let (sel, rest) = selector(&args, "move")?;
             let [delta] = take::<1>("move", "a delta point after the selector", rest)?;
@@ -1120,6 +1137,46 @@ mod tests {
             "loft last 3",
             "sweep prof rail",
         ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
+    }
+
+    #[test]
+    fn parse_section_commands() {
+        assert_eq!(
+            parse("section all 0,0,1.5 0,0,1").unwrap(),
+            Command::Section {
+                ids: None,
+                targets: Selector::All,
+                point: DVec3::new(0.0, 0.0, 1.5),
+                normal: DVec3::Z,
+            }
+        );
+        // "last N" selector count still works before the two points
+        assert!(matches!(
+            parse("section last 2 5,0,0 1,0,0").unwrap(),
+            Command::Section { targets: Selector::Last { n: 2 }, normal, .. }
+                if normal == DVec3::X
+        ));
+        assert_eq!(parse("plan 1.2").unwrap(), Command::Plan { ids: None, height: 1.2 });
+        // heights accept unit suffixes
+        assert!(matches!(
+            parse("plan 4ft").unwrap(),
+            Command::Plan { height, .. } if (height - 4.0 * METERS_PER_FOOT).abs() < 1e-12
+        ));
+        // errors carry hints
+        assert!(parse("section").unwrap_err().to_string().contains("selector"));
+        assert!(parse("section all 0,0,1.5").unwrap_err().to_string().contains("normal"));
+        assert!(parse("plan").unwrap_err().to_string().contains("height"));
+        assert!(parse("plan 1 2").unwrap_err().to_string().contains("height"));
+    }
+
+    #[test]
+    fn section_command_json_roundtrip() {
+        for line in ["section all 0,0,1.5 0,0,1", "section last 2 5,0,0 1,0,0", "plan 1.2"] {
             let cmd = parse(line).unwrap();
             let json = serde_json::to_string(&cmd).unwrap();
             let back: Command = serde_json::from_str(&json).unwrap();

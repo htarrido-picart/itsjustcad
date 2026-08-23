@@ -104,6 +104,16 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Keep only the shared volume of 2+ meshes; inputs are consumed. Example: intersect last 2",
         },
         CommandSpec {
+            name: "section",
+            usage: "section <selector> <plane point x,y,z> <normal x,y,z>",
+            summary: "Cut meshes with a plane; each closed intersection loop becomes a closed polyline on layer 'sections' (originals kept). Example: section all 0,0,1.2 0,0,1 · section tower 5,0,0 1,0,0 (vertical cross-section)",
+        },
+        CommandSpec {
+            name: "plan",
+            usage: "plan <height>",
+            summary: "Architect's plan cut: horizontal section of every mesh at the given height; wall outlines and courtyard holes land as closed polylines on layer 'sections'. Cut ~1.2m above the floor of interest. Example: plan 1.2 · plan 4.7 (second floor at 3.5m + 1.2m)",
+        },
+        CommandSpec {
             name: "move",
             usage: "move <selector> <delta x,y,z>",
             summary: "Translate objects. Example: move last 5,0,0",

@@ -44,6 +44,12 @@ enum Inverse {
         created: Vec<ObjectId>,
         snapshots: Vec<(ObjectId, Geometry)>,
     },
+    /// `section`/`plan`: delete the created loops, dropping the "sections"
+    /// layer when this command created it.
+    CreatedOnLayer {
+        created: Vec<ObjectId>,
+        layer_created: Option<String>,
+    },
     /// `layer`: restore the previous current layer, dropping the layer this
     /// command created (if any).
     LayerCurrent {
@@ -141,6 +147,15 @@ impl Session {
                     if let Some(obj) = self.doc.get_mut(id) {
                         obj.geometry = geometry;
                     }
+                }
+            }
+            Inverse::CreatedOnLayer { created, layer_created } => {
+                for id in created.clone() {
+                    self.doc.remove(id);
+                }
+                if let Some(name) = layer_created.clone() {
+                    self.doc.layers.remove(&name);
+                    self.doc.generation += 1;
                 }
             }
             Inverse::LayerCurrent { prev, created } => {
@@ -429,6 +444,60 @@ fn mesh_surface_area(mesh: &kernel_mesh::Mesh) -> f64 {
             (b - a).cross(c - a).length() / 2.0
         })
         .sum()
+}
+
+/// Layer that section/plan loops land on (created on demand).
+const SECTIONS_LAYER: &str = "sections";
+
+/// Slice every mesh among `target_ids` with the plane, inserting each closed
+/// loop as a closed polyline on the "sections" layer. Returns the created
+/// ids, the layer name if this call created it, and the mesh count.
+fn section_meshes(
+    doc: &mut Document,
+    ids: Option<Vec<ObjectId>>,
+    target_ids: &[ObjectId],
+    point: DVec3,
+    normal: DVec3,
+) -> Result<(Vec<ObjectId>, Option<String>, usize), ExecError> {
+    if normal.length() < 1e-9 {
+        return Err(ExecError::Invalid("section plane normal cannot be zero".into()));
+    }
+    let mut loops = Vec::new();
+    let mut meshes = 0usize;
+    for id in target_ids {
+        if let Geometry::Mesh(m) = &doc.get(*id).expect("resolved").geometry {
+            meshes += 1;
+            loops.extend(kernel_mesh::slice(m, point, normal, PROFILE_TOL));
+        }
+    }
+    if meshes == 0 {
+        return Err(ExecError::Invalid(
+            "section works on meshes; the selector matched none (extrude or box first)".into(),
+        ));
+    }
+    if loops.is_empty() {
+        return Err(ExecError::Invalid(format!(
+            "the section plane misses the {meshes} selected mesh(es) — check the plane point/height"
+        )));
+    }
+    // Reuse logged ids on replay; mint new ones live.
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == loops.len() => ids,
+        _ => loops.iter().map(|_| ObjectId::new()).collect(),
+    };
+    let layer_created = (!doc.layers.contains_key(SECTIONS_LAYER)).then(|| {
+        doc.layers.insert(SECTIONS_LAYER.to_string(), LayerStyle::default());
+        SECTIONS_LAYER.to_string()
+    });
+    for (points, id) in loops.into_iter().zip(&new_ids) {
+        doc.insert(SceneObject {
+            id: *id,
+            name: None,
+            layer: SECTIONS_LAYER.to_string(),
+            geometry: Geometry::Curve(Curve::Polyline { points, closed: true }),
+        });
+    }
+    Ok((new_ids, layer_created, meshes))
 }
 
 /// Look up a layer for style edits; missing layers get an actionable error.
@@ -935,6 +1004,46 @@ fn apply_forward(
                 Command::Intersect { id: Some(id), targets },
                 inverse,
                 ApplyOutcome { created: vec![id], message },
+            ))
+        }
+        Command::Section { ids, targets, point, normal } => {
+            let target_ids = resolve(doc, &targets)?;
+            let (new_ids, layer_created, meshes) =
+                section_meshes(doc, ids, &target_ids, point, normal)?;
+            Ok((
+                Command::Section { ids: Some(new_ids.clone()), targets, point, normal },
+                Inverse::CreatedOnLayer { created: new_ids.clone(), layer_created },
+                ApplyOutcome {
+                    message: format!(
+                        "sectioned {meshes} mesh(es) -> {} loop(s) on '{SECTIONS_LAYER}'",
+                        new_ids.len()
+                    ),
+                    created: new_ids,
+                },
+            ))
+        }
+        Command::Plan { ids, height } => {
+            let target_ids = doc.all_ids();
+            if target_ids.is_empty() {
+                return Err(ExecError::EmptySelection("document has 0 objects".to_string()));
+            }
+            let (new_ids, layer_created, meshes) = section_meshes(
+                doc,
+                ids,
+                &target_ids,
+                DVec3::new(0.0, 0.0, height),
+                DVec3::Z,
+            )?;
+            Ok((
+                Command::Plan { ids: Some(new_ids.clone()), height },
+                Inverse::CreatedOnLayer { created: new_ids.clone(), layer_created },
+                ApplyOutcome {
+                    message: format!(
+                        "plan cut at z={height}: {} loop(s) from {meshes} mesh(es) on '{SECTIONS_LAYER}'",
+                        new_ids.len()
+                    ),
+                    created: new_ids,
+                },
             ))
         }
         Command::Move { targets, delta } => {
@@ -1847,6 +1956,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Union { .. } => "union",
         Command::Difference { .. } => "difference",
         Command::Intersect { .. } => "intersect",
+        Command::Section { .. } => "section",
+        Command::Plan { .. } => "plan",
         Command::Move { .. } => "move",
         Command::Rotate { .. } => "rotate",
         Command::Scale { .. } => "scale",
@@ -2177,6 +2288,79 @@ mod tests {
         assert!(matches!(&log[1], Command::Revolve { id: Some(_), .. }));
         assert!(matches!(&log[4], Command::Loft { id: Some(_), .. }));
         assert!(log.iter().any(|c| matches!(c, Command::Sweep { id: Some(_), .. })));
+        let replayed = Session::replay(log.clone()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
+        // and the file format round-trips byte-identically
+        let json1 = crate::io::to_json(&s);
+        let json2 = crate::io::to_json(&crate::io::from_json(&json1).unwrap());
+        assert_eq!(json1, json2);
+    }
+
+    #[test]
+    fn section_plan_exec_undo_redo() {
+        let mut s = Session::default();
+        // Courtyard massing: 10x8 block minus a 4x4 through-cut.
+        run(&mut s, "box 0,0,0 10,8,3");
+        run(&mut s, "box 3,2,-0.5 4,4,4");
+        run(&mut s, "difference last 2 last");
+        assert_eq!(s.doc.len(), 1);
+
+        let out = run(&mut s, "plan 1.5");
+        assert_eq!(out.created.len(), 2, "outer outline + courtyard hole");
+        assert!(out.message.contains("'sections'"), "{}", out.message);
+        assert!(s.doc.layers.contains_key("sections"));
+        for id in &out.created {
+            let obj = s.doc.get(*id).unwrap();
+            assert_eq!(obj.layer, "sections");
+            let Geometry::Curve(Curve::Polyline { points, closed: true }) = &obj.geometry
+            else {
+                panic!("expected closed polyline, got {:?}", obj.geometry)
+            };
+            assert!(points.iter().all(|p| (p.z - 1.5).abs() < 1e-9));
+        }
+        // undo removes the loops AND the layer this cut created
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+        assert!(!s.doc.layers.contains_key("sections"));
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
+        assert!(s.doc.layers.contains_key("sections"));
+
+        // vertical section through the courtyard: two wall cut loops
+        let out = run(&mut s, "section last 3 0,4,0 0,1,0");
+        assert_eq!(out.created.len(), 2, "wall on each side of the courtyard");
+
+        // misses and non-meshes error without touching the document
+        let n = s.doc.len();
+        let err = s.run(parse("plan 99").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("misses"), "{err}");
+        run(&mut s, "circle 20,0,0 1");
+        let err = s.run(parse("section last 0,0,0 0,0,1").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("meshes"), "{err}");
+        assert_eq!(s.doc.len(), n + 1);
+    }
+
+    #[test]
+    fn section_replay_stability() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 10,8,3");
+        run(&mut s, "box 3,2,-0.5 4,4,4");
+        run(&mut s, "difference last 2 last");
+        run(&mut s, "plan 1.5");
+        run(&mut s, "section last 3 0,4,0 0,1,0");
+        run(&mut s, "undo");
+        run(&mut s, "redo");
+
+        let log = s.save_log();
+        // logged ops carry the minted loop ids
+        assert!(matches!(&log[3], Command::Plan { ids: Some(ids), .. } if ids.len() == 2));
+        assert!(matches!(&log[4], Command::Section { ids: Some(ids), .. } if ids.len() == 2));
         let replayed = Session::replay(log.clone()).unwrap();
         let a: Vec<_> = s.doc.objects().collect();
         let b: Vec<_> = replayed.doc.objects().collect();

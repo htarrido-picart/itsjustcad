@@ -142,6 +142,22 @@ pub enum Command {
         id: Option<ObjectId>,
         targets: Selector,
     },
+    // -- sections (mesh/plane cuts -> polylines on layer "sections") --
+    /// Cut meshes with a plane; each closed intersection loop becomes a
+    /// closed polyline on layer "sections".
+    Section {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        targets: Selector,
+        point: DVec3,
+        normal: DVec3,
+    },
+    /// Horizontal section of every mesh at z = height (the plan cut).
+    Plan {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        height: f64,
+    },
     // -- drafting (dimensions, notes, hatches) --
     /// Linear dimension between two points; the measured value is derived at
     /// display time, never stored.
