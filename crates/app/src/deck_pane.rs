@@ -381,10 +381,12 @@ impl DeckPane {
                     batch.push(text);
                 }
                 DeckDelta::Done => {
+                    tracing::info!("deck turn done");
                     done = true;
                     break;
                 }
                 DeckDelta::Error(e) => {
+                    tracing::warn!("deck error: {e}");
                     self.transcript.push(Entry::Status(format!("deck error: {e}")));
                     self.rx = None;
                     self.turn_started = None;
