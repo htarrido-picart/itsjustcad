@@ -282,6 +282,18 @@ pub enum Command {
         targets: Selector,
         name: String,
     },
+    // -- groups (named id-sets; pick and selectors expand to the whole group) --
+    /// Group objects under a name. `name` is `None` when typed without one;
+    /// exec fills a generated name and writes it back for replay.
+    Group {
+        targets: Selector,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// Dissolve every group containing the selected objects (objects stay).
+    Ungroup {
+        targets: Selector,
+    },
     // -- layers --
     /// Create (if needed) and switch the current layer for new objects.
     Layer {

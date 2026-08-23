@@ -72,6 +72,13 @@ enum Inverse {
         name: String,
         prev: Option<NamedView>,
     },
+    /// `group`: drop the group, restoring the binding it overwrote (if any).
+    GroupSet {
+        name: String,
+        prev: Option<std::collections::BTreeSet<ObjectId>>,
+    },
+    /// `ungroup`: put the dissolved groups back.
+    RestoreGroups(Vec<(String, std::collections::BTreeSet<ObjectId>)>),
     /// `sheet`: drop the sheet this command created.
     RemoveSheet(String),
     /// `sheetview`: drop the view most recently added to a sheet.
@@ -206,6 +213,19 @@ impl Session {
                     Some(view) => self.doc.named_views.insert(name.clone(), *view),
                     None => self.doc.named_views.remove(name),
                 };
+                self.doc.generation += 1;
+            }
+            Inverse::GroupSet { name, prev } => {
+                match prev {
+                    Some(members) => self.doc.groups.insert(name.clone(), members.clone()),
+                    None => self.doc.groups.remove(name),
+                };
+                self.doc.generation += 1;
+            }
+            Inverse::RestoreGroups(groups) => {
+                for (name, members) in groups.clone() {
+                    self.doc.groups.insert(name, members);
+                }
                 self.doc.generation += 1;
             }
             Inverse::RemoveSheet(name) => {
@@ -1629,6 +1649,48 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Group { targets, name } => {
+            let ids = resolve(doc, &targets)?;
+            // Replay reuses the logged name; live fills the first free groupN.
+            let name = name.unwrap_or_else(|| {
+                (1..)
+                    .map(|n| format!("group{n}"))
+                    .find(|n| !doc.groups.contains_key(n))
+                    .expect("unbounded counter finds a free name")
+            });
+            let members: std::collections::BTreeSet<ObjectId> = ids.iter().copied().collect();
+            let prev = doc.groups.insert(name.clone(), members);
+            doc.generation += 1;
+            Ok((
+                Command::Group { targets, name: Some(name.clone()) },
+                Inverse::GroupSet { name: name.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("grouped {} object(s) as '{name}'", ids.len()),
+                },
+            ))
+        }
+        Command::Ungroup { targets } => {
+            let ids = resolve(doc, &targets)?;
+            let removed = doc.groups_containing(&ids);
+            if removed.is_empty() {
+                return Err(ExecError::Invalid(
+                    "no group contains the selected objects (make one with: group <selector> [name])"
+                        .into(),
+                ));
+            }
+            let names: Vec<&str> = removed.iter().map(|(n, _)| n.as_str()).collect();
+            let message = format!("ungrouped: {}", names.join(", "));
+            for (name, _) in &removed {
+                doc.groups.remove(name);
+            }
+            doc.generation += 1;
+            Ok((
+                Command::Ungroup { targets },
+                Inverse::RestoreGroups(removed),
+                ApplyOutcome { created: Vec::new(), message },
+            ))
+        }
         Command::Layer { name } => {
             let prev = doc.current_layer.clone();
             let created = !doc.layers.contains_key(&name);
@@ -2103,6 +2165,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::PolarArray { .. } => "polararray",
         Command::Delete { .. } => "delete",
         Command::Name { .. } => "name",
+        Command::Group { .. } => "group",
+        Command::Ungroup { .. } => "ungroup",
         Command::Layer { .. } => "layer",
         Command::ToLayer { .. } => "tolayer",
         Command::LayerColor { .. } => "layercolor",
@@ -2241,6 +2305,93 @@ mod tests {
         // the copy inherits the name, so 'base' now matches both
         run(&mut s, "delete base");
         assert_eq!(s.doc.len(), 0);
+    }
+
+    #[test]
+    fn group_ungroup_undo_redo() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "box 5,0,0 1,1,1");
+        run(&mut s, "box 10,0,0 1,1,1");
+
+        let out = run(&mut s, "group last 2 boxes");
+        assert_eq!(out.message, "grouped 2 object(s) as 'boxes'");
+        let last2: std::collections::BTreeSet<ObjectId> =
+            s.doc.last_ids(2).into_iter().collect();
+        assert_eq!(s.doc.groups["boxes"], last2);
+
+        // the group name works as a selector: move acts on the whole group
+        let bb_before = s.doc.scene_aabb().unwrap();
+        let out = run(&mut s, "move boxes 0,0,2");
+        assert!(out.message.contains("2 object(s)"), "{}", out.message);
+        assert_eq!(s.doc.scene_aabb().unwrap().max.z - bb_before.max.z, 2.0);
+        run(&mut s, "undo");
+
+        // auto-naming picks the first free groupN
+        run(&mut s, "group last group-b");
+        run(&mut s, "group all");
+        assert!(s.doc.groups.contains_key("group1"), "{:?}", s.doc.groups.keys());
+
+        // ungroup dissolves every group containing the ids; objects stay.
+        // The last box sits in all three groups.
+        let n = s.doc.len();
+        let out = run(&mut s, "ungroup last");
+        for name in ["boxes", "group-b", "group1"] {
+            assert!(out.message.contains(name), "{}", out.message);
+        }
+        assert!(s.doc.groups.is_empty());
+        assert_eq!(s.doc.len(), n);
+
+        // undo restores the dissolved groups, then unwinds the group ops
+        run(&mut s, "undo");
+        assert_eq!(s.doc.groups.len(), 3);
+        run(&mut s, "undo"); // un-group all
+        assert!(!s.doc.groups.contains_key("group1"));
+        run(&mut s, "undo"); // un-group group-b
+        assert_eq!(s.doc.groups.len(), 1);
+        run(&mut s, "redo");
+        run(&mut s, "redo");
+        assert_eq!(s.doc.groups.len(), 3);
+        run(&mut s, "redo"); // re-ungroup
+        assert!(s.doc.groups.is_empty());
+
+        // group overwrite: undo restores the previous member set
+        run(&mut s, "group last boxes");
+        let prev = s.doc.groups["boxes"].clone();
+        run(&mut s, "group last 2 boxes");
+        assert_ne!(s.doc.groups["boxes"], prev);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.groups["boxes"], prev);
+
+        // ungroup with no matching group errors and leaves the doc untouched
+        run(&mut s, "ungroup boxes");
+        let err = s.run(parse("ungroup last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no group"), "{err}");
+    }
+
+    #[test]
+    fn group_replay_is_stable() {
+        let mut s = Session::default();
+        for line in [
+            "box 0,0,0 1,1,1",
+            "box 5,0,0 1,1,1",
+            "group last 2 boxes",
+            "box 10,0,0 1,1,1",
+            "group last", // auto-named group1
+            "ungroup group1",
+            "move boxes 0,0,3",
+        ] {
+            run(&mut s, line);
+        }
+        let json = crate::io::to_json(&s);
+        assert!(json.contains("\"group\""), "{json}");
+        let loaded = crate::io::from_json(&json).unwrap();
+        assert_eq!(loaded.doc.groups, s.doc.groups);
+        assert_eq!(loaded.doc.len(), s.doc.len());
+        assert_eq!(crate::io::to_json(&loaded), json, "replay-stable");
+        // deleting a member leaves the group entry; selectors filter it out
+        run(&mut s, "delete last");
+        assert!(s.doc.groups.contains_key("boxes"));
     }
 
     #[test]

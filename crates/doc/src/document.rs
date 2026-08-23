@@ -24,6 +24,10 @@ pub struct Document {
     /// Named viewport cameras, saved via the logged `view save` command so
     /// replayed files keep them. Mutators bump `generation` (exec does).
     pub named_views: BTreeMap<String, NamedView>,
+    /// Named id-sets created by the logged `group` command. Members may be
+    /// stale (deleted objects keep their entry so group undo stays symmetric);
+    /// readers filter through `get`. Mutators bump `generation` (exec does).
+    pub groups: BTreeMap<String, BTreeSet<ObjectId>>,
     /// Mailbox: a `view <name>` restore waiting for the UI to drive the active
     /// viewport camera. The app takes it each frame; never persisted.
     pub pending_view: Option<NamedView>,
@@ -42,6 +46,7 @@ impl Default for Document {
             sheets: Vec::new(),
             units: Units::default(),
             named_views: BTreeMap::new(),
+            groups: BTreeMap::new(),
             pending_view: None,
             generation: 0,
         }
@@ -93,9 +98,36 @@ impl Document {
     }
 
     pub fn find_named(&self, name: &str) -> Vec<ObjectId> {
+        // Group names win: a group selector expands to its live members, so
+        // "move <group> ..." acts on the whole group.
+        if let Some(members) = self.groups.get(name) {
+            return members
+                .iter()
+                .filter(|id| self.objects.contains_key(id))
+                .copied()
+                .collect();
+        }
         self.objects()
             .filter(|o| o.name.as_deref() == Some(name) || o.id.short() == name)
             .map(|o| o.id)
+            .collect()
+    }
+
+    /// Groups (name + live members) that contain any of `ids`.
+    pub fn groups_containing(&self, ids: &[ObjectId]) -> Vec<(String, BTreeSet<ObjectId>)> {
+        self.groups
+            .iter()
+            .filter(|(_, members)| ids.iter().any(|id| members.contains(id)))
+            .map(|(name, members)| (name.clone(), members.clone()))
+            .collect()
+    }
+
+    /// Pick expansion: the clicked id plus every member of any group that
+    /// contains it, filtered to live objects. See `expand_to_group`.
+    pub fn expand_pick(&self, id: ObjectId) -> BTreeSet<ObjectId> {
+        expand_to_group(&self.groups, id)
+            .into_iter()
+            .filter(|id| self.objects.contains_key(id))
             .collect()
     }
 
@@ -141,6 +173,21 @@ impl Document {
             .map(|o| o.geometry.aabb())
             .reduce(Aabb::union)
     }
+}
+
+/// Pure pick expansion: `id` plus the members of every group containing it.
+/// One pass only — overlapping groups do not chain transitively.
+pub fn expand_to_group(
+    groups: &BTreeMap<String, BTreeSet<ObjectId>>,
+    id: ObjectId,
+) -> BTreeSet<ObjectId> {
+    let mut out = BTreeSet::from([id]);
+    for members in groups.values() {
+        if members.contains(&id) {
+            out.extend(members.iter().copied());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -301,6 +348,45 @@ mod tests {
         assert_eq!(doc.find_named("core"), vec![named_id]);
         assert_eq!(doc.find_named(&anon_id.short()), vec![anon_id]);
         assert!(doc.find_named("nope").is_empty());
+    }
+
+    #[test]
+    fn expand_to_group_is_pure_and_unions_containing_groups() {
+        let ids: Vec<ObjectId> = (0..4).map(|_| ObjectId::new()).collect();
+        let mut groups = BTreeMap::new();
+        // no groups: the id maps to itself
+        assert_eq!(expand_to_group(&groups, ids[0]), BTreeSet::from([ids[0]]));
+
+        groups.insert("a".to_string(), BTreeSet::from([ids[0], ids[1]]));
+        groups.insert("b".to_string(), BTreeSet::from([ids[1], ids[2]]));
+        // member of one group expands to that group
+        assert_eq!(expand_to_group(&groups, ids[0]), BTreeSet::from([ids[0], ids[1]]));
+        // member of two groups unions both (single pass, no transitive chase)
+        assert_eq!(
+            expand_to_group(&groups, ids[1]),
+            BTreeSet::from([ids[0], ids[1], ids[2]])
+        );
+        // non-member stays itself
+        assert_eq!(expand_to_group(&groups, ids[3]), BTreeSet::from([ids[3]]));
+    }
+
+    #[test]
+    fn find_named_prefers_groups_and_filters_dead_members() {
+        let mut doc = Document::default();
+        let a = obj_at(Some("boxes"), DVec3::ZERO); // object named like the group
+        let a_id = a.id;
+        let b = obj_at(None, DVec3::ZERO);
+        let b_id = b.id;
+        doc.insert(a);
+        doc.insert(b);
+        doc.groups
+            .insert("boxes".to_string(), BTreeSet::from([b_id, ObjectId::new()]));
+        // group name wins over the object name; stale member filtered out
+        assert_eq!(doc.find_named("boxes"), vec![b_id]);
+        assert_eq!(doc.expand_pick(b_id), BTreeSet::from([b_id]));
+        // non-group names still resolve to objects
+        doc.groups.clear();
+        assert_eq!(doc.find_named("boxes"), vec![a_id]);
     }
 
     #[test]

@@ -252,8 +252,16 @@ impl App {
         }
     }
 
-    /// Click-select: ray through the clicked pixel vs object AABBs.
-    fn pick(&mut self, view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2, additive: bool) {
+    /// Click-select: ray through the clicked pixel vs object AABBs. Unless
+    /// `expand` is off (Cmd held), the hit expands to its whole group.
+    fn pick(
+        &mut self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        additive: bool,
+        expand: bool,
+    ) {
         let (origin, dir) = screen_ray(view_proj, rect, pos);
 
         let mut best: Option<(f64, mydrafter_doc::ObjectId)> = None;
@@ -272,14 +280,28 @@ impl App {
         if !additive {
             doc.selection.clear();
         }
+        let mut note = None;
         if let Some((_, id)) = best {
-            if additive && doc.selection.contains(&id) {
-                doc.selection.remove(&id);
+            let ids = if expand {
+                doc.expand_pick(id)
             } else {
-                doc.selection.insert(id);
+                std::collections::BTreeSet::from([id])
+            };
+            if additive && ids.iter().all(|i| doc.selection.contains(i)) {
+                for i in &ids {
+                    doc.selection.remove(i);
+                }
+            } else {
+                doc.selection.extend(&ids);
+            }
+            if ids.len() > 1 {
+                note = Some(format!("group select: {} object(s)", ids.len()));
             }
         }
         doc.generation += 1; // recolor selection
+        if let Some(note) = note {
+            self.command_line.push_line(note);
+        }
     }
 
     /// Apply a finished drag-box: project visible object AABBs to screen
@@ -516,8 +538,9 @@ impl App {
                     && response.clicked()
                     && let Some(pos) = response.interact_pointer_pos()
                 {
-                    let additive = ui.input(|i| i.modifiers.shift);
-                    self.pick(view_proj, rect, pos, additive);
+                    let (additive, bypass_group) =
+                        ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+                    self.pick(view_proj, rect, pos, additive, !bypass_group);
                 }
                 // Drag-box selection (no tool, gumball idle): left→right is a
                 // window (solid box, fully-inside only), right→left a crossing

@@ -184,6 +184,16 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Delete objects. Example: delete last",
         },
         CommandSpec {
+            name: "group",
+            usage: "group <selector> [name]",
+            summary: "Group objects under a name (auto-named group1, group2... when omitted). Clicking any member selects the whole group, and the group name works as a selector. Example: group last 2 boxes",
+        },
+        CommandSpec {
+            name: "ungroup",
+            usage: "ungroup <selector>",
+            summary: "Dissolve every group containing the selected objects; the objects themselves stay. Example: ungroup boxes",
+        },
+        CommandSpec {
             name: "name",
             usage: "name <selector> <name>",
             summary: "Name objects for later reference. Example: name last tower-a",

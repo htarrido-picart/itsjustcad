@@ -402,6 +402,20 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("delete", rest, &args)?;
             Ok(Command::Delete { targets: sel })
         }
+        "group" => {
+            let (sel, rest) = selector(&args, "group")?;
+            let name = match rest {
+                [] => None,
+                [n] => Some((*n).to_string()),
+                _ => return wrong("group", "a selector and an optional name", &args),
+            };
+            Ok(Command::Group { targets: sel, name })
+        }
+        "ungroup" => {
+            let (sel, rest) = selector(&args, "ungroup")?;
+            expect_empty("ungroup", rest, &args)?;
+            Ok(Command::Ungroup { targets: sel })
+        }
         "name" => {
             let (sel, rest) = selector(&args, "name")?;
             let [name] = take::<1>("name", "a name after the selector", rest)?;
@@ -1248,6 +1262,48 @@ mod tests {
         // missing tool selector → usage in the error
         let err = parse("difference last").unwrap_err();
         assert!(err.to_string().contains("selector"), "{err}");
+    }
+
+    #[test]
+    fn parse_group_commands() {
+        assert_eq!(
+            parse("group last 2 boxes").unwrap(),
+            Command::Group { targets: Selector::Last { n: 2 }, name: Some("boxes".into()) }
+        );
+        assert_eq!(
+            parse("group last 2").unwrap(),
+            Command::Group { targets: Selector::Last { n: 2 }, name: None }
+        );
+        assert_eq!(
+            parse("group sel").unwrap(),
+            Command::Group { targets: Selector::Selected, name: None }
+        );
+        assert_eq!(
+            parse("ungroup boxes").unwrap(),
+            Command::Ungroup { targets: Selector::Named { name: "boxes".into() } }
+        );
+        assert_eq!(
+            parse("ungroup last").unwrap(),
+            Command::Ungroup { targets: Selector::Last { n: 1 } }
+        );
+        // both are logged so groups survive save/replay
+        assert!(parse("group last 2").unwrap().is_logged());
+        assert!(parse("ungroup last").unwrap().is_logged());
+        // errors carry hints
+        assert!(parse("group").unwrap_err().to_string().contains("selector"));
+        assert!(parse("group last 2 a b").unwrap_err().to_string().contains("name"));
+        assert!(parse("ungroup").unwrap_err().to_string().contains("selector"));
+        assert!(parse("ungroup boxes extra").is_err());
+    }
+
+    #[test]
+    fn group_command_json_roundtrip() {
+        for line in ["group last 2 boxes", "group all", "ungroup boxes"] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
     }
 
     #[test]
