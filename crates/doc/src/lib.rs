@@ -6,4 +6,6 @@ mod document;
 mod object;
 
 pub use document::Document;
-pub use object::{Geometry, LayerStyle, ObjectId, SceneObject, DEFAULT_LAYER};
+pub use object::{
+    Annotation, Geometry, HatchPattern, LayerStyle, ObjectId, SceneObject, DEFAULT_LAYER,
+};

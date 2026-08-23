@@ -1,7 +1,7 @@
 use glam::DVec3;
 use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
-use mydrafter_doc::{Document, Geometry, LayerStyle, ObjectId, SceneObject};
+use mydrafter_doc::{Annotation, Document, Geometry, LayerStyle, ObjectId, SceneObject};
 
 use crate::error::ExecError;
 use crate::{Command, MirrorPlane, Selector};
@@ -304,6 +304,9 @@ fn boolean_inputs(
                 Geometry::Curve(_) => Err(ExecError::Invalid(format!(
                     "'{id}' is a curve; booleans need meshes — extrude it first"
                 ))),
+                Geometry::Annotation(_) => Err(ExecError::Invalid(format!(
+                    "'{id}' is an annotation; booleans need meshes"
+                ))),
             }
         })
         .collect()
@@ -566,6 +569,100 @@ fn apply_forward(
                 Command::Curve { id: Some(id), points, degree: degree as u32 },
                 Inverse::DeleteCreated(vec![id]),
                 outcome,
+            ))
+        }
+        Command::Dim { id, a, b, offset } => {
+            let length = (b - a).length();
+            if length < 1e-9 {
+                return Err(ExecError::Invalid(
+                    "dimension points must be distinct".into(),
+                ));
+            }
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                geometry: Geometry::Annotation(Annotation::LinearDim { a, b, offset }),
+            });
+            Ok((
+                Command::Dim { id: Some(id), a, b, offset },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("dim {id} ({length:.2} m)"),
+                },
+            ))
+        }
+        Command::Text { id, pos, text, height } => {
+            if height <= 0.0 {
+                return Err(ExecError::Invalid("text height must be positive".into()));
+            }
+            if text.is_empty() {
+                return Err(ExecError::Invalid("text needs a string".into()));
+            }
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                geometry: Geometry::Annotation(Annotation::Text {
+                    pos,
+                    text: text.clone(),
+                    height,
+                }),
+            });
+            Ok((
+                Command::Text { id: Some(id), pos, text: text.clone(), height },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("text {id} ('{text}')"),
+                },
+            ))
+        }
+        Command::Hatch { id, target, pattern } => {
+            let ids = resolve(doc, &target)?;
+            if ids.len() != 1 {
+                return Err(ExecError::Invalid(format!(
+                    "hatch selector matched {} objects, expected exactly 1",
+                    ids.len()
+                )));
+            }
+            let src = doc.get(ids[0]).expect("resolved");
+            let Geometry::Curve(curve) = &src.geometry else {
+                return Err(ExecError::Invalid(
+                    "hatch needs a closed curve boundary".into(),
+                ));
+            };
+            if !curve.is_closed() {
+                return Err(ExecError::Invalid(
+                    "hatch boundary is not closed (close it or use 'polyline ... closed')".into(),
+                ));
+            }
+            if let mydrafter_doc::HatchPattern::Lines { spacing, .. } = &pattern
+                && *spacing <= 0.0
+            {
+                return Err(ExecError::Invalid("hatch spacing must be positive".into()));
+            }
+            let boundary = curve.tessellate(PROFILE_TOL);
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                geometry: Geometry::Annotation(Annotation::Hatch {
+                    boundary,
+                    pattern: pattern.clone(),
+                }),
+            });
+            Ok((
+                Command::Hatch { id: Some(id), target, pattern },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("hatched {} -> {id}", ids[0]),
+                },
             ))
         }
         Command::Union { id, targets } => {
@@ -966,6 +1063,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Ellipse { .. } => "ellipse",
         Command::Polygon { .. } => "polygon",
         Command::Curve { .. } => "curve",
+        Command::Dim { .. } => "dim",
+        Command::Text { .. } => "text",
+        Command::Hatch { .. } => "hatch",
         Command::Union { .. } => "union",
         Command::Difference { .. } => "difference",
         Command::Intersect { .. } => "intersect",
@@ -1453,6 +1553,111 @@ mod tests {
 
         let log = s.save_log();
         assert_eq!(log.len(), 3);
+        let replayed = Session::replay(log.clone()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
+    }
+
+    #[test]
+    fn dim_and_text_create_undo() {
+        let mut s = Session::default();
+        let out = run(&mut s, "dim 0,0 10,0 0.8");
+        assert!(out.message.contains("10.00 m"), "{}", out.message);
+        run(&mut s, "text 5,3 living room 0.3");
+        assert_eq!(s.doc.len(), 2);
+        let anns: Vec<_> = s.doc.objects().collect();
+        assert!(matches!(
+            &anns[0].geometry,
+            Geometry::Annotation(Annotation::LinearDim { offset, .. }) if *offset == 0.8
+        ));
+        assert!(matches!(
+            &anns[1].geometry,
+            Geometry::Annotation(Annotation::Text { text, height, .. })
+                if text == "living room" && *height == 0.3
+        ));
+        run(&mut s, "undo");
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 0);
+        run(&mut s, "redo");
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 2);
+
+        // degenerate dim rejected
+        let err = s.run(parse("dim 1,1 1,1").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("distinct"), "{err}");
+    }
+
+    #[test]
+    fn hatch_requires_closed_curve() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 5,0");
+        let err = s.run(parse("hatch last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+
+        run(&mut s, "box 0,0,0 1,1,1");
+        let err = s.run(parse("hatch last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("curve"), "{err}");
+    }
+
+    #[test]
+    fn hatch_rect_boundary_and_undo() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "hatch last lines 45 0.5");
+        assert_eq!(s.doc.len(), 2); // boundary curve kept
+        let obj = s.doc.objects().last().unwrap();
+        let Geometry::Annotation(Annotation::Hatch { boundary, pattern }) = &obj.geometry
+        else {
+            panic!("expected hatch")
+        };
+        assert_eq!(boundary.len(), 4);
+        assert!(matches!(
+            pattern,
+            mydrafter_doc::HatchPattern::Lines { angle_deg, spacing }
+                if *angle_deg == 45.0 && *spacing == 0.5
+        ));
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+
+        // zero spacing rejected
+        let err = s.run(parse("hatch last lines 45 0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("spacing"), "{err}");
+    }
+
+    #[test]
+    fn annotations_move_and_delete() {
+        let mut s = Session::default();
+        run(&mut s, "dim 0,0 10,0 0.5");
+        run(&mut s, "move last 0,5,0");
+        let obj = s.doc.objects().next().unwrap();
+        let Geometry::Annotation(Annotation::LinearDim { a, b, .. }) = &obj.geometry else {
+            panic!("expected dim")
+        };
+        assert_eq!(*a, DVec3::new(0.0, 5.0, 0.0));
+        assert_eq!(*b, DVec3::new(10.0, 5.0, 0.0));
+        run(&mut s, "delete last");
+        assert_eq!(s.doc.len(), 0);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+    }
+
+    #[test]
+    fn drafting_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "hatch last lines 45 0.25");
+        run(&mut s, "dim 0,0 10,0 0.8");
+        run(&mut s, "text 5,3 living room 0.3");
+        run(&mut s, "circle 20,0,0 2");
+        run(&mut s, "hatch last solid");
+        run(&mut s, "move last 2 0,0,1");
+
+        let log = s.save_log();
         let replayed = Session::replay(log.clone()).unwrap();
         let a: Vec<_> = s.doc.objects().collect();
         let b: Vec<_> = replayed.doc.objects().collect();

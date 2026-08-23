@@ -59,6 +59,21 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "NURBS curve by control points (default degree 3). Example: curve 0,0 2,4 6,4 8,0",
         },
         CommandSpec {
+            name: "dim",
+            usage: "dim <a x,y,z> <b x,y,z> [offset]",
+            summary: "Linear dimension between two points; the measured distance is displayed automatically. Offset (default 0.5) places the dimension line left of a->b. Example: dim 0,0 10,0 0.8",
+        },
+        CommandSpec {
+            name: "text",
+            usage: "text <pos x,y,z> <words...> [height]",
+            summary: "Text annotation at a point; trailing number = text height in meters (default 0.2). Example: text 5,3 living room 0.3",
+        },
+        CommandSpec {
+            name: "hatch",
+            usage: "hatch <selector> [solid | lines <angle deg> <spacing>]",
+            summary: "Hatch the region of a closed curve (default: solid fill). Example: hatch last · hatch last lines 45 0.25",
+        },
+        CommandSpec {
             name: "union",
             usage: "union <selector>",
             summary: "Merge 2+ meshes into one solid; inputs are consumed. Example: union last 2",

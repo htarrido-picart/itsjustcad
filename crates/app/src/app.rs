@@ -358,6 +358,10 @@ impl App {
                 },
             ));
 
+            // Dimensions and text are 2D overlay drawing (egui text cannot go
+            // through wgpu); hatches render in the scene itself.
+            self.draw_annotations(ui, rect, view_proj, theme);
+
             if panes.len() > 1 {
                 let color = if pane == self.active_pane {
                     ui.visuals().selection.stroke.color
@@ -376,6 +380,104 @@ impl App {
         self.view_toolbar(ui, full);
         self.layers_panel(ui, full, theme);
         self.history_panel(ui, full);
+    }
+
+    /// Overlay pass for dimension and text annotations: world points project
+    /// through `view_proj`, text sizes track world-space heights on screen.
+    fn draw_annotations(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        view_proj: glam::Mat4,
+        theme: scene::Theme,
+    ) {
+        use mydrafter_doc::{Annotation, Geometry};
+        let painter = ui.painter_at(rect);
+        let doc = &self.session.doc;
+        for obj in doc.objects() {
+            if !doc.layer_visible(&obj.layer) {
+                continue;
+            }
+            let Geometry::Annotation(ann) = &obj.geometry else {
+                continue;
+            };
+            let c = if doc.selection.contains(&obj.id) {
+                theme.selected()
+            } else {
+                doc.layers
+                    .get(&obj.layer)
+                    .and_then(|s| s.color)
+                    .unwrap_or(theme.curve())
+            };
+            let color = egui::Color32::from_rgb(
+                (c[0] * 255.0).round() as u8,
+                (c[1] * 255.0).round() as u8,
+                (c[2] * 255.0).round() as u8,
+            );
+            let stroke = egui::Stroke::new(1.0, color);
+            // World height -> on-screen pixels at `at`, for text sizing.
+            let px_height = |at: glam::DVec3, h: f64| -> f32 {
+                let Some(p) = project(view_proj, rect, at) else {
+                    return 12.0;
+                };
+                // Whichever world axis is visible in this view carries the size
+                // (Z collapses in Top view, Y in Front view).
+                let len = |axis: glam::DVec3| {
+                    project(view_proj, rect, at + axis * h)
+                        .map(|q| (p - q).length())
+                        .unwrap_or(0.0)
+                };
+                len(glam::DVec3::Z).max(len(glam::DVec3::Y)).clamp(8.0, 60.0)
+            };
+            match ann {
+                Annotation::LinearDim { a, b, offset } => {
+                    let dir = (*b - *a).normalize_or_zero();
+                    let perp = glam::DVec3::new(-dir.y, dir.x, 0.0).normalize_or(glam::DVec3::X);
+                    let (a2, b2) = (*a + perp * *offset, *b + perp * *offset);
+                    let segs = [(*a, a2), (*b, b2), (a2, b2)];
+                    let mut px: Option<(egui::Pos2, egui::Pos2)> = None;
+                    for (w0, w1) in segs {
+                        if let (Some(p), Some(q)) = (
+                            project(view_proj, rect, w0),
+                            project(view_proj, rect, w1),
+                        ) {
+                            painter.line_segment([p, q], stroke);
+                            px = Some((p, q)); // last segment = dimension line
+                        }
+                    }
+                    if let Some((p, q)) = px {
+                        // 45° tick marks at the dimension line ends.
+                        let d = (q - p).normalized();
+                        let tick = egui::vec2(d.x - d.y, d.x + d.y) * 3.5;
+                        painter.line_segment([p - tick, p + tick], stroke);
+                        painter.line_segment([q - tick, q + tick], stroke);
+                        let mid = egui::pos2((p.x + q.x) * 0.5, (p.y + q.y) * 0.5);
+                        // Measured value: meters with cm precision, derived.
+                        let label = format!("{:.2}", (*b - *a).length());
+                        let size = px_height((a2 + b2) * 0.5, 0.2);
+                        painter.text(
+                            mid,
+                            egui::Align2::CENTER_BOTTOM,
+                            label,
+                            egui::FontId::proportional(size),
+                            color,
+                        );
+                    }
+                }
+                Annotation::Text { pos, text, height } => {
+                    if let Some(p) = project(view_proj, rect, *pos) {
+                        painter.text(
+                            p,
+                            egui::Align2::LEFT_BOTTOM,
+                            text,
+                            egui::FontId::proportional(px_height(*pos, *height)),
+                            color,
+                        );
+                    }
+                }
+                Annotation::Hatch { .. } => {} // rendered in the wgpu scene
+            }
+        }
     }
 
     /// Undo history: op list newest-last, current position highlighted.

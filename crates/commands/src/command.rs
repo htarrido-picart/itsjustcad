@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mydrafter_doc::ObjectId;
+use mydrafter_doc::{HatchPattern, ObjectId};
 use serde::{Deserialize, Serialize};
 
 /// Object selector. `Last(n)` ("last", "last 3") is the workhorse for both the
@@ -115,6 +115,30 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
         targets: Selector,
+    },
+    // -- drafting (dimensions, notes, hatches) --
+    /// Linear dimension between two points; the measured value is derived at
+    /// display time, never stored.
+    Dim {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        a: DVec3,
+        b: DVec3,
+        offset: f64,
+    },
+    Text {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        pos: DVec3,
+        text: String,
+        height: f64,
+    },
+    /// Hatch the region bounded by a closed curve.
+    Hatch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        target: Selector,
+        pattern: HatchPattern,
     },
     // -- edit --
     Move {

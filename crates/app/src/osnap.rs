@@ -41,6 +41,10 @@ pub fn candidates(doc: &Document) -> Vec<(DVec3, SnapKind)> {
                 // Mesh vertices are the natural corners of massing solids.
                 out.extend(m.positions().iter().map(|p| (*p, SnapKind::End)));
             }
+            // Annotation anchors (dim points, text position, hatch boundary).
+            Geometry::Annotation(a) => {
+                out.extend(a.points().into_iter().map(|p| (p, SnapKind::End)));
+            }
         }
     }
     out

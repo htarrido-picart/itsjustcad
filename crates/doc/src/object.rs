@@ -31,11 +31,44 @@ impl std::fmt::Display for ObjectId {
     }
 }
 
+/// Hatch fill pattern.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "pattern", rename_all = "snake_case")]
+pub enum HatchPattern {
+    Solid,
+    Lines { angle_deg: f64, spacing: f64 },
+}
+
+/// Drafting objects: they live in the document like geometry (layers,
+/// selection, undo) but carry measured/typed content instead of shape.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "ann", rename_all = "snake_case")]
+pub enum Annotation {
+    /// Linear dimension between `a` and `b`; the dimension line sits `offset`
+    /// to the left of a→b in the XY plane. The measured value is derived.
+    LinearDim { a: DVec3, b: DVec3, offset: f64 },
+    Text { pos: DVec3, text: String, height: f64 },
+    /// Hatch of a closed boundary polygon (tessellated at creation time).
+    Hatch { boundary: Vec<DVec3>, pattern: HatchPattern },
+}
+
+impl Annotation {
+    /// Points that bound the annotation for AABB/picking purposes.
+    pub fn points(&self) -> Vec<DVec3> {
+        match self {
+            Annotation::LinearDim { a, b, .. } => vec![*a, *b],
+            Annotation::Text { pos, .. } => vec![*pos],
+            Annotation::Hatch { boundary, .. } => boundary.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "geo", rename_all = "snake_case")]
 pub enum Geometry {
     Mesh(Mesh),
     Curve(Curve),
+    Annotation(Annotation),
 }
 
 impl Geometry {
@@ -43,6 +76,16 @@ impl Geometry {
         match self {
             Geometry::Mesh(m) => m.transform(glam::DMat4::from_translation(d)),
             Geometry::Curve(c) => c.translate(d),
+            Geometry::Annotation(a) => match a {
+                Annotation::LinearDim { a, b, .. } => {
+                    *a += d;
+                    *b += d;
+                }
+                Annotation::Text { pos, .. } => *pos += d,
+                Annotation::Hatch { boundary, .. } => {
+                    boundary.iter_mut().for_each(|p| *p += d)
+                }
+            },
         }
     }
 
@@ -55,6 +98,29 @@ impl Geometry {
                 true
             }
             Geometry::Curve(c) => c.transform(m, tol),
+            Geometry::Annotation(a) => {
+                // Anchor points transform exactly; scalar sizes (offset, text
+                // height) follow the X-axis scale so uniform scales behave.
+                let s = m.transform_vector3(DVec3::X).length();
+                match a {
+                    Annotation::LinearDim { a, b, offset } => {
+                        *a = m.transform_point3(*a);
+                        *b = m.transform_point3(*b);
+                        *offset *= s;
+                    }
+                    Annotation::Text { pos, height, .. } => {
+                        *pos = m.transform_point3(*pos);
+                        *height *= s;
+                    }
+                    Annotation::Hatch { boundary, pattern } => {
+                        boundary.iter_mut().for_each(|p| *p = m.transform_point3(*p));
+                        if let HatchPattern::Lines { spacing, .. } = pattern {
+                            *spacing *= s;
+                        }
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -62,6 +128,7 @@ impl Geometry {
         match self {
             Geometry::Mesh(m) => m.aabb(),
             Geometry::Curve(c) => Aabb::from_points(c.points_bound()),
+            Geometry::Annotation(a) => Aabb::from_points(a.points()),
         }
     }
 }

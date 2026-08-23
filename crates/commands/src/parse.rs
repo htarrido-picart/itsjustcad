@@ -1,4 +1,5 @@
 use glam::DVec3;
+use mydrafter_doc::HatchPattern;
 
 use crate::error::ParseError;
 use crate::registry::registry;
@@ -116,6 +117,59 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 points: pts.iter().map(|p| point(p)).collect::<Result<_, _>>()?,
                 degree,
             })
+        }
+        "dim" => {
+            let (offset, pts) = match args.as_slice() {
+                [a, b] => (DEFAULT_DIM_OFFSET, [*a, *b]),
+                [a, b, off] => (number(off)?, [*a, *b]),
+                _ => return wrong("dim", "two points and an optional offset", &args),
+            };
+            Ok(Command::Dim {
+                id: None,
+                a: point(pts[0])?,
+                b: point(pts[1])?,
+                offset,
+            })
+        }
+        "text" => {
+            let (&pos, rest) = args
+                .split_first()
+                .ok_or_else(|| wrong_err("text", "a position and a string", &args))?;
+            // Optional trailing height: only when it leaves at least one word.
+            let (height, words) = match rest.split_last() {
+                Some((last, init)) if !init.is_empty() && number(last).is_ok() => {
+                    (number(last)?, init)
+                }
+                _ => (DEFAULT_TEXT_HEIGHT, rest),
+            };
+            if words.is_empty() {
+                return wrong("text", "a position and a string", &args);
+            }
+            Ok(Command::Text {
+                id: None,
+                pos: point(pos)?,
+                text: words.join(" "),
+                height,
+            })
+        }
+        "hatch" => {
+            let (sel, rest) = selector(&args, "hatch")?;
+            let pattern = match rest {
+                [] | ["solid"] => HatchPattern::Solid,
+                ["lines"] => HatchPattern::Lines { angle_deg: 45.0, spacing: 0.25 },
+                ["lines", angle, spacing] => HatchPattern::Lines {
+                    angle_deg: number(angle)?,
+                    spacing: number(spacing)?,
+                },
+                _ => {
+                    return wrong(
+                        "hatch",
+                        "an optional pattern: solid, lines, or lines <angle> <spacing>",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::Hatch { id: None, target: sel, pattern })
         }
         "union" => {
             let (sel, rest) = selector(&args, "union")?;
@@ -259,6 +313,11 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }),
     }
 }
+
+/// Default dimension-line offset (meters) when the user omits it.
+const DEFAULT_DIM_OFFSET: f64 = 0.5;
+/// Default annotation text height (meters).
+const DEFAULT_TEXT_HEIGHT: f64 = 0.2;
 
 fn take<'a, const N: usize>(
     command: &'static str,
@@ -632,6 +691,90 @@ mod tests {
             "layercolor walls 0.5,0.5,0.5",
             "hide walls",
             "show walls",
+        ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
+    }
+
+    #[test]
+    fn parse_drafting_commands() {
+        assert_eq!(
+            parse("dim 0,0 10,0").unwrap(),
+            Command::Dim {
+                id: None,
+                a: DVec3::ZERO,
+                b: DVec3::new(10.0, 0.0, 0.0),
+                offset: DEFAULT_DIM_OFFSET,
+            }
+        );
+        assert!(matches!(
+            parse("dim 0,0 10,0 0.8").unwrap(),
+            Command::Dim { offset, .. } if offset == 0.8
+        ));
+        assert!(matches!(
+            parse("dim 0,0 10,0 80cm").unwrap(),
+            Command::Dim { offset, .. } if offset == 0.8
+        ));
+        assert!(parse("dim 0,0").is_err());
+
+        // text: words join, optional trailing height
+        assert_eq!(
+            parse("text 5,3 living room 0.3").unwrap(),
+            Command::Text {
+                id: None,
+                pos: DVec3::new(5.0, 3.0, 0.0),
+                text: "living room".into(),
+                height: 0.3,
+            }
+        );
+        assert!(matches!(
+            parse("text 0,0 hello").unwrap(),
+            Command::Text { ref text, height, .. }
+                if text == "hello" && height == DEFAULT_TEXT_HEIGHT
+        ));
+        // a single numeric word is the text, not a height
+        assert!(matches!(
+            parse("text 0,0 42").unwrap(),
+            Command::Text { ref text, height, .. }
+                if text == "42" && height == DEFAULT_TEXT_HEIGHT
+        ));
+        assert!(parse("text 0,0").is_err());
+
+        // hatch: default solid, explicit patterns
+        use mydrafter_doc::HatchPattern;
+        assert!(matches!(
+            parse("hatch last").unwrap(),
+            Command::Hatch { target: Selector::Last { n: 1 }, pattern: HatchPattern::Solid, .. }
+        ));
+        assert!(matches!(
+            parse("hatch last solid").unwrap(),
+            Command::Hatch { pattern: HatchPattern::Solid, .. }
+        ));
+        assert!(matches!(
+            parse("hatch slab lines 45 0.25").unwrap(),
+            Command::Hatch {
+                target: Selector::Named { .. },
+                pattern: HatchPattern::Lines { angle_deg, spacing },
+                ..
+            } if angle_deg == 45.0 && spacing == 0.25
+        ));
+        assert!(matches!(
+            parse("hatch last lines").unwrap(),
+            Command::Hatch { pattern: HatchPattern::Lines { .. }, .. }
+        ));
+        assert!(parse("hatch last dots").is_err());
+    }
+
+    #[test]
+    fn drafting_command_json_roundtrip() {
+        for line in [
+            "dim 0,0 10,0 0.8",
+            "text 5,3 living room 0.3",
+            "hatch last lines 45 0.25",
+            "hatch last",
         ] {
             let cmd = parse(line).unwrap();
             let json = serde_json::to_string(&cmd).unwrap();

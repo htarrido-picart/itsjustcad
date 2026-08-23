@@ -30,6 +30,11 @@ pub fn digest(doc: &Document) -> String {
         let kind = match &obj.geometry {
             Geometry::Mesh(_) => "mesh",
             Geometry::Curve(_) => "curve",
+            Geometry::Annotation(a) => match a {
+                mydrafter_doc::Annotation::LinearDim { .. } => "dim",
+                mydrafter_doc::Annotation::Text { .. } => "text",
+                mydrafter_doc::Annotation::Hatch { .. } => "hatch",
+            },
         };
         let name = obj
             .name
