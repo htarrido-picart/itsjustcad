@@ -129,3 +129,61 @@ impl CommandLine {
         submitted
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_line_caps_history_at_500() {
+        let mut cl = CommandLine::default();
+        for i in 0..600 {
+            cl.push_line(format!("line {i}"));
+        }
+        assert_eq!(cl.history.len(), 500);
+        assert_eq!(cl.history.first().unwrap(), "line 100");
+        assert_eq!(cl.history.last().unwrap(), "line 599");
+    }
+
+    #[test]
+    fn execute_empty_line_is_a_no_op() {
+        let mut cl = CommandLine::default();
+        let mut session = Session::default();
+        assert!(!cl.execute(&mut session, "   "));
+        assert!(cl.recall.is_empty());
+        assert_eq!(cl.history.len(), 1, "only the banner line");
+    }
+
+    #[test]
+    fn execute_runs_command_and_records_recall() {
+        let mut cl = CommandLine::default();
+        let mut session = Session::default();
+        assert!(cl.execute(&mut session, "  box 0,0,0 1,1,1  "));
+        assert_eq!(session.doc.len(), 1);
+        assert_eq!(cl.recall, vec!["box 0,0,0 1,1,1"]);
+        assert!(cl.history.iter().any(|l| l == "> box 0,0,0 1,1,1"));
+    }
+
+    #[test]
+    fn execute_parse_error_returns_false_and_echoes() {
+        let mut cl = CommandLine::default();
+        let mut session = Session::default();
+        assert!(!cl.execute(&mut session, "frobnicate"));
+        assert_eq!(session.doc.len(), 0);
+        assert!(cl.history.iter().any(|l| l.starts_with("error: ")));
+    }
+
+    #[test]
+    fn execute_help_lists_every_registry_command() {
+        let mut cl = CommandLine::default();
+        let mut session = Session::default();
+        assert!(!cl.execute(&mut session, "help"));
+        for spec in registry() {
+            assert!(
+                cl.history.iter().any(|l| l.contains(spec.usage)),
+                "help missing usage for '{}'",
+                spec.name
+            );
+        }
+    }
+}

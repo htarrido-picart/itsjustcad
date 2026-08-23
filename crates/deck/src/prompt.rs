@@ -45,3 +45,38 @@ box 10,0,0 4,4,3
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_prompt_lists_every_registry_command() {
+        let prompt = system_prompt("");
+        for spec in registry() {
+            assert!(
+                prompt.contains(spec.usage),
+                "prompt missing usage for '{}'",
+                spec.name
+            );
+            assert!(
+                prompt.contains(spec.summary),
+                "prompt missing summary for '{}'",
+                spec.name
+            );
+        }
+        assert!(prompt.contains(SELECTOR_HELP));
+    }
+
+    #[test]
+    fn empty_scene_digest_renders_placeholder() {
+        assert!(system_prompt("").contains("(empty)"));
+    }
+
+    #[test]
+    fn scene_digest_is_embedded_verbatim() {
+        let prompt = system_prompt("abc1234 box 5x5x3 'core'");
+        assert!(prompt.contains("abc1234 box 5x5x3 'core'"));
+        assert!(!prompt.contains("(empty)"));
+    }
+}
