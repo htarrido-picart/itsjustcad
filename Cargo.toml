@@ -39,12 +39,10 @@ futures = "0.3"
 async-trait = "0.1"
 rfd = "0.15"
 dirs = "6"
-truck-geometry = "0.6"
 
 # internal crates
 kernel-mesh = { path = "crates/kernel-mesh" }
 kernel-curve = { path = "crates/kernel-curve" }
-kernel-brep = { path = "crates/kernel-brep" }
 mydrafter-doc = { path = "crates/doc" }
 mydrafter-commands = { path = "crates/commands" }
 mydrafter-deck = { path = "crates/deck" }

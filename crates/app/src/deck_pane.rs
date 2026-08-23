@@ -1,3 +1,4 @@
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use mydrafter_commands::{parse, Session};
 use mydrafter_deck::{
     make_deck, probe, system_prompt, warm_model, ChatMessage, ChatRequest, DeckDelta, DecksFile,
@@ -151,6 +152,7 @@ pub struct DeckPane {
     /// Provider-side conversation handle (claude-code sessions).
     session_id: Option<String>,
     view: PaneView,
+    markdown: CommonMarkCache,
 }
 
 impl Default for DeckPane {
@@ -175,6 +177,7 @@ impl Default for DeckPane {
             warmed_model: None,
             session_id: None,
             view: PaneView::Chat,
+            markdown: CommonMarkCache::default(),
         }
     }
 }
@@ -603,7 +606,7 @@ impl DeckPane {
         } {
             let mut back = false;
             ui.horizontal(|ui| {
-                back = ui.button("← back").clicked();
+                back = ui.button("‹ back").clicked();
                 ui.label(commands_header(commands_view));
             });
             ui.separator();
@@ -631,7 +634,7 @@ impl DeckPane {
                             ui.label(egui::RichText::new(format!("you: {t}")).strong());
                         }
                         Entry::Deck(t) => {
-                            ui.label(t.trim());
+                            CommonMarkViewer::new().show(ui, &mut self.markdown, t.trim());
                         }
                         Entry::Commands(commands) => {
                             if commands_card(ui, commands) {
@@ -644,7 +647,11 @@ impl DeckPane {
                     }
                 }
                 if !self.streaming_chat.trim().is_empty() {
-                    ui.label(self.streaming_chat.trim());
+                    CommonMarkViewer::new().show(
+                        ui,
+                        &mut self.markdown,
+                        self.streaming_chat.trim(),
+                    );
                 }
                 // Live turn feedback: waiting → elapsed; streaming → char count.
                 if self.busy() {
