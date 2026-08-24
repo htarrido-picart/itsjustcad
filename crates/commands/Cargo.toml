@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 mydrafter-doc.workspace = true
+mydrafter-solar.workspace = true
 kernel-mesh.workspace = true
 kernel-curve.workspace = true
 glam.workspace = true

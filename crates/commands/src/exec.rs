@@ -76,6 +76,8 @@ enum Inverse {
     Units { prev: Units },
     /// `underlay`/`underlayopacity`/`underlayoff`: restore the previous underlay.
     Underlay { prev: Option<Underlay> },
+    /// `sun`/`sunoff`: restore the previous solar position.
+    Sun { prev: Option<mydrafter_doc::SunPosition> },
     /// `view save`: restore the previously saved view of that name (if any).
     ViewSaved {
         name: String,
@@ -225,6 +227,10 @@ impl Session {
             }
             Inverse::Underlay { prev } => {
                 self.doc.underlay = prev.clone();
+                self.doc.generation += 1;
+            }
+            Inverse::Sun { prev } => {
+                self.doc.sun = *prev;
                 self.doc.generation += 1;
             }
             Inverse::ViewSaved { name, prev } => {
@@ -2158,6 +2164,33 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Sun { azimuth_deg, altitude_deg } => {
+            let prev = doc.sun;
+            doc.sun = Some(mydrafter_doc::SunPosition { azimuth_deg, altitude_deg });
+            doc.generation += 1;
+            Ok((
+                Command::Sun { azimuth_deg, altitude_deg },
+                Inverse::Sun { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "sun az={azimuth_deg:.1}° alt={altitude_deg:.1}°"
+                    ),
+                },
+            ))
+        }
+        Command::SunOff => {
+            let prev = doc.sun.take();
+            doc.generation += 1;
+            Ok((
+                Command::SunOff,
+                Inverse::Sun { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: "sun removed (headlight shading)".into(),
+                },
+            ))
+        }
         Command::Sheet { name, paper } => {
             if doc.sheet(&name).is_some() {
                 return Err(ExecError::Invalid(format!(
@@ -2593,6 +2626,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Underlay { .. } => "underlay",
         Command::UnderlayOpacity { .. } => "underlayopacity",
         Command::UnderlayOff => "underlayoff",
+        Command::Sun { .. } => "sun",
+        Command::SunOff => "sunoff",
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
         Command::Print { .. } => "print",
@@ -4548,6 +4583,57 @@ mod tests {
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap(),
             "log must be replay-stable"
+        );
+    }
+
+    #[test]
+    fn sun_exec_sets_document_sun_and_is_logged() {
+        let mut s = Session::default();
+        assert!(s.doc.sun.is_none(), "default doc has no sun");
+
+        // Set sun; should be logged and bumps generation.
+        let g0 = s.doc.generation;
+        run(&mut s, "sun 40.71 -74.01 2024-06-21 16:58");
+        let sun = s.doc.sun.expect("sun set after command");
+        assert!(s.doc.generation > g0);
+        // The command uses the NOAA SPA: NY summer solstice noon → ~180° az, ~72.7° alt.
+        assert!((sun.azimuth_deg - 180.0).abs() < 0.5, "az={:.2}", sun.azimuth_deg);
+        assert!((sun.altitude_deg - 72.7).abs() < 0.5, "alt={:.2}", sun.altitude_deg);
+
+        // Undo removes sun.
+        s.run(crate::Command::Undo).unwrap();
+        assert!(s.doc.sun.is_none(), "sun cleared after undo");
+
+        // Redo restores sun.
+        s.run(crate::Command::Redo).unwrap();
+        assert!(s.doc.sun.is_some(), "sun restored after redo");
+    }
+
+    #[test]
+    fn sunoff_exec_clears_sun_and_is_logged() {
+        let mut s = Session::default();
+        run(&mut s, "sun 40.71 -74.01 2024-06-21 16:58");
+        run(&mut s, "sunoff");
+        assert!(s.doc.sun.is_none(), "sunoff clears sun");
+        // undo restores sun
+        s.run(crate::Command::Undo).unwrap();
+        assert!(s.doc.sun.is_some());
+    }
+
+    #[test]
+    fn sun_command_replay_stability() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 5,5,3");
+        run(&mut s, "sun 40.71 -74.01 2024-06-21 16:58");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        // Replayed document must have the same sun position.
+        assert_eq!(s.doc.sun, replayed.doc.sun);
+        // Log must be replay-stable (idempotent serialisation).
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "sun log must be replay-stable"
         );
     }
 }

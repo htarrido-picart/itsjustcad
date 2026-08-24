@@ -618,6 +618,28 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 ),
             }
         }
+        // sun <lat> <lon> <YYYY-MM-DD> <HH:MM>
+        // Computes solar position via NOAA SPA and stores az+alt in the command.
+        "sun" => match args.as_slice() {
+            [lat, lon, date, time] => {
+                let lat_deg = number(lat)?;
+                let lon_deg = number(lon)?;
+                let (year, month, day) = parse_date(date)?;
+                let (hour, minute) = parse_hhmm(time)?;
+                let pos = mydrafter_solar::solar_position(
+                    year, month, day, hour, minute, lat_deg, lon_deg,
+                );
+                Ok(Command::Sun {
+                    azimuth_deg: pos.azimuth_deg,
+                    altitude_deg: pos.altitude_deg,
+                })
+            }
+            _ => wrong("sun", "lat lon YYYY-MM-DD HH:MM", &args),
+        },
+        "sunoff" => {
+            expect_empty("sunoff", &args, &args)?;
+            Ok(Command::SunOff)
+        }
         "undo" => Ok(Command::Undo),
         "redo" => Ok(Command::Redo),
         "amend" => match &args[..] {
@@ -901,6 +923,41 @@ fn closest_command(input: &str) -> Option<String> {
         .min_by_key(|name| levenshtein(input, name))
         .filter(|name| levenshtein(input, name) <= 2)
         .map(String::from)
+}
+
+/// Parse `YYYY-MM-DD` into `(year, month, day)`.
+fn parse_date(s: &str) -> Result<(i32, u32, u32), ParseError> {
+    let bad = || ParseError::BadNumber(s.to_string());
+    let parts: Vec<&str> = s.split('-').collect();
+    match parts.as_slice() {
+        [y, m, d] => {
+            let year = y.parse::<i32>().map_err(|_| bad())?;
+            let month = m.parse::<u32>().map_err(|_| bad())?;
+            let day = d.parse::<u32>().map_err(|_| bad())?;
+            if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+                return Err(bad());
+            }
+            Ok((year, month, day))
+        }
+        _ => Err(bad()),
+    }
+}
+
+/// Parse `HH:MM` into `(hour, minute)`.
+fn parse_hhmm(s: &str) -> Result<(u32, u32), ParseError> {
+    let bad = || ParseError::BadNumber(s.to_string());
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.as_slice() {
+        [h, m] => {
+            let hour = h.parse::<u32>().map_err(|_| bad())?;
+            let minute = m.parse::<u32>().map_err(|_| bad())?;
+            if hour > 23 || minute > 59 {
+                return Err(bad());
+            }
+            Ok((hour, minute))
+        }
+        _ => Err(bad()),
+    }
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -1787,6 +1844,35 @@ mod tests {
     #[test]
     fn command_json_roundtrip() {
         let cmd = parse("polyline 0,0 5,0 5,5 closed").unwrap();
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn parse_sun_command() {
+        // NY summer solstice solar noon: expected az≈180°, alt≈72.7°
+        let cmd = parse("sun 40.71 -74.01 2024-06-21 16:58").unwrap();
+        let Command::Sun { azimuth_deg, altitude_deg } = cmd else {
+            panic!("expected Sun command");
+        };
+        assert!((azimuth_deg - 180.0).abs() < 0.5, "az={azimuth_deg:.2}");
+        assert!((altitude_deg - 72.7).abs() < 0.5, "alt={altitude_deg:.2}");
+
+        // sunoff parses correctly
+        assert!(matches!(parse("sunoff").unwrap(), Command::SunOff));
+
+        // bad date
+        assert!(parse("sun 40.0 -74.0 2024-13-01 12:00").is_err());
+        // bad time
+        assert!(parse("sun 40.0 -74.0 2024-06-21 25:00").is_err());
+        // wrong arg count
+        assert!(parse("sun 40.0 -74.0").is_err());
+    }
+
+    #[test]
+    fn sun_command_json_roundtrip() {
+        let cmd = parse("sun 40.71 -74.01 2024-06-21 16:58").unwrap();
         let json = serde_json::to_string(&cmd).unwrap();
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, back);

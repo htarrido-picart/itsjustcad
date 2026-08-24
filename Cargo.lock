@@ -2061,6 +2061,7 @@ dependencies = [
  "mydrafter-deck",
  "mydrafter-doc",
  "mydrafter-render",
+ "mydrafter-solar",
  "rfd",
  "serde",
  "serde_json",
@@ -2079,6 +2080,7 @@ dependencies = [
  "kernel-curve",
  "kernel-mesh",
  "mydrafter-doc",
+ "mydrafter-solar",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -2131,6 +2133,10 @@ dependencies = [
  "pollster",
  "wgpu",
 ]
+
+[[package]]
+name = "mydrafter-solar"
+version = "0.1.0"
 
 [[package]]
 name = "naga"

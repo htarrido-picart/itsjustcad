@@ -8,6 +8,7 @@ members = [
     "crates/commands",
     "crates/deck",
     "crates/render",
+    "crates/solar",
     "crates/app",
 ]
 
@@ -47,3 +48,4 @@ mydrafter-doc = { path = "crates/doc" }
 mydrafter-commands = { path = "crates/commands" }
 mydrafter-deck = { path = "crates/deck" }
 mydrafter-render = { path = "crates/render" }
+mydrafter-solar = { path = "crates/solar" }

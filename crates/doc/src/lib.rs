@@ -19,3 +19,15 @@ pub use units::{
     format_area, format_length, format_volume, Units, METERS_PER_FOOT, METERS_PER_INCH,
 };
 pub use view::NamedView;
+
+use serde::{Deserialize, Serialize};
+
+/// Solar position recorded by the `sun` command. Stored as azimuth + altitude
+/// (NOAA simplified SPA output) so the value is self-contained in the op-log.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SunPosition {
+    /// Clockwise from North, degrees [0, 360).
+    pub azimuth_deg: f64,
+    /// Above the horizon, degrees (negative = below horizon).
+    pub altitude_deg: f64,
+}

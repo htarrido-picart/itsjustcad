@@ -156,5 +156,6 @@ fn main() {
         scene: None,
         viewport: 0,
         mode: mydrafter_render::DisplayMode::Shaded,
+        sun_dir: None,
     };
 }

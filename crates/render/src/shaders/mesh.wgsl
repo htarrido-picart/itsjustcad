@@ -1,10 +1,12 @@
 // Flat-shaded solid with a simple headlight lambert term.
+// When a solar direction is set (misc.yzw != 0) the sun replaces the headlight.
 
 struct Camera {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     eye: vec4<f32>,
-    // x = fill alpha multiplier (display mode), yzw spare
+    // x  = fill alpha multiplier (display mode)
+    // yzw = sun direction (X=East,Y=North,Z=Up); all-zero means headlight
     misc: vec4<f32>,
 };
 
@@ -39,7 +41,13 @@ fn vs_main(in: VsIn) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
-    let l = normalize(camera.eye.xyz - in.world); // headlight
+    let sun = camera.misc.yzw;
+    // Use solar direction when set (length > 0.1), otherwise headlight.
+    let l = select(
+        normalize(camera.eye.xyz - in.world),
+        normalize(sun),
+        dot(sun, sun) > 0.01,
+    );
     let lambert = max(dot(n, l), 0.0);
     let shade = 0.35 + 0.65 * lambert;
     return vec4(object.color.rgb * shade, object.color.a * camera.misc.x);

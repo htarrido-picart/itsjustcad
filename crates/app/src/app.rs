@@ -625,6 +625,9 @@ impl App {
                 }
             }
 
+            let sun_dir = self.session.doc.sun.map(|s| {
+                mydrafter_solar::sun_direction(s.azimuth_deg, s.altitude_deg)
+            });
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                 rect,
                 ViewportCallback {
@@ -634,6 +637,7 @@ impl App {
                     scene: scene.take(),
                     viewport: pane,
                     mode: self.display_modes[cam_idx],
+                    sun_dir,
                 },
             ));
 

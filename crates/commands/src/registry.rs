@@ -259,6 +259,16 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Remove the underlay image",
         },
         CommandSpec {
+            name: "sun",
+            usage: "sun <lat> <lon> <YYYY-MM-DD> <HH:MM>",
+            summary: "Set solar lighting by computing azimuth + altitude (NOAA simplified SPA) for the given observer location and UTC time. The renderer shades meshes from that direction. Example: sun 40.71 -74.01 2024-06-21 14:00",
+        },
+        CommandSpec {
+            name: "sunoff",
+            usage: "sunoff",
+            summary: "Remove solar lighting; revert to headlight shading",
+        },
+        CommandSpec {
             name: "sheet",
             usage: "sheet <name> [a4|a3|a2|a1|a0]",
             summary: "Create a named paper sheet, landscape (default a3). Example: sheet plan a1",

@@ -16,6 +16,9 @@ pub struct ViewportCallback {
     pub viewport: usize,
     /// Display mode of this pane (shaded/wireframe/x-ray/ghosted).
     pub mode: DisplayMode,
+    /// Unit vector toward the sun (X=East, Y=North, Z=Up). When `None` the
+    /// shader falls back to the headlight (eye-direction) shading.
+    pub sun_dir: Option<[f32; 3]>,
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -28,11 +31,17 @@ impl CallbackTrait for ViewportCallback {
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let renderer: &mut SceneRenderer = resources.get_mut().expect("SceneRenderer registered");
+        // misc[0] = fill_alpha (display mode)
+        // misc[1..3] = sun direction xyz (0 = headlight fallback)
+        let (sx, sy, sz) = self
+            .sun_dir
+            .map(|d| (d[0], d[1], d[2]))
+            .unwrap_or((0.0, 0.0, 0.0));
         let cam = CameraUniform {
             view_proj: self.view_proj.to_cols_array_2d(),
             inv_view_proj: self.view_proj.inverse().to_cols_array_2d(),
             eye: [self.eye.x, self.eye.y, self.eye.z, 1.0],
-            misc: [self.mode.fill_alpha(), 0.0, 0.0, 0.0],
+            misc: [self.mode.fill_alpha(), sx, sy, sz],
         };
         renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene

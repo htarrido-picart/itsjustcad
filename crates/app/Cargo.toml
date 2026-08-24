@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 mydrafter-doc.workspace = true
+mydrafter-solar.workspace = true
 kernel-curve.workspace = true
 mydrafter-commands.workspace = true
 mydrafter-deck.workspace = true

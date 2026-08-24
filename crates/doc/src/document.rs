@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_mesh::Aabb;
 
-use crate::{LayerStyle, NamedView, ObjectId, SceneObject, Sheet, Underlay, Units, DEFAULT_LAYER};
+use crate::{
+    LayerStyle, NamedView, ObjectId, SceneObject, Sheet, SunPosition, Underlay, Units,
+    DEFAULT_LAYER,
+};
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
 #[derive(Clone, Debug)]
@@ -34,6 +37,9 @@ pub struct Document {
     /// Optional raster reference image on the ground plane. Set via the logged
     /// `underlay` command; a missing file on open is a warning, not an error.
     pub underlay: Option<Underlay>,
+    /// Solar position set by the `sun` command; `None` means headlight-only
+    /// shading. Logged so saved files replay with the same lighting.
+    pub sun: Option<SunPosition>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -52,6 +58,7 @@ impl Default for Document {
             groups: BTreeMap::new(),
             pending_view: None,
             underlay: None,
+            sun: None,
             generation: 0,
         }
     }

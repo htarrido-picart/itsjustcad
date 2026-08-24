@@ -333,6 +333,17 @@ pub enum Command {
     Units {
         units: Units,
     },
+    /// Set the document solar position (azimuth + altitude from NOAA SPA).
+    /// Logged so saved files replay with identical lighting. `None` reverts to
+    /// headlight-only shading. The renderer picks this up on the next frame.
+    Sun {
+        /// Azimuth clockwise from North, degrees [0, 360).
+        azimuth_deg: f64,
+        /// Altitude above the horizon, degrees.
+        altitude_deg: f64,
+    },
+    /// Remove the solar position (revert to headlight shading).
+    SunOff,
     // -- underlay (raster reference image on the ground plane) --
     /// Place a raster image (PNG) on the ground plane. `height` is `None` when
     /// typed/emitted; exec fills it from the image's aspect ratio (width /
