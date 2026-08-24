@@ -3,7 +3,7 @@ use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
 use mydrafter_doc::{
     format_area, format_length, format_volume, Annotation, Document, Geometry, LayerStyle,
-    NamedView, ObjectId, SceneObject, ScheduleRow, SheetTable, Underlay, Units,
+    NamedView, ObjectId, SceneObject, ScheduleRow, SheetDim, SheetTable, Underlay, Units,
 };
 
 use crate::error::ExecError;
@@ -94,6 +94,8 @@ enum Inverse {
     PopSheetView(String),
     /// `sheettable`: clear the table that was placed on a sheet.
     SheetTableRemoved(String),
+    /// `sheetdim`: remove the last dim appended to a sheet.
+    PopSheetDim(String),
 }
 
 /// Owns the document plus its op-log; the single mutation path for both the
@@ -260,6 +262,13 @@ impl Session {
                 let sheet = sheet.clone();
                 if let Some(s) = self.doc.sheet_mut(&sheet) {
                     s.table = None;
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::PopSheetDim(sheet) => {
+                let sheet = sheet.clone();
+                if let Some(s) = self.doc.sheet_mut(&sheet) {
+                    s.dims.pop();
                 }
                 self.doc.generation += 1;
             }
@@ -2161,6 +2170,7 @@ fn apply_forward(
                 paper,
                 views: Vec::new(),
                 table: None,
+                dims: Vec::new(),
             });
             doc.generation += 1;
             Ok((
@@ -2482,6 +2492,49 @@ fn apply_forward(
                 },
             ))
         }
+        Command::SheetDim { sheet, a, b, offset, view_index } => {
+            let offset_mm = offset.unwrap_or(8.0);
+            let vi = view_index.unwrap_or(0);
+            let known: Vec<String> = doc.sheets.iter().map(|s| s.name.clone()).collect();
+            let Some(s) = doc.sheet_mut(&sheet) else {
+                return Err(ExecError::Invalid(format!(
+                    "no sheet '{sheet}' (sheets: {}; create one with: sheet {sheet})",
+                    known.join(", ")
+                )));
+            };
+            if vi >= s.views.len() && !s.views.is_empty() {
+                return Err(ExecError::Invalid(format!(
+                    "view index {vi} is out of range (sheet '{sheet}' has {} views)",
+                    s.views.len()
+                )));
+            }
+            let scale = s.views.get(vi).map(|v| v.scale).unwrap_or(100.0);
+            s.dims.push(SheetDim { a_mm: a, b_mm: b, offset_mm, view_index: vi });
+            doc.generation += 1;
+            // Compute the model-space distance for the echo message.
+            let paper_dist = {
+                let dx = b[0] - a[0];
+                let dy = b[1] - a[1];
+                (dx * dx + dy * dy).sqrt()
+            };
+            let model_m = paper_dist * scale / 1000.0;
+            Ok((
+                Command::SheetDim {
+                    sheet: sheet.clone(),
+                    a,
+                    b,
+                    offset: Some(offset_mm),
+                    view_index: Some(vi),
+                },
+                Inverse::PopSheetDim(sheet.clone()),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "dim on '{sheet}' view {vi} @ 1:{scale}: {paper_dist:.1}mm paper = {model_m:.3}m model"
+                    ),
+                },
+            ))
+        }
         Command::Undo | Command::Redo | Command::Amend { .. } | Command::Import { .. } => {
             unreachable!("handled in Session::run")
         }
@@ -2556,6 +2609,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Bbox { .. } => "bbox",
         Command::Schedule { .. } => "schedule",
         Command::SheetTable { .. } => "sheettable",
+        Command::SheetDim { .. } => "sheetdim",
         Command::Undo => "undo",
         Command::Redo => "redo",
         Command::Amend { .. } => "amend",

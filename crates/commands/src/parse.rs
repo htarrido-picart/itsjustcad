@@ -594,6 +594,30 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             };
             Ok(Command::SheetTable { sheet, layer })
         }
+        "sheetdim" => {
+            // sheetdim <sheet> <x1,y1> <x2,y2> [offset_mm]
+            match args.as_slice() {
+                [sheet, a, b] => Ok(Command::SheetDim {
+                    sheet: (*sheet).to_string(),
+                    a: paper_point(a)?,
+                    b: paper_point(b)?,
+                    offset: None,
+                    view_index: None,
+                }),
+                [sheet, a, b, off] => Ok(Command::SheetDim {
+                    sheet: (*sheet).to_string(),
+                    a: paper_point(a)?,
+                    b: paper_point(b)?,
+                    offset: Some(number(off)?),
+                    view_index: None,
+                }),
+                _ => wrong(
+                    "sheetdim",
+                    "a sheet name, two paper points (mm) and an optional offset (mm)",
+                    &args,
+                ),
+            }
+        }
         "undo" => Ok(Command::Undo),
         "redo" => Ok(Command::Redo),
         "amend" => match &args[..] {
@@ -778,6 +802,27 @@ fn color3(s: &str) -> Result<[f32; 3], ParseError> {
         (g / scale) as f32,
         (b / scale) as f32,
     ])
+}
+
+/// `x,y` paper-space point in mm; bare numbers are millimetres (unlike
+/// `point()` where bare numbers are metres).
+fn paper_point(s: &str) -> Result<[f64; 2], ParseError> {
+    let bad = || ParseError::BadPoint(s.to_string());
+    let parts: Vec<&str> = s.split(',').collect();
+    let mm_val = |t: &str| -> Result<f64, ParseError> {
+        // honour explicit unit suffixes via number(), but default to mm.
+        if t.ends_with("mm") || t.ends_with("cm") || t.ends_with('m') || t.ends_with("in")
+            || t.ends_with("ft")
+        {
+            number(t).map_err(|_| bad())
+        } else {
+            t.parse::<f64>().map_err(|_| bad())
+        }
+    };
+    match parts.as_slice() {
+        [x, y] => Ok([mm_val(x)?, mm_val(y)?]),
+        _ => Err(bad()),
+    }
 }
 
 fn paper_size(s: &str) -> Result<PaperSize, ParseError> {

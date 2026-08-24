@@ -433,6 +433,20 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         layer: Option<String>,
     },
+    /// Add a paper-space dimension to a sheet (logged). `a` and `b` are paper
+    /// coordinates in mm; `offset` is the perpendicular dim-line offset in mm.
+    /// The numeric label is derived at PDF time from the model distance via the
+    /// view scale, so it always agrees with the geometry.
+    SheetDim {
+        sheet: String,
+        a: [f64; 2],
+        b: [f64; 2],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<f64>,
+        /// Which sheet view index to use for paper→model conversion (0-based).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_index: Option<usize>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild

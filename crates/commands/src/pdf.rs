@@ -4,7 +4,10 @@
 //! operators only, which keeps the crate dependency-free.
 
 use glam::{DVec2, DVec3};
-use mydrafter_doc::{Document, Geometry, LayerStyle, ScheduleRow, Sheet, SheetView, ViewDirection};
+use mydrafter_doc::{
+    Annotation, Document, Geometry, LayerStyle, ScheduleRow, Sheet, SheetDim, SheetView,
+    ViewDirection,
+};
 
 /// Chord tolerance for tessellating curves at print time (meters).
 const PRINT_TOL: f64 = 0.005;
@@ -54,9 +57,82 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
         Geometry::Mesh(mesh) => {
             out.extend(crate::dxf::mesh_feature_edges(mesh));
         }
-        // Annotations are screen-styled (arrows, glyphs); skipped in PDF v1.
+        // LinearDim annotations: render the three dim-line segments (two witness
+        // lines + one dim line) so they appear inside viewport projections.
+        Geometry::Annotation(Annotation::LinearDim { a, b, offset }) => {
+            // Perpendicular direction in the XY plane (dim offset is already in
+            // model-space meters; positive = left of a→b).
+            let dir = (*b - *a).normalize_or_zero();
+            let perp = DVec3::new(-dir.y, dir.x, 0.0) * *offset;
+            let a_off = *a + perp;
+            let b_off = *b + perp;
+            // Witness lines (with a small gap at the anchor point).
+            let gap = offset.abs() * 0.05;
+            let ga = *a + perp.normalize_or_zero() * gap;
+            let gb = *b + perp.normalize_or_zero() * gap;
+            out.push((ga, a_off));
+            out.push((gb, b_off));
+            // Dim line.
+            out.push((a_off, b_off));
+        }
         Geometry::Annotation(_) => {}
     }
+}
+
+/// Dim-line text (label only, no arrows): emits BT...ET PDF text for a
+/// dimension line between `p1` and `p2` (paper mm) with the given value string.
+/// Text is centred above the midpoint, horizontal only (simplified).
+fn emit_dim_text(p1: DVec2, p2: DVec2, label: &str, content: &mut String) {
+    let mid = (p1 + p2) / 2.0;
+    let font_pt = 7.0;
+    // Rough char width in mm at 7pt Helvetica (≈ 4pt/char).
+    let text_w_mm = label.len() as f64 * 4.0 / PT_PER_MM;
+    content.push_str(&format!(
+        "BT /F1 {font_pt} Tf {} {} Td ({}) Tj ET\n",
+        mm(mid.x - text_w_mm / 2.0),
+        mm(mid.y + 1.5), // 1.5 mm gap above the dim line
+        escape_pdf_text(label)
+    ));
+}
+
+/// Render a paper-space dimension (stored in Sheet.dims) into the content
+/// stream. Draws witness lines, a dim line, and the label.
+///
+/// The model distance is recovered from the paper distance + view scale so the
+/// label exactly reflects the geometry being measured.
+fn render_sheet_dim(d: &SheetDim, view_scale: f64, content: &mut String) {
+    let a = DVec2::new(d.a_mm[0], d.a_mm[1]);
+    let b = DVec2::new(d.b_mm[0], d.b_mm[1]);
+
+    let dir = (b - a).normalize_or_zero();
+    // Perpendicular: rotate 90° CCW.
+    let perp = DVec2::new(-dir.y, dir.x) * d.offset_mm;
+
+    let a_off = a + perp;
+    let b_off = b + perp;
+    // Short witness lines with 1 mm gap.
+    let gap_mm = 1.0_f64;
+    let gap = perp.normalize_or_zero() * gap_mm;
+    let a_start = a + gap;
+    let b_start = b + gap;
+    // 1 mm extension past the dim line.
+    let ext = perp.normalize_or_zero() * 1.0;
+
+    content.push_str(&format!(
+        "0.25 w\n\
+         {} {} m {} {} l S\n\
+         {} {} m {} {} l S\n\
+         {} {} m {} {} l S\n",
+        mm(a_start.x), mm(a_start.y), mm((a_off + ext).x), mm((a_off + ext).y),
+        mm(b_start.x), mm(b_start.y), mm((b_off + ext).x), mm((b_off + ext).y),
+        mm(a_off.x),   mm(a_off.y),   mm(b_off.x),          mm(b_off.y),
+    ));
+
+    // Label: paper distance → model distance via scale.
+    let paper_dist_mm = (b - a).length();
+    let model_m = paper_dist_mm * view_scale / 1000.0;
+    let label = format!("{:.3}m", model_m);
+    emit_dim_text(a_off, b_off, &label, content);
 }
 
 /// Default fallback style when a layer has no explicit entry.
@@ -108,8 +184,9 @@ fn mm(v: f64) -> String {
     format!("{:.2}", v * PT_PER_MM)
 }
 
-/// Render one viewport's content (border + clipped scaled line art + label)
-/// into `content`. Returns the number of geometry lines drawn.
+/// Render one viewport's content (border + clipped scaled line art + label
+/// + model-space dim text) into `content`. Returns the number of geometry
+/// lines drawn.
 fn render_view(
     doc: &Document,
     view: &SheetView,
@@ -207,6 +284,42 @@ fn render_view(
             drawn += 1;
         }
     }
+
+    // Second pass: emit dim text labels for LinearDim annotations.
+    for obj in doc.objects() {
+        if !obj.visible || !doc.layer_visible(&obj.layer) {
+            continue;
+        }
+        if let Geometry::Annotation(Annotation::LinearDim { a: da, b: db, offset: dim_off }) =
+            &obj.geometry
+        {
+            let dir = (*db - *da).normalize_or_zero();
+            let perp = DVec3::new(-dir.y, dir.x, 0.0) * *dim_off;
+            // Position label at the midpoint of the dim line.
+            let mid_world = (*da + *db) / 2.0 + perp;
+            let projected = project(view.direction, mid_world);
+            let paper_pos = DVec2::new(
+                world_to_paper_mm(projected.x, view.scale),
+                world_to_paper_mm(projected.y, view.scale),
+            );
+            // Apply the same viewport centering offset as the geometry pass.
+            let text_pos = paper_pos + offset;
+            // Only emit label when the midpoint falls inside the viewport.
+            if text_pos.x > cmin.x && text_pos.x < cmax.x
+                && text_pos.y > cmin.y && text_pos.y < cmax.y
+            {
+                let dist_m = (*db - *da).length();
+                let label = format!("{:.3}m", dist_m);
+                content.push_str(&format!(
+                    "BT /F1 7 Tf {} {} Td ({}) Tj ET\n",
+                    mm(text_pos.x),
+                    mm(text_pos.y),
+                    escape_pdf_text(&label)
+                ));
+            }
+        }
+    }
+
     drawn
 }
 
@@ -371,6 +484,12 @@ pub fn sheet_pdf(doc: &Document, sheet: &Sheet) -> (Vec<u8>, usize) {
         }
     }
 
+    // Paper-space dims (SheetDim): render after viewports so they overlay cleanly.
+    for d in &sheet.dims {
+        let scale = sheet.views.get(d.view_index).map(|v| v.scale).unwrap_or(100.0);
+        render_sheet_dim(d, scale, &mut content);
+    }
+
     (write_pdf(paper_w, paper_h, content.as_bytes()), drawn)
 }
 
@@ -469,6 +588,7 @@ mod tests {
             paper: mydrafter_doc::PaperSize::A3,
             views: vec![],
             table: None,
+            dims: vec![],
         };
         let (bytes, drawn) = sheet_pdf(&doc, &sheet);
         assert!(bytes.starts_with(b"%PDF"));
@@ -512,5 +632,105 @@ mod tests {
         // The two w values must differ.
         let w_values: std::collections::HashSet<&str> = w_ops.iter().copied().collect();
         assert!(w_values.len() >= 2, "w ops must have distinct values: {w_ops:?}");
+    }
+
+    /// Paper→model math at 1:100: 100 mm paper = 10 m model.
+    #[test]
+    fn paper_to_model_math_1_to_100() {
+        // At 1:100: paper_mm * scale / 1000 = model_m
+        let paper_mm = 100.0_f64;
+        let scale = 100.0_f64;
+        let model_m = paper_mm * scale / 1000.0;
+        assert!((model_m - 10.0).abs() < 1e-12, "100mm @ 1:100 should be 10m, got {model_m}");
+
+        // At 1:50: 50 mm = 2.5 m
+        let model_m2: f64 = 50.0 * 50.0 / 1000.0;
+        assert!((model_m2 - 2.5).abs() < 1e-12);
+
+        // Inverse: world_to_paper_mm(10.0, 100.0) = 100 mm
+        assert!((world_to_paper_mm(10.0, 100.0) - 100.0).abs() < 1e-12);
+    }
+
+    /// `sheetdim` is logged, stored in Sheet.dims, and replays identically.
+    #[test]
+    fn sheetdim_replay_stability() {
+        use crate::{parse, Session};
+
+        let mut s = Session::default();
+        s.run(parse("sheet plan a3").unwrap()).unwrap();
+        s.run(parse("sheetview plan top 100").unwrap()).unwrap();
+        s.run(parse("sheetdim plan 20,30 120,30 10").unwrap()).unwrap();
+
+        let sheet = s.doc.sheet("plan").unwrap();
+        assert_eq!(sheet.dims.len(), 1, "dim stored on sheet");
+        let d = &sheet.dims[0];
+        assert!((d.a_mm[0] - 20.0).abs() < 1e-6);
+        assert!((d.b_mm[0] - 120.0).abs() < 1e-6);
+        assert!((d.offset_mm - 10.0).abs() < 1e-6);
+
+        // Replay stability: save as JSON and reload; state must be identical.
+        let json = crate::io::to_json(&s);
+        let s2 = crate::io::from_json(&json).unwrap();
+        let sheet2 = s2.doc.sheet("plan").unwrap();
+        assert_eq!(sheet2.dims.len(), 1);
+        assert_eq!(sheet2.dims[0], sheet.dims[0]);
+        // Round-trip JSON must be identical (no non-determinism).
+        assert_eq!(crate::io::to_json(&s2), json, "replay-stable JSON");
+    }
+
+    /// `sheetdim` undo removes the dim.
+    #[test]
+    fn sheetdim_undo_removes_dim() {
+        use crate::{parse, Session};
+
+        let mut s = Session::default();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse("sheetview s1 top 100").unwrap()).unwrap();
+        s.run(parse("sheetdim s1 10,10 110,10").unwrap()).unwrap();
+        assert_eq!(s.doc.sheet("s1").unwrap().dims.len(), 1);
+
+        s.run(parse("undo").unwrap()).unwrap();
+        assert_eq!(s.doc.sheet("s1").unwrap().dims.len(), 0, "dim removed by undo");
+    }
+
+    /// PDF output contains the measured value string for a sheetdim.
+    #[test]
+    fn sheetdim_pdf_contains_dim_text() {
+        use crate::{parse, Session};
+
+        let mut s = Session::default();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse("sheetview s1 top 100").unwrap()).unwrap();
+        // 100 mm paper at 1:100 = 10 m model.
+        s.run(parse("sheetdim s1 20,50 120,50 8").unwrap()).unwrap();
+
+        let sheet = s.doc.sheet("s1").unwrap().clone();
+        let (bytes, _) = sheet_pdf(&s.doc, &sheet);
+        let content = String::from_utf8_lossy(&bytes);
+        // The label "10.000m" should appear verbatim in the PDF content stream.
+        assert!(
+            content.contains("10.000m"),
+            "PDF should contain dim label '10.000m'"
+        );
+    }
+
+    /// Model-space LinearDim lines render inside a viewport (segments drawn > 0).
+    #[test]
+    fn model_space_dim_renders_in_viewport() {
+        use crate::{parse, Session};
+
+        let mut s = Session::default();
+        // Create a dim between (0,0,0) and (5,0,0) with offset 0.5 m.
+        s.run(parse("dim 0,0,0 5,0,0 0.5").unwrap()).unwrap();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse("sheetview s1 top 100").unwrap()).unwrap();
+
+        let sheet = s.doc.sheet("s1").unwrap().clone();
+        let (bytes, drawn) = sheet_pdf(&s.doc, &sheet);
+        // Dim generates 3 segments (2 witness + 1 dim line).
+        assert!(drawn >= 3, "expected ≥3 segments for dim, got {drawn}");
+        let content = String::from_utf8_lossy(&bytes);
+        // The model distance label "5.000m" should appear in the PDF.
+        assert!(content.contains("5.000m"), "PDF should contain dim label '5.000m'");
     }
 }

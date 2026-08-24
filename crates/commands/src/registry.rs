@@ -314,6 +314,11 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Place a schedule table on a sheet; the table is rendered as a text grid in the PDF at print time. Example: sheettable plan · sheettable plan walls",
         },
         CommandSpec {
+            name: "sheetdim",
+            usage: "sheetdim <sheet> <x1,y1> <x2,y2> [offset_mm]",
+            summary: "Add a paper-space linear dimension to a sheet; a and b are paper coordinates in mm, offset is the perpendicular dim-line offset in mm (default 8). The numeric label is derived from the model distance via the view scale. Example: sheetdim plan 20,30 120,30 10",
+        },
+        CommandSpec {
             name: "view",
             usage: "view save <name> | view <name> | view list",
             summary: "Named views: save the active viewport camera, restore it later, or list saved views. Example: view save entry then view entry",

@@ -88,6 +88,22 @@ pub struct SheetTable {
     pub rows: Vec<ScheduleRow>,
 }
 
+/// A paper-space linear dimension: two paper-space anchor points (in mm,
+/// from the sheet lower-left) and a dim-line offset (mm, perpendicular to
+/// the measurement direction). The numeric label is derived at PDF time from
+/// the model distance so it always matches the geometry.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SheetDim {
+    /// First anchor in paper space (mm).
+    pub a_mm: [f64; 2],
+    /// Second anchor in paper space (mm).
+    pub b_mm: [f64; 2],
+    /// Perpendicular offset of the dimension line from a→b (mm).
+    pub offset_mm: f64,
+    /// The view whose scale converts paper→model for the label value.
+    pub view_index: usize,
+}
+
 /// A named paper layout holding scaled views of the model.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Sheet {
@@ -98,4 +114,7 @@ pub struct Sheet {
     /// Optional schedule table placed below the views.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table: Option<SheetTable>,
+    /// Paper-space dimensions added via `sheetdim`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dims: Vec<SheetDim>,
 }
