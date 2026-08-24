@@ -34,6 +34,9 @@ pub enum MenuAction {
     Help,
     /// Show the About dialog.
     About,
+    /// Open the Model Setup panel (download/manage local models). Available any
+    /// time from Tools, not just at first run.
+    ModelSetup,
 }
 
 /// Draw-tool verbs (mirror `draw_tool::try_start`). A menu pick of one of these
@@ -134,6 +137,14 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
                             action = Some(MenuAction::Execute(verb.to_string()));
                             ui.close();
                         }
+                    }
+                    ui.separator();
+                } else if title == "Tools" {
+                    // App-wired: opens the Model Setup panel (download/manage a
+                    // local model) at any time.
+                    if ui.button("Model Setup…").clicked() {
+                        action = Some(MenuAction::ModelSetup);
+                        ui.close();
                     }
                     ui.separator();
                 }

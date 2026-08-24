@@ -329,6 +329,25 @@ pub struct App {
     /// Hardware capabilities detected once at startup, shown when the user picks
     /// the "download a local model" path so tiers can be gated.
     hardware: crate::hardware::HardwareInfo,
+    /// Whether the Tools → Model Setup panel is open (works any time, not just
+    /// first-run).
+    show_model_setup: bool,
+    /// Bundled catalog of downloadable local models, parsed once.
+    catalog: crate::model_catalog::Catalog,
+    /// The download in flight from the Model Setup panel, if any. The UI polls
+    /// its [`crate::download::DownloadState`] each frame.
+    active_download: Option<ActiveDownload>,
+}
+
+/// A running install: which model, plus the [`crate::download::Download`] handle
+/// the UI polls. Kept so a completed download can be turned into a decks.json
+/// cassette exactly once.
+struct ActiveDownload {
+    model_id: String,
+    handle: crate::download::Download,
+    /// Set once we've persisted the cassette for a `Done` state, so we do it
+    /// only once.
+    persisted: bool,
 }
 
 impl App {
@@ -466,6 +485,11 @@ impl App {
                 _ => DeckBrain::Skip,
             },
             hardware: crate::hardware::detect(),
+            // Dev hook: ITSJUSTCAD_MODEL_SETUP=1 opens the Model Setup panel on
+            // startup so ITSJUSTCAD_SHOT frames can capture it without a click.
+            show_model_setup: std::env::var("ITSJUSTCAD_MODEL_SETUP").is_ok(),
+            catalog: crate::model_catalog::Catalog::load(),
+            active_download: None,
         }
     }
 
@@ -1871,7 +1895,216 @@ impl App {
                 }
             }
             MenuAction::About => self.show_about = true,
+            MenuAction::ModelSetup => self.show_model_setup = true,
         }
+    }
+
+    /// Model Setup panel: hardware recommendation, the catalog gated by RAM, an
+    /// Install button per model with a live progress bar + speed + cancel, and
+    /// the currently-installed model with Re-download / Remove. On a completed,
+    /// verified download it writes/enables the local `openai_compat` cassette in
+    /// `decks.json` (the runtime spawn is the next agent's job).
+    fn model_setup_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_model_setup {
+            return;
+        }
+
+        // 1) Poll the active download; on a fresh Done, persist the cassette once.
+        let mut done_msg: Option<String> = None;
+        if let Some(active) = &mut self.active_download {
+            let state = active.handle.state();
+            if matches!(state, crate::download::DownloadState::Done { .. }) && !active.persisted {
+                active.persisted = true;
+                if let Some(entry) = self.catalog.get(&active.model_id).cloned() {
+                    let mut decks = itsjustcad_deck::DecksFile::load_or_default();
+                    install_catalog_deck(&mut decks, &entry);
+                    decks.save();
+                    done_msg = Some(format!(
+                        "Installed {} and enabled cassette '{}'. \
+                         Start the local runtime to use it.",
+                        entry.display_name,
+                        cassette_name_for(&entry.id),
+                    ));
+                }
+            }
+        }
+        if let Some(msg) = done_msg {
+            tracing::info!("{msg}");
+        }
+
+        let mut open = true;
+        let hw = self.hardware;
+        let catalog = self.catalog.clone();
+        let decks = itsjustcad_deck::DecksFile::load_or_default();
+        // Collect UI intents, then act after the closure (avoids borrow clashes).
+        let mut install: Option<String> = None;
+        let mut cancel = false;
+        let mut remove: Option<String> = None;
+
+        egui::Window::new("Model Setup")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                // Hardware recommendation.
+                ui.label(egui::RichText::new(hw.recommendation()).strong());
+                ui.label(
+                    egui::RichText::new(format!("Suggested: {}", hw.tier().label()))
+                        .weak(),
+                );
+                ui.separator();
+
+                // The one live download (if any), shown at the top.
+                let active_state = self
+                    .active_download
+                    .as_ref()
+                    .map(|a| (a.model_id.clone(), a.handle.state()));
+
+                let recommended_id = catalog
+                    .recommended_for(hw.tier())
+                    .map(|m| m.id.clone());
+
+                for entry in &catalog.models {
+                    let runnable = entry.runnable_at(hw.ram_gb);
+                    let installed = catalog_deck_installed(&decks, &entry.id);
+                    let is_downloading = active_state
+                        .as_ref()
+                        .is_some_and(|(id, _)| id == &entry.id);
+
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&entry.display_name).strong());
+                            if recommended_id.as_deref() == Some(entry.id.as_str()) {
+                                ui.label(egui::RichText::new("· recommended").weak());
+                            }
+                            if installed {
+                                ui.label(egui::RichText::new("· installed").weak());
+                            }
+                            if entry.is_placeholder() {
+                                ui.label(
+                                    egui::RichText::new("· PLACEHOLDER")
+                                        .weak()
+                                        .italics(),
+                                );
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {} · needs {} GB RAM",
+                                match entry.tier {
+                                    crate::model_catalog::TierTag::Small3B => "3B",
+                                    crate::model_catalog::TierTag::Mid7B => "7B",
+                                },
+                                crate::download::fmt_bytes(entry.size_bytes),
+                                entry.ram_gb_min,
+                            ))
+                            .weak()
+                            .small(),
+                        );
+
+                        if !runnable {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Needs {} GB RAM — above this machine's capacity.",
+                                    entry.ram_gb_min
+                                ))
+                                .weak(),
+                            );
+                        }
+
+                        // Live progress for the model currently downloading.
+                        if let Some((_, state)) = active_state.as_ref().filter(|_| is_downloading) {
+                            ui.add(
+                                egui::ProgressBar::new(state.fraction().unwrap_or(0.0))
+                                    .show_percentage(),
+                            );
+                            ui.label(crate::download::progress_caption(state));
+                            if state.is_active() {
+                                if ui.button("Cancel").clicked() {
+                                    cancel = true;
+                                }
+                            } else if let crate::download::DownloadState::Failed { msg } = state {
+                                ui.colored_label(egui::Color32::LIGHT_RED, format!("Failed: {msg}"));
+                                if ui.button("Retry").clicked() {
+                                    install = Some(entry.id.clone());
+                                }
+                            }
+                        } else if installed {
+                            ui.horizontal(|ui| {
+                                if ui.button("Re-download").clicked() {
+                                    install = Some(entry.id.clone());
+                                }
+                                if ui.button("Remove").clicked() {
+                                    remove = Some(entry.id.clone());
+                                }
+                            });
+                        } else {
+                            let any_active = active_state
+                                .as_ref()
+                                .is_some_and(|(_, s)| s.is_active());
+                            ui.add_enabled_ui(runnable && !any_active, |ui| {
+                                if ui.button("Install").clicked() {
+                                    install = Some(entry.id.clone());
+                                }
+                            });
+                        }
+                    });
+                }
+
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
+                        "Downloads stream to ~/.config/itsjustcad/models and are \
+                         SHA-256 verified. Installing enables a local cassette; \
+                         start the runtime to use it.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+
+        if !open {
+            self.show_model_setup = false;
+        }
+
+        // 2) Act on the collected intents.
+        if cancel && let Some(active) = &self.active_download {
+            active.handle.cancel();
+        }
+        if let Some(id) = remove {
+            let mut decks = itsjustcad_deck::DecksFile::load_or_default();
+            if remove_catalog_deck(&mut decks, &id) {
+                decks.save();
+            }
+        }
+        if let Some(id) = install {
+            self.start_model_install(&id);
+        }
+    }
+
+    /// Kick off a background download for catalog model `id` into the models dir.
+    fn start_model_install(&mut self, id: &str) {
+        let Some(entry) = self.catalog.get(id).cloned() else {
+            return;
+        };
+        let Some(dir) = crate::download::models_dir() else {
+            tracing::error!("no home dir — cannot resolve models directory");
+            return;
+        };
+        let spec = crate::download::DownloadSpec {
+            url: entry.url.clone(),
+            dir,
+            file_name: entry.file_name(),
+            expected_sha256: entry.expected_sha().map(|s| s.to_string()),
+        };
+        let handle = crate::download::start(&self.tokio, spec);
+        self.active_download = Some(ActiveDownload {
+            model_id: entry.id,
+            handle,
+            persisted: false,
+        });
     }
 }
 
@@ -2021,6 +2254,75 @@ fn deck_brain_into_decks(
         }
     }
     Some(name.to_string())
+}
+
+/// Base URL the local llama.cpp server will expose an OpenAI-compatible endpoint
+/// at. The actual runtime spawn is the next agent's job; this is the port the
+/// cassette points at so it's ready the moment the server is up.
+const LOCAL_RUNTIME_BASE_URL: &str = "http://localhost:8080/v1";
+
+/// The `decks.json` cassette name for a catalog model id.
+fn cassette_name_for(model_id: &str) -> String {
+    format!("local-{model_id}")
+}
+
+/// Build the local cassette for an installed catalog model. Pure so the shape is
+/// unit-tested. `openai_compat` kind, localhost runtime base URL, grammar on
+/// (local models get grammar-constrained decoding), model = the catalog id.
+fn catalog_deck_entry(entry: &crate::model_catalog::ModelEntry) -> itsjustcad_deck::DeckConfig {
+    itsjustcad_deck::DeckConfig {
+        name: cassette_name_for(&entry.id),
+        kind: itsjustcad_deck::DeckKind::OpenaiCompat,
+        base_url: LOCAL_RUNTIME_BASE_URL.to_string(),
+        model: entry.id.clone(),
+        api_key: None,
+        grammar: true,
+    }
+}
+
+/// Insert/replace the cassette for an installed model and make it active.
+/// Returns the (possibly new) active index. Pure over `decks` — I/O is the
+/// caller's job.
+fn install_catalog_deck(
+    decks: &mut itsjustcad_deck::DecksFile,
+    entry: &crate::model_catalog::ModelEntry,
+) -> usize {
+    let cfg = catalog_deck_entry(entry);
+    match decks.decks.iter().position(|d| d.name == cfg.name) {
+        Some(i) => {
+            decks.decks[i] = cfg;
+            decks.active = i;
+            i
+        }
+        None => {
+            decks.decks.push(cfg);
+            let i = decks.decks.len() - 1;
+            decks.active = i;
+            i
+        }
+    }
+}
+
+/// Remove a catalog model's cassette from `decks.json` (does not delete the
+/// weights file). Returns true if a cassette was removed. Clamps `active`.
+fn remove_catalog_deck(decks: &mut itsjustcad_deck::DecksFile, model_id: &str) -> bool {
+    let name = cassette_name_for(model_id);
+    let Some(i) = decks.decks.iter().position(|d| d.name == name) else {
+        return false;
+    };
+    decks.decks.remove(i);
+    if decks.active >= decks.decks.len() {
+        decks.active = decks.decks.len().saturating_sub(1);
+    } else if decks.active > i {
+        decks.active -= 1;
+    }
+    true
+}
+
+/// True when a cassette for this model id already exists in decks.json.
+fn catalog_deck_installed(decks: &itsjustcad_deck::DecksFile, model_id: &str) -> bool {
+    let name = cassette_name_for(model_id);
+    decks.decks.iter().any(|d| d.name == name)
 }
 
 /// Apply a legacy-CAD preset to the egui context via the design-token system.
@@ -2248,9 +2550,12 @@ impl eframe::App for App {
                                 );
                             }
                             ui.label(
-                                egui::RichText::new("Download happens in a later step.")
-                                    .weak()
-                                    .small(),
+                                egui::RichText::new(
+                                    "Pick a model in Model Setup after Start \
+                                     (also under Tools → Model Setup).",
+                                )
+                                .weak()
+                                .small(),
                             );
                         });
                     }
@@ -2265,6 +2570,11 @@ impl eframe::App for App {
                 save_cad_origin(self.cad_origin);
                 save_deck_brain(self.deck_brain);
                 apply_deck_brain(self.deck_brain, self.hardware.tier());
+                // The "download a local model" path opens Model Setup so the
+                // user can pick + fetch a model right away.
+                if self.deck_brain == DeckBrain::Download {
+                    self.show_model_setup = true;
+                }
                 apply_preset(ui.ctx().clone(), self.cad_origin);
                 let units_cmd = units_cmd_for(&self.template_units);
                 self.command_line.execute(&mut self.session, units_cmd);
@@ -2300,6 +2610,10 @@ impl eframe::App for App {
                 self.show_about = false;
             }
         }
+
+        // Tools → Model Setup panel (also the onboarding "download a local
+        // model" entry point). Renders any time show_model_setup is set.
+        self.model_setup_ui(ui.ctx());
 
         // Mirror the op-log to the crash journal. One hook covers every
         // mutation path (command line, gumball, deck, history jumps); the
@@ -2668,5 +2982,70 @@ mod tests {
         assert_eq!(model_id_for_tier(ModelTier::None), "qwen2.5:3b");
         assert_eq!(model_id_for_tier(ModelTier::Small3B), "qwen2.5:3b");
         assert_eq!(model_id_for_tier(ModelTier::Mid7B), "qwen2.5:7b");
+    }
+
+    // ── catalog cassette install / remove ──────────────────────────────────
+
+    fn sample_entry() -> crate::model_catalog::ModelEntry {
+        crate::model_catalog::Catalog::load().models[0].clone()
+    }
+
+    #[test]
+    fn catalog_entry_is_local_openai_compat_with_grammar() {
+        let entry = sample_entry();
+        let cfg = catalog_deck_entry(&entry);
+        assert_eq!(cfg.name, format!("local-{}", entry.id));
+        assert_eq!(cfg.kind, DeckKind::OpenaiCompat);
+        assert_eq!(cfg.model, entry.id);
+        assert!(cfg.grammar, "local model cassette must have grammar on");
+        assert!(cfg.api_key.is_none());
+        assert!(itsjustcad_deck::is_local_url(&cfg.base_url), "runtime url must be local");
+    }
+
+    #[test]
+    fn install_appends_then_replaces_and_activates() {
+        let entry = sample_entry();
+        let mut decks = DecksFile {
+            decks: vec![],
+            active: 0,
+            local_only: false,
+        };
+        let i = install_catalog_deck(&mut decks, &entry);
+        assert_eq!(decks.decks.len(), 1);
+        assert_eq!(decks.active, i);
+        assert!(catalog_deck_installed(&decks, &entry.id));
+        // Re-install (re-download) replaces the same cassette, no duplicate.
+        install_catalog_deck(&mut decks, &entry);
+        assert_eq!(decks.decks.len(), 1, "same model must not duplicate");
+    }
+
+    #[test]
+    fn remove_deletes_cassette_and_clamps_active() {
+        let entry = sample_entry();
+        let mut decks = DecksFile::default();
+        let before = decks.decks.len();
+        install_catalog_deck(&mut decks, &entry);
+        assert_eq!(decks.decks.len(), before + 1);
+        assert!(remove_catalog_deck(&mut decks, &entry.id));
+        assert_eq!(decks.decks.len(), before);
+        assert!(!catalog_deck_installed(&decks, &entry.id));
+        assert!(decks.active < decks.decks.len().max(1));
+        // Removing a non-installed model is a no-op.
+        assert!(!remove_catalog_deck(&mut decks, "not-a-model"));
+    }
+
+    #[test]
+    fn model_setup_menu_action_wires_to_flag() {
+        // The menu emits ModelSetup; the app maps it to opening the panel.
+        assert_eq!(
+            crate::menu::menu_action("model_setup"),
+            crate::menu::MenuAction::Insert("model_setup ".to_string()),
+            "sanity: unknown verb still routes through menu_action"
+        );
+        // The real wiring is the Tools button emitting MenuAction::ModelSetup,
+        // matched in apply_menu_action → show_model_setup = true. Assert the
+        // variant exists and is distinct.
+        let a = crate::menu::MenuAction::ModelSetup;
+        assert_ne!(a, crate::menu::MenuAction::About);
     }
 }

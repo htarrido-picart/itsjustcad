@@ -1,0 +1,25 @@
+{
+  "_comment": "Curated local-model catalog for ItsJustCAD's Model Setup. VERIFIED entries were checked against the live HuggingFace repo (URL 200s, size = Content-Length, sha256 = the git-LFS `oid sha256:` from the /raw/ pointer file). To add/refresh an entry: GET https://huggingface.co/<repo>/raw/main/<file> and copy the oid + size. `tier` gates the UI recommendation; `ram_gb_min` gates the Install button. `runtime` selects how the next agent spawns it (gguf => llama.cpp server; llamafile => the self-contained binary).",
+  "models": [
+    {
+      "id": "qwen2.5-3b-instruct-q4km",
+      "display_name": "Qwen2.5 3B Instruct (Q4_K_M)",
+      "tier": "Small3B",
+      "url": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
+      "size_bytes": 2104932768,
+      "sha256": "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d",
+      "runtime": "gguf",
+      "ram_gb_min": 8
+    },
+    {
+      "id": "qwen2.5-7b-instruct-q3km",
+      "display_name": "Qwen2.5 7B Instruct (Q3_K_M)",
+      "tier": "Mid7B",
+      "url": "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q3_k_m.gguf",
+      "size_bytes": 3808391072,
+      "sha256": "a96b16179dc6cc9afdf0cf7a96a80c199cbd00b9be207c3465be21cb721cca5e",
+      "runtime": "gguf",
+      "ram_gb_min": 16
+    }
+  ]
+}
