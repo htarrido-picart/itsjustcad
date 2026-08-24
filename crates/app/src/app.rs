@@ -14,14 +14,14 @@ use crate::preset::{self, CadOrigin};
 use crate::scene;
 
 #[derive(Clone, PartialEq)]
-enum TemplateUnits {
+pub(crate) enum TemplateUnits {
     Meters,
     Millimeters,
     FeetInches,
 }
 
 #[derive(Clone, PartialEq)]
-enum TemplateScale {
+pub(crate) enum TemplateScale {
     Object,
     Building,
     Urban,
@@ -201,6 +201,7 @@ pub struct App {
     status_snap: Option<&'static str>,
     /// Decoded underlay pixels cached by path, so a scene rebuild (any doc
     /// change) does not re-decode the image every time.
+    #[allow(clippy::type_complexity)]
     underlay_cache: Option<(String, std::sync::Arc<(Vec<u8>, u32, u32)>)>,
     /// Whether the deck chat pane is visible; toggled by the ◂/▸ button or Cmd+\.
     deck_visible: bool,

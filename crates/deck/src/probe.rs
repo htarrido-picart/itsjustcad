@@ -118,7 +118,7 @@ pub async fn probe(config: &DeckConfig) -> Result<ProbeInfo, String> {
                         .collect()
                 })
                 .unwrap_or_default();
-            if !models.is_empty() && !models.iter().any(|m| *m == config.model) {
+            if !models.is_empty() && !models.contains(&config.model) {
                 return Err(format!(
                     "model '{}' not found on {base}. Available: {}",
                     config.model,

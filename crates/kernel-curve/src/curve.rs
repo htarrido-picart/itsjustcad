@@ -261,6 +261,7 @@ fn offset_polyline(points: &[DVec3], closed: bool, dist: f64) -> Option<Vec<DVec
     };
     let segs = if closed { n } else { n - 1 };
     let mut out = Vec::with_capacity(n);
+    #[allow(clippy::needless_range_loop)] // `i` used for modular arithmetic, not just indexing
     for i in 0..n {
         let (prev, next) = if closed {
             (seg_normal((i + n - 1) % n), seg_normal(i % n))

@@ -286,6 +286,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
 // The hatch tessellation functions live in mydrafter_doc::hatch and are
 // imported at the top of this file. Re-export hatch_lines so existing
 // test references to `hatch_segments` work without renaming.
+#[allow(unused_imports)]
 pub use mydrafter_doc::hatch::hatch_lines as hatch_segments;
 
 #[cfg(test)]

@@ -120,11 +120,11 @@ fn run_headless_mode(args: &CliArgs) -> i32 {
     };
 
     // Optional: save document.
-    if let Some(out) = &args.out_path {
-        if let Err(e) = mydrafter_commands::io::save_file(&session, std::path::Path::new(out)) {
-            eprintln!("error: could not save '{}': {e}", out);
-            return 2;
-        }
+    if let Some(out) = &args.out_path
+        && let Err(e) = mydrafter_commands::io::save_file(&session, std::path::Path::new(out))
+    {
+        eprintln!("error: could not save '{}': {e}", out);
+        return 2;
     }
 
     // Optional: render headless screenshot.
@@ -188,12 +188,24 @@ fn main() -> eframe::Result<()> {
         })
         .unwrap_or([1440.0, 900.0]);
 
+    // Embed the 256×256 icon PNG at compile time so the window icon is always
+    // available without any runtime file-system access.
+    let icon: Option<std::sync::Arc<egui::IconData>> = {
+        const ICON_PNG: &[u8] = include_bytes!("../../../assets/icon/256.png");
+        eframe::icon_data::from_png_bytes(ICON_PNG).ok().map(std::sync::Arc::new)
+    };
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("mydrafter")
+        .with_inner_size(window_size);
+    if let Some(icon) = icon {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         depth_buffer: 24,
-        viewport: egui::ViewportBuilder::default()
-            .with_title("mydrafter")
-            .with_inner_size(window_size),
+        viewport,
         ..Default::default()
     };
 

@@ -1,0 +1,186 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: mydrafter-linux-x86_64
+            binary: mydrafter
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: mydrafter-macos-aarch64
+            binary: mydrafter
+
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: mydrafter-macos-x86_64
+            binary: mydrafter
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: mydrafter-windows-x86_64
+            binary: mydrafter.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      # ── Linux system deps ──────────────────────────────────────────────
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan1 mesa-vulkan-drivers libegl1-mesa-dev \
+            libx11-xcb-dev libxcb-xfixes0-dev \
+            libwayland-dev libxkbcommon-dev
+
+      # ── Build ──────────────────────────────────────────────────────────
+      - name: Build release binary
+        run: cargo build -p mydrafter --release --target ${{ matrix.target }}
+
+      # ── Stage artifact ─────────────────────────────────────────────────
+      - name: Stage artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} staging/
+          tar -czvf ${{ matrix.artifact }}.tar.gz -C staging .
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force staging
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.binary }}" staging\
+          Compress-Archive -Path staging\* -DestinationPath "${{ matrix.artifact }}.zip"
+
+      # ── macOS .app bundle (no signing) ────────────────────────────────
+      - name: Build macOS .app bundle (unsigned)
+        if: runner.os == 'macOS'
+        run: |
+          BINARY="target/${{ matrix.target }}/release/mydrafter"
+          APP="staging/mydrafter.app"
+          MACOS="$APP/Contents/MacOS"
+          RESOURCES="$APP/Contents/Resources"
+          mkdir -p "$MACOS" "$RESOURCES"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+              "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>mydrafter</string>
+              <key>CFBundleDisplayName</key>
+              <string>mydrafter</string>
+              <key>CFBundleIdentifier</key>
+              <string>io.mydrafter.mydrafter</string>
+              <key>CFBundleVersion</key>
+              <string>${{ github.ref_name }}</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${{ github.ref_name }}</string>
+              <key>CFBundleExecutable</key>
+              <string>mydrafter</string>
+              <key>CFBundleIconFile</key>
+              <string>icon</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>NSSupportsAutomaticGraphicsSwitching</key>
+              <true/>
+              <key>LSMinimumSystemVersion</key>
+              <string>12.0</string>
+          </dict>
+          </plist>
+          PLIST
+
+          cp "$BINARY" "$MACOS/mydrafter"
+          chmod +x "$MACOS/mydrafter"
+
+          if [[ -f assets/icon/icon.icns ]]; then
+            cp assets/icon/icon.icns "$RESOURCES/icon.icns"
+          fi
+
+          tar -czvf ${{ matrix.artifact }}-app.tar.gz -C staging mydrafter.app
+
+      # ── Upload artifacts ───────────────────────────────────────────────
+      - name: Upload binary archive (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+      - name: Upload binary archive (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+      - name: Upload macOS .app bundle
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-app
+          path: ${{ matrix.artifact }}-app.tar.gz
+
+  # ── GitHub Release ─────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: mydrafter ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: artifacts/**/*

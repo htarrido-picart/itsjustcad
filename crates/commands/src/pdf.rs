@@ -218,8 +218,9 @@ fn mm(v: f64) -> String {
 }
 
 /// Render one viewport's content (border + clipped scaled line art + label
-/// + model-space dim text) into `content`. Returns the number of geometry
-/// lines drawn.
+/// + model-space dim text) into `content`.
+///
+/// Returns the number of geometry lines drawn.
 fn render_view(
     doc: &Document,
     view: &SheetView,
