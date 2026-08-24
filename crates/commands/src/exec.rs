@@ -80,6 +80,12 @@ enum Inverse {
     Underlay { prev: Option<Underlay> },
     /// `sun`/`sunoff`: restore the previous solar position.
     Sun { prev: Option<mydrafter_doc::SunPosition> },
+    /// `location` (also set as a side effect of `sun`): restore the previous
+    /// observer location and solar position.
+    Location {
+        prev_loc: Option<mydrafter_doc::GeoLocation>,
+        prev_sun: Option<mydrafter_doc::SunPosition>,
+    },
     /// `view save`: restore the previously saved view of that name (if any).
     ViewSaved {
         name: String,
@@ -249,6 +255,11 @@ impl Session {
                 self.doc.sun = *prev;
                 self.doc.generation += 1;
             }
+            Inverse::Location { prev_loc, prev_sun } => {
+                self.doc.location = *prev_loc;
+                self.doc.sun = *prev_sun;
+                self.doc.generation += 1;
+            }
             Inverse::ViewSaved { name, prev } => {
                 match prev {
                     Some(view) => self.doc.named_views.insert(name.clone(), *view),
@@ -411,8 +422,9 @@ impl Session {
             "dxf" => self.import_dxf(path),
             "obj" | "stl" | "gltf" | "glb" => self.import_mesh(path),
             "ifc" => self.import_ifc(path),
+            "epw" => self.import_epw(path),
             other => Err(ExecError::Invalid(format!(
-                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .ifc)"
+                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .ifc, .epw)"
             ))),
         }
     }
@@ -506,6 +518,36 @@ impl Session {
         Ok(ApplyOutcome {
             created,
             message: format!("imported {total} mesh(es) from {path} — one MeshLiteral op each"),
+        })
+    }
+
+    /// Import an EPW (EnergyPlus Weather) file: parse the LOCATION header for
+    /// lat/lon/tz and set it on the document via a logged `location` op, then
+    /// summarize the 8760 hourly rows (nothing heavy is retained). Only the
+    /// `location` op is logged; the weather rows are reported, not stored.
+    fn import_epw(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let s = mydrafter_solar::parse_epw(&text)
+            .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+        // Log the location so saved files replay the site without the EPW file.
+        self.run(Command::Location {
+            lat_deg: s.lat_deg,
+            lon_deg: s.lon_deg,
+            tz_hours: s.tz_hours,
+        })?;
+        let temp = match (s.mean_dry_bulb_c, s.min_dry_bulb_c, s.max_dry_bulb_c) {
+            (Some(m), Some(lo), Some(hi)) => {
+                format!(", dry-bulb {lo:.1}..{hi:.1}°C (mean {m:.1}°C)")
+            }
+            _ => String::new(),
+        };
+        Ok(ApplyOutcome {
+            created: Vec::new(),
+            message: format!(
+                "EPW '{}' @ ({:.3}, {:.3}) tz {:+.1}h, {} m elev — {} rows{temp}; location set",
+                s.city, s.lat_deg, s.lon_deg, s.tz_hours, s.elevation_m, s.rows
+            ),
         })
     }
 
@@ -923,6 +965,316 @@ fn section_meshes(
         });
     }
     Ok((new_ids, layers_created, meshes))
+}
+
+/// Layer for the sunlight-hours heatmap overlay.
+const ANALYSIS_LAYER: &str = "analysis";
+
+/// Collect every mesh's world-space triangles as `[a,b,c]` f64 vertex triples.
+/// Used by both shadow projection and sun-hours ray-casting.
+fn scene_triangles(doc: &Document) -> Vec<[[f64; 3]; 3]> {
+    let mut tris = Vec::new();
+    for obj in doc.objects() {
+        if let Geometry::Mesh(m) = &obj.geometry {
+            let pos = m.positions();
+            for f in m.faces() {
+                let v = |i: u32| {
+                    let p = pos[i as usize];
+                    [p.x, p.y, p.z]
+                };
+                tris.push([v(f[0]), v(f[1]), v(f[2])]);
+            }
+        }
+    }
+    tris
+}
+
+/// Format minutes-past-midnight as `HH:MM` (zero-padded).
+fn fmt_hhmm(min: u32) -> String {
+    format!("{:02}:{:02}", min / 60, min % 60)
+}
+
+/// Ground-shadow study. For each time stamp, compute the sun direction from the
+/// document location and project every mesh's silhouette onto `z=0` along the
+/// sun. Each object's projected points are reduced to their 2D convex hull and
+/// emitted as one closed polygon on a `shadows-HH:MM` layer (translucent dark
+/// fill). Convex-hull-per-object is a pragmatic first slice: concave footprints
+/// over-cover, but the sun-path envelope reads correctly for massing.
+#[allow(clippy::too_many_arguments)]
+fn exec_shadow_study(
+    doc: &mut Document,
+    ids: Option<Vec<ObjectId>>,
+    year: i32,
+    month: u32,
+    day: u32,
+    from_min: u32,
+    to_min: u32,
+    step_min: u32,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let loc = doc.location.ok_or_else(|| {
+        ExecError::Invalid(
+            "no location set — run `sun <lat> <lon> <date> <time>` or `location <lat> <lon>`, \
+             or `import <file.epw>` first"
+                .into(),
+        )
+    })?;
+    if step_min == 0 {
+        return Err(ExecError::Invalid("step must be > 0 minutes".into()));
+    }
+
+    // Per-object world-space vertices (grouped so each object gets its own hull).
+    let mut object_pts: Vec<Vec<[f64; 3]>> = Vec::new();
+    for obj in doc.objects() {
+        if let Geometry::Mesh(m) = &obj.geometry {
+            object_pts.push(m.positions().iter().map(|p| [p.x, p.y, p.z]).collect());
+        }
+    }
+    if object_pts.is_empty() {
+        return Err(ExecError::Invalid(
+            "shadowstudy needs meshes to cast shadows (extrude or box first)".into(),
+        ));
+    }
+
+    // Build (layer, polygon) for every stamp where the sun is up.
+    struct Poly {
+        layer: String,
+        pts: Vec<DVec3>,
+    }
+    let mut polys: Vec<Poly> = Vec::new();
+    let mut stamps_up = 0usize;
+    // Inclusive stamps from `from_min` to `to_min` at `step_min` spacing.
+    let mut t = from_min;
+    while t <= to_min {
+        // Interpret the clock time as local; convert to UTC for the SPA.
+        let utc = (t as f64 - loc.tz_hours * 60.0).rem_euclid(1440.0);
+        let (h, mi) = ((utc / 60.0) as u32, (utc % 60.0) as u32);
+        let pos =
+            mydrafter_solar::solar_position(year, month, day, h, mi, loc.lat_deg, loc.lon_deg);
+        if pos.altitude_deg > 0.0 {
+            stamps_up += 1;
+            let dir = mydrafter_solar::sun_direction(pos.azimuth_deg, pos.altitude_deg);
+            let dir = [dir[0] as f64, dir[1] as f64, dir[2] as f64];
+            let layer = format!("shadows-{}", fmt_hhmm(t));
+            for obj in &object_pts {
+                let ground: Vec<[f64; 2]> = obj
+                    .iter()
+                    .filter_map(|&p| mydrafter_solar::project_to_ground(p, dir))
+                    .map(|g| [g[0], g[1]])
+                    .collect();
+                let hull = mydrafter_solar::convex_hull_xy(ground);
+                if hull.len() >= 3 {
+                    polys.push(Poly {
+                        layer: layer.clone(),
+                        pts: hull.into_iter().map(|h| DVec3::new(h[0], h[1], 0.0)).collect(),
+                    });
+                }
+            }
+        }
+        t += step_min;
+    }
+
+    if polys.is_empty() {
+        return Err(ExecError::Invalid(format!(
+            "sun is below the horizon for the whole window on {year}-{month:02}-{day:02} \
+             at this location — no ground shadows"
+        )));
+    }
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == polys.len() => ids,
+        _ => (0..polys.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    // Ensure each distinct shadow layer exists with a translucent dark fill.
+    let mut layers_created = Vec::new();
+    for p in &polys {
+        if !doc.layers.contains_key(&p.layer) {
+            doc.layers.insert(
+                p.layer.clone(),
+                LayerStyle {
+                    color: Some([0.1, 0.1, 0.15, 0.35]),
+                    ..LayerStyle::default()
+                },
+            );
+            layers_created.push(p.layer.clone());
+        }
+    }
+
+    for (poly, id) in polys.iter().zip(&new_ids) {
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: None,
+            layer: poly.layer.clone(),
+            color: None,
+            geometry: Geometry::Curve(Curve::Polyline { points: poly.pts.clone(), closed: true }),
+        });
+    }
+    doc.generation += 1;
+
+    let n_layers = layers_created.len();
+    Ok((
+        Command::ShadowStudy {
+            ids: Some(new_ids.clone()),
+            year,
+            month,
+            day,
+            from_min,
+            to_min,
+            step_min,
+        },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome {
+            message: format!(
+                "shadowstudy {year}-{month:02}-{day:02}: {} polygon(s) across {stamps_up} \
+                 daylight stamp(s) on {n_layers} 'shadows-HH:MM' layer(s)",
+                new_ids.len()
+            ),
+            created: new_ids,
+        },
+    ))
+}
+
+/// Sunlight-hours heatmap. Sample a regular XY grid over the scene bounding box
+/// at `z=0`, and for each cell ray-cast toward the sun every 30 min of the date.
+/// A cell counts an hour of sun when no scene triangle occludes the ray. Results
+/// become a single flat quad-mesh on the `analysis` layer, per-vertex... (mesh
+/// has no per-vertex color, so we emit one small colored quad per cell instead:
+/// blue = 0 h, red = max h). Brute-force triangle intersection — fine at massing
+/// scale; a BVH is future work.
+fn exec_sun_hours(
+    doc: &mut Document,
+    ids: Option<Vec<ObjectId>>,
+    year: i32,
+    month: u32,
+    day: u32,
+    spacing: f64,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let loc = doc.location.ok_or_else(|| {
+        ExecError::Invalid(
+            "no location set — run `sun <lat> <lon> <date> <time>` or `location <lat> <lon>`, \
+             or `import <file.epw>` first"
+                .into(),
+        )
+    })?;
+    if spacing <= 0.0 {
+        return Err(ExecError::Invalid("grid spacing must be > 0".into()));
+    }
+    let aabb = doc.scene_aabb().ok_or_else(|| {
+        ExecError::Invalid("sunhours needs geometry to bound the ground grid".into())
+    })?;
+    let tris = scene_triangles(doc);
+
+    // Precompute sun directions (up only) for every 30 min of the day.
+    let mut sun_dirs: Vec<[f64; 3]> = Vec::new();
+    for slot in 0..48 {
+        let local_min = slot * 30;
+        let utc = (local_min as f64 - loc.tz_hours * 60.0).rem_euclid(1440.0);
+        let pos = mydrafter_solar::solar_position(
+            year,
+            month,
+            day,
+            (utc / 60.0) as u32,
+            (utc % 60.0) as u32,
+            loc.lat_deg,
+            loc.lon_deg,
+        );
+        if pos.altitude_deg > 0.0 {
+            let d = mydrafter_solar::sun_direction(pos.azimuth_deg, pos.altitude_deg);
+            sun_dirs.push([d[0] as f64, d[1] as f64, d[2] as f64]);
+        }
+    }
+    if sun_dirs.is_empty() {
+        return Err(ExecError::Invalid(
+            "sun never rises on this date at this location — nothing to sample".into(),
+        ));
+    }
+
+    // Grid cell centers across the footprint.
+    let nx = ((aabb.max.x - aabb.min.x) / spacing).ceil().max(1.0) as usize;
+    let ny = ((aabb.max.y - aabb.min.y) / spacing).ceil().max(1.0) as usize;
+    if nx * ny > 40_000 {
+        return Err(ExecError::Invalid(format!(
+            "grid {nx}x{ny} too fine ({} cells) — increase spacing", nx * ny
+        )));
+    }
+
+    // Ray-cast each cell center toward each sun position; count unoccluded slots.
+    let mut cells: Vec<(f64, f64, f64)> = Vec::with_capacity(nx * ny); // (x, y, hours)
+    let mut max_h = 0.0f64;
+    for iy in 0..ny {
+        for ix in 0..nx {
+            let x = aabb.min.x + (ix as f64 + 0.5) * spacing;
+            let y = aabb.min.y + (iy as f64 + 0.5) * spacing;
+            // Lift the origin slightly so a ground-coincident triangle at the
+            // sample point doesn't self-occlude.
+            let origin = [x, y, 1e-4];
+            let mut lit = 0usize;
+            for &dir in &sun_dirs {
+                let occluded = tris.iter().any(|t| {
+                    mydrafter_solar::ray_triangle(origin, dir, t[0], t[1], t[2]).is_some()
+                });
+                if !occluded {
+                    lit += 1;
+                }
+            }
+            let hours = lit as f64 * 0.5; // 30-min slots → hours
+            max_h = max_h.max(hours);
+            cells.push((x, y, hours));
+        }
+    }
+
+    // Meshes carry no per-vertex color, so emit one small colored quad per cell,
+    // grading blue (few hours) → red (most). All quads land on `analysis`; the
+    // single logged op records every quad's id for replay stability.
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == cells.len() => ids,
+        _ => (0..cells.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    let mut layers_created = Vec::new();
+    if !doc.layers.contains_key(ANALYSIS_LAYER) {
+        doc.layers
+            .insert(ANALYSIS_LAYER.to_string(), LayerStyle::default());
+        layers_created.push(ANALYSIS_LAYER.to_string());
+    }
+
+    let half = spacing * 0.5;
+    for ((x, y, hours), id) in cells.iter().zip(&new_ids) {
+        let frac = if max_h > 0.0 { hours / max_h } else { 0.0 };
+        // blue (few hours) → red (most hours)
+        let color = [frac as f32, 0.15, (1.0 - frac) as f32];
+        let corners = vec![
+            DVec3::new(x - half, y - half, 0.0),
+            DVec3::new(x + half, y - half, 0.0),
+            DVec3::new(x + half, y + half, 0.0),
+            DVec3::new(x - half, y + half, 0.0),
+        ];
+        let mesh = kernel_mesh::Mesh::new(corners, vec![[0, 1, 2], [0, 2, 3]]);
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: None,
+            layer: ANALYSIS_LAYER.to_string(),
+            color: Some(color),
+            geometry: Geometry::Mesh(mesh),
+        });
+    }
+    doc.generation += 1;
+
+    Ok((
+        Command::SunHours { ids: Some(new_ids.clone()), year, month, day, spacing },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome {
+            message: format!(
+                "sunhours {year}-{month:02}-{day:02}: {}x{ny} grid ({} cells) at {spacing} m, \
+                 max {max_h:.1} h sun on '{ANALYSIS_LAYER}'",
+                nx,
+                new_ids.len()
+            ),
+            created: new_ids,
+        },
+    ))
 }
 
 /// Vertical projection plane for a compass elevation: the outward-facing
@@ -2686,20 +3038,46 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Sun { azimuth_deg, altitude_deg } => {
-            let prev = doc.sun;
+        Command::Sun { azimuth_deg, altitude_deg, lat_deg, lon_deg } => {
+            let prev_sun = doc.sun;
+            let prev_loc = doc.location;
             doc.sun = Some(mydrafter_doc::SunPosition { azimuth_deg, altitude_deg });
+            // Record the observer location so environmental analyses can reuse
+            // it. tz is UTC (0) because `sun` takes UTC clock times.
+            doc.location = Some(mydrafter_doc::GeoLocation { lat_deg, lon_deg, tz_hours: 0.0 });
             doc.generation += 1;
             Ok((
-                Command::Sun { azimuth_deg, altitude_deg },
-                Inverse::Sun { prev },
+                Command::Sun { azimuth_deg, altitude_deg, lat_deg, lon_deg },
+                Inverse::Location { prev_loc, prev_sun },
                 ApplyOutcome {
                     created: Vec::new(),
                     message: format!(
-                        "sun az={azimuth_deg:.1}° alt={altitude_deg:.1}°"
+                        "sun az={azimuth_deg:.1}° alt={altitude_deg:.1}° @ ({lat_deg:.3},{lon_deg:.3})"
                     ),
                 },
             ))
+        }
+        Command::Location { lat_deg, lon_deg, tz_hours } => {
+            let prev_loc = doc.location;
+            let prev_sun = doc.sun;
+            doc.location = Some(mydrafter_doc::GeoLocation { lat_deg, lon_deg, tz_hours });
+            doc.generation += 1;
+            Ok((
+                Command::Location { lat_deg, lon_deg, tz_hours },
+                Inverse::Location { prev_loc, prev_sun },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "location set to ({lat_deg:.4}, {lon_deg:.4}) tz {tz_hours:+.1}h"
+                    ),
+                },
+            ))
+        }
+        Command::ShadowStudy { ids, year, month, day, from_min, to_min, step_min } => {
+            exec_shadow_study(doc, ids, year, month, day, from_min, to_min, step_min)
+        }
+        Command::SunHours { ids, year, month, day, spacing } => {
+            exec_sun_hours(doc, ids, year, month, day, spacing)
         }
         Command::SunOff => {
             let prev = doc.sun.take();
@@ -3327,6 +3705,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::UnderlayOff => "underlayoff",
         Command::Sun { .. } => "sun",
         Command::SunOff => "sunoff",
+        Command::Location { .. } => "location",
+        Command::ShadowStudy { .. } => "shadowstudy",
+        Command::SunHours { .. } => "sunhours",
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
         Command::Print { .. } => "print",
@@ -5465,14 +5846,19 @@ mod tests {
         // The command uses the NOAA SPA: NY summer solstice noon → ~180° az, ~72.7° alt.
         assert!((sun.azimuth_deg - 180.0).abs() < 0.5, "az={:.2}", sun.azimuth_deg);
         assert!((sun.altitude_deg - 72.7).abs() < 0.5, "alt={:.2}", sun.altitude_deg);
+        // sun also records the observer location for analyses.
+        let loc = s.doc.location.expect("sun sets location");
+        assert!((loc.lat_deg - 40.71).abs() < 1e-9 && (loc.lon_deg - (-74.01)).abs() < 1e-9);
 
-        // Undo removes sun.
+        // Undo removes sun and location.
         s.run(crate::Command::Undo).unwrap();
         assert!(s.doc.sun.is_none(), "sun cleared after undo");
+        assert!(s.doc.location.is_none(), "location cleared after undo");
 
         // Redo restores sun.
         s.run(crate::Command::Redo).unwrap();
         assert!(s.doc.sun.is_some(), "sun restored after redo");
+        assert!(s.doc.location.is_some(), "location restored after redo");
     }
 
     #[test]
@@ -5501,6 +5887,173 @@ mod tests {
             serde_json::to_string(&replayed.save_log()).unwrap(),
             "sun log must be replay-stable"
         );
+    }
+
+    // ---- environmental analyses: shadow study, sun-hours, EPW ----
+
+    #[test]
+    fn shadowstudy_errors_without_location() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 5,5,3");
+        let err = s
+            .run(parse("shadowstudy 2024-06-21 09:00 15:00 180").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("no location"), "{err}");
+    }
+
+    #[test]
+    fn shadowstudy_projects_polygons_and_undoes() {
+        let mut s = Session::default();
+        // A 4 m tall box; sun set (also sets location, tz=UTC).
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "sun 40.71 -74.01 2024-06-21 16:58");
+        let before = s.doc.len();
+        // Two stamps: 12:00 and 14:00 UTC (both daylight in June at NY).
+        let out = run(&mut s, "shadowstudy 2024-06-21 12:00 14:00 120");
+        assert!(!out.created.is_empty(), "shadows created: {}", out.message);
+        // One object per stamp (one box → one hull polygon per stamp).
+        assert_eq!(out.created.len(), 2, "{}", out.message);
+        // Each created object is a closed polygon on a shadows-HH:MM layer at z=0.
+        for id in &out.created {
+            let obj = s.doc.get(*id).unwrap();
+            assert!(obj.layer.starts_with("shadows-"), "layer={}", obj.layer);
+            match &obj.geometry {
+                Geometry::Curve(Curve::Polyline { points, closed }) => {
+                    assert!(*closed && points.len() >= 3);
+                    assert!(points.iter().all(|p| p.z.abs() < 1e-9), "on ground");
+                    // Shadow is offset from the box footprint (sun not at zenith),
+                    // so some projected point has |x| or |y| beyond the 0..4 box.
+                    let spread = points.iter().any(|p| p.x < -1e-6 || p.y < -1e-6 || p.x > 4.0 + 1e-6 || p.y > 4.0 + 1e-6);
+                    assert!(spread, "shadow should extend past the footprint");
+                }
+                g => panic!("expected closed polyline, got {g:?}"),
+            }
+        }
+        // Undo removes every polygon and the shadow layers.
+        s.run(crate::Command::Undo).unwrap();
+        assert_eq!(s.doc.len(), before, "shadows removed on undo");
+        assert!(
+            s.doc.layers.keys().all(|k| !k.starts_with("shadows-")),
+            "shadow layers dropped on undo"
+        );
+    }
+
+    #[test]
+    fn shadowstudy_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "sun 40.71 -74.01 2024-06-21 16:58");
+        run(&mut s, "shadowstudy 2024-06-21 12:00 14:00 120");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "shadowstudy log must be replay-stable"
+        );
+        assert_eq!(s.doc.len(), replayed.doc.len());
+    }
+
+    #[test]
+    fn sunhours_box_shades_cells_beneath_it() {
+        // A tall box centered at the origin should shade grid cells directly
+        // under it far more than cells well outside its footprint.
+        let mut s = Session::default();
+        // A tall box at the origin shades the cells beneath it…
+        run(&mut s, "box -2,-2,0 4,4,20"); // 4x4 footprint, 20 m tall
+        // …plus two tiny corner markers to widen the sampled bbox well past the
+        // box footprint (so some grid cells sit in the clear). They are 20 m out,
+        // short (0.1 m), so they cast negligible shadow on the clear cells.
+        run(&mut s, "box 12,12,0 0.1,0.1,0.1");
+        run(&mut s, "box -12,-12,0 0.1,0.1,0.1");
+        // Location due south exposure; use a mid-latitude summer date.
+        run(&mut s, "location 40.0 0.0 0");
+        let out = run(&mut s, "sunhours 2024-06-21 4");
+        assert!(!out.created.is_empty(), "cells created: {}", out.message);
+
+        // Collect (center, hours-by-color) for the created quads. Blue channel
+        // encodes (1 - fraction of max), red encodes fraction; a shaded cell is
+        // bluer (low red). Find the cell nearest origin (under the box) and one
+        // far away (outside footprint) and compare their red (=sun) component.
+        // The cell whose center is nearest the origin sits under the tall box;
+        // the cell with the most sun (max red) is somewhere in the clear. The
+        // shaded cell must receive strictly less sun.
+        let mut nearest_red = 0.0f32;
+        let mut nearest_d = f64::INFINITY;
+        let mut max_red = f32::NEG_INFINITY;
+        for id in &out.created {
+            let obj = s.doc.get(*id).unwrap();
+            let Geometry::Mesh(m) = &obj.geometry else { panic!("mesh cell") };
+            let c = m.aabb();
+            let cx = (c.min.x + c.max.x) * 0.5;
+            let cy = (c.min.y + c.max.y) * 0.5;
+            let red = obj.color.unwrap()[0];
+            let d = cx * cx + cy * cy;
+            if d < nearest_d {
+                nearest_d = d;
+                nearest_red = red;
+            }
+            max_red = max_red.max(red);
+        }
+        assert!(max_red.is_finite(), "cells present");
+        // Under-box cell gets less sun (lower red) than the sunniest clear cell.
+        assert!(
+            nearest_red < max_red,
+            "shaded cell red {nearest_red} should be < sunniest cell red {max_red}"
+        );
+    }
+
+    #[test]
+    fn import_epw_sets_location_and_reports_stats() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("mydrafter_epw_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("site.epw");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "LOCATION,Denver Intl Ap,CO,USA,TMY3,725650,39.83,-104.65,-7.0,1650.0"
+        )
+        .unwrap();
+        for kw in [
+            "DESIGN CONDITIONS,0",
+            "TYPICAL/EXTREME PERIODS,0",
+            "GROUND TEMPERATURES,0",
+            "HOLIDAYS/DAYLIGHT SAVINGS,No,0,0,0",
+            "COMMENTS 1,x",
+            "COMMENTS 2,y",
+            "DATA PERIODS,1,1,Data,Sunday,1/1,12/31",
+        ] {
+            writeln!(f, "{kw}").unwrap();
+        }
+        writeln!(f, "1999,1,1,1,60,A7,10.0,5.0,80,81100").unwrap();
+        writeln!(f, "1999,1,1,2,60,A7,20.0,6.0,78,81100").unwrap();
+        drop(f);
+
+        let mut s = Session::default();
+        let out = s
+            .run(parse(&format!("import {}", path.display())).unwrap())
+            .unwrap();
+        assert!(out.message.contains("Denver"), "{}", out.message);
+        assert!(out.message.contains("mean 15.0"), "{}", out.message);
+        let loc = s.doc.location.expect("EPW set location");
+        assert!((loc.lat_deg - 39.83).abs() < 1e-6);
+        assert!((loc.lon_deg - (-104.65)).abs() < 1e-6);
+        assert!((loc.tz_hours - (-7.0)).abs() < 1e-6);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_sun_log_without_latlon_still_loads() {
+        // Pre-enviro logs recorded Sun with only az/alt. Serde defaults must let
+        // them replay (lat/lon → 0).
+        let json = r#"[{"cmd":"sun","azimuth_deg":180.0,"altitude_deg":72.7}]"#;
+        let log: Vec<Command> = serde_json::from_str(json).unwrap();
+        let s = Session::replay(log).unwrap();
+        let sun = s.doc.sun.expect("sun replayed");
+        assert!((sun.altitude_deg - 72.7).abs() < 1e-9);
+        let loc = s.doc.location.expect("location defaulted");
+        assert_eq!((loc.lat_deg, loc.lon_deg), (0.0, 0.0));
     }
 
     // ---- block definition + instancing ----

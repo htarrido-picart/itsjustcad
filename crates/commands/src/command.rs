@@ -443,9 +443,62 @@ pub enum Command {
         azimuth_deg: f64,
         /// Altitude above the horizon, degrees.
         altitude_deg: f64,
+        /// Observer latitude/longitude the position was computed for. Recorded
+        /// as the document location so `shadowstudy`/`sunhours` can reuse it.
+        /// `#[serde(default)]` keeps old logs (which lacked these) loading — they
+        /// replay to lat/lon 0 and simply leave no usable location for analyses.
+        #[serde(default)]
+        lat_deg: f64,
+        #[serde(default)]
+        lon_deg: f64,
     },
     /// Remove the solar position (revert to headlight shading).
     SunOff,
+    /// Record the observer location (lat/lon/tz) on the document. Set by the
+    /// `sun` command and by EPW import; required by `shadowstudy`/`sunhours`.
+    /// Logged so saved files replay the location.
+    Location {
+        /// Latitude, degrees (north positive).
+        lat_deg: f64,
+        /// Longitude, degrees (east positive).
+        lon_deg: f64,
+        /// Time-zone offset from UTC in hours (east positive).
+        #[serde(default)]
+        tz_hours: f64,
+    },
+    /// Ground shadow study: for each time step across a day, project every mesh
+    /// silhouette onto the ground (`z=0`) along the sun direction and emit the
+    /// projected convex hull as a closed polygon on a per-time `shadows-HH:MM`
+    /// layer. Requires a document location (set via `sun` or EPW import).
+    ShadowStudy {
+        /// Ids of the created shadow polygons, filled in on first exec and
+        /// reused on replay so the op-log reproduces identical objects.
+        #[serde(default)]
+        ids: Option<Vec<ObjectId>>,
+        /// Date the sun positions are computed for.
+        year: i32,
+        month: u32,
+        day: u32,
+        /// Inclusive start / end local clock times, minutes past midnight.
+        from_min: u32,
+        to_min: u32,
+        /// Step between stamps, minutes (> 0).
+        step_min: u32,
+    },
+    /// Sunlight-hours heatmap: sample a ground grid over the scene bbox, ray-cast
+    /// toward the sun every 30 min of the day, and emit a colored mesh overlay on
+    /// the `analysis` layer (blue = few hours, red = most). Requires a location.
+    SunHours {
+        /// Id of the created heatmap mesh, filled in on first exec and reused on
+        /// replay for op-log stability.
+        #[serde(default)]
+        ids: Option<Vec<ObjectId>>,
+        year: i32,
+        month: u32,
+        day: u32,
+        /// Grid spacing in meters (> 0).
+        spacing: f64,
+    },
     // -- underlay (raster reference image on the ground plane) --
     /// Place a raster image (PNG) on the ground plane. `height` is `None` when
     /// typed/emitted; exec fills it from the image's aspect ratio (width /

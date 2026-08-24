@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_mesh::Aabb;
 
 use crate::{
-    BlockGeometry, LayerStyle, NamedView, ObjectId, SceneObject, Sheet, SunPosition, Underlay,
-    Units, DEFAULT_LAYER,
+    BlockGeometry, GeoLocation, LayerStyle, NamedView, ObjectId, SceneObject, Sheet, SunPosition,
+    Underlay, Units, DEFAULT_LAYER,
 };
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
@@ -43,6 +43,10 @@ pub struct Document {
     /// Solar position set by the `sun` command; `None` means headlight-only
     /// shading. Logged so saved files replay with the same lighting.
     pub sun: Option<SunPosition>,
+    /// Observer location (lat/lon/tz) set by `sun` or an EPW import; required by
+    /// environmental analyses (`shadowstudy`, `sunhours`). Logged via a
+    /// `location` op so saved files replay it.
+    pub location: Option<GeoLocation>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -63,6 +67,7 @@ impl Default for Document {
             pending_view: None,
             underlay: None,
             sun: None,
+            location: None,
             generation: 0,
         }
     }

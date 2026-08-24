@@ -314,6 +314,21 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Remove solar lighting; revert to headlight shading",
         },
         CommandSpec {
+            name: "location",
+            usage: "location <lat> <lon> [tz-hours]",
+            summary: "Set the observer location (used by shadowstudy/sunhours). tz is UTC offset in hours (default 0). Example: location 40.71 -74.01 -5",
+        },
+        CommandSpec {
+            name: "shadowstudy",
+            usage: "shadowstudy <YYYY-MM-DD> <from-HH:MM> <to-HH:MM> <step-min>",
+            summary: "Cast ground shadows of every mesh onto z=0 for each time step across a day, one closed polygon (projected convex hull per object) per stamp on 'shadows-HH:MM' layers. Needs a location (sun/location/EPW). Example: shadowstudy 2024-06-21 09:00 15:00 120",
+        },
+        CommandSpec {
+            name: "sunhours",
+            usage: "sunhours <YYYY-MM-DD> [grid-spacing]",
+            summary: "Sunlight-hours heatmap: sample a ground grid over the scene, ray-cast toward the sun every 30 min of the date, and color a mesh overlay on 'analysis' (blue = few hours, red = most). Default spacing 2 m. Needs a location. Example: sunhours 2024-06-21 1.5",
+        },
+        CommandSpec {
             name: "sheet",
             usage: "sheet <name> [a4|a3|a2|a1|a0]",
             summary: "Create a named paper sheet, landscape (default a3). Example: sheet plan a1",
@@ -335,8 +350,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "import",
-            usage: "import <path.{dxf|obj|stl|gltf|glb|ifc}>",
-            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, or IFC4/IFC2x3 (IfcTriangulatedFaceSet + IfcFacetedBrep meshes → the 'ifc' layer); unknown entities are skipped. Example: import /tmp/model.ifc",
+            usage: "import <path.{dxf|obj|stl|gltf|glb|ifc|epw}>",
+            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, IFC4/IFC2x3 (meshes → the 'ifc' layer), or EPW EnergyPlus weather (sets the document location and reports annual stats); unknown entities are skipped. Example: import /tmp/denver.epw",
         },
         CommandSpec {
             name: "distance",

@@ -773,6 +773,8 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 Ok(Command::Sun {
                     azimuth_deg: pos.azimuth_deg,
                     altitude_deg: pos.altitude_deg,
+                    lat_deg,
+                    lon_deg,
                 })
             }
             _ => wrong("sun", "lat lon YYYY-MM-DD HH:MM", &args),
@@ -780,6 +782,63 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "sunoff" => {
             expect_empty("sunoff", &args, &args)?;
             Ok(Command::SunOff)
+        }
+        // location <lat> <lon> [tz-hours]
+        "location" => match args.as_slice() {
+            [lat, lon] => Ok(Command::Location {
+                lat_deg: number(lat)?,
+                lon_deg: number(lon)?,
+                tz_hours: 0.0,
+            }),
+            [lat, lon, tz] => Ok(Command::Location {
+                lat_deg: number(lat)?,
+                lon_deg: number(lon)?,
+                tz_hours: number(tz)?,
+            }),
+            _ => wrong("location", "lat lon [tz-hours]", &args),
+        },
+        // shadowstudy <YYYY-MM-DD> <from-HH:MM> <to-HH:MM> <step-min>
+        "shadowstudy" => match args.as_slice() {
+            [date, from, to, step] => {
+                let (year, month, day) = parse_date(date)?;
+                let (fh, fm) = parse_hhmm(from)?;
+                let (th, tm) = parse_hhmm(to)?;
+                let step_min = number(step)?;
+                if step_min <= 0.0 {
+                    return Err(ParseError::BadNumber(step.to_string()));
+                }
+                let from_min = fh * 60 + fm;
+                let to_min = th * 60 + tm;
+                if to_min < from_min {
+                    return Err(ParseError::BadNumber(to.to_string()));
+                }
+                Ok(Command::ShadowStudy {
+                    ids: None,
+                    year,
+                    month,
+                    day,
+                    from_min,
+                    to_min,
+                    step_min: step_min as u32,
+                })
+            }
+            _ => wrong("shadowstudy", "YYYY-MM-DD from-HH:MM to-HH:MM step-min", &args),
+        },
+        // sunhours <YYYY-MM-DD> [grid-spacing]
+        "sunhours" => {
+            let (date, spacing) = match args.as_slice() {
+                [date] => (*date, 2.0),
+                [date, sp] => {
+                    let s = number(sp)?;
+                    if s <= 0.0 {
+                        return Err(ParseError::BadNumber(sp.to_string()));
+                    }
+                    (*date, s)
+                }
+                _ => return wrong("sunhours", "YYYY-MM-DD [grid-spacing]", &args),
+            };
+            let (year, month, day) = parse_date(date)?;
+            Ok(Command::SunHours { ids: None, year, month, day, spacing })
         }
         // -- blocks --
         // block <selector> <name>
@@ -2121,11 +2180,12 @@ mod tests {
     fn parse_sun_command() {
         // NY summer solstice solar noon: expected az≈180°, alt≈72.7°
         let cmd = parse("sun 40.71 -74.01 2024-06-21 16:58").unwrap();
-        let Command::Sun { azimuth_deg, altitude_deg } = cmd else {
+        let Command::Sun { azimuth_deg, altitude_deg, lat_deg, lon_deg } = cmd else {
             panic!("expected Sun command");
         };
         assert!((azimuth_deg - 180.0).abs() < 0.5, "az={azimuth_deg:.2}");
         assert!((altitude_deg - 72.7).abs() < 0.5, "alt={altitude_deg:.2}");
+        assert!((lat_deg - 40.71).abs() < 1e-9 && (lon_deg - (-74.01)).abs() < 1e-9);
 
         // sunoff parses correctly
         assert!(matches!(parse("sunoff").unwrap(), Command::SunOff));

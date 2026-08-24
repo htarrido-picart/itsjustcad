@@ -33,3 +33,18 @@ pub struct SunPosition {
     /// Above the horizon, degrees (negative = below horizon).
     pub altitude_deg: f64,
 }
+
+/// Observer location on Earth, recorded by the `sun` command or an EPW import.
+/// Needed by environmental analyses (`shadowstudy`, `sunhours`) to recompute
+/// sun positions over a day. Stored in the op-log via a `location` op so saved
+/// files replay identically.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GeoLocation {
+    /// Latitude, degrees (north positive).
+    pub lat_deg: f64,
+    /// Longitude, degrees (east positive).
+    pub lon_deg: f64,
+    /// Time-zone offset from UTC in hours (east positive). Sun-position math is
+    /// UTC-based; this lets analyses interpret local clock times on a date.
+    pub tz_hours: f64,
+}
