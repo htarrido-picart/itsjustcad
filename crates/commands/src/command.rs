@@ -309,6 +309,11 @@ pub enum Command {
         layer: String,
         color: [f32; 3],
     },
+    /// Set a layer's print lineweight in millimetres.
+    LayerWeight {
+        layer: String,
+        mm: f64,
+    },
     Hide {
         layer: String,
     },

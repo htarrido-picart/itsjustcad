@@ -443,6 +443,14 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 color: color3(c)?,
             })
         }
+        "layerweight" => {
+            let [layer, mm] = take::<2>("layerweight", "a layer name and a lineweight in mm", &args)?;
+            let mm = number(mm)?;
+            if mm <= 0.0 {
+                return wrong("layerweight", "a positive lineweight in mm", &args);
+            }
+            Ok(Command::LayerWeight { layer: layer.to_string(), mm })
+        }
         "hide" => {
             let [layer] = take::<1>("hide", "a layer name", &args)?;
             Ok(Command::Hide { layer: layer.to_string() })

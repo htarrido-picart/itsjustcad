@@ -214,6 +214,11 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Set a layer's display color, 0-1 or 0-255 values. Example: layercolor walls 0.8,0.2,0.1",
         },
         CommandSpec {
+            name: "layerweight",
+            usage: "layerweight <layer> <mm>",
+            summary: "Set a layer's print lineweight in mm (controls PDF stroke width and DXF code-370). Default 0.18 mm; sections layer convention is 0.35 mm. Example: layerweight sections 0.35",
+        },
+        CommandSpec {
             name: "hide",
             usage: "hide <layer>",
             summary: "Hide a layer (objects stay in the model, invisible). Example: hide walls",

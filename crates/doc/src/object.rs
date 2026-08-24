@@ -145,6 +145,14 @@ fn default_visible() -> bool {
     true
 }
 
+fn default_lineweight() -> f64 {
+    0.18
+}
+
+fn is_default_lineweight(v: &f64) -> bool {
+    (*v - 0.18).abs() < 1e-9
+}
+
 /// Per-layer display style. `color: None` means "use the theme default".
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LayerStyle {
@@ -152,11 +160,14 @@ pub struct LayerStyle {
     pub color: Option<[f32; 4]>,
     #[serde(default = "default_visible")]
     pub visible: bool,
+    /// Print lineweight in millimetres. Default 0.18 mm (ISO thin).
+    #[serde(default = "default_lineweight", skip_serializing_if = "is_default_lineweight")]
+    pub lineweight_mm: f64,
 }
 
 impl Default for LayerStyle {
     fn default() -> Self {
-        Self { color: None, visible: true }
+        Self { color: None, visible: true, lineweight_mm: 0.18 }
     }
 }
 

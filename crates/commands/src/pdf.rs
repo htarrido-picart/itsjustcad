@@ -4,7 +4,7 @@
 //! operators only, which keeps the crate dependency-free.
 
 use glam::{DVec2, DVec3};
-use mydrafter_doc::{Document, Geometry, Sheet, SheetView, ViewDirection};
+use mydrafter_doc::{Document, Geometry, LayerStyle, Sheet, SheetView, ViewDirection};
 
 /// Chord tolerance for tessellating curves at print time (meters).
 const PRINT_TOL: f64 = 0.005;
@@ -57,6 +57,11 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
         // Annotations are screen-styled (arrows, glyphs); skipped in PDF v1.
         Geometry::Annotation(_) => {}
     }
+}
+
+/// Default fallback style when a layer has no explicit entry.
+fn default_style() -> LayerStyle {
+    LayerStyle::default()
 }
 
 /// Liang-Barsky clip of a 2D segment to an axis-aligned rect. Returns the
@@ -129,51 +134,68 @@ fn render_view(
         view.scale
     ));
 
-    // Project all visible geometry, scale to mm, center in the rect.
-    let mut segments = Vec::new();
+    // Collect (lineweight_mm, world-segment) pairs, preserving layer weight.
+    let mut weighted_segs: Vec<(f64, DVec3, DVec3)> = Vec::new();
     for obj in doc.objects() {
         if obj.visible && doc.layer_visible(&obj.layer) {
-            geometry_segments(&obj.geometry, &mut segments);
+            let fallback = default_style();
+            let style = doc.layers.get(&obj.layer).unwrap_or(&fallback);
+            let w = style.lineweight_mm;
+            let base = weighted_segs.len();
+            let mut tmp = Vec::new();
+            geometry_segments(&obj.geometry, &mut tmp);
+            for (a, b) in tmp {
+                weighted_segs.push((w, a, b));
+            }
+            let _ = base; // silence unused-variable
         }
     }
-    let projected: Vec<(DVec2, DVec2)> = segments
-        .iter()
-        .map(|(a, b)| {
-            let pa = project(view.direction, *a);
-            let pb = project(view.direction, *b);
-            (
-                DVec2::new(
-                    world_to_paper_mm(pa.x, view.scale),
-                    world_to_paper_mm(pa.y, view.scale),
-                ),
-                DVec2::new(
-                    world_to_paper_mm(pb.x, view.scale),
-                    world_to_paper_mm(pb.y, view.scale),
-                ),
-            )
-        })
-        .collect();
-    if projected.is_empty() {
+    if weighted_segs.is_empty() {
         return 0;
     }
+
+    // Compute bounds for centering (weight-independent).
     let (mut lo, mut hi) = (DVec2::MAX, DVec2::MIN);
-    for (a, b) in &projected {
-        lo = lo.min(a.min(*b));
-        hi = hi.max(a.max(*b));
+    for &(_, a, b) in &weighted_segs {
+        let pa = {
+            let p = project(view.direction, a);
+            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
+        };
+        let pb = {
+            let p = project(view.direction, b);
+            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
+        };
+        lo = lo.min(pa.min(pb));
+        hi = hi.max(pa.max(pb));
     }
     let offset = (rmin + rmax) / 2.0 - (lo + hi) / 2.0;
+    let pad = 1.0;
+    let (cmin, cmax) = (rmin + DVec2::splat(pad), rmax - DVec2::splat(pad));
 
-    let pad = 1.0; // keep line art off the border stroke
-    let (cmin, cmax) = (
-        rmin + DVec2::splat(pad),
-        rmax - DVec2::splat(pad),
-    );
+    // Sort by lineweight so we can batch `w` operators.
+    weighted_segs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
     let mut drawn = 0usize;
-    content.push_str("0.35 w\n");
-    for (a, b) in projected {
-        if let Some((a, b)) = clip(a + offset, b + offset, cmin, cmax) {
+    // Use a sentinel that guarantees the first segment always emits a `w` op.
+    let mut cur_w = -1.0_f64;
+    for (w, wa, wb) in weighted_segs {
+        let pa = {
+            let p = project(view.direction, wa);
+            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
+        };
+        let pb = {
+            let p = project(view.direction, wb);
+            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
+        };
+        if let Some((a, b)) = clip(pa + offset, pb + offset, cmin, cmax) {
             if (b - a).length() < 1e-6 {
                 continue;
+            }
+            // Emit a `w` (line width) operator only on weight change.
+            // PDF line width is in points; 1 mm = PT_PER_MM pt.
+            if (w - cur_w).abs() > 1e-6 {
+                content.push_str(&format!("{:.4} w\n", w * PT_PER_MM));
+                cur_w = w;
             }
             content.push_str(&format!(
                 "{} {} m {} {} l S\n",
@@ -330,5 +352,43 @@ mod tests {
         assert!(bytes.starts_with(b"%PDF"));
         assert!(bytes.ends_with(b"%%EOF\n"));
         assert_eq!(drawn, 0);
+    }
+
+    #[test]
+    fn two_layer_weights_produce_distinct_w_ops_in_pdf() {
+        use crate::{parse, Session};
+        let mut s = Session::default();
+        // Thin layer: default 0.18 mm. Use tiny geometry (mm-scale in meter
+        // world-space) at 1:1000 so they map to a few mm on the A3 sheet.
+        s.run(parse("layer thin").unwrap()).unwrap();
+        s.run(parse("line 0,0,0 0.001,0,0").unwrap()).unwrap();
+        // Heavy layer: 0.50 mm.
+        s.run(parse("layer heavy").unwrap()).unwrap();
+        s.run(parse("layerweight heavy 0.50").unwrap()).unwrap();
+        s.run(parse("line 0.002,0,0 0.003,0,0").unwrap()).unwrap();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse("sheetview s1 top 1000").unwrap()).unwrap();
+
+        let sheet = s.doc.sheet("s1").unwrap().clone();
+        let (bytes, drawn) = sheet_pdf(&s.doc, &sheet);
+        assert_eq!(drawn, 2, "both lines drawn");
+        // The content stream is ASCII inside the PDF binary. Scan it for
+        // standalone `<number> w` lines (line-width operators) that come from
+        // our per-layer weight batching; other `w`-containing lines include
+        // `re S` and composite border ops which have trailing tokens.
+        let content = String::from_utf8_lossy(&bytes);
+        let w_ops: Vec<&str> = content
+            .split('\n')
+            .filter(|l| {
+                let t = l.trim();
+                // A standalone PDF `w` op: one number token then the `w` keyword.
+                matches!(t.split_whitespace().collect::<Vec<_>>().as_slice(),
+                    [_num, "w"])
+            })
+            .collect();
+        assert!(w_ops.len() >= 2, "expected ≥2 standalone w ops, got: {w_ops:?}");
+        // The two w values must differ.
+        let w_values: std::collections::HashSet<&str> = w_ops.iter().copied().collect();
+        assert!(w_values.len() >= 2, "w ops must have distinct values: {w_ops:?}");
     }
 }

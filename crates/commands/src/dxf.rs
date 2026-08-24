@@ -174,12 +174,16 @@ pub fn document_dxf(doc: &Document) -> (String, usize) {
     t.tag(0, "TABLE");
     t.tag(2, "LAYER");
     t.tag(70, &doc.layers.len().to_string());
-    for name in doc.layers.keys() {
+    for (name, style) in &doc.layers {
         t.tag(0, "LAYER");
         t.tag(2, &dxf_layer(name));
         t.tag(70, "0");
         t.tag(62, "7");
         t.tag(6, "CONTINUOUS");
+        // Code 370: lineweight in hundredths of a mm (ISO standard values).
+        // Round to the nearest hundredth and clamp to sane drafting range.
+        let lw_hundredths = (style.lineweight_mm * 100.0).round().clamp(0.0, 211.0) as i32;
+        t.tag(370, &lw_hundredths.to_string());
     }
     t.tag(0, "ENDTAB");
     t.tag(0, "ENDSEC");
@@ -519,6 +523,20 @@ mod tests {
         assert!(dxf.contains("2\nWALLS\n"), "layer table entry");
         assert!(dxf.contains("8\nWALLS\n"), "entity layer reference");
         assert!(dxf.contains("2\nDEFAULT\n"), "default layer still listed");
+    }
+
+    #[test]
+    fn dxf_layer_table_carries_lineweight_code_370() {
+        let mut s = Session::default();
+        run(&mut s, "layer thin");   // default 0.18 mm -> 18 hundredths
+        run(&mut s, "layer heavy");
+        run(&mut s, "layerweight heavy 0.35"); // 35 hundredths
+        let (dxf, _) = document_dxf(&s.doc);
+        // Each LAYER record must carry code 370.
+        // Default layer: 0.18 mm -> 18.
+        assert!(dxf.contains("370\n18\n"), "default 0.18 mm -> code 18");
+        // heavy layer: 0.35 mm -> 35.
+        assert!(dxf.contains("370\n35\n"), "0.35 mm -> code 35");
     }
 
     #[test]

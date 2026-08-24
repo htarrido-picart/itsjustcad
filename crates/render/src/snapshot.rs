@@ -220,7 +220,7 @@ mod tests {
         insert_tri(&mut doc, "default");
         doc.layers.insert(
             "hidden".into(),
-            LayerStyle { color: None, visible: false },
+            LayerStyle { color: None, visible: false, ..LayerStyle::default() },
         );
         insert_tri(&mut doc, "hidden");
         let scene = snapshot(&doc, Theme::Dark);
@@ -264,7 +264,7 @@ mod tests {
         let red = [1.0, 0.0, 0.0, 1.0];
         doc.layers.insert(
             "walls".into(),
-            LayerStyle { color: Some(red), visible: true },
+            LayerStyle { color: Some(red), visible: true, ..LayerStyle::default() },
         );
         let id = insert_tri(&mut doc, "walls");
         insert_tri(&mut doc, "default");

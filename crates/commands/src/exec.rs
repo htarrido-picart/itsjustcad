@@ -617,7 +617,11 @@ fn section_meshes(
         _ => loops.iter().map(|_| ObjectId::new()).collect(),
     };
     let layer_created = (!doc.layers.contains_key(SECTIONS_LAYER)).then(|| {
-        doc.layers.insert(SECTIONS_LAYER.to_string(), LayerStyle::default());
+        // Sections use a heavier lineweight (ISO medium: 0.35 mm) by convention.
+        doc.layers.insert(
+            SECTIONS_LAYER.to_string(),
+            LayerStyle { lineweight_mm: 0.35, ..LayerStyle::default() },
+        );
         SECTIONS_LAYER.to_string()
     });
     for (points, id) in loops.into_iter().zip(&new_ids) {
@@ -1847,6 +1851,20 @@ fn apply_forward(
                 },
             ))
         }
+        Command::LayerWeight { layer, mm } => {
+            let style = layer_style_mut(doc, &layer)?;
+            let prev = style.clone();
+            style.lineweight_mm = mm;
+            doc.generation += 1;
+            Ok((
+                Command::LayerWeight { layer: layer.clone(), mm },
+                Inverse::LayerStyle { layer: layer.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("layer '{layer}' lineweight set to {mm:.3} mm"),
+                },
+            ))
+        }
         Command::Hide { layer } => {
             let style = layer_style_mut(doc, &layer)?;
             let prev = style.clone();
@@ -2344,6 +2362,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Layer { .. } => "layer",
         Command::ToLayer { .. } => "tolayer",
         Command::LayerColor { .. } => "layercolor",
+        Command::LayerWeight { .. } => "layerweight",
         Command::Hide { .. } => "hide",
         Command::Show { .. } => "show",
         Command::HideObj { .. } => "hideobj",
@@ -3527,6 +3546,74 @@ mod tests {
             assert!(err.to_string().contains("no layer 'ghost'"), "{line}: {err}");
             assert!(err.to_string().contains("layer ghost"), "hint present: {err}");
         }
+    }
+
+    #[test]
+    fn layerweight_parse_exec_undo_redo() {
+        let mut s = Session::default();
+        run(&mut s, "layer walls");
+        // Default lineweight.
+        assert!((s.doc.layers["walls"].lineweight_mm - 0.18).abs() < 1e-9);
+        // Set a heavier weight.
+        let out = run(&mut s, "layerweight walls 0.35");
+        assert!(out.message.contains("0.350"), "{}", out.message);
+        assert!((s.doc.layers["walls"].lineweight_mm - 0.35).abs() < 1e-9);
+        // Undo restores the default.
+        run(&mut s, "undo");
+        assert!((s.doc.layers["walls"].lineweight_mm - 0.18).abs() < 1e-9);
+        // Redo re-applies.
+        run(&mut s, "redo");
+        assert!((s.doc.layers["walls"].lineweight_mm - 0.35).abs() < 1e-9);
+    }
+
+    #[test]
+    fn layerweight_parse_rejects_bad_inputs() {
+        assert!(parse("layerweight walls").is_err(), "missing mm arg");
+        assert!(parse("layerweight walls 0").is_err(), "zero not allowed");
+        assert!(parse("layerweight walls -0.1").is_err(), "negative not allowed");
+        // Valid parse.
+        assert_eq!(
+            parse("layerweight walls 0.18").unwrap(),
+            Command::LayerWeight { layer: "walls".into(), mm: 0.18 }
+        );
+    }
+
+    #[test]
+    fn layerweight_requires_existing_layer() {
+        let mut s = Session::default();
+        let err = s.run(parse("layerweight ghost 0.5").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no layer 'ghost'"), "{err}");
+    }
+
+    #[test]
+    fn layerweight_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "layer walls");
+        run(&mut s, "layerweight walls 0.35");
+        run(&mut s, "layer sections");
+        run(&mut s, "layerweight sections 0.50");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert!(
+            (replayed.doc.layers["walls"].lineweight_mm - 0.35).abs() < 1e-9
+        );
+        assert!(
+            (replayed.doc.layers["sections"].lineweight_mm - 0.50).abs() < 1e-9
+        );
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "replay-stable log"
+        );
+    }
+
+    #[test]
+    fn sections_layer_default_lineweight_is_heavier() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,3");
+        run(&mut s, "plan 1.5");
+        // sections layer auto-created at 0.35 mm.
+        assert!((s.doc.layers["sections"].lineweight_mm - 0.35).abs() < 1e-9);
     }
 
     #[test]
