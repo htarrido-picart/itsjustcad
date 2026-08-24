@@ -1,4 +1,5 @@
 mod app;
+mod app_verbs;
 mod boxsel;
 mod command_line;
 mod deck_pane;
@@ -26,6 +27,11 @@ fn cli_help_text() -> String {
          \x20 --out <file>                Save document after running script\n\
          \x20 --shot <path.png>           Render offscreen screenshot after running script\n\
          \x20 --headless                  No window (required for --shot without a display)\n\
+         \n\
+         Scripts may also use app-level verbs: ze/zoomextents, the standard views\n\
+         (top/front/persp/…), camera <lens>, display <mode>, save [path], help [verb].\n\
+         These frame/style the --shot render. GUI-only verbs (template, critique) are\n\
+         ignored with a warning.\n\
          \n\
          Exit codes:\n\
          \x20 0  success\n\
@@ -111,7 +117,7 @@ fn run_headless_mode(args: &CliArgs) -> i32 {
 
     let lines = headless::parse_script(&src);
     let session = mydrafter_commands::Session::default();
-    let session = match headless::run_script_lines(session, &lines) {
+    let (session, view) = match headless::run_script_lines(session, &lines) {
         Ok(s) => s,
         Err((line, msg)) => {
             eprintln!("command error: {line}\n  {msg}");
@@ -129,7 +135,7 @@ fn run_headless_mode(args: &CliArgs) -> i32 {
 
     // Optional: render headless screenshot.
     if let Some(shot) = &args.shot_path {
-        if let Err(e) = headless::render_headless(&session, std::path::Path::new(shot)) {
+        if let Err(e) = headless::render_headless(&session, std::path::Path::new(shot), &view) {
             eprintln!("error: render failed: {e}");
             return 2;
         }

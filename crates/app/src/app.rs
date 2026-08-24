@@ -390,6 +390,7 @@ impl App {
             Some("recover") => self.recover(),
             Some("ze" | "zoomextents") => self.zoom_extents(),
             // Display mode of the active viewport. View state, never logged.
+            // Verb/mode mapping is shared with the headless runner via app_verbs.
             Some("display") => match words.next().and_then(DisplayMode::parse) {
                 Some(mode) => {
                     self.display_modes[self.layout.camera_index(self.active_pane)] = mode;
@@ -531,15 +532,8 @@ impl App {
     }
 
     fn set_view(&mut self, name: &str) {
-        let view = match name {
-            "top" => StandardView::Top,
-            "bottom" => StandardView::Bottom,
-            "front" => StandardView::Front,
-            "back" => StandardView::Back,
-            "left" => StandardView::Left,
-            "right" => StandardView::Right,
-            _ => StandardView::Perspective,
-        };
+        // Shared name→view mapping (also used by the headless runner).
+        let view = crate::app_verbs::standard_view(name).unwrap_or(StandardView::Perspective);
         self.active_camera().set_view(view);
     }
 
