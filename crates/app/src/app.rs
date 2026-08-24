@@ -1670,59 +1670,14 @@ fn save_cad_origin(origin: CadOrigin) {
     save_ui_json(&v);
 }
 
-/// Apply a legacy-CAD preset to the egui context: theme (dark/light) and font sizes.
-/// Called on startup (from saved prefs) and when the user picks a preset in the
-/// template dialog. Pencil mode clear-color is handled separately in `clear_color`.
+/// Apply a legacy-CAD preset to the egui context via the design-token system.
+/// Each skin is a token set (`UiPreset::tokens`); `theme::apply` stamps the
+/// spacing/type/color roles onto egui's Style. Called on startup (from saved
+/// prefs) and when the user picks a preset in the template dialog. Pencil-mode
+/// clear-color is handled separately in `clear_color`.
 fn apply_preset(ctx: egui::Context, origin: CadOrigin) {
-    let p = preset::preset_for(origin);
-    let dark = preset::is_dark(p);
-
-    // Switch egui theme to match the preset background.
-    ctx.set_theme(if dark {
-        egui::Theme::Dark
-    } else {
-        egui::Theme::Light
-    });
-
-    // Override accent / selection color in the active theme's visuals.
-    let [ar, ag, ab, aa] = p.accent_color;
-    let accent = egui::Color32::from_rgba_unmultiplied(
-        (ar * 255.0) as u8,
-        (ag * 255.0) as u8,
-        (ab * 255.0) as u8,
-        (aa * 255.0) as u8,
-    );
-
-    let font_px = p.ui_font_px;
-    let set_style = move |style: &mut egui::Style| {
-        style.visuals.selection.bg_fill = accent;
-        style.visuals.selection.stroke = egui::Stroke::new(1.5, accent);
-        style.text_styles.insert(
-            egui::TextStyle::Body,
-            egui::FontId::proportional(font_px),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Button,
-            egui::FontId::proportional(font_px),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Monospace,
-            egui::FontId::monospace(font_px),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Small,
-            egui::FontId::proportional(font_px - 2.0),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Heading,
-            egui::FontId::proportional(font_px + 1.0),
-        );
-    };
-    if dark {
-        ctx.style_mut_of(egui::Theme::Dark, set_style);
-    } else {
-        ctx.style_mut_of(egui::Theme::Light, set_style);
-    }
+    let tokens = preset::preset_for(origin).tokens();
+    crate::theme::apply(&ctx, &tokens);
 }
 
 /// Screen position -> world-space pick ray (origin on the near plane).

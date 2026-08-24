@@ -33,6 +33,32 @@ impl CadOrigin {
 /// sRGB color as `[r, g, b, a]` in 0.0–1.0.
 pub type Rgba = [f32; 4];
 
+/// Where the command line docks. Rhino puts it at the top (below the menu
+/// bar), AutoCAD at the bottom. Drives layout order in `app.rs` and the
+/// autosuggest popup direction (down from a top line, up from a bottom line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandLinePos {
+    Top,
+    Bottom,
+}
+
+/// Which side the docked tab panel (Layers/Properties/History/Deck) sits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelSide {
+    // Left is wired by Layer 2's panel-side logic; kept for AutoCAD-style skins.
+    #[allow(dead_code)]
+    Left,
+    Right,
+}
+
+/// Menu-bar grouping flavor. Rhino and AutoCAD group the same registry verbs
+/// under different top-level menu names (see `crate::menu`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuStyle {
+    Rhino,
+    AutoCAD,
+}
+
 fn hex_to_rgba(hex: u32) -> Rgba {
     let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
     let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
@@ -62,6 +88,48 @@ pub struct UiPreset {
     /// Ordered alias table: (alias, canonical_command).
     /// Aliases are looked up BEFORE the parser, case-insensitively.
     pub aliases: &'static [(&'static str, &'static str)],
+    /// Where the command line docks (top for Rhino, bottom for AutoCAD).
+    pub command_line_pos: CommandLinePos,
+    /// Which side the docked tab panel sits on.
+    pub panel_side: PanelSide,
+    /// Default viewport count on first show (Rhino → 4-up, others single).
+    pub default_viewports: u8,
+    /// Menu-bar grouping style.
+    pub menu_style: MenuStyle,
+}
+
+impl UiPreset {
+    /// Build the design-token set for this skin. The surface/accent come from
+    /// the preset; the remaining roles are derived by luminance offset so the
+    /// UI chrome stays internally consistent (see `theme::roles_from`).
+    pub fn tokens(&self) -> crate::theme::Tokens {
+        let colors = crate::theme::roles_from(self.bg_surface(), self.accent_color);
+        crate::theme::Tokens {
+            spacing: crate::theme::Spacing::default(),
+            type_scale: crate::theme::TypeScale {
+                command: self.cmd_font_px,
+                body: self.ui_font_px,
+                small: (self.ui_font_px - 2.0).max(8.0),
+                panel_title: self.ui_font_px + 1.0,
+            },
+            colors,
+            radii: crate::theme::Radii::default(),
+            dark: crate::theme::is_dark(self.bg_surface()),
+        }
+    }
+
+    /// UI-chrome surface color. This is distinct from the viewport clear color
+    /// (`bg_color`): a Rhino viewport is light gray, but its panel chrome reads
+    /// better on a slightly different neutral. For dark skins the two match; for
+    /// light skins we nudge the chrome so panels separate from the canvas.
+    fn bg_surface(&self) -> Rgba {
+        if is_dark(self) {
+            self.bg_color
+        } else {
+            // Light skins: use a near-white chrome so text and dividers read.
+            [0.93, 0.93, 0.94, 1.0]
+        }
+    }
 }
 
 // ── AutoCAD preset ────────────────────────────────────────────────────────────
@@ -135,6 +203,10 @@ pub const AUTOCAD: UiPreset = UiPreset {
     cmd_font_px: 13.0,
     right_click_repeat_last: false,
     aliases: AUTOCAD_ALIASES,
+    command_line_pos: CommandLinePos::Bottom,
+    panel_side: PanelSide::Right,
+    default_viewports: 1,
+    menu_style: MenuStyle::AutoCAD,
 };
 
 // ── Rhino preset ──────────────────────────────────────────────────────────────
@@ -172,6 +244,10 @@ pub const RHINO: UiPreset = UiPreset {
     cmd_font_px: 13.0,
     right_click_repeat_last: true,
     aliases: RHINO_ALIASES,
+    command_line_pos: CommandLinePos::Top,
+    panel_side: PanelSide::Right,
+    default_viewports: 4,
+    menu_style: MenuStyle::Rhino,
 };
 
 // ── Revit preset ──────────────────────────────────────────────────────────────
@@ -188,6 +264,12 @@ pub const REVIT: UiPreset = UiPreset {
     cmd_font_px: 13.0,
     right_click_repeat_last: false,
     aliases: &[],
+    // Revit has no command line; we still dock one (mydrafter is command-first),
+    // but keep it at the bottom and use AutoCAD-style ribbon-ish menus.
+    command_line_pos: CommandLinePos::Bottom,
+    panel_side: PanelSide::Right,
+    default_viewports: 1,
+    menu_style: MenuStyle::AutoCAD,
 };
 
 // ── mydrafter default ─────────────────────────────────────────────────────────
@@ -202,6 +284,12 @@ pub const MYDRAFTER_DEFAULT: UiPreset = UiPreset {
     cmd_font_px: 13.0,
     right_click_repeat_last: false,
     aliases: &[],
+    // mydrafter default adopts the Rhino-style arrangement (task M-uilayout):
+    // command line on top, right tab panel, 4-up viewports, Rhino menu grouping.
+    command_line_pos: CommandLinePos::Top,
+    panel_side: PanelSide::Right,
+    default_viewports: 4,
+    menu_style: MenuStyle::Rhino,
 };
 
 /// Return the static preset for a given origin.
@@ -457,5 +545,53 @@ mod tests {
     #[test]
     fn cad_origin_default_is_none() {
         assert_eq!(CadOrigin::default(), CadOrigin::None);
+    }
+
+    // ── layout fields ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn rhino_defaults_command_line_top_and_4up() {
+        assert_eq!(RHINO.command_line_pos, CommandLinePos::Top);
+        assert_eq!(RHINO.default_viewports, 4);
+        assert_eq!(RHINO.menu_style, MenuStyle::Rhino);
+    }
+
+    #[test]
+    fn autocad_keeps_command_line_bottom_single_viewport() {
+        assert_eq!(AUTOCAD.command_line_pos, CommandLinePos::Bottom);
+        assert_eq!(AUTOCAD.default_viewports, 1);
+        assert_eq!(AUTOCAD.menu_style, MenuStyle::AutoCAD);
+    }
+
+    #[test]
+    fn mydrafter_default_is_rhino_arrangement() {
+        // Task M-uilayout: Rhino-default arrangement even for the mydrafter skin.
+        assert_eq!(MYDRAFTER_DEFAULT.command_line_pos, CommandLinePos::Top);
+        assert_eq!(MYDRAFTER_DEFAULT.default_viewports, 4);
+        assert_eq!(MYDRAFTER_DEFAULT.menu_style, MenuStyle::Rhino);
+    }
+
+    // ── token sets ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dark_preset_yields_dark_tokens() {
+        let t = AUTOCAD.tokens();
+        assert!(t.dark, "AutoCAD tokens should be dark");
+        assert!(!crate::theme::is_dark(t.colors.on_surface), "text must be light on dark");
+    }
+
+    #[test]
+    fn light_preset_yields_light_tokens() {
+        let t = RHINO.tokens();
+        assert!(!t.dark, "Rhino tokens should be light");
+        assert!(crate::theme::is_dark(t.colors.on_surface), "text must be dark on light");
+    }
+
+    #[test]
+    fn tokens_type_scale_follows_font_px() {
+        let t = MYDRAFTER_DEFAULT.tokens();
+        assert_eq!(t.type_scale.command, MYDRAFTER_DEFAULT.cmd_font_px);
+        assert_eq!(t.type_scale.body, MYDRAFTER_DEFAULT.ui_font_px);
+        assert!(t.type_scale.small < t.type_scale.body);
     }
 }
