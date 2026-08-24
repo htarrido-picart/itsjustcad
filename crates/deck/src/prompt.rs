@@ -1,13 +1,29 @@
-use mydrafter_commands::{registry, SELECTOR_HELP};
+use mydrafter_commands::{registry, PluginRegistry, SELECTOR_HELP};
 
 /// Build the system prompt from the command registry (single source of truth)
 /// plus a compact scene digest. Regenerated every turn so the model always
 /// sees current geometry.
-pub fn system_prompt(scene_digest: &str) -> String {
+///
+/// `plugins` are user/LLM-authored macros — the LLM must see them so it can
+/// call plugin verbs directly (`<pluginname> args...`) and author new ones via
+/// the `plugin define` command.
+pub fn system_prompt(scene_digest: &str, plugins: &PluginRegistry) -> String {
     let mut commands = String::new();
     for spec in registry() {
         commands.push_str(&format!("  {:<44} {}\n", spec.usage, spec.summary));
     }
+
+    // Plugin macros (if any) as callable verbs, plus the authoring commands.
+    let mut plugin_block = String::new();
+    if !plugins.is_empty() {
+        plugin_block.push_str("\n## Plugins (user macros — call by name)\n");
+        for p in plugins.iter() {
+            plugin_block.push_str(&format!("  {:<44} {}\n", p.usage(), p.summary()));
+        }
+    }
+    plugin_block.push_str(
+        "\nYou can author a reusable macro mid-conversation with:\n  plugin define {\"name\":\"<name>\",\"description\":\"...\",\"params\":[{\"name\":\"h\",\"default\":\"3\"}],\"body\":[\"rect 0,0 {0} {0}\",\"extrude last {h}\"]}\nBody lines are command templates; {0} {1} (or {param-name}) substitute positional args. Invoke it later as `<name> arg1 arg2`.\n",
+    );
 
     format!(
         r#"You are the drafting companion inside mydrafter, a CAD program for architects. You model by emitting commands — the same commands the human types. Coordinates are meters, Z is up, the ground plane is z=0.
@@ -18,6 +34,7 @@ Emit commands inside a ```draft fenced block, ONE command per line. Commands exe
 ## Commands
 {commands}
 {selectors}
+{plugin_block}
 
 ## Rules
 - Points are x,y,z or x,y (z=0). No spaces inside a point. Units: bare numbers are meters; 250cm and 500mm also work.
@@ -46,6 +63,7 @@ box 10,0,0 4,4,3
 "#,
         commands = commands,
         selectors = SELECTOR_HELP,
+        plugin_block = plugin_block,
         scene = if scene_digest.is_empty() {
             "(empty)"
         } else {
@@ -57,10 +75,11 @@ box 10,0,0 4,4,3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mydrafter_commands::{Plugin, PluginParam};
 
     #[test]
     fn system_prompt_lists_every_registry_command() {
-        let prompt = system_prompt("");
+        let prompt = system_prompt("", &PluginRegistry::new());
         for spec in registry() {
             assert!(
                 prompt.contains(spec.usage),
@@ -78,13 +97,34 @@ mod tests {
 
     #[test]
     fn empty_scene_digest_renders_placeholder() {
-        assert!(system_prompt("").contains("(empty)"));
+        assert!(system_prompt("", &PluginRegistry::new()).contains("(empty)"));
     }
 
     #[test]
     fn scene_digest_is_embedded_verbatim() {
-        let prompt = system_prompt("abc1234 box 5x5x3 'core'");
+        let prompt = system_prompt("abc1234 box 5x5x3 'core'", &PluginRegistry::new());
         assert!(prompt.contains("abc1234 box 5x5x3 'core'"));
         assert!(!prompt.contains("(empty)"));
+    }
+
+    #[test]
+    fn plugin_verbs_appear_in_prompt() {
+        let mut reg = PluginRegistry::new();
+        reg.insert(Plugin {
+            name: "column-grid".into(),
+            description: "Grid of columns".into(),
+            params: vec![PluginParam { name: "nx".into(), default: Some("5".into()) }],
+            body: vec!["box 0,0,0 0.4,0.4,3".into()],
+        });
+        let prompt = system_prompt("", &reg);
+        assert!(prompt.contains("column-grid <nx>"), "{prompt}");
+        assert!(prompt.contains("Grid of columns"));
+        // The authoring instruction is always present.
+        assert!(prompt.contains("plugin define"));
+    }
+
+    #[test]
+    fn authoring_instruction_present_without_plugins() {
+        assert!(system_prompt("", &PluginRegistry::new()).contains("plugin define"));
     }
 }

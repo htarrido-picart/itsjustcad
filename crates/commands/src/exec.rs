@@ -121,6 +121,11 @@ pub struct Session {
     pub doc: Document,
     log: Vec<AppliedOp>,
     cursor: usize,
+    /// Runtime plugin macros. Not part of the op-log or file format — plugins
+    /// expand to ordinary logged commands at invoke time, so replay never
+    /// touches this. Held here so the deck prompt, help and autosuggest can all
+    /// consult one authoritative table.
+    pub plugins: crate::plugin::PluginRegistry,
 }
 
 impl Session {

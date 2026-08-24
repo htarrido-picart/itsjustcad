@@ -13,7 +13,7 @@ async fn main() {
     let deck = make_deck(config);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let req = ChatRequest::text(
-        system_prompt(""),
+        system_prompt("", &mydrafter_commands::PluginRegistry::new()),
         vec![ChatMessage { role: Role::User, content: prompt }],
         String::new(),
         2048,

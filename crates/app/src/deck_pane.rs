@@ -437,7 +437,7 @@ impl DeckPane {
         };
         let deck = make_deck(config);
         let mut req = ChatRequest::text(
-            system_prompt(&crate::scene::digest(&session.doc)),
+            system_prompt(&crate::scene::digest(&session.doc), &session.plugins),
             self.messages.clone(),
             String::new(),
             4096,

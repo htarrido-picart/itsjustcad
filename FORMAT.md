@@ -343,3 +343,28 @@ a `FORMAT_MIGRATION.md` alongside the bump.
 Concretely: the io.rs test suite contains `pre_*` tests that load
 hand-written minimal v1 JSON and assert that newly-added features default
 gracefully. Every new command or field must add such a test.
+
+## Plugins (macros) and replay safety
+
+Plugins are user/LLM-authored macros stored **outside** the op-log, one JSON
+file per plugin under `~/.config/mydrafter/plugins/<name>.plugin.json`:
+
+```json
+{"name": "column-grid",
+ "description": "Grid of columns",
+ "params": [{"name": "nx", "default": "5"}, {"name": "ny", "default": "3"}],
+ "body": ["box 0,0,0 0.4,0.4,3", "array last {0},{1},1 3,4,0"]}
+```
+
+Invoking `column-grid 6 4` substitutes positional `{0}`/`{1}` (and `{param-name}`)
+into the `body` lines and runs each through the substrate. **Expansion happens at
+execute time; the individual expanded commands are what land in the op-log** — the
+plugin call itself is never logged. This is deliberate:
+
+- **Replay never re-expands a plugin.** A saved file replays the expanded ops, so
+  the drawing is stable even if the plugin is later edited, renamed, or deleted.
+- The op-log stays self-contained (the "reconstructable from the log" invariant
+  borrowed from DeepSeek-Harness): a file has no dependency on the author's
+  plugin directory.
+
+Plugins therefore add **no new op-log command** and require no format-version bump.

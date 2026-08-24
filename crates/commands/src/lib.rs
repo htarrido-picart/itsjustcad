@@ -14,6 +14,7 @@ pub mod mesh_export;
 pub mod mesh_import;
 mod parse;
 pub mod pdf;
+pub mod plugin;
 mod registry;
 pub mod svg;
 
@@ -21,4 +22,5 @@ pub use command::{Command, CompassDir, MirrorPlane, Selector};
 pub use error::{ExecError, ParseError};
 pub use exec::{ApplyOutcome, Session};
 pub use parse::parse;
+pub use plugin::{Plugin, PluginError, PluginParam, PluginRegistry};
 pub use registry::{registry, CommandSpec, SELECTOR_HELP};

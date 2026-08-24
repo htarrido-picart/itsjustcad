@@ -276,8 +276,12 @@ impl App {
             }
         }
 
+        let mut session = Session::default();
+        // Load user/LLM-authored plugin macros from disk into the session.
+        command_line.load_plugins(&mut session);
+
         Self {
-            session: Session::default(),
+            session,
             command_line,
             deck_pane: DeckPane::default(),
             draw_tool: DrawTool::default(),

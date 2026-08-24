@@ -98,11 +98,22 @@ pub fn verb_completions(
     prefix: &str,
     limit: usize,
     preset_aliases: &'static [(&'static str, &'static str)],
+    plugin_verbs: &[(String, String)],
 ) -> Vec<Suggestion> {
     let prefix_lower = prefix.to_lowercase();
 
     // Build the full candidate list: registry names, their aliases, then app verbs.
     let mut candidates: Vec<Suggestion> = Vec::new();
+
+    // Plugin macros — LLM/user-authored verbs, offered alongside builtins.
+    for (name, usage) in plugin_verbs {
+        if name.starts_with(prefix_lower.as_str()) || prefix_lower.is_empty() {
+            candidates.push(Suggestion {
+                completion: name.clone(),
+                usage: Some(usage.clone()),
+            });
+        }
+    }
 
     for spec in registry() {
         let name = spec.name;
@@ -201,6 +212,7 @@ pub fn suggestions(
     object_names: &[String],
     limit: usize,
     preset_aliases: &'static [(&'static str, &'static str)],
+    plugin_verbs: &[(String, String)],
 ) -> Vec<Suggestion> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {
@@ -209,7 +221,7 @@ pub fn suggestions(
 
     if !verb_is_complete(input) {
         // Still typing the verb.
-        return verb_completions(trimmed, limit, preset_aliases);
+        return verb_completions(trimmed, limit, preset_aliases, plugin_verbs);
     }
 
     // Verb is done — find its usage string.
@@ -241,13 +253,13 @@ mod tests {
 
     #[test]
     fn prefix_box_returns_box() {
-        let results = verb_completions("bo", 8, &[]);
+        let results = verb_completions("bo", 8, &[], &[]);
         assert!(results.iter().any(|s| s.completion == "box"), "{results:?}");
     }
 
     #[test]
     fn prefix_b_returns_box_and_bbox() {
-        let results = verb_completions("b", 8, &[]);
+        let results = verb_completions("b", 8, &[], &[]);
         let names: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
         assert!(names.contains(&"box"), "{names:?}");
         assert!(names.contains(&"bbox"), "{names:?}");
@@ -255,50 +267,50 @@ mod tests {
 
     #[test]
     fn exact_match_sorts_first() {
-        let results = verb_completions("box", 8, &[]);
+        let results = verb_completions("box", 8, &[], &[]);
         assert_eq!(results[0].completion, "box", "{results:?}");
     }
 
     #[test]
     fn alias_pline_appears_for_pl_prefix() {
-        let results = verb_completions("pl", 8, &[]);
+        let results = verb_completions("pl", 8, &[], &[]);
         assert!(results.iter().any(|s| s.completion == "pline"), "{results:?}");
     }
 
     #[test]
     fn alias_diff_appears_for_di_prefix() {
-        let results = verb_completions("di", 16, &[]);
+        let results = verb_completions("di", 16, &[], &[]);
         assert!(results.iter().any(|s| s.completion == "diff"), "{results:?}");
     }
 
     #[test]
     fn alias_del_appears_for_de_prefix() {
-        let results = verb_completions("de", 16, &[]);
+        let results = verb_completions("de", 16, &[], &[]);
         assert!(results.iter().any(|s| s.completion == "del"), "{results:?}");
     }
 
     #[test]
     fn app_verb_ze_appears_for_z_prefix() {
-        let results = verb_completions("z", 8, &[]);
+        let results = verb_completions("z", 8, &[], &[]);
         assert!(results.iter().any(|s| s.completion == "ze"), "{results:?}");
     }
 
     #[test]
     fn app_verb_help_appears_for_he_prefix() {
-        let results = verb_completions("he", 8, &[]);
+        let results = verb_completions("he", 8, &[], &[]);
         assert!(results.iter().any(|s| s.completion == "help"), "{results:?}");
     }
 
     #[test]
     fn registry_verbs_carry_usage_hint() {
-        let results = verb_completions("box", 4, &[]);
+        let results = verb_completions("box", 4, &[], &[]);
         let box_sugg = results.iter().find(|s| s.completion == "box").unwrap();
         assert!(box_sugg.usage.is_some(), "box should have a usage hint");
     }
 
     #[test]
     fn app_verb_has_no_usage_hint() {
-        let results = verb_completions("ze", 4, &[]);
+        let results = verb_completions("ze", 4, &[], &[]);
         let ze_sugg = results.iter().find(|s| s.completion == "ze").unwrap();
         assert!(ze_sugg.usage.is_none(), "app verb ze should have no usage hint");
     }
@@ -306,13 +318,13 @@ mod tests {
     #[test]
     fn empty_prefix_returns_empty() {
         // top-level suggestions fn returns empty for empty input
-        let results = suggestions("", &[], 8, &[]);
+        let results = suggestions("", &[], 8, &[], &[]);
         assert!(results.is_empty(), "{results:?}");
     }
 
     #[test]
     fn no_duplicate_completions() {
-        let results = verb_completions("", 500, &[]);
+        let results = verb_completions("", 500, &[], &[]);
         let mut seen = std::collections::HashSet::new();
         for s in &results {
             assert!(seen.insert(s.completion.clone()), "duplicate: {}", s.completion);
@@ -398,7 +410,7 @@ mod tests {
     fn suggestions_after_selector_verb_returns_object_names() {
         // "extrude " — verb complete, expects selector
         let object_names = vec!["tower".to_string(), "slab".to_string()];
-        let results = suggestions("extrude ", &object_names, 8, &[]);
+        let results = suggestions("extrude ", &object_names, 8, &[], &[]);
         let completions: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
         assert!(completions.contains(&"last"), "{completions:?}");
         assert!(completions.contains(&"tower"), "{completions:?}");
@@ -407,13 +419,13 @@ mod tests {
     #[test]
     fn suggestions_for_non_selector_verb_returns_empty() {
         // "box " — verb complete, no selector expected
-        let results = suggestions("box ", &[], 8, &[]);
+        let results = suggestions("box ", &[], 8, &[], &[]);
         assert!(results.is_empty(), "{results:?}");
     }
 
     #[test]
     fn suggestions_typing_verb_returns_verb_completions() {
-        let results = suggestions("ext", &[], 8, &[]);
+        let results = suggestions("ext", &[], 8, &[], &[]);
         assert!(results.iter().any(|s| s.completion == "extrude"), "{results:?}");
     }
 
@@ -422,7 +434,7 @@ mod tests {
     #[test]
     fn autocad_alias_l_appears_in_suggestions() {
         use crate::preset::AUTOCAD_ALIASES;
-        let results = verb_completions("l", 20, AUTOCAD_ALIASES);
+        let results = verb_completions("l", 20, AUTOCAD_ALIASES, &[]);
         let completions: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
         assert!(completions.contains(&"l"), "AutoCAD alias 'l' should appear: {completions:?}");
     }
@@ -430,7 +442,7 @@ mod tests {
     #[test]
     fn autocad_alias_e_appears_in_suggestions() {
         use crate::preset::AUTOCAD_ALIASES;
-        let results = verb_completions("e", 20, AUTOCAD_ALIASES);
+        let results = verb_completions("e", 20, AUTOCAD_ALIASES, &[]);
         let completions: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
         assert!(completions.contains(&"e"), "AutoCAD alias 'e' should appear: {completions:?}");
     }
@@ -438,7 +450,7 @@ mod tests {
     #[test]
     fn no_duplicates_with_preset_aliases() {
         use crate::preset::AUTOCAD_ALIASES;
-        let results = verb_completions("", 500, AUTOCAD_ALIASES);
+        let results = verb_completions("", 500, AUTOCAD_ALIASES, &[]);
         let mut seen = std::collections::HashSet::new();
         for s in &results {
             assert!(seen.insert(s.completion.clone()), "duplicate: {}", s.completion);
