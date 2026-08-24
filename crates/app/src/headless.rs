@@ -4,8 +4,8 @@
 //! Exit codes: 0 ok | 1 command error | 2 file/IO error.
 
 use crate::app_verbs::{self, AppVerb};
-use mydrafter_commands::{Session, parse};
-use mydrafter_render::{DisplayMode, OrbitCamera, PanoProjection, StandardView};
+use itsjustcad_commands::{Session, parse};
+use itsjustcad_render::{DisplayMode, OrbitCamera, PanoProjection, StandardView};
 
 // ── Headless view state ─────────────────────────────────────────────────────────
 
@@ -77,8 +77,8 @@ pub fn run_script_lines(
                 apply_camera(&mut view, arg.as_deref(), arg2.as_deref())
             }
             Some(AppVerb::Save(path)) => {
-                let out = path.as_deref().unwrap_or("out.mydrafter.json");
-                mydrafter_commands::io::save_file(&session, std::path::Path::new(out))
+                let out = path.as_deref().unwrap_or("out.itsjustcad.json");
+                itsjustcad_commands::io::save_file(&session, std::path::Path::new(out))
                     .map_err(|e| (line.clone(), e.to_string()))?;
                 println!("saved {out}");
             }
@@ -120,7 +120,7 @@ fn apply_camera(view: &mut HeadlessView, arg: Option<&str>, arg2: Option<&str>) 
             view.pano = Some(parse_fisheye(arg2));
         }
         _ => {
-            let focal = mydrafter_render::preset_focal_mm(arg)
+            let focal = itsjustcad_render::preset_focal_mm(arg)
                 .or_else(|| arg.strip_suffix("mm").unwrap_or(arg).parse::<f32>().ok());
             if let Some(f) = focal.filter(|f| *f > 0.0) {
                 view.focal_mm = Some(f);
@@ -152,7 +152,7 @@ pub fn render_headless(
     path: &std::path::Path,
     view: &HeadlessView,
 ) -> Result<(), String> {
-    use mydrafter_render::{
+    use itsjustcad_render::{
         SceneRenderer, Theme, camera_uniform_with_mode, snapshot, DEPTH_FORMAT,
     };
 
@@ -214,7 +214,7 @@ pub fn render_headless(
         // Put the eye at the scene centre by collapsing the orbit distance to
         // a hair; look direction (yaw/pitch) is preserved for the remap basis.
         camera.distance = camera.distance.clamp(1e-4, 0.01);
-        let img = mydrafter_render::render_pano_image(
+        let img = itsjustcad_render::render_pano_image(
             &device, &queue, &mut renderer, &camera, theme, mode, W, H, 1024,
         );
         let rgba = image::RgbaImage::from_raw(img.width, img.height, img.rgba)
@@ -427,9 +427,9 @@ mod tests {
 
     #[test]
     fn save_verb_writes_document() {
-        let dir = std::env::temp_dir().join(format!("mydrafter_hl_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("itsjustcad_hl_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let out = dir.join("saved.mydrafter.json");
+        let out = dir.join("saved.itsjustcad.json");
         let session = Session::default();
         let lines = vec![
             "box 0,0,0 1,1,1".to_owned(),

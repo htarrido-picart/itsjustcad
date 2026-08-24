@@ -10,7 +10,7 @@
 //! [`verbs_in`]) carry no egui state and are unit-tested standalone. The `ui`
 //! entry point renders them and returns the action the user picked.
 
-use mydrafter_commands::{registry, Category};
+use itsjustcad_commands::{registry, Category};
 
 use crate::preset::MenuStyle;
 
@@ -156,7 +156,7 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
                 action = Some(MenuAction::Help);
                 ui.close();
             }
-            if ui.button("About mydrafter").clicked() {
+            if ui.button("About ItsJustCAD").clicked() {
                 action = Some(MenuAction::About);
                 ui.close();
             }
@@ -166,8 +166,8 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
 }
 
 /// Dev/screenshot hook: render a given top-level menu's grouped items as an
-/// open dropdown-style panel just under the bar, so `MYDRAFTER_SHOT` frames can
-/// show the grouping without a live click. Set `MYDRAFTER_MENU_DEMO=<title>`
+/// open dropdown-style panel just under the bar, so `ITSJUSTCAD_SHOT` frames can
+/// show the grouping without a live click. Set `ITSJUSTCAD_MENU_DEMO=<title>`
 /// (e.g. `Solid`). Faithful — it lists exactly `verbs_in(categories)`.
 pub fn demo_open(ctx: &egui::Context, style: MenuStyle, title: &str, at: egui::Pos2) {
     let Some((_, cats)) = top_menus(style).into_iter().find(|(t, _)| *t == title) else {

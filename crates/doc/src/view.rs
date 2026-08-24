@@ -26,7 +26,7 @@ pub struct NamedView {
 }
 
 /// Serde-friendly panorama/fisheye projection stored in a [`NamedView`].
-/// Mirrors `mydrafter_render::PanoProjection`.
+/// Mirrors `itsjustcad_render::PanoProjection`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum PanoView {

@@ -1,20 +1,20 @@
 [package]
-name = "mydrafter"
+name = "itsjustcad"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "mydrafter"
+name = "itsjustcad"
 path = "src/main.rs"
 
 [dependencies]
-mydrafter-doc.workspace = true
-mydrafter-solar.workspace = true
+itsjustcad-doc.workspace = true
+itsjustcad-solar.workspace = true
 kernel-curve.workspace = true
-mydrafter-commands.workspace = true
-mydrafter-deck.workspace = true
-mydrafter-render.workspace = true
+itsjustcad-commands.workspace = true
+itsjustcad-deck.workspace = true
+itsjustcad-render.workspace = true
 kernel-mesh.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true

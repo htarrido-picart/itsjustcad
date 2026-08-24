@@ -1,6 +1,6 @@
 # Legacy CAD UI Conventions Research
 
-Research date: 2026-08-24. Drives mydrafter theme presets and alias tables.
+Research date: 2026-08-24. Drives ItsJustCAD theme presets and alias tables.
 All hex values given as `#RRGGBB` sRGB.
 
 ---
@@ -160,7 +160,7 @@ Source: Rhino 8 window layout documentation at docs.mcneel.com/rhino/8/help/en-u
 - **Scroll wheel**: zoom.
 - Context menu: configurable; default is right-click = repeat last.
 
-This is a critical workflow convention that mydrafter should match: right-click = accept/repeat.
+This is a critical workflow convention that ItsJustCAD should match: right-click = accept/repeat.
 
 Source: McNeel docs "Repeat | Rhino 3D modeling"; discourse thread "Disable enter repeat command on right mouse button".
 
@@ -241,7 +241,7 @@ Source: Autodesk support "How to change the size and typeface in the Revit UI".
 - Quick Access Toolbar (QAT) above ribbon for Save, Undo, Redo, etc.
 - Ribbon auto-collapses to tab labels only (double-click to expand).
 
-Key insight: Revit users expect **context-sensitive tools** — the active object type changes what's available. mydrafter could surface this via the deck/command-line context rather than a ribbon.
+Key insight: Revit users expect **context-sensitive tools** — the active object type changes what's available. ItsJustCAD could surface this via the deck/command-line context rather than a ribbon.
 
 ### Mouse Navigation
 
@@ -258,7 +258,7 @@ Source: Mashyo "How to Navigate in Revit: Zoom, Orbit, Pan"; Autodesk navigation
 
 ### No Command Line
 
-Revit has no persistent command line. Commands are initiated only via ribbon, keyboard shortcuts, or right-click context menus. This is the sharpest contrast with AutoCAD/Rhino — mydrafter's command-line-first approach will feel more like AutoCAD/Rhino to Revit migrants.
+Revit has no persistent command line. Commands are initiated only via ribbon, keyboard shortcuts, or right-click context menus. This is the sharpest contrast with AutoCAD/Rhino — ItsJustCAD's command-line-first approach will feel more like AutoCAD/Rhino to Revit migrants.
 
 ---
 
@@ -301,13 +301,13 @@ Source: Autodesk support "Ribbon and Palette icons are too small on high-resolut
 1. **AutoCAD**: stores icons at multiple resolutions in CUI; scales ribbon via Windows DPI awareness.
 2. **Rhino**: uses OS-level scaling (HiDPI retina on Mac; DPI awareness on Windows).
 3. **Revit**: fully DPI-aware via WPF; all UI elements scale with Windows display settings.
-4. **Pattern for mydrafter**: declare DPI awareness, scale viewport content independently from UI chrome, use egui's built-in pixels_per_point for crisp rendering.
+4. **Pattern for ItsJustCAD**: declare DPI awareness, scale viewport content independently from UI chrome, use egui's built-in pixels_per_point for crisp rendering.
 
 ---
 
 ## Preset Table
 
-This table is the direct source for implementing mydrafter theme presets.
+This table is the direct source for implementing ItsJustCAD theme presets.
 
 ### AutoCAD Preset
 
@@ -370,11 +370,11 @@ This table is the direct source for implementing mydrafter theme presets.
 
 ---
 
-## Implementation Notes for mydrafter
+## Implementation Notes for ItsJustCAD
 
-1. **Theme switcher**: three named presets ("AutoCAD", "Rhino", "Revit") loadable at runtime. Store in `~/.config/mydrafter/ui.json` under a `theme` key.
+1. **Theme switcher**: three named presets ("AutoCAD", "Rhino", "Revit") loadable at runtime. Store in `~/.config/itsjustcad/ui.json` under a `theme` key.
 
-2. **Command-line position**: make it configurable top vs bottom. AutoCAD veterans expect bottom; Rhino users expect top. Default mydrafter to bottom (AutoCAD convention is larger user base).
+2. **Command-line position**: make it configurable top vs bottom. AutoCAD veterans expect bottom; Rhino users expect top. Default ItsJustCAD to bottom (AutoCAD convention is larger user base).
 
 3. **Right-click behavior**: expose as a preference — "Repeat last command" (Rhino) vs "Context menu" (AutoCAD/Revit). Rhino convention strongly preferred by power users.
 

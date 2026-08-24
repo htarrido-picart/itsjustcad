@@ -1,7 +1,7 @@
 //! CLI smoke test: streams one prompt through the active deck.
-//! Usage: cargo run -p mydrafter-deck --example chat -- "make three boxes"
+//! Usage: cargo run -p itsjustcad-deck --example chat -- "make three boxes"
 
-use mydrafter_deck::{make_deck, system_prompt, ChatMessage, ChatRequest, DeckDelta, DecksFile, Role};
+use itsjustcad_deck::{make_deck, system_prompt, ChatMessage, ChatRequest, DeckDelta, DecksFile, Role};
 
 #[tokio::main]
 async fn main() {
@@ -13,7 +13,7 @@ async fn main() {
     let deck = make_deck(config);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let req = ChatRequest::text(
-        system_prompt("", &mydrafter_commands::PluginRegistry::new()),
+        system_prompt("", &itsjustcad_commands::PluginRegistry::new()),
         vec![ChatMessage { role: Role::User, content: prompt }],
         String::new(),
         2048,

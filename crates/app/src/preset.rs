@@ -1,4 +1,4 @@
-//! Legacy-CAD skin presets — AutoCAD, Rhino, Revit, or mydrafter default.
+//! Legacy-CAD skin presets — AutoCAD, Rhino, Revit, or ItsJustCAD default.
 //!
 //! Each preset encodes: viewport background, grid colors, ui/cmd font size,
 //! accent color, command-line flavor, right-click repeat-last flag, and
@@ -14,7 +14,7 @@ pub enum CadOrigin {
     AutoCAD,
     Rhino,
     Revit,
-    /// mydrafter default (no legacy skin).
+    /// ItsJustCAD default (no legacy skin).
     #[default]
     None,
 }
@@ -25,7 +25,7 @@ impl CadOrigin {
             CadOrigin::AutoCAD => "AutoCAD",
             CadOrigin::Rhino => "Rhino",
             CadOrigin::Revit => "Revit",
-            CadOrigin::None => "mydrafter default",
+            CadOrigin::None => "ItsJustCAD default",
         }
     }
 }
@@ -272,7 +272,7 @@ pub const REVIT: UiPreset = UiPreset {
     cmd_font_px: 13.0,
     right_click_repeat_last: false,
     aliases: &[],
-    // Revit has no command line; we still dock one (mydrafter is command-first),
+    // Revit has no command line; we still dock one (ItsJustCAD is command-first),
     // but keep it at the bottom and use AutoCAD-style ribbon-ish menus.
     command_line_pos: CommandLinePos::Bottom,
     panel_side: PanelSide::Right,
@@ -280,9 +280,9 @@ pub const REVIT: UiPreset = UiPreset {
     menu_style: MenuStyle::AutoCAD,
 };
 
-// ── mydrafter default ─────────────────────────────────────────────────────────
+// ── ItsJustCAD default ─────────────────────────────────────────────────────────
 
-pub const MYDRAFTER_DEFAULT: UiPreset = UiPreset {
+pub const ITSJUSTCAD_DEFAULT: UiPreset = UiPreset {
     bg_color: [0.13, 0.14, 0.16, 1.0],
     grid_major_color: [0.22, 0.24, 0.27, 1.0],
     grid_minor_color: [0.18, 0.19, 0.21, 1.0],
@@ -292,7 +292,7 @@ pub const MYDRAFTER_DEFAULT: UiPreset = UiPreset {
     cmd_font_px: 13.0,
     right_click_repeat_last: false,
     aliases: &[],
-    // mydrafter default adopts the Rhino-style arrangement (task M-uilayout):
+    // ItsJustCAD default adopts the Rhino-style arrangement (task M-uilayout):
     // command line on top, right tab panel, 4-up viewports, Rhino menu grouping.
     command_line_pos: CommandLinePos::Top,
     panel_side: PanelSide::Right,
@@ -306,7 +306,7 @@ pub fn preset_for(origin: CadOrigin) -> &'static UiPreset {
         CadOrigin::AutoCAD => &AUTOCAD,
         CadOrigin::Rhino => &RHINO,
         CadOrigin::Revit => &REVIT,
-        CadOrigin::None => &MYDRAFTER_DEFAULT,
+        CadOrigin::None => &ITSJUSTCAD_DEFAULT,
     }
 }
 
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(preset_for(CadOrigin::AutoCAD).bg_color, AUTOCAD.bg_color);
         assert_eq!(preset_for(CadOrigin::Rhino).bg_color, RHINO.bg_color);
         assert_eq!(preset_for(CadOrigin::Revit).bg_color, REVIT.bg_color);
-        assert_eq!(preset_for(CadOrigin::None).bg_color, MYDRAFTER_DEFAULT.bg_color);
+        assert_eq!(preset_for(CadOrigin::None).bg_color, ITSJUSTCAD_DEFAULT.bg_color);
     }
 
     // ── expand_alias ──────────────────────────────────────────────────────────
@@ -572,11 +572,11 @@ mod tests {
     }
 
     #[test]
-    fn mydrafter_default_is_rhino_arrangement() {
-        // Task M-uilayout: Rhino-default arrangement even for the mydrafter skin.
-        assert_eq!(MYDRAFTER_DEFAULT.command_line_pos, CommandLinePos::Top);
-        assert_eq!(MYDRAFTER_DEFAULT.default_viewports, 4);
-        assert_eq!(MYDRAFTER_DEFAULT.menu_style, MenuStyle::Rhino);
+    fn itsjustcad_default_is_rhino_arrangement() {
+        // Task M-uilayout: Rhino-default arrangement even for the ItsJustCAD skin.
+        assert_eq!(ITSJUSTCAD_DEFAULT.command_line_pos, CommandLinePos::Top);
+        assert_eq!(ITSJUSTCAD_DEFAULT.default_viewports, 4);
+        assert_eq!(ITSJUSTCAD_DEFAULT.menu_style, MenuStyle::Rhino);
     }
 
     // ── token sets ────────────────────────────────────────────────────────────
@@ -597,9 +597,9 @@ mod tests {
 
     #[test]
     fn tokens_type_scale_follows_font_px() {
-        let t = MYDRAFTER_DEFAULT.tokens();
-        assert_eq!(t.type_scale.command, MYDRAFTER_DEFAULT.cmd_font_px);
-        assert_eq!(t.type_scale.body, MYDRAFTER_DEFAULT.ui_font_px);
+        let t = ITSJUSTCAD_DEFAULT.tokens();
+        assert_eq!(t.type_scale.command, ITSJUSTCAD_DEFAULT.cmd_font_px);
+        assert_eq!(t.type_scale.body, ITSJUSTCAD_DEFAULT.ui_font_px);
         assert!(t.type_scale.small < t.type_scale.body);
     }
 }

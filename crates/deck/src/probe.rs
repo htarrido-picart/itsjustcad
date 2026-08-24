@@ -134,7 +134,7 @@ pub async fn probe(config: &DeckConfig) -> Result<ProbeInfo, String> {
             let Some(key) = config.resolved_key() else {
                 let hint = config.api_key.as_deref().unwrap_or("api_key");
                 return Err(format!(
-                    "no API key ({hint} not set) — add it to ~/.config/mydrafter/decks.json or export the env var"
+                    "no API key ({hint} not set) — add it to ~/.config/itsjustcad/decks.json or export the env var"
                 ));
             };
             let response = client

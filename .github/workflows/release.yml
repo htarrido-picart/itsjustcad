@@ -19,23 +19,23 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: mydrafter-linux-x86_64
-            binary: mydrafter
+            artifact: itsjustcad-linux-x86_64
+            binary: itsjustcad
 
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: mydrafter-macos-aarch64
-            binary: mydrafter
+            artifact: itsjustcad-macos-aarch64
+            binary: itsjustcad
 
           - os: macos-13
             target: x86_64-apple-darwin
-            artifact: mydrafter-macos-x86_64
-            binary: mydrafter
+            artifact: itsjustcad-macos-x86_64
+            binary: itsjustcad
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: mydrafter-windows-x86_64
-            binary: mydrafter.exe
+            artifact: itsjustcad-windows-x86_64
+            binary: itsjustcad.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -69,7 +69,7 @@ jobs:
 
       # ── Build ──────────────────────────────────────────────────────────
       - name: Build release binary
-        run: cargo build -p mydrafter --release --target ${{ matrix.target }}
+        run: cargo build -p itsjustcad --release --target ${{ matrix.target }}
 
       # ── Stage artifact ─────────────────────────────────────────────────
       - name: Stage artifact (Unix)
@@ -91,8 +91,8 @@ jobs:
       - name: Build macOS .app bundle (unsigned)
         if: runner.os == 'macOS'
         run: |
-          BINARY="target/${{ matrix.target }}/release/mydrafter"
-          APP="staging/mydrafter.app"
+          BINARY="target/${{ matrix.target }}/release/itsjustcad"
+          APP="staging/ItsJustCAD.app"
           MACOS="$APP/Contents/MacOS"
           RESOURCES="$APP/Contents/Resources"
           mkdir -p "$MACOS" "$RESOURCES"
@@ -104,17 +104,17 @@ jobs:
           <plist version="1.0">
           <dict>
               <key>CFBundleName</key>
-              <string>mydrafter</string>
+              <string>ItsJustCAD</string>
               <key>CFBundleDisplayName</key>
-              <string>mydrafter</string>
+              <string>ItsJustCAD</string>
               <key>CFBundleIdentifier</key>
-              <string>io.mydrafter.mydrafter</string>
+              <string>com.itsjustcad.app</string>
               <key>CFBundleVersion</key>
               <string>${{ github.ref_name }}</string>
               <key>CFBundleShortVersionString</key>
               <string>${{ github.ref_name }}</string>
               <key>CFBundleExecutable</key>
-              <string>mydrafter</string>
+              <string>ItsJustCAD</string>
               <key>CFBundleIconFile</key>
               <string>icon</string>
               <key>CFBundlePackageType</key>
@@ -129,14 +129,14 @@ jobs:
           </plist>
           PLIST
 
-          cp "$BINARY" "$MACOS/mydrafter"
-          chmod +x "$MACOS/mydrafter"
+          cp "$BINARY" "$MACOS/ItsJustCAD"
+          chmod +x "$MACOS/ItsJustCAD"
 
           if [[ -f assets/icon/icon.icns ]]; then
             cp assets/icon/icon.icns "$RESOURCES/icon.icns"
           fi
 
-          tar -czvf ${{ matrix.artifact }}-app.tar.gz -C staging mydrafter.app
+          tar -czvf ${{ matrix.artifact }}-app.tar.gz -C staging ItsJustCAD.app
 
       # ── Upload artifacts ───────────────────────────────────────────────
       - name: Upload binary archive (Unix)
@@ -179,7 +179,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          name: mydrafter ${{ github.ref_name }}
+          name: ItsJustCAD ${{ github.ref_name }}
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true

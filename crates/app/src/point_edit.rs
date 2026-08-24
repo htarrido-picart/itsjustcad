@@ -5,9 +5,9 @@
 //! contract as the gumball) so the op-log stays authoritative and undo works.
 
 use glam::{DVec3, Mat4};
-use mydrafter_commands::{Command, Selector};
+use itsjustcad_commands::{Command, Selector};
 use kernel_curve::Curve;
-use mydrafter_doc::{Document, Geometry, ObjectId};
+use itsjustcad_doc::{Document, Geometry, ObjectId};
 
 const HANDLE_PX: f32 = 5.0;
 const HIT_PX: f32 = 8.0;

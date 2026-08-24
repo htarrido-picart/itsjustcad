@@ -544,7 +544,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "blocklib",
             usage: "blocklib [list]",
-            summary: "List block names in the on-disk library (~/.config/mydrafter/blocks/). Example: blocklib",
+            summary: "List block names in the on-disk library (~/.config/itsjustcad/blocks/). Example: blocklib",
             category: Category::Annotate,
         },
         CommandSpec {

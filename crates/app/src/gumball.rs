@@ -5,8 +5,8 @@
 //! the op-log stays the single source of truth and undo works.
 
 use glam::{DMat4, DVec3, Mat4};
-use mydrafter_commands::{Command, Selector};
-use mydrafter_doc::{Document, ObjectId};
+use itsjustcad_commands::{Command, Selector};
+use itsjustcad_doc::{Document, ObjectId};
 
 /// Screen-space sizes (logical px, pre-zoom).
 const AXIS_PX: f32 = 70.0;
@@ -326,8 +326,8 @@ fn pending_matrix(drag: &DragState) -> DMat4 {
     }
 }
 
-fn drag_readout(drag: &DragState, units: mydrafter_doc::Units) -> String {
-    let d = || mydrafter_doc::format_length(units, drag.current - drag.start);
+fn drag_readout(drag: &DragState, units: itsjustcad_doc::Units) -> String {
+    let d = || itsjustcad_doc::format_length(units, drag.current - drag.start);
     match drag.handle {
         Handle::MoveX => format!("dx {}", d()),
         Handle::MoveY => format!("dy {}", d()),

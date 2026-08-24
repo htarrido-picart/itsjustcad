@@ -5,7 +5,7 @@
 //! meshes export their feature edges as LINE entities.
 
 use glam::DVec3;
-use mydrafter_doc::{Annotation, Document, Geometry};
+use itsjustcad_doc::{Annotation, Document, Geometry};
 
 /// Chord tolerance for tessellating curves R12 cannot represent (meters).
 const EXPORT_TOL: f64 = 0.005;
@@ -92,7 +92,7 @@ fn text(t: &mut Tags, layer: &str, pos: DVec3, height: f64, content: &str) {
 }
 
 /// One document object -> zero or more entities. Returns entities written.
-fn entity(t: &mut Tags, layer: &str, geometry: &Geometry, units: mydrafter_doc::Units) -> usize {
+fn entity(t: &mut Tags, layer: &str, geometry: &Geometry, units: itsjustcad_doc::Units) -> usize {
     match geometry {
         Geometry::Curve(curve) => match curve {
             kernel_curve::Curve::Line { a, b } => {
@@ -141,13 +141,13 @@ fn entity(t: &mut Tags, layer: &str, geometry: &Geometry, units: mydrafter_doc::
                 let left = DVec3::new(-dir.y, dir.x, 0.0) * *offset;
                 line(t, layer, *a + left, *b + left);
                 let mid = (*a + *b) / 2.0 + left;
-                text(t, layer, mid, 0.2, &mydrafter_doc::format_length(units, (*b - *a).length()));
+                text(t, layer, mid, 0.2, &itsjustcad_doc::format_length(units, (*b - *a).length()));
                 2
             }
             Annotation::Text { pos, text: s, height } => {
                 // Tessellate via Hershey stroke font to world-space polylines so
                 // the text renders at world scale consistently across all outputs.
-                let strokes = mydrafter_doc::hershey::text_strokes(s, [pos.x, pos.y], *height);
+                let strokes = itsjustcad_doc::hershey::text_strokes(s, [pos.x, pos.y], *height);
                 let n = strokes.len();
                 for poly in strokes {
                     let pts: Vec<DVec3> = poly
@@ -567,9 +567,9 @@ mod tests {
     // ---------- import ----------
 
     use crate::Command;
-    use mydrafter_doc::Geometry as G;
+    use itsjustcad_doc::Geometry as G;
 
-    fn curve_of(obj: &mydrafter_doc::SceneObject) -> &kernel_curve::Curve {
+    fn curve_of(obj: &itsjustcad_doc::SceneObject) -> &kernel_curve::Curve {
         match &obj.geometry {
             G::Curve(c) => c,
             other => panic!("expected a curve, got {other:?}"),
@@ -621,7 +621,7 @@ mod tests {
         run(&mut s, "line 0,0,0 10,0,3");
         run(&mut s, "circle 20,0,0 2.5");
         run(&mut s, "arc 30,0,0 5 30 120");
-        let path = std::env::temp_dir().join("mydrafter_import_roundtrip.dxf");
+        let path = std::env::temp_dir().join("itsjustcad_import_roundtrip.dxf");
         run(&mut s, &format!("export {}", path.display()));
 
         let mut s2 = Session::default();
@@ -633,7 +633,7 @@ mod tests {
         assert!(out.message.contains("(0 skipped)"), "{}", out.message);
         assert_eq!(out.created.len(), 5);
         assert_eq!(s2.doc.len(), s.doc.len());
-        assert_eq!(s2.doc.current_layer, mydrafter_doc::DEFAULT_LAYER);
+        assert_eq!(s2.doc.current_layer, itsjustcad_doc::DEFAULT_LAYER);
 
         // Same order, same layers (lowercased round-trip), same geometry.
         for (a, b) in s.doc.objects().zip(s2.doc.objects()) {
@@ -672,7 +672,7 @@ mod tests {
         run(&mut s, "layer walls");
         run(&mut s, "polyline 0,0 5,0 5,5 closed");
         run(&mut s, "circle 8,0,0 1.5");
-        let path = std::env::temp_dir().join("mydrafter_import_replay.dxf");
+        let path = std::env::temp_dir().join("itsjustcad_import_replay.dxf");
         run(&mut s, &format!("export {}", path.display()));
 
         let mut s2 = Session::default();
@@ -743,7 +743,7 @@ mod tests {
         let mut s = Session::default();
         run(&mut s, "circle 0,0,0 3");
         run(&mut s, "arc 10,0,0 2 300 60"); // wraps through 0 degrees
-        let path = std::env::temp_dir().join("mydrafter_import_arcs.dxf");
+        let path = std::env::temp_dir().join("itsjustcad_import_arcs.dxf");
         run(&mut s, &format!("export {}", path.display()));
         let mut s2 = Session::default();
         run(&mut s2, &format!("import {}", path.display()));
@@ -764,7 +764,7 @@ mod tests {
     fn mesh_feature_edges_import_as_lines_one_op_each() {
         let mut s = Session::default();
         run(&mut s, "box 0,0,0 2,2,2");
-        let path = std::env::temp_dir().join("mydrafter_import_box.dxf");
+        let path = std::env::temp_dir().join("itsjustcad_import_box.dxf");
         run(&mut s, &format!("export {}", path.display()));
         let mut s2 = Session::default();
         run(&mut s2, &format!("import {}", path.display()));
@@ -788,7 +788,7 @@ mod tests {
         assert!(err.to_string().contains("cannot read"), "{err}");
 
         // A file named .dxf but with garbage content should fail with a parse error.
-        let path = std::env::temp_dir().join("mydrafter_not_a_dxf.dxf");
+        let path = std::env::temp_dir().join("itsjustcad_not_a_dxf.dxf");
         std::fs::write(&path, "hello\nworld\nagain\n").unwrap();
         let err = s
             .run(Command::Import { path: path.display().to_string() })

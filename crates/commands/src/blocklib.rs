@@ -1,11 +1,11 @@
-//! Block content library: on-disk ~/.config/mydrafter/blocks/*.block.json
+//! Block content library: on-disk ~/.config/itsjustcad/blocks/*.block.json
 //! with a starter set embedded from assets/blocks/ and seeded on first run.
 //!
 //! Commands: `blocklib list`, `blockload <name>`, `blocksave <name>`.
 
 use std::path::PathBuf;
 
-use mydrafter_doc::BlockGeometry;
+use itsjustcad_doc::BlockGeometry;
 use serde::{Deserialize, Serialize};
 
 /// On-disk format for a `.block.json` file.
@@ -45,17 +45,17 @@ pub(crate) static STARTER_BLOCKS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Returns `~/.config/mydrafter/blocks/`.
+/// Returns `~/.config/itsjustcad/blocks/`.
 pub fn blocklib_dir() -> Option<PathBuf> {
     Some(
         dirs::home_dir()?
             .join(".config")
-            .join("mydrafter")
+            .join("itsjustcad")
             .join("blocks"),
     )
 }
 
-/// Seed `~/.config/mydrafter/blocks/` from the embedded starter blocks if the
+/// Seed `~/.config/itsjustcad/blocks/` from the embedded starter blocks if the
 /// directory does not exist or is empty. Silently skips on any I/O error.
 pub fn seed_if_empty() {
     let Some(dir) = blocklib_dir() else { return };
@@ -202,7 +202,7 @@ mod tests {
 
     fn tmp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir()
-            .join("mydrafter_blocklib_tests")
+            .join("itsjustcad_blocklib_tests")
             .join(label);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();

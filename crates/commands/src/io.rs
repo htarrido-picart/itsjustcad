@@ -13,9 +13,15 @@ pub const CHECKPOINT_VERSION: u32 = 1;
 /// reproducing identical ids; branches are seeded verbatim (replayed only when
 /// switched to). `branches`/`branch` are serde-default so pre-branch files load
 /// unchanged, and are omitted from the output when there are no branches.
+///
+/// The version field is written as `"itsjustcad"` but reads either spelling:
+/// `#[serde(alias = "mydrafter")]` accepts the historical key, so every file
+/// ever written by the old product still loads. The "v1 replays forever"
+/// promise holds across the rename — see FORMAT.md.
 #[derive(Serialize, Deserialize)]
 struct FileFormat {
-    mydrafter: u32,
+    #[serde(alias = "mydrafter")]
+    itsjustcad: u32,
     ops: Vec<Command>,
     /// Named branches of the op-log (each a saved effective log). Empty for
     /// files with no design options.
@@ -29,7 +35,7 @@ struct FileFormat {
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoError {
-    #[error("not a mydrafter file: {0}")]
+    #[error("not an itsjustcad file: {0}")]
     BadFormat(#[from] serde_json::Error),
     #[error("unsupported format version {0} (this build reads {FORMAT_VERSION})")]
     BadVersion(u32),
@@ -45,7 +51,7 @@ pub fn to_json(session: &Session) -> String {
     // branchless file stays byte-identical to the pre-branch format.
     let branch = (!branches.is_empty()).then(|| session.current_branch().to_string());
     let file = FileFormat {
-        mydrafter: FORMAT_VERSION,
+        itsjustcad: FORMAT_VERSION,
         ops: session.save_log(),
         branches,
         branch,
@@ -55,8 +61,8 @@ pub fn to_json(session: &Session) -> String {
 
 pub fn from_json(json: &str) -> Result<Session, IoError> {
     let file: FileFormat = serde_json::from_str(json)?;
-    if file.mydrafter != FORMAT_VERSION {
-        return Err(IoError::BadVersion(file.mydrafter));
+    if file.itsjustcad != FORMAT_VERSION {
+        return Err(IoError::BadVersion(file.itsjustcad));
     }
     let mut session = Session::replay(file.ops)?;
     session.set_branches(
@@ -75,7 +81,7 @@ struct Checkpoint {
     /// Number of forward ops the snapshot reflects; must match the op-log's
     /// length for the snapshot to be trusted.
     op_count: usize,
-    doc: mydrafter_doc::Document,
+    doc: itsjustcad_doc::Document,
 }
 
 /// Sidecar path for a document: `<file>.checkpoint`.
@@ -114,8 +120,8 @@ pub fn save_file(session: &Session, path: &std::path::Path) -> Result<(), IoErro
 pub fn load_file(path: &std::path::Path) -> Result<Session, IoError> {
     let json = std::fs::read_to_string(path)?;
     let file: FileFormat = serde_json::from_str(&json)?;
-    if file.mydrafter != FORMAT_VERSION {
-        return Err(IoError::BadVersion(file.mydrafter));
+    if file.itsjustcad != FORMAT_VERSION {
+        return Err(IoError::BadVersion(file.itsjustcad));
     }
 
     let branch = file.branch.unwrap_or_else(|| crate::exec::MAIN_BRANCH.to_string());
@@ -196,8 +202,8 @@ mod tests {
         }"#;
         let s = from_json(json).unwrap();
         assert_eq!(s.doc.len(), 1);
-        assert_eq!(s.doc.current_layer, mydrafter_doc::DEFAULT_LAYER);
-        assert!(s.doc.objects().all(|o| o.layer == mydrafter_doc::DEFAULT_LAYER));
+        assert_eq!(s.doc.current_layer, itsjustcad_doc::DEFAULT_LAYER);
+        assert!(s.doc.objects().all(|o| o.layer == itsjustcad_doc::DEFAULT_LAYER));
         assert_eq!(s.doc.layers.len(), 1);
     }
 
@@ -256,7 +262,7 @@ mod tests {
             ]
         }"#;
         let s = from_json(json).unwrap();
-        assert_eq!(s.doc.units, mydrafter_doc::Units::M);
+        assert_eq!(s.doc.units, itsjustcad_doc::Units::M);
     }
 
     #[test]
@@ -268,7 +274,7 @@ mod tests {
         let json = to_json(&s);
         assert!(json.contains("\"units\""), "{json}");
         let loaded = from_json(&json).unwrap();
-        assert_eq!(loaded.doc.units, mydrafter_doc::Units::FtIn);
+        assert_eq!(loaded.doc.units, itsjustcad_doc::Units::FtIn);
         assert_eq!(to_json(&loaded), json);
     }
 
@@ -276,7 +282,7 @@ mod tests {
     fn save_load_preserves_named_views() {
         let mut s = Session::default();
         s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
-        let v = mydrafter_doc::NamedView {
+        let v = itsjustcad_doc::NamedView {
             target: [4.5, -2.0, 1.25],
             distance: 27.5,
             yaw: -0.75,
@@ -364,7 +370,7 @@ mod tests {
         s
     }
 
-    fn objects_of(s: &Session) -> Vec<mydrafter_doc::SceneObject> {
+    fn objects_of(s: &Session) -> Vec<itsjustcad_doc::SceneObject> {
         s.doc.objects().cloned().collect()
     }
 
@@ -383,7 +389,7 @@ mod tests {
 
     #[test]
     fn checkpoint_round_trips_and_skips_replay() {
-        let dir = std::env::temp_dir().join(format!("mydrafter_cp_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("itsjustcad_cp_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("scene.mydrafter");
         let s = built_session();
@@ -404,7 +410,7 @@ mod tests {
 
     #[test]
     fn stale_checkpoint_falls_back_to_replay() {
-        let dir = std::env::temp_dir().join(format!("mydrafter_stale_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("itsjustcad_stale_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("scene.mydrafter");
         let s = built_session();
@@ -454,6 +460,29 @@ mod tests {
         fast.run(Command::Redo).unwrap();
         assert_eq!(objects_of(&fast), before, "redo restores opened state");
         assert_eq!(fast.doc.sun, s.doc.sun);
+    }
+
+    #[test]
+    fn old_mydrafter_version_field_still_loads() {
+        // Backward-compat guarantee across the mydrafter → ItsJustCAD rename:
+        // a file written by the OLD product spells the version field
+        // `"mydrafter"`. The serde alias must accept it so no existing file
+        // ever fails to load. New saves write `"itsjustcad"`.
+        let old = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "box",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "size": [2.0, 2.0, 2.0]}
+            ]
+        }"#;
+        let s = from_json(old).expect("old mydrafter-keyed file loads");
+        assert_eq!(s.doc.len(), 1);
+        // And a fresh save now emits the new key while staying replay-stable.
+        let json = to_json(&s);
+        assert!(json.contains("\"itsjustcad\": 1"), "new key written: {json}");
+        assert!(!json.contains("\"mydrafter\""), "old key not re-emitted: {json}");
+        assert_eq!(to_json(&from_json(&json).unwrap()), json, "replay-stable");
     }
 
     #[test]

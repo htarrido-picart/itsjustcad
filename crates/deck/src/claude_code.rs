@@ -74,7 +74,7 @@ fn is_unscoped_read(tool: &str) -> bool {
 
 /// Claude via the local `claude` CLI as a hidden subprocess — uses the user's
 /// Claude subscription (OAuth), no API key. The CLI is transport only; the
-/// command substrate never leaves mydrafter.
+/// command substrate never leaves ItsJustCAD.
 pub struct ClaudeCodeDeck {
     name: String,
     model: String,
@@ -252,8 +252,8 @@ mod tests {
 
     #[test]
     fn vision_shot_becomes_a_path_scoped_read() {
-        let tools = scoped_allowed_tools(&[], Some("/tmp/mydrafter-critique.png"));
-        assert_eq!(tools, vec!["Read(/tmp/mydrafter-critique.png)".to_string()]);
+        let tools = scoped_allowed_tools(&[], Some("/tmp/itsjustcad-critique.png"));
+        assert_eq!(tools, vec!["Read(/tmp/itsjustcad-critique.png)".to_string()]);
     }
 
     #[test]

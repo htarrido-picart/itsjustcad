@@ -1,4 +1,6 @@
-Usage: mydrafter [OPTIONS]
+ItsJustCAD — It's just CAD
+
+Usage: itsjustcad [OPTIONS]
 
 Options:
   --help, -h                  Show this help
@@ -7,15 +9,20 @@ Options:
   --shot <path.png>           Render offscreen screenshot after running script
   --headless                  No window (required for --shot without a display)
 
+Scripts may also use app-level verbs: ze/zoomextents, the standard views
+(top/front/persp/…), camera <lens>, display <mode>, save [path], help [verb].
+These frame/style the --shot render. GUI-only verbs (template, critique) are
+ignored with a warning.
+
 Exit codes:
   0  success
   1  command error (failing line + error printed to stderr)
   2  file / IO error
 
 Env vars:
-  MYDRAFTER_RUN=<cmd;cmd>    Execute commands on startup (GUI mode)
-  MYDRAFTER_SHOT=<path.png>  Screenshot and exit (GUI mode)
-  MYDRAFTER_DECK_RUN=<text>  Send deck message on startup
+  ITSJUSTCAD_RUN=<cmd;cmd>    Execute commands on startup (GUI mode)
+  ITSJUSTCAD_SHOT=<path.png>  Screenshot and exit (GUI mode)
+  ITSJUSTCAD_DECK_RUN=<text>  Send deck message on startup
 
 Commands:
   box                  box <corner x,y,z> <size x,y,z>                    Axis-aligned box
@@ -100,6 +107,9 @@ Commands:
   block                block <selector> <name>                            Capture the geometry of selected objects as a named reusable block definition (like a symbol/component)
   insert               insert <name> <position x,y,z> [rotation_deg] [scale] Place an instance of a named block at a point with optional rotation (degrees CCW about Z) and uniform scale
   blocks               blocks                                             List all block definitions with their geometry counts (query only)
+  blocklib             blocklib [list]                                    List block names in the on-disk library (~/
+  blockload            blockload <name>                                   Load a library block into the document as a named definition ready to insert
+  blocksave            blocksave <name> [description]                     Save the named block definition from the document back to the library
   select               select <selector>                                  Set the selection
   selectnone           selectnone                                         Clear the selection
   undo                 undo                                               Undo the last geometry command

@@ -1,7 +1,7 @@
 use glam::DVec3;
 use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
-use mydrafter_doc::{
+use itsjustcad_doc::{
     format_area, format_length, format_volume, Annotation, Document, Geometry, LayerStyle,
     NamedView, ObjectId, SceneObject, ScheduleRow, SheetDim, SheetTable, Underlay, Units,
 };
@@ -81,12 +81,12 @@ enum Inverse {
     /// `underlay`/`underlayopacity`/`underlayoff`: restore the previous underlay.
     Underlay { prev: Option<Underlay> },
     /// `sun`/`sunoff`: restore the previous solar position.
-    Sun { prev: Option<mydrafter_doc::SunPosition> },
+    Sun { prev: Option<itsjustcad_doc::SunPosition> },
     /// `location` (also set as a side effect of `sun`): restore the previous
     /// observer location and solar position.
     Location {
-        prev_loc: Option<mydrafter_doc::GeoLocation>,
-        prev_sun: Option<mydrafter_doc::SunPosition>,
+        prev_loc: Option<itsjustcad_doc::GeoLocation>,
+        prev_sun: Option<itsjustcad_doc::SunPosition>,
     },
     /// `view save`: restore the previously saved view of that name (if any).
     ViewSaved {
@@ -112,7 +112,7 @@ enum Inverse {
     BlockDef {
         name: String,
         /// Previous definition (None if newly created).
-        prev: Option<Vec<mydrafter_doc::BlockGeometry>>,
+        prev: Option<Vec<itsjustcad_doc::BlockGeometry>>,
     },
 }
 
@@ -713,7 +713,7 @@ impl Session {
     fn import_epw(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
         let text = std::fs::read_to_string(&path)
             .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
-        let s = mydrafter_solar::parse_epw(&text)
+        let s = itsjustcad_solar::parse_epw(&text)
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
         // Log the location so saved files replay the site without the EPW file.
         self.run(Command::Location {
@@ -1462,19 +1462,19 @@ fn exec_shadow_study(
         let utc = (t as f64 - loc.tz_hours * 60.0).rem_euclid(1440.0);
         let (h, mi) = ((utc / 60.0) as u32, (utc % 60.0) as u32);
         let pos =
-            mydrafter_solar::solar_position(year, month, day, h, mi, loc.lat_deg, loc.lon_deg);
+            itsjustcad_solar::solar_position(year, month, day, h, mi, loc.lat_deg, loc.lon_deg);
         if pos.altitude_deg > 0.0 {
             stamps_up += 1;
-            let dir = mydrafter_solar::sun_direction(pos.azimuth_deg, pos.altitude_deg);
+            let dir = itsjustcad_solar::sun_direction(pos.azimuth_deg, pos.altitude_deg);
             let dir = [dir[0] as f64, dir[1] as f64, dir[2] as f64];
             let layer = format!("shadows-{}", fmt_hhmm(t));
             for obj in &object_pts {
                 let ground: Vec<[f64; 2]> = obj
                     .iter()
-                    .filter_map(|&p| mydrafter_solar::project_to_ground(p, dir))
+                    .filter_map(|&p| itsjustcad_solar::project_to_ground(p, dir))
                     .map(|g| [g[0], g[1]])
                     .collect();
-                let hull = mydrafter_solar::convex_hull_xy(ground);
+                let hull = itsjustcad_solar::convex_hull_xy(ground);
                 if hull.len() >= 3 {
                     polys.push(Poly {
                         layer: layer.clone(),
@@ -1596,7 +1596,7 @@ fn exec_sun_hours(
     for slot in 0..48 {
         let local_min = slot * 30;
         let utc = (local_min as f64 - loc.tz_hours * 60.0).rem_euclid(1440.0);
-        let pos = mydrafter_solar::solar_position(
+        let pos = itsjustcad_solar::solar_position(
             year,
             month,
             day,
@@ -1606,7 +1606,7 @@ fn exec_sun_hours(
             loc.lon_deg,
         );
         if pos.altitude_deg > 0.0 {
-            let d = mydrafter_solar::sun_direction(pos.azimuth_deg, pos.altitude_deg);
+            let d = itsjustcad_solar::sun_direction(pos.azimuth_deg, pos.altitude_deg);
             sun_dirs.push([d[0] as f64, d[1] as f64, d[2] as f64]);
         }
     }
@@ -2416,13 +2416,13 @@ fn apply_forward(
                 ));
             }
             let pattern_spacing = match &pattern {
-                mydrafter_doc::HatchPattern::Lines { spacing, .. }
-                | mydrafter_doc::HatchPattern::Crosshatch { spacing, .. }
-                | mydrafter_doc::HatchPattern::Brick { spacing }
-                | mydrafter_doc::HatchPattern::Concrete { spacing }
-                | mydrafter_doc::HatchPattern::Insulation { spacing }
-                | mydrafter_doc::HatchPattern::Earth { spacing } => Some(*spacing),
-                mydrafter_doc::HatchPattern::Solid => None,
+                itsjustcad_doc::HatchPattern::Lines { spacing, .. }
+                | itsjustcad_doc::HatchPattern::Crosshatch { spacing, .. }
+                | itsjustcad_doc::HatchPattern::Brick { spacing }
+                | itsjustcad_doc::HatchPattern::Concrete { spacing }
+                | itsjustcad_doc::HatchPattern::Insulation { spacing }
+                | itsjustcad_doc::HatchPattern::Earth { spacing } => Some(*spacing),
+                itsjustcad_doc::HatchPattern::Solid => None,
             };
             if let Some(sp) = pattern_spacing
                 && sp <= 0.0
@@ -3464,10 +3464,10 @@ fn apply_forward(
         Command::Sun { azimuth_deg, altitude_deg, lat_deg, lon_deg } => {
             let prev_sun = doc.sun;
             let prev_loc = doc.location;
-            doc.sun = Some(mydrafter_doc::SunPosition { azimuth_deg, altitude_deg });
+            doc.sun = Some(itsjustcad_doc::SunPosition { azimuth_deg, altitude_deg });
             // Record the observer location so environmental analyses can reuse
             // it. tz is UTC (0) because `sun` takes UTC clock times.
-            doc.location = Some(mydrafter_doc::GeoLocation { lat_deg, lon_deg, tz_hours: 0.0 });
+            doc.location = Some(itsjustcad_doc::GeoLocation { lat_deg, lon_deg, tz_hours: 0.0 });
             doc.generation += 1;
             Ok((
                 Command::Sun { azimuth_deg, altitude_deg, lat_deg, lon_deg },
@@ -3483,7 +3483,7 @@ fn apply_forward(
         Command::Location { lat_deg, lon_deg, tz_hours } => {
             let prev_loc = doc.location;
             let prev_sun = doc.sun;
-            doc.location = Some(mydrafter_doc::GeoLocation { lat_deg, lon_deg, tz_hours });
+            doc.location = Some(itsjustcad_doc::GeoLocation { lat_deg, lon_deg, tz_hours });
             doc.generation += 1;
             Ok((
                 Command::Location { lat_deg, lon_deg, tz_hours },
@@ -3521,7 +3521,7 @@ fn apply_forward(
                 )));
             }
             let (w, h) = paper.landscape_mm();
-            doc.sheets.push(mydrafter_doc::Sheet {
+            doc.sheets.push(itsjustcad_doc::Sheet {
                 name: name.clone(),
                 paper,
                 views: Vec::new(),
@@ -3549,7 +3549,7 @@ fn apply_forward(
                     known.join(", ")
                 )));
             };
-            s.views.push(mydrafter_doc::SheetView { direction, scale });
+            s.views.push(itsjustcad_doc::SheetView { direction, scale });
             let count = s.views.len();
             doc.generation += 1;
             Ok((
@@ -3992,7 +3992,7 @@ fn apply_forward(
             ))
         }
         Command::BlockDefine { targets, name, geometries } => {
-            use mydrafter_doc::BlockGeometry;
+            use itsjustcad_doc::BlockGeometry;
             let ids = resolve(doc, &targets)?;
             // Snapshot geometry from source objects.
             let snaps: Vec<BlockGeometry> = if let Some(g) = geometries {
@@ -4111,7 +4111,7 @@ fn apply_forward(
             ))
         }
         Command::BlockLibLoad { name, geometries } => {
-            use mydrafter_doc::BlockGeometry;
+            use itsjustcad_doc::BlockGeometry;
             let snaps: Vec<BlockGeometry> = if let Some(g) = geometries {
                 // Replay path: use stored geometries.
                 g
@@ -5870,7 +5870,7 @@ mod tests {
         assert_eq!(boundary.len(), 4);
         assert!(matches!(
             pattern,
-            mydrafter_doc::HatchPattern::Lines { angle_deg, spacing }
+            itsjustcad_doc::HatchPattern::Lines { angle_deg, spacing }
                 if *angle_deg == 45.0 && *spacing == 0.5
         ));
         run(&mut s, "undo");
@@ -5922,7 +5922,7 @@ mod tests {
 
     #[test]
     fn sheet_create_view_undo_redo() {
-        use mydrafter_doc::{PaperSize, ViewDirection};
+        use itsjustcad_doc::{PaperSize, ViewDirection};
         let mut s = Session::default();
         let out = run(&mut s, "sheet plan a1");
         assert!(out.message.contains("841x594mm"), "{}", out.message);
@@ -6145,7 +6145,7 @@ mod tests {
 
     /// Write a `w`x`h` PNG to a temp path and return it.
     fn temp_png(w: u32, h: u32, tag: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("mydrafter_underlay_{tag}_{w}x{h}.png"));
+        let path = std::env::temp_dir().join(format!("itsjustcad_underlay_{tag}_{w}x{h}.png"));
         let img = image::RgbaImage::from_pixel(w, h, image::Rgba([200, 100, 50, 255]));
         img.save(&path).unwrap();
         path
@@ -6541,7 +6541,7 @@ mod tests {
     #[test]
     fn import_epw_sets_location_and_reports_stats() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("mydrafter_epw_test");
+        let dir = std::env::temp_dir().join("itsjustcad_epw_test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("site.epw");
         let mut f = std::fs::File::create(&path).unwrap();
@@ -6606,7 +6606,7 @@ mod tests {
         // Insert an instance.
         run(&mut s, "insert mytree 5,0,0");
         let last = s.doc.objects().last().unwrap();
-        assert!(matches!(last.geometry, mydrafter_doc::Geometry::Instance { ref block, .. } if block == "mytree"));
+        assert!(matches!(last.geometry, itsjustcad_doc::Geometry::Instance { ref block, .. } if block == "mytree"));
     }
 
     #[test]
@@ -6617,7 +6617,7 @@ mod tests {
         run(&mut s, "insert door 3,0,0 90 2");
         let obj = s.doc.objects().last().unwrap();
         match &obj.geometry {
-            mydrafter_doc::Geometry::Instance { block, position, rotation_deg, scale } => {
+            itsjustcad_doc::Geometry::Instance { block, position, rotation_deg, scale } => {
                 assert_eq!(block, "door");
                 assert!((position.x - 3.0).abs() < 1e-9);
                 assert!((rotation_deg - 90.0).abs() < 1e-9);
@@ -6706,7 +6706,7 @@ mod tests {
         use crate::blocklib::{load_from_dir, seed_dir};
         let tmp = {
             let dir = std::env::temp_dir()
-                .join("mydrafter_exec_blockload")
+                .join("itsjustcad_exec_blockload")
                 .join(format!("{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             dir
@@ -6722,7 +6722,7 @@ mod tests {
         assert_eq!(s.doc.len(), 2, "two tree instances inserted");
         for obj in s.doc.objects() {
             assert!(
-                matches!(&obj.geometry, mydrafter_doc::Geometry::Instance { block, .. } if block == "tree"),
+                matches!(&obj.geometry, itsjustcad_doc::Geometry::Instance { block, .. } if block == "tree"),
                 "expected tree instance"
             );
         }
@@ -6735,7 +6735,7 @@ mod tests {
         // We inject a BlockLibLoad with pre-filled geometries (replay form)
         // so the test doesn't require the library directory to exist.
         use kernel_curve::Curve;
-        use mydrafter_doc::BlockGeometry;
+        use itsjustcad_doc::BlockGeometry;
 
         let geoms = vec![BlockGeometry::Curve(Curve::Arc {
             center: glam::DVec3::ZERO,
@@ -6764,7 +6764,7 @@ mod tests {
     #[test]
     fn blockload_undo_removes_definition() {
         use kernel_curve::Curve;
-        use mydrafter_doc::BlockGeometry;
+        use itsjustcad_doc::BlockGeometry;
 
         let geoms = vec![BlockGeometry::Curve(Curve::Line {
             a: glam::DVec3::ZERO,
@@ -6953,7 +6953,7 @@ mod tests {
     // ---- site: terrain / geojson import / osmfile ----
 
     fn write_tmp(name: &str, contents: &[u8]) -> String {
-        let path = std::env::temp_dir().join(format!("mydrafter_test_{name}"));
+        let path = std::env::temp_dir().join(format!("itsjustcad_test_{name}"));
         std::fs::write(&path, contents).unwrap();
         path.to_string_lossy().into_owned()
     }

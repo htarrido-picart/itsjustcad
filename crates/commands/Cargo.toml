@@ -1,12 +1,12 @@
 [package]
-name = "mydrafter-commands"
+name = "itsjustcad-commands"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-mydrafter-doc.workspace = true
-mydrafter-solar.workspace = true
+itsjustcad-doc.workspace = true
+itsjustcad-solar.workspace = true
 kernel-mesh.workspace = true
 kernel-curve.workspace = true
 glam.workspace = true

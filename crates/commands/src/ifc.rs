@@ -31,7 +31,7 @@
 
 use glam::{DMat4, DVec3};
 use kernel_mesh::Mesh;
-use mydrafter_doc::{Document, Geometry, Units, METERS_PER_FOOT, METERS_PER_INCH};
+use itsjustcad_doc::{Document, Geometry, Units, METERS_PER_FOOT, METERS_PER_INCH};
 
 // ============================================================================
 // EXPORT
@@ -96,17 +96,17 @@ pub fn export(doc: &Document, path: &str) -> Result<(Vec<u8>, String), String> {
     let application = ids.next();
     let owner_history = ids.next();
     line(&mut body, person, "IFCPERSON($,$,'',$,$,$,$,$)");
-    line(&mut body, org, "IFCORGANIZATION($,'mydrafter',$,$,$)");
+    line(&mut body, org, "IFCORGANIZATION($,'ItsJustCAD',$,$,$)");
     line(
         &mut body,
         person_and_org,
         &format!("IFCPERSONANDORGANIZATION(#{person},#{org},$)"),
     );
-    line(&mut body, app_dev, "IFCORGANIZATION($,'mydrafter',$,$,$)");
+    line(&mut body, app_dev, "IFCORGANIZATION($,'ItsJustCAD',$,$,$)");
     line(
         &mut body,
         application,
-        &format!("IFCAPPLICATION(#{app_dev},'0.1','mydrafter','mydrafter')"),
+        &format!("IFCAPPLICATION(#{app_dev},'0.1','ItsJustCAD','ItsJustCAD')"),
     );
     line(
         &mut body,
@@ -137,7 +137,7 @@ pub fn export(doc: &Document, path: &str) -> Result<(Vec<u8>, String), String> {
         &mut body,
         project,
         &format!(
-            "IFCPROJECT('{}',#{owner_history},'mydrafter project',$,$,$,$,(#{context}),#{unit_assignment})",
+            "IFCPROJECT('{}',#{owner_history},'ItsJustCAD project',$,$,$,$,(#{context}),#{unit_assignment})",
             guid(project)
         ),
     );
@@ -500,7 +500,7 @@ fn assemble(path: &str, body: &str, unit_note: &str) -> String {
         "ISO-10303-21;\n\
 HEADER;\n\
 FILE_DESCRIPTION(('ViewDefinition [CoordinationView]'),'2;1');\n\
-FILE_NAME('{name}','',(''),(''),'mydrafter','mydrafter','{note}');\n\
+FILE_NAME('{name}','',(''),(''),'ItsJustCAD','ItsJustCAD','{note}');\n\
 FILE_SCHEMA(('IFC4'));\n\
 ENDSEC;\n\
 DATA;\n\

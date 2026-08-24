@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mydrafter_commands::{Command, Session};
+use itsjustcad_commands::{Command, Session};
 
 /// Write `contents` to `path` with mode 0600 on unix (L-1 / M-3: config files
 /// such as transcripts must not be world-readable on multi-user hosts).
@@ -145,7 +145,7 @@ fn write_all(path: &Path, lines: &[String]) -> std::io::Result<()> {
 }
 
 pub fn default_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".config").join("mydrafter").join("journal"))
+    Some(dirs::home_dir()?.join(".config").join("itsjustcad").join("journal"))
 }
 
 /// Journals left by other (crashed) sessions, newest first by mtime.
@@ -178,7 +178,7 @@ pub fn load(path: &Path) -> Result<Session, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mydrafter_commands::parse;
+    use itsjustcad_commands::parse;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir()

@@ -1,4 +1,4 @@
-use mydrafter_commands::{registry, PluginRegistry, SELECTOR_HELP};
+use itsjustcad_commands::{registry, PluginRegistry, SELECTOR_HELP};
 
 /// Build the system prompt from the command registry (single source of truth)
 /// plus a compact scene digest. Regenerated every turn so the model always
@@ -26,7 +26,7 @@ pub fn system_prompt(scene_digest: &str, plugins: &PluginRegistry) -> String {
     );
 
     format!(
-        r#"You are the drafting companion inside mydrafter, a CAD program for architects. You model by emitting commands — the same commands the human types. Coordinates are meters, Z is up, the ground plane is z=0.
+        r#"You are the drafting companion inside ItsJustCAD, a CAD program for architects. You model by emitting commands — the same commands the human types. Coordinates are meters, Z is up, the ground plane is z=0.
 
 ## How to draw
 Emit commands inside a ```draft fenced block, ONE command per line. Commands execute live as you stream them. Text outside the block is chat shown to the architect. Keep chat brief.
@@ -75,7 +75,7 @@ box 10,0,0 4,4,3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mydrafter_commands::{Plugin, PluginParam};
+    use itsjustcad_commands::{Plugin, PluginParam};
 
     #[test]
     fn system_prompt_lists_every_registry_command() {

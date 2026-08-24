@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# bundle-macos.sh — Build a macOS .app bundle for mydrafter (unsigned).
+# bundle-macos.sh — Build a macOS .app bundle for ItsJustCAD (unsigned).
 #
 # Usage:  ./scripts/bundle-macos.sh [--release]
 #   --release   build with `cargo build --release` (default: debug)
 #
-# Output: dist/mydrafter.app
+# Output: dist/ItsJustCAD.app
 #
 # NOTE: The resulting bundle is unsigned and unnotarised.
 #       To distribute outside the developer machine you need:
-#         codesign --deep --force --sign "Developer ID Application: ..." dist/mydrafter.app
+#         codesign --deep --force --sign "Developer ID Application: ..." dist/ItsJustCAD.app
 #         xcrun notarytool submit ...
 #       Those steps require Apple developer credentials not included here.
 
@@ -17,7 +17,7 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DIST="$REPO_ROOT/dist"
-APP="$DIST/mydrafter.app"
+APP="$DIST/ItsJustCAD.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
@@ -38,12 +38,12 @@ for arg in "$@"; do
   esac
 done
 
-echo "==> Building mydrafter ($PROFILE)…"
+echo "==> Building ItsJustCAD ($PROFILE)…"
 cd "$REPO_ROOT"
 # shellcheck disable=SC2086
-cargo build -p mydrafter $RELEASE_FLAG
+cargo build -p itsjustcad $RELEASE_FLAG
 
-BINARY="$REPO_ROOT/target/$PROFILE/mydrafter"
+BINARY="$REPO_ROOT/target/$PROFILE/itsjustcad"
 if [[ ! -f "$BINARY" ]]; then
   echo "ERROR: binary not found at $BINARY" >&2
   exit 1
@@ -55,7 +55,7 @@ rm -rf "$APP"
 mkdir -p "$MACOS" "$RESOURCES"
 
 # Info.plist
-BUNDLE_ID="io.mydrafter.mydrafter"
+BUNDLE_ID="com.itsjustcad.app"
 VERSION="0.1.0"
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -64,9 +64,9 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>mydrafter</string>
+    <string>ItsJustCAD</string>
     <key>CFBundleDisplayName</key>
-    <string>mydrafter</string>
+    <string>ItsJustCAD</string>
     <key>CFBundleIdentifier</key>
     <string>${BUNDLE_ID}</string>
     <key>CFBundleVersion</key>
@@ -74,7 +74,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key>
     <string>${VERSION}</string>
     <key>CFBundleExecutable</key>
-    <string>mydrafter</string>
+    <string>ItsJustCAD</string>
     <key>CFBundleIconFile</key>
     <string>icon</string>
     <key>CFBundlePackageType</key>
@@ -92,8 +92,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 PLIST
 
 # Binary
-cp "$BINARY" "$MACOS/mydrafter"
-chmod +x "$MACOS/mydrafter"
+cp "$BINARY" "$MACOS/ItsJustCAD"
+chmod +x "$MACOS/ItsJustCAD"
 
 # Icon (icns)
 ICNS="$REPO_ROOT/assets/icon/icon.icns"
@@ -101,7 +101,7 @@ if [[ -f "$ICNS" ]]; then
   cp "$ICNS" "$RESOURCES/icon.icns"
 else
   echo "WARN: $ICNS not found — bundle will have no icon."
-  echo "      Run: cargo run -p mydrafter --example gen_icon"
+  echo "      Run: cargo run -p itsjustcad --example gen_icon"
   echo "      Then re-run this script."
 fi
 

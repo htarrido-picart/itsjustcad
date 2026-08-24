@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use glam::DVec3;
-use mydrafter_render::{OrbitCamera, SceneRenderer, Theme, DEPTH_FORMAT};
+use itsjustcad_render::{OrbitCamera, SceneRenderer, Theme, DEPTH_FORMAT};
 use wgpu::TextureFormat;
 
 const W: u32 = 640;
@@ -113,7 +113,7 @@ fn render_to_image(ctx: &GpuContext, renderer: &SceneRenderer, theme: Theme) -> 
             multiview_mask: None,
         });
         let mut pass = pass.forget_lifetime();
-        renderer.paint(&mut pass, 0, mydrafter_render::DisplayMode::Shaded);
+        renderer.paint(&mut pass, 0, itsjustcad_render::DisplayMode::Shaded);
     }
 
     let bytes_per_row = (W * 4).next_multiple_of(256);
@@ -205,7 +205,7 @@ fn make_renderer(
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
     renderer.set_meshes(&ctx.device, &meshes, 0);
     if !lines.is_empty() {
-        let data = mydrafter_render::SceneData {
+        let data = itsjustcad_render::SceneData {
             meshes: vec![],
             lines,
             edges: vec![],
@@ -217,7 +217,7 @@ fn make_renderer(
     let aspect = W as f32 / H as f32;
     let vp = camera.view_proj(aspect);
     let eye = camera.eye();
-    let cam = mydrafter_render::camera_uniform(vp, eye);
+    let cam = itsjustcad_render::camera_uniform(vp, eye);
     renderer.write_camera(&ctx.device, &ctx.queue, 0, &cam);
     renderer
 }
@@ -239,7 +239,7 @@ fn golden_single_box_dark() {
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
     renderer.set_meshes(&ctx.device, &[(mesh.to_render(), theme.mesh())], 0);
     let aspect = W as f32 / H as f32;
-    let cam = mydrafter_render::camera_uniform(camera.view_proj(aspect), camera.eye());
+    let cam = itsjustcad_render::camera_uniform(camera.view_proj(aspect), camera.eye());
     renderer.write_camera(&ctx.device, &ctx.queue, 0, &cam);
 
     let img = render_to_image(&ctx, &renderer, theme);
@@ -294,7 +294,7 @@ fn golden_underlay_dark() {
             rgba.extend_from_slice(&c);
         }
     }
-    let underlay = mydrafter_render::UnderlayData {
+    let underlay = itsjustcad_render::UnderlayData {
         rgba,
         width_px: n,
         height_px: n,
@@ -306,7 +306,7 @@ fn golden_underlay_dark() {
         ],
         opacity: 0.8,
     };
-    let data = mydrafter_render::SceneData {
+    let data = itsjustcad_render::SceneData {
         meshes: vec![],
         lines: vec![],
         edges: vec![],
@@ -316,7 +316,7 @@ fn golden_underlay_dark() {
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
     renderer.set_scene(&ctx.device, &ctx.queue, &data, 0);
     let aspect = W as f32 / H as f32;
-    let cam = mydrafter_render::camera_uniform(camera.view_proj(aspect), camera.eye());
+    let cam = itsjustcad_render::camera_uniform(camera.view_proj(aspect), camera.eye());
     renderer.write_camera(&ctx.device, &ctx.queue, 0, &cam);
 
     let img = render_to_image(&ctx, &renderer, theme);

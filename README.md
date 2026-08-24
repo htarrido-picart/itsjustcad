@@ -1,4 +1,6 @@
-# mydrafter
+# ItsJustCAD
+
+*It's just CAD.*
 
 **A complete architect's CAD in a single ~10 MB binary — with an LLM drafting
 partner built into the app.**
@@ -18,8 +20,8 @@ that draws with the exact same commands you type.
 Requires Rust stable (see `rust-toolchain.toml`).
 
 ```sh
-git clone https://github.com/htarrido/mydrafter
-cd mydrafter
+git clone https://github.com/htarrido/itsjustcad
+cd itsjustcad
 cargo run --release
 ```
 
@@ -46,7 +48,7 @@ and dimension the south side"* — it emits the same commands, which you can
 inspect, undo, and edit.
 
 `help` lists every command in-app; `help difference` explains one;
-`mydrafter --help` prints the same from a terminal. Full generated reference:
+`itsjustcad --help` prints the same from a terminal. Full generated reference:
 [docs/COMMANDS.txt](docs/COMMANDS.txt).
 
 ---
@@ -75,7 +77,7 @@ LLM emits   {"cmd":"extrude","profile":{"sel":"last","n":1},"height":3.0}
 
 ### 2. The file is the history
 
-A `.mydrafter.json` file stores no geometry — it stores the ordered list of
+A `.itsjustcad.json` file stores no geometry — it stores the ordered list of
 commands that built the model. Opening a file replays it. That one decision
 buys, for free:
 
@@ -100,7 +102,7 @@ OpenAI-compatible endpoint — one adapter trait, switch in the toolbar, or flip
 
 And the LLM can *author tools*: ask for a stair generator and it defines a
 **plugin** mid-conversation (`plugin define …`); say keep it and it persists to
-`~/.config/mydrafter/plugins/`, appearing in autosuggest, `help`, and the
+`~/.config/itsjustcad/plugins/`, appearing in autosuggest, `help`, and the
 LLM's own vocabulary from then on. `plugin save <name> <n>` turns your own
 last *n* commands into a tool the same way.
 
@@ -158,7 +160,7 @@ Native save stays the op-log JSON.
 ### Automate
 
 ```sh
-mydrafter --run script.txt --headless --shot render.png --out model.mydrafter.json
+itsjustcad --run script.txt --headless --shot render.png --out model.itsjustcad.json
 ```
 
 Full headless CLI with exit codes (0 ok / 1 command error / 2 IO) —
@@ -181,7 +183,7 @@ The right panel is not a chatbot bolted on — it speaks the command substrate.
 - Failed commands feed back automatically for self-correction; conversations
   survive restarts; **local-only** toggle keeps everything on your machine
 
-Configure cassettes in `~/.config/mydrafter/decks.json`:
+Configure cassettes in `~/.config/itsjustcad/decks.json`:
 
 ```json
 {
@@ -249,11 +251,11 @@ cargo clippy --workspace
 scripts/bundle-macos.sh      # unsigned .app bundle
 
 # headless render, no window needed
-cargo run -p mydrafter-render --example headless -- out.png scene.mydrafter.json
+cargo run -p itsjustcad-render --example headless -- out.png scene.itsjustcad.json
 
 # scripted GUI run: commands + screenshot (used by CI and agents)
-MYDRAFTER_RUN="rect 0,0,0 6 4;extrude last 3" \
-MYDRAFTER_SHOT=/tmp/shot.png cargo run -p mydrafter
+ITSJUSTCAD_RUN="rect 0,0,0 6 4;extrude last 3" \
+ITSJUSTCAD_SHOT=/tmp/shot.png cargo run -p itsjustcad
 
 # golden-image regression tests
 cargo test --workspace -- --ignored golden

@@ -1,28 +1,28 @@
 //! Headless smoke render: draws a scene to an offscreen texture and writes a
 //! PNG. Lets CI (and agent sessions without a WindowServer) verify pixels.
 //!
-//! Usage: cargo run -p mydrafter-render --example headless [-- out.png [scene.mydrafter.json]]
+//! Usage: cargo run -p itsjustcad-render --example headless [-- out.png [scene.itsjustcad.json]]
 
 use glam::DVec3;
-use mydrafter_render::{OrbitCamera, SceneRenderer, ViewportCallback, DEPTH_FORMAT};
+use itsjustcad_render::{OrbitCamera, SceneRenderer, ViewportCallback, DEPTH_FORMAT};
 
 const W: u32 = 1280;
 const H: u32 = 800;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 fn main() {
-    let out = std::env::args().nth(1).unwrap_or("/tmp/mydrafter_headless.png".into());
-    let mode = match std::env::var("MYDRAFTER_MODE").as_deref() {
-        Ok(s) => mydrafter_render::DisplayMode::parse(s).unwrap_or_default(),
-        _ => mydrafter_render::DisplayMode::default(),
+    let out = std::env::args().nth(1).unwrap_or("/tmp/itsjustcad_headless.png".into());
+    let mode = match std::env::var("ITSJUSTCAD_MODE").as_deref() {
+        Ok(s) => itsjustcad_render::DisplayMode::parse(s).unwrap_or_default(),
+        _ => itsjustcad_render::DisplayMode::default(),
     };
     // Pencil mode forces paper-white; otherwise respect the theme env.
-    let theme = if mode == mydrafter_render::DisplayMode::Pencil {
-        mydrafter_render::Theme::Light // closest to paper white
+    let theme = if mode == itsjustcad_render::DisplayMode::Pencil {
+        itsjustcad_render::Theme::Light // closest to paper white
     } else {
-        match std::env::var("MYDRAFTER_THEME").as_deref() {
-            Ok("light") => mydrafter_render::Theme::Light,
-            _ => mydrafter_render::Theme::Dark,
+        match std::env::var("ITSJUSTCAD_THEME").as_deref() {
+            Ok("light") => itsjustcad_render::Theme::Light,
+            _ => itsjustcad_render::Theme::Dark,
         }
     };
 
@@ -36,9 +36,9 @@ fn main() {
 
     let mut camera = OrbitCamera::default();
     if let Some(scene_path) = std::env::args().nth(2) {
-        let session = mydrafter_commands::io::load_file(std::path::Path::new(&scene_path))
+        let session = itsjustcad_commands::io::load_file(std::path::Path::new(&scene_path))
             .expect("load scene");
-        let scene = mydrafter_render::snapshot(&session.doc, theme);
+        let scene = itsjustcad_render::snapshot(&session.doc, theme);
         renderer.set_scene(&device, &queue, &scene, 0);
         if let Some(bb) = session.doc.scene_aabb() {
             let center = bb.center();
@@ -50,7 +50,7 @@ fn main() {
         let box_a = kernel_mesh::make_box(DVec3::new(-2.5, -2.5, 0.0), DVec3::new(5.0, 5.0, 3.0));
         let box_b = kernel_mesh::make_box(DVec3::new(3.5, -1.0, 0.0), DVec3::new(2.0, 2.0, 5.0));
         let mesh_color = theme.mesh();
-        let edge_color = if mode == mydrafter_render::DisplayMode::Pencil {
+        let edge_color = if mode == itsjustcad_render::DisplayMode::Pencil {
             [0.1, 0.1, 0.1, 1.0f32] // will be overridden to black by shader anyway
         } else {
             theme.curve()
@@ -67,7 +67,7 @@ fn main() {
                 [[a.x as f32, a.y as f32, a.z as f32], [b.x as f32, b.y as f32, b.z as f32]]
             })
             .collect();
-        let scene = mydrafter_render::SceneData {
+        let scene = itsjustcad_render::SceneData {
             meshes: vec![(box_a.to_render(), mesh_color), (box_b.to_render(), mesh_color)],
             lines: vec![],
             edges: vec![(edges_a, edge_color), (edges_b, edge_color)],
@@ -84,7 +84,7 @@ fn main() {
     let aspect = W as f32 / H as f32;
     let view_proj = camera.view_proj(aspect);
     let eye = camera.eye();
-    let cam = mydrafter_render::camera_uniform_with_mode(view_proj, eye, mode);
+    let cam = itsjustcad_render::camera_uniform_with_mode(view_proj, eye, mode);
     renderer.write_camera(&device, &queue, 0, &cam);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
@@ -119,8 +119,8 @@ fn main() {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear({
-                        let bg = if mode == mydrafter_render::DisplayMode::Pencil {
-                            mydrafter_render::DisplayMode::pencil_background()
+                        let bg = if mode == itsjustcad_render::DisplayMode::Pencil {
+                            itsjustcad_render::DisplayMode::pencil_background()
                         } else {
                             theme.background()
                         };

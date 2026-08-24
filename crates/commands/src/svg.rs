@@ -6,7 +6,7 @@
 //! font so they render identically in the viewport, PDF, SVG, and DXF.
 
 use glam::{DVec2, DVec3};
-use mydrafter_doc::{Annotation, Document, Geometry, LayerStyle, ViewDirection};
+use itsjustcad_doc::{Annotation, Document, Geometry, LayerStyle, ViewDirection};
 
 /// Chord tolerance for tessellating curves (meters), matching the other exporters.
 const SVG_TOL: f64 = 0.005;
@@ -58,7 +58,7 @@ fn collect_segments(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
         // Text annotations: tessellate via Hershey stroke font so they render
         // as world-space geometry (identical appearance across viewport/SVG/PDF/DXF).
         Geometry::Annotation(Annotation::Text { pos, text, height }) => {
-            let strokes = mydrafter_doc::hershey::text_strokes(text, [pos.x, pos.y], *height);
+            let strokes = itsjustcad_doc::hershey::text_strokes(text, [pos.x, pos.y], *height);
             for poly in strokes {
                 for pair in poly.windows(2) {
                     let a = DVec3::new(pair[0][0], pair[0][1], pos.z);

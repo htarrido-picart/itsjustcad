@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mydrafter_doc::{
+use itsjustcad_doc::{
     HatchPattern, PaperSize, Units, ViewDirection, METERS_PER_FOOT, METERS_PER_INCH,
 };
 
@@ -788,7 +788,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 let lon_deg = number(lon)?;
                 let (year, month, day) = parse_date(date)?;
                 let (hour, minute) = parse_hhmm(time)?;
-                let pos = mydrafter_solar::solar_position(
+                let pos = itsjustcad_solar::solar_position(
                     year, month, day, hour, minute, lat_deg, lon_deg,
                 );
                 Ok(Command::Sun {
@@ -2045,7 +2045,7 @@ mod tests {
         assert!(parse("text 0,0").is_err());
 
         // hatch: default solid, explicit patterns
-        use mydrafter_doc::HatchPattern;
+        use itsjustcad_doc::HatchPattern;
         assert!(matches!(
             parse("hatch last").unwrap(),
             Command::Hatch { target: Selector::Last { n: 1 }, pattern: HatchPattern::Solid, .. }
@@ -2086,7 +2086,7 @@ mod tests {
 
     #[test]
     fn parse_sheet_commands() {
-        use mydrafter_doc::{PaperSize, ViewDirection};
+        use itsjustcad_doc::{PaperSize, ViewDirection};
         assert_eq!(
             parse("sheet plan").unwrap(),
             Command::Sheet { name: "plan".into(), paper: PaperSize::A3 }

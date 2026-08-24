@@ -22,7 +22,9 @@ mod theme;
 fn cli_help_text() -> String {
     let mut out = String::new();
     out.push_str(
-        "Usage: mydrafter [OPTIONS]\n\
+        "ItsJustCAD — It's just CAD\n\
+         \n\
+         Usage: itsjustcad [OPTIONS]\n\
          \n\
          Options:\n\
          \x20 --help, -h                  Show this help\n\
@@ -42,18 +44,18 @@ fn cli_help_text() -> String {
          \x20 2  file / IO error\n\
          \n\
          Env vars:\n\
-         \x20 MYDRAFTER_RUN=<cmd;cmd>    Execute commands on startup (GUI mode)\n\
-         \x20 MYDRAFTER_SHOT=<path.png>  Screenshot and exit (GUI mode)\n\
-         \x20 MYDRAFTER_DECK_RUN=<text>  Send deck message on startup\n\
+         \x20 ITSJUSTCAD_RUN=<cmd;cmd>    Execute commands on startup (GUI mode)\n\
+         \x20 ITSJUSTCAD_SHOT=<path.png>  Screenshot and exit (GUI mode)\n\
+         \x20 ITSJUSTCAD_DECK_RUN=<text>  Send deck message on startup\n\
          \n\
          Commands:\n",
     );
-    for spec in mydrafter_commands::registry() {
+    for spec in itsjustcad_commands::registry() {
         let first_sentence = spec.summary.split('.').next().unwrap_or(spec.summary).trim();
         out.push_str(&format!("  {:<20} {:<50} {}\n", spec.name, spec.usage, first_sentence));
     }
     out.push('\n');
-    out.push_str(mydrafter_commands::SELECTOR_HELP);
+    out.push_str(itsjustcad_commands::SELECTOR_HELP);
     out
 }
 
@@ -119,7 +121,7 @@ fn run_headless_mode(args: &CliArgs) -> i32 {
     };
 
     let lines = headless::parse_script(&src);
-    let session = mydrafter_commands::Session::default();
+    let session = itsjustcad_commands::Session::default();
     let (session, view) = match headless::run_script_lines(session, &lines) {
         Ok(s) => s,
         Err((line, msg)) => {
@@ -130,7 +132,7 @@ fn run_headless_mode(args: &CliArgs) -> i32 {
 
     // Optional: save document.
     if let Some(out) = &args.out_path
-        && let Err(e) = mydrafter_commands::io::save_file(&session, std::path::Path::new(out))
+        && let Err(e) = itsjustcad_commands::io::save_file(&session, std::path::Path::new(out))
     {
         eprintln!("error: could not save '{}': {e}", out);
         return 2;
@@ -163,7 +165,7 @@ fn main() -> eframe::Result<()> {
         // GUI path can also honour --run after startup through env vars.
         if cli.headless {
             tracing_subscriber::fmt::init();
-            mydrafter_commands::blocklib::seed_if_empty();
+            itsjustcad_commands::blocklib::seed_if_empty();
             let code = run_headless_mode(&cli);
             std::process::exit(code);
         }
@@ -187,8 +189,8 @@ fn main() -> eframe::Result<()> {
         runtime.block_on(std::future::pending::<()>());
     });
 
-    // MYDRAFTER_WINDOW_SIZE=WxH lets screenshots test at different resolutions.
-    let window_size: [f32; 2] = std::env::var("MYDRAFTER_WINDOW_SIZE")
+    // ITSJUSTCAD_WINDOW_SIZE=WxH lets screenshots test at different resolutions.
+    let window_size: [f32; 2] = std::env::var("ITSJUSTCAD_WINDOW_SIZE")
         .ok()
         .and_then(|s| {
             let mut parts = s.split('x');
@@ -206,7 +208,7 @@ fn main() -> eframe::Result<()> {
     };
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("mydrafter")
+        .with_title("ItsJustCAD")
         .with_inner_size(window_size);
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
@@ -220,7 +222,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "mydrafter",
+        "ItsJustCAD",
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, handle)))),
     )
@@ -233,7 +235,7 @@ mod tests {
     #[test]
     fn cli_help_contains_every_verb() {
         let text = cli_help_text();
-        for spec in mydrafter_commands::registry() {
+        for spec in itsjustcad_commands::registry() {
             assert!(text.contains(spec.name), "CLI help missing '{}'", spec.name);
         }
     }

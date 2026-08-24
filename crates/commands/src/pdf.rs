@@ -4,7 +4,7 @@
 //! operators only, which keeps the crate dependency-free.
 
 use glam::{DVec2, DVec3};
-use mydrafter_doc::{
+use itsjustcad_doc::{
     Annotation, Document, Geometry, LayerStyle, ScheduleRow, Sheet, SheetDim, SheetView,
     ViewDirection,
 };
@@ -76,7 +76,7 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
             out.push((a_off, b_off));
         }
         Geometry::Annotation(Annotation::Hatch { boundary, pattern }) => {
-            use mydrafter_doc::{
+            use itsjustcad_doc::{
                 hatch::{hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
                 HatchPattern,
             };
@@ -107,7 +107,7 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
         // segments. This makes them appear in viewports at world scale and in
         // PDF/SVG/DXF exports consistently (same path as geometry).
         Geometry::Annotation(Annotation::Text { pos, text, height }) => {
-            let strokes = mydrafter_doc::hershey::text_strokes(text, [pos.x, pos.y], *height);
+            let strokes = itsjustcad_doc::hershey::text_strokes(text, [pos.x, pos.y], *height);
             for poly in strokes {
                 for pair in poly.windows(2) {
                     let a = DVec3::new(pair[0][0], pair[0][1], pos.z);
@@ -631,7 +631,7 @@ mod tests {
         let doc = Document::default();
         let sheet = Sheet {
             name: "empty".into(),
-            paper: mydrafter_doc::PaperSize::A3,
+            paper: itsjustcad_doc::PaperSize::A3,
             views: vec![],
             table: None,
             dims: vec![],

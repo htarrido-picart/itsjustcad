@@ -1,5 +1,5 @@
 use glam::{DVec2, DVec3};
-use mydrafter_doc::{
+use itsjustcad_doc::{
     hatch::{hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
     Annotation, Document, Geometry, HatchPattern, SceneObject,
 };
@@ -219,7 +219,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
             }
             Geometry::Annotation(Annotation::Text { pos, text, height }) => {
                 let color = resolve_color(obj, layer_color, theme, selected, mode, false);
-                let strokes = mydrafter_doc::hershey::text_strokes(
+                let strokes = itsjustcad_doc::hershey::text_strokes(
                     text,
                     [pos.x, pos.y],
                     *height,
@@ -253,7 +253,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                     let color = resolve_color(obj, layer_color, theme, selected, mode, false);
                     for def_geo in defs {
                         match def_geo {
-                            mydrafter_doc::BlockGeometry::Mesh(m) => {
+                            itsjustcad_doc::BlockGeometry::Mesh(m) => {
                                 // Transform positions and build a new mesh.
                                 let new_pos: Vec<DVec3> =
                                     m.positions().iter().map(|&p| transform(p)).collect();
@@ -271,7 +271,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                                     .collect();
                                 scene.edges.push((segments, color));
                             }
-                            mydrafter_doc::BlockGeometry::Curve(c) => {
+                            itsjustcad_doc::BlockGeometry::Curve(c) => {
                                 let mut pts: Vec<[f32; 3]> = c
                                     .tessellate(DISPLAY_TOL)
                                     .iter()
@@ -287,7 +287,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                                 }
                                 scene.lines.push((pts, color));
                             }
-                            mydrafter_doc::BlockGeometry::Annotation(_) => {
+                            itsjustcad_doc::BlockGeometry::Annotation(_) => {
                                 // Annotations in block definitions are not rendered in
                                 // the viewport (no egui overlay bridge for instances).
                             }
@@ -300,16 +300,16 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
     scene
 }
 
-// The hatch tessellation functions live in mydrafter_doc::hatch and are
+// The hatch tessellation functions live in itsjustcad_doc::hatch and are
 // imported at the top of this file. Re-export hatch_lines so existing
 // test references to `hatch_segments` work without renaming.
 #[allow(unused_imports)]
-pub use mydrafter_doc::hatch::hatch_lines as hatch_segments;
+pub use itsjustcad_doc::hatch::hatch_lines as hatch_segments;
 
 #[cfg(test)]
 mod tests {
     use glam::DVec3;
-    use mydrafter_doc::{Document, LayerStyle, ObjectId, SceneObject};
+    use itsjustcad_doc::{Document, LayerStyle, ObjectId, SceneObject};
 
     use super::*;
     use crate::renderer::ColorMode;
@@ -412,9 +412,9 @@ mod tests {
             name: None,
             layer: "default".into(),
             color: None,
-            geometry: Geometry::Annotation(mydrafter_doc::Annotation::Hatch {
+            geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Hatch {
                 boundary: square.clone(),
-                pattern: mydrafter_doc::HatchPattern::Solid,
+                pattern: itsjustcad_doc::HatchPattern::Solid,
             }),
         });
         let scene = snapshot(&doc, Theme::Dark);
@@ -428,9 +428,9 @@ mod tests {
             name: None,
             layer: "default".into(),
             color: None,
-            geometry: Geometry::Annotation(mydrafter_doc::Annotation::Hatch {
+            geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Hatch {
                 boundary: square,
-                pattern: mydrafter_doc::HatchPattern::Lines { angle_deg: 0.0, spacing: 0.5 },
+                pattern: itsjustcad_doc::HatchPattern::Lines { angle_deg: 0.0, spacing: 0.5 },
             }),
         });
         let scene = snapshot(&doc, Theme::Dark);
@@ -452,7 +452,7 @@ mod tests {
             name: None,
             layer: "default".into(),
             color: None,
-            geometry: Geometry::Annotation(mydrafter_doc::Annotation::LinearDim {
+            geometry: Geometry::Annotation(itsjustcad_doc::Annotation::LinearDim {
                 a: DVec3::ZERO,
                 b: DVec3::X,
                 offset: 0.5,
@@ -470,7 +470,7 @@ mod tests {
             name: None,
             layer: "default".into(),
             color: None,
-            geometry: Geometry::Annotation(mydrafter_doc::Annotation::Text {
+            geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Text {
                 pos: DVec3::ZERO,
                 text: "note".into(),
                 height: 0.2,
@@ -538,8 +538,8 @@ mod tests {
     #[test]
     fn crosshatch_has_twice_the_segments_of_lines() {
         let sq = unit_square();
-        let horiz = mydrafter_doc::hatch::hatch_lines(&sq, 0.0, 0.25);
-        let vert = mydrafter_doc::hatch::hatch_lines(&sq, 90.0, 0.25);
+        let horiz = itsjustcad_doc::hatch::hatch_lines(&sq, 0.0, 0.25);
+        let vert = itsjustcad_doc::hatch::hatch_lines(&sq, 90.0, 0.25);
         assert!(!horiz.is_empty());
         assert!(!vert.is_empty(), "vertical set must be non-empty");
     }
@@ -547,32 +547,32 @@ mod tests {
     #[test]
     fn brick_segments_produces_horizontal_and_vertical_lines() {
         let sq = unit_square();
-        let segs = mydrafter_doc::hatch::hatch_brick(&sq, 0.25);
+        let segs = itsjustcad_doc::hatch::hatch_brick(&sq, 0.25);
         assert!(!segs.is_empty(), "brick must produce segments");
-        assert!(mydrafter_doc::hatch::hatch_brick(&sq[..2], 0.25).is_empty());
-        assert!(mydrafter_doc::hatch::hatch_brick(&sq, 0.0).is_empty());
+        assert!(itsjustcad_doc::hatch::hatch_brick(&sq[..2], 0.25).is_empty());
+        assert!(itsjustcad_doc::hatch::hatch_brick(&sq, 0.0).is_empty());
     }
 
     #[test]
     fn concrete_segments_nonzero_for_valid_boundary() {
         let sq = unit_square();
-        let segs = mydrafter_doc::hatch::hatch_concrete(&sq, 0.3);
+        let segs = itsjustcad_doc::hatch::hatch_concrete(&sq, 0.3);
         assert!(!segs.is_empty(), "concrete must produce segments");
-        assert!(mydrafter_doc::hatch::hatch_concrete(&sq, 0.0).is_empty());
+        assert!(itsjustcad_doc::hatch::hatch_concrete(&sq, 0.0).is_empty());
     }
 
     #[test]
     fn insulation_segments_nonzero_for_valid_boundary() {
         let sq = unit_square();
-        let segs = mydrafter_doc::hatch::hatch_insulation(&sq, 0.3);
+        let segs = itsjustcad_doc::hatch::hatch_insulation(&sq, 0.3);
         assert!(!segs.is_empty(), "insulation must produce segments");
-        assert!(mydrafter_doc::hatch::hatch_insulation(&sq, 0.0).is_empty());
+        assert!(itsjustcad_doc::hatch::hatch_insulation(&sq, 0.0).is_empty());
     }
 
     #[test]
     fn earth_segments_nonzero_and_shorter_than_lines() {
         let sq = unit_square();
-        let segs = mydrafter_doc::hatch::hatch_earth(&sq, 0.25);
+        let segs = itsjustcad_doc::hatch::hatch_earth(&sq, 0.25);
         assert!(!segs.is_empty(), "earth must produce segments");
         for [a, b] in &segs {
             for p in [a, b] {
@@ -580,7 +580,7 @@ mod tests {
                 assert!(p.y > -1e-6 && p.y < 1.0 + 1e-6, "y out: {}", p.y);
             }
         }
-        assert!(mydrafter_doc::hatch::hatch_earth(&sq, 0.0).is_empty());
+        assert!(itsjustcad_doc::hatch::hatch_earth(&sq, 0.0).is_empty());
     }
 
     #[test]
@@ -593,7 +593,7 @@ mod tests {
         // Register block definition manually.
         doc.blocks.insert(
             "tri".to_string(),
-            vec![mydrafter_doc::BlockGeometry::Mesh(mesh)],
+            vec![itsjustcad_doc::BlockGeometry::Mesh(mesh)],
         );
         // Insert an instance object.
         doc.insert(SceneObject {

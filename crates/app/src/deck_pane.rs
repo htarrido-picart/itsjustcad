@@ -1,7 +1,7 @@
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use mydrafter_commands::{parse, Command, Session};
+use itsjustcad_commands::{parse, Command, Session};
 use serde::{Deserialize, Serialize};
-use mydrafter_deck::{
+use itsjustcad_deck::{
     make_deck, probe, system_prompt, warm_model, ChatMessage, ChatRequest, DeckDelta, DecksFile,
     ExtractEvent, Extractor, ProbeInfo, Role, WarmOutcome,
 };
@@ -71,7 +71,7 @@ fn saved_chat_path() -> Option<std::path::PathBuf> {
     Some(
         dirs::home_dir()?
             .join(".config")
-            .join("mydrafter")
+            .join("itsjustcad")
             .join("deck_chat.json"),
     )
 }
@@ -331,7 +331,7 @@ pub struct DeckPane {
     /// escape the sandbox are still queued even when this is on.
     allow_deck_side_effects: bool,
     /// Sandbox root for deck-originated fs paths — the current document's
-    /// directory when known, else the mydrafter documents dir. Set by the app.
+    /// directory when known, else the ItsJustCAD documents dir. Set by the app.
     sandbox_root: Option<std::path::PathBuf>,
 }
 
@@ -939,7 +939,7 @@ impl DeckPane {
                 self.decks.local_only = local_only;
                 // If the active deck became hidden, switch to the first visible one.
                 if local_only {
-                    let active_is_remote = !mydrafter_deck::is_local_url(
+                    let active_is_remote = !itsjustcad_deck::is_local_url(
                         self.decks.decks.get(self.decks.active)
                             .map(|d| d.base_url.as_str())
                             .unwrap_or(""),
@@ -1271,7 +1271,7 @@ mod side_effect_gate_tests {
             "critique must scope file access to the one screenshot"
         );
         // And the adapter turns that into a path-scoped Read of exactly that file.
-        let scoped = mydrafter_deck::scoped_allowed_tools(
+        let scoped = itsjustcad_deck::scoped_allowed_tools(
             &req.allowed_tools,
             req.vision_shot_path.as_deref(),
         );
@@ -1287,7 +1287,7 @@ mod side_effect_gate_tests {
         pane.vision_turn = true;
         let mut session = Session::default();
         let sentinel = std::env::temp_dir()
-            .join(format!("mydrafter_vision_evil_{}.csv", std::process::id()));
+            .join(format!("itsjustcad_vision_evil_{}.csv", std::process::id()));
         let _ = std::fs::remove_file(&sentinel);
         pane.handle_extract_events(
             vec![
@@ -1348,7 +1348,7 @@ mod side_effect_gate_tests {
         session.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
         // Sentinel path in temp; it must never be created.
         let sentinel = std::env::temp_dir()
-            .join(format!("mydrafter_evil_{}.csv", std::process::id()));
+            .join(format!("itsjustcad_evil_{}.csv", std::process::id()));
         let _ = std::fs::remove_file(&sentinel);
         pane.handle_extract_events(
             vec![ExtractEvent::Command(format!("export {}", sentinel.display()))],
@@ -1408,7 +1408,7 @@ mod side_effect_gate_tests {
     fn allow_toggle_auto_runs_in_sandbox_but_still_gates_outside() {
         // With the opt-in on, an in-sandbox export runs; an outside one is still
         // queued. Uses a temp dir as the sandbox root so the export can write.
-        let dir = std::env::temp_dir().join(format!("mydrafter_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("itsjustcad_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut pane = blank_pane();
         pane.allow_deck_side_effects = true;

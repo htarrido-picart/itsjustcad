@@ -1746,6 +1746,104 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "itsjustcad"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "eframe",
+ "egui",
+ "egui-wgpu",
+ "egui_commonmark",
+ "glam",
+ "image",
+ "itsjustcad-commands",
+ "itsjustcad-deck",
+ "itsjustcad-doc",
+ "itsjustcad-render",
+ "itsjustcad-solar",
+ "kernel-curve",
+ "kernel-mesh",
+ "pollster",
+ "rfd",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wgpu",
+]
+
+[[package]]
+name = "itsjustcad-commands"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "glam",
+ "image",
+ "itsjustcad-doc",
+ "itsjustcad-solar",
+ "kernel-curve",
+ "kernel-mesh",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "itsjustcad-deck"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dirs",
+ "eventsource-stream",
+ "futures",
+ "itsjustcad-commands",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "itsjustcad-doc"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "kernel-curve",
+ "kernel-mesh",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "itsjustcad-render"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "egui",
+ "egui-wgpu",
+ "glam",
+ "image",
+ "itsjustcad-commands",
+ "itsjustcad-doc",
+ "kernel-curve",
+ "kernel-mesh",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
+name = "itsjustcad-solar"
+version = "0.1.0"
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2042,104 +2140,6 @@ dependencies = [
  "num-traits",
  "pxfm",
 ]
-
-[[package]]
-name = "mydrafter"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs",
- "eframe",
- "egui",
- "egui-wgpu",
- "egui_commonmark",
- "glam",
- "image",
- "kernel-curve",
- "kernel-mesh",
- "mydrafter-commands",
- "mydrafter-deck",
- "mydrafter-doc",
- "mydrafter-render",
- "mydrafter-solar",
- "pollster",
- "rfd",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "wgpu",
-]
-
-[[package]]
-name = "mydrafter-commands"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "glam",
- "image",
- "kernel-curve",
- "kernel-mesh",
- "mydrafter-doc",
- "mydrafter-solar",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "uuid",
-]
-
-[[package]]
-name = "mydrafter-deck"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "dirs",
- "eventsource-stream",
- "futures",
- "mydrafter-commands",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "mydrafter-doc"
-version = "0.1.0"
-dependencies = [
- "glam",
- "kernel-curve",
- "kernel-mesh",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "uuid",
-]
-
-[[package]]
-name = "mydrafter-render"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "egui",
- "egui-wgpu",
- "glam",
- "image",
- "kernel-curve",
- "kernel-mesh",
- "mydrafter-commands",
- "mydrafter-doc",
- "pollster",
- "wgpu",
-]
-
-[[package]]
-name = "mydrafter-solar"
-version = "0.1.0"
 
 [[package]]
 name = "naga"

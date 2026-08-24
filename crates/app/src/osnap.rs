@@ -3,7 +3,7 @@
 
 use glam::DVec3;
 use kernel_curve::Curve;
-use mydrafter_doc::{Document, Geometry};
+use itsjustcad_doc::{Document, Geometry};
 
 /// Screen-space pick radius in logical pixels.
 pub const SNAP_RADIUS_PX: f32 = 10.0;
@@ -150,7 +150,7 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mydrafter_doc::{ObjectId, SceneObject};
+    use itsjustcad_doc::{ObjectId, SceneObject};
 
     fn doc_with(geometry: Geometry) -> Document {
         let mut doc = Document::default();
@@ -158,7 +158,7 @@ mod tests {
             visible: true,
             id: ObjectId::new(),
             name: None,
-            layer: mydrafter_doc::DEFAULT_LAYER.to_string(),
+            layer: itsjustcad_doc::DEFAULT_LAYER.to_string(),
             color: None,
             geometry,
         });
@@ -259,7 +259,7 @@ mod tests {
                 visible: true,
                 id: ObjectId::new(),
                 name: None,
-                layer: mydrafter_doc::DEFAULT_LAYER.to_string(),
+                layer: itsjustcad_doc::DEFAULT_LAYER.to_string(),
                 color: None,
                 geometry: Geometry::Mesh(kernel_mesh::make_box(corner, corner + DVec3::ONE)),
             });

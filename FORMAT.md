@@ -1,14 +1,22 @@
-# mydrafter file format — op-log v1
+# ItsJustCAD file format — op-log v1
 
-`*.mydrafter.json` is a newline-pretty JSON op-log. Opening a file replays
+`*.itsjustcad.json` is a newline-pretty JSON op-log. Opening a file replays
 every logged op through the same `apply` path used live. The scene is fully
 derived; nothing else is stored.
+
+> **Rename compatibility (mydrafter → ItsJustCAD).** The product was renamed but
+> the format is unchanged. Both the historical `*.mydrafter.json` extension and
+> the new `*.itsjustcad.json` extension load; the version field is accepted under
+> **both** spellings — `"mydrafter"` (legacy) and `"itsjustcad"` (new) — via a
+> serde alias. New saves write the new extension and the new field key. Every
+> file ever written by the old product still opens unchanged: the
+> v1-replays-forever promise below spans the rename.
 
 ## Top-level shape
 
 ```json
 {
-  "mydrafter": 1,
+  "itsjustcad": 1,
   "ops": [ … ],
   "branches": { "tower": [ … ], "courtyard": [ … ] },
   "branch": "tower"
@@ -17,7 +25,7 @@ derived; nothing else is stored.
 
 | field | type | notes |
 |---|---|---|
-| `mydrafter` | `u32` | format version, currently **1** |
+| `itsjustcad` | `u32` | format version, currently **1**. Legacy files spell this key `mydrafter`; readers accept either (serde alias) |
 | `ops` | array of Command | ordered forward log; replayed in array order |
 | `branches` | map name → array of Command | design options; **optional**, omitted when empty (see below) |
 | `branch` | string | which branch `ops` belongs to; **optional**, omitted when there are no branches |
@@ -27,8 +35,9 @@ load unchanged on branch `main`, and a file with no design options serializes
 without either field, staying byte-identical to the original v1 shape. No
 version bump is required.
 
-A reader **must** reject files where `mydrafter` > the version it knows. A
-reader **must** accept files where `mydrafter` == 1 forever — that is the
+A reader **must** reject files where the version > the version it knows. A
+reader **must** accept files where the version == 1 forever — regardless of
+whether the field is spelled `mydrafter` or `itsjustcad` — that is the
 v1-replays-forever promise (see below).
 
 ## Id semantics
@@ -343,8 +352,9 @@ Valid values: `"m"`, `"cm"`, `"mm"`, `"ft_in"`.
 
 ## The v1-replays-forever promise
 
-Any file that satisfies `"mydrafter": 1` and validates against the schema above
-**must** open without error in all future builds of this project. New fields
+Any file that satisfies version `1` (spelled `"itsjustcad": 1` or, for legacy
+files, `"mydrafter": 1`) and validates against the schema above **must** open
+without error in all future builds of this project. New fields
 added to existing commands use `#[serde(default)]` so old files that omit them
 still load. No existing field is ever removed or renamed. The version number is
 bumped only for genuinely breaking changes, with a migration path described in
@@ -382,7 +392,7 @@ The checkpoint is **purely a cache**:
 ## Plugins (macros) and replay safety
 
 Plugins are user/LLM-authored macros stored **outside** the op-log, one JSON
-file per plugin under `~/.config/mydrafter/plugins/<name>.plugin.json`:
+file per plugin under `~/.config/itsjustcad/plugins/<name>.plugin.json`:
 
 ```json
 {"name": "column-grid",

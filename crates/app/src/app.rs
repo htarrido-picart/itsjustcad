@@ -1,5 +1,5 @@
-use mydrafter_commands::Session;
-use mydrafter_render::{
+use itsjustcad_commands::Session;
+use itsjustcad_render::{
     ColorMode, DisplayMode, OrbitCamera, SceneRenderer, StandardView, UnderlayData,
     ViewportCallback, ViewportLayout,
 };
@@ -27,16 +27,41 @@ pub(crate) enum TemplateScale {
     Urban,
 }
 
-/// Return a private directory for mydrafter runtime files (mode 0o700 on Unix).
-/// Prefers `$XDG_RUNTIME_DIR/mydrafter`, then `$HOME/.config/mydrafter`, then
-/// a `mydrafter` subdirectory inside the system temp dir as a last resort.
+/// Decide whether the one-time `~/.config/mydrafter` → `~/.config/itsjustcad`
+/// migration should run. Pure so it can be unit-tested: migrate iff the OLD
+/// dir exists and the NEW one does not. Any other combination is a no-op (new
+/// install, already-migrated, or a manual mix we must not clobber).
+fn should_migrate_config(old_exists: bool, new_exists: bool) -> bool {
+    old_exists && !new_exists
+}
+
+/// One-time config migration across the mydrafter → ItsJustCAD rename: if the
+/// user has a legacy `~/.config/mydrafter` and no `~/.config/itsjustcad` yet,
+/// move it so decks/plugins/blocks/journal/prefs carry over. Best-effort;
+/// failure is non-fatal (the app just starts with fresh config).
+pub(crate) fn migrate_legacy_config() {
+    let Some(cfg) = dirs::home_dir().map(|h| h.join(".config")) else { return };
+    let old = cfg.join("mydrafter");
+    let new = cfg.join("itsjustcad");
+    if should_migrate_config(old.exists(), new.exists()) {
+        if let Err(e) = std::fs::rename(&old, &new) {
+            tracing::warn!("config migration {old:?} -> {new:?} failed: {e}");
+        } else {
+            tracing::info!("migrated legacy config {old:?} -> {new:?}");
+        }
+    }
+}
+
+/// Return a private directory for ItsJustCAD runtime files (mode 0o700 on Unix).
+/// Prefers `$XDG_RUNTIME_DIR/itsjustcad`, then `$HOME/.config/itsjustcad`, then
+/// an `itsjustcad` subdirectory inside the system temp dir as a last resort.
 /// The directory is created if it does not exist.
 pub(crate) fn private_runtime_dir() -> std::path::PathBuf {
     let candidate = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(std::env::temp_dir)
-        .join("mydrafter");
+        .join("itsjustcad");
 
     if !candidate.exists() {
         #[cfg(unix)]
@@ -117,7 +142,7 @@ fn tagged_screenshot(ctx: &egui::Context, tag: &str) -> Option<egui::ColorImage>
     })
 }
 
-/// The first untagged `Screenshot` event this frame (the dev/`MYDRAFTER_SHOT`
+/// The first untagged `Screenshot` event this frame (the dev/`ITSJUSTCAD_SHOT`
 /// capture); critique-tagged shots are skipped.
 fn untagged_screenshot(ctx: &egui::Context) -> Option<egui::ColorImage> {
     ctx.input(|i| {
@@ -151,7 +176,7 @@ pub(crate) fn camera_distance_for(s: &TemplateScale) -> f32 {
 /// - `Some(verb)`: usage + summary for that verb, or an unknown-command note.
 pub(crate) fn help_lines(verb: Option<&str>) -> Vec<String> {
     match verb {
-        None => mydrafter_commands::registry()
+        None => itsjustcad_commands::registry()
             .iter()
             .map(|spec| {
                 let first = spec.summary.split('.').next().unwrap_or(spec.summary).trim();
@@ -159,7 +184,7 @@ pub(crate) fn help_lines(verb: Option<&str>) -> Vec<String> {
             })
             .collect(),
         Some(v) => {
-            if let Some(spec) = mydrafter_commands::registry().iter().find(|s| s.name == v) {
+            if let Some(spec) = itsjustcad_commands::registry().iter().find(|s| s.name == v) {
                 vec![
                     format!("usage: {}", spec.usage),
                     spec.summary.to_string(),
@@ -197,18 +222,18 @@ pub struct App {
     uploaded_color_mode: Option<ColorMode>,
     /// Last zoom factor written to ui.json (avoid rewriting every frame).
     saved_zoom: f32,
-    /// Dev self-verification: MYDRAFTER_SHOT=<path.png> captures a frame and exits.
+    /// Dev self-verification: ITSJUSTCAD_SHOT=<path.png> captures a frame and exits.
     shot_path: Option<String>,
-    /// Dev scripting: MYDRAFTER_RUN="cmd;cmd;..." executes on startup.
+    /// Dev scripting: ITSJUSTCAD_RUN="cmd;cmd;..." executes on startup.
     startup_script: Option<String>,
-    /// Dev scripting: MYDRAFTER_DECK_RUN="prompt" sends one deck message on
-    /// startup; with MYDRAFTER_SHOT set, the shot waits for the turn to end.
+    /// Dev scripting: ITSJUSTCAD_DECK_RUN="prompt" sends one deck message on
+    /// startup; with ITSJUSTCAD_SHOT set, the shot waits for the turn to end.
     deck_script: Option<String>,
-    /// Dev hook: MYDRAFTER_TYPE="text" pre-fills the command input (without
-    /// executing) so the autosuggest popup is visible in MYDRAFTER_SHOT frames.
+    /// Dev hook: ITSJUSTCAD_TYPE="text" pre-fills the command input (without
+    /// executing) so the autosuggest popup is visible in ITSJUSTCAD_SHOT frames.
     type_script: Option<String>,
     frame_count: u64,
-    /// Set once the dev-shot `MYDRAFTER_SAVE` side effect has run, so it fires
+    /// Set once the dev-shot `ITSJUSTCAD_SAVE` side effect has run, so it fires
     /// exactly once even though the screenshot is (re-)requested every frame
     /// until its echo lands.
     shot_saved: bool,
@@ -261,6 +286,9 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, tokio: tokio::runtime::Handle) -> Self {
+        // One-time prefs carry-over from the old product name.
+        migrate_legacy_config();
+
         let rs = cc
             .wgpu_render_state
             .as_ref()
@@ -328,7 +356,7 @@ impl App {
         command_line.load_plugins(&mut session);
 
         // Seed the block content library on first run (no-op if already present).
-        mydrafter_commands::blocklib::seed_if_empty();
+        itsjustcad_commands::blocklib::seed_if_empty();
 
         Self {
             session,
@@ -357,10 +385,10 @@ impl App {
             uploaded_theme: None,
             uploaded_color_mode: None,
             saved_zoom: zoom,
-            shot_path: std::env::var("MYDRAFTER_SHOT").ok(),
-            startup_script: std::env::var("MYDRAFTER_RUN").ok(),
-            deck_script: std::env::var("MYDRAFTER_DECK_RUN").ok(),
-            type_script: std::env::var("MYDRAFTER_TYPE").ok(),
+            shot_path: std::env::var("ITSJUSTCAD_SHOT").ok(),
+            startup_script: std::env::var("ITSJUSTCAD_RUN").ok(),
+            deck_script: std::env::var("ITSJUSTCAD_DECK_RUN").ok(),
+            type_script: std::env::var("ITSJUSTCAD_TYPE").ok(),
             frame_count: 0,
             shot_saved: false,
             pending_layer_color: None,
@@ -484,7 +512,7 @@ impl App {
             Some("view") => {
                 if let ["save", name] = words.collect::<Vec<_>>().as_slice() {
                     let camera = named_view_of(self.active_camera());
-                    let cmd = mydrafter_commands::Command::ViewSave {
+                    let cmd = itsjustcad_commands::Command::ViewSave {
                         name: (*name).to_string(),
                         camera: Some(camera),
                     };
@@ -625,7 +653,7 @@ impl App {
                 let cam = self.active_camera();
                 cam.ortho = false;
                 cam.two_point = false;
-                cam.pano = Some(mydrafter_render::PanoProjection::Equirect);
+                cam.pano = Some(itsjustcad_render::PanoProjection::Equirect);
                 self.command_line.push_line("camera: 360° equirectangular panorama");
             }
             "fisheye" | "fish" => {
@@ -635,20 +663,20 @@ impl App {
                 cam.two_point = false;
                 cam.pano = Some(p);
                 let deg = match p {
-                    mydrafter_render::PanoProjection::Fisheye { fov } => fov.to_degrees(),
+                    itsjustcad_render::PanoProjection::Fisheye { fov } => fov.to_degrees(),
                     _ => 180.0,
                 };
                 self.command_line.push_line(format!("camera: fisheye {deg:.0}° fov"));
             }
             _ => {
                 // Named phone sim, or a numeric focal length (optional "mm").
-                let focal = mydrafter_render::preset_focal_mm(arg).or_else(|| {
+                let focal = itsjustcad_render::preset_focal_mm(arg).or_else(|| {
                     arg.strip_suffix("mm").unwrap_or(arg).parse::<f32>().ok()
                 });
                 match focal {
                     Some(f) if f > 0.0 => {
                         self.active_camera().set_lens_mm(f, aspect);
-                        let fov = mydrafter_render::fov_for_focal_mm(f).to_degrees();
+                        let fov = itsjustcad_render::fov_for_focal_mm(f).to_degrees();
                         let tag = match arg {
                             "phone" => " (26mm equiv)",
                             "phonewide" => " (13mm equiv)",
@@ -688,7 +716,7 @@ impl App {
 
         // Build a BVH over visible object AABBs so the ray only tests the boxes
         // it actually crosses rather than every object in the scene.
-        let pickable: Vec<(mydrafter_doc::ObjectId, kernel_mesh::Aabb)> = self
+        let pickable: Vec<(itsjustcad_doc::ObjectId, kernel_mesh::Aabb)> = self
             .session
             .doc
             .objects()
@@ -696,7 +724,7 @@ impl App {
             .map(|obj| (obj.id, obj.geometry.aabb()))
             .collect();
         let bvh = kernel_mesh::Bvh::build(&pickable.iter().map(|(_, bb)| *bb).collect::<Vec<_>>());
-        let mut best: Option<(f64, mydrafter_doc::ObjectId)> = None;
+        let mut best: Option<(f64, itsjustcad_doc::ObjectId)> = None;
         for i in bvh.ray_candidates(origin, dir) {
             let (id, bb) = pickable[i as usize];
             if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
@@ -743,7 +771,7 @@ impl App {
         mode: crate::boxsel::BoxMode,
         additive: bool,
     ) {
-        let items: Vec<(mydrafter_doc::ObjectId, egui::Rect)> = self
+        let items: Vec<(itsjustcad_doc::ObjectId, egui::Rect)> = self
             .session
             .doc
             .objects()
@@ -774,12 +802,12 @@ impl App {
     fn save(&mut self, path: Option<std::path::PathBuf>) {
         let path = path.or_else(|| {
             rfd::FileDialog::new()
-                .add_filter("mydrafter", &["mydrafter.json", "json"])
-                .set_file_name("untitled.mydrafter.json")
+                .add_filter("ItsJustCAD", &["itsjustcad.json", "mydrafter.json", "json"])
+                .set_file_name("untitled.itsjustcad.json")
                 .save_file()
         });
         let Some(path) = path else { return };
-        match mydrafter_commands::io::save_file(&self.session, &path) {
+        match itsjustcad_commands::io::save_file(&self.session, &path) {
             Ok(()) => {
                 // Ops are safe in the file now; drop the crash journal.
                 if let Some(j) = &mut self.journal {
@@ -830,11 +858,11 @@ impl App {
     fn open(&mut self, path: Option<std::path::PathBuf>) {
         let path = path.or_else(|| {
             rfd::FileDialog::new()
-                .add_filter("mydrafter", &["mydrafter.json", "json"])
+                .add_filter("ItsJustCAD", &["itsjustcad.json", "mydrafter.json", "json"])
                 .pick_file()
         });
         let Some(path) = path else { return };
-        match mydrafter_commands::io::load_file(&path) {
+        match itsjustcad_commands::io::load_file(&path) {
             Ok(session) => {
                 self.session = session;
                 self.uploaded_generation = None;
@@ -855,7 +883,7 @@ impl App {
         ctx.request_repaint(); // keep frames flowing until the shot lands
         // With a deck script, wait for the LLM turn(s) to finish before shooting.
         let deck_ready =
-            std::env::var("MYDRAFTER_DECK_RUN").is_err() || self.deck_pane.turns_completed();
+            std::env::var("ITSJUSTCAD_DECK_RUN").is_err() || self.deck_pane.turns_completed();
         if deck_ready {
             self.frame_count += 1;
         }
@@ -865,10 +893,10 @@ impl App {
         // `request_repaint` forever, which is the multi-minute hang. Requesting
         // each frame guarantees the echo lands within a frame or two.
         if self.frame_count >= 20 {
-            // One-shot MYDRAFTER_SAVE side effect.
+            // One-shot ITSJUSTCAD_SAVE side effect.
             if !self.shot_saved {
                 self.shot_saved = true;
-                if let Ok(path) = std::env::var("MYDRAFTER_SAVE") {
+                if let Ok(path) = std::env::var("ITSJUSTCAD_SAVE") {
                     self.save(Some(path.into()));
                 }
             }
@@ -949,7 +977,7 @@ impl App {
             let mut s = scene::snapshot_with_mode(
                 &self.session.doc,
                 theme,
-                mydrafter_render::ColorModeSnapshot { color_mode: active_color_mode },
+                itsjustcad_render::ColorModeSnapshot { color_mode: active_color_mode },
             );
             s.underlay = self.decode_underlay();
             Some(s)
@@ -1090,7 +1118,7 @@ impl App {
             }
 
             let sun_dir = self.session.doc.sun.map(|s| {
-                mydrafter_solar::sun_direction(s.azimuth_deg, s.altitude_deg)
+                itsjustcad_solar::sun_direction(s.azimuth_deg, s.altitude_deg)
             });
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                 rect,
@@ -1145,7 +1173,7 @@ impl App {
         view_proj: glam::Mat4,
         theme: scene::Theme,
     ) {
-        use mydrafter_doc::{Annotation, Geometry};
+        use itsjustcad_doc::{Annotation, Geometry};
         let painter = ui.painter_at(rect);
         let doc = &self.session.doc;
         for obj in doc.objects() {
@@ -1208,7 +1236,7 @@ impl App {
                         let mid = egui::pos2((p.x + q.x) * 0.5, (p.y + q.y) * 0.5);
                         // Measured value: derived, formatted in document units.
                         let label =
-                            mydrafter_doc::format_length(doc.units, (*b - *a).length());
+                            itsjustcad_doc::format_length(doc.units, (*b - *a).length());
                         let size = px_height((a2 + b2) * 0.5, 0.2);
                         painter.text(
                             mid,
@@ -1331,7 +1359,7 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let layers: Vec<(String, mydrafter_doc::LayerStyle)> = self
+                let layers: Vec<(String, itsjustcad_doc::LayerStyle)> = self
                     .session
                     .doc
                     .layers
@@ -1759,7 +1787,7 @@ impl App {
             crate::menu::ui(ui, style)
         });
         // Dev/screenshot hook: force one menu open to show grouped items.
-        if let Ok(title) = std::env::var("MYDRAFTER_MENU_DEMO") {
+        if let Ok(title) = std::env::var("ITSJUSTCAD_MENU_DEMO") {
             let at = egui::pos2(bar.response.rect.left() + 8.0, bar.response.rect.bottom());
             crate::menu::demo_open(ui.ctx(), style, &title, at);
         }
@@ -1789,7 +1817,7 @@ impl App {
 }
 
 fn ui_config_path() -> Option<std::path::PathBuf> {
-    Some(dirs::home_dir()?.join(".config").join("mydrafter").join("ui.json"))
+    Some(dirs::home_dir()?.join(".config").join("itsjustcad").join("ui.json"))
 }
 
 fn load_ui_json() -> serde_json::Value {
@@ -1970,8 +1998,8 @@ impl eframe::App for App {
         // Use the active pane's display mode to drive the clear colour.
         let active_mode =
             self.display_modes[self.layout.camera_index(self.active_pane)];
-        if active_mode == mydrafter_render::DisplayMode::Pencil {
-            return mydrafter_render::DisplayMode::pencil_background();
+        if active_mode == itsjustcad_render::DisplayMode::Pencil {
+            return itsjustcad_render::DisplayMode::pencil_background();
         }
         // Legacy-CAD preset background overrides theme when active.
         if self.cad_origin != CadOrigin::None {
@@ -1993,7 +2021,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.run_startup_script();
-        // MYDRAFTER_TYPE: pre-fill command input (dev hook for autosuggest screenshots).
+        // ITSJUSTCAD_TYPE: pre-fill command input (dev hook for autosuggest screenshots).
         if let Some(text) = self.type_script.take() {
             self.command_line.prefill(text);
         }
@@ -2054,14 +2082,14 @@ impl eframe::App for App {
         // Help → About dialog.
         if self.show_about {
             let mut open = true;
-            egui::Window::new("About mydrafter")
+            egui::Window::new("About ItsJustCAD")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .open(&mut open)
                 .show(ui.ctx(), |ui| {
-                    ui.label(egui::RichText::new("mydrafter").heading());
-                    ui.label("A command-first, FOSS CAD workspace.");
+                    ui.label(egui::RichText::new("ItsJustCAD").heading());
+                    ui.label("It's just CAD — a command-first, FOSS CAD workspace.");
                     ui.add_space(6.0);
                     ui.label("Licensed AGPLv3.");
                     ui.label(format!("Preset: {}", preset::preset_for(self.cad_origin).menu_style_label()));
@@ -2221,8 +2249,8 @@ impl eframe::App for App {
 }
 
 /// Snapshot the orbit camera as document-storable named-view parameters.
-fn named_view_of(cam: &OrbitCamera) -> mydrafter_doc::NamedView {
-    mydrafter_doc::NamedView {
+fn named_view_of(cam: &OrbitCamera) -> itsjustcad_doc::NamedView {
+    itsjustcad_doc::NamedView {
         target: cam.target.to_array(),
         distance: cam.distance,
         yaw: cam.yaw,
@@ -2234,7 +2262,7 @@ fn named_view_of(cam: &OrbitCamera) -> mydrafter_doc::NamedView {
     }
 }
 
-fn apply_named_view(cam: &mut OrbitCamera, view: &mydrafter_doc::NamedView) {
+fn apply_named_view(cam: &mut OrbitCamera, view: &itsjustcad_doc::NamedView) {
     cam.target = glam::Vec3::from_array(view.target);
     cam.distance = view.distance;
     cam.yaw = view.yaw;
@@ -2246,20 +2274,20 @@ fn apply_named_view(cam: &mut OrbitCamera, view: &mydrafter_doc::NamedView) {
 }
 
 /// Bridge the renderer's `PanoProjection` to the doc's serde `PanoView`.
-fn pano_to_view(p: mydrafter_render::PanoProjection) -> mydrafter_doc::PanoView {
+fn pano_to_view(p: itsjustcad_render::PanoProjection) -> itsjustcad_doc::PanoView {
     match p {
-        mydrafter_render::PanoProjection::Equirect => mydrafter_doc::PanoView::Equirect,
-        mydrafter_render::PanoProjection::Fisheye { fov } => {
-            mydrafter_doc::PanoView::Fisheye { fov }
+        itsjustcad_render::PanoProjection::Equirect => itsjustcad_doc::PanoView::Equirect,
+        itsjustcad_render::PanoProjection::Fisheye { fov } => {
+            itsjustcad_doc::PanoView::Fisheye { fov }
         }
     }
 }
 
-fn pano_from_view(v: mydrafter_doc::PanoView) -> mydrafter_render::PanoProjection {
+fn pano_from_view(v: itsjustcad_doc::PanoView) -> itsjustcad_render::PanoProjection {
     match v {
-        mydrafter_doc::PanoView::Equirect => mydrafter_render::PanoProjection::Equirect,
-        mydrafter_doc::PanoView::Fisheye { fov } => {
-            mydrafter_render::PanoProjection::Fisheye { fov }
+        itsjustcad_doc::PanoView::Equirect => itsjustcad_render::PanoProjection::Equirect,
+        itsjustcad_doc::PanoView::Fisheye { fov } => {
+            itsjustcad_render::PanoProjection::Fisheye { fov }
         }
     }
 }
@@ -2267,7 +2295,15 @@ fn pano_from_view(v: mydrafter_doc::PanoView) -> mydrafter_render::PanoProjectio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mydrafter_commands::registry;
+    use itsjustcad_commands::registry;
+
+    #[test]
+    fn config_migration_only_when_old_present_and_new_absent() {
+        assert!(should_migrate_config(true, false), "legacy only → migrate");
+        assert!(!should_migrate_config(false, false), "fresh install → no-op");
+        assert!(!should_migrate_config(true, true), "already migrated → no-op");
+        assert!(!should_migrate_config(false, true), "new only → no-op");
+    }
 
     #[test]
     fn critique_prompt_names_the_image_and_frames_the_ask() {
@@ -2300,7 +2336,7 @@ mod tests {
             !path.starts_with("/tmp"),
             "critique path must not be world-writable /tmp: {path:?}"
         );
-        // Must be inside the mydrafter private dir (not a bare temp path).
+        // Must be inside the ItsJustCAD private dir (not a bare temp path).
         let dir = private_runtime_dir();
         assert!(
             path.starts_with(&dir),

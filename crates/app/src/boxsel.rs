@@ -5,7 +5,7 @@
 //! rects; this module only compares rectangles, so it is unit-testable
 //! without a camera or a document.
 
-use mydrafter_doc::ObjectId;
+use itsjustcad_doc::ObjectId;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BoxMode {

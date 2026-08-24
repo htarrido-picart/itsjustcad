@@ -1,4 +1,4 @@
-//! Design-token system for the mydrafter UI.
+//! Design-token system for the ItsJustCAD UI.
 //!
 //! A small Material/SwiftUI-informed token layer that replaces scattered
 //! `Color32::from_rgb` calls and ad-hoc font sizes with named, semantic values.

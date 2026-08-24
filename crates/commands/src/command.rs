@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mydrafter_doc::{HatchPattern, NamedView, ObjectId, PaperSize, Units, ViewDirection};
+use itsjustcad_doc::{HatchPattern, NamedView, ObjectId, PaperSize, Units, ViewDirection};
 use serde::{Deserialize, Serialize};
 
 /// Object selector. `Last(n)` ("last", "last 3") is the workhorse for both the
@@ -659,7 +659,7 @@ pub enum Command {
         name: String,
         /// Geometry snapshots filled at apply time for replay.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        geometries: Option<Vec<mydrafter_doc::BlockGeometry>>,
+        geometries: Option<Vec<itsjustcad_doc::BlockGeometry>>,
     },
     /// Place an instance of a block definition at a point.
     BlockInsert {
@@ -675,17 +675,17 @@ pub enum Command {
     /// List block definitions (query; never logged).
     BlocksList,
     // -- block content library (.block.json on disk) --
-    /// List block names available in ~/.config/mydrafter/blocks/ (query; never logged).
+    /// List block names available in ~/.config/itsjustcad/blocks/ (query; never logged).
     BlockLibList,
     /// Load a library block into the document as a named block definition.
     /// `geometries` is `None` when typed; exec fills it for replay.
     BlockLibLoad {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        geometries: Option<Vec<mydrafter_doc::BlockGeometry>>,
+        geometries: Option<Vec<itsjustcad_doc::BlockGeometry>>,
     },
     /// Write the current block definition `name` from the document back to the
-    /// library as `~/.config/mydrafter/blocks/<name>.block.json`.
+    /// library as `~/.config/itsjustcad/blocks/<name>.block.json`.
     BlockLibSave {
         name: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]

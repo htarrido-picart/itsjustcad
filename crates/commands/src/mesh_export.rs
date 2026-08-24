@@ -8,7 +8,7 @@
 //! of these formats model dimensions or text as geometry we care to round-trip.
 
 use glam::DVec3;
-use mydrafter_doc::{Document, Geometry};
+use itsjustcad_doc::{Document, Geometry};
 
 /// Chord tolerance for tessellating curved curves (meters), matching the DXF
 /// exporter so wireframe output is consistent across formats.
@@ -100,7 +100,7 @@ fn write_stl(meshes: &[MeshPart]) -> Vec<u8> {
     let tri_count: usize = meshes.iter().map(|m| m.faces.len()).sum();
     let mut out = Vec::with_capacity(84 + 50 * tri_count);
     let mut header = [0u8; 80];
-    let tag = b"mydrafter binary STL";
+    let tag = b"ItsJustCAD binary STL";
     header[..tag.len()].copy_from_slice(tag);
     out.extend_from_slice(&header);
     out.extend_from_slice(&(tri_count as u32).to_le_bytes());
@@ -138,7 +138,7 @@ fn obj_num(v: f64) -> String {
 /// `v` + `f`; curves emit `o <name>` + `v` + a single `l` polyline. Returns the
 /// text bytes, triangle count and line-segment count.
 fn write_obj(meshes: &[MeshPart], lines: &[LinePart]) -> (Vec<u8>, usize, usize) {
-    let mut s = String::from("# mydrafter OBJ export\n");
+    let mut s = String::from("# ItsJustCAD OBJ export\n");
     let mut base = 1u32; // OBJ vertex indices are 1-based
     let mut tris = 0usize;
     let mut segs = 0usize;
@@ -318,7 +318,7 @@ fn write_glb(meshes: &[MeshPart]) -> (Vec<u8>, usize) {
 
     let total_len = bin.len();
     let json = format!(
-        "{{\"asset\":{{\"version\":\"2.0\",\"generator\":\"mydrafter\"}},\
+        "{{\"asset\":{{\"version\":\"2.0\",\"generator\":\"ItsJustCAD\"}},\
          \"scene\":0,\"scenes\":[{{\"nodes\":[{node_indices}]}}],\
          \"nodes\":[{node_json}],\"meshes\":[{mesh_json}],\
          \"accessors\":[{accessors}],\"bufferViews\":[{buffer_views}],\
@@ -428,7 +428,7 @@ mod tests {
         let tri = u32::from_le_bytes(bytes[80..84].try_into().unwrap());
         assert_eq!(tri, 12);
         assert_eq!(bytes.len(), 84 + 50 * 12, "84 header + 50 per triangle");
-        assert!(bytes[..20].starts_with(b"mydrafter"));
+        assert!(bytes[..21].starts_with(b"ItsJustCAD binary STL"));
     }
 
     #[test]

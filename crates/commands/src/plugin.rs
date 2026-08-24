@@ -11,7 +11,7 @@
 //! op-logs stable even if a plugin is later edited or deleted (see FORMAT.md).
 //!
 //! Persistence: one JSON file per plugin under
-//! `~/.config/mydrafter/plugins/<name>.plugin.json`. Loaded at startup into a
+//! `~/.config/itsjustcad/plugins/<name>.plugin.json`. Loaded at startup into a
 //! `PluginRegistry` that autosuggest, help and the deck prompt all consult.
 
 use std::collections::BTreeMap;
@@ -269,12 +269,12 @@ impl PluginRegistry {
     }
 }
 
-/// Default on-disk location for plugins: `~/.config/mydrafter/plugins`.
+/// Default on-disk location for plugins: `~/.config/itsjustcad/plugins`.
 pub fn default_dir() -> Option<PathBuf> {
     Some(
         dirs::home_dir()?
             .join(".config")
-            .join("mydrafter")
+            .join("itsjustcad")
             .join("plugins"),
     )
 }

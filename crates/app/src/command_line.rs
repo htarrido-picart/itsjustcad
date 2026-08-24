@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use mydrafter_commands::plugin::{self, Plugin, PluginRegistry};
-use mydrafter_commands::{parse, registry, Command, Session};
+use itsjustcad_commands::plugin::{self, Plugin, PluginRegistry};
+use itsjustcad_commands::{parse, registry, Command, Session};
 
 use crate::suggest::{self, Suggestion};
 
@@ -25,7 +25,7 @@ pub struct CommandLine {
     suggest_dismissed: bool,
     /// The input text that was current when we last built `suggestions`.
     suggest_for: String,
-    /// On-disk plugin directory (`~/.config/mydrafter/plugins`). The registry
+    /// On-disk plugin directory (`~/.config/itsjustcad/plugins`). The registry
     /// itself lives on `Session` so the deck prompt can reach it.
     plugin_dir: PathBuf,
     /// Raw command-line text of every document-changing command, in order —
@@ -40,7 +40,7 @@ impl Default for CommandLine {
     fn default() -> Self {
         Self {
             input: String::new(),
-            history: vec!["mydrafter — type 'help' for commands".to_string()],
+            history: vec!["ItsJustCAD — type 'help' for commands".to_string()],
             recall: Vec::new(),
             recall_pos: None,
             focus_next_frame: true,
@@ -106,7 +106,7 @@ impl CommandLine {
             for p in session.plugins.iter() {
                 self.push_line(format!("  {:<28} {}", p.usage(), p.summary()));
             }
-            self.push_line(format!("  {}", mydrafter_commands::SELECTOR_HELP));
+            self.push_line(format!("  {}", itsjustcad_commands::SELECTOR_HELP));
             return false;
         }
 
@@ -295,8 +295,8 @@ impl CommandLine {
     }
 
     /// Pre-fill the command input with `text` without executing it.
-    /// Used by the MYDRAFTER_TYPE dev hook to make the autosuggest popup
-    /// visible in MYDRAFTER_SHOT screenshots.
+    /// Used by the ITSJUSTCAD_TYPE dev hook to make the autosuggest popup
+    /// visible in ITSJUSTCAD_SHOT screenshots.
     pub fn prefill(&mut self, text: String) {
         self.input = text;
         self.suggest_for.clear(); // force suggestion refresh
@@ -583,7 +583,7 @@ mod tests {
         let mut session = Session::default();
         cl.execute(&mut session, "box 0,0,0 1,1,1");
         let out = std::env::temp_dir()
-            .join(format!("mydrafter_human_export_{}.csv", std::process::id()));
+            .join(format!("itsjustcad_human_export_{}.csv", std::process::id()));
         let _ = std::fs::remove_file(&out);
         assert!(cl.execute(&mut session, &format!("export {}", out.display())));
         assert!(out.exists(), "human-typed export must write to disk");

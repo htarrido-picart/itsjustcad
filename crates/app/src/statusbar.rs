@@ -2,7 +2,7 @@
 //! snap state and the active view. The egui strip in `app.rs` only lays
 //! these strings out, so everything user-visible here is unit-testable.
 
-use mydrafter_doc::{format_length, Units};
+use itsjustcad_doc::{format_length, Units};
 
 /// Cursor position on the ground plane, each axis in document units.
 /// No cursor over a viewport reads as an em-dash placeholder.
@@ -65,7 +65,7 @@ pub fn view_label(yaw: f32, pitch: f32, ortho: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mydrafter_doc::METERS_PER_FOOT;
+    use itsjustcad_doc::METERS_PER_FOOT;
     use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
     #[test]

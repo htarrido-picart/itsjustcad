@@ -12,7 +12,7 @@
 //! Legacy-CAD preset aliases (from `preset.rs`) are injected at call time
 //! via the `active_preset_aliases` parameter added to the main entry point.
 
-use mydrafter_commands::registry;
+use itsjustcad_commands::registry;
 
 /// Canonical → one or more aliases recognised by the parser.
 /// Update this list whenever parse.rs match arms change.

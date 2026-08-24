@@ -1,7 +1,7 @@
 //! Shared app-level verb dispatch.
 //!
 //! Some verbs are handled by the app rather than the command substrate
-//! (`mydrafter_commands::parse`): view/camera/display state, `ze`, `save`,
+//! (`itsjustcad_commands::parse`): view/camera/display state, `ze`, `save`,
 //! `help`, and GUI-only actions like `template`/`critique`. The GUI
 //! (`App::execute_line`) and the headless runner (`headless.rs`) both need to
 //! recognise the same set, so the classification lives here as one table
@@ -14,7 +14,7 @@
 //!     camera, prints `help`, honours `save`, and warns-and-ignores GUI-only
 //!     verbs instead of erroring.
 
-use mydrafter_render::{DisplayMode, StandardView};
+use itsjustcad_render::{DisplayMode, StandardView};
 
 /// An app-level verb that the substrate parser does not own.
 #[derive(Clone, Debug, PartialEq)]

@@ -131,8 +131,8 @@ impl Default for DecksFile {
 }
 
 pub fn config_path() -> Option<std::path::PathBuf> {
-    // ~/.config/mydrafter on every platform — CLI-tool convention, greppable.
-    Some(dirs::home_dir()?.join(".config").join("mydrafter").join("decks.json"))
+    // ~/.config/itsjustcad on every platform — CLI-tool convention, greppable.
+    Some(dirs::home_dir()?.join(".config").join("itsjustcad").join("decks.json"))
 }
 
 impl DecksFile {

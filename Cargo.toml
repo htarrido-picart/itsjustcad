@@ -16,7 +16,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/htarrido/mydrafter"
+repository = "https://github.com/htarrido/itsjustcad"
 
 [workspace.dependencies]
 # eframe 0.35 requires wgpu ^29 — do NOT bump wgpu to 30 until an eframe release supports it,
@@ -44,11 +44,11 @@ dirs = "6"
 # internal crates
 kernel-mesh = { path = "crates/kernel-mesh" }
 kernel-curve = { path = "crates/kernel-curve" }
-mydrafter-doc = { path = "crates/doc" }
-mydrafter-commands = { path = "crates/commands" }
-mydrafter-deck = { path = "crates/deck" }
-mydrafter-render = { path = "crates/render" }
-mydrafter-solar = { path = "crates/solar" }
+itsjustcad-doc = { path = "crates/doc" }
+itsjustcad-commands = { path = "crates/commands" }
+itsjustcad-deck = { path = "crates/deck" }
+itsjustcad-render = { path = "crates/render" }
+itsjustcad-solar = { path = "crates/solar" }
 
 [profile.release]
 strip = true
