@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! LLM deck: cassette-player providers behind one trait. Ollama, Kimi, Claude,
 //! any OpenAI-compatible endpoint. The deck emits plain-text commands in
 //! ```draft fenced blocks — the same language humans type — extracted by a

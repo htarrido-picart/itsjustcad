@@ -293,7 +293,15 @@ policy — not just Rust — is why the binary is ~10 MB.
 
 ## License
 
-AGPL-3.0-or-later. See [`LICENSE`](LICENSE). Dependency licenses enforced
-with `cargo deny check licenses`.
+Copyright © 2026 Hector Tarrido-Picart.
+
+**The desktop app is free and open source under AGPL-3.0-or-later** (see
+[`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)) — use it, fork it, build on it. The
+AGPL's copyleft means any modified or network-served version must also be open.
+
+**Commercial and mobile licensing** (a paid iOS / iPadOS / tablet edition) are
+offered separately by the author under proprietary terms — the AGPL covers the
+open desktop build only. Contributions are welcome under a CLA (see
+[`CONTRIBUTING.md`](CONTRIBUTING.md)).
 
 The file format and command language are documented and stable — build on them.

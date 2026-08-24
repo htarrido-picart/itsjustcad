@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Curve kernel: 2D/3D primitives (line, polyline, arc, ellipse) and NURBS curves.
 //!
 //! Rectangle, polygon and circle are constructed as closed polylines / full

@@ -60,7 +60,20 @@ One subject line, imperative mood. Body optional. End with:
 Co-Authored-By: <name> <email>
 ```
 
-## License
+## License & Contributor License Agreement (CLA)
 
-All contributions are AGPLv3-or-later. Do not paste code from incompatibly-
-licensed sources.
+The desktop app is AGPLv3-or-later, but the copyright is held solely by the
+author, who also ships a paid mobile edition and offers commercial licenses.
+
+**By submitting a contribution you agree to a Contributor License Agreement:**
+you license your contribution to the author under terms that let the author
+(a) release it in the AGPLv3 desktop app, and (b) include it in the proprietary
+commercial and mobile (iOS/iPadOS/Android tablet) editions. You keep copyright
+to your own contribution; you grant the author the right to dual-license it.
+This is what keeps the free open desktop build and the paid mobile build
+possible from one codebase.
+
+If you cannot agree to this, open an issue to discuss before sending a PR.
+
+Do not paste code from incompatibly-licensed sources. Contributors are credited
+in `AUTHORS`. The author-attribution notices (AGPLv3 §7b) must not be removed.

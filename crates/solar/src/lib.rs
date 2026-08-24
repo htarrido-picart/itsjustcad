@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Solar position algorithm — NOAA simplified SPA.
 //!
 //! Reference: NOAA Solar Calculator spreadsheet equations (public domain,

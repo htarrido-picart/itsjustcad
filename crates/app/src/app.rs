@@ -2091,7 +2091,9 @@ impl eframe::App for App {
                     ui.label(egui::RichText::new("ItsJustCAD").heading());
                     ui.label("It's just CAD — a command-first, FOSS CAD workspace.");
                     ui.add_space(6.0);
-                    ui.label("Licensed AGPLv3.");
+                    // Attribution required under AGPLv3 §7(b) — do not remove.
+                    ui.label("© 2026 Hector Tarrido-Picart");
+                    ui.label("Desktop: AGPLv3. Commercial & mobile licensing from the author.");
                     ui.label(format!("Preset: {}", preset::preset_for(self.cad_origin).menu_style_label()));
                     ui.add_space(6.0);
                     if ui.button("Close").clicked() {

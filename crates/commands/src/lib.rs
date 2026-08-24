@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! The command substrate: one language spoken by the human command line and
 //! the LLM deck. A document is an op-log of `Command`s — undo, file format and
 //! replay all derive from it.

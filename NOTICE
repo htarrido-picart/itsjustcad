@@ -1,0 +1,20 @@
+ItsJustCAD
+Copyright © 2026 Hector Tarrido-Picart
+
+Licensing
+---------
+The desktop application is free and open source under the GNU Affero General
+Public License v3.0-or-later (see LICENSE). Under AGPLv3 §7(b), the author
+attribution shown in the application's About dialog and source headers must be
+preserved in any distributed copy or derivative.
+
+The copyright is held solely by Hector Tarrido-Picart. Commercial licenses and
+the paid mobile edition (iOS / iPadOS / Android tablet) are offered separately
+by the author under proprietary terms — the AGPL applies to the open desktop
+build only. For a commercial or mobile license, contact the author.
+
+Contributions
+-------------
+Contributions are welcome under a Contributor License Agreement that assigns
+the author the rights needed to keep offering the commercial/mobile editions
+(see CONTRIBUTING.md). Contributors are credited in AUTHORS.

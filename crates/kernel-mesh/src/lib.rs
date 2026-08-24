@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Mesh kernel: indexed face-vertex meshes, primitives, extrusion.
 //!
 //! Document space is f64 (`DVec3`); GPU data is produced by [`Mesh::to_render`].
