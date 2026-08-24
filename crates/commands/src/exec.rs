@@ -372,12 +372,24 @@ impl Session {
         })
     }
 
-    /// Import a DXF file by expanding it into ordinary substrate commands run
-    /// one by one: each entity is its own logged op (plus `layer` switches),
-    /// so a large DXF makes a large op-log — the cost of keeping the op-log,
-    /// not the DXF file, as the record. Each entity undoes individually. On a
-    /// mid-import failure the entities already applied stay logged.
+    /// Import a file by dispatching on extension.
+    ///
+    /// - `.dxf` → expand into substrate ops (Line/Polyline/Circle/Arc/Text +
+    ///   Layer switches), one logged op per entity.
+    /// - `.obj` / `.stl` / `.gltf` / `.glb` → one `MeshLiteral` logged op per
+    ///   named object in the file.
     fn import(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let ext = path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+        match ext.as_str() {
+            "dxf" => self.import_dxf(path),
+            "obj" | "stl" | "gltf" | "glb" => self.import_mesh(path),
+            other => Err(ExecError::Invalid(format!(
+                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb)"
+            ))),
+        }
+    }
+
+    fn import_dxf(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
         let text = std::fs::read_to_string(&path)
             .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
         let parsed = crate::dxf::parse_dxf(&text)
@@ -400,6 +412,33 @@ impl Session {
                 "imported {total} entities from {path} ({} skipped) — one logged op each",
                 parsed.skipped
             ),
+        })
+    }
+
+    fn import_mesh(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let parts = crate::mesh_import::import(&path, &bytes)
+            .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+        if parts.is_empty() {
+            return Err(ExecError::Invalid(format!("'{path}' contains no importable meshes")));
+        }
+        let total = parts.len();
+        let mut created = Vec::new();
+        for (name, mesh) in parts {
+            let positions = mesh.positions().to_vec();
+            let faces = mesh.faces().to_vec();
+            let out = self.run(Command::MeshLiteral {
+                id: None,
+                positions,
+                faces,
+                name: Some(name),
+            })?;
+            created.extend(out.created);
+        }
+        Ok(ApplyOutcome {
+            created,
+            message: format!("imported {total} mesh(es) from {path} — one MeshLiteral op each"),
         })
     }
 
@@ -2271,15 +2310,26 @@ fn apply_forward(
             ))
         }
         Command::Export { path } => {
-            let is_dxf = path.rsplit('.').next().is_some_and(|e| e.eq_ignore_ascii_case("dxf"));
-            let (bytes, detail): (Vec<u8>, String) = if is_dxf {
-                let (text, entities) = crate::dxf::document_dxf(doc);
-                (text.into_bytes(), format!("DXF, {entities} entities"))
-            } else {
-                let (bytes, count) = crate::mesh_export::export(doc, &path)
-                    .map_err(ExecError::Invalid)?;
-                let label = path.rsplit('.').next().unwrap_or("").to_ascii_uppercase();
-                (bytes, format!("{label}, {count}"))
+            let ext = path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+            let (bytes, detail): (Vec<u8>, String) = match ext.as_str() {
+                "dxf" => {
+                    let (text, entities) = crate::dxf::document_dxf(doc);
+                    (text.into_bytes(), format!("DXF, {entities} entities"))
+                }
+                "svg" => {
+                    let (b, count) = crate::svg::export_svg(doc);
+                    (b, format!("SVG, {count}"))
+                }
+                "csv" => {
+                    let (b, count) = crate::csv::export_csv(doc);
+                    (b, format!("CSV, {count}"))
+                }
+                _ => {
+                    let (bytes, count) = crate::mesh_export::export(doc, &path)
+                        .map_err(ExecError::Invalid)?;
+                    let label = ext.to_ascii_uppercase();
+                    (bytes, format!("{label}, {count}"))
+                }
             };
             let size = bytes.len();
             std::fs::write(&path, bytes)
@@ -2568,6 +2618,45 @@ fn apply_forward(
                 },
             ))
         }
+        Command::MeshLiteral { id, positions, faces, name } => {
+            if positions.is_empty() || faces.is_empty() {
+                return Err(ExecError::Invalid(
+                    "mesh_literal: positions and faces must be non-empty".into(),
+                ));
+            }
+            // Validate face indices.
+            let n = positions.len() as u32;
+            for f in &faces {
+                if f.iter().any(|&i| i >= n) {
+                    return Err(ExecError::Invalid(format!(
+                        "mesh_literal: face index out of range (max index={}, positions={})",
+                        f.iter().copied().max().unwrap_or(0),
+                        n
+                    )));
+                }
+            }
+            let id = id.unwrap_or_default();
+            let mesh = kernel_mesh::Mesh::new(positions.clone(), faces.clone());
+            let face_count = faces.len();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: name.clone(),
+                layer: doc.current_layer.clone(),
+                geometry: Geometry::Mesh(mesh),
+            });
+            Ok((
+                Command::MeshLiteral { id: Some(id), positions, faces, name: name.clone() },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "mesh {id} ({face_count} triangles{})",
+                        name.as_deref().map(|n| format!(", '{n}'")).unwrap_or_default()
+                    ),
+                },
+            ))
+        }
         Command::Undo | Command::Redo | Command::Amend { .. } | Command::Import { .. } => {
             unreachable!("handled in Session::run")
         }
@@ -2645,6 +2734,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Schedule { .. } => "schedule",
         Command::SheetTable { .. } => "sheettable",
         Command::SheetDim { .. } => "sheetdim",
+        Command::MeshLiteral { .. } => "mesh_literal",
         Command::Undo => "undo",
         Command::Redo => "redo",
         Command::Amend { .. } => "amend",

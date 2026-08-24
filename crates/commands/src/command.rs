@@ -381,7 +381,8 @@ pub enum Command {
         sheet: String,
         path: String,
     },
-    /// Export the whole document as DXF R12. Not logged, like Print.
+    /// Export the whole document as DXF R12, SVG, CSV, or 3D mesh format.
+    /// Not logged: export is I/O, not model state.
     Export {
         path: String,
     },
@@ -389,8 +390,21 @@ pub enum Command {
     /// substrate op (Line/Polyline/Circle/Arc/Text, plus Layer switches), so
     /// the op-log — not the DXF file — is the record. Import itself is never
     /// logged; replaying a saved file needs no access to the imported DXF.
+    /// Mesh imports (.obj/.stl/.gltf/.glb) use MeshLiteral ops instead.
     Import {
         path: String,
+    },
+    /// A raw triangle mesh carried verbatim in the op-log. Used by mesh import
+    /// (.obj/.stl/.gltf/.glb) so each imported object is one self-contained
+    /// logged op — no external file dependency on replay. Not exposed in the
+    /// registry (internal: suppress from LLM prompt generation).
+    MeshLiteral {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        positions: Vec<DVec3>,
+        faces: Vec<[u32; 3]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     // -- named views --
     /// Save the active viewport camera under a name. `camera` is `None` when

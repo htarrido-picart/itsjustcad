@@ -753,7 +753,8 @@ mod tests {
         let err = s.run(parse("import /nonexistent/nope.dxf").unwrap()).unwrap_err();
         assert!(err.to_string().contains("cannot read"), "{err}");
 
-        let path = std::env::temp_dir().join("mydrafter_not_a_dxf.txt");
+        // A file named .dxf but with garbage content should fail with a parse error.
+        let path = std::env::temp_dir().join("mydrafter_not_a_dxf.dxf");
         std::fs::write(&path, "hello\nworld\nagain\n").unwrap();
         let err = s
             .run(Command::Import { path: path.display().to_string() })

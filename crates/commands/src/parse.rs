@@ -537,11 +537,11 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             })
         }
         "export" => {
-            let [path] = take::<1>("export", "an output path (.dxf/.stl/.obj/.gltf/.glb)", &args)?;
+            let [path] = take::<1>("export", "an output path (.dxf/.stl/.obj/.gltf/.glb/.svg/.csv)", &args)?;
             Ok(Command::Export { path: path.to_string() })
         }
         "import" => {
-            let [path] = take::<1>("import", "an input path (.dxf)", &args)?;
+            let [path] = take::<1>("import", "an input path (.dxf/.obj/.stl/.gltf/.glb)", &args)?;
             Ok(Command::Import { path: path.to_string() })
         }
         "view" => match args.as_slice() {
