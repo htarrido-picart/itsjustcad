@@ -85,8 +85,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "hatch",
-            usage: "hatch <selector> [solid | lines <angle deg> <spacing>]",
-            summary: "Hatch the region of a closed curve (default: solid fill). Example: hatch last · hatch last lines 45 0.25",
+            usage: "hatch <selector> [solid | lines [angle spacing] | crosshatch [angle spacing] | brick [spacing] | concrete [spacing] | insulation [spacing] | earth [spacing]]",
+            summary: "Hatch the region of a closed curve. Patterns: solid (fill), lines (parallel, default 45° 0.25m), crosshatch (two perpendicular sets), brick (running bond, horizontal courses), concrete (dash-dot scatter), insulation (batt zigzag), earth (45° short dashes). Example: hatch last · hatch last brick 0.2 · hatch last insulation 0.3",
         },
         CommandSpec {
             name: "union",
@@ -337,6 +337,21 @@ pub fn registry() -> &'static [CommandSpec] {
             name: "view",
             usage: "view save <name> | view <name> | view list",
             summary: "Named views: save the active viewport camera, restore it later, or list saved views. Example: view save entry then view entry",
+        },
+        CommandSpec {
+            name: "block",
+            usage: "block <selector> <name>",
+            summary: "Capture the geometry of selected objects as a named reusable block definition (like a symbol/component). Inputs stay in the scene; the definition is a geometry snapshot. Example: block last door · block last 3 tree (architect: door, window, tree, column, stair)",
+        },
+        CommandSpec {
+            name: "insert",
+            usage: "insert <name> <position x,y,z> [rotation_deg] [scale]",
+            summary: "Place an instance of a named block at a point with optional rotation (degrees CCW about Z) and uniform scale. Instances move/scale/rotate as a single object. Example: insert door 3,0,0 · insert tree 10,5,0 0 0.8 · insert column 0,0,0 90 1",
+        },
+        CommandSpec {
+            name: "blocks",
+            usage: "blocks",
+            summary: "List all block definitions with their geometry counts (query only). Example: blocks",
         },
         CommandSpec {
             name: "select",

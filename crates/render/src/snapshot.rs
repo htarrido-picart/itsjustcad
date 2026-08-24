@@ -1,5 +1,8 @@
 use glam::{DVec2, DVec3};
-use mydrafter_doc::{Annotation, Document, Geometry, HatchPattern};
+use mydrafter_doc::{
+    hatch::{hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
+    Annotation, Document, Geometry, HatchPattern,
+};
 
 use crate::renderer::SceneData;
 
@@ -42,6 +45,19 @@ impl Theme {
             Theme::Dark => [0.98, 0.75, 0.10, 1.0],
             Theme::Light => [0.90, 0.50, 0.05, 1.0],
         }
+    }
+}
+
+/// Push segment pairs as 2-point line strips into the scene lines list.
+fn push_hatch_segs(lines: &mut Vec<(Vec<[f32; 3]>, [f32; 4])>, segs: Vec<[DVec3; 2]>, color: [f32; 4]) {
+    for [a, b] in segs {
+        lines.push((
+            vec![
+                [a.x as f32, a.y as f32, a.z as f32],
+                [b.x as f32, b.y as f32, b.z as f32],
+            ],
+            color,
+        ));
     }
 }
 
@@ -124,71 +140,96 @@ pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
                         }
                     }
                     HatchPattern::Lines { angle_deg, spacing } => {
-                        for [a, b] in hatch_segments(boundary, *angle_deg, *spacing) {
-                            scene.lines.push((
-                                vec![
-                                    [a.x as f32, a.y as f32, a.z as f32],
-                                    [b.x as f32, b.y as f32, b.z as f32],
-                                ],
-                                color,
-                            ));
-                        }
+                        push_hatch_segs(&mut scene.lines, hatch_lines(boundary, *angle_deg, *spacing), color);
+                    }
+                    HatchPattern::Crosshatch { angle_deg, spacing } => {
+                        push_hatch_segs(&mut scene.lines, hatch_lines(boundary, *angle_deg, *spacing), color);
+                        push_hatch_segs(&mut scene.lines, hatch_lines(boundary, *angle_deg + 90.0, *spacing), color);
+                    }
+                    HatchPattern::Brick { spacing } => {
+                        push_hatch_segs(&mut scene.lines, hatch_brick(boundary, *spacing), color);
+                    }
+                    HatchPattern::Concrete { spacing } => {
+                        push_hatch_segs(&mut scene.lines, hatch_concrete(boundary, *spacing), color);
+                    }
+                    HatchPattern::Insulation { spacing } => {
+                        push_hatch_segs(&mut scene.lines, hatch_insulation(boundary, *spacing), color);
+                    }
+                    HatchPattern::Earth { spacing } => {
+                        push_hatch_segs(&mut scene.lines, hatch_earth(boundary, *spacing), color);
                     }
                 }
             }
             Geometry::Annotation(_) => {}
+            // Block instances: resolved to constituent geometry at render time.
+            Geometry::Instance { block, position, rotation_deg, scale } => {
+                if let Some(defs) = doc.blocks.get(block) {
+                    let s = *scale;
+                    let rot = rotation_deg.to_radians();
+                    let (sin_r, cos_r) = rot.sin_cos();
+                    let transform = |p: DVec3| -> DVec3 {
+                        // Scale, rotate about Z, then translate.
+                        let ps = p * s;
+                        DVec3::new(
+                            ps.x * cos_r - ps.y * sin_r + position.x,
+                            ps.x * sin_r + ps.y * cos_r + position.y,
+                            ps.z * s + position.z,
+                        )
+                    };
+                    let color = if selected { theme.selected() } else { layer_color.unwrap_or(theme.curve()) };
+                    for def_geo in defs {
+                        match def_geo {
+                            mydrafter_doc::BlockGeometry::Mesh(m) => {
+                                // Transform positions and build a new mesh.
+                                let new_pos: Vec<DVec3> =
+                                    m.positions().iter().map(|&p| transform(p)).collect();
+                                let new_mesh = kernel_mesh::Mesh::new(new_pos, m.faces().to_vec());
+                                let mesh_color = if selected { theme.selected() } else { layer_color.unwrap_or(theme.mesh()) };
+                                scene.meshes.push((new_mesh.to_render(), mesh_color));
+                                let segments: Vec<[f32; 3]> = kernel_mesh::feature_edges(&new_mesh)
+                                    .iter()
+                                    .flat_map(|(a, b)| {
+                                        [
+                                            [a.x as f32, a.y as f32, a.z as f32],
+                                            [b.x as f32, b.y as f32, b.z as f32],
+                                        ]
+                                    })
+                                    .collect();
+                                scene.edges.push((segments, color));
+                            }
+                            mydrafter_doc::BlockGeometry::Curve(c) => {
+                                let mut pts: Vec<[f32; 3]> = c
+                                    .tessellate(DISPLAY_TOL)
+                                    .iter()
+                                    .map(|&p| {
+                                        let tp = transform(p);
+                                        [tp.x as f32, tp.y as f32, tp.z as f32]
+                                    })
+                                    .collect();
+                                if c.is_closed()
+                                    && let Some(first) = pts.first().copied()
+                                {
+                                    pts.push(first);
+                                }
+                                scene.lines.push((pts, color));
+                            }
+                            mydrafter_doc::BlockGeometry::Annotation(_) => {
+                                // Annotations in block definitions are not rendered in
+                                // the viewport (no egui overlay bridge for instances).
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     scene
 }
 
-/// Parallel hatch lines clipped to a closed polygon (even-odd rule) in the
-/// XY plane; the boundary's first-point z carries through.
-pub fn hatch_segments(boundary: &[DVec3], angle_deg: f64, spacing: f64) -> Vec<[DVec3; 2]> {
-    if boundary.len() < 3 || spacing <= 0.0 {
-        return Vec::new();
-    }
-    let z = boundary[0].z;
-    let angle = angle_deg.to_radians();
-    let (sin, cos) = angle.sin_cos();
-    // Rotate into the pattern frame: hatch lines become horizontal.
-    let to_pattern = |p: DVec3| DVec2::new(p.x * cos + p.y * sin, -p.x * sin + p.y * cos);
-    let from_pattern =
-        |p: DVec2| DVec3::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos, z);
-    let pts: Vec<DVec2> = boundary.iter().map(|&p| to_pattern(p)).collect();
-    let (min_y, max_y) = pts
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
-            (lo.min(p.y), hi.max(p.y))
-        });
-
-    let mut segments = Vec::new();
-    let mut k = (min_y / spacing).ceil() as i64;
-    while (k as f64) * spacing <= max_y {
-        let y = k as f64 * spacing;
-        // Even-odd: collect x crossings of the scanline with every edge.
-        let mut xs: Vec<f64> = Vec::new();
-        for i in 0..pts.len() {
-            let a = pts[i];
-            let b = pts[(i + 1) % pts.len()];
-            // Half-open rule avoids double-counting vertices on the line.
-            if (a.y <= y) != (b.y <= y) {
-                xs.push(a.x + (y - a.y) / (b.y - a.y) * (b.x - a.x));
-            }
-        }
-        xs.sort_by(|p, q| p.partial_cmp(q).expect("finite"));
-        for &[x0, x1] in xs.as_chunks::<2>().0 {
-            if x1 - x0 > 1e-9 {
-                segments.push([
-                    from_pattern(DVec2::new(x0, y)),
-                    from_pattern(DVec2::new(x1, y)),
-                ]);
-            }
-        }
-        k += 1;
-    }
-    segments
-}
+// The hatch tessellation functions live in mydrafter_doc::hatch and are
+// imported at the top of this file. Re-export hatch_lines so existing
+// test references to `hatch_segments` work without renaming.
+pub use mydrafter_doc::hatch::hatch_lines as hatch_segments;
 
 #[cfg(test)]
 mod tests {
@@ -392,5 +433,91 @@ mod tests {
         let scene = snapshot(&doc, Theme::Light);
         assert_eq!(scene.meshes.len(), 1);
         assert_eq!(scene.meshes[0].1, Theme::Light.mesh());
+    }
+
+    fn unit_square() -> Vec<DVec3> {
+        vec![
+            DVec3::ZERO,
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+        ]
+    }
+
+    #[test]
+    fn crosshatch_has_twice_the_segments_of_lines() {
+        let sq = unit_square();
+        let horiz = mydrafter_doc::hatch::hatch_lines(&sq, 0.0, 0.25);
+        let vert = mydrafter_doc::hatch::hatch_lines(&sq, 90.0, 0.25);
+        assert!(!horiz.is_empty());
+        assert!(!vert.is_empty(), "vertical set must be non-empty");
+    }
+
+    #[test]
+    fn brick_segments_produces_horizontal_and_vertical_lines() {
+        let sq = unit_square();
+        let segs = mydrafter_doc::hatch::hatch_brick(&sq, 0.25);
+        assert!(!segs.is_empty(), "brick must produce segments");
+        assert!(mydrafter_doc::hatch::hatch_brick(&sq[..2], 0.25).is_empty());
+        assert!(mydrafter_doc::hatch::hatch_brick(&sq, 0.0).is_empty());
+    }
+
+    #[test]
+    fn concrete_segments_nonzero_for_valid_boundary() {
+        let sq = unit_square();
+        let segs = mydrafter_doc::hatch::hatch_concrete(&sq, 0.3);
+        assert!(!segs.is_empty(), "concrete must produce segments");
+        assert!(mydrafter_doc::hatch::hatch_concrete(&sq, 0.0).is_empty());
+    }
+
+    #[test]
+    fn insulation_segments_nonzero_for_valid_boundary() {
+        let sq = unit_square();
+        let segs = mydrafter_doc::hatch::hatch_insulation(&sq, 0.3);
+        assert!(!segs.is_empty(), "insulation must produce segments");
+        assert!(mydrafter_doc::hatch::hatch_insulation(&sq, 0.0).is_empty());
+    }
+
+    #[test]
+    fn earth_segments_nonzero_and_shorter_than_lines() {
+        let sq = unit_square();
+        let segs = mydrafter_doc::hatch::hatch_earth(&sq, 0.25);
+        assert!(!segs.is_empty(), "earth must produce segments");
+        for [a, b] in &segs {
+            for p in [a, b] {
+                assert!(p.x > -1e-6 && p.x < 1.0 + 1e-6, "x out: {}", p.x);
+                assert!(p.y > -1e-6 && p.y < 1.0 + 1e-6, "y out: {}", p.y);
+            }
+        }
+        assert!(mydrafter_doc::hatch::hatch_earth(&sq, 0.0).is_empty());
+    }
+
+    #[test]
+    fn block_instance_renders_via_snapshot() {
+        let mesh = kernel_mesh::Mesh::new(
+            vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+            vec![[0, 1, 2]],
+        );
+        let mut doc = Document::default();
+        // Register block definition manually.
+        doc.blocks.insert(
+            "tri".to_string(),
+            vec![mydrafter_doc::BlockGeometry::Mesh(mesh)],
+        );
+        // Insert an instance object.
+        doc.insert(SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: "default".into(),
+            geometry: Geometry::Instance {
+                block: "tri".to_string(),
+                position: DVec3::new(5.0, 0.0, 0.0),
+                rotation_deg: 0.0,
+                scale: 1.0,
+            },
+        });
+        let scene = snapshot(&doc, Theme::Dark);
+        assert_eq!(scene.meshes.len(), 1, "instance resolves to its block mesh");
     }
 }

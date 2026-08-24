@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_mesh::Aabb;
 
 use crate::{
-    LayerStyle, NamedView, ObjectId, SceneObject, Sheet, SunPosition, Underlay, Units,
-    DEFAULT_LAYER,
+    BlockGeometry, LayerStyle, NamedView, ObjectId, SceneObject, Sheet, SunPosition, Underlay,
+    Units, DEFAULT_LAYER,
 };
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
@@ -31,6 +31,9 @@ pub struct Document {
     /// stale (deleted objects keep their entry so group undo stays symmetric);
     /// readers filter through `get`. Mutators bump `generation` (exec does).
     pub groups: BTreeMap<String, BTreeSet<ObjectId>>,
+    /// Block definitions: name → ordered list of geometry snapshots. Mutators
+    /// bump `generation` (exec does).
+    pub blocks: BTreeMap<String, Vec<BlockGeometry>>,
     /// Mailbox: a `view <name>` restore waiting for the UI to drive the active
     /// viewport camera. The app takes it each frame; never persisted.
     pub pending_view: Option<NamedView>,
@@ -56,6 +59,7 @@ impl Default for Document {
             units: Units::default(),
             named_views: BTreeMap::new(),
             groups: BTreeMap::new(),
+            blocks: BTreeMap::new(),
             pending_view: None,
             underlay: None,
             sun: None,

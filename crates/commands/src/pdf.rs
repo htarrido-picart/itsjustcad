@@ -75,7 +75,38 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
             // Dim line.
             out.push((a_off, b_off));
         }
+        Geometry::Annotation(Annotation::Hatch { boundary, pattern }) => {
+            use mydrafter_doc::{
+                hatch::{hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
+                HatchPattern,
+            };
+            let segs: Vec<[glam::DVec3; 2]> = match pattern {
+                HatchPattern::Solid => {
+                    // Solid fill approximated as a closed boundary outline.
+                    let n = boundary.len();
+                    (0..n).map(|i| [boundary[i], boundary[(i + 1) % n]]).collect()
+                }
+                HatchPattern::Lines { angle_deg, spacing } => {
+                    hatch_lines(boundary, *angle_deg, *spacing)
+                }
+                HatchPattern::Crosshatch { angle_deg, spacing } => {
+                    let mut s = hatch_lines(boundary, *angle_deg, *spacing);
+                    s.extend(hatch_lines(boundary, *angle_deg + 90.0, *spacing));
+                    s
+                }
+                HatchPattern::Brick { spacing } => hatch_brick(boundary, *spacing),
+                HatchPattern::Concrete { spacing } => hatch_concrete(boundary, *spacing),
+                HatchPattern::Insulation { spacing } => hatch_insulation(boundary, *spacing),
+                HatchPattern::Earth { spacing } => hatch_earth(boundary, *spacing),
+            };
+            for [a, b] in segs {
+                out.push((a, b));
+            }
+        }
         Geometry::Annotation(_) => {}
+        // Block instances: resolve in the renderer. PDF export skips them
+        // (no block definition expansion at PDF time yet).
+        Geometry::Instance { .. } => {}
     }
 }
 

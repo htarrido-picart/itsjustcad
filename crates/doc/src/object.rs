@@ -37,6 +37,16 @@ impl std::fmt::Display for ObjectId {
 pub enum HatchPattern {
     Solid,
     Lines { angle_deg: f64, spacing: f64 },
+    /// Two sets of parallel lines at `angle_deg` and `angle_deg + 90°`.
+    Crosshatch { angle_deg: f64, spacing: f64 },
+    /// Running bond brick pattern: horizontal courses with staggered joints.
+    Brick { spacing: f64 },
+    /// Concrete: irregular short dashes approximating the standard dash-dot scatter.
+    Concrete { spacing: f64 },
+    /// Insulation batt: zigzag line along the boundary's long axis.
+    Insulation { spacing: f64 },
+    /// Earth fill: 45° short dashes (standard drafting earth hatch).
+    Earth { spacing: f64 },
 }
 
 /// Drafting objects: they live in the document like geometry (layers,
@@ -63,12 +73,54 @@ impl Annotation {
     }
 }
 
+/// A geometry snapshot stored in a block definition. The same enum as
+/// `Geometry` minus recursive Instance references (blocks are flat).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "geo", rename_all = "snake_case")]
+pub enum BlockGeometry {
+    Mesh(Mesh),
+    Curve(Curve),
+    Annotation(Annotation),
+}
+
+impl BlockGeometry {
+    pub fn aabb(&self) -> Aabb {
+        match self {
+            BlockGeometry::Mesh(m) => m.aabb(),
+            BlockGeometry::Curve(c) => Aabb::from_points(c.points_bound()),
+            BlockGeometry::Annotation(a) => Aabb::from_points(a.points()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "geo", rename_all = "snake_case")]
 pub enum Geometry {
     Mesh(Mesh),
     Curve(Curve),
     Annotation(Annotation),
+    /// Reference to a named block definition, placed at `position` with
+    /// optional rotation (degrees CCW about Z) and uniform scale.
+    Instance {
+        block: String,
+        position: DVec3,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        rotation_deg: f64,
+        #[serde(default = "one", skip_serializing_if = "is_one")]
+        scale: f64,
+    },
+}
+
+fn is_zero(v: &f64) -> bool {
+    v.abs() < 1e-12
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+fn is_one(v: &f64) -> bool {
+    (v - 1.0).abs() < 1e-12
 }
 
 impl Geometry {
@@ -86,6 +138,7 @@ impl Geometry {
                     boundary.iter_mut().for_each(|p| *p += d)
                 }
             },
+            Geometry::Instance { position, .. } => *position += d,
         }
     }
 
@@ -114,11 +167,24 @@ impl Geometry {
                     }
                     Annotation::Hatch { boundary, pattern } => {
                         boundary.iter_mut().for_each(|p| *p = m.transform_point3(*p));
-                        if let HatchPattern::Lines { spacing, .. } = pattern {
-                            *spacing *= s;
+                        let s = m.transform_vector3(DVec3::X).length();
+                        match pattern {
+                            HatchPattern::Lines { spacing, .. }
+                            | HatchPattern::Crosshatch { spacing, .. }
+                            | HatchPattern::Brick { spacing }
+                            | HatchPattern::Concrete { spacing }
+                            | HatchPattern::Insulation { spacing }
+                            | HatchPattern::Earth { spacing } => *spacing *= s,
+                            HatchPattern::Solid => {}
                         }
                     }
                 }
+                true
+            }
+            Geometry::Instance { position, scale, .. } => {
+                let s = m.transform_vector3(DVec3::X).length();
+                *position = m.transform_point3(*position);
+                *scale *= s;
                 true
             }
         }
@@ -129,6 +195,13 @@ impl Geometry {
             Geometry::Mesh(m) => m.aabb(),
             Geometry::Curve(c) => Aabb::from_points(c.points_bound()),
             Geometry::Annotation(a) => Aabb::from_points(a.points()),
+            // Approximate AABB: a small sphere around the insertion point.
+            // The real size is only known with the block definition, which lives
+            // on Document; keep it a point so picking still works.
+            Geometry::Instance { position, scale, .. } => {
+                let s = *scale;
+                Aabb::from_points(vec![*position - DVec3::splat(s), *position + DVec3::splat(s)])
+            }
         }
     }
 }

@@ -54,9 +54,9 @@ fn collect(doc: &Document) -> (Vec<MeshPart>, Vec<LinePart>) {
                     lines.push(LinePart { name, points, closed: c.is_closed() });
                 }
             }
-            // Annotations (dims, text, hatches) have no place in a solid/surface
+            // Annotations and instances have no place in a solid/surface
             // interchange format.
-            Geometry::Annotation(_) => {}
+            Geometry::Annotation(_) | Geometry::Instance { .. } => {}
         }
     }
     (meshes, lines)

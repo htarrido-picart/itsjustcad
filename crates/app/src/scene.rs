@@ -43,6 +43,11 @@ pub fn digest(doc: &Document) -> String {
                 mydrafter_doc::Annotation::Text { .. } => "text",
                 mydrafter_doc::Annotation::Hatch { .. } => "hatch",
             },
+            Geometry::Instance { block, .. } => {
+                // Show block name in the digest so LLM knows what kind of block.
+                let _ = block; // used in Display below
+                "instance"
+            }
         };
         let name = obj
             .name

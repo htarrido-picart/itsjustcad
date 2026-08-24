@@ -505,6 +505,31 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         view_index: Option<usize>,
     },
+    // -- blocks (reusable geometry definitions + instancing) --
+    /// Capture the geometry of selected objects as a named block definition.
+    /// The source objects remain in the scene; the definition is a snapshot.
+    /// `geometries` is `None` when typed; exec fills it and writes back for
+    /// replay, so saved files are self-contained (no live object dependency).
+    BlockDefine {
+        targets: Selector,
+        name: String,
+        /// Geometry snapshots filled at apply time for replay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        geometries: Option<Vec<mydrafter_doc::BlockGeometry>>,
+    },
+    /// Place an instance of a block definition at a point.
+    BlockInsert {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        name: String,
+        position: DVec3,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rotation_deg: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scale: Option<f64>,
+    },
+    /// List block definitions (query; never logged).
+    BlocksList,
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild
@@ -533,6 +558,7 @@ impl Command {
                 | Command::Volume { .. }
                 | Command::Bbox { .. }
                 | Command::Schedule { .. }
+                | Command::BlocksList
                 | Command::Undo
                 | Command::Redo
                 | Command::Amend { .. }

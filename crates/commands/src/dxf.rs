@@ -154,6 +154,9 @@ fn entity(t: &mut Tags, layer: &str, geometry: &Geometry, units: mydrafter_doc::
                 1
             }
         },
+        // Block instances: exported as the boundary box only (block definitions
+        // are resolved by the renderer, not by DXF export — R12 has no XREF).
+        Geometry::Instance { .. } => 0,
     }
 }
 

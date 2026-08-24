@@ -200,10 +200,23 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                     angle_deg: number(angle)?,
                     spacing: number(spacing)?,
                 },
+                ["crosshatch"] => HatchPattern::Crosshatch { angle_deg: 45.0, spacing: 0.25 },
+                ["crosshatch", angle, spacing] => HatchPattern::Crosshatch {
+                    angle_deg: number(angle)?,
+                    spacing: number(spacing)?,
+                },
+                ["brick"] => HatchPattern::Brick { spacing: 0.25 },
+                ["brick", spacing] => HatchPattern::Brick { spacing: number(spacing)? },
+                ["concrete"] => HatchPattern::Concrete { spacing: 0.3 },
+                ["concrete", spacing] => HatchPattern::Concrete { spacing: number(spacing)? },
+                ["insulation"] => HatchPattern::Insulation { spacing: 0.3 },
+                ["insulation", spacing] => HatchPattern::Insulation { spacing: number(spacing)? },
+                ["earth"] => HatchPattern::Earth { spacing: 0.25 },
+                ["earth", spacing] => HatchPattern::Earth { spacing: number(spacing)? },
                 _ => {
                     return wrong(
                         "hatch",
-                        "an optional pattern: solid, lines, or lines <angle> <spacing>",
+                        "an optional pattern: solid, lines [a s], crosshatch [a s], brick [s], concrete [s], insulation [s], earth [s]",
                         &args,
                     )
                 }
@@ -666,6 +679,47 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "sunoff" => {
             expect_empty("sunoff", &args, &args)?;
             Ok(Command::SunOff)
+        }
+        // -- blocks --
+        // block <selector> <name>
+        "block" => {
+            let (sel, rest) = selector(&args, "block")?;
+            let [name] = take::<1>("block", "a block name after the selector", rest)
+                .map_err(|_| wrong_err("block", "a selector and a block name", &args))?;
+            Ok(Command::BlockDefine {
+                targets: sel,
+                name: name.to_string(),
+                geometries: None,
+            })
+        }
+        // insert <name> <point> [rotation_deg] [scale]
+        "insert" => match args.as_slice() {
+            [name, pos] => Ok(Command::BlockInsert {
+                id: None,
+                name: (*name).to_string(),
+                position: point(pos)?,
+                rotation_deg: None,
+                scale: None,
+            }),
+            [name, pos, rot] => Ok(Command::BlockInsert {
+                id: None,
+                name: (*name).to_string(),
+                position: point(pos)?,
+                rotation_deg: Some(number(rot)?),
+                scale: None,
+            }),
+            [name, pos, rot, sc] => Ok(Command::BlockInsert {
+                id: None,
+                name: (*name).to_string(),
+                position: point(pos)?,
+                rotation_deg: Some(number(rot)?),
+                scale: Some(number(sc)?),
+            }),
+            _ => wrong("insert", "a block name, an insertion point, optional rotation (deg) and scale", &args),
+        },
+        "blocks" => {
+            expect_empty("blocks", &args, &args)?;
+            Ok(Command::BlocksList)
         }
         "undo" => Ok(Command::Undo),
         "redo" => Ok(Command::Redo),

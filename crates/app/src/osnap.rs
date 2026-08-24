@@ -48,6 +48,10 @@ pub fn candidates(doc: &Document) -> Vec<(DVec3, SnapKind)> {
             Geometry::Annotation(a) => {
                 out.extend(a.points().into_iter().map(|p| (p, SnapKind::End)));
             }
+            // Block instance: snap to insertion point.
+            Geometry::Instance { position, .. } => {
+                out.push((*position, SnapKind::End));
+            }
         }
     }
     out

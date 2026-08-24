@@ -3,6 +3,7 @@
 //! about how it is mutated.
 
 mod document;
+pub mod hatch;
 mod object;
 mod sheet;
 mod underlay;
@@ -11,7 +12,8 @@ mod view;
 
 pub use document::Document;
 pub use object::{
-    Annotation, Geometry, HatchPattern, LayerStyle, ObjectId, SceneObject, DEFAULT_LAYER,
+    Annotation, BlockGeometry, Geometry, HatchPattern, LayerStyle, ObjectId, SceneObject,
+    DEFAULT_LAYER,
 };
 pub use sheet::{PaperSize, ScheduleRow, Sheet, SheetDim, SheetTable, SheetView, ViewDirection};
 pub use underlay::Underlay;

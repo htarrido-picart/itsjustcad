@@ -98,6 +98,12 @@ enum Inverse {
     SheetTableRemoved(String),
     /// `sheetdim`: remove the last dim appended to a sheet.
     PopSheetDim(String),
+    /// `block`: remove the block definition this command created/replaced.
+    BlockDef {
+        name: String,
+        /// Previous definition (None if newly created).
+        prev: Option<Vec<mydrafter_doc::BlockGeometry>>,
+    },
 }
 
 /// Owns the document plus its op-log; the single mutation path for both the
@@ -275,6 +281,17 @@ impl Session {
                 let sheet = sheet.clone();
                 if let Some(s) = self.doc.sheet_mut(&sheet) {
                     s.dims.pop();
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::BlockDef { name, prev } => {
+                match prev {
+                    Some(defs) => {
+                        self.doc.blocks.insert(name.clone(), defs.clone());
+                    }
+                    None => {
+                        self.doc.blocks.remove(name);
+                    }
                 }
                 self.doc.generation += 1;
             }
@@ -594,6 +611,9 @@ fn boolean_inputs(
                 Geometry::Annotation(_) => Err(ExecError::Invalid(format!(
                     "'{id}' is an annotation; booleans need meshes"
                 ))),
+                Geometry::Instance { block, .. } => Err(ExecError::Invalid(format!(
+                    "'{id}' is a block instance ('{block}'); booleans need meshes — explode the instance or extrude it first"
+                ))),
             }
         })
         .collect()
@@ -690,6 +710,7 @@ pub(crate) fn build_schedule_rows(doc: &Document, layer: Option<&str>) -> Vec<Sc
                 Geometry::Mesh(_) => "mesh",
                 Geometry::Curve(_) => "curve",
                 Geometry::Annotation(_) => "annotation",
+                Geometry::Instance { .. } => "instance",
             };
             let area_m2 = match &o.geometry {
                 Geometry::Curve(c) if c.is_closed() => {
@@ -1378,8 +1399,17 @@ fn apply_forward(
                     "hatch boundary is not closed (close it or use 'polyline ... closed')".into(),
                 ));
             }
-            if let mydrafter_doc::HatchPattern::Lines { spacing, .. } = &pattern
-                && *spacing <= 0.0
+            let pattern_spacing = match &pattern {
+                mydrafter_doc::HatchPattern::Lines { spacing, .. }
+                | mydrafter_doc::HatchPattern::Crosshatch { spacing, .. }
+                | mydrafter_doc::HatchPattern::Brick { spacing }
+                | mydrafter_doc::HatchPattern::Concrete { spacing }
+                | mydrafter_doc::HatchPattern::Insulation { spacing }
+                | mydrafter_doc::HatchPattern::Earth { spacing } => Some(*spacing),
+                mydrafter_doc::HatchPattern::Solid => None,
+            };
+            if let Some(sp) = pattern_spacing
+                && sp <= 0.0
             {
                 return Err(ExecError::Invalid("hatch spacing must be positive".into()));
             }
@@ -2633,6 +2663,11 @@ fn apply_forward(
                             "'{id}' is an annotation — area needs a closed curve or a mesh"
                         )))
                     }
+                    Geometry::Instance { block, .. } => {
+                        return Err(ExecError::Invalid(format!(
+                            "'{id}' is a block instance ('{block}') — area not supported on instances"
+                        )))
+                    }
                 };
             }
             Ok((
@@ -2662,6 +2697,11 @@ fn apply_forward(
                     Geometry::Annotation(_) => {
                         return Err(ExecError::Invalid(format!(
                             "'{id}' is an annotation; volume needs meshes"
+                        )))
+                    }
+                    Geometry::Instance { block, .. } => {
+                        return Err(ExecError::Invalid(format!(
+                            "'{id}' is a block instance ('{block}'); volume not supported on instances"
                         )))
                     }
                 }
@@ -2826,6 +2866,107 @@ fn apply_forward(
                 },
             ))
         }
+        Command::BlockDefine { targets, name, geometries } => {
+            use mydrafter_doc::BlockGeometry;
+            let ids = resolve(doc, &targets)?;
+            // Snapshot geometry from source objects.
+            let snaps: Vec<BlockGeometry> = if let Some(g) = geometries {
+                // Replay path: use stored snapshots.
+                g
+            } else {
+                // Live path: snapshot from current objects.
+                ids.iter()
+                    .filter_map(|id| {
+                        let obj = doc.get(*id)?;
+                        Some(match &obj.geometry {
+                            Geometry::Mesh(m) => BlockGeometry::Mesh(m.clone()),
+                            Geometry::Curve(c) => BlockGeometry::Curve(c.clone()),
+                            Geometry::Annotation(a) => BlockGeometry::Annotation(a.clone()),
+                            // Instances within a block are flattened/skipped.
+                            Geometry::Instance { .. } => return None,
+                        })
+                    })
+                    .collect()
+            };
+            if snaps.is_empty() {
+                return Err(ExecError::Invalid(
+                    "block: selected objects produced no geometry snapshots (instances are not capturable)".into(),
+                ));
+            }
+            let prev = doc.blocks.insert(name.clone(), snaps.clone());
+            doc.generation += 1;
+            let n = snaps.len();
+            Ok((
+                Command::BlockDefine {
+                    targets,
+                    name: name.clone(),
+                    geometries: Some(snaps),
+                },
+                Inverse::BlockDef { name: name.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("block '{}' defined ({n} geometr{})", name, if n == 1 { "y" } else { "ies" }),
+                },
+            ))
+        }
+        Command::BlockInsert { id, name, position, rotation_deg, scale } => {
+            if !doc.blocks.contains_key(&name) {
+                return Err(ExecError::Invalid(format!(
+                    "no block named '{name}' (use 'blocks' to list definitions)"
+                )));
+            }
+            let id = id.unwrap_or_default();
+            let rot = rotation_deg.unwrap_or(0.0);
+            let sc = scale.unwrap_or(1.0);
+            if sc <= 0.0 {
+                return Err(ExecError::Invalid("block insert scale must be positive".into()));
+            }
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                geometry: Geometry::Instance {
+                    block: name.clone(),
+                    position,
+                    rotation_deg: rot,
+                    scale: sc,
+                },
+            });
+            Ok((
+                Command::BlockInsert {
+                    id: Some(id),
+                    name: name.clone(),
+                    position,
+                    rotation_deg: Some(rot),
+                    scale: Some(sc),
+                },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("insert '{}' -> {id} at {position}", name),
+                },
+            ))
+        }
+        Command::BlocksList => {
+            let list: Vec<String> = doc
+                .blocks
+                .iter()
+                .map(|(n, defs)| format!("  {n} ({} geometr{})", defs.len(), if defs.len() == 1 { "y" } else { "ies" }))
+                .collect();
+            let msg = if list.is_empty() {
+                "no block definitions".to_string()
+            } else {
+                format!("blocks:\n{}", list.join("\n"))
+            };
+            Ok((
+                Command::BlocksList,
+                // BlocksList is not logged (is_logged returns false), so this
+                // Inverse is never stored. Use a harmless variant.
+                Inverse::DeleteCreated(Vec::new()),
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
         Command::Undo | Command::Redo | Command::Amend { .. } | Command::Import { .. } => {
             unreachable!("handled in Session::run")
         }
@@ -2905,6 +3046,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::SheetTable { .. } => "sheettable",
         Command::SheetDim { .. } => "sheetdim",
         Command::MeshLiteral { .. } => "mesh_literal",
+        Command::BlockDefine { .. } => "block",
+        Command::BlockInsert { .. } => "insert",
+        Command::BlocksList => "blocks",
         Command::Undo => "undo",
         Command::Redo => "redo",
         Command::Amend { .. } => "amend",
@@ -4987,5 +5131,96 @@ mod tests {
             serde_json::to_string(&replayed.save_log()).unwrap(),
             "sun log must be replay-stable"
         );
+    }
+
+    // ---- block definition + instancing ----
+
+    #[test]
+    fn block_define_stores_geometry_and_insert_creates_instance() {
+        let mut s = Session::default();
+        // Create a simple box as source geometry.
+        run(&mut s, "box 0,0,0 1,1,2");
+        run(&mut s, "block last mytree");
+        assert!(s.doc.blocks.contains_key("mytree"), "block definition stored");
+        let defs = s.doc.blocks.get("mytree").unwrap();
+        assert_eq!(defs.len(), 1, "one geometry in block");
+
+        // Insert an instance.
+        run(&mut s, "insert mytree 5,0,0");
+        let last = s.doc.objects().last().unwrap();
+        assert!(matches!(last.geometry, mydrafter_doc::Geometry::Instance { ref block, .. } if block == "mytree"));
+    }
+
+    #[test]
+    fn block_insert_with_rotation_and_scale() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last door");
+        run(&mut s, "insert door 3,0,0 90 2");
+        let obj = s.doc.objects().last().unwrap();
+        match &obj.geometry {
+            mydrafter_doc::Geometry::Instance { block, position, rotation_deg, scale } => {
+                assert_eq!(block, "door");
+                assert!((position.x - 3.0).abs() < 1e-9);
+                assert!((rotation_deg - 90.0).abs() < 1e-9);
+                assert!((scale - 2.0).abs() < 1e-9);
+            }
+            _ => panic!("expected Instance geometry"),
+        }
+    }
+
+    #[test]
+    fn block_define_undo_removes_definition() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last myblock");
+        assert!(s.doc.blocks.contains_key("myblock"));
+        s.run(crate::Command::Undo).unwrap();
+        assert!(!s.doc.blocks.contains_key("myblock"), "undo removes block def");
+    }
+
+    #[test]
+    fn block_insert_undo_removes_instance() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last widget");
+        run(&mut s, "insert widget 0,5,0");
+        let n = s.doc.len();
+        s.run(crate::Command::Undo).unwrap();
+        assert_eq!(s.doc.len(), n - 1, "undo removes instance");
+    }
+
+    #[test]
+    fn block_insert_replay_stability() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,2,3");
+        run(&mut s, "block last column");
+        run(&mut s, "insert column 0,0,0");
+        run(&mut s, "insert column 5,0,0 45 1.5");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(s.doc.len(), replayed.doc.len());
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "block log must be replay-stable"
+        );
+    }
+
+    #[test]
+    fn blocks_list_is_not_logged() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last b");
+        let log_before = s.save_log().len();
+        run(&mut s, "blocks");
+        assert_eq!(s.save_log().len(), log_before, "blocks list must not be logged");
+    }
+
+    #[test]
+    fn insert_unknown_block_errors() {
+        let mut s = Session::default();
+        let result = s.run(crate::parse::parse("insert nosuchblock 0,0,0").unwrap());
+        assert!(result.is_err(), "should error on unknown block");
     }
 }
