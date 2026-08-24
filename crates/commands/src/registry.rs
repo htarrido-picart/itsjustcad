@@ -443,6 +443,11 @@ pub fn registry() -> &'static [CommandSpec] {
             usage: "amend <step> <command...>",
             summary: "Rewrite history: replace the op at <step> (0 = first op) with a new command and replay the whole log; later ops rebuild against the change. On failure nothing changes. Example: amend 0 box 0,0,0 8,8,3",
         },
+        CommandSpec {
+            name: "option",
+            usage: "option save <name> | option <name> | option list | option delete <name>",
+            summary: "Design options: named branches of the op-log for comparing schemes. 'option save tower' snapshots the current model as a branch; 'option courtyard' switches to (replays) another branch, auto-saving in-progress work to the branch you leave first; 'option list' shows branches (* = current); 'option delete <name>' removes one. Example: box 0,0,0 5,5,20 then option save tower",
+        },
     ]
 }
 

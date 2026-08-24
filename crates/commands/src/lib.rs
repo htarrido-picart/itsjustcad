@@ -19,9 +19,9 @@ pub mod plugin;
 mod registry;
 pub mod svg;
 
-pub use command::{Command, CompassDir, MirrorPlane, Selector};
+pub use command::{Command, CompassDir, MirrorPlane, OptionOp, Selector};
 pub use error::{ExecError, ParseError};
-pub use exec::{ApplyOutcome, Session};
+pub use exec::{ApplyOutcome, Session, MAIN_BRANCH};
 pub use parse::parse;
 pub use plugin::{Plugin, PluginError, PluginParam, PluginRegistry};
 pub use registry::{registry, CommandSpec, SELECTOR_HELP};

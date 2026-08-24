@@ -9,7 +9,9 @@ derived; nothing else is stored.
 ```json
 {
   "mydrafter": 1,
-  "ops": [ … ]
+  "ops": [ … ],
+  "branches": { "tower": [ … ], "courtyard": [ … ] },
+  "branch": "tower"
 }
 ```
 
@@ -17,6 +19,13 @@ derived; nothing else is stored.
 |---|---|---|
 | `mydrafter` | `u32` | format version, currently **1** |
 | `ops` | array of Command | ordered forward log; replayed in array order |
+| `branches` | map name → array of Command | design options; **optional**, omitted when empty (see below) |
+| `branch` | string | which branch `ops` belongs to; **optional**, omitted when there are no branches |
+
+`branches`/`branch` are serde-default: pre-branch v1 files (which have neither)
+load unchanged on branch `main`, and a file with no design options serializes
+without either field, staying byte-identical to the original v1 shape. No
+version bump is required.
 
 A reader **must** reject files where `mydrafter` > the version it knows. A
 reader **must** accept files where `mydrafter` == 1 forever — that is the
@@ -55,7 +64,8 @@ Only commands that mutate model state appear in the log. These commands are
 **never** logged (they are I/O or queries):
 
 `select`, `select_none`, `view_restore`, `view_list`, `print`, `export`,
-`import`, `distance`, `area`, `volume`, `bbox`, `undo`, `redo`, `amend`
+`import`, `distance`, `area`, `volume`, `bbox`, `undo`, `redo`, `amend`,
+`option`
 
 `import` is special: it expands DXF entities into their equivalent substrate
 ops (line, polyline, circle, arc, text, layer), which **are** logged. The
@@ -393,3 +403,35 @@ plugin call itself is never logged. This is deliberate:
   plugin directory.
 
 Plugins therefore add **no new op-log command** and require no format-version bump.
+
+## Design options (op-log branches)
+
+A file may carry named **branches** of the op-log under the optional top-level
+`branches` map. Each branch is a full saved effective log (same shape as `ops`);
+`branch` names which one the live `ops` belong to. They let a session hold
+several design schemes side by side and switch between them.
+
+The `option` command is **meta-level, like `undo`/`amend`** — it is *never*
+logged (it mutates the branch table and, on switch, replays a branch; the branch
+logs themselves are the record). Its four forms:
+
+- `option save <name>` — snapshot the current effective log as branch `<name>`
+  (overwriting any existing one) and make it current.
+- `option <name>` — switch: if the live log has diverged from the stored copy of
+  the current branch, that work is **auto-saved back to the current branch
+  first** (nothing is lost), then `<name>` is replayed and adopted as current.
+- `option list` — list branch names (current marked `*`).
+- `option delete <name>` — drop a branch; the current branch cannot be deleted.
+
+Semantics notes:
+
+- **Branches are just named saved logs.** Switching *replays* the target through
+  the same `apply` path used live, reproducing identical ids — so a round-trip
+  save→switch-away→switch-back yields the identical document.
+- Work always continues on **whichever branch you are on**; there is no separate
+  "detached" state.
+- Switching bumps the document `generation` (cache invalidation for GPU/journal),
+  so a replayed branch equals a standalone replay of its log *in objects*, though
+  the `generation` counter may differ.
+- Branches replay only when switched to, so loading a multi-option file costs a
+  single replay (the current branch) — the others sit as inert logs until used.

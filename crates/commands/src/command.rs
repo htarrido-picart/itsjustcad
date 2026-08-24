@@ -683,6 +683,25 @@ pub enum Command {
         step: usize,
         with: Box<Command>,
     },
+    /// Design options: named branches of the op-log. Meta-level, like Undo —
+    /// mutates the session's branch table (and may replay), never itself logged.
+    Option(OptionOp),
+}
+
+/// The four `option` sub-commands. See [`crate::exec::Session::option`] for the
+/// switching/auto-save semantics.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum OptionOp {
+    /// Snapshot the current effective log as branch `name` and make it current.
+    Save { name: String },
+    /// Switch to branch `name`: auto-save current work to the current branch if
+    /// it diverged, then replay `name`.
+    Switch { name: String },
+    /// List branch names (marks the current one).
+    List,
+    /// Delete branch `name` (never the current branch).
+    Delete { name: String },
 }
 
 impl Command {
@@ -708,6 +727,7 @@ impl Command {
                 | Command::Undo
                 | Command::Redo
                 | Command::Amend { .. }
+                | Command::Option(..)
         )
     }
 }

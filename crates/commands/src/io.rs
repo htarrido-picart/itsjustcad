@@ -8,12 +8,23 @@ pub const FORMAT_VERSION: u32 = 1;
 /// stale or unrecognized checkpoint is simply ignored (full replay).
 pub const CHECKPOINT_VERSION: u32 = 1;
 
-/// File format: the effective forward op-log, nothing else. Loading replays it
-/// through the same `apply` path used live, reproducing identical ids.
+/// File format: the effective forward op-log plus, optionally, design-option
+/// branches. Loading replays `ops` through the same `apply` path used live,
+/// reproducing identical ids; branches are seeded verbatim (replayed only when
+/// switched to). `branches`/`branch` are serde-default so pre-branch files load
+/// unchanged, and are omitted from the output when there are no branches.
 #[derive(Serialize, Deserialize)]
 struct FileFormat {
     mydrafter: u32,
     ops: Vec<Command>,
+    /// Named branches of the op-log (each a saved effective log). Empty for
+    /// files with no design options.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    branches: std::collections::BTreeMap<String, Vec<Command>>,
+    /// The branch the live `ops` belong to. Absent (→ "main") in old files and
+    /// whenever there are no branches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -29,9 +40,15 @@ pub enum IoError {
 }
 
 pub fn to_json(session: &Session) -> String {
+    let branches = session.branches().clone();
+    // Only record the current branch marker when there are branches; a
+    // branchless file stays byte-identical to the pre-branch format.
+    let branch = (!branches.is_empty()).then(|| session.current_branch().to_string());
     let file = FileFormat {
         mydrafter: FORMAT_VERSION,
         ops: session.save_log(),
+        branches,
+        branch,
     };
     serde_json::to_string_pretty(&file).expect("op-log serializes")
 }
@@ -41,7 +58,12 @@ pub fn from_json(json: &str) -> Result<Session, IoError> {
     if file.mydrafter != FORMAT_VERSION {
         return Err(IoError::BadVersion(file.mydrafter));
     }
-    Ok(Session::replay(file.ops)?)
+    let mut session = Session::replay(file.ops)?;
+    session.set_branches(
+        file.branches,
+        file.branch.unwrap_or_else(|| crate::exec::MAIN_BRANCH.to_string()),
+    );
+    Ok(session)
 }
 
 /// Checkpoint sidecar: a serialized `Document` snapshot plus the op count it
@@ -96,15 +118,21 @@ pub fn load_file(path: &std::path::Path) -> Result<Session, IoError> {
         return Err(IoError::BadVersion(file.mydrafter));
     }
 
+    let branch = file.branch.unwrap_or_else(|| crate::exec::MAIN_BRANCH.to_string());
+
     if let Ok(text) = std::fs::read_to_string(checkpoint_path(path))
         && let Ok(cp) = serde_json::from_str::<Checkpoint>(&text)
         && cp.mydrafter_checkpoint == CHECKPOINT_VERSION
         && cp.op_count == file.ops.len()
     {
-        return Ok(Session::from_snapshot(cp.doc, file.ops));
+        let mut session = Session::from_snapshot(cp.doc, file.ops);
+        session.set_branches(file.branches, branch);
+        return Ok(session);
     }
 
-    Ok(Session::replay(file.ops)?)
+    let mut session = Session::replay(file.ops)?;
+    session.set_branches(file.branches, branch);
+    Ok(session)
 }
 
 #[cfg(test)]
@@ -433,5 +461,50 @@ mod tests {
             panic!("expected version error");
         };
         assert!(matches!(err, IoError::BadVersion(99)));
+    }
+
+    #[test]
+    fn branches_round_trip_through_file() {
+        // Build two options, land on the second, then save/reload.
+        let mut s = Session::default();
+        s.run(parse("box 0,0,0 2,2,10").unwrap()).unwrap();
+        s.run(parse("option save tower").unwrap()).unwrap();
+        s.run(parse("box 0,0,0 8,8,3").unwrap()).unwrap();
+        s.run(parse("option save courtyard").unwrap()).unwrap();
+        s.run(parse("option tower").unwrap()).unwrap();
+
+        let json = to_json(&s);
+        assert!(json.contains("\"branches\""), "branches serialized: {json}");
+        assert!(json.contains("courtyard"));
+        let loaded = from_json(&json).unwrap();
+
+        assert_eq!(loaded.current_branch(), "tower");
+        assert_eq!(loaded.branches().len(), 2);
+        assert_eq!(loaded.branches(), s.branches());
+        // Live doc equals the tower branch (1 tall box).
+        assert_eq!(loaded.doc.len(), 1);
+        assert_eq!(to_json(&loaded), json, "replay-stable with branches");
+    }
+
+    #[test]
+    fn old_file_without_branches_loads_on_main() {
+        // Pre-branch files have no `branches`/`branch` fields.
+        let old = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "box",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "size": [2.0, 2.0, 2.0]}
+            ]
+        }"#;
+        let s = from_json(old).unwrap();
+        assert_eq!(s.doc.len(), 1);
+        assert!(s.branches().is_empty());
+        assert_eq!(s.current_branch(), crate::MAIN_BRANCH);
+        // A branchless session serializes without the optional fields, so the
+        // format stays byte-compatible with old readers.
+        let json = to_json(&s);
+        assert!(!json.contains("branches"), "no branch fields emitted: {json}");
+        assert!(!json.contains("\"branch\""));
     }
 }

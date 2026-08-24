@@ -6,8 +6,10 @@ use mydrafter_doc::{
     NamedView, ObjectId, SceneObject, ScheduleRow, SheetDim, SheetTable, Underlay, Units,
 };
 
+use std::collections::BTreeMap;
+
 use crate::error::ExecError;
-use crate::{Command, CompassDir, MirrorPlane, Selector};
+use crate::{Command, CompassDir, MirrorPlane, OptionOp, Selector};
 
 /// Chord tolerance used when tessellating profile curves for extrusion.
 const PROFILE_TOL: f64 = 0.01;
@@ -116,7 +118,6 @@ enum Inverse {
 
 /// Owns the document plus its op-log; the single mutation path for both the
 /// human command line and the LLM deck.
-#[derive(Default)]
 pub struct Session {
     pub doc: Document,
     log: Vec<AppliedOp>,
@@ -130,6 +131,31 @@ pub struct Session {
     /// forward ops whose inverses have not yet been materialized. `None` once
     /// the history is live. Never part of the file format.
     pending_log: Option<Vec<Command>>,
+    /// Named design-option branches: each is a saved effective op-log. Persisted
+    /// in the file (see `crate::io`). The branch you are on is `current_branch`;
+    /// its stored log is refreshed on switch/save so divergence is detectable.
+    /// Empty by default — old files carry no branches and load unchanged.
+    branches: BTreeMap<String, Vec<Command>>,
+    /// The branch the live log belongs to. `MAIN_BRANCH` until you save/switch.
+    current_branch: String,
+}
+
+/// The implicit branch every session starts on and that divergent work is
+/// auto-saved to. Never needs an explicit `option save main`.
+pub const MAIN_BRANCH: &str = "main";
+
+impl Default for Session {
+    fn default() -> Self {
+        Session {
+            doc: Document::default(),
+            log: Vec::new(),
+            cursor: 0,
+            plugins: crate::plugin::PluginRegistry::default(),
+            pending_log: None,
+            branches: BTreeMap::new(),
+            current_branch: MAIN_BRANCH.to_string(),
+        }
+    }
 }
 
 impl Session {
@@ -138,6 +164,7 @@ impl Session {
             Command::Undo => self.undo(),
             Command::Redo => self.redo(),
             Command::Amend { step, with } => self.amend(step, *with),
+            Command::Option(op) => self.option(op),
             Command::Import { path } => self.import(path),
             Command::Terrain { path } => self.terrain(path),
             Command::OsmFile { path } => self.osmfile(path),
@@ -426,6 +453,11 @@ impl Session {
         // old document never mistake the rebuilt one for it.
         fresh.doc.generation = fresh.doc.generation.max(self.doc.generation) + 1;
         let count = fresh.log.len();
+        // Amend rewrites the live log but leaves the design-option branches
+        // (and which one we are on) intact — they are meta-level, like the
+        // saved branches themselves.
+        fresh.branches = std::mem::take(&mut self.branches);
+        fresh.current_branch = std::mem::take(&mut self.current_branch);
         *self = fresh;
         Ok(ApplyOutcome {
             created: Vec::new(),
@@ -434,6 +466,128 @@ impl Session {
                 describe(&self.log[step].op)
             ),
         })
+    }
+
+    /// Design options: named branches of the op-log.
+    ///
+    /// Model (simplest correct one): a branch is a named saved effective log.
+    /// The live session is always "on" a branch (`current_branch`, starting at
+    /// [`MAIN_BRANCH`]). Switching replays the target branch; the work you were
+    /// doing keeps going on whichever branch you land on.
+    ///
+    /// - `save <name>`: snapshot the current effective log as branch `name`,
+    ///   overwriting any existing branch of that name, and make `name` current.
+    /// - `<name>` (switch): if the live log has diverged from the stored copy of
+    ///   the current branch, first auto-save it back to the current branch (so
+    ///   in-progress work is never lost — divergence is committed to where it
+    ///   was made). Then replay branch `name` and adopt it as current. The
+    ///   stored copy of `name` is refreshed to exactly what was replayed.
+    /// - `list`: names of all branches, current marked with `*`.
+    /// - `delete <name>`: drop a branch; the current branch cannot be deleted.
+    fn option(&mut self, op: OptionOp) -> Result<ApplyOutcome, ExecError> {
+        match op {
+            OptionOp::Save { name } => {
+                let log = self.save_log();
+                self.branches.insert(name.clone(), log);
+                self.current_branch = name.clone();
+                Ok(ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("option saved: {name} (now current)"),
+                })
+            }
+            OptionOp::Switch { name } => {
+                if name == self.current_branch {
+                    // Re-sync the stored copy with any live divergence, but do
+                    // not replay (that would needlessly rebuild the doc).
+                    self.branches.insert(name.clone(), self.save_log());
+                    return Ok(ApplyOutcome {
+                        created: Vec::new(),
+                        message: format!("already on option: {name}"),
+                    });
+                }
+                let Some(target) = self.branches.get(&name).cloned() else {
+                    let known = if self.branches.is_empty() {
+                        "none".to_string()
+                    } else {
+                        self.branches.keys().cloned().collect::<Vec<_>>().join(", ")
+                    };
+                    return Err(ExecError::Invalid(format!(
+                        "no option '{name}' (saved: {known}; create one with: option save {name})"
+                    )));
+                };
+                // Auto-save divergent in-progress work to the branch we are
+                // leaving, so nothing is lost.
+                let current = self.current_branch.clone();
+                self.branches.insert(current, self.save_log());
+                // Replay the target through the same apply path used live.
+                let mut fresh = Session::replay(target.clone())?;
+                fresh.doc.generation = fresh.doc.generation.max(self.doc.generation) + 1;
+                fresh.branches = std::mem::take(&mut self.branches);
+                fresh.current_branch = name.clone();
+                // Refresh the stored copy to exactly what replay produced.
+                fresh.branches.insert(name.clone(), target);
+                *self = fresh;
+                Ok(ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("switched to option: {name}"),
+                })
+            }
+            OptionOp::List => {
+                let msg = if self.branches.is_empty() {
+                    format!(
+                        "no saved options (on '{}'; save one with: option save <name>)",
+                        self.current_branch
+                    )
+                } else {
+                    let names: Vec<String> = self
+                        .branches
+                        .keys()
+                        .map(|n| {
+                            if *n == self.current_branch {
+                                format!("*{n}")
+                            } else {
+                                n.clone()
+                            }
+                        })
+                        .collect();
+                    format!("options: {}", names.join(", "))
+                };
+                Ok(ApplyOutcome { created: Vec::new(), message: msg })
+            }
+            OptionOp::Delete { name } => {
+                if name == self.current_branch {
+                    return Err(ExecError::Invalid(format!(
+                        "cannot delete the current option '{name}'; switch to another first"
+                    )));
+                }
+                if self.branches.remove(&name).is_none() {
+                    return Err(ExecError::Invalid(format!("no option '{name}' to delete")));
+                }
+                Ok(ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("deleted option: {name}"),
+                })
+            }
+        }
+    }
+
+    /// Read-only access to the saved branches (name → effective log), for the
+    /// file format. See [`Session::option`] for the semantics.
+    pub fn branches(&self) -> &BTreeMap<String, Vec<Command>> {
+        &self.branches
+    }
+
+    /// The branch the live log currently belongs to.
+    pub fn current_branch(&self) -> &str {
+        &self.current_branch
+    }
+
+    /// Seed branches and the current-branch marker when loading a file. The live
+    /// log/doc are unaffected; missing (old-file) values leave the defaults
+    /// (empty branch table, [`MAIN_BRANCH`]).
+    pub fn set_branches(&mut self, branches: BTreeMap<String, Vec<Command>>, current: String) {
+        self.branches = branches;
+        self.current_branch = current;
     }
 
     /// Import a file by dispatching on extension.
@@ -784,6 +938,7 @@ impl Session {
             cursor: 0,
             plugins: crate::plugin::PluginRegistry::default(),
             pending_log: Some(log),
+            ..Session::default()
         }
     }
 
@@ -3938,6 +4093,7 @@ fn apply_forward(
         Command::Undo
         | Command::Redo
         | Command::Amend { .. }
+        | Command::Option(..)
         | Command::Import { .. }
         | Command::Terrain { .. }
         | Command::OsmFile { .. } => {
@@ -4040,6 +4196,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Undo => "undo",
         Command::Redo => "redo",
         Command::Amend { .. } => "amend",
+        Command::Option(..) => "option",
     }
 }
 
@@ -6718,5 +6875,80 @@ mod tests {
         assert_eq!(replayed.doc.all_ids(), s.doc.all_ids());
         // Triangular footprint extrudes to 3 side quads (6 tris) + 2 caps = 8.
         assert_eq!(mesh_faces_on_layer(&replayed, "context"), 8);
+    }
+
+    // ---- design options: op-log branches ----
+
+    #[test]
+    fn option_save_switch_round_trips_document() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,10"); // tower massing
+        run(&mut s, "option save tower");
+        let tower_ids = s.doc.all_ids();
+        let tower_log = s.save_log();
+
+        // Diverge onto a fresh scheme and save it.
+        run(&mut s, "box 0,0,0 8,8,3"); // now tower + courtyard slab
+        run(&mut s, "option save courtyard");
+        assert_eq!(s.current_branch(), "courtyard");
+        assert_eq!(s.doc.len(), 2);
+
+        // Switch back to tower: replay reproduces the exact earlier state.
+        let out = run(&mut s, "option tower");
+        assert_eq!(out.message, "switched to option: tower");
+        assert_eq!(s.current_branch(), "tower");
+        assert_eq!(s.doc.all_ids(), tower_ids, "replayed ids identical");
+        assert_eq!(s.save_log(), tower_log, "live log is the tower branch");
+
+        // Round-trip: tower branch equals a standalone replay of its log
+        // (the switch bumps `generation` for cache invalidation, so compare
+        // the objects rather than the whole Document).
+        let fresh = Session::replay(tower_log).unwrap();
+        let objs = |s: &Session| {
+            let mut v: Vec<_> = s.doc.objects().cloned().collect();
+            v.sort_by_key(|o| o.id);
+            v
+        };
+        assert_eq!(objs(&s), objs(&fresh));
+    }
+
+    #[test]
+    fn option_switch_auto_saves_divergent_work() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "option save a");
+        run(&mut s, "box 5,0,0 1,1,1");
+        run(&mut s, "option save b");
+
+        // On branch b, keep working WITHOUT saving, then switch away.
+        run(&mut s, "box 10,0,0 1,1,1");
+        assert_eq!(s.doc.len(), 3);
+        run(&mut s, "option a"); // leaving b with unsaved divergence
+        assert_eq!(s.doc.len(), 1, "landed on a");
+
+        // The divergent third box must have been auto-saved into b.
+        run(&mut s, "option b");
+        assert_eq!(s.doc.len(), 3, "b kept the in-progress box");
+    }
+
+    #[test]
+    fn option_list_marks_current_and_delete_guards() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "option save a");
+        run(&mut s, "option save b");
+        let out = run(&mut s, "option list");
+        assert!(out.message.contains("*b"), "{}", out.message);
+        assert!(out.message.contains("a"), "{}", out.message);
+
+        // Cannot delete the branch you are on.
+        let err = s.run(parse("option delete b").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("current"), "{err}");
+
+        // Deleting another is fine; switching to a missing one errors.
+        run(&mut s, "option delete a");
+        assert_eq!(s.branches().len(), 1);
+        let err = s.run(parse("option nope").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no option 'nope'"), "{err}");
     }
 }

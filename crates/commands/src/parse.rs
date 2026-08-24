@@ -5,7 +5,7 @@ use mydrafter_doc::{
 
 use crate::error::ParseError;
 use crate::registry::registry;
-use crate::{Command, CompassDir, MirrorPlane, Selector};
+use crate::{Command, CompassDir, MirrorPlane, OptionOp, Selector};
 
 /// Hand-rolled `verb arg arg...` parser. Chosen over a combinator library
 /// because error message quality feeds the LLM retry loop.
@@ -701,6 +701,19 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             ["list"] => Ok(Command::ViewList),
             [name] if *name != "save" => Ok(Command::ViewRestore { name: (*name).to_string() }),
             _ => wrong("view", "'save <name>', a saved view name, or 'list'", &args),
+        },
+        "option" | "opt" => match args.as_slice() {
+            ["save", name] => Ok(Command::Option(OptionOp::Save { name: (*name).to_string() })),
+            ["list"] => Ok(Command::Option(OptionOp::List)),
+            ["delete", name] => Ok(Command::Option(OptionOp::Delete { name: (*name).to_string() })),
+            [name] if !matches!(*name, "save" | "list" | "delete") => {
+                Ok(Command::Option(OptionOp::Switch { name: (*name).to_string() }))
+            }
+            _ => wrong(
+                "option",
+                "'save <name>', a branch name to switch to, 'list', or 'delete <name>'",
+                &args,
+            ),
         },
         "select" => {
             let (sel, rest) = selector(&args, "select")?;
