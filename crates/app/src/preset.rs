@@ -118,6 +118,14 @@ impl UiPreset {
         }
     }
 
+    /// Human label for this preset's menu style (About dialog).
+    pub fn menu_style_label(&self) -> &'static str {
+        match self.menu_style {
+            MenuStyle::Rhino => "Rhino-style menus",
+            MenuStyle::AutoCAD => "AutoCAD-style menus",
+        }
+    }
+
     /// UI-chrome surface color. This is distinct from the viewport clear color
     /// (`bg_color`): a Rhino viewport is light gray, but its panel chrome reads
     /// better on a slightly different neutral. For dark skins the two match; for

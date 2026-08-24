@@ -249,6 +249,8 @@ pub struct App {
     panel_tabs: crate::tabstrip::TabState,
     /// Whether the right docked panel is shown at all (Cmd+\ hides/shows).
     panel_visible: bool,
+    /// Whether the Help → About dialog is open.
+    show_about: bool,
     /// Whether to show the first-run template picker on next frame.
     show_template_picker: bool,
     template_units: TemplateUnits,
@@ -375,6 +377,7 @@ impl App {
             deck_visible,
             panel_tabs: crate::tabstrip::TabState::default(),
             panel_visible: true,
+            show_about: false,
             show_template_picker: !load_template_done(),
             template_units: TemplateUnits::Meters,
             template_scale: TemplateScale::Building,
@@ -1747,14 +1750,41 @@ impl App {
         self.layers_panel(ui, theme);
     }
 
-    /// Top menu bar (Layer 3). Placeholder until the registry-driven menus land;
-    /// draws an empty top strip so the layout reserves the row.
+    /// Top menu bar (Layer 3): registry-driven, grouped per preset
+    /// (`menu::top_menus`). The chosen action is dispatched via
+    /// [`Self::apply_menu_action`].
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("mydrafter").weak().small());
-            });
+        let style = preset::preset_for(self.cad_origin).menu_style;
+        let bar = egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
+            crate::menu::ui(ui, style)
         });
+        // Dev/screenshot hook: force one menu open to show grouped items.
+        if let Ok(title) = std::env::var("MYDRAFTER_MENU_DEMO") {
+            let at = egui::pos2(bar.response.rect.left() + 8.0, bar.response.rect.bottom());
+            crate::menu::demo_open(ui.ctx(), style, &title, at);
+        }
+        if let Some(action) = bar.inner {
+            self.apply_menu_action(action);
+        }
+    }
+
+    /// Dispatch a menu pick. The rule (see `menu::menu_action`): draw verbs
+    /// start the interactive tool, no-arg verbs execute, arg verbs prefill the
+    /// command line for typing.
+    fn apply_menu_action(&mut self, action: crate::menu::MenuAction) {
+        use crate::menu::MenuAction;
+        match action {
+            MenuAction::Execute(line) | MenuAction::StartDraw(line) => self.execute_line(line),
+            MenuAction::Insert(prefix) => {
+                self.command_line.prefill(prefix);
+            }
+            MenuAction::Help => {
+                for line in help_lines(None) {
+                    self.command_line.push_line(line);
+                }
+            }
+            MenuAction::About => self.show_about = true,
+        }
     }
 }
 
@@ -2018,6 +2048,30 @@ impl eframe::App for App {
                 for cam in &mut self.cameras {
                     cam.distance = distance;
                 }
+            }
+        }
+
+        // Help → About dialog.
+        if self.show_about {
+            let mut open = true;
+            egui::Window::new("About mydrafter")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.label(egui::RichText::new("mydrafter").heading());
+                    ui.label("A command-first, FOSS CAD workspace.");
+                    ui.add_space(6.0);
+                    ui.label("Licensed AGPLv3.");
+                    ui.label(format!("Preset: {}", preset::preset_for(self.cad_origin).menu_style_label()));
+                    ui.add_space(6.0);
+                    if ui.button("Close").clicked() {
+                        self.show_about = false;
+                    }
+                });
+            if !open {
+                self.show_about = false;
             }
         }
 

@@ -8,6 +8,7 @@ mod gumball;
 mod headless;
 mod journal;
 mod keymap;
+mod menu;
 mod osnap;
 mod point_edit;
 mod precise;
