@@ -13,6 +13,7 @@ mod hardware;
 mod headless;
 mod journal;
 mod keymap;
+mod local_runtime;
 mod menu;
 mod model_catalog;
 mod osnap;

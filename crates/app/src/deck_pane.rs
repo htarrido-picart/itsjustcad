@@ -33,6 +33,34 @@ const MAX_RETRIES: u8 = 2;
 /// Hard cap on one deck turn. A wedged CLI subprocess is killed (kill_on_drop)
 /// instead of idling for hours; the session revives on the next send.
 const TURN_TIMEOUT_SECS: u64 = 600;
+/// How long to wait for a freshly-spawned local model server to answer its
+/// health check before giving up. A cold llama.cpp/llamafile start (mmap the
+/// weights, warm the first token) can take tens of seconds on a big model.
+const LOCAL_RUNTIME_TIMEOUT_SECS: u64 = 120;
+
+/// Whether `config` is a catalog-installed local cassette that ItsJustCAD serves
+/// by spawning a subprocess: an `openai_compat` cassette with grammar on whose
+/// `model` names a known catalog id. This deliberately excludes user-managed
+/// endpoints (e.g. a hand-configured Ollama on :11434) — those the user runs
+/// themselves; we only auto-spawn models we downloaded via Model Setup.
+fn is_spawnable_local(
+    config: &itsjustcad_deck::DeckConfig,
+    catalog: &crate::model_catalog::Catalog,
+) -> bool {
+    config.kind == itsjustcad_deck::DeckKind::OpenaiCompat
+        && config.grammar
+        && catalog.get(&config.model).is_some()
+}
+
+/// The outcome of ensuring a local runtime for a turn.
+enum LocalReady {
+    /// The server is healthy; the string is the live base URL to talk to.
+    Ready(String),
+    /// The server is still starting; retry the turn on a later frame.
+    Pending,
+    /// The server could not be started or went unhealthy; `String` is why.
+    Failed(String),
+}
 
 #[derive(Serialize, Deserialize)]
 struct ExecutedCommand {
@@ -336,6 +364,18 @@ pub struct DeckPane {
     /// Sandbox root for deck-originated fs paths — the current document's
     /// directory when known, else the ItsJustCAD documents dir. Set by the app.
     sandbox_root: Option<std::path::PathBuf>,
+    /// Lazily-spawned local model server for the active local cassette. Held so
+    /// `kill_on_drop` tears the server down on app exit or a model switch. `None`
+    /// until the first turn on a local grammar cassette; replaced when the active
+    /// local model changes.
+    local_runtime: Option<crate::local_runtime::LocalRuntime>,
+    /// Bundled catalog, used to resolve a local cassette's model id to a file +
+    /// runtime when spawning the local server.
+    catalog: crate::model_catalog::Catalog,
+    /// A turn was requested while the local runtime was still starting; the
+    /// user's message is already queued, so `tick` retries `start_turn` once the
+    /// runtime reports Ready (or drops it on Failed).
+    deferred_local_turn: bool,
 }
 
 impl Default for DeckPane {
@@ -374,6 +414,9 @@ impl Default for DeckPane {
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
             sandbox_root: None,
+            local_runtime: None,
+            catalog: crate::model_catalog::Catalog::load(),
+            deferred_local_turn: false,
         }
     }
 }
@@ -518,17 +561,107 @@ impl DeckPane {
         self.send(session, handle);
     }
 
+    /// Lazily spawn (or reuse) the local model server for `config` and report
+    /// whether this turn can proceed. On the first call for a model it spawns the
+    /// subprocess and returns [`LocalReady::Pending`]; subsequent calls poll the
+    /// runtime state and return `Ready` (with the live `127.0.0.1:<port>` base
+    /// URL) once healthy, or `Failed`. Switching to a different local model drops
+    /// the old runtime (killing its server) and spawns the new one.
+    ///
+    /// Never blocks: the spawn + health-check run on the tokio runtime; this only
+    /// reads a shared state and (once) fires the spawn.
+    fn ensure_local_runtime(
+        &mut self,
+        config: &itsjustcad_deck::DeckConfig,
+        handle: &tokio::runtime::Handle,
+    ) -> LocalReady {
+        // Drop a runtime that's serving a different model (a cassette switch).
+        if let Some(rt) = &self.local_runtime
+            && rt.model_id() != config.model
+        {
+            self.local_runtime = None; // kill_on_drop tears the old server down
+        }
+
+        if let Some(rt) = &self.local_runtime {
+            return match rt.state() {
+                crate::local_runtime::RuntimeState::Ready { base_url } => {
+                    LocalReady::Ready(base_url)
+                }
+                crate::local_runtime::RuntimeState::Failed { msg } => {
+                    // Drop the failed runtime so a later turn can retry a fresh
+                    // spawn rather than being stuck on the dead handle.
+                    self.local_runtime = None;
+                    LocalReady::Failed(msg)
+                }
+                _ => LocalReady::Pending,
+            };
+        }
+
+        // First use: resolve the file + runtime, pick a port, spawn.
+        let Some(models_dir) = crate::download::models_dir() else {
+            return LocalReady::Failed("no home directory for models".into());
+        };
+        let plan = match crate::local_runtime::resolve_runtime(
+            &self.catalog,
+            &models_dir,
+            &config.model,
+        ) {
+            Ok(p) => p,
+            Err(e) => return LocalReady::Failed(e),
+        };
+        let port = match crate::local_runtime::free_port() {
+            Ok(p) => p,
+            Err(e) => return LocalReady::Failed(e),
+        };
+        match crate::local_runtime::LocalRuntime::spawn(
+            handle,
+            &config.model,
+            &plan,
+            port,
+            std::time::Duration::from_secs(LOCAL_RUNTIME_TIMEOUT_SECS),
+        ) {
+            Ok(rt) => {
+                self.local_runtime = Some(rt);
+                self.transcript
+                    .push(Entry::Status("starting local model…".into()));
+                LocalReady::Pending
+            }
+            Err(e) => LocalReady::Failed(e),
+        }
+    }
+
     fn start_turn(&mut self, session: &Session, handle: &tokio::runtime::Handle) {
         if let Err(reason) = self.decks.check_local_only() {
             self.transcript.push(Entry::Status(format!("blocked: {reason}")));
             return;
         }
-        let Some(config) = self.decks.decks.get(self.decks.active) else {
+        let Some(config) = self.decks.decks.get(self.decks.active).cloned() else {
             self.transcript
                 .push(Entry::Status("no deck configured".into()));
             return;
         };
-        let deck = make_deck(config);
+        // A catalog-installed local cassette (openai_compat + grammar + model is
+        // a known catalog id) is served by a subprocess we spawn on demand. If
+        // it isn't up yet, kick it off and defer this turn — the pane polls the
+        // runtime state and revives the input on the next frame once it's ready.
+        let mut config = config;
+        if is_spawnable_local(&config, &self.catalog) {
+            match self.ensure_local_runtime(&config, handle) {
+                LocalReady::Ready(base_url) => config.base_url = base_url,
+                LocalReady::Pending => {
+                    // Put the message back so the user's turn is not lost; a later
+                    // frame retries once the server reports Ready.
+                    self.deferred_local_turn = true;
+                    return;
+                }
+                LocalReady::Failed(msg) => {
+                    self.transcript
+                        .push(Entry::Status(format!("local model failed: {msg}")));
+                    return;
+                }
+            }
+        }
+        let deck = make_deck(&config);
         let mut req = ChatRequest::text(
             system_prompt(&crate::scene::digest(&session.doc), &session.plugins),
             self.messages.clone(),
@@ -810,11 +943,27 @@ impl DeckPane {
                 "turn killed after {TURN_TIMEOUT_SECS}s — subprocess was stuck"
             )));
         }
+        // A turn deferred while the local model was starting: retry once the
+        // runtime resolves. `start_turn` re-checks the state and either proceeds
+        // (Ready), keeps deferring (still Pending), or reports Failed.
+        if self.deferred_local_turn && !self.busy() {
+            let still_starting = matches!(
+                self.local_runtime.as_ref().map(|r| r.state()),
+                Some(crate::local_runtime::RuntimeState::Starting)
+            );
+            if still_starting {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            } else {
+                self.deferred_local_turn = false;
+                self.start_turn(session, handle);
+            }
+        }
         self.poll_probe(handle);
         self.poll_warm(handle);
         // Keep the event loop running while background work is in flight,
         // whether or not the panel is rendered this frame.
         if self.busy()
+            || self.deferred_local_turn
             || matches!(self.probe, ProbeState::Checking(_))
             || matches!(self.warm, WarmState::Warming { .. })
         {
@@ -1015,6 +1164,19 @@ impl DeckPane {
                 if ui.small_button("stop").clicked() {
                     self.stop_turn();
                 }
+            }
+            // Local model server status (only when one is starting/failed/ready).
+            if let Some(rt) = &self.local_runtime {
+                let state = rt.state();
+                let color = match state {
+                    crate::local_runtime::RuntimeState::Failed { .. } => ERR_COLOR,
+                    crate::local_runtime::RuntimeState::Ready { .. } => OK_COLOR,
+                    crate::local_runtime::RuntimeState::Starting => ACCENT,
+                };
+                if matches!(state, crate::local_runtime::RuntimeState::Starting) {
+                    ui.spinner();
+                }
+                ui.colored_label(color, state.caption());
             }
             if ui
                 .add_enabled(!self.busy() && self.ready(), egui::Button::new("critique").small())
@@ -1239,6 +1401,9 @@ mod side_effect_gate_tests {
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
             sandbox_root: None,
+            local_runtime: None,
+            catalog: crate::model_catalog::Catalog::load(),
+            deferred_local_turn: false,
         }
     }
 
