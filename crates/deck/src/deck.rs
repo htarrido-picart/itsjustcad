@@ -28,6 +28,40 @@ pub struct ChatRequest {
     /// the adapter may send only the newest message instead of the full
     /// transcript. HTTP adapters ignore it.
     pub session_id: Option<String>,
+    /// Tools the model may use this turn (claude-code cassette only). Empty =
+    /// none, keeping the deck a pure text substrate. `["Read"]` lets a vision
+    /// critique turn open a screenshot the prompt points at. HTTP adapters
+    /// ignore it.
+    pub allowed_tools: Vec<String>,
+    /// Agentic turn budget (claude-code cassette only). 1 for a plain reply; a
+    /// tool-using turn (Read a screenshot, then answer) needs 2+. HTTP
+    /// adapters ignore it.
+    pub max_turns: u32,
+}
+
+impl ChatRequest {
+    /// A plain text turn: no tools, single agentic step. Keeps the tool/turn
+    /// defaults in one place so the substrate stays text-only unless a turn
+    /// opts in.
+    pub fn text(
+        system: String,
+        messages: Vec<ChatMessage>,
+        model: String,
+        max_tokens: u32,
+        temperature: f32,
+        session_id: Option<String>,
+    ) -> Self {
+        Self {
+            system,
+            messages,
+            model,
+            max_tokens,
+            temperature,
+            session_id,
+            allowed_tools: Vec::new(),
+            max_turns: 1,
+        }
+    }
 }
 
 /// Streaming events from a deck to the UI.

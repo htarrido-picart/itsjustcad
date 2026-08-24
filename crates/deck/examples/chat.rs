@@ -12,14 +12,14 @@ async fn main() {
 
     let deck = make_deck(config);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let req = ChatRequest {
-        system: system_prompt(""),
-        messages: vec![ChatMessage { role: Role::User, content: prompt }],
-        model: String::new(),
-        max_tokens: 2048,
-        temperature: 0.2,
-        session_id: None,
-    };
+    let req = ChatRequest::text(
+        system_prompt(""),
+        vec![ChatMessage { role: Role::User, content: prompt }],
+        String::new(),
+        2048,
+        0.2,
+        None,
+    );
     tokio::spawn(async move { deck.stream_chat(req, tx).await });
 
     while let Some(delta) = rx.recv().await {

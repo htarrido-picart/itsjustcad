@@ -247,6 +247,13 @@ pub struct DeckPane {
     session_id: Option<String>,
     view: PaneView,
     markdown: CommonMarkCache,
+    /// The next turn is a vision critique: grant the claude-code cassette the
+    /// Read tool (to open the screenshot) and a 2nd agentic step (read, then
+    /// answer). Consumed by `start_turn`; retries within the turn inherit it.
+    vision_turn: bool,
+    /// The critique button was clicked; the app owns the viewport screenshot so
+    /// it polls and clears this, then drives the capture + `send_critique`.
+    critique_requested: bool,
 }
 
 impl Default for DeckPane {
@@ -280,6 +287,8 @@ impl Default for DeckPane {
             session_id: saved.session_id,
             view: PaneView::Chat,
             markdown: CommonMarkCache::default(),
+            vision_turn: false,
+            critique_requested: false,
         }
     }
 }
@@ -287,6 +296,12 @@ impl Default for DeckPane {
 impl DeckPane {
     pub fn busy(&self) -> bool {
         self.rx.is_some()
+    }
+
+    /// Poll+clear the critique button. The app drives the viewport screenshot
+    /// (which the pane can't reach) and then calls `send_critique`.
+    pub fn take_critique_request(&mut self) -> bool {
+        std::mem::take(&mut self.critique_requested)
     }
 
     /// Snapshot the chat to disk so an idle/quit/crash can be revived later.
@@ -391,7 +406,22 @@ impl DeckPane {
         session: &Session,
         handle: &tokio::runtime::Handle,
     ) {
+        self.vision_turn = false;
         self.input = text.to_string();
+        self.send(session, handle);
+    }
+
+    /// Send a viewport critique: a vision turn whose prompt already points at
+    /// the on-disk screenshot. The claude-code cassette gets the Read tool for
+    /// this turn (and its error-retries) so it can open the image.
+    pub fn send_critique(
+        &mut self,
+        prompt: &str,
+        session: &Session,
+        handle: &tokio::runtime::Handle,
+    ) {
+        self.vision_turn = true;
+        self.input = prompt.to_string();
         self.send(session, handle);
     }
 
@@ -406,14 +436,21 @@ impl DeckPane {
             return;
         };
         let deck = make_deck(config);
-        let req = ChatRequest {
-            system: system_prompt(&crate::scene::digest(&session.doc)),
-            messages: self.messages.clone(),
-            model: String::new(),
-            max_tokens: 4096,
-            temperature: 0.2,
-            session_id: self.session_id.clone(),
-        };
+        let mut req = ChatRequest::text(
+            system_prompt(&crate::scene::digest(&session.doc)),
+            self.messages.clone(),
+            String::new(),
+            4096,
+            0.2,
+            self.session_id.clone(),
+        );
+        if self.vision_turn {
+            // Grant Read (to open the screenshot) and a 2nd agentic step so the
+            // model can read then answer. Claude-code cassette only; HTTP
+            // adapters ignore these fields (vision there is a noted cut).
+            req.allowed_tools = vec!["Read".into()];
+            req.max_turns = 2;
+        }
         let (tx, rx) = unbounded_channel();
         self.rx = Some(rx);
         self.extractor = Extractor::default();
@@ -515,6 +552,10 @@ impl DeckPane {
                 content: feedback,
             });
             self.start_turn(session, handle);
+        } else {
+            // Turn fully done (no retry queued): a vision turn does not carry
+            // over to the next normal send.
+            self.vision_turn = false;
         }
         self.persist_chat();
     }
@@ -736,6 +777,13 @@ impl DeckPane {
                 if ui.small_button("stop").clicked() {
                     self.stop_turn();
                 }
+            }
+            if ui
+                .add_enabled(!self.busy() && self.ready(), egui::Button::new("critique").small())
+                .on_hover_text("screenshot the viewport and ask the deck to assess it")
+                .clicked()
+            {
+                self.critique_requested = true;
             }
             if ui.small_button("clear").clicked() {
                 self.transcript.clear();

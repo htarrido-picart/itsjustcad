@@ -27,6 +27,75 @@ enum TemplateScale {
     Urban,
 }
 
+/// Fixed path the viewport critique screenshot is written to before the vision
+/// deck turn reads it. Overwritten each critique; /tmp is world-readable to the
+/// `claude` subprocess.
+pub(crate) const CRITIQUE_SHOT_PATH: &str = "/tmp/mydrafter-critique.png";
+
+/// The message sent to the deck for a viewport critique. Points the model at
+/// the screenshot on disk (the claude-code cassette opens it with the Read
+/// tool) and frames the assessment. Pure so the prompt is unit-testable.
+pub(crate) fn critique_prompt(image_path: &str, question: &str) -> String {
+    let mut p = format!(
+        "Read {image_path} — it is a screenshot of the current CAD viewport. \
+You are an architecture critic. Assess the massing, proportion, and how light \
+reads across the form. Be specific and direct; no flattery."
+    );
+    let q = question.trim();
+    if !q.is_empty() {
+        p.push_str(&format!(" Also address: {q}"));
+    }
+    p
+}
+
+/// Tag stamped on a critique screenshot's `UserData` so its echoed `Screenshot`
+/// event is routed to the critique handler, not the dev-shot exit path.
+const CRITIQUE_TAG: &str = "critique";
+
+/// Persist an egui screenshot buffer as a PNG. Shared by the dev shot and the
+/// viewport critique.
+fn save_screenshot_png(img: &egui::ColorImage, path: &std::path::Path) {
+    let png = image::RgbaImage::from_raw(
+        img.width() as u32,
+        img.height() as u32,
+        img.as_raw().to_vec(),
+    )
+    .expect("screenshot buffer size");
+    png.save(path).expect("write screenshot");
+}
+
+/// The first `Screenshot` event this frame whose `UserData` carries the given
+/// string tag.
+fn tagged_screenshot(ctx: &egui::Context, tag: &str) -> Option<egui::ColorImage> {
+    ctx.input(|i| {
+        i.events.iter().find_map(|e| match e {
+            egui::Event::Screenshot { image, user_data, .. }
+                if user_data
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.downcast_ref::<&str>())
+                    == Some(&tag) =>
+            {
+                Some((**image).clone())
+            }
+            _ => None,
+        })
+    })
+}
+
+/// The first untagged `Screenshot` event this frame (the dev/`MYDRAFTER_SHOT`
+/// capture); critique-tagged shots are skipped.
+fn untagged_screenshot(ctx: &egui::Context) -> Option<egui::ColorImage> {
+    ctx.input(|i| {
+        i.events.iter().find_map(|e| match e {
+            egui::Event::Screenshot { image, user_data, .. } if user_data.data.is_none() => {
+                Some((**image).clone())
+            }
+            _ => None,
+        })
+    })
+}
+
 pub(crate) fn units_cmd_for(u: &TemplateUnits) -> &'static str {
     match u {
         TemplateUnits::Meters => "units m",
@@ -110,6 +179,10 @@ pub struct App {
     pending_layer_color: Option<(String, [f32; 3])>,
     /// Last executed command line; Enter/Space on the canvas repeats it.
     last_line: Option<String>,
+    /// A `critique` request awaiting its viewport screenshot. Holds the
+    /// optional user question; once the tagged Screenshot event lands, the PNG
+    /// is written and a vision deck turn (Read tool enabled) is fired.
+    pending_critique: Option<String>,
     /// Cmd+C pressed with a selection; Cmd+V then runs `copy sel 1,1,0`.
     clipboard_armed: bool,
     /// In-progress drag-box selection: anchor position of the drag.
@@ -233,6 +306,7 @@ impl App {
             frame_count: 0,
             pending_layer_color: None,
             last_line: None,
+            pending_critique: None,
             clipboard_armed: false,
             box_drag: None,
             journal,
@@ -364,6 +438,17 @@ impl App {
             }
             Some("template") => {
                 self.show_template_picker = true;
+            }
+            // Vision: screenshot the viewport and ask the deck to critique it.
+            // The rest of the line (if any) is a user question folded into the
+            // prompt. Deferred: the shot lands a frame later (see handle_critique).
+            Some("critique") => {
+                if !self.deck_visible {
+                    self.deck_visible = true;
+                    save_deck_visible(self.deck_visible);
+                }
+                let question = words.collect::<Vec<_>>().join(" ");
+                self.pending_critique = Some(question);
             }
             _ => {
                 if self.draw_tool.try_start(line) {
@@ -685,21 +770,37 @@ impl App {
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         }
-        let image = ctx.input(|i| {
-            i.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                _ => None,
-            })
-        });
-        if let Some(img) = image {
-            let png = image::RgbaImage::from_raw(
-                img.width() as u32,
-                img.height() as u32,
-                img.as_raw().to_vec(),
-            )
-            .expect("screenshot buffer size");
-            png.save(&path).expect("write screenshot");
+        // Ignore a critique-tagged shot here — `handle_critique` claims it.
+        if let Some(img) = untagged_screenshot(ctx) {
+            save_screenshot_png(&img, std::path::Path::new(&path));
             std::process::exit(0);
+        }
+    }
+
+    /// When a `critique` request is pending, drive the screenshot: request the
+    /// capture, and when the tagged frame lands, write the PNG and fire the
+    /// vision deck turn (Read tool enabled) that reads it.
+    fn handle_critique(&mut self, ctx: &egui::Context) {
+        if self.pending_critique.is_none() {
+            return;
+        }
+        ctx.request_repaint(); // keep frames flowing until the shot lands
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+            CRITIQUE_TAG,
+        )));
+        // Ignore empty frames (the framebuffer is 0-sized until the first real
+        // paint); keep requesting until a rendered frame lands.
+        if let Some(img) = tagged_screenshot(ctx, CRITIQUE_TAG)
+            .filter(|i| i.width() > 0 && i.height() > 0)
+        {
+            let question = self.pending_critique.take().unwrap_or_default();
+            save_screenshot_png(&img, std::path::Path::new(CRITIQUE_SHOT_PATH));
+            let prompt = critique_prompt(CRITIQUE_SHOT_PATH, &question);
+            tracing::info!(target: "deck", "critique prompt: {prompt}");
+            self.command_line
+                .push_line(format!("critique: captured {CRITIQUE_SHOT_PATH}"));
+            self.deck_pane
+                .send_critique(&prompt, &self.session, &self.tokio);
         }
     }
 
@@ -1720,7 +1821,12 @@ impl eframe::App for App {
             }
         }
 
+        // Deck's "critique" button: same effect as the `critique` verb.
+        if self.deck_pane.take_critique_request() {
+            self.pending_critique = Some(String::new());
+        }
         self.handle_dev_screenshot(ui.ctx());
+        self.handle_critique(ui.ctx());
 
         // Persist zoom changes from any source (buttons or Cmd+=/Cmd+-).
         let zoom = ui.ctx().zoom_factor();
@@ -1889,6 +1995,25 @@ fn apply_named_view(cam: &mut OrbitCamera, view: &mydrafter_doc::NamedView) {
 mod tests {
     use super::*;
     use mydrafter_commands::registry;
+
+    #[test]
+    fn critique_prompt_names_the_image_and_frames_the_ask() {
+        let p = critique_prompt("/tmp/mydrafter-critique.png", "");
+        assert!(p.contains("Read /tmp/mydrafter-critique.png"));
+        assert!(p.contains("architecture critic"));
+        assert!(p.contains("massing"));
+        assert!(p.contains("proportion"));
+        assert!(p.contains("light"));
+        // No trailing "Also address:" when there is no question.
+        assert!(!p.contains("Also address"));
+    }
+
+    #[test]
+    fn critique_prompt_folds_in_user_question() {
+        let p = critique_prompt(CRITIQUE_SHOT_PATH, "  is the roof pitch too steep?  ");
+        // Whitespace-trimmed and appended.
+        assert!(p.ends_with("Also address: is the roof pitch too steep?"));
+    }
 
     #[test]
     fn help_all_lists_every_registry_verb() {
