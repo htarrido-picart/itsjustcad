@@ -15,6 +15,11 @@ use kernel_mesh::{triangulate, Mesh};
 
 const EARTH_RADIUS_M: f64 = 6_378_137.0;
 
+/// Maximum number of points accepted by [`terrain_from_points`]. Above this,
+/// the Bowyer-Watson triangulation becomes too slow for the UI thread (O(n²)).
+/// Callers that need more points should downsample first.
+pub const MAX_TERRAIN_POINTS: usize = 20_000;
+
 /// A geo origin used to project lon/lat degrees to local meters.
 #[derive(Clone, Copy, Debug)]
 pub struct GeoOrigin {
@@ -187,6 +192,9 @@ fn coord_seq(v: &serde_json::Value, origin: Option<GeoOrigin>) -> Option<Vec<DVe
 
 /// Parse a CSV of `x,y,z` survey points (header row optional; non-numeric first
 /// row is skipped). Blank lines and `#` comments are ignored.
+///
+/// Returns `Err` if any coordinate is non-finite (NaN, ±Inf, or overflowing
+/// f64 parse). This prevents silent corrupt-mesh generation.
 pub fn parse_csv_points(text: &str) -> Result<Vec<DVec3>, String> {
     let mut pts = Vec::new();
     for (i, raw) in text.lines().enumerate() {
@@ -206,6 +214,12 @@ pub fn parse_csv_points(text: &str) -> Result<Vec<DVec3>, String> {
             ))
         };
         match parse3() {
+            Some(p) if !p.is_finite() => {
+                return Err(format!(
+                    "line {}: non-finite coordinate (NaN or Inf)",
+                    i + 1
+                ))
+            }
             Some(p) => pts.push(p),
             None if i == 0 => continue, // header row
             None => return Err(format!("line {}: non-numeric coordinate", i + 1)),
@@ -215,10 +229,28 @@ pub fn parse_csv_points(text: &str) -> Result<Vec<DVec3>, String> {
 }
 
 /// Delaunay-triangulate scattered 3D points (by their XY) into a terrain mesh,
-/// keeping each vertex's z. Fewer than 3 points → error.
+/// keeping each vertex's z. Fewer than 3 points → error. More than
+/// [`MAX_TERRAIN_POINTS`] → error (prevents O(n²) UI-thread freeze).
+///
+/// Non-finite points are rejected defensively even if the caller already
+/// filtered them — the triangulator would produce garbage geometry on NaN/Inf.
 pub fn terrain_from_points(pts: &[DVec3]) -> Result<Mesh, String> {
     if pts.len() < 3 {
         return Err(format!("terrain needs at least 3 points, got {}", pts.len()));
+    }
+    if pts.len() > MAX_TERRAIN_POINTS {
+        return Err(format!(
+            "terrain point cap exceeded: {} points (max {}). \
+             Downsample or crop the survey before importing.",
+            pts.len(),
+            MAX_TERRAIN_POINTS
+        ));
+    }
+    if let Some(bad) = pts.iter().find(|p| !p.is_finite()) {
+        return Err(format!(
+            "terrain point with non-finite coordinate: ({}, {}, {})",
+            bad.x, bad.y, bad.z
+        ));
     }
     let xy: Vec<DVec2> = pts.iter().map(|p| p.truncate()).collect();
     let faces = triangulate(&xy);
@@ -516,5 +548,73 @@ mod tests {
         let bldgs = parse_overpass(osm, Some(GeoOrigin { lat_deg: 0.0, lon_deg: 0.0 })).unwrap();
         assert_eq!(bldgs.len(), 1);
         assert_eq!(bldgs[0].height_m, DEFAULT_BUILDING_HEIGHT_M);
+    }
+
+    // ---- M-1 regression: terrain point cap ----
+
+    /// Feeding more than MAX_TERRAIN_POINTS must return Err — not hang the UI.
+    #[test]
+    fn terrain_from_points_rejects_over_cap() {
+        // Build MAX_TERRAIN_POINTS+1 distinct points. This would freeze the UI
+        // thread in O(n²) before the cap was added; now it must Err immediately.
+        let pts: Vec<DVec3> = (0..=(MAX_TERRAIN_POINTS as u64))
+            .map(|i| DVec3::new(i as f64, (i % 1000) as f64, 0.0))
+            .collect();
+        let err = terrain_from_points(&pts).unwrap_err();
+        assert!(
+            err.contains("cap exceeded"),
+            "expected cap error, got: {err}"
+        );
+    }
+
+    // ---- M-2 regressions: NaN / Inf in CSV ----
+
+    /// "nan" in any coordinate must be rejected.
+    #[test]
+    fn csv_nan_coordinate_is_rejected() {
+        let csv = "0,0,0\n10,0,1\nnan,5,2\n";
+        let err = parse_csv_points(csv).unwrap_err();
+        assert!(
+            err.contains("non-finite") || err.contains("non-numeric"),
+            "expected finite-check error, got: {err}"
+        );
+    }
+
+    /// "inf" in any coordinate must be rejected.
+    #[test]
+    fn csv_inf_coordinate_is_rejected() {
+        let csv = "0,0,0\n10,0,1\n5,inf,2\n";
+        let err = parse_csv_points(csv).unwrap_err();
+        assert!(
+            err.contains("non-finite") || err.contains("non-numeric"),
+            "expected finite-check error, got: {err}"
+        );
+    }
+
+    /// A value so large it overflows f64 to Inf must also be rejected.
+    #[test]
+    fn csv_overflow_to_inf_is_rejected() {
+        // 1e309 overflows f64 → +Inf when parsed.
+        let csv = "0,0,0\n10,0,1\n5,5,1e309\n";
+        let err = parse_csv_points(csv).unwrap_err();
+        assert!(
+            err.contains("non-finite") || err.contains("non-numeric"),
+            "expected finite-check error, got: {err}"
+        );
+    }
+
+    /// terrain_from_points must also reject a pre-built NaN point defensively.
+    #[test]
+    fn terrain_from_points_rejects_nan_input() {
+        let pts = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(0.5, 1.0, f64::NAN),
+        ];
+        let err = terrain_from_points(&pts).unwrap_err();
+        assert!(
+            err.contains("non-finite"),
+            "expected non-finite error, got: {err}"
+        );
     }
 }

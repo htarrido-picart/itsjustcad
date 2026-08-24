@@ -541,7 +541,8 @@ impl DeckPane {
             // exfiltration via an attacker-controlled scene name). A 2nd agentic
             // step lets the model open the shot then answer. Claude-code cassette
             // only; HTTP adapters ignore these fields (vision there is a cut).
-            req.vision_shot_path = Some(crate::app::CRITIQUE_SHOT_PATH.to_string());
+            req.vision_shot_path =
+                Some(crate::app::critique_shot_path().display().to_string());
             req.max_turns = 2;
         }
         let (tx, rx) = unbounded_channel();
@@ -1255,8 +1256,9 @@ mod side_effect_gate_tests {
             None,
         );
         // Mirror the vision-turn arm of start_turn.
+        let expected_shot = crate::app::critique_shot_path().display().to_string();
         if pane.vision_turn {
-            req.vision_shot_path = Some(crate::app::CRITIQUE_SHOT_PATH.to_string());
+            req.vision_shot_path = Some(expected_shot.clone());
             req.max_turns = 2;
         }
         assert!(
@@ -1265,7 +1267,7 @@ mod side_effect_gate_tests {
         );
         assert_eq!(
             req.vision_shot_path.as_deref(),
-            Some(crate::app::CRITIQUE_SHOT_PATH),
+            Some(expected_shot.as_str()),
             "critique must scope file access to the one screenshot"
         );
         // And the adapter turns that into a path-scoped Read of exactly that file.
@@ -1273,10 +1275,7 @@ mod side_effect_gate_tests {
             &req.allowed_tools,
             req.vision_shot_path.as_deref(),
         );
-        assert_eq!(
-            scoped,
-            vec![format!("Read({})", crate::app::CRITIQUE_SHOT_PATH)]
-        );
+        assert_eq!(scoped, vec![format!("Read({expected_shot})")]);
     }
 
     #[test]

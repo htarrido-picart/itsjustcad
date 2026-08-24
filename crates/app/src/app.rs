@@ -27,10 +27,44 @@ pub(crate) enum TemplateScale {
     Urban,
 }
 
-/// Fixed path the viewport critique screenshot is written to before the vision
-/// deck turn reads it. Overwritten each critique; /tmp is world-readable to the
-/// `claude` subprocess.
-pub(crate) const CRITIQUE_SHOT_PATH: &str = "/tmp/mydrafter-critique.png";
+/// Return a private directory for mydrafter runtime files (mode 0o700 on Unix).
+/// Prefers `$XDG_RUNTIME_DIR/mydrafter`, then `$HOME/.config/mydrafter`, then
+/// a `mydrafter` subdirectory inside the system temp dir as a last resort.
+/// The directory is created if it does not exist.
+pub(crate) fn private_runtime_dir() -> std::path::PathBuf {
+    let candidate = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("mydrafter");
+
+    if !candidate.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&candidate)
+                .ok();
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(&candidate).ok();
+        }
+    }
+    candidate
+}
+
+/// Return the path where the viewport critique screenshot is written.
+///
+/// The file lives in [`private_runtime_dir()`], which is only accessible to the
+/// current user (mode 0700 on Unix). This prevents a symlink pre-plant attack
+/// where a world-writable `/tmp` path could redirect the write to an arbitrary
+/// file via a symlink.
+pub(crate) fn critique_shot_path() -> std::path::PathBuf {
+    private_runtime_dir().join("critique.png")
+}
 
 /// The message sent to the deck for a viewport critique. Points the model at
 /// the screenshot on disk (the claude-code cassette opens it with the Read
@@ -824,11 +858,13 @@ impl App {
             .filter(|i| i.width() > 0 && i.height() > 0)
         {
             let question = self.pending_critique.take().unwrap_or_default();
-            save_screenshot_png(&img, std::path::Path::new(CRITIQUE_SHOT_PATH));
-            let prompt = critique_prompt(CRITIQUE_SHOT_PATH, &question);
+            let shot_path = critique_shot_path();
+            save_screenshot_png(&img, &shot_path);
+            let shot_str = shot_path.display().to_string();
+            let prompt = critique_prompt(&shot_str, &question);
             tracing::info!(target: "deck", "critique prompt: {prompt}");
             self.command_line
-                .push_line(format!("critique: captured {CRITIQUE_SHOT_PATH}"));
+                .push_line(format!("critique: captured {shot_str}"));
             self.deck_pane
                 .send_critique(&prompt, &self.session, &self.tokio);
         }
@@ -2040,8 +2076,8 @@ mod tests {
 
     #[test]
     fn critique_prompt_names_the_image_and_frames_the_ask() {
-        let p = critique_prompt("/tmp/mydrafter-critique.png", "");
-        assert!(p.contains("Read /tmp/mydrafter-critique.png"));
+        let p = critique_prompt("/some/private/path/critique.png", "");
+        assert!(p.contains("Read /some/private/path/critique.png"));
         assert!(p.contains("architecture critic"));
         assert!(p.contains("massing"));
         assert!(p.contains("proportion"));
@@ -2052,9 +2088,34 @@ mod tests {
 
     #[test]
     fn critique_prompt_folds_in_user_question() {
-        let p = critique_prompt(CRITIQUE_SHOT_PATH, "  is the roof pitch too steep?  ");
+        let shot_str = critique_shot_path().display().to_string();
+        let p = critique_prompt(&shot_str, "  is the roof pitch too steep?  ");
         // Whitespace-trimmed and appended.
         assert!(p.ends_with("Also address: is the roof pitch too steep?"));
+    }
+
+    /// M-4 regression: the critique screenshot path must NOT be under /tmp
+    /// (world-writable, symlink-plantable). It must be inside the user's
+    /// private config/runtime directory.
+    #[test]
+    fn critique_shot_path_is_not_under_tmp() {
+        let path = critique_shot_path();
+        // The path must not start with /tmp (the fixed-path vulnerability).
+        assert!(
+            !path.starts_with("/tmp"),
+            "critique path must not be world-writable /tmp: {path:?}"
+        );
+        // Must be inside the mydrafter private dir (not a bare temp path).
+        let dir = private_runtime_dir();
+        assert!(
+            path.starts_with(&dir),
+            "critique path {path:?} should be inside private dir {dir:?}"
+        );
+        // The private dir itself should not be /tmp directly.
+        assert!(
+            dir != std::path::Path::new("/tmp"),
+            "private_runtime_dir must not be bare /tmp"
+        );
     }
 
     #[test]

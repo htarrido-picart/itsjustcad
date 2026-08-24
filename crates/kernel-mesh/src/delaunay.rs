@@ -4,7 +4,16 @@
 //! survey points, then lift each triangle's vertices back to their z to make a
 //! terrain surface mesh. Returns index triples into the input point slice.
 
+use std::collections::HashSet;
+
 use glam::DVec2;
+
+/// Quantise a coordinate to a grid of 1 µm so that float noise does not
+/// prevent deduplication of logically-identical survey points.
+#[inline]
+fn quantize(v: f64) -> i64 {
+    (v * 1_000_000.0).round() as i64
+}
 
 /// Delaunay triangulation of `pts` (XY). Returns CCW index triples into `pts`.
 ///
@@ -44,10 +53,15 @@ pub fn triangulate(pts: &[DVec2]) -> Vec<[u32; 3]> {
 
     let mut tris: Vec<[u32; 3]> = vec![[n as u32, n as u32 + 1, n as u32 + 2]];
 
+    // Build a hash-set of seen (quantized_x, quantized_y) pairs so that the
+    // duplicate-skip below is O(1) per point instead of O(n).
+    let mut seen: HashSet<(i64, i64)> = HashSet::with_capacity(n);
+
     for (pi, p) in pts.iter().enumerate() {
-        // Skip exact XY duplicates: they add no triangles and break the
-        // circumcircle test (degenerate). First occurrence keeps the point.
-        if pts[..pi].contains(p) {
+        // Skip XY duplicates (quantized to 1 µm): they add no triangles and
+        // break the circumcircle test. First occurrence keeps the point.
+        let key = (quantize(p.x), quantize(p.y));
+        if !seen.insert(key) {
             continue;
         }
         let pi = pi as u32;
