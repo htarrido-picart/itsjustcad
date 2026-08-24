@@ -8,7 +8,13 @@ use crate::{
 };
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
-#[derive(Clone, Debug)]
+///
+/// `Serialize`/`Deserialize` exist only for the optional checkpoint sidecar
+/// (a fast-open cache); the op-log remains the source of truth. `serde(default)`
+/// on every field keeps older/partial snapshots loading, and `PartialEq` lets
+/// tests assert a snapshot round-trip equals a full replay.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Document {
     objects: BTreeMap<ObjectId, SceneObject>,
     /// Creation order of live objects; drives `last N` selectors.
@@ -36,6 +42,7 @@ pub struct Document {
     pub blocks: BTreeMap<String, Vec<BlockGeometry>>,
     /// Mailbox: a `view <name>` restore waiting for the UI to drive the active
     /// viewport camera. The app takes it each frame; never persisted.
+    #[serde(skip)]
     pub pending_view: Option<NamedView>,
     /// Optional raster reference image on the ground plane. Set via the logged
     /// `underlay` command; a missing file on open is a warning, not an error.

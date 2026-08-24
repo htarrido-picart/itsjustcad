@@ -30,13 +30,31 @@ pub fn grid_snap(p: DVec3) -> DVec3 {
     (p * 10.0).round() / 10.0
 }
 
-/// Collect snap candidates from the whole document. Cheap at massing scale;
-/// callers may cache on `doc.generation` if it ever shows up in a profile.
+/// Collect snap candidates from the whole document (no culling). The live app
+/// uses [`candidates_filtered`] with a screen-proximity predicate; this
+/// unfiltered form is the reference used by tests and any caller that wants
+/// every point.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn candidates(doc: &Document) -> Vec<(DVec3, SnapKind)> {
+    candidates_filtered(doc, |_| true)
+}
+
+/// Screen-proximity culled variant: only objects for which `keep(aabb)` returns
+/// true contribute candidates. Callers pass a predicate that projects the
+/// object's world AABB and keeps it when it lands within the snap radius of the
+/// cursor, so a 10k-object scene only pushes points from the handful of objects
+/// under the pointer. Equivalent to [`candidates`] when `keep` is always true.
+pub fn candidates_filtered(
+    doc: &Document,
+    keep: impl Fn(kernel_mesh::Aabb) -> bool,
+) -> Vec<(DVec3, SnapKind)> {
     let mut out = Vec::new();
     for obj in doc.objects() {
         if !obj.visible || !doc.layer_visible(&obj.layer) {
             continue; // invisible geometry must not attract the cursor
+        }
+        if !keep(obj.geometry.aabb()) {
+            continue; // object nowhere near the cursor — skip its points
         }
         match &obj.geometry {
             Geometry::Curve(c) => curve_candidates(c, &mut out),
@@ -225,5 +243,78 @@ mod tests {
             grid_snap(DVec3::new(1.234, 5.678, 0.0)),
             DVec3::new(1.2, 5.7, 0.0)
         );
+    }
+
+    // ---- stress harness: 10k-object pick + osnap under a loose time bound ----
+
+    /// Build a document with `n` unit boxes on a grid so pick/osnap have a large,
+    /// spatially spread scene to cull against.
+    fn grid_doc(n: usize) -> Document {
+        let mut doc = Document::default();
+        let side = (n as f64).sqrt().ceil() as usize;
+        for i in 0..n {
+            let (gx, gy) = ((i % side) as f64, (i / side) as f64);
+            let corner = DVec3::new(gx * 3.0, gy * 3.0, 0.0);
+            doc.insert(SceneObject {
+                visible: true,
+                id: ObjectId::new(),
+                name: None,
+                layer: mydrafter_doc::DEFAULT_LAYER.to_string(),
+                color: None,
+                geometry: Geometry::Mesh(kernel_mesh::make_box(corner, corner + DVec3::ONE)),
+            });
+        }
+        doc
+    }
+
+    #[test]
+    fn stress_pick_and_osnap_10k_objects() {
+        let n = 10_000;
+        let doc = grid_doc(n);
+
+        // BVH-accelerated pick: cast a ray at the scene and cull object AABBs.
+        let boxes: Vec<kernel_mesh::Aabb> =
+            doc.objects().map(|o| o.geometry.aabb()).collect();
+        let t0 = std::time::Instant::now();
+        let bvh = kernel_mesh::Bvh::build(&boxes);
+        let build_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let origin = DVec3::new(15.0, 15.0, 100.0);
+        let dir = DVec3::new(0.0, 0.0, -1.0);
+        let t1 = std::time::Instant::now();
+        let mut picks = 0usize;
+        for _ in 0..1000 {
+            picks += bvh.ray_candidates(origin, dir).len();
+        }
+        let pick_ms = t1.elapsed().as_secs_f64() * 1e3 / 1000.0;
+        assert!(picks > 0, "ray should cross at least one box");
+
+        // Osnap culling: keep only objects whose AABB overlaps a small world
+        // window around a query point (stand-in for the screen-proximity cull).
+        let win = kernel_mesh::Aabb::from_points([
+            DVec3::new(14.0, 14.0, -1.0),
+            DVec3::new(16.0, 16.0, 2.0),
+        ]);
+        let t2 = std::time::Instant::now();
+        let cands = candidates_filtered(&doc, |bb| {
+            bb.min.x <= win.max.x
+                && bb.max.x >= win.min.x
+                && bb.min.y <= win.max.y
+                && bb.max.y >= win.min.y
+        });
+        let osnap_ms = t2.elapsed().as_secs_f64() * 1e3;
+
+        // Loose, non-flaky bound: just require the whole thing to complete well
+        // under a second on any dev machine, and log the real numbers.
+        eprintln!(
+            "stress {n} objs: bvh build {build_ms:.2} ms, pick {pick_ms:.4} ms/ray, \
+             osnap cull {osnap_ms:.2} ms -> {} candidates",
+            cands.len()
+        );
+        assert!(build_ms < 1000.0, "bvh build too slow: {build_ms} ms");
+        assert!(pick_ms < 50.0, "pick too slow: {pick_ms} ms/ray");
+        assert!(osnap_ms < 1000.0, "osnap cull too slow: {osnap_ms} ms");
+        // The cull must actually shrink the candidate set versus the whole scene.
+        assert!(cands.len() < n, "cull should drop most objects, got {}", cands.len());
     }
 }

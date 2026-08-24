@@ -126,6 +126,10 @@ pub struct Session {
     /// touches this. Held here so the deck prompt, help and autosuggest can all
     /// consult one authoritative table.
     pub plugins: crate::plugin::PluginRegistry,
+    /// Set only after a checkpoint fast-open ([`Session::from_snapshot`]): the
+    /// forward ops whose inverses have not yet been materialized. `None` once
+    /// the history is live. Never part of the file format.
+    pending_log: Option<Vec<Command>>,
 }
 
 impl Session {
@@ -139,6 +143,11 @@ impl Session {
             Command::OsmFile { path } => self.osmfile(path),
             cmd => {
                 let logged = cmd.is_logged();
+                // A new logged edit truncates the redo tail, so the undo history
+                // must be live first (rebuild it if this was a fast-open).
+                if logged {
+                    self.ensure_history()?;
+                }
                 let (op, inverse, outcome) = apply_forward(&mut self.doc, cmd)?;
                 if logged {
                     self.log.truncate(self.cursor);
@@ -151,6 +160,7 @@ impl Session {
     }
 
     fn undo(&mut self) -> Result<ApplyOutcome, ExecError> {
+        self.ensure_history()?; // rebuild inverses if fast-opened
         if self.cursor == 0 {
             return Err(ExecError::NothingToUndo);
         }
@@ -340,6 +350,7 @@ impl Session {
     }
 
     fn redo(&mut self) -> Result<ApplyOutcome, ExecError> {
+        self.ensure_history()?; // rebuild inverses if fast-opened
         if self.cursor >= self.log.len() {
             return Err(ExecError::NothingToRedo);
         }
@@ -352,7 +363,15 @@ impl Session {
 
     /// Read-only view for the history panel: one describe() entry per logged
     /// op (oldest first) plus the cursor. Step N = state after the first N ops.
+    /// After a fast-open the inverses are not yet materialized, so this reads
+    /// the pending forward log (cursor sits at its end).
     pub fn history(&self) -> (Vec<String>, usize) {
+        if let Some(pending) = &self.pending_log {
+            return (
+                pending.iter().map(|op| describe(op).to_string()).collect(),
+                pending.len(),
+            );
+        }
         (
             self.log.iter().map(|a| describe(&a.op).to_string()).collect(),
             self.cursor,
@@ -739,8 +758,53 @@ impl Session {
     }
 
     /// Effective forward log (up to the undo cursor) — this is the file format.
+    /// After a fast-open the inverses are still pending, so the untouched
+    /// forward log is returned directly (its cursor sits at the end).
     pub fn save_log(&self) -> Vec<Command> {
+        if let Some(pending) = &self.pending_log {
+            return pending.clone();
+        }
         self.log[..self.cursor].iter().map(|a| a.op.clone()).collect()
+    }
+
+    /// Fast-open from a checkpoint: seed the document directly from a snapshot
+    /// and adopt the forward log for saving, skipping the (potentially costly)
+    /// geometry replay. `doc` must equal what `replay(log.clone())?.doc` would
+    /// produce — the checkpoint sidecar is a cache, and callers only invoke this
+    /// after confirming the checkpoint's op count matches `log`.
+    ///
+    /// Inverses (needed for undo) are *not* materialized here — that would
+    /// require the very replay we are skipping. They are rebuilt lazily the
+    /// first time the undo history is touched (undo/redo/amend), via
+    /// [`ensure_history`]. The common open→view→save path never pays for it.
+    pub fn from_snapshot(doc: Document, log: Vec<Command>) -> Self {
+        Session {
+            doc,
+            log: Vec::new(),
+            cursor: 0,
+            plugins: crate::plugin::PluginRegistry::default(),
+            pending_log: Some(log),
+        }
+    }
+
+    /// Materialize the op-log with inverses if this session was fast-opened from
+    /// a checkpoint. Replays the pending log against a scratch session to
+    /// recover each op's inverse, then adopts that history and its cursor.
+    /// A no-op once the history is present. Returns any replay error.
+    fn ensure_history(&mut self) -> Result<(), ExecError> {
+        let Some(log) = self.pending_log.take() else {
+            return Ok(());
+        };
+        let rebuilt = Session::replay(log)?;
+        // The snapshot doc is authoritative (it may carry live-only state like
+        // the selection); the replay only supplies the log/inverses/cursor.
+        debug_assert_eq!(
+            self.doc, rebuilt.doc,
+            "checkpoint snapshot diverged from op-log replay"
+        );
+        self.log = rebuilt.log;
+        self.cursor = rebuilt.cursor;
+        Ok(())
     }
 
     /// Rebuild a session by replaying a saved log through the same `apply`
@@ -1354,7 +1418,20 @@ fn exec_sun_hours(
     let aabb = doc.scene_aabb().ok_or_else(|| {
         ExecError::Invalid("sunhours needs geometry to bound the ground grid".into())
     })?;
-    let tris = scene_triangles(doc);
+    // Build a BVH over the scene triangles so each cell/sun ray only tests the
+    // triangles whose boxes it crosses instead of the whole soup.
+    let tri_bvh = kernel_mesh::TriBvh::build(
+        scene_triangles(doc)
+            .into_iter()
+            .map(|t| {
+                [
+                    DVec3::from_array(t[0]),
+                    DVec3::from_array(t[1]),
+                    DVec3::from_array(t[2]),
+                ]
+            })
+            .collect(),
+    );
 
     // Precompute sun directions (up only) for every 30 min of the day.
     let mut sun_dirs: Vec<[f64; 3]> = Vec::new();
@@ -1399,13 +1476,10 @@ fn exec_sun_hours(
             let y = aabb.min.y + (iy as f64 + 0.5) * spacing;
             // Lift the origin slightly so a ground-coincident triangle at the
             // sample point doesn't self-occlude.
-            let origin = [x, y, 1e-4];
+            let origin = DVec3::new(x, y, 1e-4);
             let mut lit = 0usize;
             for &dir in &sun_dirs {
-                let occluded = tris.iter().any(|t| {
-                    mydrafter_solar::ray_triangle(origin, dir, t[0], t[1], t[2]).is_some()
-                });
-                if !occluded {
+                if !tri_bvh.ray_occluded(origin, DVec3::from_array(dir)) {
                     lit += 1;
                 }
             }

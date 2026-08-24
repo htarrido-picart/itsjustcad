@@ -608,16 +608,23 @@ impl App {
     ) {
         let (origin, dir) = screen_ray(view_proj, rect, pos);
 
+        // Build a BVH over visible object AABBs so the ray only tests the boxes
+        // it actually crosses rather than every object in the scene.
+        let pickable: Vec<(mydrafter_doc::ObjectId, kernel_mesh::Aabb)> = self
+            .session
+            .doc
+            .objects()
+            .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
+            .map(|obj| (obj.id, obj.geometry.aabb()))
+            .collect();
+        let bvh = kernel_mesh::Bvh::build(&pickable.iter().map(|(_, bb)| *bb).collect::<Vec<_>>());
         let mut best: Option<(f64, mydrafter_doc::ObjectId)> = None;
-        for obj in self.session.doc.objects() {
-            if !obj.visible || !self.session.doc.layer_visible(&obj.layer) {
-                continue; // hidden objects/layers are unpickable
-            }
-            let bb = obj.geometry.aabb();
+        for i in bvh.ray_candidates(origin, dir) {
+            let (id, bb) = pickable[i as usize];
             if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
                 && best.is_none_or(|(bt, _)| t < bt)
             {
-                best = Some((t, obj.id));
+                best = Some((t, id));
             }
         }
         let doc = &mut self.session.doc;
@@ -1314,8 +1321,20 @@ impl App {
             .hover_pos()
             .or_else(|| response.interact_pointer_pos());
         let mut snap_hit = cursor_px.and_then(|pos| {
+            // Screen-proximity cull: only objects whose projected AABB (grown by
+            // the snap radius) covers the cursor contribute snap points. At 10k
+            // objects this trims the candidate list from every vertex in the
+            // scene to just the few under the pointer.
+            let cands = crate::osnap::candidates_filtered(&self.session.doc, |bb| {
+                match projected_rect(view_proj, rect, bb.min, bb.max) {
+                    Some(r) => r
+                        .expand(crate::osnap::SNAP_RADIUS_PX)
+                        .contains(pos),
+                    None => true, // behind camera / partly clipped: keep to be safe
+                }
+            });
             crate::osnap::resolve(
-                &crate::osnap::candidates(&self.session.doc),
+                &cands,
                 pos,
                 crate::osnap::SNAP_RADIUS_PX,
                 |w| project(view_proj, rect, w),

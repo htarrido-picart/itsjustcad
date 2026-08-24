@@ -344,6 +344,31 @@ Concretely: the io.rs test suite contains `pre_*` tests that load
 hand-written minimal v1 JSON and assert that newly-added features default
 gracefully. Every new command or field must add such a test.
 
+## Checkpoint sidecar (optional fast-open cache)
+
+Saving `<file>` also writes `<file>.checkpoint`, a compact JSON snapshot of the
+derived document plus the op count it reflects:
+
+```json
+{"mydrafter_checkpoint": 1, "op_count": 42, "doc": { … Document snapshot … }}
+```
+
+On open, if a checkpoint exists **and** its `op_count` matches the op-log's
+length **and** its `mydrafter_checkpoint` version is understood, the document is
+seeded directly from the snapshot and replay is skipped. Otherwise (no sidecar,
+version or count mismatch, or any parse error) the op-log is replayed in full.
+
+The checkpoint is **purely a cache**:
+
+- The op-log remains the single source of truth. The snapshot must equal what a
+  full replay produces; a `debug_assert` guards this when the undo history is
+  first materialized, and `io.rs` tests compare snapshot-load against replay.
+- **Deleting `<file>.checkpoint` is always safe** — the next open just replays.
+- It carries no long-term compatibility promise: a stale or unreadable
+  checkpoint is silently ignored, never an error.
+- Fast-open defers rebuilding undo inverses until the undo history is first
+  touched, so open→view→save never pays for the replay.
+
 ## Plugins (macros) and replay safety
 
 Plugins are user/LLM-authored macros stored **outside** the op-log, one JSON

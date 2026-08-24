@@ -4,6 +4,10 @@ use crate::{Command, ExecError, Session};
 
 pub const FORMAT_VERSION: u32 = 1;
 
+/// Checkpoint sidecar version. Bumped independently of the op-log format; a
+/// stale or unrecognized checkpoint is simply ignored (full replay).
+pub const CHECKPOINT_VERSION: u32 = 1;
+
 /// File format: the effective forward op-log, nothing else. Loading replays it
 /// through the same `apply` path used live, reproducing identical ids.
 #[derive(Serialize, Deserialize)]
@@ -40,12 +44,67 @@ pub fn from_json(json: &str) -> Result<Session, IoError> {
     Ok(Session::replay(file.ops)?)
 }
 
-pub fn save_file(session: &Session, path: &std::path::Path) -> Result<(), IoError> {
-    Ok(std::fs::write(path, to_json(session))?)
+/// Checkpoint sidecar: a serialized `Document` snapshot plus the op count it
+/// corresponds to. Optional fast-open cache — the op-log stays the source of
+/// truth, so a missing, stale, or corrupt checkpoint just falls back to replay.
+#[derive(Serialize, Deserialize)]
+struct Checkpoint {
+    mydrafter_checkpoint: u32,
+    /// Number of forward ops the snapshot reflects; must match the op-log's
+    /// length for the snapshot to be trusted.
+    op_count: usize,
+    doc: mydrafter_doc::Document,
 }
 
+/// Sidecar path for a document: `<file>.checkpoint`.
+fn checkpoint_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".checkpoint");
+    std::path::PathBuf::from(p)
+}
+
+/// Serialize the session's document snapshot for the checkpoint sidecar.
+fn checkpoint_json(session: &Session) -> String {
+    let cp = Checkpoint {
+        mydrafter_checkpoint: CHECKPOINT_VERSION,
+        op_count: session.save_log().len(),
+        doc: session.doc.clone(),
+    };
+    serde_json::to_string(&cp).expect("document snapshot serializes")
+}
+
+/// Write the op-log file and, alongside it, a `<file>.checkpoint` fast-open
+/// cache. A failure to write the checkpoint is non-fatal: the primary file is
+/// already saved and the cache is optional. Deleting the checkpoint is always
+/// safe — the next open just replays the op-log.
+pub fn save_file(session: &Session, path: &std::path::Path) -> Result<(), IoError> {
+    std::fs::write(path, to_json(session))?;
+    // Best-effort: never let a checkpoint problem fail an otherwise-good save.
+    let _ = std::fs::write(checkpoint_path(path), checkpoint_json(session));
+    Ok(())
+}
+
+/// Load a document. If a `<file>.checkpoint` exists whose `op_count` matches the
+/// op-log, seed the session directly from the snapshot and skip replay;
+/// otherwise (no sidecar, version/count mismatch, or any parse error) fall back
+/// to a full op-log replay. Correctness is guaranteed by a `debug_assert` in
+/// [`Session::from_snapshot`]'s lazy history rebuild and by the round-trip test.
 pub fn load_file(path: &std::path::Path) -> Result<Session, IoError> {
-    from_json(&std::fs::read_to_string(path)?)
+    let json = std::fs::read_to_string(path)?;
+    let file: FileFormat = serde_json::from_str(&json)?;
+    if file.mydrafter != FORMAT_VERSION {
+        return Err(IoError::BadVersion(file.mydrafter));
+    }
+
+    if let Ok(text) = std::fs::read_to_string(checkpoint_path(path))
+        && let Ok(cp) = serde_json::from_str::<Checkpoint>(&text)
+        && cp.mydrafter_checkpoint == CHECKPOINT_VERSION
+        && cp.op_count == file.ops.len()
+    {
+        return Ok(Session::from_snapshot(cp.doc, file.ops));
+    }
+
+    Ok(Session::replay(file.ops)?)
 }
 
 #[cfg(test)]
@@ -256,6 +315,116 @@ mod tests {
         let loaded = from_json(&json).unwrap();
         assert_eq!(loaded.doc.underlay, s.doc.underlay);
         assert_eq!(to_json(&loaded), json, "replay-stable");
+    }
+
+    // ---- checkpoint fast-open cache ----
+
+    fn built_session() -> Session {
+        let mut s = Session::default();
+        for line in [
+            "box 0,0,0 5,5,3",
+            "box 1,1,-1 2,2,5",
+            "difference last 2 last",
+            "circle 12,2,0 2.5",
+            "extrude last 8",
+            "layer walls",
+            "sun 40.71 -74.01 2024-06-21 15:00",
+        ] {
+            s.run(parse(line).unwrap()).unwrap();
+        }
+        s
+    }
+
+    fn objects_of(s: &Session) -> Vec<mydrafter_doc::SceneObject> {
+        s.doc.objects().cloned().collect()
+    }
+
+    #[test]
+    fn fast_open_snapshot_equals_full_replay() {
+        // The core correctness invariant: a session seeded from the snapshot is
+        // indistinguishable from one rebuilt by replaying the op-log.
+        let s = built_session();
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        let fast = Session::from_snapshot(s.doc.clone(), log);
+        assert_eq!(fast.doc, replayed.doc, "snapshot doc == replay doc");
+        assert_eq!(fast.save_log(), replayed.save_log(), "same forward log");
+        assert_eq!(objects_of(&fast), objects_of(&replayed));
+    }
+
+    #[test]
+    fn checkpoint_round_trips_and_skips_replay() {
+        let dir = std::env::temp_dir().join(format!("mydrafter_cp_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scene.mydrafter");
+        let s = built_session();
+        save_file(&s, &path).unwrap();
+
+        // The sidecar exists and carries the matching op count.
+        let cp_text = std::fs::read_to_string(checkpoint_path(&path)).unwrap();
+        let cp: Checkpoint = serde_json::from_str(&cp_text).unwrap();
+        assert_eq!(cp.op_count, s.save_log().len());
+
+        // Loading with a valid checkpoint yields the same document as a replay.
+        let loaded = load_file(&path).unwrap();
+        assert_eq!(loaded.doc, s.doc);
+        assert_eq!(to_json(&loaded), to_json(&s), "save is byte-identical");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_checkpoint_falls_back_to_replay() {
+        let dir = std::env::temp_dir().join(format!("mydrafter_stale_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scene.mydrafter");
+        let s = built_session();
+        save_file(&s, &path).unwrap();
+
+        // Corrupt the checkpoint's op_count so it no longer matches the op-log.
+        let mut cp: Checkpoint =
+            serde_json::from_str(&std::fs::read_to_string(checkpoint_path(&path)).unwrap())
+                .unwrap();
+        cp.op_count += 999;
+        std::fs::write(checkpoint_path(&path), serde_json::to_string(&cp).unwrap()).unwrap();
+
+        // Load must ignore the stale sidecar and replay to the correct state.
+        let loaded = load_file(&path).unwrap();
+        assert_eq!(loaded.doc, s.doc, "stale checkpoint ignored, replay is correct");
+
+        // Deleting the checkpoint is always safe: plain replay still works.
+        std::fs::remove_file(checkpoint_path(&path)).unwrap();
+        let loaded2 = load_file(&path).unwrap();
+        assert_eq!(loaded2.doc, s.doc);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn undo_works_after_fast_open() {
+        // Fast-open defers inverse materialization; the first undo must rebuild
+        // the history and behave exactly like a replayed session's undo.
+        let s = built_session();
+        let before = objects_of(&s);
+        let mut fast = Session::from_snapshot(s.doc.clone(), s.save_log());
+
+        // A brand-new edit, then undo it — exercises ensure_history on the edit
+        // path and the undo path.
+        fast.run(parse("box 20,20,0 1,1,1").unwrap()).unwrap();
+        assert_eq!(fast.doc.len(), before.len() + 1);
+        fast.run(Command::Undo).unwrap();
+        assert_eq!(objects_of(&fast), before, "undo returns to opened state");
+
+        // Undoing further walks back into the pre-open history: undo the last
+        // pre-open op (a `sun`) and compare to a replay that stops one op short.
+        fast.run(Command::Undo).unwrap();
+        let mut short_log = s.save_log();
+        short_log.pop();
+        let expected = Session::replay(short_log).unwrap();
+        assert_eq!(fast.doc.sun, expected.doc.sun, "pre-open sun op undone");
+        fast.run(Command::Redo).unwrap();
+        assert_eq!(objects_of(&fast), before, "redo restores opened state");
+        assert_eq!(fast.doc.sun, s.doc.sun);
     }
 
     #[test]
