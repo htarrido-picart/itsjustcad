@@ -33,11 +33,41 @@ impl DeckConfig {
     }
 }
 
+/// Returns `true` when `url` resolves to localhost (empty, "localhost", or
+/// "127.*" / "[::1]" / "0.0.0.0" host). Used by the local-only filter.
+pub fn is_local_url(url: &str) -> bool {
+    if url.is_empty() {
+        return true; // ClaudeCode (subprocess) has no base_url — always local.
+    }
+    // Strip scheme and path — we only care about the host part.
+    let host_part = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or(url);
+    // Strip port.
+    let host = if let Some(bracket_end) = host_part.find(']') {
+        // IPv6 literal like [::1]:11434
+        &host_part[..=bracket_end]
+    } else {
+        host_part.split(':').next().unwrap_or(host_part)
+    };
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "::1"
+    ) || host.starts_with("127.")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecksFile {
     pub decks: Vec<DeckConfig>,
     #[serde(default)]
     pub active: usize,
+    /// When true: only cassettes with local base_urls are shown; any attempt
+    /// to send to a non-local endpoint is blocked. Persisted in decks.json.
+    #[serde(default)]
+    pub local_only: bool,
 }
 
 impl Default for DecksFile {
@@ -74,6 +104,7 @@ impl Default for DecksFile {
                 },
             ],
             active: 0,
+            local_only: false,
         }
     }
 }
@@ -96,5 +127,77 @@ impl DecksFile {
             let _ = std::fs::create_dir_all(path.parent().expect("has parent"));
             let _ = std::fs::write(path, serde_json::to_string_pretty(self).expect("serializes"));
         }
+    }
+
+    /// Cassettes visible under the current `local_only` setting.
+    pub fn visible_decks(&self) -> impl Iterator<Item = (usize, &DeckConfig)> {
+        self.decks.iter().enumerate().filter(|(_, d)| {
+            !self.local_only || is_local_url(&d.base_url)
+        })
+    }
+
+    /// Returns `Err` when `local_only` is on and the active cassette is remote.
+    pub fn check_local_only(&self) -> Result<(), String> {
+        if !self.local_only {
+            return Ok(());
+        }
+        let config = self.decks.get(self.active).ok_or_else(|| "no deck configured".to_string())?;
+        if is_local_url(&config.base_url) {
+            Ok(())
+        } else {
+            Err(format!(
+                "local-only mode is on — '{}' ({}) is a remote endpoint",
+                config.name, config.base_url
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_url_classification() {
+        assert!(is_local_url(""));
+        assert!(is_local_url("http://localhost:11434/v1"));
+        assert!(is_local_url("http://127.0.0.1:8080"));
+        assert!(is_local_url("http://[::1]:5000"));
+        assert!(is_local_url("http://0.0.0.0"));
+        assert!(is_local_url("http://127.255.0.1/api"));
+        assert!(!is_local_url("https://api.anthropic.com"));
+        assert!(!is_local_url("https://api.moonshot.ai/v1"));
+        assert!(!is_local_url("http://192.168.1.10:11434/v1"));
+    }
+
+    #[test]
+    fn local_only_filter_hides_remote_decks() {
+        let mut df = DecksFile::default();
+        df.local_only = true;
+        let visible: Vec<&str> = df.visible_decks().map(|(_, d)| d.name.as_str()).collect();
+        // claude-code (empty base_url) and ollama (localhost) are local; claude + kimi are not.
+        assert!(visible.contains(&"claude-code"), "{visible:?}");
+        assert!(visible.contains(&"ollama"), "{visible:?}");
+        assert!(!visible.contains(&"claude"), "{visible:?}");
+        assert!(!visible.contains(&"kimi"), "{visible:?}");
+    }
+
+    #[test]
+    fn check_local_only_blocks_remote_active() {
+        let mut df = DecksFile::default();
+        df.local_only = true;
+        // Default active is 0 (claude-code, local) → OK.
+        assert!(df.check_local_only().is_ok());
+        // Switch active to "claude" (index 2, remote) → Err.
+        df.active = 2;
+        assert!(df.check_local_only().is_err());
+    }
+
+    #[test]
+    fn local_only_field_serde_defaults_false() {
+        // Files without the field must deserialise with local_only = false.
+        let json = r#"{"decks": [], "active": 0}"#;
+        let df: DecksFile = serde_json::from_str(json).unwrap();
+        assert!(!df.local_only);
     }
 }

@@ -396,6 +396,10 @@ impl DeckPane {
     }
 
     fn start_turn(&mut self, session: &Session, handle: &tokio::runtime::Handle) {
+        if let Err(reason) = self.decks.check_local_only() {
+            self.transcript.push(Entry::Status(format!("blocked: {reason}")));
+            return;
+        }
         let Some(config) = self.decks.decks.get(self.decks.active) else {
             self.transcript
                 .push(Entry::Status("no deck configured".into()));
@@ -616,19 +620,53 @@ impl DeckPane {
             }
             ui.label(format!("{:.0}%", zoom * 100.0));
             ui.separator();
+            // Local-only toggle: when on, only localhost cassettes are shown and
+            // cloud sends are blocked.
+            let mut local_only = self.decks.local_only;
+            if ui
+                .checkbox(&mut local_only, "local only")
+                .on_hover_text("hide cloud decks and block remote sends")
+                .changed()
+            {
+                self.decks.local_only = local_only;
+                // If the active deck became hidden, switch to the first visible one.
+                if local_only {
+                    let active_is_remote = !mydrafter_deck::is_local_url(
+                        self.decks.decks.get(self.decks.active)
+                            .map(|d| d.base_url.as_str())
+                            .unwrap_or(""),
+                    );
+                    let first_local = self.decks.visible_decks().map(|(i, _)| i).next();
+                    if active_is_remote
+                        && let Some(idx) = first_local
+                    {
+                        self.decks.active = idx;
+                        self.session_id = None;
+                        self.persist_chat();
+                    }
+                }
+                self.decks.save();
+            }
+            ui.separator();
             ui.label("deck:");
-            let names: Vec<String> = self.decks.decks.iter().map(|d| d.name.clone()).collect();
+            // Only show cassettes permitted by the current local_only setting.
+            let visible_decks: Vec<(usize, String)> = self
+                .decks
+                .visible_decks()
+                .map(|(i, d)| (i, d.name.clone()))
+                .collect();
             egui::ComboBox::from_id_salt("deck_select")
                 .selected_text(
-                    names
+                    self.decks
+                        .decks
                         .get(self.decks.active)
-                        .cloned()
+                        .map(|d| d.name.clone())
                         .unwrap_or_else(|| "—".into()),
                 )
                 .show_ui(ui, |ui| {
-                    for (i, name) in names.iter().enumerate() {
+                    for (i, name) in &visible_decks {
                         if ui
-                            .selectable_value(&mut self.decks.active, i, name)
+                            .selectable_value(&mut self.decks.active, *i, name)
                             .clicked()
                         {
                             self.decks.save();
