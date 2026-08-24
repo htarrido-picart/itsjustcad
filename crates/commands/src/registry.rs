@@ -304,6 +304,16 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Report the combined bounding box (min, max, size) of objects (query only). Example: bbox all",
         },
         CommandSpec {
+            name: "schedule",
+            usage: "schedule [layer]",
+            summary: "Print a schedule table (name/id/layer/type/area/volume) for all objects or a layer's objects, grouped by name (query only). Example: schedule · schedule walls",
+        },
+        CommandSpec {
+            name: "sheettable",
+            usage: "sheettable <sheet> [layer]",
+            summary: "Place a schedule table on a sheet; the table is rendered as a text grid in the PDF at print time. Example: sheettable plan · sheettable plan walls",
+        },
+        CommandSpec {
             name: "view",
             usage: "view save <name> | view <name> | view list",
             summary: "Named views: save the active viewport camera, restore it later, or list saved views. Example: view save entry then view entry",

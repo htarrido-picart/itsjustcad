@@ -13,7 +13,7 @@ pub use document::Document;
 pub use object::{
     Annotation, Geometry, HatchPattern, LayerStyle, ObjectId, SceneObject, DEFAULT_LAYER,
 };
-pub use sheet::{PaperSize, Sheet, SheetView, ViewDirection};
+pub use sheet::{PaperSize, ScheduleRow, Sheet, SheetTable, SheetView, ViewDirection};
 pub use underlay::Underlay;
 pub use units::{
     format_area, format_length, format_volume, Units, METERS_PER_FOOT, METERS_PER_INCH,

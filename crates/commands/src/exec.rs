@@ -3,7 +3,7 @@ use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
 use mydrafter_doc::{
     format_area, format_length, format_volume, Annotation, Document, Geometry, LayerStyle,
-    NamedView, ObjectId, SceneObject, Underlay, Units,
+    NamedView, ObjectId, SceneObject, ScheduleRow, SheetTable, Underlay, Units,
 };
 
 use crate::error::ExecError;
@@ -92,6 +92,8 @@ enum Inverse {
     RemoveSheet(String),
     /// `sheetview`: drop the view most recently added to a sheet.
     PopSheetView(String),
+    /// `sheettable`: clear the table that was placed on a sheet.
+    SheetTableRemoved(String),
 }
 
 /// Owns the document plus its op-log; the single mutation path for both the
@@ -251,6 +253,13 @@ impl Session {
                 let sheet = sheet.clone();
                 if let Some(s) = self.doc.sheet_mut(&sheet) {
                     s.views.pop();
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::SheetTableRemoved(sheet) => {
+                let sheet = sheet.clone();
+                if let Some(s) = self.doc.sheet_mut(&sheet) {
+                    s.table = None;
                 }
                 self.doc.generation += 1;
             }
@@ -575,6 +584,125 @@ fn mesh_surface_area(mesh: &kernel_mesh::Mesh) -> f64 {
             (b - a).cross(c - a).length() / 2.0
         })
         .sum()
+}
+
+/// Build schedule rows for objects on the given layer (all layers if `None`).
+/// Rows are ordered by creation order.
+pub(crate) fn build_schedule_rows(doc: &Document, layer: Option<&str>) -> Vec<ScheduleRow> {
+    doc.objects()
+        .filter(|o| layer.is_none_or(|l| o.layer == l))
+        .map(|o| {
+            let kind = match &o.geometry {
+                Geometry::Mesh(_) => "mesh",
+                Geometry::Curve(_) => "curve",
+                Geometry::Annotation(_) => "annotation",
+            };
+            let area_m2 = match &o.geometry {
+                Geometry::Curve(c) if c.is_closed() => {
+                    shoelace_area(&c.tessellate(PROFILE_TOL))
+                }
+                Geometry::Mesh(m) => mesh_surface_area(m),
+                _ => 0.0,
+            };
+            let volume_m3 = match &o.geometry {
+                Geometry::Mesh(m) => kernel_mesh::signed_volume(m),
+                _ => 0.0,
+            };
+            ScheduleRow {
+                id: o.id.short(),
+                name: o.name.clone().unwrap_or_else(|| o.id.short()),
+                layer: o.layer.clone(),
+                kind: kind.to_string(),
+                area_m2,
+                volume_m3,
+            }
+        })
+        .collect()
+}
+
+/// Render schedule rows as an ASCII table for the command line.
+pub(crate) fn format_schedule_table(rows: &[ScheduleRow], units: Units) -> String {
+    // Column widths: name, id, layer, type, area, volume.
+    const HDR: [&str; 6] = ["Name", "ID", "Layer", "Type", "Area", "Volume"];
+    let (per_m, label) = units.per_meter();
+    let area_label = format!("Area ({label}²)");
+    let vol_label = format!("Vol ({label}³)");
+
+    // Compute per-row cell text.
+    let cells: Vec<[String; 6]> = rows
+        .iter()
+        .map(|r| {
+            [
+                r.name.clone(),
+                r.id.clone(),
+                r.layer.clone(),
+                r.kind.clone(),
+                format!("{:.2}", r.area_m2 * per_m * per_m),
+                format!("{:.2}", r.volume_m3 * per_m * per_m * per_m),
+            ]
+        })
+        .collect();
+
+    let hdrs: [String; 6] = [
+        HDR[0].to_string(),
+        HDR[1].to_string(),
+        HDR[2].to_string(),
+        HDR[3].to_string(),
+        area_label,
+        vol_label,
+    ];
+    let mut widths = [0usize; 6];
+    for (i, h) in hdrs.iter().enumerate() {
+        widths[i] = h.len();
+    }
+    for row in &cells {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    let sep: String = widths.iter().map(|w| "-".repeat(w + 2)).collect::<Vec<_>>().join("+");
+    let sep = format!("+{}+", sep);
+
+    let fmt_row = |cols: &[String; 6]| -> String {
+        let inner: String = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!(" {:<w$} ", c, w = widths[i]))
+            .collect::<Vec<_>>()
+            .join("|");
+        format!("|{inner}|")
+    };
+
+    let mut out = String::new();
+    out.push_str(&sep);
+    out.push('\n');
+    out.push_str(&fmt_row(&hdrs));
+    out.push('\n');
+    out.push_str(&sep);
+    out.push('\n');
+    for row in &cells {
+        out.push_str(&fmt_row(row));
+        out.push('\n');
+    }
+    out.push_str(&sep);
+
+    // Append grouped counts by name.
+    let mut name_counts: Vec<(String, usize)> = Vec::new();
+    for row in rows {
+        if let Some(entry) = name_counts.iter_mut().find(|(n, _)| n == &row.name) {
+            entry.1 += 1;
+        } else {
+            name_counts.push((row.name.clone(), 1));
+        }
+    }
+    if !name_counts.is_empty() {
+        out.push_str("\nCounts by name:");
+        for (name, count) in &name_counts {
+            out.push_str(&format!("\n  {name}: {count}"));
+        }
+    }
+    out
 }
 
 /// Layer that section/plan loops land on (created on demand).
@@ -2032,6 +2160,7 @@ fn apply_forward(
                 name: name.clone(),
                 paper,
                 views: Vec::new(),
+                table: None,
             });
             doc.generation += 1;
             Ok((
@@ -2313,6 +2442,46 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Schedule { layer } => {
+            let rows = build_schedule_rows(doc, layer.as_deref());
+            let msg = if rows.is_empty() {
+                match &layer {
+                    Some(l) => format!("no objects on layer '{l}'"),
+                    None => "no objects in document".to_string(),
+                }
+            } else {
+                format_schedule_table(&rows, doc.units)
+            };
+            Ok((
+                Command::Schedule { layer },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::SheetTable { sheet, layer } => {
+            // Build rows before borrowing the sheet (avoid simultaneous borrows).
+            let rows = build_schedule_rows(doc, layer.as_deref());
+            let count = rows.len();
+            let known: Vec<String> = doc.sheets.iter().map(|s| s.name.clone()).collect();
+            let Some(s) = doc.sheet_mut(&sheet) else {
+                return Err(ExecError::Invalid(format!(
+                    "no sheet '{sheet}' (sheets: {}; create one with: sheet {sheet})",
+                    known.join(", ")
+                )));
+            };
+            s.table = Some(SheetTable { layer: layer.clone(), rows });
+            doc.generation += 1;
+            Ok((
+                Command::SheetTable { sheet: sheet.clone(), layer },
+                Inverse::SheetTableRemoved(sheet.clone()),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "schedule table placed on '{sheet}' ({count} row(s))"
+                    ),
+                },
+            ))
+        }
         Command::Undo | Command::Redo | Command::Amend { .. } | Command::Import { .. } => {
             unreachable!("handled in Session::run")
         }
@@ -2385,6 +2554,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Area { .. } => "area",
         Command::Volume { .. } => "volume",
         Command::Bbox { .. } => "bbox",
+        Command::Schedule { .. } => "schedule",
+        Command::SheetTable { .. } => "sheettable",
         Command::Undo => "undo",
         Command::Redo => "redo",
         Command::Amend { .. } => "amend",
@@ -4202,6 +4373,127 @@ mod tests {
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap(),
             "replay-stable log"
+        );
+    }
+
+    // ── schedule / sheettable ────────────────────────────────────────────────
+
+    #[test]
+    fn schedule_known_doc_expected_numbers() {
+        let mut s = Session::default();
+        // A 2×3×4 box: volume = 24 m³, surface area = 2*(2*3 + 2*4 + 3*4) = 52 m²
+        run(&mut s, "box 0,0,0 2,3,4");
+        run(&mut s, "name last cube");
+        // A circle radius 1 on layer "arcs": closed XY area = π ≈ 3.14 m²
+        run(&mut s, "layer arcs");
+        run(&mut s, "circle 0,0,0 1");
+
+        let out = run(&mut s, "schedule");
+        // Table contains both objects.
+        assert!(
+            out.message.contains("cube"),
+            "name column missing: {}",
+            out.message
+        );
+        assert!(
+            out.message.contains("mesh"),
+            "type column missing: {}",
+            out.message
+        );
+        assert!(
+            out.message.contains("curve"),
+            "curve type missing: {}",
+            out.message
+        );
+        // Volume of the box should appear in the table (~24.00).
+        assert!(
+            out.message.contains("24.00"),
+            "box volume 24 m³ missing: {}",
+            out.message
+        );
+
+        // Layer filter: only the circle.
+        let out2 = run(&mut s, "schedule arcs");
+        assert!(out2.message.contains("curve"), "filtered: {}", out2.message);
+        assert!(
+            !out2.message.contains("cube"),
+            "box leaked through layer filter: {}",
+            out2.message
+        );
+        // Area of circle radius 1 ≈ π (tessellated; expect within 2% of π).
+        // The schedule table shows it in m²; parse the value from the row.
+        let area_val: f64 = {
+            let rows = build_schedule_rows(&s.doc, Some("arcs"));
+            assert_eq!(rows.len(), 1);
+            rows[0].area_m2
+        };
+        assert!(
+            (area_val - std::f64::consts::PI).abs() < 0.1,
+            "circle area {area_val} not close to π"
+        );
+    }
+
+    #[test]
+    fn sheettable_places_rows_on_sheet_and_pdf_contains_text() {
+        let mut s = Session::default();
+        // Box 5×5×3 → volume 75 m³.
+        run(&mut s, "box 0,0,0 5,5,3");
+        run(&mut s, "name last building");
+        run(&mut s, "sheet plan a3");
+        run(&mut s, "sheettable plan");
+
+        // Rows are stored on the sheet.
+        let tbl = s.doc.sheet("plan").unwrap().table.as_ref().unwrap();
+        assert_eq!(tbl.rows.len(), 1, "one object in doc");
+        let row = &tbl.rows[0];
+        assert_eq!(row.name, "building");
+        assert_eq!(row.kind, "mesh");
+        assert!((row.volume_m3 - 75.0).abs() < 1e-6, "volume {}", row.volume_m3);
+
+        // PDF output contains row text.
+        let sheet = s.doc.sheet("plan").unwrap().clone();
+        let (bytes, _) = crate::pdf::sheet_pdf(&s.doc, &sheet);
+        let content = String::from_utf8_lossy(&bytes);
+        assert!(
+            content.contains("building"),
+            "PDF missing 'building': (truncated)"
+        );
+        assert!(
+            content.contains("75.00"),
+            "PDF missing volume 75.00: (truncated)"
+        );
+    }
+
+    #[test]
+    fn sheettable_undo_clears_table() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "sheet s1 a3");
+        run(&mut s, "sheettable s1");
+        assert!(s.doc.sheet("s1").unwrap().table.is_some());
+        run(&mut s, "undo");
+        assert!(s.doc.sheet("s1").unwrap().table.is_none(), "undo must clear table");
+    }
+
+    #[test]
+    fn sheettable_replay_stability() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 3,4,5");
+        run(&mut s, "name last block");
+        run(&mut s, "sheet lay a3");
+        run(&mut s, "sheettable lay");
+
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        let orig_tbl = s.doc.sheet("lay").unwrap().table.as_ref().unwrap();
+        let rep_tbl = replayed.doc.sheet("lay").unwrap().table.as_ref().unwrap();
+        assert_eq!(orig_tbl.rows.len(), rep_tbl.rows.len());
+        assert_eq!(orig_tbl.rows[0].name, rep_tbl.rows[0].name);
+        assert!((orig_tbl.rows[0].volume_m3 - rep_tbl.rows[0].volume_m3).abs() < 1e-9);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "log must be replay-stable"
         );
     }
 }

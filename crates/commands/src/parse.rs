@@ -578,6 +578,22 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("bbox", rest, &args)?;
             Ok(Command::Bbox { targets: sel })
         }
+        "schedule" => {
+            let layer = match args.as_slice() {
+                [] => None,
+                [name] => Some((*name).to_string()),
+                _ => return wrong("schedule", "an optional layer name", &args),
+            };
+            Ok(Command::Schedule { layer })
+        }
+        "sheettable" => {
+            let (sheet, layer) = match args.as_slice() {
+                [sheet] => ((*sheet).to_string(), None),
+                [sheet, layer] => ((*sheet).to_string(), Some((*layer).to_string())),
+                _ => return wrong("sheettable", "a sheet name and an optional layer name", &args),
+            };
+            Ok(Command::SheetTable { sheet, layer })
+        }
         "undo" => Ok(Command::Undo),
         "redo" => Ok(Command::Redo),
         "amend" => match &args[..] {

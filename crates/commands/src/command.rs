@@ -418,6 +418,21 @@ pub enum Command {
     Bbox {
         targets: Selector,
     },
+    /// Print a schedule table (name/id/layer/type/area/volume) to the command
+    /// line, grouped by name. Query only; never logged.
+    Schedule {
+        /// Optional layer filter; `None` means all layers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layer: Option<String>,
+    },
+    /// Place a schedule table on a sheet (logged). The table is written into
+    /// the PDF at print time; no geometry is created in the 3D scene.
+    SheetTable {
+        sheet: String,
+        /// Optional layer filter; `None` means all layers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layer: Option<String>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild
@@ -445,6 +460,7 @@ impl Command {
                 | Command::Area { .. }
                 | Command::Volume { .. }
                 | Command::Bbox { .. }
+                | Command::Schedule { .. }
                 | Command::Undo
                 | Command::Redo
                 | Command::Amend { .. }

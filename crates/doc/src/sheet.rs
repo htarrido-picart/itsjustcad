@@ -65,6 +65,29 @@ pub struct SheetView {
     pub scale: f64,
 }
 
+/// One row in a material/object schedule table.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ScheduleRow {
+    pub id: String,
+    pub name: String,
+    pub layer: String,
+    pub kind: String,
+    /// Footprint area in m² (closed curves: XY shoelace; meshes: surface area).
+    pub area_m2: f64,
+    /// Signed volume in m³; 0.0 for curves and annotations.
+    pub volume_m3: f64,
+}
+
+/// A schedule table placed on a sheet.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SheetTable {
+    /// Optional layer filter; `None` means all layers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// Cached rows (built at place time, regenerated on replay via exec).
+    pub rows: Vec<ScheduleRow>,
+}
+
 /// A named paper layout holding scaled views of the model.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Sheet {
@@ -72,4 +95,7 @@ pub struct Sheet {
     pub paper: PaperSize,
     #[serde(default)]
     pub views: Vec<SheetView>,
+    /// Optional schedule table placed below the views.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<SheetTable>,
 }

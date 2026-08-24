@@ -4,7 +4,7 @@
 //! operators only, which keeps the crate dependency-free.
 
 use glam::{DVec2, DVec3};
-use mydrafter_doc::{Document, Geometry, LayerStyle, Sheet, SheetView, ViewDirection};
+use mydrafter_doc::{Document, Geometry, LayerStyle, ScheduleRow, Sheet, SheetView, ViewDirection};
 
 /// Chord tolerance for tessellating curves at print time (meters).
 const PRINT_TOL: f64 = 0.005;
@@ -210,6 +210,119 @@ fn render_view(
     drawn
 }
 
+/// Column headers and alignment for schedule tables.
+const TABLE_COLS: [&str; 6] = ["Name", "ID", "Layer", "Type", "Area", "Volume"];
+/// Table font size in points.
+const TABLE_FONT_PT: f64 = 7.0;
+/// Row height in mm.
+const TABLE_ROW_MM: f64 = 4.5;
+/// Left margin for the table block in mm.
+const TABLE_LEFT_MM: f64 = 12.0;
+
+/// Render a schedule table into `content` starting at `y_mm` (bottom of table
+/// area, PDF coords). Returns the height consumed in mm.
+fn render_table(rows: &[ScheduleRow], y_start_mm: f64, content: &mut String) -> f64 {
+    if rows.is_empty() {
+        return 0.0;
+    }
+
+    // Build cell text (no unit conversion; always meters).
+    let cells: Vec<[String; 6]> = rows
+        .iter()
+        .map(|r| {
+            [
+                r.name.clone(),
+                r.id.clone(),
+                r.layer.clone(),
+                r.kind.clone(),
+                format!("{:.2}", r.area_m2),
+                format!("{:.2}", r.volume_m3),
+            ]
+        })
+        .collect();
+
+    // Compute column widths in characters, then convert to mm (7pt Helvetica
+    // average ~4.2pt per char, conservatively use 4pt so table fits A3).
+    const CHAR_PT: f64 = 4.2;
+    let mut widths = [0usize; 6];
+    for (i, h) in TABLE_COLS.iter().enumerate() {
+        widths[i] = h.len();
+    }
+    for row in &cells {
+        for (i, c) in row.iter().enumerate() {
+            widths[i] = widths[i].max(c.len());
+        }
+    }
+    let col_mm: Vec<f64> = widths.iter().map(|w| (*w as f64 * CHAR_PT + 4.0) / PT_PER_MM).collect();
+    let total_w: f64 = col_mm.iter().sum();
+
+    let n_rows = 1 + rows.len(); // header + data
+    let total_h = n_rows as f64 * TABLE_ROW_MM;
+
+    // Draw header row background (light grey) for visual separation.
+    let header_y = y_start_mm + (rows.len() as f64) * TABLE_ROW_MM;
+    content.push_str(&format!(
+        "0.85 g {} {} {} {} re f 0 g\n",
+        mm(TABLE_LEFT_MM),
+        mm(header_y),
+        mm(total_w),
+        mm(TABLE_ROW_MM)
+    ));
+
+    // Draw outer border.
+    content.push_str(&format!(
+        "0.5 w {} {} {} {} re S\n",
+        mm(TABLE_LEFT_MM),
+        mm(y_start_mm),
+        mm(total_w),
+        mm(total_h)
+    ));
+
+    // Draw all rows (header + data).
+    let all_rows: Vec<[String; 6]> = std::iter::once(TABLE_COLS.map(str::to_string))
+        .chain(cells)
+        .collect();
+
+    for (row_i, row) in all_rows.iter().enumerate() {
+        // y of this row (header at top = high y, data rows below).
+        let row_y = y_start_mm + (n_rows - 1 - row_i) as f64 * TABLE_ROW_MM;
+        // Horizontal divider above this row (skip bottom-most).
+        if row_i > 0 {
+            content.push_str(&format!(
+                "0.3 w {} {} m {} {} l S\n",
+                mm(TABLE_LEFT_MM),
+                mm(row_y + TABLE_ROW_MM),
+                mm(TABLE_LEFT_MM + total_w),
+                mm(row_y + TABLE_ROW_MM)
+            ));
+        }
+        // Cell text.
+        let mut x = TABLE_LEFT_MM;
+        for (col_i, cell) in row.iter().enumerate() {
+            content.push_str(&format!(
+                "BT /F1 {TABLE_FONT_PT} Tf {} {} Td ({}) Tj ET\n",
+                mm(x + 1.0),
+                mm(row_y + 1.2),
+                escape_pdf_text(cell)
+            ));
+            // Vertical separator.
+            if col_i < 5 {
+                let sep_x = x + col_mm[col_i];
+                content.push_str(&format!(
+                    "0.3 w {} {} m {} {} l S\n",
+                    mm(sep_x),
+                    mm(y_start_mm),
+                    mm(sep_x),
+                    mm(y_start_mm + total_h)
+                ));
+            }
+            x += col_mm[col_i];
+        }
+    }
+
+    total_h
+}
+
 /// Build the complete PDF for a sheet. Returns the file bytes and the number
 /// of geometry lines drawn across all viewports.
 pub fn sheet_pdf(doc: &Document, sheet: &Sheet) -> (Vec<u8>, usize) {
@@ -233,12 +346,20 @@ pub fn sheet_pdf(doc: &Document, sheet: &Sheet) -> (Vec<u8>, usize) {
         sheet.paper.label()
     ));
 
-    // Equal horizontal slices between the margins, above the title strip.
+    // Render schedule table first to know how much vertical space it takes.
+    let table_h = if let Some(tbl) = &sheet.table {
+        render_table(&tbl.rows, MARGIN_MM + TITLE_MM, &mut content)
+    } else {
+        0.0
+    };
+    let view_y0 = MARGIN_MM + TITLE_MM + if table_h > 0.0 { table_h + GUTTER_MM } else { 0.0 };
+
+    // Equal horizontal slices between the margins, above the title strip (and table).
     let n = sheet.views.len();
     if n > 0 {
         let area_w = paper_w - 2.0 * MARGIN_MM;
         let view_w = (area_w - GUTTER_MM * (n as f64 - 1.0)) / n as f64;
-        let (y0, y1) = (MARGIN_MM + TITLE_MM, paper_h - MARGIN_MM);
+        let (y0, y1) = (view_y0, paper_h - MARGIN_MM);
         for (i, view) in sheet.views.iter().enumerate() {
             let x0 = MARGIN_MM + i as f64 * (view_w + GUTTER_MM);
             drawn += render_view(
@@ -347,6 +468,7 @@ mod tests {
             name: "empty".into(),
             paper: mydrafter_doc::PaperSize::A3,
             views: vec![],
+            table: None,
         };
         let (bytes, drawn) = sheet_pdf(&doc, &sheet);
         assert!(bytes.starts_with(b"%PDF"));
