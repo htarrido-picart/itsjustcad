@@ -285,13 +285,13 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "export",
-            usage: "export <path.{dxf|stl|obj|gltf|glb}>",
-            summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), or OBJ (meshes plus curves as polylines). Example: export /tmp/model.glb",
+            usage: "export <path.{dxf|stl|obj|gltf|glb|svg|csv|ifc}>",
+            summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), OBJ (meshes plus curves as polylines), SVG, CSV, or IFC4 openBIM (mesh objects as IfcBuildingElementProxy for Revit/BlenderBIM). Example: export /tmp/model.ifc",
         },
         CommandSpec {
             name: "import",
-            usage: "import <path.dxf>",
-            summary: "Import a DXF file (R12 and later): LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC and TEXT entities become objects on their layers, each logged as its own op; unknown entities are skipped. Example: import /tmp/site.dxf",
+            usage: "import <path.{dxf|obj|stl|gltf|glb|ifc}>",
+            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, or IFC4/IFC2x3 (IfcTriangulatedFaceSet + IfcFacetedBrep meshes → the 'ifc' layer); unknown entities are skipped. Example: import /tmp/model.ifc",
         },
         CommandSpec {
             name: "distance",

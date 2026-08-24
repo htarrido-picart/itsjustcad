@@ -383,8 +383,9 @@ impl Session {
         match ext.as_str() {
             "dxf" => self.import_dxf(path),
             "obj" | "stl" | "gltf" | "glb" => self.import_mesh(path),
+            "ifc" => self.import_ifc(path),
             other => Err(ExecError::Invalid(format!(
-                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb)"
+                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .ifc)"
             ))),
         }
     }
@@ -435,6 +436,45 @@ impl Session {
                 name: Some(name),
             })?;
             created.extend(out.created);
+        }
+        Ok(ApplyOutcome {
+            created,
+            message: format!("imported {total} mesh(es) from {path} — one MeshLiteral op each"),
+        })
+    }
+
+    /// Import an IFC4 (or IFC2x3) file: each recovered mesh becomes one
+    /// `MeshLiteral` op on the `ifc` layer, so the op-log — not the IFC file —
+    /// is the record. Storey/element names carry through as the object name.
+    fn import_ifc(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let parts = crate::ifc::import(&bytes)
+            .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+        if parts.is_empty() {
+            return Err(ExecError::Invalid(format!(
+                "'{path}' contains no importable IFC geometry"
+            )));
+        }
+        let prev_layer = self.doc.current_layer.clone();
+        if self.doc.current_layer != "ifc" {
+            self.run(Command::Layer { name: "ifc".to_string() })?;
+        }
+        let total = parts.len();
+        let mut created = Vec::new();
+        for (name, mesh) in parts {
+            let positions = mesh.positions().to_vec();
+            let faces = mesh.faces().to_vec();
+            let out = self.run(Command::MeshLiteral {
+                id: None,
+                positions,
+                faces,
+                name: Some(name),
+            })?;
+            created.extend(out.created);
+        }
+        if self.doc.current_layer != prev_layer {
+            self.run(Command::Layer { name: prev_layer })?;
         }
         Ok(ApplyOutcome {
             created,
@@ -2323,6 +2363,10 @@ fn apply_forward(
                 "csv" => {
                     let (b, count) = crate::csv::export_csv(doc);
                     (b, format!("CSV, {count}"))
+                }
+                "ifc" => {
+                    let (b, count) = crate::ifc::export(doc, &path).map_err(ExecError::Invalid)?;
+                    (b, format!("IFC4, {count}"))
                 }
                 _ => {
                     let (bytes, count) = crate::mesh_export::export(doc, &path)
