@@ -49,3 +49,10 @@ mydrafter-commands = { path = "crates/commands" }
 mydrafter-deck = { path = "crates/deck" }
 mydrafter-render = { path = "crates/render" }
 mydrafter-solar = { path = "crates/solar" }
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = "z"
