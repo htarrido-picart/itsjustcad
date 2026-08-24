@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Legacy-CAD skin presets — AutoCAD, Rhino, Revit, or ItsJustCAD default.
 //!
 //! Each preset encodes: viewport background, grid colors, ui/cmd font size,

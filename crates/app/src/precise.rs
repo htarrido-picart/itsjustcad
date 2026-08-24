@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Precise numeric input while drawing (Rhino habit): "5.2,3" absolute,
 //! "@2,3" relative to the last picked point, bare "5" a distance from the
 //! last point along the current cursor direction. Pure functions — the app

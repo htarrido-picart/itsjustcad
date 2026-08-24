@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 use egui::{Pos2, Rect};
 
 /// How the central 3D area is split into viewport panes. Camera slots are

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 use glam::DVec3;
 use itsjustcad_doc::{
     HatchPattern, PaperSize, Units, ViewDirection, METERS_PER_FOOT, METERS_PER_INCH,

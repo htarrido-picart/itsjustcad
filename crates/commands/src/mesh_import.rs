@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Mesh importers: OBJ (v/vt/vn slash forms, o/g/l), binary and ASCII STL,
 //! glTF 2.0 GLB (positions + indices from mesh primitives, single buffer),
 //! and Collada 1.4/1.5 (.dae) — geometry/mesh sources, triangles/polylist,

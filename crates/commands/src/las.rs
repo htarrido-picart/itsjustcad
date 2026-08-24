@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Minimal LAS 1.2–1.4 parser for point-cloud import.
 //!
 //! Reads the public header block to extract scale/offset and the number of

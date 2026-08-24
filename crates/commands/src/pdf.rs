@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Vector PDF export for sheets: each viewport projects visible geometry
 //! edges through an orthographic camera at the view's scale into PDF line
 //! art. The writer is hand-rolled — the output is uncompressed line/text

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Command-line autosuggestion engine.
 //!
 //! All public functions are pure and fully unit-tested.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Curve editing operations in the XY plane: closest point, curve-curve
 //! intersection, split, extend, join and fillet.
 //!

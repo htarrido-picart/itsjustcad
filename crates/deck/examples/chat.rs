@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! CLI smoke test: streams one prompt through the active deck.
 //! Usage: cargo run -p itsjustcad-deck --example chat -- "make three boxes"
 

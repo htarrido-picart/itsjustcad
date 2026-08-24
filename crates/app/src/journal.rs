@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Crash-recovery journal: one serialized `Command` per line (JSONL), mirroring
 //! the session's effective op-log. Lives in the app layer — the substrate
 //! stays journal-free. Deleted on clean save/exit; survivors mean a crash,

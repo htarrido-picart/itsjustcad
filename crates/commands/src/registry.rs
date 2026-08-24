@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 /// Menu category for a command. Single taxonomy feeding the menu bar, the
 /// (future) toolbar, and the command palette. Every registry verb maps to
 /// exactly one category (asserted by `menu_grouping_has_no_orphans` in the app).

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Site geometry importers: GeoJSON features, CSV survey points, and Overpass
 //! (OpenStreetMap) building footprints. Pure parsing + geometry — no I/O, no
 //! network. The `exec` layer reads a file's bytes and calls these, then expands

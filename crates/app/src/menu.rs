@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Registry-driven menu bar.
 //!
 //! The menu structure is derived from ONE source — the command registry's

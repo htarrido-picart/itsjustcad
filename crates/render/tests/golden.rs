@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Golden-image regression tests.
 //!
 //! These tests are `#[ignore]` so they do not run in normal `cargo test`. Run

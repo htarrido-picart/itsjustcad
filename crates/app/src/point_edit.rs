@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Control-point editor: when a single Curve::Nurbs or Curve::Polyline is
 //! selected, its control/vertex points are drawn as small draggable squares.
 //! Dragging a handle previews the moved point; on release ONE `setpoint`

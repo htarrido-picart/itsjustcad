@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Block content library: on-disk ~/.config/itsjustcad/blocks/*.block.json
 //! with a starter set embedded from assets/blocks/ and seeded on first run.
 //!

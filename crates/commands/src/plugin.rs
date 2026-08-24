@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! LLM-authorable, user-persisted plugins — the "everything is a plugin" slice.
 //!
 //! Borrowed from DeepSeek-Harness's plugin ethos: an extension model where new

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Non-pinhole camera projections (panorama + fisheye).
 //!
 //! A pinhole `view_proj` matrix cannot express a >180° field of view or the

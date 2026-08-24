@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! 3D interchange export by file extension: binary STL, OBJ, and glTF 2.0 GLB.
 //!
 //! Hand-written and dependency-free, in the spirit of [`crate::dxf`]. These are

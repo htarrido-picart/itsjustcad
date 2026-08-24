@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Embedded single-stroke (Hershey simplex) vector font.
 //!
 //! Glyphs cover ASCII 32–126.  Each glyph is stored as a compact byte array:

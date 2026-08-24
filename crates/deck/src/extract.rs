@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 /// Streaming extractor: splits model output into chat text and command lines
 /// from ```draft fenced blocks, emitting each command the moment its newline
 /// arrives — that is what makes geometry appear live while tokens stream.

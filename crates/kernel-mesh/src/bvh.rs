@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Bounding-volume hierarchy: a median-split AABB tree for accelerating ray
 //! and proximity queries over collections of primitives. Zero dependencies
 //! beyond `glam`; pure f64 document space.

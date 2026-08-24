@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Gumball transform gizmo: shown at the selection's combined AABB center.
 //! Arrows drag-move along X/Y/Z, the ring rotates about Z, the center square
 //! scales uniformly. Drags preview as a ghost wireframe; on release ONE

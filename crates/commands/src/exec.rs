@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 use glam::DVec3;
 use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;

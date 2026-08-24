@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use itsjustcad_commands::{parse, Command, Session};
 use serde::{Deserialize, Serialize};

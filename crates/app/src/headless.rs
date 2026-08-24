@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Headless CLI runner: executes a script file (or stdin) against the command
 //! substrate, optionally renders an offscreen PNG, and saves the document.
 //!

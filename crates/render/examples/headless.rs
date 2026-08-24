@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Headless smoke render: draws a scene to an offscreen texture and writes a
 //! PNG. Lets CI (and agent sessions without a WindowServer) verify pixels.
 //!

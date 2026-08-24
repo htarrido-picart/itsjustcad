@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Generate ItsJustCAD app icon PNGs at standard sizes.
 //!
 //! Run: cargo run -p itsjustcad --example gen_icon

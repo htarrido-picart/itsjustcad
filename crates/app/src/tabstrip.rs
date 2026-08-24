@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Hand-rolled tab-strip state machine + a thin egui renderer.
 //!
 //! Used by the right docked panel (Layers / Properties / History / Deck) and,

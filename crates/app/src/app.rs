@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 use itsjustcad_commands::Session;
 use itsjustcad_render::{
     ColorMode, DisplayMode, OrbitCamera, SceneRenderer, StandardView, UnderlayData,

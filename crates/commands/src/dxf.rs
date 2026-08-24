@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! DXF R12 (AC1009) ASCII export: the whole document as flat entities.
 //! Hand-written — R12 is a simple tagged text format (group code line, value
 //! line), which keeps the crate dependency-free. Lines, polylines, circles

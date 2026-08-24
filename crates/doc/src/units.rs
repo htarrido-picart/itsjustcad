@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 use serde::{Deserialize, Serialize};
 
 pub const METERS_PER_FOOT: f64 = 0.3048;

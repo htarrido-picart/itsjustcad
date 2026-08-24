@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Bottom status strip: pure formatting for cursor coordinates, counts,
 //! snap state and the active view. The egui strip in `app.rs` only lays
 //! these strings out, so everything user-visible here is unit-testable.

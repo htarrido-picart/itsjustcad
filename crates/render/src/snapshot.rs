@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 use glam::{DVec2, DVec3};
 use itsjustcad_doc::{
     hatch::{hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},

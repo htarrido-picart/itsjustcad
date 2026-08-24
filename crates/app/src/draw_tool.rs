@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 use glam::DVec3;
 
 /// Rhino-style interactive drawing: type a bare verb ("rect"), pick points on

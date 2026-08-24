@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Drag-box selection: pure screen-space geometry, Rhino convention.
 //!
 //! Left→right drag = window (only objects fully inside), right→left =

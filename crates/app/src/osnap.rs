@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Object snapping: click-to-draw sticks to endpoints, midpoints and centers
 //! of existing geometry (screen-space radius), falling back to the 10cm grid.
 

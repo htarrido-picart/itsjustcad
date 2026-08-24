@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! Mesh booleans via BSP clipping (csg.js port, f64 document space).
 //!
 //! Good enough for watertight massing solids from `make_box`/`extrude_profile`.

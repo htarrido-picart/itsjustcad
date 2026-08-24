@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 use serde::{Deserialize, Serialize};
 
 /// Write `contents` to `path` with mode 0600 on unix so API keys stored in

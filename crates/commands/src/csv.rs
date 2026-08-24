@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! CSV export: one row per scene object, RFC 4180-compliant quoting.
 //!
 //! Header: name,id,layer,type,area,volume

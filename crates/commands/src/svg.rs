@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! SVG export: 2D projection of the current view using the same orthographic
 //! projection and edge-extraction helpers as the PDF exporter.  Each layer
 //! becomes a `<g>` element with stroke colour from the layer colour and

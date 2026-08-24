@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
 //! IFC4 export + import — the openBIM bridge to Revit / BlenderBIM / IfcOpenShell.
 //!
 //! Hand-written and dependency-free, in the spirit of [`crate::dxf`] and
