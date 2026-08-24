@@ -350,8 +350,18 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "import",
-            usage: "import <path.{dxf|obj|stl|gltf|glb|ifc|epw}>",
-            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, IFC4/IFC2x3 (meshes → the 'ifc' layer), or EPW EnergyPlus weather (sets the document location and reports annual stats); unknown entities are skipped. Example: import /tmp/denver.epw",
+            usage: "import <path.{dxf|obj|stl|gltf|glb|ifc|epw|geojson}>",
+            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), or GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0.5m marker circle; properties.name → object name; lon/lat projected to local meters when a location is set, else treated as local xy). Example: import /tmp/site.geojson",
+        },
+        CommandSpec {
+            name: "terrain",
+            usage: "terrain <path.{csv|geojson}>",
+            summary: "Build a terrain surface mesh on layer 'terrain'. .csv = Delaunay-triangulate x,y,z survey points (header row optional). .geojson = triangulate the vertices of elevation contour LineStrings (elevation read from the 'elevation' or 'ele' property; lon/lat projected when a location is set). Example: terrain /tmp/survey.csv",
+        },
+        CommandSpec {
+            name: "osmfile",
+            usage: "osmfile <path.json>",
+            summary: "Build OpenStreetMap building context from a saved Overpass API JSON export ('out geom;' query): each building-tagged way footprint is extruded (height tag, else building:levels x 3 m, else 9 m) into a mesh on layer 'context'. lon/lat projected to local meters when a location is set. Example: osmfile /tmp/overpass.json",
         },
         CommandSpec {
             name: "distance",

@@ -682,8 +682,16 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             Ok(Command::Export { path: path.to_string() })
         }
         "import" => {
-            let [path] = take::<1>("import", "an input path (.dxf/.obj/.stl/.gltf/.glb)", &args)?;
+            let [path] = take::<1>("import", "an input path (.dxf/.obj/.stl/.gltf/.glb/.geojson)", &args)?;
             Ok(Command::Import { path: path.to_string() })
+        }
+        "terrain" => {
+            let [path] = take::<1>("terrain", "a .csv or .geojson path", &args)?;
+            Ok(Command::Terrain { path: path.to_string() })
+        }
+        "osmfile" => {
+            let [path] = take::<1>("osmfile", "an Overpass .json path", &args)?;
+            Ok(Command::OsmFile { path: path.to_string() })
         }
         "view" => match args.as_slice() {
             ["save", name] => Ok(Command::ViewSave {

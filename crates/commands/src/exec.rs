@@ -130,6 +130,8 @@ impl Session {
             Command::Redo => self.redo(),
             Command::Amend { step, with } => self.amend(step, *with),
             Command::Import { path } => self.import(path),
+            Command::Terrain { path } => self.terrain(path),
+            Command::OsmFile { path } => self.osmfile(path),
             cmd => {
                 let logged = cmd.is_logged();
                 let (op, inverse, outcome) = apply_forward(&mut self.doc, cmd)?;
@@ -423,8 +425,9 @@ impl Session {
             "obj" | "stl" | "gltf" | "glb" => self.import_mesh(path),
             "ifc" => self.import_ifc(path),
             "epw" => self.import_epw(path),
+            "geojson" | "json" => self.import_geojson(path),
             other => Err(ExecError::Invalid(format!(
-                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .ifc, .epw)"
+                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .ifc, .epw, .geojson)"
             ))),
         }
     }
@@ -548,6 +551,158 @@ impl Session {
                 "EPW '{}' @ ({:.3}, {:.3}) tz {:+.1}h, {} m elev — {} rows{temp}; location set",
                 s.city, s.lat_deg, s.lon_deg, s.tz_hours, s.elevation_m, s.rows
             ),
+        })
+    }
+
+    /// The document's geo origin for projecting lon/lat to local meters, if a
+    /// location has been set (EPW/`sun`/`location`).
+    fn geo_origin(&self) -> Option<crate::geo::GeoOrigin> {
+        self.doc
+            .location
+            .map(|l| crate::geo::GeoOrigin { lat_deg: l.lat_deg, lon_deg: l.lon_deg })
+    }
+
+    /// Import GeoJSON features as substrate ops: Polygon → closed Polyline,
+    /// LineString → open Polyline, Point → a tiny marker Circle (there is no
+    /// point primitive). `properties.name` becomes the object name. Each op is
+    /// logged individually so the op-log — not the GeoJSON file — is the record.
+    fn import_geojson(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let feats = crate::geo::parse_geojson(&bytes, self.geo_origin())
+            .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+        if feats.is_empty() {
+            return Err(ExecError::Invalid(format!("'{path}' has no importable features")));
+        }
+        use crate::geo::GeoFeature;
+        let total = feats.len();
+        let mut created = Vec::new();
+        for feat in feats {
+            let (cmd, name) = match feat {
+                GeoFeature::Polygon { name, ring } => (
+                    Command::Polyline {
+                        id: None,
+                        points: ring.iter().map(|p| DVec3::new(p.x, p.y, 0.0)).collect(),
+                        closed: true,
+                    },
+                    name,
+                ),
+                GeoFeature::Line { name, points } => (
+                    Command::Polyline {
+                        id: None,
+                        points: points.iter().map(|p| DVec3::new(p.x, p.y, 0.0)).collect(),
+                        closed: false,
+                    },
+                    name,
+                ),
+                // No point primitive: a 0.5 m marker circle stands in.
+                GeoFeature::Point { name, at } => (
+                    Command::Circle { id: None, center: DVec3::new(at.x, at.y, 0.0), radius: 0.5 },
+                    name,
+                ),
+            };
+            let out = self.run(cmd)?;
+            created.extend(out.created.iter().copied());
+            if let (Some(name), Some(id)) = (name, out.created.first()) {
+                self.run(Command::Name {
+                    targets: Selector::Ids { ids: vec![*id] },
+                    name,
+                })?;
+            }
+        }
+        Ok(ApplyOutcome {
+            created,
+            message: format!(
+                "imported {total} GeoJSON feature(s) from {path} (points → 0.5m marker circles)"
+            ),
+        })
+    }
+
+    /// Build a terrain surface from a `.csv` (x,y,z points) or `.geojson`
+    /// (elevation contour LineStrings) file. Delaunay-triangulates the points
+    /// and adds one MeshLiteral op on layer "terrain".
+    fn terrain(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let ext = path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+        let mesh = match ext.as_str() {
+            "csv" | "txt" => {
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| ExecError::Invalid(format!("'{path}' is not valid UTF-8")))?;
+                let pts = crate::geo::parse_csv_points(&text)
+                    .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+                crate::geo::terrain_from_points(&pts)
+            }
+            "geojson" | "json" => {
+                // "elevation" then "ele" are the common contour z tags.
+                crate::geo::terrain_from_contours(&bytes, self.geo_origin(), "elevation")
+                    .or_else(|_| {
+                        crate::geo::terrain_from_contours(&bytes, self.geo_origin(), "ele")
+                    })
+            }
+            other => {
+                return Err(ExecError::Invalid(format!(
+                    "terrain: unknown extension '.{other}' (use .csv or .geojson)"
+                )));
+            }
+        }
+        .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+
+        let prev_layer = self.doc.current_layer.clone();
+        if self.doc.current_layer != "terrain" {
+            self.run(Command::Layer { name: "terrain".to_string() })?;
+        }
+        let faces_n = mesh.faces().len();
+        let out = self.run(Command::MeshLiteral {
+            id: None,
+            positions: mesh.positions().to_vec(),
+            faces: mesh.faces().to_vec(),
+            name: Some("terrain".to_string()),
+        })?;
+        if self.doc.current_layer != prev_layer {
+            self.run(Command::Layer { name: prev_layer })?;
+        }
+        Ok(ApplyOutcome {
+            created: out.created,
+            message: format!("terrain surface from {path}: {faces_n} triangles on layer 'terrain'"),
+        })
+    }
+
+    /// Build OSM building context from a saved Overpass API JSON export: each
+    /// building footprint is extruded (height tag or 9 m default) into a
+    /// MeshLiteral op on layer "context".
+    fn osmfile(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let buildings = crate::geo::parse_overpass(&bytes, self.geo_origin())
+            .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+        if buildings.is_empty() {
+            return Err(ExecError::Invalid(format!(
+                "'{path}' has no building footprints (need Overpass 'out geom;' ways with a building tag)"
+            )));
+        }
+        let prev_layer = self.doc.current_layer.clone();
+        if self.doc.current_layer != "context" {
+            self.run(Command::Layer { name: "context".to_string() })?;
+        }
+        let total = buildings.len();
+        let mut created = Vec::new();
+        for b in buildings {
+            let mesh = kernel_mesh::extrude_profile(&b.ring, 0.0, b.height_m);
+            let out = self.run(Command::MeshLiteral {
+                id: None,
+                positions: mesh.positions().to_vec(),
+                faces: mesh.faces().to_vec(),
+                name: b.name,
+            })?;
+            created.extend(out.created);
+        }
+        if self.doc.current_layer != prev_layer {
+            self.run(Command::Layer { name: prev_layer })?;
+        }
+        Ok(ApplyOutcome {
+            created,
+            message: format!("OSM context from {path}: {total} building(s) on layer 'context'"),
         })
     }
 
@@ -3635,7 +3790,12 @@ fn apply_forward(
                 ApplyOutcome { created: Vec::new(), message: msg },
             ))
         }
-        Command::Undo | Command::Redo | Command::Amend { .. } | Command::Import { .. } => {
+        Command::Undo
+        | Command::Redo
+        | Command::Amend { .. }
+        | Command::Import { .. }
+        | Command::Terrain { .. }
+        | Command::OsmFile { .. } => {
             unreachable!("handled in Session::run")
         }
     }
@@ -3713,6 +3873,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Print { .. } => "print",
         Command::Export { .. } => "export",
         Command::Import { .. } => "import",
+        Command::Terrain { .. } => "terrain",
+        Command::OsmFile { .. } => "osmfile",
         Command::ViewSave { .. } => "view save",
         Command::ViewRestore { .. } => "view",
         Command::ViewList => "view list",
@@ -6307,5 +6469,107 @@ mod tests {
         assert!(c.is_closed());
         let Curve::Polyline { points, .. } = c else { panic!() };
         assert_eq!(points.len(), 24);
+    }
+
+    // ---- site: terrain / geojson import / osmfile ----
+
+    fn write_tmp(name: &str, contents: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!("mydrafter_test_{name}"));
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn mesh_faces_on_layer(s: &Session, layer: &str) -> usize {
+        s.doc
+            .objects()
+            .filter(|o| o.layer == layer)
+            .filter_map(|o| match &o.geometry {
+                Geometry::Mesh(m) => Some(m.faces().len()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn terrain_csv_square_center_is_four_triangles() {
+        let path = write_tmp("terr.csv", b"x,y,z\n0,0,0\n1,0,0\n1,1,0\n0,1,0\n0.5,0.5,2\n");
+        let mut s = Session::default();
+        let out = run(&mut s, &format!("terrain {path}"));
+        assert!(out.message.contains("4 triangles"), "{}", out.message);
+        assert_eq!(mesh_faces_on_layer(&s, "terrain"), 4);
+        // The terrain op is not itself logged; its MeshLiteral expansion is,
+        // and the current layer is restored to default afterwards.
+        assert_eq!(s.doc.current_layer, "default");
+    }
+
+    #[test]
+    fn terrain_replay_stable() {
+        let path = write_tmp("terr2.csv", b"0,0,0\n4,0,1\n4,4,0\n0,4,1\n2,2,3\n");
+        let mut s = Session::default();
+        run(&mut s, &format!("terrain {path}"));
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(mesh_faces_on_layer(&replayed, "terrain"), 4);
+        assert_eq!(replayed.doc.all_ids(), s.doc.all_ids(), "ids stable on replay");
+    }
+
+    #[test]
+    fn import_geojson_polygon_line_point() {
+        let gj = br#"{"type":"FeatureCollection","features":[
+          {"type":"Feature","properties":{"name":"lot"},
+           "geometry":{"type":"Polygon","coordinates":[[[0,0],[10,0],[10,10],[0,10],[0,0]]]}},
+          {"type":"Feature","properties":{},
+           "geometry":{"type":"LineString","coordinates":[[0,0],[5,5]]}},
+          {"type":"Feature","properties":{"name":"tree"},
+           "geometry":{"type":"Point","coordinates":[3,3]}}
+        ]}"#;
+        let path = write_tmp("site.geojson", gj);
+        let mut s = Session::default();
+        let out = run(&mut s, &format!("import {path}"));
+        assert!(out.message.contains("3 GeoJSON feature"), "{}", out.message);
+        // Polygon → closed polyline, Line → open polyline, Point → circle.
+        let closed = s
+            .doc
+            .objects()
+            .filter(|o| matches!(&o.geometry, Geometry::Curve(c) if c.is_closed()))
+            .count();
+        assert!(closed >= 2, "polygon + point-circle are closed");
+        assert!(s.doc.find_named("lot").len() == 1, "polygon carries its name");
+        assert!(s.doc.find_named("tree").len() == 1, "point carries its name");
+    }
+
+    #[test]
+    fn osmfile_extrudes_buildings_on_context_layer() {
+        let osm = br#"{"elements":[
+          {"type":"way","id":1,"tags":{"building":"yes","height":"12"},
+           "geometry":[{"lat":0,"lon":0},{"lat":0,"lon":0.0002},
+                       {"lat":0.0002,"lon":0.0002},{"lat":0.0002,"lon":0},{"lat":0,"lon":0}]},
+          {"type":"way","id":2,"tags":{"highway":"residential"},
+           "geometry":[{"lat":0,"lon":0},{"lat":0,"lon":0.001}]}
+        ]}"#;
+        let path = write_tmp("overpass.json", osm);
+        let mut s = Session::default();
+        // A location makes lon/lat project to local meters (else degrees).
+        run(&mut s, "location 0 0");
+        let out = run(&mut s, &format!("osmfile {path}"));
+        assert!(out.message.contains("1 building"), "{}", out.message);
+        // One extruded box → 12 side/cap triangles.
+        assert_eq!(mesh_faces_on_layer(&s, "context"), 12);
+        assert_eq!(s.doc.current_layer, "default", "layer restored");
+    }
+
+    #[test]
+    fn osmfile_replay_stable() {
+        let osm = br#"{"elements":[
+          {"type":"way","id":1,"tags":{"building":"yes"},
+           "geometry":[{"lat":0,"lon":0},{"lat":0,"lon":0.0002},
+                       {"lat":0.0002,"lon":0},{"lat":0,"lon":0}]}
+        ]}"#;
+        let path = write_tmp("overpass2.json", osm);
+        let mut s = Session::default();
+        run(&mut s, &format!("osmfile {path}"));
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(replayed.doc.all_ids(), s.doc.all_ids());
+        // Triangular footprint extrudes to 3 side quads (6 tris) + 2 caps = 8.
+        assert_eq!(mesh_faces_on_layer(&replayed, "context"), 8);
     }
 }

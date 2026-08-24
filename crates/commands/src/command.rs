@@ -549,6 +549,20 @@ pub enum Command {
     Import {
         path: String,
     },
+    /// Build a terrain surface mesh from a file and add it on layer "terrain".
+    /// `.csv` → Delaunay-triangulate x,y,z survey points; `.geojson` →
+    /// triangulate the vertices of elevation contour LineStrings. Expands into a
+    /// single MeshLiteral op (self-contained); the Terrain op itself is not
+    /// logged, exactly like Import.
+    Terrain {
+        path: String,
+    },
+    /// Build OSM building context from a saved Overpass API JSON export: each
+    /// building footprint way is extruded (height tag or 9 m default) into a
+    /// MeshLiteral op on layer "context". Not logged (its expansions are).
+    OsmFile {
+        path: String,
+    },
     /// A raw triangle mesh carried verbatim in the op-log. Used by mesh import
     /// (.obj/.stl/.gltf/.glb) so each imported object is one self-contained
     /// logged op — no external file dependency on replay. Not exposed in the
@@ -675,6 +689,8 @@ impl Command {
                 | Command::Print { .. }
                 | Command::Export { .. }
                 | Command::Import { .. }
+                | Command::Terrain { .. }
+                | Command::OsmFile { .. }
                 | Command::Distance { .. }
                 | Command::Area { .. }
                 | Command::Volume { .. }

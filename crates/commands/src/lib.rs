@@ -7,6 +7,7 @@ pub mod csv;
 pub mod dxf;
 mod error;
 mod exec;
+pub mod geo;
 pub mod ifc;
 pub mod io;
 pub mod mesh_export;
