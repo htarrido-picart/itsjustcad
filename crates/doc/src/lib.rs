@@ -4,6 +4,7 @@
 
 mod document;
 pub mod hatch;
+pub mod hershey;
 mod object;
 mod sheet;
 mod underlay;

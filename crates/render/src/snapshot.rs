@@ -217,6 +217,23 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                     }
                 }
             }
+            Geometry::Annotation(Annotation::Text { pos, text, height }) => {
+                let color = resolve_color(obj, layer_color, theme, selected, mode, false);
+                let strokes = mydrafter_doc::hershey::text_strokes(
+                    text,
+                    [pos.x, pos.y],
+                    *height,
+                );
+                for poly in strokes {
+                    let pts: Vec<[f32; 3]> = poly
+                        .iter()
+                        .map(|p| [p[0] as f32, p[1] as f32, pos.z as f32])
+                        .collect();
+                    if pts.len() >= 2 {
+                        scene.lines.push((pts, color));
+                    }
+                }
+            }
             Geometry::Annotation(_) => {}
             // Block instances: resolved to constituent geometry at render time.
             Geometry::Instance { block, position, rotation_deg, scale } => {
@@ -426,9 +443,10 @@ mod tests {
     }
 
     #[test]
-    fn dim_and_text_are_overlay_only() {
-        let mut doc = Document::default();
-        doc.insert(SceneObject {
+    fn dim_is_overlay_only_text_renders_as_strokes() {
+        // LinearDim is still rendered as an egui overlay (no strokes in scene).
+        let mut doc_dim = Document::default();
+        doc_dim.insert(SceneObject {
             visible: true,
             id: ObjectId::new(),
             name: None,
@@ -440,7 +458,13 @@ mod tests {
                 offset: 0.5,
             }),
         });
-        doc.insert(SceneObject {
+        let scene_dim = snapshot(&doc_dim, Theme::Dark);
+        assert!(scene_dim.meshes.is_empty() && scene_dim.lines.is_empty(),
+            "LinearDim should not produce scene geometry");
+
+        // Text annotations now render as Hershey vector strokes in world space.
+        let mut doc_text = Document::default();
+        doc_text.insert(SceneObject {
             visible: true,
             id: ObjectId::new(),
             name: None,
@@ -452,8 +476,10 @@ mod tests {
                 height: 0.2,
             }),
         });
-        let scene = snapshot(&doc, Theme::Dark);
-        assert!(scene.meshes.is_empty() && scene.lines.is_empty());
+        let scene_text = snapshot(&doc_text, Theme::Dark);
+        assert!(scene_text.meshes.is_empty(), "text should not produce meshes");
+        assert!(!scene_text.lines.is_empty(),
+            "text annotation must produce Hershey stroke lines in the scene");
     }
 
     #[test]

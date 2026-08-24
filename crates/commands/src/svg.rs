@@ -2,7 +2,8 @@
 //! projection and edge-extraction helpers as the PDF exporter.  Each layer
 //! becomes a `<g>` element with stroke colour from the layer colour and
 //! stroke-width from `lineweight_mm` (converted to SVG user-units via the
-//! viewBox scale). Annotations are emitted as `<text>` elements.
+//! viewBox scale). Text annotations are tessellated via the Hershey stroke
+//! font so they render identically in the viewport, PDF, SVG, and DXF.
 
 use glam::{DVec2, DVec3};
 use mydrafter_doc::{Annotation, Document, Geometry, LayerStyle, ViewDirection};
@@ -54,6 +55,18 @@ fn collect_segments(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
             segs.push((gb, b_off));
             segs.push((a_off, b_off));
         }
+        // Text annotations: tessellate via Hershey stroke font so they render
+        // as world-space geometry (identical appearance across viewport/SVG/PDF/DXF).
+        Geometry::Annotation(Annotation::Text { pos, text, height }) => {
+            let strokes = mydrafter_doc::hershey::text_strokes(text, [pos.x, pos.y], *height);
+            for poly in strokes {
+                for pair in poly.windows(2) {
+                    let a = DVec3::new(pair[0][0], pair[0][1], pos.z);
+                    let b = DVec3::new(pair[1][0], pair[1][1], pos.z);
+                    segs.push((a, b));
+                }
+            }
+        }
         Geometry::Annotation(_) => {}
         // Block instances are not directly renderable in SVG export.
         Geometry::Instance { .. } => {}
@@ -101,11 +114,12 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
     let dir = DEFAULT_DIR; // always top-down for now (no live camera in export path)
 
     // Collect all projected 2D segments per layer.
+    // Text annotations are tessellated by collect_segments via the Hershey
+    // stroke font and flow through as regular line segments.
     struct LayerData {
         name: String,
         style: LayerStyle,
         segs: Vec<(DVec2, DVec2)>,
-        texts: Vec<(DVec2, String, f64)>, // (pos, text, height_m)
     }
 
     // Gather layers in document layer order (alphabetical + default first).
@@ -122,7 +136,6 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
             name: n.clone(),
             style: doc.layers.get(n).unwrap_or(&fallback).clone(),
             segs: Vec::new(),
-            texts: Vec::new(),
         })
         .collect();
     // Objects whose layer is not in the layer table go to an implicit fallback.
@@ -130,7 +143,6 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
         name: "__orphan__".to_string(),
         style: fallback.clone(),
         segs: Vec::new(),
-        texts: Vec::new(),
     };
 
     let mut all_pts: Vec<DVec2> = Vec::new();
@@ -144,14 +156,6 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
             .iter_mut()
             .find(|l| l.name == obj.layer)
             .unwrap_or(&mut orphan);
-
-        // Text annotations.
-        if let Geometry::Annotation(Annotation::Text { pos, text, height }) = &obj.geometry {
-            let p2 = project(dir, *pos);
-            layer_data.texts.push((p2, text.clone(), *height));
-            all_pts.push(p2);
-            continue;
-        }
 
         let world_segs = collect_segments(&obj.geometry);
         for (a, b) in &world_segs {
@@ -206,7 +210,7 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
 
     let all_layers = layers.iter().chain(std::iter::once(&orphan));
     for layer in all_layers {
-        if layer.segs.is_empty() && layer.texts.is_empty() {
+        if layer.segs.is_empty() {
             continue;
         }
         layer_count += 1;
@@ -227,18 +231,6 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
                 svg_num(b.x), svg_num(b.y),
             ));
             path_count += 1;
-        }
-
-        // Text annotations.
-        for (pos, text, height) in &layer.texts {
-            svg.push_str(&format!(
-                "    <text x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\">{}</text>\n",
-                svg_num(pos.x),
-                svg_num(pos.y),
-                svg_num(*height),
-                stroke,
-                xml_escape(text),
-            ));
         }
 
         svg.push_str("  </g>\n");
@@ -322,5 +314,33 @@ mod tests {
         let svg = String::from_utf8(bytes).unwrap();
         assert!(svg.contains("id=\"a\""), "layer a group");
         assert!(svg.contains("id=\"b\""), "layer b group");
+    }
+
+    /// Text annotation renders as Hershey vector strokes (SVG `<line>` elements),
+    /// not as an SVG `<text>` element.
+    #[test]
+    fn svg_text_annotation_renders_as_hershey_strokes() {
+        let mut s = Session::default();
+        // "Hi" at 1m height.
+        s.run(parse("text 0,0,0 Hi 1").unwrap()).unwrap();
+
+        let (bytes, summary) = export_svg(&s.doc);
+        let svg = String::from_utf8(bytes).unwrap();
+
+        // No SVG <text> elements — text is all strokes.
+        assert!(
+            !svg.contains("<text "),
+            "text annotation must not emit SVG <text> elements\n{svg}"
+        );
+        // Must have <line> elements from Hershey strokes.
+        assert!(
+            svg.contains("<line "),
+            "text annotation must emit <line> elements from Hershey strokes\n{svg}"
+        );
+        // Summary must report segments > 0.
+        assert!(
+            !summary.contains("0 segments"),
+            "segments must be > 0 for text annotation: {summary}"
+        );
     }
 }

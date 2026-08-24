@@ -103,7 +103,19 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
                 out.push((a, b));
             }
         }
-        Geometry::Annotation(_) => {}
+        // Text annotations: tessellate via Hershey stroke font into world-space
+        // segments. This makes them appear in viewports at world scale and in
+        // PDF/SVG/DXF exports consistently (same path as geometry).
+        Geometry::Annotation(Annotation::Text { pos, text, height }) => {
+            let strokes = mydrafter_doc::hershey::text_strokes(text, [pos.x, pos.y], *height);
+            for poly in strokes {
+                for pair in poly.windows(2) {
+                    let a = DVec3::new(pair[0][0], pair[0][1], pos.z);
+                    let b = DVec3::new(pair[1][0], pair[1][1], pos.z);
+                    out.push((a, b));
+                }
+            }
+        }
         // Block instances: resolve in the renderer. PDF export skips them
         // (no block definition expansion at PDF time yet).
         Geometry::Instance { .. } => {}
@@ -746,6 +758,36 @@ mod tests {
             content.contains("10.000m"),
             "PDF should contain dim label '10.000m'"
         );
+    }
+
+    /// Text annotation "HELLO" at 0.01m height renders as Hershey strokes in PDF.
+    ///
+    /// At 1:1 scale, 0.01m → 10mm on paper (fits comfortably on A3).
+    /// "HELLO" has strokes: H(3), E(3), L(1), L(1), O(1) → ≥9 stroke segments.
+    #[test]
+    fn text_annotation_renders_as_hershey_strokes_in_pdf() {
+        use crate::{parse, Session};
+
+        let mut s = Session::default();
+        // Place "HELLO" at origin. Height 0.01m = 10mm at 1:1 scale → fits on A3.
+        s.run(parse("text 0,0,0 HELLO 0.01").unwrap()).unwrap();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        // 1:1 scale: 0.01m world → 10mm on paper.
+        s.run(parse("sheetview s1 top 1").unwrap()).unwrap();
+
+        let sheet = s.doc.sheet("s1").unwrap().clone();
+        let (bytes, drawn) = sheet_pdf(&s.doc, &sheet);
+        // "HELLO" has 5 letters each with multiple strokes (H=3, E=3, L=1, L=1, O=1)
+        // total ≥ 9 stroke segments drawn.
+        assert!(drawn >= 9, "expected ≥9 stroke segments for HELLO, got {drawn}");
+        // The PDF content must contain line-draw operators.
+        let content = String::from_utf8_lossy(&bytes);
+        // Count "l S" occurrences (each segment ends with " l S").
+        let seg_count = content.matches(" l S\n").count();
+        assert!(seg_count >= 9, "expected ≥9 PDF line segments for HELLO, got {seg_count}");
+        // Confirm PDF structure is valid.
+        assert!(bytes.starts_with(b"%PDF"), "valid PDF header");
+        assert!(bytes.ends_with(b"%%EOF\n"), "valid PDF trailer");
     }
 
     /// Model-space LinearDim lines render inside a viewport (segments drawn > 0).

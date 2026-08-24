@@ -145,8 +145,18 @@ fn entity(t: &mut Tags, layer: &str, geometry: &Geometry, units: mydrafter_doc::
                 2
             }
             Annotation::Text { pos, text: s, height } => {
-                text(t, layer, *pos, *height, s);
-                1
+                // Tessellate via Hershey stroke font to world-space polylines so
+                // the text renders at world scale consistently across all outputs.
+                let strokes = mydrafter_doc::hershey::text_strokes(s, [pos.x, pos.y], *height);
+                let n = strokes.len();
+                for poly in strokes {
+                    let pts: Vec<DVec3> = poly
+                        .iter()
+                        .map(|p| DVec3::new(p[0], p[1], pos.z))
+                        .collect();
+                    polyline(t, layer, &pts, false);
+                }
+                n
             }
             Annotation::Hatch { boundary, .. } => {
                 // Pattern dropped; the boundary survives as a closed polyline.
@@ -462,18 +472,21 @@ mod tests {
         run(&mut s, "circle 20,0,0 2.5");
         run(&mut s, "arc 30,0,0 5 0 90");
         run(&mut s, "ellipse 40,0,0 4 2");
+        // Text annotations are tessellated as Hershey stroke polylines — no DXF
+        // TEXT entities. The count reflects the number of stroke polylines.
         run(&mut s, "text 5,3,0 hello 0.3");
         let (dxf, count) = document_dxf(&s.doc);
         let entities = scan_entities(&dxf);
-        // polyline: POLYLINE + 3 VERTEX + SEQEND; ellipse tessellates to a
-        // polyline with N vertices. Entity count reports logical entities.
-        assert_eq!(count, 6);
+        // LINE, closed polyline, circle, arc, ellipse→polyline, plus N Hershey
+        // stroke polylines for "hello". At minimum more than 5 entities.
+        assert!(count > 5, "expected >5 logical entities, got {count}");
         assert_eq!(entities.iter().filter(|e| *e == "LINE").count(), 1);
-        assert_eq!(entities.iter().filter(|e| *e == "POLYLINE").count(), 2);
-        assert_eq!(entities.iter().filter(|e| *e == "SEQEND").count(), 2);
+        // closed polyline + ellipse + hershey strokes for "hello" (≥5 letters)
+        assert!(entities.iter().filter(|e| *e == "POLYLINE").count() >= 2);
         assert_eq!(entities.iter().filter(|e| *e == "CIRCLE").count(), 1);
         assert_eq!(entities.iter().filter(|e| *e == "ARC").count(), 1);
-        assert_eq!(entities.iter().filter(|e| *e == "TEXT").count(), 1);
+        // Text annotation no longer emits DXF TEXT entities.
+        assert_eq!(entities.iter().filter(|e| *e == "TEXT").count(), 0);
     }
 
     #[test]
@@ -597,6 +610,9 @@ mod tests {
     #[test]
     fn import_round_trips_our_export() {
         // Courtyard (outer + inner rects) plus one of every exact curve kind.
+        // Text annotations are excluded: they export as Hershey stroke polylines
+        // and cannot round-trip back to Annotation::Text (by design — the DXF
+        // format receives vector geometry, not string metadata).
         let mut s = Session::default();
         run(&mut s, "layer courtyard");
         run(&mut s, "rect 0,0,0 10 8");
@@ -605,7 +621,6 @@ mod tests {
         run(&mut s, "line 0,0,0 10,0,3");
         run(&mut s, "circle 20,0,0 2.5");
         run(&mut s, "arc 30,0,0 5 30 120");
-        run(&mut s, "text 5,3,0 hello 0.3");
         let path = std::env::temp_dir().join("mydrafter_import_roundtrip.dxf");
         run(&mut s, &format!("export {}", path.display()));
 
@@ -613,9 +628,10 @@ mod tests {
         let out = s2
             .run(Command::Import { path: path.display().to_string() })
             .unwrap();
-        assert!(out.message.contains("imported 6 entities"), "{}", out.message);
+        // 2 rects (polylines) + line + circle + arc = 5 curve entities.
+        assert!(out.message.contains("imported 5 entities"), "{}", out.message);
         assert!(out.message.contains("(0 skipped)"), "{}", out.message);
-        assert_eq!(out.created.len(), 6);
+        assert_eq!(out.created.len(), 5);
         assert_eq!(s2.doc.len(), s.doc.len());
         assert_eq!(s2.doc.current_layer, mydrafter_doc::DEFAULT_LAYER);
 
@@ -624,17 +640,30 @@ mod tests {
             assert_eq!(a.layer, b.layer);
             match (&a.geometry, &b.geometry) {
                 (G::Curve(ca), G::Curve(cb)) => assert_curve_close(ca, cb),
-                (
-                    G::Annotation(Annotation::Text { pos, text, height }),
-                    G::Annotation(Annotation::Text { pos: p2, text: t2, height: h2 }),
-                ) => {
-                    assert!((*pos - *p2).length() < 1e-9);
-                    assert_eq!(text, t2);
-                    assert!((height - h2).abs() < 1e-9);
-                }
                 other => panic!("geometry kinds differ: {other:?}"),
             }
         }
+    }
+
+    /// Text annotation exports as Hershey stroke polylines (not DXF TEXT).
+    #[test]
+    fn text_annotation_exports_as_hershey_polylines() {
+        let mut s = Session::default();
+        run(&mut s, "text 0,0,0 Hi 1.0");
+        let (dxf, count) = document_dxf(&s.doc);
+        // Hershey strokes for "Hi" — both letters have strokes.
+        assert!(count >= 2, "expected ≥2 Hershey polylines for 'Hi', got {count}");
+        // No DXF TEXT entity emitted.
+        assert_eq!(
+            scan_entities(&dxf).iter().filter(|e| *e == "TEXT").count(),
+            0,
+            "text annotation must not emit DXF TEXT (use Hershey polylines)"
+        );
+        // But POLYLINE entities must exist.
+        assert!(
+            scan_entities(&dxf).iter().filter(|e| *e == "POLYLINE").count() >= 1,
+            "expected POLYLINE entities from Hershey strokes"
+        );
     }
 
     #[test]
