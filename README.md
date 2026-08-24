@@ -15,12 +15,29 @@ that draws with the exact same commands you type.
 
 ---
 
-## Quick start
+## Download
+
+**[⬇ Download the latest release](https://github.com/htarrido-picart/itsjustcad/releases/latest)** — one file, no installer, nothing else to set up.
+
+| Your OS | Grab | First launch |
+|---|---|---|
+| **macOS** | `ItsJustCAD.app` (or `.dmg`) | Right‑click the app → **Open** (once) |
+| **Windows** | `itsjustcad.exe` | Double‑click → **More info → Run anyway** (once) |
+| **Linux** | the `AppImage` | `chmod +x` it, then run |
+
+> The app is not code‑signed yet, so your OS shows a one‑time "unidentified
+> developer" / "Windows protected your PC" warning on the very first launch.
+> Use the step above to open it; after that it just launches. Nothing to
+> install, no dependencies — it's a single ~10 MB program.
+
+---
+
+## Build from source
 
 Requires Rust stable (see `rust-toolchain.toml`).
 
 ```sh
-git clone https://github.com/htarrido/itsjustcad
+git clone https://github.com/htarrido-picart/itsjustcad
 cd itsjustcad
 cargo run --release
 ```
