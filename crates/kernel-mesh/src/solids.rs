@@ -106,6 +106,183 @@ pub fn sweep_profile(profile: &[DVec3], rail: &[DVec3]) -> Mesh {
     skin_stack(&rings, false)
 }
 
+/// Sweep a closed profile between two open rails, lofting it station by station
+/// so its extent tracks both rails. Rails are resampled to a common station
+/// count; at each station the frame is built from rail-a's tangent and the chord
+/// to rail-b, and the profile is scaled so its width spans the rail gap and
+/// placed on the chord midpoint. Capped at both ends, watertight.
+pub fn sweep2_profile(profile: &[DVec3], rail_a: &[DVec3], rail_b: &[DVec3]) -> Mesh {
+    assert!(profile.len() >= 3, "profile needs at least 3 points");
+    assert!(rail_a.len() >= 2 && rail_b.len() >= 2, "rails need 2+ points");
+    let n = rail_a.len().max(rail_b.len()).max(2);
+    let a = resample_open(rail_a, n);
+    let b = resample_open(rail_b, n);
+
+    // Profile local coords in its own plane; u spans profile width, so scaling u
+    // to the rail gap makes the swept profile's ends touch both rails.
+    let centroid = profile.iter().copied().sum::<DVec3>() / profile.len() as f64;
+    let normal = newell(profile).normalize_or_zero();
+    let (pu, pv) = plane_basis(normal);
+    let local: Vec<DVec2> = profile
+        .iter()
+        .map(|p| DVec2::new((*p - centroid).dot(pu), (*p - centroid).dot(pv)))
+        .collect();
+    let half_w = local.iter().map(|l| l.x.abs()).fold(0.0, f64::max).max(1e-9);
+
+    let tangent = |r: &[DVec3], i: usize| -> DVec3 {
+        let ahead = if i + 1 < n { r[i + 1] - r[i] } else { DVec3::ZERO };
+        let behind = if i > 0 { r[i] - r[i - 1] } else { DVec3::ZERO };
+        (ahead.normalize_or_zero() + behind.normalize_or_zero()).normalize_or_zero()
+    };
+
+    let rings: Vec<Vec<DVec3>> = (0..n)
+        .map(|i| {
+            let chord = b[i] - a[i];
+            let gap = chord.length().max(1e-9);
+            let u = chord / gap; // points from rail-a toward rail-b
+            let t = tangent(&a, i);
+            // v is normal to both the rail run and the chord, so the profile's
+            // height sits across the swept sheet (not along the run direction).
+            let mut w = t.cross(u);
+            if w.length_squared() < 1e-18 {
+                w = plane_basis(u).0;
+            }
+            let v = w.normalize();
+            let mid = (a[i] + b[i]) * 0.5;
+            let sx = gap / (2.0 * half_w); // scale profile width to the gap
+            local
+                .iter()
+                .map(|l| mid + u * (l.x * sx) + v * l.y)
+                .collect()
+        })
+        .collect();
+    skin_stack(&rings, false)
+}
+
+/// Revolve a closed profile about an axis where the radial offset is modulated
+/// by a rail: at each angular station the profile is pushed out by the rail's
+/// distance from the axis (resampled to the station count), so the swept radius
+/// follows the rail. Full turns wrap; partial turns are capped.
+pub fn rail_revolve_profile(
+    profile: &[DVec3],
+    rail: &[DVec3],
+    axis_pt: DVec3,
+    axis_dir: DVec3,
+    tol: f64,
+) -> Mesh {
+    assert!(profile.len() >= 3, "profile needs at least 3 points");
+    assert!(rail.len() >= 2, "rail needs at least 2 points");
+    let axis = axis_dir.normalize();
+    let (bu, _bv) = plane_basis(axis);
+    // Radial distance of each rail point from the axis, sampled by rail angle
+    // (angle of its projection about the axis, measured from bu).
+    let mut samples: Vec<(f64, f64)> = rail
+        .iter()
+        .map(|p| {
+            let d = *p - axis_pt;
+            let radial = d - axis * d.dot(axis);
+            let ang = radial.dot(axis.cross(bu)).atan2(radial.dot(bu));
+            let ang = if ang < 0.0 { ang + std::f64::consts::TAU } else { ang };
+            (ang, radial.length())
+        })
+        .collect();
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let radius_at = |a: f64| -> f64 {
+        // Nearest-angle radius (rails are coarse guides, not smooth fields).
+        samples
+            .iter()
+            .min_by(|x, y| {
+                let da = ((x.0 - a).abs()).min(std::f64::consts::TAU - (x.0 - a).abs());
+                let db = ((y.0 - a).abs()).min(std::f64::consts::TAU - (y.0 - a).abs());
+                da.total_cmp(&db)
+            })
+            .map(|s| s.1)
+            .unwrap_or(0.0)
+    };
+    let rmax = samples.iter().map(|s| s.1).fold(0.0, f64::max).max(1e-9);
+    let angle = std::f64::consts::TAU;
+    let n = segments_for(rmax, angle, tol);
+    let rings: Vec<Vec<DVec3>> = (0..n)
+        .map(|k| {
+            let a = angle * k as f64 / n as f64;
+            let q = DQuat::from_axis_angle(axis, a);
+            let scale = radius_at(a) / rmax;
+            profile
+                .iter()
+                .map(|p| {
+                    let d = *p - axis_pt;
+                    let radial = d - axis * d.dot(axis);
+                    let along = axis * d.dot(axis);
+                    axis_pt + q * (radial * scale + along)
+                })
+                .collect()
+        })
+        .collect();
+    skin_stack(&rings, true)
+}
+
+/// Sweep a circular profile along a curve with the radius interpolated linearly
+/// from `r0` at the start to `r1` at the end (a variable-radius pipe). Uses
+/// parallel-transport frames like `sweep_profile`; capped, watertight.
+pub fn pipe_curve(curve: &[DVec3], r0: f64, r1: f64, tol: f64) -> Mesh {
+    assert!(curve.len() >= 2, "pipe curve needs 2+ points");
+    assert!(r0 > 0.0 && r1 > 0.0, "pipe radii must be positive");
+    let sides = segments_for(r0.max(r1), std::f64::consts::TAU, tol);
+    let unit: Vec<DVec2> = (0..sides)
+        .map(|i| {
+            let a = std::f64::consts::TAU * i as f64 / sides as f64;
+            DVec2::new(a.cos(), a.sin())
+        })
+        .collect();
+
+    let m = curve.len();
+    let tangent = |i: usize| -> DVec3 {
+        let ahead = if i + 1 < m { curve[i + 1] - curve[i] } else { DVec3::ZERO };
+        let behind = if i > 0 { curve[i] - curve[i - 1] } else { DVec3::ZERO };
+        (ahead.normalize_or_zero() + behind.normalize_or_zero()).normalize_or_zero()
+    };
+    let t0 = tangent(0);
+    let (mut u, mut v) = plane_basis(t0);
+    let mut prev_t = t0;
+    let rings: Vec<Vec<DVec3>> = (0..m)
+        .map(|i| {
+            let t = tangent(i);
+            let q = DQuat::from_rotation_arc(prev_t, t);
+            u = q * u;
+            v = q * v;
+            prev_t = t;
+            let f = if m > 1 { i as f64 / (m - 1) as f64 } else { 0.0 };
+            let r = r0 + (r1 - r0) * f;
+            unit.iter().map(|c| curve[i] + u * (c.x * r) + v * (c.y * r)).collect()
+        })
+        .collect();
+    skin_stack(&rings, false)
+}
+
+/// Resample an open polyline to `n` points spaced uniformly by arclength,
+/// keeping the endpoints.
+fn resample_open(pts: &[DVec3], n: usize) -> Vec<DVec3> {
+    let m = pts.len();
+    let mut cum = Vec::with_capacity(m);
+    cum.push(0.0);
+    for i in 1..m {
+        cum.push(cum[i - 1] + pts[i - 1].distance(pts[i]));
+    }
+    let total = *cum.last().expect("non-empty");
+    if total <= 0.0 {
+        return vec![pts[0]; n];
+    }
+    (0..n)
+        .map(|k| {
+            let s = total * k as f64 / (n - 1).max(1) as f64;
+            let i = (cum.partition_point(|&c| c <= s).min(m - 1)).max(1) - 1;
+            let seg = cum[i + 1] - cum[i];
+            let t = if seg > 0.0 { (s - cum[i]) / seg } else { 0.0 };
+            pts[i].lerp(pts[i + 1], t)
+        })
+        .collect()
+}
+
 /// Connect a stack of same-count rings with quad strips. `wrap` joins the last
 /// ring back to the first (full revolution); otherwise both ends are capped.
 /// The result is coherently wound, degenerate-free, and oriented outward.
@@ -417,6 +594,72 @@ mod tests {
         let m = sweep_profile(&profile, &rail);
         let want = 3.0 * (1.0 + std::f64::consts::FRAC_1_SQRT_2);
         assert!((signed_volume(&m) - want).abs() < 1e-9);
+        assert!(watertight(&m));
+    }
+
+    #[test]
+    fn pipe_along_straight_line_is_cylinder() {
+        // Circular pipe r=1 along a 5-long line: V = pi r^2 h = 5 pi.
+        let curve = vec![DVec3::ZERO, DVec3::new(0.0, 0.0, 5.0)];
+        let m = pipe_curve(&curve, 1.0, 1.0, 0.001);
+        // n-gon cross section under-fills the true circle by (n/2)sin(tau/n)/pi.
+        let sides = segments_for(1.0, std::f64::consts::TAU, 0.001) as f64;
+        let ngon = (sides / 2.0) * (std::f64::consts::TAU / sides).sin() / std::f64::consts::PI;
+        let want = 5.0 * std::f64::consts::PI * ngon;
+        assert!((signed_volume(&m) - want).abs() < 0.01, "{}", signed_volume(&m));
+        assert!(watertight(&m));
+    }
+
+    #[test]
+    fn pipe_variable_radius_is_a_cone_frustum() {
+        // r0=2 -> r1=1 over h=3: V = pi h/3 (r0^2 + r0 r1 + r1^2) = 7 pi (n-gon).
+        let curve = vec![DVec3::ZERO, DVec3::new(0.0, 0.0, 3.0)];
+        let m = pipe_curve(&curve, 2.0, 1.0, 0.001);
+        let sides = segments_for(2.0, std::f64::consts::TAU, 0.001) as f64;
+        let ngon = (sides / 2.0) * (std::f64::consts::TAU / sides).sin() / std::f64::consts::PI;
+        let want = 7.0 * std::f64::consts::PI * ngon;
+        assert!((signed_volume(&m) - want).abs() < 0.05, "{}", signed_volume(&m));
+        assert!(watertight(&m));
+    }
+
+    #[test]
+    fn sweep2_between_parallel_straight_rails_is_prism() {
+        // Unit-square profile (width 1) between two parallel rails 2 apart,
+        // running 4 in z. Profile width scales to the gap (2), height stays 1,
+        // so the swept solid is a 2 x 1 x 4 prism: V = 8.
+        let profile = vec![
+            DVec3::new(-0.5, -0.5, 0.0),
+            DVec3::new(0.5, -0.5, 0.0),
+            DVec3::new(0.5, 0.5, 0.0),
+            DVec3::new(-0.5, 0.5, 0.0),
+        ];
+        let rail_a = vec![DVec3::new(-1.0, 0.0, 0.0), DVec3::new(-1.0, 0.0, 4.0)];
+        let rail_b = vec![DVec3::new(1.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 4.0)];
+        let m = sweep2_profile(&profile, &rail_a, &rail_b);
+        assert!((signed_volume(&m) - 8.0).abs() < 1e-9, "{}", signed_volume(&m));
+        assert!(watertight(&m));
+    }
+
+    #[test]
+    fn rail_revolve_constant_rail_matches_revolve() {
+        // A rail at constant radius reduces rail-revolve to a plain full revolve.
+        let profile = rect_xz(2.0, 3.0, 0.0, 1.0);
+        let rail = circle_xy(2.5, 0.0, 24); // constant radius 2.5 about z
+        let m = rail_revolve_profile(&profile, &rail, DVec3::ZERO, DVec3::Z, 0.01);
+        let plain = revolve_profile(
+            &profile,
+            DVec3::ZERO,
+            DVec3::Z,
+            std::f64::consts::TAU,
+            0.01,
+        );
+        // Same scale factor everywhere (rail radius / rmax = 1), so volumes match.
+        assert!(
+            (signed_volume(&m) - signed_volume(&plain)).abs() < 0.05,
+            "{} vs {}",
+            signed_volume(&m),
+            signed_volume(&plain)
+        );
         assert!(watertight(&m));
     }
 

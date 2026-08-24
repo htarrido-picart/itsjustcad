@@ -34,6 +34,21 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Sweep one closed profile curve along an open rail curve (profile centered on the rail, no-twist frames, capped ends). Example: sweep prof rail",
         },
         CommandSpec {
+            name: "sweep2",
+            usage: "sweep2 <profile selector> <rail-a selector> <rail-b selector>",
+            summary: "Sweep one closed profile between two open rails, lofting it so its ends track both rails at every station (profile width scales to the rail gap). Capped, watertight. Example: sweep2 prof railA railB",
+        },
+        CommandSpec {
+            name: "railrevolve",
+            usage: "railrevolve <profile selector> <rail selector> <axis point x,y,z> <axis dir x,y,z>",
+            summary: "Revolve one closed profile about an axis where the radius follows a rail curve (nearest-angle radius). Full turn. Example: railrevolve prof rail 0,0,0 0,0,1",
+        },
+        CommandSpec {
+            name: "pipe",
+            usage: "pipe <curve selector> <radius> [end radius]",
+            summary: "Sweep a circular profile along a curve with a linearly interpolated radius (variable-radius pipe). Capped, watertight. Example: pipe path 2 · pipe path 2 0.5",
+        },
+        CommandSpec {
             name: "line",
             usage: "line <a x,y,z> <b x,y,z>",
             summary: "Line segment. Example: line 0,0,0 10,0,0",

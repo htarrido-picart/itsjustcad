@@ -18,4 +18,7 @@ pub use edges::{feature_edges, project_edges_behind, project_edges_onto};
 pub use mesh::{Mesh, RenderMesh};
 pub use primitives::{extrude_profile, make_box};
 pub use section::slice;
-pub use solids::{loft_profiles, revolve_profile, sweep_profile};
+pub use solids::{
+    loft_profiles, pipe_curve, rail_revolve_profile, revolve_profile, sweep2_profile,
+    sweep_profile,
+};

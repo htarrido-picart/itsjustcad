@@ -1225,6 +1225,117 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Sweep2 { id, profile, rail_a, rail_b } => {
+            let (profile_id, profile_curve) = one_curve(doc, &profile, "sweep2")?;
+            if !profile_curve.is_closed() {
+                return Err(ExecError::BadProfile(
+                    "sweep2 profile is not closed (close it or use 'polyline ... closed')".into(),
+                ));
+            }
+            let profile_pts = profile_curve.tessellate(PROFILE_TOL);
+            let (a_id, a_curve) = one_curve(doc, &rail_a, "sweep2")?;
+            let (b_id, b_curve) = one_curve(doc, &rail_b, "sweep2")?;
+            let a_pts = a_curve.tessellate(PROFILE_TOL);
+            let b_pts = b_curve.tessellate(PROFILE_TOL);
+            if a_pts.len() < 2 || b_pts.len() < 2 {
+                return Err(ExecError::Invalid("sweep2 rails need 2+ points each".into()));
+            }
+            let mesh = kernel_mesh::sweep2_profile(&profile_pts, &a_pts, &b_pts);
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                geometry: Geometry::Mesh(mesh),
+            });
+            Ok((
+                Command::Sweep2 { id: Some(id), profile, rail_a, rail_b },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("swept {profile_id} along {a_id} & {b_id} -> {id}"),
+                },
+            ))
+        }
+        Command::RailRevolve { id, profile, rail, axis_point, axis_dir } => {
+            let (profile_id, profile_curve) = one_curve(doc, &profile, "railrevolve")?;
+            if !profile_curve.is_closed() {
+                return Err(ExecError::BadProfile(
+                    "railrevolve profile is not closed (close it or use 'polyline ... closed')".into(),
+                ));
+            }
+            if axis_dir.length() < 1e-9 {
+                return Err(ExecError::Invalid("railrevolve axis direction cannot be zero".into()));
+            }
+            let profile_pts = profile_curve.tessellate(PROFILE_TOL);
+            let (rail_id, rail_curve) = one_curve(doc, &rail, "railrevolve")?;
+            let rail_pts = rail_curve.tessellate(PROFILE_TOL);
+            if rail_pts.len() < 2 {
+                return Err(ExecError::Invalid("railrevolve rail needs 2+ points".into()));
+            }
+            let mesh = kernel_mesh::rail_revolve_profile(
+                &profile_pts,
+                &rail_pts,
+                axis_point,
+                axis_dir.normalize(),
+                PROFILE_TOL,
+            );
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                geometry: Geometry::Mesh(mesh),
+            });
+            Ok((
+                Command::RailRevolve { id: Some(id), profile, rail, axis_point, axis_dir },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("rail-revolved {profile_id} along {rail_id} -> {id}"),
+                },
+            ))
+        }
+        Command::Pipe { id, curve, radius, end_radius } => {
+            if radius <= 0.0 {
+                return Err(ExecError::Invalid(format!(
+                    "pipe radius must be positive, got {radius}"
+                )));
+            }
+            let r1 = end_radius.unwrap_or(radius);
+            if r1 <= 0.0 {
+                return Err(ExecError::Invalid(format!(
+                    "pipe end radius must be positive, got {r1}"
+                )));
+            }
+            let (curve_id, curve_geom) = one_curve(doc, &curve, "pipe")?;
+            let pts = curve_geom.tessellate(PROFILE_TOL);
+            if pts.len() < 2 {
+                return Err(ExecError::Invalid("pipe curve needs 2+ points".into()));
+            }
+            let mesh = kernel_mesh::pipe_curve(&pts, radius, r1, PROFILE_TOL);
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                geometry: Geometry::Mesh(mesh),
+            });
+            Ok((
+                Command::Pipe { id: Some(id), curve, radius, end_radius },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("piped {curve_id} -> {id}"),
+                },
+            ))
+        }
         Command::Line { id, a, b } => {
             let (id, outcome) = insert_curve(doc, id, Curve::Line { a, b }, "line");
             Ok((
@@ -3051,6 +3162,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Revolve { .. } => "revolve",
         Command::Loft { .. } => "loft",
         Command::Sweep { .. } => "sweep",
+        Command::Sweep2 { .. } => "sweep2",
+        Command::RailRevolve { .. } => "railrevolve",
+        Command::Pipe { .. } => "pipe",
         Command::Line { .. } => "line",
         Command::Polyline { .. } => "polyline",
         Command::Rectangle { .. } => "rect",
@@ -3557,6 +3671,68 @@ mod tests {
     }
 
     #[test]
+    fn sweep2_between_parallel_rails_is_prism_undo_redo() {
+        let mut s = Session::default();
+        // Unit-square profile (width 1) between two rails 2 apart, running 4 up.
+        run(&mut s, "rect -0.5,-0.5,0 1 1");
+        run(&mut s, "name last prof");
+        run(&mut s, "line -1,0,0 -1,0,4");
+        run(&mut s, "name last ra");
+        run(&mut s, "line 1,0,0 1,0,4");
+        run(&mut s, "name last rb");
+        run(&mut s, "sweep2 prof ra rb");
+        assert_eq!(s.doc.len(), 4);
+        assert!((mesh_volume(&s) - 8.0).abs() < 1e-6, "{}", mesh_volume(&s));
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 3);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 4);
+
+        // open profile is rejected
+        let err = s.run(parse("sweep2 ra ra rb").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+    }
+
+    #[test]
+    fn pipe_straight_line_is_cylinder_undo_redo() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 0,0,5");
+        run(&mut s, "pipe last 1");
+        assert_eq!(s.doc.len(), 2);
+        // n-gon cross section under-fills the true circle; stay under 2%.
+        let v = mesh_volume(&s);
+        let ideal = 5.0 * std::f64::consts::PI;
+        assert!(v > 0.0 && v <= ideal && (ideal - v) / ideal < 0.02, "{v}");
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 2);
+
+        let err = s.run(parse("pipe last 0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("positive"), "{err}");
+    }
+
+    #[test]
+    fn railrevolve_undo_redo_and_axis_check() {
+        let mut s = Session::default();
+        // Profile in the xz plane (spans the z axis it revolves about).
+        run(&mut s, "polyline 2,0,0 3,0,0 3,0,1 2,0,1 closed");
+        run(&mut s, "name last prof");
+        run(&mut s, "circle 0,0,0 2.5");
+        run(&mut s, "name last rail");
+        run(&mut s, "railrevolve prof rail 0,0,0 0,0,1");
+        assert_eq!(s.doc.len(), 3);
+        assert!(mesh_volume(&s) > 0.0);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
+
+        let err = s.run(parse("railrevolve prof rail 0,0,0 0,0,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("axis"), "{err}");
+    }
+
+    #[test]
     fn solids_replay_stability() {
         let mut s = Session::default();
         run(&mut s, "polyline 0.2,0,0 1,0,0 0.8,0,1.5 0.3,0,2 0.2,0,2 closed");
@@ -3569,6 +3745,13 @@ mod tests {
         run(&mut s, "line -8,0,0 -8,0,3");
         run(&mut s, "name last rail");
         run(&mut s, "sweep prof rail");
+        run(&mut s, "line -12,-1,0 -12,-1,3");
+        run(&mut s, "name last ra");
+        run(&mut s, "line -12,1,0 -12,1,3");
+        run(&mut s, "name last rb");
+        run(&mut s, "sweep2 prof ra rb");
+        run(&mut s, "line -16,0,0 -16,0,4");
+        run(&mut s, "pipe last 1 0.4");
         run(&mut s, "undo");
         run(&mut s, "redo");
 
@@ -3577,6 +3760,8 @@ mod tests {
         assert!(matches!(&log[1], Command::Revolve { id: Some(_), .. }));
         assert!(matches!(&log[4], Command::Loft { id: Some(_), .. }));
         assert!(log.iter().any(|c| matches!(c, Command::Sweep { id: Some(_), .. })));
+        assert!(log.iter().any(|c| matches!(c, Command::Sweep2 { id: Some(_), .. })));
+        assert!(log.iter().any(|c| matches!(c, Command::Pipe { id: Some(_), .. })));
         let replayed = Session::replay(log.clone()).unwrap();
         let a: Vec<_> = s.doc.objects().collect();
         let b: Vec<_> = replayed.doc.objects().collect();

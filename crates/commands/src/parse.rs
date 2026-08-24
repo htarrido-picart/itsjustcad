@@ -68,6 +68,50 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("sweep", rest, &args)?;
             Ok(Command::Sweep { id: None, profile, rail })
         }
+        "sweep2" => {
+            let (profile, rest) = selector(&args, "sweep2")?;
+            let (rail_a, rest) = selector(rest, "sweep2")?;
+            let (rail_b, rest) = selector(rest, "sweep2")?;
+            expect_empty("sweep2", rest, &args)?;
+            Ok(Command::Sweep2 { id: None, profile, rail_a, rail_b })
+        }
+        "railrevolve" => {
+            let (profile, rest) = selector(&args, "railrevolve")?;
+            let (rail, rest) = selector(rest, "railrevolve")?;
+            let [p, d] = match rest {
+                [p, d] => [*p, *d],
+                _ => {
+                    return wrong(
+                        "railrevolve",
+                        "a profile selector, a rail selector, an axis point and an axis direction",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::RailRevolve {
+                id: None,
+                profile,
+                rail,
+                axis_point: point(p)?,
+                axis_dir: point(d)?,
+            })
+        }
+        "pipe" => {
+            // A bare 'last' selects one curve; the next number is the radius,
+            // not an object count (like revolve).
+            let (curve, rest) = match args.split_first() {
+                Some((&"last", rest)) => (Selector::Last { n: 1 }, rest),
+                _ => selector(&args, "pipe")?,
+            };
+            let (radius, end_radius) = match rest {
+                [r] => (number(r)?, None),
+                [r, e] => (number(r)?, Some(number(e)?)),
+                _ => {
+                    return wrong("pipe", "a curve selector, a radius and an optional end radius", &args)
+                }
+            };
+            Ok(Command::Pipe { id: None, curve, radius, end_radius })
+        }
         "line" => {
             let [a, b] = take::<2>("line", "two points", &args)?;
             Ok(Command::Line {
@@ -1518,7 +1562,26 @@ mod tests {
                 rail: Selector::Named { .. },
             }
         ));
+        assert!(matches!(
+            parse("sweep2 prof ra rb").unwrap(),
+            Command::Sweep2 { id: None, .. }
+        ));
+        assert!(matches!(
+            parse("railrevolve prof rail 0,0,0 0,0,1").unwrap(),
+            Command::RailRevolve { id: None, axis_dir, .. } if axis_dir == DVec3::Z
+        ));
+        assert!(matches!(
+            parse("pipe path 2 0.5").unwrap(),
+            Command::Pipe { radius, end_radius: Some(e), .. } if radius == 2.0 && e == 0.5
+        ));
+        assert!(matches!(
+            parse("pipe path 2").unwrap(),
+            Command::Pipe { end_radius: None, .. }
+        ));
         // errors carry hints
+        assert!(parse("sweep2 prof ra").unwrap_err().to_string().contains("selector"));
+        assert!(parse("railrevolve prof rail").unwrap_err().to_string().contains("axis"));
+        assert!(parse("pipe path").unwrap_err().to_string().contains("radius"));
         assert!(parse("revolve").unwrap_err().to_string().contains("selector"));
         assert!(parse("revolve last 0,0,0 0,0,1 90 extra").unwrap_err().to_string().contains("axis"));
         assert!(parse("loft").unwrap_err().to_string().contains("selector"));
@@ -1534,6 +1597,10 @@ mod tests {
             "revolve vase 0,0,0 0,0,1 270",
             "loft last 3",
             "sweep prof rail",
+            "sweep2 prof ra rb",
+            "railrevolve prof rail 0,0,0 0,0,1",
+            "pipe path 2",
+            "pipe path 2 0.5",
         ] {
             let cmd = parse(line).unwrap();
             let json = serde_json::to_string(&cmd).unwrap();

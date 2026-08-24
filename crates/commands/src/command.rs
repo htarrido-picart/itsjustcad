@@ -93,6 +93,35 @@ pub enum Command {
         profile: Selector,
         rail: Selector,
     },
+    /// Sweep a closed profile between two open rails, lofting it so its ends
+    /// track both rails at every station. Capped, watertight.
+    Sweep2 {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        profile: Selector,
+        rail_a: Selector,
+        rail_b: Selector,
+    },
+    /// Revolve a closed profile about an axis where the radius follows a rail
+    /// curve (nearest-angle radius sampling). Full turn.
+    RailRevolve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        profile: Selector,
+        rail: Selector,
+        axis_point: DVec3,
+        axis_dir: DVec3,
+    },
+    /// Sweep a circular profile along a curve with a linearly interpolated
+    /// radius (variable-radius pipe). Capped, watertight.
+    Pipe {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        curve: Selector,
+        radius: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_radius: Option<f64>,
+    },
     // -- 2D primitives (create Curve objects) --
     Line {
         #[serde(default, skip_serializing_if = "Option::is_none")]
