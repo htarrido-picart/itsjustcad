@@ -174,6 +174,10 @@ pub struct App {
     /// executing) so the autosuggest popup is visible in MYDRAFTER_SHOT frames.
     type_script: Option<String>,
     frame_count: u64,
+    /// Set once the dev-shot `MYDRAFTER_SAVE` side effect has run, so it fires
+    /// exactly once even though the screenshot is (re-)requested every frame
+    /// until its echo lands.
+    shot_saved: bool,
     /// Layer color being edited in the panel; the `layercolor` command is
     /// issued once, when the mouse is released (avoids one op per drag frame).
     pending_layer_color: Option<(String, [f32; 3])>,
@@ -309,6 +313,7 @@ impl App {
             deck_script: std::env::var("MYDRAFTER_DECK_RUN").ok(),
             type_script: std::env::var("MYDRAFTER_TYPE").ok(),
             frame_count: 0,
+            shot_saved: false,
             pending_layer_color: None,
             last_line: None,
             pending_critique: None,
@@ -776,14 +781,27 @@ impl App {
         if deck_ready {
             self.frame_count += 1;
         }
-        if self.frame_count == 20 {
-            if let Ok(path) = std::env::var("MYDRAFTER_SAVE") {
-                self.save(Some(path.into()));
+        // Warm-up frames let the scene settle before capturing. Once past the
+        // threshold, RE-REQUEST the screenshot every frame (not once at
+        // `== 20`): a single dropped/late echo used to leave the app spinning
+        // `request_repaint` forever, which is the multi-minute hang. Requesting
+        // each frame guarantees the echo lands within a frame or two.
+        if self.frame_count >= 20 {
+            // One-shot MYDRAFTER_SAVE side effect.
+            if !self.shot_saved {
+                self.shot_saved = true;
+                if let Ok(path) = std::env::var("MYDRAFTER_SAVE") {
+                    self.save(Some(path.into()));
+                }
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         }
-        // Ignore a critique-tagged shot here — `handle_critique` claims it.
-        if let Some(img) = untagged_screenshot(ctx) {
+        // Ignore a critique-tagged shot here — `handle_critique` claims it. Skip
+        // 0-sized frames (the framebuffer is empty until the first real paint),
+        // matching the critique path, so we never save a blank PNG.
+        if let Some(img) =
+            untagged_screenshot(ctx).filter(|i| i.width() > 0 && i.height() > 0)
+        {
             save_screenshot_png(&img, std::path::Path::new(&path));
             std::process::exit(0);
         }
