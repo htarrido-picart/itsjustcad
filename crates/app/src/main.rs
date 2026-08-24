@@ -7,6 +7,7 @@ mod gumball;
 mod journal;
 mod keymap;
 mod osnap;
+mod point_edit;
 mod precise;
 mod preset;
 mod scene;

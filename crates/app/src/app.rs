@@ -74,6 +74,7 @@ pub struct App {
     deck_pane: DeckPane,
     draw_tool: DrawTool,
     gumball: Gumball,
+    point_edit: crate::point_edit::PointEdit,
     tokio: tokio::runtime::Handle,
     /// Camera slots shared across layouts: 0 Persp, 1 Top, 2 Front, 3 Right.
     cameras: [OrbitCamera; 4],
@@ -205,6 +206,7 @@ impl App {
             deck_pane: DeckPane::default(),
             draw_tool: DrawTool::default(),
             gumball: Gumball::default(),
+            point_edit: crate::point_edit::PointEdit::default(),
             tokio,
             cameras: {
                 let mut cams = [OrbitCamera::default(); 4];
@@ -742,14 +744,32 @@ impl App {
                 // the op-log stays the single source of truth.
                 let mut consumed = false;
                 if pane == self.active_pane {
-                    let out =
-                        self.gumball
-                            .ui(ui, rect, &response, view_proj, &self.session.doc);
-                    consumed = out.consumed;
-                    if let Some(cmd) = out.command {
+                    // Control-point handles win over the gumball: a single
+                    // curve with editable points is edited vertex-by-vertex.
+                    let pe = self.point_edit.ui(
+                        ui,
+                        rect,
+                        &response,
+                        view_proj,
+                        &self.session.doc,
+                    );
+                    if let Some(cmd) = pe.command {
                         match self.session.run(cmd) {
                             Ok(outcome) => self.command_line.push_line(outcome.message),
                             Err(e) => self.command_line.push_line(format!("error: {e}")),
+                        }
+                    }
+                    consumed = pe.consumed;
+                    if !consumed {
+                        let out =
+                            self.gumball
+                                .ui(ui, rect, &response, view_proj, &self.session.doc);
+                        consumed = out.consumed;
+                        if let Some(cmd) = out.command {
+                            match self.session.run(cmd) {
+                                Ok(outcome) => self.command_line.push_line(outcome.message),
+                                Err(e) => self.command_line.push_line(format!("error: {e}")),
+                            }
                         }
                     }
                 }

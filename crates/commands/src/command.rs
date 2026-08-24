@@ -177,6 +177,36 @@ pub enum Command {
         points: Vec<DVec3>,
         degree: u32,
     },
+    /// C2 cubic curve interpolating the given points exactly. Append "closed"
+    /// to make a periodic loop.
+    InterpCurve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        points: Vec<DVec3>,
+        closed: bool,
+    },
+    /// 3D helix about +Z through `center` (dense polyline).
+    Helix {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        center: DVec3,
+        radius: f64,
+        height: f64,
+        turns: f64,
+    },
+    /// Move one control/vertex point of a NURBS or Polyline curve.
+    SetPoint {
+        target: Selector,
+        index: u32,
+        position: DVec3,
+    },
+    /// Resample a curve to `count` points (open/closed matching the source).
+    Rebuild {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        target: Selector,
+        count: u32,
+    },
     // -- booleans (mesh CSG; inputs are consumed, one result mesh replaces them) --
     Union {
         #[serde(default, skip_serializing_if = "Option::is_none")]

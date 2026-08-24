@@ -201,6 +201,50 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 degree,
             })
         }
+        "interpcurve" | "interp" => {
+            let (closed, pts) = match args.split_last() {
+                Some((&"closed", rest)) => (true, rest),
+                _ => (false, &args[..]),
+            };
+            if pts.len() < 3 {
+                return wrong("interpcurve", "at least 3 points", &args);
+            }
+            Ok(Command::InterpCurve {
+                id: None,
+                points: pts.iter().map(|p| point(p)).collect::<Result<_, _>>()?,
+                closed,
+            })
+        }
+        "helix" => {
+            let [center, r, h, turns] =
+                take::<4>("helix", "a center point, radius, height and turns", &args)?;
+            Ok(Command::Helix {
+                id: None,
+                center: point(center)?,
+                radius: number(r)?,
+                height: number(h)?,
+                turns: number(turns)?,
+            })
+        }
+        "setpoint" => {
+            // Single-token selector so a trailing "last" cannot swallow the
+            // index (setpoint targets exactly one curve).
+            let [sel, idx, pos] =
+                take::<3>("setpoint", "a curve selector, point index and new x,y,z", &args)?;
+            Ok(Command::SetPoint {
+                target: selector_one(sel)?,
+                index: idx.parse().map_err(|_| ParseError::BadNumber(idx.to_string()))?,
+                position: point(pos)?,
+            })
+        }
+        "rebuild" => {
+            let [sel, n] = take::<2>("rebuild", "a curve selector and a point count", &args)?;
+            Ok(Command::Rebuild {
+                id: None,
+                target: selector_one(sel)?,
+                count: n.parse().map_err(|_| ParseError::BadNumber(n.to_string()))?,
+            })
+        }
         "dim" => {
             let (offset, pts) = match args.as_slice() {
                 [a, b] => (DEFAULT_DIM_OFFSET, [*a, *b]),
@@ -1317,6 +1361,40 @@ mod tests {
     fn parse_curve_with_degree() {
         let cmd = parse("curve 0,0 2,4 6,4 8,0 degree 2").unwrap();
         assert!(matches!(cmd, Command::Curve { degree: 2, ref points, .. } if points.len() == 4));
+    }
+
+    #[test]
+    fn parse_interpcurve_open_and_closed() {
+        assert!(matches!(
+            parse("interpcurve 0,0 2,4 6,4 8,0").unwrap(),
+            Command::InterpCurve { closed: false, ref points, .. } if points.len() == 4
+        ));
+        assert!(matches!(
+            parse("interpcurve 0,0 2,4 6,4 closed").unwrap(),
+            Command::InterpCurve { closed: true, ref points, .. } if points.len() == 3
+        ));
+        assert!(parse("interpcurve 0,0 2,4").is_err()); // needs 3+
+    }
+
+    #[test]
+    fn parse_helix() {
+        assert!(matches!(
+            parse("helix 0,0,0 3 12 4").unwrap(),
+            Command::Helix { radius, height, turns, .. }
+                if radius == 3.0 && height == 12.0 && turns == 4.0
+        ));
+    }
+
+    #[test]
+    fn parse_setpoint_and_rebuild() {
+        assert!(matches!(
+            parse("setpoint last 2 4,5,0").unwrap(),
+            Command::SetPoint { index: 2, target: Selector::Last { n: 1 }, .. }
+        ));
+        assert!(matches!(
+            parse("rebuild last 20").unwrap(),
+            Command::Rebuild { count: 20, target: Selector::Last { n: 1 }, .. }
+        ));
     }
 
     #[test]

@@ -89,6 +89,26 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "NURBS curve by control points (default degree 3). Example: curve 0,0 2,4 6,4 8,0",
         },
         CommandSpec {
+            name: "interpcurve",
+            usage: "interpcurve <p1> <p2> <p3> ... [closed]",
+            summary: "C2 cubic curve passing through the points exactly. Append 'closed' for a loop. Example: interpcurve 0,0 2,4 6,4 8,0 10,2",
+        },
+        CommandSpec {
+            name: "helix",
+            usage: "helix <center x,y,z> <radius> <height> <turns>",
+            summary: "3D helix about +Z (dense polyline). Example: helix 0,0,0 3 12 4",
+        },
+        CommandSpec {
+            name: "setpoint",
+            usage: "setpoint <curve selector> <index> <x,y,z>",
+            summary: "Move one control/vertex point of a NURBS or polyline curve. Example: setpoint last 2 4,5,0",
+        },
+        CommandSpec {
+            name: "rebuild",
+            usage: "rebuild <curve selector> <count>",
+            summary: "Resample a curve to N evenly-spaced points (polyline). Example: rebuild last 20",
+        },
+        CommandSpec {
             name: "dim",
             usage: "dim <a x,y,z> <b x,y,z> [offset]",
             summary: "Linear dimension between two points; the measured distance is displayed automatically. Offset (default 0.5) places the dimension line left of a->b. Example: dim 0,0 10,0 0.8",

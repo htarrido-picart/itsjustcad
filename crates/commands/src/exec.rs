@@ -1459,6 +1459,114 @@ fn apply_forward(
                 outcome,
             ))
         }
+        Command::InterpCurve { id, points, closed } => {
+            if points.len() < 3 {
+                return Err(ExecError::Invalid(
+                    "interpcurve needs at least 3 points".into(),
+                ));
+            }
+            let curve = kernel_curve::interpolate_curve(&points, closed).ok_or_else(|| {
+                ExecError::Invalid("interpcurve: points are degenerate (coincident)".into())
+            })?;
+            let (id, outcome) = insert_curve(doc, id, curve, "interpcurve");
+            Ok((
+                Command::InterpCurve { id: Some(id), points, closed },
+                Inverse::DeleteCreated(vec![id]),
+                outcome,
+            ))
+        }
+        Command::Helix { id, center, radius, height, turns } => {
+            let curve = kernel_curve::helix(center, radius, height, turns).ok_or_else(|| {
+                ExecError::Invalid("helix needs radius > 0 and turns != 0".into())
+            })?;
+            let (id, outcome) = insert_curve(doc, id, curve, "helix");
+            Ok((
+                Command::Helix { id: Some(id), center, radius, height, turns },
+                Inverse::DeleteCreated(vec![id]),
+                outcome,
+            ))
+        }
+        Command::SetPoint { target, index, position } => {
+            let ids = resolve(doc, &target)?;
+            let [tid] = ids[..] else {
+                return Err(ExecError::Invalid(format!(
+                    "setpoint target matched {} objects, expected exactly 1",
+                    ids.len()
+                )));
+            };
+            let curve = curve_of(doc, tid, "setpoint")?.clone();
+            let mut new = curve.clone();
+            let i = index as usize;
+            match &mut new {
+                Curve::Nurbs { control, .. } => {
+                    if i >= control.len() {
+                        return Err(ExecError::Invalid(format!(
+                            "setpoint index {i} out of range (curve has {} control points)",
+                            control.len()
+                        )));
+                    }
+                    control[i] = position;
+                }
+                Curve::Polyline { points, .. } => {
+                    if i >= points.len() {
+                        return Err(ExecError::Invalid(format!(
+                            "setpoint index {i} out of range (polyline has {} points)",
+                            points.len()
+                        )));
+                    }
+                    points[i] = position;
+                }
+                _ => {
+                    return Err(ExecError::Invalid(
+                        "setpoint works on NURBS and polyline curves only".into(),
+                    ))
+                }
+            }
+            let obj = doc.get_mut(tid).expect("resolved");
+            let snapshot = obj.geometry.clone();
+            obj.geometry = Geometry::Curve(new);
+            Ok((
+                Command::SetPoint { target, index, position },
+                Inverse::SetGeometry(vec![(tid, snapshot)]),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("setpoint {tid} [{i}] -> {position}"),
+                },
+            ))
+        }
+        Command::Rebuild { id, target, count } => {
+            let ids = resolve(doc, &target)?;
+            let [tid] = ids[..] else {
+                return Err(ExecError::Invalid(format!(
+                    "rebuild target matched {} objects, expected exactly 1",
+                    ids.len()
+                )));
+            };
+            if count < 2 {
+                return Err(ExecError::Invalid("rebuild count must be >= 2".into()));
+            }
+            let curve = curve_of(doc, tid, "rebuild")?;
+            let rebuilt = kernel_curve::rebuild(curve, count as usize, PROFILE_TOL)
+                .ok_or_else(|| ExecError::Invalid("rebuild: curve is degenerate".into()))?;
+            let id = id.unwrap_or_default();
+            let (obj, index) = doc.remove(tid).expect("resolved");
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: obj.name.clone(),
+                layer: obj.layer.clone(),
+                color: obj.color,
+                geometry: Geometry::Curve(rebuilt),
+            });
+            Ok((
+                Command::Rebuild { id: Some(id), target, count },
+                Inverse::Replace { created: vec![id], consumed: vec![(obj, index)] },
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("rebuilt {tid} -> {id} ({count} points)"),
+                },
+            ))
+        }
         Command::Dim { id, a, b, offset } => {
             let length = (b - a).length();
             if length < 1e-9 {
@@ -3173,6 +3281,10 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Ellipse { .. } => "ellipse",
         Command::Polygon { .. } => "polygon",
         Command::Curve { .. } => "curve",
+        Command::InterpCurve { .. } => "interpcurve",
+        Command::Helix { .. } => "helix",
+        Command::SetPoint { .. } => "setpoint",
+        Command::Rebuild { .. } => "rebuild",
         Command::Dim { .. } => "dim",
         Command::Text { .. } => "text",
         Command::Hatch { .. } => "hatch",
@@ -5537,5 +5649,110 @@ mod tests {
         assert!((r - 1.0).abs() < 0.005, "r={r}");
         assert!((g - 128.0 / 255.0).abs() < 0.005, "g={g}");
         assert!(b.abs() < 0.005, "b={b}");
+    }
+
+    fn curve_of_last(s: &Session) -> Curve {
+        let id = *s.doc.all_ids().last().unwrap();
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Curve(c) => c.clone(),
+            _ => panic!("not a curve"),
+        }
+    }
+
+    #[test]
+    fn interpcurve_passes_through_points() {
+        let mut s = Session::default();
+        run(&mut s, "interpcurve 0,0 2,4 6,4 8,0 10,2");
+        let Curve::Nurbs { control, weights, knots, degree } = curve_of_last(&s) else {
+            panic!("expected nurbs")
+        };
+        // Endpoints are interpolated exactly (clamped).
+        let p0 = kernel_curve::nurbs_point(&control, &weights, &knots, degree, 0.0);
+        let p1 = kernel_curve::nurbs_point(&control, &weights, &knots, degree, 1.0);
+        assert!(p0.distance(DVec3::new(0.0, 0.0, 0.0)) < 1e-6);
+        assert!(p1.distance(DVec3::new(10.0, 2.0, 0.0)) < 1e-6);
+    }
+
+    #[test]
+    fn helix_radius_and_height_via_command() {
+        let mut s = Session::default();
+        run(&mut s, "helix 0,0,0 3 12 4");
+        let Curve::Polyline { points, .. } = curve_of_last(&s) else { panic!() };
+        for p in &points {
+            assert!(((p.x * p.x + p.y * p.y).sqrt() - 3.0).abs() < 1e-9);
+        }
+        let zmax = points.iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        assert!((zmax - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn setpoint_moves_control_and_undo_replay() {
+        let mut s = Session::default();
+        run(&mut s, "curve 0,0 2,4 6,4 8,0");
+        let id = *s.doc.all_ids().last().unwrap();
+        let before = curve_of_last(&s);
+        run(&mut s, "setpoint last 1 3,9,0");
+        let Curve::Nurbs { control, .. } = curve_of_last(&s) else { panic!() };
+        assert!(control[1].distance(DVec3::new(3.0, 9.0, 0.0)) < 1e-12);
+        // Undo restores the original geometry exactly.
+        s.run(Command::Undo).unwrap();
+        assert_eq!(
+            match &s.doc.get(id).unwrap().geometry {
+                Geometry::Curve(c) => c.clone(),
+                _ => panic!(),
+            },
+            before
+        );
+        // Redo re-applies.
+        s.run(Command::Redo).unwrap();
+        let Curve::Nurbs { control, .. } = curve_of_last(&s) else { panic!() };
+        assert!(control[1].distance(DVec3::new(3.0, 9.0, 0.0)) < 1e-12);
+
+        // Replay from the op-log reproduces the edited curve.
+        let json = crate::io::to_json(&s);
+        let loaded = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&loaded), json, "replay-stable");
+    }
+
+    #[test]
+    fn setpoint_on_polyline() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0 5,0 5,5 closed");
+        run(&mut s, "setpoint last 2 9,9,0");
+        let Curve::Polyline { points, .. } = curve_of_last(&s) else { panic!() };
+        assert!(points[2].distance(DVec3::new(9.0, 9.0, 0.0)) < 1e-12);
+    }
+
+    #[test]
+    fn setpoint_index_out_of_range_errors() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0 5,0 5,5");
+        let err = s.run(parse("setpoint last 9 1,1,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn rebuild_resamples_to_count_and_undo() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0 10,0");
+        let out = run(&mut s, "rebuild last 6");
+        assert!(out.message.contains("6 points"), "{}", out.message);
+        let Curve::Polyline { points, .. } = curve_of_last(&s) else { panic!() };
+        assert_eq!(points.len(), 6);
+        // Undo brings back the original 2-point polyline.
+        s.run(Command::Undo).unwrap();
+        let Curve::Polyline { points, .. } = curve_of_last(&s) else { panic!() };
+        assert_eq!(points.len(), 2);
+    }
+
+    #[test]
+    fn rebuild_closed_curve_stays_closed() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0,0 5");
+        run(&mut s, "rebuild last 24");
+        let c = curve_of_last(&s);
+        assert!(c.is_closed());
+        let Curve::Polyline { points, .. } = c else { panic!() };
+        assert_eq!(points.len(), 24);
     }
 }
