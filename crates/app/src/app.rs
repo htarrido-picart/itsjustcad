@@ -242,7 +242,13 @@ pub struct App {
     #[allow(clippy::type_complexity)]
     underlay_cache: Option<(String, std::sync::Arc<(Vec<u8>, u32, u32)>)>,
     /// Whether the deck chat pane is visible; toggled by the ◂/▸ button or Cmd+\.
+    /// Retained for the `critique` verb (reveals the Deck tab); the right panel's
+    /// own visibility is governed by `panel_tabs`.
     deck_visible: bool,
+    /// Right docked panel tab state (Layers/Properties/History/Deck).
+    panel_tabs: crate::tabstrip::TabState,
+    /// Whether the right docked panel is shown at all (Cmd+\ hides/shows).
+    panel_visible: bool,
     /// Whether to show the first-run template picker on next frame.
     show_template_picker: bool,
     template_units: TemplateUnits,
@@ -339,7 +345,11 @@ impl App {
             },
             display_modes: [DisplayMode::default(); 4],
             color_modes: [ColorMode::default(); 4],
-            layout: ViewportLayout::Single,
+            layout: match preset::preset_for(cad_origin).default_viewports {
+                4 => ViewportLayout::Four,
+                2 => ViewportLayout::Two,
+                _ => ViewportLayout::Single,
+            },
             active_pane: 0,
             uploaded_generation: None,
             uploaded_theme: None,
@@ -363,6 +373,8 @@ impl App {
             status_snap: None,
             underlay_cache: None,
             deck_visible,
+            panel_tabs: crate::tabstrip::TabState::default(),
+            panel_visible: true,
             show_template_picker: !load_template_done(),
             template_units: TemplateUnits::Meters,
             template_scale: TemplateScale::Building,
@@ -492,6 +504,9 @@ impl App {
             // The rest of the line (if any) is a user question folded into the
             // prompt. Deferred: the shot lands a frame later (see handle_critique).
             Some("critique") => {
+                // Reveal the Deck tab so the critique reply is visible.
+                self.panel_visible = true;
+                self.panel_tabs.show(crate::tabstrip::PanelTab::Deck);
                 if !self.deck_visible {
                     self.deck_visible = true;
                     save_deck_visible(self.deck_visible);
@@ -1112,9 +1127,10 @@ impl App {
             self.box_drag = None;
         }
 
-        self.view_toolbar(ui, full);
-        self.layers_panel(ui, full, theme);
-        self.history_panel(ui, full);
+        // Display/color-mode chips stay as a compact floating overlay in the
+        // top-left of the active viewport (per-viewport state, no overlap with
+        // the docked panels). Standard views moved to the bottom viewport tabs.
+        self.view_overlay(ui, full);
     }
 
     /// Overlay pass for dimension and text annotations: world points project
@@ -1216,44 +1232,35 @@ impl App {
         }
     }
 
-    /// Undo history: op list newest-last, current position highlighted.
+    /// Undo history tab body: op list newest-last, current position highlighted.
     /// Clicking an entry jumps there by running undo/redo through the
-    /// session, so the op-log stays the single source of truth.
-    fn history_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+    /// session, so the op-log stays the single source of truth. Rendered inside
+    /// the docked right panel (no floating Area).
+    fn history_panel(&mut self, ui: &mut egui::Ui) {
         let (entries, cursor) = self.session.history();
         let mut jump: Option<usize> = None;
-        egui::Area::new(egui::Id::new("history_panel"))
-            .fixed_pos(rect.left_top() + egui::vec2(8.0, 60.0))
-            .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(130.0);
-                    egui::CollapsingHeader::new(format!("History ({})", entries.len()))
-                        .id_salt("history_panel_header")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(260.0)
-                                .show(ui, |ui| {
-                                    if ui.selectable_label(cursor == 0, "(start)").clicked() {
-                                        jump = Some(0);
-                                    }
-                                    for (i, name) in entries.iter().enumerate() {
-                                        let step = i + 1; // state after op i
-                                        let label = format!("{step}. {name}");
-                                        let text = if step > cursor {
-                                            egui::RichText::new(label).weak() // undone
-                                        } else {
-                                            egui::RichText::new(label)
-                                        };
-                                        if ui.selectable_label(step == cursor, text).clicked() {
-                                            jump = Some(step);
-                                        }
-                                    }
-                                });
-                            ui.separator();
-                            ui.weak("amend <op#> <command> rewrites a step\n(first op is 0, e.g. amend 0 box 0,0,0 8,8,3)");
-                        });
-                });
+        ui.label(egui::RichText::new(format!("History ({})", entries.len())).heading());
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if ui.selectable_label(cursor == 0, "(start)").clicked() {
+                    jump = Some(0);
+                }
+                for (i, name) in entries.iter().enumerate() {
+                    let step = i + 1; // state after op i
+                    let label = format!("{step}. {name}");
+                    let text = if step > cursor {
+                        egui::RichText::new(label).weak() // undone
+                    } else {
+                        egui::RichText::new(label)
+                    };
+                    if ui.selectable_label(step == cursor, text).clicked() {
+                        jump = Some(step);
+                    }
+                }
+                ui.separator();
+                ui.weak("amend <op#> <command> rewrites a step\n(first op is 0, e.g. amend 0 box 0,0,0 8,8,3)");
             });
         if let Some(step) = jump {
             match self.session.jump_to(step) {
@@ -1266,61 +1273,102 @@ impl App {
         }
     }
 
-    /// Layers panel: visibility toggle, color swatch, current-layer switch.
+    /// Properties tab body: read-out of the active selection (count, layer,
+    /// combined bounding box). Query-only; no ops issued.
+    fn properties_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Properties").heading());
+        ui.separator();
+        let doc = &self.session.doc;
+        let sel = &doc.selection;
+        if sel.is_empty() {
+            ui.weak("No selection.");
+            ui.add_space(4.0);
+            ui.weak("Click an object in a viewport, or use `select all`.");
+            return;
+        }
+        ui.label(format!("{} object(s) selected", sel.len()));
+        // Layers spanned by the selection.
+        let mut layers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut aabb: Option<kernel_mesh::Aabb> = None;
+        for obj in doc.objects().filter(|o| sel.contains(&o.id)) {
+            layers.insert(obj.layer.as_str());
+            let bb = obj.geometry.aabb();
+            aabb = Some(match aabb {
+                Some(a) => a.union(bb),
+                None => bb,
+            });
+        }
+        ui.label(format!("layer(s): {}", layers.into_iter().collect::<Vec<_>>().join(", ")));
+        if let Some(bb) = aabb {
+            let s = bb.size();
+            ui.separator();
+            ui.label("bounding box:");
+            ui.monospace(format!(
+                "  size  {}",
+                crate::statusbar::format_cursor(doc.units, Some(s))
+            ));
+            ui.monospace(format!(
+                "  min   {}",
+                crate::statusbar::format_cursor(doc.units, Some(bb.min))
+            ));
+            ui.monospace(format!(
+                "  max   {}",
+                crate::statusbar::format_cursor(doc.units, Some(bb.max))
+            ));
+        }
+    }
+
+    /// Layers tab body: visibility toggle, color swatch, current-layer switch.
     /// Every edit goes through the command substrate so it is logged/undoable.
-    fn layers_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect, theme: scene::Theme) {
+    /// Rendered inside the docked right panel (no floating Area).
+    fn layers_panel(&mut self, ui: &mut egui::Ui, theme: scene::Theme) {
         let mut lines: Vec<String> = Vec::new();
-        egui::Area::new(egui::Id::new("layers_panel"))
-            .fixed_pos(rect.right_top() + egui::vec2(-190.0, 8.0))
-            .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(170.0);
-                    egui::CollapsingHeader::new("Layers")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            let layers: Vec<(String, mydrafter_doc::LayerStyle)> = self
-                                .session
-                                .doc
-                                .layers
-                                .iter()
-                                .map(|(n, s)| (n.clone(), s.clone()))
-                                .collect();
-                            let current = self.session.doc.current_layer.clone();
-                            for (name, style) in layers {
-                                ui.horizontal(|ui| {
-                                    let mut visible = style.visible;
-                                    if ui
-                                        .checkbox(&mut visible, "")
-                                        .on_hover_text("visible")
-                                        .changed()
-                                    {
-                                        let verb = if visible { "show" } else { "hide" };
-                                        lines.push(format!("{verb} {name}"));
-                                    }
-                                    let fallback = theme.mesh();
-                                    let mut rgb = self
-                                        .pending_layer_color
-                                        .as_ref()
-                                        .filter(|(n, _)| *n == name)
-                                        .map(|(_, c)| *c)
-                                        .or_else(|| style.color.map(|c| [c[0], c[1], c[2]]))
-                                        .unwrap_or([fallback[0], fallback[1], fallback[2]]);
-                                    if ui.color_edit_button_rgb(&mut rgb).changed() {
-                                        self.pending_layer_color = Some((name.clone(), rgb));
-                                    }
-                                    let is_current = name == current;
-                                    if ui
-                                        .selectable_label(is_current, &name)
-                                        .on_hover_text("set current layer")
-                                        .clicked()
-                                        && !is_current
-                                    {
-                                        lines.push(format!("layer {name}"));
-                                    }
-                                });
-                            }
-                        });
-                });
+        ui.label(egui::RichText::new("Layers").heading());
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let layers: Vec<(String, mydrafter_doc::LayerStyle)> = self
+                    .session
+                    .doc
+                    .layers
+                    .iter()
+                    .map(|(n, s)| (n.clone(), s.clone()))
+                    .collect();
+                let current = self.session.doc.current_layer.clone();
+                for (name, style) in layers {
+                    ui.horizontal(|ui| {
+                        let mut visible = style.visible;
+                        if ui
+                            .checkbox(&mut visible, "")
+                            .on_hover_text("visible")
+                            .changed()
+                        {
+                            let verb = if visible { "show" } else { "hide" };
+                            lines.push(format!("{verb} {name}"));
+                        }
+                        let fallback = theme.mesh();
+                        let mut rgb = self
+                            .pending_layer_color
+                            .as_ref()
+                            .filter(|(n, _)| *n == name)
+                            .map(|(_, c)| *c)
+                            .or_else(|| style.color.map(|c| [c[0], c[1], c[2]]))
+                            .unwrap_or([fallback[0], fallback[1], fallback[2]]);
+                        if ui.color_edit_button_rgb(&mut rgb).changed() {
+                            self.pending_layer_color = Some((name.clone(), rgb));
+                        }
+                        let is_current = name == current;
+                        if ui
+                            .selectable_label(is_current, &name)
+                            .on_hover_text("set current layer")
+                            .clicked()
+                            && !is_current
+                        {
+                            lines.push(format!("layer {name}"));
+                        }
+                    });
+                }
             });
         // Commit the color edit once the mouse is released — one logged op
         // per edit instead of one per drag frame.
@@ -1535,25 +1583,16 @@ impl App {
         });
     }
 
-    fn view_toolbar(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        egui::Area::new(egui::Id::new("view_toolbar"))
+    /// Compact display/color-mode + layout chips, floating in the top-left of
+    /// the viewport frame. Standard-view switching lives in the bottom viewport
+    /// tab bar (`viewport_tab_bar`), so this overlay is small and never collides
+    /// with the docked panels or the top command line.
+    fn view_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        egui::Area::new(egui::Id::new("view_overlay"))
             .fixed_pos(rect.left_top() + egui::vec2(8.0, 8.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        for (label, name) in [
-                            ("Persp", "persp"),
-                            ("Top", "top"),
-                            ("Front", "front"),
-                            ("Right", "right"),
-                            ("Left", "left"),
-                            ("Back", "back"),
-                            ("Bottom", "bottom"),
-                        ] {
-                            if ui.small_button(label).clicked() {
-                                self.set_view(name);
-                            }
-                        }
                         if ui.small_button("ZE").on_hover_text("zoom extents").clicked() {
                             self.zoom_extents();
                         }
@@ -1604,6 +1643,118 @@ impl App {
                     });
                 });
             });
+    }
+
+    /// Bottom viewport tab bar (Rhino convention): Persp/Top/Front/Right plus
+    /// any saved named views. Clicking a tab sets the active pane's view (or
+    /// restores a named view). Rendered as a `TopBottomPanel::bottom` inside the
+    /// central viewport frame so it never overlaps the canvas.
+    fn viewport_tab_bar(&mut self, ui: &mut egui::Ui) {
+        let named: Vec<String> = self.session.doc.named_views.keys().cloned().collect();
+        let tabs = crate::tabstrip::viewport_tabs(&named);
+        // Highlight the tab matching the active pane's current view.
+        let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
+        let current = crate::statusbar::view_label(cam.yaw, cam.pitch, cam.ortho);
+        let mut chosen: Option<String> = None;
+        ui.horizontal(|ui| {
+            for (label, verb) in &tabs {
+                let selected = label.eq_ignore_ascii_case(current);
+                if ui.selectable_label(selected, label).clicked() {
+                    chosen = Some(verb.clone());
+                }
+            }
+        });
+        if let Some(verb) = chosen {
+            self.execute_line(verb);
+        }
+    }
+
+    /// Command-line panel body. `at_top` positions the autosuggest popup and
+    /// history: a top-docked line scrolls history downward with the popup
+    /// opening *below* the input; a bottom-docked line keeps the Rhino/AutoCAD
+    /// layout with history above and the popup above the input.
+    fn command_line_body(&mut self, ui: &mut egui::Ui, at_top: bool) {
+        let object_names: Vec<String> = self
+            .session
+            .doc
+            .objects()
+            .filter_map(|o| o.name.clone())
+            .collect();
+        let aliases = self.active_aliases();
+        if let Some(line) = self.command_line.ui(ui, &object_names, aliases, at_top) {
+            self.execute_line(line);
+        }
+    }
+
+    /// Right docked tab panel (Layer 2): a hand-rolled tab strip over
+    /// Layers / Properties / History / Deck. Clicking the active tab collapses
+    /// the panel to just the strip; a chevron also toggles it. The deck keeps
+    /// its resize behavior (the whole panel is resizable) and background
+    /// streaming (tick runs every frame in `ui`, independent of visibility).
+    fn right_panel(&mut self, ui: &mut egui::Ui) {
+        use crate::tabstrip::PanelTab;
+        if !self.panel_visible {
+            // Collapsed to nothing: a small ▸ handle at the top-right edge.
+            let vr = ui.ctx().viewport_rect();
+            egui::Area::new(egui::Id::new("panel_show_btn"))
+                .fixed_pos(egui::pos2(vr.right() - 28.0, vr.top() + 88.0))
+                .show(ui.ctx(), |ui| {
+                    if ui.small_button("◂").on_hover_text("show panel (Cmd+\\)").clicked() {
+                        self.panel_visible = true;
+                    }
+                });
+            return;
+        }
+
+        let collapsed = self.panel_tabs.is_collapsed();
+        let theme = if ui.visuals().dark_mode { scene::Theme::Dark } else { scene::Theme::Light };
+        let mut panel = egui::Panel::right("right_panel").resizable(!collapsed);
+        panel = if collapsed {
+            panel.default_size(120.0).min_size(90.0)
+        } else {
+            panel.default_size(320.0).min_size(240.0)
+        };
+        panel.show(ui, |ui| {
+            // Header row: chevron + tab strip.
+            ui.horizontal(|ui| {
+                if ui.small_button("▸").on_hover_text("hide panel (Cmd+\\)").clicked() {
+                    self.panel_visible = false;
+                }
+                if let Some(tab) = crate::tabstrip::strip_ui(ui, self.panel_tabs) {
+                    self.panel_tabs.click(tab);
+                    if tab == PanelTab::Deck {
+                        self.deck_visible = !self.panel_tabs.is_collapsed();
+                    }
+                }
+            });
+            ui.separator();
+            if self.panel_tabs.is_collapsed() {
+                return;
+            }
+            match self.panel_tabs.active() {
+                PanelTab::Layers => self.layers_tab(ui, theme),
+                PanelTab::Properties => self.properties_panel(ui),
+                PanelTab::History => self.history_panel(ui),
+                PanelTab::Deck => {
+                    self.deck_pane.ui(ui, &mut self.session, &self.tokio);
+                }
+            }
+        });
+    }
+
+    /// Layers tab wrapper: runs the layers UI then commits any pending edits.
+    fn layers_tab(&mut self, ui: &mut egui::Ui, theme: scene::Theme) {
+        self.layers_panel(ui, theme);
+    }
+
+    /// Top menu bar (Layer 3). Placeholder until the registry-driven menus land;
+    /// draws an empty top strip so the layout reserves the row.
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("mydrafter").weak().small());
+            });
+        });
     }
 }
 
@@ -1904,12 +2055,25 @@ impl eframe::App for App {
         // streaming turns and probes keep making progress while the pane is hidden.
         self.deck_pane.tick(&mut self.session, &self.tokio, ui.ctx());
 
-        // Cmd+\ toggles the deck pane (backslash is not used elsewhere).
+        // Cmd+\ reveals the Deck tab in the right panel (or hides the panel if
+        // the Deck tab is already the active, visible one). Backslash is not
+        // used elsewhere.
         let toggle_deck = ui.input_mut(|i| {
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::Backslash)
         });
         if toggle_deck {
-            self.deck_visible = !self.deck_visible;
+            use crate::tabstrip::PanelTab;
+            let deck_showing = self.panel_visible
+                && !self.panel_tabs.is_collapsed()
+                && self.panel_tabs.active() == PanelTab::Deck;
+            if deck_showing {
+                self.panel_visible = false;
+                self.deck_visible = false;
+            } else {
+                self.panel_visible = true;
+                self.panel_tabs.show(PanelTab::Deck);
+                self.deck_visible = true;
+            }
             save_deck_visible(self.deck_visible);
         }
 
@@ -1949,71 +2113,40 @@ impl eframe::App for App {
             }
         }
 
-        // Status strip sits below the command line (first bottom panel is
-        // outermost); all strings come from the pure fns in `statusbar`.
+        // ── Fixed docked slots (Layer 2) ─────────────────────────────────
+        // Panel order matters: the first-declared panel is outermost. We build
+        // the menu bar at the very top, then the command line (top OR bottom by
+        // preset), the status bar (always very bottom), then the right tab
+        // panel, and finally the central viewport frame with its bottom tab bar.
+        let preset = preset::preset_for(self.cad_origin);
+        let cmd_top = preset.command_line_pos == preset::CommandLinePos::Top;
+
+        // 1. Menu bar (Layer 3) — always the topmost strip.
+        self.menu_bar(ui);
+
+        // 2. Command line at TOP (Rhino default), directly under the menu bar.
+        if cmd_top {
+            egui::Panel::top("command_line")
+                .resizable(false)
+                .show(ui, |ui| self.command_line_body(ui, true));
+        }
+
+        // 3. Status bar — always at the very bottom.
         egui::Panel::bottom("statusbar")
             .resizable(false)
             .show(ui, |ui| self.status_bar(ui));
 
-        egui::Panel::bottom("command_line")
-            .resizable(false)
-            .show(ui, |ui| {
-                let object_names: Vec<String> = self
-                    .session
-                    .doc
-                    .objects()
-                    .filter_map(|o| o.name.clone())
-                    .collect();
-                let aliases = self.active_aliases();
-                if let Some(line) = self.command_line.ui(ui, &object_names, aliases) {
-                    self.execute_line(line);
-                }
-            });
-
-        // Deck pane: resizable right Panel (drag handle from egui) with a
-        // collapse/expand chevron button always reachable at the right edge.
-        // Min width 240 px; no hard max so the user can stretch freely.
-        if self.deck_visible {
-            egui::Panel::right("deck")
-                .resizable(true)
-                .default_size(340.0)
-                .min_size(240.0)
-                .show(ui, |ui| {
-                    // Chevron button at the top of the panel header row.
-                    ui.horizontal(|ui| {
-                        if ui
-                            .small_button("◂")
-                            .on_hover_text("hide deck (Cmd+\\)")
-                            .clicked()
-                        {
-                            self.deck_visible = false;
-                            save_deck_visible(false);
-                        }
-                        ui.label(egui::RichText::new("deck").weak().small());
-                    });
-                    ui.separator();
-                    self.deck_pane.ui(ui, &mut self.session, &self.tokio);
-                });
-        } else {
-            // When hidden, draw a small ▸ button at the right edge so the
-            // user can reopen the deck without a menu.
-            let viewport_rect = ui.ctx().viewport_rect();
-            egui::Area::new(egui::Id::new("deck_show_btn"))
-                .fixed_pos(egui::pos2(
-                    viewport_rect.right() - 28.0,
-                    viewport_rect.top() + 8.0,
-                ))
-                .show(ui.ctx(), |ui| {
-                    if ui
-                        .small_button("▸")
-                        .on_hover_text("show deck (Cmd+\\)")
-                        .clicked()
-                    {
-                        self.deck_visible = true;
-                        save_deck_visible(true);
-                    }
-                });
+        // 4. Command line at BOTTOM (AutoCAD), above the status bar.
+        if !cmd_top {
+            egui::Panel::bottom("command_line")
+                .resizable(false)
+                .show(ui, |ui| self.command_line_body(ui, false));
         }
+
+        // 5. Right docked tab panel: Layers / Properties / History / Deck.
+        // The deck lives here as a tab; its tick() still runs every frame above
+        // regardless of visibility, so background streaming keeps progressing.
+        self.right_panel(ui);
 
         // A `view <name>` restore (command line, deck or script) parks the
         // saved camera in the document mailbox; drive the active viewport.
@@ -2021,9 +2154,15 @@ impl eframe::App for App {
             apply_named_view(self.active_camera(), &view);
         }
 
+        // 6. Central viewport frame with the bottom viewport tab bar.
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.viewport(ui));
+            .show(ui, |ui| {
+                egui::Panel::bottom("viewport_tabs")
+                    .resizable(false)
+                    .show(ui, |ui| self.viewport_tab_bar(ui));
+                self.viewport(ui);
+            });
     }
 }
 

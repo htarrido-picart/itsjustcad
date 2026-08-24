@@ -15,6 +15,7 @@ mod preset;
 mod scene;
 mod statusbar;
 mod suggest;
+mod tabstrip;
 mod theme;
 
 fn cli_help_text() -> String {

@@ -357,23 +357,52 @@ impl CommandLine {
         ui: &mut egui::Ui,
         object_names: &[String],
         preset_aliases: &'static [(&'static str, &'static str)],
+        at_top: bool,
     ) -> Option<String> {
-        let mut submitted = None;
-
-        // Show ~3 lines of history (legacy CAD default: 3 rows).
-        // Height = 3 × (13 px font + ~6 px spacing) ≈ 57 px; +padding.
-        egui::ScrollArea::vertical()
-            .max_height(80.0)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for line in &self.history {
-                    ui.monospace(line);
-                }
-            });
-
         // Recompute suggestions if input changed.
         self.refresh_suggestions(object_names, preset_aliases);
 
+        // History (~3 rows). For a BOTTOM-docked command line the history sits
+        // ABOVE the input (Rhino/AutoCAD look) and the popup opens upward; for a
+        // TOP-docked line the input comes first and history/popup open DOWNWARD.
+        let history_block = |cl: &Self, ui: &mut egui::Ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("cmd_history")
+                .max_height(80.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for line in &cl.history {
+                        ui.monospace(line);
+                    }
+                });
+        };
+
+        if at_top {
+            // Input first, then popup + history below it.
+            let submitted = self.input_row(ui);
+            self.suggestion_block(ui, false);
+            history_block(self, ui);
+            return submitted;
+        }
+
+        // Bottom-docked (original layout): history, popup, then input.
+        history_block(self, ui);
+        self.suggestion_block(ui, true);
+        self.input_row(ui)
+    }
+
+    /// True when the autosuggest popup should be visible for the current input.
+    fn popup_visible(&self) -> bool {
+        let verb = suggest::verb_of(self.input.trim_start());
+        let show_usage_hint = suggest::verb_is_complete(&self.input) && !verb.is_empty();
+        !self.suggest_dismissed && !self.suggestions.is_empty() && !show_usage_hint
+    }
+
+    /// Draw the usage hint (when a verb is fully typed) and the autosuggest
+    /// popup. `above_input` records whether this block sits above the input row
+    /// (bottom-docked) or below it (top-docked) — the content is identical; the
+    /// caller controls placement by call order.
+    fn suggestion_block(&mut self, ui: &mut egui::Ui, _above_input: bool) {
         // ── Usage hint (shown when verb is fully typed) ──────────────────
         let verb = suggest::verb_of(self.input.trim_start()).to_string();
         let show_usage_hint = suggest::verb_is_complete(&self.input) && !verb.is_empty();
@@ -391,12 +420,7 @@ impl CommandLine {
             );
         }
 
-        // ── Autosuggest popup (above the input row) ──────────────────────
-        let show_popup = !self.suggest_dismissed
-            && !self.suggestions.is_empty()
-            && !show_usage_hint; // hide popup once verb is selected
-
-        if show_popup {
+        if self.popup_visible() {
             let sel = self.suggest_sel.unwrap_or(usize::MAX);
             for (i, s) in self.suggestions.iter().enumerate() {
                 let label = if let Some(u) = &s.usage {
@@ -416,8 +440,13 @@ impl CommandLine {
             }
             ui.separator();
         }
+    }
 
-        // ── Input row ────────────────────────────────────────────────────
+    /// The prompt + text input row, with history recall, popup navigation and
+    /// suggestion acceptance. Returns Some(line) when the user pressed Enter.
+    fn input_row(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        let mut submitted = None;
+        let show_popup = self.popup_visible();
         ui.horizontal(|ui| {
             ui.monospace(">");
             let response = ui.add(
@@ -508,7 +537,6 @@ impl CommandLine {
                 self.suggest_dismissed = false;
             }
         });
-
         submitted
     }
 }
