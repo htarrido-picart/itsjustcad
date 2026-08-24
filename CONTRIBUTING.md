@@ -73,6 +73,11 @@ to your own contribution; you grant the author the right to dual-license it.
 This is what keeps the free open desktop build and the paid mobile build
 possible from one codebase.
 
+The agreement is codified in git: see [`CLA.md`](CLA.md). On your first PR a bot
+asks you to sign by commenting one line; your signature (GitHub id + timestamp +
+CLA version) is recorded in `.github/cla-signatures.json` and the PR is blocked
+until signed. No paper, no email — the git record is the proof.
+
 If you cannot agree to this, open an issue to discuss before sending a PR.
 
 Do not paste code from incompatibly-licensed sources. Contributors are credited
