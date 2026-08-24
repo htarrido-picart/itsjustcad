@@ -1,0 +1,31 @@
+{
+  "name": "north-arrow",
+  "description": "North arrow: filled arrowhead pointing +Y with 'N' label. 0.5 m height.",
+  "geometries": [
+    {
+      "geo": "curve",
+      "kind": "polyline",
+      "points": [
+        [0.0, 0.5, 0.0],
+        [-0.15, 0.0, 0.0],
+        [0.0, 0.1, 0.0],
+        [0.15, 0.0, 0.0],
+        [0.0, 0.5, 0.0]
+      ],
+      "closed": true
+    },
+    {
+      "geo": "curve",
+      "kind": "line",
+      "a": [0.0, 0.5, 0.0],
+      "b": [0.0, -0.1, 0.0]
+    },
+    {
+      "geo": "annotation",
+      "ann": "text",
+      "pos": [-0.08, -0.35, 0.0],
+      "text": "N",
+      "height": 0.2
+    }
+  ]
+}

@@ -4093,6 +4093,68 @@ fn apply_forward(
                 ApplyOutcome { created: Vec::new(), message: msg },
             ))
         }
+        Command::BlockLibList => {
+            let (names, dir) = crate::blocklib::list()
+                .map_err(|e| ExecError::Invalid(e.to_string()))?;
+            let msg = if names.is_empty() {
+                format!("block library empty ({dir})\nhint: run 'blocksave <name>' to save a block definition")
+            } else {
+                format!(
+                    "library blocks ({dir}):\n{}",
+                    names.iter().map(|n| format!("  {n}")).collect::<Vec<_>>().join("\n")
+                )
+            };
+            Ok((
+                Command::BlockLibList,
+                Inverse::DeleteCreated(Vec::new()),
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::BlockLibLoad { name, geometries } => {
+            use mydrafter_doc::BlockGeometry;
+            let snaps: Vec<BlockGeometry> = if let Some(g) = geometries {
+                // Replay path: use stored geometries.
+                g
+            } else {
+                // Live path: load from library.
+                let bf = crate::blocklib::load(&name)
+                    .map_err(|e| ExecError::Invalid(e.to_string()))?;
+                bf.geometries
+            };
+            let n = snaps.len();
+            let prev = doc.blocks.insert(name.clone(), snaps.clone());
+            doc.generation += 1;
+            let msg = format!(
+                "block '{}' loaded from library ({n} geometr{})",
+                name,
+                if n == 1 { "y" } else { "ies" }
+            );
+            Ok((
+                Command::BlockLibLoad {
+                    name: name.clone(),
+                    geometries: Some(snaps),
+                },
+                Inverse::BlockDef { name, prev },
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::BlockLibSave { name, description } => {
+            let defs = doc.blocks.get(&name).ok_or_else(|| {
+                ExecError::Invalid(format!(
+                    "no block named '{name}' in document (define it first with 'block')"
+                ))
+            })?;
+            let path = crate::blocklib::save(&name, &description, defs.clone())
+                .map_err(|e| ExecError::Invalid(e.to_string()))?;
+            Ok((
+                Command::BlockLibSave { name: name.clone(), description },
+                Inverse::DeleteCreated(Vec::new()),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("block '{}' saved to {}", name, path.display()),
+                },
+            ))
+        }
         Command::Undo
         | Command::Redo
         | Command::Amend { .. }
@@ -4196,6 +4258,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::BlockDefine { .. } => "block",
         Command::BlockInsert { .. } => "insert",
         Command::BlocksList => "blocks",
+        Command::BlockLibList => "blocklib",
+        Command::BlockLibLoad { .. } => "blockload",
+        Command::BlockLibSave { .. } => "blocksave",
         Command::Undo => "undo",
         Command::Redo => "redo",
         Command::Amend { .. } => "amend",
@@ -6617,6 +6682,112 @@ mod tests {
         assert!(result.is_err(), "should error on unknown block");
     }
 
+    // ---- block library commands ----
+
+    #[test]
+    fn blocklib_list_is_not_logged() {
+        let mut s = Session::default();
+        let log_before = s.save_log().len();
+        run(&mut s, "blocklib");
+        assert_eq!(s.save_log().len(), log_before, "blocklib list must not be logged");
+    }
+
+    #[test]
+    fn blocklib_list_variant_accepted() {
+        // Both "blocklib" and "blocklib list" should parse.
+        let cmd1 = crate::parse::parse("blocklib").unwrap();
+        let cmd2 = crate::parse::parse("blocklib list").unwrap();
+        assert_eq!(cmd1, cmd2);
+    }
+
+    #[test]
+    fn blockload_loads_starter_tree_and_inserts() {
+        // Use the embedded starter block geometry directly (no fs dependency in CI).
+        use crate::blocklib::{load_from_dir, seed_dir};
+        let tmp = {
+            let dir = std::env::temp_dir()
+                .join("mydrafter_exec_blockload")
+                .join(format!("{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dir
+        };
+        seed_dir(&tmp);
+
+        let bf = load_from_dir(&tmp, "tree").unwrap();
+        let mut s = Session::default();
+        s.doc.blocks.insert(bf.name.clone(), bf.geometries);
+
+        run(&mut s, "insert tree 5,5,0");
+        run(&mut s, "insert tree 10,3,0");
+        assert_eq!(s.doc.len(), 2, "two tree instances inserted");
+        for obj in s.doc.objects() {
+            assert!(
+                matches!(&obj.geometry, mydrafter_doc::Geometry::Instance { block, .. } if block == "tree"),
+                "expected tree instance"
+            );
+        }
+    }
+
+    #[test]
+    fn blockload_command_replay_stability() {
+        // Drive the full blockload command through Session::run so we can test
+        // that the replay log is self-contained (geometries are embedded).
+        // We inject a BlockLibLoad with pre-filled geometries (replay form)
+        // so the test doesn't require the library directory to exist.
+        use kernel_curve::Curve;
+        use mydrafter_doc::BlockGeometry;
+
+        let geoms = vec![BlockGeometry::Curve(Curve::Arc {
+            center: glam::DVec3::ZERO,
+            radius: 0.5,
+            start: 0.0,
+            end: std::f64::consts::TAU,
+        })];
+        let cmd = crate::Command::BlockLibLoad {
+            name: "tree".to_string(),
+            geometries: Some(geoms),
+        };
+        let mut s = Session::default();
+        s.run(cmd).unwrap();
+        assert!(s.doc.blocks.contains_key("tree"), "block defined after load");
+
+        // Replay the log.
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "blockload must be replay-stable"
+        );
+    }
+
+    #[test]
+    fn blockload_undo_removes_definition() {
+        use kernel_curve::Curve;
+        use mydrafter_doc::BlockGeometry;
+
+        let geoms = vec![BlockGeometry::Curve(Curve::Line {
+            a: glam::DVec3::ZERO,
+            b: glam::DVec3::new(1.0, 0.0, 0.0),
+        })];
+        let cmd = crate::Command::BlockLibLoad {
+            name: "mylib".to_string(),
+            geometries: Some(geoms),
+        };
+        let mut s = Session::default();
+        s.run(cmd).unwrap();
+        assert!(s.doc.blocks.contains_key("mylib"));
+        run(&mut s, "undo");
+        assert!(!s.doc.blocks.contains_key("mylib"), "undo removes loaded block");
+    }
+
+    #[test]
+    fn blocksave_unknown_block_errors() {
+        let mut s = Session::default();
+        let result = s.run(crate::parse::parse("blocksave nosuchblock").unwrap());
+        assert!(result.is_err(), "blocksave of undefined block must error");
+    }
+
     #[test]
     fn color_set_undo_redo_replay() {
         let mut s = Session::default();
@@ -6955,4 +7126,5 @@ mod tests {
         let err = s.run(parse("option nope").unwrap()).unwrap_err();
         assert!(err.to_string().contains("no option 'nope'"), "{err}");
     }
+
 }

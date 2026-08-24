@@ -319,6 +319,9 @@ impl App {
         // Load user/LLM-authored plugin macros from disk into the session.
         command_line.load_plugins(&mut session);
 
+        // Seed the block content library on first run (no-op if already present).
+        mydrafter_commands::blocklib::seed_if_empty();
+
         Self {
             session,
             command_line,

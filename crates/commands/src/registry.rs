@@ -419,6 +419,21 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "List all block definitions with their geometry counts (query only). Example: blocks",
         },
         CommandSpec {
+            name: "blocklib",
+            usage: "blocklib [list]",
+            summary: "List block names in the on-disk library (~/.config/mydrafter/blocks/). Example: blocklib",
+        },
+        CommandSpec {
+            name: "blockload",
+            usage: "blockload <name>",
+            summary: "Load a library block into the document as a named definition ready to insert. Example: blockload tree · blockload door-single",
+        },
+        CommandSpec {
+            name: "blocksave",
+            usage: "blocksave <name> [description]",
+            summary: "Save the named block definition from the document back to the library. Example: blocksave my-column 'precast column 400mm'",
+        },
+        CommandSpec {
             name: "select",
             usage: "select <selector>",
             summary: "Set the selection. Example: select all",

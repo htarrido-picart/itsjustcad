@@ -1,0 +1,30 @@
+{
+  "name": "window-double",
+  "description": "Double window, 1.2 m wide, 0.05 m frame in plan. Mullion at centre.",
+  "geometries": [
+    {
+      "geo": "curve",
+      "kind": "polyline",
+      "points": [
+        [0.0, 0.0, 0.0],
+        [1.2, 0.0, 0.0],
+        [1.2, 0.05, 0.0],
+        [0.0, 0.05, 0.0],
+        [0.0, 0.0, 0.0]
+      ],
+      "closed": true
+    },
+    {
+      "geo": "curve",
+      "kind": "line",
+      "a": [0.6, 0.0, 0.0],
+      "b": [0.6, 0.05, 0.0]
+    },
+    {
+      "geo": "curve",
+      "kind": "line",
+      "a": [0.0, 0.025, 0.0],
+      "b": [1.2, 0.025, 0.0]
+    }
+  ]
+}

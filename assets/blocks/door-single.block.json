@@ -1,0 +1,26 @@
+{
+  "name": "door-single",
+  "description": "Single swing door, 0.9 m wide. Hinge at origin, leaf swings 90° CCW.",
+  "geometries": [
+    {
+      "geo": "curve",
+      "kind": "line",
+      "a": [0.0, 0.0, 0.0],
+      "b": [0.9, 0.0, 0.0]
+    },
+    {
+      "geo": "curve",
+      "kind": "line",
+      "a": [0.0, 0.0, 0.0],
+      "b": [0.0, 0.9, 0.0]
+    },
+    {
+      "geo": "curve",
+      "kind": "arc",
+      "center": [0.0, 0.0, 0.0],
+      "radius": 0.9,
+      "start": 0.0,
+      "end": 1.5707963267948966
+    }
+  ]
+}

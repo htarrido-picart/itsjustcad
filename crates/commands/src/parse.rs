@@ -902,6 +902,35 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("blocks", &args, &args)?;
             Ok(Command::BlocksList)
         }
+        // -- block content library --
+        // blocklib list   (same as "blocklib" with no args)
+        "blocklib" => {
+            // Allow both "blocklib" and "blocklib list"
+            match args.as_slice() {
+                [] | ["list"] => Ok(Command::BlockLibList),
+                _ => wrong("blocklib", "'list' or no arguments", &args),
+            }
+        }
+        // blockload <name>
+        "blockload" => match args.as_slice() {
+            [name] => Ok(Command::BlockLibLoad {
+                name: (*name).to_string(),
+                geometries: None,
+            }),
+            _ => wrong("blockload", "a library block name", &args),
+        },
+        // blocksave <name> [description...]
+        "blocksave" => match args.as_slice() {
+            [name] => Ok(Command::BlockLibSave {
+                name: (*name).to_string(),
+                description: String::new(),
+            }),
+            [name, desc @ ..] => Ok(Command::BlockLibSave {
+                name: (*name).to_string(),
+                description: desc.join(" "),
+            }),
+            _ => wrong("blocksave", "a block name", &args),
+        },
         "undo" => Ok(Command::Undo),
         "redo" => Ok(Command::Redo),
         "amend" => match &args[..] {

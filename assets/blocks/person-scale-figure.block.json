@@ -1,0 +1,51 @@
+{
+  "name": "person-scale-figure",
+  "description": "Elevation scale figure: 1.8 m tall. Head circle + body + arms + legs polylines.",
+  "geometries": [
+    {
+      "geo": "curve",
+      "kind": "arc",
+      "center": [0.0, 1.65, 0.0],
+      "radius": 0.15,
+      "start": 0.0,
+      "end": 6.283185307179586
+    },
+    {
+      "geo": "curve",
+      "kind": "polyline",
+      "points": [
+        [0.0, 1.5, 0.0],
+        [0.0, 0.9, 0.0]
+      ],
+      "closed": false
+    },
+    {
+      "geo": "curve",
+      "kind": "polyline",
+      "points": [
+        [-0.3, 1.2, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.3, 1.2, 0.0]
+      ],
+      "closed": false
+    },
+    {
+      "geo": "curve",
+      "kind": "polyline",
+      "points": [
+        [0.0, 0.9, 0.0],
+        [-0.2, 0.0, 0.0]
+      ],
+      "closed": false
+    },
+    {
+      "geo": "curve",
+      "kind": "polyline",
+      "points": [
+        [0.0, 0.9, 0.0],
+        [0.2, 0.0, 0.0]
+      ],
+      "closed": false
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "grid-bubble",
+  "description": "Grid reference bubble: 0.3 m diameter circle with centred 'A' label.",
+  "geometries": [
+    {
+      "geo": "curve",
+      "kind": "arc",
+      "center": [0.0, 0.0, 0.0],
+      "radius": 0.15,
+      "start": 0.0,
+      "end": 6.283185307179586
+    },
+    {
+      "geo": "annotation",
+      "ann": "text",
+      "pos": [-0.05, -0.07, 0.0],
+      "text": "A",
+      "height": 0.14
+    }
+  ]
+}

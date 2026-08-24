@@ -160,6 +160,7 @@ fn main() -> eframe::Result<()> {
         // GUI path can also honour --run after startup through env vars.
         if cli.headless {
             tracing_subscriber::fmt::init();
+            mydrafter_commands::blocklib::seed_if_empty();
             let code = run_headless_mode(&cli);
             std::process::exit(code);
         }

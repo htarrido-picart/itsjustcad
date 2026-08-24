@@ -674,6 +674,23 @@ pub enum Command {
     },
     /// List block definitions (query; never logged).
     BlocksList,
+    // -- block content library (.block.json on disk) --
+    /// List block names available in ~/.config/mydrafter/blocks/ (query; never logged).
+    BlockLibList,
+    /// Load a library block into the document as a named block definition.
+    /// `geometries` is `None` when typed; exec fills it for replay.
+    BlockLibLoad {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        geometries: Option<Vec<mydrafter_doc::BlockGeometry>>,
+    },
+    /// Write the current block definition `name` from the document back to the
+    /// library as `~/.config/mydrafter/blocks/<name>.block.json`.
+    BlockLibSave {
+        name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        description: String,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild
@@ -724,6 +741,7 @@ impl Command {
                 | Command::Bbox { .. }
                 | Command::Schedule { .. }
                 | Command::BlocksList
+                | Command::BlockLibList
                 | Command::Undo
                 | Command::Redo
                 | Command::Amend { .. }
@@ -748,11 +766,13 @@ impl Command {
             // fs writes
             Command::Export { .. }
                 | Command::Print { .. }
+                | Command::BlockLibSave { .. }
                 // fs reads (can be probed to exfiltrate / DoS)
                 | Command::Import { .. }
                 | Command::Terrain { .. }
                 | Command::OsmFile { .. }
                 | Command::Underlay { .. }
+                | Command::BlockLibLoad { .. }
         )
     }
 
@@ -766,6 +786,12 @@ impl Command {
             Command::Terrain { path } => Some(format!("terrain ← {path}")),
             Command::OsmFile { path } => Some(format!("osm ← {path}")),
             Command::Underlay { path, .. } => Some(format!("underlay ← {path}")),
+            Command::BlockLibLoad { name, .. } => {
+                Some(format!("blockload ← library:{name}"))
+            }
+            Command::BlockLibSave { name, .. } => {
+                Some(format!("blocksave → library:{name}"))
+            }
             _ => None,
         }
     }
