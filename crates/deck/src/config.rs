@@ -45,6 +45,14 @@ pub struct DeckConfig {
     /// Literal key, or "env:VAR_NAME" to read from the environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Opt-in grammar-constrained decoding. When true, the `openai_compat`
+    /// cassette attaches a GBNF grammar (derived from the command registry) to
+    /// each request so local models can only emit real verbs inside real
+    /// ```draft fences. Sent as an extra `grammar` JSON field — llama.cpp's
+    /// server honours it; endpoints that don't (OpenAI proper) ignore it.
+    /// Leave false for cloud endpoints. Other cassettes ignore this flag.
+    #[serde(default)]
+    pub grammar: bool,
 }
 
 impl DeckConfig {
@@ -104,6 +112,7 @@ impl Default for DecksFile {
                     base_url: String::new(),
                     model: "sonnet".into(),
                     api_key: None,
+                    grammar: false,
                 },
                 DeckConfig {
                     name: "ollama".into(),
@@ -111,6 +120,8 @@ impl Default for DecksFile {
                     base_url: "http://localhost:11434/v1".into(),
                     model: "qwen3".into(),
                     api_key: None,
+                    // Local model — constrain decoding on by default.
+                    grammar: true,
                 },
                 DeckConfig {
                     name: "claude".into(),
@@ -118,6 +129,7 @@ impl Default for DecksFile {
                     base_url: "https://api.anthropic.com".into(),
                     model: "claude-sonnet-4-6".into(),
                     api_key: Some("env:ANTHROPIC_API_KEY".into()),
+                    grammar: false,
                 },
                 DeckConfig {
                     name: "kimi".into(),
@@ -125,6 +137,7 @@ impl Default for DecksFile {
                     base_url: "https://api.moonshot.ai/v1".into(),
                     model: "kimi-k2-0905-preview".into(),
                     api_key: Some("env:MOONSHOT_API_KEY".into()),
+                    grammar: false,
                 },
             ],
             active: 0,

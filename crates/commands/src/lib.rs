@@ -11,6 +11,7 @@ pub mod csv;
 pub mod dxf;
 mod error;
 mod exec;
+pub mod gbnf;
 pub mod geo;
 pub mod ifc;
 pub mod io;
