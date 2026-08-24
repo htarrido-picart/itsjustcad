@@ -15,6 +15,7 @@ mod mesh;
 mod primitives;
 mod section;
 mod solids;
+mod structsection;
 
 pub use aabb::Aabb;
 pub use bvh::{ray_triangle, Bvh, TriBvh};
@@ -25,7 +26,8 @@ pub use edges::{feature_edges, project_edges_behind, project_edges_onto};
 pub use mesh::{Mesh, RenderMesh};
 pub use primitives::{extrude_profile, make_box};
 pub use section::slice;
+pub use structsection::Section as StructSection;
 pub use solids::{
-    loft_profiles, pipe_curve, rail_revolve_profile, revolve_profile, sweep2_profile,
-    sweep_profile,
+    area_member, frame_member, loft_profiles, pipe_curve, rail_revolve_profile, revolve_profile,
+    sweep2_profile, sweep_profile,
 };

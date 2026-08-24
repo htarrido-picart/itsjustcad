@@ -81,6 +81,7 @@ pub fn top_menus(style: MenuStyle) -> Vec<(&'static str, Vec<Category>)> {
             ("Transform", vec![Category::Transform]),
             ("Dimension", vec![Category::Dimension]),
             ("Analyze", vec![Category::Analyze]),
+            ("Structure", vec![Category::Structure]),
             ("Tools", vec![Category::Annotate, Category::Tools]),
         ],
         // AutoCAD: File / Edit / View / Draw / Modify / Dimension / Format /
@@ -93,6 +94,7 @@ pub fn top_menus(style: MenuStyle) -> Vec<(&'static str, Vec<Category>)> {
             ("Modify", vec![Category::Transform, Category::Boolean]),
             ("Dimension", vec![Category::Dimension]),
             ("Format", vec![Category::Annotate]),
+            ("Structure", vec![Category::Structure]),
             // AutoCAD groups inquiry/analysis tools under Tools.
             ("Tools", vec![Category::Tools, Category::Analyze]),
         ],
@@ -206,8 +208,8 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// The 12 categories, for exhaustiveness checks.
-    const ALL_CATEGORIES: [Category; 12] = [
+    /// The 13 categories, for exhaustiveness checks.
+    const ALL_CATEGORIES: [Category; 13] = [
         Category::File,
         Category::Edit,
         Category::View,
@@ -219,6 +221,7 @@ mod tests {
         Category::Annotate,
         Category::Dimension,
         Category::Analyze,
+        Category::Structure,
         Category::Tools,
     ];
 
@@ -274,12 +277,15 @@ mod tests {
         let rhino: Vec<_> = top_menus(MenuStyle::Rhino).iter().map(|(t, _)| *t).collect();
         assert_eq!(
             rhino,
-            ["File", "Edit", "View", "Curve", "Solid", "Transform", "Dimension", "Analyze", "Tools"]
+            [
+                "File", "Edit", "View", "Curve", "Solid", "Transform", "Dimension", "Analyze",
+                "Structure", "Tools"
+            ]
         );
         let acad: Vec<_> = top_menus(MenuStyle::AutoCAD).iter().map(|(t, _)| *t).collect();
         assert_eq!(
             acad,
-            ["File", "Edit", "View", "Draw", "Modify", "Dimension", "Format", "Tools"]
+            ["File", "Edit", "View", "Draw", "Modify", "Dimension", "Format", "Structure", "Tools"]
         );
     }
 

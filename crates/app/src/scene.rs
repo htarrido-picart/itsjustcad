@@ -104,6 +104,8 @@ pub fn digest(doc: &Document) -> String {
                 "instance"
             }
             Geometry::Points { .. } => "pointcloud",
+            Geometry::Frame { kind, .. } => kind.label(),
+            Geometry::Area { kind, .. } => kind.label(),
         };
         let name = obj
             .name

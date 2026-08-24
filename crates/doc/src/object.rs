@@ -7,6 +7,8 @@ use kernel_mesh::{Aabb, Mesh};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::structure::Section;
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct ObjectId(pub Uuid);
@@ -115,6 +117,68 @@ pub enum Geometry {
     /// Decimated point cloud from a LAS import. Positions are world-space
     /// after applying LAS scale factors and offsets.
     Points { positions: Vec<DVec3> },
+    /// Structural frame member (beam or column): a line from `a` to `b` given a
+    /// named section swept along it, rolled by `orientation_deg`. The `mesh` is
+    /// the derived solid, kept so pick/move/export treat this like any solid.
+    Frame {
+        kind: FrameKind,
+        a: DVec3,
+        b: DVec3,
+        section: Section,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        material: Option<String>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        orientation_deg: f64,
+        mesh: Mesh,
+    },
+    /// Structural area member (slab or wall): a closed `boundary` extruded by
+    /// `thickness` along `dir`. The `mesh` is the derived solid.
+    Area {
+        kind: AreaKind,
+        boundary: Vec<DVec3>,
+        thickness: f64,
+        dir: DVec3,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        material: Option<String>,
+        mesh: Mesh,
+    },
+}
+
+/// Frame member ergonomic subtype. Both use the same underlying representation;
+/// the distinction drives defaults (beam ~horizontal, column ~vertical) and
+/// display/scheduling labels.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameKind {
+    Beam,
+    Column,
+}
+
+impl FrameKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            FrameKind::Beam => "beam",
+            FrameKind::Column => "column",
+        }
+    }
+}
+
+/// Area member ergonomic subtype (slab extrudes vertically, wall along its
+/// normal).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AreaKind {
+    Slab,
+    Wall,
+}
+
+impl AreaKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            AreaKind::Slab => "slab",
+            AreaKind::Wall => "wall",
+        }
+    }
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -146,6 +210,26 @@ impl Geometry {
             },
             Geometry::Instance { position, .. } => *position += d,
             Geometry::Points { positions } => positions.iter_mut().for_each(|p| *p += d),
+            Geometry::Frame { a, b, mesh, .. } => {
+                *a += d;
+                *b += d;
+                mesh.transform(glam::DMat4::from_translation(d));
+            }
+            Geometry::Area { boundary, mesh, .. } => {
+                boundary.iter_mut().for_each(|p| *p += d);
+                mesh.transform(glam::DMat4::from_translation(d));
+            }
+        }
+    }
+
+    /// The derived/backing triangle mesh for solid-facing consumers (export,
+    /// volume, section cuts). `None` for non-solid geometry.
+    pub fn mesh(&self) -> Option<&Mesh> {
+        match self {
+            Geometry::Mesh(m) | Geometry::Frame { mesh: m, .. } | Geometry::Area { mesh: m, .. } => {
+                Some(m)
+            }
+            _ => None,
         }
     }
 
@@ -198,6 +282,18 @@ impl Geometry {
                 positions.iter_mut().for_each(|p| *p = m.transform_point3(*p));
                 true
             }
+            Geometry::Frame { a, b, mesh, .. } => {
+                *a = m.transform_point3(*a);
+                *b = m.transform_point3(*b);
+                mesh.transform(*m);
+                true
+            }
+            Geometry::Area { boundary, dir, mesh, .. } => {
+                boundary.iter_mut().for_each(|p| *p = m.transform_point3(*p));
+                *dir = m.transform_vector3(*dir);
+                mesh.transform(*m);
+                true
+            }
         }
     }
 
@@ -214,6 +310,7 @@ impl Geometry {
                 Aabb::from_points(vec![*position - DVec3::splat(s), *position + DVec3::splat(s)])
             }
             Geometry::Points { positions } => Aabb::from_points(positions.clone()),
+            Geometry::Frame { mesh, .. } | Geometry::Area { mesh, .. } => mesh.aabb(),
         }
     }
 }

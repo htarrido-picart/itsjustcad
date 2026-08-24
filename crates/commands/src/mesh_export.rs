@@ -42,7 +42,9 @@ fn collect(doc: &Document) -> (Vec<MeshPart>, Vec<LinePart>) {
         // SceneObject names are optional; fall back to a stable per-object label.
         let name = obj.name.clone().unwrap_or_else(|| format!("object_{}", meshes.len() + lines.len()));
         match &obj.geometry {
-            Geometry::Mesh(m) => meshes.push(MeshPart {
+            Geometry::Mesh(m)
+            | Geometry::Frame { mesh: m, .. }
+            | Geometry::Area { mesh: m, .. } => meshes.push(MeshPart {
                 name,
                 positions: m.positions().to_vec(),
                 faces: m.faces().to_vec(),

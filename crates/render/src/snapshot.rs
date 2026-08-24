@@ -147,7 +147,11 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
         let layer_color = style.and_then(|s| s.color);
         let selected = doc.selection.contains(&obj.id);
         match &obj.geometry {
-            Geometry::Mesh(mesh) => {
+            // Frame/area structural members carry a derived mesh; render them
+            // exactly like a solid mesh.
+            Geometry::Mesh(mesh)
+            | Geometry::Frame { mesh, .. }
+            | Geometry::Area { mesh, .. } => {
                 let color = resolve_color(obj, layer_color, theme, selected, mode, true);
                 scene.meshes.push((mesh.to_render(), color));
                 // Feature edges for the wireframe/x-ray/ghosted display modes.

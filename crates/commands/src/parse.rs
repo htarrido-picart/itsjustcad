@@ -3,7 +3,8 @@
 
 use glam::DVec3;
 use itsjustcad_doc::{
-    HatchPattern, PaperSize, Units, ViewDirection, METERS_PER_FOOT, METERS_PER_INCH,
+    AreaKind, FrameKind, HatchPattern, PaperSize, Section as StructSection, Units, ViewDirection,
+    METERS_PER_FOOT, METERS_PER_INCH,
 };
 
 use crate::error::ParseError;
@@ -331,6 +332,17 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             Ok(Command::Intersect { id: None, targets: sel })
         }
         "section" => {
+            // Two commands share the "section" verb: the structural section
+            // definition ("section <name> rect|circle|iwf|pipe ...") and the
+            // mesh plane-cut ("section <selector> <point> <normal>"). Disambiguate
+            // on the shape keyword in the second position.
+            const SHAPES: [&str; 8] = [
+                "rect", "rectangular", "circle", "circular", "iwf", "wideflange", "pipe",
+                "square",
+            ];
+            if args.get(1).is_some_and(|t| SHAPES.contains(t)) {
+                return parse_section(&args);
+            }
             let (sel, rest) = selector(&args, "section")?;
             let [p, n] = take::<2>("section", "a plane point and a normal after the selector", rest)
                 .map_err(|_| {
@@ -934,6 +946,24 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             }),
             _ => wrong("blocksave", "a block name", &args),
         },
+        "material" => {
+            let [name, e, d] =
+                take::<3>("material", "a name, elastic modulus E and density", &args)?;
+            Ok(Command::DefMaterial {
+                name: name.to_string(),
+                elastic_modulus_e: number(e)?,
+                density: number(d)?,
+            })
+        }
+        "grid" => parse_grid(&args),
+        "story" | "level" => {
+            let [name, elev] = take::<2>("story", "a name and an elevation", &args)?;
+            Ok(Command::DefStory { name: name.to_string(), elevation: number(elev)? })
+        }
+        "beam" => parse_frame(FrameKind::Beam, &args),
+        "column" => parse_frame(FrameKind::Column, &args),
+        "slab" => parse_area(AreaKind::Slab, &args),
+        "wall" => parse_area(AreaKind::Wall, &args),
         "undo" => Ok(Command::Undo),
         "redo" => Ok(Command::Redo),
         "amend" => match &args[..] {
@@ -959,6 +989,158 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
 const DEFAULT_DIM_OFFSET: f64 = 0.5;
 /// Default annotation text height (meters).
 const DEFAULT_TEXT_HEIGHT: f64 = 0.2;
+
+/// `section <name> rect|circle|iwf|pipe <dims...>`
+fn parse_section(args: &[&str]) -> Result<Command, ParseError> {
+    let (name, rest) = args
+        .split_first()
+        .ok_or_else(|| wrong_err("section", "a name then a profile shape", args))?;
+    let section = match rest {
+        ["rect", w, h] | ["rectangular", w, h] => {
+            StructSection::Rectangular { w: number(w)?, h: number(h)? }
+        }
+        ["circle", d] | ["circular", d] => StructSection::Circular { d: number(d)? },
+        ["iwf", d, bf, tf, tw] | ["wideflange", d, bf, tf, tw] => StructSection::IWideFlange {
+            d: number(d)?,
+            bf: number(bf)?,
+            tf: number(tf)?,
+            tw: number(tw)?,
+        },
+        ["pipe", d, t] => StructSection::Pipe { d: number(d)?, t: number(t)? },
+        _ => {
+            return wrong(
+                "section",
+                "a name then rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t>",
+                args,
+            )
+        }
+    };
+    Ok(Command::DefSection { name: (*name).to_string(), section })
+}
+
+/// `grid <name> x A:0 B:5 ... y 1:0 2:4 ... [levels 0,3,6]`
+fn parse_grid(args: &[&str]) -> Result<Command, ParseError> {
+    let (name, mut rest) = args
+        .split_first()
+        .ok_or_else(|| wrong_err("grid", "a name, x axes and y axes", args))?;
+    let mut x_axes = Vec::new();
+    let mut y_axes = Vec::new();
+    let mut levels = Vec::new();
+    // Walk tokens; keywords x/y/levels switch the active bucket.
+    #[derive(PartialEq)]
+    enum Bucket {
+        None,
+        X,
+        Y,
+        Levels,
+    }
+    let mut bucket = Bucket::None;
+    while let Some((&tok, tail)) = rest.split_first() {
+        rest = tail;
+        match tok {
+            "x" => bucket = Bucket::X,
+            "y" => bucket = Bucket::Y,
+            "levels" | "level" => bucket = Bucket::Levels,
+            _ => match bucket {
+                Bucket::X | Bucket::Y => {
+                    let (label, coord) = tok
+                        .split_once(':')
+                        .ok_or_else(|| wrong_err("grid", "axes as label:coord (e.g. A:0)", args))?;
+                    let entry = (label.to_string(), number(coord)?);
+                    if bucket == Bucket::X {
+                        x_axes.push(entry);
+                    } else {
+                        y_axes.push(entry);
+                    }
+                }
+                Bucket::Levels => {
+                    for c in tok.split(',') {
+                        levels.push(number(c)?);
+                    }
+                }
+                Bucket::None => {
+                    return wrong("grid", "'x' or 'y' before axis entries", args)
+                }
+            },
+        }
+    }
+    if x_axes.is_empty() && y_axes.is_empty() {
+        return wrong("grid", "at least one x or y axis (e.g. x A:0 B:5)", args);
+    }
+    Ok(Command::DefGrid { name: (*name).to_string(), x_axes, y_axes, levels })
+}
+
+/// Shared trailing `[material <m>]` and `[rot <deg>]` options for members.
+fn member_options<'a>(
+    mut rest: &'a [&'a str],
+    command: &'static str,
+    args: &[&str],
+) -> Result<(Option<String>, Option<f64>), ParseError> {
+    let mut material = None;
+    let mut rot = None;
+    while let Some((&tok, tail)) = rest.split_first() {
+        match tok {
+            "material" | "mat" => {
+                let (&m, t2) = tail
+                    .split_first()
+                    .ok_or_else(|| wrong_err(command, "a material name after 'material'", args))?;
+                material = Some(m.to_string());
+                rest = t2;
+            }
+            "rot" | "orientation" => {
+                let (&d, t2) = tail
+                    .split_first()
+                    .ok_or_else(|| wrong_err(command, "an angle after 'rot'", args))?;
+                rot = Some(number(d)?);
+                rest = t2;
+            }
+            _ => return Err(wrong_err(command, "optional 'material <m>' and 'rot <deg>'", args)),
+        }
+    }
+    Ok((material, rot))
+}
+
+/// `beam|column <a> <b> <section> [material <m>] [rot <deg>]`
+fn parse_frame(kind: FrameKind, args: &[&str]) -> Result<Command, ParseError> {
+    let command = kind.label();
+    let [a, b, section] = match args {
+        [a, b, s, ..] => [*a, *b, *s],
+        _ => {
+            return wrong(command, "two endpoints and a section name", args)
+        }
+    };
+    let (material, orientation_deg) = member_options(&args[3..], command, args)?;
+    Ok(Command::FrameMember {
+        id: None,
+        kind,
+        a: point(a)?,
+        b: point(b)?,
+        section: section.to_string(),
+        material,
+        orientation_deg,
+    })
+}
+
+/// `slab|wall <p1> <p2> <p3> ... thick <t> [material <m>]`
+fn parse_area(kind: AreaKind, args: &[&str]) -> Result<Command, ParseError> {
+    let command = kind.label();
+    // Split at the 'thick' keyword: everything before is boundary points.
+    let Some(tpos) = args.iter().position(|&t| t == "thick" || t == "thickness") else {
+        return wrong(command, "boundary points then 'thick <t>'", args);
+    };
+    let pts = &args[..tpos];
+    if pts.len() < 3 {
+        return wrong(command, "at least 3 boundary points before 'thick'", args);
+    }
+    let after = &args[tpos + 1..];
+    let (&t, rest) = after
+        .split_first()
+        .ok_or_else(|| wrong_err(command, "a thickness after 'thick'", args))?;
+    let thickness = number(t)?;
+    let (material, _rot) = member_options(rest, command, args)?;
+    let boundary = pts.iter().map(|p| point(p)).collect::<Result<_, _>>()?;
+    Ok(Command::AreaMember { id: None, kind, boundary, thickness, material })
+}
 
 fn take<'a, const N: usize>(
     command: &'static str,
@@ -2257,5 +2439,119 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, back);
+    }
+
+    // ---- structural members ----------------------------------------------
+
+    #[test]
+    fn section_shapes_parse() {
+        assert!(matches!(
+            parse("section c rect 0.4 0.6").unwrap(),
+            Command::DefSection { section: StructSection::Rectangular { .. }, .. }
+        ));
+        assert!(matches!(
+            parse("section p pipe 0.2 0.01").unwrap(),
+            Command::DefSection { section: StructSection::Pipe { .. }, .. }
+        ));
+        assert!(matches!(
+            parse("section w iwf 0.31 0.2 0.013 0.008").unwrap(),
+            Command::DefSection { section: StructSection::IWideFlange { .. }, .. }
+        ));
+        assert!(parse("section c triangle 1 1").is_err());
+    }
+
+    #[test]
+    fn material_parses() {
+        let Command::DefMaterial { name, elastic_modulus_e, density } =
+            parse("material steel 200e9 7850").unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(name, "steel");
+        assert!((elastic_modulus_e - 200e9).abs() < 1.0);
+        assert!((density - 7850.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn grid_parses_axes_and_levels() {
+        let Command::DefGrid { name, x_axes, y_axes, levels } =
+            parse("grid main x A:0 B:6 y 1:0 2:5 levels 0,3.5").unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(name, "main");
+        assert_eq!(x_axes, vec![("A".to_string(), 0.0), ("B".to_string(), 6.0)]);
+        assert_eq!(y_axes, vec![("1".to_string(), 0.0), ("2".to_string(), 5.0)]);
+        assert_eq!(levels, vec![0.0, 3.5]);
+        assert!(parse("grid empty").is_err());
+    }
+
+    #[test]
+    fn story_parses() {
+        assert!(matches!(
+            parse("story L1 3.5").unwrap(),
+            Command::DefStory { .. }
+        ));
+        assert!(matches!(
+            parse("level L1 3.5").unwrap(),
+            Command::DefStory { .. }
+        ));
+    }
+
+    #[test]
+    fn beam_and_column_parse_with_options() {
+        let Command::FrameMember { kind, section, material, orientation_deg, .. } =
+            parse("beam 0,0,3 6,0,3 W12 material steel rot 90").unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(kind, FrameKind::Beam);
+        assert_eq!(section, "W12");
+        assert_eq!(material.as_deref(), Some("steel"));
+        assert_eq!(orientation_deg, Some(90.0));
+
+        assert!(matches!(
+            parse("column 0,0,0 0,0,3.5 c").unwrap(),
+            Command::FrameMember { kind: FrameKind::Column, .. }
+        ));
+        assert!(parse("beam 0,0,0 c").is_err());
+    }
+
+    #[test]
+    fn slab_and_wall_parse() {
+        let Command::AreaMember { kind, boundary, thickness, .. } =
+            parse("slab 0,0 6,0 6,4 0,4 thick 0.2").unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(kind, AreaKind::Slab);
+        assert_eq!(boundary.len(), 4);
+        assert!((thickness - 0.2).abs() < 1e-9);
+
+        assert!(matches!(
+            parse("wall 0,0 6,0 6,0.2 0,0.2 thick 3").unwrap(),
+            Command::AreaMember { kind: AreaKind::Wall, .. }
+        ));
+        // too few points
+        assert!(parse("slab 0,0 6,0 thick 0.2").is_err());
+        // missing thickness keyword
+        assert!(parse("slab 0,0 6,0 6,4 0,4").is_err());
+    }
+
+    #[test]
+    fn structural_commands_json_roundtrip() {
+        for line in [
+            "section w iwf 0.31 0.2 0.013 0.008",
+            "material steel 200e9 7850",
+            "grid main x A:0 B:6 y 1:0 levels 0,3.5",
+            "story L1 0",
+            "beam 0,0,3 6,0,3 W12 material steel rot 45",
+            "slab 0,0 6,0 6,4 0,4 thick 0.2",
+        ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "roundtrip failed for: {line}");
+        }
     }
 }

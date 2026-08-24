@@ -43,7 +43,9 @@ fn collect_segments(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
                 segs.push((last, first));
             }
         }
-        Geometry::Mesh(mesh) => {
+        Geometry::Mesh(mesh)
+        | Geometry::Frame { mesh, .. }
+        | Geometry::Area { mesh, .. } => {
             segs.extend(crate::dxf::mesh_feature_edges(mesh));
         }
         Geometry::Annotation(Annotation::LinearDim { a, b, offset }) => {

@@ -2,7 +2,10 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 use glam::DVec3;
-use itsjustcad_doc::{HatchPattern, NamedView, ObjectId, PaperSize, Units, ViewDirection};
+use itsjustcad_doc::{
+    AreaKind, FrameKind, HatchPattern, NamedView, ObjectId, PaperSize, Section as StructSection,
+    Units, ViewDirection,
+};
 use serde::{Deserialize, Serialize};
 
 /// Object selector. `Last(n)` ("last", "last 3") is the workhorse for both the
@@ -694,6 +697,61 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         description: String,
     },
+    // -- structure (grids, stories, sections, materials, frame/area members) --
+    /// Define (or replace) a named structural section (profile). Stored on the
+    /// document; referenced by frame members.
+    DefSection {
+        name: String,
+        section: StructSection,
+    },
+    /// Define (or replace) a named structural material. Stored, never analyzed.
+    DefMaterial {
+        name: String,
+        elastic_modulus_e: f64,
+        density: f64,
+    },
+    /// Define (or replace) a named reference grid: labeled X/Y axes at fixed
+    /// coordinates, plus optional level lines. Rendered as reference geometry.
+    DefGrid {
+        name: String,
+        x_axes: Vec<(String, f64)>,
+        y_axes: Vec<(String, f64)>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        levels: Vec<f64>,
+    },
+    /// Define (or replace) a building story/level by name and elevation.
+    DefStory {
+        name: String,
+        elevation: f64,
+    },
+    /// Frame member (beam or column): a line member with a named section swept
+    /// along it, rolled by `orientation_deg`. `beam` and `column` are two verbs
+    /// mapping to this one command; the `kind` disambiguates. `id` is filled at
+    /// apply time and written back for replay stability.
+    FrameMember {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        kind: FrameKind,
+        a: DVec3,
+        b: DVec3,
+        section: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        material: Option<String>,
+        #[serde(default, skip_serializing_if = "is_zero_opt")]
+        orientation_deg: Option<f64>,
+    },
+    /// Area member (slab or wall): a closed boundary extruded by `thickness`.
+    /// `slab` extrudes vertically (+Z), `wall` extrudes along its in-plane
+    /// normal. `id` is filled at apply time and written back for replay.
+    AreaMember {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        kind: AreaKind,
+        boundary: Vec<DVec3>,
+        thickness: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        material: Option<String>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild
@@ -722,6 +780,10 @@ pub enum OptionOp {
     List,
     /// Delete branch `name` (never the current branch).
     Delete { name: String },
+}
+
+fn is_zero_opt(v: &Option<f64>) -> bool {
+    v.is_none_or(|x| x.abs() < 1e-12)
 }
 
 impl Command {

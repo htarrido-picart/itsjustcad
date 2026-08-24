@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_mesh::Aabb;
 
 use crate::{
-    BlockGeometry, GeoLocation, LayerStyle, NamedView, ObjectId, SceneObject, Sheet, SunPosition,
-    Underlay, Units, DEFAULT_LAYER,
+    BlockGeometry, GeoLocation, Grid, LayerStyle, Material, NamedView, ObjectId, SceneObject,
+    Section, Sheet, Story, SunPosition, Underlay, Units, DEFAULT_LAYER,
 };
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
@@ -57,6 +57,19 @@ pub struct Document {
     /// environmental analyses (`shadowstudy`, `sunhours`). Logged via a
     /// `location` op so saved files replay it.
     pub location: Option<GeoLocation>,
+    /// Named structural sections (profiles) referenced by frame members.
+    /// `serde(default)` keeps pre-structural files loading.
+    #[serde(default)]
+    pub sections: BTreeMap<String, Section>,
+    /// Named structural materials (stored, never analyzed).
+    #[serde(default)]
+    pub materials: BTreeMap<String, Material>,
+    /// Named reference grids (axis lines + optional levels).
+    #[serde(default)]
+    pub grids: BTreeMap<String, Grid>,
+    /// Building stories/levels, in creation order.
+    #[serde(default)]
+    pub stories: Vec<Story>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -78,6 +91,10 @@ impl Default for Document {
             underlay: None,
             sun: None,
             location: None,
+            sections: BTreeMap::new(),
+            materials: BTreeMap::new(),
+            grids: BTreeMap::new(),
+            stories: Vec::new(),
             generation: 0,
         }
     }
@@ -257,6 +274,22 @@ mod tests {
         assert!(style.color.is_none());
         assert!(doc.layer_visible(DEFAULT_LAYER));
         assert!(doc.layer_visible("never-created"), "unknown layers read visible");
+    }
+
+    #[test]
+    fn pre_structural_document_json_loads() {
+        // A snapshot written before structural tables existed omits the
+        // sections/materials/grids/stories keys entirely.
+        let mut v = serde_json::to_value(Document::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        for key in ["sections", "materials", "grids", "stories"] {
+            obj.remove(key);
+        }
+        let back: Document = serde_json::from_value(v).unwrap();
+        assert!(back.sections.is_empty());
+        assert!(back.materials.is_empty());
+        assert!(back.grids.is_empty());
+        assert!(back.stories.is_empty());
     }
 
     #[test]

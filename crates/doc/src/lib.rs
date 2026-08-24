@@ -10,16 +10,18 @@ pub mod hatch;
 pub mod hershey;
 mod object;
 mod sheet;
+mod structure;
 mod underlay;
 mod units;
 mod view;
 
 pub use document::Document;
 pub use object::{
-    Annotation, BlockGeometry, Geometry, HatchPattern, LayerStyle, ObjectId, SceneObject,
-    DEFAULT_LAYER,
+    Annotation, AreaKind, BlockGeometry, FrameKind, Geometry, HatchPattern, LayerStyle, ObjectId,
+    SceneObject, DEFAULT_LAYER,
 };
 pub use sheet::{PaperSize, ScheduleRow, Sheet, SheetDim, SheetTable, SheetView, ViewDirection};
+pub use structure::{Grid, Material, Section, Story};
 pub use underlay::Underlay;
 pub use units::{
     format_area, format_length, format_volume, Units, METERS_PER_FOOT, METERS_PER_INCH,

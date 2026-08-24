@@ -57,7 +57,9 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
                 out.push((last, first));
             }
         }
-        Geometry::Mesh(mesh) => {
+        Geometry::Mesh(mesh)
+        | Geometry::Frame { mesh, .. }
+        | Geometry::Area { mesh, .. } => {
             out.extend(crate::dxf::mesh_feature_edges(mesh));
         }
         // LinearDim annotations: render the three dim-line segments (two witness

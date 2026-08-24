@@ -34,7 +34,7 @@
 
 use glam::{DMat4, DVec3};
 use kernel_mesh::Mesh;
-use itsjustcad_doc::{Document, Geometry, Units, METERS_PER_FOOT, METERS_PER_INCH};
+use itsjustcad_doc::{Document, Units, METERS_PER_FOOT, METERS_PER_INCH};
 
 // ============================================================================
 // EXPORT
@@ -53,7 +53,7 @@ struct Part {
 fn collect(doc: &Document) -> Vec<Part> {
     let mut parts = Vec::new();
     for obj in doc.objects() {
-        if let Geometry::Mesh(m) = &obj.geometry {
+        if let Some(m) = obj.geometry.mesh() {
             if m.faces().is_empty() {
                 continue;
             }

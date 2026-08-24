@@ -5,8 +5,9 @@ use glam::DVec3;
 use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
 use itsjustcad_doc::{
-    format_area, format_length, format_volume, Annotation, Document, Geometry, LayerStyle,
-    NamedView, ObjectId, SceneObject, ScheduleRow, SheetDim, SheetTable, Underlay, Units,
+    format_area, format_length, format_volume, Annotation, Document, Geometry, Grid, LayerStyle,
+    Material, NamedView, ObjectId, SceneObject, ScheduleRow, SheetDim, SheetTable, Story, Underlay,
+    Units,
 };
 
 use std::collections::BTreeMap;
@@ -117,6 +118,24 @@ enum Inverse {
         /// Previous definition (None if newly created).
         prev: Option<Vec<itsjustcad_doc::BlockGeometry>>,
     },
+    /// `section`: restore the previous named section binding (None if new).
+    SectionDef {
+        name: String,
+        prev: Option<itsjustcad_doc::Section>,
+    },
+    /// `material`: restore the previous named material binding (None if new).
+    MaterialDef {
+        name: String,
+        prev: Option<Material>,
+    },
+    /// `grid`: restore the previous named grid binding (None if new).
+    GridDef {
+        name: String,
+        prev: Option<Grid>,
+    },
+    /// `story`: restore the previous story list (a story replace/append edits
+    /// the whole list, so snapshot it).
+    StoryList(Vec<Story>),
 }
 
 /// Owns the document plus its op-log; the single mutation path for both the
@@ -371,6 +390,43 @@ impl Session {
                 for (obj, index) in consumed.iter().rev() {
                     self.doc.restore(obj.clone(), *index);
                 }
+            }
+            Inverse::SectionDef { name, prev } => {
+                match prev {
+                    Some(s) => {
+                        self.doc.sections.insert(name.clone(), *s);
+                    }
+                    None => {
+                        self.doc.sections.remove(name);
+                    }
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::MaterialDef { name, prev } => {
+                match prev {
+                    Some(m) => {
+                        self.doc.materials.insert(name.clone(), *m);
+                    }
+                    None => {
+                        self.doc.materials.remove(name);
+                    }
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::GridDef { name, prev } => {
+                match prev {
+                    Some(g) => {
+                        self.doc.grids.insert(name.clone(), g.clone());
+                    }
+                    None => {
+                        self.doc.grids.remove(name);
+                    }
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::StoryList(prev) => {
+                self.doc.stories = prev.clone();
+                self.doc.generation += 1;
             }
         }
         Ok(ApplyOutcome {
@@ -1069,7 +1125,9 @@ fn boolean_inputs(
         .map(|id| {
             let obj = doc.get(*id).expect("resolved id exists");
             match &obj.geometry {
-                Geometry::Mesh(m) => Ok(m.clone()),
+                Geometry::Mesh(m)
+                | Geometry::Frame { mesh: m, .. }
+                | Geometry::Area { mesh: m, .. } => Ok(m.clone()),
                 Geometry::Curve(_) => Err(ExecError::Invalid(format!(
                     "'{id}' is a curve; booleans need meshes — extrude it first"
                 ))),
@@ -1181,18 +1239,20 @@ pub(crate) fn build_schedule_rows(doc: &Document, layer: Option<&str>) -> Vec<Sc
                 Geometry::Annotation(_) => "annotation",
                 Geometry::Instance { .. } => "instance",
                 Geometry::Points { .. } => "pointcloud",
+                Geometry::Frame { kind, .. } => kind.label(),
+                Geometry::Area { kind, .. } => kind.label(),
             };
             let area_m2 = match &o.geometry {
                 Geometry::Curve(c) if c.is_closed() => {
                     shoelace_area(&c.tessellate(PROFILE_TOL))
                 }
-                Geometry::Mesh(m) => mesh_surface_area(m),
-                _ => 0.0,
+                _ => o.geometry.mesh().map(mesh_surface_area).unwrap_or(0.0),
             };
-            let volume_m3 = match &o.geometry {
-                Geometry::Mesh(m) => kernel_mesh::signed_volume(m),
-                _ => 0.0,
-            };
+            let volume_m3 = o
+                .geometry
+                .mesh()
+                .map(kernel_mesh::signed_volume)
+                .unwrap_or(0.0);
             ScheduleRow {
                 id: o.id.short(),
                 name: o.name.clone().unwrap_or_else(|| o.id.short()),
@@ -3749,7 +3809,9 @@ fn apply_forward(
                             "'{id}' is an open curve — area needs a closed curve or a mesh"
                         )))
                     }
-                    Geometry::Mesh(m) => mesh_surface_area(m),
+                    Geometry::Mesh(m)
+                    | Geometry::Frame { mesh: m, .. }
+                    | Geometry::Area { mesh: m, .. } => mesh_surface_area(m),
                     Geometry::Annotation(_) => {
                         return Err(ExecError::Invalid(format!(
                             "'{id}' is an annotation — area needs a closed curve or a mesh"
@@ -3785,7 +3847,9 @@ fn apply_forward(
             let mut total = 0.0;
             for id in &ids {
                 match &doc.get(*id).expect("resolved").geometry {
-                    Geometry::Mesh(m) => total += kernel_mesh::signed_volume(m),
+                    Geometry::Mesh(m)
+                    | Geometry::Frame { mesh: m, .. }
+                    | Geometry::Area { mesh: m, .. } => total += kernel_mesh::signed_volume(m),
                     Geometry::Curve(_) => {
                         return Err(ExecError::Invalid(format!(
                             "'{id}' is a curve; volume needs meshes — extrude it first"
@@ -4007,7 +4071,9 @@ fn apply_forward(
                     .filter_map(|id| {
                         let obj = doc.get(*id)?;
                         Some(match &obj.geometry {
-                            Geometry::Mesh(m) => BlockGeometry::Mesh(m.clone()),
+                            Geometry::Mesh(m)
+                            | Geometry::Frame { mesh: m, .. }
+                            | Geometry::Area { mesh: m, .. } => BlockGeometry::Mesh(m.clone()),
                             Geometry::Curve(c) => BlockGeometry::Curve(c.clone()),
                             Geometry::Annotation(a) => BlockGeometry::Annotation(a.clone()),
                             // Instances and point clouds within a block are skipped.
@@ -4158,6 +4224,179 @@ fn apply_forward(
                 },
             ))
         }
+        Command::DefSection { name, section } => {
+            let prev = doc.sections.insert(name.clone(), section);
+            doc.generation += 1;
+            let msg = format!("section '{name}' defined");
+            Ok((
+                Command::DefSection { name: name.clone(), section },
+                Inverse::SectionDef { name, prev },
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::DefMaterial { name, elastic_modulus_e, density } => {
+            let prev = doc
+                .materials
+                .insert(name.clone(), Material { elastic_modulus_e, density });
+            doc.generation += 1;
+            let msg = format!("material '{name}' (E={elastic_modulus_e}, ρ={density})");
+            Ok((
+                Command::DefMaterial { name: name.clone(), elastic_modulus_e, density },
+                Inverse::MaterialDef { name, prev },
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::DefGrid { name, x_axes, y_axes, levels } => {
+            let grid = Grid {
+                x_axes: x_axes.clone(),
+                y_axes: y_axes.clone(),
+                levels: levels.clone(),
+            };
+            let prev = doc.grids.insert(name.clone(), grid);
+            doc.generation += 1;
+            let msg = format!(
+                "grid '{name}' ({} x-axes, {} y-axes, {} levels)",
+                x_axes.len(),
+                y_axes.len(),
+                levels.len()
+            );
+            Ok((
+                Command::DefGrid { name: name.clone(), x_axes, y_axes, levels },
+                Inverse::GridDef { name, prev },
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::DefStory { name, elevation } => {
+            let prev = doc.stories.clone();
+            // Replace by name if it already exists, else append; keep sorted by
+            // elevation so level lists read bottom-to-top.
+            if let Some(s) = doc.stories.iter_mut().find(|s| s.name == name) {
+                s.elevation = elevation;
+            } else {
+                doc.stories.push(Story { name: name.clone(), elevation });
+            }
+            doc.stories.sort_by(|a, b| a.elevation.total_cmp(&b.elevation));
+            doc.generation += 1;
+            Ok((
+                Command::DefStory { name: name.clone(), elevation },
+                Inverse::StoryList(prev),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("story '{name}' at {elevation} m"),
+                },
+            ))
+        }
+        Command::FrameMember { id, kind, a, b, section, material, orientation_deg } => {
+            if (b - a).length() < 1e-9 {
+                return Err(ExecError::Invalid(
+                    "frame member endpoints coincide (zero-length member)".into(),
+                ));
+            }
+            let sec = *doc.sections.get(&section).ok_or_else(|| {
+                ExecError::Invalid(format!(
+                    "no section named '{section}' (define one with 'section {section} rect ...')"
+                ))
+            })?;
+            if let Some(m) = &material
+                && !doc.materials.contains_key(m)
+            {
+                return Err(ExecError::Invalid(format!(
+                    "no material named '{m}' (define one with 'material {m} <E> <density>')"
+                )));
+            }
+            let orient = orientation_deg.unwrap_or(0.0);
+            let mesh = kernel_mesh::frame_member(&sec.boundary(), a, b, orient.to_radians());
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                geometry: Geometry::Frame {
+                    kind,
+                    a,
+                    b,
+                    section: sec,
+                    material: material.clone(),
+                    orientation_deg: orient,
+                    mesh,
+                },
+            });
+            Ok((
+                Command::FrameMember {
+                    id: Some(id),
+                    kind,
+                    a,
+                    b,
+                    section,
+                    material,
+                    orientation_deg,
+                },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("{} {id} ({:.2} m)", kind.label(), (b - a).length()),
+                },
+            ))
+        }
+        Command::AreaMember { id, kind, boundary, thickness, material } => {
+            use itsjustcad_doc::AreaKind;
+            if boundary.len() < 3 {
+                return Err(ExecError::Invalid(
+                    "area member needs a closed boundary of at least 3 points".into(),
+                ));
+            }
+            if thickness <= 0.0 {
+                return Err(ExecError::Invalid("area member thickness must be positive".into()));
+            }
+            if let Some(m) = &material
+                && !doc.materials.contains_key(m)
+            {
+                return Err(ExecError::Invalid(format!(
+                    "no material named '{m}' (define one with 'material {m} <E> <density>')"
+                )));
+            }
+            // Slab extrudes up (+Z); wall extrudes along its in-plane normal
+            // (boundary plane normal projected onto XY, rotated 90°). For a
+            // typical vertical wall drawn as a footprint line the normal is
+            // horizontal; fall back to +Z if the boundary is degenerate.
+            let dir = match kind {
+                AreaKind::Slab => DVec3::Z,
+                AreaKind::Wall => wall_normal(&boundary),
+            };
+            let mesh = kernel_mesh::area_member(&boundary, dir, thickness);
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                geometry: Geometry::Area {
+                    kind,
+                    boundary: boundary.clone(),
+                    thickness,
+                    dir,
+                    material: material.clone(),
+                    mesh,
+                },
+            });
+            Ok((
+                Command::AreaMember {
+                    id: Some(id),
+                    kind,
+                    boundary,
+                    thickness,
+                    material,
+                },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("{} {id} (t={thickness} m)", kind.label()),
+                },
+            ))
+        }
         Command::Undo
         | Command::Redo
         | Command::Amend { .. }
@@ -4168,6 +4407,27 @@ fn apply_forward(
             unreachable!("handled in Session::run")
         }
     }
+}
+
+/// Extrusion direction for a wall: the boundary's plane normal. A footprint
+/// drawn flat in XY has a +Z normal, which would make it a slab; so for walls
+/// we prefer the horizontal normal of the footprint's dominant edge. Falls back
+/// to +Z when the boundary has no usable in-plane extent.
+fn wall_normal(boundary: &[DVec3]) -> DVec3 {
+    // Longest edge direction, rotated 90° in XY, gives the wall's thickness
+    // direction (perpendicular to the wall run, horizontal).
+    let mut best = DVec3::ZERO;
+    let mut best_len = 0.0;
+    for i in 0..boundary.len() {
+        let e = boundary[(i + 1) % boundary.len()] - boundary[i];
+        let l = e.length();
+        if l > best_len {
+            best_len = l;
+            best = e;
+        }
+    }
+    let n = DVec3::new(-best.y, best.x, 0.0);
+    if n.length() < 1e-9 { DVec3::Z } else { n.normalize() }
 }
 
 fn describe(cmd: &Command) -> &'static str {
@@ -4264,6 +4524,12 @@ fn describe(cmd: &Command) -> &'static str {
         Command::BlockLibList => "blocklib",
         Command::BlockLibLoad { .. } => "blockload",
         Command::BlockLibSave { .. } => "blocksave",
+        Command::DefSection { .. } => "section",
+        Command::DefMaterial { .. } => "material",
+        Command::DefGrid { .. } => "grid",
+        Command::DefStory { .. } => "story",
+        Command::FrameMember { kind, .. } => kind.label(),
+        Command::AreaMember { kind, .. } => kind.label(),
         Command::Undo => "undo",
         Command::Redo => "redo",
         Command::Amend { .. } => "amend",
@@ -7130,4 +7396,163 @@ mod tests {
         assert!(err.to_string().contains("no option 'nope'"), "{err}");
     }
 
+    // ---- structural members ----------------------------------------------
+
+    /// Replay the saved log into a fresh session; the doc must match bit-for-bit.
+    fn assert_replay_stable(s: &Session) {
+        let replayed = Session::replay(s.save_log()).expect("replay succeeds");
+        assert_eq!(replayed.doc, s.doc, "replay doc == live doc");
+    }
+
+    #[test]
+    fn section_define_exec_undo_replay() {
+        let mut s = Session::default();
+        run(&mut s, "section col rect 0.4 0.6");
+        assert!(s.doc.sections.contains_key("col"));
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.sections.is_empty());
+        run(&mut s, "redo");
+        assert!(s.doc.sections.contains_key("col"));
+    }
+
+    #[test]
+    fn material_define_exec_undo_replay() {
+        let mut s = Session::default();
+        run(&mut s, "material steel 200e9 7850");
+        let m = s.doc.materials.get("steel").expect("material defined");
+        assert!((m.elastic_modulus_e - 200e9).abs() < 1.0);
+        assert!((m.density - 7850.0).abs() < 1e-9);
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.materials.is_empty());
+    }
+
+    #[test]
+    fn grid_define_exec_undo_replay() {
+        let mut s = Session::default();
+        run(&mut s, "grid main x A:0 B:6 C:12 y 1:0 2:5 levels 0,3.5,7");
+        let g = s.doc.grids.get("main").expect("grid defined");
+        assert_eq!(g.x_axes.len(), 3);
+        assert_eq!(g.y_axes.len(), 2);
+        assert_eq!(g.levels.len(), 3);
+        assert_eq!(g.x_axes[1], ("B".to_string(), 6.0));
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.grids.is_empty());
+    }
+
+    #[test]
+    fn story_define_sorts_and_undo_replay() {
+        let mut s = Session::default();
+        run(&mut s, "story L2 3.5");
+        run(&mut s, "story L1 0");
+        // sorted by elevation, bottom first
+        assert_eq!(s.doc.stories[0].name, "L1");
+        assert_eq!(s.doc.stories[1].name, "L2");
+        assert_replay_stable(&s);
+        run(&mut s, "undo"); // removes L1 add
+        assert_eq!(s.doc.stories.len(), 1);
+        assert_eq!(s.doc.stories[0].name, "L2");
+    }
+
+    #[test]
+    fn beam_rect_section_is_watertight_with_correct_volume() {
+        let mut s = Session::default();
+        run(&mut s, "section b rect 0.4 0.6");
+        let out = run(&mut s, "beam 0,0,3 5,0,3 b");
+        let id = out.created[0];
+        let Geometry::Frame { mesh, .. } = &s.doc.get(id).unwrap().geometry else {
+            panic!("beam should be a Frame geometry");
+        };
+        // V = w*h*length = 0.4*0.6*5 = 1.2
+        assert!((kernel_mesh::signed_volume(mesh) - 1.2).abs() < 1e-6);
+        // Watertight: every undirected edge balances.
+        let welded = kernel_mesh::weld(mesh, 1e-9);
+        let mut bal: std::collections::HashMap<(u32, u32), i64> = std::collections::HashMap::new();
+        for f in welded.faces() {
+            if f[0] == f[1] || f[1] == f[2] || f[0] == f[2] {
+                continue;
+            }
+            for (a, b) in [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
+                *bal.entry((a.min(b), a.max(b))).or_default() += if a < b { 1 } else { -1 };
+            }
+        }
+        assert!(!bal.is_empty() && bal.values().all(|&v| v == 0), "beam mesh watertight");
+        assert_replay_stable(&s);
+    }
+
+    #[test]
+    fn column_and_beam_exec_undo_redo() {
+        let mut s = Session::default();
+        run(&mut s, "section c rect 0.3 0.3");
+        run(&mut s, "column 0,0,0 0,0,3.5 c");
+        assert_eq!(s.doc.len(), 1);
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 0);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 1);
+    }
+
+    #[test]
+    fn beam_missing_section_errors() {
+        let mut s = Session::default();
+        let err = s.run(parse("beam 0,0,0 5,0,0 nope").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no section"), "{err}");
+    }
+
+    #[test]
+    fn beam_with_undefined_material_errors() {
+        let mut s = Session::default();
+        run(&mut s, "section b rect 0.4 0.6");
+        let err = s
+            .run(parse("beam 0,0,0 5,0,0 b material nope").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("no material"), "{err}");
+    }
+
+    #[test]
+    fn slab_extrudes_boundary_with_correct_volume() {
+        let mut s = Session::default();
+        let out = run(&mut s, "slab 0,0 6,0 6,4 0,4 thick 0.2");
+        let id = out.created[0];
+        let Geometry::Area { mesh, kind, .. } = &s.doc.get(id).unwrap().geometry else {
+            panic!("slab should be an Area geometry");
+        };
+        assert_eq!(kind.label(), "slab");
+        // V = 6*4*0.2 = 4.8
+        assert!((kernel_mesh::signed_volume(mesh) - 4.8).abs() < 1e-6);
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 0);
+    }
+
+    #[test]
+    fn wall_exec_undo_replay() {
+        let mut s = Session::default();
+        run(&mut s, "material concrete 30e9 2400");
+        let out = run(&mut s, "wall 0,0 6,0 6,0.2 0,0.2 thick 3 material concrete");
+        let id = out.created[0];
+        assert!(matches!(s.doc.get(id).unwrap().geometry, Geometry::Area { .. }));
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 0);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 1);
+    }
+
+    #[test]
+    fn frame_member_id_written_back_for_replay() {
+        // The logged op must carry the concrete id so replay reproduces it.
+        let mut s = Session::default();
+        run(&mut s, "section b rect 0.4 0.6");
+        run(&mut s, "beam 0,0,0 5,0,0 b");
+        let log = s.save_log();
+        let has_id = log.iter().any(|op| matches!(
+            op,
+            Command::FrameMember { id: Some(_), .. }
+        ));
+        assert!(has_id, "frame member id must be written back into the log");
+    }
 }

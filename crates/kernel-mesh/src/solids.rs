@@ -262,6 +262,40 @@ pub fn pipe_curve(curve: &[DVec3], r0: f64, r1: f64, tol: f64) -> Mesh {
     skin_stack(&rings, false)
 }
 
+/// Sweep a closed 2D section boundary (in its local x/y plane, first point not
+/// repeated) along the straight axis from `a` to `b` into a watertight prism.
+/// The section's local +x is rotated by `orientation` radians about the axis
+/// (member "roll"); its local +y then completes the right-handed frame. This is
+/// the frame-member (beam/column) mesher: the result's volume equals the section
+/// area times the axis length exactly (flat parallel end caps).
+pub fn frame_member(section: &[DVec2], a: DVec3, b: DVec3, orientation: f64) -> Mesh {
+    assert!(section.len() >= 3, "section needs at least 3 points");
+    let axis = (b - a).normalize_or_zero();
+    let axis = if axis == DVec3::ZERO { DVec3::Z } else { axis };
+    // Base in-plane frame perpendicular to the axis, then rolled by orientation.
+    let (u0, v0) = plane_basis(axis);
+    let (c, s) = (orientation.cos(), orientation.sin());
+    let u = u0 * c + v0 * s;
+    let v = -u0 * s + v0 * c;
+    let place = |base: DVec3| -> Vec<DVec3> {
+        section.iter().map(|p| base + u * p.x + v * p.y).collect()
+    };
+    skin_stack(&[place(a), place(b)], false)
+}
+
+/// Extrude a closed 2D boundary (in the XY plane, world coords, first point not
+/// repeated) along `dir` by `thickness` into a watertight slab/wall solid. When
+/// `dir` is +Z this is a floor slab; an in-plane normal makes a wall. Volume
+/// equals the boundary area times the thickness exactly.
+pub fn area_member(boundary: &[DVec3], dir: DVec3, thickness: f64) -> Mesh {
+    assert!(boundary.len() >= 3, "boundary needs at least 3 points");
+    let d = dir.normalize_or_zero();
+    let d = if d == DVec3::ZERO { DVec3::Z } else { d };
+    let offset = d * thickness;
+    let top: Vec<DVec3> = boundary.iter().map(|p| *p + offset).collect();
+    skin_stack(&[boundary.to_vec(), top], false)
+}
+
 /// Resample an open polyline to `n` points spaced uniformly by arclength,
 /// keeping the endpoints.
 fn resample_open(pts: &[DVec3], n: usize) -> Vec<DVec3> {
@@ -663,6 +697,53 @@ mod tests {
             signed_volume(&m),
             signed_volume(&plain)
         );
+        assert!(watertight(&m));
+    }
+
+    #[test]
+    fn frame_member_rect_section_is_prism() {
+        // 0.4 x 0.6 rectangle swept 5 along +z: V = 0.4*0.6*5 = 1.2.
+        let section = vec![
+            DVec2::new(-0.2, -0.3),
+            DVec2::new(0.2, -0.3),
+            DVec2::new(0.2, 0.3),
+            DVec2::new(-0.2, 0.3),
+        ];
+        let m = frame_member(&section, DVec3::ZERO, DVec3::new(0.0, 0.0, 5.0), 0.0);
+        assert!((signed_volume(&m) - 1.2).abs() < 1e-9, "{}", signed_volume(&m));
+        assert!(watertight(&m));
+    }
+
+    #[test]
+    fn frame_member_orientation_preserves_volume() {
+        let section = vec![
+            DVec2::new(-0.2, -0.3),
+            DVec2::new(0.2, -0.3),
+            DVec2::new(0.2, 0.3),
+            DVec2::new(-0.2, 0.3),
+        ];
+        // A horizontal beam rolled 30 degrees: volume is invariant to roll.
+        let m = frame_member(
+            &section,
+            DVec3::ZERO,
+            DVec3::new(4.0, 0.0, 0.0),
+            30f64.to_radians(),
+        );
+        assert!((signed_volume(&m) - 0.4 * 0.6 * 4.0).abs() < 1e-9);
+        assert!(watertight(&m));
+    }
+
+    #[test]
+    fn area_member_slab_is_extruded_boundary() {
+        // 6 x 4 slab, thickness 0.2 upward: V = 6*4*0.2 = 4.8.
+        let boundary = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(6.0, 0.0, 0.0),
+            DVec3::new(6.0, 4.0, 0.0),
+            DVec3::new(0.0, 4.0, 0.0),
+        ];
+        let m = area_member(&boundary, DVec3::Z, 0.2);
+        assert!((signed_volume(&m) - 4.8).abs() < 1e-9, "{}", signed_volume(&m));
         assert!(watertight(&m));
     }
 

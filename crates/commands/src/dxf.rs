@@ -129,7 +129,9 @@ fn entity(t: &mut Tags, layer: &str, geometry: &Geometry, units: itsjustcad_doc:
                 1
             }
         },
-        Geometry::Mesh(mesh) => {
+        Geometry::Mesh(mesh)
+        | Geometry::Frame { mesh, .. }
+        | Geometry::Area { mesh, .. } => {
             let edges = mesh_feature_edges(mesh);
             let n = edges.len();
             for (a, b) in edges {

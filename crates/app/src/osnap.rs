@@ -61,8 +61,11 @@ pub fn candidates_filtered(
         }
         match &obj.geometry {
             Geometry::Curve(c) => curve_candidates(c, &mut out),
-            Geometry::Mesh(m) => {
-                // Mesh vertices are the natural corners of massing solids.
+            Geometry::Mesh(m)
+            | Geometry::Frame { mesh: m, .. }
+            | Geometry::Area { mesh: m, .. } => {
+                // Mesh vertices are the natural corners of massing solids and
+                // structural members.
                 out.extend(m.positions().iter().map(|p| (*p, SnapKind::End)));
             }
             // Annotation anchors (dim points, text position, hatch boundary).

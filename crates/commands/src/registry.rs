@@ -17,6 +17,7 @@ pub enum Category {
     Annotate,
     Dimension,
     Analyze,
+    Structure,
     Tools,
 }
 
@@ -35,6 +36,7 @@ impl Category {
             Category::Annotate => "Annotate",
             Category::Dimension => "Dimension",
             Category::Analyze => "Analyze",
+            Category::Structure => "Structure",
             Category::Tools => "Tools",
         }
     }
@@ -210,8 +212,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "section",
-            usage: "section <selector> <plane point x,y,z> <normal x,y,z>",
-            summary: "Cut meshes with a plane; each closed intersection loop becomes a heavy closed polyline on layer 'sections', and feature edges beyond the plane are projected onto it as thin polylines on 'sections-proj' (originals kept). Example: section all 0,0,1.2 0,0,1 · section tower 5,0,0 1,0,0 (vertical cross-section)",
+            usage: "section <selector> <plane point x,y,z> <normal x,y,z>  |  section <name> rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t>",
+            summary: "Two uses. (1) Plane cut: cut meshes with a plane; each closed loop becomes a heavy polyline on layer 'sections'. Example: section all 0,0,1.2 0,0,1. (2) Structural section: define a named cross-section (profile) for beam/column members, chosen by a shape keyword in second position — rect (solid rectangle), circle, iwf (I / wide-flange: depth, flange width, flange thickness, web thickness), pipe (hollow round). Example: section W12 iwf 0.31 0.2 0.013 0.008 · section col rect 0.4 0.4",
             category: Category::Dimension,
         },
         CommandSpec {
@@ -597,6 +599,48 @@ pub fn registry() -> &'static [CommandSpec] {
             usage: "option save <name> | option <name> | option list | option delete <name>",
             summary: "Design options: named branches of the op-log for comparing schemes. 'option save tower' snapshots the current model as a branch; 'option courtyard' switches to (replays) another branch, auto-saving in-progress work to the branch you leave first; 'option list' shows branches (* = current); 'option delete <name>' removes one. Example: box 0,0,0 5,5,20 then option save tower",
             category: Category::Edit,
+        },
+        CommandSpec {
+            name: "material",
+            usage: "material <name> <elastic-modulus-E> <density>",
+            summary: "Define a named structural material (stored for interoperability, never analyzed here). E in Pa, density in kg/m³. Example: material steel 200e9 7850 · material concrete 30e9 2400",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "grid",
+            usage: "grid <name> x A:0 B:5 ... y 1:0 2:4 ... [levels 0,3,6]",
+            summary: "Define a labeled reference grid: X axes and Y axes as label:coord pairs, plus optional level elevations. Rendered as reference lines. Example: grid main x A:0 B:6 C:12 y 1:0 2:5 levels 0,3.5,7",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "story",
+            usage: "story <name> <elevation>",
+            summary: "Define a building story/level by name and elevation (meters); stored sorted by elevation. Example: story L1 0 · story L2 3.5",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "beam",
+            usage: "beam <a x,y,z> <b x,y,z> <section> [material <m>] [rot <deg>]",
+            summary: "Frame member (horizontal): sweep a named section along the line a→b into a solid. Optional material and roll angle (deg). Example: beam 0,0,3 6,0,3 W12 material steel · beam 0,0,3 6,0,3 col rot 90",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "column",
+            usage: "column <a x,y,z> <b x,y,z> <section> [material <m>] [rot <deg>]",
+            summary: "Frame member (vertical): sweep a named section along the line a→b into a solid. Same as beam, distinct for scheduling/ergonomics. Example: column 0,0,0 0,0,3.5 col material concrete",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "slab",
+            usage: "slab <p1> <p2> <p3> ... thick <t> [material <m>]",
+            summary: "Area member: extrude a closed boundary upward (+Z) by thickness into a floor slab. Example: slab 0,0 6,0 6,4 0,4 thick 0.2 material concrete",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "wall",
+            usage: "wall <p1> <p2> <p3> ... thick <t> [material <m>]",
+            summary: "Area member: extrude a closed boundary along its horizontal normal by thickness into a wall. Example: wall 0,0 6,0 6,0.2 0,0.2 thick 3 material concrete",
+            category: Category::Structure,
         },
     ]
 }

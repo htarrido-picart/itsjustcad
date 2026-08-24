@@ -35,6 +35,7 @@ const ALIASES: &[&str] = &[
     "deselect",     // selectnone
     "dist",         // distance
     "vol",          // volume
+    "level",        // story
 ];
 
 /// Every verb the grammar admits: canonical registry names plus parser aliases,
