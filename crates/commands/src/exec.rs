@@ -600,13 +600,16 @@ impl Session {
         let ext = path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).unwrap_or_default();
         match ext.as_str() {
             "dxf" => self.import_dxf(path),
-            "obj" | "stl" | "gltf" | "glb" => self.import_mesh(path),
+            "obj" | "stl" | "gltf" | "glb" | "dae" => self.import_mesh(path),
             "ifc" => self.import_ifc(path),
             "epw" => self.import_epw(path),
             "geojson" | "json" => self.import_geojson(path),
             "las" => self.import_las(path),
+            "laz" => Err(ExecError::Invalid(
+                "LAZ is compressed; decompress to .las first (e.g. laszip)".to_string(),
+            )),
             other => Err(ExecError::Invalid(format!(
-                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .ifc, .epw, .geojson, .las)"
+                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .dae, .ifc, .epw, .geojson, .las)"
             ))),
         }
     }

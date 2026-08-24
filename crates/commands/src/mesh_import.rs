@@ -1,5 +1,7 @@
 //! Mesh importers: OBJ (v/vt/vn slash forms, o/g/l), binary and ASCII STL,
-//! and glTF 2.0 GLB (positions + indices from mesh primitives, single buffer).
+//! glTF 2.0 GLB (positions + indices from mesh primitives, single buffer),
+//! and Collada 1.4/1.5 (.dae) — geometry/mesh sources, triangles/polylist,
+//! node transforms (matrix/translate/rotate/scale).
 //!
 //! Each returns a `Vec<(String, kernel_mesh::Mesh)>` — one named part per
 //! object/group in the file. Empty parts are silently dropped.
@@ -16,8 +18,9 @@ pub fn import(path: &str, bytes: &[u8]) -> Result<Vec<(String, Mesh)>, String> {
         "obj" => parse_obj(bytes),
         "stl" => parse_stl(bytes),
         "gltf" | "glb" => parse_glb(bytes),
+        "dae" => parse_collada(bytes),
         other => Err(format!(
-            "unknown 3D import extension '.{other}' (supported: .obj, .stl, .gltf, .glb)"
+            "unknown 3D import extension '.{other}' (supported: .obj, .stl, .gltf, .glb, .dae)"
         )),
     }
 }
@@ -456,6 +459,603 @@ fn read_scalar_accessor(
     Ok(result)
 }
 
+// ---- Collada (.dae) ----
+
+/// Parse a Collada 1.4/1.5 XML file.
+///
+/// Strategy (no external XML crate):
+/// 1. Walk the text looking for `<geometry>` blocks, extract `<source>` float
+///    arrays and `<triangles>` / `<polylist>` elements, resolve POSITION input,
+///    fan-triangulate n-gons.
+/// 2. Walk `<node>` blocks to find `<instance_geometry>` references and
+///    accumulate transform matrices (matrix/translate/rotate/scale).
+/// 3. Apply the node transform to each referenced mesh's positions.
+///
+/// Unknown elements and attributes are silently skipped — tolerant by design.
+fn parse_collada(bytes: &[u8]) -> Result<Vec<(String, Mesh)>, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "Collada .dae file is not valid UTF-8".to_string())?;
+
+    // Safety ceiling: reject files > 512 MB before doing any work.
+    const MAX_DAE_BYTES: usize = 512 * 1024 * 1024;
+    if bytes.len() > MAX_DAE_BYTES {
+        return Err(format!(
+            "Collada file too large ({} MB > 512 MB limit)",
+            bytes.len() / 1_048_576
+        ));
+    }
+
+    // ---- step 1: collect geometry definitions keyed by id ----
+    // We build a map: geometry_id → Vec<(name, Mesh)>
+    use std::collections::HashMap;
+    let mut geom_map: HashMap<String, Vec<(String, Mesh)>> = HashMap::new();
+
+    // Iterate over <geometry ...> ... </geometry> blocks.
+    let mut search = text;
+    while let Some(geom_start) = find_tag_open(search, "geometry") {
+        let rest = &search[geom_start..];
+        let (geom_attrs, inner, consumed) = extract_element(rest, "geometry")?;
+        let geom_id = attr_value(geom_attrs, "id").unwrap_or("geometry").to_string();
+        let geom_name = attr_value(geom_attrs, "name")
+            .unwrap_or(&geom_id)
+            .to_string();
+        let meshes = parse_collada_mesh(inner, &geom_name)?;
+        if !meshes.is_empty() {
+            geom_map.insert(geom_id, meshes);
+        }
+        search = &search[geom_start + consumed..];
+    }
+
+    // ---- step 2: walk <node> tree for instance_geometry + transforms ----
+    // We collect: (mesh_name, positions, faces) with transforms applied.
+    let mut out: Vec<(String, Mesh)> = Vec::new();
+
+    // Find all <instance_geometry> elements in the document.
+    let mut search2 = text;
+    while let Some(ig_start) = find_tag_open(search2, "instance_geometry") {
+        let rest = &search2[ig_start..];
+        // Grab the url attribute (references geometry id with a leading '#').
+        let (attrs, _inner, consumed) = extract_element_or_empty_tag(rest, "instance_geometry");
+        let url = attr_value(attrs, "url").unwrap_or("").to_string();
+        let geom_id = url.trim_start_matches('#');
+
+        // Walk backwards in search2 to find the closest enclosing <node> and
+        // its transforms. We scan the prefix before ig_start.
+        let prefix = &search2[..ig_start];
+        let transform = extract_node_transform(prefix);
+
+        if let Some(parts) = geom_map.get(geom_id) {
+            for (name, mesh) in parts {
+                let transformed_positions: Vec<DVec3> = mesh
+                    .positions()
+                    .iter()
+                    .map(|&p| apply_mat4(transform, p))
+                    .collect();
+                let faces = mesh.faces().to_vec();
+                out.push((name.clone(), Mesh::new(transformed_positions, faces)));
+            }
+        }
+
+        search2 = &search2[ig_start + consumed..];
+    }
+
+    // Fallback: if no <instance_geometry> found (bare geometry-only file),
+    // emit all geometries without transform.
+    if out.is_empty() {
+        for (_id, parts) in geom_map {
+            out.extend(parts);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Parse `<mesh>` inside a single `<geometry>` block.
+fn parse_collada_mesh(inner: &str, geom_name: &str) -> Result<Vec<(String, Mesh)>, String> {
+    use std::collections::HashMap;
+
+    // Collect <source> float arrays keyed by id.
+    let mut sources: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut search = inner;
+    while let Some(src_start) = find_tag_open(search, "source") {
+        let rest = &search[src_start..];
+        let (src_attrs, src_inner, src_consumed) = extract_element(rest, "source")?;
+        let src_id = attr_value(src_attrs, "id").unwrap_or("").to_string();
+        // Extract <float_array> content.
+        if let Some(fa_start) = find_tag_open(src_inner, "float_array") {
+            let fa_rest = &src_inner[fa_start..];
+            if let Ok((_, fa_inner, _)) = extract_element(fa_rest, "float_array") {
+                let floats: Vec<f32> = fa_inner
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<f32>().ok())
+                    .collect();
+                sources.insert(src_id, floats);
+            }
+        }
+        search = &search[src_start + src_consumed..];
+    }
+
+    // Find <vertices> to resolve the POSITION semantic → source id.
+    let mut position_source: Option<String> = None;
+    if let Some(v_start) = find_tag_open(inner, "vertices") {
+        let v_rest = &inner[v_start..];
+        if let Ok((_, v_inner, _)) = extract_element(v_rest, "vertices") {
+            // Find <input semantic="POSITION" source="#...">
+            let mut sv = v_inner;
+            while let Some(inp_start) = find_tag_open(sv, "input") {
+                let inp_rest = &sv[inp_start..];
+                let (inp_attrs, _, inp_consumed) =
+                    extract_element_or_empty_tag(inp_rest, "input");
+                let semantic = attr_value(inp_attrs, "semantic").unwrap_or("");
+                if semantic == "POSITION" {
+                    let src = attr_value(inp_attrs, "source").unwrap_or("");
+                    position_source = Some(src.trim_start_matches('#').to_string());
+                }
+                sv = &sv[inp_start + inp_consumed..];
+            }
+        }
+    }
+
+    let pos_floats = position_source
+        .as_deref()
+        .and_then(|id| sources.get(id))
+        .or_else(|| {
+            // Fallback: find any source whose id contains "position" or "Position".
+            sources
+                .iter()
+                .find(|(k, _)| k.to_ascii_lowercase().contains("position"))
+                .map(|(_, v)| v)
+        });
+
+    let pos_floats = match pos_floats {
+        Some(f) => f,
+        None => return Ok(Vec::new()), // no positions → skip
+    };
+
+    // Build position list from float triples.
+    let raw_positions: Vec<DVec3> = pos_floats
+        .as_chunks::<3>().0.iter()
+        .map(|c| DVec3::new(c[0] as f64, c[1] as f64, c[2] as f64))
+        .collect();
+
+    if raw_positions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Safety cap on position count.
+    const MAX_VERTS: usize = 50_000_000;
+    if raw_positions.len() > MAX_VERTS {
+        return Err(format!(
+            "Collada geometry '{}' has {} positions, exceeding {} limit",
+            geom_name,
+            raw_positions.len(),
+            MAX_VERTS
+        ));
+    }
+
+    let mut all_faces: Vec<[u32; 3]> = Vec::new();
+
+    // ---- <triangles> ----
+    let mut search_t = inner;
+    while let Some(tri_start) = find_tag_open(search_t, "triangles") {
+        let rest = &search_t[tri_start..];
+        let (tri_attrs, tri_inner, tri_consumed) = extract_element(rest, "triangles")?;
+        let _ = tri_attrs; // count attribute optional
+        // Find VERTEX input offset.
+        let vertex_offset = find_input_offset(tri_inner, "VERTEX").unwrap_or(0);
+        let stride = total_input_stride(tri_inner);
+        // <p> indices.
+        if let Some(p_start) = find_tag_open(tri_inner, "p") {
+            let p_rest = &tri_inner[p_start..];
+            if let Ok((_, p_inner, _)) = extract_element(p_rest, "p") {
+                let indices: Vec<u32> = p_inner
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<u32>().ok())
+                    .collect();
+                collect_triangles_from_p(
+                    &indices, stride, vertex_offset, raw_positions.len(), &mut all_faces,
+                );
+            }
+        }
+        search_t = &search_t[tri_start + tri_consumed..];
+    }
+
+    // ---- <polylist> ----
+    let mut search_p = inner;
+    while let Some(pl_start) = find_tag_open(search_p, "polylist") {
+        let rest = &search_p[pl_start..];
+        let (pl_attrs, pl_inner, pl_consumed) = extract_element(rest, "polylist")?;
+        let _ = pl_attrs;
+        let vertex_offset = find_input_offset(pl_inner, "VERTEX").unwrap_or(0);
+        let stride = total_input_stride(pl_inner);
+        // <vcount> polygon sizes.
+        let vcounts: Vec<u32> = if let Some(vc_start) = find_tag_open(pl_inner, "vcount") {
+            let vc_rest = &pl_inner[vc_start..];
+            if let Ok((_, vc_inner, _)) = extract_element(vc_rest, "vcount") {
+                vc_inner
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<u32>().ok())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        if let Some(p_start) = find_tag_open(pl_inner, "p") {
+            let p_rest = &pl_inner[p_start..];
+            if let Ok((_, p_inner, _)) = extract_element(p_rest, "p") {
+                let indices: Vec<u32> = p_inner
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<u32>().ok())
+                    .collect();
+                collect_polylist_from_p(
+                    &indices,
+                    &vcounts,
+                    stride,
+                    vertex_offset,
+                    raw_positions.len(),
+                    &mut all_faces,
+                );
+            }
+        }
+        search_p = &search_p[pl_start + pl_consumed..];
+    }
+
+    if all_faces.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Safety cap on face count.
+    const MAX_FACES: usize = 50_000_000;
+    if all_faces.len() > MAX_FACES {
+        return Err(format!(
+            "Collada geometry '{}' has {} faces, exceeding {} limit",
+            geom_name,
+            all_faces.len(),
+            MAX_FACES
+        ));
+    }
+
+    Ok(vec![(geom_name.to_string(), Mesh::new(raw_positions, all_faces))])
+}
+
+/// Collect triangles from a flat <p> index buffer (stride = inputs per vertex).
+fn collect_triangles_from_p(
+    indices: &[u32],
+    stride: usize,
+    vertex_offset: usize,
+    pos_len: usize,
+    out: &mut Vec<[u32; 3]>,
+) {
+    let stride = stride.max(1);
+    let tri_count = indices.len() / (3 * stride);
+    let pos_len = pos_len as u32;
+    for t in 0..tri_count {
+        let base = t * 3 * stride;
+        let a = indices[base + vertex_offset];
+        let b = indices[base + stride + vertex_offset];
+        let c = indices[base + 2 * stride + vertex_offset];
+        // H-5 pattern: discard OOB faces.
+        if a < pos_len && b < pos_len && c < pos_len {
+            out.push([a, b, c]);
+        }
+    }
+}
+
+/// Fan-triangulate polygons from a <polylist> <p> buffer.
+fn collect_polylist_from_p(
+    indices: &[u32],
+    vcounts: &[u32],
+    stride: usize,
+    vertex_offset: usize,
+    pos_len: usize,
+    out: &mut Vec<[u32; 3]>,
+) {
+    let stride = stride.max(1);
+    let pos_len = pos_len as u32;
+    let mut cursor = 0usize;
+    for &vc in vcounts {
+        let n = vc as usize;
+        if n < 3 || cursor + n * stride > indices.len() {
+            cursor += n * stride;
+            continue;
+        }
+        let v0 = indices[cursor + vertex_offset];
+        for i in 1..(n - 1) {
+            let v1 = indices[cursor + i * stride + vertex_offset];
+            let v2 = indices[cursor + (i + 1) * stride + vertex_offset];
+            if v0 < pos_len && v1 < pos_len && v2 < pos_len {
+                out.push([v0, v1, v2]);
+            }
+        }
+        cursor += n * stride;
+    }
+}
+
+/// Find the offset attribute of an <input semantic="X"> element.
+fn find_input_offset(xml: &str, semantic: &str) -> Option<usize> {
+    let mut search = xml;
+    while let Some(s) = find_tag_open(search, "input") {
+        let rest = &search[s..];
+        let (attrs, _, consumed) = extract_element_or_empty_tag(rest, "input");
+        let sem = attr_value(attrs, "semantic").unwrap_or("");
+        if sem == semantic {
+            let off = attr_value(attrs, "offset")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            return Some(off);
+        }
+        search = &search[s + consumed..];
+    }
+    None
+}
+
+/// Count the total number of <input> elements to determine the per-vertex stride.
+fn total_input_stride(xml: &str) -> usize {
+    let mut stride = 0usize;
+    let mut search = xml;
+    while let Some(s) = find_tag_open(search, "input") {
+        let rest = &search[s..];
+        let (attrs, _, consumed) = extract_element_or_empty_tag(rest, "input");
+        let off = attr_value(attrs, "offset")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        stride = stride.max(off + 1);
+        search = &search[s + consumed..];
+    }
+    stride.max(1)
+}
+
+/// Walk the XML prefix before an `<instance_geometry>` to find the most recent
+/// `<node>` and extract its cumulative transform as a column-major 4×4 matrix
+/// (stored row-major in our array for `apply_mat4`).
+fn extract_node_transform(prefix: &str) -> [f64; 16] {
+    // Identity matrix.
+    let mut mat = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0f64,
+    ];
+
+    // Find the last <node ...> in prefix.
+    let node_start = match rfind_tag_open(prefix, "node") {
+        Some(s) => s,
+        None => return mat,
+    };
+    let node_text = &prefix[node_start..];
+
+    // Walk transform children until we hit the end of the opening tag region.
+    // We look for <matrix>, <translate>, <rotate>, <scale> in document order.
+    let tag_names = ["matrix", "translate", "rotate", "scale"];
+    // Collect all transforms in order.
+    let mut transforms: Vec<(usize, &str, Vec<f64>)> = Vec::new();
+    for tag in &tag_names {
+        let mut search = node_text;
+        let mut offset = 0usize;
+        while let Some(s) = find_tag_open(search, tag) {
+            let rest = &search[s..];
+            if let Ok((_, inner, consumed)) = extract_element(rest, tag) {
+                let vals: Vec<f64> = inner
+                    .split_whitespace()
+                    .filter_map(|v| v.parse::<f64>().ok())
+                    .collect();
+                transforms.push((offset + s, tag, vals));
+                offset += s + consumed;
+                search = &rest[consumed..];
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Sort by document position.
+    transforms.sort_by_key(|(pos, _, _)| *pos);
+
+    for (_, tag, vals) in transforms {
+        let m = match tag {
+            "matrix" if vals.len() == 16 => {
+                // Collada uses column-major (like OpenGL). vals[0..4] = col0.
+                // We store row-major: row i, col j = mat[i*4+j].
+                // Collada col-major to row-major: result[i][j] = vals[j*4+i].
+                [
+                    vals[0], vals[4], vals[8],  vals[12],
+                    vals[1], vals[5], vals[9],  vals[13],
+                    vals[2], vals[6], vals[10], vals[14],
+                    vals[3], vals[7], vals[11], vals[15],
+                ]
+            }
+            "translate" if vals.len() >= 3 => [
+                1.0, 0.0, 0.0, vals[0],
+                0.0, 1.0, 0.0, vals[1],
+                0.0, 0.0, 1.0, vals[2],
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            "scale" if vals.len() >= 3 => [
+                vals[0], 0.0,     0.0,     0.0,
+                0.0,     vals[1], 0.0,     0.0,
+                0.0,     0.0,     vals[2], 0.0,
+                0.0,     0.0,     0.0,     1.0,
+            ],
+            "rotate" if vals.len() >= 4 => {
+                // Axis-angle: vals[0..3] = axis, vals[3] = angle in degrees.
+                let ax = vals[0];
+                let ay = vals[1];
+                let az = vals[2];
+                let angle = vals[3].to_radians();
+                let c = angle.cos();
+                let s = angle.sin();
+                let t = 1.0 - c;
+                [
+                    t*ax*ax+c,    t*ax*ay-s*az, t*ax*az+s*ay, 0.0,
+                    t*ax*ay+s*az, t*ay*ay+c,    t*ay*az-s*ax, 0.0,
+                    t*ax*az-s*ay, t*ay*az+s*ax, t*az*az+c,    0.0,
+                    0.0,          0.0,          0.0,          1.0,
+                ]
+            }
+            _ => continue,
+        };
+        mat = mat4_mul(mat, m);
+    }
+    mat
+}
+
+/// Row-major 4×4 matrix multiply: result = a × b.
+fn mat4_mul(a: [f64; 16], b: [f64; 16]) -> [f64; 16] {
+    let mut c = [0.0f64; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            for k in 0..4 {
+                c[i * 4 + j] += a[i * 4 + k] * b[k * 4 + j];
+            }
+        }
+    }
+    c
+}
+
+/// Apply a row-major 4×4 transform matrix to a point.
+fn apply_mat4(m: [f64; 16], p: DVec3) -> DVec3 {
+    let x = m[0] * p.x + m[1] * p.y + m[2]  * p.z + m[3];
+    let y = m[4] * p.x + m[5] * p.y + m[6]  * p.z + m[7];
+    let z = m[8] * p.x + m[9] * p.y + m[10] * p.z + m[11];
+    DVec3::new(x, y, z)
+}
+
+// ---- Minimal XML helpers ----
+
+/// Find the byte offset of the start of `<tag` in `xml`.
+fn find_tag_open(xml: &str, tag: &str) -> Option<usize> {
+    let needle = format!("<{}", tag);
+    // Must be followed by whitespace, '>', or '/>' to avoid partial matches.
+    let bytes = xml.as_bytes();
+    let nb = needle.as_bytes();
+    let tag_byte = if tag.is_empty() { return None } else { tag.as_bytes()[0] };
+    let _ = tag_byte;
+    let mut i = 0;
+    while i + nb.len() <= bytes.len() {
+        if bytes[i..].starts_with(nb) {
+            let after = i + nb.len();
+            if after >= bytes.len() || matches!(bytes[after], b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/') {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the LAST occurrence of `<tag` in `xml` (for node-ancestor search).
+fn rfind_tag_open(xml: &str, tag: &str) -> Option<usize> {
+    let needle = format!("<{}", tag);
+    let bytes = xml.as_bytes();
+    let nb = needle.as_bytes();
+    let mut last = None;
+    let mut i = 0;
+    while i + nb.len() <= bytes.len() {
+        if bytes[i..].starts_with(nb) {
+            let after = i + nb.len();
+            if after >= bytes.len() || matches!(bytes[after], b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/') {
+                last = Some(i);
+            }
+        }
+        i += 1;
+    }
+    last
+}
+
+/// Extract `<tag attrs...> inner </tag>` from the start of `xml`.
+/// Returns (attrs_str, inner_str, bytes_consumed).
+fn extract_element<'a>(xml: &'a str, tag: &str) -> Result<(&'a str, &'a str, usize), String> {
+    // Find the end of the opening tag.
+    let open_end = xml.find('>').ok_or_else(|| format!("Collada: unclosed <{tag}>"))?;
+    let open_tag = &xml[..open_end];
+    // Self-closing?
+    if open_tag.ends_with('/') {
+        return Ok((&xml[1 + tag.len()..open_end - 1], "", open_end + 1));
+    }
+    let attrs_str = &xml[1 + tag.len()..open_end];
+
+    // Find the matching </tag>.
+    let close = format!("</{}>", tag);
+    let inner_start = open_end + 1;
+    // Handle nested same-tag elements (depth counting).
+    let mut depth = 1usize;
+    let mut pos = inner_start;
+    while pos < xml.len() {
+        let remaining = &xml[pos..];
+        let open_pat = format!("<{}", tag);
+        let next_open = remaining.find(open_pat.as_str()).map(|i| i + pos);
+        let next_close = remaining.find(close.as_str()).map(|i| i + pos);
+        match (next_open, next_close) {
+            (Some(o), Some(c)) if o < c => {
+                // Check it's a real tag (not a partial match).
+                let after_o = o + open_pat.len();
+                if after_o < xml.len()
+                    && matches!(xml.as_bytes()[after_o], b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/')
+                {
+                    depth += 1;
+                }
+                pos = o + 1;
+            }
+            (_, Some(c)) => {
+                depth -= 1;
+                if depth == 0 {
+                    let inner = &xml[inner_start..c];
+                    let consumed = c + close.len();
+                    return Ok((attrs_str, inner, consumed));
+                }
+                pos = c + 1;
+            }
+            _ => break,
+        }
+    }
+    // If no close tag found, treat the rest as inner content (tolerant).
+    let inner = &xml[inner_start..];
+    Ok((attrs_str, inner, xml.len()))
+}
+
+/// Extract element or self-closing tag attrs, returning ("", ...) for inner.
+fn extract_element_or_empty_tag<'a>(xml: &'a str, tag: &str) -> (&'a str, &'a str, usize) {
+    // Find the end of the tag.
+    if let Some(end) = xml.find('>') {
+        let tag_body = &xml[1 + tag.len()..end];
+        let is_self_closing = tag_body.ends_with('/') || xml[..end + 1].ends_with("/>");
+        if is_self_closing {
+            return (tag_body.trim_end_matches('/'), "", end + 1);
+        }
+        // Has body — find </tag>
+        let close = format!("</{}>", tag);
+        let inner_start = end + 1;
+        if let Some(c) = xml[inner_start..].find(close.as_str()) {
+            let inner = &xml[inner_start..inner_start + c];
+            return (tag_body, inner, inner_start + c + close.len());
+        }
+        (tag_body, &xml[inner_start..], xml.len())
+    } else {
+        (&xml[1 + tag.len()..], "", xml.len())
+    }
+}
+
+/// Extract the value of an attribute from an attrs string, e.g. `id="foo"` → `"foo"`.
+fn attr_value<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+    // Look for `name="value"` or `name='value'`.
+    let pattern = format!("{}=", name);
+    let pos = attrs.find(pattern.as_str())?;
+    let rest = &attrs[pos + pattern.len()..];
+    if let Some(inner) = rest.strip_prefix('"') {
+        let end = inner.find('"')?;
+        Some(&inner[..end])
+    } else if let Some(inner) = rest.strip_prefix('\'') {
+        let end = inner.find('\'')?;
+        Some(&inner[..end])
+    } else {
+        // Unquoted (uncommon but tolerate).
+        let end = rest.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+}
+
 // ---- tests ----
 
 #[cfg(test)]
@@ -678,5 +1278,210 @@ endsolid test\n\
         let parts = parse_glb(&glb_bytes).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].1.faces().len(), 12);
+    }
+
+    // ---- Collada (.dae) ----
+
+    /// Minimal synthetic .dae with 4 positions and 2 triangles.
+    fn make_quad_dae(geom_id: &str, geom_name: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+             <COLLADA xmlns=\"http://www.collada.org/2005/11/COLLADASchema\" version=\"1.4.1\">\n\
+               <library_geometries>\n\
+                 <geometry id=\"{gid}\" name=\"{gname}\">\n\
+                   <mesh>\n\
+                     <source id=\"{gid}-positions\">\n\
+                       <float_array count=\"12\">0 0 0  1 0 0  1 1 0  0 1 0</float_array>\n\
+                     </source>\n\
+                     <vertices id=\"{gid}-vertices\">\n\
+                       <input semantic=\"POSITION\" source=\"#{gid}-positions\"/>\n\
+                     </vertices>\n\
+                     <triangles count=\"2\">\n\
+                       <input semantic=\"VERTEX\" source=\"#{gid}-vertices\" offset=\"0\"/>\n\
+                       <p>0 1 2  0 2 3</p>\n\
+                     </triangles>\n\
+                   </mesh>\n\
+                 </geometry>\n\
+               </library_geometries>\n\
+               <library_visual_scenes>\n\
+                 <visual_scene id=\"Scene\">\n\
+                   <node id=\"Mesh\">\n\
+                     <instance_geometry url=\"#{gid}\"/>\n\
+                   </node>\n\
+                 </visual_scene>\n\
+               </library_visual_scenes>\n\
+             </COLLADA>",
+            gid = geom_id,
+            gname = geom_name
+        )
+    }
+
+    #[test]
+    fn collada_basic_quad_triangle_count() {
+        let dae = make_quad_dae("Quad", "Quad");
+        let parts = parse_collada(dae.as_bytes()).unwrap();
+        assert_eq!(parts.len(), 1, "expected 1 mesh part");
+        let (name, mesh) = &parts[0];
+        assert_eq!(name, "Quad");
+        assert_eq!(mesh.faces().len(), 2, "quad = 2 triangles");
+        assert_eq!(mesh.positions().len(), 4, "4 unique positions");
+    }
+
+    #[test]
+    fn collada_positions_correct() {
+        let dae = make_quad_dae("Q", "Q");
+        let parts = parse_collada(dae.as_bytes()).unwrap();
+        let mesh = &parts[0].1;
+        let pos = mesh.positions();
+        assert!((pos[0] - glam::DVec3::new(0.0, 0.0, 0.0)).length() < 1e-9);
+        assert!((pos[1] - glam::DVec3::new(1.0, 0.0, 0.0)).length() < 1e-9);
+        assert!((pos[3] - glam::DVec3::new(0.0, 1.0, 0.0)).length() < 1e-9);
+    }
+
+    #[test]
+    fn collada_node_translate_applied() {
+        // Wrap the geometry in a node with a <translate>.
+        let dae = r##"<?xml version="1.0"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <library_geometries>
+    <geometry id="G" name="G">
+      <mesh>
+        <source id="G-pos">
+          <float_array count="9">0 0 0  1 0 0  0 1 0</float_array>
+        </source>
+        <vertices id="G-verts">
+          <input semantic="POSITION" source="#G-pos"/>
+        </vertices>
+        <triangles count="1">
+          <input semantic="VERTEX" source="#G-verts" offset="0"/>
+          <p>0 1 2</p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="S">
+      <node id="N">
+        <translate>10 20 30</translate>
+        <instance_geometry url="#G"/>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+</COLLADA>"##;
+        let parts = parse_collada(dae.as_bytes()).unwrap();
+        assert_eq!(parts.len(), 1);
+        let mesh = &parts[0].1;
+        // First position was (0,0,0), after translate(10,20,30) → (10,20,30).
+        let p = mesh.positions()[0];
+        assert!((p.x - 10.0).abs() < 1e-9, "x={}", p.x);
+        assert!((p.y - 20.0).abs() < 1e-9, "y={}", p.y);
+        assert!((p.z - 30.0).abs() < 1e-9, "z={}", p.z);
+    }
+
+    #[test]
+    fn collada_polylist_fan_triangulated() {
+        // A quad polygon (4 verts) in <polylist> should become 2 triangles.
+        let dae = r##"<?xml version="1.0"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <library_geometries>
+    <geometry id="PL" name="PL">
+      <mesh>
+        <source id="PL-pos">
+          <float_array count="12">0 0 0  1 0 0  1 1 0  0 1 0</float_array>
+        </source>
+        <vertices id="PL-verts">
+          <input semantic="POSITION" source="#PL-pos"/>
+        </vertices>
+        <polylist count="1">
+          <input semantic="VERTEX" source="#PL-verts" offset="0"/>
+          <vcount>4</vcount>
+          <p>0 1 2 3</p>
+        </polylist>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="S">
+      <node id="N">
+        <instance_geometry url="#PL"/>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+</COLLADA>"##;
+        let parts = parse_collada(dae.as_bytes()).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].1.faces().len(), 2, "quad → 2 triangles via fan");
+    }
+
+    #[test]
+    fn collada_oob_face_indices_dropped() {
+        // <p> contains an index (99) that is out of bounds for 4 positions.
+        // This must not panic; the valid triangle is kept, the bad one dropped.
+        let dae = r##"<?xml version="1.0"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <library_geometries>
+    <geometry id="OOB" name="OOB">
+      <mesh>
+        <source id="OOB-pos">
+          <float_array count="9">0 0 0  1 0 0  0 1 0</float_array>
+        </source>
+        <vertices id="OOB-verts">
+          <input semantic="POSITION" source="#OOB-pos"/>
+        </vertices>
+        <triangles count="2">
+          <input semantic="VERTEX" source="#OOB-verts" offset="0"/>
+          <p>0 1 2  0 99 2</p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="S">
+      <node id="N">
+        <instance_geometry url="#OOB"/>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+</COLLADA>"##;
+        let parts = parse_collada(dae.as_bytes()).unwrap();
+        // The bad triangle (index 99) is filtered out; only the valid one remains.
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].1.faces().len(), 1, "OOB triangle dropped");
+    }
+
+    #[test]
+    fn collada_malformed_not_utf8_errors() {
+        // Invalid UTF-8 bytes should return a clear error, not panic.
+        let result = parse_collada(&[0xFF, 0xFE, 0x00]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("UTF-8"), "error: {msg}");
+    }
+
+    #[test]
+    fn collada_dispatch_via_import() {
+        // Ensure the extension dispatch table routes .dae correctly.
+        let dae = make_quad_dae("D", "D");
+        let parts = import("/tmp/test.dae", dae.as_bytes()).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].1.faces().len(), 2);
+    }
+
+    // ---- LAZ actionable error ----
+
+    #[test]
+    fn laz_gives_actionable_error_via_exec() {
+        use crate::{parse, Session};
+        // Write a fake .laz file (content doesn't matter — exec rejects by extension).
+        let tmp = std::env::temp_dir().join("test_reject.laz");
+        std::fs::write(&tmp, b"fake laz content").unwrap();
+        let mut s = Session::default();
+        let cmd = parse(&format!("import {}", tmp.display())).unwrap();
+        let err = s.run(cmd).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LAZ") && msg.contains("decompress") && msg.contains(".las"),
+            "error should mention LAZ and decompress: {msg}"
+        );
     }
 }
