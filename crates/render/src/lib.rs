@@ -6,7 +6,7 @@ mod renderer;
 mod snapshot;
 mod viewport_callback;
 
-pub use camera::{OrbitCamera, StandardView};
+pub use camera::{fov_for_focal_mm, preset_focal_mm, OrbitCamera, StandardView};
 pub use layout::ViewportLayout;
 pub use renderer::{
     hue_from_seed, CameraUniform, ColorMode, DisplayMode, SceneData, SceneRenderer, UnderlayData,

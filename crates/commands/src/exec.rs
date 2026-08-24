@@ -3914,6 +3914,7 @@ mod tests {
             pitch: 0.5,
             fov_y: 45f32.to_radians(),
             ortho: true,
+            two_point: false,
         }
     }
 

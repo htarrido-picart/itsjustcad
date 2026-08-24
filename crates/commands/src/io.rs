@@ -196,6 +196,7 @@ mod tests {
             pitch: 1.2,
             fov_y: 45f32.to_radians(),
             ortho: false,
+            two_point: false,
         };
         s.run(crate::Command::ViewSave { name: "entry".to_string(), camera: Some(v) })
             .unwrap();

@@ -13,6 +13,12 @@ pub struct OrbitCamera {
     /// Parallel projection — true for the standard plan/elevation views
     /// (architects need measurable drawings, not perspective foreshortening).
     pub ortho: bool,
+    /// Two-point (architectural) perspective: world verticals stay vertical and
+    /// parallel on screen. The eye looks horizontally (pitch is removed from the
+    /// view basis) and the pitch is reintroduced as a vertical shear of the
+    /// projection, so a tower still "leans into frame" without its edges
+    /// converging. Ignored when `ortho`.
+    pub two_point: bool,
 }
 
 impl Default for OrbitCamera {
@@ -24,6 +30,7 @@ impl Default for OrbitCamera {
             pitch: 0.5,
             fov_y: 45f32.to_radians(),
             ortho: false,
+            two_point: false,
         }
     }
 }
@@ -60,11 +67,11 @@ impl OrbitCamera {
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
-        // Straight-down/up views degenerate with a Z up-vector; fall back to Y.
-        let up = if self.pitch.abs() > 1.55 { Vec3::Y } else { Vec3::Z };
-        let view = Mat4::look_at_rh(self.eye(), self.target, up);
         let aspect = aspect.max(1e-3);
-        let proj = if self.ortho {
+        if self.ortho {
+            // Straight-down/up views degenerate with a Z up-vector; fall back to Y.
+            let up = if self.pitch.abs() > 1.55 { Vec3::Y } else { Vec3::Z };
+            let view = Mat4::look_at_rh(self.eye(), self.target, up);
             // Half-height matches the perspective frustum at the target, so
             // dolly (distance) still reads as zoom and view switches keep the
             // apparent scale.
@@ -72,11 +79,62 @@ impl OrbitCamera {
             let half_w = half_h * aspect;
             // Symmetric depth range: parallel views must not clip geometry
             // that sits behind the eye plane.
-            Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -5.0e4, 5.0e4)
-        } else {
-            Mat4::perspective_rh(self.fov_y, aspect, 0.05, 5.0e4)
-        };
+            let proj = Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -5.0e4, 5.0e4);
+            return proj * view;
+        }
+        if self.two_point {
+            return self.two_point_view_proj(aspect);
+        }
+        let up = if self.pitch.abs() > 1.55 { Vec3::Y } else { Vec3::Z };
+        let view = Mat4::look_at_rh(self.eye(), self.target, up);
+        let proj = Mat4::perspective_rh(self.fov_y, aspect, 0.05, 5.0e4);
         proj * view
+    }
+
+    /// Two-point perspective: the view basis is levelled (the forward axis is
+    /// forced horizontal) so world verticals never converge, and the removed
+    /// pitch is folded back in as a vertical shear on the projection. The shear
+    /// is `tan(pitch)` scaled by `cot(fov_y/2)` (i.e. divided by the half-height
+    /// at unit depth) so panning the pitch tracks the same framing a normal
+    /// perspective would give at the target, just without vertical convergence.
+    fn two_point_view_proj(&self, aspect: f32) -> Mat4 {
+        // Levelled eye: same yaw/target/distance, but the eye sits at target
+        // height so the forward axis is horizontal.
+        let (sy, cy) = self.yaw.sin_cos();
+        let horiz = Vec3::new(cy, sy, 0.0);
+        let eye = self.target + self.distance * horiz;
+        // Look horizontally toward a level target so verticals stay vertical.
+        let level_target = self.target;
+        let level_target = Vec3::new(level_target.x, level_target.y, eye.z);
+        let view = Mat4::look_at_rh(eye, level_target, Vec3::Z);
+        let proj = Mat4::perspective_rh(self.fov_y, aspect, 0.05, 5.0e4);
+        // Vertical frame shift: we want `clip.y += shear * clip.w`, which after
+        // the perspective divide is a constant `ndc.y += shear` — the whole
+        // image slides up/down with pitch while verticals stay parallel. clip.w
+        // is carried by proj.z_axis.w (= -1 for perspective_rh), so folding the
+        // shift into the z->y coupling makes it survive the divide at every
+        // depth. `shear = tan(pitch)/tan(fov_y/2)` maps pitch to NDC so it
+        // tracks the framing a normal perspective gives at the target.
+        // Negative sign: tilting the eye up (positive pitch) slides scene content
+        // *down* the frame, exactly as a real lens shift / tilted sensor does, so
+        // a tall tower's top drops toward center as you "look up".
+        let shear = -self.pitch.tan() / (self.fov_y * 0.5).tan();
+        let mut m = proj; // glam Mat4 is column-major; y-row = .y of each column.
+        m.z_axis.y += shear * proj.z_axis.w;
+        m.w_axis.y += shear * proj.w_axis.w; // 0 for perspective, kept for clarity.
+        m * view
+    }
+
+    /// Full-frame lens: 36mm sensor width, `fov = 2*atan(18/f)` (horizontal).
+    /// Stored as a vertical fov via the current aspect so framing matches a
+    /// real camera's horizontal angle of view.
+    pub fn set_lens_mm(&mut self, focal_mm: f32, aspect: f32) {
+        let fov_h = fov_for_focal_mm(focal_mm);
+        // Convert horizontal fov to vertical for the stored fov_y.
+        let half_w = (fov_h * 0.5).tan();
+        let half_h = half_w / aspect.max(1e-3);
+        self.fov_y = 2.0 * half_h.atan();
+        self.ortho = false;
     }
 
     /// Rhino-style standard views. Keeps target and distance.
@@ -96,6 +154,27 @@ impl OrbitCamera {
         // Plan/elevation views are parallel projections; only the 3D view is
         // perspective. Sticky until the next view switch (Rhino behavior).
         self.ortho = view != StandardView::Perspective;
+        // A standard view switch drops two-point mode; it is a `camera` opt-in.
+        self.two_point = false;
+    }
+}
+
+/// Horizontal angle of view for a full-frame (36mm-wide sensor) lens:
+/// `fov = 2*atan(18/f)`. Returned in radians.
+pub fn fov_for_focal_mm(focal_mm: f32) -> f32 {
+    2.0 * (18.0 / focal_mm.max(1e-3)).atan()
+}
+
+/// Full-frame-equivalent focal length for a named `camera` preset, or `None`
+/// if the token is not a recognised lens/preset. Numeric forms like "35mm" are
+/// handled by the caller; this covers the phone sims.
+///   phone     = 26mm equiv (iPhone main wide)
+///   phonewide = 13mm equiv (iPhone ultra-wide)
+pub fn preset_focal_mm(name: &str) -> Option<f32> {
+    match name {
+        "phone" => Some(26.0),
+        "phonewide" => Some(13.0),
+        _ => None,
     }
 }
 
@@ -158,6 +237,96 @@ mod tests {
         let after = screen_xy(cam.view_proj(1.0), Vec3::new(5.0, 0.0, 0.0));
         // Doubling distance halves the apparent size (point moves toward center).
         assert!((after.x.abs() - before.x.abs() / 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fov_matches_known_full_frame_lenses() {
+        // Canonical horizontal angles of view for a 36mm-wide sensor.
+        // (references: 50mm≈39.6°, 35mm≈54.4°, 24mm≈73.7°, 85mm≈23.9°, 15mm≈100.4°)
+        for (f, deg) in [(50.0, 39.6), (35.0, 54.4), (24.0, 73.7), (85.0, 23.9), (15.0, 100.4)] {
+            let got = fov_for_focal_mm(f).to_degrees();
+            assert!((got - deg).abs() < 0.2, "{f}mm -> {got}° expected ~{deg}°");
+        }
+    }
+
+    #[test]
+    fn longer_lens_is_narrower_fov() {
+        assert!(fov_for_focal_mm(85.0) < fov_for_focal_mm(50.0));
+        assert!(fov_for_focal_mm(50.0) < fov_for_focal_mm(15.0));
+    }
+
+    #[test]
+    fn phone_presets_map_to_equivalents() {
+        assert_eq!(preset_focal_mm("phone"), Some(26.0));
+        assert_eq!(preset_focal_mm("phonewide"), Some(13.0));
+        assert_eq!(preset_focal_mm("nope"), None);
+        // Ultra-wide phone is wider than the main camera.
+        assert!(fov_for_focal_mm(13.0) > fov_for_focal_mm(26.0));
+    }
+
+    #[test]
+    fn set_lens_stores_horizontal_fov_via_aspect() {
+        let mut cam = OrbitCamera::default();
+        let aspect = 16.0 / 9.0;
+        cam.set_lens_mm(50.0, aspect);
+        // Reconstruct the horizontal fov from the stored vertical one.
+        let half_h = (cam.fov_y * 0.5).tan();
+        let fov_h = 2.0 * (half_h * aspect).atan();
+        assert!((fov_h - fov_for_focal_mm(50.0)).abs() < 1e-4);
+        assert!(!cam.ortho);
+    }
+
+    #[test]
+    fn two_point_keeps_verticals_parallel() {
+        let mut cam = OrbitCamera::default();
+        // Look up at a tower: a pitch that would make a normal perspective
+        // converge the verticals noticeably.
+        cam.target = Vec3::new(0.0, 0.0, 5.0);
+        cam.distance = 30.0;
+        cam.yaw = -std::f32::consts::FRAC_PI_2; // face +Y-ish, verticals across x
+        cam.pitch = 0.6;
+        cam.two_point = true;
+        let m = cam.view_proj(1.5);
+
+        // Two vertical edges of a tower at x = ±4. For each, compare the screen
+        // x at the base vs. the top; a true vertical stays at constant screen x.
+        for x in [-4.0f32, 4.0] {
+            let base = screen_xy(m, Vec3::new(x, 8.0, 0.0));
+            let top = screen_xy(m, Vec3::new(x, 8.0, 40.0));
+            assert!(
+                (base.x - top.x).abs() < 1e-4,
+                "two-point vertical must not lean: base.x={} top.x={}",
+                base.x,
+                top.x
+            );
+        }
+
+        // Sanity: a normal perspective at the same pitch WOULD converge them.
+        cam.two_point = false;
+        let m = cam.view_proj(1.5);
+        let base = screen_xy(m, Vec3::new(4.0, 8.0, 0.0));
+        let top = screen_xy(m, Vec3::new(4.0, 8.0, 40.0));
+        assert!(
+            (base.x - top.x).abs() > 1e-3,
+            "normal perspective should converge verticals"
+        );
+    }
+
+    #[test]
+    fn two_point_pitch_shifts_frame_vertically() {
+        // Increasing pitch slides the framing up (the tower top moves toward
+        // center) without tilting verticals.
+        let mut cam = OrbitCamera::default();
+        cam.target = Vec3::new(0.0, 0.0, 5.0);
+        cam.distance = 30.0;
+        cam.yaw = -std::f32::consts::FRAC_PI_2;
+        cam.two_point = true;
+
+        cam.pitch = 0.0;
+        let top_low = screen_xy(cam.view_proj(1.5), Vec3::new(0.0, 8.0, 40.0)).y;
+        cam.pitch = 0.6;
+        let top_high = screen_xy(cam.view_proj(1.5), Vec3::new(0.0, 8.0, 40.0)).y;
+        assert!(top_high < top_low, "looking up should lower the top's NDC y toward center: {top_low} -> {top_high}");
     }
 
     #[test]

@@ -15,6 +15,9 @@ pub struct NamedView {
     pub fov_y: f32,
     #[serde(default)]
     pub ortho: bool,
+    /// Two-point (architectural) perspective; see `OrbitCamera::two_point`.
+    #[serde(default)]
+    pub two_point: bool,
 }
 
 fn default_fov_y() -> f32 {
@@ -34,6 +37,7 @@ mod tests {
             pitch: -0.5,
             fov_y: 45f32.to_radians(),
             ortho: true,
+            two_point: false,
         };
         let json = serde_json::to_string(&v).unwrap();
         let back: NamedView = serde_json::from_str(&json).unwrap();
@@ -49,5 +53,6 @@ mod tests {
         .unwrap();
         assert_eq!(v.fov_y, 45f32.to_radians());
         assert!(!v.ortho);
+        assert!(!v.two_point);
     }
 }

@@ -121,6 +121,9 @@ pub struct App {
     /// Cursor ground-plane position in the active pane, for the status bar
     /// (written during the viewport pass, read next frame by the strip).
     status_cursor: Option<glam::DVec3>,
+    /// Aspect (w/h) of the active pane from the last paint; the `camera <lens>`
+    /// command needs it to convert a horizontal angle of view to `fov_y`.
+    active_aspect: f32,
     /// Snap kind currently hit by the draw tool, for the status bar.
     status_snap: Option<&'static str>,
     /// Decoded underlay pixels cached by path, so a scene rebuild (any doc
@@ -235,6 +238,7 @@ impl App {
             journal,
             journaled_generation: None,
             status_cursor: None,
+            active_aspect: 16.0 / 9.0,
             status_snap: None,
             underlay_cache: None,
             deck_visible,
@@ -330,6 +334,12 @@ impl App {
             | "perspective")) => {
                 self.set_view(view);
                 self.command_line.push_line(format!("view: {view}"));
+            }
+            // Camera projection / lens. View state, never logged — mirrors
+            // `display` and the standard-view verbs above.
+            Some("camera") => {
+                let arg = words.next().map(str::to_ascii_lowercase);
+                self.set_camera(arg.as_deref());
             }
             // `view save` captures the active camera — only the app can; the
             // parser leaves `camera: None`. Other `view ...` forms parse as-is.
@@ -436,6 +446,56 @@ impl App {
             _ => StandardView::Perspective,
         };
         self.active_camera().set_view(view);
+    }
+
+    /// `camera <2point|persp|15|24|35|50|85|phone|phonewide>`. Numeric args may
+    /// carry a trailing "mm". Two-point toggles architectural perspective; the
+    /// lens presets set `fov_y` from a full-frame angle of view. All are view
+    /// state on the active pane, never logged.
+    fn set_camera(&mut self, arg: Option<&str>) {
+        let aspect = self.active_aspect;
+        let Some(arg) = arg else {
+            self.command_line.push_line(
+                "usage: camera 2point|persp|<15|24|35|50|85>mm|phone|phonewide",
+            );
+            return;
+        };
+        match arg {
+            "2point" | "twopoint" | "2pt" => {
+                let cam = self.active_camera();
+                cam.ortho = false;
+                cam.two_point = true;
+                self.command_line.push_line("camera: two-point perspective");
+            }
+            "persp" | "perspective" | "1point" | "normal" => {
+                let cam = self.active_camera();
+                cam.ortho = false;
+                cam.two_point = false;
+                self.command_line.push_line("camera: perspective");
+            }
+            _ => {
+                // Named phone sim, or a numeric focal length (optional "mm").
+                let focal = mydrafter_render::preset_focal_mm(arg).or_else(|| {
+                    arg.strip_suffix("mm").unwrap_or(arg).parse::<f32>().ok()
+                });
+                match focal {
+                    Some(f) if f > 0.0 => {
+                        self.active_camera().set_lens_mm(f, aspect);
+                        let fov = mydrafter_render::fov_for_focal_mm(f).to_degrees();
+                        let tag = match arg {
+                            "phone" => " (26mm equiv)",
+                            "phonewide" => " (13mm equiv)",
+                            _ => "",
+                        };
+                        self.command_line
+                            .push_line(format!("camera: {f:.0}mm{tag} — {fov:.0}° hfov"));
+                    }
+                    _ => self.command_line.push_line(
+                        "usage: camera 2point|persp|<15|24|35|50|85>mm|phone|phonewide",
+                    ),
+                }
+            }
+        }
     }
 
     fn zoom_extents(&mut self) {
@@ -725,6 +785,7 @@ impl App {
 
             // Status-bar cursor readout follows the active pane's hover.
             if pane == self.active_pane {
+                self.active_aspect = aspect; // for `camera <lens>` fov conversion
                 self.status_cursor = response
                     .hover_pos()
                     .and_then(|pos| ground_point(view_proj, rect, pos));
@@ -1810,6 +1871,7 @@ fn named_view_of(cam: &OrbitCamera) -> mydrafter_doc::NamedView {
         pitch: cam.pitch,
         fov_y: cam.fov_y,
         ortho: cam.ortho,
+        two_point: cam.two_point,
     }
 }
 
@@ -1820,6 +1882,7 @@ fn apply_named_view(cam: &mut OrbitCamera, view: &mydrafter_doc::NamedView) {
     cam.pitch = view.pitch;
     cam.fov_y = view.fov_y;
     cam.ortho = view.ortho;
+    cam.two_point = view.two_point;
 }
 
 #[cfg(test)]
