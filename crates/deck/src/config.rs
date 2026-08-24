@@ -1,5 +1,26 @@
 use serde::{Deserialize, Serialize};
 
+/// Write `contents` to `path` with mode 0600 on unix so API keys stored in
+/// config files are not world-readable on multi-user hosts (M-3 / L-1).
+pub(crate) fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DeckKind {
@@ -125,7 +146,8 @@ impl DecksFile {
     pub fn save(&self) {
         if let Some(path) = config_path() {
             let _ = std::fs::create_dir_all(path.parent().expect("has parent"));
-            let _ = std::fs::write(path, serde_json::to_string_pretty(self).expect("serializes"));
+            // M-3: 0600 so literal API keys are not world-readable on multi-user hosts.
+            let _ = write_private(&path, &serde_json::to_string_pretty(self).expect("serializes"));
         }
     }
 

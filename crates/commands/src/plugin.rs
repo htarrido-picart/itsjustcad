@@ -19,6 +19,33 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Write `contents` to `path` with mode 0600 on unix (readable only by owner).
+/// On non-unix platforms it falls back to a plain write.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
+/// Returns `true` when the plugin name is safe to use as a filename component.
+/// Mirrors the guard in `define()` — rejects empty, and any `/`, `\`, or `.`.
+fn name_is_valid(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', '.'])
+}
+
 /// One positional parameter of a plugin, with an optional default value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PluginParam {
@@ -159,6 +186,15 @@ impl PluginRegistry {
                 .and_then(|s| serde_json::from_str::<Plugin>(&s).map_err(|e| e.to_string()))
             {
                 Ok(p) => {
+                    // H-6: validate name on load — reject traversal names that
+                    // slipped past define() (e.g. hand-planted plugin files).
+                    if !name_is_valid(&p.name) {
+                        warnings.push(format!(
+                            "{}: skipped — plugin name {:?} contains unsafe characters",
+                            path.display(), p.name
+                        ));
+                        continue;
+                    }
                     reg.plugins.insert(p.name.clone(), p);
                 }
                 Err(e) => warnings.push(format!("{}: {e}", path.display())),
@@ -199,23 +235,33 @@ impl PluginRegistry {
             return Err(PluginError::EmptyName);
         }
         // Guard the on-disk filename against path traversal / separators.
-        if plugin.name.contains(['/', '\\', '.']) {
+        if !name_is_valid(&plugin.name) {
             return Err(PluginError::BadName(plugin.name.clone()));
         }
         std::fs::create_dir_all(dir).map_err(|e| PluginError::Io(e.to_string()))?;
         let json = serde_json::to_string_pretty(&plugin)
             .map_err(|e| PluginError::Io(e.to_string()))?;
-        std::fs::write(plugin.path_in(dir), json).map_err(|e| PluginError::Io(e.to_string()))?;
+        // L-1: write with 0600 so plugin files (which can contain command bodies
+        // that reference local paths) are not world-readable on multi-user hosts.
+        write_private(&plugin.path_in(dir), &json)
+            .map_err(|e| PluginError::Io(e.to_string()))?;
         self.plugins.insert(plugin.name.clone(), plugin);
         Ok(())
     }
 
     /// Remove a plugin from memory and disk.
     pub fn delete(&mut self, name: &str, dir: &Path) -> Result<(), PluginError> {
+        // H-6: re-validate name before deriving the disk path — never join a
+        // raw attacker-controlled string with dir.
+        if !name_is_valid(name) {
+            return Err(PluginError::BadName(name.to_string()));
+        }
         let Some(plugin) = self.plugins.remove(name) else {
             return Err(PluginError::Unknown(name.to_string()));
         };
-        let path = plugin.path_in(dir);
+        // Re-derive path from the already-validated in-memory name (same as
+        // plugin.name, which passed validate() at define/load time).
+        let path = dir.join(format!("{}.plugin.json", plugin.name));
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| PluginError::Io(e.to_string()))?;
         }
@@ -370,5 +416,70 @@ mod tests {
         };
         let out = p.expand(&["0,0,0".into(), "5,5,3".into()]).unwrap();
         assert_eq!(out[0], "box 0,0,0 5,5,3");
+    }
+
+    // ── H-6 regression tests ────────────────────────────────────────────────
+
+    /// A hand-planted plugin JSON with a traversal name must be silently
+    /// skipped (with a warning) on load, never inserted into the registry.
+    #[test]
+    fn load_dir_rejects_traversal_name() {
+        let dir = std::env::temp_dir()
+            .join(format!("mydrafter-plugtest-traversal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Plant a hostile plugin file with a traversal name in the JSON body.
+        let malicious_json = r#"{"name":"../../../../.ssh/authorized_keys","body":["echo pwned"]}"#;
+        std::fs::write(dir.join("evil.plugin.json"), malicious_json).unwrap();
+
+        let (reg, warnings) = PluginRegistry::load_dir(&dir);
+
+        // The traversal name must NOT appear in the registry.
+        assert!(reg.is_empty(), "traversal plugin was loaded: {:?}", reg.plugins.keys().collect::<Vec<_>>());
+        // A warning must have been emitted.
+        assert!(!warnings.is_empty(), "expected a warning about the bad name");
+        assert!(warnings[0].contains("unsafe characters"), "warning text: {:?}", warnings);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After loading a legitimate plugin, `delete` with a traversal name must
+    /// fail with `BadName` — it must never reach `remove_file` outside the dir.
+    #[test]
+    fn delete_rejects_traversal_name_before_remove_file() {
+        let dir = std::env::temp_dir()
+            .join(format!("mydrafter-plugtest-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut reg = PluginRegistry::new();
+        reg.define(column_grid(), &dir).unwrap();
+
+        // Attempt to delete using a traversal name — must be rejected.
+        let result = reg.delete("../../../.ssh/authorized_keys", &dir);
+        assert_eq!(result, Err(PluginError::BadName("../../../.ssh/authorized_keys".into())));
+
+        // The legitimate plugin must still be in memory and on disk.
+        assert!(reg.contains("column-grid"));
+        assert!(column_grid().path_in(&dir).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plugin file written by `define` must have mode 0600 on unix (L-1).
+    #[cfg(unix)]
+    #[test]
+    fn define_writes_private_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir()
+            .join(format!("mydrafter-plugtest-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut reg = PluginRegistry::new();
+        reg.define(column_grid(), &dir).unwrap();
+
+        let meta = std::fs::metadata(column_grid().path_in(&dir)).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

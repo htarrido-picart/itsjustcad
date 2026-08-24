@@ -90,7 +90,11 @@ impl SavedChatRef<'_> {
     fn save(&self) {
         let Some(path) = saved_chat_path() else { return };
         let _ = std::fs::create_dir_all(path.parent().expect("has parent"));
-        let _ = std::fs::write(path, serde_json::to_string_pretty(self).expect("serializes"));
+        // L-1: 0600 — transcript contains user messages and scene digests.
+        let _ = crate::journal::write_private(
+            &path,
+            serde_json::to_string_pretty(self).expect("serializes").as_bytes(),
+        );
     }
 }
 

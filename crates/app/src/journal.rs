@@ -7,6 +7,54 @@ use std::path::{Path, PathBuf};
 
 use mydrafter_commands::{Command, Session};
 
+/// Write `contents` to `path` with mode 0600 on unix (L-1 / M-3: config files
+/// such as transcripts must not be world-readable on multi-user hosts).
+pub(crate) fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
+/// Like `write_private` but opens for append; creates the file with mode 0600
+/// on unix so the journal (which records command ops) is not world-readable.
+pub(crate) fn append_private(path: &Path, contents: &[u8], _first_write: bool) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents)?;
+        f.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        f.write_all(contents)?;
+        f.sync_all()
+    }
+}
+
 pub struct Journal {
     path: PathBuf,
     /// Serialized ops currently on disk; prefix-compare decides append vs rewrite.
@@ -78,22 +126,22 @@ fn remove_if_exists(path: &Path) -> std::io::Result<()> {
 }
 
 fn append_lines(path: &Path, lines: &[String], first_write: bool) -> std::io::Result<()> {
-    use std::io::Write;
     if first_write && let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut buf = String::new();
     for line in lines {
-        writeln!(file, "{line}")?;
+        buf.push_str(line);
+        buf.push('\n');
     }
-    file.sync_all()
+    append_private(path, buf.as_bytes(), first_write)
 }
 
 fn write_all(path: &Path, lines: &[String]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, lines.join("\n") + "\n")
+    write_private(path, (lines.join("\n") + "\n").as_bytes())
 }
 
 pub fn default_dir() -> Option<PathBuf> {
