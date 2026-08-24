@@ -481,6 +481,9 @@ impl App {
             }
         }
         if let Some(prompt) = self.deck_script.take() {
+            // Reveal the Deck tab so the scripted conversation is visible in
+            // ITSJUSTCAD_DECK_RUN screenshots.
+            self.panel_tabs.show(crate::tabstrip::PanelTab::Deck);
             self.deck_pane
                 .send_text(&prompt, &self.session, &self.tokio);
         }
