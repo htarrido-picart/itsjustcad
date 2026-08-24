@@ -32,6 +32,46 @@ pub(crate) fn build_prompt(messages: &[ChatMessage], has_session: bool) -> Strin
     }
 }
 
+/// Resolve the effective `--allowed-tools` list for a turn.
+///
+/// SECURITY (H-1): file access is only ever a Read scoped to the single vision
+/// screenshot. This helper is the choke point:
+/// - Any bare/unscoped `Read` (or `Read()` with no path) in `allowed_tools` is
+///   DROPPED — it must never reach the CLI, or an attacker-controlled scene name
+///   in the prompt could steer the model to read `decks.json` (API keys) or any
+///   other file.
+/// - When `vision_shot_path` is set, a single `Read(<abs path>)` is appended,
+///   granting access to exactly that one screenshot and nothing else.
+///
+/// Pure so the scoping rule is unit-testable without spawning the CLI.
+pub fn scoped_allowed_tools(allowed: &[String], vision_shot_path: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = allowed
+        .iter()
+        .filter(|t| !is_unscoped_read(t))
+        .cloned()
+        .collect();
+    if let Some(path) = vision_shot_path {
+        let path = path.trim();
+        if !path.is_empty() {
+            out.push(format!("Read({path})"));
+        }
+    }
+    out
+}
+
+/// True for a Read specifier that is NOT confined to a concrete path: bare
+/// `Read`, or `Read()` / `Read( )` with an empty argument. These are forbidden.
+fn is_unscoped_read(tool: &str) -> bool {
+    let t = tool.trim();
+    if t == "Read" {
+        return true;
+    }
+    if let Some(rest) = t.strip_prefix("Read(").and_then(|r| r.strip_suffix(')')) {
+        return rest.trim().is_empty();
+    }
+    false
+}
+
 /// Claude via the local `claude` CLI as a hidden subprocess — uses the user's
 /// Claude subscription (OAuth), no API key. The CLI is transport only; the
 /// command substrate never leaves mydrafter.
@@ -81,11 +121,17 @@ impl ClaudeCodeDeck {
             r#"{"mcpServers":{}}"#.into(),
         ];
         // Grant only the tools this turn opted into. Empty keeps the deck a
-        // pure text substrate (the default); a vision critique passes `Read` so
-        // the model can open the screenshot the prompt points at.
-        if !req.allowed_tools.is_empty() {
+        // pure text substrate (the default).
+        //
+        // SECURITY (H-1): file access is NEVER an unscoped `Read`. A vision
+        // critique sets `vision_shot_path`; we translate it into a Read scoped
+        // to exactly that one file (`Read(<abs path>)`). Any bare `Read` (or
+        // other unscoped Read) that somehow reaches `allowed_tools` is dropped —
+        // the only way to read a file is the single scoped screenshot path.
+        let scoped = scoped_allowed_tools(&req.allowed_tools, req.vision_shot_path.as_deref());
+        if !scoped.is_empty() {
             args.push("--allowed-tools".into());
-            args.push(req.allowed_tools.join(","));
+            args.push(scoped.join(","));
         }
         if let Some(session) = &req.session_id {
             args.push("--resume".into());
@@ -200,5 +246,46 @@ mod tests {
     fn session_prompt_empty_when_no_user_turn() {
         let messages = vec![msg(Role::Assistant, "hi")];
         assert!(build_prompt(&messages, true).is_empty());
+    }
+
+    // --- SECURITY H-1: file access is only ever a path-scoped Read ---
+
+    #[test]
+    fn vision_shot_becomes_a_path_scoped_read() {
+        let tools = scoped_allowed_tools(&[], Some("/tmp/mydrafter-critique.png"));
+        assert_eq!(tools, vec!["Read(/tmp/mydrafter-critique.png)".to_string()]);
+    }
+
+    #[test]
+    fn no_vision_shot_grants_no_read() {
+        // The default text turn: no file access whatsoever.
+        assert!(scoped_allowed_tools(&[], None).is_empty());
+    }
+
+    #[test]
+    fn bare_read_is_dropped_even_if_requested() {
+        // Regression for H-1: a bare/unscoped `Read` must NEVER reach the CLI,
+        // even if a caller (or a future bug) puts one in `allowed_tools`. Before
+        // the fix, `--allowed-tools Read` granted arbitrary file read, letting an
+        // attacker-controlled scene name steer the model into reading decks.json.
+        let tools = scoped_allowed_tools(&["Read".into()], None);
+        assert!(tools.is_empty(), "unscoped Read must be stripped, got {tools:?}");
+
+        // Empty-arg Read() is equally unscoped and must go too.
+        assert!(scoped_allowed_tools(&["Read()".into()], None).is_empty());
+        assert!(scoped_allowed_tools(&["Read( )".into()], None).is_empty());
+    }
+
+    #[test]
+    fn bare_read_dropped_but_scoped_shot_still_granted() {
+        // A stray bare Read is dropped; the legitimate scoped screenshot remains
+        // the ONLY file the model can open.
+        let tools = scoped_allowed_tools(&["Read".into()], Some("/tmp/shot.png"));
+        assert_eq!(tools, vec!["Read(/tmp/shot.png)".to_string()]);
+    }
+
+    #[test]
+    fn empty_vision_path_grants_nothing() {
+        assert!(scoped_allowed_tools(&[], Some("   ")).is_empty());
     }
 }

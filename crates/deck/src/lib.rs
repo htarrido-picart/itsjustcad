@@ -12,6 +12,7 @@ mod openai_compat;
 mod probe;
 mod prompt;
 
+pub use claude_code::scoped_allowed_tools;
 pub use config::{is_local_url, DeckConfig, DeckKind, DecksFile};
 pub use deck::{make_deck, ChatMessage, ChatRequest, DeckDelta, DeckError, LlmDeck, Role};
 pub use extract::{Extractor, ExtractEvent};

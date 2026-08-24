@@ -29,10 +29,18 @@ pub struct ChatRequest {
     /// transcript. HTTP adapters ignore it.
     pub session_id: Option<String>,
     /// Tools the model may use this turn (claude-code cassette only). Empty =
-    /// none, keeping the deck a pure text substrate. `["Read"]` lets a vision
-    /// critique turn open a screenshot the prompt points at. HTTP adapters
-    /// ignore it.
+    /// none, keeping the deck a pure text substrate. HTTP adapters ignore it.
+    ///
+    /// SECURITY (H-1): this is NEVER a bare `Read`. A vision critique sets
+    /// `vision_shot_path` instead, from which the claude-code adapter derives a
+    /// *path-scoped* `Read(<that one file>)` specifier — the model can open the
+    /// screenshot and nothing else (no `decks.json` key exfiltration, no
+    /// arbitrary file read via an attacker-controlled scene name in the prompt).
     pub allowed_tools: Vec<String>,
+    /// The single screenshot a vision-critique turn is allowed to open
+    /// (claude-code cassette only). When set, the adapter grants a Read scoped
+    /// to exactly this path and nothing else. `None` = no file access.
+    pub vision_shot_path: Option<String>,
     /// Agentic turn budget (claude-code cassette only). 1 for a plain reply; a
     /// tool-using turn (Read a screenshot, then answer) needs 2+. HTTP
     /// adapters ignore it.
@@ -59,6 +67,7 @@ impl ChatRequest {
             temperature,
             session_id,
             allowed_tools: Vec::new(),
+            vision_shot_path: None,
             max_turns: 1,
         }
     }

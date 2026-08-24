@@ -309,9 +309,11 @@ pub struct DeckPane {
     session_id: Option<String>,
     view: PaneView,
     markdown: CommonMarkCache,
-    /// The next turn is a vision critique: grant the claude-code cassette the
-    /// Read tool (to open the screenshot) and a 2nd agentic step (read, then
-    /// answer). Consumed by `start_turn`; retries within the turn inherit it.
+    /// The current turn is a vision critique: the claude-code cassette gets a
+    /// Read *scoped to the single critique screenshot* (H-1) plus a 2nd agentic
+    /// step (open the shot, then answer). A critique turn is prose-only — it
+    /// runs no draft commands (H-2). Set by `send_critique`, cleared in
+    /// `finish_turn` BEFORE any retry so file access is granted exactly once.
     vision_turn: bool,
     /// The critique button was clicked; the app owns the viewport screenshot so
     /// it polls and clears this, then drives the capture + `send_critique`.
@@ -495,8 +497,9 @@ impl DeckPane {
     }
 
     /// Send a viewport critique: a vision turn whose prompt already points at
-    /// the on-disk screenshot. The claude-code cassette gets the Read tool for
-    /// this turn (and its error-retries) so it can open the image.
+    /// the on-disk screenshot. The claude-code cassette gets a Read scoped to
+    /// exactly that one screenshot (H-1) for this turn only — never re-granted
+    /// on a retry (H-2). The turn is prose-only and runs no draft commands.
     pub fn send_critique(
         &mut self,
         prompt: &str,
@@ -528,10 +531,13 @@ impl DeckPane {
             self.session_id.clone(),
         );
         if self.vision_turn {
-            // Grant Read (to open the screenshot) and a 2nd agentic step so the
-            // model can read then answer. Claude-code cassette only; HTTP
-            // adapters ignore these fields (vision there is a noted cut).
-            req.allowed_tools = vec!["Read".into()];
+            // SECURITY (H-1): grant NO unscoped Read. Instead point the adapter
+            // at the single fixed critique screenshot; it derives a Read scoped
+            // to exactly that file (no arbitrary read, no `decks.json` key
+            // exfiltration via an attacker-controlled scene name). A 2nd agentic
+            // step lets the model open the shot then answer. Claude-code cassette
+            // only; HTTP adapters ignore these fields (vision there is a cut).
+            req.vision_shot_path = Some(crate::app::CRITIQUE_SHOT_PATH.to_string());
             req.max_turns = 2;
         }
         let (tx, rx) = unbounded_channel();
@@ -583,6 +589,16 @@ impl DeckPane {
         for event in events {
             match event {
                 ExtractEvent::Chat(text) => self.streaming_chat.push_str(&text),
+                // SECURITY (H-2): a vision-critique turn is prose-only. Any
+                // ```draft``` block a critique produces is NOT parsed, run, or
+                // queued — a turn that was granted file access must not also be
+                // able to drive side-effecting commands. Show it as prose so the
+                // user still sees what the model said.
+                ExtractEvent::Command(line) if self.vision_turn => {
+                    self.streaming_chat.push_str("\n```draft\n");
+                    self.streaming_chat.push_str(&line);
+                    self.streaming_chat.push_str("\n```\n");
+                }
                 ExtractEvent::Command(line) => {
                     // Parse first so we can classify. A parse error is reported
                     // exactly as before (no execution attempted).
@@ -674,6 +690,14 @@ impl DeckPane {
             role: Role::Assistant,
             content: std::mem::take(&mut self.current_response),
         });
+        // SECURITY (H-2): a critique is a single vision turn. Clear the flag
+        // BEFORE any retry so a re-emit turn never re-grants the scoped Read —
+        // file access is granted exactly once, for the original critique, and
+        // never on an auto-retry (nor on the next normal send). A vision turn
+        // also emits no draft commands (see `handle_extract_events`), so it can
+        // never queue the error-driven retry, but clear here regardless to be
+        // robust to future changes.
+        self.vision_turn = false;
         if !self.errors_this_turn.is_empty() && self.retries < MAX_RETRIES {
             self.retries += 1;
             let feedback = format!(
@@ -690,10 +714,6 @@ impl DeckPane {
                 content: feedback,
             });
             self.start_turn(session, handle);
-        } else {
-            // Turn fully done (no retry queued): a vision turn does not carry
-            // over to the next normal send.
-            self.vision_turn = false;
         }
         self.persist_chat();
     }
@@ -1212,6 +1232,108 @@ mod side_effect_gate_tests {
             allow_deck_side_effects: false,
             sandbox_root: None,
         }
+    }
+
+    // --- SECURITY H-1/H-2: vision-critique file access ---
+
+    #[test]
+    fn critique_turn_requests_scoped_read_not_unscoped() {
+        // H-1: a vision turn must pass the single screenshot path (→ scoped
+        // Read), and must NOT put a bare `Read` in allowed_tools.
+        let mut pane = blank_pane();
+        pane.vision_turn = true;
+        let mut req = ChatRequest::text(
+            String::new(),
+            Vec::new(),
+            String::new(),
+            4096,
+            0.2,
+            None,
+        );
+        // Mirror the vision-turn arm of start_turn.
+        if pane.vision_turn {
+            req.vision_shot_path = Some(crate::app::CRITIQUE_SHOT_PATH.to_string());
+            req.max_turns = 2;
+        }
+        assert!(
+            req.allowed_tools.is_empty(),
+            "critique must not grant an unscoped Read tool"
+        );
+        assert_eq!(
+            req.vision_shot_path.as_deref(),
+            Some(crate::app::CRITIQUE_SHOT_PATH),
+            "critique must scope file access to the one screenshot"
+        );
+        // And the adapter turns that into a path-scoped Read of exactly that file.
+        let scoped = mydrafter_deck::scoped_allowed_tools(
+            &req.allowed_tools,
+            req.vision_shot_path.as_deref(),
+        );
+        assert_eq!(
+            scoped,
+            vec![format!("Read({})", crate::app::CRITIQUE_SHOT_PATH)]
+        );
+    }
+
+    #[test]
+    fn vision_turn_does_not_execute_or_queue_commands() {
+        // H-2: a critique turn is prose-only. A ```draft``` export it emits is
+        // neither run nor queued — it is shown as prose. Before the fix a
+        // Read-granted turn could also drive side-effecting commands.
+        let mut pane = blank_pane();
+        pane.vision_turn = true;
+        let mut session = Session::default();
+        let sentinel = std::env::temp_dir()
+            .join(format!("mydrafter_vision_evil_{}.csv", std::process::id()));
+        let _ = std::fs::remove_file(&sentinel);
+        pane.handle_extract_events(
+            vec![
+                ExtractEvent::Command(format!("export {}", sentinel.display())),
+                ExtractEvent::Command("box 0,0,0 1,1,1".into()),
+            ],
+            &mut session,
+        );
+        assert!(
+            pane.pending_side_effects.is_empty(),
+            "vision turn must not queue side-effects"
+        );
+        assert!(
+            pane.current_commands.is_empty(),
+            "vision turn must not execute any command"
+        );
+        assert_eq!(session.doc.len(), 0, "no geometry op should have run");
+        assert!(!sentinel.exists());
+        assert!(
+            pane.streaming_chat.contains("export"),
+            "the emitted command should surface as prose"
+        );
+    }
+
+    #[test]
+    fn vision_turn_emits_no_errors_so_no_retry_can_re_grant_read() {
+        // H-2 (structural): a critique turn runs no commands, so it can never
+        // accumulate `errors_this_turn` — the error-driven retry that would
+        // re-enter start_turn (and re-grant the scoped Read) is unreachable. A
+        // malicious ```draft``` in a critique response is shown as prose, not
+        // executed, and leaves no error to trigger a retry.
+        let mut pane = blank_pane();
+        pane.vision_turn = true;
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![
+                // Even a command that WOULD fail to parse must not register an
+                // error on a vision turn (it isn't parsed at all).
+                ExtractEvent::Command("export".into()),
+                ExtractEvent::Command("totally not a command".into()),
+            ],
+            &mut session,
+        );
+        assert!(
+            pane.errors_this_turn.is_empty(),
+            "a vision turn must produce no command errors → no retry path"
+        );
+        assert!(pane.current_commands.is_empty());
+        assert!(pane.pending_side_effects.is_empty());
     }
 
     #[test]
