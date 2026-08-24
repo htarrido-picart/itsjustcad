@@ -805,7 +805,12 @@ fn triangulated_face_set(records: &Records, rec: &Record, xform: DMat4) -> Optio
             .filter_map(|n| n.trim().parse::<u32>().ok())
             .collect();
         if idx.len() == 3 {
-            // IFC indices are 1-based.
+            // IFC indices are 1-based. H-4: reject any index that is 0 (would
+            // underflow on subtraction) or that exceeds the positions count.
+            let n = positions.len() as u32;
+            if idx.iter().any(|&v| v == 0 || v > n) {
+                continue;
+            }
             faces.push([idx[0] - 1, idx[1] - 1, idx[2] - 1]);
         }
     }
@@ -873,6 +878,15 @@ fn faceted_brep(records: &Records, rec: &Record, xform: DMat4) -> Option<Mesh> {
         }
     }
 
+    if faces.is_empty() {
+        return None;
+    }
+    // H-5: drop any face whose indices exceed the positions array (defensive).
+    let pos_len = positions.len() as u32;
+    let faces: Vec<[u32; 3]> = faces
+        .into_iter()
+        .filter(|f| f.iter().all(|&v| v < pos_len))
+        .collect();
     if faces.is_empty() {
         return None;
     }
@@ -1191,6 +1205,51 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         assert_eq!(num(-3.0), "-3.");
         assert!(num(1.5).contains('.'));
         assert_eq!(num(f64::NAN), "0.");
+    }
+
+    // ---- H-4: IFC zero-index underflow ----
+    // CoordIndex containing (0,1,2) is invalid (IFC is 1-based); before the fix
+    // `0u32 - 1` wraps to u32::MAX causing an OOB panic in Mesh.  After the fix
+    // the offending face is silently skipped.
+    #[test]
+    fn ifc_zero_coord_index_does_not_panic() {
+        // Three points, but CoordIndex references index 0 (invalid, 1-based).
+        let ifc = "\
+ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));\n\
+#2=IFCTRIANGULATEDFACESET(#1,$,.T.,((0,1,2)),$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+        // The zero-indexed face must be dropped, yielding either empty or Err —
+        // crucially it must NOT panic.
+        let result = import(ifc.as_bytes()).unwrap();
+        // The bad face was filtered; no valid mesh should survive.
+        assert!(result.is_empty(), "bad face should be dropped, got {:?}", result.len());
+    }
+
+    // ---- H-4: IFC out-of-range index ----
+    // CoordIndex (1,2,99) where there are only 3 points (max valid = 3).
+    #[test]
+    fn ifc_out_of_range_coord_index_does_not_panic() {
+        let ifc = "\
+ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));\n\
+#2=IFCTRIANGULATEDFACESET(#1,$,.T.,((1,2,99)),$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+        let result = import(ifc.as_bytes()).unwrap();
+        assert!(result.is_empty(), "OOB face should be dropped");
+    }
+
+    // ---- Valid IFC with good indices still loads correctly after guard ----
+    #[test]
+    fn ifc_valid_coord_index_still_loads() {
+        let ifc = "\
+ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));\n\
+#2=IFCTRIANGULATEDFACESET(#1,$,.T.,((1,2,3)),$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+        let result = import(ifc.as_bytes()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1.faces().len(), 1);
     }
 }
 

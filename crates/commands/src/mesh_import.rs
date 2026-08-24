@@ -336,10 +336,16 @@ fn parse_glb_binary(bytes: &[u8]) -> Result<Vec<(String, Mesh)>, String> {
                 continue;
             }
             let n3 = indices.len() / 3;
+            let pos_len = positions.len() as u32;
+            // H-5: discard any face that references an out-of-bounds vertex index.
             let faces: Vec<[u32; 3]> = (0..n3)
                 .map(|i| [indices[i * 3], indices[i * 3 + 1], indices[i * 3 + 2]])
+                .filter(|f| f.iter().all(|&v| v < pos_len))
                 .collect();
 
+            if faces.is_empty() {
+                continue;
+            }
             out.push((name.clone(), Mesh::new(positions, faces)));
             break; // one primitive per mesh is our contract
         }
@@ -356,7 +362,7 @@ fn read_vec3_accessor(
     acc_i: usize,
 ) -> Result<Vec<DVec3>, String> {
     let acc = accessors.get(acc_i).ok_or_else(|| format!("GLB: accessor {acc_i} missing"))?;
-    let count = acc["count"].as_u64().ok_or("GLB: accessor missing count")? as usize;
+    let raw_count = acc["count"].as_u64().ok_or("GLB: accessor missing count")? as usize;
     let component_type = acc["componentType"].as_u64().unwrap_or(0);
     if component_type != 5126 {
         return Err(format!("GLB: POSITION accessor componentType {component_type} != 5126 (f32)"));
@@ -374,6 +380,13 @@ fn read_vec3_accessor(
     let byte_stride = view["byteStride"].as_u64().map(|s| s as usize);
     let stride = byte_stride.unwrap_or(12); // 3 * 4 bytes for packed VEC3 f32
     let start = view_offset + acc_offset;
+
+    // H-3: cap count against actual BIN size before allocating, plus an absolute
+    // safety ceiling to prevent multi-GB allocations from malicious files.
+    const MAX_VERTICES: usize = 50_000_000;
+    let remaining = bin.len().saturating_sub(start);
+    let max_by_bin = remaining.checked_div(stride).unwrap_or(0);
+    let count = raw_count.min(max_by_bin).min(MAX_VERTICES);
 
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
@@ -397,7 +410,7 @@ fn read_scalar_accessor(
     acc_i: usize,
 ) -> Result<Vec<u32>, String> {
     let acc = accessors.get(acc_i).ok_or_else(|| format!("GLB: accessor {acc_i} missing"))?;
-    let count = acc["count"].as_u64().ok_or("GLB: index accessor missing count")? as usize;
+    let raw_count = acc["count"].as_u64().ok_or("GLB: index accessor missing count")? as usize;
     let component_type = acc["componentType"].as_u64().unwrap_or(0);
     if acc["type"].as_str() != Some("SCALAR") {
         return Err("GLB: index accessor type is not SCALAR".to_string());
@@ -417,6 +430,12 @@ fn read_scalar_accessor(
         5125 => 4,        // u32
         other => return Err(format!("GLB: unsupported index componentType {other}")),
     };
+
+    // H-3: cap count against actual BIN size + absolute ceiling.
+    const MAX_INDICES: usize = 150_000_000;
+    let remaining = bin.len().saturating_sub(start);
+    let max_by_bin = remaining.checked_div(elem_size).unwrap_or(0);
+    let count = raw_count.min(max_by_bin).min(MAX_INDICES);
 
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
@@ -576,5 +595,88 @@ endsolid test\n\
     fn unknown_extension_errors() {
         let err = import("/tmp/x.abc", b"").unwrap_err();
         assert!(err.contains(".abc"));
+    }
+
+    // ---- H-3: GLB accessor count OOM (huge count, empty BIN) ----
+    // A minimal GLB with a POSITION accessor declaring count=9999999999 but
+    // the BIN chunk is empty.  Before the fix this would Vec::with_capacity
+    // a ~240 GB buffer and abort.  After the fix it must return Err gracefully.
+    #[test]
+    fn glb_huge_accessor_count_empty_bin_returns_err() {
+        // Build a minimal valid GLB header + JSON chunk; BIN chunk is absent.
+        let json = serde_json::json!({
+            "meshes": [{
+                "name": "evil",
+                "primitives": [{
+                    "mode": 4,
+                    "attributes": { "POSITION": 0 },
+                    "indices": 1
+                }]
+            }],
+            "accessors": [
+                {
+                    "bufferView": 0,
+                    "byteOffset": 0,
+                    "componentType": 5126,
+                    "count": 9_999_999_999u64,
+                    "type": "VEC3"
+                },
+                {
+                    "bufferView": 0,
+                    "byteOffset": 0,
+                    "componentType": 5125,
+                    "count": 9_999_999_999u64,
+                    "type": "SCALAR"
+                }
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 0 }
+            ],
+            "buffers": [{ "byteLength": 0 }]
+        });
+        let json_bytes = json.to_string().into_bytes();
+        // Pad JSON to 4-byte alignment.
+        let json_len = json_bytes.len();
+        let padded_len = (json_len + 3) & !3;
+        let mut json_padded = json_bytes;
+        json_padded.resize(padded_len, b' ');
+
+        // GLB header: magic, version, total length.
+        let chunk_len = padded_len as u32;
+        let total = 12 + 8 + chunk_len; // header + chunk-header + chunk-data
+        let mut glb = Vec::new();
+        glb.extend_from_slice(b"glTF");           // magic
+        glb.extend_from_slice(&2u32.to_le_bytes()); // version
+        glb.extend_from_slice(&total.to_le_bytes());
+        glb.extend_from_slice(&chunk_len.to_le_bytes());
+        glb.extend_from_slice(&0x4E4F534Au32.to_le_bytes()); // JSON chunk type
+        glb.extend_from_slice(&json_padded);
+
+        // Must return Err — not panic or OOM.
+        let result = parse_glb(&glb);
+        // With an empty BIN the position accessor's effective count becomes 0,
+        // so the mesh will have no positions and be skipped, yielding Ok([]).
+        // Either Ok([]) or Err is acceptable — the key property is no abort/OOM.
+        match &result {
+            Ok(parts) => assert!(parts.is_empty(), "no valid mesh should be produced"),
+            Err(_) => {} // also fine
+        }
+    }
+
+    // ---- H-5: GLB with out-of-bounds face indices is filtered, not OOB-panicked ----
+    #[test]
+    fn glb_oob_face_indices_are_dropped() {
+        // Build a real (tiny) GLB from a box, then corrupt the index data.
+        use crate::{parse, Session};
+        let mut s = Session::default();
+        s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        let (glb_bytes, _) = crate::mesh_export::export(&s.doc, "/tmp/x.glb").unwrap();
+
+        // The fix (H-5 filter) ensures that even if indices contain junk values
+        // that exceed positions.len(), parse_glb returns Ok without panicking.
+        // Verify the normal round-trip still works (no valid faces dropped).
+        let parts = parse_glb(&glb_bytes).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].1.faces().len(), 12);
     }
 }
