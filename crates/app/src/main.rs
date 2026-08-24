@@ -8,6 +8,7 @@ mod journal;
 mod keymap;
 mod osnap;
 mod precise;
+mod preset;
 mod scene;
 mod statusbar;
 mod suggest;

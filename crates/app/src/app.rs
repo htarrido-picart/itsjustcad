@@ -10,6 +10,7 @@ use crate::draw_tool::DrawTool;
 use crate::gumball::Gumball;
 use crate::journal::{self, Journal};
 use crate::keymap;
+use crate::preset::{self, CadOrigin};
 use crate::scene;
 
 #[derive(Clone, PartialEq)]
@@ -126,6 +127,8 @@ pub struct App {
     show_template_picker: bool,
     template_units: TemplateUnits,
     template_scale: TemplateScale,
+    /// Legacy-CAD origin selected in the template picker (persisted to ui.json).
+    cad_origin: CadOrigin,
 }
 
 impl App {
@@ -177,6 +180,8 @@ impl App {
         cc.egui_ctx.style_mut_of(egui::Theme::Light, set_cad_fonts);
 
         let deck_visible = load_deck_visible().unwrap_or(true);
+        let cad_origin = load_cad_origin().unwrap_or_default();
+        apply_preset(cc.egui_ctx.clone(), cad_origin);
 
         let journal = Journal::open_default();
         let mut command_line = CommandLine::default();
@@ -228,7 +233,13 @@ impl App {
             show_template_picker: !load_template_done(),
             template_units: TemplateUnits::Meters,
             template_scale: TemplateScale::Building,
+            cad_origin,
         }
+    }
+
+    /// Active alias map from the current preset (used by autosuggest + execute_line).
+    fn active_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        preset::preset_for(self.cad_origin).aliases
     }
 
     fn run_startup_script(&mut self) {
@@ -245,7 +256,17 @@ impl App {
 
     /// App-level verbs (save/open, camera) wrap the command substrate.
     fn execute_line(&mut self, line: String) {
-        let line = line.trim();
+        // Expand legacy-CAD alias BEFORE any dispatch (case-insensitive single-token).
+        let expanded: String;
+        let line = {
+            let aliases = self.active_aliases();
+            if let Some(exp) = preset::expand_alias(line.trim(), aliases) {
+                expanded = exp;
+                expanded.as_str()
+            } else {
+                line.trim()
+            }
+        };
         if !line.is_empty() {
             self.last_line = Some(line.to_string()); // Enter/Space repeat
         }
@@ -725,6 +746,16 @@ impl App {
                     let (additive, bypass_group) =
                         ui.input(|i| (i.modifiers.shift, i.modifiers.command));
                     self.pick(view_proj, rect, pos, additive, !bypass_group);
+                }
+                // Rhino preset: right-click (no drag) = repeat last command.
+                // We only fire when the click was NOT consumed by a drag and the
+                // cursor did not move (egui's secondary_clicked covers this).
+                if preset::preset_for(self.cad_origin).right_click_repeat_last
+                    && pane == self.active_pane
+                    && response.secondary_clicked()
+                    && let Some(line) = self.last_line.clone()
+                {
+                    self.execute_line(line);
                 }
                 // Drag-box selection (no tool, gumball idle): left→right is a
                 // window (solid box, fully-inside only), right→left a crossing
@@ -1311,6 +1342,73 @@ fn save_template_done() {
     save_ui_json(&v);
 }
 
+fn load_cad_origin() -> Option<CadOrigin> {
+    let v = load_ui_json();
+    let s = v["cad_origin"].as_str()?;
+    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+}
+
+fn save_cad_origin(origin: CadOrigin) {
+    let mut v = load_ui_json();
+    v["cad_origin"] = serde_json::to_value(origin).unwrap_or(serde_json::Value::Null);
+    save_ui_json(&v);
+}
+
+/// Apply a legacy-CAD preset to the egui context: theme (dark/light) and font sizes.
+/// Called on startup (from saved prefs) and when the user picks a preset in the
+/// template dialog. Pencil mode clear-color is handled separately in `clear_color`.
+fn apply_preset(ctx: egui::Context, origin: CadOrigin) {
+    let p = preset::preset_for(origin);
+    let dark = preset::is_dark(p);
+
+    // Switch egui theme to match the preset background.
+    ctx.set_theme(if dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    });
+
+    // Override accent / selection color in the active theme's visuals.
+    let [ar, ag, ab, aa] = p.accent_color;
+    let accent = egui::Color32::from_rgba_unmultiplied(
+        (ar * 255.0) as u8,
+        (ag * 255.0) as u8,
+        (ab * 255.0) as u8,
+        (aa * 255.0) as u8,
+    );
+
+    let font_px = p.ui_font_px;
+    let set_style = move |style: &mut egui::Style| {
+        style.visuals.selection.bg_fill = accent;
+        style.visuals.selection.stroke = egui::Stroke::new(1.5, accent);
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            egui::FontId::proportional(font_px),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Button,
+            egui::FontId::proportional(font_px),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(font_px),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Small,
+            egui::FontId::proportional(font_px - 2.0),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::proportional(font_px + 1.0),
+        );
+    };
+    if dark {
+        ctx.style_mut_of(egui::Theme::Dark, set_style);
+    } else {
+        ctx.style_mut_of(egui::Theme::Light, set_style);
+    }
+}
+
 /// Screen position -> world-space pick ray (origin on the near plane).
 pub(crate) fn screen_ray(
     view_proj: glam::Mat4,
@@ -1423,6 +1521,10 @@ impl eframe::App for App {
         if active_mode == mydrafter_render::DisplayMode::Pencil {
             return mydrafter_render::DisplayMode::pencil_background();
         }
+        // Legacy-CAD preset background overrides theme when active.
+        if self.cad_origin != CadOrigin::None {
+            return preset::preset_for(self.cad_origin).bg_color;
+        }
         if visuals.dark_mode {
             scene::Theme::Dark.background()
         } else {
@@ -1461,6 +1563,24 @@ impl eframe::App for App {
                     ui.radio_value(&mut self.template_scale, TemplateScale::Building, "Building (~30m)");
                     ui.radio_value(&mut self.template_scale, TemplateScale::Urban, "Urban (~300m)");
                     ui.add_space(8.0);
+                    ui.label("Which CAD are you coming from?");
+                    ui.radio_value(
+                        &mut self.cad_origin, CadOrigin::None,
+                        CadOrigin::None.label(),
+                    );
+                    ui.radio_value(
+                        &mut self.cad_origin, CadOrigin::AutoCAD,
+                        CadOrigin::AutoCAD.label(),
+                    );
+                    ui.radio_value(
+                        &mut self.cad_origin, CadOrigin::Rhino,
+                        CadOrigin::Rhino.label(),
+                    );
+                    ui.radio_value(
+                        &mut self.cad_origin, CadOrigin::Revit,
+                        CadOrigin::Revit.label(),
+                    );
+                    ui.add_space(8.0);
                     if ui.button("Start").clicked() {
                         done = true;
                     }
@@ -1468,6 +1588,8 @@ impl eframe::App for App {
             if done {
                 self.show_template_picker = false;
                 save_template_done();
+                save_cad_origin(self.cad_origin);
+                apply_preset(ui.ctx().clone(), self.cad_origin);
                 let units_cmd = units_cmd_for(&self.template_units);
                 self.command_line.execute(&mut self.session, units_cmd);
                 let distance = camera_distance_for(&self.template_scale);
@@ -1566,7 +1688,8 @@ impl eframe::App for App {
                     .objects()
                     .filter_map(|o| o.name.clone())
                     .collect();
-                if let Some(line) = self.command_line.ui(ui, &object_names) {
+                let aliases = self.active_aliases();
+                if let Some(line) = self.command_line.ui(ui, &object_names, aliases) {
                     self.execute_line(line);
                 }
             });

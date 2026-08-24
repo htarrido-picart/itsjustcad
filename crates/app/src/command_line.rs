@@ -111,14 +111,19 @@ impl CommandLine {
     }
 
     /// Recompute suggestions when `input` has changed.
-    fn refresh_suggestions(&mut self, object_names: &[String]) {
+    fn refresh_suggestions(
+        &mut self,
+        object_names: &[String],
+        preset_aliases: &'static [(&'static str, &'static str)],
+    ) {
         if self.input == self.suggest_for {
             return;
         }
         self.suggest_for = self.input.clone();
         self.suggest_dismissed = false;
         self.suggest_sel = None;
-        self.suggestions = suggest::suggestions(&self.input, object_names, MAX_SUGGESTIONS);
+        self.suggestions =
+            suggest::suggestions(&self.input, object_names, MAX_SUGGESTIONS, preset_aliases);
     }
 
     /// Accept the currently-highlighted (or first) suggestion, completing the
@@ -148,9 +153,14 @@ impl CommandLine {
 
     /// Returns Some(command) when the user pressed Enter.
     /// `object_names` — names of named objects in the current document; used
-    /// to populate selector suggestions. Pass `doc.objects().filter_map(|o|
-    /// o.name.clone()).collect::<Vec<_>>()` from the caller.
-    pub fn ui(&mut self, ui: &mut egui::Ui, object_names: &[String]) -> Option<String> {
+    /// to populate selector suggestions.
+    /// `preset_aliases` — active legacy-CAD alias map from `preset::preset_for`.
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        object_names: &[String],
+        preset_aliases: &'static [(&'static str, &'static str)],
+    ) -> Option<String> {
         let mut submitted = None;
 
         // Show ~3 lines of history (legacy CAD default: 3 rows).
@@ -165,7 +175,7 @@ impl CommandLine {
             });
 
         // Recompute suggestions if input changed.
-        self.refresh_suggestions(object_names);
+        self.refresh_suggestions(object_names, preset_aliases);
 
         // ── Usage hint (shown when verb is fully typed) ──────────────────
         let verb = suggest::verb_of(self.input.trim_start()).to_string();
@@ -367,7 +377,7 @@ mod tests {
     fn refresh_suggestions_populates_on_prefix() {
         let mut cl = CommandLine::default();
         cl.input = "bo".to_string();
-        cl.refresh_suggestions(&[]);
+        cl.refresh_suggestions(&[], &[]);
         assert!(!cl.suggestions.is_empty(), "expected suggestions for 'bo'");
         assert!(cl.suggestions.iter().any(|s| s.completion == "box"), "{:?}", cl.suggestions);
     }
@@ -376,10 +386,10 @@ mod tests {
     fn refresh_suggestions_clears_on_new_input() {
         let mut cl = CommandLine::default();
         cl.input = "bo".to_string();
-        cl.refresh_suggestions(&[]);
+        cl.refresh_suggestions(&[], &[]);
         let count_before = cl.suggestions.len();
         cl.input = "zzzz".to_string();
-        cl.refresh_suggestions(&[]);
+        cl.refresh_suggestions(&[], &[]);
         assert!(cl.suggestions.len() < count_before, "should be fewer (likely 0) for 'zzzz'");
     }
 
@@ -387,7 +397,7 @@ mod tests {
     fn accept_suggestion_completes_verb() {
         let mut cl = CommandLine::default();
         cl.input = "bo".to_string();
-        cl.refresh_suggestions(&[]);
+        cl.refresh_suggestions(&[], &[]);
         assert!(!cl.suggestions.is_empty());
         cl.suggest_sel = Some(0); // should be 'box'
         cl.accept_suggestion();
@@ -398,7 +408,7 @@ mod tests {
     fn suggestions_dismissed_after_accept() {
         let mut cl = CommandLine::default();
         cl.input = "bo".to_string();
-        cl.refresh_suggestions(&[]);
+        cl.refresh_suggestions(&[], &[]);
         cl.suggest_sel = Some(0);
         cl.accept_suggestion();
         assert!(cl.suggest_dismissed, "popup should be dismissed after accept");

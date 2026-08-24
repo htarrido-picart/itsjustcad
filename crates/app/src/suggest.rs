@@ -8,6 +8,9 @@
 //! See: `crates/commands/src/parse.rs` match arms for polyline/pline,
 //! rect/rectangle, difference/diff/subtract, intersect/intersection,
 //! delete/del, polararray/parray.
+//!
+//! Legacy-CAD preset aliases (from `preset.rs`) are injected at call time
+//! via the `active_preset_aliases` parameter added to the main entry point.
 
 use mydrafter_commands::registry;
 
@@ -83,10 +86,17 @@ const SELECTOR_TOKENS: &[&str] = &["last", "all", "sel"];
 
 /// Produce up to `limit` verb completions for `prefix`.
 ///
+/// `preset_aliases` is the active legacy-CAD alias map from `preset::preset_for`.
+/// Pass `&[]` when no preset is active.
+///
 /// Ordering: exact match before prefix match. Registry canonical names come
-/// first, then aliases, then app-only verbs. All comparisons are
-/// case-insensitive.
-pub fn verb_completions(prefix: &str, limit: usize) -> Vec<Suggestion> {
+/// first, then parser aliases, then preset aliases, then app-only verbs.
+/// All comparisons are case-insensitive.
+pub fn verb_completions(
+    prefix: &str,
+    limit: usize,
+    preset_aliases: &'static [(&'static str, &'static str)],
+) -> Vec<Suggestion> {
     let prefix_lower = prefix.to_lowercase();
 
     // Build the full candidate list: registry names, their aliases, then app verbs.
@@ -100,7 +110,7 @@ pub fn verb_completions(prefix: &str, limit: usize) -> Vec<Suggestion> {
                 usage: Some(spec.usage.to_string()),
             });
         }
-        // Aliases for this canonical name
+        // Parser-level aliases for this canonical name
         for alias_list in ALIASES.iter().filter(|(canon, _)| *canon == name) {
             for alias in alias_list.1.iter() {
                 if alias.starts_with(prefix_lower.as_str()) {
@@ -110,6 +120,21 @@ pub fn verb_completions(prefix: &str, limit: usize) -> Vec<Suggestion> {
                     });
                 }
             }
+        }
+    }
+
+    // Preset (legacy-CAD) aliases — shown with a hint pointing at the canonical.
+    for &(alias, canonical) in preset_aliases {
+        if alias.starts_with(prefix_lower.as_str()) || prefix_lower.is_empty() {
+            // Find usage for the canonical command if it's in the registry.
+            let usage = registry()
+                .iter()
+                .find(|s| s.name == canonical)
+                .map(|s| s.usage.to_string());
+            candidates.push(Suggestion {
+                completion: alias.to_string(),
+                usage,
+            });
         }
     }
 
@@ -163,11 +188,18 @@ pub fn selector_completions(prefix: &str, object_names: &[String], limit: usize)
 /// Top-level entry: given the current `input` text and a list of named objects,
 /// return suggestions appropriate for the cursor position.
 ///
-/// - Empty / single incomplete token: verb completions.
+/// `preset_aliases` — active legacy-CAD alias map (pass `&[]` for default).
+///
+/// - Empty / single incomplete token: verb completions (including preset aliases).
 /// - Verb is complete AND usage expects a selector: selector completions for
 ///   the last token.
 /// - Verb is complete but usage does NOT expect a selector: empty (no noise).
-pub fn suggestions(input: &str, object_names: &[String], limit: usize) -> Vec<Suggestion> {
+pub fn suggestions(
+    input: &str,
+    object_names: &[String],
+    limit: usize,
+    preset_aliases: &'static [(&'static str, &'static str)],
+) -> Vec<Suggestion> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {
         return vec![];
@@ -175,7 +207,7 @@ pub fn suggestions(input: &str, object_names: &[String], limit: usize) -> Vec<Su
 
     if !verb_is_complete(input) {
         // Still typing the verb.
-        return verb_completions(trimmed, limit);
+        return verb_completions(trimmed, limit, preset_aliases);
     }
 
     // Verb is done — find its usage string.
@@ -207,13 +239,13 @@ mod tests {
 
     #[test]
     fn prefix_box_returns_box() {
-        let results = verb_completions("bo", 8);
+        let results = verb_completions("bo", 8, &[]);
         assert!(results.iter().any(|s| s.completion == "box"), "{results:?}");
     }
 
     #[test]
     fn prefix_b_returns_box_and_bbox() {
-        let results = verb_completions("b", 8);
+        let results = verb_completions("b", 8, &[]);
         let names: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
         assert!(names.contains(&"box"), "{names:?}");
         assert!(names.contains(&"bbox"), "{names:?}");
@@ -221,50 +253,50 @@ mod tests {
 
     #[test]
     fn exact_match_sorts_first() {
-        let results = verb_completions("box", 8);
+        let results = verb_completions("box", 8, &[]);
         assert_eq!(results[0].completion, "box", "{results:?}");
     }
 
     #[test]
     fn alias_pline_appears_for_pl_prefix() {
-        let results = verb_completions("pl", 8);
+        let results = verb_completions("pl", 8, &[]);
         assert!(results.iter().any(|s| s.completion == "pline"), "{results:?}");
     }
 
     #[test]
     fn alias_diff_appears_for_di_prefix() {
-        let results = verb_completions("di", 16);
+        let results = verb_completions("di", 16, &[]);
         assert!(results.iter().any(|s| s.completion == "diff"), "{results:?}");
     }
 
     #[test]
     fn alias_del_appears_for_de_prefix() {
-        let results = verb_completions("de", 16);
+        let results = verb_completions("de", 16, &[]);
         assert!(results.iter().any(|s| s.completion == "del"), "{results:?}");
     }
 
     #[test]
     fn app_verb_ze_appears_for_z_prefix() {
-        let results = verb_completions("z", 8);
+        let results = verb_completions("z", 8, &[]);
         assert!(results.iter().any(|s| s.completion == "ze"), "{results:?}");
     }
 
     #[test]
     fn app_verb_help_appears_for_he_prefix() {
-        let results = verb_completions("he", 8);
+        let results = verb_completions("he", 8, &[]);
         assert!(results.iter().any(|s| s.completion == "help"), "{results:?}");
     }
 
     #[test]
     fn registry_verbs_carry_usage_hint() {
-        let results = verb_completions("box", 4);
+        let results = verb_completions("box", 4, &[]);
         let box_sugg = results.iter().find(|s| s.completion == "box").unwrap();
         assert!(box_sugg.usage.is_some(), "box should have a usage hint");
     }
 
     #[test]
     fn app_verb_has_no_usage_hint() {
-        let results = verb_completions("ze", 4);
+        let results = verb_completions("ze", 4, &[]);
         let ze_sugg = results.iter().find(|s| s.completion == "ze").unwrap();
         assert!(ze_sugg.usage.is_none(), "app verb ze should have no usage hint");
     }
@@ -272,13 +304,13 @@ mod tests {
     #[test]
     fn empty_prefix_returns_empty() {
         // top-level suggestions fn returns empty for empty input
-        let results = suggestions("", &[], 8);
+        let results = suggestions("", &[], 8, &[]);
         assert!(results.is_empty(), "{results:?}");
     }
 
     #[test]
     fn no_duplicate_completions() {
-        let results = verb_completions("", 500);
+        let results = verb_completions("", 500, &[]);
         let mut seen = std::collections::HashSet::new();
         for s in &results {
             assert!(seen.insert(s.completion.clone()), "duplicate: {}", s.completion);
@@ -364,7 +396,7 @@ mod tests {
     fn suggestions_after_selector_verb_returns_object_names() {
         // "extrude " — verb complete, expects selector
         let object_names = vec!["tower".to_string(), "slab".to_string()];
-        let results = suggestions("extrude ", &object_names, 8);
+        let results = suggestions("extrude ", &object_names, 8, &[]);
         let completions: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
         assert!(completions.contains(&"last"), "{completions:?}");
         assert!(completions.contains(&"tower"), "{completions:?}");
@@ -373,14 +405,42 @@ mod tests {
     #[test]
     fn suggestions_for_non_selector_verb_returns_empty() {
         // "box " — verb complete, no selector expected
-        let results = suggestions("box ", &[], 8);
+        let results = suggestions("box ", &[], 8, &[]);
         assert!(results.is_empty(), "{results:?}");
     }
 
     #[test]
     fn suggestions_typing_verb_returns_verb_completions() {
-        let results = suggestions("ext", &[], 8);
+        let results = suggestions("ext", &[], 8, &[]);
         assert!(results.iter().any(|s| s.completion == "extrude"), "{results:?}");
+    }
+
+    // ── preset alias suggestions ──────────────────────────────────────────────
+
+    #[test]
+    fn autocad_alias_l_appears_in_suggestions() {
+        use crate::preset::AUTOCAD_ALIASES;
+        let results = verb_completions("l", 20, AUTOCAD_ALIASES);
+        let completions: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
+        assert!(completions.contains(&"l"), "AutoCAD alias 'l' should appear: {completions:?}");
+    }
+
+    #[test]
+    fn autocad_alias_e_appears_in_suggestions() {
+        use crate::preset::AUTOCAD_ALIASES;
+        let results = verb_completions("e", 20, AUTOCAD_ALIASES);
+        let completions: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
+        assert!(completions.contains(&"e"), "AutoCAD alias 'e' should appear: {completions:?}");
+    }
+
+    #[test]
+    fn no_duplicates_with_preset_aliases() {
+        use crate::preset::AUTOCAD_ALIASES;
+        let results = verb_completions("", 500, AUTOCAD_ALIASES);
+        let mut seen = std::collections::HashSet::new();
+        for s in &results {
+            assert!(seen.insert(s.completion.clone()), "duplicate: {}", s.completion);
+        }
     }
 
     // ── usage_for_verb ──────────────────────────────────────────────────────
