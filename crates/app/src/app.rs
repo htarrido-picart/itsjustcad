@@ -12,6 +12,61 @@ use crate::journal::{self, Journal};
 use crate::keymap;
 use crate::scene;
 
+#[derive(Clone, PartialEq)]
+enum TemplateUnits {
+    Meters,
+    Millimeters,
+    FeetInches,
+}
+
+#[derive(Clone, PartialEq)]
+enum TemplateScale {
+    Object,
+    Building,
+    Urban,
+}
+
+pub(crate) fn units_cmd_for(u: &TemplateUnits) -> &'static str {
+    match u {
+        TemplateUnits::Meters => "units m",
+        TemplateUnits::Millimeters => "units mm",
+        TemplateUnits::FeetInches => "units ftin",
+    }
+}
+
+pub(crate) fn camera_distance_for(s: &TemplateScale) -> f32 {
+    match s {
+        TemplateScale::Object => 5.0,
+        TemplateScale::Building => 30.0,
+        TemplateScale::Urban => 300.0,
+    }
+}
+
+/// Returns help lines for the command reference.
+/// - `None` verb: one line per command "  name — first sentence"
+/// - `Some(verb)`: usage + summary for that verb, or an unknown-command note.
+pub(crate) fn help_lines(verb: Option<&str>) -> Vec<String> {
+    match verb {
+        None => mydrafter_commands::registry()
+            .iter()
+            .map(|spec| {
+                let first = spec.summary.split('.').next().unwrap_or(spec.summary).trim();
+                format!("  {} \u{2014} {}", spec.name, first)
+            })
+            .collect(),
+        Some(v) => {
+            if let Some(spec) = mydrafter_commands::registry().iter().find(|s| s.name == v) {
+                vec![
+                    format!("usage: {}", spec.usage),
+                    spec.summary.to_string(),
+                ]
+            } else {
+                vec![format!("unknown command: {v}")]
+            }
+        }
+    }
+}
+
 pub struct App {
     session: Session,
     command_line: CommandLine,
@@ -64,6 +119,10 @@ pub struct App {
     underlay_cache: Option<(String, std::sync::Arc<(Vec<u8>, u32, u32)>)>,
     /// Whether the deck chat pane is visible; toggled by the ◂/▸ button or Cmd+\.
     deck_visible: bool,
+    /// Whether to show the first-run template picker on next frame.
+    show_template_picker: bool,
+    template_units: TemplateUnits,
+    template_scale: TemplateScale,
 }
 
 impl App {
@@ -129,6 +188,9 @@ impl App {
             status_snap: None,
             underlay_cache: None,
             deck_visible,
+            show_template_picker: !load_template_done(),
+            template_units: TemplateUnits::Meters,
+            template_scale: TemplateScale::Building,
         }
     }
 
@@ -216,6 +278,16 @@ impl App {
                 } else {
                     self.command_line.execute(&mut self.session, line);
                 }
+            }
+            Some("help") => {
+                let verb = words.next();
+                let lines = help_lines(verb);
+                for line in lines {
+                    self.command_line.push_line(line);
+                }
+            }
+            Some("template") => {
+                self.show_template_picker = true;
             }
             _ => {
                 if self.draw_tool.try_start(line) {
@@ -1178,6 +1250,16 @@ fn save_deck_visible(visible: bool) {
     save_ui_json(&v);
 }
 
+fn load_template_done() -> bool {
+    load_ui_json()["template_done"].as_bool().unwrap_or(false)
+}
+
+fn save_template_done() {
+    let mut v = load_ui_json();
+    v["template_done"] = serde_json::json!(true);
+    save_ui_json(&v);
+}
+
 /// Screen position -> world-space pick ray (origin on the near plane).
 pub(crate) fn screen_ray(
     view_proj: glam::Mat4,
@@ -1299,6 +1381,39 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.run_startup_script();
+
+        if self.show_template_picker {
+            let mut done = false;
+            egui::Window::new("New Document Setup")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label("Units:");
+                    ui.radio_value(&mut self.template_units, TemplateUnits::Meters, "Meters");
+                    ui.radio_value(&mut self.template_units, TemplateUnits::Millimeters, "Millimeters");
+                    ui.radio_value(&mut self.template_units, TemplateUnits::FeetInches, "Feet-inches");
+                    ui.add_space(8.0);
+                    ui.label("Scale:");
+                    ui.radio_value(&mut self.template_scale, TemplateScale::Object, "Object (~5m)");
+                    ui.radio_value(&mut self.template_scale, TemplateScale::Building, "Building (~30m)");
+                    ui.radio_value(&mut self.template_scale, TemplateScale::Urban, "Urban (~300m)");
+                    ui.add_space(8.0);
+                    if ui.button("Start").clicked() {
+                        done = true;
+                    }
+                });
+            if done {
+                self.show_template_picker = false;
+                save_template_done();
+                let units_cmd = units_cmd_for(&self.template_units);
+                self.command_line.execute(&mut self.session, units_cmd);
+                let distance = camera_distance_for(&self.template_scale);
+                for cam in &mut self.cameras {
+                    cam.distance = distance;
+                }
+            }
+        }
 
         // Mirror the op-log to the crash journal. One hook covers every
         // mutation path (command line, gumball, deck, history jumps); the
@@ -1464,4 +1579,53 @@ fn apply_named_view(cam: &mut OrbitCamera, view: &mydrafter_doc::NamedView) {
     cam.pitch = view.pitch;
     cam.fov_y = view.fov_y;
     cam.ortho = view.ortho;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mydrafter_commands::registry;
+
+    #[test]
+    fn help_all_lists_every_registry_verb() {
+        let lines = help_lines(None);
+        let text = lines.join("\n");
+        for spec in registry() {
+            assert!(text.contains(spec.name), "help missing verb '{}'", spec.name);
+        }
+    }
+
+    #[test]
+    fn help_verb_shows_usage() {
+        let lines = help_lines(Some("box"));
+        let text = lines.join("\n");
+        assert!(text.contains("box <corner"), "expected usage: {text}");
+    }
+
+    #[test]
+    fn help_unknown_verb_reports_error() {
+        let lines = help_lines(Some("xyzzy"));
+        assert!(lines.iter().any(|l| l.contains("unknown")));
+    }
+
+    #[test]
+    fn template_units_mapping() {
+        assert_eq!(units_cmd_for(&TemplateUnits::Meters), "units m");
+        assert_eq!(units_cmd_for(&TemplateUnits::Millimeters), "units mm");
+        assert_eq!(units_cmd_for(&TemplateUnits::FeetInches), "units ftin");
+    }
+
+    #[test]
+    fn template_scale_distance() {
+        assert_eq!(camera_distance_for(&TemplateScale::Object), 5.0f32);
+        assert_eq!(camera_distance_for(&TemplateScale::Building), 30.0f32);
+        assert_eq!(camera_distance_for(&TemplateScale::Urban), 300.0f32);
+    }
+
+    #[test]
+    fn prefs_round_trip_template_done() {
+        let mut v = serde_json::Value::Object(Default::default());
+        v["template_done"] = serde_json::json!(true);
+        assert_eq!(v["template_done"].as_bool(), Some(true));
+    }
 }
