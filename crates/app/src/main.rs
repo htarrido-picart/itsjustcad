@@ -10,6 +10,7 @@ mod osnap;
 mod precise;
 mod scene;
 mod statusbar;
+mod suggest;
 
 fn cli_help_text() -> String {
     let mut out = String::new();

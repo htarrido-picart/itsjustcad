@@ -95,6 +95,9 @@ pub struct App {
     /// Dev scripting: MYDRAFTER_DECK_RUN="prompt" sends one deck message on
     /// startup; with MYDRAFTER_SHOT set, the shot waits for the turn to end.
     deck_script: Option<String>,
+    /// Dev hook: MYDRAFTER_TYPE="text" pre-fills the command input (without
+    /// executing) so the autosuggest popup is visible in MYDRAFTER_SHOT frames.
+    type_script: Option<String>,
     frame_count: u64,
     /// Layer color being edited in the panel; the `layercolor` command is
     /// issued once, when the mouse is released (avoids one op per drag frame).
@@ -177,6 +180,7 @@ impl App {
             shot_path: std::env::var("MYDRAFTER_SHOT").ok(),
             startup_script: std::env::var("MYDRAFTER_RUN").ok(),
             deck_script: std::env::var("MYDRAFTER_DECK_RUN").ok(),
+            type_script: std::env::var("MYDRAFTER_TYPE").ok(),
             frame_count: 0,
             pending_layer_color: None,
             last_line: None,
@@ -1388,6 +1392,10 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.run_startup_script();
+        // MYDRAFTER_TYPE: pre-fill command input (dev hook for autosuggest screenshots).
+        if let Some(text) = self.type_script.take() {
+            self.command_line.prefill(text);
+        }
 
         if self.show_template_picker {
             let mut done = false;
@@ -1505,7 +1513,13 @@ impl eframe::App for App {
         egui::Panel::bottom("command_line")
             .resizable(false)
             .show(ui, |ui| {
-                if let Some(line) = self.command_line.ui(ui) {
+                let object_names: Vec<String> = self
+                    .session
+                    .doc
+                    .objects()
+                    .filter_map(|o| o.name.clone())
+                    .collect();
+                if let Some(line) = self.command_line.ui(ui, &object_names) {
                     self.execute_line(line);
                 }
             });
