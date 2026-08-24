@@ -583,6 +583,38 @@ impl DeckPane {
         }
     }
 
+    /// Drive background work (drain + probe + warm) without rendering anything.
+    /// Call every frame even when the pane is hidden so streaming turns keep
+    /// making progress and the timeout logic fires correctly.
+    /// When active work is in flight, requests a fast repaint via `ctx`.
+    pub fn tick(
+        &mut self,
+        session: &mut Session,
+        handle: &tokio::runtime::Handle,
+        ctx: &egui::Context,
+    ) {
+        self.drain(session, handle);
+        if self.busy()
+            && let Some(started) = self.turn_started
+            && started.elapsed().as_secs() > TURN_TIMEOUT_SECS
+        {
+            self.stop_turn();
+            self.transcript.push(Entry::Status(format!(
+                "turn killed after {TURN_TIMEOUT_SECS}s — subprocess was stuck"
+            )));
+        }
+        self.poll_probe(handle);
+        self.poll_warm(handle);
+        // Keep the event loop running while background work is in flight,
+        // whether or not the panel is rendered this frame.
+        if self.busy()
+            || matches!(self.probe, ProbeState::Checking(_))
+            || matches!(self.warm, WarmState::Warming { .. })
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,

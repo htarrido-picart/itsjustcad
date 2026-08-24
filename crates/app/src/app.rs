@@ -62,6 +62,8 @@ pub struct App {
     /// Decoded underlay pixels cached by path, so a scene rebuild (any doc
     /// change) does not re-decode the image every time.
     underlay_cache: Option<(String, std::sync::Arc<(Vec<u8>, u32, u32)>)>,
+    /// Whether the deck chat pane is visible; toggled by the ◂/▸ button or Cmd+\.
+    deck_visible: bool,
 }
 
 impl App {
@@ -79,6 +81,7 @@ impl App {
         // Cmd+= / Cmd+- / Cmd+0 also work (egui built-in zoom).
         let zoom = load_zoom().unwrap_or(1.3);
         cc.egui_ctx.set_zoom_factor(zoom);
+        let deck_visible = load_deck_visible().unwrap_or(true);
 
         let journal = Journal::open_default();
         let mut command_line = CommandLine::default();
@@ -125,6 +128,7 @@ impl App {
             status_cursor: None,
             status_snap: None,
             underlay_cache: None,
+            deck_visible,
         }
     }
 
@@ -1137,17 +1141,41 @@ fn ui_config_path() -> Option<std::path::PathBuf> {
     Some(dirs::home_dir()?.join(".config").join("mydrafter").join("ui.json"))
 }
 
+fn load_ui_json() -> serde_json::Value {
+    ui_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()))
+}
+
+fn save_ui_json(value: &serde_json::Value) {
+    if let Some(path) = ui_config_path() {
+        let _ = std::fs::create_dir_all(path.parent().expect("has parent"));
+        let _ = std::fs::write(
+            path,
+            serde_json::to_string_pretty(value).expect("serializes"),
+        );
+    }
+}
+
 fn load_zoom() -> Option<f32> {
-    let json = std::fs::read_to_string(ui_config_path()?).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
-    value["zoom"].as_f64().map(|z| (z as f32).clamp(0.5, 3.0))
+    load_ui_json()["zoom"].as_f64().map(|z| (z as f32).clamp(0.5, 3.0))
 }
 
 fn save_zoom(zoom: f32) {
-    if let Some(path) = ui_config_path() {
-        let _ = std::fs::create_dir_all(path.parent().expect("has parent"));
-        let _ = std::fs::write(path, format!("{{\n  \"zoom\": {zoom}\n}}\n"));
-    }
+    let mut v = load_ui_json();
+    v["zoom"] = serde_json::json!(zoom);
+    save_ui_json(&v);
+}
+
+fn load_deck_visible() -> Option<bool> {
+    load_ui_json()["deck_visible"].as_bool()
+}
+
+fn save_deck_visible(visible: bool) {
+    let mut v = load_ui_json();
+    v["deck_visible"] = serde_json::json!(visible);
+    save_ui_json(&v);
 }
 
 /// Screen position -> world-space pick ray (origin on the near plane).
@@ -1297,6 +1325,19 @@ impl eframe::App for App {
             self.open(None);
         }
 
+        // Deck pane tick: must run every frame regardless of visibility so
+        // streaming turns and probes keep making progress while the pane is hidden.
+        self.deck_pane.tick(&mut self.session, &self.tokio, ui.ctx());
+
+        // Cmd+\ toggles the deck pane (backslash is not used elsewhere).
+        let toggle_deck = ui.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Backslash)
+        });
+        if toggle_deck {
+            self.deck_visible = !self.deck_visible;
+            save_deck_visible(self.deck_visible);
+        }
+
         // Canvas shortcuts: pure keymap resolves each key press to a command
         // line; nothing fires while a text field owns the keyboard.
         let typing = ui.ctx().memory(|m| m.focused().is_some());
@@ -1347,12 +1388,50 @@ impl eframe::App for App {
                 }
             });
 
-        egui::Panel::right("deck")
-            .resizable(true)
-            .default_size(340.0)
-            .show(ui, |ui| {
-                self.deck_pane.ui(ui, &mut self.session, &self.tokio);
-            });
+        // Deck pane: resizable right Panel (drag handle from egui) with a
+        // collapse/expand chevron button always reachable at the right edge.
+        // Min width 240 px; no hard max so the user can stretch freely.
+        if self.deck_visible {
+            egui::Panel::right("deck")
+                .resizable(true)
+                .default_size(340.0)
+                .min_size(240.0)
+                .show(ui, |ui| {
+                    // Chevron button at the top of the panel header row.
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("◂")
+                            .on_hover_text("hide deck (Cmd+\\)")
+                            .clicked()
+                        {
+                            self.deck_visible = false;
+                            save_deck_visible(false);
+                        }
+                        ui.label(egui::RichText::new("deck").weak().small());
+                    });
+                    ui.separator();
+                    self.deck_pane.ui(ui, &mut self.session, &self.tokio);
+                });
+        } else {
+            // When hidden, draw a small ▸ button at the right edge so the
+            // user can reopen the deck without a menu.
+            let viewport_rect = ui.ctx().viewport_rect();
+            egui::Area::new(egui::Id::new("deck_show_btn"))
+                .fixed_pos(egui::pos2(
+                    viewport_rect.right() - 28.0,
+                    viewport_rect.top() + 8.0,
+                ))
+                .show(ui.ctx(), |ui| {
+                    if ui
+                        .small_button("▸")
+                        .on_hover_text("show deck (Cmd+\\)")
+                        .clicked()
+                    {
+                        self.deck_visible = true;
+                        save_deck_visible(true);
+                    }
+                });
+        }
 
         // A `view <name>` restore (command line, deck or script) parks the
         // saved camera in the document mailbox; drive the active viewport.
