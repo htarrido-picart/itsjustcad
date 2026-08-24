@@ -12,9 +12,18 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 fn main() {
     let out = std::env::args().nth(1).unwrap_or("/tmp/mydrafter_headless.png".into());
-    let theme = match std::env::var("MYDRAFTER_THEME").as_deref() {
-        Ok("light") => mydrafter_render::Theme::Light,
-        _ => mydrafter_render::Theme::Dark,
+    let mode = match std::env::var("MYDRAFTER_MODE").as_deref() {
+        Ok(s) => mydrafter_render::DisplayMode::parse(s).unwrap_or_default(),
+        _ => mydrafter_render::DisplayMode::default(),
+    };
+    // Pencil mode forces paper-white; otherwise respect the theme env.
+    let theme = if mode == mydrafter_render::DisplayMode::Pencil {
+        mydrafter_render::Theme::Light // closest to paper white
+    } else {
+        match std::env::var("MYDRAFTER_THEME").as_deref() {
+            Ok("light") => mydrafter_render::Theme::Light,
+            _ => mydrafter_render::Theme::Dark,
+        }
     };
 
     let instance = wgpu::Instance::default();
@@ -37,18 +46,44 @@ fn main() {
             camera.distance = (bb.size().length() as f32 * 1.2).max(5.0);
         }
     } else {
-        let meshes = vec![(
-            kernel_mesh::make_box(DVec3::new(-2.5, -2.5, 0.0), DVec3::new(5.0, 5.0, 3.0))
-                .to_render(),
-            [0.72, 0.73, 0.78, 1.0f32],
-        )];
-        renderer.set_meshes(&device, &meshes, 0);
+        // Default scene: two boxes with feature edges (exercises pencil mode occlusion)
+        let box_a = kernel_mesh::make_box(DVec3::new(-2.5, -2.5, 0.0), DVec3::new(5.0, 5.0, 3.0));
+        let box_b = kernel_mesh::make_box(DVec3::new(3.5, -1.0, 0.0), DVec3::new(2.0, 2.0, 5.0));
+        let mesh_color = theme.mesh();
+        let edge_color = if mode == mydrafter_render::DisplayMode::Pencil {
+            [0.1, 0.1, 0.1, 1.0f32] // will be overridden to black by shader anyway
+        } else {
+            theme.curve()
+        };
+        let edges_a: Vec<[f32; 3]> = kernel_mesh::feature_edges(&box_a)
+            .iter()
+            .flat_map(|(a, b)| {
+                [[a.x as f32, a.y as f32, a.z as f32], [b.x as f32, b.y as f32, b.z as f32]]
+            })
+            .collect();
+        let edges_b: Vec<[f32; 3]> = kernel_mesh::feature_edges(&box_b)
+            .iter()
+            .flat_map(|(a, b)| {
+                [[a.x as f32, a.y as f32, a.z as f32], [b.x as f32, b.y as f32, b.z as f32]]
+            })
+            .collect();
+        let scene = mydrafter_render::SceneData {
+            meshes: vec![(box_a.to_render(), mesh_color), (box_b.to_render(), mesh_color)],
+            lines: vec![],
+            edges: vec![(edges_a, edge_color), (edges_b, edge_color)],
+            underlay: None,
+        };
+        renderer.set_scene(&device, &queue, &scene, 0);
+        camera.target = glam::Vec3::new(0.5, 0.0, 2.5);
+        camera.distance = 16.0;
+        camera.yaw = -0.6;
+        camera.pitch = 0.55;
     }
 
     let aspect = W as f32 / H as f32;
     let view_proj = camera.view_proj(aspect);
     let eye = camera.eye();
-    let cam = mydrafter_render::camera_uniform(view_proj, eye);
+    let cam = mydrafter_render::camera_uniform_with_mode(view_proj, eye, mode);
     renderer.write_camera(&device, &queue, 0, &cam);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
@@ -83,7 +118,12 @@ fn main() {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear({
-                        let [r, g, b, a] = theme.background();
+                        let bg = if mode == mydrafter_render::DisplayMode::Pencil {
+                            mydrafter_render::DisplayMode::pencil_background()
+                        } else {
+                            theme.background()
+                        };
+                        let [r, g, b, a] = bg;
                         wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: a as f64 }
                     }),
                     store: wgpu::StoreOp::Store,
@@ -103,7 +143,7 @@ fn main() {
             multiview_mask: None,
         });
         let mut pass = pass.forget_lifetime();
-        renderer.paint(&mut pass, 0, mydrafter_render::DisplayMode::Shaded);
+        renderer.paint(&mut pass, 0, mode);
     }
 
     let bytes_per_row = (W * 4).next_multiple_of(256);
@@ -155,7 +195,7 @@ fn main() {
         generation: 0,
         scene: None,
         viewport: 0,
-        mode: mydrafter_render::DisplayMode::Shaded,
+        mode,
         sun_dir: None,
     };
 }

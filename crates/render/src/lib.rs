@@ -13,11 +13,20 @@ pub use snapshot::{snapshot, Theme};
 pub use viewport_callback::ViewportCallback;
 
 pub fn camera_uniform(view_proj: glam::Mat4, eye: glam::Vec3) -> CameraUniform {
+    camera_uniform_with_mode(view_proj, eye, DisplayMode::default())
+}
+
+/// Build a camera uniform encoding the given display mode and no sun.
+pub fn camera_uniform_with_mode(
+    view_proj: glam::Mat4,
+    eye: glam::Vec3,
+    mode: DisplayMode,
+) -> CameraUniform {
     CameraUniform {
         view_proj: view_proj.to_cols_array_2d(),
         inv_view_proj: view_proj.inverse().to_cols_array_2d(),
         eye: [eye.x, eye.y, eye.z, 1.0],
-        misc: [1.0, 0.0, 0.0, 0.0],
+        misc: [mode.fill_alpha(), 0.0, 0.0, 0.0],
     }
 }
 

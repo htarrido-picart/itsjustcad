@@ -40,6 +40,16 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // Pencil mode: misc.x < 0 signals hidden-line paper-white fill.
+    // A very subtle shading keeps convex faces distinguishable without ink.
+    if (camera.misc.x < 0.0) {
+        let n = normalize(in.normal);
+        let l = normalize(camera.eye.xyz - in.world);
+        let lambert = max(dot(n, l), 0.0);
+        // Near-white: slight shadow (0.90) on unlit faces, full white (0.97) on lit.
+        let shade = 0.90 + 0.07 * lambert;
+        return vec4(shade, shade, shade * 0.98, 1.0);
+    }
     let n = normalize(in.normal);
     let sun = camera.misc.yzw;
     // Use solar direction when set (length > 0.1), otherwise headlight.

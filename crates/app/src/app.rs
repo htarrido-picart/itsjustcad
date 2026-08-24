@@ -244,7 +244,7 @@ impl App {
                 }
                 None => {
                     self.command_line
-                        .push_line("usage: display shaded|wireframe|xray|ghosted");
+                        .push_line("usage: display shaded|wireframe|xray|ghosted|pencil");
                 }
             },
             Some("viewports" | "vp") => {
@@ -1365,6 +1365,13 @@ fn ray_aabb(origin: glam::DVec3, dir: glam::DVec3, min: glam::DVec3, max: glam::
 
 impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        // Pencil mode forces paper white regardless of the egui theme.
+        // Use the active pane's display mode to drive the clear colour.
+        let active_mode =
+            self.display_modes[self.layout.camera_index(self.active_pane)];
+        if active_mode == mydrafter_render::DisplayMode::Pencil {
+            return mydrafter_render::DisplayMode::pencil_background();
+        }
         if visuals.dark_mode {
             scene::Theme::Dark.background()
         } else {

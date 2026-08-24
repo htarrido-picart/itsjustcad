@@ -24,14 +24,19 @@ pub enum DisplayMode {
     XRay,
     /// Half-transparent fill + edges.
     Ghosted,
+    /// Architect's hidden-line drawing: paper-white fill with depth writes
+    /// (occlusion) and black feature edges on top. Background and grid also
+    /// switch to paper white regardless of the egui theme.
+    Pencil,
 }
 
 impl DisplayMode {
-    pub const ALL: [DisplayMode; 4] = [
+    pub const ALL: [DisplayMode; 5] = [
         DisplayMode::Shaded,
         DisplayMode::Wireframe,
         DisplayMode::XRay,
         DisplayMode::Ghosted,
+        DisplayMode::Pencil,
     ];
 
     pub fn label(self) -> &'static str {
@@ -40,6 +45,7 @@ impl DisplayMode {
             DisplayMode::Wireframe => "Wireframe",
             DisplayMode::XRay => "X-Ray",
             DisplayMode::Ghosted => "Ghosted",
+            DisplayMode::Pencil => "Pencil",
         }
     }
 
@@ -49,17 +55,21 @@ impl DisplayMode {
             "wireframe" | "wire" => Some(DisplayMode::Wireframe),
             "xray" | "x-ray" => Some(DisplayMode::XRay),
             "ghosted" | "ghost" => Some(DisplayMode::Ghosted),
+            "pencil" => Some(DisplayMode::Pencil),
             _ => None,
         }
     }
 
     /// Mesh fill alpha multiplier fed to the shader via the camera UBO.
+    /// Pencil uses -1.0 as a sentinel: the shader interprets negative values
+    /// as "pencil mode — render paper-white, ignore object color".
     pub fn fill_alpha(self) -> f32 {
         match self {
             DisplayMode::Shaded => 1.0,
             DisplayMode::Wireframe => 0.0, // fill pass skipped entirely
             DisplayMode::XRay => 0.18,
             DisplayMode::Ghosted => 0.55,
+            DisplayMode::Pencil => -1.0, // sentinel: pencil white fill
         }
     }
 
@@ -72,8 +82,74 @@ impl DisplayMode {
     }
 
     /// Transparent modes skip depth writes so geometry reads through.
+    /// Pencil uses depth writes: occlusion is the whole point of hidden-line.
     pub fn depth_writes(self) -> bool {
-        self == DisplayMode::Shaded
+        matches!(self, DisplayMode::Shaded | DisplayMode::Pencil)
+    }
+
+    /// Pencil mode forces the viewport clear colour to paper white regardless
+    /// of the egui dark/light theme.
+    pub fn pencil_background() -> [f32; 4] {
+        [0.97, 0.97, 0.95, 1.0]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DisplayMode;
+
+    #[test]
+    fn pencil_parse_round_trip() {
+        assert_eq!(DisplayMode::parse("pencil"), Some(DisplayMode::Pencil));
+        assert_eq!(DisplayMode::Pencil.label(), "Pencil");
+    }
+
+    #[test]
+    fn pencil_in_all() {
+        assert!(DisplayMode::ALL.contains(&DisplayMode::Pencil));
+    }
+
+    #[test]
+    fn pencil_fill_alpha_is_negative_sentinel() {
+        assert!(DisplayMode::Pencil.fill_alpha() < 0.0);
+        // Other modes are non-negative
+        for mode in DisplayMode::ALL {
+            if mode != DisplayMode::Pencil {
+                assert!(mode.fill_alpha() >= 0.0, "{mode:?} should have non-negative alpha");
+            }
+        }
+    }
+
+    #[test]
+    fn pencil_draws_fill_and_edges_with_depth_writes() {
+        assert!(DisplayMode::Pencil.draws_fill());
+        assert!(DisplayMode::Pencil.draws_edges());
+        assert!(DisplayMode::Pencil.depth_writes());
+    }
+
+    #[test]
+    fn pencil_background_is_near_white() {
+        let bg = DisplayMode::pencil_background();
+        // All channels > 0.9 (near white)
+        assert!(bg[0] > 0.9 && bg[1] > 0.9 && bg[2] > 0.9);
+        assert_eq!(bg[3], 1.0);
+    }
+
+    #[test]
+    fn all_modes_parse() {
+        for (s, expected) in [
+            ("shaded", DisplayMode::Shaded),
+            ("wireframe", DisplayMode::Wireframe),
+            ("wire", DisplayMode::Wireframe),
+            ("xray", DisplayMode::XRay),
+            ("x-ray", DisplayMode::XRay),
+            ("ghosted", DisplayMode::Ghosted),
+            ("ghost", DisplayMode::Ghosted),
+            ("pencil", DisplayMode::Pencil),
+        ] {
+            assert_eq!(DisplayMode::parse(s), Some(expected), "parse({s:?}) failed");
+        }
+        assert_eq!(DisplayMode::parse("unknown"), None);
     }
 }
 
