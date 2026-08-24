@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/logo-transparent.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo/logo-appstore.png">
+    <img alt="ItsJustCAD" src="assets/logo/logo-appstore.png" width="180">
+  </picture>
+</p>
+
 # ItsJustCAD
 
 *It's just CAD.*
@@ -29,6 +37,32 @@ that draws with the exact same commands you type.
 > developer" / "Windows protected your PC" warning on the very first launch.
 > Use the step above to open it; after that it just launches. Nothing to
 > install, no dependencies — it's a single ~10 MB program.
+
+---
+
+## Why ItsJustCAD
+
+Every CAD tool sits in one corner of the map. **AutoCAD** and **Revit** are
+powerful and closed — subscription-only since 2021, expensive, and tethered to
+Autodesk's cloud. **Rhino** is cheaper but still closed and paid. **FreeCAD** is
+free and open, but perpetually clunky and unfunded. **Shapr3D** is polished but
+proprietary. Nobody occupies the obvious lane: **free, open, LLM-native, and
+built for architects** — and actually funded well enough to be *good*.
+
+That's ItsJustCAD. It's AGPL-3.0 and will stay that way; a paid mobile edition
+pays for the polish, so this isn't another donation-starved side project.
+
+The difference isn't an "AI" button bolted onto a toolbar. **The whole app is
+the command language**, and the LLM speaks it natively — it draws with the same
+commands you type, teaches you how, and can even *write its own tools* mid-
+conversation. Human clicks, typed commands, and the LLM all flow through one
+path. There is no second, worse code path for the machine.
+
+And it stays yours: **10 MB, one file, no subscription, no cloud tether.** Your
+`.itsjustcad.json` is a readable op-log — the ordered list of commands that
+built your model — that you own and can diff forever.
+
+*It's just CAD.*
 
 ---
 
@@ -127,6 +161,9 @@ last *n* commands into a tool the same way.
 
 ## Feature tour
 
+![The ItsJustCAD interface — menu bar, command line, four-viewport layout, and a right dock with Layers, Properties, History, and Deck tabs](docs/shot-ui.png)
+*A familiar, Rhino-style interface: menu bar, command line, multi-viewport layout, and a docked panel — it adapts to the CAD you came from.*
+
 ### Model
 Boxes · extrude · revolve / loft / sweep / **sweep2 (two rails)** /
 rail-revolve / variable-radius pipe · booleans (union / difference /
@@ -151,11 +188,17 @@ Perspective, true-ortho plan/elevation views · **two-point perspective**
 **pencil** (hidden-line on white paper) · color by layer / object / type /
 random · named views · image underlay for tracing scans
 
+![Plan cut in pencil mode — poché walls around a courtyard, hidden-line white-paper view](docs/shot-plan-pencil.png)
+*`plan 1.5` + `display pencil`: a hidden-line plan cut — poché walls, an open courtyard, a central core.*
+
 ### Analyze
 `sun <lat> <lon> <date> <time>` real solar lighting (NOAA SPA, in-repo) ·
 `shadowstudy` across a day · `sunhours` heatmap with occlusion ray-casting
 (BVH-accelerated) · EPW weather import · measure: distance / area / volume /
 bbox · schedules (quantity takeoffs)
+
+![Sun and shadow study — a massing lit by real solar position with ground shadows cast across the day](docs/shot-sun-shadow.png)
+*`sun` + `shadowstudy`: real solar position (NOAA SPA) casts shadows across the day.*
 
 ### Document
 Plan/section cuts — heavy cut lines + light projected edges · elevation views
@@ -163,6 +206,9 @@ Plan/section cuts — heavy cut lines + light projected edges · elevation views
 crosshatch, brick, concrete, insulation, earth · sheets (A4–A0) with scaled
 ortho views, schedule tables, and dimensions · per-layer lineweights · vector
 PDF export
+
+![Elevation drawing — a three-storey facade outline with floor lines and a grid of windows](docs/shot-elevation.png)
+*`elevation south`: a clean projected facade — the drafting output, straight from the model.*
 
 ### Exchange
 
@@ -188,6 +234,9 @@ scriptable from CI, cron, or another program. `-` reads stdin.
 ## The deck (LLM partner)
 
 The right panel is not a chatbot bolted on — it speaks the command substrate.
+
+![The deck in action — a natural-language prompt draws a podium-and-tower massing, with inspectable command cards in the conversation](docs/shot-deck.png)
+*"Draw a podium, then a tower on top" — the deck emits the same commands you'd type, as cards you can inspect, undo, or amend.*
 
 - **Draws** by emitting commands you can inspect (click the command card),
   undo, or amend
