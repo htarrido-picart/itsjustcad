@@ -16,7 +16,7 @@ pub mod pdf;
 mod registry;
 pub mod svg;
 
-pub use command::{Command, MirrorPlane, Selector};
+pub use command::{Command, CompassDir, MirrorPlane, Selector};
 pub use error::{ExecError, ParseError};
 pub use exec::{ApplyOutcome, Session};
 pub use parse::parse;

@@ -7,7 +7,7 @@ use mydrafter_doc::{
 };
 
 use crate::error::ExecError;
-use crate::{Command, MirrorPlane, Selector};
+use crate::{Command, CompassDir, MirrorPlane, Selector};
 
 /// Chord tolerance used when tessellating profile curves for extrusion.
 const PROFILE_TOL: f64 = 0.01;
@@ -51,11 +51,11 @@ enum Inverse {
         created: Vec<ObjectId>,
         snapshots: Vec<(ObjectId, Geometry)>,
     },
-    /// `section`/`plan`: delete the created loops, dropping the "sections"
-    /// layer when this command created it.
+    /// `section`/`plan`/`elevation`: delete the created loops, dropping any
+    /// layers this command created ("sections", "sections-proj", "elevations").
     CreatedOnLayer {
         created: Vec<ObjectId>,
-        layer_created: Option<String>,
+        layers_created: Vec<String>,
     },
     /// `layer`: restore the previous current layer, dropping the layer this
     /// command created (if any).
@@ -180,11 +180,11 @@ impl Session {
                     }
                 }
             }
-            Inverse::CreatedOnLayer { created, layer_created } => {
+            Inverse::CreatedOnLayer { created, layers_created } => {
                 for id in created.clone() {
                     self.doc.remove(id);
                 }
-                if let Some(name) = layer_created.clone() {
+                for name in layers_created.clone() {
                     self.doc.layers.remove(&name);
                     self.doc.generation += 1;
                 }
@@ -799,28 +799,51 @@ pub(crate) fn format_schedule_table(rows: &[ScheduleRow], units: Units) -> Strin
     out
 }
 
-/// Layer that section/plan loops land on (created on demand).
+/// Layer that section/plan cut loops land on (created on demand).
 const SECTIONS_LAYER: &str = "sections";
+/// Layer for projected feature edges below/beyond a cut (thin lineweight).
+const SECTIONS_PROJ_LAYER: &str = "sections-proj";
+/// Layer for elevation (pure-projection) outlines.
+const ELEVATIONS_LAYER: &str = "elevations";
+/// Heavy cut lineweight (ISO medium) vs thin projected-edge lineweight.
+const CUT_WEIGHT_MM: f64 = 0.5;
+const PROJ_WEIGHT_MM: f64 = 0.13;
+
+/// Ensure `layer` exists with the given lineweight; records it in `created` if
+/// this call minted it (for undo).
+fn ensure_layer(doc: &mut Document, layer: &str, weight_mm: f64, created: &mut Vec<String>) {
+    if !doc.layers.contains_key(layer) {
+        doc.layers.insert(
+            layer.to_string(),
+            LayerStyle { lineweight_mm: weight_mm, ..LayerStyle::default() },
+        );
+        created.push(layer.to_string());
+    }
+}
 
 /// Slice every mesh among `target_ids` with the plane, inserting each closed
-/// loop as a closed polyline on the "sections" layer. Returns the created
-/// ids, the layer name if this call created it, and the mesh count.
+/// loop as a closed polyline on "sections", plus the feature edges of geometry
+/// behind the plane (below a plan cut / beyond a section) projected onto the
+/// plane as open polylines on "sections-proj" (thin lineweight). Returns the
+/// created ids, the layers this call created (for undo), and the mesh count.
 fn section_meshes(
     doc: &mut Document,
     ids: Option<Vec<ObjectId>>,
     target_ids: &[ObjectId],
     point: DVec3,
     normal: DVec3,
-) -> Result<(Vec<ObjectId>, Option<String>, usize), ExecError> {
+) -> Result<(Vec<ObjectId>, Vec<String>, usize), ExecError> {
     if normal.length() < 1e-9 {
         return Err(ExecError::Invalid("section plane normal cannot be zero".into()));
     }
     let mut loops = Vec::new();
+    let mut proj_edges: Vec<(DVec3, DVec3)> = Vec::new();
     let mut meshes = 0usize;
     for id in target_ids {
         if let Geometry::Mesh(m) = &doc.get(*id).expect("resolved").geometry {
             meshes += 1;
             loops.extend(kernel_mesh::slice(m, point, normal, PROFILE_TOL));
+            proj_edges.extend(kernel_mesh::project_edges_behind(m, point, normal, PROFILE_TOL));
         }
     }
     if meshes == 0 {
@@ -833,29 +856,111 @@ fn section_meshes(
             "the section plane misses the {meshes} selected mesh(es) — check the plane point/height"
         )));
     }
-    // Reuse logged ids on replay; mint new ones live.
+    // Reuse logged ids on replay; mint new ones live. Cut loops come first,
+    // then one polyline per projected edge, so id order is stable.
+    let total = loops.len() + proj_edges.len();
     let new_ids: Vec<ObjectId> = match ids {
-        Some(ids) if ids.len() == loops.len() => ids,
-        _ => loops.iter().map(|_| ObjectId::new()).collect(),
+        Some(ids) if ids.len() == total => ids,
+        _ => (0..total).map(|_| ObjectId::new()).collect(),
     };
-    let layer_created = (!doc.layers.contains_key(SECTIONS_LAYER)).then(|| {
-        // Sections use a heavier lineweight (ISO medium: 0.35 mm) by convention.
-        doc.layers.insert(
-            SECTIONS_LAYER.to_string(),
-            LayerStyle { lineweight_mm: 0.35, ..LayerStyle::default() },
-        );
-        SECTIONS_LAYER.to_string()
-    });
-    for (points, id) in loops.into_iter().zip(&new_ids) {
+    let mut layers_created = Vec::new();
+    ensure_layer(doc, SECTIONS_LAYER, CUT_WEIGHT_MM, &mut layers_created);
+    if !proj_edges.is_empty() {
+        ensure_layer(doc, SECTIONS_PROJ_LAYER, PROJ_WEIGHT_MM, &mut layers_created);
+    }
+    let mut id_iter = new_ids.iter();
+    for points in loops {
         doc.insert(SceneObject {
             visible: true,
-            id: *id,
+            id: *id_iter.next().expect("id per loop"),
             name: None,
             layer: SECTIONS_LAYER.to_string(),
             geometry: Geometry::Curve(Curve::Polyline { points, closed: true }),
         });
     }
-    Ok((new_ids, layer_created, meshes))
+    for (a, b) in proj_edges {
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id_iter.next().expect("id per edge"),
+            name: None,
+            layer: SECTIONS_PROJ_LAYER.to_string(),
+            geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
+        });
+    }
+    Ok((new_ids, layers_created, meshes))
+}
+
+/// Vertical projection plane for a compass elevation: the outward-facing
+/// normal (toward the viewer) and a point on the geometry's bounding face on
+/// that side, pushed out by `depth`. `north` = the face you see standing to the
+/// north looking south, so its normal points +Y. Falls back to the origin when
+/// the scene has no bounds.
+fn elevation_plane(
+    doc: &Document,
+    _target_ids: &[ObjectId],
+    dir: CompassDir,
+    depth: f64,
+) -> (DVec3, DVec3) {
+    let normal = match dir {
+        CompassDir::North => DVec3::Y,
+        CompassDir::South => -DVec3::Y,
+        CompassDir::East => DVec3::X,
+        CompassDir::West => -DVec3::X,
+    };
+    let Some(aabb) = doc.scene_aabb() else {
+        return (normal * depth, normal);
+    };
+    // Only the coordinate along the normal matters (projection collapses the
+    // rest). Pick the bounding extreme the viewer faces: the corner furthest in
+    // the +normal direction. dot with a +1/-1 axis selects max or min.
+    let extreme = if normal.max_element() > 0.0 { aabb.max } else { aabb.min };
+    (extreme + normal * depth, normal)
+}
+
+/// Project the feature edges of every mesh among `target_ids` orthographically
+/// onto the vertical elevation plane, emitting them as open polylines on the
+/// "elevations" layer. Returns the created ids, layers created, mesh count.
+fn elevation_meshes(
+    doc: &mut Document,
+    ids: Option<Vec<ObjectId>>,
+    target_ids: &[ObjectId],
+    point: DVec3,
+    normal: DVec3,
+) -> Result<(Vec<ObjectId>, Vec<String>, usize), ExecError> {
+    let mut edges: Vec<(DVec3, DVec3)> = Vec::new();
+    let mut meshes = 0usize;
+    for id in target_ids {
+        if let Geometry::Mesh(m) = &doc.get(*id).expect("resolved").geometry {
+            meshes += 1;
+            edges.extend(kernel_mesh::project_edges_onto(m, point, normal, PROFILE_TOL));
+        }
+    }
+    if meshes == 0 {
+        return Err(ExecError::Invalid(
+            "elevation works on meshes; the document has none (extrude or box first)".into(),
+        ));
+    }
+    if edges.is_empty() {
+        return Err(ExecError::Invalid(
+            "elevation produced no edges — the geometry has no feature edges facing the view".into(),
+        ));
+    }
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == edges.len() => ids,
+        _ => (0..edges.len()).map(|_| ObjectId::new()).collect(),
+    };
+    let mut layers_created = Vec::new();
+    ensure_layer(doc, ELEVATIONS_LAYER, PROJ_WEIGHT_MM, &mut layers_created);
+    for ((a, b), id) in edges.into_iter().zip(&new_ids) {
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: None,
+            layer: ELEVATIONS_LAYER.to_string(),
+            geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
+        });
+    }
+    Ok((new_ids, layers_created, meshes))
 }
 
 /// Look up a layer for style edits; missing layers get an actionable error.
@@ -1374,14 +1479,14 @@ fn apply_forward(
         }
         Command::Section { ids, targets, point, normal } => {
             let target_ids = resolve(doc, &targets)?;
-            let (new_ids, layer_created, meshes) =
+            let (new_ids, layers_created, meshes) =
                 section_meshes(doc, ids, &target_ids, point, normal)?;
             Ok((
                 Command::Section { ids: Some(new_ids.clone()), targets, point, normal },
-                Inverse::CreatedOnLayer { created: new_ids.clone(), layer_created },
+                Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
                 ApplyOutcome {
                     message: format!(
-                        "sectioned {meshes} mesh(es) -> {} loop(s) on '{SECTIONS_LAYER}'",
+                        "sectioned {meshes} mesh(es) -> {} curve(s) on '{SECTIONS_LAYER}'/'{SECTIONS_PROJ_LAYER}'",
                         new_ids.len()
                     ),
                     created: new_ids,
@@ -1393,7 +1498,7 @@ fn apply_forward(
             if target_ids.is_empty() {
                 return Err(ExecError::EmptySelection("document has 0 objects".to_string()));
             }
-            let (new_ids, layer_created, meshes) = section_meshes(
+            let (new_ids, layers_created, meshes) = section_meshes(
                 doc,
                 ids,
                 &target_ids,
@@ -1402,10 +1507,30 @@ fn apply_forward(
             )?;
             Ok((
                 Command::Plan { ids: Some(new_ids.clone()), height },
-                Inverse::CreatedOnLayer { created: new_ids.clone(), layer_created },
+                Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
                 ApplyOutcome {
                     message: format!(
-                        "plan cut at z={height}: {} loop(s) from {meshes} mesh(es) on '{SECTIONS_LAYER}'",
+                        "plan cut at z={height}: {} curve(s) from {meshes} mesh(es) on '{SECTIONS_LAYER}'/'{SECTIONS_PROJ_LAYER}'",
+                        new_ids.len()
+                    ),
+                    created: new_ids,
+                },
+            ))
+        }
+        Command::Elevation { ids, direction, depth } => {
+            let target_ids = doc.all_ids();
+            if target_ids.is_empty() {
+                return Err(ExecError::EmptySelection("document has 0 objects".to_string()));
+            }
+            let (point, normal) = elevation_plane(doc, &target_ids, direction, depth);
+            let (new_ids, layers_created, meshes) =
+                elevation_meshes(doc, ids, &target_ids, point, normal)?;
+            Ok((
+                Command::Elevation { ids: Some(new_ids.clone()), direction, depth },
+                Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+                ApplyOutcome {
+                    message: format!(
+                        "{direction} elevation: {} edge(s) from {meshes} mesh(es) on '{ELEVATIONS_LAYER}'",
                         new_ids.len()
                     ),
                     created: new_ids,
@@ -2730,6 +2855,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Intersect { .. } => "intersect",
         Command::Section { .. } => "section",
         Command::Plan { .. } => "plan",
+        Command::Elevation { .. } => "elevation",
         Command::Move { .. } => "move",
         Command::Rotate { .. } => "rotate",
         Command::Scale { .. } => "scale",
@@ -3256,31 +3382,58 @@ mod tests {
         run(&mut s, "box 3,2,-0.5 4,4,4");
         run(&mut s, "difference last 2 last");
         assert_eq!(s.doc.len(), 1);
+        run(&mut s, "name last court");
 
         let out = run(&mut s, "plan 1.5");
-        assert_eq!(out.created.len(), 2, "outer outline + courtyard hole");
         assert!(out.message.contains("'sections'"), "{}", out.message);
         assert!(s.doc.layers.contains_key("sections"));
+        assert!(s.doc.layers.contains_key("sections-proj"), "projected edges below");
+        // Cut lineweight is heavier than projected lineweight.
+        assert!(
+            s.doc.layers["sections"].lineweight_mm > s.doc.layers["sections-proj"].lineweight_mm
+        );
+        // Two closed cut loops on "sections" (outer outline + courtyard hole),
+        // both at the cut height; the rest are open projected edges below it.
+        let mut cut_loops = 0;
+        let mut proj_edges = 0;
         for id in &out.created {
             let obj = s.doc.get(*id).unwrap();
-            assert_eq!(obj.layer, "sections");
-            let Geometry::Curve(Curve::Polyline { points, closed: true }) = &obj.geometry
-            else {
-                panic!("expected closed polyline, got {:?}", obj.geometry)
-            };
-            assert!(points.iter().all(|p| (p.z - 1.5).abs() < 1e-9));
+            match &obj.geometry {
+                Geometry::Curve(Curve::Polyline { points, closed: true }) => {
+                    assert_eq!(obj.layer, "sections");
+                    assert!(points.iter().all(|p| (p.z - 1.5).abs() < 1e-9));
+                    cut_loops += 1;
+                }
+                Geometry::Curve(Curve::Polyline { points, closed: false }) => {
+                    assert_eq!(obj.layer, "sections-proj");
+                    // projected onto the cut plane
+                    assert!(points.iter().all(|p| (p.z - 1.5).abs() < 1e-9));
+                    proj_edges += 1;
+                }
+                g => panic!("unexpected geometry {g:?}"),
+            }
         }
-        // undo removes the loops AND the layer this cut created
+        assert_eq!(cut_loops, 2, "outer outline + courtyard hole");
+        assert!(proj_edges > 0, "geometry below the cut projects edges");
+        let created_len = out.created.len();
+        // undo removes every created curve AND both layers this cut created
         run(&mut s, "undo");
         assert_eq!(s.doc.len(), 1);
         assert!(!s.doc.layers.contains_key("sections"));
+        assert!(!s.doc.layers.contains_key("sections-proj"));
         run(&mut s, "redo");
-        assert_eq!(s.doc.len(), 3);
+        assert_eq!(s.doc.len(), 1 + created_len);
         assert!(s.doc.layers.contains_key("sections"));
 
-        // vertical section through the courtyard: two wall cut loops
-        let out = run(&mut s, "section last 3 0,4,0 0,1,0");
-        assert_eq!(out.created.len(), 2, "wall on each side of the courtyard");
+        // vertical section through the courtyard: two wall cut loops (+ any
+        // projected edges beyond the plane)
+        let out = run(&mut s, "section court 0,4,0 0,1,0");
+        let cut_loops = out
+            .created
+            .iter()
+            .filter(|id| s.doc.get(**id).unwrap().layer == "sections")
+            .count();
+        assert_eq!(cut_loops, 2, "wall on each side of the courtyard");
 
         // misses and non-meshes error without touching the document
         let n = s.doc.len();
@@ -3293,20 +3446,81 @@ mod tests {
     }
 
     #[test]
+    fn elevation_exec_undo_redo() {
+        let mut s = Session::default();
+        // Two boxes side by side; south elevation looks north onto the y=min
+        // face. Each box outlines to 8 non-degenerate projected edges.
+        run(&mut s, "box 0,0,0 2,2,3");
+        run(&mut s, "box 5,0,0 2,2,3");
+        let out = run(&mut s, "elevation south");
+        assert_eq!(out.created.len(), 16, "8 outline edges per box");
+        assert!(s.doc.layers.contains_key("elevations"));
+        for id in &out.created {
+            let obj = s.doc.get(*id).unwrap();
+            assert_eq!(obj.layer, "elevations");
+            let Geometry::Curve(Curve::Polyline { points, closed: false }) = &obj.geometry
+            else {
+                panic!("expected open polyline, got {:?}", obj.geometry)
+            };
+            // south elevation flattens onto the y = 0 plane (both boxes' min.y)
+            assert!(points.iter().all(|p| p.y.abs() < 1e-9), "{points:?}");
+        }
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        assert!(!s.doc.layers.contains_key("elevations"));
+        run(&mut s, "redo");
+        assert!(s.doc.layers.contains_key("elevations"));
+
+        // depth pushes the plane outward along +... no, for south the normal is
+        // -Y, so depth moves the plane to more negative y.
+        run(&mut s, "undo");
+        let out = run(&mut s, "elevation south 1");
+        let obj = s.doc.get(out.created[0]).unwrap();
+        let Geometry::Curve(Curve::Polyline { points, .. }) = &obj.geometry else {
+            unreachable!()
+        };
+        assert!(points.iter().all(|p| (p.y + 1.0).abs() < 1e-9), "depth offset");
+
+        // empty document errors
+        let mut empty = Session::default();
+        let err = empty.run(parse("elevation east").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("0 objects"), "{err}");
+    }
+
+    #[test]
+    fn elevation_replay_stability() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,3");
+        run(&mut s, "elevation west 0.5");
+        let log = s.save_log();
+        assert!(matches!(&log[1], Command::Elevation { ids: Some(ids), .. } if !ids.is_empty()));
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            s.doc.objects().collect::<Vec<_>>(),
+            replayed.doc.objects().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
+    }
+
+    #[test]
     fn section_replay_stability() {
         let mut s = Session::default();
         run(&mut s, "box 0,0,0 10,8,3");
         run(&mut s, "box 3,2,-0.5 4,4,4");
         run(&mut s, "difference last 2 last");
+        run(&mut s, "name last court");
         run(&mut s, "plan 1.5");
-        run(&mut s, "section last 3 0,4,0 0,1,0");
+        run(&mut s, "section court 0,4,0 0,1,0");
         run(&mut s, "undo");
         run(&mut s, "redo");
 
         let log = s.save_log();
         // logged ops carry the minted loop ids
-        assert!(matches!(&log[3], Command::Plan { ids: Some(ids), .. } if ids.len() == 2));
-        assert!(matches!(&log[4], Command::Section { ids: Some(ids), .. } if ids.len() == 2));
+        assert!(matches!(&log[4], Command::Plan { ids: Some(ids), .. } if ids.len() >= 2));
+        assert!(matches!(&log[5], Command::Section { ids: Some(ids), .. } if ids.len() >= 2));
         let replayed = Session::replay(log.clone()).unwrap();
         let a: Vec<_> = s.doc.objects().collect();
         let b: Vec<_> = replayed.doc.objects().collect();
@@ -4006,8 +4220,12 @@ mod tests {
         let mut s = Session::default();
         run(&mut s, "box 0,0,0 4,4,3");
         run(&mut s, "plan 1.5");
-        // sections layer auto-created at 0.35 mm.
-        assert!((s.doc.layers["sections"].lineweight_mm - 0.35).abs() < 1e-9);
+        // cut layer heavier than the projected-edge layer.
+        assert!((s.doc.layers["sections"].lineweight_mm - CUT_WEIGHT_MM).abs() < 1e-9);
+        assert!((s.doc.layers["sections-proj"].lineweight_mm - PROJ_WEIGHT_MM).abs() < 1e-9);
+        assert!(
+            s.doc.layers["sections"].lineweight_mm > s.doc.layers["sections-proj"].lineweight_mm
+        );
     }
 
     #[test]

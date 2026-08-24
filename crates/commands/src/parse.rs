@@ -5,7 +5,7 @@ use mydrafter_doc::{
 
 use crate::error::ParseError;
 use crate::registry::registry;
-use crate::{Command, MirrorPlane, Selector};
+use crate::{Command, CompassDir, MirrorPlane, Selector};
 
 /// Hand-rolled `verb arg arg...` parser. Chosen over a combinator library
 /// because error message quality feeds the LLM retry loop.
@@ -242,6 +242,33 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "plan" => {
             let [h] = take::<1>("plan", "a cut height", &args)?;
             Ok(Command::Plan { ids: None, height: number(h)? })
+        }
+        "elevation" => {
+            let direction = match args.first().copied() {
+                Some("north") => CompassDir::North,
+                Some("south") => CompassDir::South,
+                Some("east") => CompassDir::East,
+                Some("west") => CompassDir::West,
+                _ => {
+                    return Err(wrong_err(
+                        "elevation",
+                        "a direction (north, south, east, or west) and an optional depth",
+                        &args,
+                    ))
+                }
+            };
+            let depth = match args.get(1) {
+                Some(d) => number(d)?,
+                None => 0.0,
+            };
+            if args.len() > 2 {
+                return Err(wrong_err(
+                    "elevation",
+                    "a direction (north, south, east, or west) and an optional depth",
+                    &args,
+                ));
+            }
+            Ok(Command::Elevation { ids: None, direction, depth })
         }
         "move" => {
             let (sel, rest) = selector(&args, "move")?;
@@ -1479,8 +1506,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_elevation_commands() {
+        assert_eq!(
+            parse("elevation south").unwrap(),
+            Command::Elevation { ids: None, direction: CompassDir::South, depth: 0.0 }
+        );
+        assert!(matches!(
+            parse("elevation east 2.5").unwrap(),
+            Command::Elevation { direction: CompassDir::East, depth, .. }
+                if (depth - 2.5).abs() < 1e-12
+        ));
+        for (line, dir) in [
+            ("elevation north", CompassDir::North),
+            ("elevation west", CompassDir::West),
+        ] {
+            assert!(matches!(parse(line).unwrap(), Command::Elevation { direction, .. } if direction == dir));
+        }
+        // errors: bad direction, missing direction, too many args
+        assert!(parse("elevation up").unwrap_err().to_string().contains("direction"));
+        assert!(parse("elevation").unwrap_err().to_string().contains("direction"));
+        assert!(parse("elevation south 1 2").unwrap_err().to_string().contains("direction"));
+    }
+
+    #[test]
     fn section_command_json_roundtrip() {
-        for line in ["section all 0,0,1.5 0,0,1", "section last 2 5,0,0 1,0,0", "plan 1.2"] {
+        for line in [
+            "section all 0,0,1.5 0,0,1",
+            "section last 2 5,0,0 1,0,0",
+            "plan 1.2",
+            "elevation north",
+            "elevation east 2",
+        ] {
             let cmd = parse(line).unwrap();
             let json = serde_json::to_string(&cmd).unwrap();
             let back: Command = serde_json::from_str(&json).unwrap();

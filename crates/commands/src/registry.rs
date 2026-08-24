@@ -106,12 +106,17 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "section",
             usage: "section <selector> <plane point x,y,z> <normal x,y,z>",
-            summary: "Cut meshes with a plane; each closed intersection loop becomes a closed polyline on layer 'sections' (originals kept). Example: section all 0,0,1.2 0,0,1 · section tower 5,0,0 1,0,0 (vertical cross-section)",
+            summary: "Cut meshes with a plane; each closed intersection loop becomes a heavy closed polyline on layer 'sections', and feature edges beyond the plane are projected onto it as thin polylines on 'sections-proj' (originals kept). Example: section all 0,0,1.2 0,0,1 · section tower 5,0,0 1,0,0 (vertical cross-section)",
         },
         CommandSpec {
             name: "plan",
             usage: "plan <height>",
-            summary: "Architect's plan cut: horizontal section of every mesh at the given height; wall outlines and courtyard holes land as closed polylines on layer 'sections'. Cut ~1.2m above the floor of interest. Example: plan 1.2 · plan 4.7 (second floor at 3.5m + 1.2m)",
+            summary: "Architect's plan cut: horizontal section of every mesh at the given height; wall outlines and courtyard holes land as heavy closed polylines on layer 'sections', and edges of geometry below the cut (furniture, floor) are projected down as thin polylines on 'sections-proj'. Cut ~1.2m above the floor of interest. Example: plan 1.2 · plan 4.7 (second floor at 3.5m + 1.2m)",
+        },
+        CommandSpec {
+            name: "elevation",
+            usage: "elevation <north|south|east|west> [depth]",
+            summary: "Orthographic side-view outline: feature edges of all geometry projected onto the vertical plane for the compass direction (no cutting), as thin polylines on layer 'elevations'. 'north' is the face seen looking south. Example: elevation south · elevation east 2",
         },
         CommandSpec {
             name: "move",

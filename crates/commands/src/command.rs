@@ -24,6 +24,29 @@ pub enum MirrorPlane {
     PointNormal { point: DVec3, normal: DVec3 },
 }
 
+/// Compass direction naming an elevation view. `North` names the elevation you
+/// see standing to the north looking south (i.e. the building's north face).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompassDir {
+    North,
+    South,
+    East,
+    West,
+}
+
+impl std::fmt::Display for CompassDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            CompassDir::North => "north",
+            CompassDir::South => "south",
+            CompassDir::East => "east",
+            CompassDir::West => "west",
+        };
+        f.write_str(s)
+    }
+}
+
 /// The shared command language. `id`/`ids` fields are `None` when typed or
 /// emitted; they are filled at apply time and written back into the logged op
 /// so replay reproduces identical ids.
@@ -157,6 +180,16 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
         height: f64,
+    },
+    /// Orthographic side-view outline: feature edges of every mesh projected
+    /// onto the vertical plane for the named compass direction, on layer
+    /// "elevations". `depth` offsets the projection plane outward (default 0).
+    Elevation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        direction: CompassDir,
+        #[serde(default)]
+        depth: f64,
     },
     // -- drafting (dimensions, notes, hatches) --
     /// Linear dimension between two points; the measured value is derived at
