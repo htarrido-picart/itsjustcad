@@ -153,8 +153,10 @@ impl CommandLine {
     pub fn ui(&mut self, ui: &mut egui::Ui, object_names: &[String]) -> Option<String> {
         let mut submitted = None;
 
+        // Show ~3 lines of history (legacy CAD default: 3 rows).
+        // Height = 3 × (13 px font + ~6 px spacing) ≈ 57 px; +padding.
         egui::ScrollArea::vertical()
-            .max_height(96.0)
+            .max_height(80.0)
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for line in &self.history {
@@ -175,8 +177,8 @@ impl CommandLine {
                 egui::Label::new(
                     egui::RichText::new(usage)
                         .weak()
-                        .small()
-                        .font(egui::FontId::monospace(10.0)),
+                        .text_style(egui::TextStyle::Small)
+                        .font(egui::FontId::monospace(11.0)),
                 )
                 .wrap(),
             );

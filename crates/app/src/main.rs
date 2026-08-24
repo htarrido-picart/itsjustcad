@@ -40,12 +40,23 @@ fn main() -> eframe::Result<()> {
         runtime.block_on(std::future::pending::<()>());
     });
 
+    // MYDRAFTER_WINDOW_SIZE=WxH lets screenshots test at different resolutions.
+    let window_size: [f32; 2] = std::env::var("MYDRAFTER_WINDOW_SIZE")
+        .ok()
+        .and_then(|s| {
+            let mut parts = s.split('x');
+            let w = parts.next()?.parse::<f32>().ok()?;
+            let h = parts.next()?.parse::<f32>().ok()?;
+            Some([w, h])
+        })
+        .unwrap_or([1440.0, 900.0]);
+
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         depth_buffer: 24,
         viewport: egui::ViewportBuilder::default()
             .with_title("mydrafter")
-            .with_inner_size([1440.0, 900.0]),
+            .with_inner_size(window_size),
         ..Default::default()
     };
 

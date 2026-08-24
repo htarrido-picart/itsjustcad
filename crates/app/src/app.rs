@@ -143,6 +143,39 @@ impl App {
         // Cmd+= / Cmd+- / Cmd+0 also work (egui built-in zoom).
         let zoom = load_zoom().unwrap_or(1.3);
         cc.egui_ctx.set_zoom_factor(zoom);
+
+        // Legacy-CAD-informed font sizes (see docs/ui-legacy-research.md):
+        //   command line / monospace prompt: 13 px  (~10 pt at 96 DPI)
+        //   body / panels / status bar:      13 px  (~9–10 pt)
+        //   small (autosuggest, hints):      11 px  (~8 pt)
+        //   heading (panel titles):          14 px  (~11 pt)
+        // These are logical pixels before the zoom factor is applied.
+        // Applied to both themes so light and dark look consistent.
+        let set_cad_fonts = |style: &mut egui::Style| {
+            style.text_styles.insert(
+                egui::TextStyle::Monospace,
+                egui::FontId::monospace(13.0),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Body,
+                egui::FontId::proportional(13.0),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Small,
+                egui::FontId::proportional(11.0),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::proportional(13.0),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                egui::FontId::proportional(14.0),
+            );
+        };
+        cc.egui_ctx.style_mut_of(egui::Theme::Dark, set_cad_fonts);
+        cc.egui_ctx.style_mut_of(egui::Theme::Light, set_cad_fonts);
+
         let deck_visible = load_deck_visible().unwrap_or(true);
 
         let journal = Journal::open_default();
@@ -629,9 +662,20 @@ impl App {
                 let shift = ui.input(|i| i.modifiers.shift);
                 if shift {
                     self.cameras[cam_idx].pan(delta.x, delta.y);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 } else {
                     self.cameras[cam_idx].orbit(delta.x, delta.y);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                 }
+            } else if response.hovered()
+                && ui.input(|i| {
+                    i.pointer
+                        .button_down(egui::PointerButton::Secondary)
+                        || i.pointer.button_down(egui::PointerButton::Middle)
+                })
+            {
+                // Show grab cursor while holding the button before movement.
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
             }
             if response.hovered() {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -652,6 +696,9 @@ impl App {
             if self.draw_tool.active() {
                 // Draw/osnap only in the active pane; one prompt, one ghost.
                 if pane == self.active_pane {
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    }
                     self.drawing_input(ui, rect, &response, view_proj);
                 }
             } else {
@@ -857,13 +904,13 @@ impl App {
         let (entries, cursor) = self.session.history();
         let mut jump: Option<usize> = None;
         egui::Area::new(egui::Id::new("history_panel"))
-            .fixed_pos(rect.left_top() + egui::vec2(8.0, 48.0))
+            .fixed_pos(rect.left_top() + egui::vec2(8.0, 60.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(130.0);
                     egui::CollapsingHeader::new(format!("History ({})", entries.len()))
                         .id_salt("history_panel_header")
-                        .default_open(true)
+                        .default_open(false)
                         .show(ui, |ui| {
                             egui::ScrollArea::vertical()
                                 .max_height(260.0)

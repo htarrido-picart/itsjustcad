@@ -35,9 +35,11 @@ impl OrbitCamera {
         self.target + self.distance * Vec3::new(cp * cy, cp * sy, sp)
     }
 
+    /// Orbit sensitivity: 0.005 rad/px ≈ 0.29°/px, matching legacy CAD feel
+    /// (AutoCAD/Rhino interactive rotation is roughly 0.25–0.35°/px).
     pub fn orbit(&mut self, dx: f32, dy: f32) {
-        self.yaw -= dx * 0.01;
-        self.pitch = (self.pitch + dy * 0.01).clamp(
+        self.yaw -= dx * 0.005;
+        self.pitch = (self.pitch + dy * 0.005).clamp(
             -std::f32::consts::FRAC_PI_2,
             std::f32::consts::FRAC_PI_2,
         );
