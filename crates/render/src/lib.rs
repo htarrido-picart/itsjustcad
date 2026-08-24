@@ -8,8 +8,10 @@ mod viewport_callback;
 
 pub use camera::{OrbitCamera, StandardView};
 pub use layout::ViewportLayout;
-pub use renderer::{CameraUniform, DisplayMode, SceneData, SceneRenderer, UnderlayData};
-pub use snapshot::{snapshot, Theme};
+pub use renderer::{
+    hue_from_seed, CameraUniform, ColorMode, DisplayMode, SceneData, SceneRenderer, UnderlayData,
+};
+pub use snapshot::{snapshot, snapshot_with_mode, ColorModeSnapshot, Theme};
 pub use viewport_callback::ViewportCallback;
 
 pub fn camera_uniform(view_proj: glam::Mat4, eye: glam::Vec3) -> CameraUniform {

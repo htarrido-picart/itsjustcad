@@ -94,6 +94,65 @@ impl DisplayMode {
     }
 }
 
+/// How object colors are resolved in the viewport. View state — never logged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorMode {
+    /// Object color → layer color → theme default (current behavior).
+    #[default]
+    ByLayer,
+    /// Per-object color override wins; falls back to layer then theme.
+    ByObject,
+    /// Fixed hue per geometry type: teal for meshes, white/dark for curves,
+    /// amber for annotations.
+    ByType,
+    /// Stable hash of the object id → unique hue; great for untangling imports.
+    Random,
+}
+
+impl ColorMode {
+    pub const ALL: [ColorMode; 4] = [
+        ColorMode::ByLayer,
+        ColorMode::ByObject,
+        ColorMode::ByType,
+        ColorMode::Random,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorMode::ByLayer => "By Layer",
+            ColorMode::ByObject => "By Object",
+            ColorMode::ByType => "By Type",
+            ColorMode::Random => "Random",
+        }
+    }
+}
+
+/// Stable hue for a given u64 seed (e.g. hash of object id bytes).
+/// Returns a fully-saturated, medium-lightness RGBA color.
+pub fn hue_from_seed(seed: u64) -> [f32; 4] {
+    // Mix the bits to spread similar ids far apart on the hue wheel.
+    let h = seed.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(seed >> 16);
+    let hue = (h & 0xFFFF) as f32 / 65536.0; // 0..1
+    hsv_to_rgb(hue, 0.75, 0.85)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 4] {
+    let i = (h * 6.0).floor() as u32 % 6;
+    let f = h * 6.0 - (h * 6.0).floor();
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
+    let (r, g, b) = match i {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    [r, g, b, 1.0]
+}
+
 #[cfg(test)]
 mod tests {
     use super::DisplayMode;

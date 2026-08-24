@@ -509,6 +509,19 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("showobj", rest, &args)?;
             Ok(Command::ShowObj { targets: sel })
         }
+        "color" => {
+            let (sel, rest) = selector(&args, "color")?;
+            match rest {
+                ["off"] => Ok(Command::ColorOff { targets: sel }),
+                [c] => Ok(Command::Color { targets: sel, color: color3(c)? }),
+                _ => wrong("color", "a selector then an r,g,b color or 'off'", &args),
+            }
+        }
+        "coloroff" => {
+            let (sel, rest) = selector(&args, "coloroff")?;
+            expect_empty("coloroff", rest, &args)?;
+            Ok(Command::ColorOff { targets: sel })
+        }
         "units" => {
             let [u] = take::<1>("units", "a unit: m, cm, mm, ft, in or ftin", &args)?;
             let units = Units::parse(u)

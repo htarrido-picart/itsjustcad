@@ -1,6 +1,6 @@
 use mydrafter_doc::{Document, Geometry};
 
-pub use mydrafter_render::{snapshot, Theme};
+pub use mydrafter_render::{snapshot_with_mode, Theme};
 
 /// Compact scene description for the LLM system prompt.
 /// Selected objects are marked `[SELECTED]` and receive a full detail block

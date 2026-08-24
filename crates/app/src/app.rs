@@ -1,7 +1,7 @@
 use mydrafter_commands::Session;
 use mydrafter_render::{
-    DisplayMode, OrbitCamera, SceneRenderer, StandardView, UnderlayData, ViewportCallback,
-    ViewportLayout,
+    ColorMode, DisplayMode, OrbitCamera, SceneRenderer, StandardView, UnderlayData,
+    ViewportCallback, ViewportLayout,
 };
 
 use crate::command_line::CommandLine;
@@ -80,6 +80,8 @@ pub struct App {
     /// Display mode per camera slot (view state, follows the camera across
     /// layout switches; never logged).
     display_modes: [DisplayMode; 4],
+    /// Color mode per camera slot (view state; never logged).
+    color_modes: [ColorMode; 4],
     layout: ViewportLayout,
     /// Last hovered pane; view commands and tools target its camera.
     active_pane: usize,
@@ -87,6 +89,8 @@ pub struct App {
     uploaded_generation: Option<u64>,
     /// Theme of the last GPU upload; theme flips force a re-upload.
     uploaded_theme: Option<scene::Theme>,
+    /// Color mode of the last GPU upload; mode changes force a re-upload.
+    uploaded_color_mode: Option<ColorMode>,
     /// Last zoom factor written to ui.json (avoid rewriting every frame).
     saved_zoom: f32,
     /// Dev self-verification: MYDRAFTER_SHOT=<path.png> captures a frame and exits.
@@ -210,10 +214,12 @@ impl App {
                 cams
             },
             display_modes: [DisplayMode::default(); 4],
+            color_modes: [ColorMode::default(); 4],
             layout: ViewportLayout::Single,
             active_pane: 0,
             uploaded_generation: None,
             uploaded_theme: None,
+            uploaded_color_mode: None,
             saved_zoom: zoom,
             shot_path: std::env::var("MYDRAFTER_SHOT").ok(),
             startup_script: std::env::var("MYDRAFTER_RUN").ok(),
@@ -656,14 +662,22 @@ impl App {
             scene::Theme::Light
         };
         let generation = self.session.doc.generation;
+        // Color mode of the active pane drives the snapshot; changes stale it.
+        let active_color_mode = self.color_modes[self.layout.camera_index(self.active_pane)];
         let stale = self.uploaded_generation != Some(generation)
-            || self.uploaded_theme != Some(theme);
+            || self.uploaded_theme != Some(theme)
+            || self.uploaded_color_mode != Some(active_color_mode);
         // Scene is uploaded once (renderer shared); only the first pane's
         // callback carries the snapshot, the rest just set their camera.
         let mut scene = if stale {
             self.uploaded_generation = Some(generation);
             self.uploaded_theme = Some(theme);
-            let mut s = scene::snapshot(&self.session.doc, theme);
+            self.uploaded_color_mode = Some(active_color_mode);
+            let mut s = scene::snapshot_with_mode(
+                &self.session.doc,
+                theme,
+                mydrafter_render::ColorModeSnapshot { color_mode: active_color_mode },
+            );
             s.underlay = self.decode_underlay();
             Some(s)
         } else {
@@ -1258,7 +1272,7 @@ impl App {
                             self.zoom_extents();
                         }
                         ui.separator();
-                        // Display mode of the active pane's camera slot.
+                        // Display mode and color mode of the active pane's camera slot.
                         let slot = self.layout.camera_index(self.active_pane);
                         egui::ComboBox::from_id_salt("display_mode")
                             .selected_text(self.display_modes[slot].label())
@@ -1269,6 +1283,22 @@ impl App {
                                         mode,
                                         mode.label(),
                                     );
+                                }
+                            });
+                        egui::ComboBox::from_id_salt("color_mode")
+                            .selected_text(self.color_modes[slot].label())
+                            .show_ui(ui, |ui| {
+                                for mode in ColorMode::ALL {
+                                    let prev = self.color_modes[slot];
+                                    ui.selectable_value(
+                                        &mut self.color_modes[slot],
+                                        mode,
+                                        mode.label(),
+                                    );
+                                    // Force re-upload when mode changes.
+                                    if self.color_modes[slot] != prev {
+                                        self.uploaded_color_mode = None;
+                                    }
                                 }
                             });
                         ui.separator();

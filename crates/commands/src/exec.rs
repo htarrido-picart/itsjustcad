@@ -72,6 +72,8 @@ enum Inverse {
     LayerStyle { layer: String, prev: LayerStyle },
     /// `hideobj`/`showobj`: restore each object's previous visible flag.
     ObjectVisibility(Vec<(ObjectId, bool)>),
+    /// `color`/`coloroff`: restore each object's previous color override.
+    ObjectColor(Vec<(ObjectId, Option<[f32; 3]>)>),
     /// `units`: restore the previous display unit.
     Units { prev: Units },
     /// `underlay`/`underlayopacity`/`underlayoff`: restore the previous underlay.
@@ -226,6 +228,14 @@ impl Session {
                         obj.visible = visible;
                     }
                 }
+            }
+            Inverse::ObjectColor(prev) => {
+                for (id, color) in prev.clone() {
+                    if let Some(obj) = self.doc.get_mut(id) {
+                        obj.color = color;
+                    }
+                }
+                self.doc.generation += 1;
             }
             Inverse::Units { prev } => {
                 self.doc.units = *prev;
@@ -546,6 +556,7 @@ fn insert_curve(
         id,
         name: None,
         layer: doc.current_layer.clone(),
+        color: None,
         geometry: Geometry::Curve(curve),
     });
     let outcome = ApplyOutcome {
@@ -665,6 +676,7 @@ fn replace_with_result(
         id,
         name,
         layer,
+        color: None,
         geometry: Geometry::Mesh(result),
     });
     Ok((
@@ -896,6 +908,7 @@ fn section_meshes(
             id: *id_iter.next().expect("id per loop"),
             name: None,
             layer: SECTIONS_LAYER.to_string(),
+            color: None,
             geometry: Geometry::Curve(Curve::Polyline { points, closed: true }),
         });
     }
@@ -905,6 +918,7 @@ fn section_meshes(
             id: *id_iter.next().expect("id per edge"),
             name: None,
             layer: SECTIONS_PROJ_LAYER.to_string(),
+            color: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -978,6 +992,7 @@ fn elevation_meshes(
             id: *id,
             name: None,
             layer: ELEVATIONS_LAYER.to_string(),
+            color: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -1042,6 +1057,7 @@ fn apply_forward(
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Mesh(kernel_mesh::make_box(corner, size)),
             });
             Ok((
@@ -1079,6 +1095,7 @@ fn apply_forward(
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Mesh(extrude_profile(&profile2d, base_z, height)),
             });
             Ok((
@@ -1122,6 +1139,7 @@ fn apply_forward(
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -1158,6 +1176,7 @@ fn apply_forward(
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -1194,6 +1213,7 @@ fn apply_forward(
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -1341,6 +1361,7 @@ fn apply_forward(
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Annotation(Annotation::LinearDim { a, b, offset }),
             });
             Ok((
@@ -1365,6 +1386,7 @@ fn apply_forward(
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Annotation(Annotation::Text {
                     pos,
                     text: text.clone(),
@@ -1420,6 +1442,7 @@ fn apply_forward(
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Annotation(Annotation::Hatch {
                     boundary,
                     pattern: pattern.clone(),
@@ -1684,6 +1707,7 @@ fn apply_forward(
                     id: *pid,
                     name: obj.name.clone(),
                     layer: obj.layer.clone(),
+                    color: None,
                     geometry: Geometry::Curve(piece),
                 });
             }
@@ -1751,6 +1775,7 @@ fn apply_forward(
                 id,
                 name: obj.name.clone(),
                 layer: obj.layer.clone(),
+                color: None,
                 geometry: Geometry::Curve(kept),
             });
             Ok((
@@ -1827,7 +1852,7 @@ fn apply_forward(
                 }
             }
             let id = id.unwrap_or_default();
-            doc.insert(SceneObject { id, name, layer, visible: true, geometry: Geometry::Curve(joined) });
+            doc.insert(SceneObject { id, name, layer, visible: true, color: None, geometry: Geometry::Curve(joined) });
             Ok((
                 Command::Join { id: Some(id), targets },
                 Inverse::Replace { created: vec![id], consumed },
@@ -1883,6 +1908,7 @@ fn apply_forward(
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Curve(arc),
             });
             Ok((
@@ -1926,6 +1952,7 @@ fn apply_forward(
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Curve(offset),
             });
             Ok((
@@ -2301,6 +2328,48 @@ fn apply_forward(
                 ApplyOutcome {
                     created: Vec::new(),
                     message: format!("showed {} object(s)", ids.len()),
+                },
+            ))
+        }
+        Command::Color { targets, color } => {
+            let ids = resolve(doc, &targets)?;
+            let mut prev = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let obj = doc.get_mut(*id).expect("resolved");
+                prev.push((*id, obj.color));
+                obj.color = Some(color);
+            }
+            doc.generation += 1;
+            Ok((
+                Command::Color { targets, color },
+                Inverse::ObjectColor(prev),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "colored {} object(s) ({:.2},{:.2},{:.2})",
+                        ids.len(),
+                        color[0],
+                        color[1],
+                        color[2]
+                    ),
+                },
+            ))
+        }
+        Command::ColorOff { targets } => {
+            let ids = resolve(doc, &targets)?;
+            let mut prev = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let obj = doc.get_mut(*id).expect("resolved");
+                prev.push((*id, obj.color));
+                obj.color = None;
+            }
+            doc.generation += 1;
+            Ok((
+                Command::ColorOff { targets },
+                Inverse::ObjectColor(prev),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("cleared color on {} object(s)", ids.len()),
                 },
             ))
         }
@@ -2852,6 +2921,7 @@ fn apply_forward(
                 id,
                 name: name.clone(),
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2926,6 +2996,7 @@ fn apply_forward(
                 id,
                 name: None,
                 layer: doc.current_layer.clone(),
+                color: None,
                 geometry: Geometry::Instance {
                     block: name.clone(),
                     position,
@@ -3022,6 +3093,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Show { .. } => "show",
         Command::HideObj { .. } => "hideobj",
         Command::ShowObj { .. } => "showobj",
+        Command::Color { .. } => "color",
+        Command::ColorOff { .. } => "coloroff",
         Command::Units { .. } => "units",
         Command::Underlay { .. } => "underlay",
         Command::UnderlayOpacity { .. } => "underlayopacity",
@@ -5222,5 +5295,62 @@ mod tests {
         let mut s = Session::default();
         let result = s.run(crate::parse::parse("insert nosuchblock 0,0,0").unwrap());
         assert!(result.is_err(), "should error on unknown block");
+    }
+
+    #[test]
+    fn color_set_undo_redo_replay() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        let id = *s.doc.all_ids().last().unwrap();
+
+        // Set color
+        run(&mut s, "color last 1,0,0");
+        assert_eq!(s.doc.get(id).unwrap().color, Some([1.0, 0.0, 0.0]));
+
+        // Undo restores None
+        run(&mut s, "undo");
+        assert_eq!(s.doc.get(id).unwrap().color, None);
+
+        // Redo re-applies
+        run(&mut s, "redo");
+        assert_eq!(s.doc.get(id).unwrap().color, Some([1.0, 0.0, 0.0]));
+
+        // coloroff clears it
+        run(&mut s, "color last off");
+        assert_eq!(s.doc.get(id).unwrap().color, None);
+
+        // Replay produces the same result
+        let log = s.save_log();
+        let s2 = Session::replay(log).unwrap();
+        assert_eq!(s2.doc.get(id).unwrap().color, None);
+    }
+
+    #[test]
+    fn coloroff_undo_restores_previous_color() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        let id = *s.doc.all_ids().last().unwrap();
+
+        run(&mut s, "color last 0,1,0");
+        assert_eq!(s.doc.get(id).unwrap().color, Some([0.0, 1.0, 0.0]));
+
+        run(&mut s, "color last off");
+        assert_eq!(s.doc.get(id).unwrap().color, None);
+
+        // Undo coloroff restores the green
+        run(&mut s, "undo");
+        assert_eq!(s.doc.get(id).unwrap().color, Some([0.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn color_255_scale_accepted() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "color last 255,128,0");
+        let id = *s.doc.all_ids().last().unwrap();
+        let [r, g, b] = s.doc.get(id).unwrap().color.unwrap();
+        assert!((r - 1.0).abs() < 0.005, "r={r}");
+        assert!((g - 128.0 / 255.0).abs() < 0.005, "g={g}");
+        assert!(b.abs() < 0.005, "b={b}");
     }
 }

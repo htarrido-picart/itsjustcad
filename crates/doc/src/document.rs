@@ -227,6 +227,7 @@ mod tests {
             id: ObjectId::new(),
             name: name.map(str::to_string),
             layer: DEFAULT_LAYER.to_string(),
+            color: None,
             geometry: Geometry::Mesh(mesh),
         }
     }

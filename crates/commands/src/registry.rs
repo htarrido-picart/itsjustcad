@@ -244,6 +244,11 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Show hidden objects ('showobj all' reveals everything). Example: showobj all",
         },
         CommandSpec {
+            name: "color",
+            usage: "color <selector> <r,g,b | off>",
+            summary: "Set or clear a per-object color override (0-1 or 0-255 values). Beats the layer color. 'color last off' clears it. Example: color last 1,0.3,0 · color walls off",
+        },
+        CommandSpec {
             name: "units",
             usage: "units <m|cm|mm|ft|in|ftin>",
             summary: "Set the display unit for dimensions and readouts (geometry stays meters internally). Number suffixes work everywhere regardless: 500mm, 2.5m, 12ft, 6in, and feet-inches typed as 12ft6in (shown as 12'-6\"). Example: units ftin",

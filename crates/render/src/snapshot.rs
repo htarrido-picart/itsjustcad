@@ -1,10 +1,16 @@
 use glam::{DVec2, DVec3};
 use mydrafter_doc::{
     hatch::{hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
-    Annotation, Document, Geometry, HatchPattern,
+    Annotation, Document, Geometry, HatchPattern, SceneObject,
 };
 
-use crate::renderer::SceneData;
+use crate::renderer::{hue_from_seed, ColorMode, SceneData};
+
+/// Parameters for color resolution that accompany a snapshot call.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColorModeSnapshot {
+    pub color_mode: ColorMode,
+}
 
 /// Chord tolerance for display tessellation of curves.
 const DISPLAY_TOL: f64 = 0.005;
@@ -61,8 +67,63 @@ fn push_hatch_segs(lines: &mut Vec<(Vec<[f32; 3]>, [f32; 4])>, segs: Vec<[DVec3;
     }
 }
 
+/// Resolve the display color for an object given the active color mode.
+/// Selection always wins over everything; otherwise the mode determines priority.
+fn resolve_color(
+    obj: &SceneObject,
+    layer_color: Option<[f32; 4]>,
+    theme: Theme,
+    selected: bool,
+    mode: ColorMode,
+    is_mesh: bool,
+) -> [f32; 4] {
+    if selected {
+        return theme.selected();
+    }
+    match mode {
+        // ByLayer: object color beats layer color beats theme default.
+        // The `color` command stores object.color; it always wins over layer.
+        ColorMode::ByLayer => {
+            obj.color
+                .map(|[r, g, b]| [r, g, b, 1.0])
+                .or(layer_color)
+                .unwrap_or(if is_mesh { theme.mesh() } else { theme.curve() })
+        }
+        // ByObject: identical priority to ByLayer; name signals intent — the
+        // user wants per-object colors front and center.
+        ColorMode::ByObject => {
+            obj.color
+                .map(|[r, g, b]| [r, g, b, 1.0])
+                .or(layer_color)
+                .unwrap_or(if is_mesh { theme.mesh() } else { theme.curve() })
+        }
+        ColorMode::ByType => {
+            if is_mesh {
+                [0.35, 0.75, 0.72, 1.0]
+            } else {
+                match &obj.geometry {
+                    Geometry::Annotation(_) => [0.92, 0.70, 0.20, 1.0],
+                    _ => if theme == Theme::Dark { [0.92, 0.94, 0.97, 1.0] } else { [0.10, 0.11, 0.14, 1.0] },
+                }
+            }
+        }
+        ColorMode::Random => {
+            // Stable hash of the ObjectId (UUID bytes).
+            let bytes = obj.id.0.as_bytes();
+            let seed = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            hue_from_seed(seed)
+        }
+    }
+}
+
 /// Snapshot the document into GPU-ready buffers.
 pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
+    snapshot_with_mode(doc, theme, ColorModeSnapshot::default())
+}
+
+/// Snapshot with an explicit color mode.
+pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) -> SceneData {
+    let mode = cms.color_mode;
     let mut scene = SceneData {
         meshes: Vec::new(),
         lines: Vec::new(),
@@ -79,16 +140,11 @@ pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
         if style.is_some_and(|s| !s.visible) {
             continue; // hidden layer
         }
-        // Layer color wins over the theme default; selection wins over both.
         let layer_color = style.and_then(|s| s.color);
         let selected = doc.selection.contains(&obj.id);
         match &obj.geometry {
             Geometry::Mesh(mesh) => {
-                let color = if selected {
-                    theme.selected()
-                } else {
-                    layer_color.unwrap_or(theme.mesh())
-                };
+                let color = resolve_color(obj, layer_color, theme, selected, mode, true);
                 scene.meshes.push((mesh.to_render(), color));
                 // Feature edges for the wireframe/x-ray/ghosted display modes.
                 let edge_color = if selected { theme.selected() } else { theme.curve() };
@@ -104,11 +160,7 @@ pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
                 scene.edges.push((segments, edge_color));
             }
             Geometry::Curve(curve) => {
-                let color = if selected {
-                    theme.selected()
-                } else {
-                    layer_color.unwrap_or(theme.curve())
-                };
+                let color = resolve_color(obj, layer_color, theme, selected, mode, false);
                 let mut pts: Vec<[f32; 3]> = curve
                     .tessellate(DISPLAY_TOL)
                     .iter()
@@ -124,11 +176,7 @@ pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
             // Hatches are scene geometry (fill triangles / pattern lines);
             // dimensions and text are drawn as an egui overlay by the app.
             Geometry::Annotation(Annotation::Hatch { boundary, pattern }) => {
-                let color = if selected {
-                    theme.selected()
-                } else {
-                    layer_color.unwrap_or(theme.curve())
-                };
+                let color = resolve_color(obj, layer_color, theme, selected, mode, false);
                 match pattern {
                     HatchPattern::Solid => {
                         let pts2: Vec<DVec2> =
@@ -176,7 +224,7 @@ pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
                             ps.z * s + position.z,
                         )
                     };
-                    let color = if selected { theme.selected() } else { layer_color.unwrap_or(theme.curve()) };
+                    let color = resolve_color(obj, layer_color, theme, selected, mode, false);
                     for def_geo in defs {
                         match def_geo {
                             mydrafter_doc::BlockGeometry::Mesh(m) => {
@@ -184,7 +232,7 @@ pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
                                 let new_pos: Vec<DVec3> =
                                     m.positions().iter().map(|&p| transform(p)).collect();
                                 let new_mesh = kernel_mesh::Mesh::new(new_pos, m.faces().to_vec());
-                                let mesh_color = if selected { theme.selected() } else { layer_color.unwrap_or(theme.mesh()) };
+                                let mesh_color = resolve_color(obj, layer_color, theme, selected, mode, true);
                                 scene.meshes.push((new_mesh.to_render(), mesh_color));
                                 let segments: Vec<[f32; 3]> = kernel_mesh::feature_edges(&new_mesh)
                                     .iter()
@@ -237,6 +285,7 @@ mod tests {
     use mydrafter_doc::{Document, LayerStyle, ObjectId, SceneObject};
 
     use super::*;
+    use crate::renderer::ColorMode;
 
     fn insert_tri(doc: &mut Document, layer: &str) -> ObjectId {
         let mesh = kernel_mesh::Mesh::new(
@@ -248,6 +297,7 @@ mod tests {
             id: ObjectId::new(),
             name: None,
             layer: layer.to_string(),
+            color: None,
             geometry: Geometry::Mesh(mesh),
         };
         let id = obj.id;
@@ -287,6 +337,7 @@ mod tests {
             id: ObjectId::new(),
             name: None,
             layer: "default".into(),
+            color: None,
             geometry: Geometry::Mesh(kernel_mesh::make_box(
                 DVec3::ZERO,
                 DVec3::new(2.0, 1.0, 3.0),
@@ -333,6 +384,7 @@ mod tests {
             id: ObjectId::new(),
             name: None,
             layer: "default".into(),
+            color: None,
             geometry: Geometry::Annotation(mydrafter_doc::Annotation::Hatch {
                 boundary: square.clone(),
                 pattern: mydrafter_doc::HatchPattern::Solid,
@@ -348,6 +400,7 @@ mod tests {
             id: ObjectId::new(),
             name: None,
             layer: "default".into(),
+            color: None,
             geometry: Geometry::Annotation(mydrafter_doc::Annotation::Hatch {
                 boundary: square,
                 pattern: mydrafter_doc::HatchPattern::Lines { angle_deg: 0.0, spacing: 0.5 },
@@ -370,6 +423,7 @@ mod tests {
             id: ObjectId::new(),
             name: None,
             layer: "default".into(),
+            color: None,
             geometry: Geometry::Annotation(mydrafter_doc::Annotation::LinearDim {
                 a: DVec3::ZERO,
                 b: DVec3::X,
@@ -381,6 +435,7 @@ mod tests {
             id: ObjectId::new(),
             name: None,
             layer: "default".into(),
+            color: None,
             geometry: Geometry::Annotation(mydrafter_doc::Annotation::Text {
                 pos: DVec3::ZERO,
                 text: "note".into(),
@@ -510,6 +565,7 @@ mod tests {
             id: ObjectId::new(),
             name: None,
             layer: "default".into(),
+            color: None,
             geometry: Geometry::Instance {
                 block: "tri".to_string(),
                 position: DVec3::new(5.0, 0.0, 0.0),
@@ -519,5 +575,88 @@ mod tests {
         });
         let scene = snapshot(&doc, Theme::Dark);
         assert_eq!(scene.meshes.len(), 1, "instance resolves to its block mesh");
+    }
+
+    // -- color mode tests --
+
+    fn two_mesh_doc() -> Document {
+        let mut doc = Document::default();
+        insert_tri(&mut doc, "default");
+        insert_tri(&mut doc, "default");
+        doc
+    }
+
+    #[test]
+    fn by_object_color_overrides_theme() {
+        let mut doc = two_mesh_doc();
+        let id = doc.all_ids()[0];
+        doc.get_mut(id).unwrap().color = Some([1.0, 0.0, 0.0]);
+
+        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::ByObject };
+        let scene = snapshot_with_mode(&doc, Theme::Dark, cms);
+        // First object should be red (object color wins)
+        assert_eq!(scene.meshes[0].1, [1.0, 0.0, 0.0, 1.0]);
+        // Second has no color override — falls back to layer then theme
+        assert_eq!(scene.meshes[1].1, Theme::Dark.mesh());
+    }
+
+    #[test]
+    fn by_type_mesh_hue_distinct_from_curve() {
+        let mut doc = Document::default();
+        // Add a mesh and a closed curve
+        insert_tri(&mut doc, "default");
+        doc.insert(SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: "default".into(),
+            color: None,
+            geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
+                points: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+                closed: true,
+            }),
+        });
+
+        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::ByType };
+        let scene = snapshot_with_mode(&doc, Theme::Dark, cms);
+        assert!(!scene.meshes.is_empty());
+        assert!(!scene.lines.is_empty());
+        // Mesh color is the teal ByType hue
+        assert_eq!(scene.meshes[0].1, [0.35, 0.75, 0.72, 1.0]);
+        // Curve color is theme curve (not mesh)
+        assert_ne!(scene.lines[0].1, scene.meshes[0].1);
+    }
+
+    #[test]
+    fn random_mode_differs_per_object() {
+        let doc = two_mesh_doc();
+        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::Random };
+        let scene = snapshot_with_mode(&doc, Theme::Dark, cms);
+        assert_eq!(scene.meshes.len(), 2);
+        // Two distinct objects should (almost certainly) get different random colors.
+        // This is probabilistic but the uuid space makes collision astronomically rare.
+        assert_ne!(scene.meshes[0].1, scene.meshes[1].1, "random colors should differ");
+    }
+
+    #[test]
+    fn random_mode_is_stable_across_calls() {
+        let doc = two_mesh_doc();
+        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::Random };
+        let scene1 = snapshot_with_mode(&doc, Theme::Dark, cms);
+        let scene2 = snapshot_with_mode(&doc, Theme::Dark, cms);
+        assert_eq!(scene1.meshes[0].1, scene2.meshes[0].1, "random color must be stable");
+        assert_eq!(scene1.meshes[1].1, scene2.meshes[1].1, "random color must be stable");
+    }
+
+    #[test]
+    fn hue_from_seed_produces_valid_rgba() {
+        use crate::renderer::hue_from_seed;
+        for seed in [0u64, 1, 42, u64::MAX, 0x9e3779b97f4a7c15] {
+            let [r, g, b, a] = hue_from_seed(seed);
+            assert!(r >= 0.0 && r <= 1.0, "r={r}");
+            assert!(g >= 0.0 && g <= 1.0, "g={g}");
+            assert!(b >= 0.0 && b <= 1.0, "b={b}");
+            assert_eq!(a, 1.0);
+        }
     }
 }

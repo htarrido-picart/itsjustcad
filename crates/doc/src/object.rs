@@ -255,5 +255,9 @@ pub struct SceneObject {
     /// pre-visibility JSON loading.
     #[serde(default = "default_visible")]
     pub visible: bool,
+    /// Per-object override color (RGB 0..1). `None` defers to layer/theme.
+    /// Serde default keeps pre-color JSON loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 3]>,
     pub geometry: Geometry,
 }

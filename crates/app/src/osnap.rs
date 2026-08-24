@@ -133,6 +133,7 @@ mod tests {
             id: ObjectId::new(),
             name: None,
             layer: mydrafter_doc::DEFAULT_LAYER.to_string(),
+            color: None,
             geometry,
         });
         doc

@@ -361,6 +361,16 @@ pub enum Command {
     ShowObj {
         targets: Selector,
     },
+    // -- per-object color --
+    /// Set a per-object color override (RGB 0..1 or 0..255). Beats layer color.
+    Color {
+        targets: Selector,
+        color: [f32; 3],
+    },
+    /// Clear per-object color override (reverts to layer/theme color).
+    ColorOff {
+        targets: Selector,
+    },
     /// Set the document display unit. Logged so replayed files keep their
     /// unit; geometry always stores meters regardless.
     Units {
