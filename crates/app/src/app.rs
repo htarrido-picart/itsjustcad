@@ -30,6 +30,44 @@ pub(crate) enum TemplateScale {
     Urban,
 }
 
+/// The "deck brain" choice offered during onboarding: where the LLM that powers
+/// the deck runs. Selection is persisted to `ui.json` and (for the local paths)
+/// writes a cassette entry into `decks.json`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeckBrain {
+    /// Point at a cloud API later (Anthropic/OpenAI-compatible). No cassette
+    /// written now — the user enters a key in the deck settings.
+    Cloud,
+    /// Local via an already-running Ollama at http://localhost:11434.
+    Ollama,
+    /// Download a local model (the fetch is a later sub-phase; here we only
+    /// record the chosen tier and write the local cassette).
+    Download,
+    /// Decide later — no cassette written, no pref locked in.
+    Skip,
+}
+
+impl DeckBrain {
+    fn label(self) -> &'static str {
+        match self {
+            DeckBrain::Cloud => "Cloud (enter an API key later)",
+            DeckBrain::Ollama => "Local via Ollama (http://localhost:11434)",
+            DeckBrain::Download => "Download a local model",
+            DeckBrain::Skip => "Skip — decide later",
+        }
+    }
+
+    /// String key persisted in `ui.json`.
+    fn as_pref(self) -> &'static str {
+        match self {
+            DeckBrain::Cloud => "cloud",
+            DeckBrain::Ollama => "ollama",
+            DeckBrain::Download => "download",
+            DeckBrain::Skip => "skip",
+        }
+    }
+}
+
 /// Decide whether the one-time `~/.config/mydrafter` → `~/.config/itsjustcad`
 /// migration should run. Pure so it can be unit-tested: migrate iff the OLD
 /// dir exists and the NEW one does not. Any other combination is a no-op (new
@@ -285,6 +323,12 @@ pub struct App {
     template_scale: TemplateScale,
     /// Legacy-CAD origin selected in the template picker (persisted to ui.json).
     cad_origin: CadOrigin,
+    /// Deck-brain choice in the onboarding modal (persisted to ui.json; local
+    /// paths also write a cassette into decks.json).
+    deck_brain: DeckBrain,
+    /// Hardware capabilities detected once at startup, shown when the user picks
+    /// the "download a local model" path so tiers can be gated.
+    hardware: crate::hardware::HardwareInfo,
 }
 
 impl App {
@@ -413,6 +457,15 @@ impl App {
             template_units: TemplateUnits::Meters,
             template_scale: TemplateScale::Building,
             cad_origin,
+            // Dev hook: ITSJUSTCAD_BRAIN=download pre-selects the download path so
+            // the hardware-recommendation panel is visible in ITSJUSTCAD_SHOT frames.
+            deck_brain: match std::env::var("ITSJUSTCAD_BRAIN").ok().as_deref() {
+                Some("download") => DeckBrain::Download,
+                Some("ollama") => DeckBrain::Ollama,
+                Some("cloud") => DeckBrain::Cloud,
+                _ => DeckBrain::Skip,
+            },
+            hardware: crate::hardware::detect(),
         }
     }
 
@@ -1882,6 +1935,91 @@ fn save_cad_origin(origin: CadOrigin) {
     save_ui_json(&v);
 }
 
+/// Persist the deck-brain onboarding choice to `ui.json`.
+fn save_deck_brain(brain: DeckBrain) {
+    let mut v = load_ui_json();
+    v["deck_brain"] = serde_json::json!(brain.as_pref());
+    save_ui_json(&v);
+}
+
+/// Load the persisted deck-brain choice, if any.
+#[allow(dead_code)] // read on re-open of the model-setup dialog (later sub-phase)
+fn load_deck_brain() -> Option<DeckBrain> {
+    match load_ui_json()["deck_brain"].as_str()? {
+        "cloud" => Some(DeckBrain::Cloud),
+        "ollama" => Some(DeckBrain::Ollama),
+        "download" => Some(DeckBrain::Download),
+        "skip" => Some(DeckBrain::Skip),
+        _ => None,
+    }
+}
+
+/// Model id to seed the local cassette with for a given hardware tier.
+fn model_id_for_tier(tier: crate::hardware::ModelTier) -> &'static str {
+    use crate::hardware::ModelTier;
+    match tier {
+        // 3B-class default; 7B-class default. Names match common Ollama tags.
+        ModelTier::None | ModelTier::Small3B => "qwen2.5:3b",
+        ModelTier::Mid7B => "qwen2.5:7b",
+    }
+}
+
+/// Apply the onboarding deck-brain choice: write/update the appropriate cassette
+/// in `decks.json` and make it active. Cloud and Skip write no cassette (the
+/// user configures those from the deck settings). `tier` is only consulted for
+/// the Download path to pick a sensible default model.
+///
+/// Returns the deck name that was made active, if any. Pure enough to unit-test
+/// via [`deck_brain_into_decks`]; this wrapper just handles load/save I/O.
+fn apply_deck_brain(brain: DeckBrain, tier: crate::hardware::ModelTier) {
+    if matches!(brain, DeckBrain::Cloud | DeckBrain::Skip) {
+        return;
+    }
+    let mut decks = itsjustcad_deck::DecksFile::load_or_default();
+    if deck_brain_into_decks(&mut decks, brain, tier).is_some() {
+        decks.save();
+    }
+}
+
+/// Pure core of [`apply_deck_brain`]: mutate `decks` for the given choice and
+/// return the name of the deck made active. Ollama and Download both produce a
+/// local `openai_compat` cassette pointed at localhost:11434 with grammar on;
+/// Download additionally names the tier's default model. Cloud/Skip are no-ops.
+fn deck_brain_into_decks(
+    decks: &mut itsjustcad_deck::DecksFile,
+    brain: DeckBrain,
+    tier: crate::hardware::ModelTier,
+) -> Option<String> {
+    use itsjustcad_deck::{DeckConfig, DeckKind};
+    let (name, model) = match brain {
+        DeckBrain::Ollama => ("ollama", "qwen3".to_string()),
+        DeckBrain::Download => ("local-download", model_id_for_tier(tier).to_string()),
+        DeckBrain::Cloud | DeckBrain::Skip => return None,
+    };
+    let entry = DeckConfig {
+        name: name.to_string(),
+        kind: DeckKind::OpenaiCompat,
+        base_url: "http://localhost:11434/v1".to_string(),
+        model,
+        api_key: None,
+        // Local model — grammar-constrained decoding on by default (per the
+        // grammar agent's flag) so it can only emit real verbs in draft fences.
+        grammar: true,
+    };
+    // Replace an existing cassette of the same name, else append.
+    match decks.decks.iter().position(|d| d.name == name) {
+        Some(i) => {
+            decks.decks[i] = entry;
+            decks.active = i;
+        }
+        None => {
+            decks.decks.push(entry);
+            decks.active = decks.decks.len() - 1;
+        }
+    }
+    Some(name.to_string())
+}
+
 /// Apply a legacy-CAD preset to the egui context via the design-token system.
 /// Each skin is a token set (`UiPreset::tokens`); `theme::apply` stamps the
 /// spacing/type/color roles onto egui's Style. Called on startup (from saved
@@ -2064,6 +2202,56 @@ impl eframe::App for App {
                         CadOrigin::Revit.label(),
                     );
                     ui.add_space(8.0);
+                    ui.separator();
+                    ui.label("Deck brain — where should the assistant run?");
+                    ui.radio_value(&mut self.deck_brain, DeckBrain::Cloud, DeckBrain::Cloud.label());
+                    ui.radio_value(&mut self.deck_brain, DeckBrain::Ollama, DeckBrain::Ollama.label());
+                    ui.radio_value(
+                        &mut self.deck_brain,
+                        DeckBrain::Download,
+                        DeckBrain::Download.label(),
+                    );
+                    ui.radio_value(&mut self.deck_brain, DeckBrain::Skip, DeckBrain::Skip.label());
+
+                    // For the "download a local model" path, show the hardware
+                    // recommendation and gate tiers the RAM can't run.
+                    if self.deck_brain == DeckBrain::Download {
+                        use crate::hardware::ModelTier;
+                        let hw = &self.hardware;
+                        let tier = hw.tier();
+                        ui.add_space(4.0);
+                        ui.group(|ui| {
+                            ui.label(egui::RichText::new(hw.recommendation()).strong());
+                            ui.label(format!("Suggested: {}", tier.label()));
+                            // 3B is always offered; 7B only when the machine can run it.
+                            ui.label("• 3B model — fits ~8 GB machines");
+                            let can_7b = matches!(tier, ModelTier::Mid7B);
+                            if can_7b {
+                                ui.label("• 7B model — recommended for this machine");
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "• 7B model — needs 16 GB+ RAM (unavailable)",
+                                    )
+                                    .weak(),
+                                );
+                            }
+                            if matches!(tier, ModelTier::None) {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Low RAM — a cloud brain will likely feel better.",
+                                    )
+                                    .italics(),
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new("Download happens in a later step.")
+                                    .weak()
+                                    .small(),
+                            );
+                        });
+                    }
+                    ui.add_space(8.0);
                     if ui.button("Start").clicked() {
                         done = true;
                     }
@@ -2072,6 +2260,8 @@ impl eframe::App for App {
                 self.show_template_picker = false;
                 save_template_done();
                 save_cad_origin(self.cad_origin);
+                save_deck_brain(self.deck_brain);
+                apply_deck_brain(self.deck_brain, self.hardware.tier());
                 apply_preset(ui.ctx().clone(), self.cad_origin);
                 let units_cmd = units_cmd_for(&self.template_units);
                 self.command_line.execute(&mut self.session, units_cmd);
@@ -2395,5 +2585,85 @@ mod tests {
         let mut v = serde_json::Value::Object(Default::default());
         v["template_done"] = serde_json::json!(true);
         assert_eq!(v["template_done"].as_bool(), Some(true));
+    }
+
+    // ── deck-brain onboarding ──────────────────────────────────────────────
+
+    use crate::hardware::ModelTier;
+    use itsjustcad_deck::{DeckKind, DecksFile};
+
+    #[test]
+    fn deck_brain_pref_round_trip() {
+        // The pref string maps back to the same enum for every variant.
+        for brain in [
+            DeckBrain::Cloud,
+            DeckBrain::Ollama,
+            DeckBrain::Download,
+            DeckBrain::Skip,
+        ] {
+            let s = brain.as_pref();
+            let back = match s {
+                "cloud" => DeckBrain::Cloud,
+                "ollama" => DeckBrain::Ollama,
+                "download" => DeckBrain::Download,
+                "skip" => DeckBrain::Skip,
+                other => panic!("unexpected pref {other}"),
+            };
+            assert_eq!(back, brain);
+        }
+    }
+
+    #[test]
+    fn cloud_and_skip_write_no_cassette() {
+        let mut decks = DecksFile::default();
+        let before = decks.decks.len();
+        assert!(deck_brain_into_decks(&mut decks, DeckBrain::Cloud, ModelTier::Mid7B).is_none());
+        assert!(deck_brain_into_decks(&mut decks, DeckBrain::Skip, ModelTier::Mid7B).is_none());
+        assert_eq!(decks.decks.len(), before, "no cassette added for cloud/skip");
+    }
+
+    #[test]
+    fn ollama_choice_activates_local_cassette() {
+        // Start from an empty file to isolate the write.
+        let mut decks = DecksFile {
+            decks: vec![],
+            active: 0,
+            local_only: false,
+        };
+        let name = deck_brain_into_decks(&mut decks, DeckBrain::Ollama, ModelTier::Mid7B).unwrap();
+        assert_eq!(name, "ollama");
+        let active = &decks.decks[decks.active];
+        assert_eq!(active.name, "ollama");
+        assert_eq!(active.kind, DeckKind::OpenaiCompat);
+        assert_eq!(active.base_url, "http://localhost:11434/v1");
+        assert!(active.grammar, "local cassette must have grammar on");
+        assert!(active.api_key.is_none());
+        assert!(itsjustcad_deck::is_local_url(&active.base_url));
+    }
+
+    #[test]
+    fn download_choice_names_model_from_tier() {
+        let mut decks = DecksFile {
+            decks: vec![],
+            active: 0,
+            local_only: false,
+        };
+        // 7B tier → 7b model.
+        deck_brain_into_decks(&mut decks, DeckBrain::Download, ModelTier::Mid7B);
+        assert_eq!(decks.decks[decks.active].model, "qwen2.5:7b");
+        assert!(decks.decks[decks.active].grammar);
+
+        // 3B tier → 3b model, replacing the same-named cassette (no dup).
+        let n = decks.decks.len();
+        deck_brain_into_decks(&mut decks, DeckBrain::Download, ModelTier::Small3B);
+        assert_eq!(decks.decks.len(), n, "same name replaced, not duplicated");
+        assert_eq!(decks.decks[decks.active].model, "qwen2.5:3b");
+    }
+
+    #[test]
+    fn model_id_tier_mapping() {
+        assert_eq!(model_id_for_tier(ModelTier::None), "qwen2.5:3b");
+        assert_eq!(model_id_for_tier(ModelTier::Small3B), "qwen2.5:3b");
+        assert_eq!(model_id_for_tier(ModelTier::Mid7B), "qwen2.5:7b");
     }
 }
