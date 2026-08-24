@@ -1,18 +1,64 @@
 # mydrafter
 
-FOSS Rust CAD for architects — Rhino-style command line, 3D viewport, and an
-LLM drafting companion **inside** the app, not bolted on as an external plugin.
+**A complete architect's CAD in a single ~10 MB binary — with an LLM drafting
+partner built into the app.**
 
-AGPLv3. Pure Rust (egui + wgpu + glam). Cross-platform (Linux / macOS / Windows).
+FOSS, AGPL-3.0-or-later. Pure Rust (egui + wgpu + glam). Linux / macOS / Windows.
+
+Model buildings, cut plans and sections, lay out dimensioned sheets, print
+vector PDFs, exchange DXF/IFC/glTF with every major CAD — and talk to an LLM
+that draws with the exact same commands you type.
 
 ![viewport screenshot](docs/shot-viewport.png)
 
-## The one-command substrate
+---
 
-The central bet: **one command substrate**. The human command line and the LLM
-deck emit the same `Command` enum. The document *is* the ordered op-log of
-those commands — undo, the file format, and replay all derive from it
-automatically. Every session doubles as a training transcript.
+## Quick start
+
+Requires Rust stable (see `rust-toolchain.toml`).
+
+```sh
+git clone https://github.com/htarrido/mydrafter
+cd mydrafter
+cargo run --release
+```
+
+First run asks two questions — your units (meters / millimeters / feet-inches)
+and which CAD you're coming from (**AutoCAD / Rhino / Revit / none**). The UI
+adapts: background colors, font sizes, and command aliases match the software
+your hands already know. `pl`, `o`, `tr`, `co` all work if you chose AutoCAD.
+
+A 60-second tour — type into the command line (bottom bar):
+
+```
+box 0,0,0 10,10,3          # a slab
+box 3,3,-1 4,4,5           # a courtyard core
+difference last 2 last     # cut the courtyard through the slab
+plan 1.5                   # plan cut at 1.5 m → 'sections' layer
+display pencil             # hidden-line white-paper view
+sheet plan-01 a3           # a paper sheet
+sheetview plan-01 top 1:100
+print plan-01 plan.pdf     # vector PDF at scale
+```
+
+Or tell the deck (right panel): *"make a 10 by 10 slab with a 4 by 4 courtyard
+and dimension the south side"* — it emits the same commands, which you can
+inspect, undo, and edit.
+
+`help` lists every command in-app; `help difference` explains one;
+`mydrafter --help` prints the same from a terminal. Full generated reference:
+[docs/COMMANDS.txt](docs/COMMANDS.txt).
+
+---
+
+## The three ideas
+
+### 1. One command substrate
+
+The human command line, the mouse tools, the gumball, keyboard shortcuts, and
+the LLM all emit the same `Command` values through one mutation path. There is
+no second code path anywhere — a click-drawn rectangle and an LLM-drawn
+rectangle are the same operation.
 
 ```
 human types "extrude last 3"
@@ -27,113 +73,208 @@ LLM emits   {"cmd":"extrude","profile":{"sel":"last","n":1},"height":3.0}
    op-log (the saved file)
 ```
 
-## Status
+### 2. The file is the history
 
-MVP: geometry on screen, two ways — command line and LLM.
+A `.mydrafter.json` file stores no geometry — it stores the ordered list of
+commands that built the model. Opening a file replays it. That one decision
+buys, for free:
 
-- Perspective viewport: infinite grid, Z-up orbit camera, click-select, `ze`
-  zoom extents
-- Command language: `box`, `extrude`, `revolve`, `loft`, `sweep`, `line`,
-  `polyline`, `rect`, `circle`, `arc`, `ellipse`, `polygon`, `curve` (NURBS),
-  `union`, `difference`, `intersect`, `section`, `plan`, `dim`, `text`,
-  `hatch`, `move`, `copy`, `array`, `polar_array`, `rotate`, `scale`,
-  `mirror`, `split`, `trim`, `extend`, `join`, `fillet`, `offset`, `delete`,
-  `name`, `group`, `layer`, `units`, `sheet`, `print`, `export`, `undo`,
-  `redo`, and more
-- LLM deck: describe what to draw; commands stream out and execute live;
-  failed commands are fed back automatically
-- Save / load: op-log JSON (`save scene.mydrafter.json`, `open …`, Cmd+S/O)
+- **Perfect undo/redo** — inverse ops derived per command
+- **History editing** — `amend 3 box 0,0,0 8,8,3` rewrites step 3 and
+  re-derives everything downstream (parametric-ish editing, no solver)
+- **Design options** — `option save scheme-a`, model differently,
+  `option save scheme-b`, switch freely; branches live inside the file
+- **Crash recovery** — every command is journaled; relaunch, type `recover`
+- **Git-friendly files** — diffs read as design changes, not binary noise
+- **Fast open** — a checkpoint sidecar skips replay on big files (safe to
+  delete, always)
 
-## Build
+Format documented in [FORMAT.md](FORMAT.md), with a stability promise:
+v1 files replay forever.
 
-Requires Rust stable (see `rust-toolchain.toml`).
+### 3. Everything is swappable
+
+LLM brains are **cassettes** — Claude (CLI or API), Ollama local models, any
+OpenAI-compatible endpoint — one adapter trait, switch in the toolbar, or flip
+**local-only** mode so nothing leaves your machine.
+
+And the LLM can *author tools*: ask for a stair generator and it defines a
+**plugin** mid-conversation (`plugin define …`); say keep it and it persists to
+`~/.config/mydrafter/plugins/`, appearing in autosuggest, `help`, and the
+LLM's own vocabulary from then on. `plugin save <name> <n>` turns your own
+last *n* commands into a tool the same way.
+
+---
+
+## Feature tour
+
+### Model
+Boxes · extrude · revolve / loft / sweep / **sweep2 (two rails)** /
+rail-revolve / variable-radius pipe · booleans (union / difference /
+intersect — in-repo BSP CSG) · curves: lines, polylines, arcs, circles,
+ellipses, polygons, NURBS, interpolated C2 curves, helix · curve editing:
+split / trim / extend / join / fillet / offset / rebuild / draggable control
+points · transforms: move / rotate / scale / mirror / copy / linear + polar
+arrays · **blocks**: capture any selection as a definition, `insert` instances
+anywhere · groups · terrain from survey points (in-repo Delaunay) · LAS point
+clouds
+
+### Draw precisely
+Object snaps (end / mid / center) · typed coordinates mid-tool (`5.2,3`,
+`@2,3` relative, bare distances) · Shift ortho lock · window/crossing
+drag-select (Rhino convention) · autosuggest with usage hints as you type ·
+gumball on selection
+
+### See
+Perspective, true-ortho plan/elevation views · **two-point perspective**
+(verticals stay vertical) · lens presets 15–85 mm + phone-camera sims ·
+1/2/4 viewport layouts · display modes: shaded / wireframe / x-ray / ghosted /
+**pencil** (hidden-line on white paper) · color by layer / object / type /
+random · named views · image underlay for tracing scans
+
+### Analyze
+`sun <lat> <lon> <date> <time>` real solar lighting (NOAA SPA, in-repo) ·
+`shadowstudy` across a day · `sunhours` heatmap with occlusion ray-casting
+(BVH-accelerated) · EPW weather import · measure: distance / area / volume /
+bbox · schedules (quantity takeoffs)
+
+### Document
+Plan/section cuts — heavy cut lines + light projected edges · elevation views
+· linear dimensions (model + paper space) · text · hatches: solid, lines,
+crosshatch, brick, concrete, insulation, earth · sheets (A4–A0) with scaled
+ortho views, schedule tables, and dimensions · per-layer lineweights · vector
+PDF export
+
+### Exchange
+
+| Direction | Formats |
+|---|---|
+| Import | DXF · OBJ · STL · glTF/GLB · **IFC** · GeoJSON · OSM (Overpass export) · LAS · EPW |
+| Export | DXF · OBJ · STL · glTF/GLB · **IFC4** · SVG · CSV · PDF |
+
+IFC is the Revit bridge — both directions, hand-written, zero dependencies.
+Native save stays the op-log JSON.
+
+### Automate
 
 ```sh
-git clone https://github.com/htarrido/mydrafter
-cd mydrafter
-cargo run -p mydrafter
+mydrafter --run script.txt --headless --shot render.png --out model.mydrafter.json
 ```
 
-Try in the command line (bottom bar):
+Full headless CLI with exit codes (0 ok / 1 command error / 2 IO) —
+scriptable from CI, cron, or another program. `-` reads stdin.
 
-```
-rect 0,0,0 6 4
-extrude last 3
-circle 12,2 2.5
-extrude last 8
-ze
-```
+---
 
-Or tell the deck (right pane): *"make three 4×4×3 towers in a row, 6 m apart"*.
+## The deck (LLM partner)
 
-Run tests:
+The right panel is not a chatbot bolted on — it speaks the command substrate.
 
-```sh
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
-```
+- **Draws** by emitting commands you can inspect (click the command card),
+  undo, or amend
+- **Teaches**: ask *"how do I make walls from a centerline?"* — it explains
+  `offset → extrude → difference` instead of just doing it
+- **Sees**: press **critique** — it screenshots your viewport and reviews the
+  massing like a design critic
+- **Knows your selection**: select something, say "make this taller"
+- **Builds tools**: authors persistent plugins on request
+- Failed commands feed back automatically for self-correction; conversations
+  survive restarts; **local-only** toggle keeps everything on your machine
 
-## LLM decks ("cassette player")
-
-Any OpenAI-compatible endpoint or Anthropic. Configure
-`~/.config/mydrafter/decks.json`:
+Configure cassettes in `~/.config/mydrafter/decks.json`:
 
 ```json
 {
   "decks": [
+    { "name": "claude-code", "kind": "claude_code", "model": "sonnet" },
     { "name": "ollama",  "kind": "openai_compat",
-      "base_url": "http://localhost:11434/v1", "model": "gpt-oss:20b" },
+      "base_url": "http://localhost:11434/v1", "model": "qwen3" },
     { "name": "claude",  "kind": "anthropic",
       "base_url": "https://api.anthropic.com",
-      "model": "claude-sonnet-4-5", "api_key": "env:ANTHROPIC_API_KEY" },
-    { "name": "kimi",    "kind": "openai_compat",
-      "base_url": "https://api.moonshot.ai/v1",
-      "model": "kimi-k2-0905-preview", "api_key": "env:MOONSHOT_API_KEY" }
+      "model": "claude-sonnet-4-6", "api_key": "env:ANTHROPIC_API_KEY" }
   ],
   "active": 0
 }
 ```
 
-`api_key` is a literal or `env:VAR`. Swap decks with the combo box in the deck
-pane. The model receives the command registry and a scene digest; it never
-touches raw geometry.
+`api_key` is a literal or `env:VAR`. The model receives the command registry
+and a scene digest; it never touches raw geometry.
+
+---
+
+## Keyboard & mouse
+
+| | |
+|---|---|
+| RMB drag / Shift+RMB / scroll | orbit / pan / zoom |
+| `l` `r` `c` `p` | line / rect / circle / polyline tools |
+| Delete · Cmd+Z / Cmd+Shift+Z · Cmd+A · Cmd+C/V · Cmd+S | the usual |
+| Tab | accept autosuggest |
+| Cmd+\ | collapse the deck pane |
+| Esc | cancel tool / deselect |
+| Drag L→R / R→L | window / crossing select |
+
+---
 
 ## Architecture
 
 ```
 crates/
-  kernel-mesh/    f64 face-vertex meshes, primitives, extrusion, BSP CSG
-  kernel-curve/   line/polyline/arc/ellipse/NURBS (own de Boor), tessellation
-  kernel-brep/    stub — truck-based BREP planned
-  doc/            scene state; knows nothing about how it is mutated
+  kernel-mesh/    f64 face-vertex meshes, primitives, extrusion, BSP CSG,
+                  surfacing (revolve/loft/sweep/sweep2), sections, BVH, Delaunay
+  kernel-curve/   line/polyline/arc/ellipse/NURBS (own de Boor), tessellation,
+                  offset, intersections, fillet
+  kernel-brep/    stub — exact BREP planned
+  solar/          NOAA SPA solar position, shadow projection, EPW parsing
+  doc/            scene state (layers, sheets, blocks, units, sun); knows
+                  nothing about how it is mutated
   commands/       THE substrate: Command enum, parser, registry, Session
-                  (op-log + inverse-op undo + replay), file io
-  deck/           LlmDeck trait, OpenAI-compat + Anthropic SSE adapters,
-                  streaming ```draft extractor, system prompt builder
-  render/         wgpu pipelines in egui paint callbacks, grid shader,
-                  orbit camera, headless renderer
-  app/            shell: viewport, command line, deck pane
+                  (op-log + inverse-op undo + amend + options + replay),
+                  file io, plugins, exporters/importers (dxf/pdf/svg/csv/
+                  mesh/ifc/las/geojson/osm)
+  deck/           LlmDeck trait, Claude-CLI + OpenAI-compat + Anthropic
+                  adapters, streaming ```draft extractor, prompt builder
+  render/         wgpu pipelines in egui paint callbacks, display modes,
+                  per-viewport cameras, headless renderer
+  app/            shell: viewport(s), command line + autosuggest, deck pane,
+                  panels, osnap, gumball, keymap, presets, journal
 ```
 
-File format: see [`FORMAT.md`](FORMAT.md).
-Contributing: see [`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-## Dev hooks (CI / agents)
+## Building & testing
 
 ```sh
-# render a scene headlessly (no window needed)
+cargo build --release        # single ~10 MB binary
+cargo test --workspace       # 630+ tests
+cargo clippy --workspace
+scripts/bundle-macos.sh      # unsigned .app bundle
+
+# headless render, no window needed
 cargo run -p mydrafter-render --example headless -- out.png scene.mydrafter.json
 
-# scripted app run: commands + screenshot
+# scripted GUI run: commands + screenshot (used by CI and agents)
 MYDRAFTER_RUN="rect 0,0,0 6 4;extrude last 3" \
 MYDRAFTER_SHOT=/tmp/shot.png cargo run -p mydrafter
 
-# golden-image regression test (requires blessed PNGs in tests/golden/)
+# golden-image regression tests
 cargo test --workspace -- --ignored golden
 ```
 
+Minimal dependencies by policy: the CSG engine, DXF/PDF/SVG/glTF/IFC
+readers-writers, solar math, Delaunay, and BVH are written in-repo. That
+policy — not just Rust — is why the binary is ~10 MB.
+
+## Docs
+
+| File | What |
+|---|---|
+| [docs/COMMANDS.txt](docs/COMMANDS.txt) | Every command, generated from `--help` |
+| [FORMAT.md](FORMAT.md) | The op-log file format + stability promise |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Tests-required, one-substrate rule, minimal deps |
+| [docs/ui-legacy-research.md](docs/ui-legacy-research.md) | The AutoCAD/Rhino/Revit conventions the skins implement |
+
 ## License
 
-AGPL-3.0-or-later. See [`LICENSE`](LICENSE).
+AGPL-3.0-or-later. See [`LICENSE`](LICENSE). Dependency licenses enforced
+with `cargo deny check licenses`.
 
-Dependency licenses enforced with `cargo deny check licenses`.
+The file format and command language are documented and stable — build on them.

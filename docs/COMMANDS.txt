@@ -1,0 +1,110 @@
+Usage: mydrafter [OPTIONS]
+
+Options:
+  --help, -h                  Show this help
+  --run <script.txt | ->      Execute commands from file or stdin (one per line, # comments)
+  --out <file>                Save document after running script
+  --shot <path.png>           Render offscreen screenshot after running script
+  --headless                  No window (required for --shot without a display)
+
+Exit codes:
+  0  success
+  1  command error (failing line + error printed to stderr)
+  2  file / IO error
+
+Env vars:
+  MYDRAFTER_RUN=<cmd;cmd>    Execute commands on startup (GUI mode)
+  MYDRAFTER_SHOT=<path.png>  Screenshot and exit (GUI mode)
+  MYDRAFTER_DECK_RUN=<text>  Send deck message on startup
+
+Commands:
+  box                  box <corner x,y,z> <size x,y,z>                    Axis-aligned box
+  extrude              extrude <selector> <height>                        Extrude a closed profile curve upward
+  revolve              revolve <selector> [axis point x,y,z] [axis dir x,y,z] [angle deg] Revolve one closed profile curve into a solid (default: full circle about the z axis through the origin; partial angles are capped)
+  loft                 loft <selector>                                    Skin 2+ closed curves (stacked in creation order) into one capped solid; profiles are resampled to matching point counts
+  sweep                sweep <profile selector> <rail selector>           Sweep one closed profile curve along an open rail curve (profile centered on the rail, no-twist frames, capped ends)
+  sweep2               sweep2 <profile selector> <rail-a selector> <rail-b selector> Sweep one closed profile between two open rails, lofting it so its ends track both rails at every station (profile width scales to the rail gap)
+  railrevolve          railrevolve <profile selector> <rail selector> <axis point x,y,z> <axis dir x,y,z> Revolve one closed profile about an axis where the radius follows a rail curve (nearest-angle radius)
+  pipe                 pipe <curve selector> <radius> [end radius]        Sweep a circular profile along a curve with a linearly interpolated radius (variable-radius pipe)
+  line                 line <a x,y,z> <b x,y,z>                           Line segment
+  polyline             polyline <p1> <p2> ... [closed]                    Polyline through points; append 'closed' to close it
+  rect                 rect <corner x,y,z> <width> <height>               Rectangle in the XY plane
+  circle               circle <center x,y,z> <radius>                     Circle in the XY plane
+  arc                  arc <center x,y,z> <radius> <start deg> <end deg>  CCW arc in the XY plane
+  ellipse              ellipse <center x,y,z> <rx> <ry>                   Ellipse in the XY plane
+  polygon              polygon <center x,y,z> <radius> <sides>            Regular polygon in the XY plane
+  curve                curve <p1> <p2> <p3> ... [degree N]                NURBS curve by control points (default degree 3)
+  interpcurve          interpcurve <p1> <p2> <p3> ... [closed]            C2 cubic curve passing through the points exactly
+  helix                helix <center x,y,z> <radius> <height> <turns>     3D helix about +Z (dense polyline)
+  setpoint             setpoint <curve selector> <index> <x,y,z>          Move one control/vertex point of a NURBS or polyline curve
+  rebuild              rebuild <curve selector> <count>                   Resample a curve to N evenly-spaced points (polyline)
+  dim                  dim <a x,y,z> <b x,y,z> [offset]                   Linear dimension between two points; the measured distance is displayed automatically
+  text                 text <pos x,y,z> <words...> [height]               Text annotation at a point; trailing number = text height in meters (default 0
+  hatch                hatch <selector> [solid | lines [angle spacing] | crosshatch [angle spacing] | brick [spacing] | concrete [spacing] | insulation [spacing] | earth [spacing]] Hatch the region of a closed curve
+  union                union <selector>                                   Merge 2+ meshes into one solid; inputs are consumed
+  difference           difference <target selector> <tool selector>       Subtract tool meshes from target meshes (cut holes, courtyards); inputs are consumed and tools win overlapping selectors
+  intersect            intersect <selector>                               Keep only the shared volume of 2+ meshes; inputs are consumed
+  section              section <selector> <plane point x,y,z> <normal x,y,z> Cut meshes with a plane; each closed intersection loop becomes a heavy closed polyline on layer 'sections', and feature edges beyond the plane are projected onto it as thin polylines on 'sections-proj' (originals kept)
+  plan                 plan <height>                                      Architect's plan cut: horizontal section of every mesh at the given height; wall outlines and courtyard holes land as heavy closed polylines on layer 'sections', and edges of geometry below the cut (furniture, floor) are projected down as thin polylines on 'sections-proj'
+  elevation            elevation <north|south|east|west> [depth]          Orthographic side-view outline: feature edges of all geometry projected onto the vertical plane for the compass direction (no cutting), as thin polylines on layer 'elevations'
+  move                 move <selector> <delta x,y,z>                      Translate objects
+  rotate               rotate <selector> <angle deg> [x|y|z] [about <x,y,z>] Rotate objects (default: about z through their bounding-box center)
+  scale                scale <selector> <factor | fx,fy,fz> [about <x,y,z>] Scale objects uniformly or per-axis (default: about their bounding-box center)
+  split                split <selector> <point x,y>                       Split a curve in two at the nearest point on it to the given point; the original is replaced by the pieces
+  trim                 trim <target selector> <cutter selector> <keep point x,y> Cut a curve where it crosses the cutter curve(s) and keep only the piece nearest the keep point; the rest is removed
+  extend               extend <selector> <distance>                       Extend both open ends of curves by a distance (lines/polylines tangentially, arcs along their circle)
+  join                 join <selector>                                    Join end-touching curves (1e-6 gap tolerance) into one polyline; inputs are consumed, arcs are tessellated
+  fillet               fillet <a selector> <b selector> <radius> | fillet <selector matching 2> <radius> Round the corner between two lines with a tangent arc, trimming both lines to the tangency points
+  offset               offset <selector> <distance>                       Offset a curve in the XY plane; original kept
+  mirror               mirror <selector> <xy|yz|xz | point normal>        Mirror objects across a plane
+  copy                 copy <selector> <delta x,y,z>                      Duplicate objects with an offset
+  array                array <selector> <nx,ny,nz> <dx,dy,dz>             Grid of copies at the given spacings; the originals fill cell 0,0,0 (nx,ny works too, nz=1)
+  polararray           polararray <selector> <count> [center x,y,z] [total angle deg] Circular array of copies about the z axis (default: full circle about the targets' bounding-box center; count includes the original)
+  delete               delete <selector>                                  Delete objects
+  group                group <selector> [name]                            Group objects under a name (auto-named group1, group2
+  ungroup              ungroup <selector>                                 Dissolve every group containing the selected objects; the objects themselves stay
+  name                 name <selector> <name>                             Name objects for later reference
+  layer                layer <name>                                       Create (if needed) and switch the current layer; new objects land on it
+  tolayer              tolayer <selector> <name>                          Move objects onto a layer (created if needed)
+  layercolor           layercolor <layer> <r,g,b>                         Set a layer's display color, 0-1 or 0-255 values
+  layerweight          layerweight <layer> <mm>                           Set a layer's print lineweight in mm (controls PDF stroke width and DXF code-370)
+  hide                 hide <layer>                                       Hide a layer (objects stay in the model, invisible)
+  show                 show <layer>                                       Show a hidden layer
+  hideobj              hideobj <selector>                                 Hide individual objects (they stay in the model, invisible and unpickable)
+  showobj              showobj <selector>                                 Show hidden objects ('showobj all' reveals everything)
+  color                color <selector> <r,g,b | off>                     Set or clear a per-object color override (0-1 or 0-255 values)
+  units                units <m|cm|mm|ft|in|ftin>                         Set the display unit for dimensions and readouts (geometry stays meters internally)
+  underlay             underlay <path.png> [corner x,y] [width]           Place a raster image (PNG) flat on the ground plane to trace over; corner is the lower-left in meters (default 0,0), width in meters (default 10, height follows the image aspect)
+  underlayopacity      underlayopacity <0..1>                             Set the underlay's blend opacity
+  underlayoff          underlayoff                                        Remove the underlay image
+  sun                  sun <lat> <lon> <YYYY-MM-DD> <HH:MM>               Set solar lighting by computing azimuth + altitude (NOAA simplified SPA) for the given observer location and UTC time
+  sunoff               sunoff                                             Remove solar lighting; revert to headlight shading
+  location             location <lat> <lon> [tz-hours]                    Set the observer location (used by shadowstudy/sunhours)
+  shadowstudy          shadowstudy <YYYY-MM-DD> <from-HH:MM> <to-HH:MM> <step-min> Cast ground shadows of every mesh onto z=0 for each time step across a day, one closed polygon (projected convex hull per object) per stamp on 'shadows-HH:MM' layers
+  sunhours             sunhours <YYYY-MM-DD> [grid-spacing]               Sunlight-hours heatmap: sample a ground grid over the scene, ray-cast toward the sun every 30 min of the date, and color a mesh overlay on 'analysis' (blue = few hours, red = most)
+  sheet                sheet <name> [a4|a3|a2|a1|a0]                      Create a named paper sheet, landscape (default a3)
+  sheetview            sheetview <sheet> <top|front|right|persp> <scale>  Add a scaled ortho view to a sheet; scale is 1:100 or 100 (1m = 10mm at 1:100)
+  print                print <sheet> <path.pdf>                           Export a sheet as a vector PDF at its views' scales
+  export               export <path.{dxf|stl|obj|gltf|glb|svg|csv|ifc}>   Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), OBJ (meshes plus curves as polylines), SVG, CSV, or IFC4 openBIM (mesh objects as IfcBuildingElementProxy for Revit/BlenderBIM)
+  import               import <path.{dxf|obj|stl|gltf|glb|ifc|epw|geojson|las}> Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0
+  terrain              terrain <path.{csv|geojson}>                       Build a terrain surface mesh on layer 'terrain'
+  osmfile              osmfile <path.json>                                Build OpenStreetMap building context from a saved Overpass API JSON export ('out geom;' query): each building-tagged way footprint is extruded (height tag, else building:levels x 3 m, else 9 m) into a mesh on layer 'context'
+  distance             distance <a x,y,z> <b x,y,z>                       Measure the distance between two points (query only, nothing is created)
+  area                 area <selector>                                    Measure area: closed curves report the enclosed XY area, meshes their total surface area (query only)
+  volume               volume <selector>                                  Measure the volume of solid meshes (query only)
+  bbox                 bbox <selector>                                    Report the combined bounding box (min, max, size) of objects (query only)
+  schedule             schedule [layer]                                   Print a schedule table (name/id/layer/type/area/volume) for all objects or a layer's objects, grouped by name (query only)
+  sheettable           sheettable <sheet> [layer]                         Place a schedule table on a sheet; the table is rendered as a text grid in the PDF at print time
+  sheetdim             sheetdim <sheet> <x1,y1> <x2,y2> [offset_mm]       Add a paper-space linear dimension to a sheet; a and b are paper coordinates in mm, offset is the perpendicular dim-line offset in mm (default 8)
+  view                 view save <name> | view <name> | view list         Named views: save the active viewport camera, restore it later, or list saved views
+  block                block <selector> <name>                            Capture the geometry of selected objects as a named reusable block definition (like a symbol/component)
+  insert               insert <name> <position x,y,z> [rotation_deg] [scale] Place an instance of a named block at a point with optional rotation (degrees CCW about Z) and uniform scale
+  blocks               blocks                                             List all block definitions with their geometry counts (query only)
+  select               select <selector>                                  Set the selection
+  selectnone           selectnone                                         Clear the selection
+  undo                 undo                                               Undo the last geometry command
+  redo                 redo                                               Redo
+  amend                amend <step> <command...>                          Rewrite history: replace the op at <step> (0 = first op) with a new command and replay the whole log; later ops rebuild against the change
+  option               option save <name> | option <name> | option list | option delete <name> Design options: named branches of the op-log for comparing schemes
+
+Selectors: 'last' (most recent object), 'last N' (N most recent), 'all', 'sel' (current selection), or an object name.
