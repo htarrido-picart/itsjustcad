@@ -48,6 +48,7 @@ pub fn digest(doc: &Document) -> String {
                 let _ = block; // used in Display below
                 "instance"
             }
+            Geometry::Points { .. } => "pointcloud",
         };
         let name = obj
             .name

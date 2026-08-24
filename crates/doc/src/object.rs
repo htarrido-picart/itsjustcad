@@ -109,6 +109,9 @@ pub enum Geometry {
         #[serde(default = "one", skip_serializing_if = "is_one")]
         scale: f64,
     },
+    /// Decimated point cloud from a LAS import. Positions are world-space
+    /// after applying LAS scale factors and offsets.
+    Points { positions: Vec<DVec3> },
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -139,6 +142,7 @@ impl Geometry {
                 }
             },
             Geometry::Instance { position, .. } => *position += d,
+            Geometry::Points { positions } => positions.iter_mut().for_each(|p| *p += d),
         }
     }
 
@@ -187,6 +191,10 @@ impl Geometry {
                 *scale *= s;
                 true
             }
+            Geometry::Points { positions } => {
+                positions.iter_mut().for_each(|p| *p = m.transform_point3(*p));
+                true
+            }
         }
     }
 
@@ -202,6 +210,7 @@ impl Geometry {
                 let s = *scale;
                 Aabb::from_points(vec![*position - DVec3::splat(s), *position + DVec3::splat(s)])
             }
+            Geometry::Points { positions } => Aabb::from_points(positions.clone()),
         }
     }
 }

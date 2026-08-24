@@ -71,6 +71,7 @@ fn main() {
             meshes: vec![(box_a.to_render(), mesh_color), (box_b.to_render(), mesh_color)],
             lines: vec![],
             edges: vec![(edges_a, edge_color), (edges_b, edge_color)],
+            points: vec![],
             underlay: None,
         };
         renderer.set_scene(&device, &queue, &scene, 0);

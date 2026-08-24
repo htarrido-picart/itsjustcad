@@ -575,6 +575,14 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    /// Decimated point cloud carried verbatim in the op-log. Produced by LAS
+    /// import; self-contained so replay needs no external file. Not exposed in
+    /// the registry.
+    PointLiteral {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        positions: Vec<DVec3>,
+    },
     // -- named views --
     /// Save the active viewport camera under a name. `camera` is `None` when
     /// typed; the app fills it before apply and it is written back into the

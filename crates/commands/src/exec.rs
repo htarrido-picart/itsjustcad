@@ -431,8 +431,9 @@ impl Session {
             "ifc" => self.import_ifc(path),
             "epw" => self.import_epw(path),
             "geojson" | "json" => self.import_geojson(path),
+            "las" => self.import_las(path),
             other => Err(ExecError::Invalid(format!(
-                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .ifc, .epw, .geojson)"
+                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .ifc, .epw, .geojson, .las)"
             ))),
         }
     }
@@ -619,6 +620,32 @@ impl Session {
             created,
             message: format!(
                 "imported {total} GeoJSON feature(s) from {path} (points → 0.5m marker circles)"
+            ),
+        })
+    }
+
+    /// Import a LAS 1.2–1.4 point cloud. Decimates to ≤200k points and stores
+    /// as a single `PointLiteral` op on layer "pointcloud". LAZ gets an error.
+    fn import_las(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let pts = crate::las::parse(&bytes)
+            .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+        if pts.positions.is_empty() {
+            return Err(ExecError::Invalid(format!("'{path}' contains no point records")));
+        }
+        let kept = pts.positions.len();
+        let total = pts.total_records;
+        let stride = pts.stride;
+
+        if self.doc.current_layer != "pointcloud" {
+            self.run(Command::Layer { name: "pointcloud".to_string() })?;
+        }
+        let out = self.run(Command::PointLiteral { id: None, positions: pts.positions })?;
+        Ok(ApplyOutcome {
+            created: out.created,
+            message: format!(
+                "imported {kept} points from {path} (total {total}, stride {stride})"
             ),
         })
     }
@@ -827,6 +854,9 @@ fn boolean_inputs(
                 Geometry::Instance { block, .. } => Err(ExecError::Invalid(format!(
                     "'{id}' is a block instance ('{block}'); booleans need meshes — explode the instance or extrude it first"
                 ))),
+                Geometry::Points { .. } => Err(ExecError::Invalid(format!(
+                    "'{id}' is a point cloud; booleans need meshes"
+                ))),
             }
         })
         .collect()
@@ -925,6 +955,7 @@ pub(crate) fn build_schedule_rows(doc: &Document, layer: Option<&str>) -> Vec<Sc
                 Geometry::Curve(_) => "curve",
                 Geometry::Annotation(_) => "annotation",
                 Geometry::Instance { .. } => "instance",
+                Geometry::Points { .. } => "pointcloud",
             };
             let area_m2 = match &o.geometry {
                 Geometry::Curve(c) if c.is_closed() => {
@@ -3494,6 +3525,11 @@ fn apply_forward(
                             "'{id}' is a block instance ('{block}') — area not supported on instances"
                         )))
                     }
+                    Geometry::Points { .. } => {
+                        return Err(ExecError::Invalid(format!(
+                            "'{id}' is a point cloud — area not supported on point clouds"
+                        )))
+                    }
                 };
             }
             Ok((
@@ -3528,6 +3564,11 @@ fn apply_forward(
                     Geometry::Instance { block, .. } => {
                         return Err(ExecError::Invalid(format!(
                             "'{id}' is a block instance ('{block}'); volume not supported on instances"
+                        )))
+                    }
+                    Geometry::Points { .. } => {
+                        return Err(ExecError::Invalid(format!(
+                            "'{id}' is a point cloud; volume not supported on point clouds"
                         )))
                     }
                 }
@@ -3693,6 +3734,31 @@ fn apply_forward(
                 },
             ))
         }
+        Command::PointLiteral { id, positions } => {
+            if positions.is_empty() {
+                return Err(ExecError::Invalid(
+                    "point_literal: positions must be non-empty".into(),
+                ));
+            }
+            let id = id.unwrap_or_default();
+            let count = positions.len();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                geometry: Geometry::Points { positions: positions.clone() },
+            });
+            Ok((
+                Command::PointLiteral { id: Some(id), positions },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("point cloud {id} ({count} points)"),
+                },
+            ))
+        }
         Command::BlockDefine { targets, name, geometries } => {
             use mydrafter_doc::BlockGeometry;
             let ids = resolve(doc, &targets)?;
@@ -3709,8 +3775,8 @@ fn apply_forward(
                             Geometry::Mesh(m) => BlockGeometry::Mesh(m.clone()),
                             Geometry::Curve(c) => BlockGeometry::Curve(c.clone()),
                             Geometry::Annotation(a) => BlockGeometry::Annotation(a.clone()),
-                            // Instances within a block are flattened/skipped.
-                            Geometry::Instance { .. } => return None,
+                            // Instances and point clouds within a block are skipped.
+                            Geometry::Instance { .. } | Geometry::Points { .. } => return None,
                         })
                     })
                     .collect()
@@ -3893,6 +3959,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::SheetTable { .. } => "sheettable",
         Command::SheetDim { .. } => "sheetdim",
         Command::MeshLiteral { .. } => "mesh_literal",
+        Command::PointLiteral { .. } => "point_literal",
         Command::BlockDefine { .. } => "block",
         Command::BlockInsert { .. } => "insert",
         Command::BlocksList => "blocks",

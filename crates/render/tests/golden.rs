@@ -209,6 +209,7 @@ fn make_renderer(
             meshes: vec![],
             lines,
             edges: vec![],
+            points: vec![],
             underlay: None,
         };
         renderer.set_scene(&ctx.device, &ctx.queue, &data, 0);
@@ -309,6 +310,7 @@ fn golden_underlay_dark() {
         meshes: vec![],
         lines: vec![],
         edges: vec![],
+        points: vec![],
         underlay: Some(underlay),
     };
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);

@@ -257,6 +257,8 @@ pub struct SceneData {
     /// Mesh feature edges as flat segment lists (point pairs), drawn in the
     /// wireframe/x-ray/ghosted display modes.
     pub edges: Vec<(Vec<[f32; 3]>, [f32; 4])>,
+    /// Point clouds: flat list of positions, rendered as PointList.
+    pub points: Vec<(Vec<[f32; 3]>, [f32; 4])>,
     /// Optional raster reference image on the ground plane.
     pub underlay: Option<UnderlayData>,
 }
@@ -270,6 +272,8 @@ pub struct SceneRenderer {
     curve_pipeline: wgpu::RenderPipeline,
     /// LineList variant of the curve pipeline for mesh feature edges.
     edge_pipeline: wgpu::RenderPipeline,
+    /// PointList pipeline for point-cloud geometry.
+    point_pipeline: wgpu::RenderPipeline,
     camera_layout: wgpu::BindGroupLayout,
     /// One camera UBO + bind group per viewport pane. egui-wgpu runs every
     /// callback's `prepare` before any `paint`, so panes must not share a
@@ -282,6 +286,7 @@ pub struct SceneRenderer {
     meshes: Vec<GpuMesh>,
     lines: Vec<GpuLine>,
     edges: Vec<GpuLine>,
+    point_clouds: Vec<GpuLine>,
     underlay: Option<GpuUnderlay>,
     /// Document generation the GPU buffers were built from.
     pub generation: u64,
@@ -529,6 +534,46 @@ impl SceneRenderer {
             cache: None,
         });
 
+        // Point cloud: same shader as curves, PointList topology.
+        let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("point_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: wgpu::VertexState {
+                module: &curve_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &curve_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::PointList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Underlay: a textured quad. Bind group 1 = texture + sampler + opacity.
         let underlay_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("underlay_layout"),
@@ -612,6 +657,7 @@ impl SceneRenderer {
             mesh_xray_pipeline,
             curve_pipeline,
             edge_pipeline,
+            point_pipeline,
             camera_layout,
             cameras: Vec::new(),
             object_layout,
@@ -620,6 +666,7 @@ impl SceneRenderer {
             meshes: Vec::new(),
             lines: Vec::new(),
             edges: Vec::new(),
+            point_clouds: Vec::new(),
             underlay: None,
             generation: u64::MAX,
         }
@@ -765,6 +812,23 @@ impl SceneRenderer {
             });
         }
 
+        self.point_clouds.clear();
+        for (points, color) in &scene.points {
+            if points.is_empty() {
+                continue;
+            }
+            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("pointcloud_vb"),
+                contents: bytemuck::cast_slice(points),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            self.point_clouds.push(GpuLine {
+                vertex_buf,
+                vertex_count: points.len() as u32,
+                object_bind_group: self.object_bind_group(device, *color),
+            });
+        }
+
         self.underlay = scene
             .underlay
             .as_ref()
@@ -902,6 +966,15 @@ impl SceneRenderer {
             render_pass.set_bind_group(1, &line.object_bind_group, &[]);
             render_pass.set_vertex_buffer(0, line.vertex_buf.slice(..));
             render_pass.draw(0..line.vertex_count, 0..1);
+        }
+
+        // Point clouds: rendered as PointList after lines so they appear on top
+        // of surfaces but below the grid.
+        render_pass.set_pipeline(&self.point_pipeline);
+        for cloud in &self.point_clouds {
+            render_pass.set_bind_group(1, &cloud.object_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, cloud.vertex_buf.slice(..));
+            render_pass.draw(0..cloud.vertex_count, 0..1);
         }
 
         // Grid last: blends over background, depth-tested against meshes.

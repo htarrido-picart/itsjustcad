@@ -350,8 +350,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "import",
-            usage: "import <path.{dxf|obj|stl|gltf|glb|ifc|epw|geojson}>",
-            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), or GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0.5m marker circle; properties.name → object name; lon/lat projected to local meters when a location is set, else treated as local xy). Example: import /tmp/site.geojson",
+            usage: "import <path.{dxf|obj|stl|gltf|glb|ifc|epw|geojson|las}>",
+            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0.5m marker circle; properties.name → object name; lon/lat projected to local meters when a location is set, else treated as local xy), or LAS 1.2–1.4 point cloud (formats 0–3; decimated to ≤200k points; stored on layer 'pointcloud'; LAZ not supported). Example: import /tmp/site.las",
         },
         CommandSpec {
             name: "terrain",

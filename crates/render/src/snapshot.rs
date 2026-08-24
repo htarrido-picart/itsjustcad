@@ -128,6 +128,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
         meshes: Vec::new(),
         lines: Vec::new(),
         edges: Vec::new(),
+        points: Vec::new(),
         // The underlay image is decoded app-side (the app owns the `image`
         // dependency) and attached to the returned scene.
         underlay: None,
@@ -175,6 +176,14 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
             }
             // Hatches are scene geometry (fill triangles / pattern lines);
             // dimensions and text are drawn as an egui overlay by the app.
+            Geometry::Points { positions } => {
+                let color = resolve_color(obj, layer_color, theme, selected, mode, false);
+                let pts: Vec<[f32; 3]> = positions
+                    .iter()
+                    .map(|p| [p.x as f32, p.y as f32, p.z as f32])
+                    .collect();
+                scene.points.push((pts, color));
+            }
             Geometry::Annotation(Annotation::Hatch { boundary, pattern }) => {
                 let color = resolve_color(obj, layer_color, theme, selected, mode, false);
                 match pattern {

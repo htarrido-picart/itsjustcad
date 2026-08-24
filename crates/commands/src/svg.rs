@@ -57,6 +57,8 @@ fn collect_segments(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
         Geometry::Annotation(_) => {}
         // Block instances are not directly renderable in SVG export.
         Geometry::Instance { .. } => {}
+        // Point clouds are not rendered in SVG export.
+        Geometry::Points { .. } => {}
     }
     segs
 }

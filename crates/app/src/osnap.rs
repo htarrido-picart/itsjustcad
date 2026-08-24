@@ -52,6 +52,14 @@ pub fn candidates(doc: &Document) -> Vec<(DVec3, SnapKind)> {
             Geometry::Instance { position, .. } => {
                 out.push((*position, SnapKind::End));
             }
+            // Point clouds: only snap when the cloud is small; large clouds
+            // would swamp the candidate list and hurt performance.
+            Geometry::Points { positions } if positions.len() <= 5_000 => {
+                out.extend(positions.iter().map(|p| (*p, SnapKind::End)));
+            }
+            Geometry::Points { .. } => {
+                // Too many points — skip osnap to keep the candidate list lean.
+            }
         }
     }
     out

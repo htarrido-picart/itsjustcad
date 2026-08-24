@@ -107,6 +107,8 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
         // Block instances: resolve in the renderer. PDF export skips them
         // (no block definition expansion at PDF time yet).
         Geometry::Instance { .. } => {}
+        // Point clouds are not rendered in PDF/print export.
+        Geometry::Points { .. } => {}
     }
 }
 
