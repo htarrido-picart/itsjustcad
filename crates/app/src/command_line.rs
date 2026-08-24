@@ -548,6 +548,21 @@ mod tests {
     }
 
     #[test]
+    fn human_typed_export_still_runs_unaffected_by_deck_gate() {
+        // The C-2/H-7 gate confines *deck-originated* side-effects only; a human
+        // typing export at the command line must write the file as before.
+        let mut cl = CommandLine::default();
+        let mut session = Session::default();
+        cl.execute(&mut session, "box 0,0,0 1,1,1");
+        let out = std::env::temp_dir()
+            .join(format!("mydrafter_human_export_{}.csv", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        assert!(cl.execute(&mut session, &format!("export {}", out.display())));
+        assert!(out.exists(), "human-typed export must write to disk");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
     fn execute_parse_error_returns_false_and_echoes() {
         let mut cl = CommandLine::default();
         let mut session = Session::default();

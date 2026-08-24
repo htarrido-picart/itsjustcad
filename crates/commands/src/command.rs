@@ -730,4 +730,89 @@ impl Command {
                 | Command::Option(..)
         )
     }
+
+    /// Commands that reach outside the in-memory document — filesystem reads /
+    /// writes, subprocesses, or network — as opposed to pure geometry edits.
+    ///
+    /// The deck (LLM) may auto-run pure ops, but side-effecting ops it emits
+    /// must be confirmed by a human first (security C-2 / H-7). A human typing
+    /// the same command at the command line is unaffected; this classifier only
+    /// gates *deck-originated* execution.
+    ///
+    /// If the file grows a new fs/net/subprocess command, add it here — the
+    /// default is "pure" so an omission fails open, but the unit tests below
+    /// pin the current side-effecting set.
+    pub fn is_side_effecting(&self) -> bool {
+        matches!(
+            self,
+            // fs writes
+            Command::Export { .. }
+                | Command::Print { .. }
+                // fs reads (can be probed to exfiltrate / DoS)
+                | Command::Import { .. }
+                | Command::Terrain { .. }
+                | Command::OsmFile { .. }
+                | Command::Underlay { .. }
+        )
+    }
+
+    /// A short human-readable path/target for the confirm affordance, when the
+    /// command touches the filesystem. `None` for pure ops.
+    pub fn side_effect_summary(&self) -> Option<String> {
+        match self {
+            Command::Export { path } => Some(format!("export → {path}")),
+            Command::Print { path, sheet } => Some(format!("print sheet '{sheet}' → {path}")),
+            Command::Import { path } => Some(format!("import ← {path}")),
+            Command::Terrain { path } => Some(format!("terrain ← {path}")),
+            Command::OsmFile { path } => Some(format!("osm ← {path}")),
+            Command::Underlay { path, .. } => Some(format!("underlay ← {path}")),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    fn sel() -> Selector {
+        Selector::Last { n: 1 }
+    }
+
+    #[test]
+    fn fs_touching_commands_are_side_effecting() {
+        let cases: Vec<Command> = vec![
+            Command::Export { path: "/tmp/x.dxf".into() },
+            Command::Print { sheet: "S1".into(), path: "/tmp/x.pdf".into() },
+            Command::Import { path: "/etc/passwd".into() },
+            Command::Terrain { path: "/tmp/t.csv".into() },
+            Command::OsmFile { path: "/tmp/o.json".into() },
+            Command::Underlay { path: "/tmp/p.png".into(), corner: None, width: None, height: None },
+        ];
+        for c in &cases {
+            assert!(c.is_side_effecting(), "{c:?} must be side-effecting");
+            assert!(
+                c.side_effect_summary().is_some(),
+                "{c:?} must carry a summary path"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_geometry_ops_are_not_side_effecting() {
+        let cases: Vec<Command> = vec![
+            Command::Box { id: None, corner: DVec3::ZERO, size: DVec3::ONE },
+            Command::Move { targets: sel(), delta: DVec3::X },
+            Command::Union { id: None, targets: sel() },
+            Command::Difference { id: None, target: sel(), tools: sel() },
+            Command::Delete { targets: sel() },
+            Command::Extrude { id: None, profile: sel(), height: 3.0 },
+            Command::Undo,
+            Command::Redo,
+        ];
+        for c in &cases {
+            assert!(!c.is_side_effecting(), "{c:?} must be pure");
+            assert!(c.side_effect_summary().is_none(), "{c:?} has no fs path");
+        }
+    }
 }

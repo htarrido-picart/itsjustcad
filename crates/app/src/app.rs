@@ -708,6 +708,9 @@ impl App {
                     j.discard();
                 }
                 self.journaled_generation = Some(self.session.doc.generation);
+                // Confine deck-originated fs paths to this document's directory.
+                self.deck_pane
+                    .set_sandbox_root(path.parent().map(|p| p.to_path_buf()));
                 self.command_line
                     .push_line(format!("saved {}", path.display()));
             }
@@ -757,6 +760,9 @@ impl App {
             Ok(session) => {
                 self.session = session;
                 self.uploaded_generation = None;
+                // Confine deck-originated fs paths to this document's directory.
+                self.deck_pane
+                    .set_sandbox_root(path.parent().map(|p| p.to_path_buf()));
                 self.command_line
                     .push_line(format!("opened {} ({} objects)", path.display(), self.session.doc.len()));
             }

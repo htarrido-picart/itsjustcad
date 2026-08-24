@@ -1,5 +1,5 @@
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use mydrafter_commands::{parse, Session};
+use mydrafter_commands::{parse, Command, Session};
 use serde::{Deserialize, Serialize};
 use mydrafter_deck::{
     make_deck, probe, system_prompt, warm_model, ChatMessage, ChatRequest, DeckDelta, DecksFile,
@@ -136,6 +136,68 @@ mod saved_chat_tests {
     }
 }
 
+/// The filesystem path a side-effecting command targets, if any.
+fn deck_command_path(cmd: &Command) -> Option<&str> {
+    match cmd {
+        Command::Export { path }
+        | Command::Print { path, .. }
+        | Command::Import { path }
+        | Command::Terrain { path }
+        | Command::OsmFile { path }
+        | Command::Underlay { path, .. } => Some(path.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `candidate` resolves inside `root`. Purely lexical (no fs access, so
+/// it works for not-yet-created export targets): both are normalized by folding
+/// out `.`/`..` segments, then we check the prefix. A candidate that climbs
+/// above `root` with `..` — or an absolute path elsewhere — is rejected. This
+/// is the deck path sandbox (C-2/H-7): a `../../etc/passwd` import is "outside".
+fn path_within(root: &std::path::Path, candidate: &std::path::Path) -> bool {
+    use std::path::{Component, PathBuf};
+    // Resolve the candidate against root when it is relative.
+    let joined: PathBuf = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    let normalize = |p: &std::path::Path| -> Option<PathBuf> {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::ParentDir => {
+                    // Refuse to climb above the filesystem-anchored prefix.
+                    if !out.pop() {
+                        return None;
+                    }
+                }
+                Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        Some(out)
+    };
+    let (Some(root_n), Some(cand_n)) = (normalize(root), normalize(&joined)) else {
+        return false;
+    };
+    cand_n.starts_with(&root_n)
+}
+
+/// A side-effecting command the deck emitted that is waiting for a human OK
+/// before it touches the filesystem (security C-2 / H-7). The raw `line` is
+/// kept so, once confirmed, it flows through the same execute+log path as any
+/// other command and replays identically.
+struct PendingSideEffect {
+    line: String,
+    cmd: Command,
+    /// Human-readable "export → /path" summary for the confirm affordance.
+    summary: String,
+    /// True when the target path escaped the sandbox root — surfaced in the
+    /// affordance so the user knows the deck is writing/reading outside the doc.
+    outside_sandbox: bool,
+}
+
 /// Deck pane navigation: chat, or a full-pane command detail with a back button.
 enum PaneView {
     Chat,
@@ -254,6 +316,17 @@ pub struct DeckPane {
     /// The critique button was clicked; the app owns the viewport screenshot so
     /// it polls and clears this, then drives the capture + `send_critique`.
     critique_requested: bool,
+    /// Deck-emitted side-effecting commands (export/print/import/…) awaiting an
+    /// explicit human [run]/[skip]. They never touch the filesystem until the
+    /// user confirms (security C-2 / H-7).
+    pending_side_effects: Vec<PendingSideEffect>,
+    /// Opt-in: auto-run deck side-effecting commands whose path stays inside the
+    /// sandbox root, without a per-command prompt. Defaults OFF. Paths that
+    /// escape the sandbox are still queued even when this is on.
+    allow_deck_side_effects: bool,
+    /// Sandbox root for deck-originated fs paths — the current document's
+    /// directory when known, else the mydrafter documents dir. Set by the app.
+    sandbox_root: Option<std::path::PathBuf>,
 }
 
 impl Default for DeckPane {
@@ -289,6 +362,9 @@ impl Default for DeckPane {
             markdown: CommonMarkCache::default(),
             vision_turn: false,
             critique_requested: false,
+            pending_side_effects: Vec::new(),
+            allow_deck_side_effects: false,
+            sandbox_root: None,
         }
     }
 }
@@ -302,6 +378,13 @@ impl DeckPane {
     /// (which the pane can't reach) and then calls `send_critique`.
     pub fn take_critique_request(&mut self) -> bool {
         std::mem::take(&mut self.critique_requested)
+    }
+
+    /// Set the sandbox root used to judge whether a deck-emitted fs path is
+    /// "inside the document's directory". Called by the app when a document is
+    /// opened/saved. `None` (unknown) makes every deck path require confirmation.
+    pub fn set_sandbox_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.sandbox_root = root;
     }
 
     /// Snapshot the chat to disk so an idle/quit/crash can be revived later.
@@ -501,19 +584,74 @@ impl DeckPane {
             match event {
                 ExtractEvent::Chat(text) => self.streaming_chat.push_str(&text),
                 ExtractEvent::Command(line) => {
-                    let result = parse(&line)
-                        .map_err(|e| e.to_string())
-                        .and_then(|cmd| session.run(cmd).map_err(|e| e.to_string()));
-                    if let Err(e) = &result {
-                        self.errors_this_turn.push(format!("`{line}` failed: {e}"));
+                    // Parse first so we can classify. A parse error is reported
+                    // exactly as before (no execution attempted).
+                    let cmd = match parse(&line) {
+                        Ok(cmd) => cmd,
+                        Err(e) => {
+                            let e = e.to_string();
+                            self.errors_this_turn.push(format!("`{line}` failed: {e}"));
+                            self.current_commands.push(ExecutedCommand {
+                                line,
+                                result: Err(e),
+                            });
+                            continue;
+                        }
+                    };
+                    // SECURITY (C-2/H-7): a side-effecting command *emitted by
+                    // the deck* never touches the filesystem without an explicit
+                    // human OK. Pure geometry ops auto-run as before.
+                    if cmd.is_side_effecting() {
+                        let outside = self.path_outside_sandbox(&cmd);
+                        // Opt-in fast path: user allowed deck side-effects AND
+                        // the path stays inside the sandbox → run without a
+                        // per-command prompt. Escaping paths are always queued.
+                        if self.allow_deck_side_effects && !outside {
+                            self.run_deck_command(&line, cmd, session);
+                        } else {
+                            let summary = cmd
+                                .side_effect_summary()
+                                .unwrap_or_else(|| line.clone());
+                            self.pending_side_effects.push(PendingSideEffect {
+                                line,
+                                cmd,
+                                summary,
+                                outside_sandbox: outside,
+                            });
+                        }
+                        continue;
                     }
-                    self.current_commands.push(ExecutedCommand {
-                        line,
-                        result: result.map(|o| o.message),
-                    });
+                    self.run_deck_command(&line, cmd, session);
                 }
             }
         }
+    }
+
+    /// Execute a (parsed) deck command through the same session path the human
+    /// command line uses, recording the outcome in this turn's command list.
+    fn run_deck_command(&mut self, line: &str, cmd: Command, session: &mut Session) {
+        let result = session.run(cmd).map_err(|e| e.to_string());
+        if let Err(e) = &result {
+            self.errors_this_turn.push(format!("`{line}` failed: {e}"));
+        }
+        self.current_commands.push(ExecutedCommand {
+            line: line.to_string(),
+            result: result.map(|o| o.message),
+        });
+    }
+
+    /// True when the fs path a side-effecting command targets is NOT inside the
+    /// sandbox root (the document's directory). With no known root we treat every
+    /// path as outside, so the confirm affordance always appears — fail closed.
+    fn path_outside_sandbox(&self, cmd: &Command) -> bool {
+        let Some(path) = deck_command_path(cmd) else {
+            // No path (shouldn't happen for side-effecting cmds) → be safe.
+            return true;
+        };
+        let Some(root) = &self.sandbox_root else {
+            return true;
+        };
+        !path_within(root, std::path::Path::new(path))
     }
 
     fn finish_turn(&mut self, session: &Session, handle: &tokio::runtime::Handle) {
@@ -653,6 +791,78 @@ impl DeckPane {
             || matches!(self.warm, WarmState::Warming { .. })
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Render the confirm affordances for deck-emitted side-effecting commands.
+    /// Each queued command shows "deck wants to: export → /path  [run] [skip]".
+    /// A path that escaped the sandbox is flagged so the user knows the deck is
+    /// touching a file outside the document's directory (security C-2/H-7).
+    fn side_effect_confirm_ui(&mut self, ui: &mut egui::Ui, session: &mut Session) {
+        if self.pending_side_effects.is_empty() {
+            return;
+        }
+        ui.separator();
+        // Global opt-in: run in-sandbox side-effects without a prompt. Escaping
+        // paths still require the explicit [run] below even when this is on.
+        ui.checkbox(
+            &mut self.allow_deck_side_effects,
+            "allow deck file side-effects inside the document folder",
+        )
+        .on_hover_text(
+            "when on, deck-emitted export/import inside the document directory run without asking; paths outside always ask",
+        );
+
+        let mut run_idx: Option<usize> = None;
+        let mut skip_idx: Option<usize> = None;
+        for (i, pending) in self.pending_side_effects.iter().enumerate() {
+            egui::Frame::group(ui.style())
+                .fill(ui.visuals().extreme_bg_color)
+                .inner_margin(egui::Margin::same(6))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new("deck wants to:").strong().color(ACCENT),
+                        );
+                        ui.label(egui::RichText::new(&pending.summary).monospace());
+                    });
+                    if pending.outside_sandbox {
+                        ui.label(
+                            egui::RichText::new(
+                                "⚠ path is OUTSIDE the document folder",
+                            )
+                            .color(ERR_COLOR)
+                            .small(),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("run").clicked() {
+                            run_idx = Some(i);
+                        }
+                        if ui.button("skip").clicked() {
+                            skip_idx = Some(i);
+                        }
+                    });
+                });
+        }
+        // Apply at most one action per frame (indices stay valid).
+        if let Some(i) = run_idx {
+            let p = self.pending_side_effects.remove(i);
+            // The originating turn is already finished, so run it directly and
+            // record it as its own transcript entry (current_commands has been
+            // drained). This goes through session.run — logged/replayed like any
+            // command, so replay reproduces the confirmed side-effect.
+            let result = session.run(p.cmd).map_err(|e| e.to_string());
+            self.transcript.push(Entry::Commands(vec![ExecutedCommand {
+                line: p.line,
+                result: result.map(|o| o.message),
+            }]));
+            self.persist_chat();
+        } else if let Some(i) = skip_idx {
+            let p = self.pending_side_effects.remove(i);
+            self.transcript
+                .push(Entry::Status(format!("skipped deck side-effect: {}", p.summary)));
+            self.persist_chat();
         }
     }
 
@@ -941,6 +1151,8 @@ impl DeckPane {
             self.view = view;
         }
 
+        self.side_effect_confirm_ui(ui, session);
+
         ui.separator();
         let hint = if self.ready() {
             "describe what to draw… (Enter sends, Shift+Enter newline)"
@@ -963,5 +1175,156 @@ impl DeckPane {
             self.input = self.input.trim_end_matches('\n').to_string();
             self.send(session, handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod side_effect_gate_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// A DeckPane with empty state, isolated from the on-disk chat/decks.
+    fn blank_pane() -> DeckPane {
+        DeckPane {
+            decks: DecksFile::default(),
+            input: String::new(),
+            transcript: Vec::new(),
+            messages: Vec::new(),
+            rx: None,
+            turn_task: None,
+            turn_started: None,
+            extractor: Extractor::default(),
+            current_response: String::new(),
+            streaming_chat: String::new(),
+            errors_this_turn: Vec::new(),
+            current_commands: Vec::new(),
+            retries: 0,
+            probe: ProbeState::Unknown,
+            probed_deck: None,
+            warm: WarmState::Idle,
+            warmed_model: None,
+            session_id: None,
+            view: PaneView::Chat,
+            markdown: CommonMarkCache::default(),
+            vision_turn: false,
+            critique_requested: false,
+            pending_side_effects: Vec::new(),
+            allow_deck_side_effects: false,
+            sandbox_root: None,
+        }
+    }
+
+    #[test]
+    fn deck_emitted_export_is_not_auto_run_but_queued() {
+        // THE bug this fix closes: an LLM-drafted export must NOT touch the fs
+        // without a human OK. Before the fix, handle_extract_events ran it.
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        session.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        // Sentinel path in temp; it must never be created.
+        let sentinel = std::env::temp_dir()
+            .join(format!("mydrafter_evil_{}.csv", std::process::id()));
+        let _ = std::fs::remove_file(&sentinel);
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command(format!("export {}", sentinel.display()))],
+            &mut session,
+        );
+        assert_eq!(
+            pane.pending_side_effects.len(),
+            1,
+            "export must be queued for confirmation"
+        );
+        assert!(
+            pane.current_commands.is_empty(),
+            "export must NOT have executed"
+        );
+        assert!(pane.pending_side_effects[0].summary.contains("export"));
+        assert!(
+            !sentinel.exists(),
+            "the deck export must NOT have written to disk"
+        );
+    }
+
+    #[test]
+    fn deck_emitted_import_of_sensitive_path_is_queued_and_flagged_outside() {
+        // import ../../../etc/passwd escapes any sandbox → queued + flagged.
+        let mut pane = blank_pane();
+        pane.set_sandbox_root(Some(PathBuf::from("/home/u/proj")));
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("import ../../../etc/passwd".into())],
+            &mut session,
+        );
+        assert_eq!(pane.pending_side_effects.len(), 1);
+        assert!(
+            pane.pending_side_effects[0].outside_sandbox,
+            "escaping path must be flagged outside the sandbox"
+        );
+    }
+
+    #[test]
+    fn pure_geometry_op_still_auto_runs() {
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 5,5,3".into())],
+            &mut session,
+        );
+        assert!(
+            pane.pending_side_effects.is_empty(),
+            "pure box must not be queued"
+        );
+        assert_eq!(pane.current_commands.len(), 1);
+        assert!(pane.current_commands[0].result.is_ok());
+        assert_eq!(session.doc.len(), 1, "box must be in the document");
+    }
+
+    #[test]
+    fn allow_toggle_auto_runs_in_sandbox_but_still_gates_outside() {
+        // With the opt-in on, an in-sandbox export runs; an outside one is still
+        // queued. Uses a temp dir as the sandbox root so the export can write.
+        let dir = std::env::temp_dir().join(format!("mydrafter_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut pane = blank_pane();
+        pane.allow_deck_side_effects = true;
+        pane.set_sandbox_root(Some(dir.clone()));
+        let mut session = Session::default();
+        session.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+
+        let inside = dir.join("out.csv");
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command(format!("export {}", inside.display()))],
+            &mut session,
+        );
+        assert!(
+            pane.pending_side_effects.is_empty(),
+            "in-sandbox export with toggle on must auto-run"
+        );
+        assert_eq!(pane.current_commands.len(), 1);
+
+        // Outside path is still gated even with the toggle on.
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("export /tmp/elsewhere.csv".into())],
+            &mut session,
+        );
+        assert_eq!(
+            pane.pending_side_effects.len(),
+            1,
+            "outside export must still be queued despite the toggle"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_within_rejects_parent_escape_and_absolute_elsewhere() {
+        let root = Path::new("/home/u/proj");
+        assert!(path_within(root, Path::new("out.dxf")));
+        assert!(path_within(root, Path::new("sub/out.dxf")));
+        assert!(path_within(root, Path::new("/home/u/proj/sub/out.dxf")));
+        assert!(!path_within(root, Path::new("../secret")));
+        assert!(!path_within(root, Path::new("../../etc/passwd")));
+        assert!(!path_within(root, Path::new("/etc/passwd")));
+        // sneaky: climb out then back to a sibling
+        assert!(!path_within(root, Path::new("../proj-evil/x")));
     }
 }
