@@ -5,7 +5,7 @@
 
 use crate::app_verbs::{self, AppVerb};
 use mydrafter_commands::{Session, parse};
-use mydrafter_render::{DisplayMode, OrbitCamera, StandardView};
+use mydrafter_render::{DisplayMode, OrbitCamera, PanoProjection, StandardView};
 
 // ── Headless view state ─────────────────────────────────────────────────────────
 
@@ -20,6 +20,9 @@ pub struct HeadlessView {
     pub focal_mm: Option<f32>,
     /// Two-point perspective toggle, from `camera 2point|persp`.
     pub two_point: Option<bool>,
+    /// Non-pinhole projection, from `camera pano|fisheye [fov]`. Cleared by
+    /// `camera persp`. Rendered via the cubemap remap path.
+    pub pano: Option<PanoProjection>,
     /// Display mode, from `display <mode>`.
     pub display: DisplayMode,
 }
@@ -70,7 +73,9 @@ pub fn run_script_lines(
             }
             Some(AppVerb::View(v)) => view.view = Some(v),
             Some(AppVerb::Display(mode)) => view.display = mode,
-            Some(AppVerb::Camera(arg)) => apply_camera(&mut view, arg.as_deref()),
+            Some(AppVerb::Camera(arg, arg2)) => {
+                apply_camera(&mut view, arg.as_deref(), arg2.as_deref())
+            }
             Some(AppVerb::Save(path)) => {
                 let out = path.as_deref().unwrap_or("out.mydrafter.json");
                 mydrafter_commands::io::save_file(&session, std::path::Path::new(out))
@@ -94,13 +99,26 @@ pub fn run_script_lines(
     Ok((session, view))
 }
 
-/// Apply a `camera <arg>` token to the headless view: two-point/perspective
-/// toggles, or a numeric/preset focal length (mirrors `App::set_camera`).
-fn apply_camera(view: &mut HeadlessView, arg: Option<&str>) {
+/// Apply a `camera <arg> [arg2]` token to the headless view: two-point /
+/// perspective toggles, panorama / fisheye projections, or a numeric/preset
+/// focal length (mirrors `App::set_camera`).
+fn apply_camera(view: &mut HeadlessView, arg: Option<&str>, arg2: Option<&str>) {
     let Some(arg) = arg else { return };
     match arg {
-        "2point" | "twopoint" | "2pt" => view.two_point = Some(true),
-        "persp" | "perspective" | "1point" | "normal" => view.two_point = Some(false),
+        "2point" | "twopoint" | "2pt" => {
+            view.two_point = Some(true);
+            view.pano = None;
+        }
+        "persp" | "perspective" | "1point" | "normal" => {
+            view.two_point = Some(false);
+            view.pano = None;
+        }
+        "pano" | "panorama" | "equirect" | "360" => {
+            view.pano = Some(PanoProjection::Equirect);
+        }
+        "fisheye" | "fish" => {
+            view.pano = Some(parse_fisheye(arg2));
+        }
         _ => {
             let focal = mydrafter_render::preset_focal_mm(arg)
                 .or_else(|| arg.strip_suffix("mm").unwrap_or(arg).parse::<f32>().ok());
@@ -108,6 +126,18 @@ fn apply_camera(view: &mut HeadlessView, arg: Option<&str>) {
                 view.focal_mm = Some(f);
             }
         }
+    }
+}
+
+/// Parse the optional fisheye field of view (in degrees) into a
+/// [`PanoProjection::Fisheye`]; defaults to a 180° hemisphere. Clamped to a
+/// sane 1°..=360° so a stray value can't produce a degenerate lens.
+pub(crate) fn parse_fisheye(arg2: Option<&str>) -> PanoProjection {
+    match arg2.and_then(|s| s.parse::<f32>().ok()) {
+        Some(deg) if deg > 0.0 => {
+            PanoProjection::Fisheye { fov: deg.clamp(1.0, 360.0).to_radians() }
+        }
+        _ => PanoProjection::default_fisheye(),
     }
 }
 
@@ -163,6 +193,11 @@ pub fn render_headless(
         camera.two_point = tp;
         camera.ortho = false;
     }
+    if let Some(p) = view.pano {
+        camera.pano = Some(p);
+        camera.ortho = false;
+        camera.two_point = false;
+    }
     // Framing always tracks the scene extents (the `ze` behavior).
     if let Some(bb) = session.doc.scene_aabb() {
         let c = bb.center();
@@ -170,6 +205,22 @@ pub fn render_headless(
         camera.distance = (bb.size().length() as f32 * 1.2).max(5.0);
     } else {
         camera.distance = 16.0;
+    }
+
+    // Panorama / fisheye render through the cubemap remap path: the eye sits
+    // *inside* the scene (at the framed target) so it is surrounded, and the
+    // six faces are captured + remapped instead of a single pinhole pass.
+    if view.pano.is_some() {
+        // Put the eye at the scene centre by collapsing the orbit distance to
+        // a hair; look direction (yaw/pitch) is preserved for the remap basis.
+        camera.distance = camera.distance.clamp(1e-4, 0.01);
+        let img = mydrafter_render::render_pano_image(
+            &device, &queue, &mut renderer, &camera, theme, mode, W, H, 1024,
+        );
+        let rgba = image::RgbaImage::from_raw(img.width, img.height, img.rgba)
+            .ok_or_else(|| "pano image buffer size mismatch".to_string())?;
+        rgba.save(path).map_err(|e| format!("write png: {e}"))?;
+        return Ok(());
     }
 
     let view_proj = camera.view_proj(aspect);
@@ -319,6 +370,51 @@ mod tests {
         assert_eq!(view.view, Some(StandardView::Front));
         assert_eq!(view.focal_mm, Some(35.0));
         assert_eq!(view.display, DisplayMode::Pencil);
+    }
+
+    #[test]
+    fn camera_pano_and_fisheye_set_projection() {
+        let session = Session::default();
+        let lines = vec!["camera pano".to_owned()];
+        let (_o, view) = run_script_lines(session, &lines).expect("pano verb");
+        assert_eq!(view.pano, Some(PanoProjection::Equirect));
+
+        // Fisheye with explicit fov (degrees) -> radians on the projection.
+        let (_o, view) =
+            run_script_lines(Session::default(), &["camera fisheye 120".to_owned()]).unwrap();
+        match view.pano {
+            Some(PanoProjection::Fisheye { fov }) => {
+                assert!((fov - 120f32.to_radians()).abs() < 1e-4, "fov={fov}")
+            }
+            other => panic!("expected fisheye, got {other:?}"),
+        }
+
+        // Bare `camera fisheye` defaults to a 180° hemisphere.
+        let (_o, view) =
+            run_script_lines(Session::default(), &["camera fisheye".to_owned()]).unwrap();
+        assert_eq!(view.pano, Some(PanoProjection::default_fisheye()));
+
+        // `camera persp` clears any panorama projection.
+        let (_o, view) = run_script_lines(
+            Session::default(),
+            &["camera pano".to_owned(), "camera persp".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(view.pano, None);
+    }
+
+    #[test]
+    fn fisheye_fov_is_clamped_to_sane_range() {
+        // A wild value cannot produce a degenerate (<=0 or absurd) lens.
+        assert_eq!(parse_fisheye(Some("0")), PanoProjection::default_fisheye());
+        assert_eq!(parse_fisheye(Some("-40")), PanoProjection::default_fisheye());
+        match parse_fisheye(Some("99999")) {
+            PanoProjection::Fisheye { fov } => {
+                assert!((fov - 360f32.to_radians()).abs() < 1e-4, "clamped to 360°")
+            }
+            _ => panic!("expected fisheye"),
+        }
+        assert_eq!(parse_fisheye(Some("junk")), PanoProjection::default_fisheye());
     }
 
     #[test]

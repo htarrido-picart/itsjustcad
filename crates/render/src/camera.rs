@@ -1,5 +1,7 @@
 use glam::{Mat4, Vec3};
 
+use crate::pano::PanoProjection;
+
 /// Z-up orbit camera with Rhino-style controls (RMB orbit, Shift+RMB pan, scroll dolly).
 #[derive(Clone, Copy, Debug)]
 pub struct OrbitCamera {
@@ -19,6 +21,11 @@ pub struct OrbitCamera {
     /// projection, so a tower still "leans into frame" without its edges
     /// converging. Ignored when `ortho`.
     pub two_point: bool,
+    /// Non-pinhole projection (panorama / fisheye). When `Some`, `view_proj`
+    /// cannot express the image: the renderer must capture a cubemap from the
+    /// eye and remap it in a post pass (see [`crate::pano`]). `None` =
+    /// ordinary pinhole (ortho / two-point / perspective as above).
+    pub pano: Option<PanoProjection>,
 }
 
 impl Default for OrbitCamera {
@@ -31,6 +38,7 @@ impl Default for OrbitCamera {
             fov_y: 45f32.to_radians(),
             ortho: false,
             two_point: false,
+            pano: None,
         }
     }
 }
@@ -156,6 +164,23 @@ impl OrbitCamera {
         self.ortho = view != StandardView::Perspective;
         // A standard view switch drops two-point mode; it is a `camera` opt-in.
         self.two_point = false;
+        // …and drops any panorama/fisheye projection for the same reason.
+        self.pano = None;
+    }
+
+    /// Orthonormal view basis `(right, up, forward)` used when capturing the
+    /// cubemap for a panorama/fisheye. `forward` is the horizontal look
+    /// direction from yaw; pitch tilts the basis up/down. Z-up world, so the
+    /// reference up is +Z. Degenerates near the poles are handled by falling
+    /// back to +Y, mirroring `view_proj`.
+    pub fn view_basis(&self) -> (Vec3, Vec3, Vec3) {
+        let forward = (self.target - self.eye()).normalize_or_zero();
+        let forward = if forward == Vec3::ZERO { Vec3::X } else { forward };
+        let world_up = if forward.z.abs() > 0.999 { Vec3::Y } else { Vec3::Z };
+        let right = forward.cross(world_up).normalize_or_zero();
+        let right = if right == Vec3::ZERO { Vec3::X } else { right };
+        let up = right.cross(forward).normalize();
+        (right, up, forward)
     }
 }
 

@@ -284,6 +284,7 @@ mod tests {
             fov_y: 45f32.to_radians(),
             ortho: false,
             two_point: false,
+            pano: None,
         };
         s.run(crate::Command::ViewSave { name: "entry".to_string(), camera: Some(v) })
             .unwrap();

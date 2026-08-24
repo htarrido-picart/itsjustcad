@@ -4221,6 +4221,7 @@ mod tests {
             fov_y: 45f32.to_radians(),
             ortho: true,
             two_point: false,
+            pano: None,
         }
     }
 

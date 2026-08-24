@@ -18,6 +18,22 @@ pub struct NamedView {
     /// Two-point (architectural) perspective; see `OrbitCamera::two_point`.
     #[serde(default)]
     pub two_point: bool,
+    /// Non-pinhole projection (panorama / fisheye). `None` = ordinary pinhole.
+    /// Mirrors `render::PanoProjection`; kept here (not in render) so saved
+    /// files carry it without the doc crate depending on the renderer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pano: Option<PanoView>,
+}
+
+/// Serde-friendly panorama/fisheye projection stored in a [`NamedView`].
+/// Mirrors `mydrafter_render::PanoProjection`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum PanoView {
+    /// Equirectangular (lat/long) 360x180 panorama.
+    Equirect,
+    /// Equidistant fisheye with a field of view in radians.
+    Fisheye { fov: f32 },
 }
 
 fn default_fov_y() -> f32 {
@@ -38,10 +54,33 @@ mod tests {
             fov_y: 45f32.to_radians(),
             ortho: true,
             two_point: false,
+            pano: None,
         };
         let json = serde_json::to_string(&v).unwrap();
         let back: NamedView = serde_json::from_str(&json).unwrap();
         assert_eq!(back, v);
+    }
+
+    #[test]
+    fn pano_round_trips() {
+        let v = NamedView {
+            target: [0.0, 0.0, 1.5],
+            distance: 0.01,
+            yaw: 0.2,
+            pitch: 0.0,
+            fov_y: 45f32.to_radians(),
+            ortho: false,
+            two_point: false,
+            pano: Some(PanoView::Fisheye { fov: std::f32::consts::PI }),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: NamedView = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+        // Equirect variant too.
+        let mut v2 = v;
+        v2.pano = Some(PanoView::Equirect);
+        let back2: NamedView = serde_json::from_str(&serde_json::to_string(&v2).unwrap()).unwrap();
+        assert_eq!(back2.pano, Some(PanoView::Equirect));
     }
 
     #[test]
@@ -54,5 +93,6 @@ mod tests {
         assert_eq!(v.fov_y, 45f32.to_radians());
         assert!(!v.ortho);
         assert!(!v.two_point);
+        assert_eq!(v.pano, None);
     }
 }

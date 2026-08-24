@@ -23,9 +23,12 @@ pub enum AppVerb {
     ZoomExtents,
     /// Standard view direction (`top`/`front`/`persp`/…).
     View(StandardView),
-    /// Camera projection / lens (`camera 2point|persp|<n>mm|phone|…`).
-    /// The raw argument is carried so each front-end applies it as it can.
-    Camera(Option<String>),
+    /// Camera projection / lens
+    /// (`camera 2point|persp|pano|fisheye [fov]|<n>mm|phone|…`).
+    /// `.0` = first argument (mode/lens), `.1` = optional second argument
+    /// (the fisheye field of view in degrees). Carried raw so each front-end
+    /// applies it as it can.
+    Camera(Option<String>, Option<String>),
     /// Display mode of the active viewport (`display shaded|wireframe|…`).
     Display(DisplayMode),
     /// Persist the document (`save [path]`). Argument is the optional path.
@@ -60,7 +63,10 @@ pub fn classify(line: &str) -> Option<AppVerb> {
     Some(match verb {
         "ze" | "zoomextents" => AppVerb::ZoomExtents,
         "display" => AppVerb::Display(words.next().and_then(DisplayMode::parse)?),
-        "camera" => AppVerb::Camera(words.next().map(str::to_ascii_lowercase)),
+        "camera" => AppVerb::Camera(
+            words.next().map(str::to_ascii_lowercase),
+            words.next().map(str::to_ascii_lowercase),
+        ),
         "save" => AppVerb::Save(words.next().map(str::to_owned)),
         "help" => AppVerb::Help(words.next().map(str::to_owned)),
         "template" => AppVerb::GuiOnly("template"),
@@ -86,7 +92,11 @@ mod tests {
         assert!(matches!(classify("display pencil"), Some(AppVerb::Display(_))));
         // Unknown display mode is not an app verb (falls through).
         assert_eq!(classify("display bogus"), None);
-        assert_eq!(classify("camera 35mm"), Some(AppVerb::Camera(Some("35mm".into()))));
+        assert_eq!(classify("camera 35mm"), Some(AppVerb::Camera(Some("35mm".into()), None)));
+        assert_eq!(
+            classify("camera fisheye 120"),
+            Some(AppVerb::Camera(Some("fisheye".into()), Some("120".into())))
+        );
     }
 
     #[test]

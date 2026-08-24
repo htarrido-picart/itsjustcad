@@ -20,7 +20,7 @@ pub use underlay::Underlay;
 pub use units::{
     format_area, format_length, format_volume, Units, METERS_PER_FOOT, METERS_PER_INCH,
 };
-pub use view::NamedView;
+pub use view::{NamedView, PanoView};
 
 use serde::{Deserialize, Serialize};
 

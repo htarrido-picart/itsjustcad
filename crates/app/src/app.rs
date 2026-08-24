@@ -458,7 +458,8 @@ impl App {
             // `display` and the standard-view verbs above.
             Some("camera") => {
                 let arg = words.next().map(str::to_ascii_lowercase);
-                self.set_camera(arg.as_deref());
+                let arg2 = words.next().map(str::to_ascii_lowercase);
+                self.set_camera(arg.as_deref(), arg2.as_deref());
             }
             // `view save` captures the active camera — only the app can; the
             // parser leaves `camera: None`. Other `view ...` forms parse as-is.
@@ -571,15 +572,16 @@ impl App {
         self.active_camera().set_view(view);
     }
 
-    /// `camera <2point|persp|15|24|35|50|85|phone|phonewide>`. Numeric args may
-    /// carry a trailing "mm". Two-point toggles architectural perspective; the
-    /// lens presets set `fov_y` from a full-frame angle of view. All are view
-    /// state on the active pane, never logged.
-    fn set_camera(&mut self, arg: Option<&str>) {
+    /// `camera <2point|persp|pano|fisheye [fov]|15|24|35|50|85|phone|phonewide>`.
+    /// Numeric args may carry a trailing "mm". Two-point toggles architectural
+    /// perspective; `pano`/`fisheye` switch to a non-pinhole projection rendered
+    /// via the cubemap remap; the lens presets set `fov_y` from a full-frame
+    /// angle of view. All are view state on the active pane, never logged.
+    fn set_camera(&mut self, arg: Option<&str>, arg2: Option<&str>) {
         let aspect = self.active_aspect;
         let Some(arg) = arg else {
             self.command_line.push_line(
-                "usage: camera 2point|persp|<15|24|35|50|85>mm|phone|phonewide",
+                "usage: camera 2point|persp|pano|fisheye [fov]|<15|24|35|50|85>mm|phone|phonewide",
             );
             return;
         };
@@ -588,13 +590,34 @@ impl App {
                 let cam = self.active_camera();
                 cam.ortho = false;
                 cam.two_point = true;
+                cam.pano = None;
                 self.command_line.push_line("camera: two-point perspective");
             }
             "persp" | "perspective" | "1point" | "normal" => {
                 let cam = self.active_camera();
                 cam.ortho = false;
                 cam.two_point = false;
+                cam.pano = None;
                 self.command_line.push_line("camera: perspective");
+            }
+            "pano" | "panorama" | "equirect" | "360" => {
+                let cam = self.active_camera();
+                cam.ortho = false;
+                cam.two_point = false;
+                cam.pano = Some(mydrafter_render::PanoProjection::Equirect);
+                self.command_line.push_line("camera: 360° equirectangular panorama");
+            }
+            "fisheye" | "fish" => {
+                let p = crate::headless::parse_fisheye(arg2);
+                let cam = self.active_camera();
+                cam.ortho = false;
+                cam.two_point = false;
+                cam.pano = Some(p);
+                let deg = match p {
+                    mydrafter_render::PanoProjection::Fisheye { fov } => fov.to_degrees(),
+                    _ => 180.0,
+                };
+                self.command_line.push_line(format!("camera: fisheye {deg:.0}° fov"));
             }
             _ => {
                 // Named phone sim, or a numeric focal length (optional "mm").
@@ -614,7 +637,7 @@ impl App {
                             .push_line(format!("camera: {f:.0}mm{tag} — {fov:.0}° hfov"));
                     }
                     _ => self.command_line.push_line(
-                        "usage: camera 2point|persp|<15|24|35|50|85>mm|phone|phonewide",
+                        "usage: camera 2point|persp|pano|fisheye [fov]|<15|24|35|50|85>mm|phone|phonewide",
                     ),
                 }
             }
@@ -2056,6 +2079,7 @@ fn named_view_of(cam: &OrbitCamera) -> mydrafter_doc::NamedView {
         fov_y: cam.fov_y,
         ortho: cam.ortho,
         two_point: cam.two_point,
+        pano: cam.pano.map(pano_to_view),
     }
 }
 
@@ -2067,6 +2091,26 @@ fn apply_named_view(cam: &mut OrbitCamera, view: &mydrafter_doc::NamedView) {
     cam.fov_y = view.fov_y;
     cam.ortho = view.ortho;
     cam.two_point = view.two_point;
+    cam.pano = view.pano.map(pano_from_view);
+}
+
+/// Bridge the renderer's `PanoProjection` to the doc's serde `PanoView`.
+fn pano_to_view(p: mydrafter_render::PanoProjection) -> mydrafter_doc::PanoView {
+    match p {
+        mydrafter_render::PanoProjection::Equirect => mydrafter_doc::PanoView::Equirect,
+        mydrafter_render::PanoProjection::Fisheye { fov } => {
+            mydrafter_doc::PanoView::Fisheye { fov }
+        }
+    }
+}
+
+fn pano_from_view(v: mydrafter_doc::PanoView) -> mydrafter_render::PanoProjection {
+    match v {
+        mydrafter_doc::PanoView::Equirect => mydrafter_render::PanoProjection::Equirect,
+        mydrafter_doc::PanoView::Fisheye { fov } => {
+            mydrafter_render::PanoProjection::Fisheye { fov }
+        }
+    }
 }
 
 #[cfg(test)]
