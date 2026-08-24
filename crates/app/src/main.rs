@@ -4,6 +4,7 @@ mod command_line;
 mod deck_pane;
 mod draw_tool;
 mod gumball;
+mod headless;
 mod journal;
 mod keymap;
 mod osnap;
@@ -16,7 +17,28 @@ mod suggest;
 
 fn cli_help_text() -> String {
     let mut out = String::new();
-    out.push_str("Usage: mydrafter [OPTIONS]\n\nOptions:\n  --help, -h    Show this help\n\nEnv vars:\n  MYDRAFTER_RUN=<cmd;cmd>    Execute commands on startup\n  MYDRAFTER_SHOT=<path.png>  Screenshot and exit\n  MYDRAFTER_DECK_RUN=<text>  Send deck message on startup\n\nCommands:\n");
+    out.push_str(
+        "Usage: mydrafter [OPTIONS]\n\
+         \n\
+         Options:\n\
+         \x20 --help, -h                  Show this help\n\
+         \x20 --run <script.txt | ->      Execute commands from file or stdin (one per line, # comments)\n\
+         \x20 --out <file>                Save document after running script\n\
+         \x20 --shot <path.png>           Render offscreen screenshot after running script\n\
+         \x20 --headless                  No window (required for --shot without a display)\n\
+         \n\
+         Exit codes:\n\
+         \x20 0  success\n\
+         \x20 1  command error (failing line + error printed to stderr)\n\
+         \x20 2  file / IO error\n\
+         \n\
+         Env vars:\n\
+         \x20 MYDRAFTER_RUN=<cmd;cmd>    Execute commands on startup (GUI mode)\n\
+         \x20 MYDRAFTER_SHOT=<path.png>  Screenshot and exit (GUI mode)\n\
+         \x20 MYDRAFTER_DECK_RUN=<text>  Send deck message on startup\n\
+         \n\
+         Commands:\n",
+    );
     for spec in mydrafter_commands::registry() {
         let first_sentence = spec.summary.split('.').next().unwrap_or(spec.summary).trim();
         out.push_str(&format!("  {:<20} {:<50} {}\n", spec.name, spec.usage, first_sentence));
@@ -26,10 +48,123 @@ fn cli_help_text() -> String {
     out
 }
 
+/// Parsed CLI arguments for the headless / script path.
+struct CliArgs {
+    run_path: Option<String>, // "--run <path | ->"
+    out_path: Option<String>, // "--out <file>"
+    shot_path: Option<String>, // "--shot <path.png>"
+    headless: bool,
+}
+
+fn parse_cli_args() -> CliArgs {
+    let args: Vec<String> = std::env::args().collect();
+    let mut run_path = None;
+    let mut out_path = None;
+    let mut shot_path = None;
+    let mut headless = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--run" => {
+                i += 1;
+                run_path = args.get(i).cloned();
+            }
+            "--out" => {
+                i += 1;
+                out_path = args.get(i).cloned();
+            }
+            "--shot" => {
+                i += 1;
+                shot_path = args.get(i).cloned();
+            }
+            "--headless" => headless = true,
+            // --help / -h handled before parse_cli_args is called
+            _ => {}
+        }
+        i += 1;
+    }
+    CliArgs { run_path, out_path, shot_path, headless }
+}
+
+/// Entry point for `--run` (headless or not). Returns an OS exit code.
+fn run_headless_mode(args: &CliArgs) -> i32 {
+    // Read the script source.
+    let src = match args.run_path.as_deref() {
+        Some("-") => {
+            use std::io::Read as _;
+            let mut s = String::new();
+            if std::io::stdin().read_to_string(&mut s).is_err() {
+                eprintln!("error: could not read stdin");
+                return 2;
+            }
+            s
+        }
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: could not read '{}': {e}", path);
+                return 2;
+            }
+        },
+        None => String::new(),
+    };
+
+    let lines = headless::parse_script(&src);
+    let session = mydrafter_commands::Session::default();
+    let session = match headless::run_script_lines(session, &lines) {
+        Ok(s) => s,
+        Err((line, msg)) => {
+            eprintln!("command error: {line}\n  {msg}");
+            return 1;
+        }
+    };
+
+    // Optional: save document.
+    if let Some(out) = &args.out_path {
+        if let Err(e) = mydrafter_commands::io::save_file(&session, std::path::Path::new(out)) {
+            eprintln!("error: could not save '{}': {e}", out);
+            return 2;
+        }
+    }
+
+    // Optional: render headless screenshot.
+    if let Some(shot) = &args.shot_path {
+        if let Err(e) = headless::render_headless(&session, std::path::Path::new(shot)) {
+            eprintln!("error: render failed: {e}");
+            return 2;
+        }
+        println!("wrote {shot}");
+    }
+
+    0
+}
+
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         print!("{}", cli_help_text());
         std::process::exit(0);
+    }
+
+    let cli = parse_cli_args();
+
+    // Headless path: --headless flag, or --run/--shot with no GUI needed.
+    if cli.headless || (cli.run_path.is_some() && cli.shot_path.is_some() && !cli.headless) {
+        // Only go headless when --headless is explicitly set, or when both
+        // --run and --shot are given together (the canonical "batch render" use).
+        // GUI path can also honour --run after startup through env vars.
+        if cli.headless {
+            tracing_subscriber::fmt::init();
+            let code = run_headless_mode(&cli);
+            std::process::exit(code);
+        }
+    }
+
+    // Explicit --run without --headless: run with a window but execute script
+    // first (honours --out / --shot via headless path if --headless is set).
+    if cli.run_path.is_some() && !cli.headless {
+        tracing_subscriber::fmt::init();
+        let code = run_headless_mode(&cli);
+        std::process::exit(code);
     }
 
     tracing_subscriber::fmt::init();
@@ -79,5 +214,14 @@ mod tests {
         for spec in mydrafter_commands::registry() {
             assert!(text.contains(spec.name), "CLI help missing '{}'", spec.name);
         }
+    }
+
+    #[test]
+    fn cli_help_contains_run_flag() {
+        let text = cli_help_text();
+        assert!(text.contains("--run"));
+        assert!(text.contains("--headless"));
+        assert!(text.contains("--out"));
+        assert!(text.contains("--shot"));
     }
 }

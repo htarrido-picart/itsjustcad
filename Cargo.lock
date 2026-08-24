@@ -2062,6 +2062,7 @@ dependencies = [
  "mydrafter-doc",
  "mydrafter-render",
  "mydrafter-solar",
+ "pollster",
  "rfd",
  "serde",
  "serde_json",
@@ -2069,6 +2070,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wgpu",
 ]
 
 [[package]]

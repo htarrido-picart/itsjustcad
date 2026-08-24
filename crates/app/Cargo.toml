@@ -18,6 +18,7 @@ mydrafter-render.workspace = true
 kernel-mesh.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
+wgpu.workspace = true
 eframe.workspace = true
 glam.workspace = true
 tokio.workspace = true
@@ -29,6 +30,7 @@ dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
+pollster = "0.4"
 egui_commonmark = "0.24"
 
 [dev-dependencies]
