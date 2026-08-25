@@ -3691,6 +3691,10 @@ fn apply_forward(
                     let (b, count) = crate::ifc::export(doc, &path).map_err(ExecError::Invalid)?;
                     (b, format!("IFC4, {count}"))
                 }
+                "saf" => {
+                    let (b, detail) = crate::saf::export(doc).map_err(ExecError::Invalid)?;
+                    (b, detail)
+                }
                 _ => {
                     let (bytes, count) = crate::mesh_export::export(doc, &path)
                         .map_err(ExecError::Invalid)?;

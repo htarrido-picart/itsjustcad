@@ -458,8 +458,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "export",
-            usage: "export <path.{dxf|stl|obj|gltf|glb|svg|csv|ifc}>",
-            summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), OBJ (meshes plus curves as polylines), SVG, CSV, or IFC4 openBIM (mesh objects as IfcBuildingElementProxy for Revit/BlenderBIM). Example: export /tmp/model.ifc",
+            usage: "export <path.{dxf|stl|obj|gltf|glb|svg|csv|ifc|saf}>",
+            summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), OBJ (meshes plus curves as polylines), SVG, CSV, IFC4 openBIM, or SAF (Structural Analysis Format — ZIP of CSVs matching SAF 2.2.0 sheet names, for handoff to RFEM/SCIA/FEM-Design). Example: export /tmp/model.saf",
             category: Category::File,
         },
         CommandSpec {

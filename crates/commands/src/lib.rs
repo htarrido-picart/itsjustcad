@@ -22,6 +22,7 @@ mod parse;
 pub mod pdf;
 pub mod plugin;
 mod registry;
+pub mod saf;
 pub mod svg;
 
 pub use command::{Command, CompassDir, MirrorPlane, OptionOp, Selector};
