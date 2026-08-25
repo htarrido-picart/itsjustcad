@@ -31,6 +31,14 @@ impl PanelTab {
             PanelTab::Deck => "Chat",
         }
     }
+
+    /// The Lucide [`crate::icons::Icon`] shown beside this tab's label.
+    pub fn icon(self) -> crate::icons::Icon {
+        match self {
+            PanelTab::Model => crate::icons::Icon::Layers,
+            PanelTab::Deck => crate::icons::Icon::Chat,
+        }
+    }
 }
 
 /// Panel tab-strip state: the active tab and a collapsed flag. Pure; the
@@ -43,7 +51,10 @@ pub struct TabState {
 
 impl Default for TabState {
     fn default() -> Self {
-        Self { active: PanelTab::Model, collapsed: false }
+        Self {
+            active: PanelTab::Model,
+            collapsed: false,
+        }
     }
 }
 
@@ -84,12 +95,32 @@ impl TabState {
 
 /// Draw the panel tab strip. Returns the tab clicked this frame, if any. The
 /// caller applies the click to its [`TabState`] and paints the active body.
-pub fn strip_ui(ui: &mut egui::Ui, state: TabState) -> Option<PanelTab> {
+pub fn strip_ui(
+    ui: &mut egui::Ui,
+    icons: &crate::icons::Icons,
+    state: TabState,
+) -> Option<PanelTab> {
     let mut clicked = None;
     ui.horizontal(|ui| {
         for tab in PanelTab::ALL {
             let selected = tab == state.active && !state.collapsed;
-            if ui.selectable_label(selected, tab.label()).clicked() {
+            // Icon tinted to accent when selected, foreground otherwise — a
+            // borderless segmented-control look (icon + label, no chrome).
+            let size = ui.text_style_height(&egui::TextStyle::Body);
+            let color = if selected {
+                ui.visuals().selection.bg_fill
+            } else {
+                ui.visuals().weak_text_color()
+            };
+            let img = icons.image(ui.ctx(), tab.icon(), size, color);
+            let resp = ui
+                .horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.add(img);
+                    ui.selectable_label(selected, tab.label())
+                })
+                .inner;
+            if resp.clicked() {
                 clicked = Some(tab);
             }
         }
@@ -151,7 +182,12 @@ mod tests {
         let tabs = viewport_tabs(&["Top".to_string(), "custom".to_string()]);
         // "Top" collides with the standard tab and is dropped.
         assert_eq!(tabs.len(), 5);
-        assert!(tabs.iter().filter(|(l, _)| l.eq_ignore_ascii_case("top")).count() == 1);
+        assert!(
+            tabs.iter()
+                .filter(|(l, _)| l.eq_ignore_ascii_case("top"))
+                .count()
+                == 1
+        );
         assert_eq!(tabs[4].0, "custom");
     }
 

@@ -152,6 +152,14 @@ reads across the form. Be specific and direct; no flattery."
 /// event is routed to the critique handler, not the dev-shot exit path.
 const CRITIQUE_TAG: &str = "critique";
 
+/// Draw a small Lucide section-header icon, tinted to the dimmed foreground and
+/// vertically centered against the collapsing-header title it precedes.
+fn section_icon(ui: &mut egui::Ui, icons: &crate::icons::Icons, icon: crate::icons::Icon) {
+    let size = ui.text_style_height(&egui::TextStyle::Body);
+    let color = ui.visuals().weak_text_color();
+    ui.add(icons.image(ui.ctx(), icon, size, color));
+}
+
 /// Persist an egui screenshot buffer as a PNG. Shared by the dev shot and the
 /// viewport critique.
 fn save_screenshot_png(img: &egui::ColorImage, path: &std::path::Path) {
@@ -348,6 +356,9 @@ pub struct App {
     /// The download in flight from the Model Setup panel, if any. The UI polls
     /// its [`crate::download::DownloadState`] each frame.
     active_download: Option<ActiveDownload>,
+    /// Lucide line-icon texture cache for the chrome (menu bar, tab strip).
+    /// Decodes + uploads each icon once, on first draw.
+    icons: crate::icons::Icons,
 }
 
 /// A running install: which model, plus the [`crate::download::Download`] handle
@@ -518,6 +529,7 @@ impl App {
             show_model_setup: std::env::var("ITSJUSTCAD_MODEL_SETUP").is_ok(),
             catalog: crate::model_catalog::Catalog::load(),
             active_download: None,
+            icons: crate::icons::Icons::new(),
         }
     }
 
@@ -2273,6 +2285,16 @@ impl App {
         let collapsed = self.panel_tabs.is_collapsed();
         let theme = if ui.visuals().dark_mode { scene::Theme::Dark } else { scene::Theme::Light };
         let mut panel = egui::Panel::right("right_panel").resizable(!collapsed);
+        // A small inner margin off the 8pt grid so icon+label rows (tab strip,
+        // section headers) aren't flush against the dock edge (SwiftUI-style
+        // breathing room). Keeps the default panel fill/stroke.
+        panel = panel.frame(
+            egui::Frame::side_top_panel(ui.style())
+                .inner_margin(egui::Margin::symmetric(
+                    crate::theme::Spacing::default().s as i8,
+                    4,
+                )),
+        );
         panel = if collapsed {
             panel.default_size(120.0).min_size(90.0)
         } else {
@@ -2284,7 +2306,7 @@ impl App {
                 if ui.small_button("▸").on_hover_text("hide panel (Cmd+\\)").clicked() {
                     self.panel_visible = false;
                 }
-                if let Some(tab) = crate::tabstrip::strip_ui(ui, self.panel_tabs) {
+                if let Some(tab) = crate::tabstrip::strip_ui(ui, &self.icons, self.panel_tabs) {
                     self.panel_tabs.click(tab);
                     if tab == PanelTab::Deck {
                         self.deck_visible = !self.panel_tabs.is_collapsed();
@@ -2314,14 +2336,20 @@ impl App {
                             .resizable(true)
                             .default_size(160.0)
                             .show(ui, |ui| {
-                                egui::CollapsingHeader::new("Properties")
-                                    .default_open(true)
-                                    .show(ui, |ui| self.properties_panel(ui));
+                                ui.horizontal(|ui| {
+                                    section_icon(ui, &self.icons, crate::icons::Icon::Properties);
+                                    egui::CollapsingHeader::new("Properties")
+                                        .default_open(true)
+                                        .show(ui, |ui| self.properties_panel(ui));
+                                });
                             });
                         egui::CentralPanel::default().show(ui, |ui| {
-                            egui::CollapsingHeader::new("Layers")
-                                .default_open(true)
-                                .show(ui, |ui| self.layers_tab(ui, theme));
+                            ui.horizontal(|ui| {
+                                section_icon(ui, &self.icons, crate::icons::Icon::Layers);
+                                egui::CollapsingHeader::new("Layers")
+                                    .default_open(true)
+                                    .show(ui, |ui| self.layers_tab(ui, theme));
+                            });
                         });
                     }
                     PanelTab::Deck => {
@@ -2342,13 +2370,14 @@ impl App {
     /// [`Self::apply_menu_action`].
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let style = preset::preset_for(self.cad_origin).menu_style;
+        let icons = &self.icons;
         let bar = egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
-            crate::menu::ui(ui, style)
+            crate::menu::ui(ui, icons, style)
         });
         // Dev/screenshot hook: force one menu open to show grouped items.
         if let Ok(title) = std::env::var("ITSJUSTCAD_MENU_DEMO") {
             let at = egui::pos2(bar.response.rect.left() + 8.0, bar.response.rect.bottom());
-            crate::menu::demo_open(ui.ctx(), style, &title, at);
+            crate::menu::demo_open(ui.ctx(), &self.icons, style, &title, at);
         }
         if let Some(action) = bar.inner {
             self.apply_menu_action(action);

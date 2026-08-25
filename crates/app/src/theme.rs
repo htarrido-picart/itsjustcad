@@ -17,14 +17,19 @@
 //! state beyond the `Style` they are handed, so the numeric relationships
 //! (spacing scale, type scale, luminance) are unit-testable standalone.
 
-/// 8px-based spacing scale (Material's 8dp grid, with a 4px half-step).
-/// All inter-widget gaps and paddings derive from these four values.
+/// 8pt-based spacing scale (SwiftUI/Material 8-pt grid, with a 4pt half-step and
+/// a 12pt three-quarter step). All inter-widget gaps and paddings derive from
+/// this one scale — call sites reference a token, never a raw pixel literal.
+///
+/// The exposed scale is `4 / 8 / 12 / 16 / 24 / 32`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spacing {
-    /// 4px — tight inner padding, icon gaps.
+    /// 4px — tight inner padding, icon↔label gaps.
     pub xs: f32,
-    /// 8px — default item spacing.
+    /// 8px — default item spacing (grid unit).
     pub s: f32,
+    /// 12px — cozy control padding, compact section gaps.
+    pub sm: f32,
     /// 16px — section padding, panel inner margin.
     pub m: f32,
     /// 24px — group separation.
@@ -35,7 +40,14 @@ pub struct Spacing {
 
 impl Default for Spacing {
     fn default() -> Self {
-        Self { xs: 4.0, s: 8.0, m: 16.0, l: 24.0, xl: 32.0 }
+        Self {
+            xs: 4.0,
+            s: 8.0,
+            sm: 12.0,
+            m: 16.0,
+            l: 24.0,
+            xl: 32.0,
+        }
     }
 }
 
@@ -56,7 +68,12 @@ pub struct TypeScale {
 
 impl Default for TypeScale {
     fn default() -> Self {
-        Self { command: 13.0, body: 13.0, small: 11.0, panel_title: 14.0 }
+        Self {
+            command: 13.0,
+            body: 13.0,
+            small: 11.0,
+            panel_title: 14.0,
+        }
     }
 }
 
@@ -94,7 +111,10 @@ pub struct Radii {
 
 impl Default for Radii {
     fn default() -> Self {
-        Self { small: 3.0, medium: 5.0 }
+        Self {
+            small: 3.0,
+            medium: 5.0,
+        }
     }
 }
 
@@ -146,8 +166,16 @@ pub fn roles_from(surface: Rgba, accent: Rgba) -> ColorRoles {
             c[3],
         ]
     };
-    let on = if dark { [0.90, 0.92, 0.95, 1.0] } else { [0.10, 0.11, 0.12, 1.0] };
-    let on_variant = if dark { [0.60, 0.62, 0.66, 1.0] } else { [0.40, 0.41, 0.44, 1.0] };
+    let on = if dark {
+        [0.90, 0.92, 0.95, 1.0]
+    } else {
+        [0.10, 0.11, 0.12, 1.0]
+    };
+    let on_variant = if dark {
+        [0.60, 0.62, 0.66, 1.0]
+    } else {
+        [0.40, 0.41, 0.44, 1.0]
+    };
     ColorRoles {
         surface,
         surface_variant: shift(surface, 0.05),
@@ -183,18 +211,36 @@ pub fn apply(ctx: &egui::Context, tokens: &Tokens) {
 pub fn apply_to_style(style: &mut egui::Style, t: &Tokens) {
     // ── Type scale → egui text styles ──────────────────────────────────
     let ts = t.type_scale;
-    style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(ts.command));
-    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(ts.body));
-    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(ts.body));
-    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(ts.small));
-    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(ts.panel_title));
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::monospace(ts.command),
+    );
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(ts.body));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(ts.body));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::proportional(ts.small));
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        egui::FontId::proportional(ts.panel_title),
+    );
 
-    // ── Spacing scale → egui spacing ───────────────────────────────────
+    // ── Spacing scale → egui spacing (8pt grid) ────────────────────────
     let sp = t.spacing;
-    style.spacing.item_spacing = egui::vec2(sp.s, t.spacing.xs);
-    style.spacing.button_padding = egui::vec2(sp.s, sp.xs);
+    style.spacing.item_spacing = egui::vec2(sp.s, sp.xs);
+    // Cozier, SwiftUI-like control padding drawn straight off the grid.
+    style.spacing.button_padding = egui::vec2(sp.sm, sp.xs);
     style.spacing.menu_margin = egui::Margin::same(sp.xs as i8);
     style.spacing.indent = sp.m;
+    // ── Accessibility: minimum hit-target ──────────────────────────────
+    // SwiftUI/HIG floor is ~44pt; egui's default (~14) is too small. Raise the
+    // interactive minimum so every button/toggle meets a comfortable target.
+    style.spacing.interact_size.y = style.spacing.interact_size.y.max(sp.l);
+    style.spacing.button_padding.y = style.spacing.button_padding.y.max(sp.xs);
 
     // ── Color roles → egui visuals ─────────────────────────────────────
     let c = t.colors;
@@ -222,9 +268,12 @@ pub fn apply_to_style(style: &mut egui::Style, t: &Tokens) {
     v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, on_variant);
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, outline);
 
+    // Borderless idle controls (SwiftUI style): no heavy outline at rest —
+    // affordance comes from spacing + subtle fills, with borders only on hover.
     v.widgets.inactive.bg_fill = surface_variant;
     v.widgets.inactive.weak_bg_fill = surface_variant;
     v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, on_surface);
+    v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
 
     v.widgets.hovered.bg_fill = surface_variant;
     v.widgets.hovered.weak_bg_fill = surface_variant;
@@ -234,6 +283,12 @@ pub fn apply_to_style(style: &mut egui::Style, t: &Tokens) {
     v.widgets.active.bg_fill = primary;
     v.widgets.active.weak_bg_fill = primary;
     v.widgets.active.fg_stroke = egui::Stroke::new(1.5, on_surface);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, primary);
+
+    // ── Accessibility: a visible keyboard focus ring ───────────────────
+    // A clear 2px accent ring on the focused widget (SwiftUI/HIG focus cue).
+    v.widgets.hovered.expansion = 1.0;
+    v.selection.stroke = egui::Stroke::new(2.0, primary);
 
     // ── Corner radii ───────────────────────────────────────────────────
     let small = egui::CornerRadius::same(t.radii.small as u8);
@@ -255,13 +310,51 @@ mod tests {
         let s = Spacing::default();
         assert_eq!(s.xs, 4.0);
         assert_eq!(s.s, 8.0);
+        assert_eq!(s.sm, 12.0);
         assert_eq!(s.m, 16.0);
         assert_eq!(s.l, 24.0);
         assert_eq!(s.xl, 32.0);
-        // Each step (past xs) is a multiple of 8.
+        // Each step (past xs) is a multiple of 4, and the 8-grid steps of 8.
+        for v in [s.xs, s.s, s.sm, s.m, s.l, s.xl] {
+            assert_eq!(v % 4.0, 0.0, "{v} not on 4px grid");
+        }
         for v in [s.s, s.m, s.xl] {
             assert_eq!(v % 8.0, 0.0, "{v} not on 8px grid");
         }
+    }
+
+    #[test]
+    fn spacing_scale_is_the_documented_ramp() {
+        // The one exposed scale is exactly 4 / 8 / 12 / 16 / 24 / 32.
+        let s = Spacing::default();
+        assert_eq!(
+            [s.xs, s.s, s.sm, s.m, s.l, s.xl],
+            [4.0, 8.0, 12.0, 16.0, 24.0, 32.0]
+        );
+        // Strictly increasing.
+        let ramp = [s.xs, s.s, s.sm, s.m, s.l, s.xl];
+        for w in ramp.windows(2) {
+            assert!(w[0] < w[1], "ramp not strictly increasing at {w:?}");
+        }
+    }
+
+    #[test]
+    fn apply_to_style_enforces_min_hit_target_and_borderless_idle() {
+        let mut style = egui::Style::default();
+        let tokens = Tokens {
+            spacing: Spacing::default(),
+            type_scale: TypeScale::default(),
+            colors: roles_from([0.13, 0.14, 0.16, 1.0], [0.35, 0.65, 1.0, 1.0]),
+            radii: Radii::default(),
+            dark: true,
+        };
+        apply_to_style(&mut style, &tokens);
+        // Min hit-target height meets the grid's `l` (24) floor for a11y.
+        assert!(style.spacing.interact_size.y >= tokens.spacing.l);
+        // Idle controls are borderless (no outline until hover).
+        assert_eq!(style.visuals.widgets.inactive.bg_stroke, egui::Stroke::NONE);
+        // Focus/selection ring is a visible 2px accent.
+        assert_eq!(style.visuals.selection.stroke.width, 2.0);
     }
 
     #[test]
@@ -311,7 +404,12 @@ mod tests {
         let mut style = egui::Style::default();
         let tokens = Tokens {
             spacing: Spacing::default(),
-            type_scale: TypeScale { command: 15.0, body: 14.0, small: 10.0, panel_title: 18.0 },
+            type_scale: TypeScale {
+                command: 15.0,
+                body: 14.0,
+                small: 10.0,
+                panel_title: 18.0,
+            },
             colors: roles_from([0.13, 0.14, 0.16, 1.0], [0.35, 0.65, 1.0, 1.0]),
             radii: Radii::default(),
             dark: true,

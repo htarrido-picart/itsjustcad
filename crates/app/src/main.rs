@@ -11,6 +11,7 @@ mod draw_tool;
 mod gumball;
 mod hardware;
 mod headless;
+mod icons;
 mod journal;
 mod keymap;
 mod local_runtime;

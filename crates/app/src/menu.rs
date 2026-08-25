@@ -13,8 +13,9 @@
 //! [`verbs_in`]) carry no egui state and are unit-tested standalone. The `ui`
 //! entry point renders them and returns the action the user picked.
 
-use itsjustcad_commands::{registry, Category};
+use itsjustcad_commands::{Category, registry};
 
+use crate::icons::{Icon, Icons};
 use crate::preset::MenuStyle;
 
 /// What happens when a menu item is chosen. The rule (documented on each
@@ -58,72 +59,58 @@ pub enum MenuAction {
 const DRAW_VERBS: [&str; 4] = ["line", "polyline", "rect", "circle"];
 
 // ── Menu iconography ─────────────────────────────────────────────────────────
-// Lightweight, dependency-free glyph icons (egui bundles emoji coverage) give
-// the menus an AutoCAD-style scannable icon column. One glyph per action /
-// per registry category so related verbs read as a group.
-const ICON_NEW: &str = "📄";
-const ICON_NEW_SESSION: &str = "🆕";
-const ICON_OPEN: &str = "📂";
-const ICON_SAVE: &str = "💾";
-const ICON_IMPORT: &str = "📥";
-const ICON_EXPORT: &str = "📤";
-const ICON_PRINT: &str = "🖨";
-const ICON_UNDO: &str = "↩";
-const ICON_REDO: &str = "↪";
-const ICON_HISTORY: &str = "🕘";
-const ICON_MODEL: &str = "🤖";
-const ICON_HELP: &str = "❓";
-const ICON_ABOUT: &str = "ℹ";
+// Lucide (ISC-licensed, FOSS) line icons give the menus a clean, consistent-
+// stroke scannable column — one icon per action / per registry category so
+// related verbs read as a group. See `crate::icons`.
 
-/// A glyph for a registry verb, chosen by its [`Category`] so every verb in a
-/// menu group shares an icon (scannable AutoCAD-style hierarchy). Draw/curve
-/// verbs, solids, transforms etc. each get a distinct mark.
-fn verb_icon(verb: &str) -> &'static str {
-    // A few high-traffic verbs get a specific glyph; the rest fall back to the
-    // category icon so the whole menu stays visually grouped.
+/// A Lucide [`Icon`] for a registry verb, chosen by its [`Category`] so every
+/// verb in a menu group shares a mark. A few high-traffic verbs get a specific
+/// icon; the rest fall back to their category mark so the menu stays grouped.
+fn verb_icon(verb: &str) -> Icon {
     match verb {
-        "line" | "polyline" => return "╱",
-        "rect" => return "▭",
-        "circle" => return "◯",
-        "box" => return "◻",
-        "move" => return "✥",
-        "copy" => return "⧉",
-        "rotate" => return "⟳",
-        "scale" => return "⤢",
-        "mirror" => return "◫",
+        "line" | "polyline" => return Icon::Line,
+        "rect" => return Icon::Rect,
+        "circle" => return Icon::CircleShape,
+        "box" => return Icon::BoxShape,
+        "move" => return Icon::Move,
+        "copy" => return Icon::Copy,
+        "rotate" => return Icon::Rotate,
+        "scale" => return Icon::Scale,
+        "mirror" => return Icon::Mirror,
         _ => {}
     }
     registry()
         .iter()
         .find(|s| s.name == verb)
         .map(|s| category_icon(s.category))
-        .unwrap_or("•")
+        .unwrap_or(Icon::ToolsCat)
 }
 
-/// One glyph per command [`Category`] — the group mark used when a verb has no
-/// specific icon.
-fn category_icon(cat: Category) -> &'static str {
+/// One Lucide [`Icon`] per command [`Category`] — the group mark used when a
+/// verb has no specific icon.
+fn category_icon(cat: Category) -> Icon {
     match cat {
-        Category::File => ICON_OPEN,
-        Category::Edit => "✎",
-        Category::View => "👁",
-        Category::Draw2d => "╱",
-        Category::Curve => "〰",
-        Category::Solid => "◻",
-        Category::Boolean => "⧉",
-        Category::Transform => "✥",
-        Category::Annotate => "🅰",
-        Category::Dimension => "📏",
-        Category::Analyze => "🔍",
-        Category::Structure => "🏗",
-        Category::Tools => "🔧",
+        Category::File => Icon::Open,
+        Category::Edit => Icon::EditCat,
+        Category::View => Icon::View,
+        Category::Draw2d => Icon::Line,
+        Category::Curve => Icon::Curve,
+        Category::Solid => Icon::Solid,
+        Category::Boolean => Icon::Boolean,
+        Category::Transform => Icon::Transform,
+        Category::Annotate => Icon::Annotate,
+        Category::Dimension => Icon::Dimension,
+        Category::Analyze => Icon::Analyze,
+        Category::Structure => Icon::Structure,
+        Category::Tools => Icon::ToolsCat,
     }
 }
 
-/// Render one menu row as `<icon>  <label>`, so every menu item carries a
-/// leading glyph in a consistent column. Returns the button [`Response`].
-fn item(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
-    ui.button(format!("{icon}  {label}"))
+/// Render one menu row as `<icon>  <label>` with a Lucide icon tinted to the
+/// current foreground, so every menu item carries a leading mark in a consistent
+/// column. Returns the row's click [`Response`].
+fn item(ui: &mut egui::Ui, icons: &Icons, icon: Icon, label: &str) -> egui::Response {
+    icons.menu_item(ui, icon, label)
 }
 
 /// Classify a registry verb into a [`MenuAction`]. Pure: depends only on the
@@ -181,7 +168,10 @@ pub fn top_menus(style: MenuStyle) -> Vec<(&'static str, Vec<Category>)> {
             ("File", vec![Category::File]),
             ("Edit", vec![Category::Edit]),
             ("View", vec![Category::View]),
-            ("Draw", vec![Category::Draw2d, Category::Curve, Category::Solid]),
+            (
+                "Draw",
+                vec![Category::Draw2d, Category::Curve, Category::Solid],
+            ),
             ("Modify", vec![Category::Transform, Category::Boolean]),
             ("Dimension", vec![Category::Dimension]),
             ("Format", vec![Category::Annotate]),
@@ -204,32 +194,32 @@ pub fn verbs_in(cats: &[Category]) -> Vec<&'static str> {
 /// Draw the menu bar. Returns the action the user picked this frame, if any.
 /// File/Edit menus prepend the app-wired actions (save/open/…); Help is added
 /// as the last menu.
-pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
+pub fn ui(ui: &mut egui::Ui, icons: &Icons, style: MenuStyle) -> Option<MenuAction> {
     let mut action = None;
     egui::MenuBar::new().ui(ui, |ui| {
         for (title, cats) in top_menus(style) {
             ui.menu_button(title, |ui| {
-                // File / Edit get their app-wired actions first. Leading glyphs
-                // give the menu an AutoCAD-style scannable icon column.
+                // File / Edit get their app-wired actions first. Leading Lucide
+                // icons give the menu a clean, scannable column.
                 if title == "File" {
                     // New group.
-                    if item(ui, ICON_NEW, "New").clicked() {
+                    if item(ui, icons, Icon::New, "New").clicked() {
                         action = Some(MenuAction::NewDocument);
                         ui.close();
                     }
-                    if item(ui, ICON_NEW_SESSION, "New file session").clicked() {
+                    if item(ui, icons, Icon::NewSession, "New file session").clicked() {
                         action = Some(MenuAction::NewSession);
                         ui.close();
                     }
                     ui.separator();
                     for (icon, label, verb) in [
-                        (ICON_OPEN, "Open…", "open"),
-                        (ICON_SAVE, "Save…", "save"),
-                        (ICON_IMPORT, "Import…", "import"),
-                        (ICON_EXPORT, "Export…", "export"),
-                        (ICON_PRINT, "Print…", "print"),
+                        (Icon::Open, "Open…", "open"),
+                        (Icon::Save, "Save…", "save"),
+                        (Icon::Import, "Import…", "import"),
+                        (Icon::Export, "Export…", "export"),
+                        (Icon::Print, "Print…", "print"),
                     ] {
-                        if item(ui, icon, label).clicked() {
+                        if item(ui, icons, icon, label).clicked() {
                             action = Some(menu_action(verb));
                             ui.close();
                         }
@@ -237,14 +227,14 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
                     ui.separator();
                 } else if title == "Edit" {
                     for (icon, label, verb) in
-                        [(ICON_UNDO, "Undo", "undo"), (ICON_REDO, "Redo", "redo")]
+                        [(Icon::Undo, "Undo", "undo"), (Icon::Redo, "Redo", "redo")]
                     {
-                        if item(ui, icon, label).clicked() {
+                        if item(ui, icons, icon, label).clicked() {
                             action = Some(MenuAction::Execute(verb.to_string()));
                             ui.close();
                         }
                     }
-                    if item(ui, ICON_HISTORY, "Edit history…").clicked() {
+                    if item(ui, icons, Icon::History, "Edit history…").clicked() {
                         action = Some(MenuAction::EditHistory);
                         ui.close();
                     }
@@ -253,11 +243,11 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
                     // App-wired: opens the Model Setup panel (download/manage a
                     // local model) at any time — this is the "download a local
                     // model" entry point users can reach from the menu bar.
-                    if item(ui, ICON_MODEL, "Model Setup…").clicked() {
+                    if item(ui, icons, Icon::Model, "Model Setup…").clicked() {
                         action = Some(MenuAction::ModelSetup);
                         ui.close();
                     }
-                    if item(ui, ICON_MODEL, "Download local model…").clicked() {
+                    if item(ui, icons, Icon::Model, "Download local model…").clicked() {
                         action = Some(MenuAction::ModelSetup);
                         ui.close();
                     }
@@ -273,10 +263,7 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
                         .filter(|verb| {
                             // File/Edit already surfaced their wired verbs above.
                             !(title == "File"
-                                && matches!(
-                                    *verb,
-                                    "open" | "save" | "import" | "export" | "print"
-                                ))
+                                && matches!(*verb, "open" | "save" | "import" | "export" | "print"))
                                 && !(title == "Edit" && matches!(*verb, "undo" | "redo"))
                         })
                         .collect();
@@ -288,7 +275,7 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
                     }
                     first_group = false;
                     for verb in verbs {
-                        if item(ui, verb_icon(verb), verb).clicked() {
+                        if item(ui, icons, verb_icon(verb), verb).clicked() {
                             action = Some(menu_action(verb));
                             ui.close();
                         }
@@ -298,11 +285,11 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
         }
         // Help is synthetic (not a registry category).
         ui.menu_button("Help", |ui| {
-            if item(ui, ICON_HELP, "Command reference").clicked() {
+            if item(ui, icons, Icon::Help, "Command reference").clicked() {
                 action = Some(MenuAction::Help);
                 ui.close();
             }
-            if item(ui, ICON_ABOUT, "About ItsJustCAD").clicked() {
+            if item(ui, icons, Icon::About, "About ItsJustCAD").clicked() {
                 action = Some(MenuAction::About);
                 ui.close();
             }
@@ -312,15 +299,27 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
         // chat pane): dark/light toggle + text-size stepper apply app-wide.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let zoom = ui.ctx().zoom_factor();
-            if ui.small_button("A+").on_hover_text("bigger text (Cmd =)").clicked() {
+            if ui
+                .small_button("A+")
+                .on_hover_text("bigger text (Cmd =)")
+                .clicked()
+            {
                 ui.ctx().set_zoom_factor((zoom + 0.1).min(3.0));
             }
             ui.label(format!("{:.0}%", zoom * 100.0));
-            if ui.small_button("A−").on_hover_text("smaller text (Cmd -)").clicked() {
+            if ui
+                .small_button("A−")
+                .on_hover_text("smaller text (Cmd -)")
+                .clicked()
+            {
                 ui.ctx().set_zoom_factor((zoom - 0.1).max(0.5));
             }
             ui.separator();
             egui::widgets::global_theme_preference_switch(ui);
+            // Lucide sun-moon mark labelling the light/dark toggle.
+            let size = ui.text_style_height(&egui::TextStyle::Body);
+            let color = ui.visuals().weak_text_color();
+            ui.add(icons.image(ui.ctx(), Icon::Theme, size, color));
         });
     });
     action
@@ -330,7 +329,13 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
 /// open dropdown-style panel just under the bar, so `ITSJUSTCAD_SHOT` frames can
 /// show the grouping without a live click. Set `ITSJUSTCAD_MENU_DEMO=<title>`
 /// (e.g. `Solid`). Faithful — it lists exactly `verbs_in(categories)`.
-pub fn demo_open(ctx: &egui::Context, style: MenuStyle, title: &str, at: egui::Pos2) {
+pub fn demo_open(
+    ctx: &egui::Context,
+    icons: &Icons,
+    style: MenuStyle,
+    title: &str,
+    at: egui::Pos2,
+) {
     let Some((_, cats)) = top_menus(style).into_iter().find(|(t, _)| *t == title) else {
         return;
     };
@@ -342,7 +347,7 @@ pub fn demo_open(ctx: &egui::Context, style: MenuStyle, title: &str, at: egui::P
                 ui.label(egui::RichText::new(title).strong());
                 ui.separator();
                 for verb in verbs_in(&cats) {
-                    let _ = item(ui, verb_icon(verb), verb);
+                    let _ = item(ui, icons, verb_icon(verb), verb);
                 }
             });
         });
@@ -374,15 +379,25 @@ mod tests {
         let mut seen: Vec<Category> = Vec::new();
         for (_, cats) in top_menus(style) {
             for c in cats {
-                assert!(!seen.contains(&c), "category {c:?} appears in two menus for {style:?}");
+                assert!(
+                    !seen.contains(&c),
+                    "category {c:?} appears in two menus for {style:?}"
+                );
                 seen.push(c);
             }
         }
         let seen_set: HashSet<_> = seen.iter().copied().collect();
         for c in ALL_CATEGORIES {
-            assert!(seen_set.contains(&c), "category {c:?} missing from menus for {style:?}");
+            assert!(
+                seen_set.contains(&c),
+                "category {c:?} missing from menus for {style:?}"
+            );
         }
-        assert_eq!(seen.len(), ALL_CATEGORIES.len(), "categories not a clean partition");
+        assert_eq!(
+            seen.len(),
+            ALL_CATEGORIES.len(),
+            "categories not a clean partition"
+        );
     }
 
     #[test]
@@ -419,18 +434,42 @@ mod tests {
 
     #[test]
     fn rhino_and_autocad_have_expected_titles() {
-        let rhino: Vec<_> = top_menus(MenuStyle::Rhino).iter().map(|(t, _)| *t).collect();
+        let rhino: Vec<_> = top_menus(MenuStyle::Rhino)
+            .iter()
+            .map(|(t, _)| *t)
+            .collect();
         assert_eq!(
             rhino,
             [
-                "File", "Edit", "View", "Curve", "Solid", "Transform", "Dimension", "Analyze",
-                "Structure", "Tools"
+                "File",
+                "Edit",
+                "View",
+                "Curve",
+                "Solid",
+                "Transform",
+                "Dimension",
+                "Analyze",
+                "Structure",
+                "Tools"
             ]
         );
-        let acad: Vec<_> = top_menus(MenuStyle::AutoCAD).iter().map(|(t, _)| *t).collect();
+        let acad: Vec<_> = top_menus(MenuStyle::AutoCAD)
+            .iter()
+            .map(|(t, _)| *t)
+            .collect();
         assert_eq!(
             acad,
-            ["File", "Edit", "View", "Draw", "Modify", "Dimension", "Format", "Structure", "Tools"]
+            [
+                "File",
+                "Edit",
+                "View",
+                "Draw",
+                "Modify",
+                "Dimension",
+                "Format",
+                "Structure",
+                "Tools"
+            ]
         );
     }
 
@@ -466,11 +505,48 @@ mod tests {
 
     #[test]
     fn every_registry_verb_has_a_menu_icon() {
-        // No verb falls through to the empty placeholder; each category and each
-        // specific verb resolves to a non-empty glyph so the menu icon column is
-        // always populated.
+        // Each category and each specific verb resolves to a Lucide [`Icon`] with
+        // a non-empty stable name, so the menu icon column is always populated.
         for spec in registry() {
-            assert!(!verb_icon(spec.name).is_empty(), "verb {} has no icon", spec.name);
+            assert!(
+                !verb_icon(spec.name).name().is_empty(),
+                "verb {} has no icon",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn category_icons_are_distinct_per_category() {
+        // Each registry category maps to its own group mark (no two categories
+        // collapse to the same icon), so menu groups stay visually separable.
+        use std::collections::HashSet;
+        let cats = [
+            Category::File,
+            Category::Edit,
+            Category::View,
+            Category::Draw2d,
+            Category::Curve,
+            Category::Solid,
+            Category::Boolean,
+            Category::Transform,
+            Category::Annotate,
+            Category::Dimension,
+            Category::Analyze,
+            Category::Structure,
+            Category::Tools,
+        ];
+        let mut seen = HashSet::new();
+        for c in cats {
+            // File and Tools may share their category-default with a wired action
+            // icon, but the 11 drawing/analysis categories must be distinct.
+            if matches!(c, Category::File | Category::Tools) {
+                continue;
+            }
+            assert!(
+                seen.insert(category_icon(c)),
+                "category {c:?} icon collides"
+            );
         }
     }
 
