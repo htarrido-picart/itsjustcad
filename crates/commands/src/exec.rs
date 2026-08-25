@@ -862,6 +862,7 @@ impl Session {
         match ext.as_str() {
             "dxf" => self.import_dxf(path),
             "obj" | "stl" | "gltf" | "glb" | "dae" => self.import_mesh(path),
+            "3dm" => self.import_3dm(path),
             "ifc" => self.import_ifc(path),
             "epw" => self.import_epw(path),
             "geojson" | "json" => self.import_geojson(path),
@@ -870,7 +871,7 @@ impl Session {
                 "LAZ is compressed; decompress to .las first (e.g. laszip)".to_string(),
             )),
             other => Err(ExecError::Invalid(format!(
-                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .dae, .ifc, .epw, .geojson, .las)"
+                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .dae, .3dm, .ifc, .epw, .geojson, .las)"
             ))),
         }
     }
@@ -925,6 +926,63 @@ impl Session {
         Ok(ApplyOutcome {
             created,
             message: format!("imported {total} mesh(es) from {path} — one MeshLiteral op each"),
+        })
+    }
+
+    /// Rhino `.3dm` (openNURBS) import: reconstruct meshes and curves.
+    ///
+    /// `ON_Mesh` → `MeshLiteral`; `ON_LineCurve`/`ON_PolylineCurve` → `Polyline`;
+    /// `ON_NurbsCurve` → a dense tessellated `Polyline` (full NURBS is a later
+    /// kernel job). Each object's Rhino name and layer are preserved (the layer
+    /// becomes the current layer via a logged `Layer` op, like [`Self::import_ifc`]).
+    /// Breps/surfaces/points/annotations are skipped and counted. Every object is
+    /// emitted as one logged substrate command, so the import replays from the
+    /// op-log without the `.3dm` file.
+    fn import_3dm(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let parsed = crate::rhino3dm::import(&bytes)
+            .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+        if parsed.objects.is_empty() {
+            return Err(ExecError::Invalid(format!(
+                "'{path}' contains no importable meshes or curves ({} object(s) skipped)",
+                parsed.skipped
+            )));
+        }
+
+        let prev_layer = self.doc.current_layer.clone();
+        let mut created = Vec::new();
+        let mut meshes = 0usize;
+        let mut curves = 0usize;
+        for obj in parsed.objects {
+            self.switch_layer(&obj.layer)?;
+            let name = if obj.name.is_empty() { None } else { Some(obj.name) };
+            let out = match obj.geom {
+                crate::rhino3dm::Imported::Mesh(mesh) => {
+                    meshes += 1;
+                    self.run(Command::MeshLiteral {
+                        id: None,
+                        positions: mesh.positions().to_vec(),
+                        faces: mesh.faces().to_vec(),
+                        name,
+                    })?
+                }
+                crate::rhino3dm::Imported::Polyline { points, closed } => {
+                    curves += 1;
+                    self.run(Command::Polyline { id: None, points, closed })?
+                }
+            };
+            created.extend(out.created);
+        }
+        self.switch_layer(&prev_layer)?;
+
+        Ok(ApplyOutcome {
+            created,
+            message: format!(
+                "imported {path}: {meshes} mesh(es), {curves} curve(s) \
+                 ({} skipped) — logged as substrate commands",
+                parsed.skipped
+            ),
         })
     }
 
@@ -8914,5 +8972,86 @@ mod tests {
         let json = r#"{"itsjustcad":1,"ops":[]}"#;
         let s = crate::io::from_json(json).unwrap();
         assert!(!s.doc.show_lineweights, "missing show_lineweights must default to false");
+    }
+
+    // ── Rhino .3dm import ────────────────────────────────────────────────────
+
+    /// Full-flow: write a spec-conformant .3dm to a temp file, import it via the
+    /// substrate `Command::Import`, and assert (a) mesh + curve counts, (b) each
+    /// object landed on its Rhino layer, (c) the mesh name is preserved, and (d)
+    /// the whole import is logged and replays byte-identically.
+    #[test]
+    fn import_3dm_meshes_curves_layers_and_replay() {
+        use crate::rhino3dm::{write_min, WriteItem};
+
+        let bytes = write_min(
+            &["walls", "guides"],
+            &[
+                WriteItem::Mesh {
+                    name: "panel".to_string(),
+                    layer_index: 0,
+                    positions: vec![
+                        DVec3::new(0.0, 0.0, 0.0),
+                        DVec3::new(2.0, 0.0, 0.0),
+                        DVec3::new(2.0, 1.0, 0.0),
+                        DVec3::new(0.0, 1.0, 0.0),
+                    ],
+                    tris: vec![[0, 1, 2], [0, 2, 3]],
+                },
+                WriteItem::Line {
+                    name: "axis".to_string(),
+                    layer_index: 1,
+                    a: DVec3::new(0.0, 0.0, 0.0),
+                    b: DVec3::new(10.0, 0.0, 0.0),
+                },
+                WriteItem::Polyline {
+                    name: "trace".to_string(),
+                    layer_index: 1,
+                    points: vec![
+                        DVec3::new(0.0, 0.0, 0.0),
+                        DVec3::new(1.0, 1.0, 0.0),
+                        DVec3::new(2.0, 0.0, 0.0),
+                    ],
+                },
+            ],
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("itsjustcad_test_{}.3dm", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut s = Session::default();
+        let out = run(&mut s, &format!("import {}", path.display()));
+        std::fs::remove_file(&path).ok();
+
+        assert!(out.message.contains("1 mesh(es)"), "message: {}", out.message);
+        assert!(out.message.contains("2 curve(s)"), "message: {}", out.message);
+
+        // Three geometry objects: one mesh, two curves.
+        let meshes = s.doc.objects().filter(|o| matches!(o.geometry, Geometry::Mesh { .. })).count();
+        let curves =
+            s.doc.objects().filter(|o| matches!(o.geometry, Geometry::Curve(Curve::Polyline { .. }))).count();
+        assert_eq!(meshes, 1, "one mesh imported");
+        assert_eq!(curves, 2, "line + polyline imported");
+
+        // The mesh kept its Rhino name and landed on the 'walls' layer.
+        let mesh_obj = s
+            .doc
+            .objects()
+            .find(|o| matches!(o.geometry, Geometry::Mesh { .. }))
+            .expect("mesh present");
+        assert_eq!(mesh_obj.name.as_deref(), Some("panel"));
+        assert_eq!(mesh_obj.layer, "walls");
+
+        // Both curves landed on the 'guides' layer.
+        for c in s.doc.objects().filter(|o| matches!(o.geometry, Geometry::Curve(Curve::Polyline { .. }))) {
+            assert_eq!(c.layer, "guides");
+        }
+
+        // The import is logged; the op-log replays byte-identically.
+        let json1 = crate::io::to_json(&s);
+        let loaded = crate::io::from_json(&json1).unwrap();
+        let json2 = crate::io::to_json(&loaded);
+        assert_eq!(json1, json2, "3dm import op-log must replay identically");
     }
 }
