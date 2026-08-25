@@ -426,6 +426,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // intentionally verifying compiled preset values
     fn rhino_right_click_repeat_last() {
         assert!(RHINO.right_click_repeat_last);
         assert!(!AUTOCAD.right_click_repeat_last);

@@ -283,7 +283,7 @@ mod tests {
     fn sort_recent_orders_newest_first() {
         let mut docs = doc_with_two_sessions();
         docs.sort_recent();
-        assert_eq!(docs.sessions[0].updated, 201.max(200)); // session b (updated 201)
+        assert_eq!(docs.sessions[0].updated, 201); // session b (updated 201)
         assert!(docs.sessions[0].updated >= docs.sessions[1].updated);
     }
 

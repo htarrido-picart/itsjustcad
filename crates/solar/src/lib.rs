@@ -379,6 +379,7 @@ mod tests {
     const TOL: f64 = 0.5; // ±0.5° tolerance per task spec
 
     /// Helper: assert both az and alt are within TOL degrees of expected values.
+    #[allow(clippy::too_many_arguments)] // test helper — grouping into a struct would add noise
     fn assert_sun(
         label: &str,
         year: i32, month: u32, day: u32, h: u32, min: u32,

@@ -65,6 +65,7 @@ impl DownloadState {
 
     /// True while a fetch/verify is actively running (used to disable the
     /// Install button and offer Cancel).
+    #[allow(dead_code)] // used by itsjustcad (app crate); invisible to download_model example
     pub fn is_active(&self) -> bool {
         matches!(
             self,
@@ -77,6 +78,7 @@ impl DownloadState {
 /// flip. Dropping it does not stop the task — call [`Download::cancel`].
 pub struct Download {
     state: Arc<Mutex<DownloadState>>,
+    #[allow(dead_code)] // read via cancel() method; field itself only written in start()
     cancel: Arc<AtomicBool>,
 }
 
@@ -88,6 +90,7 @@ impl Download {
 
     /// Request cancellation. The background task notices between chunks, drops
     /// the connection, and moves to `Failed { "cancelled" }`.
+    #[allow(dead_code)] // called by itsjustcad (app crate); invisible to download_model example
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
     }
@@ -116,6 +119,7 @@ impl DownloadSpec {
 }
 
 /// The default models directory: `~/.config/itsjustcad/models`.
+#[allow(dead_code)] // called by itsjustcad (app crate); invisible to download_model example
 pub fn models_dir() -> Option<PathBuf> {
     Some(
         dirs::home_dir()?

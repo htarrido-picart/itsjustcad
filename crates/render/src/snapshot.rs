@@ -865,9 +865,9 @@ mod tests {
         use crate::renderer::hue_from_seed;
         for seed in [0u64, 1, 42, u64::MAX, 0x9e3779b97f4a7c15] {
             let [r, g, b, a] = hue_from_seed(seed);
-            assert!(r >= 0.0 && r <= 1.0, "r={r}");
-            assert!(g >= 0.0 && g <= 1.0, "g={g}");
-            assert!(b >= 0.0 && b <= 1.0, "b={b}");
+            assert!((0.0..=1.0).contains(&r), "r={r}");
+            assert!((0.0..=1.0).contains(&g), "g={g}");
+            assert!((0.0..=1.0).contains(&b), "b={b}");
             assert_eq!(a, 1.0);
         }
     }

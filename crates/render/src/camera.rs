@@ -306,14 +306,16 @@ mod tests {
 
     #[test]
     fn two_point_keeps_verticals_parallel() {
-        let mut cam = OrbitCamera::default();
-        // Look up at a tower: a pitch that would make a normal perspective
-        // converge the verticals noticeably.
-        cam.target = Vec3::new(0.0, 0.0, 5.0);
-        cam.distance = 30.0;
-        cam.yaw = -std::f32::consts::FRAC_PI_2; // face +Y-ish, verticals across x
-        cam.pitch = 0.6;
-        cam.two_point = true;
+        let mut cam = OrbitCamera {
+            // Look up at a tower: a pitch that would make a normal perspective
+            // converge the verticals noticeably.
+            target: Vec3::new(0.0, 0.0, 5.0),
+            distance: 30.0,
+            yaw: -std::f32::consts::FRAC_PI_2, // face +Y-ish, verticals across x
+            pitch: 0.6,
+            two_point: true,
+            ..OrbitCamera::default()
+        };
         let m = cam.view_proj(1.5);
 
         // Two vertical edges of a tower at x = ±4. For each, compare the screen
@@ -344,11 +346,13 @@ mod tests {
     fn two_point_pitch_shifts_frame_vertically() {
         // Increasing pitch slides the framing up (the tower top moves toward
         // center) without tilting verticals.
-        let mut cam = OrbitCamera::default();
-        cam.target = Vec3::new(0.0, 0.0, 5.0);
-        cam.distance = 30.0;
-        cam.yaw = -std::f32::consts::FRAC_PI_2;
-        cam.two_point = true;
+        let mut cam = OrbitCamera {
+            target: Vec3::new(0.0, 0.0, 5.0),
+            distance: 30.0,
+            yaw: -std::f32::consts::FRAC_PI_2,
+            two_point: true,
+            ..OrbitCamera::default()
+        };
 
         cam.pitch = 0.0;
         let top_low = screen_xy(cam.view_proj(1.5), Vec3::new(0.0, 8.0, 40.0)).y;

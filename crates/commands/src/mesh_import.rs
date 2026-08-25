@@ -1260,10 +1260,9 @@ endsolid test\n\
         // With an empty BIN the position accessor's effective count becomes 0,
         // so the mesh will have no positions and be skipped, yielding Ok([]).
         // Either Ok([]) or Err is acceptable — the key property is no abort/OOM.
-        match &result {
-            Ok(parts) => assert!(parts.is_empty(), "no valid mesh should be produced"),
-            Err(_) => {} // also fine
-        }
+        if let Ok(parts) = &result {
+            assert!(parts.is_empty(), "no valid mesh should be produced");
+        } // Err(_) is also fine
     }
 
     // ---- H-5: GLB with out-of-bounds face indices is filtered, not OOB-panicked ----

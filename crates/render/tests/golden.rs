@@ -236,10 +236,12 @@ fn golden_single_box_dark() {
     let ctx = GpuContext::new();
     let mesh = kernel_mesh::make_box(DVec3::new(-2.5, -2.5, 0.0), DVec3::new(5.0, 5.0, 3.0));
     let theme = Theme::Dark;
-    let mut camera = OrbitCamera::default();
-    camera.distance = 14.0;
-    camera.yaw = -0.6;
-    camera.pitch = 0.55;
+    let camera = OrbitCamera {
+        distance: 14.0,
+        yaw: -0.6,
+        pitch: 0.55,
+        ..OrbitCamera::default()
+    };
 
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
     renderer.set_meshes(&ctx.device, &[(mesh.to_render(), theme.mesh(), [0.5, 0.0])], 0);
@@ -260,11 +262,13 @@ fn golden_two_boxes_light() {
     let box_a = kernel_mesh::make_box(DVec3::ZERO, DVec3::new(4.0, 4.0, 3.0));
     let box_b =
         kernel_mesh::make_box(DVec3::new(6.0, 0.0, 0.0), DVec3::new(3.0, 3.0, 5.0));
-    let mut camera = OrbitCamera::default();
-    camera.target = glam::Vec3::new(4.5, 2.0, 2.5);
-    camera.distance = 18.0;
-    camera.yaw = -0.9;
-    camera.pitch = 0.45;
+    let camera = OrbitCamera {
+        target: glam::Vec3::new(4.5, 2.0, 2.5),
+        distance: 18.0,
+        yaw: -0.9,
+        pitch: 0.45,
+        ..OrbitCamera::default()
+    };
 
     let meshes = vec![
         (box_a.to_render(), theme.mesh(), [0.5, 0.0]),
@@ -283,11 +287,13 @@ fn golden_two_boxes_light() {
 fn golden_underlay_dark() {
     let ctx = GpuContext::new();
     let theme = Theme::Dark;
-    let mut camera = OrbitCamera::default();
-    camera.target = glam::Vec3::ZERO;
-    camera.distance = 20.0;
-    camera.yaw = 0.0;
-    camera.pitch = 1.4; // near top-down
+    let camera = OrbitCamera {
+        target: glam::Vec3::ZERO,
+        distance: 20.0,
+        yaw: 0.0,
+        pitch: 1.4, // near top-down
+        ..OrbitCamera::default()
+    };
 
     // 4x4 checkerboard, 64x64 px.
     let n = 64u32;

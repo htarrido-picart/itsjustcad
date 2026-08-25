@@ -237,8 +237,7 @@ mod tests {
 
     #[test]
     fn local_only_filter_hides_remote_decks() {
-        let mut df = DecksFile::default();
-        df.local_only = true;
+        let df = DecksFile { local_only: true, ..DecksFile::default() };
         let visible: Vec<&str> = df.visible_decks().map(|(_, d)| d.name.as_str()).collect();
         // claude-code (empty base_url) and ollama (localhost) are local; claude + kimi are not.
         assert!(visible.contains(&"claude-code"), "{visible:?}");
@@ -249,8 +248,7 @@ mod tests {
 
     #[test]
     fn check_local_only_blocks_remote_active() {
-        let mut df = DecksFile::default();
-        df.local_only = true;
+        let mut df = DecksFile { local_only: true, ..DecksFile::default() };
         // Default active is 0 (claude-code, local) → OK.
         assert!(df.check_local_only().is_ok());
         // Switch active to "claude" (index 2, remote) → Err.

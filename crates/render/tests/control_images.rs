@@ -60,11 +60,13 @@ fn control_images_written_nonzero_and_distinct() {
     // A three-quarter perspective framed on the scene.
     let bb = doc.scene_aabb().expect("scene has extents");
     let c = bb.center();
-    let mut cam = OrbitCamera::default();
-    cam.target = Vec3::new(c.x as f32, c.y as f32, c.z as f32);
-    cam.distance = (bb.size().length() as f32 * 1.2).max(5.0);
-    cam.pitch = 0.55;
-    cam.yaw = -0.6;
+    let cam = OrbitCamera {
+        target: Vec3::new(c.x as f32, c.y as f32, c.z as f32),
+        distance: (bb.size().length() as f32 * 1.2).max(5.0),
+        pitch: 0.55,
+        yaw: -0.6,
+        ..OrbitCamera::default()
+    };
     let aspect = W as f32 / H as f32;
     let view_proj = cam.view_proj(aspect);
     let eye = cam.eye();
@@ -108,7 +110,7 @@ fn control_images_written_nonzero_and_distinct() {
     // Each image has actual drawn content (not a flat clear).
     let distinct_values = |rgba: &[u8]| {
         let mut set = std::collections::HashSet::new();
-        for px in rgba.chunks_exact(4) {
+        for px in rgba.as_chunks::<4>().0 {
             set.insert((px[0], px[1], px[2]));
             if set.len() > 3 {
                 break;

@@ -608,8 +608,7 @@ mod tests {
 
     #[test]
     fn refresh_suggestions_populates_on_prefix() {
-        let mut cl = CommandLine::default();
-        cl.input = "bo".to_string();
+        let mut cl = CommandLine { input: "bo".to_string(), ..CommandLine::default() };
         cl.refresh_suggestions(&[], &[]);
         assert!(!cl.suggestions.is_empty(), "expected suggestions for 'bo'");
         assert!(cl.suggestions.iter().any(|s| s.completion == "box"), "{:?}", cl.suggestions);
@@ -617,8 +616,7 @@ mod tests {
 
     #[test]
     fn refresh_suggestions_clears_on_new_input() {
-        let mut cl = CommandLine::default();
-        cl.input = "bo".to_string();
+        let mut cl = CommandLine { input: "bo".to_string(), ..CommandLine::default() };
         cl.refresh_suggestions(&[], &[]);
         let count_before = cl.suggestions.len();
         cl.input = "zzzz".to_string();
@@ -628,8 +626,7 @@ mod tests {
 
     #[test]
     fn accept_suggestion_completes_verb() {
-        let mut cl = CommandLine::default();
-        cl.input = "bo".to_string();
+        let mut cl = CommandLine { input: "bo".to_string(), ..CommandLine::default() };
         cl.refresh_suggestions(&[], &[]);
         assert!(!cl.suggestions.is_empty());
         cl.suggest_sel = Some(0); // should be 'box'
@@ -639,8 +636,7 @@ mod tests {
 
     #[test]
     fn suggestions_dismissed_after_accept() {
-        let mut cl = CommandLine::default();
-        cl.input = "bo".to_string();
+        let mut cl = CommandLine { input: "bo".to_string(), ..CommandLine::default() };
         cl.refresh_suggestions(&[], &[]);
         cl.suggest_sel = Some(0);
         cl.accept_suggestion();
@@ -654,8 +650,7 @@ mod tests {
         let dir = std::env::temp_dir()
             .join(format!("mydrafter-cl-plug-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut cl = CommandLine::default();
-        cl.plugin_dir = dir.clone();
+        let cl = CommandLine { plugin_dir: dir.clone(), ..CommandLine::default() };
         (cl, dir)
     }
 

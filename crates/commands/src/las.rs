@@ -304,7 +304,7 @@ mod tests {
                     data[base + 8..base + 12].copy_from_slice(&3i32.to_le_bytes());
                 }
             }
-            let pts = parse(&data).expect(&format!("format {fmt} should parse"));
+            let pts = parse(&data).unwrap_or_else(|e| panic!("format {fmt} should parse: {e}"));
             assert_eq!(pts.positions.len(), 3, "format {fmt}");
         }
     }

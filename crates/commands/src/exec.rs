@@ -7339,7 +7339,7 @@ mod tests {
             .message
             .split_whitespace()
             .filter_map(|w| w.parse().ok())
-            .last()
+            .next_back()
             .unwrap_or_else(|| panic!("no number in '{}'", out.message));
         // inscribed-polygon tessellation underestimates slightly
         assert!((area - std::f64::consts::PI * 4.0).abs() < 0.1, "{area}");
@@ -7352,7 +7352,7 @@ mod tests {
             .message
             .split_whitespace()
             .filter_map(|w| w.parse::<f64>().ok())
-            .last()
+            .next_back()
             .unwrap();
         assert!((total - (60.0 + std::f64::consts::PI * 4.0 + 52.0)).abs() < 0.1);
         // open curves and annotations refuse with hints
@@ -8867,8 +8867,6 @@ mod tests {
     /// exec + undo + redo for `lineweight`, `lineweightoff`, and `showweights`.
     #[test]
     fn lineweight_exec_undo_redo() {
-        use crate::parse;
-
         let mut s = Session::default();
         run(&mut s, "line 0,0,0 5,0,0");
         let id = s.doc.objects().next().unwrap().id;
