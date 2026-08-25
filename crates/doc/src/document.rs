@@ -7,7 +7,7 @@ use kernel_mesh::Aabb;
 
 use crate::{
     BlockGeometry, GeoLocation, Grid, LayerStyle, Material, NamedView, ObjectId, SceneObject,
-    Section, Sheet, Story, SunPosition, Underlay, Units, DEFAULT_LAYER,
+    Section, Sheet, Story, StructLoad, StructSupport, SunPosition, Underlay, Units, DEFAULT_LAYER,
 };
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
@@ -70,6 +70,16 @@ pub struct Document {
     /// Building stories/levels, in creation order.
     #[serde(default)]
     pub stories: Vec<Story>,
+    /// Structural loads (point, line, area) placed on the model. Stored for
+    /// exchange/annotation; no analysis is performed here. `serde(default)`
+    /// keeps pre-load files loading cleanly.
+    #[serde(default)]
+    pub loads: Vec<StructLoad>,
+    /// Support / boundary conditions (pinned, fixed, roller) placed on the
+    /// model. Stored for exchange/annotation only. `serde(default)` keeps
+    /// pre-support files loading cleanly.
+    #[serde(default)]
+    pub supports: Vec<StructSupport>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -95,6 +105,8 @@ impl Default for Document {
             materials: BTreeMap::new(),
             grids: BTreeMap::new(),
             stories: Vec::new(),
+            loads: Vec::new(),
+            supports: Vec::new(),
             generation: 0,
         }
     }
@@ -282,7 +294,7 @@ mod tests {
         // sections/materials/grids/stories keys entirely.
         let mut v = serde_json::to_value(Document::default()).unwrap();
         let obj = v.as_object_mut().unwrap();
-        for key in ["sections", "materials", "grids", "stories"] {
+        for key in ["sections", "materials", "grids", "stories", "loads", "supports"] {
             obj.remove(key);
         }
         let back: Document = serde_json::from_value(v).unwrap();
@@ -290,6 +302,8 @@ mod tests {
         assert!(back.materials.is_empty());
         assert!(back.grids.is_empty());
         assert!(back.stories.is_empty());
+        assert!(back.loads.is_empty());
+        assert!(back.supports.is_empty());
     }
 
     #[test]

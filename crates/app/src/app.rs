@@ -1219,6 +1219,8 @@ impl App {
             // Dimensions and text are 2D overlay drawing (egui text cannot go
             // through wgpu); hatches render in the scene itself.
             self.draw_annotations(ui, rect, view_proj, theme);
+            // Structural loads (arrows) and supports (symbols) overlay.
+            self.draw_struct_overlays(ui, rect, view_proj);
 
             if panes.len() > 1 {
                 let color = if pane == self.active_pane {
@@ -1343,6 +1345,176 @@ impl App {
                 }
                 Annotation::Hatch { .. } => {} // rendered in the wgpu scene
             }
+        }
+    }
+
+    /// Overlay pass for structural loads and supports: loads → color-coded
+    /// arrows, supports → geometric symbols (triangle/square/circle).
+    /// All drawing is in 2D egui screen space projected from world coordinates.
+    fn draw_struct_overlays(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        view_proj: glam::Mat4,
+    ) {
+        use itsjustcad_doc::{LoadGeometry, RestraintKind};
+        let painter = ui.painter_at(rect);
+        let doc = &self.session.doc;
+
+        // Color palette for loads vs supports.
+        let load_color = egui::Color32::from_rgb(255, 160, 40); // amber
+        let support_color = egui::Color32::from_rgb(80, 200, 120); // green
+
+        // Arrow length in screen pixels.
+        const ARROW_PX: f32 = 32.0;
+        // Arrowhead half-width.
+        const HEAD_PX: f32 = 6.0;
+
+        let project = |p: glam::DVec3| -> Option<egui::Pos2> { project(view_proj, rect, p) };
+
+        // Helper: draw a 2D arrow from `tail` to `head` on screen.
+        let draw_arrow = |tail: egui::Pos2, head: egui::Pos2, color: egui::Color32| {
+            let d = head - tail;
+            let len = d.length();
+            if len < 2.0 {
+                return;
+            }
+            let u = d / len;
+            let perp = egui::vec2(-u.y, u.x);
+            let stroke = egui::Stroke::new(2.0, color);
+            // Shaft
+            painter.line_segment([tail, head], stroke);
+            // Arrowhead triangle
+            let base = head - u * HEAD_PX * 2.0;
+            let p1 = base + perp * HEAD_PX;
+            let p2 = base - perp * HEAD_PX;
+            painter.add(egui::Shape::convex_polygon(
+                vec![head, p1, p2],
+                color,
+                egui::Stroke::NONE,
+            ));
+        };
+
+        // Draw loads.
+        for load in &doc.loads {
+            let dir2 = {
+                // Project the direction as a screen delta.
+                let origin = match &load.geometry {
+                    LoadGeometry::Point { position } => *position,
+                    LoadGeometry::Line { a, b } => (*a + *b) * 0.5,
+                    LoadGeometry::Area { boundary } => {
+                        if boundary.is_empty() {
+                            continue;
+                        }
+                        let sum: glam::DVec3 = boundary.iter().copied().sum();
+                        sum / boundary.len() as f64
+                    }
+                };
+                let Some(p0) = project(origin) else { continue };
+                let dir_world = load.direction * 0.5; // 0.5 m reference length
+                let Some(p1) = project(origin + dir_world) else { continue };
+                let d = p1 - p0;
+                if d.length() < 1.0 {
+                    // Direction collapsed to zero on screen; use a default down arrow.
+                    egui::vec2(0.0, 1.0)
+                } else {
+                    d.normalized()
+                }
+            };
+
+            // Arrow: tail is the application point, head is tip (direction-pointing).
+            let anchor = match &load.geometry {
+                LoadGeometry::Point { position } => {
+                    project(*position)
+                }
+                LoadGeometry::Line { a, b } => {
+                    let mid = (*a + *b) * 0.5;
+                    project(mid)
+                }
+                LoadGeometry::Area { boundary } => {
+                    if boundary.is_empty() {
+                        continue;
+                    }
+                    let sum: glam::DVec3 = boundary.iter().copied().sum();
+                    project(sum / boundary.len() as f64)
+                }
+            };
+            let Some(anch) = anchor else { continue };
+            let tail = anch;
+            let head = anch + dir2 * ARROW_PX;
+            draw_arrow(tail, head, load_color);
+            // Label
+            painter.text(
+                head + egui::vec2(4.0, -4.0),
+                egui::Align2::LEFT_BOTTOM,
+                &load.name,
+                egui::FontId::proportional(10.0),
+                load_color,
+            );
+        }
+
+        // Draw supports.
+        const SYM_R: f32 = 8.0; // symbol radius/half-size
+        for sup in &doc.supports {
+            let Some(sc) = project(sup.position) else { continue };
+            match sup.kind {
+                RestraintKind::Pinned => {
+                    // Triangle pointing up (apex at node).
+                    let apex = sc;
+                    let base_l = apex + egui::vec2(-SYM_R, SYM_R * 1.5);
+                    let base_r = apex + egui::vec2(SYM_R, SYM_R * 1.5);
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![apex, base_l, base_r],
+                        support_color,
+                        egui::Stroke::NONE,
+                    ));
+                    // Ground line
+                    let stroke = egui::Stroke::new(2.0, support_color);
+                    painter.line_segment(
+                        [base_l - egui::vec2(2.0, 0.0), base_r + egui::vec2(2.0, 0.0)],
+                        stroke,
+                    );
+                }
+                RestraintKind::Fixed => {
+                    // Filled square at node.
+                    let tl = sc - egui::vec2(SYM_R, SYM_R);
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(tl, egui::vec2(SYM_R * 2.0, SYM_R * 2.0)),
+                        0.0,
+                        support_color,
+                    );
+                    // Ground line below
+                    let stroke = egui::Stroke::new(2.0, support_color);
+                    let base_y = sc.y + SYM_R;
+                    painter.line_segment(
+                        [egui::pos2(sc.x - SYM_R, base_y), egui::pos2(sc.x + SYM_R, base_y)],
+                        stroke,
+                    );
+                }
+                RestraintKind::Roller => {
+                    // Circle (roller can rotate).
+                    painter.circle_filled(sc, SYM_R, support_color);
+                    // Show roller axis as a short line through the circle.
+                    if let Some(ax) = sup.roller_axis {
+                        let p0 = project(sup.position - ax * 0.3);
+                        let p1 = project(sup.position + ax * 0.3);
+                        if let (Some(p0), Some(p1)) = (p0, p1) {
+                            painter.line_segment(
+                                [p0, p1],
+                                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                            );
+                        }
+                    }
+                }
+            }
+            // Label: kind below the symbol.
+            painter.text(
+                sc + egui::vec2(SYM_R + 2.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                sup.kind.label(),
+                egui::FontId::proportional(10.0),
+                support_color,
+            );
         }
     }
 

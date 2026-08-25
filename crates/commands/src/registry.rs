@@ -642,6 +642,18 @@ pub fn registry() -> &'static [CommandSpec] {
             summary: "Area member: extrude a closed boundary along its horizontal normal by thickness into a wall. Example: wall 0,0 6,0 6,0.2 0,0.2 thick 3 material concrete",
             category: Category::Structure,
         },
+        CommandSpec {
+            name: "load",
+            usage: "load <point|line|area> [name] <target/point(s)> <magnitude> <dx,dy,dz>",
+            summary: "Record a structural load (data + overlay arrow; no analysis). point = concentrated force at a node (N); line = distributed along a member (N/m); area = pressure on a surface (Pa). Direction is a world-space vector. Example: load point dead 0,0,3 10000 0,0,-1 · load line live 0,0,3 6,0,3 5000 0,0,-1 · load area wind 0,0,0 6,0,0 6,4,0 0,4,0 end 2000 1,0,0",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "support",
+            usage: "support <x,y,z> <pinned|fixed|roller> [axis dx,dy,dz]",
+            summary: "Record a structural support / boundary condition (data + overlay symbol; no analysis). pinned = all translations fixed; fixed = all 6 DOFs fixed; roller = one translation free (provide the free axis). Example: support 0,0,0 pinned · support 6,0,0 roller 1,0,0 · support 3,3,0 fixed",
+            category: Category::Structure,
+        },
     ]
 }
 

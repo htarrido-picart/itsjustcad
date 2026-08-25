@@ -8,6 +8,7 @@
 mod document;
 pub mod hatch;
 pub mod hershey;
+pub mod loads;
 mod object;
 mod sheet;
 mod structure;
@@ -16,6 +17,7 @@ mod units;
 mod view;
 
 pub use document::Document;
+pub use loads::{LoadGeometry, RestraintKind, StructLoad, StructSupport};
 pub use object::{
     Annotation, AreaKind, BlockGeometry, FrameKind, Geometry, HatchPattern, LayerStyle, ObjectId,
     SceneObject, DEFAULT_LAYER,

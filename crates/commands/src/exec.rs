@@ -6,8 +6,8 @@ use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
 use itsjustcad_doc::{
     format_area, format_length, format_volume, Annotation, Document, Geometry, Grid, LayerStyle,
-    Material, NamedView, ObjectId, SceneObject, ScheduleRow, SheetDim, SheetTable, Story, Underlay,
-    Units,
+    LoadGeometry, Material, NamedView, ObjectId, SceneObject, ScheduleRow,
+    SheetDim, SheetTable, Story, StructLoad, StructSupport, Underlay, Units,
 };
 
 use std::collections::BTreeMap;
@@ -136,6 +136,10 @@ enum Inverse {
     /// `story`: restore the previous story list (a story replace/append edits
     /// the whole list, so snapshot it).
     StoryList(Vec<Story>),
+    /// `load`: remove the load that was appended at the given index.
+    RemoveLoad(usize),
+    /// `support`: remove the support that was appended at the given index.
+    RemoveSupport(usize),
 }
 
 /// Owns the document plus its op-log; the single mutation path for both the
@@ -427,6 +431,18 @@ impl Session {
             Inverse::StoryList(prev) => {
                 self.doc.stories = prev.clone();
                 self.doc.generation += 1;
+            }
+            Inverse::RemoveLoad(idx) => {
+                if *idx < self.doc.loads.len() {
+                    self.doc.loads.remove(*idx);
+                    self.doc.generation += 1;
+                }
+            }
+            Inverse::RemoveSupport(idx) => {
+                if *idx < self.doc.supports.len() {
+                    self.doc.supports.remove(*idx);
+                    self.doc.generation += 1;
+                }
             }
         }
         Ok(ApplyOutcome {
@@ -4397,6 +4413,60 @@ fn apply_forward(
                 },
             ))
         }
+        Command::AddLoad { name, geometry, magnitude, direction, index } => {
+            // Normalise the direction vector; reject zero vector.
+            let len = direction.length();
+            if len < 1e-12 {
+                return Err(ExecError::Invalid(
+                    "load direction must be a non-zero vector".into(),
+                ));
+            }
+            let dir = direction / len;
+            let load = StructLoad {
+                name: name.clone(),
+                magnitude,
+                direction: dir,
+                geometry: geometry.clone(),
+            };
+            // Use the pre-filled index on replay so undo removes the same slot.
+            let idx = index.unwrap_or(doc.loads.len());
+            doc.loads.insert(idx, load);
+            doc.generation += 1;
+            let kind_label = match &geometry {
+                LoadGeometry::Point { .. } => "point",
+                LoadGeometry::Line { .. } => "line",
+                LoadGeometry::Area { .. } => "area",
+            };
+            let msg = format!("load '{name}' ({kind_label}, {magnitude:.4e})");
+            Ok((
+                Command::AddLoad {
+                    name,
+                    geometry,
+                    magnitude,
+                    direction: dir,
+                    index: Some(idx),
+                },
+                Inverse::RemoveLoad(idx),
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::AddSupport { position, kind, roller_axis, index } => {
+            // Normalise roller axis if provided.
+            let roller_axis = roller_axis.map(|ax| {
+                let l = ax.length();
+                if l < 1e-12 { DVec3::X } else { ax / l }
+            });
+            let support = StructSupport { position, kind, roller_axis };
+            let idx = index.unwrap_or(doc.supports.len());
+            doc.supports.insert(idx, support);
+            doc.generation += 1;
+            let msg = format!("support {} at ({:.2},{:.2},{:.2})", kind.label(), position.x, position.y, position.z);
+            Ok((
+                Command::AddSupport { position, kind, roller_axis, index: Some(idx) },
+                Inverse::RemoveSupport(idx),
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
         Command::Undo
         | Command::Redo
         | Command::Amend { .. }
@@ -4530,6 +4600,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::DefStory { .. } => "story",
         Command::FrameMember { kind, .. } => kind.label(),
         Command::AreaMember { kind, .. } => kind.label(),
+        Command::AddLoad { .. } => "load",
+        Command::AddSupport { .. } => "support",
         Command::Undo => "undo",
         Command::Redo => "redo",
         Command::Amend { .. } => "amend",
@@ -7554,5 +7626,168 @@ mod tests {
             Command::FrameMember { id: Some(_), .. }
         ));
         assert!(has_id, "frame member id must be written back into the log");
+    }
+
+    // -----------------------------------------------------------------------
+    // Structural loads
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_point_parse_exec_undo_redo() {
+        let mut s = Session::default();
+        // Exec: load appended to doc.loads, no SceneObject created.
+        let out = run(&mut s, "load point dead 0,0,3 10000 0,0,-1");
+        assert!(out.created.is_empty(), "load creates no scene object");
+        assert_eq!(s.doc.loads.len(), 1);
+        assert_eq!(s.doc.loads[0].name, "dead");
+        assert_eq!(s.doc.loads[0].magnitude, 10_000.0);
+        // Direction should be normalised (-Z).
+        let d = s.doc.loads[0].direction;
+        assert!((d.length() - 1.0).abs() < 1e-9, "direction must be unit");
+        assert!((d.z + 1.0).abs() < 1e-9);
+        // Replay stability while the load exists.
+        assert_replay_stable(&s);
+
+        // Undo: load removed.
+        run(&mut s, "undo");
+        assert!(s.doc.loads.is_empty(), "undo should clear the load");
+
+        // Redo: load back.
+        run(&mut s, "redo");
+        assert_eq!(s.doc.loads.len(), 1, "redo should restore the load");
+    }
+
+    #[test]
+    fn load_line_parse_exec_undo() {
+        let mut s = Session::default();
+        run(&mut s, "load line live 0,0,3 6,0,3 5000 0,0,-1");
+        assert_eq!(s.doc.loads.len(), 1);
+        assert_eq!(s.doc.loads[0].name, "live");
+        use itsjustcad_doc::LoadGeometry;
+        assert!(matches!(&s.doc.loads[0].geometry, LoadGeometry::Line { .. }));
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.loads.is_empty());
+    }
+
+    #[test]
+    fn load_area_parse_exec_undo() {
+        let mut s = Session::default();
+        run(&mut s, "load area wind 0,0,0 6,0,0 6,4,0 0,4,0 end 2000 1,0,0");
+        assert_eq!(s.doc.loads.len(), 1);
+        assert_eq!(s.doc.loads[0].name, "wind");
+        use itsjustcad_doc::LoadGeometry;
+        assert!(matches!(&s.doc.loads[0].geometry, LoadGeometry::Area { boundary } if boundary.len() == 4));
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.loads.is_empty());
+    }
+
+    #[test]
+    fn load_index_written_back_for_replay() {
+        let mut s = Session::default();
+        run(&mut s, "load point dead 0,0,3 10000 0,0,-1");
+        let log = s.save_log();
+        let has_index = log.iter().any(|op| {
+            matches!(op, Command::AddLoad { index: Some(_), .. })
+        });
+        assert!(has_index, "AddLoad must carry index for replay stability");
+    }
+
+    #[test]
+    fn load_zero_direction_errors() {
+        let mut s = Session::default();
+        let err = s.run(parse("load point dead 0,0,3 10000 0,0,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("direction"), "{err}");
+    }
+
+    #[test]
+    fn old_file_without_loads_field_deserializes() {
+        use itsjustcad_doc::Document;
+        let mut v = serde_json::to_value(Document::default()).unwrap();
+        v.as_object_mut().unwrap().remove("loads");
+        v.as_object_mut().unwrap().remove("supports");
+        let doc: Document = serde_json::from_value(v).unwrap();
+        assert!(doc.loads.is_empty());
+        assert!(doc.supports.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Structural supports
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn support_pinned_parse_exec_undo_redo() {
+        let mut s = Session::default();
+        let out = run(&mut s, "support 0,0,0 pinned");
+        assert!(out.created.is_empty(), "support creates no scene object");
+        assert_eq!(s.doc.supports.len(), 1);
+        use itsjustcad_doc::RestraintKind;
+        assert_eq!(s.doc.supports[0].kind, RestraintKind::Pinned);
+        assert_eq!(s.doc.supports[0].position, glam::DVec3::ZERO);
+        assert_replay_stable(&s);
+
+        run(&mut s, "undo");
+        assert!(s.doc.supports.is_empty());
+
+        run(&mut s, "redo");
+        assert_eq!(s.doc.supports.len(), 1);
+    }
+
+    #[test]
+    fn support_fixed_parse_exec() {
+        let mut s = Session::default();
+        run(&mut s, "support 3,3,0 fixed");
+        use itsjustcad_doc::RestraintKind;
+        assert_eq!(s.doc.supports[0].kind, RestraintKind::Fixed);
+        assert_replay_stable(&s);
+    }
+
+    #[test]
+    fn support_roller_parse_exec_with_axis() {
+        let mut s = Session::default();
+        run(&mut s, "support 6,0,0 roller 1,0,0");
+        use itsjustcad_doc::RestraintKind;
+        let sup = &s.doc.supports[0];
+        assert_eq!(sup.kind, RestraintKind::Roller);
+        let ax = sup.roller_axis.expect("roller axis should be set");
+        assert!((ax.length() - 1.0).abs() < 1e-9, "axis should be unit");
+        assert!((ax.x - 1.0).abs() < 1e-9);
+        assert_replay_stable(&s);
+    }
+
+    #[test]
+    fn support_index_written_back_for_replay() {
+        let mut s = Session::default();
+        run(&mut s, "support 0,0,0 pinned");
+        let log = s.save_log();
+        let has_index = log.iter().any(|op| {
+            matches!(op, Command::AddSupport { index: Some(_), .. })
+        });
+        assert!(has_index, "AddSupport must carry index for replay stability");
+    }
+
+    #[test]
+    fn multiple_loads_and_supports_replay_stable() {
+        let mut s = Session::default();
+        // Build a simple frame.
+        run(&mut s, "section c rect 0.3 0.3");
+        run(&mut s, "column 0,0,0 0,0,3.5 c");
+        run(&mut s, "column 6,0,0 6,0,3.5 c");
+        run(&mut s, "beam 0,0,3.5 6,0,3.5 c");
+        // Add loads.
+        run(&mut s, "load point dead 0,0,3.5 10000 0,0,-1");
+        run(&mut s, "load line live 0,0,3.5 6,0,3.5 3000 0,0,-1");
+        // Add supports.
+        run(&mut s, "support 0,0,0 pinned");
+        run(&mut s, "support 6,0,0 roller 1,0,0");
+        assert_eq!(s.doc.loads.len(), 2);
+        assert_eq!(s.doc.supports.len(), 2);
+        // Full replay must reproduce the identical document.
+        assert_replay_stable(&s);
+        // File round-trip.
+        let json1 = crate::io::to_json(&s);
+        let json2 = crate::io::to_json(&crate::io::from_json(&json1).unwrap());
+        assert_eq!(json1, json2);
     }
 }

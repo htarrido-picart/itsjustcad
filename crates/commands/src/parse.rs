@@ -3,8 +3,8 @@
 
 use glam::DVec3;
 use itsjustcad_doc::{
-    AreaKind, FrameKind, HatchPattern, PaperSize, Section as StructSection, Units, ViewDirection,
-    METERS_PER_FOOT, METERS_PER_INCH,
+    AreaKind, FrameKind, HatchPattern, LoadGeometry, PaperSize, RestraintKind,
+    Section as StructSection, Units, ViewDirection, METERS_PER_FOOT, METERS_PER_INCH,
 };
 
 use crate::error::ParseError;
@@ -964,6 +964,8 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "column" => parse_frame(FrameKind::Column, &args),
         "slab" => parse_area(AreaKind::Slab, &args),
         "wall" => parse_area(AreaKind::Wall, &args),
+        "load" => parse_load(&args),
+        "support" => parse_support(&args),
         "undo" => Ok(Command::Undo),
         "redo" => Ok(Command::Redo),
         "amend" => match &args[..] {
@@ -1433,6 +1435,152 @@ fn parse_hhmm(s: &str) -> Result<(u32, u32), ParseError> {
             Ok((hour, minute))
         }
         _ => Err(bad()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// load <kind> <target/point> <magnitude> <direction>
+//
+// Syntax:
+//   load point <x,y,z> <magnitude> <dx,dy,dz>
+//   load line  <ax,ay,az> <bx,by,bz> <magnitude> <dx,dy,dz>
+//   load area  <p1> <p2> <p3> ... end <magnitude> <dx,dy,dz>
+//
+// The name defaults to "load" when not provided (may be overridden by a name
+// qualifier later).  For now we use the kind as the name.
+// ---------------------------------------------------------------------------
+fn parse_load(args: &[&str]) -> Result<Command, ParseError> {
+    match args.split_first() {
+        Some((&"point", rest)) => match rest {
+            [pos, mag, dir] => Ok(Command::AddLoad {
+                name: "load".into(),
+                geometry: LoadGeometry::Point { position: point(pos)? },
+                magnitude: number(mag)?,
+                direction: point(dir)?,
+                index: None,
+            }),
+            [name, pos, mag, dir] => Ok(Command::AddLoad {
+                name: name.to_string(),
+                geometry: LoadGeometry::Point { position: point(pos)? },
+                magnitude: number(mag)?,
+                direction: point(dir)?,
+                index: None,
+            }),
+            _ => wrong(
+                "load",
+                "load point [name] <x,y,z> <magnitude> <dx,dy,dz>",
+                args,
+            ),
+        },
+        Some((&"line", rest)) => match rest {
+            [a, b, mag, dir] => Ok(Command::AddLoad {
+                name: "load".into(),
+                geometry: LoadGeometry::Line { a: point(a)?, b: point(b)? },
+                magnitude: number(mag)?,
+                direction: point(dir)?,
+                index: None,
+            }),
+            [name, a, b, mag, dir] => Ok(Command::AddLoad {
+                name: name.to_string(),
+                geometry: LoadGeometry::Line { a: point(a)?, b: point(b)? },
+                magnitude: number(mag)?,
+                direction: point(dir)?,
+                index: None,
+            }),
+            _ => wrong(
+                "load",
+                "load line [name] <ax,ay,az> <bx,by,bz> <magnitude> <dx,dy,dz>",
+                args,
+            ),
+        },
+        Some((&"area", rest)) => {
+            // area [name] <p1> <p2> ... end <magnitude> <dx,dy,dz>
+            // tokens until "end" are boundary points; name is detected by
+            // checking whether the first token looks like a coordinate (contains ',')
+            // or not (a bare word = name).
+            let (name, pts_and_rest) = if rest.first().is_some_and(|t| !t.contains(',')) {
+                (rest[0].to_string(), &rest[1..])
+            } else {
+                ("load".into(), rest)
+            };
+            // split on "end"
+            let end_pos = pts_and_rest
+                .iter()
+                .position(|&t| t.eq_ignore_ascii_case("end"))
+                .ok_or_else(|| {
+                    wrong_err("load", "load area <p1> <p2> ... end <magnitude> <dir>", args)
+                })?;
+            let (boundary_tokens, after_end) = pts_and_rest.split_at(end_pos);
+            let after_end = &after_end[1..]; // skip "end"
+            if boundary_tokens.len() < 3 {
+                return wrong(
+                    "load",
+                    "load area needs at least 3 boundary points before 'end'",
+                    args,
+                );
+            }
+            let boundary: Result<Vec<_>, _> = boundary_tokens.iter().map(|t| point(t)).collect();
+            match after_end {
+                [mag, dir] => Ok(Command::AddLoad {
+                    name,
+                    geometry: LoadGeometry::Area { boundary: boundary? },
+                    magnitude: number(mag)?,
+                    direction: point(dir)?,
+                    index: None,
+                }),
+                _ => wrong("load", "load area ... end <magnitude> <dx,dy,dz>", args),
+            }
+        }
+        _ => wrong(
+            "load",
+            "load <point|line|area> [name] <target> <magnitude> <direction>",
+            args,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// support <x,y,z> <pinned|fixed|roller> [axis dx,dy,dz]
+// ---------------------------------------------------------------------------
+fn parse_support(args: &[&str]) -> Result<Command, ParseError> {
+    match args {
+        [pos, kind] => {
+            let k = restraint_kind(kind)?;
+            if k == RestraintKind::Roller {
+                return wrong("support", "roller supports require an axis: support <pos> roller <dx,dy,dz>", args);
+            }
+            Ok(Command::AddSupport {
+                position: point(pos)?,
+                kind: k,
+                roller_axis: None,
+                index: None,
+            })
+        }
+        [pos, kind, axis] => {
+            let k = restraint_kind(kind)?;
+            let ax = if k == RestraintKind::Roller { Some(point(axis)?) } else { None };
+            Ok(Command::AddSupport {
+                position: point(pos)?,
+                kind: k,
+                roller_axis: ax,
+                index: None,
+            })
+        }
+        _ => wrong("support", "support <x,y,z> <pinned|fixed|roller> [axis dx,dy,dz]", args),
+    }
+}
+
+fn restraint_kind(s: &str) -> Result<RestraintKind, ParseError> {
+    match s.to_lowercase().as_str() {
+        "pinned" | "pin" => Ok(RestraintKind::Pinned),
+        "fixed" | "fix" => Ok(RestraintKind::Fixed),
+        "roller" | "roll" => Ok(RestraintKind::Roller),
+        _ => Err(ParseError::WrongArgs {
+            command: "support",
+            expected: "pinned, fixed or roller",
+            got: s.to_string(),
+            usage: "support <x,y,z> <pinned|fixed|roller> [axis dx,dy,dz]",
+        }),
     }
 }
 

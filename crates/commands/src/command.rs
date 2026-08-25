@@ -3,8 +3,8 @@
 
 use glam::DVec3;
 use itsjustcad_doc::{
-    AreaKind, FrameKind, HatchPattern, NamedView, ObjectId, PaperSize, Section as StructSection,
-    Units, ViewDirection,
+    AreaKind, FrameKind, HatchPattern, NamedView, ObjectId, PaperSize,
+    RestraintKind, Section as StructSection, Units, ViewDirection,
 };
 use serde::{Deserialize, Serialize};
 
@@ -751,6 +751,40 @@ pub enum Command {
         thickness: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         material: Option<String>,
+    },
+    // -- structural loads & supports (data + light viz; no analysis) --
+    /// Add a structural load to the document. Three geometry kinds: `point`
+    /// (concentrated force at a node), `line` (distributed along a member),
+    /// `area` (pressure on a surface). Magnitude is in SI units (N / N/m / Pa).
+    /// Direction is a normalised world-space vector. Not a SceneObject — the
+    /// load is stored in `doc.loads` and drawn as a 2D overlay arrow.
+    AddLoad {
+        /// Human label (e.g. "dead", "live-floor").
+        name: String,
+        /// Load geometry kind and location.
+        geometry: itsjustcad_doc::LoadGeometry,
+        /// Magnitude in N (point), N/m (line) or Pa (area).
+        magnitude: f64,
+        /// World-space force direction (stored normalised).
+        direction: DVec3,
+        /// Index into `doc.loads` filled on first exec; used for replay
+        /// stability so undo removes the exact same entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+    },
+    /// Add a support / boundary condition to the document. Stored in
+    /// `doc.supports` and drawn as a 2D overlay symbol. Not a SceneObject.
+    AddSupport {
+        /// World-space position.
+        position: DVec3,
+        /// Restraint type.
+        kind: RestraintKind,
+        /// Free-translation axis for roller supports (ignored otherwise).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        roller_axis: Option<DVec3>,
+        /// Index into `doc.supports` filled on first exec; replay stability.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
     },
     Undo,
     Redo,
