@@ -867,11 +867,12 @@ impl Session {
             "epw" => self.import_epw(path),
             "geojson" | "json" => self.import_geojson(path),
             "las" => self.import_las(path),
+            "e57" => self.import_e57(path),
             "laz" => Err(ExecError::Invalid(
                 "LAZ is compressed; decompress to .las first (e.g. laszip)".to_string(),
             )),
             other => Err(ExecError::Invalid(format!(
-                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .dae, .3dm, .ifc, .epw, .geojson, .las)"
+                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .dae, .3dm, .ifc, .epw, .geojson, .las, .e57)"
             ))),
         }
     }
@@ -1215,6 +1216,44 @@ impl Session {
             created: out.created,
             message: format!(
                 "imported {kept} points from {path} (total {total}, stride {stride})"
+            ),
+        })
+    }
+
+    /// Import an E57 point-cloud file (ASTM E2807). Reads all point-cloud
+    /// sections, extracts Cartesian positions + optional colors, decimates to
+    /// ≤200k, and stores on layer "pointcloud" as a single `PointLiteral` op.
+    fn import_e57(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let pts = crate::e57::parse(&bytes)
+            .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+
+        let kept = pts.positions.len();
+        let total = pts.total_records;
+        let stride = pts.stride;
+        let skipped = pts.skipped_sections;
+
+        if self.doc.current_layer != "pointcloud" {
+            self.run(Command::Layer { name: "pointcloud".to_string() })?;
+        }
+        let out = self.run(Command::PointLiteral { id: None, positions: pts.positions })?;
+
+        let color_note = if pts.colors.is_empty() {
+            String::new()
+        } else {
+            format!(", {} colors", pts.colors.len())
+        };
+        let skip_note = if skipped > 0 {
+            format!(", {skipped} section(s) skipped (no Cartesian coords)")
+        } else {
+            String::new()
+        };
+
+        Ok(ApplyOutcome {
+            created: out.created,
+            message: format!(
+                "imported {kept} points from {path} (total {total}, stride {stride}{color_note}{skip_note})"
             ),
         })
     }

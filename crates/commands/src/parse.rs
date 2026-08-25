@@ -749,7 +749,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             Ok(Command::ControlImages { prefix: prefix.to_string() })
         }
         "import" => {
-            let [path] = take::<1>("import", "an input path (.dxf/.obj/.stl/.gltf/.glb/.dae/.geojson/.las)", &args)?;
+            let [path] = take::<1>("import", "an input path (.dxf/.obj/.stl/.gltf/.glb/.dae/.geojson/.las/.e57)", &args)?;
             Ok(Command::Import { path: path.to_string() })
         }
         "terrain" => {

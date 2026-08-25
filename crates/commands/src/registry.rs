@@ -511,8 +511,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "import",
-            usage: "import <path.{dxf|obj|stl|gltf|glb|dae|3dm|ifc|epw|geojson|las}>",
-            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, Rhino .3dm (openNURBS: meshes → MeshLiteral, lines/polylines/NURBS curves → Polyline, on their Rhino layer; breps/surfaces skipped), IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0.5m marker circle; properties.name → object name; lon/lat projected to local meters when a location is set, else treated as local xy), or LAS 1.2–1.4 point cloud (formats 0–3; decimated to ≤200k points; stored on layer 'pointcloud'; LAZ not supported). Example: import /tmp/site.las",
+            usage: "import <path.{dxf|obj|stl|gltf|glb|dae|3dm|ifc|epw|geojson|las|e57}>",
+            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, Rhino .3dm (openNURBS: meshes → MeshLiteral, lines/polylines/NURBS curves → Polyline, on their Rhino layer; breps/surfaces skipped), IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0.5m marker circle; properties.name → object name; lon/lat projected to local meters when a location is set, else treated as local xy), LAS 1.2–1.4 point cloud (formats 0–3; decimated to ≤200k points; stored on layer 'pointcloud'; LAZ not supported), or E57 point cloud (ASTM E2807; Cartesian + optional RGB/intensity; all sections merged; decimated to ≤200k; stored on layer 'pointcloud'). Example: import /tmp/site.las · import /tmp/scan.e57",
             category: Category::File,
         },
         CommandSpec {

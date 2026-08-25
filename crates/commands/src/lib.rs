@@ -9,6 +9,7 @@ pub mod blocklib;
 mod command;
 pub mod csv;
 pub mod dxf;
+pub mod e57;
 mod error;
 mod exec;
 pub mod gbnf;
