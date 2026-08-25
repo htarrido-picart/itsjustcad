@@ -928,6 +928,13 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let (year, month, day) = parse_date(date)?;
             Ok(Command::SunHours { ids: None, year, month, day, spacing })
         }
+        // facesunhours <selector> <YYYY-MM-DD>
+        "facesunhours" => {
+            let (targets, rest) = selector(&args, "facesunhours")?;
+            let [date] = take::<1>("facesunhours", "a YYYY-MM-DD date after the selector", rest)?;
+            let (year, month, day) = parse_date(date)?;
+            Ok(Command::FaceSunHours { targets, ids: None, year, month, day })
+        }
         // -- blocks --
         // block <selector> <name>
         "block" => {

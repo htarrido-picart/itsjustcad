@@ -480,6 +480,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "facesunhours",
+            usage: "facesunhours <selector> <YYYY-MM-DD>",
+            summary: "Per-face insolation: for the selected mesh, ray-cast each triangle toward the sun every 30 min of the date (occlusion-tested against the scene) and color an overlay copy on 'analysis' (blue = few hours, red = most). Reports min/avg/max sun-hours. Needs a location. Example: facesunhours last 2024-06-21",
+            category: Category::Analyze,
+        },
+        CommandSpec {
             name: "sheet",
             usage: "sheet <name> [a4|a3|a2|a1|a0]",
             summary: "Create a named paper sheet, landscape (default a3). Example: sheet plan a1",

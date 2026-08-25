@@ -550,6 +550,23 @@ pub enum Command {
         /// Grid spacing in meters (> 0).
         spacing: f64,
     },
+    /// Per-face insolation: for a selected mesh, ray-cast each triangle centroid
+    /// toward the sun every 30 min of the day (occlusion-tested against the whole
+    /// scene) and count the daylight hours of direct sun each face receives.
+    /// Emits a colored overlay copy of the selected faces on the `analysis` layer
+    /// (blue = few hours → red = most) and reports min/avg/max hours. Requires a
+    /// document location (set via `sun`/`location`/EPW import).
+    FaceSunHours {
+        /// Objects whose faces are analysed.
+        targets: Selector,
+        /// Ids of the created overlay meshes, filled in on first exec and reused
+        /// on replay for op-log stability.
+        #[serde(default)]
+        ids: Option<Vec<ObjectId>>,
+        year: i32,
+        month: u32,
+        day: u32,
+    },
     // -- underlay (raster reference image on the ground plane) --
     /// Place a raster image (PNG) on the ground plane. `height` is `None` when
     /// typed/emitted; exec fills it from the image's aspect ratio (width /

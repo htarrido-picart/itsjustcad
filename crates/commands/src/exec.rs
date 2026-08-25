@@ -2148,6 +2148,179 @@ fn exec_sun_hours(
     ))
 }
 
+/// Per-face insolation (sun-hours). For each triangle of the selected mesh(es),
+/// ray-cast from the triangle centroid toward the sun every 30 min of the date
+/// and count the daylight half-hours with no scene triangle occluding the ray.
+/// The result is one small colored overlay triangle per face on the `analysis`
+/// layer (blue = few hours → red = most), plus a min/avg/max report. Mirrors
+/// `sunhours` (ground grid) but samples the actual faces instead of a plane, so
+/// tilted/vertical surfaces get an honest count and self-shadowing is handled by
+/// testing against the whole scene (including the surface's own object).
+fn exec_face_sun_hours(
+    doc: &mut Document,
+    targets: Selector,
+    ids: Option<Vec<ObjectId>>,
+    year: i32,
+    month: u32,
+    day: u32,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let loc = doc.location.ok_or_else(|| {
+        ExecError::Invalid(
+            "no location set — run `sun <lat> <lon> <date> <time>` or `location <lat> <lon>`, \
+             or `import <file.epw>` first"
+                .into(),
+        )
+    })?;
+    let target_ids = resolve(doc, &targets)?;
+
+    // World-space triangles of the *selected* faces only (what we score + color).
+    let mut faces: Vec<[DVec3; 3]> = Vec::new();
+    for id in &target_ids {
+        if let Some(obj) = doc.get(*id)
+            && let Geometry::Mesh(m) = &obj.geometry
+        {
+            let pos = m.positions();
+            for f in m.faces() {
+                faces.push([pos[f[0] as usize], pos[f[1] as usize], pos[f[2] as usize]]);
+            }
+        }
+    }
+    if faces.is_empty() {
+        return Err(ExecError::Invalid(
+            "facesunhours needs a selected mesh (extrude or box first, then select)".into(),
+        ));
+    }
+
+    // Occlusion is tested against the whole scene (so neighbouring massing and
+    // the surface's own object can shade it).
+    let tri_bvh = kernel_mesh::TriBvh::build(
+        scene_triangles(doc)
+            .into_iter()
+            .map(|t| {
+                [
+                    DVec3::from_array(t[0]),
+                    DVec3::from_array(t[1]),
+                    DVec3::from_array(t[2]),
+                ]
+            })
+            .collect(),
+    );
+
+    // Sun directions (up only) every 30 min of the date.
+    let mut sun_dirs: Vec<DVec3> = Vec::new();
+    for slot in 0..48 {
+        let local_min = slot * 30;
+        let utc = (local_min as f64 - loc.tz_hours * 60.0).rem_euclid(1440.0);
+        let pos = itsjustcad_solar::solar_position(
+            year,
+            month,
+            day,
+            (utc / 60.0) as u32,
+            (utc % 60.0) as u32,
+            loc.lat_deg,
+            loc.lon_deg,
+        );
+        if pos.altitude_deg > 0.0 {
+            let d = itsjustcad_solar::sun_direction(pos.azimuth_deg, pos.altitude_deg);
+            sun_dirs.push(DVec3::new(d[0] as f64, d[1] as f64, d[2] as f64));
+        }
+    }
+    if sun_dirs.is_empty() {
+        return Err(ExecError::Invalid(
+            "sun never rises on this date at this location — nothing to sample".into(),
+        ));
+    }
+
+    // Score each face: hours of unoccluded sun. A ray is only counted when the
+    // sun is on the lit side of the face (dot(normal, sun) > 0); a downward- or
+    // away-facing surface can't see that sun position at all.
+    let mut hours: Vec<f64> = Vec::with_capacity(faces.len());
+    let mut max_h = 0.0f64;
+    for tri in &faces {
+        let centroid = (tri[0] + tri[1] + tri[2]) / 3.0;
+        let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
+        let nlen = normal.length();
+        if nlen > 1e-12 {
+            normal /= nlen;
+        }
+        // Lift the origin off the surface along the normal so the face's own
+        // triangle doesn't self-occlude the ray.
+        let origin = centroid + normal * 1e-3;
+        let mut lit = 0usize;
+        for &dir in &sun_dirs {
+            if normal.dot(dir) <= 0.0 {
+                continue; // sun behind the face
+            }
+            if !tri_bvh.ray_occluded(origin, dir) {
+                lit += 1;
+            }
+        }
+        let h = lit as f64 * 0.5;
+        max_h = max_h.max(h);
+        hours.push(h);
+    }
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == faces.len() => ids,
+        _ => (0..faces.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    let mut layers_created = Vec::new();
+    if !doc.layers.contains_key(ANALYSIS_LAYER) {
+        doc.layers
+            .insert(ANALYSIS_LAYER.to_string(), LayerStyle::default());
+        layers_created.push(ANALYSIS_LAYER.to_string());
+    }
+
+    for ((tri, &h), id) in faces.iter().zip(&hours).zip(&new_ids) {
+        let frac = if max_h > 0.0 { h / max_h } else { 0.0 };
+        let color = [frac as f32, 0.15, (1.0 - frac) as f32];
+        // Overlay copy of the face, nudged toward the sky along its normal so it
+        // renders just above the source surface instead of z-fighting with it.
+        let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
+        let nlen = normal.length();
+        if nlen > 1e-12 {
+            normal /= nlen;
+        }
+        let lift = normal * 5e-3;
+        let mesh = kernel_mesh::Mesh::new(
+            vec![tri[0] + lift, tri[1] + lift, tri[2] + lift],
+            vec![[0, 1, 2]],
+        );
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: None,
+            layer: ANALYSIS_LAYER.to_string(),
+            color: Some(color),
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Mesh(mesh),
+        });
+    }
+    doc.generation += 1;
+
+    let n = hours.len() as f64;
+    let sum: f64 = hours.iter().sum();
+    let avg = sum / n;
+    let min_h = hours.iter().cloned().fold(f64::INFINITY, f64::min);
+    let daylight = itsjustcad_solar::daylight_hours(year, month, day, loc.lat_deg);
+
+    Ok((
+        Command::FaceSunHours { targets, ids: Some(new_ids.clone()), year, month, day },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome {
+            message: format!(
+                "facesunhours {year}-{month:02}-{day:02}: {} face(s), sun-hours \
+                 min {min_h:.1} / avg {avg:.1} / max {max_h:.1} \
+                 (astronomical daylight {daylight:.1} h) on '{ANALYSIS_LAYER}'",
+                new_ids.len()
+            ),
+            created: new_ids,
+        },
+    ))
+}
+
 /// Vertical projection plane for a compass elevation: the outward-facing
 /// normal (toward the viewer) and a point on the geometry's bounding face on
 /// that side, pushed out by `depth`. `north` = the face you see standing to the
@@ -4210,6 +4383,9 @@ fn apply_forward(
         Command::SunHours { ids, year, month, day, spacing } => {
             exec_sun_hours(doc, ids, year, month, day, spacing)
         }
+        Command::FaceSunHours { targets, ids, year, month, day } => {
+            exec_face_sun_hours(doc, targets, ids, year, month, day)
+        }
         Command::SunOff => {
             let prev = doc.sun.take();
             doc.generation += 1;
@@ -5364,6 +5540,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Location { .. } => "location",
         Command::ShadowStudy { .. } => "shadowstudy",
         Command::SunHours { .. } => "sunhours",
+        Command::FaceSunHours { .. } => "facesunhours",
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
         Command::Print { .. } => "print",
@@ -7853,6 +8030,112 @@ mod tests {
             nearest_red < max_red,
             "shaded cell red {nearest_red} should be < sunniest cell red {max_red}"
         );
+    }
+
+    #[test]
+    fn facesunhours_parse_round_trip() {
+        let c = parse("facesunhours last 2024-06-21").unwrap();
+        match &c {
+            Command::FaceSunHours { targets, ids, year, month, day } => {
+                assert!(matches!(targets, Selector::Last { n: 1 }));
+                assert!(ids.is_none());
+                assert_eq!((*year, *month, *day), (2024, 6, 21));
+            }
+            other => panic!("expected FaceSunHours, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn facesunhours_open_face_approaches_daylight_hours() {
+        // A wide, flat, sky-facing slab with nothing above it should receive
+        // close to the full astronomical daylight hours for the date/latitude.
+        let mut s = Session::default();
+        // 40x40 m slab, 0.2 m thick — its top faces point straight up.
+        run(&mut s, "box -20,-20,0 40,40,0.2");
+        run(&mut s, "location 40.0 0.0 0");
+        let out = run(&mut s, "facesunhours last 2024-06-21");
+        assert!(!out.created.is_empty(), "faces created: {}", out.message);
+
+        let daylight = itsjustcad_solar::daylight_hours(2024, 6, 21, 40.0);
+        // Top faces (color red ≈ max) should reach ~ the astronomical daylight
+        // hours. We recover the max sun-hours from the message and compare.
+        // The overlay encodes hours only relatively, so assert on the reported
+        // max in the message (avg is dragged down by the shaded underside/sides).
+        assert!(
+            out.message.contains(&format!("astronomical daylight {daylight:.1} h")),
+            "message: {}", out.message
+        );
+        // Parse "max <n>" from the message and compare to daylight.
+        let max_tok = out
+            .message
+            .split("max ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<f64>().ok())
+            .expect("max hours in message");
+        assert!(
+            (max_tok - daylight).abs() <= 0.75,
+            "sky-facing max sun-hours {max_tok} should be ~ daylight {daylight} h"
+        );
+    }
+
+    #[test]
+    fn facesunhours_occluded_face_gets_less_sun() {
+        let parse_max = |m: &str| -> f64 {
+            m.split("max ")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap()
+        };
+
+        // Open case: a sky-facing slab with clear sky.
+        let mut open = Session::default();
+        run(&mut open, "box -5,-5,0 10,10,0.2");
+        run(&mut open, "location 40.0 0.0 0");
+        let open_max = parse_max(&run(&mut open, "facesunhours last 2024-06-21").message);
+
+        // Occluded case: a big canopy 5 m above the *same* slab. Build the
+        // canopy FIRST, then the slab, so `last` selects the slab we measure.
+        let mut occ = Session::default();
+        run(&mut occ, "box -8,-8,5 16,16,0.2"); // canopy overhead
+        run(&mut occ, "box -5,-5,0 10,10,0.2"); // slab (last → measured)
+        run(&mut occ, "location 40.0 0.0 0");
+        let occ_max = parse_max(&run(&mut occ, "facesunhours last 2024-06-21").message);
+
+        assert!(
+            occ_max < open_max,
+            "occluded max {occ_max} should be < open max {open_max}"
+        );
+    }
+
+    #[test]
+    fn facesunhours_exec_undo_and_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "location 40.71 0.0 0");
+        let before = s.doc.len();
+        let out = run(&mut s, "facesunhours last 2024-06-21");
+        assert!(!out.created.is_empty());
+        for id in &out.created {
+            let obj = s.doc.get(*id).unwrap();
+            assert_eq!(obj.layer, "analysis");
+            assert!(matches!(obj.geometry, Geometry::Mesh(_)));
+        }
+        // Undo removes every overlay face and the analysis layer.
+        s.run(crate::Command::Undo).unwrap();
+        assert_eq!(s.doc.len(), before, "overlays removed on undo");
+
+        // Replay stability: to_json -> from_json -> to_json byte-identical.
+        run(&mut s, "facesunhours last 2024-06-21");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "facesunhours log must be replay-stable"
+        );
+        assert_eq!(s.doc.len(), replayed.doc.len());
     }
 
     #[test]

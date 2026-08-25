@@ -175,6 +175,75 @@ pub fn sun_direction(az_deg: f64, alt_deg: f64) -> [f32; 3] {
     [x as f32, y as f32, z as f32]
 }
 
+/// Astronomical daylight hours for a date/latitude — the length of time the
+/// centre of the sun is above the true horizon (altitude > 0), ignoring
+/// atmospheric refraction and local terrain. This is the theoretical maximum an
+/// unobstructed, sky-facing point can receive, and is the reference an
+/// occlusion-free insolation sample should approach.
+///
+/// Uses the standard sunrise hour-angle equation
+/// `cos(H0) = -tan(lat)·tan(decl)` with the sun's declination taken from the
+/// SPA solar-noon position (accurate to well within a minute for our purposes).
+/// Handles polar day (returns 24 h) and polar night (returns 0 h).
+pub fn daylight_hours(year: i32, month: u32, day: u32, lat_deg: f64) -> f64 {
+    // Declination at solar noon UTC on this date is a good representative value
+    // for the whole (short) day. Recover it from the noon altitude/azimuth by
+    // re-deriving: altitude at the meridian gives decl for a known latitude.
+    // Simpler: sample the SPA at a longitude/time whose hour angle is ~0.
+    // We approximate decl via the altitude at local solar noon where
+    // altitude = 90 - |lat - decl|, so decl = lat - (90 - alt) with the sun to
+    // the south, or lat + (90 - alt) to the north. To avoid the branch we take
+    // decl directly from a small dedicated computation below.
+    let decl = sun_declination(year, month, day);
+    let lat = lat_deg.to_radians();
+    let d = decl.to_radians();
+    let cos_h0 = -lat.tan() * d.tan();
+    if cos_h0 <= -1.0 {
+        24.0 // sun never sets (polar day)
+    } else if cos_h0 >= 1.0 {
+        0.0 // sun never rises (polar night)
+    } else {
+        // H0 in radians; total daylight spans 2·H0. Convert to hours:
+        // the sun sweeps 15°/h, so hours = 2·H0(deg)/15 = 2·H0(rad)·(12/π).
+        let h0 = cos_h0.acos(); // radians, [0, π]
+        2.0 * h0 * (12.0 / std::f64::consts::PI)
+    }
+}
+
+/// Sun declination (degrees) at ~solar-noon UTC on a date. Extracted from the
+/// same series `solar_position` uses so the two stay consistent.
+fn sun_declination(year: i32, month: u32, day: u32) -> f64 {
+    let (y, m) = if month <= 2 {
+        (year as f64 - 1.0, month as f64 + 12.0)
+    } else {
+        (year as f64, month as f64)
+    };
+    let a = (y / 100.0).floor();
+    let b = 2.0 - a + (a / 4.0).floor();
+    let day_frac = day as f64 + 0.5; // noon UTC
+    let jd = (365.25 * (y + 4716.0)).floor()
+        + (30.6001 * (m + 1.0)).floor()
+        + day_frac
+        + b
+        - 1524.5;
+    let t = (jd - 2_451_545.0) / 36_525.0;
+    let m_sun = (357.52911 + t * (35_999.050_29 - t * 0.0001537)).rem_euclid(360.0);
+    let m_rad = m_sun.to_radians();
+    let c = (1.914602 - t * (0.004817 + 0.000014 * t)) * m_rad.sin()
+        + (0.019993 - 0.000101 * t) * (2.0 * m_rad).sin()
+        + 0.000289 * (3.0 * m_rad).sin();
+    let l0 = (280.46646 + t * (36_000.769_83 + t * 0.0003032)).rem_euclid(360.0);
+    let sun_lon = l0 + c;
+    let omega = 125.04 - 1934.136 * t;
+    let sun_app_lon = sun_lon - 0.00569 - 0.00478 * omega.to_radians().sin();
+    let mean_obliq = 23.0
+        + (26.0 + (21.448 - t * (46.8150 + t * (0.00059 - t * 0.001813))) / 60.0) / 60.0;
+    let obliq_corr = mean_obliq + 0.00256 * omega.to_radians().cos();
+    let sun_app_rad = sun_app_lon.to_radians();
+    let obliq_rad = obliq_corr.to_radians();
+    f64::asin(obliq_rad.sin() * sun_app_rad.sin()).to_degrees()
+}
+
 // ---------------------------------------------------------------------------
 // Environmental analysis geometry: shadow projection + ray-casting.
 // Pure f64 math, no GPU/doc dependencies, so it lives here beside the SPA and
@@ -600,5 +669,47 @@ DATA PERIODS,1,1,Data,Sunday,1/1,12/31
     #[test]
     fn epw_missing_location_errors() {
         assert!(parse_epw("1999,1,1,1,60,A7,10.0\n").is_err());
+    }
+
+    // --- daylight_hours (astronomical daylight duration) ---
+
+    #[test]
+    fn daylight_equinox_is_about_twelve_hours_everywhere() {
+        // At an equinox the sun is ~on the celestial equator, so every latitude
+        // gets ≈12 h of daylight (geometric-centre definition, no refraction).
+        for lat in [-45.0, -10.0, 0.0, 23.5, 51.5, 60.0] {
+            let h = daylight_hours(2024, 3, 20, lat);
+            assert!(
+                (h - 12.0).abs() < 0.25,
+                "equinox at lat {lat}: {h:.3} h, expected ~12"
+            );
+        }
+    }
+
+    #[test]
+    fn daylight_summer_longer_than_winter_in_north() {
+        // London (51.5°N): long summer day, short winter day, summing to ~24 h
+        // across the solstices (the pair is symmetric about the equinox).
+        let summer = daylight_hours(2024, 6, 21, 51.5);
+        let winter = daylight_hours(2024, 12, 21, 51.5);
+        assert!(summer > 16.0 && summer < 17.0, "London summer {summer:.2} h");
+        assert!(winter > 7.0 && winter < 8.5, "London winter {winter:.2} h");
+        assert!(summer > winter);
+        // Symmetry: summer + winter ≈ 24 h.
+        assert!((summer + winter - 24.0).abs() < 0.6, "sum {:.2}", summer + winter);
+    }
+
+    #[test]
+    fn daylight_polar_day_and_night() {
+        // Above the Arctic Circle (78°N): 24 h sun in June, 0 h in December.
+        assert_eq!(daylight_hours(2024, 6, 21, 78.0), 24.0);
+        assert_eq!(daylight_hours(2024, 12, 21, 78.0), 0.0);
+    }
+
+    #[test]
+    fn daylight_matches_ny_solstice() {
+        // New York 40.71°N on the summer solstice: ~15 h of daylight.
+        let h = daylight_hours(2024, 6, 21, 40.71);
+        assert!(h > 14.8 && h < 15.3, "NY solstice daylight {h:.3} h");
     }
 }
