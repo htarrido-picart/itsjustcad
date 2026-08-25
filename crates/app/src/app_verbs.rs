@@ -271,6 +271,51 @@ mod tests {
     }
 
     #[test]
+    fn view_verb_help_stays_consistent_with_classify() {
+        let h = itsjustcad_deck::VIEW_VERB_HELP;
+        // Every verb advertised must actually classify as an app verb, so the
+        // model is never told about syntax the dispatcher rejects.
+        for line in [
+            "ze",
+            "zoomextents",
+            "top",
+            "front",
+            "persp",
+            "display pencil",
+            "display shaded",
+            "display xray",
+            "display ghosted",
+            "sketchup",
+            "su",
+            "light sun",
+            "lightmode working",
+            "sketchy on",
+            "edgefx jitter=.05",
+            "profiles on",
+            "profileedges off",
+            "camera 2point",
+            "camera persp",
+            "camera pano",
+            "camera fisheye 120",
+            "camera 35mm",
+            "camera phone iphone-ultrawide",
+            "basemap sat 800 0.6",
+            "basemap off",
+        ] {
+            assert!(classify(line).is_some(), "help advertises '{line}' but classify rejects it");
+        }
+        // Key syntax substrings the deck prompt relies on.
+        assert!(h.contains("display shaded|wireframe|xray|ghosted|pencil"));
+        assert!(h.contains("light working|sun|presentation"));
+        assert!(h.contains("sketchy on|off"));
+        assert!(h.contains("camera fisheye [fov]"));
+        assert!(h.contains("camera phone <lens>"));
+        assert!(h.contains("iphone-ultrawide"));
+        assert!(h.contains("galaxy-tele"));
+        assert!(h.contains("zoom to fit"));
+    }
+
+    #[test]
     fn substrate_verbs_fall_through() {
         assert_eq!(classify("box 0,0,0 1,1,1"), None);
         assert_eq!(classify("layer walls"), None);

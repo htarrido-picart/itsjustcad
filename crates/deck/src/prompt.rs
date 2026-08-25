@@ -3,6 +3,55 @@
 
 use itsjustcad_commands::{registry, PluginRegistry, SELECTOR_HELP};
 
+/// The "View & camera commands" section of the deck system prompt.
+///
+/// These are *app verbs*, not substrate [`registry`] commands: they change what
+/// the viewport shows (framing, display mode, lighting, NPR styling, camera
+/// projection/lens, site basemap) without mutating the drawing or the op-log,
+/// so they have no `itsjustcad_commands::Command` and cannot flow through the
+/// registry-driven command list. We advertise them here as a dedicated section
+/// so the model knows they exist with correct syntax and one example each. The
+/// app dispatches them via `itsjustcad::app_verbs::classify`; a test there
+/// asserts every line advertised here actually classifies, so the prompt can
+/// never promise syntax the dispatcher rejects.
+pub const VIEW_VERB_HELP: &str = "\
+## View & camera commands (app verbs — same ```draft block; change what's shown, not the model)
+These NEVER modify the drawing or the op-log; they frame/style the active viewport exactly like the human's command line. Emit them inside the ```draft block just like drawing commands. Use them when the user asks to reframe, orbit to a view, zoom, change lens/projection, or restyle the viewport — never to draw geometry.
+
+Framing & standard views:
+  ze                                           zoom to fit all geometry (alias: zoomextents)             e.g. ze
+  top|bottom|front|back|left|right|persp        set a standard view direction                            e.g. top
+  view <name>                                   same, by name (perspective = persp)                      e.g. view front
+
+Display mode (how solids are drawn):
+  display shaded|wireframe|xray|ghosted|pencil  viewport display mode                                    e.g. display pencil
+  sketchup                                      SketchUp look preset (working light + profile edges +    e.g. sketchup
+                                                gradient background; alias: su)
+
+Lighting:
+  light working|sun|presentation                lighting model (alias: lightmode)                        e.g. light sun
+
+Non-photoreal (NPR) styling:
+  sketchy on|off                                hand-drawn 'sketchy edges' character                     e.g. sketchy on
+  edgefx jitter=.. extension=.. depthcue=..     tune the sketchy edge effect (key=value tokens)          e.g. edgefx jitter=.05 extension=.1
+        endpoints=.. passes=..
+  profiles on|off                               thick SketchUp-style profile edges (alias: profileedges) e.g. profiles on
+
+Camera projection & lens:
+  camera 2point                                 two-point perspective (verticals stay vertical)          e.g. camera 2point
+  camera persp                                  ordinary perspective                                     e.g. camera persp
+  camera pano                                   360° equirectangular panorama                            e.g. camera pano
+  camera fisheye [fov]                          fisheye projection, optional field of view in degrees    e.g. camera fisheye 120
+  camera <n>mm                                  lens by focal length: 15mm 24mm 35mm 50mm 85mm           e.g. camera 35mm
+  camera phone <lens>                           phone-camera sim; lenses: iphone-main iphone-ultrawide   e.g. camera phone iphone-ultrawide
+                                                iphone-tele pixel-main pixel-ultrawide pixel-tele
+                                                galaxy-main galaxy-ultrawide galaxy-tele (bare = iphone-main)
+
+Site context:
+  basemap [osm|sat] [span_m] [opacity]          georeferenced satellite/OSM underlay (basemap off        e.g. basemap sat 800 0.6
+                                                clears)
+";
+
 /// Build the system prompt from the command registry (single source of truth)
 /// plus a compact scene digest. Regenerated every turn so the model always
 /// sees current geometry.
@@ -39,20 +88,7 @@ Emit commands inside a ```draft fenced block, ONE command per line. Commands exe
 {selectors}
 {plugin_block}
 
-## View & camera (app verbs — same ```draft block; change what's shown, not the model)
-These do NOT modify the drawing; they frame/style the view like the human's command line does. Emit them in the ```draft block just like drawing commands.
-  ze                                           zoom to fit all geometry (a.k.a. zoomextents)
-  top|bottom|front|back|left|right|persp        set a standard view direction
-  camera 2point                                 two-point perspective (verticals stay vertical)
-  camera persp                                  ordinary perspective
-  camera pano                                   360° equirectangular panorama
-  camera fisheye [fov]                          fisheye projection, optional field of view in degrees (e.g. camera fisheye 120)
-  camera <n>mm                                  lens by focal length: 15mm 24mm 35mm 50mm 85mm
-  camera phone <lens>                           phone-camera sim (e.g. camera phone iphone-ultrawide)
-  display shaded|wireframe|pencil|…             viewport display mode
-  lightmode working|sun|presentation            lighting model
-Use these when the user asks to reframe, orbit to a view, change lens/projection, or restyle the viewport — never to draw geometry.
-
+{view_verbs}
 ## Rules
 - Points are x,y,z or x,y (z=0). No spaces inside a point. Units: bare numbers are meters; 250cm and 500mm also work.
 - 'last' refers to the most recently created object; 'last N' to the N most recent. After a command that creates an object, that object is 'last'.
@@ -81,6 +117,7 @@ box 10,0,0 4,4,3
         commands = commands,
         selectors = SELECTOR_HELP,
         plugin_block = plugin_block,
+        view_verbs = VIEW_VERB_HELP,
         scene = if scene_digest.is_empty() {
             "(empty)"
         } else {
@@ -144,5 +181,40 @@ mod tests {
     #[test]
     fn authoring_instruction_present_without_plugins() {
         assert!(system_prompt("", &PluginRegistry::new()).contains("plugin define"));
+    }
+
+    #[test]
+    fn prompt_advertises_view_and_camera_app_verbs() {
+        let p = system_prompt("", &PluginRegistry::new());
+        // The whole dedicated section is embedded verbatim.
+        assert!(p.contains(VIEW_VERB_HELP));
+        // Section header.
+        assert!(p.contains("## View & camera commands"));
+        // Framing / zoom-extents.
+        assert!(p.contains("ze"));
+        assert!(p.contains("zoom to fit all geometry"));
+        // Standard views.
+        assert!(p.contains("top|bottom|front|back|left|right|persp"));
+        // Display modes (all five) + sketchup preset.
+        assert!(p.contains("display shaded|wireframe|xray|ghosted|pencil"));
+        assert!(p.contains("display pencil"));
+        assert!(p.contains("sketchup"));
+        // Lighting.
+        assert!(p.contains("light working|sun|presentation"));
+        // NPR.
+        assert!(p.contains("sketchy on|off"));
+        assert!(p.contains("edgefx jitter="));
+        assert!(p.contains("profiles on|off"));
+        // Camera projections + lenses + phone sims.
+        assert!(p.contains("camera 2point"));
+        assert!(p.contains("camera pano"));
+        assert!(p.contains("camera fisheye [fov]"));
+        assert!(p.contains("camera <n>mm"));
+        assert!(p.contains("camera phone <lens>"));
+        assert!(p.contains("iphone-ultrawide"));
+        assert!(p.contains("pixel-main"));
+        assert!(p.contains("galaxy-tele"));
+        // Basemap.
+        assert!(p.contains("basemap [osm|sat]"));
     }
 }
