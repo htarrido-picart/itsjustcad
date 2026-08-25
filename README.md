@@ -27,11 +27,14 @@ that draws with the exact same commands you type.
 
 **[⬇ Download the latest release](https://github.com/htarrido-picart/itsjustcad/releases/latest)** — one file, no installer, nothing else to set up.
 
-| Your OS | Grab | First launch |
+| Your OS | Download | First launch |
 |---|---|---|
-| **macOS** | `ItsJustCAD.app` (or `.dmg`) | Right‑click the app → **Open** (once) |
-| **Windows** | `itsjustcad.exe` | Double‑click → **More info → Run anyway** (once) |
-| **Linux** | the `AppImage` | `chmod +x` it, then run |
+| **macOS** (Apple Silicon) | [⬇ `ItsJustCAD.app`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-macos-aarch64-app.tar.gz) | Unpack, then right‑click the app → **Open** (once) |
+| **macOS** (Intel) | [⬇ `ItsJustCAD.app`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-macos-x86_64-app.tar.gz) | Unpack, then right‑click the app → **Open** (once) |
+| **Windows** (x86‑64) | [⬇ `itsjustcad.exe`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-windows-x86_64.zip) | Unzip → double‑click → **More info → Run anyway** (once) |
+| **Linux** (x86‑64) | [⬇ `itsjustcad`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-linux-x86_64.tar.gz) | `tar xzf`, `chmod +x itsjustcad`, then run |
+
+Each link always resolves to the **newest release** — no need to update it per version.
 
 > The app is not code‑signed yet, so your OS shows a one‑time "unidentified
 > developer" / "Windows protected your PC" warning on the very first launch.
