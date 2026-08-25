@@ -112,8 +112,10 @@ impl UiPreset {
             type_scale: crate::theme::TypeScale {
                 command: self.cmd_font_px,
                 body: self.ui_font_px,
-                small: (self.ui_font_px - 2.0).max(8.0),
-                panel_title: self.ui_font_px + 1.0,
+                // WCAG-lifted small floor (11 → 12) even for compact skins.
+                small: (self.ui_font_px - 1.0).max(12.0),
+                panel_title: self.ui_font_px + 3.0,
+                ..crate::theme::TypeScale::default()
             },
             colors,
             radii: crate::theme::Radii::default(),

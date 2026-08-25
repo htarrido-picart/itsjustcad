@@ -379,7 +379,7 @@ impl CommandLine {
         let history_block = |cl: &Self, ui: &mut egui::Ui| {
             egui::ScrollArea::vertical()
                 .id_salt("cmd_history")
-                .max_height(80.0)
+                .max_height(crate::theme::Spacing::HISTORY_H)
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     for line in &cl.history {

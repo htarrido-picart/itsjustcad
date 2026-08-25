@@ -289,7 +289,7 @@ fn render_command_code(ui: &mut egui::Ui, commands: &[ExecutedCommand]) {
     let font = egui::TextStyle::Monospace.resolve(ui.style());
     egui::Frame::group(ui.style())
         .fill(ui.visuals().code_bg_color)
-        .inner_margin(egui::Margin::same(8))
+        .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             for cmd in commands {
@@ -1197,7 +1197,7 @@ impl DeckPane {
         for (i, pending) in self.pending_side_effects.iter().enumerate() {
             egui::Frame::group(ui.style())
                 .fill(ui.visuals().extreme_bg_color)
-                .inner_margin(egui::Margin::same(6))
+                .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
@@ -1591,7 +1591,7 @@ impl DeckPane {
         }
 
         let mut open_detail: Option<PaneView> = None;
-        let input_height = 64.0;
+        let input_height = crate::theme::Spacing::CHAT_INPUT_H;
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .max_height(ui.available_height() - input_height)

@@ -3126,7 +3126,10 @@ impl App {
         let mut reopen = false;
         let mut cancel = false;
         egui::Area::new(egui::Id::new("download_chip"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
+            .anchor(
+                egui::Align2::RIGHT_BOTTOM,
+                [-crate::theme::Spacing::SM, -crate::theme::Spacing::SM],
+            )
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -3701,6 +3704,13 @@ impl eframe::App for App {
         // ITSJUSTCAD_TYPE: pre-fill command input (dev hook for autosuggest screenshots).
         if let Some(text) = self.type_script.take() {
             self.command_line.prefill(text);
+        }
+        // ITSJUSTCAD_DIALOG=about: open an overlay so a --shot captures elevated
+        // surfaces (dialog/popover) floating above the panels. Dev-only hook.
+        if self.frame_count == 0
+            && std::env::var("ITSJUSTCAD_DIALOG").as_deref() == Ok("about")
+        {
+            self.show_about = true;
         }
 
         if self.show_template_picker {
