@@ -135,8 +135,14 @@ impl DisplayMode {
         self != DisplayMode::Wireframe
     }
 
+    /// Whether this mode draws mesh feature edges. Shaded now draws them too:
+    /// the SketchUp/Rhino "shaded + edges" default (thin theme-aware ink over
+    /// the fill). Only the feature edges (boundary + sharp creases) are emitted
+    /// by the snapshot, so a box shows its 12 clean edges with no interior
+    /// triangulation. Every mode draws edges; a box uses `edges_enabled` in
+    /// `paint` to let the user turn the default Shaded edges off.
     pub fn draws_edges(self) -> bool {
-        self != DisplayMode::Shaded
+        true
     }
 
     /// Transparent modes skip depth writes so geometry reads through.
@@ -355,6 +361,17 @@ mod tests {
         assert!(DisplayMode::Pencil.draws_fill());
         assert!(DisplayMode::Pencil.draws_edges());
         assert!(DisplayMode::Pencil.depth_writes());
+    }
+
+    #[test]
+    fn shaded_draws_feature_edges_by_default() {
+        // Shaded now draws mesh feature edges (the SketchUp/Rhino "shaded +
+        // edges" look), matching every other mode.
+        assert!(DisplayMode::Shaded.draws_edges());
+        assert!(DisplayMode::Shaded.draws_fill());
+        for mode in DisplayMode::ALL {
+            assert!(mode.draws_edges(), "{mode:?} should draw feature edges");
+        }
     }
 
     #[test]
@@ -1177,11 +1194,15 @@ impl SceneRenderer {
         GpuUnderlay { vertex_buf, index_buf, bind_group }
     }
 
+    /// `edges_enabled` lets the caller suppress the feature-edge pass (the
+    /// Shaded "+ edges" default is on but user-toggleable). It has no effect on
+    /// modes that require edges to be legible (wireframe/x-ray/ghosted/pencil).
     pub fn paint(
         &self,
         render_pass: &mut wgpu::RenderPass<'static>,
         viewport: usize,
         mode: DisplayMode,
+        edges_enabled: bool,
     ) {
         let Some((_, camera_bind_group)) = self.cameras.get(viewport) else {
             return; // paint before any prepare for this pane — nothing to draw yet
@@ -1222,7 +1243,12 @@ impl SceneRenderer {
             }
         }
 
-        if mode.draws_edges() {
+        // Shaded draws edges by default but can be turned off; other modes
+        // always need them. Wireframe additionally has no fill, so edges must
+        // never be suppressed there.
+        let draw_edges = mode.draws_edges()
+            && (edges_enabled || mode == DisplayMode::Wireframe);
+        if draw_edges {
             render_pass.set_pipeline(&self.edge_pipeline);
             for edge in &self.edges {
                 render_pass.set_bind_group(1, &edge.object_bind_group, &[]);

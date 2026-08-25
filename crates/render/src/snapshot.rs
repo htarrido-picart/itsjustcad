@@ -563,7 +563,15 @@ mod tests {
         assert_eq!(scene.edges.len(), 1);
         // 12 feature edges (flat quad diagonals excluded) = 24 endpoints.
         assert_eq!(scene.edges[0].0.len(), 24);
+        // Theme-aware ink: near-white on dark, near-black on light. No profile
+        // ribbons (thin default edges are distinct from the sketchup preset).
         assert_eq!(scene.edges[0].1, Theme::Dark.curve());
+        assert!(scene.profile_edges.is_empty());
+        let light = snapshot(&doc, Theme::Light);
+        assert_eq!(light.edges[0].0.len(), 24);
+        assert_eq!(light.edges[0].1, Theme::Light.curve());
+        // Ink actually differs between themes so edges read on both backgrounds.
+        assert_ne!(scene.edges[0].1, light.edges[0].1);
     }
 
     #[test]

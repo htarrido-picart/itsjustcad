@@ -27,6 +27,9 @@ pub struct ViewportCallback {
     /// When true the grid shader paints a sky/ground gradient background behind
     /// the scene (SketchUp look) instead of the flat clear colour.
     pub background_gradient: bool,
+    /// Draw mesh feature edges. On by default (the Shaded "+ edges" look);
+    /// user-toggleable. Ignored by modes that always need edges.
+    pub edges_enabled: bool,
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -73,6 +76,6 @@ impl CallbackTrait for ViewportCallback {
         resources: &egui_wgpu::CallbackResources,
     ) {
         let renderer: &SceneRenderer = resources.get().expect("SceneRenderer registered");
-        renderer.paint(render_pass, self.viewport, self.mode);
+        renderer.paint(render_pass, self.viewport, self.mode, self.edges_enabled);
     }
 }

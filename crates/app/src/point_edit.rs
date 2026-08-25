@@ -2,18 +2,42 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 //! Control-point editor: when a single Curve::Nurbs or Curve::Polyline is
-//! selected, its control/vertex points are drawn as small draggable squares.
-//! Dragging a handle previews the moved point; on release ONE `setpoint`
-//! command is emitted through the substrate (same drag-end-emits-command
-//! contract as the gumball) so the op-log stays authoritative and undo works.
+//! selected, its control/vertex points are drawn as small draggable FILLED
+//! CIRCLES (theme-aware ink: black on light, white on dark; the active /
+//! hovered node switches to the accent color). Dragging a handle previews the
+//! moved point; on release ONE `setpoint` command is emitted through the
+//! substrate (same drag-end-emits-command contract as the gumball) so the
+//! op-log stays authoritative and undo works.
 
 use glam::{DVec3, Mat4};
 use itsjustcad_commands::{Command, Selector};
 use kernel_curve::Curve;
 use itsjustcad_doc::{Document, Geometry, ObjectId};
+use itsjustcad_render::Theme;
 
-const HANDLE_PX: f32 = 5.0;
+/// Radius (logical px) of a control-point dot.
+const HANDLE_PX: f32 = 4.0;
 const HIT_PX: f32 = 8.0;
+
+/// Fill color of a control-point dot. An idle node reads as theme ink
+/// (near-black on light, near-white on dark); the selected / hovered node
+/// switches to the accent selection color so the active grip stands out.
+pub fn node_color(theme: Theme, active: bool) -> egui::Color32 {
+    if active {
+        let [r, g, b, _] = theme.selected();
+        egui::Color32::from_rgb(to_u8(r), to_u8(g), to_u8(b))
+    } else {
+        match theme {
+            // Near-white ink on the dark viewport, near-black on the light one.
+            Theme::Dark => egui::Color32::from_rgb(235, 238, 245),
+            Theme::Light => egui::Color32::from_rgb(20, 20, 24),
+        }
+    }
+}
+
+fn to_u8(c: f32) -> u8 {
+    (c.clamp(0.0, 1.0) * 255.0).round() as u8
+}
 
 struct DragState {
     id: ObjectId,
@@ -52,6 +76,7 @@ impl PointEdit {
         response: &egui::Response,
         view_proj: Mat4,
         doc: &Document,
+        theme: Theme,
     ) -> PointEditOutput {
         let mut out = PointEditOutput { command: None, consumed: false };
 
@@ -137,26 +162,55 @@ impl PointEdit {
                 _ => *p,
             };
             let Some(sp) = project(world) else { continue };
-            let color = if active_idx == Some(i) || hovered == Some(i) {
-                egui::Color32::from_rgb(255, 210, 80)
-            } else {
-                egui::Color32::from_rgb(120, 200, 255)
+            let active = active_idx == Some(i) || hovered == Some(i);
+            let fill = node_color(theme, active);
+            // Small filled circle with a thin contrasting outline so the dot
+            // reads on both the shaded fill and the background.
+            painter.circle_filled(sp, HANDLE_PX, fill);
+            let ring = match theme {
+                Theme::Dark => egui::Color32::from_rgb(20, 20, 24),
+                Theme::Light => egui::Color32::from_rgb(235, 238, 245),
             };
-            painter.rect_filled(
-                egui::Rect::from_center_size(sp, egui::Vec2::splat(HANDLE_PX * 2.0)),
-                0.0,
-                color,
-            );
-            painter.rect_stroke(
-                egui::Rect::from_center_size(sp, egui::Vec2::splat(HANDLE_PX * 2.0)),
-                0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(20, 20, 20)),
-                egui::StrokeKind::Middle,
-            );
+            painter.circle_stroke(sp, HANDLE_PX, egui::Stroke::new(1.0, ring));
         }
         if self.drag.is_some() {
             ui.ctx().request_repaint();
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_node_is_theme_ink() {
+        // Near-black on light, near-white on dark; the two differ.
+        let light = node_color(Theme::Light, false);
+        let dark = node_color(Theme::Dark, false);
+        assert!(light.r() < 60 && light.g() < 60 && light.b() < 60, "light ink is dark");
+        assert!(dark.r() > 200 && dark.g() > 200 && dark.b() > 200, "dark ink is light");
+        assert_ne!(light, dark);
+    }
+
+    #[test]
+    fn selected_node_switches_to_accent() {
+        // Active node uses the accent selection color, distinct from idle ink,
+        // and identical on both themes' active state up to the accent value.
+        for theme in [Theme::Dark, Theme::Light] {
+            let idle = node_color(theme, false);
+            let active = node_color(theme, true);
+            assert_ne!(idle, active, "selection must change the node color");
+            let [r, g, b, _] = theme.selected();
+            assert_eq!(
+                active,
+                egui::Color32::from_rgb(
+                    (r * 255.0).round() as u8,
+                    (g * 255.0).round() as u8,
+                    (b * 255.0).round() as u8
+                )
+            );
+        }
     }
 }

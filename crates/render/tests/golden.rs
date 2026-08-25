@@ -116,7 +116,7 @@ fn render_to_image(ctx: &GpuContext, renderer: &SceneRenderer, theme: Theme) -> 
             multiview_mask: None,
         });
         let mut pass = pass.forget_lifetime();
-        renderer.paint(&mut pass, 0, itsjustcad_render::DisplayMode::Shaded);
+        renderer.paint(&mut pass, 0, itsjustcad_render::DisplayMode::Shaded, true);
     }
 
     let bytes_per_row = (W * 4).next_multiple_of(256);

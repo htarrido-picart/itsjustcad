@@ -39,6 +39,9 @@ pub enum AppVerb {
     /// Toggle SketchUp-style thick profile edges (`profileedges [on|off]`).
     /// `None` means bare toggle.
     ProfileEdges(Option<bool>),
+    /// Toggle the thin mesh feature edges drawn in Shaded mode by default
+    /// (`shadededges [on|off]` / `meshedges`). `None` means bare toggle.
+    ShadedEdges(Option<bool>),
     /// SketchUp display preset (`sketchup`): working light + profile edges +
     /// gradient background.
     SketchUp,
@@ -151,6 +154,12 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             None => None,
             _ => return None,
         }),
+        "shadededges" | "meshedges" => AppVerb::ShadedEdges(match words.next() {
+            Some("on" | "true" | "1") => Some(true),
+            Some("off" | "false" | "0") => Some(false),
+            None => None,
+            _ => return None,
+        }),
         "sketchup" | "su" => AppVerb::SketchUp,
         "sketchy" => AppVerb::Sketchy(match words.next() {
             Some("on" | "true" | "1") => Some(true),
@@ -206,6 +215,10 @@ mod tests {
         assert_eq!(classify("profileedges off"), Some(AppVerb::ProfileEdges(Some(false))));
         assert_eq!(classify("profiles"), Some(AppVerb::ProfileEdges(None)));
         assert_eq!(classify("profileedges garbage"), None);
+        assert_eq!(classify("shadededges on"), Some(AppVerb::ShadedEdges(Some(true))));
+        assert_eq!(classify("shadededges off"), Some(AppVerb::ShadedEdges(Some(false))));
+        assert_eq!(classify("meshedges"), Some(AppVerb::ShadedEdges(None)));
+        assert_eq!(classify("shadededges garbage"), None);
         assert_eq!(classify("sketchup"), Some(AppVerb::SketchUp));
         assert_eq!(classify("su"), Some(AppVerb::SketchUp));
     }

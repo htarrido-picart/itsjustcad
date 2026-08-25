@@ -264,6 +264,15 @@ pub struct App {
     light_mode: itsjustcad_render::LightMode,
     /// SketchUp-style thick profile / silhouette edges. View state.
     profile_edges: bool,
+    /// Thin mesh feature edges in Shaded mode (the SketchUp/Rhino "shaded +
+    /// edges" default). ON by default; toggled by `shadededges [on|off]`.
+    /// Persisted to `ui.json`. View state, never logged.
+    shaded_edges: bool,
+    /// Transform gumball/gizmo visibility (Rhino-style persistent toggle).
+    /// Default OFF: selecting an object shows only the highlight, no gizmo, and
+    /// the gumball is neither drawn nor hit-tested. Toggled with `gumball` / the
+    /// `G` hotkey / the status-bar chip. Persisted to `ui.json`. View state.
+    show_gumball: bool,
     /// Hand-drawn "sketchy edges" NPR character. View state.
     sketchy: itsjustcad_render::SketchyParams,
     layout: ViewportLayout,
@@ -494,6 +503,8 @@ impl App {
             color_modes: [ColorMode::default(); 4],
             light_mode: itsjustcad_render::LightMode::default(),
             profile_edges: false,
+            shaded_edges: load_shaded_edges().unwrap_or(true),
+            show_gumball: load_gumball_visible().unwrap_or(false),
             sketchy: itsjustcad_render::SketchyParams::default(),
             layout: match preset::preset_for(cad_origin).default_viewports {
                 4 => ViewportLayout::Four,
@@ -709,6 +720,32 @@ impl App {
                 self.profile_edges = on;
                 self.command_line
                     .push_line(format!("profile edges: {}", if on { "on" } else { "off" }));
+            }
+            // Toggle the thin Shaded-mode feature edges (default ON). View
+            // state, never logged; persisted to ui.json.
+            Some("shadededges" | "meshedges") => {
+                let on = match words.next() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => !self.shaded_edges, // bare toggle
+                };
+                self.shaded_edges = on;
+                save_shaded_edges(on);
+                self.command_line
+                    .push_line(format!("shaded edges: {}", if on { "on" } else { "off" }));
+            }
+            // Toggle the transform gumball/gizmo (Rhino-style persistent
+            // toggle). View state, never logged; persisted to ui.json.
+            Some("gumball" | "gizmo") => {
+                let on = match words.next() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => !self.show_gumball, // bare toggle
+                };
+                self.show_gumball = on;
+                save_gumball_visible(on);
+                self.command_line
+                    .push_line(format!("gumball: {}", if on { "on" } else { "off" }));
             }
             // "SketchUp" display preset: Working hemispheric shading + thick
             // profile edges + shaded display. Combines the ergonomics of the
@@ -1572,6 +1609,7 @@ impl App {
                         &response,
                         view_proj,
                         &self.session.doc,
+                        theme,
                     );
                     if let Some(cmd) = pe.command {
                         match self.session.run(cmd) {
@@ -1580,7 +1618,11 @@ impl App {
                         }
                     }
                     consumed = pe.consumed;
-                    if !consumed {
+                    // Gumball is a persistent Rhino-style toggle (default OFF):
+                    // when hidden it is neither drawn nor hit-tested, so a plain
+                    // selection shows only the highlight. Move/rotate/scale verbs
+                    // work regardless of this flag.
+                    if !consumed && self.show_gumball {
                         let out =
                             self.gumball
                                 .ui(ui, rect, &response, view_proj, &self.session.doc);
@@ -1652,8 +1694,26 @@ impl App {
                     sun_dir,
                     light: self.light_mode,
                     background_gradient: self.profile_edges,
+                    edges_enabled: self.shaded_edges,
                 },
             ));
+
+            // Per-pane view-name annotation (Rhino/SketchUp): a small,
+            // unobtrusive, theme-colored, non-interactive label in the pane's
+            // top-left corner. Drawn for every pane in single/2/4 layouts; the
+            // bottom tab bar carries the interactive view controls, so this
+            // top-left overlay never overlaps them.
+            {
+                let cam = &self.cameras[cam_idx];
+                let label = crate::statusbar::view_label(cam.yaw, cam.pitch, cam.ortho);
+                ui.painter_at(rect).text(
+                    rect.left_top() + egui::vec2(8.0, 6.0),
+                    egui::Align2::LEFT_TOP,
+                    label,
+                    egui::TextStyle::Small.resolve(ui.style()),
+                    ui.visuals().weak_text_color(),
+                );
+            }
 
             // Dimensions and text are 2D overlay drawing (egui text cannot go
             // through wgpu); hatches render in the scene itself.
@@ -2542,6 +2602,19 @@ impl App {
                 "view: {}",
                 crate::statusbar::view_label(cam.yaw, cam.pitch, cam.ortho)
             ));
+            ui.separator();
+            // Gumball toggle chip (Rhino-style): selectable state mirrors the
+            // `gumball` verb / `G` hotkey so all three stay in sync.
+            let mut on = self.show_gumball;
+            if ui
+                .selectable_label(on, "gumball")
+                .on_hover_text("Toggle transform gizmo (G)")
+                .clicked()
+            {
+                on = !on;
+                self.show_gumball = on;
+                save_gumball_visible(on);
+            }
         });
     }
 
@@ -3205,6 +3278,28 @@ fn load_deck_visible() -> Option<bool> {
 fn save_deck_visible(visible: bool) {
     let mut v = load_ui_json();
     v["deck_visible"] = serde_json::json!(visible);
+    save_ui_json(&v);
+}
+
+/// Restore the persisted Shaded feature-edge toggle (default ON when absent).
+fn load_shaded_edges() -> Option<bool> {
+    load_ui_json()["shaded_edges"].as_bool()
+}
+
+fn save_shaded_edges(on: bool) {
+    let mut v = load_ui_json();
+    v["shaded_edges"] = serde_json::json!(on);
+    save_ui_json(&v);
+}
+
+/// Restore the persisted gumball-visibility toggle (default OFF when absent).
+fn load_gumball_visible() -> Option<bool> {
+    load_ui_json()["show_gumball"].as_bool()
+}
+
+fn save_gumball_visible(visible: bool) {
+    let mut v = load_ui_json();
+    v["show_gumball"] = serde_json::json!(visible);
     save_ui_json(&v);
 }
 

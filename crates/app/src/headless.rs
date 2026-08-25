@@ -121,7 +121,7 @@ fn seed_basemap_cache(session: &Session, spec: &str) -> Result<(), String> {
 /// View-affecting state accumulated by app-level verbs while a headless script
 /// runs. Applied by [`render_headless`] to build the offscreen camera, so
 /// `ze` / `view` / `camera` / `display` in a script actually change the render.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct HeadlessView {
     /// Standard view direction, if a `top`/`front`/`persp`/… verb was run.
     pub view: Option<StandardView>,
@@ -142,6 +142,25 @@ pub struct HeadlessView {
     /// Hand-drawn "sketchy edges" NPR character, from `sketchy [on|off]` /
     /// `edgefx …`. Default (disabled) is a clean pass.
     pub sketchy: SketchyParams,
+    /// Thin mesh feature edges in Shaded mode. ON by default (the SketchUp /
+    /// Rhino "shaded + edges" look); toggled by `shadededges [on|off]`.
+    pub shaded_edges: bool,
+}
+
+impl Default for HeadlessView {
+    fn default() -> Self {
+        Self {
+            view: None,
+            focal_mm: None,
+            two_point: None,
+            pano: None,
+            display: DisplayMode::default(),
+            light: LightMode::default(),
+            profile_edges: false,
+            sketchy: SketchyParams::default(),
+            shaded_edges: true,
+        }
+    }
 }
 
 // ── Script parsing ────────────────────────────────────────────────────────────
@@ -193,6 +212,9 @@ pub fn run_script_lines(
             Some(AppVerb::Light(m)) => view.light = m,
             Some(AppVerb::ProfileEdges(on)) => {
                 view.profile_edges = on.unwrap_or(!view.profile_edges)
+            }
+            Some(AppVerb::ShadedEdges(on)) => {
+                view.shaded_edges = on.unwrap_or(!view.shaded_edges)
             }
             Some(AppVerb::SketchUp) => {
                 view.light = LightMode::Working;
@@ -612,7 +634,7 @@ pub fn render_headless(
             multiview_mask: None,
         });
         let mut pass = pass.forget_lifetime();
-        renderer.paint(&mut pass, 0, mode);
+        renderer.paint(&mut pass, 0, mode, view.shaded_edges);
     }
 
     let bytes_per_row = (W * 4).next_multiple_of(256);

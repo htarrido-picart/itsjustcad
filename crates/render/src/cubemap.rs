@@ -143,7 +143,7 @@ pub fn render_pano_image(
                 multiview_mask: None,
             });
             let mut pass = pass.forget_lifetime();
-            renderer.paint(&mut pass, 0, mode);
+            renderer.paint(&mut pass, 0, mode, true);
         }
         queue.submit([encoder.finish()]);
     }

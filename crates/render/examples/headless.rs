@@ -153,7 +153,7 @@ fn main() {
             multiview_mask: None,
         });
         let mut pass = pass.forget_lifetime();
-        renderer.paint(&mut pass, 0, mode);
+        renderer.paint(&mut pass, 0, mode, true);
     }
 
     let bytes_per_row = (W * 4).next_multiple_of(256);
@@ -209,5 +209,6 @@ fn main() {
         sun_dir: None,
         light: itsjustcad_render::LightMode::default(),
         background_gradient: false,
+        edges_enabled: true,
     };
 }

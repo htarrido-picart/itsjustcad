@@ -130,6 +130,16 @@ mod tests {
     }
 
     #[test]
+    fn four_viewport_pane_labels() {
+        // The 4-viewport layout's camera slots (0 Persp, 1 Top, 2 Front,
+        // 3 Right) each yield their corner annotation string.
+        assert_eq!(view_label(-FRAC_PI_4, 0.6, false), "Persp");
+        assert_eq!(view_label(-FRAC_PI_2, FRAC_PI_2, true), "Top");
+        assert_eq!(view_label(-FRAC_PI_2, 0.0, true), "Front");
+        assert_eq!(view_label(0.0, 0.0, true), "Right");
+    }
+
+    #[test]
     fn free_orbits_fall_back() {
         assert_eq!(view_label(-FRAC_PI_4, 0.5, false), "Persp");
         assert_eq!(view_label(0.3, 0.2, true), "Ortho");
