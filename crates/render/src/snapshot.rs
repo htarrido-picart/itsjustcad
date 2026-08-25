@@ -8,6 +8,7 @@ use itsjustcad_doc::{
 };
 
 use crate::renderer::{hue_from_seed, ColorMode, SceneData};
+use crate::sketchy::{sketchify_segments, SketchyParams};
 
 /// Parameters for color resolution that accompany a snapshot call.
 #[derive(Clone, Copy, Debug, Default)]
@@ -19,6 +20,25 @@ pub struct ColorModeSnapshot {
     /// lineweight" look. Interior edges stay as thin lines. Off by default so
     /// existing render paths are unchanged.
     pub profile_edges: bool,
+    /// Hand-drawn "sketchy edges" character (NPR stage 2): jitter overdraw,
+    /// endpoint overshoot, thick endpoints and depth cue applied to the feature
+    /// edge geometry. Inactive by default (identity transform).
+    pub sketchy: SketchyParams,
+    /// Camera eye + scene radius for the sketchy depth cue. `None` skips the
+    /// depth term (uniform sketchy amount).
+    pub sketchy_eye: Option<glam::Vec3>,
+    pub sketchy_radius: f32,
+}
+
+impl ColorModeSnapshot {
+    /// Apply the sketchy transform to a feature-edge segment soup, if active.
+    fn sketchify(&self, segments: Vec<[f32; 3]>) -> Vec<[f32; 3]> {
+        if self.sketchy.active() {
+            sketchify_segments(&segments, self.sketchy, self.sketchy_eye, self.sketchy_radius)
+        } else {
+            segments
+        }
+    }
 }
 
 /// Dark "ink" color for SketchUp-style profile edges — a near-black charcoal
@@ -261,10 +281,14 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                     // so they read as bold outlines on the light gradient
                     // background — theme.curve() would be near-white and vanish.
                     let (profile, interior) = classify_edges(mesh);
-                    scene.edges.push((interior, edge_color, lw_mm));
+                    scene.edges.push((cms.sketchify(interior), edge_color, lw_mm));
                     if !profile.is_empty() {
                         let ink = if selected { theme.selected() } else { PROFILE_INK };
-                        scene.profile_edges.push((profile, ink, PROFILE_HALF_WIDTH));
+                        scene.profile_edges.push((
+                            cms.sketchify(profile),
+                            ink,
+                            PROFILE_HALF_WIDTH,
+                        ));
                     }
                 } else {
                     let segments: Vec<[f32; 3]> = kernel_mesh::feature_edges(mesh)
@@ -276,7 +300,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                             ]
                         })
                         .collect();
-                    scene.edges.push((segments, edge_color, lw_mm));
+                    scene.edges.push((cms.sketchify(segments), edge_color, lw_mm));
                 }
             }
             Geometry::Curve(curve) => {

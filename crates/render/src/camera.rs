@@ -195,15 +195,58 @@ pub fn fov_for_focal_mm(focal_mm: f32) -> f32 {
 
 /// Full-frame-equivalent focal length for a named `camera` preset, or `None`
 /// if the token is not a recognised lens/preset. Numeric forms like "35mm" are
-/// handled by the caller; this covers the phone sims.
-///   phone     = 26mm equiv (iPhone main wide)
-///   phonewide = 13mm equiv (iPhone ultra-wide)
+/// handled by the caller; this covers the phone lens sims.
+///
+/// The bare aliases keep the original short spelling (`phone` = the iPhone main
+/// wide, `phonewide` = its ultra-wide); the richer set is reachable by name via
+/// [`phone_preset`] / [`PHONE_PRESETS`] and the `camera phone <name>` verb.
 pub fn preset_focal_mm(name: &str) -> Option<f32> {
     match name {
+        // Back-compat shorthands.
         "phone" => Some(26.0),
         "phonewide" => Some(13.0),
-        _ => None,
+        "phonetele" => Some(77.0),
+        // Otherwise fall through to the named phone-lens table.
+        other => phone_preset(other).map(|p| p.focal_mm),
     }
+}
+
+/// A simulated phone camera lens: a 35mm-equivalent focal length (the number
+/// phone makers quote), so the same [`fov_for_focal_mm`] full-frame math gives
+/// the real horizontal angle of view. Real phone sensors are tiny (a few mm),
+/// but the *equivalent* focal already folds in the sensor crop factor, so we
+/// only ever need the equivalent to reproduce the framing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PhonePreset {
+    /// Lookup token used by `camera phone <name>`.
+    pub name: &'static str,
+    /// 35mm-equivalent focal length in mm.
+    pub focal_mm: f32,
+    /// Human label for the command echo.
+    pub label: &'static str,
+}
+
+/// Named phone-lens presets. Focal lengths are the makers' published 35mm
+/// equivalents (ultra-wide ≈ 13mm, main wide ≈ 24–26mm, tele ≈ 70–120mm), so
+/// `fov_for_focal_mm` reproduces each lens's real horizontal angle of view.
+pub const PHONE_PRESETS: &[PhonePreset] = &[
+    // Apple iPhone (Pro-class three-camera system).
+    PhonePreset { name: "iphone-ultrawide", focal_mm: 13.0, label: "iPhone ultra-wide (13mm eq)" },
+    PhonePreset { name: "iphone-main", focal_mm: 26.0, label: "iPhone main wide (26mm eq)" },
+    PhonePreset { name: "iphone-tele", focal_mm: 77.0, label: "iPhone telephoto (77mm eq)" },
+    // Google Pixel.
+    PhonePreset { name: "pixel-ultrawide", focal_mm: 13.0, label: "Pixel ultra-wide (13mm eq)" },
+    PhonePreset { name: "pixel-main", focal_mm: 25.0, label: "Pixel main wide (25mm eq)" },
+    PhonePreset { name: "pixel-tele", focal_mm: 112.0, label: "Pixel telephoto (112mm eq)" },
+    // Samsung Galaxy S-series.
+    PhonePreset { name: "galaxy-ultrawide", focal_mm: 13.0, label: "Galaxy ultra-wide (13mm eq)" },
+    PhonePreset { name: "galaxy-main", focal_mm: 24.0, label: "Galaxy main wide (24mm eq)" },
+    PhonePreset { name: "galaxy-tele", focal_mm: 70.0, label: "Galaxy telephoto (70mm eq)" },
+];
+
+/// Look up a named phone-lens preset (case-sensitive; callers lower-case first).
+pub fn phone_preset(name: &str) -> Option<PhonePreset> {
+    PHONE_PRESETS.iter().copied().find(|p| p.name == name)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,9 +330,35 @@ mod tests {
     fn phone_presets_map_to_equivalents() {
         assert_eq!(preset_focal_mm("phone"), Some(26.0));
         assert_eq!(preset_focal_mm("phonewide"), Some(13.0));
+        assert_eq!(preset_focal_mm("phonetele"), Some(77.0));
         assert_eq!(preset_focal_mm("nope"), None);
         // Ultra-wide phone is wider than the main camera.
         assert!(fov_for_focal_mm(13.0) > fov_for_focal_mm(26.0));
+    }
+
+    #[test]
+    fn named_phone_presets_resolve_and_order_by_fov() {
+        // Every named preset resolves through both the table and the shorthand.
+        for p in PHONE_PRESETS {
+            assert_eq!(phone_preset(p.name), Some(*p));
+            assert_eq!(preset_focal_mm(p.name), Some(p.focal_mm));
+        }
+        assert_eq!(phone_preset("does-not-exist"), None);
+        // Within one phone the ordering ultra-wide < main < tele holds (wider FOV
+        // for shorter focal).
+        let uw = phone_preset("iphone-ultrawide").unwrap().focal_mm;
+        let main = phone_preset("iphone-main").unwrap().focal_mm;
+        let tele = phone_preset("iphone-tele").unwrap().focal_mm;
+        assert!(uw < main && main < tele);
+        assert!(fov_for_focal_mm(uw) > fov_for_focal_mm(main));
+        assert!(fov_for_focal_mm(main) > fov_for_focal_mm(tele));
+    }
+
+    #[test]
+    fn iphone_main_matches_documented_fov() {
+        // 26mm-equivalent full-frame gives ~69.4° horizontal AoV.
+        let deg = fov_for_focal_mm(preset_focal_mm("phone").unwrap()).to_degrees();
+        assert!((deg - 69.4).abs() < 0.5, "iPhone main ~26mm -> {deg}°");
     }
 
     #[test]

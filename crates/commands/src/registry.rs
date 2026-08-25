@@ -576,6 +576,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::View,
         },
         CommandSpec {
+            name: "camera",
+            usage: "camera <2point|persp|pano|fisheye [fov]|phone [lens]|<mm>>",
+            summary: "Set the active viewport's projection (view state, not logged). '2point' = architectural two-point perspective (verticals stay vertical); 'persp' = normal perspective; 'pano'/'360' = equirectangular 360° panorama; 'fisheye [deg]' = equidistant fisheye at the given field of view (default 180°); a focal length like '35' or '35mm' sets a full-frame lens; 'phone [lens]' simulates a real phone lens (iphone-main, iphone-ultrawide, iphone-tele, pixel-main, galaxy-tele, …). Example: camera 2point · camera fisheye 200 · camera phone iphone-ultrawide",
+            category: Category::View,
+        },
+        CommandSpec {
             name: "block",
             usage: "block <selector> <name>",
             summary: "Capture the geometry of selected objects as a named reusable block definition (like a symbol/component). Inputs stay in the scene; the definition is a geometry snapshot. Example: block last door · block last 3 tree (architect: door, window, tree, column, stair)",

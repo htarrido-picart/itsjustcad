@@ -264,6 +264,8 @@ pub struct App {
     light_mode: itsjustcad_render::LightMode,
     /// SketchUp-style thick profile / silhouette edges. View state.
     profile_edges: bool,
+    /// Hand-drawn "sketchy edges" NPR character. View state.
+    sketchy: itsjustcad_render::SketchyParams,
     layout: ViewportLayout,
     /// Last hovered pane; view commands and tools target its camera.
     active_pane: usize,
@@ -275,6 +277,8 @@ pub struct App {
     uploaded_color_mode: Option<ColorMode>,
     /// Profile-edge flag of the last GPU upload; toggling forces a re-upload.
     uploaded_profile_edges: Option<bool>,
+    /// Sketchy params of the last GPU upload; changes force a re-upload.
+    uploaded_sketchy: Option<itsjustcad_render::SketchyParams>,
     /// Last zoom factor written to ui.json (avoid rewriting every frame).
     saved_zoom: f32,
     /// Dev self-verification: ITSJUSTCAD_SHOT=<path.png> captures a frame and exits.
@@ -484,6 +488,7 @@ impl App {
             color_modes: [ColorMode::default(); 4],
             light_mode: itsjustcad_render::LightMode::default(),
             profile_edges: false,
+            sketchy: itsjustcad_render::SketchyParams::default(),
             layout: match preset::preset_for(cad_origin).default_viewports {
                 4 => ViewportLayout::Four,
                 2 => ViewportLayout::Two,
@@ -494,6 +499,7 @@ impl App {
             uploaded_theme: None,
             uploaded_color_mode: None,
             uploaded_profile_edges: None,
+            uploaded_sketchy: None,
             saved_zoom: zoom,
             shot_path: std::env::var("ITSJUSTCAD_SHOT").ok(),
             startup_script: std::env::var("ITSJUSTCAD_RUN").ok(),
@@ -705,6 +711,30 @@ impl App {
                 self.command_line
                     .push_line("preset: sketchup (working light + profile edges)");
             }
+            // Toggle hand-drawn "sketchy edges" NPR character.
+            Some("sketchy") => {
+                let on = match words.next() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => !self.sketchy.enabled, // bare toggle
+                };
+                self.sketchy.enabled = on;
+                self.command_line
+                    .push_line(format!("sketchy edges: {}", if on { "on" } else { "off" }));
+            }
+            // Tune the sketchy edge effect. Tuning implies the effect is on.
+            Some("edgefx") => {
+                self.sketchy.enabled = true;
+                self.sketchy = self.sketchy.apply_tokens(words);
+                self.command_line.push_line(format!(
+                    "edgefx: jitter={} passes={} ext={} depthcue={} endpoints={}",
+                    self.sketchy.jitter,
+                    self.sketchy.passes,
+                    self.sketchy.extension,
+                    self.sketchy.depthcue,
+                    self.sketchy.endpoints,
+                ));
+            }
             Some("viewports" | "vp") => {
                 match words.next() {
                     Some("1") => self.set_layout(ViewportLayout::Single),
@@ -910,7 +940,7 @@ impl App {
         let aspect = self.active_aspect;
         let Some(arg) = arg else {
             self.command_line.push_line(
-                "usage: camera 2point|persp|pano|fisheye [fov]|<15|24|35|50|85>mm|phone|phonewide",
+                "usage: camera 2point|persp|pano|fisheye [fov]|phone [lens]|<15|24|35|50|85>mm",
             );
             return;
         };
@@ -948,8 +978,29 @@ impl App {
                 };
                 self.command_line.push_line(format!("camera: fisheye {deg:.0}° fov"));
             }
+            // `camera phone <preset>`: a named real phone lens (iPhone / Pixel /
+            // Galaxy ultra-wide / main / tele). Bare `camera phone` = the iPhone
+            // main wide, matching the shorthand.
+            "phone" => {
+                let preset = arg2.and_then(itsjustcad_render::phone_preset);
+                let (focal, label) = match preset {
+                    Some(p) => (p.focal_mm, p.label.to_string()),
+                    None if arg2.is_none() => (26.0, "iPhone main wide (26mm eq)".to_string()),
+                    None => {
+                        let names: Vec<&str> =
+                            itsjustcad_render::PHONE_PRESETS.iter().map(|p| p.name).collect();
+                        self.command_line
+                            .push_line(format!("camera phone: unknown lens; try {}", names.join(", ")));
+                        return;
+                    }
+                };
+                self.active_camera().set_lens_mm(focal, aspect);
+                let fov = itsjustcad_render::fov_for_focal_mm(focal).to_degrees();
+                self.command_line
+                    .push_line(format!("camera: {label} — {fov:.0}° hfov"));
+            }
             _ => {
-                // Named phone sim, or a numeric focal length (optional "mm").
+                // Named phone sim shorthand, or a numeric focal length ("35"/"35mm").
                 let focal = itsjustcad_render::preset_focal_mm(arg).or_else(|| {
                     arg.strip_suffix("mm").unwrap_or(arg).parse::<f32>().ok()
                 });
@@ -960,13 +1011,14 @@ impl App {
                         let tag = match arg {
                             "phone" => " (26mm equiv)",
                             "phonewide" => " (13mm equiv)",
+                            "phonetele" => " (77mm equiv)",
                             _ => "",
                         };
                         self.command_line
                             .push_line(format!("camera: {f:.0}mm{tag} — {fov:.0}° hfov"));
                     }
                     _ => self.command_line.push_line(
-                        "usage: camera 2point|persp|pano|fisheye [fov]|<15|24|35|50|85>mm|phone|phonewide",
+                        "usage: camera 2point|persp|pano|fisheye [fov]|phone [lens]|<15|24|35|50|85>mm",
                     ),
                 }
             }
@@ -1329,7 +1381,8 @@ impl App {
         let stale = self.uploaded_generation != Some(generation)
             || self.uploaded_theme != Some(theme)
             || self.uploaded_color_mode != Some(active_color_mode)
-            || self.uploaded_profile_edges != Some(self.profile_edges);
+            || self.uploaded_profile_edges != Some(self.profile_edges)
+            || self.uploaded_sketchy != Some(self.sketchy);
         // Scene is uploaded once (renderer shared); only the first pane's
         // callback carries the snapshot, the rest just set their camera.
         let mut scene = if stale {
@@ -1337,12 +1390,29 @@ impl App {
             self.uploaded_theme = Some(theme);
             self.uploaded_color_mode = Some(active_color_mode);
             self.uploaded_profile_edges = Some(self.profile_edges);
+            self.uploaded_sketchy = Some(self.sketchy);
+            // Sketchy depth cue: bias by the active pane's eye + scene radius.
+            let (sketchy_eye, sketchy_radius) = if self.sketchy.active() {
+                let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
+                let r = self
+                    .session
+                    .doc
+                    .scene_aabb()
+                    .map(|bb| (bb.size().length() as f32 * 0.5).max(0.5))
+                    .unwrap_or(8.0);
+                (Some(cam.eye()), r)
+            } else {
+                (None, 0.0)
+            };
             let mut s = scene::snapshot_with_mode(
                 &self.session.doc,
                 theme,
                 itsjustcad_render::ColorModeSnapshot {
                     color_mode: active_color_mode,
                     profile_edges: self.profile_edges,
+                    sketchy: self.sketchy,
+                    sketchy_eye,
+                    sketchy_radius,
                 },
             );
             s.underlay = self.decode_underlay();

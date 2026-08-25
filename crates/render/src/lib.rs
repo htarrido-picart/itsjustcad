@@ -9,10 +9,14 @@ mod cubemap;
 mod layout;
 mod pano;
 mod renderer;
+mod sketchy;
 mod snapshot;
 mod viewport_callback;
 
-pub use camera::{fov_for_focal_mm, preset_focal_mm, OrbitCamera, StandardView};
+pub use camera::{
+    fov_for_focal_mm, phone_preset, preset_focal_mm, OrbitCamera, PhonePreset, StandardView,
+    PHONE_PRESETS,
+};
 pub use control::{render_control_images, ControlImagePaths};
 pub use cubemap::{render_pano_image, PanoImage};
 pub use pano::{
@@ -23,6 +27,9 @@ pub use layout::ViewportLayout;
 pub use renderer::{
     hue_from_seed, CameraUniform, ColorMode, DisplayMode, LightMode, SceneData, SceneRenderer,
     UnderlayData,
+};
+pub use sketchy::{
+    edge_seed, jitter_offset, sketchify_segments, SketchyParams,
 };
 pub use snapshot::{snapshot, snapshot_with_mode, ColorModeSnapshot, Theme};
 pub use viewport_callback::ViewportCallback;

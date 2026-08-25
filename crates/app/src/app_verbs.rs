@@ -42,6 +42,12 @@ pub enum AppVerb {
     /// SketchUp display preset (`sketchup`): working light + profile edges +
     /// gradient background.
     SketchUp,
+    /// Toggle hand-drawn "sketchy edges" NPR character (`sketchy [on|off]`).
+    /// `None` means bare toggle.
+    Sketchy(Option<bool>),
+    /// Tune the sketchy edge effect (`edgefx jitter=.. extension=.. …`).
+    /// Carries the raw `key=value` tokens for the front-end to apply.
+    EdgeFx(Vec<String>),
     /// Persist the document (`save [path]`). Argument is the optional path.
     Save(Option<String>),
     /// Command reference (`help [verb]`).
@@ -82,6 +88,13 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             _ => return None,
         }),
         "sketchup" | "su" => AppVerb::SketchUp,
+        "sketchy" => AppVerb::Sketchy(match words.next() {
+            Some("on" | "true" | "1") => Some(true),
+            Some("off" | "false" | "0") => Some(false),
+            None => None,
+            _ => return None,
+        }),
+        "edgefx" => AppVerb::EdgeFx(words.map(str::to_owned).collect()),
         "camera" => AppVerb::Camera(
             words.next().map(str::to_ascii_lowercase),
             words.next().map(str::to_ascii_lowercase),
@@ -130,6 +143,19 @@ mod tests {
         assert_eq!(classify("profileedges garbage"), None);
         assert_eq!(classify("sketchup"), Some(AppVerb::SketchUp));
         assert_eq!(classify("su"), Some(AppVerb::SketchUp));
+    }
+
+    #[test]
+    fn classifies_sketchy_and_edgefx() {
+        assert_eq!(classify("sketchy on"), Some(AppVerb::Sketchy(Some(true))));
+        assert_eq!(classify("sketchy off"), Some(AppVerb::Sketchy(Some(false))));
+        assert_eq!(classify("sketchy"), Some(AppVerb::Sketchy(None)));
+        assert_eq!(classify("sketchy garbage"), None);
+        assert_eq!(
+            classify("edgefx jitter=.05 extension=.1"),
+            Some(AppVerb::EdgeFx(vec!["jitter=.05".into(), "extension=.1".into()]))
+        );
+        assert_eq!(classify("edgefx"), Some(AppVerb::EdgeFx(vec![])));
     }
 
     #[test]

@@ -8,7 +8,9 @@
 
 use crate::app_verbs::{self, AppVerb};
 use itsjustcad_commands::{Session, parse};
-use itsjustcad_render::{DisplayMode, LightMode, OrbitCamera, PanoProjection, StandardView};
+use itsjustcad_render::{
+    DisplayMode, LightMode, OrbitCamera, PanoProjection, SketchyParams, StandardView,
+};
 
 // ── Headless view state ─────────────────────────────────────────────────────────
 
@@ -33,6 +35,9 @@ pub struct HeadlessView {
     /// SketchUp-style thick profile edges + gradient background, from
     /// `profileedges [on|off]` or the `sketchup` preset.
     pub profile_edges: bool,
+    /// Hand-drawn "sketchy edges" NPR character, from `sketchy [on|off]` /
+    /// `edgefx …`. Default (disabled) is a clean pass.
+    pub sketchy: SketchyParams,
 }
 
 // ── Script parsing ────────────────────────────────────────────────────────────
@@ -89,6 +94,15 @@ pub fn run_script_lines(
                 view.light = LightMode::Working;
                 view.profile_edges = true;
                 view.display = DisplayMode::Shaded;
+            }
+            Some(AppVerb::Sketchy(on)) => {
+                view.sketchy.enabled = on.unwrap_or(!view.sketchy.enabled);
+            }
+            Some(AppVerb::EdgeFx(tokens)) => {
+                // Tuning implies the effect is on.
+                view.sketchy.enabled = true;
+                view.sketchy =
+                    view.sketchy.apply_tokens(tokens.iter().map(String::as_str));
             }
             Some(AppVerb::Camera(arg, arg2)) => {
                 apply_camera(&mut view, arg.as_deref(), arg2.as_deref())
@@ -147,6 +161,18 @@ fn apply_camera(view: &mut HeadlessView, arg: Option<&str>, arg2: Option<&str>) 
         }
         "fisheye" | "fish" => {
             view.pano = Some(parse_fisheye(arg2));
+        }
+        // `camera phone <preset>`: named real phone lens (bare = iPhone main).
+        "phone" => {
+            let focal = arg2
+                .and_then(itsjustcad_render::phone_preset)
+                .map(|p| p.focal_mm)
+                .or(if arg2.is_none() { Some(26.0) } else { None });
+            if let Some(f) = focal {
+                view.focal_mm = Some(f);
+                view.pano = None;
+                view.two_point = Some(false);
+            }
         }
         _ => {
             let focal = itsjustcad_render::preset_focal_mm(arg)
@@ -277,10 +303,32 @@ pub fn render_headless(
             .map_err(|e| e.to_string())?;
 
     let mut renderer = SceneRenderer::new(&device, FORMAT);
+    // Depth cue needs the camera eye + scene radius; build them up front so the
+    // sketchy transform can bias foreground edges. Aspect only affects the lens,
+    // not the eye/radius used here, so the pre-pano camera is fine.
+    let aspect = W as f32 / H as f32;
+    let sketchy = view.sketchy;
+    let (sketchy_eye, sketchy_radius) = if sketchy.active() {
+        let cam = build_headless_camera(session, view, aspect);
+        let r = session
+            .doc
+            .scene_aabb()
+            .map(|bb| (bb.size().length() as f32 * 0.5).max(0.5))
+            .unwrap_or(8.0);
+        (Some(cam.eye()), r)
+    } else {
+        (None, 0.0)
+    };
     let mut scene = snapshot_with_mode(
         &session.doc,
         theme,
-        ColorModeSnapshot { profile_edges: view.profile_edges, ..Default::default() },
+        ColorModeSnapshot {
+            profile_edges: view.profile_edges,
+            sketchy,
+            sketchy_eye,
+            sketchy_radius,
+            ..Default::default()
+        },
     );
 
     // When show_lineweights is on, add thick-line quad meshes for each line
@@ -337,7 +385,6 @@ pub fn render_headless(
 
     renderer.set_scene(&device, &queue, &scene, 0);
 
-    let aspect = W as f32 / H as f32;
     // Orientation, lens, projection and framing (shared with control-image
     // export so both paths see the same view).
     let mut camera = build_headless_camera(session, view, aspect);
@@ -574,6 +621,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.pano, None);
+    }
+
+    #[test]
+    fn camera_phone_presets_set_focal_length() {
+        // Named lens resolves to its 35mm-equivalent focal length.
+        let (_o, view) = run_script_lines(
+            Session::default(),
+            &["camera phone iphone-ultrawide".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(view.focal_mm, Some(13.0));
+
+        let (_o, view) =
+            run_script_lines(Session::default(), &["camera phone iphone-tele".to_owned()]).unwrap();
+        assert_eq!(view.focal_mm, Some(77.0));
+
+        // Bare `camera phone` = iPhone main wide (26mm equiv).
+        let (_o, view) =
+            run_script_lines(Session::default(), &["camera phone".to_owned()]).unwrap();
+        assert_eq!(view.focal_mm, Some(26.0));
+
+        // Unknown lens name leaves focal unset (no silent wrong lens).
+        let (_o, view) =
+            run_script_lines(Session::default(), &["camera phone boguslens".to_owned()]).unwrap();
+        assert_eq!(view.focal_mm, None);
     }
 
     #[test]
