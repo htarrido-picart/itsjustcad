@@ -229,7 +229,15 @@ impl CommandLine {
                 let json = rest[1..].join(" ");
                 self.plugin_define(session, &json);
             }
-            _ => self.push_line("usage: plugin list | save <name> <n> | define <json> | delete <name>"),
+            Some("reload") => {
+                // Re-scan the plugin directory: picks up newly-installed or
+                // hand-edited plugin folders without restarting the app.
+                self.load_plugins(session);
+                self.push_line(format!("reloaded {} plugin(s)", session.plugins.len()));
+            }
+            _ => self.push_line(
+                "usage: plugin list | reload | save <name> <n> | define <json> | delete <name>",
+            ),
         }
         false
     }
@@ -245,6 +253,7 @@ impl CommandLine {
         let plugin = Plugin {
             name: name.to_string(),
             description: format!("Captured from {take} command(s)."),
+            category: None,
             params: Vec::new(),
             body,
         };
@@ -662,8 +671,8 @@ mod tests {
         let json = r#"{"name":"tinybox","description":"a box","params":[{"name":"s","default":"2"}],"body":["box 0,0,0 {0},{0},{0}"]}"#;
         cl.execute(&mut session, &format!("plugin define {json}"));
         assert!(session.plugins.contains("tinybox"));
-        // Persisted to disk.
-        assert!(dir.join("tinybox.plugin.json").exists());
+        // Persisted to disk in the manifest layout `<name>/plugin.json`.
+        assert!(dir.join("tinybox").join("plugin.json").exists());
         // Autosuggest cache updated.
         assert!(cl.plugin_verbs.iter().any(|(n, _)| n == "tinybox"));
 
@@ -721,8 +730,75 @@ mod tests {
         assert!(session.plugins.contains("gone"));
         cl.execute(&mut session, "plugin delete gone");
         assert!(!session.plugins.contains("gone"));
-        assert!(!dir.join("gone.plugin.json").exists());
+        assert!(!dir.join("gone").exists());
         assert!(!cl.plugin_verbs.iter().any(|(n, _)| n == "gone"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Install a plugin as a hand-authored manifest folder (`<name>/plugin.json`)
+    /// — the documented user layout — then `plugin reload` picks it up and its
+    /// command executes, lowering to the expected substrate command.
+    #[test]
+    fn install_manifest_then_reload_and_invoke() {
+        let (mut cl, dir) = plugin_cl("manifest");
+        let mut session = Session::default();
+        // Hand-install a plugin folder, as a user dropping a plugin in would.
+        std::fs::create_dir_all(dir.join("greek-column")).unwrap();
+        let manifest = r#"{
+            "name": "greek-column",
+            "description": "A Doric column",
+            "category": "Classical",
+            "params": [{"name": "h", "default": "4"}],
+            "body": ["box 0,0,0 0.3,0.3,{h}"]
+        }"#;
+        std::fs::write(
+            dir.join("greek-column").join("plugin.json"),
+            manifest,
+        )
+        .unwrap();
+
+        // Not loaded yet.
+        assert!(!session.plugins.contains("greek-column"));
+        // Reload scans the dir.
+        cl.execute(&mut session, "plugin reload");
+        assert!(session.plugins.contains("greek-column"));
+        assert_eq!(
+            session.plugins.get("greek-column").unwrap().menu_category(),
+            "Classical"
+        );
+
+        // Invoke → lowers to the expected substrate command, logged individually.
+        let changed = cl.execute(&mut session, "greek-column 5");
+        assert!(changed);
+        assert_eq!(cl.logged_inputs.last().unwrap(), "box 0,0,0 0.3,0.3,5");
+        assert_eq!(session.doc.len(), 1);
+
+        // Default kicks in when the arg is omitted.
+        cl.execute(&mut session, "greek-column");
+        assert_eq!(cl.logged_inputs.last().unwrap(), "box 0,0,0 0.3,0.3,4");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A malformed manifest is rejected on reload with a scrollback warning and
+    /// never crashes or registers a broken verb.
+    #[test]
+    fn reload_rejects_malformed_manifest() {
+        let (mut cl, dir) = plugin_cl("malformed");
+        let mut session = Session::default();
+        std::fs::create_dir_all(dir.join("broken")).unwrap();
+        std::fs::write(
+            dir.join("broken").join("plugin.json"),
+            r#"{"name": "broken", not json"#,
+        )
+        .unwrap();
+
+        cl.execute(&mut session, "plugin reload");
+        assert!(!session.plugins.contains("broken"));
+        assert!(
+            cl.history.iter().any(|l| l.contains("plugin load warning")),
+            "expected a load warning in scrollback: {:?}",
+            cl.history
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -752,6 +828,7 @@ mod tests {
         session.plugins.insert(Plugin {
             name: "box".into(),
             description: String::new(),
+            category: None,
             params: vec![],
             body: vec!["circle 0,0,0 99".into()],
         });

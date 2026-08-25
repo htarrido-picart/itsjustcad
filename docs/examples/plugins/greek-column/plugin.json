@@ -1,0 +1,11 @@
+{
+  "name": "greek-column",
+  "description": "A simple Doric column: a square shaft of height h.",
+  "category": "Classical",
+  "params": [
+    { "name": "h", "default": "4" }
+  ],
+  "body": [
+    "box 0,0,0 0.3,0.3,{h}"
+  ]
+}

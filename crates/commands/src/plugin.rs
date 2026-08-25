@@ -13,9 +13,23 @@
 //! Replay never re-expands a plugin; it replays the expanded ops. That keeps old
 //! op-logs stable even if a plugin is later edited or deleted (see FORMAT.md).
 //!
-//! Persistence: one JSON file per plugin under
-//! `~/.config/itsjustcad/plugins/<name>.plugin.json`. Loaded at startup into a
-//! `PluginRegistry` that autosuggest, help and the deck prompt all consult.
+//! Persistence — TWO on-disk layouts are accepted under
+//! `~/.config/itsjustcad/plugins/`, both loaded at startup into a
+//! `PluginRegistry` that autosuggest, help, the menu and the deck prompt all
+//! consult:
+//! * **Manifest (formalized user layout):** one directory per plugin,
+//!   `<name>/plugin.json`. This is the documented, user-facing format (see
+//!   `docs/plugins.md`) — a self-contained plugin folder a user can drop in.
+//! * **Flat (legacy / LLM quick-author):** a single `<name>.plugin.json`
+//!   file. Retained so op-logs and older installs keep working.
+//!
+//! `define()` writes the manifest layout; `load_dir()` reads both.
+//!
+//! Safety: a plugin is a *declarative macro* — a list of command-template lines
+//! composed from existing substrate verbs plus `{param}` substitution. It can
+//! NEVER run native code or bypass the op-log: every expanded line is parsed and
+//! executed as an ordinary substrate command (logged individually). This is the
+//! same hardened posture as the deck.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -65,6 +79,12 @@ pub struct Plugin {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Optional menu group. When set (and non-empty) the plugin verb surfaces
+    /// under a "Plugins ▸ <category>" submenu; otherwise it lands directly under
+    /// the top-level "Plugins" menu. Purely a UI hint — it never affects how the
+    /// plugin lowers to substrate commands.
+    #[serde(default)]
+    pub category: Option<String>,
     #[serde(default)]
     pub params: Vec<PluginParam>,
     pub body: Vec<String>,
@@ -121,7 +141,28 @@ impl Plugin {
         Ok(out)
     }
 
-    /// Path this plugin persists to under `dir`.
+    /// Menu group label for this plugin: its declared `category`, or `"Plugins"`
+    /// when none is set. Used to build the Plugins menu (see `menu.rs`).
+    pub fn menu_category(&self) -> &str {
+        match &self.category {
+            Some(c) if !c.trim().is_empty() => c.as_str(),
+            _ => "Plugins",
+        }
+    }
+
+    /// Directory this plugin's manifest lives in under `dir` (`<dir>/<name>/`).
+    pub fn dir_in(&self, dir: &Path) -> PathBuf {
+        dir.join(&self.name)
+    }
+
+    /// Manifest path this plugin persists to under `dir`
+    /// (`<dir>/<name>/plugin.json`) — the formalized, user-facing layout.
+    pub fn manifest_in(&self, dir: &Path) -> PathBuf {
+        self.dir_in(dir).join("plugin.json")
+    }
+
+    /// Legacy flat path (`<dir>/<name>.plugin.json`). Still read by `load_dir`
+    /// and cleaned up by `delete` so older installs keep working.
     pub fn path_in(&self, dir: &Path) -> PathBuf {
         dir.join(format!("{}.plugin.json", self.name))
     }
@@ -171,8 +212,10 @@ impl PluginRegistry {
         Self::default()
     }
 
-    /// Load every `*.plugin.json` under `dir` (ignored if the dir is absent).
-    /// Malformed files are skipped with the error collected in the return.
+    /// Load every plugin under `dir` (ignored if the dir is absent). Accepts
+    /// BOTH the manifest layout (`<name>/plugin.json`) and the legacy flat
+    /// layout (`<name>.plugin.json`). Malformed files are skipped with the error
+    /// collected in the return so one bad plugin never blocks the rest.
     pub fn load_dir(dir: &Path) -> (Self, Vec<String>) {
         let mut reg = Self::new();
         let mut warnings = Vec::new();
@@ -181,10 +224,20 @@ impl PluginRegistry {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.to_string_lossy().ends_with(".plugin.json") {
+            // Manifest layout: a subdirectory holding `plugin.json`.
+            let manifest = if path.is_dir() {
+                Some(path.join("plugin.json"))
+            } else if path.to_string_lossy().ends_with(".plugin.json") {
+                // Legacy flat layout.
+                Some(path.clone())
+            } else {
+                None
+            };
+            let Some(manifest) = manifest else { continue };
+            if !manifest.exists() {
                 continue;
             }
-            match std::fs::read_to_string(&path)
+            match std::fs::read_to_string(&manifest)
                 .map_err(|e| e.to_string())
                 .and_then(|s| serde_json::from_str::<Plugin>(&s).map_err(|e| e.to_string()))
             {
@@ -194,13 +247,13 @@ impl PluginRegistry {
                     if !name_is_valid(&p.name) {
                         warnings.push(format!(
                             "{}: skipped — plugin name {:?} contains unsafe characters",
-                            path.display(), p.name
+                            manifest.display(), p.name
                         ));
                         continue;
                     }
                     reg.plugins.insert(p.name.clone(), p);
                 }
-                Err(e) => warnings.push(format!("{}: {e}", path.display())),
+                Err(e) => warnings.push(format!("{}: {e}", manifest.display())),
             }
         }
         (reg, warnings)
@@ -241,12 +294,14 @@ impl PluginRegistry {
         if !name_is_valid(&plugin.name) {
             return Err(PluginError::BadName(plugin.name.clone()));
         }
-        std::fs::create_dir_all(dir).map_err(|e| PluginError::Io(e.to_string()))?;
+        // Write the formalized manifest layout: `<dir>/<name>/plugin.json`.
+        let plugin_dir = plugin.dir_in(dir);
+        std::fs::create_dir_all(&plugin_dir).map_err(|e| PluginError::Io(e.to_string()))?;
         let json = serde_json::to_string_pretty(&plugin)
             .map_err(|e| PluginError::Io(e.to_string()))?;
         // L-1: write with 0600 so plugin files (which can contain command bodies
         // that reference local paths) are not world-readable on multi-user hosts.
-        write_private(&plugin.path_in(dir), &json)
+        write_private(&plugin.manifest_in(dir), &json)
             .map_err(|e| PluginError::Io(e.to_string()))?;
         self.plugins.insert(plugin.name.clone(), plugin);
         Ok(())
@@ -262,11 +317,16 @@ impl PluginRegistry {
         let Some(plugin) = self.plugins.remove(name) else {
             return Err(PluginError::Unknown(name.to_string()));
         };
-        // Re-derive path from the already-validated in-memory name (same as
-        // plugin.name, which passed validate() at define/load time).
-        let path = dir.join(format!("{}.plugin.json", plugin.name));
-        if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| PluginError::Io(e.to_string()))?;
+        // Re-derive paths from the already-validated in-memory name (same as
+        // plugin.name, which passed validate() at define/load time). Remove both
+        // the manifest directory and any legacy flat file.
+        let manifest_dir = dir.join(&plugin.name);
+        if manifest_dir.is_dir() {
+            std::fs::remove_dir_all(&manifest_dir).map_err(|e| PluginError::Io(e.to_string()))?;
+        }
+        let flat = dir.join(format!("{}.plugin.json", plugin.name));
+        if flat.exists() {
+            std::fs::remove_file(&flat).map_err(|e| PluginError::Io(e.to_string()))?;
         }
         Ok(())
     }
@@ -304,6 +364,7 @@ mod tests {
         Plugin {
             name: "column-grid".into(),
             description: "Grid of columns".into(),
+            category: None,
             params: vec![
                 PluginParam { name: "nx".into(), default: Some("5".into()) },
                 PluginParam { name: "ny".into(), default: Some("3".into()) },
@@ -335,6 +396,7 @@ mod tests {
         let p = Plugin {
             name: "t".into(),
             description: String::new(),
+            category: None,
             params: vec![PluginParam { name: "h".into(), default: Some("3".into()) }],
             body: vec!["extrude last {h}".into()],
         };
@@ -347,6 +409,7 @@ mod tests {
         let p = Plugin {
             name: "t".into(),
             description: String::new(),
+            category: None,
             params: vec![PluginParam { name: "h".into(), default: None }],
             body: vec!["extrude last {0}".into()],
         };
@@ -361,6 +424,7 @@ mod tests {
         let p = Plugin {
             name: "t".into(),
             description: String::new(),
+            category: None,
             params: vec![],
             body: vec!["note {foo} and {9}".into()],
         };
@@ -378,7 +442,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut reg = PluginRegistry::new();
         reg.define(column_grid(), &dir).unwrap();
-        assert!(column_grid().path_in(&dir).exists());
+        // define() writes the formalized manifest layout `<name>/plugin.json`.
+        assert!(column_grid().manifest_in(&dir).exists());
 
         let (loaded, warnings) = PluginRegistry::load_dir(&dir);
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -388,7 +453,8 @@ mod tests {
         let mut reg2 = loaded.clone();
         reg2.delete("column-grid", &dir).unwrap();
         assert!(!reg2.contains("column-grid"));
-        assert!(!column_grid().path_in(&dir).exists());
+        assert!(!column_grid().manifest_in(&dir).exists());
+        assert!(!column_grid().dir_in(&dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -414,6 +480,7 @@ mod tests {
         let p = Plugin {
             name: "t".into(),
             description: String::new(),
+            category: None,
             params: vec![],
             body: vec!["box {0} {1}".into()],
         };
@@ -463,7 +530,7 @@ mod tests {
 
         // The legitimate plugin must still be in memory and on disk.
         assert!(reg.contains("column-grid"));
-        assert!(column_grid().path_in(&dir).exists());
+        assert!(column_grid().manifest_in(&dir).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -479,10 +546,93 @@ mod tests {
         let mut reg = PluginRegistry::new();
         reg.define(column_grid(), &dir).unwrap();
 
-        let meta = std::fs::metadata(column_grid().path_in(&dir)).unwrap();
+        let meta = std::fs::metadata(column_grid().manifest_in(&dir)).unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── manifest layout + category (formalized plugin API) ───────────────────
+
+    /// A hand-authored manifest directory (`<name>/plugin.json`) — the
+    /// documented user layout — loads with its declared category.
+    #[test]
+    fn load_dir_reads_manifest_layout_with_category() {
+        let dir = std::env::temp_dir()
+            .join(format!("mydrafter-plugtest-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("greek-column")).unwrap();
+        let json = r#"{
+            "name": "greek-column",
+            "description": "A fluted Doric column",
+            "category": "Classical",
+            "params": [{"name": "h", "default": "4"}],
+            "body": ["cylinder 0,0,0 0.3 {h}"]
+        }"#;
+        std::fs::write(dir.join("greek-column").join("plugin.json"), json).unwrap();
+
+        let (reg, warnings) = PluginRegistry::load_dir(&dir);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let p = reg.get("greek-column").expect("plugin loaded from manifest");
+        assert_eq!(p.menu_category(), "Classical");
+        assert_eq!(p.expand(&[]).unwrap()[0], "cylinder 0,0,0 0.3 4");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plugin with no category falls back to the generic "Plugins" menu group.
+    #[test]
+    fn menu_category_defaults_to_plugins() {
+        assert_eq!(column_grid().menu_category(), "Plugins");
+        let mut p = column_grid();
+        p.category = Some("   ".into()); // blank → still the default group
+        assert_eq!(p.menu_category(), "Plugins");
+    }
+
+    /// A malformed manifest is rejected with a clear, path-tagged error and does
+    /// not crash the loader or poison the registry.
+    #[test]
+    fn load_dir_reports_malformed_manifest() {
+        let dir = std::env::temp_dir()
+            .join(format!("mydrafter-plugtest-bad-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("broken")).unwrap();
+        // Missing the required `body` field + trailing junk.
+        std::fs::write(
+            dir.join("broken").join("plugin.json"),
+            r#"{"name": "broken" oops"#,
+        )
+        .unwrap();
+
+        let (reg, warnings) = PluginRegistry::load_dir(&dir);
+        assert!(reg.is_empty(), "malformed plugin must not load");
+        assert_eq!(warnings.len(), 1, "expected exactly one warning");
+        assert!(
+            warnings[0].contains("plugin.json"),
+            "warning should name the file: {:?}",
+            warnings
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// serde back-compat: a manifest WITHOUT the newer `category` field (as an
+    /// older install would have written) still deserializes, defaulting the
+    /// field to `None`. Guards the `#[serde(default)]` on `category`.
+    #[test]
+    fn pre_category_manifest_still_loads() {
+        let legacy = r#"{
+            "name": "old",
+            "description": "pre-category plugin",
+            "params": [],
+            "body": ["box 0,0,0 1,1,1"]
+        }"#;
+        let p: Plugin = serde_json::from_str(legacy).unwrap();
+        assert_eq!(p.category, None);
+        assert_eq!(p.menu_category(), "Plugins");
+        // Round-trips: re-serialize → re-parse is byte-stable and id-stable.
+        let json = serde_json::to_string(&p).unwrap();
+        let p2: Plugin = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, p2);
+        assert_eq!(json, serde_json::to_string(&p2).unwrap());
     }
 }

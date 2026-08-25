@@ -2506,6 +2506,18 @@ impl App {
     /// [`Self::apply_menu_action`].
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let style = preset::preset_for(self.cad_origin).menu_style;
+        // Snapshot user plugins for the Plugins menu (grouped by category).
+        let plugin_entries: Vec<crate::menu::PluginMenuEntry> = self
+            .session
+            .plugins
+            .iter()
+            .map(|p| crate::menu::PluginMenuEntry {
+                name: p.name.clone(),
+                category: p.menu_category().to_string(),
+                has_params: !p.params.is_empty(),
+                summary: p.summary(),
+            })
+            .collect();
         let icons = &self.icons;
         // When the true native OS menu bar (muda) is attached, it owns the
         // File/Edit/… verb menus; the in-window strip then carries only the
@@ -2514,18 +2526,24 @@ impl App {
         // On Linux muda is not compiled in, so this branch is omitted.
         #[cfg(not(target_os = "linux"))]
         if self.native_menu.is_some() {
-            egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
+            let bar = egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
                 crate::menu::appearance_only(ui, icons);
             });
+            // Dev/screenshot hook still fires under the native bar so the menu
+            // model (incl. the Plugins menu) can be captured in a shot.
+            if let Ok(title) = std::env::var("ITSJUSTCAD_MENU_DEMO") {
+                let at = egui::pos2(bar.response.rect.left() + 8.0, bar.response.rect.bottom());
+                crate::menu::demo_open(ui.ctx(), &self.icons, style, &title, at, &plugin_entries);
+            }
             return;
         }
         let bar = egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
-            crate::menu::ui(ui, icons, style)
+            crate::menu::ui(ui, icons, style, &plugin_entries)
         });
         // Dev/screenshot hook: force one menu open to show grouped items.
         if let Ok(title) = std::env::var("ITSJUSTCAD_MENU_DEMO") {
             let at = egui::pos2(bar.response.rect.left() + 8.0, bar.response.rect.bottom());
-            crate::menu::demo_open(ui.ctx(), &self.icons, style, &title, at);
+            crate::menu::demo_open(ui.ctx(), &self.icons, style, &title, at, &plugin_entries);
         }
         if let Some(action) = bar.inner {
             self.apply_menu_action(action);

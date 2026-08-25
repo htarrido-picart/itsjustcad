@@ -7,6 +7,7 @@
 | [Command Reference](command-reference.md) | Every command, organised by category |
 | [File Format](file-format.md) | The op-log format (see also [FORMAT.md](../FORMAT.md)) |
 | [Deck](deck.md) | The LLM drafting partner: cassettes, local models, plugins |
+| [Plugins](plugins.md) | Extend ItsJustCAD with your own commands and menu entries (declarative, safe) |
 | [Interop](interop.md) | DXF / IFC / SAF / glTF / LAS import and export |
 
 ---

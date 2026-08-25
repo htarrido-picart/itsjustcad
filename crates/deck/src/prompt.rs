@@ -116,6 +116,7 @@ mod tests {
         reg.insert(Plugin {
             name: "column-grid".into(),
             description: "Grid of columns".into(),
+            category: None,
             params: vec![PluginParam { name: "nx".into(), default: Some("5".into()) }],
             body: vec!["box 0,0,0 0.4,0.4,3".into()],
         });

@@ -58,6 +58,45 @@ pub enum MenuAction {
 /// starts the interactive picker rather than typing text.
 const DRAW_VERBS: [&str; 4] = ["line", "polyline", "rect", "circle"];
 
+/// One user-plugin verb surfaced in the "Plugins" menu. Built from the session
+/// [`itsjustcad_commands::plugin::Plugin`] registry (name, its declared menu
+/// group, whether it takes params, and a one-line summary for the tooltip).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginMenuEntry {
+    pub name: String,
+    pub category: String,
+    /// True when the plugin declares parameters — picking it prefills the
+    /// command line (so the user can supply args) instead of executing at once.
+    pub has_params: bool,
+    pub summary: String,
+}
+
+/// The [`MenuAction`] a plugin menu pick dispatches: a parameterless plugin runs
+/// immediately; a parameterised one is prefilled for the user to complete. Both
+/// still lower to substrate commands through the ordinary command-line path.
+pub fn plugin_action(entry: &PluginMenuEntry) -> MenuAction {
+    if entry.has_params {
+        MenuAction::Insert(format!("{} ", entry.name))
+    } else {
+        MenuAction::Execute(entry.name.clone())
+    }
+}
+
+/// Group plugin entries by their menu category, preserving first-seen order of
+/// groups and entry order within each. Feeds both the in-window and (test-only)
+/// menu models so plugins appear grouped under "Plugins ▸ <category>".
+pub fn plugin_groups(entries: &[PluginMenuEntry]) -> Vec<(String, Vec<PluginMenuEntry>)> {
+    let mut groups: Vec<(String, Vec<PluginMenuEntry>)> = Vec::new();
+    for e in entries {
+        if let Some(g) = groups.iter_mut().find(|(k, _)| *k == e.category) {
+            g.1.push(e.clone());
+        } else {
+            groups.push((e.category.clone(), vec![e.clone()]));
+        }
+    }
+    groups
+}
+
 // ── Menu iconography ─────────────────────────────────────────────────────────
 // Lucide (ISC-licensed, FOSS) line icons give the menus a clean, consistent-
 // stroke scannable column — one icon per action / per registry category so
@@ -314,7 +353,12 @@ pub fn verbs_in(cats: &[Category]) -> Vec<&'static str> {
 /// Draw the menu bar. Returns the action the user picked this frame, if any.
 /// File/Edit menus prepend the app-wired actions (save/open/…); Help is added
 /// as the last menu.
-pub fn ui(ui: &mut egui::Ui, icons: &Icons, style: MenuStyle) -> Option<MenuAction> {
+pub fn ui(
+    ui: &mut egui::Ui,
+    icons: &Icons,
+    style: MenuStyle,
+    plugins: &[PluginMenuEntry],
+) -> Option<MenuAction> {
     let mut action = None;
     egui::MenuBar::new().ui(ui, |ui| {
         for (title, cats) in top_menus(style) {
@@ -403,6 +447,37 @@ pub fn ui(ui: &mut egui::Ui, icons: &Icons, style: MenuStyle) -> Option<MenuActi
                 }
             });
         }
+        // User plugins get their own top-level menu, grouped by declared
+        // category. Only shown when at least one plugin is loaded so the bar
+        // stays clean on a fresh install.
+        if !plugins.is_empty() {
+            ui.menu_button("Plugins", |ui| {
+                let mut first_group = true;
+                for (group, entries) in plugin_groups(plugins) {
+                    if !first_group {
+                        ui.separator();
+                    }
+                    first_group = false;
+                    // A non-default group name gets a faint header row.
+                    if group != "Plugins" {
+                        ui.label(egui::RichText::new(group).weak().small());
+                    }
+                    for entry in entries {
+                        let resp = item(ui, icons, Icon::ToolsCat, &entry.name);
+                        let resp = if entry.summary.is_empty() {
+                            resp
+                        } else {
+                            resp.on_hover_text(&entry.summary)
+                        };
+                        if resp.clicked() {
+                            action = Some(plugin_action(&entry));
+                            ui.close();
+                        }
+                    }
+                }
+            });
+        }
+
         // Help is synthetic (not a registry category).
         ui.menu_button("Help", |ui| {
             if item(ui, icons, Icon::Help, "Command reference").clicked() {
@@ -472,7 +547,30 @@ pub fn demo_open(
     style: MenuStyle,
     title: &str,
     at: egui::Pos2,
+    plugins: &[PluginMenuEntry],
 ) {
+    // The synthetic "Plugins" menu is demoed from the plugin list, not from a
+    // registry category — used by the sanity screenshot.
+    if title == "Plugins" {
+        egui::Area::new(egui::Id::new("menu_demo"))
+            .fixed_pos(at)
+            .show(ctx, |ui| {
+                egui::Frame::menu(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(180.0);
+                    ui.label(egui::RichText::new("Plugins").strong());
+                    ui.separator();
+                    for (group, entries) in plugin_groups(plugins) {
+                        if group != "Plugins" {
+                            ui.label(egui::RichText::new(group).weak().small());
+                        }
+                        for entry in entries {
+                            let _ = item(ui, icons, Icon::ToolsCat, &entry.name);
+                        }
+                    }
+                });
+            });
+        return;
+    }
     let Some((_, cats)) = top_menus(style).into_iter().find(|(t, _)| *t == title) else {
         return;
     };
@@ -494,6 +592,44 @@ pub fn demo_open(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn entry(name: &str, cat: &str, has_params: bool) -> PluginMenuEntry {
+        PluginMenuEntry {
+            name: name.into(),
+            category: cat.into(),
+            has_params,
+            summary: String::new(),
+        }
+    }
+
+    /// A parameterless plugin executes immediately; a parameterised one prefills.
+    #[test]
+    fn plugin_action_executes_or_prefills_by_params() {
+        assert_eq!(
+            plugin_action(&entry("greek-column", "Classical", false)),
+            MenuAction::Execute("greek-column".into())
+        );
+        assert_eq!(
+            plugin_action(&entry("grid", "Plugins", true)),
+            MenuAction::Insert("grid ".into())
+        );
+    }
+
+    /// Grouping preserves first-seen group order and collates entries per group.
+    #[test]
+    fn plugin_groups_collate_by_category() {
+        let entries = vec![
+            entry("a", "Classical", false),
+            entry("b", "Plugins", false),
+            entry("c", "Classical", true),
+        ];
+        let groups = plugin_groups(&entries);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "Classical");
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0, "Plugins");
+        assert_eq!(groups[1].1.len(), 1);
+    }
 
     /// The 13 categories, for exhaustiveness checks.
     const ALL_CATEGORIES: [Category; 13] = [
