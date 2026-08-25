@@ -62,6 +62,25 @@ pub fn scoped_allowed_tools(allowed: &[String], vision_shot_path: Option<&str>) 
     out
 }
 
+/// Full `--allowed-tools` list for a turn: the scoped file access (see
+/// [`scoped_allowed_tools`]) plus, when `web_search` is opted in, Anthropic's
+/// `WebSearch`/`WebFetch` tools. Web search is OFF by default, so a plain turn
+/// grants neither — the deck stays sealed unless the user toggles it on.
+///
+/// Pure so the gating is unit-testable without spawning the CLI.
+pub fn turn_allowed_tools(
+    allowed: &[String],
+    vision_shot_path: Option<&str>,
+    web_search: bool,
+) -> Vec<String> {
+    let mut out = scoped_allowed_tools(allowed, vision_shot_path);
+    if web_search {
+        out.push("WebSearch".to_string());
+        out.push("WebFetch".to_string());
+    }
+    out
+}
+
 /// True for a Read specifier that is NOT confined to a concrete path: bare
 /// `Read`, or `Read()` / `Read( )` with an empty argument. These are forbidden.
 fn is_unscoped_read(tool: &str) -> bool {
@@ -100,8 +119,13 @@ impl ClaudeCodeDeck {
 
         let model = if req.model.is_empty() { &self.model } else { &req.model };
         // A tool-using turn needs at least 2 agentic steps (call the tool, then
-        // answer); clamp so a caller can never starve the answer step.
-        let max_turns = req.max_turns.max(1).to_string();
+        // answer); clamp so a caller can never starve the answer step. When web
+        // search is on, guarantee at least 3 (search, read result, answer).
+        let mut turns = req.max_turns.max(1);
+        if req.web_search {
+            turns = turns.max(3);
+        }
+        let max_turns = turns.to_string();
         let mut args: Vec<String> = vec![
             "-p".into(),
             prompt,
@@ -131,7 +155,11 @@ impl ClaudeCodeDeck {
         // to exactly that one file (`Read(<abs path>)`). Any bare `Read` (or
         // other unscoped Read) that somehow reaches `allowed_tools` is dropped —
         // the only way to read a file is the single scoped screenshot path.
-        let scoped = scoped_allowed_tools(&req.allowed_tools, req.vision_shot_path.as_deref());
+        let scoped = turn_allowed_tools(
+            &req.allowed_tools,
+            req.vision_shot_path.as_deref(),
+            req.web_search,
+        );
         if !scoped.is_empty() {
             args.push("--allowed-tools".into());
             args.push(scoped.join(","));
@@ -290,5 +318,31 @@ mod tests {
     #[test]
     fn empty_vision_path_grants_nothing() {
         assert!(scoped_allowed_tools(&[], Some("   ")).is_empty());
+    }
+
+    // --- Opt-in web search gating ---
+
+    #[test]
+    fn web_search_off_grants_no_web_tools() {
+        // The default: a plain turn has no web access whatsoever.
+        let tools = turn_allowed_tools(&[], None, false);
+        assert!(tools.is_empty(), "off must grant nothing, got {tools:?}");
+    }
+
+    #[test]
+    fn web_search_on_adds_websearch_and_webfetch() {
+        let tools = turn_allowed_tools(&[], None, true);
+        assert!(tools.contains(&"WebSearch".to_string()), "{tools:?}");
+        assert!(tools.contains(&"WebFetch".to_string()), "{tools:?}");
+    }
+
+    #[test]
+    fn web_search_does_not_loosen_the_read_scope() {
+        // H-1 still holds with web search on: a bare Read is dropped; only the
+        // scoped screenshot survives, alongside the web tools.
+        let tools = turn_allowed_tools(&["Read".into()], Some("/tmp/shot.png"), true);
+        assert!(tools.contains(&"Read(/tmp/shot.png)".to_string()), "{tools:?}");
+        assert!(!tools.iter().any(|t| t == "Read"), "bare Read leaked: {tools:?}");
+        assert!(tools.contains(&"WebSearch".to_string()));
     }
 }

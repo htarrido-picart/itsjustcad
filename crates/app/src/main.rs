@@ -4,6 +4,7 @@
 mod app;
 mod app_verbs;
 mod boxsel;
+mod chat_store;
 mod command_line;
 mod deck_pane;
 mod download;
@@ -27,6 +28,7 @@ mod statusbar;
 mod suggest;
 mod tabstrip;
 mod theme;
+mod ui_plane;
 
 fn cli_help_text() -> String {
     let mut out = String::new();

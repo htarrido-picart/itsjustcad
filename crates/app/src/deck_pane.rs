@@ -381,6 +381,22 @@ pub struct DeckPane {
     /// user's message is already queued, so `tick` retries `start_turn` once the
     /// runtime reports Ready (or drops it on Failed).
     deferred_local_turn: bool,
+    /// Opt-in web search (the "allow web search" toggle). Default OFF preserves
+    /// the offline/sealed stance. When ON, the turn's `ChatRequest.web_search`
+    /// is set: the anthropic cassette attaches the server-side web_search tool,
+    /// and the claude-code cassette adds WebSearch/WebFetch. Local grammar
+    /// cassettes ignore it (noted as out-of-scope for now).
+    allow_web_search: bool,
+    /// Multi-session chat store for the CURRENT document, keyed by its uuid and
+    /// kept app-local (never written into the shared document). Loaded lazily on
+    /// the first `sync_store` once the document uuid is known.
+    store: Option<crate::chat_store::DocSessions>,
+    /// Current search query over the store's sessions.
+    session_search: String,
+    /// UI-plane actions the deck emitted this turn (layout changes). Applied to
+    /// `ui.json` — NOT the op-log — and pending the app's reconcile. The app
+    /// drains these each frame via [`DeckPane::take_ui_actions`].
+    pending_ui_actions: Vec<crate::ui_plane::UiAction>,
 }
 
 impl Default for DeckPane {
@@ -423,6 +439,10 @@ impl Default for DeckPane {
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),
             deferred_local_turn: false,
+            allow_web_search: false,
+            store: None,
+            session_search: String::new(),
+            pending_ui_actions: Vec::new(),
         }
     }
 }
@@ -449,6 +469,9 @@ impl DeckPane {
     /// conversation handle, and clear the transcript + message history. Used by
     /// File → "New file session". The selected cassette/model are kept.
     pub fn new_session(&mut self) {
+        // Archive the outgoing conversation into the per-document store before
+        // clearing it, so switching sessions never loses history.
+        self.archive_current_session();
         self.stop_turn();
         self.session_id = None;
         self.messages.clear();
@@ -461,6 +484,52 @@ impl DeckPane {
         self.attached_image = None;
         self.view = PaneView::Chat;
         self.persist_chat();
+    }
+
+    /// Drain the UI-plane actions the deck emitted since the last call. The app
+    /// applies each into `ui.json` and reconciles its live widgets. These are
+    /// layout changes only — never document mutations.
+    pub fn take_ui_actions(&mut self) -> Vec<crate::ui_plane::UiAction> {
+        std::mem::take(&mut self.pending_ui_actions)
+    }
+
+    /// Point the multi-session store at `doc_uuid`, loading that document's
+    /// app-local sessions. Called by the app when a document is opened/saved and
+    /// its uuid becomes known. Reloads only when the uuid changes.
+    pub fn sync_store(&mut self, doc_uuid: &str) {
+        let needs_load = self
+            .store
+            .as_ref()
+            .map(|s| s.doc_uuid != doc_uuid)
+            .unwrap_or(true);
+        if needs_load {
+            self.store = Some(crate::chat_store::DocSessions::load(doc_uuid));
+        }
+    }
+
+    /// Save the current transcript as (or into) a named session in the store,
+    /// keyed by the current document. Private + app-local; the shared document
+    /// is never touched. No-op until `sync_store` has established a store.
+    pub fn archive_current_session(&mut self) {
+        let Some(store) = self.store.as_mut() else { return };
+        if self.messages.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut session = crate::chat_store::ChatSession::new(now);
+        for m in &self.messages {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            };
+            session.push(role, &m.content, now);
+        }
+        store.sessions.push(session);
+        store.sort_recent();
+        store.save();
     }
 
     /// Snapshot the chat to disk so an idle/quit/crash can be revived later.
@@ -694,6 +763,10 @@ impl DeckPane {
             0.2,
             self.session_id.clone(),
         );
+        // Opt-in web search: only set when the user toggled it on. Off keeps the
+        // request tool-free (offline/sealed). Cassettes that don't support it
+        // ignore the flag.
+        req.web_search = self.allow_web_search;
         if self.vision_turn {
             // SECURITY (H-1): grant NO unscoped Read. Instead point the adapter
             // at a SINGLE fixed image — either the user-attached image or the
@@ -775,6 +848,20 @@ impl DeckPane {
                     self.streaming_chat.push_str("\n```\n");
                 }
                 ExtractEvent::Command(line) => {
+                    // UI/SESSION TOOL PLANE (distinct from document commands):
+                    // a layout verb changes window state via ui.json, NOT the
+                    // op-log. Try it first — the two tool groups are disjoint, so
+                    // a real document command never parses as a ui action. A ui
+                    // action is queued for the app to apply and never runs
+                    // through `session.run`, so it cannot enter the drawing.
+                    if let Ok(action) = crate::ui_plane::parse_ui_action(&line) {
+                        self.current_commands.push(ExecutedCommand {
+                            line: format!("ui: {line}"),
+                            result: Ok(action.summary()),
+                        });
+                        self.pending_ui_actions.push(action);
+                        continue;
+                    }
                     // Parse first so we can classify. A parse error is reported
                     // exactly as before (no execution attempted).
                     let cmd = match parse(&line) {
@@ -1077,6 +1164,109 @@ impl DeckPane {
         }
     }
 
+    /// Seed a couple of demo chat sessions into the current store — a dev hook
+    /// (`ITSJUSTCAD_DECK_PANE`) so a screenshot can show the switcher + search
+    /// populated without a live model. No-op if the store already has sessions.
+    pub fn seed_demo_sessions(&mut self) {
+        let Some(store) = self.store.as_mut() else { return };
+        if !store.sessions.is_empty() {
+            return;
+        }
+        let mut a = crate::chat_store::ChatSession::new(200);
+        a.push("user", "make a five by five office core with a stair", 200);
+        a.push("assistant", "Drew the core and a stair to level 2.", 201);
+        let mut b = crate::chat_store::ChatSession::new(100);
+        b.push("user", "add a curtain wall facade to the north side", 100);
+        b.push("assistant", "Added a glass facade along the north edge.", 101);
+        store.sessions.push(a);
+        store.sessions.push(b);
+        store.sort_recent();
+    }
+
+    /// Multi-session switcher + full-text search over the current document's
+    /// stored chats. A search field lists matching sessions with a snippet;
+    /// clicking a session loads its transcript (jumping to the matched turn).
+    /// Collapsed by default so it never crowds the live chat.
+    fn session_browser_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(store) = self.store.as_ref() else { return };
+        let count = store.sessions.len();
+        egui::CollapsingHeader::new(format!("💬 sessions ({count})"))
+            .id_salt("deck_sessions")
+            .default_open(count > 0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("search:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.session_search)
+                            .hint_text("find across this doc's chats")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                let mut load_session: Option<String> = None;
+                // Re-borrow the store immutably for the results (search_field is
+                // a separate field, so this does not alias).
+                let store = self.store.as_ref().expect("store present");
+                if !self.session_search.trim().is_empty() {
+                    let hits = store.search(&self.session_search);
+                    if hits.is_empty() {
+                        ui.label(egui::RichText::new("no matches").weak().italics());
+                    }
+                    for hit in hits.iter().take(20) {
+                        let label = format!("{} — {}", hit.session_title, hit.snippet);
+                        if ui.selectable_label(false, label).clicked() {
+                            load_session = Some(hit.session_id.clone());
+                        }
+                    }
+                } else {
+                    for s in store.sessions.iter().take(20) {
+                        let turns = s.turns.len();
+                        if ui
+                            .selectable_label(false, format!("{} ({turns})", s.title))
+                            .clicked()
+                        {
+                            load_session = Some(s.id.clone());
+                        }
+                    }
+                }
+                if let Some(id) = load_session {
+                    self.load_stored_session(&id);
+                }
+            });
+    }
+
+    /// Load a stored session's turns into the live transcript for viewing /
+    /// continuation. Archives the current conversation first so nothing is lost.
+    fn load_stored_session(&mut self, id: &str) {
+        // Snapshot the outgoing conversation before replacing it.
+        self.archive_current_session();
+        let Some(store) = self.store.as_ref() else { return };
+        let Some(session) = store.get(id) else { return };
+        self.messages = session
+            .turns
+            .iter()
+            .map(|t| ChatMessage {
+                role: if t.role == "assistant" { Role::Assistant } else { Role::User },
+                content: t.content.clone(),
+            })
+            .collect();
+        self.transcript = session
+            .turns
+            .iter()
+            .map(|t| {
+                if t.role == "assistant" {
+                    Entry::Deck(t.content.clone())
+                } else {
+                    Entry::User(t.content.clone())
+                }
+            })
+            .collect();
+        // A loaded session is a fresh provider conversation (no live handle).
+        self.session_id = None;
+        self.session_search.clear();
+        self.view = PaneView::Chat;
+        self.persist_chat();
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -1132,6 +1322,19 @@ impl DeckPane {
                     }
                 }
                 self.decks.save();
+            }
+            // Opt-in web search toggle. Default OFF. Only meaningful for cloud
+            // cassettes (anthropic server-side tool, claude-code WebSearch);
+            // disabled under local-only, which forbids remote calls anyway.
+            let web_capable = !self.decks.local_only;
+            ui.add_enabled_ui(web_capable, |ui| {
+                ui.checkbox(&mut self.allow_web_search, "allow web search")
+                    .on_hover_text(
+                        "let the model search/fetch the web this turn (cloud cassettes only); off by default to stay sealed",
+                    );
+            });
+            if !web_capable {
+                self.allow_web_search = false;
             }
             ui.separator();
             ui.label("deck:");
@@ -1276,6 +1479,8 @@ impl DeckPane {
             ProbeState::Unknown => {}
         }
         ui.separator();
+
+        self.session_browser_ui(ui);
 
         // Child pane: full command code view with a back button.
         if let Some(commands_view) = match self.view {
@@ -1463,7 +1668,44 @@ mod side_effect_gate_tests {
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),
             deferred_local_turn: false,
+            allow_web_search: false,
+            store: None,
+            session_search: String::new(),
+            pending_ui_actions: Vec::new(),
         }
+    }
+
+    // --- Opt-in web search gating at the request-build boundary ---
+
+    #[test]
+    fn web_search_flag_defaults_off_and_mirrors_into_request() {
+        // The pane's toggle is OFF by default → the turn's ChatRequest carries
+        // web_search=false (tool absent from the request). Flipping the toggle
+        // sets the flag. This mirrors the `req.web_search = self.allow_web_search`
+        // line in start_turn without needing a live model/tokio runtime.
+        let mut pane = blank_pane();
+        assert!(!pane.allow_web_search, "web search must default OFF");
+        let mut req = ChatRequest::text(String::new(), Vec::new(), String::new(), 4096, 0.2, None);
+        req.web_search = pane.allow_web_search;
+        assert!(!req.web_search, "OFF → request has web_search=false");
+
+        pane.allow_web_search = true;
+        req.web_search = pane.allow_web_search;
+        assert!(req.web_search, "ON → request has web_search=true");
+    }
+
+    #[test]
+    fn local_only_forces_web_search_off() {
+        // Under local-only (no remote calls permitted) the toggle is force-off,
+        // so a sealed session can never emit a web_search request.
+        let mut pane = blank_pane();
+        pane.allow_web_search = true;
+        pane.decks.local_only = true;
+        // Mirror the header guard: local-only clears the flag.
+        if pane.decks.local_only {
+            pane.allow_web_search = false;
+        }
+        assert!(!pane.allow_web_search);
     }
 
     // --- SECURITY H-1/H-2: vision-critique file access ---

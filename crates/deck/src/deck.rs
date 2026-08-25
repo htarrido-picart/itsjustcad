@@ -48,6 +48,15 @@ pub struct ChatRequest {
     /// tool-using turn (Read a screenshot, then answer) needs 2+. HTTP
     /// adapters ignore it.
     pub max_turns: u32,
+    /// Opt-in web search for this turn. Default `false` (offline/sealed stance).
+    /// When `true`:
+    /// - the anthropic cassette attaches Anthropic's server-side `web_search`
+    ///   tool to the request;
+    /// - the claude-code cassette adds `WebSearch`/`WebFetch` to `--allowed-tools`.
+    ///
+    /// Off keeps the tool absent from the request entirely. Other cassettes
+    /// (local grammar) ignore it.
+    pub web_search: bool,
 }
 
 impl ChatRequest {
@@ -72,6 +81,7 @@ impl ChatRequest {
             allowed_tools: Vec::new(),
             vision_shot_path: None,
             max_turns: 1,
+            web_search: false,
         }
     }
 }

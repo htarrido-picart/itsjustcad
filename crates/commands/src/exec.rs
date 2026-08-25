@@ -199,6 +199,12 @@ pub struct Session {
     branches: BTreeMap<String, Vec<Command>>,
     /// The branch the live log belongs to. `MAIN_BRANCH` until you save/switch.
     current_branch: String,
+    /// Stable document identity written into the file header (see `crate::io`).
+    /// `None` for a scratch/never-saved session and for pre-uuid files (which
+    /// stay byte-identical on re-save). The app keys per-document chat sessions
+    /// off this; it is NOT part of the replayable op-log, so it never affects
+    /// geometry, ids, or replay-stability.
+    doc_uuid: Option<String>,
 }
 
 /// The implicit branch every session starts on and that divergent work is
@@ -272,6 +278,7 @@ impl Default for Session {
             pending_log: None,
             branches: BTreeMap::new(),
             current_branch: MAIN_BRANCH.to_string(),
+            doc_uuid: None,
         }
     }
 }
@@ -697,6 +704,8 @@ impl Session {
         // saved branches themselves.
         fresh.branches = std::mem::take(&mut self.branches);
         fresh.current_branch = std::mem::take(&mut self.current_branch);
+        // Document identity is header-level, not part of the amended op-log.
+        fresh.doc_uuid = self.doc_uuid.take();
         *self = fresh;
         Ok(ApplyOutcome {
             created: Vec::new(),
@@ -827,6 +836,19 @@ impl Session {
     pub fn set_branches(&mut self, branches: BTreeMap<String, Vec<Command>>, current: String) {
         self.branches = branches;
         self.current_branch = current;
+    }
+
+    /// Stable document identity from the file header, if the file carried one
+    /// (or one was assigned this run). `None` for pre-uuid files and scratch
+    /// sessions. Header-level only — never part of the op-log or replay.
+    pub fn doc_uuid(&self) -> Option<&str> {
+        self.doc_uuid.as_deref()
+    }
+
+    /// Set (or clear) the stable document identity. Used by `crate::io` on load
+    /// and by the app when it stamps a fresh uuid onto a first save.
+    pub fn set_doc_uuid(&mut self, uuid: Option<String>) {
+        self.doc_uuid = uuid;
     }
 
     /// Import a file by dispatching on extension.

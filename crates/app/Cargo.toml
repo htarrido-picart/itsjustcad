@@ -33,6 +33,7 @@ rfd.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = "0.4"
 egui_commonmark = "0.24"
@@ -41,6 +42,3 @@ egui_commonmark = "0.24"
 # attached in interactive windowed mode; headless/tests never touch it.
 muda = "0.19"
 raw-window-handle = "0.6"
-
-[dev-dependencies]
-uuid.workspace = true

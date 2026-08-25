@@ -580,6 +580,11 @@ impl App {
             self.panel_tabs.show(crate::tabstrip::PanelTab::Deck);
             self.deck_pane
                 .send_text(&prompt, &self.session, &self.tokio);
+        } else if std::env::var("ITSJUSTCAD_DECK_PANE").is_ok() {
+            // Dev hook: reveal the Deck tab (no send) so ITSJUSTCAD_SHOT frames
+            // capture the chat pane chrome — session switcher/search + the
+            // opt-in web-search toggle — without needing a live model.
+            self.panel_tabs.show(crate::tabstrip::PanelTab::Deck);
         }
     }
 
@@ -2658,6 +2663,34 @@ impl App {
     }
 }
 
+impl App {
+    /// The current document's stable uuid, stamping a fresh one onto the session
+    /// when the file never carried one. Header-level only (see
+    /// `Session::set_doc_uuid`) — it is not part of the op-log and never affects
+    /// geometry or replay. Used to key the deck's per-document chat store.
+    fn ensure_doc_uuid(&mut self) -> String {
+        if let Some(u) = self.session.doc_uuid() {
+            return u.to_string();
+        }
+        let fresh = uuid::Uuid::new_v4().to_string();
+        self.session.set_doc_uuid(Some(fresh.clone()));
+        fresh
+    }
+
+    /// Reconcile live widgets to a UI-plane change just written to `ui.json`.
+    /// Only touches window layout (panel visibility, theme) — never the drawing.
+    fn reconcile_ui_plane(&mut self, ui_json: &serde_json::Value) {
+        if let Some(v) = ui_json["panel_visible"].as_bool() {
+            self.panel_visible = v;
+        }
+        match ui_json["theme"].as_str() {
+            Some("dark") => self.forced_dark = Some(true),
+            Some("light") => self.forced_dark = Some(false),
+            _ => {}
+        }
+    }
+}
+
 fn ui_config_path() -> Option<std::path::PathBuf> {
     Some(dirs::home_dir()?.join(".config").join("itsjustcad").join("ui.json"))
 }
@@ -3240,6 +3273,28 @@ impl eframe::App for App {
         // Deck pane tick: must run every frame regardless of visibility so
         // streaming turns and probes keep making progress while the pane is hidden.
         self.deck_pane.tick(&mut self.session, &self.tokio, ui.ctx());
+
+        // Multi-session store: key the deck's per-document chats off a stable
+        // document uuid (stamped lazily if the file never had one). App-local,
+        // private — never written into the shared drawing.
+        let doc_uuid = self.ensure_doc_uuid();
+        self.deck_pane.sync_store(&doc_uuid);
+        if std::env::var("ITSJUSTCAD_DECK_PANE").is_ok() {
+            self.deck_pane.seed_demo_sessions();
+        }
+
+        // UI/SESSION TOOL PLANE: apply any layout actions the deck emitted into
+        // ui.json — never the op-log. Layout is not the drawing, so it must not
+        // replay or undo. The document/op-log is untouched by this.
+        let ui_actions = self.deck_pane.take_ui_actions();
+        if !ui_actions.is_empty() {
+            let mut v = load_ui_json();
+            for action in &ui_actions {
+                crate::ui_plane::apply(&mut v, action);
+            }
+            save_ui_json(&v);
+            self.reconcile_ui_plane(&v);
+        }
 
         // Cmd+\ reveals the Deck tab in the right panel (or hides the panel if
         // the Deck tab is already the active, visible one). Backslash is not

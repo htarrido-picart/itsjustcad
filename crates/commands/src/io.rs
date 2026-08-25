@@ -25,6 +25,12 @@ pub const CHECKPOINT_VERSION: u32 = 1;
 struct FileFormat {
     #[serde(alias = "mydrafter")]
     itsjustcad: u32,
+    /// Stable document identity (RFC-4122 UUID string). `serde(default)` +
+    /// `skip_serializing_if` keeps pre-uuid files loading AND keeps a document
+    /// that never had a uuid byte-identical on re-save. The app keys per-doc
+    /// chat sessions off this; it is NOT replayed and does not affect geometry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uuid: Option<String>,
     ops: Vec<Command>,
     /// Named branches of the op-log (each a saved effective log). Empty for
     /// files with no design options.
@@ -55,6 +61,7 @@ pub fn to_json(session: &Session) -> String {
     let branch = (!branches.is_empty()).then(|| session.current_branch().to_string());
     let file = FileFormat {
         itsjustcad: FORMAT_VERSION,
+        uuid: session.doc_uuid().map(str::to_string),
         ops: session.save_log(),
         branches,
         branch,
@@ -72,6 +79,7 @@ pub fn from_json(json: &str) -> Result<Session, IoError> {
         file.branches,
         file.branch.unwrap_or_else(|| crate::exec::MAIN_BRANCH.to_string()),
     );
+    session.set_doc_uuid(file.uuid);
     Ok(session)
 }
 
@@ -136,11 +144,13 @@ pub fn load_file(path: &std::path::Path) -> Result<Session, IoError> {
     {
         let mut session = Session::from_snapshot(cp.doc, file.ops);
         session.set_branches(file.branches, branch);
+        session.set_doc_uuid(file.uuid);
         return Ok(session);
     }
 
     let mut session = Session::replay(file.ops)?;
     session.set_branches(file.branches, branch);
+    session.set_doc_uuid(file.uuid);
     Ok(session)
 }
 
@@ -187,6 +197,57 @@ mod tests {
         let ids: Vec<_> = s.doc.objects().map(|o| o.id).collect();
         let loaded_ids: Vec<_> = loaded.doc.objects().map(|o| o.id).collect();
         assert_eq!(ids, loaded_ids, "identical objects after replay");
+    }
+
+    #[test]
+    fn pre_uuid_file_loads_and_stays_byte_identical_on_resave() {
+        // A hand-written file from before the doc uuid existed: no `uuid` key.
+        // It must load, expose no uuid, and re-serialize byte-for-byte identical
+        // (skip_serializing_if keeps the header clean for never-stamped docs).
+        let json = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "box",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "size": [2.0, 2.0, 2.0]}
+            ]
+        }"#;
+        let s = from_json(json).unwrap();
+        assert!(s.doc_uuid().is_none(), "pre-uuid file must carry no uuid");
+        // Re-save produces no uuid field at all.
+        let out = to_json(&s);
+        assert!(!out.contains("uuid"), "never-stamped doc must not gain a uuid: {out}");
+        // And round-trips stably.
+        assert_eq!(to_json(&from_json(&out).unwrap()), out);
+    }
+
+    #[test]
+    fn uuid_round_trips_when_present() {
+        let mut s = Session::default();
+        s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        s.set_doc_uuid(Some("11112222-3333-4444-5555-666677778888".into()));
+        let json = to_json(&s);
+        assert!(json.contains("\"uuid\""), "uuid must be written: {json}");
+        let loaded = from_json(&json).unwrap();
+        assert_eq!(
+            loaded.doc_uuid(),
+            Some("11112222-3333-4444-5555-666677778888")
+        );
+        // Replay-stable with the uuid in place.
+        assert_eq!(to_json(&loaded), json);
+    }
+
+    #[test]
+    fn uuid_survives_amend() {
+        let mut s = Session::default();
+        s.run(parse("box 0,0,0 5,5,3").unwrap()).unwrap();
+        s.set_doc_uuid(Some("aaaa0000-0000-4000-8000-000000000001".into()));
+        s.amend(0, parse("box 0,0,0 8,8,3").unwrap()).unwrap();
+        assert_eq!(
+            s.doc_uuid(),
+            Some("aaaa0000-0000-4000-8000-000000000001"),
+            "amend must preserve document identity"
+        );
     }
 
     #[test]
