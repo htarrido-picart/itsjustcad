@@ -5,7 +5,6 @@
 //! the LLM deck. A document is an op-log of `Command`s — undo, file format and
 //! replay all derive from it.
 
-pub mod basemap;
 pub mod blocklib;
 mod command;
 pub mod csv;
