@@ -39,6 +39,14 @@ impl GeoOrigin {
         let y = (lat_deg - self.lat_deg).to_radians() * EARTH_RADIUS_M;
         DVec2::new(x, y)
     }
+
+    /// Public equirectangular projection of a lon/lat point to local meters
+    /// (`[x, y]`), sharing the exact math used for GeoJSON/OSM import so the
+    /// basemap lines up with imported site geometry.
+    pub fn project_public(&self, lon_deg: f64, lat_deg: f64) -> [f64; 2] {
+        let p = self.project(lon_deg, lat_deg);
+        [p.x, p.y]
+    }
 }
 
 /// Map one raw GeoJSON `[x, y]` coordinate to local meters using the heuristic.

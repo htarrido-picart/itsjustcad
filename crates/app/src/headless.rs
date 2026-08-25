@@ -12,6 +12,30 @@ use itsjustcad_render::{
     DisplayMode, LightMode, OrbitCamera, PanoProjection, SketchyParams, StandardView,
 };
 
+/// Build renderer [`UnderlayData`] from a document's transient basemap (already
+/// decoded + georeferenced). Shared conceptually with the GUI's `basemap_data`.
+pub(crate) fn basemap_scene_data(
+    doc: &itsjustcad_doc::Document,
+) -> Option<itsjustcad_render::UnderlayData> {
+    let b = doc.basemap.as_ref()?;
+    if b.rgba.is_empty() || b.width_px == 0 || b.height_px == 0 {
+        return None;
+    }
+    let c = b.quad_corners();
+    Some(itsjustcad_render::UnderlayData {
+        rgba: b.rgba.clone(),
+        width_px: b.width_px,
+        height_px: b.height_px,
+        corners: [
+            [c[0].x as f32, c[0].y as f32, 0.0],
+            [c[1].x as f32, c[1].y as f32, 0.0],
+            [c[2].x as f32, c[2].y as f32, 0.0],
+            [c[3].x as f32, c[3].y as f32, 0.0],
+        ],
+        opacity: b.opacity,
+    })
+}
+
 // ── Headless view state ─────────────────────────────────────────────────────────
 
 /// View-affecting state accumulated by app-level verbs while a headless script
@@ -330,6 +354,11 @@ pub fn render_headless(
             ..Default::default()
         },
     );
+
+    // Attach the transient basemap (satellite/OSM ground image) if one was set
+    // by a `basemap` verb earlier in the script. Pixels are already decoded and
+    // georeferenced in local meters.
+    scene.basemap = basemap_scene_data(&session.doc);
 
     // When show_lineweights is on, add thick-line quad meshes for each line
     // with a non-hairline lineweight. In headless mode the egui painter overlay

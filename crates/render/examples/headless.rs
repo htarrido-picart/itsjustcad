@@ -80,6 +80,7 @@ fn main() {
             profile_edges: vec![],
             points: vec![],
             underlay: None,
+            basemap: None,
             show_lineweights: false,
         };
         renderer.set_scene(&device, &queue, &scene, 0);

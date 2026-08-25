@@ -6,8 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_mesh::Aabb;
 
 use crate::{
-    BlockGeometry, GeoLocation, Grid, LayerStyle, Material, NamedView, ObjectId, ParamBlockDef,
-    SceneObject, Section, Sheet, Story, StructLoad, StructSupport, SunPosition, Underlay, Units,
+    Basemap, BlockGeometry, GeoLocation, Grid, LayerStyle, Material, NamedView, ObjectId,
+    ParamBlockDef, SceneObject, Section, Sheet, Story, StructLoad, StructSupport, SunPosition,
+    Underlay, Units,
     DEFAULT_LAYER,
 };
 
@@ -58,6 +59,12 @@ pub struct Document {
     /// Optional raster reference image on the ground plane. Set via the logged
     /// `underlay` command; a missing file on open is a warning, not an error.
     pub underlay: Option<Underlay>,
+    /// Georeferenced satellite/OSM basemap under the model. TRANSIENT session
+    /// state: `#[serde(skip)]` keeps it out of the op-log and save file (it is
+    /// large and reproducible from the location). Set by the app's `basemap`
+    /// verb, never logged.
+    #[serde(skip)]
+    pub basemap: Option<Basemap>,
     /// Solar position set by the `sun` command; `None` means headlight-only
     /// shading. Logged so saved files replay with the same lighting.
     pub sun: Option<SunPosition>,
@@ -114,6 +121,7 @@ impl Default for Document {
             param_blocks: BTreeMap::new(),
             pending_view: None,
             underlay: None,
+            basemap: None,
             sun: None,
             location: None,
             sections: BTreeMap::new(),

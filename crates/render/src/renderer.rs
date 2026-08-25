@@ -448,6 +448,9 @@ pub struct SceneData {
     pub points: Vec<(Vec<[f32; 3]>, [f32; 4])>,
     /// Optional raster reference image on the ground plane.
     pub underlay: Option<UnderlayData>,
+    /// Optional georeferenced satellite/OSM basemap, drawn UNDER the underlay on
+    /// the ground plane. Same textured-quad shape as [`UnderlayData`].
+    pub basemap: Option<UnderlayData>,
     /// When true the renderer draws fat-line quads for lines with
     /// non-hairline weights; when false all strokes are 1-pixel hairlines.
     pub show_lineweights: bool,
@@ -481,6 +484,7 @@ pub struct SceneRenderer {
     profile_ribbons: Vec<GpuMesh>,
     point_clouds: Vec<GpuLine>,
     underlay: Option<GpuUnderlay>,
+    basemap: Option<GpuUnderlay>,
     /// Document generation the GPU buffers were built from.
     pub generation: u64,
 }
@@ -862,6 +866,7 @@ impl SceneRenderer {
             profile_ribbons: Vec::new(),
             point_clouds: Vec::new(),
             underlay: None,
+            basemap: None,
             generation: u64::MAX,
         }
     }
@@ -1084,6 +1089,10 @@ impl SceneRenderer {
             .underlay
             .as_ref()
             .map(|u| self.build_underlay(device, queue, u));
+        self.basemap = scene
+            .basemap
+            .as_ref()
+            .map(|u| self.build_underlay(device, queue, u));
     }
 
     /// Upload one underlay: an RGBA8 texture, a quad (two triangles) with uvs,
@@ -1179,7 +1188,17 @@ impl SceneRenderer {
         };
         render_pass.set_bind_group(0, camera_bind_group, &[]);
 
-        // Underlay first: on the ground plane, depth-written so meshes occlude
+        // Basemap first (bottom of the ground-plane stack): satellite/OSM tiles
+        // under any tracing underlay. Same textured-quad pipeline.
+        if let Some(b) = &self.basemap {
+            render_pass.set_pipeline(&self.underlay_pipeline);
+            render_pass.set_bind_group(1, &b.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, b.vertex_buf.slice(..));
+            render_pass.set_index_buffer(b.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..6, 0, 0..1);
+        }
+
+        // Underlay next: on the ground plane, depth-written so meshes occlude
         // it and the grid blends over it.
         if let Some(u) = &self.underlay {
             render_pass.set_pipeline(&self.underlay_pipeline);

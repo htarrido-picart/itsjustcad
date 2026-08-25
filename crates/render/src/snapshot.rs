@@ -251,6 +251,9 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
         // The underlay image is decoded app-side (the app owns the `image`
         // dependency) and attached to the returned scene.
         underlay: None,
+        // The basemap is transient session state (doc.basemap); the app attaches
+        // its already-decoded pixels to the scene, same as the underlay.
+        basemap: None,
         show_lineweights: doc.show_lineweights,
     };
     for obj in doc.objects() {

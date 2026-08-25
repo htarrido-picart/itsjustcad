@@ -863,6 +863,29 @@ impl App {
         })
     }
 
+    /// Convert the document's transient basemap (already-decoded satellite/OSM
+    /// pixels in local meters) into GPU-ready `UnderlayData`. No file I/O — the
+    /// basemap is held in memory, not on disk.
+    fn basemap_data(&self) -> Option<UnderlayData> {
+        let b = self.session.doc.basemap.as_ref()?;
+        if b.rgba.is_empty() || b.width_px == 0 || b.height_px == 0 {
+            return None;
+        }
+        let c = b.quad_corners();
+        Some(UnderlayData {
+            rgba: b.rgba.clone(),
+            width_px: b.width_px,
+            height_px: b.height_px,
+            corners: [
+                [c[0].x as f32, c[0].y as f32, 0.0],
+                [c[1].x as f32, c[1].y as f32, 0.0],
+                [c[2].x as f32, c[2].y as f32, 0.0],
+                [c[3].x as f32, c[3].y as f32, 0.0],
+            ],
+            opacity: b.opacity,
+        })
+    }
+
     /// Camera of the active (last hovered) pane.
     fn active_camera(&mut self) -> &mut OrbitCamera {
         &mut self.cameras[self.layout.camera_index(self.active_pane)]
@@ -1416,6 +1439,7 @@ impl App {
                 },
             );
             s.underlay = self.decode_underlay();
+            s.basemap = self.basemap_data();
             Some(s)
         } else {
             None

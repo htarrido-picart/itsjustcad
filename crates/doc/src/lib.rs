@@ -25,7 +25,7 @@ pub use object::{
 };
 pub use sheet::{PaperSize, ScheduleRow, Sheet, SheetDim, SheetTable, SheetView, ViewDirection};
 pub use structure::{Grid, Material, Section, Story};
-pub use underlay::Underlay;
+pub use underlay::{Basemap, Underlay};
 pub use units::{
     format_area, format_length, format_volume, Units, METERS_PER_FOOT, METERS_PER_INCH,
 };

@@ -215,10 +215,27 @@ pub const MAIN_BRANCH: &str = "main";
 /// so `insert pdoor|pwindow|pcolumn ...` works out of the box. Each is a plain
 /// command template using the `{param}` substitution machinery.
 ///
-/// - `pdoor`  — door leaf (a rectangle of the given `width`) plus a swing arc of
-///   `swing` degrees; the leaf-and-swing footprint scales with `width`.
-/// - `pwindow` — a window opening `width` × `height` with a mullion line.
-/// - `pcolumn` — a square column footprint of side `size`.
+/// ### Doors (plan-view, origin at hinge/frame-corner)
+/// - `pdoor`        — single-swing door leaf + arc (default width=0.9 m).
+/// - `pdoor_double` — double-swing door, two leaves opening from centre seam.
+/// - `pdoor_sliding`— sliding door: one panel shown offset inside frame.
+///
+/// ### Windows (plan-view, thickness along Y)
+/// - `pwindow`         — fixed window: frame rect + centre glazing line.
+/// - `pwindow_casement`— casement: frame + diagonal open-sash indicator.
+/// - `pwindow_sliding` — sliding: frame + two sash-divider lines.
+///
+/// ### Furniture (plan-view)
+/// - `pdesk`  — rectangular work surface (default 1.6 × 0.8 m).
+/// - `pchair` — seat square + curved back arc (default 0.5 m).
+/// - `pbed`   — bed frame + pillow zone (default double 1.5 × 2.0 m).
+/// - `ptable` — round table as a circle (default radius 0.45 m).
+/// - `psofa`  — sofa: seat + back + two armrests (default 2.0 × 0.9 m).
+/// - `ptoilet`— WC plan: tank rect + bowl body + front arc.
+/// - `psink`  — basin rect + drain circle (default 0.6 × 0.5 m).
+///
+/// ### Structure
+/// - `pcolumn` — square column footprint of side `size`.
 pub fn starter_param_blocks() -> Vec<(String, itsjustcad_doc::ParamBlockDef)> {
     use itsjustcad_doc::{ParamBlockDef, ParamBlockParam};
     let p = |name: &str, default: &str| ParamBlockParam {
@@ -230,30 +247,236 @@ pub fn starter_param_blocks() -> Vec<(String, itsjustcad_doc::ParamBlockDef)> {
         body: body.iter().map(|s| s.to_string()).collect(),
     };
     vec![
+        // ── Doors ────────────────────────────────────────────────────────────
+
+        // Single-swing door: leaf rect + quarter-circle swing arc.
+        // Origin at hinge (0,0). Leaf extends along +X; arc sweeps 0→swing°.
         (
             "pdoor".to_string(),
             mk(
                 vec![p("width", "0.9"), p("swing", "90")],
                 &[
-                    // Door leaf: a thin rectangle along +X of length `width`.
                     "rect 0,0,0 {width} 0.05",
-                    // Swing arc: radius = width, from 0° to `swing`.
                     "arc 0,0,0 {width} 0 {swing}",
                 ],
             ),
         ),
+
+        // Double-swing door: two equal leaves from each jamb meeting at centre.
+        // `half` = width/2; each leaf swings 90° outward from its hinge.
+        // All derived dims are explicit params so the template stays pure-subst.
         (
-            "pwindow".to_string(),
+            "pdoor_double".to_string(),
             mk(
-                vec![p("width", "1.2"), p("height", "1.5")],
+                vec![p("width", "1.8"), p("half", "0.9")],
                 &[
-                    // Frame rectangle width × height.
-                    "rect 0,0,0 {width} {height}",
-                    // Vertical mullion at the top edge (width-dependent).
-                    "line 0,{height},0 {width},{height},0",
+                    // Left leaf: hinge at (0,0), extends +X for `half` metres
+                    "rect 0,0,0 {half} 0.05",
+                    // Left swing arc: centre (0,0), radius=half, 0→90°
+                    "arc 0,0,0 {half} 0 90",
+                    // Right leaf: hinge at ({width},0), extends -X for `half` metres
+                    "rect {half},0,0 {half} 0.05",
+                    // Right swing arc: centre ({width},0), radius=half, 90→180°
+                    "arc {width},0,0 {half} 90 180",
                 ],
             ),
         ),
+
+        // Sliding door: frame outline + one panel occupying the left half.
+        // `half` = width/2 (expose as param for easy override).
+        (
+            "pdoor_sliding".to_string(),
+            mk(
+                vec![p("width", "0.9"), p("depth", "0.1"), p("half", "0.45")],
+                &[
+                    // Frame outline
+                    "rect 0,0,0 {width} {depth}",
+                    // Sliding panel in left half
+                    "rect 0,0,0 {half} {depth}",
+                    // Overlap indicator line
+                    "line {half},0,0 {half},{depth},0",
+                ],
+            ),
+        ),
+
+        // ── Windows ──────────────────────────────────────────────────────────
+
+        // Fixed window: outer frame rect + single centre glazing line.
+        // `half_depth` = depth/2 (centre of wall thickness).
+        (
+            "pwindow".to_string(),
+            mk(
+                vec![p("width", "1.2"), p("depth", "0.15"), p("half_depth", "0.075")],
+                &[
+                    "rect 0,0,0 {width} {depth}",
+                    "line 0,{half_depth},0 {width},{half_depth},0",
+                ],
+            ),
+        ),
+
+        // Casement window: frame + diagonal indicating the sash swings out.
+        // Hinge at (0, depth); free corner swings to ({width}, 0).
+        (
+            "pwindow_casement".to_string(),
+            mk(
+                vec![p("width", "0.9"), p("depth", "0.15")],
+                &[
+                    "rect 0,0,0 {width} {depth}",
+                    "line 0,{depth},0 {width},0,0",
+                ],
+            ),
+        ),
+
+        // Sliding window: frame + two vertical sash-divider lines.
+        // `third` ≈ width/3; `two_thirds` ≈ 2×width/3 — explicit params.
+        (
+            "pwindow_sliding".to_string(),
+            mk(
+                vec![
+                    p("width", "1.2"),
+                    p("depth", "0.15"),
+                    p("third", "0.4"),
+                    p("two_thirds", "0.8"),
+                ],
+                &[
+                    "rect 0,0,0 {width} {depth}",
+                    "line {third},0,0 {third},{depth},0",
+                    "line {two_thirds},0,0 {two_thirds},{depth},0",
+                ],
+            ),
+        ),
+
+        // ── Furniture ────────────────────────────────────────────────────────
+
+        // Desk: main surface rectangle + keyboard-tray line 0.15 m from front.
+        (
+            "pdesk".to_string(),
+            mk(
+                vec![p("width", "1.6"), p("depth", "0.8")],
+                &[
+                    "rect 0,0,0 {width} {depth}",
+                    "line 0,0.15,0 {width},0.15,0",
+                ],
+            ),
+        ),
+
+        // Chair: seat square + back-rest arc behind the seat.
+        // `half` = size/2 (centre X for back arc); arc sweeps 0→180° behind seat.
+        (
+            "pchair".to_string(),
+            mk(
+                vec![p("size", "0.5"), p("half", "0.25")],
+                &[
+                    // Seat cushion square
+                    "rect 0,0,0 {size} {size}",
+                    // Back-rest arc: centre at ({half},{size}), radius={half}
+                    "arc {half},{size},0 {half} 0 180",
+                ],
+            ),
+        ),
+
+        // Bed: frame outline + pillow-zone rect + centre-line.
+        // `pillow_y` = length - 0.35 (head end); `pillow_w` = width - 0.1;
+        // `half` = width/2 (centre divider).
+        (
+            "pbed".to_string(),
+            mk(
+                vec![
+                    p("width", "1.5"),
+                    p("length", "2.0"),
+                    p("half", "0.75"),
+                    p("pillow_y", "1.65"),
+                    p("pillow_w", "1.4"),
+                ],
+                &[
+                    // Bed frame outline
+                    "rect 0,0,0 {width} {length}",
+                    // Pillow zone at head end
+                    "rect 0.05,{pillow_y},0 {pillow_w} 0.3",
+                    // Centre divider line (foot-end up to head)
+                    "line {half},0.4,0 {half},{pillow_y},0",
+                ],
+            ),
+        ),
+
+        // Round table: circle, radius param (default 0.45 m ≈ 4-person table).
+        (
+            "ptable".to_string(),
+            mk(
+                vec![p("radius", "0.45")],
+                &["circle 0,0,0 {radius}"],
+            ),
+        ),
+
+        // Sofa: seat cushion rect + back-rest rect + left/right armrests.
+        // Derived dims are explicit params for pure-substitution templates.
+        // `seat_d` = seat depth (≈0.55); `back_d` = back thickness (≈0.2);
+        // `arm_x` = width − 0.15 (right armrest X origin).
+        (
+            "psofa".to_string(),
+            mk(
+                vec![
+                    p("width", "2.0"),
+                    p("depth", "0.9"),
+                    p("seat_d", "0.55"),
+                    p("back_d", "0.2"),
+                    p("arm_x", "1.85"),
+                ],
+                &[
+                    // Seat cushion area
+                    "rect 0,0,0 {width} {seat_d}",
+                    // Back rest
+                    "rect 0,{seat_d},0 {width} {back_d}",
+                    // Left armrest (0.15 m wide, full depth)
+                    "rect 0,0,0 0.15 {depth}",
+                    // Right armrest
+                    "rect {arm_x},0,0 0.15 {depth}",
+                ],
+            ),
+        ),
+
+        // Toilet: cistern rect + bowl body rect + front convex arc.
+        // `bowl_d` = bowl body depth (≈0.48); `half` = width/2 for arc centre.
+        (
+            "ptoilet".to_string(),
+            mk(
+                vec![
+                    p("width", "0.38"),
+                    p("depth", "0.72"),
+                    p("bowl_d", "0.48"),
+                    p("half", "0.19"),
+                ],
+                &[
+                    // Cistern at the back
+                    "rect 0,{bowl_d},0 {width} 0.15",
+                    // Bowl body rectangle
+                    "rect 0,0,0 {width} {bowl_d}",
+                    // Front arc (convex front of bowl)
+                    "arc {half},0,0 {half} 0 180",
+                ],
+            ),
+        ),
+
+        // Sink: basin outline rect + drain circle at basin centre.
+        // `half_w` = width/2; `half_d` = depth/2 (drain centre coords).
+        (
+            "psink".to_string(),
+            mk(
+                vec![
+                    p("width", "0.6"),
+                    p("depth", "0.5"),
+                    p("half_w", "0.3"),
+                    p("half_d", "0.25"),
+                ],
+                &[
+                    "rect 0,0,0 {width} {depth}",
+                    "circle {half_w},{half_d},0 0.04",
+                ],
+            ),
+        ),
+
+        // ── Structure ────────────────────────────────────────────────────────
+
         (
             "pcolumn".to_string(),
             mk(
@@ -5708,7 +5931,7 @@ mod tests {
         assert!((ww - 3.0).abs() < 1e-6, "wide door footprint, got {ww}");
         assert!(ww > wn, "wide door must be wider than narrow");
 
-        let win = run(&mut s, "insert pwindow 0,5,0 width=2.0 height=1.0").created[0];
+        let win = run(&mut s, "insert pwindow 0,5,0 width=2.0 depth=0.15").created[0];
         assert!((baked_width(&s, win) - 2.0).abs() < 1e-6);
 
         let col = run(&mut s, "insert pcolumn 0,10,0 size=0.6").created[0];
@@ -5769,6 +5992,172 @@ mod tests {
             }
             c => panic!("expected BlockInsert, got {c:?}"),
         }
+    }
+
+    // ── asset-pack tests ────────────────────────────────────────────────────────
+
+    /// Helper: bounding-box depth (Y extent) of the baked geometry.
+    fn baked_depth(s: &Session, id: ObjectId) -> f64 {
+        let key = instance_block_key(s, id);
+        let defs = s.doc.blocks.get(&key).expect("baked block present");
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for d in defs {
+            let bb = d.aabb();
+            min = min.min(bb.min.y);
+            max = max.max(bb.max.y);
+        }
+        max - min
+    }
+
+    /// Each asset instantiates with geometry at expected real-world scale.
+    #[test]
+    fn asset_pack_doors_instantiate_at_expected_size() {
+        let mut s = Session::default();
+
+        // pdoor: 0.9 m wide by default; arc makes footprint 2×width in X.
+        let door = run(&mut s, "insert pdoor 0,0,0").created[0];
+        let dw = baked_width(&s, door);
+        assert!((dw - 1.8).abs() < 1e-6, "pdoor footprint width, got {dw}");
+
+        // pdoor_double: default total width 1.8, half=0.9.
+        // Arc AABB is conservative (full bounding square of circle), so the
+        // two arcs of radius 0.9 centred at x=0 and x=1.8 produce an X span
+        // from -0.9 to 2.7 → baked_width = 3.6 (2 × diameter).
+        let ddoor = run(&mut s, "insert pdoor_double 0,0,0").created[0];
+        let ddw = baked_width(&s, ddoor);
+        assert!((ddw - 3.6).abs() < 1e-6, "pdoor_double AABB width, got {ddw}");
+
+        // pdoor_sliding: 0.9 m wide frame.
+        let sdoor = run(&mut s, "insert pdoor_sliding 0,0,0").created[0];
+        let sdw = baked_width(&s, sdoor);
+        assert!((sdw - 0.9).abs() < 1e-6, "pdoor_sliding width, got {sdw}");
+    }
+
+    #[test]
+    fn asset_pack_windows_instantiate_at_expected_size() {
+        let mut s = Session::default();
+
+        // pwindow: default 1.2 m wide.
+        let win = run(&mut s, "insert pwindow 0,0,0").created[0];
+        assert!((baked_width(&s, win) - 1.2).abs() < 1e-6);
+
+        // pwindow_casement: default 0.9 m wide.
+        let cas = run(&mut s, "insert pwindow_casement 0,0,0").created[0];
+        assert!((baked_width(&s, cas) - 0.9).abs() < 1e-6);
+
+        // pwindow_sliding: default 1.2 m wide.
+        let sld = run(&mut s, "insert pwindow_sliding 0,0,0").created[0];
+        assert!((baked_width(&s, sld) - 1.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn asset_pack_furniture_instantiates_at_expected_size() {
+        let mut s = Session::default();
+
+        // pdesk: 1.6 × 0.8 m.
+        let desk = run(&mut s, "insert pdesk 0,0,0").created[0];
+        assert!((baked_width(&s, desk) - 1.6).abs() < 1e-6, "desk width");
+        assert!((baked_depth(&s, desk) - 0.8).abs() < 1e-6, "desk depth");
+
+        // pchair: 0.5 m seat (back arc extends behind, so depth > 0.5).
+        let chair = run(&mut s, "insert pchair 0,5,0").created[0];
+        let cw = baked_width(&s, chair);
+        assert!((cw - 0.5).abs() < 1e-6, "chair seat width, got {cw}");
+        // Back arc extends 0.25 m beyond seat, so baked depth ≈ 0.75.
+        let cd = baked_depth(&s, chair);
+        assert!(cd > 0.5, "chair depth includes back arc, got {cd}");
+
+        // pbed: 1.5 × 2.0 m frame.
+        let bed = run(&mut s, "insert pbed 5,0,0").created[0];
+        assert!((baked_width(&s, bed) - 1.5).abs() < 1e-6, "bed width");
+        assert!((baked_depth(&s, bed) - 2.0).abs() < 1e-6, "bed depth");
+
+        // ptable: circle radius 0.45 → diameter 0.9 in both axes.
+        let table = run(&mut s, "insert ptable 0,10,0").created[0];
+        let tw = baked_width(&s, table);
+        assert!((tw - 0.9).abs() < 1e-6, "round table diameter, got {tw}");
+
+        // psofa: 2.0 m wide.
+        let sofa = run(&mut s, "insert psofa 0,15,0").created[0];
+        assert!((baked_width(&s, sofa) - 2.0).abs() < 1e-6, "sofa width");
+
+        // ptoilet: 0.38 m wide.
+        let toilet = run(&mut s, "insert ptoilet 5,10,0").created[0];
+        assert!((baked_width(&s, toilet) - 0.38).abs() < 1e-6, "toilet width");
+
+        // psink: 0.6 × 0.5 m.
+        let sink = run(&mut s, "insert psink 5,15,0").created[0];
+        assert!((baked_width(&s, sink) - 0.6).abs() < 1e-6, "sink width");
+        assert!((baked_depth(&s, sink) - 0.5).abs() < 1e-6, "sink depth");
+    }
+
+    /// Parametric response: changing width changes baked geometry footprint.
+    #[test]
+    fn asset_pack_parametric_response() {
+        let mut s = Session::default();
+
+        // pdesk: widen from 1.6 to 2.0.
+        let desk = run(&mut s, "insert pdesk 0,0,0 width=1.6").created[0];
+        let w0 = baked_width(&s, desk);
+        assert!((w0 - 1.6).abs() < 1e-6);
+        run(&mut s, "param last width=2.0");
+        let w1 = baked_width(&s, desk);
+        assert!((w1 - 2.0).abs() < 1e-6, "desk widened to 2.0, got {w1}");
+
+        // pwindow_sliding: change width.
+        let win = run(&mut s, "insert pwindow_sliding 10,0,0 width=0.9").created[0];
+        let ww0 = baked_width(&s, win);
+        assert!((ww0 - 0.9).abs() < 1e-6);
+        run(&mut s, "param last width=1.5 third=0.5 two_thirds=1.0");
+        let ww1 = baked_width(&s, win);
+        assert!((ww1 - 1.5).abs() < 1e-6, "sliding window widened to 1.5, got {ww1}");
+    }
+
+    /// Insert + undo + redo round-trip for an asset-pack block.
+    #[test]
+    fn asset_pack_undo_redo() {
+        let mut s = Session::default();
+        let id = run(&mut s, "insert psofa 0,0,0").created[0];
+        let key = instance_block_key(&s, id);
+        assert!(s.doc.blocks.contains_key(&key));
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).is_none(), "sofa removed by undo");
+        assert!(!s.doc.blocks.contains_key(&key), "baked block removed");
+        run(&mut s, "redo");
+        assert!(s.doc.get(id).is_some(), "sofa restored by redo");
+        let key2 = instance_block_key(&s, id);
+        assert!(s.doc.blocks.contains_key(&key2));
+    }
+
+    /// Replay stability: op-log JSON is byte-identical after round-trip.
+    #[test]
+    fn asset_pack_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "insert pdoor_double 0,0,0 width=1.6 half=0.8");
+        run(&mut s, "insert pdesk 5,0,0 width=1.8");
+        run(&mut s, "insert ptoilet 10,0,0");
+        run(&mut s, "insert psink 15,0,0");
+
+        let j1 = crate::io::to_json(&s);
+        let s2 = crate::io::from_json(&j1).unwrap();
+        let j2 = crate::io::to_json(&s2);
+        assert_eq!(j1, j2, "asset-pack op-log must be byte-stable across replay");
+    }
+
+    /// Door is ~0.9 m wide; chair is ~0.5 m; chair should be narrower than door.
+    #[test]
+    fn asset_relative_scale_chair_smaller_than_door() {
+        let mut s = Session::default();
+        let door = run(&mut s, "insert pdoor 0,0,0").created[0];
+        let chair = run(&mut s, "insert pchair 5,0,0").created[0];
+        // Door arc footprint = 1.8 m; chair seat = 0.5 m.
+        assert!(
+            baked_width(&s, chair) < baked_width(&s, door),
+            "chair ({}) must be narrower than door ({})",
+            baked_width(&s, chair),
+            baked_width(&s, door)
+        );
     }
 
     fn sample_view(distance: f32) -> NamedView {

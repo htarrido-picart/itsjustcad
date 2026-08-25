@@ -215,6 +215,7 @@ fn make_renderer(
             profile_edges: vec![],
             points: vec![],
             underlay: None,
+            basemap: None,
             show_lineweights: false,
         };
         renderer.set_scene(&ctx.device, &ctx.queue, &data, 0);
@@ -324,6 +325,7 @@ fn golden_underlay_dark() {
         profile_edges: vec![],
         points: vec![],
         underlay: Some(underlay),
+        basemap: None,
         show_lineweights: false,
     };
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
