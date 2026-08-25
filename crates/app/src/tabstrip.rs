@@ -9,25 +9,25 @@
 //! dependency, so its transitions are unit-tested standalone. The `ui` helper
 //! only draws the strip and reports clicks back.
 
-/// The tabs of the right docked panel. The `Deck` variant keeps its internal
-/// name (module/type churn avoided) but is shown to the user as "Chat".
+/// The tabs of the right docked panel. Two workspaces:
+///   - `Model`: Layers **and** Properties shown together as stacked,
+///     independently-collapsible sections (Rhino-style — both visible at once,
+///     not one-or-the-other).
+///   - `Deck`: the embedded LLM chat, shown to the user as "Chat" (the
+///     deck/cassette internals keep their names — no module/type churn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelTab {
-    Layers,
-    Properties,
+    Model,
     Deck,
 }
 
 impl PanelTab {
     /// All tabs in display order.
-    pub const ALL: [PanelTab; 3] = [PanelTab::Layers, PanelTab::Properties, PanelTab::Deck];
+    pub const ALL: [PanelTab; 2] = [PanelTab::Model, PanelTab::Deck];
 
     pub fn label(self) -> &'static str {
         match self {
-            PanelTab::Layers => "Layers",
-            PanelTab::Properties => "Properties",
-            // The `Deck` tab is the embedded LLM chat; the user-facing label is
-            // "Chat" (the deck/cassette internals keep their names).
+            PanelTab::Model => "Model",
             PanelTab::Deck => "Chat",
         }
     }
@@ -43,7 +43,7 @@ pub struct TabState {
 
 impl Default for TabState {
     fn default() -> Self {
-        Self { active: PanelTab::Layers, collapsed: false }
+        Self { active: PanelTab::Model, collapsed: false }
     }
 }
 
@@ -156,46 +156,48 @@ mod tests {
     }
 
     #[test]
-    fn default_is_layers_open() {
+    fn default_is_model_open() {
         let s = TabState::default();
-        assert_eq!(s.active(), PanelTab::Layers);
+        assert_eq!(s.active(), PanelTab::Model);
         assert!(!s.is_collapsed());
     }
 
     #[test]
     fn click_other_tab_activates_it() {
         let mut s = TabState::default();
-        s.click(PanelTab::Properties);
-        assert_eq!(s.active(), PanelTab::Properties);
+        s.click(PanelTab::Deck);
+        assert_eq!(s.active(), PanelTab::Deck);
         assert!(!s.is_collapsed());
     }
 
     #[test]
-    fn no_history_tab_and_chat_label() {
-        // The History tab was dropped (the command line is the op-log); the Deck
-        // tab is user-visible as "Chat".
-        assert_eq!(PanelTab::ALL.len(), 3);
+    fn two_tabs_model_and_chat_no_history_no_deck_label() {
+        // Rhino-style: Layers+Properties live TOGETHER under one "Model"
+        // workspace; the only tabs are Model and Chat. History was dropped (the
+        // command line is the op-log); the Deck variant shows as "Chat".
+        assert_eq!(PanelTab::ALL.len(), 2);
         let labels: Vec<_> = PanelTab::ALL.iter().map(|t| t.label()).collect();
+        assert_eq!(labels, ["Model", "Chat"]);
         assert!(!labels.contains(&"History"));
+        assert!(!labels.contains(&"Layers"));
         assert!(!labels.contains(&"Deck"));
-        assert!(labels.contains(&"Chat"));
         assert_eq!(PanelTab::Deck.label(), "Chat");
     }
 
     #[test]
     fn click_active_tab_collapses_then_expands() {
         let mut s = TabState::default();
-        s.click(PanelTab::Layers); // active → collapse
+        s.click(PanelTab::Model); // active → collapse
         assert!(s.is_collapsed());
-        assert_eq!(s.active(), PanelTab::Layers);
-        s.click(PanelTab::Layers); // active again → expand
+        assert_eq!(s.active(), PanelTab::Model);
+        s.click(PanelTab::Model); // active again → expand
         assert!(!s.is_collapsed());
     }
 
     #[test]
     fn click_different_tab_while_collapsed_expands() {
         let mut s = TabState::default();
-        s.click(PanelTab::Layers); // collapse
+        s.click(PanelTab::Model); // collapse
         assert!(s.is_collapsed());
         s.click(PanelTab::Deck); // switch → must expand
         assert_eq!(s.active(), PanelTab::Deck);
@@ -205,7 +207,7 @@ mod tests {
     #[test]
     fn show_forces_tab_open() {
         let mut s = TabState::default();
-        s.click(PanelTab::Layers); // collapse
+        s.click(PanelTab::Model); // collapse
         s.show(PanelTab::Deck);
         assert_eq!(s.active(), PanelTab::Deck);
         assert!(!s.is_collapsed());
@@ -214,10 +216,10 @@ mod tests {
     #[test]
     fn toggle_collapsed_keeps_active() {
         let mut s = TabState::default();
-        s.click(PanelTab::Properties);
+        s.click(PanelTab::Deck);
         s.toggle_collapsed();
         assert!(s.is_collapsed());
-        assert_eq!(s.active(), PanelTab::Properties);
+        assert_eq!(s.active(), PanelTab::Deck);
     }
 
     #[test]

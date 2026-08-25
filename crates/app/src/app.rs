@@ -1808,8 +1808,7 @@ impl App {
     /// Properties tab body: read-out of the active selection (count, layer,
     /// combined bounding box). Query-only; no ops issued.
     fn properties_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Properties").heading());
-        ui.separator();
+        // Title comes from the enclosing CollapsingHeader in the Model workspace.
         let doc = &self.session.doc;
         let sel = &doc.selection;
         if sel.is_empty() {
@@ -1854,9 +1853,8 @@ impl App {
     /// Every edit goes through the command substrate so it is logged/undoable.
     /// Rendered inside the docked right panel (no floating Area).
     fn layers_panel(&mut self, ui: &mut egui::Ui, theme: scene::Theme) {
+        // Title comes from the enclosing CollapsingHeader in the Model workspace.
         let mut lines: Vec<String> = Vec::new();
-        ui.label(egui::RichText::new("Layers").heading());
-        ui.separator();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -2253,8 +2251,26 @@ impl App {
             // Tab body fills the remaining space above the command line.
             egui::CentralPanel::default().show(ui, |ui| {
                 match self.panel_tabs.active() {
-                    PanelTab::Layers => self.layers_tab(ui, theme),
-                    PanelTab::Properties => self.properties_panel(ui),
+                    // Rhino-style "Model" workspace: Layers AND Properties shown
+                    // together as stacked, independently-collapsible sections
+                    // (both visible at once, not one-or-the-other). Properties is
+                    // docked to the BOTTOM so the (scrollable) Layers list fills
+                    // the space between the strip and it.
+                    PanelTab::Model => {
+                        egui::Panel::bottom("properties_section")
+                            .resizable(true)
+                            .default_size(160.0)
+                            .show(ui, |ui| {
+                                egui::CollapsingHeader::new("Properties")
+                                    .default_open(true)
+                                    .show(ui, |ui| self.properties_panel(ui));
+                            });
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            egui::CollapsingHeader::new("Layers")
+                                .default_open(true)
+                                .show(ui, |ui| self.layers_tab(ui, theme));
+                        });
+                    }
                     PanelTab::Deck => {
                         self.deck_pane.ui(ui, &mut self.session, &self.tokio);
                     }
