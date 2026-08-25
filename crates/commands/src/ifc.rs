@@ -23,6 +23,34 @@
 //! Curves and annotations are skipped — IFC has no lightweight home for our
 //! wireframe primitives and correctness beats completeness.
 //!
+//! ## Structural analysis model (IFC4)
+//! Alongside the physical geometry, `export` also emits an
+//! `IfcStructuralAnalysisModel` (dual export: physical proxies **and** the
+//! analysis graph, so the same file opens in Revit/BlenderBIM *and* hands off to
+//! ETABS / SAP2000 / RFEM via IfcOpenShell). Frame members
+//! ([`itsjustcad_doc::Geometry::Frame`]) become `IfcStructuralCurveMember`s and
+//! area members ([`itsjustcad_doc::Geometry::Area`]) become
+//! `IfcStructuralSurfaceMember`s, each with an `IfcEdge`/`IfcFaceSurface`
+//! topology and a placement. Sections map to the `IfcProfileDef` family
+//! (`IfcRectangleProfileDef`, `IfcCircleProfileDef`, `IfcIShapeProfileDef`,
+//! `IfcCircleHollowProfileDef`) and are attached to members via
+//! `IfcMaterialProfileSet` / `IfcRelAssociatesMaterial`. Named materials become
+//! `IfcMaterial` with an `IfcMechanicalMaterialProperties` (Young's modulus and
+//! density). Loads become `IfcStructuralLoadGroup` → `IfcStructuralPointAction`
+//! / `IfcStructuralLinearAction` / `IfcStructuralPlanarAction` carrying an
+//! `IfcStructuralLoadSingleForce`. Supports become `IfcStructuralPointConnection`
+//! with an `IfcBoundaryNodeCondition`. The model, its members, connections and
+//! load groups are grouped via `IfcRelAssignsToGroup` and connected to the
+//! spatial structure via `IfcRelServicesBuildings`.
+//!
+//! **Scope cuts (noted, not bugs):** member/surface topology uses simple
+//! straight `IfcEdge`s and a single `IfcFaceSurface` plane rather than fully
+//! resolved connectivity (no automatic node merging between members); load cases
+//! collapse to one `IfcStructuralLoadGroup`; roller free-axis is recorded but the
+//! `IfcBoundaryNodeCondition` uses translational stiffness flags only (no partial
+//! stiffness values); the analysis geometry is *not* re-imported by
+//! [`import`] (import stays mesh-only). Correctness over completeness.
+//!
 //! ## Import
 //! A tolerant SPF reader: it splits the DATA section into `#id -> (ENTITY, raw
 //! args)` records, ignoring the HEADER and any line it cannot parse. From that
@@ -34,7 +62,10 @@
 
 use glam::{DMat4, DVec3};
 use kernel_mesh::Mesh;
-use itsjustcad_doc::{Document, Units, METERS_PER_FOOT, METERS_PER_INCH};
+use itsjustcad_doc::{
+    Document, FrameKind, Geometry, LoadGeometry, RestraintKind, Section, StructLoad, StructSupport,
+    Units, METERS_PER_FOOT, METERS_PER_INCH,
+};
 
 // ============================================================================
 // EXPORT
@@ -70,6 +101,63 @@ fn collect(doc: &Document) -> Vec<Part> {
         }
     }
     parts
+}
+
+/// One frame member captured for the structural analysis model.
+struct FrameMember {
+    name: String,
+    kind: FrameKind,
+    a: DVec3,
+    b: DVec3,
+    section: Section,
+    material: Option<String>,
+}
+
+/// One area (slab/wall) member captured for the structural analysis model.
+struct AreaMember {
+    name: String,
+    boundary: Vec<DVec3>,
+    thickness: f64,
+    material: Option<String>,
+}
+
+/// Collect structural frame + area members from the document, in creation
+/// order, so the analysis model mirrors the physical one.
+fn collect_structural(doc: &Document) -> (Vec<FrameMember>, Vec<AreaMember>) {
+    let mut frames = Vec::new();
+    let mut areas = Vec::new();
+    for obj in doc.objects() {
+        match &obj.geometry {
+            Geometry::Frame { kind, a, b, section, material, .. } => {
+                let name = obj
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_{}", kind.label(), frames.len()));
+                frames.push(FrameMember {
+                    name,
+                    kind: *kind,
+                    a: *a,
+                    b: *b,
+                    section: *section,
+                    material: material.clone(),
+                });
+            }
+            Geometry::Area { kind, boundary, thickness, material, .. } => {
+                let name = obj
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_{}", kind.label(), areas.len()));
+                areas.push(AreaMember {
+                    name,
+                    boundary: boundary.clone(),
+                    thickness: *thickness,
+                    material: material.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    (frames, areas)
 }
 
 /// A monotonically increasing STEP id allocator. Ids are written back into the
@@ -236,13 +324,647 @@ pub fn export(doc: &Document, path: &str) -> Result<(Vec<u8>, String), String> {
         );
     }
 
+    // --- structural analysis model (IfcStructuralAnalysisModel) ---
+    let struct_counts = write_structural_model(
+        &mut body,
+        &mut ids,
+        doc,
+        owner_history,
+        context,
+        world_origin,
+        building,
+    );
+
     let file = assemble(path, &body, unit_note);
-    let detail = format!(
+    let mut detail = format!(
         "{} element{}, {total_tris} triangles",
         parts.len(),
         if parts.len() == 1 { "" } else { "s" }
     );
+    if struct_counts.any() {
+        detail.push_str(&format!(
+            "; analysis: {} member{}, {} surface{}, {} load{}, {} support{}",
+            struct_counts.members,
+            plural(struct_counts.members),
+            struct_counts.surfaces,
+            plural(struct_counts.surfaces),
+            struct_counts.loads,
+            plural(struct_counts.loads),
+            struct_counts.supports,
+            plural(struct_counts.supports),
+        ));
+    }
     Ok((file.into_bytes(), detail))
+}
+
+/// Tally of what the analysis model emitted, for the command echo.
+#[derive(Default)]
+struct StructCounts {
+    members: usize,
+    surfaces: usize,
+    loads: usize,
+    supports: usize,
+}
+impl StructCounts {
+    fn any(&self) -> bool {
+        self.members + self.surfaces + self.loads + self.supports > 0
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Emit the full `IfcStructuralAnalysisModel` graph — members, surfaces,
+/// profiles, materials, loads and supports — grouped and wired to the building.
+/// Returns nothing beyond the counts; ids are appended into `body`.
+#[allow(clippy::too_many_arguments)]
+fn write_structural_model(
+    body: &mut String,
+    ids: &mut Ids,
+    doc: &Document,
+    owner_history: u64,
+    context: u64,
+    world_origin: u64,
+    building: u64,
+) -> StructCounts {
+    let (frames, areas) = collect_structural(doc);
+    let mut counts = StructCounts::default();
+
+    // Nothing structural at all → emit no analysis model (keep files lean and
+    // avoid an empty group that some importers flag).
+    if frames.is_empty()
+        && areas.is_empty()
+        && doc.loads.is_empty()
+        && doc.supports.is_empty()
+    {
+        return counts;
+    }
+
+    // --- materials: IfcMaterial + IfcMechanicalMaterialProperties (E, rho) ---
+    // Map material name -> IfcMaterial id, emitted once and shared.
+    let mut material_ids: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    for (name, mat) in &doc.materials {
+        let m = ids.next();
+        line(body, m, &format!("IFCMATERIAL('{}',$,$)", step_string(name)));
+        // IfcMechanicalMaterialProperties(Material, DynamicViscosity,
+        // YoungModulus, ShearModulus, PoissonRatio, ThermalExpansionCoefficient)
+        let props = ids.next();
+        line(
+            body,
+            props,
+            &format!(
+                "IFCMECHANICALMATERIALPROPERTIES(#{m},$,{},$,$,$)",
+                num(mat.elastic_modulus_e)
+            ),
+        );
+        // Density is a general material property (mass density measure).
+        let dens_prop = ids.next();
+        line(
+            body,
+            dens_prop,
+            &format!(
+                "IFCPROPERTYSINGLEVALUE('MassDensity',$,IFCMASSDENSITYMEASURE({}),$)",
+                num(mat.density)
+            ),
+        );
+        let dens_set = ids.next();
+        line(
+            body,
+            dens_set,
+            &format!(
+                "IFCMATERIALPROPERTIES('Density',$,(#{dens_prop}),#{m})"
+            ),
+        );
+        material_ids.insert(name.clone(), m);
+    }
+
+    // --- the analysis model itself ---
+    let model_place_axis = ids.next();
+    line(
+        body,
+        model_place_axis,
+        &format!("IFCAXIS2PLACEMENT3D(#{world_origin},$,$)"),
+    );
+    let model = ids.next();
+    // IfcStructuralAnalysisModel(GlobalId, Owner, Name, Desc, ObjectType,
+    //   PredefinedType, OrientationOf2DPlane, LoadedBy, HasResults,
+    //   SharedPlacement)
+    line(
+        body,
+        model,
+        &format!(
+            "IFCSTRUCTURALANALYSISMODEL('{}',#{owner_history},'Analysis Model',$,$,.LOADING_3D.,$,$,$,#{model_place_axis})",
+            guid(model)
+        ),
+    );
+    // Service the building (spatial wiring).
+    let rel = ids.next();
+    line(
+        body,
+        rel,
+        &format!(
+            "IFCRELSERVICESBUILDINGS('{}',#{owner_history},$,$,#{model},(#{building}))",
+            guid(rel)
+        ),
+    );
+
+    // Members and connections are gathered so we can group them all under the
+    // model with a single IfcRelAssignsToGroup.
+    let mut grouped: Vec<u64> = Vec::new();
+
+    // --- frame members: IfcStructuralCurveMember ---
+    for fm in &frames {
+        let member = write_curve_member(
+            body, ids, owner_history, context, world_origin, fm, &material_ids,
+        );
+        grouped.push(member);
+        counts.members += 1;
+    }
+
+    // --- area members: IfcStructuralSurfaceMember ---
+    for am in &areas {
+        let surface = write_surface_member(
+            body, ids, owner_history, context, world_origin, am, &material_ids,
+        );
+        grouped.push(surface);
+        counts.surfaces += 1;
+    }
+
+    // --- supports: IfcStructuralPointConnection + boundary conditions ---
+    for sup in &doc.supports {
+        let conn = write_support(body, ids, owner_history, context, world_origin, sup);
+        grouped.push(conn);
+        counts.supports += 1;
+    }
+
+    // --- loads: one IfcStructuralLoadGroup holding the actions ---
+    if !doc.loads.is_empty() {
+        let load_group = ids.next();
+        // IfcStructuralLoadGroup(GlobalId, Owner, Name, Desc, ObjectType,
+        //   PredefinedType, ActionType, ActionSource, Coefficient, Purpose)
+        line(
+            body,
+            load_group,
+            &format!(
+                "IFCSTRUCTURALLOADGROUP('{}',#{owner_history},'Loads',$,$,.LOAD_GROUP.,.NOTDEFINED.,.NOTDEFINED.,$,$)",
+                guid(load_group)
+            ),
+        );
+        let mut actions: Vec<u64> = Vec::new();
+        for load in &doc.loads {
+            let action =
+                write_load(body, ids, owner_history, context, world_origin, load);
+            actions.push(action);
+            counts.loads += 1;
+        }
+        // Group the actions under the load group.
+        if !actions.is_empty() {
+            let rel = ids.next();
+            let refs = actions
+                .iter()
+                .map(|a| format!("#{a}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            line(
+                body,
+                rel,
+                &format!(
+                    "IFCRELASSIGNSTOGROUP('{}',#{owner_history},$,$,({refs}),$,#{load_group})",
+                    guid(rel)
+                ),
+            );
+        }
+        // The load group is loaded_by the model → assign it into the model too.
+        grouped.push(load_group);
+    }
+
+    // --- assign every member/connection/loadgroup into the analysis model ---
+    if !grouped.is_empty() {
+        let rel = ids.next();
+        let refs = grouped
+            .iter()
+            .map(|g| format!("#{g}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        line(
+            body,
+            rel,
+            &format!(
+                "IFCRELASSIGNSTOGROUP('{}',#{owner_history},$,$,({refs}),$,#{model})",
+                guid(rel)
+            ),
+        );
+    }
+
+    counts
+}
+
+/// Emit one `IfcStructuralCurveMember` for a frame member: a topology edge
+/// between its two endpoints, a profile (via material-profile association) and
+/// an optional material.
+#[allow(clippy::too_many_arguments)]
+fn write_curve_member(
+    body: &mut String,
+    ids: &mut Ids,
+    owner_history: u64,
+    context: u64,
+    world_origin: u64,
+    fm: &FrameMember,
+    material_ids: &std::collections::HashMap<String, u64>,
+) -> u64 {
+    // Endpoints as vertex points.
+    let pa = ids.next();
+    line(body, pa, &format!("IFCCARTESIANPOINT(({},{},{}))", num(fm.a.x), num(fm.a.y), num(fm.a.z)));
+    let pb = ids.next();
+    line(body, pb, &format!("IFCCARTESIANPOINT(({},{},{}))", num(fm.b.x), num(fm.b.y), num(fm.b.z)));
+    let va = ids.next();
+    line(body, va, &format!("IFCVERTEXPOINT(#{pa})"));
+    let vb = ids.next();
+    line(body, vb, &format!("IFCVERTEXPOINT(#{pb})"));
+    let edge = ids.next();
+    line(body, edge, &format!("IFCEDGE(#{va},#{vb})"));
+    let topo = ids.next();
+    line(
+        body,
+        topo,
+        &format!("IFCTOPOLOGYREPRESENTATION(#{context},'Reference','Edge',(#{edge}))"),
+    );
+    let prod_shape = ids.next();
+    line(body, prod_shape, &format!("IFCPRODUCTDEFINITIONSHAPE($,$,(#{topo}))"));
+
+    // Local placement at the world origin (topology already carries world coords).
+    let axis = ids.next();
+    line(body, axis, &format!("IFCAXIS2PLACEMENT3D(#{world_origin},$,$)"));
+    let placement = ids.next();
+    line(body, placement, &format!("IFCLOCALPLACEMENT($,#{axis})"));
+
+    let member = ids.next();
+    // IfcStructuralCurveMember(GlobalId, Owner, Name, Desc, ObjectType,
+    //   ObjectPlacement, Representation, PredefinedType, Axis)
+    let predefined = match fm.kind {
+        FrameKind::Beam | FrameKind::Column => ".RIGID_JOINED_MEMBER.",
+    };
+    // Axis: a reference direction for the local z of the section (roll axis).
+    let up = ids.next();
+    line(body, up, "IFCDIRECTION((0.,0.,1.))");
+    line(
+        body,
+        member,
+        &format!(
+            "IFCSTRUCTURALCURVEMEMBER('{}',#{owner_history},'{}',$,$,#{placement},#{prod_shape},{predefined},#{up})",
+            guid(member),
+            step_string(&fm.name)
+        ),
+    );
+
+    // Section profile + material association.
+    let profile = write_profile(body, ids, &fm.section, &fm.name);
+    let mat_id = fm.material.as_ref().and_then(|m| material_ids.get(m)).copied();
+    // IfcMaterialProfile(Name, Desc, Material, Profile, Priority, Category)
+    let mat_ref = mat_id.map(|m| format!("#{m}")).unwrap_or_else(|| "$".to_string());
+    let mat_profile = ids.next();
+    line(
+        body,
+        mat_profile,
+        &format!(
+            "IFCMATERIALPROFILE('{}',$,{mat_ref},#{profile},$,$)",
+            step_string(&fm.name)
+        ),
+    );
+    let mat_profile_set = ids.next();
+    line(
+        body,
+        mat_profile_set,
+        &format!(
+            "IFCMATERIALPROFILESET('{}',$,(#{mat_profile}),$)",
+            step_string(&fm.name)
+        ),
+    );
+    let rel = ids.next();
+    line(
+        body,
+        rel,
+        &format!(
+            "IFCRELASSOCIATESMATERIAL('{}',#{owner_history},$,$,(#{member}),#{mat_profile_set})",
+            guid(rel)
+        ),
+    );
+
+    member
+}
+
+/// Emit one `IfcStructuralSurfaceMember` for an area member: a planar face over
+/// its boundary polygon, plus thickness and optional material.
+#[allow(clippy::too_many_arguments)]
+fn write_surface_member(
+    body: &mut String,
+    ids: &mut Ids,
+    owner_history: u64,
+    context: u64,
+    world_origin: u64,
+    am: &AreaMember,
+    material_ids: &std::collections::HashMap<String, u64>,
+) -> u64 {
+    // Boundary as a poly loop of cartesian points.
+    let mut pt_refs = Vec::new();
+    for p in &am.boundary {
+        let pt = ids.next();
+        line(body, pt, &format!("IFCCARTESIANPOINT(({},{},{}))", num(p.x), num(p.y), num(p.z)));
+        pt_refs.push(pt);
+    }
+    let poly = ids.next();
+    let pts = pt_refs.iter().map(|p| format!("#{p}")).collect::<Vec<_>>().join(",");
+    line(body, poly, &format!("IFCPOLYLOOP(({pts}))"));
+    let bound = ids.next();
+    line(body, bound, &format!("IFCFACEOUTERBOUND(#{poly},.T.)"));
+    // Plane surface at the boundary's first point.
+    let origin = am.boundary.first().copied().unwrap_or(DVec3::ZERO);
+    let plane_pt = ids.next();
+    line(body, plane_pt, &format!("IFCCARTESIANPOINT(({},{},{}))", num(origin.x), num(origin.y), num(origin.z)));
+    let plane_axis = ids.next();
+    line(body, plane_axis, &format!("IFCAXIS2PLACEMENT3D(#{plane_pt},$,$)"));
+    let plane = ids.next();
+    line(body, plane, &format!("IFCPLANE(#{plane_axis})"));
+    let face = ids.next();
+    line(body, face, &format!("IFCFACESURFACE((#{bound}),#{plane},.T.)"));
+    let topo = ids.next();
+    line(
+        body,
+        topo,
+        &format!("IFCTOPOLOGYREPRESENTATION(#{context},'Reference','Face',(#{face}))"),
+    );
+    let prod_shape = ids.next();
+    line(body, prod_shape, &format!("IFCPRODUCTDEFINITIONSHAPE($,$,(#{topo}))"));
+
+    let axis = ids.next();
+    line(body, axis, &format!("IFCAXIS2PLACEMENT3D(#{world_origin},$,$)"));
+    let placement = ids.next();
+    line(body, placement, &format!("IFCLOCALPLACEMENT($,#{axis})"));
+
+    let member = ids.next();
+    // IfcStructuralSurfaceMember(GlobalId, Owner, Name, Desc, ObjectType,
+    //   ObjectPlacement, Representation, PredefinedType, Thickness)
+    line(
+        body,
+        member,
+        &format!(
+            "IFCSTRUCTURALSURFACEMEMBER('{}',#{owner_history},'{}',$,$,#{placement},#{prod_shape},.SHELL.,{})",
+            guid(member),
+            step_string(&am.name),
+            num(am.thickness)
+        ),
+    );
+
+    // Material association (plain material — surfaces use a layer set in strict
+    // IFC, but a direct IfcRelAssociatesMaterial to the IfcMaterial is valid and
+    // widely read; kept simple, noted).
+    if let Some(mat_id) = am.material.as_ref().and_then(|m| material_ids.get(m)).copied() {
+        let rel = ids.next();
+        line(
+            body,
+            rel,
+            &format!(
+                "IFCRELASSOCIATESMATERIAL('{}',#{owner_history},$,$,(#{member}),#{mat_id})",
+                guid(rel)
+            ),
+        );
+    }
+
+    member
+}
+
+/// Map a [`Section`] to the matching `IfcProfileDef` and emit it. Returns the
+/// profile id. Dimensions are in metres (matching the model length unit).
+fn write_profile(body: &mut String, ids: &mut Ids, section: &Section, name: &str) -> u64 {
+    let profile = ids.next();
+    let label = step_string(name);
+    let entity = match *section {
+        // IfcRectangleProfileDef(ProfileType, ProfileName, Position, XDim, YDim)
+        Section::Rectangular { w, h } => format!(
+            "IFCRECTANGLEPROFILEDEF(.AREA.,'{label}',$,{},{})",
+            num(w),
+            num(h)
+        ),
+        // IfcCircleProfileDef(ProfileType, ProfileName, Position, Radius)
+        Section::Circular { d } => format!(
+            "IFCCIRCLEPROFILEDEF(.AREA.,'{label}',$,{})",
+            num(d * 0.5)
+        ),
+        // IfcCircleHollowProfileDef(ProfileType, Name, Position, Radius, WallThickness)
+        Section::Pipe { d, t } => format!(
+            "IFCCIRCLEHOLLOWPROFILEDEF(.AREA.,'{label}',$,{},{})",
+            num(d * 0.5),
+            num(t)
+        ),
+        // IfcIShapeProfileDef(ProfileType, Name, Position, OverallWidth,
+        //   OverallDepth, WebThickness, FlangeThickness, FilletRadius,
+        //   FlangeEdgeRadius, FlangeSlope)
+        Section::IWideFlange { d, bf, tf, tw } => format!(
+            "IFCISHAPEPROFILEDEF(.AREA.,'{label}',$,{},{},{},{},$,$,$)",
+            num(bf),
+            num(d),
+            num(tw),
+            num(tf)
+        ),
+    };
+    line(body, profile, &entity);
+    profile
+}
+
+/// Emit an `IfcStructuralPointConnection` with an `IfcBoundaryNodeCondition`
+/// expressing the restraint (pinned/fixed/roller). Returns the connection id.
+fn write_support(
+    body: &mut String,
+    ids: &mut Ids,
+    owner_history: u64,
+    context: u64,
+    world_origin: u64,
+    sup: &StructSupport,
+) -> u64 {
+    let pt = ids.next();
+    line(
+        body,
+        pt,
+        &format!(
+            "IFCCARTESIANPOINT(({},{},{}))",
+            num(sup.position.x),
+            num(sup.position.y),
+            num(sup.position.z)
+        ),
+    );
+    let vertex = ids.next();
+    line(body, vertex, &format!("IFCVERTEXPOINT(#{pt})"));
+    let topo = ids.next();
+    line(
+        body,
+        topo,
+        &format!("IFCTOPOLOGYREPRESENTATION(#{context},'Reference','Vertex',(#{vertex}))"),
+    );
+    let prod_shape = ids.next();
+    line(body, prod_shape, &format!("IFCPRODUCTDEFINITIONSHAPE($,$,(#{topo}))"));
+
+    let axis = ids.next();
+    line(body, axis, &format!("IFCAXIS2PLACEMENT3D(#{world_origin},$,$)"));
+    let placement = ids.next();
+    line(body, placement, &format!("IFCLOCALPLACEMENT($,#{axis})"));
+
+    // Boundary condition: translational DOF flags. Pinned = all translations
+    // fixed, rotations free; Fixed = all 6 fixed; Roller = translations fixed
+    // except the free axis (approximated: Z free when no axis given).
+    // IfcBoundaryNodeCondition(Name, TranslationalStiffnessX/Y/Z,
+    //   RotationalStiffnessX/Y/Z). We use IfcBoolLogical .T. for "fixed" and
+    //   $ for "free" — a widely-read convention for rigid supports.
+    let (tx, ty, tz, rx, ry, rz) = match sup.kind {
+        RestraintKind::Fixed => (".T.", ".T.", ".T.", ".T.", ".T.", ".T."),
+        RestraintKind::Pinned => (".T.", ".T.", ".T.", "$", "$", "$"),
+        RestraintKind::Roller => {
+            // Free along the roller axis's dominant component; default Z free.
+            let ax = sup.roller_axis.unwrap_or(DVec3::Z);
+            let (ux, uy, uz) = (ax.x.abs(), ax.y.abs(), ax.z.abs());
+            if ux >= uy && ux >= uz {
+                ("$", ".T.", ".T.", "$", "$", "$")
+            } else if uy >= ux && uy >= uz {
+                (".T.", "$", ".T.", "$", "$", "$")
+            } else {
+                (".T.", ".T.", "$", "$", "$", "$")
+            }
+        }
+    };
+    let bcond = ids.next();
+    line(
+        body,
+        bcond,
+        &format!(
+            "IFCBOUNDARYNODECONDITION('{}',{tx},{ty},{tz},{rx},{ry},{rz})",
+            sup.kind.label()
+        ),
+    );
+
+    let conn = ids.next();
+    // IfcStructuralPointConnection(GlobalId, Owner, Name, Desc, ObjectType,
+    //   ObjectPlacement, Representation, AppliedCondition, ConditionCoordinateSystem)
+    line(
+        body,
+        conn,
+        &format!(
+            "IFCSTRUCTURALPOINTCONNECTION('{}',#{owner_history},'{}',$,$,#{placement},#{prod_shape},#{bcond},$)",
+            guid(conn),
+            sup.kind.label()
+        ),
+    );
+    conn
+}
+
+/// Emit one structural action (point/linear/planar) carrying an
+/// `IfcStructuralLoadSingleForce`. Returns the action id.
+fn write_load(
+    body: &mut String,
+    ids: &mut Ids,
+    owner_history: u64,
+    context: u64,
+    world_origin: u64,
+    load: &StructLoad,
+) -> u64 {
+    // The load value: a single force with the magnitude spread onto the world
+    // direction. Point → N; Line → N/m; Area → Pa (kept as a force measure —
+    // IfcStructuralLoadSingleForce carries force components regardless).
+    let f = load.direction.normalize_or_zero() * load.magnitude;
+    let load_def = ids.next();
+    // IfcStructuralLoadSingleForce(Name, ForceX, ForceY, ForceZ,
+    //   MomentX, MomentY, MomentZ)
+    line(
+        body,
+        load_def,
+        &format!(
+            "IFCSTRUCTURALLOADSINGLEFORCE('{}',{},{},{},$,$,$)",
+            step_string(&load.name),
+            num(f.x),
+            num(f.y),
+            num(f.z)
+        ),
+    );
+
+    // Topology + placement for where the action applies.
+    let (topo_kind, topo_items) = match &load.geometry {
+        LoadGeometry::Point { position } => {
+            let pt = ids.next();
+            line(body, pt, &format!("IFCCARTESIANPOINT(({},{},{}))", num(position.x), num(position.y), num(position.z)));
+            let v = ids.next();
+            line(body, v, &format!("IFCVERTEXPOINT(#{pt})"));
+            ("Vertex", format!("#{v}"))
+        }
+        LoadGeometry::Line { a, b } => {
+            let pa = ids.next();
+            line(body, pa, &format!("IFCCARTESIANPOINT(({},{},{}))", num(a.x), num(a.y), num(a.z)));
+            let pb = ids.next();
+            line(body, pb, &format!("IFCCARTESIANPOINT(({},{},{}))", num(b.x), num(b.y), num(b.z)));
+            let va = ids.next();
+            line(body, va, &format!("IFCVERTEXPOINT(#{pa})"));
+            let vb = ids.next();
+            line(body, vb, &format!("IFCVERTEXPOINT(#{pb})"));
+            let edge = ids.next();
+            line(body, edge, &format!("IFCEDGE(#{va},#{vb})"));
+            ("Edge", format!("#{edge}"))
+        }
+        LoadGeometry::Area { boundary } => {
+            let mut refs = Vec::new();
+            for p in boundary {
+                let pt = ids.next();
+                line(body, pt, &format!("IFCCARTESIANPOINT(({},{},{}))", num(p.x), num(p.y), num(p.z)));
+                refs.push(pt);
+            }
+            let poly = ids.next();
+            let pts = refs.iter().map(|p| format!("#{p}")).collect::<Vec<_>>().join(",");
+            line(body, poly, &format!("IFCPOLYLOOP(({pts}))"));
+            let bound = ids.next();
+            line(body, bound, &format!("IFCFACEOUTERBOUND(#{poly},.T.)"));
+            let face = ids.next();
+            line(body, face, &format!("IFCFACE((#{bound}))"));
+            ("Face", format!("#{face}"))
+        }
+    };
+    let topo = ids.next();
+    line(
+        body,
+        topo,
+        &format!("IFCTOPOLOGYREPRESENTATION(#{context},'Reference','{topo_kind}',({topo_items}))"),
+    );
+    let prod_shape = ids.next();
+    line(body, prod_shape, &format!("IFCPRODUCTDEFINITIONSHAPE($,$,(#{topo}))"));
+    let axis = ids.next();
+    line(body, axis, &format!("IFCAXIS2PLACEMENT3D(#{world_origin},$,$)"));
+    let placement = ids.next();
+    line(body, placement, &format!("IFCLOCALPLACEMENT($,#{axis})"));
+
+    let action = ids.next();
+    // Choose the action entity by geometry kind. Common attribute tail:
+    // (GlobalId, Owner, Name, Desc, ObjectType, ObjectPlacement, Representation,
+    //  AppliedLoad, GlobalOrLocal, DestabilizingLoad[, ProjectedOrTrue|extra])
+    let entity = match &load.geometry {
+        LoadGeometry::Point { .. } => format!(
+            "IFCSTRUCTURALPOINTACTION('{}',#{owner_history},'{}',$,$,#{placement},#{prod_shape},#{load_def},.GLOBAL_COORDS.,.F.)",
+            guid(action),
+            step_string(&load.name)
+        ),
+        LoadGeometry::Line { .. } => format!(
+            "IFCSTRUCTURALLINEARACTION('{}',#{owner_history},'{}',$,$,#{placement},#{prod_shape},#{load_def},.GLOBAL_COORDS.,.F.,.GLOBAL_COORDS.)",
+            guid(action),
+            step_string(&load.name)
+        ),
+        LoadGeometry::Area { .. } => format!(
+            "IFCSTRUCTURALPLANARACTION('{}',#{owner_history},'{}',$,$,#{placement},#{prod_shape},#{load_def},.GLOBAL_COORDS.,.F.,.GLOBAL_COORDS.)",
+            guid(action),
+            step_string(&load.name)
+        ),
+    };
+    line(body, action, &entity);
+    action
 }
 
 /// Emit an SI-metre unit assignment (length/area/volume), or a
@@ -256,6 +978,12 @@ fn write_units(body: &mut String, ids: &mut Ids, units: Units) -> (u64, &'static
     line(body, sqm, "IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.)");
     let cbm = ids.next();
     line(body, cbm, "IFCSIUNIT(*,.VOLUMEUNIT.,$,.CUBIC_METRE.)");
+    // Force (newton) and pressure (pascal) so structural load values carry
+    // interpretable units for analysis-tool round-trips.
+    let newton = ids.next();
+    line(body, newton, "IFCSIUNIT(*,.FORCEUNIT.,$,.NEWTON.)");
+    let pascal = ids.next();
+    line(body, pascal, "IFCSIUNIT(*,.PRESSUREUNIT.,$,.PASCAL.)");
 
     let (length_unit, note): (u64, &'static str) = match units {
         // Metric families all keep the SI metre as the model length unit
@@ -299,7 +1027,7 @@ fn write_units(body: &mut String, ids: &mut Ids, units: Units) -> (u64, &'static
     line(
         body,
         assign,
-        &format!("IFCUNITASSIGNMENT((#{length_unit},#{sqm},#{cbm}))"),
+        &format!("IFCUNITASSIGNMENT((#{length_unit},#{sqm},#{cbm},#{newton},#{pascal}))"),
     );
     (assign, note)
 }
@@ -1240,6 +1968,165 @@ ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
 ENDSEC;\nEND-ISO-10303-21;\n";
         let result = import(ifc.as_bytes()).unwrap();
         assert!(result.is_empty(), "OOB face should be dropped");
+    }
+
+    // ========================================================================
+    // Structural analysis model
+    // ========================================================================
+
+    /// A small steel portal frame: two columns + a beam (I-section), a slab,
+    /// a steel material, a point load and two supports. Enough to exercise
+    /// every structural entity family.
+    fn portal() -> Session {
+        let mut s = Session::default();
+        run(&mut s, "material steel 2.0e11 7850");
+        run(&mut s, "section W12 iwf 0.3 0.2 0.015 0.01");
+        run(&mut s, "section COL rect 0.3 0.3");
+        run(&mut s, "section PIP pipe 0.2 0.01");
+        // Two columns (0..3 in z), a beam across the top.
+        run(&mut s, "column 0,0,0 0,0,3 COL material steel");
+        run(&mut s, "column 5,0,0 5,0,3 COL material steel");
+        run(&mut s, "beam 0,0,3 5,0,3 W12 material steel");
+        // A floor slab boundary at z=3.
+        run(&mut s, "slab 0,0,3 5,0,3 5,4,3 0,4,3 thick 0.2 material steel");
+        // A downward point load at midspan.
+        run(&mut s, "load point 2.5,0,3 10000 0,0,-1");
+        // Supports at each column base.
+        run(&mut s, "support 0,0,0 fixed");
+        run(&mut s, "support 5,0,0 pinned");
+        s
+    }
+
+    #[test]
+    fn structural_model_has_analysis_entities() {
+        let s = portal();
+        let (bytes, detail) = export(&s.doc, "/tmp/portal.ifc").unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        // The analysis model shell.
+        assert_eq!(text.matches("IFCSTRUCTURALANALYSISMODEL(").count(), 1);
+        // Three frame members (2 columns + 1 beam).
+        assert_eq!(text.matches("IFCSTRUCTURALCURVEMEMBER(").count(), 3);
+        // One area surface member (the slab).
+        assert_eq!(text.matches("IFCSTRUCTURALSURFACEMEMBER(").count(), 1);
+        // Two supports → two point connections + boundary conditions.
+        assert_eq!(text.matches("IFCSTRUCTURALPOINTCONNECTION(").count(), 2);
+        assert_eq!(text.matches("IFCBOUNDARYNODECONDITION(").count(), 2);
+        // One load group + one point action + one single force.
+        assert_eq!(text.matches("IFCSTRUCTURALLOADGROUP(").count(), 1);
+        assert_eq!(text.matches("IFCSTRUCTURALPOINTACTION(").count(), 1);
+        assert_eq!(text.matches("IFCSTRUCTURALLOADSINGLEFORCE(").count(), 1);
+
+        // Physical geometry export still present (dual export).
+        assert!(text.contains("IFCBUILDINGELEMENTPROXY("), "physical proxies dropped");
+        assert!(text.contains("FILE_SCHEMA(('IFC4'))"));
+
+        // Detail echo mentions the analysis tally.
+        assert!(detail.contains("analysis:"), "detail: {detail}");
+        assert!(detail.contains("3 members"), "detail: {detail}");
+    }
+
+    #[test]
+    fn structural_model_emits_profile_family() {
+        let s = portal();
+        let (bytes, _) = export(&s.doc, "/tmp/prof.ifc").unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        // Each section family maps to its IfcProfileDef.
+        assert_eq!(text.matches("IFCISHAPEPROFILEDEF(").count(), 1);
+        assert_eq!(text.matches("IFCRECTANGLEPROFILEDEF(").count(), 2); // two columns share COL, emitted per member
+        // (COL rect used on both columns → one profile per member = 2)
+        // The pipe section is defined but unused by any member; unused sections
+        // are not emitted (profiles are emitted per member, on demand).
+        assert_eq!(text.matches("IFCCIRCLEHOLLOWPROFILEDEF(").count(), 0);
+    }
+
+    #[test]
+    fn structural_model_emits_material_with_properties() {
+        let s = portal();
+        let (bytes, _) = export(&s.doc, "/tmp/mat.ifc").unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.matches("IFCMATERIAL(").count(), 1);
+        assert!(text.contains("'steel'"), "material name missing");
+        // Mechanical properties carry Young's modulus.
+        assert_eq!(text.matches("IFCMECHANICALMATERIALPROPERTIES(").count(), 1);
+        assert!(text.contains("200000000000."), "E not written as 2e11");
+        // Density recorded.
+        assert!(text.contains("IFCMASSDENSITYMEASURE(7850."), "density missing");
+        // Members associate the material.
+        assert!(text.contains("IFCRELASSOCIATESMATERIAL("));
+        assert!(text.contains("IFCMATERIALPROFILESET("));
+    }
+
+    #[test]
+    fn boundary_conditions_reflect_restraint_kind() {
+        let s = portal();
+        let (bytes, _) = export(&s.doc, "/tmp/bc.ifc").unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        // Fixed: all six .T.  Pinned: three translational .T., rotations $.
+        assert!(
+            text.contains("IFCBOUNDARYNODECONDITION('fixed',.T.,.T.,.T.,.T.,.T.,.T.)"),
+            "fixed BC missing"
+        );
+        assert!(
+            text.contains("IFCBOUNDARYNODECONDITION('pinned',.T.,.T.,.T.,$,$,$)"),
+            "pinned BC missing"
+        );
+    }
+
+    #[test]
+    fn roller_support_frees_axis() {
+        let mut s = Session::default();
+        run(&mut s, "section COL rect 0.3 0.3");
+        run(&mut s, "column 0,0,0 0,0,3 COL");
+        run(&mut s, "support 0,0,0 roller 1,0,0");
+        let (bytes, _) = export(&s.doc, "/tmp/roll.ifc").unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        // X free ($), Y and Z fixed (.T.).
+        assert!(
+            text.contains("IFCBOUNDARYNODECONDITION('roller',$,.T.,.T.,$,$,$)"),
+            "roller X-free BC missing"
+        );
+    }
+
+    #[test]
+    fn load_kinds_map_to_action_entities() {
+        let mut s = Session::default();
+        run(&mut s, "load point 0,0,0 100 0,0,-1");
+        run(&mut s, "load line 0,0,0 1,0,0 50 0,0,-1");
+        run(&mut s, "load area 0,0,0 1,0,0 1,1,0 0,1,0 end 25 0,0,-1");
+        let (bytes, _) = export(&s.doc, "/tmp/loads.ifc").unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.matches("IFCSTRUCTURALPOINTACTION(").count(), 1);
+        assert_eq!(text.matches("IFCSTRUCTURALLINEARACTION(").count(), 1);
+        assert_eq!(text.matches("IFCSTRUCTURALPLANARACTION(").count(), 1);
+        assert_eq!(text.matches("IFCSTRUCTURALLOADSINGLEFORCE(").count(), 3);
+    }
+
+    #[test]
+    fn no_structural_data_emits_no_analysis_model() {
+        // The courtyard has only plain boxes: no frames, areas, loads, supports.
+        let s = courtyard();
+        let (bytes, detail) = export(&s.doc, "/tmp/nostruct.ifc").unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("IFCSTRUCTURALANALYSISMODEL("), "unexpected analysis model");
+        assert!(!detail.contains("analysis:"), "detail: {detail}");
+        // Physical proxies still there.
+        assert_eq!(text.matches("IFCBUILDINGELEMENTPROXY(").count(), 4);
+    }
+
+    #[test]
+    fn structural_members_carry_topology_and_placement() {
+        let s = portal();
+        let (bytes, _) = export(&s.doc, "/tmp/topo.ifc").unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        // Curve members use edges; surface members use face surfaces.
+        assert!(text.contains("IFCEDGE("), "no member edge topology");
+        assert!(text.contains("IFCFACESURFACE("), "no surface topology");
+        assert!(text.contains("IFCTOPOLOGYREPRESENTATION("));
+        // The analysis model is serviced onto the building.
+        assert_eq!(text.matches("IFCRELSERVICESBUILDINGS(").count(), 1);
+        // Group assignment wires members into the model.
+        assert!(text.contains("IFCRELASSIGNSTOGROUP("));
     }
 
     // ---- Valid IFC with good indices still loads correctly after guard ----
