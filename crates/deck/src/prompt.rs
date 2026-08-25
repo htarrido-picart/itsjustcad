@@ -39,6 +39,20 @@ Emit commands inside a ```draft fenced block, ONE command per line. Commands exe
 {selectors}
 {plugin_block}
 
+## View & camera (app verbs — same ```draft block; change what's shown, not the model)
+These do NOT modify the drawing; they frame/style the view like the human's command line does. Emit them in the ```draft block just like drawing commands.
+  ze                                           zoom to fit all geometry (a.k.a. zoomextents)
+  top|bottom|front|back|left|right|persp        set a standard view direction
+  camera 2point                                 two-point perspective (verticals stay vertical)
+  camera persp                                  ordinary perspective
+  camera pano                                   360° equirectangular panorama
+  camera fisheye [fov]                          fisheye projection, optional field of view in degrees (e.g. camera fisheye 120)
+  camera <n>mm                                  lens by focal length: 15mm 24mm 35mm 50mm 85mm
+  camera phone <lens>                           phone-camera sim (e.g. camera phone iphone-ultrawide)
+  display shaded|wireframe|pencil|…             viewport display mode
+  lightmode working|sun|presentation            lighting model
+Use these when the user asks to reframe, orbit to a view, change lens/projection, or restyle the viewport — never to draw geometry.
+
 ## Rules
 - Points are x,y,z or x,y (z=0). No spaces inside a point. Units: bare numbers are meters; 250cm and 500mm also work.
 - 'last' refers to the most recently created object; 'last N' to the N most recent. After a command that creates an object, that object is 'last'.

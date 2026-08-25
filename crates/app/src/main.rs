@@ -164,7 +164,85 @@ fn run_headless_mode(args: &CliArgs) -> i32 {
     0
 }
 
+/// Format one crash record: ISO-ish timestamp, panic message, source location,
+/// and a captured backtrace. The message and location are compiled in even in a
+/// stripped release binary, so this pinpoints panics that Finder-launched apps
+/// would otherwise swallow (no stderr, SIGABRT with no note).
+fn format_crash_record(
+    timestamp: &str,
+    message: &str,
+    location: Option<&std::panic::Location<'_>>,
+    backtrace: &std::backtrace::Backtrace,
+) -> String {
+    let loc = location
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_else(|| "<unknown location>".to_string());
+    format!(
+        "===== PANIC {timestamp} =====\n\
+         message : {message}\n\
+         location: {loc}\n\
+         backtrace:\n{backtrace}\n\n"
+    )
+}
+
+/// Path to the crash log: `~/.config/itsjustcad/crash.log` (matches the rest of
+/// the app's config convention).
+fn crash_log_path() -> Option<std::path::PathBuf> {
+    Some(dirs::home_dir()?.join(".config").join("itsjustcad").join("crash.log"))
+}
+
+/// A coarse UTC timestamp (seconds since the Unix epoch) with no extra deps —
+/// enough to order crashes in the log.
+fn crash_timestamp() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("t+{}s (unix)", d.as_secs()),
+        Err(_) => "t=?".to_string(),
+    }
+}
+
+/// Append one crash record to `path`, creating parent dirs as needed.
+/// Best-effort: IO errors are ignored (the caller is already panicking).
+fn append_crash_record(path: &std::path::Path, record: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(record.as_bytes());
+    }
+}
+
+/// Install a panic hook that appends a full crash record (message + location +
+/// backtrace + timestamp) to `~/.config/itsjustcad/crash.log`, and still prints
+/// to stderr for terminal launches. Appends so multiple crashes accumulate.
+fn install_crash_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        // Extract the panic payload message.
+        let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let record =
+            format_crash_record(&crash_timestamp(), &message, info.location(), &backtrace);
+
+        // Always surface to stderr (terminal launches).
+        eprint!("{record}");
+
+        // Append to the crash log (best-effort; ignore IO errors — we're already
+        // panicking).
+        if let Some(path) = crash_log_path() {
+            append_crash_record(&path, &record);
+        }
+    }));
+}
+
 fn main() -> eframe::Result<()> {
+    install_crash_hook();
+
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         print!("{}", cli_help_text());
         std::process::exit(0);
@@ -252,6 +330,46 @@ mod tests {
         for spec in itsjustcad_commands::registry() {
             assert!(text.contains(spec.name), "CLI help missing '{}'", spec.name);
         }
+    }
+
+    #[test]
+    fn crash_record_includes_message_and_location() {
+        // A real Location can't be constructed by hand, so exercise the format
+        // via #[track_caller]: capture the caller location here.
+        #[track_caller]
+        fn record() -> (String, &'static std::panic::Location<'static>) {
+            let loc = std::panic::Location::caller();
+            let bt = std::backtrace::Backtrace::disabled();
+            (format_crash_record("t+42s (unix)", "boom: it broke", Some(loc), &bt), loc)
+        }
+        let (rec, loc) = record();
+        assert!(rec.contains("PANIC t+42s (unix)"), "{rec}");
+        assert!(rec.contains("message : boom: it broke"), "{rec}");
+        assert!(rec.contains(&format!("location: {}:{}", loc.file(), loc.line())), "{rec}");
+        assert!(rec.contains("backtrace:"), "{rec}");
+    }
+
+    #[test]
+    fn crash_record_handles_unknown_location() {
+        let bt = std::backtrace::Backtrace::disabled();
+        let rec = format_crash_record("t=?", "msg", None, &bt);
+        assert!(rec.contains("location: <unknown location>"), "{rec}");
+        assert!(rec.contains("message : msg"), "{rec}");
+    }
+
+    #[test]
+    fn append_crash_record_accumulates() {
+        let dir = std::env::temp_dir().join(format!("ijc_crash_test_{}", std::process::id()));
+        let path = dir.join("crash.log");
+        let _ = std::fs::remove_file(&path);
+        append_crash_record(&path, "first\n");
+        append_crash_record(&path, "second\n");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("first"));
+        assert!(contents.contains("second"));
+        // Append, not overwrite.
+        assert!(contents.find("first").unwrap() < contents.find("second").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

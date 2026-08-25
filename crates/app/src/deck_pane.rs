@@ -406,6 +406,13 @@ pub struct DeckPane {
     /// `ui.json` — NOT the op-log — and pending the app's reconcile. The app
     /// drains these each frame via [`DeckPane::take_ui_actions`].
     pending_ui_actions: Vec<crate::ui_plane::UiAction>,
+    /// App-level verb lines the deck emitted this turn (`camera`, `display`,
+    /// `lightmode`, `ze`, the standard views, …). These are NOT substrate
+    /// document commands and NOT ui-plane actions — they drive the app's
+    /// view/camera/display/lighting state. The app drains these each frame via
+    /// [`DeckPane::take_app_verbs`] and runs them through the same app-verb-aware
+    /// path as the human command line (`App::execute_line`). Never op-logged.
+    pending_app_verbs: Vec<String>,
 }
 
 impl Default for DeckPane {
@@ -452,6 +459,7 @@ impl Default for DeckPane {
             store: None,
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
+            pending_app_verbs: Vec::new(),
         }
     }
 }
@@ -535,6 +543,15 @@ impl DeckPane {
     /// layout changes only — never document mutations.
     pub fn take_ui_actions(&mut self) -> Vec<crate::ui_plane::UiAction> {
         std::mem::take(&mut self.pending_ui_actions)
+    }
+
+    /// Drain the app-level verb lines the deck emitted since the last call
+    /// (`camera`, `display`, `lightmode`, `ze`, standard views, …). The app runs
+    /// each through `App::execute_line` — the same app-verb-aware path the human
+    /// command line uses — so the deck can change the camera/view/display like a
+    /// person can. These never enter the op-log.
+    pub fn take_app_verbs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_app_verbs)
     }
 
     /// Point the multi-session store at `doc_uuid`, loading that document's
@@ -904,6 +921,26 @@ impl DeckPane {
                             result: Ok(action.summary()),
                         });
                         self.pending_ui_actions.push(action);
+                        continue;
+                    }
+                    // APP-VERB PLANE (distinct from document commands and ui
+                    // actions): view/camera/display/lighting verbs like
+                    // `camera 2point`, `display shaded`, `lightmode sun`, `ze`,
+                    // and the standard views are owned by the app, not the
+                    // substrate parser (which would reject them). Queue them for
+                    // the app to run through `App::execute_line` — the same path
+                    // the human command line uses — so the deck can drive the view
+                    // exactly like a person. GUI-only verbs (`template`,
+                    // `critique`) are intentionally NOT run from the deck; skip
+                    // them here so they fall through and are reported as unknown.
+                    if let Some(verb) = crate::app_verbs::classify(&line)
+                        && !matches!(verb, crate::app_verbs::AppVerb::GuiOnly(_))
+                    {
+                        self.current_commands.push(ExecutedCommand {
+                            line: line.clone(),
+                            result: Ok("applied (view/camera)".to_string()),
+                        });
+                        self.pending_app_verbs.push(line);
                         continue;
                     }
                     // Parse first so we can classify. A parse error is reported
@@ -1658,9 +1695,20 @@ impl DeckPane {
         } else {
             "deck unavailable — fix the connection above"
         };
+        // Stable, explicit id so focus survives layout/enablement changes across
+        // frames (prevents flicker + dropped keystrokes).
+        let input_id = egui::Id::new("deck_chat_input");
+        // Enable when the deck is ready and idle — BUT never disable the field
+        // out from under the user while it holds focus (a turn that starts, or a
+        // `ready()`/`busy()` toggle, mid-type would otherwise steal focus and
+        // flicker). `send()` still gates on `busy()`, so keeping it enabled is
+        // safe: nothing is sent until the field is actually ready.
+        let has_focus = ui.memory(|m| m.has_focus(input_id));
+        let enabled = (!self.busy() && self.ready()) || has_focus;
         let response = ui.add_enabled(
-            !self.busy() && self.ready(),
+            enabled,
             egui::TextEdit::multiline(&mut self.input)
+                .id(input_id)
                 .desired_rows(2)
                 .desired_width(f32::INFINITY)
                 .hint_text(hint),
@@ -1716,6 +1764,7 @@ mod side_effect_gate_tests {
             store: None,
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
+            pending_app_verbs: Vec::new(),
         }
     }
 
@@ -1750,6 +1799,77 @@ mod side_effect_gate_tests {
             pane.allow_web_search = false;
         }
         assert!(!pane.allow_web_search);
+    }
+
+    // --- Deck app-verb routing (camera/view/display/lighting) ---
+
+    #[test]
+    fn deck_camera_verb_is_queued_not_errored() {
+        // A deck-emitted `camera 2point` is an APP VERB — the substrate parser
+        // rejects it, so before this fix it was reported as a failure. Now it is
+        // queued for the app to run through `execute_line`, with no turn error.
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("camera 2point".to_string())],
+            &mut session,
+        );
+        assert_eq!(pane.take_app_verbs(), vec!["camera 2point".to_string()]);
+        assert!(pane.errors_this_turn.is_empty(), "app verb must not error");
+    }
+
+    #[test]
+    fn deck_view_and_display_verbs_are_queued() {
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![
+                ExtractEvent::Command("ze".to_string()),
+                ExtractEvent::Command("top".to_string()),
+                ExtractEvent::Command("display shaded".to_string()),
+                ExtractEvent::Command("lightmode sun".to_string()),
+            ],
+            &mut session,
+        );
+        assert_eq!(
+            pane.take_app_verbs(),
+            vec![
+                "ze".to_string(),
+                "top".to_string(),
+                "display shaded".to_string(),
+                "lightmode sun".to_string(),
+            ]
+        );
+        assert!(pane.errors_this_turn.is_empty());
+    }
+
+    #[test]
+    fn deck_gui_only_verb_is_not_queued_as_app_verb() {
+        // `template`/`critique` are GUI-only; the deck must NOT run them as app
+        // verbs. They fall through to the parser (and are reported as unknown),
+        // so nothing lands in the app-verb queue.
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("template".to_string())],
+            &mut session,
+        );
+        assert!(pane.take_app_verbs().is_empty());
+    }
+
+    #[test]
+    fn deck_draw_command_still_runs_through_substrate() {
+        // A real geometry command is not an app verb: it must still execute via
+        // the session (not land in the app-verb queue).
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        let before = session.doc.len();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 1,1,1".to_string())],
+            &mut session,
+        );
+        assert!(pane.take_app_verbs().is_empty(), "draw cmd is not an app verb");
+        assert!(session.doc.len() > before, "draw cmd must mutate the doc");
     }
 
     // --- SECURITY H-1/H-2: vision-critique file access ---

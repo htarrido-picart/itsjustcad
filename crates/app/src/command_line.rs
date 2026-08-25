@@ -453,6 +453,10 @@ impl CommandLine {
             ui.monospace(">");
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.input)
+                    // Stable, explicit id so focus persists across frames
+                    // regardless of layout changes above it — prevents dropped
+                    // keystrokes / flicker from an auto-generated positional id.
+                    .id(egui::Id::new("command_line_input"))
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
                     .hint_text("box 0,0,0 5,5,3"),

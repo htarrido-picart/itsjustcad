@@ -2505,13 +2505,12 @@ impl App {
             if self.panel_tabs.is_collapsed() {
                 return;
             }
-            // The command line is docked at the BOTTOM of the right panel and is
-            // ALWAYS visible (panel width), under whatever tab is active — it is
-            // the op-log scrollback + input for every mode, not just Chat.
-            egui::Panel::bottom("command_line")
-                .resizable(false)
-                .show(ui, |ui| self.command_line_body(ui));
-            // Tab body fills the remaining space above the command line.
+            // The command line USED to be docked at the bottom of this right panel.
+            // It now lives as a top-level, full-width bottom panel at the very
+            // bottom of the window (see `command_line_panel` in `ui()`), which
+            // fixes the flicker/dropped-keystroke bug caused by a bottom panel
+            // nested inside the resizable right panel. The tab body now fills the
+            // full right panel.
             egui::CentralPanel::default().show(ui, |ui| {
                 match self.panel_tabs.active() {
                     // Rhino-style "Model" workspace: Layers AND Properties shown
@@ -3601,6 +3600,15 @@ impl eframe::App for App {
             self.reconcile_ui_plane(&v);
         }
 
+        // APP-VERB PLANE: run any app-level verbs the deck emitted (camera/view/
+        // display/lighting/ze) through the SAME app-verb-aware path the human
+        // command line uses. The substrate parser rejects these, so the deck
+        // queues them here instead of trying to `session.run` them. Never logged.
+        let app_verb_lines = self.deck_pane.take_app_verbs();
+        for line in app_verb_lines {
+            self.execute_line(line);
+        }
+
         // Cmd+\ reveals the Deck tab in the right panel (or hides the panel if
         // the Deck tab is already the active, visible one). Backslash is not
         // used elsewhere.
@@ -3660,16 +3668,25 @@ impl eframe::App for App {
         }
 
         // ── Fixed docked slots (Layer 2) ─────────────────────────────────
-        // Panel order matters: the first-declared panel is outermost. We build
-        // the menu bar at the very top, the status bar (always very bottom),
-        // then the right tab panel — which now hosts the command line docked at
-        // its own bottom — and finally the central viewport frame with its
-        // bottom tab bar.
+        // Panel order matters: the first-declared bottom panel is OUTERMOST, i.e.
+        // lowest on screen. We build the menu bar at the very top, then the
+        // command line as a full-width panel at the VERY bottom of the window,
+        // the status bar directly above it, then the right tab panel, and finally
+        // the central viewport frame with its bottom tab bar.
 
         // 1. Menu bar (Layer 3) — always the topmost strip.
         self.menu_bar(ui);
 
-        // 2. Status bar — always at the very bottom.
+        // 2. Command line — top-level, FULL WIDTH, at the very bottom of the
+        // window (declared first among bottom panels so it is the lowest). Always
+        // visible: it is the op-log scrollback + input for every mode. Moving it
+        // out of the nested right panel fixes the input flicker/dropped-keystroke
+        // bug (an unstable bottom panel inside a resizable right panel).
+        egui::Panel::bottom("command_line")
+            .resizable(false)
+            .show(ui, |ui| self.command_line_body(ui));
+
+        // 3. Status bar — directly above the command line.
         egui::Panel::bottom("statusbar")
             .resizable(false)
             .show(ui, |ui| self.status_bar(ui));
