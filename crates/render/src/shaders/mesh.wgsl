@@ -14,6 +14,8 @@ struct Camera {
 
 struct ObjectParams {
     color: vec4<f32>,
+    // x = roughness (0 smooth .. 1 matte), y = metallic (0 .. 1), zw spare.
+    material: vec4<f32>,
 };
 
 @group(1) @binding(0) var<uniform> object: ObjectParams;
@@ -52,13 +54,33 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     let n = normalize(in.normal);
     let sun = camera.misc.yzw;
+    let view_dir = normalize(camera.eye.xyz - in.world);
     // Use solar direction when set (length > 0.1), otherwise headlight.
     let l = select(
-        normalize(camera.eye.xyz - in.world),
+        view_dir,
         normalize(sun),
         dot(sun, sun) > 0.01,
     );
     let lambert = max(dot(n, l), 0.0);
+
+    // Blinn-Phong-ish specular so material2 presets read distinctly:
+    //  - low roughness -> tight bright highlight (glass / metal look shiny)
+    //  - high roughness -> broad dim highlight (concrete looks matte)
+    //  - metallic tints the highlight by the base color (metal), otherwise white.
+    let roughness = clamp(object.material.x, 0.02, 1.0);
+    let metallic = clamp(object.material.y, 0.0, 1.0);
+    let half_v = normalize(l + view_dir);
+    let n_dot_h = max(dot(n, half_v), 0.0);
+    // Shininess exponent grows as roughness shrinks.
+    let shininess = mix(4.0, 256.0, 1.0 - roughness);
+    let spec_strength = mix(0.15, 0.9, 1.0 - roughness);
+    let spec = pow(n_dot_h, shininess) * spec_strength * lambert;
+    let spec_tint = mix(vec3(1.0, 1.0, 1.0), object.color.rgb, metallic);
+
+    // Metals have little diffuse; dielectrics keep the usual matte base.
+    let diffuse_amt = mix(1.0, 0.25, metallic);
     let shade = 0.35 + 0.65 * lambert;
-    return vec4(object.color.rgb * shade, object.color.a * camera.misc.x);
+    let base = object.color.rgb * shade * diffuse_amt;
+    let lit = base + spec_tint * spec;
+    return vec4(lit, object.color.a * camera.misc.x);
 }

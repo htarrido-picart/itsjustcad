@@ -94,6 +94,18 @@ pub fn run_script_lines(
                 eprintln!("warning: '{name}' is GUI-only; ignored in headless mode");
             }
             None => {
+                // `controlimages <prefix>` needs the GPU view; the substrate
+                // exec can't render, so intercept it here and drive the wgpu
+                // control-image path against the accumulated headless view.
+                if let Some(prefix) = line.strip_prefix("controlimages ") {
+                    let prefix = prefix.trim();
+                    if prefix.is_empty() {
+                        return Err((line.clone(), "controlimages needs a path prefix".into()));
+                    }
+                    render_control_images_headless(&session, prefix, &view)
+                        .map_err(|e| (line.clone(), e))?;
+                    continue;
+                }
                 let cmd = parse(line).map_err(|e| (line.clone(), e.to_string()))?;
                 session.run(cmd).map_err(|e| (line.clone(), e.to_string()))?;
             }
@@ -144,6 +156,80 @@ pub(crate) fn parse_fisheye(arg2: Option<&str>) -> PanoProjection {
     }
 }
 
+/// Build the offscreen [`OrbitCamera`] for a headless render at `aspect`,
+/// applying the accumulated `view`/`camera` state and framing to the scene
+/// extents. Shared by the PNG renderer and the control-image export so both see
+/// the same view.
+fn build_headless_camera(session: &Session, view: &HeadlessView, aspect: f32) -> OrbitCamera {
+    let mut camera = OrbitCamera::default();
+    if let Some(v) = view.view {
+        camera.set_view(v);
+    } else {
+        camera.pitch = 0.55;
+        camera.yaw = -0.6;
+    }
+    if let Some(f) = view.focal_mm {
+        camera.set_lens_mm(f, aspect);
+    }
+    if let Some(tp) = view.two_point {
+        camera.two_point = tp;
+        camera.ortho = false;
+    }
+    if let Some(p) = view.pano {
+        camera.pano = Some(p);
+        camera.ortho = false;
+        camera.two_point = false;
+    }
+    if let Some(bb) = session.doc.scene_aabb() {
+        let c = bb.center();
+        camera.target = glam::Vec3::new(c.x as f32, c.y as f32, c.z as f32);
+        camera.distance = (bb.size().length() as f32 * 1.2).max(5.0);
+    } else {
+        camera.distance = 16.0;
+    }
+    camera
+}
+
+/// Render the three control images (`<prefix>_depth/edge/mask.png`) from the
+/// accumulated headless view using an on-demand wgpu device.
+pub fn render_control_images_headless(
+    session: &Session,
+    prefix: &str,
+    view: &HeadlessView,
+) -> Result<(), String> {
+    const W: u32 = 1280;
+    const H: u32 = 800;
+    let aspect = W as f32 / H as f32;
+
+    let instance = wgpu::Instance::default();
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .map_err(|e| format!("no wgpu adapter: {e:?}"))?;
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .map_err(|e| e.to_string())?;
+
+    let camera = build_headless_camera(session, view, aspect);
+    let view_proj = camera.view_proj(aspect);
+    let eye = camera.eye();
+    // Depth normalization range from the scene extents around the eye.
+    let (near, far) = match session.doc.scene_aabb() {
+        Some(bb) => {
+            let c = bb.center();
+            let center = glam::Vec3::new(c.x as f32, c.y as f32, c.z as f32);
+            let radius = (bb.size().length() as f32 * 0.5).max(0.5);
+            let d = (eye - center).length();
+            ((d - radius).max(0.01), d + radius)
+        }
+        None => (0.1, 100.0),
+    };
+
+    itsjustcad_render::render_control_images(
+        &device, &queue, &session.doc, view_proj, eye, near, far, W, H, prefix,
+    )
+    .map(|_| ())
+}
+
 // ── Offscreen PNG renderer ────────────────────────────────────────────────────
 
 /// Render the document to `path` using the headless wgpu path (no window).
@@ -178,37 +264,10 @@ pub fn render_headless(
     let scene = snapshot(&session.doc, theme);
     renderer.set_scene(&device, &queue, &scene, 0);
 
-    let mut camera = OrbitCamera::default();
-    // Orientation: an explicit `view` verb wins; otherwise keep a pleasant
-    // default 3/4 perspective.
-    if let Some(v) = view.view {
-        camera.set_view(v);
-    } else {
-        camera.pitch = 0.55;
-        camera.yaw = -0.6;
-    }
     let aspect = W as f32 / H as f32;
-    // Lens / projection from `camera` verbs (only meaningful in perspective).
-    if let Some(f) = view.focal_mm {
-        camera.set_lens_mm(f, aspect);
-    }
-    if let Some(tp) = view.two_point {
-        camera.two_point = tp;
-        camera.ortho = false;
-    }
-    if let Some(p) = view.pano {
-        camera.pano = Some(p);
-        camera.ortho = false;
-        camera.two_point = false;
-    }
-    // Framing always tracks the scene extents (the `ze` behavior).
-    if let Some(bb) = session.doc.scene_aabb() {
-        let c = bb.center();
-        camera.target = glam::Vec3::new(c.x as f32, c.y as f32, c.z as f32);
-        camera.distance = (bb.size().length() as f32 * 1.2).max(5.0);
-    } else {
-        camera.distance = 16.0;
-    }
+    // Orientation, lens, projection and framing (shared with control-image
+    // export so both paths see the same view).
+    let mut camera = build_headless_camera(session, view, aspect);
 
     // Panorama / fisheye render through the cubemap remap path: the eye sits
     // *inside* the scene (at the framed target) so it is surrounded, and the

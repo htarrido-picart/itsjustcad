@@ -436,6 +436,18 @@ pub enum Command {
     ColorOff {
         targets: Selector,
     },
+    /// Set a per-object appearance material: a named preset (concrete/glass/
+    /// metal/wood) or explicit base color + roughness + metallic. Distinct verb
+    /// `material2` (not `material`) because `material` is the structural material
+    /// definition (E + density). This one is render-only appearance.
+    Material2 {
+        targets: Selector,
+        material: itsjustcad_doc::ObjectMaterial,
+    },
+    /// Clear a per-object appearance material (reverts to the flat color path).
+    Material2Off {
+        targets: Selector,
+    },
     /// Set the document display unit. Logged so replayed files keep their
     /// unit; geometry always stores meters regardless.
     Units {
@@ -546,6 +558,14 @@ pub enum Command {
     /// Not logged: export is I/O, not model state.
     Export {
         path: String,
+    },
+    /// Write three control images from the current view for hand-off to a
+    /// diffusion / image-editing tool: `<prefix>_depth.png` (near/far depth
+    /// gradient), `<prefix>_edge.png` (feature-edge linework), and
+    /// `<prefix>_mask.png` (a flat semantic color per layer). Requires the GPU
+    /// view, so the app/headless runner performs the render; not logged (I/O).
+    ControlImages {
+        prefix: String,
     },
     /// Import a DXF file: each supported entity becomes its own logged
     /// substrate op (Line/Polyline/Circle/Arc/Text, plus Layer switches), so
@@ -831,6 +851,7 @@ impl Command {
                 | Command::ViewList
                 | Command::Print { .. }
                 | Command::Export { .. }
+                | Command::ControlImages { .. }
                 | Command::Import { .. }
                 | Command::Terrain { .. }
                 | Command::OsmFile { .. }
@@ -864,6 +885,7 @@ impl Command {
             self,
             // fs writes
             Command::Export { .. }
+                | Command::ControlImages { .. }
                 | Command::Print { .. }
                 | Command::BlockLibSave { .. }
                 // fs reads (can be probed to exfiltrate / DoS)
@@ -880,6 +902,9 @@ impl Command {
     pub fn side_effect_summary(&self) -> Option<String> {
         match self {
             Command::Export { path } => Some(format!("export → {path}")),
+            Command::ControlImages { prefix } => {
+                Some(format!("control images → {prefix}_[depth|edge|mask].png"))
+            }
             Command::Print { path, sheet } => Some(format!("print sheet '{sheet}' → {path}")),
             Command::Import { path } => Some(format!("import ← {path}")),
             Command::Terrain { path } => Some(format!("terrain ← {path}")),

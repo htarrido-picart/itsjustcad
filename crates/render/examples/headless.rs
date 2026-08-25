@@ -71,7 +71,10 @@ fn main() {
             })
             .collect();
         let scene = itsjustcad_render::SceneData {
-            meshes: vec![(box_a.to_render(), mesh_color), (box_b.to_render(), mesh_color)],
+            meshes: vec![
+                (box_a.to_render(), mesh_color, [0.5, 0.0]),
+                (box_b.to_render(), mesh_color, [0.5, 0.0]),
+            ],
             lines: vec![],
             edges: vec![(edges_a, edge_color), (edges_b, edge_color)],
             points: vec![],

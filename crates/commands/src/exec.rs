@@ -80,6 +80,8 @@ enum Inverse {
     ObjectVisibility(Vec<(ObjectId, bool)>),
     /// `color`/`coloroff`: restore each object's previous color override.
     ObjectColor(Vec<(ObjectId, Option<[f32; 3]>)>),
+    /// `material2`/`material2off`: restore each object's previous material.
+    ObjectMaterial(Vec<(ObjectId, Option<itsjustcad_doc::ObjectMaterial>)>),
     /// `units`: restore the previous display unit.
     Units { prev: Units },
     /// `underlay`/`underlayopacity`/`underlayoff`: restore the previous underlay.
@@ -309,6 +311,14 @@ impl Session {
                 for (id, color) in prev.clone() {
                     if let Some(obj) = self.doc.get_mut(id) {
                         obj.color = color;
+                    }
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::ObjectMaterial(prev) => {
+                for (id, material) in prev.clone() {
+                    if let Some(obj) = self.doc.get_mut(id) {
+                        obj.material = material;
                     }
                 }
                 self.doc.generation += 1;
@@ -1157,6 +1167,7 @@ fn insert_curve(
         name: None,
         layer: doc.current_layer.clone(),
         color: None,
+        material: None,
         geometry: Geometry::Curve(curve),
     });
     let outcome = ApplyOutcome {
@@ -1282,6 +1293,7 @@ fn replace_with_result(
         name,
         layer,
         color: None,
+        material: None,
         geometry: Geometry::Mesh(result),
     });
     Ok((
@@ -1517,6 +1529,7 @@ fn section_meshes(
             name: None,
             layer: SECTIONS_LAYER.to_string(),
             color: None,
+            material: None,
             geometry: Geometry::Curve(Curve::Polyline { points, closed: true }),
         });
     }
@@ -1527,6 +1540,7 @@ fn section_meshes(
             name: None,
             layer: SECTIONS_PROJ_LAYER.to_string(),
             color: None,
+            material: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -1673,6 +1687,7 @@ fn exec_shadow_study(
             name: None,
             layer: poly.layer.clone(),
             color: None,
+            material: None,
             geometry: Geometry::Curve(Curve::Polyline { points: poly.pts.clone(), closed: true }),
         });
     }
@@ -1833,6 +1848,7 @@ fn exec_sun_hours(
             name: None,
             layer: ANALYSIS_LAYER.to_string(),
             color: Some(color),
+            material: None,
             geometry: Geometry::Mesh(mesh),
         });
     }
@@ -1921,6 +1937,7 @@ fn elevation_meshes(
             name: None,
             layer: ELEVATIONS_LAYER.to_string(),
             color: None,
+            material: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -1986,6 +2003,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Mesh(kernel_mesh::make_box(corner, size)),
             });
             Ok((
@@ -2024,6 +2042,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Mesh(extrude_profile(&profile2d, base_z, height)),
             });
             Ok((
@@ -2068,6 +2087,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2105,6 +2125,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2142,6 +2163,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2176,6 +2198,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2217,6 +2240,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2253,6 +2277,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2484,6 +2509,7 @@ fn apply_forward(
                 name: obj.name.clone(),
                 layer: obj.layer.clone(),
                 color: obj.color,
+                material: None,
                 geometry: Geometry::Curve(rebuilt),
             });
             Ok((
@@ -2509,6 +2535,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Annotation(Annotation::LinearDim { a, b, offset }),
             });
             Ok((
@@ -2534,6 +2561,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Annotation(Annotation::Text {
                     pos,
                     text: text.clone(),
@@ -2590,6 +2618,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Annotation(Annotation::Hatch {
                     boundary,
                     pattern: pattern.clone(),
@@ -2855,6 +2884,7 @@ fn apply_forward(
                     name: obj.name.clone(),
                     layer: obj.layer.clone(),
                     color: None,
+                    material: None,
                     geometry: Geometry::Curve(piece),
                 });
             }
@@ -2923,6 +2953,7 @@ fn apply_forward(
                 name: obj.name.clone(),
                 layer: obj.layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Curve(kept),
             });
             Ok((
@@ -2999,7 +3030,7 @@ fn apply_forward(
                 }
             }
             let id = id.unwrap_or_default();
-            doc.insert(SceneObject { id, name, layer, visible: true, color: None, geometry: Geometry::Curve(joined) });
+            doc.insert(SceneObject { id, name, layer, visible: true, color: None, material: None, geometry: Geometry::Curve(joined) });
             Ok((
                 Command::Join { id: Some(id), targets },
                 Inverse::Replace { created: vec![id], consumed },
@@ -3056,6 +3087,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Curve(arc),
             });
             Ok((
@@ -3100,6 +3132,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Curve(offset),
             });
             Ok((
@@ -3520,6 +3553,49 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Material2 { targets, material } => {
+            let ids = resolve(doc, &targets)?;
+            let mut prev = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let obj = doc.get_mut(*id).expect("resolved");
+                prev.push((*id, obj.material));
+                obj.material = Some(material);
+            }
+            doc.generation += 1;
+            let (_, rough, metal) = material.pbr();
+            let label = match material {
+                itsjustcad_doc::ObjectMaterial::Preset { preset } => preset.label().to_string(),
+                itsjustcad_doc::ObjectMaterial::Custom { .. } => {
+                    format!("custom (rough {rough:.2}, metal {metal:.2})")
+                }
+            };
+            Ok((
+                Command::Material2 { targets, material },
+                Inverse::ObjectMaterial(prev),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("material2 {label} on {} object(s)", ids.len()),
+                },
+            ))
+        }
+        Command::Material2Off { targets } => {
+            let ids = resolve(doc, &targets)?;
+            let mut prev = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let obj = doc.get_mut(*id).expect("resolved");
+                prev.push((*id, obj.material));
+                obj.material = None;
+            }
+            doc.generation += 1;
+            Ok((
+                Command::Material2Off { targets },
+                Inverse::ObjectMaterial(prev),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("cleared material2 on {} object(s)", ids.len()),
+                },
+            ))
+        }
         Command::Units { units } => {
             let prev = doc.units;
             doc.units = units;
@@ -3787,6 +3863,16 @@ fn apply_forward(
                     message: format!("exported {detail} -> {path} ({size} bytes)"),
                 },
             ))
+        }
+        Command::ControlImages { prefix } => {
+            // Requires the GPU view (depth buffer, edge/mask passes), which lives
+            // in the render/app layer — the commands crate has no wgpu. The app
+            // and headless runner intercept this verb and call
+            // `itsjustcad_render::render_control_images` directly. Reaching exec
+            // means no GPU context is available.
+            Err(ExecError::Invalid(format!(
+                "controlimages needs the GPU view — run 'controlimages {prefix}' from the app command line or headless renderer"
+            )))
         }
         Command::ViewSave { name, camera } => {
             let Some(camera) = camera else {
@@ -4113,6 +4199,7 @@ fn apply_forward(
                 name: name.clone(),
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -4141,6 +4228,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Points { positions: positions.clone() },
             });
             Ok((
@@ -4215,6 +4303,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Instance {
                     block: name.clone(),
                     position,
@@ -4407,6 +4496,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Frame {
                     kind,
                     a,
@@ -4467,6 +4557,7 @@ fn apply_forward(
                 name: None,
                 layer: doc.current_layer.clone(),
                 color: None,
+                material: None,
                 geometry: Geometry::Area {
                     kind,
                     boundary: boundary.clone(),
@@ -4636,6 +4727,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::ShowObj { .. } => "showobj",
         Command::Color { .. } => "color",
         Command::ColorOff { .. } => "coloroff",
+        Command::Material2 { .. } => "material2",
+        Command::Material2Off { .. } => "material2off",
         Command::Units { .. } => "units",
         Command::Underlay { .. } => "underlay",
         Command::UnderlayOpacity { .. } => "underlayopacity",
@@ -4649,6 +4742,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::SheetView { .. } => "sheetview",
         Command::Print { .. } => "print",
         Command::Export { .. } => "export",
+        Command::ControlImages { .. } => "controlimages",
         Command::Import { .. } => "import",
         Command::Terrain { .. } => "terrain",
         Command::OsmFile { .. } => "osmfile",
@@ -7250,6 +7344,76 @@ mod tests {
         // Undo coloroff restores the green
         run(&mut s, "undo");
         assert_eq!(s.doc.get(id).unwrap().color, Some([0.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn material2_set_undo_redo_replay() {
+        use itsjustcad_doc::{MaterialPreset, ObjectMaterial};
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        let id = *s.doc.all_ids().last().unwrap();
+
+        // Apply a preset material.
+        run(&mut s, "material2 last glass");
+        assert_eq!(
+            s.doc.get(id).unwrap().material,
+            Some(ObjectMaterial::Preset { preset: MaterialPreset::Glass })
+        );
+
+        // Undo restores None.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.get(id).unwrap().material, None);
+
+        // Redo re-applies.
+        run(&mut s, "redo");
+        assert!(matches!(
+            s.doc.get(id).unwrap().material,
+            Some(ObjectMaterial::Preset { preset: MaterialPreset::Glass })
+        ));
+
+        // Replace with a custom material, then material2off clears it.
+        run(&mut s, "material2 last roughness=0.9 metallic=0 color=0.6,0.6,0.6");
+        match s.doc.get(id).unwrap().material {
+            Some(ObjectMaterial::Custom { roughness, .. }) => {
+                assert!((roughness - 0.9).abs() < 1e-6)
+            }
+            other => panic!("expected custom, got {other:?}"),
+        }
+        run(&mut s, "material2 last off");
+        assert_eq!(s.doc.get(id).unwrap().material, None);
+
+        // Undo the off restores the custom material.
+        run(&mut s, "undo");
+        assert!(matches!(
+            s.doc.get(id).unwrap().material,
+            Some(ObjectMaterial::Custom { .. })
+        ));
+
+        // Replay reproduces the exact final state.
+        let log = s.save_log();
+        let s2 = Session::replay(log).unwrap();
+        assert_eq!(s2.doc.get(id).unwrap().material, s.doc.get(id).unwrap().material);
+    }
+
+    #[test]
+    fn material2_replay_stable_json() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2");
+        run(&mut s, "material2 last metal");
+        run(&mut s, "box 3,0,0 4,4,4");
+        run(&mut s, "material2 last roughness=0.2 metallic=1 color=0.8,0.8,0.9");
+
+        let json = crate::io::to_json(&s);
+        let loaded = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&loaded), json, "replay-stable json");
+    }
+
+    #[test]
+    fn material2_needs_gpu_message_from_exec() {
+        // controlimages reaching exec (no GPU) is a clear error, not a panic.
+        let mut s = Session::default();
+        let err = s.run(parse("controlimages /tmp/x").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("GPU"), "{err}");
     }
 
     #[test]

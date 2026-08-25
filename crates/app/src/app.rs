@@ -549,6 +549,14 @@ impl App {
                     self.command_line.push_line("nothing to paste");
                 }
             }
+            Some("controlimages") => {
+                match words.next() {
+                    Some(prefix) => self.export_control_images(prefix),
+                    None => self
+                        .command_line
+                        .push_line("usage: controlimages <path-prefix>"),
+                }
+            }
             Some("open") => self.open(words.next().map(Into::into)),
             Some("recover") => self.recover(),
             Some("ze" | "zoomextents") => self.zoom_extents(),
@@ -702,6 +710,63 @@ impl App {
         // Shared name→view mapping (also used by the headless runner).
         let view = crate::app_verbs::standard_view(name).unwrap_or(StandardView::Perspective);
         self.active_camera().set_view(view);
+    }
+
+    /// `controlimages <prefix>`: render the three CAD control maps (depth / edge
+    /// / mask) from the active viewport's camera. Uses an on-demand wgpu device
+    /// so it does not need the egui paint callback's render state. Not logged.
+    fn export_control_images(&mut self, prefix: &str) {
+        const W: u32 = 1280;
+        const H: u32 = 800;
+        let aspect = W as f32 / H as f32;
+        let cam_idx = self.layout.camera_index(self.active_pane);
+        let camera = self.cameras[cam_idx];
+        let view_proj = camera.view_proj(aspect);
+        let eye = camera.eye();
+        let (near, far) = match self.session.doc.scene_aabb() {
+            Some(bb) => {
+                let c = bb.center();
+                let center = glam::Vec3::new(c.x as f32, c.y as f32, c.z as f32);
+                let radius = (bb.size().length() as f32 * 0.5).max(0.5);
+                let d = (eye - center).length();
+                ((d - radius).max(0.01), d + radius)
+            }
+            None => (0.1, 100.0),
+        };
+
+        let result = (|| -> Result<itsjustcad_render::ControlImagePaths, String> {
+            let instance = wgpu::Instance::default();
+            let adapter = pollster::block_on(
+                instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+            )
+            .map_err(|e| format!("no wgpu adapter: {e:?}"))?;
+            let (device, queue) = pollster::block_on(
+                adapter.request_device(&wgpu::DeviceDescriptor::default()),
+            )
+            .map_err(|e| e.to_string())?;
+            itsjustcad_render::render_control_images(
+                &device,
+                &queue,
+                &self.session.doc,
+                view_proj,
+                eye,
+                near,
+                far,
+                W,
+                H,
+                prefix,
+            )
+        })();
+
+        match result {
+            Ok(paths) => self.command_line.push_line(format!(
+                "control images -> {} , {} , {}",
+                paths.depth.display(),
+                paths.edge.display(),
+                paths.mask.display()
+            )),
+            Err(e) => self.command_line.push_line(format!("controlimages failed: {e}")),
+        }
     }
 
     /// `camera <2point|persp|pano|fisheye [fov]|15|24|35|50|85|phone|phonewide>`.

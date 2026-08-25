@@ -201,7 +201,7 @@ fn check_or_bless(actual: &image::RgbaImage, name: &str) {
 /// Build a renderer from raw mesh + line data and a fixed camera orbit.
 fn make_renderer(
     ctx: &GpuContext,
-    meshes: Vec<(kernel_mesh::RenderMesh, [f32; 4])>,
+    meshes: Vec<(kernel_mesh::RenderMesh, [f32; 4], [f32; 2])>,
     lines: Vec<(Vec<[f32; 3]>, [f32; 4])>,
     camera: &OrbitCamera,
 ) -> SceneRenderer {
@@ -240,7 +240,7 @@ fn golden_single_box_dark() {
     camera.pitch = 0.55;
 
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
-    renderer.set_meshes(&ctx.device, &[(mesh.to_render(), theme.mesh())], 0);
+    renderer.set_meshes(&ctx.device, &[(mesh.to_render(), theme.mesh(), [0.5, 0.0])], 0);
     let aspect = W as f32 / H as f32;
     let cam = itsjustcad_render::camera_uniform(camera.view_proj(aspect), camera.eye());
     renderer.write_camera(&ctx.device, &ctx.queue, 0, &cam);
@@ -265,8 +265,8 @@ fn golden_two_boxes_light() {
     camera.pitch = 0.45;
 
     let meshes = vec![
-        (box_a.to_render(), theme.mesh()),
-        (box_b.to_render(), [0.6, 0.2, 0.1, 1.0]),
+        (box_a.to_render(), theme.mesh(), [0.5, 0.0]),
+        (box_b.to_render(), [0.6, 0.2, 0.1, 1.0], [0.5, 0.0]),
     ];
     let renderer = make_renderer(&ctx, meshes, vec![], &camera);
     let img = render_to_image(&ctx, &renderer, theme);

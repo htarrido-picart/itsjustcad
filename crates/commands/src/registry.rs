@@ -385,6 +385,17 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Annotate,
         },
         CommandSpec {
+            // Distinct verb `material2` (NOT `material`): `material` already names
+            // the STRUCTURAL material command (elastic modulus + density, used by
+            // analysis and IFC). `material2` is a RENDER-ONLY appearance material
+            // (base color + roughness + metallic, or a preset) — a different
+            // concept, so it gets its own verb rather than overloading `material`.
+            name: "material2",
+            usage: "material2 <selector> <concrete|glass|metal|wood | roughness=.. metallic=.. color=r,g,b | off>",
+            summary: "Set a per-object appearance material for rendering: a preset (concrete/glass/metal/wood) or custom scalars (roughness=0..1, metallic=0..1, color=r,g,b). Presets shade visibly differently (glass smooth, concrete matte, metal specular). 'material2 last off' clears it. Distinct from 'material' (structural E+density). Example: material2 last glass · material2 walls roughness=0.9 metallic=0 color=0.6,0.6,0.6",
+            category: Category::Annotate,
+        },
+        CommandSpec {
             name: "units",
             usage: "units <m|cm|mm|ft|in|ftin>",
             summary: "Set the display unit for dimensions and readouts (geometry stays meters internally). Number suffixes work everywhere regardless: 500mm, 2.5m, 12ft, 6in, and feet-inches typed as 12ft6in (shown as 12'-6\"). Example: units ftin",
@@ -460,6 +471,12 @@ pub fn registry() -> &'static [CommandSpec] {
             name: "export",
             usage: "export <path.{dxf|stl|obj|gltf|glb|svg|csv|ifc|saf}>",
             summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), OBJ (meshes plus curves as polylines), SVG, CSV, IFC4 openBIM, or SAF (Structural Analysis Format — ZIP of CSVs matching SAF 2.2.0 sheet names, for handoff to RFEM/SCIA/FEM-Design). Example: export /tmp/model.saf",
+            category: Category::File,
+        },
+        CommandSpec {
+            name: "controlimages",
+            usage: "controlimages <path-prefix>",
+            summary: "Write three control images from the CURRENT view for hand-off to a diffusion / image-editing tool: <prefix>_depth.png (near-to-far depth gradient), <prefix>_edge.png (feature-edge linework), and <prefix>_mask.png (a flat semantic color per layer). CAD-owned control inputs for the diffusion cassette. Example: controlimages /tmp/scene",
             category: Category::File,
         },
         CommandSpec {

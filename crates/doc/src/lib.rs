@@ -19,8 +19,8 @@ mod view;
 pub use document::Document;
 pub use loads::{LoadGeometry, RestraintKind, StructLoad, StructSupport};
 pub use object::{
-    Annotation, AreaKind, BlockGeometry, FrameKind, Geometry, HatchPattern, LayerStyle, ObjectId,
-    SceneObject, DEFAULT_LAYER,
+    Annotation, AreaKind, BlockGeometry, FrameKind, Geometry, HatchPattern, LayerStyle,
+    MaterialPreset, ObjectId, ObjectMaterial, SceneObject, DEFAULT_LAYER,
 };
 pub use sheet::{PaperSize, ScheduleRow, Sheet, SheetDim, SheetTable, SheetView, ViewDirection};
 pub use structure::{Grid, Material, Section, Story};

@@ -272,6 +272,7 @@ mod tests {
             name: name.map(str::to_string),
             layer: DEFAULT_LAYER.to_string(),
             color: None,
+            material: None,
             geometry: Geometry::Mesh(mesh),
         }
     }

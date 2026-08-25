@@ -4,6 +4,7 @@
 //! Viewport rendering: wgpu pipelines inside egui paint callbacks.
 
 mod camera;
+mod control;
 mod cubemap;
 mod layout;
 mod pano;
@@ -12,6 +13,7 @@ mod snapshot;
 mod viewport_callback;
 
 pub use camera::{fov_for_focal_mm, preset_focal_mm, OrbitCamera, StandardView};
+pub use control::{render_control_images, ControlImagePaths};
 pub use cubemap::{render_pano_image, PanoImage};
 pub use pano::{
     equirect_dir_to_ndc, equirect_ndc_to_dir, fisheye_ndc_to_dir, fisheye_radius, pixel_to_ndc,

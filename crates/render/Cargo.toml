@@ -13,8 +13,8 @@ egui-wgpu.workspace = true
 wgpu.workspace = true
 glam.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 itsjustcad-commands.workspace = true
 pollster = "0.4"
-image = { version = "0.25", default-features = false, features = ["png"] }

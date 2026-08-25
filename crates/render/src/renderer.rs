@@ -219,6 +219,10 @@ mod tests {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ObjectParams {
     color: [f32; 4],
+    /// x = roughness (0 smooth .. 1 matte), y = metallic (0 dielectric .. 1
+    /// metal), z,w spare. Drives the specular term in the mesh shader so
+    /// `material2` presets read differently (glass shiny, concrete matte).
+    material: [f32; 4],
 }
 
 struct GpuMesh {
@@ -253,7 +257,9 @@ pub struct UnderlayData {
 
 /// CPU-side scene snapshot handed to the renderer when the document changes.
 pub struct SceneData {
-    pub meshes: Vec<(RenderMesh, [f32; 4])>,
+    /// `(mesh, rgba, [roughness, metallic])`. The material scalars default to
+    /// `[0.5, 0.0]` (mid-rough dielectric) when the object has no `material2`.
+    pub meshes: Vec<(RenderMesh, [f32; 4], [f32; 2])>,
     /// Line strips: consecutive points, `closed` handled by repeating the seam
     /// point on the CPU side.
     pub lines: Vec<(Vec<[f32; 3]>, [f32; 4])>,
@@ -708,12 +714,12 @@ impl SceneRenderer {
     pub fn set_meshes(
         &mut self,
         device: &wgpu::Device,
-        meshes: &[(RenderMesh, [f32; 4])],
+        meshes: &[(RenderMesh, [f32; 4], [f32; 2])],
         generation: u64,
     ) {
         use wgpu::util::DeviceExt as _;
         self.meshes.clear();
-        for (mesh, color) in meshes {
+        for (mesh, color, rm) in meshes {
             let mut vertices = Vec::with_capacity(mesh.positions.len() * 6);
             for (p, n) in mesh.positions.iter().zip(&mesh.normals) {
                 vertices.extend_from_slice(p);
@@ -729,7 +735,7 @@ impl SceneRenderer {
                 contents: bytemuck::cast_slice(&mesh.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
-            let params = ObjectParams { color: *color };
+            let params = ObjectParams { color: *color, material: [rm[0], rm[1], 0.0, 0.0] };
             let object_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("object_ubo"),
                 contents: bytemuck::bytes_of(&params),
@@ -755,7 +761,7 @@ impl SceneRenderer {
 
     fn object_bind_group(&self, device: &wgpu::Device, color: [f32; 4]) -> wgpu::BindGroup {
         use wgpu::util::DeviceExt as _;
-        let params = ObjectParams { color };
+        let params = ObjectParams { color, material: [0.5, 0.0, 0.0, 0.0] };
         let object_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("object_ubo"),
             contents: bytemuck::bytes_of(&params),

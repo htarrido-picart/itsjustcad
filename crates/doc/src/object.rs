@@ -315,6 +315,80 @@ impl Geometry {
     }
 }
 
+/// A named physical-material preset for rendering. Each preset maps to a
+/// canonical base color / roughness / metallic so `material2 sel glass` reads
+/// distinctly from `material2 sel concrete` in the viewport and in the exported
+/// control images. Kept separate from the *structural* `Material` (E + density)
+/// which drives analysis and IFC — this one is purely appearance.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialPreset {
+    Concrete,
+    Glass,
+    Metal,
+    Wood,
+}
+
+impl MaterialPreset {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "concrete" => Some(MaterialPreset::Concrete),
+            "glass" => Some(MaterialPreset::Glass),
+            "metal" => Some(MaterialPreset::Metal),
+            "wood" => Some(MaterialPreset::Wood),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MaterialPreset::Concrete => "concrete",
+            MaterialPreset::Glass => "glass",
+            MaterialPreset::Metal => "metal",
+            MaterialPreset::Wood => "wood",
+        }
+    }
+
+    /// Canonical (base_color, roughness, metallic) for the preset.
+    pub fn pbr(self) -> ([f32; 3], f32, f32) {
+        match self {
+            // Light grey, matte, dielectric.
+            MaterialPreset::Concrete => ([0.62, 0.62, 0.60], 0.90, 0.0),
+            // Cool tinted, very smooth, dielectric (rendered translucent-ish).
+            MaterialPreset::Glass => ([0.55, 0.72, 0.80], 0.05, 0.0),
+            // Neutral bright, smooth, fully metallic.
+            MaterialPreset::Metal => ([0.80, 0.81, 0.83], 0.25, 1.0),
+            // Warm brown, medium roughness, dielectric.
+            MaterialPreset::Wood => ([0.55, 0.36, 0.20], 0.65, 0.0),
+        }
+    }
+}
+
+/// Per-object appearance material: an explicit base color + PBR-ish scalars, or
+/// a named [`MaterialPreset`]. Applied by `material2`. Serialized with
+/// `#[serde(default)]` on the object field so pre-material files still load.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObjectMaterial {
+    Preset { preset: MaterialPreset },
+    Custom { color: [f32; 3], roughness: f32, metallic: f32 },
+}
+
+impl ObjectMaterial {
+    /// Resolve to (base_color, roughness, metallic) regardless of the variant.
+    pub fn pbr(&self) -> ([f32; 3], f32, f32) {
+        match self {
+            ObjectMaterial::Preset { preset } => preset.pbr(),
+            ObjectMaterial::Custom { color, roughness, metallic } => (*color, *roughness, *metallic),
+        }
+    }
+
+    /// Base color alone (drives the mesh fill color path).
+    pub fn base_color(&self) -> [f32; 3] {
+        self.pbr().0
+    }
+}
+
 /// Name of the layer every document starts with; objects land here unless the
 /// current layer was switched.
 pub const DEFAULT_LAYER: &str = "default";
@@ -368,5 +442,60 @@ pub struct SceneObject {
     /// Serde default keeps pre-color JSON loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[f32; 3]>,
+    /// Per-object appearance material (`material2`): base color + roughness +
+    /// metallic, or a named preset. `None` defers to the flat color path.
+    /// Serde default keeps pre-material JSON loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material: Option<ObjectMaterial>,
     pub geometry: Geometry,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn material_preset_parse_and_pbr() {
+        assert_eq!(MaterialPreset::parse("glass"), Some(MaterialPreset::Glass));
+        assert_eq!(MaterialPreset::parse("nope"), None);
+        // Presets must be visually distinct: glass is smooth, concrete matte,
+        // metal fully metallic.
+        let (_, glass_rough, _) = MaterialPreset::Glass.pbr();
+        let (_, concrete_rough, _) = MaterialPreset::Concrete.pbr();
+        let (_, _, metal_metallic) = MaterialPreset::Metal.pbr();
+        assert!(glass_rough < concrete_rough, "glass must be smoother than concrete");
+        assert_eq!(metal_metallic, 1.0, "metal must be fully metallic");
+    }
+
+    #[test]
+    fn object_material_resolves_uniformly() {
+        let custom = ObjectMaterial::Custom { color: [0.1, 0.2, 0.3], roughness: 0.7, metallic: 0.4 };
+        let (c, r, m) = custom.pbr();
+        assert_eq!(c, [0.1, 0.2, 0.3]);
+        assert!((r - 0.7).abs() < 1e-6 && (m - 0.4).abs() < 1e-6);
+        assert_eq!(custom.base_color(), [0.1, 0.2, 0.3]);
+    }
+
+    /// A pre-material SceneObject JSON (no `material` field) must still load,
+    /// defaulting the material to None.
+    #[test]
+    fn pre_material_scene_object_loads() {
+        let json = r#"{
+            "id": "00000000000000000000000000000001",
+            "name": null,
+            "layer": "default",
+            "visible": true,
+            "geometry": { "geo": "points", "positions": [] }
+        }"#;
+        // Deserialize just the fields we care about via a permissive check: the
+        // material field must default to None on an object that omits it.
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(parsed.get("material").is_none(), "fixture omits material");
+        // Round-trip through SceneObject: material defaults to None and a
+        // re-serialized object omits the field (skip_serializing_if None).
+        let obj: SceneObject = serde_json::from_value(parsed).unwrap();
+        assert!(obj.material.is_none(), "missing material defaults to None");
+        let back = serde_json::to_value(&obj).unwrap();
+        assert!(back.get("material").is_none(), "None material is not serialized");
+    }
 }

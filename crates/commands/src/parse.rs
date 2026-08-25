@@ -625,6 +625,15 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("coloroff", rest, &args)?;
             Ok(Command::ColorOff { targets: sel })
         }
+        "material2" => {
+            let (sel, rest) = selector(&args, "material2")?;
+            material2_body(sel, rest, &args)
+        }
+        "material2off" => {
+            let (sel, rest) = selector(&args, "material2off")?;
+            expect_empty("material2off", rest, &args)?;
+            Ok(Command::Material2Off { targets: sel })
+        }
         "units" => {
             let [u] = take::<1>("units", "a unit: m, cm, mm, ft, in or ftin", &args)?;
             let units = Units::parse(u)
@@ -695,6 +704,11 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "export" => {
             let [path] = take::<1>("export", "an output path (.dxf/.stl/.obj/.gltf/.glb/.svg/.csv)", &args)?;
             Ok(Command::Export { path: path.to_string() })
+        }
+        "controlimages" => {
+            let [prefix] =
+                take::<1>("controlimages", "a path prefix (writes <prefix>_depth/edge/mask.png)", &args)?;
+            Ok(Command::ControlImages { prefix: prefix.to_string() })
         }
         "import" => {
             let [path] = take::<1>("import", "an input path (.dxf/.obj/.stl/.gltf/.glb/.dae/.geojson/.las)", &args)?;
@@ -1283,6 +1297,68 @@ fn counts3(s: &str) -> Result<[u32; 3], ParseError> {
 }
 
 /// `r,g,b` color; values above 1 are read as a 0-255 byte triple.
+/// Parse the tail of a `material2 <sel> ...` command: either `off`, a single
+/// preset keyword (`concrete`/`glass`/`metal`/`wood`), or any mix of
+/// `roughness=..`, `metallic=..`, `color=r,g,b` key/value tokens (a custom
+/// material). Unspecified custom scalars default to a mid dielectric.
+fn material2_body(
+    sel: Selector,
+    rest: &[&str],
+    args: &[&str],
+) -> Result<Command, ParseError> {
+    use itsjustcad_doc::{MaterialPreset, ObjectMaterial};
+    match rest {
+        [] => wrong("material2", "a preset, key=value list, or 'off'", args),
+        ["off"] => Ok(Command::Material2Off { targets: sel }),
+        [one] if MaterialPreset::parse(one).is_some() => {
+            let preset = MaterialPreset::parse(one).unwrap();
+            Ok(Command::Material2 { targets: sel, material: ObjectMaterial::Preset { preset } })
+        }
+        tokens => {
+            // Custom: key=value pairs. Defaults keep a plausible matte dielectric.
+            let mut color = [0.7f32, 0.7, 0.7];
+            let mut roughness = 0.5f32;
+            let mut metallic = 0.0f32;
+            let mut saw_any = false;
+            for t in tokens {
+                let (key, val) = t.split_once('=').ok_or_else(|| {
+                    wrong_err("material2", "key=value pairs (roughness= metallic= color=)", args)
+                })?;
+                saw_any = true;
+                match key {
+                    "color" | "c" => color = color3(val)?,
+                    "roughness" | "rough" | "r" => {
+                        roughness = val
+                            .parse::<f32>()
+                            .map_err(|_| wrong_err("material2", "roughness=<0..1>", args))?
+                            .clamp(0.0, 1.0)
+                    }
+                    "metallic" | "metal" | "m" => {
+                        metallic = val
+                            .parse::<f32>()
+                            .map_err(|_| wrong_err("material2", "metallic=<0..1>", args))?
+                            .clamp(0.0, 1.0)
+                    }
+                    _ => {
+                        return wrong(
+                            "material2",
+                            "keys color=, roughness=, metallic= (or a preset name)",
+                            args,
+                        )
+                    }
+                }
+            }
+            if !saw_any {
+                return wrong("material2", "a preset, key=value list, or 'off'", args);
+            }
+            Ok(Command::Material2 {
+                targets: sel,
+                material: ObjectMaterial::Custom { color, roughness, metallic },
+            })
+        }
+    }
+}
+
 fn color3(s: &str) -> Result<[f32; 3], ParseError> {
     let bad = || ParseError::BadColor(s.to_string());
     let parts: Vec<f64> = s
@@ -2701,5 +2777,75 @@ mod tests {
             let back: Command = serde_json::from_str(&json).unwrap();
             assert_eq!(cmd, back, "roundtrip failed for: {line}");
         }
+    }
+
+    #[test]
+    fn material2_preset_parses() {
+        use itsjustcad_doc::{MaterialPreset, ObjectMaterial};
+        let Command::Material2 { material, .. } = parse("material2 last glass").unwrap() else {
+            panic!("expected Material2");
+        };
+        assert_eq!(material, ObjectMaterial::Preset { preset: MaterialPreset::Glass });
+
+        // Each preset keyword resolves.
+        for (kw, p) in [
+            ("concrete", MaterialPreset::Concrete),
+            ("metal", MaterialPreset::Metal),
+            ("wood", MaterialPreset::Wood),
+        ] {
+            let Command::Material2 { material, .. } =
+                parse(&format!("material2 last {kw}")).unwrap()
+            else {
+                panic!();
+            };
+            assert_eq!(material, ObjectMaterial::Preset { preset: p });
+        }
+    }
+
+    #[test]
+    fn material2_custom_and_off_parse() {
+        use itsjustcad_doc::ObjectMaterial;
+        let Command::Material2 { material, .. } =
+            parse("material2 last roughness=0.9 metallic=0 color=0.6,0.6,0.6").unwrap()
+        else {
+            panic!("expected custom Material2");
+        };
+        let ObjectMaterial::Custom { color, roughness, metallic } = material else {
+            panic!("expected custom variant");
+        };
+        assert!((roughness - 0.9).abs() < 1e-6);
+        assert!((metallic - 0.0).abs() < 1e-6);
+        assert!((color[0] - 0.6).abs() < 1e-6);
+
+        assert!(matches!(parse("material2 last off").unwrap(), Command::Material2Off { .. }));
+        // A bare selector with nothing else is an error.
+        assert!(parse("material2 last").is_err());
+        // Unknown key errors.
+        assert!(parse("material2 last shininess=3").is_err());
+    }
+
+    #[test]
+    fn material2_json_roundtrips() {
+        for line in [
+            "material2 last glass",
+            "material2 all concrete",
+            "material2 last roughness=0.3 metallic=1 color=200,200,210",
+            "material2 last off",
+        ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "roundtrip failed for: {line}");
+        }
+    }
+
+    #[test]
+    fn controlimages_parses_and_roundtrips() {
+        let cmd = parse("controlimages /tmp/scene").unwrap();
+        assert_eq!(cmd, Command::ControlImages { prefix: "/tmp/scene".into() });
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+        assert!(parse("controlimages").unwrap_err().to_string().contains("prefix"));
     }
 }

@@ -119,6 +119,31 @@ fn resolve_color(
     }
 }
 
+/// Default material scalars for a mesh with no `material2`: mid-roughness
+/// dielectric. Matches the shader's neutral appearance for legacy objects.
+const DEFAULT_ROUGH_METAL: [f32; 2] = [0.5, 0.0];
+
+/// Resolve the mesh fill color AND its roughness/metallic for the shader. A
+/// `material2` on the object overrides the base color (unless selection wins)
+/// and supplies the PBR scalars; otherwise we fall back to the flat color path
+/// with default scalars.
+fn resolve_mesh_material(
+    obj: &SceneObject,
+    layer_color: Option<[f32; 4]>,
+    theme: Theme,
+    selected: bool,
+    mode: ColorMode,
+) -> ([f32; 4], [f32; 2]) {
+    let flat = resolve_color(obj, layer_color, theme, selected, mode, true);
+    match &obj.material {
+        Some(m) if !selected => {
+            let ([r, g, b], rough, metal) = m.pbr();
+            ([r, g, b, flat[3]], [rough, metal])
+        }
+        _ => (flat, DEFAULT_ROUGH_METAL),
+    }
+}
+
 /// Snapshot the document into GPU-ready buffers.
 pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
     snapshot_with_mode(doc, theme, ColorModeSnapshot::default())
@@ -152,8 +177,9 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
             Geometry::Mesh(mesh)
             | Geometry::Frame { mesh, .. }
             | Geometry::Area { mesh, .. } => {
-                let color = resolve_color(obj, layer_color, theme, selected, mode, true);
-                scene.meshes.push((mesh.to_render(), color));
+                let (color, rm) =
+                    resolve_mesh_material(obj, layer_color, theme, selected, mode);
+                scene.meshes.push((mesh.to_render(), color, rm));
                 // Feature edges for the wireframe/x-ray/ghosted display modes.
                 let edge_color = if selected { theme.selected() } else { theme.curve() };
                 let segments: Vec<[f32; 3]> = kernel_mesh::feature_edges(mesh)
@@ -200,7 +226,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                         let faces = kernel_mesh::earcut(&pts2);
                         if !faces.is_empty() {
                             let mesh = kernel_mesh::Mesh::new(boundary.clone(), faces);
-                            scene.meshes.push((mesh.to_render(), color));
+                            scene.meshes.push((mesh.to_render(), color, DEFAULT_ROUGH_METAL));
                         }
                     }
                     HatchPattern::Lines { angle_deg, spacing } => {
@@ -266,7 +292,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                                     m.positions().iter().map(|&p| transform(p)).collect();
                                 let new_mesh = kernel_mesh::Mesh::new(new_pos, m.faces().to_vec());
                                 let mesh_color = resolve_color(obj, layer_color, theme, selected, mode, true);
-                                scene.meshes.push((new_mesh.to_render(), mesh_color));
+                                scene.meshes.push((new_mesh.to_render(), mesh_color, DEFAULT_ROUGH_METAL));
                                 let segments: Vec<[f32; 3]> = kernel_mesh::feature_edges(&new_mesh)
                                     .iter()
                                     .flat_map(|(a, b)| {
@@ -319,7 +345,6 @@ mod tests {
     use itsjustcad_doc::{Document, LayerStyle, ObjectId, SceneObject};
 
     use super::*;
-    use crate::renderer::ColorMode;
 
     fn insert_tri(doc: &mut Document, layer: &str) -> ObjectId {
         let mesh = kernel_mesh::Mesh::new(
@@ -332,6 +357,7 @@ mod tests {
             name: None,
             layer: layer.to_string(),
             color: None,
+            material: None,
             geometry: Geometry::Mesh(mesh),
         };
         let id = obj.id;
@@ -372,6 +398,7 @@ mod tests {
             name: None,
             layer: "default".into(),
             color: None,
+            material: None,
             geometry: Geometry::Mesh(kernel_mesh::make_box(
                 DVec3::ZERO,
                 DVec3::new(2.0, 1.0, 3.0),
@@ -419,6 +446,7 @@ mod tests {
             name: None,
             layer: "default".into(),
             color: None,
+            material: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Hatch {
                 boundary: square.clone(),
                 pattern: itsjustcad_doc::HatchPattern::Solid,
@@ -435,6 +463,7 @@ mod tests {
             name: None,
             layer: "default".into(),
             color: None,
+            material: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Hatch {
                 boundary: square,
                 pattern: itsjustcad_doc::HatchPattern::Lines { angle_deg: 0.0, spacing: 0.5 },
@@ -459,6 +488,7 @@ mod tests {
             name: None,
             layer: "default".into(),
             color: None,
+            material: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::LinearDim {
                 a: DVec3::ZERO,
                 b: DVec3::X,
@@ -477,6 +507,7 @@ mod tests {
             name: None,
             layer: "default".into(),
             color: None,
+            material: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Text {
                 pos: DVec3::ZERO,
                 text: "note".into(),
@@ -609,6 +640,7 @@ mod tests {
             name: None,
             layer: "default".into(),
             color: None,
+            material: None,
             geometry: Geometry::Instance {
                 block: "tri".to_string(),
                 position: DVec3::new(5.0, 0.0, 0.0),
@@ -654,6 +686,7 @@ mod tests {
             name: None,
             layer: "default".into(),
             color: None,
+            material: None,
             geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
                 points: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
                 closed: true,
