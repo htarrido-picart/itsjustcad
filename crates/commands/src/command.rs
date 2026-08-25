@@ -713,6 +713,24 @@ pub enum Command {
         rotation_deg: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scale: Option<f64>,
+        /// Param overrides `key=value` for a dynamic (parametric) block. Empty
+        /// for a plain block. `serde(default)` keeps pre-dynamic logs loading.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        params: std::collections::BTreeMap<String, String>,
+    },
+    /// Define (or replace) a parametric (dynamic) block: named params with
+    /// defaults plus a command-template body (`{param}` substitution). Stored on
+    /// the document; `insert` bakes it at instance param values.
+    BlockParamDefine {
+        name: String,
+        params: Vec<itsjustcad_doc::ParamBlockParam>,
+        body: Vec<String>,
+    },
+    /// Edit one param of an existing dynamic-block instance and re-derive its
+    /// geometry. `key=value` pairs override the instance's current params.
+    BlockParamSet {
+        target: Selector,
+        params: std::collections::BTreeMap<String, String>,
     },
     /// List block definitions (query; never logged).
     BlocksList,

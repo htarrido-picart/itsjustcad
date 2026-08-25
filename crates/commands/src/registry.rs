@@ -565,8 +565,20 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "insert",
-            usage: "insert <name> <position x,y,z> [rotation_deg] [scale]",
-            summary: "Place an instance of a named block at a point with optional rotation (degrees CCW about Z) and uniform scale. Instances move/scale/rotate as a single object. Example: insert door 3,0,0 · insert tree 10,5,0 0 0.8 · insert column 0,0,0 90 1",
+            usage: "insert <name> <position x,y,z> [rotation_deg] [scale] [param=value ...]",
+            summary: "Place an instance of a named block at a point with optional rotation (degrees CCW about Z), uniform scale, and — for dynamic blocks — param overrides. Example: insert door 3,0,0 · insert tree 10,5,0 0 0.8 · insert pdoor 0,0,0 width=1.2",
+            category: Category::Annotate,
+        },
+        CommandSpec {
+            name: "pblock",
+            usage: "pblock <name> [param=default ...] : templ ; templ ; ...",
+            summary: "Define a dynamic (parametric) block: named params with defaults plus a command-template body ({param} substitution). Instances bake geometry at their own param values, editable via 'param'. Example: pblock pdoor width=0.9 : rect 0,0,0 {width},0.05 ; line {width},0,0 {width},{width},0",
+            category: Category::Annotate,
+        },
+        CommandSpec {
+            name: "param",
+            usage: "param <selector> <key=value ...>",
+            summary: "Edit a parameter of a selected dynamic-block instance; its geometry re-derives from the template. Example: param last width=1.2 · param last swing=45",
             category: Category::Annotate,
         },
         CommandSpec {

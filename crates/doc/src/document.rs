@@ -6,8 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_mesh::Aabb;
 
 use crate::{
-    BlockGeometry, GeoLocation, Grid, LayerStyle, Material, NamedView, ObjectId, SceneObject,
-    Section, Sheet, Story, StructLoad, StructSupport, SunPosition, Underlay, Units, DEFAULT_LAYER,
+    BlockGeometry, GeoLocation, Grid, LayerStyle, Material, NamedView, ObjectId, ParamBlockDef,
+    SceneObject, Section, Sheet, Story, StructLoad, StructSupport, SunPosition, Underlay, Units,
+    DEFAULT_LAYER,
 };
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
@@ -41,8 +42,15 @@ pub struct Document {
     /// readers filter through `get`. Mutators bump `generation` (exec does).
     pub groups: BTreeMap<String, BTreeSet<ObjectId>>,
     /// Block definitions: name → ordered list of geometry snapshots. Mutators
-    /// bump `generation` (exec does).
+    /// bump `generation` (exec does). For dynamic blocks this also holds each
+    /// instance's baked geometry under a per-instance key (see `param_blocks`).
     pub blocks: BTreeMap<String, Vec<BlockGeometry>>,
+    /// Parametric (dynamic) block definitions: name → params + command template.
+    /// Instances reference these via `Geometry::Instance::source` and bake their
+    /// own geometry into `blocks`. `serde(default)` keeps pre-dynamic files
+    /// loading cleanly.
+    #[serde(default)]
+    pub param_blocks: BTreeMap<String, ParamBlockDef>,
     /// Mailbox: a `view <name>` restore waiting for the UI to drive the active
     /// viewport camera. The app takes it each frame; never persisted.
     #[serde(skip)]
@@ -103,6 +111,7 @@ impl Default for Document {
             named_views: BTreeMap::new(),
             groups: BTreeMap::new(),
             blocks: BTreeMap::new(),
+            param_blocks: BTreeMap::new(),
             pending_view: None,
             underlay: None,
             sun: None,

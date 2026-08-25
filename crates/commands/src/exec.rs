@@ -124,6 +124,25 @@ enum Inverse {
         /// Previous definition (None if newly created).
         prev: Option<Vec<itsjustcad_doc::BlockGeometry>>,
     },
+    /// `pblock`: restore the previous parametric-block definition (None if new).
+    ParamBlockDef {
+        name: String,
+        prev: Option<itsjustcad_doc::ParamBlockDef>,
+    },
+    /// Dynamic-block `insert`: remove the created instance object AND its
+    /// per-instance baked geometry entry in `doc.blocks`.
+    CreatedAndBake {
+        created: Vec<ObjectId>,
+        block_key: String,
+    },
+    /// `param` (edit an instance's dynamic-block param): restore the instance's
+    /// prior geometry (its params map) and its prior baked geometry.
+    ParamBlockSet {
+        id: ObjectId,
+        prev_geometry: itsjustcad_doc::Geometry,
+        block_key: String,
+        prev_bake: Vec<itsjustcad_doc::BlockGeometry>,
+    },
     /// `section`: restore the previous named section binding (None if new).
     SectionDef {
         name: String,
@@ -176,10 +195,67 @@ pub struct Session {
 /// auto-saved to. Never needs an explicit `option save main`.
 pub const MAIN_BRANCH: &str = "main";
 
+/// Built-in parametric (dynamic) block definitions, seeded into every session
+/// so `insert pdoor|pwindow|pcolumn ...` works out of the box. Each is a plain
+/// command template using the `{param}` substitution machinery.
+///
+/// - `pdoor`  — door leaf (a rectangle of the given `width`) plus a swing arc of
+///   `swing` degrees; the leaf-and-swing footprint scales with `width`.
+/// - `pwindow` — a window opening `width` × `height` with a mullion line.
+/// - `pcolumn` — a square column footprint of side `size`.
+pub fn starter_param_blocks() -> Vec<(String, itsjustcad_doc::ParamBlockDef)> {
+    use itsjustcad_doc::{ParamBlockDef, ParamBlockParam};
+    let p = |name: &str, default: &str| ParamBlockParam {
+        name: name.to_string(),
+        default: default.to_string(),
+    };
+    let mk = |params: Vec<ParamBlockParam>, body: &[&str]| ParamBlockDef {
+        params,
+        body: body.iter().map(|s| s.to_string()).collect(),
+    };
+    vec![
+        (
+            "pdoor".to_string(),
+            mk(
+                vec![p("width", "0.9"), p("swing", "90")],
+                &[
+                    // Door leaf: a thin rectangle along +X of length `width`.
+                    "rect 0,0,0 {width} 0.05",
+                    // Swing arc: radius = width, from 0° to `swing`.
+                    "arc 0,0,0 {width} 0 {swing}",
+                ],
+            ),
+        ),
+        (
+            "pwindow".to_string(),
+            mk(
+                vec![p("width", "1.2"), p("height", "1.5")],
+                &[
+                    // Frame rectangle width × height.
+                    "rect 0,0,0 {width} {height}",
+                    // Vertical mullion at the top edge (width-dependent).
+                    "line 0,{height},0 {width},{height},0",
+                ],
+            ),
+        ),
+        (
+            "pcolumn".to_string(),
+            mk(
+                vec![p("size", "0.4")],
+                &["rect 0,0,0 {size} {size}"],
+            ),
+        ),
+    ]
+}
+
 impl Default for Session {
     fn default() -> Self {
+        let mut doc = Document::default();
+        for (name, def) in starter_param_blocks() {
+            doc.param_blocks.insert(name, def);
+        }
         Session {
-            doc: Document::default(),
+            doc,
             log: Vec::new(),
             cursor: 0,
             plugins: crate::plugin::PluginRegistry::default(),
@@ -410,6 +486,31 @@ impl Session {
                         self.doc.blocks.remove(name);
                     }
                 }
+                self.doc.generation += 1;
+            }
+            Inverse::ParamBlockDef { name, prev } => {
+                match prev {
+                    Some(def) => {
+                        self.doc.param_blocks.insert(name.clone(), def.clone());
+                    }
+                    None => {
+                        self.doc.param_blocks.remove(name);
+                    }
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::CreatedAndBake { created, block_key } => {
+                for id in created.clone() {
+                    self.doc.remove(id);
+                }
+                self.doc.blocks.remove(block_key);
+                self.doc.generation += 1;
+            }
+            Inverse::ParamBlockSet { id, prev_geometry, block_key, prev_bake } => {
+                if let Some(obj) = self.doc.get_mut(*id) {
+                    obj.geometry = prev_geometry.clone();
+                }
+                self.doc.blocks.insert(block_key.clone(), prev_bake.clone());
                 self.doc.generation += 1;
             }
             Inverse::Replace { created, consumed } => {
@@ -2005,6 +2106,49 @@ fn curve_of<'a>(doc: &'a Document, id: ObjectId, verb: &str) -> Result<&'a Curve
             "{verb} works on curves; '{id}' is not a curve"
         ))),
     }
+}
+
+/// Per-instance baked-block key for a dynamic-block instance. Deterministic in
+/// the instance id so undo/redo/replay recreate the exact same key.
+fn param_bake_key(source: &str, id: ObjectId) -> String {
+    format!("__param/{source}/{}", id.short())
+}
+
+/// Bake a parametric block at concrete param `values`: expand its template,
+/// run each line on a scratch document, and harvest the resulting geometry as
+/// a flat `Vec<BlockGeometry>`. Instances/points produced by the template are
+/// skipped (blocks are flat). Runs on a throwaway `Session` so the template's
+/// own commands never touch the live op-log.
+fn bake_param_block(
+    def: &itsjustcad_doc::ParamBlockDef,
+    values: &BTreeMap<String, String>,
+) -> Result<Vec<itsjustcad_doc::BlockGeometry>, ExecError> {
+    use itsjustcad_doc::BlockGeometry;
+    let mut scratch = Session::default();
+    for line in def.expand(values) {
+        let cmd = crate::parse::parse(&line)
+            .map_err(|e| ExecError::Invalid(format!("param-block template line '{line}': {e}")))?;
+        scratch
+            .run(cmd)
+            .map_err(|e| ExecError::Invalid(format!("param-block template line '{line}': {e}")))?;
+    }
+    let mut out = Vec::new();
+    for obj in scratch.doc.objects() {
+        match &obj.geometry {
+            Geometry::Mesh(m)
+            | Geometry::Frame { mesh: m, .. }
+            | Geometry::Area { mesh: m, .. } => out.push(BlockGeometry::Mesh(m.clone())),
+            Geometry::Curve(c) => out.push(BlockGeometry::Curve(c.clone())),
+            Geometry::Annotation(a) => out.push(BlockGeometry::Annotation(a.clone())),
+            Geometry::Instance { .. } | Geometry::Points { .. } => {}
+        }
+    }
+    if out.is_empty() {
+        return Err(ExecError::Invalid(
+            "param-block template produced no geometry".into(),
+        ));
+    }
+    Ok(out)
 }
 
 /// Apply a (non-undo) command. Returns the op with ids filled for the log.
@@ -4375,8 +4519,9 @@ fn apply_forward(
                 },
             ))
         }
-        Command::BlockInsert { id, name, position, rotation_deg, scale } => {
-            if !doc.blocks.contains_key(&name) {
+        Command::BlockInsert { id, name, position, rotation_deg, scale, params } => {
+            let is_param = doc.param_blocks.contains_key(&name);
+            if !is_param && !doc.blocks.contains_key(&name) {
                 return Err(ExecError::Invalid(format!(
                     "no block named '{name}' (use 'blocks' to list definitions)"
                 )));
@@ -4386,6 +4531,47 @@ fn apply_forward(
             let sc = scale.unwrap_or(1.0);
             if sc <= 0.0 {
                 return Err(ExecError::Invalid("block insert scale must be positive".into()));
+            }
+            // Dynamic block: bake this instance's geometry under a per-instance
+            // key and record the resolved param values on the instance.
+            if is_param {
+                let def = doc.param_blocks.get(&name).expect("checked").clone();
+                let values = def.resolve_values(&params);
+                let baked = bake_param_block(&def, &values)?;
+                let key = param_bake_key(&name, id);
+                doc.blocks.insert(key.clone(), baked);
+                doc.insert(SceneObject {
+                    visible: true,
+                    id,
+                    name: None,
+                    layer: doc.current_layer.clone(),
+                    color: None,
+                    material: None,
+                    lineweight_mm: None,
+                    geometry: Geometry::Instance {
+                        block: key.clone(),
+                        position,
+                        rotation_deg: rot,
+                        scale: sc,
+                        source: Some(name.clone()),
+                        params: values.clone(),
+                    },
+                });
+                return Ok((
+                    Command::BlockInsert {
+                        id: Some(id),
+                        name: name.clone(),
+                        position,
+                        rotation_deg: Some(rot),
+                        scale: Some(sc),
+                        params: values,
+                    },
+                    Inverse::CreatedAndBake { created: vec![id], block_key: key },
+                    ApplyOutcome {
+                        created: vec![id],
+                        message: format!("insert '{name}' -> {id} at {position}"),
+                    },
+                ));
             }
             doc.insert(SceneObject {
                 visible: true,
@@ -4400,6 +4586,8 @@ fn apply_forward(
                     position,
                     rotation_deg: rot,
                     scale: sc,
+                    source: None,
+                    params: Default::default(),
                 },
             });
             Ok((
@@ -4409,11 +4597,103 @@ fn apply_forward(
                     position,
                     rotation_deg: Some(rot),
                     scale: Some(sc),
+                    params: Default::default(),
                 },
                 Inverse::DeleteCreated(vec![id]),
                 ApplyOutcome {
                     created: vec![id],
                     message: format!("insert '{}' -> {id} at {position}", name),
+                },
+            ))
+        }
+        Command::BlockParamDefine { name, params, body } => {
+            use itsjustcad_doc::ParamBlockDef;
+            if name.is_empty() {
+                return Err(ExecError::Invalid("pblock: name cannot be empty".into()));
+            }
+            let def = ParamBlockDef { params: params.clone(), body: body.clone() };
+            // Validate the template bakes at its defaults before committing.
+            bake_param_block(&def, &def.default_values())?;
+            let prev = doc.param_blocks.insert(name.clone(), def);
+            doc.generation += 1;
+            let np = params.len();
+            Ok((
+                Command::BlockParamDefine { name: name.clone(), params, body },
+                Inverse::ParamBlockDef { name: name.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "dynamic block '{name}' defined ({np} param{})",
+                        if np == 1 { "" } else { "s" }
+                    ),
+                },
+            ))
+        }
+        Command::BlockParamSet { target, params } => {
+            let ids = resolve(doc, &target)?;
+            if ids.len() != 1 {
+                return Err(ExecError::Invalid(format!(
+                    "param: selector matched {} objects, expected exactly 1",
+                    ids.len()
+                )));
+            }
+            let id = ids[0];
+            let obj = doc.get(id).expect("resolved");
+            let (source, cur_params, position, rot, sc) = match &obj.geometry {
+                Geometry::Instance {
+                    source: Some(src),
+                    params: cur,
+                    position,
+                    rotation_deg,
+                    scale,
+                    ..
+                } => (src.clone(), cur.clone(), *position, *rotation_deg, *scale),
+                _ => {
+                    return Err(ExecError::Invalid(format!(
+                        "param: '{id}' is not a dynamic-block instance"
+                    )))
+                }
+            };
+            let def = doc
+                .param_blocks
+                .get(&source)
+                .ok_or_else(|| {
+                    ExecError::Invalid(format!("param: no dynamic block '{source}'"))
+                })?
+                .clone();
+            // Reject unknown keys so typos surface instead of silently no-op.
+            for k in params.keys() {
+                if !cur_params.contains_key(k) {
+                    return Err(ExecError::Invalid(format!(
+                        "param: '{source}' has no parameter '{k}'"
+                    )));
+                }
+            }
+            let mut new_values = cur_params.clone();
+            for (k, v) in &params {
+                new_values.insert(k.clone(), v.clone());
+            }
+            let baked = bake_param_block(&def, &new_values)?;
+            let key = param_bake_key(&source, id);
+            let prev_bake = doc.blocks.insert(key.clone(), baked).unwrap_or_default();
+            let prev_geometry = doc.get(id).expect("resolved").geometry.clone();
+            if let Some(o) = doc.get_mut(id) {
+                o.geometry = Geometry::Instance {
+                    block: key.clone(),
+                    position,
+                    rotation_deg: rot,
+                    scale: sc,
+                    source: Some(source.clone()),
+                    params: new_values.clone(),
+                };
+            }
+            doc.generation += 1;
+            Ok((
+                Command::BlockParamSet { target, params },
+                Inverse::ParamBlockSet { id, prev_geometry, block_key: key, prev_bake },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("param: '{id}' updated"),
                 },
             ))
         }
@@ -4858,6 +5138,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::PointLiteral { .. } => "point_literal",
         Command::BlockDefine { .. } => "block",
         Command::BlockInsert { .. } => "insert",
+        Command::BlockParamDefine { .. } => "pblock",
+        Command::BlockParamSet { .. } => "param",
         Command::BlocksList => "blocks",
         Command::BlockLibList => "blocklib",
         Command::BlockLibLoad { .. } => "blockload",
@@ -4884,6 +5166,182 @@ mod tests {
 
     fn run(s: &mut Session, line: &str) -> ApplyOutcome {
         s.run(parse(line).unwrap()).unwrap()
+    }
+
+    // ── dynamic (parametric) blocks ─────────────────────────────────────────
+
+    /// The baked-geometry key an instance points at, for inspection in tests.
+    fn instance_block_key(s: &Session, id: ObjectId) -> String {
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Instance { block, .. } => block.clone(),
+            g => panic!("expected instance, got {g:?}"),
+        }
+    }
+
+    fn baked_len(s: &Session, id: ObjectId) -> usize {
+        let key = instance_block_key(s, id);
+        s.doc.blocks.get(&key).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Bounding-box width (X extent) of the baked geometry an instance resolves
+    /// to — the observable that must change when `width` changes.
+    fn baked_width(s: &Session, id: ObjectId) -> f64 {
+        let key = instance_block_key(s, id);
+        let defs = s.doc.blocks.get(&key).expect("baked block present");
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for d in defs {
+            let bb = d.aabb();
+            min = min.min(bb.min.x);
+            max = max.max(bb.max.x);
+        }
+        max - min
+    }
+
+    #[test]
+    fn pblock_define_insert_and_param_edit_updates_geometry() {
+        let mut s = Session::default();
+        run(&mut s, "pblock testdoor width=0.9 : rect 0,0,0 {width} 0.05 ; arc 0,0,0 {width} 0 90");
+        assert!(s.doc.param_blocks.contains_key("testdoor"));
+
+        let created = run(&mut s, "insert testdoor 0,0,0 width=1.0").created;
+        let id = created[0];
+        assert_eq!(baked_len(&s, id), 2, "rect + arc baked");
+        // The arc's conservative bound makes the footprint 2×width; the exact
+        // ratio is invariant — what matters is that it tracks the param.
+        let w0 = baked_width(&s, id);
+        assert!((w0 - 2.0).abs() < 1e-6, "width footprint for width=1.0, got {w0}");
+
+        // Edit the param -> geometry re-derives (footprint doubles).
+        run(&mut s, "param last width=2.0");
+        let w1 = baked_width(&s, id);
+        assert!((w1 - 4.0).abs() < 1e-6, "footprint for width=2.0, got {w1}");
+        assert!(w1 > w0, "wider param -> wider geometry");
+
+        // Undo restores prior geometry (footprint back to width=1.0).
+        run(&mut s, "undo");
+        let w2 = baked_width(&s, id);
+        assert!((w2 - 2.0).abs() < 1e-6, "undo restores footprint, got {w2}");
+
+        // Redo re-applies the edit.
+        run(&mut s, "redo");
+        let w3 = baked_width(&s, id);
+        assert!((w3 - 4.0).abs() < 1e-6, "redo re-applies footprint, got {w3}");
+    }
+
+    #[test]
+    fn param_insert_uses_defaults_when_no_override() {
+        let mut s = Session::default();
+        run(&mut s, "pblock t width=1.5 : rect 0,0,0 {width} 0.1");
+        let id = run(&mut s, "insert t 0,0,0").created[0];
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Instance { params, source, .. } => {
+                assert_eq!(source.as_deref(), Some("t"));
+                assert_eq!(params.get("width").map(String::as_str), Some("1.5"));
+            }
+            g => panic!("expected instance, got {g:?}"),
+        }
+        assert!((baked_width(&s, id) - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn param_insert_undo_removes_instance_and_bake() {
+        let mut s = Session::default();
+        run(&mut s, "pblock t size=0.4 : rect 0,0,0 {size} {size}");
+        let id = run(&mut s, "insert t 0,0,0").created[0];
+        let key = instance_block_key(&s, id);
+        assert!(s.doc.blocks.contains_key(&key));
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).is_none(), "instance removed");
+        assert!(!s.doc.blocks.contains_key(&key), "baked block removed");
+    }
+
+    #[test]
+    fn param_define_undo_redo() {
+        let mut s = Session::default();
+        assert!(!s.doc.param_blocks.contains_key("foo"));
+        run(&mut s, "pblock foo w=1 : rect 0,0,0 {w} {w}");
+        assert!(s.doc.param_blocks.contains_key("foo"));
+        run(&mut s, "undo");
+        assert!(!s.doc.param_blocks.contains_key("foo"), "define undone");
+        run(&mut s, "redo");
+        assert!(s.doc.param_blocks.contains_key("foo"), "define redone");
+    }
+
+    #[test]
+    fn starter_blocks_instantiate_at_different_params() {
+        // pdoor / pwindow / pcolumn are seeded — insert at varied params.
+        let mut s = Session::default();
+        let narrow = run(&mut s, "insert pdoor 0,0,0 width=0.8").created[0];
+        let wide = run(&mut s, "insert pdoor 5,0,0 width=1.5").created[0];
+        let wn = baked_width(&s, narrow);
+        let ww = baked_width(&s, wide);
+        // Door footprint tracks width (arc bound makes it 2×width).
+        assert!((wn - 1.6).abs() < 1e-6, "narrow door footprint, got {wn}");
+        assert!((ww - 3.0).abs() < 1e-6, "wide door footprint, got {ww}");
+        assert!(ww > wn, "wide door must be wider than narrow");
+
+        let win = run(&mut s, "insert pwindow 0,5,0 width=2.0 height=1.0").created[0];
+        assert!((baked_width(&s, win) - 2.0).abs() < 1e-6);
+
+        let col = run(&mut s, "insert pcolumn 0,10,0 size=0.6").created[0];
+        assert!((baked_width(&s, col) - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn param_set_rejects_unknown_param() {
+        let mut s = Session::default();
+        run(&mut s, "pblock t w=1 : rect 0,0,0 {w} {w}");
+        run(&mut s, "insert t 0,0,0");
+        let err = s.run(parse("param last bogus=9").unwrap()).unwrap_err();
+        assert!(matches!(err, ExecError::Invalid(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn param_set_on_plain_block_errors() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last plainblk");
+        run(&mut s, "insert plainblk 3,0,0");
+        let err = s.run(parse("param last size=2").unwrap()).unwrap_err();
+        assert!(matches!(err, ExecError::Invalid(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn param_insert_replay_stable() {
+        // A log with a define, an insert-with-params, and a param edit must
+        // survive to_json -> from_json -> to_json byte-identically.
+        let mut s = Session::default();
+        run(&mut s, "pblock pd width=0.9 : rect 0,0,0 {width} 0.05 ; arc 0,0,0 {width} 0 90");
+        run(&mut s, "insert pd 1,2,0 width=1.3");
+        run(&mut s, "param last width=1.7");
+
+        let j1 = crate::io::to_json(&s);
+        let s2 = crate::io::from_json(&j1).unwrap();
+        let j2 = crate::io::to_json(&s2);
+        assert_eq!(j1, j2, "op-log JSON must be byte-stable across replay");
+
+        // Ids stable: the instance keeps its baked-block key after replay.
+        let id = s.doc.all_ids()[0];
+        assert_eq!(
+            instance_block_key(&s, id),
+            instance_block_key(&s2, id),
+            "baked-block key stable across replay"
+        );
+    }
+
+    #[test]
+    fn insert_with_params_parse_round_trip() {
+        let cmd = parse("insert pdoor 0,0,0 90 1.5 width=1.2").unwrap();
+        match &cmd {
+            Command::BlockInsert { name, rotation_deg, scale, params, .. } => {
+                assert_eq!(name, "pdoor");
+                assert_eq!(*rotation_deg, Some(90.0));
+                assert_eq!(*scale, Some(1.5));
+                assert_eq!(params.get("width").map(String::as_str), Some("1.2"));
+            }
+            c => panic!("expected BlockInsert, got {c:?}"),
+        }
     }
 
     fn sample_view(distance: f32) -> NamedView {
@@ -7226,7 +7684,7 @@ mod tests {
         run(&mut s, "insert door 3,0,0 90 2");
         let obj = s.doc.objects().last().unwrap();
         match &obj.geometry {
-            itsjustcad_doc::Geometry::Instance { block, position, rotation_deg, scale } => {
+            itsjustcad_doc::Geometry::Instance { block, position, rotation_deg, scale, .. } => {
                 assert_eq!(block, "door");
                 assert!((position.x - 3.0).abs() < 1e-9);
                 assert!((rotation_deg - 90.0).abs() < 1e-9);

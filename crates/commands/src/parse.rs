@@ -927,31 +927,66 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 geometries: None,
             })
         }
-        // insert <name> <point> [rotation_deg] [scale]
-        "insert" => match args.as_slice() {
-            [name, pos] => Ok(Command::BlockInsert {
+        // insert <name> <point> [rotation_deg] [scale] [key=value ...]
+        "insert" => {
+            let (name, pos, rest) = match args.as_slice() {
+                [name, pos, rest @ ..] => (*name, *pos, rest),
+                _ => return wrong(
+                    "insert",
+                    "a block name, an insertion point, optional rotation (deg), scale and key=value params",
+                    &args,
+                ),
+            };
+            // Split trailing tokens: `key=value` are params; bare numbers fill
+            // rotation then scale positionally.
+            let mut params = std::collections::BTreeMap::new();
+            let mut nums: Vec<f64> = Vec::new();
+            for tok in rest {
+                if let Some((k, v)) = tok.split_once('=') {
+                    if k.is_empty() {
+                        return wrong("insert", "a non-empty param name in key=value", &args);
+                    }
+                    params.insert(k.to_string(), v.to_string());
+                } else {
+                    nums.push(number(tok)?);
+                }
+            }
+            if nums.len() > 2 {
+                return wrong(
+                    "insert",
+                    "at most a rotation and a scale before key=value params",
+                    &args,
+                );
+            }
+            Ok(Command::BlockInsert {
                 id: None,
-                name: (*name).to_string(),
+                name: name.to_string(),
                 position: point(pos)?,
-                rotation_deg: None,
-                scale: None,
-            }),
-            [name, pos, rot] => Ok(Command::BlockInsert {
-                id: None,
-                name: (*name).to_string(),
-                position: point(pos)?,
-                rotation_deg: Some(number(rot)?),
-                scale: None,
-            }),
-            [name, pos, rot, sc] => Ok(Command::BlockInsert {
-                id: None,
-                name: (*name).to_string(),
-                position: point(pos)?,
-                rotation_deg: Some(number(rot)?),
-                scale: Some(number(sc)?),
-            }),
-            _ => wrong("insert", "a block name, an insertion point, optional rotation (deg) and scale", &args),
-        },
+                rotation_deg: nums.first().copied(),
+                scale: nums.get(1).copied(),
+                params,
+            })
+        }
+        // pblock <name> [pname=default ...] : <body ; separated>
+        "pblock" => parse_pblock(input),
+        // param <selector> <key=value ...>
+        "param" => {
+            let (sel, rest) = selector(&args, "param")?;
+            if rest.is_empty() {
+                return wrong("param", "a selector and one or more key=value params", &args);
+            }
+            let mut params = std::collections::BTreeMap::new();
+            for tok in rest {
+                let Some((k, v)) = tok.split_once('=') else {
+                    return wrong("param", "key=value params", &args);
+                };
+                if k.is_empty() {
+                    return wrong("param", "a non-empty param name in key=value", &args);
+                }
+                params.insert(k.to_string(), v.to_string());
+            }
+            Ok(Command::BlockParamSet { target: sel, params })
+        }
         "blocks" => {
             expect_empty("blocks", &args, &args)?;
             Ok(Command::BlocksList)
@@ -1057,6 +1092,53 @@ fn parse_section(args: &[&str]) -> Result<Command, ParseError> {
         }
     };
     Ok(Command::DefSection { name: (*name).to_string(), section })
+}
+
+/// `pblock <name> [pname=default ...] : templ line 1 ; templ line 2 ; ...`
+///
+/// The `:` separates the param header from the command-template body; body
+/// lines are separated by `;`. Reuses the raw input so body lines keep spaces.
+fn parse_pblock(input: &str) -> Result<Command, ParseError> {
+    // Strip the leading verb.
+    let after = input
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .map(|(_, r)| r)
+        .unwrap_or("");
+    let Some((header, body_str)) = after.split_once(':') else {
+        return Err(wrong_err(
+            "pblock",
+            "a name, key=default params, ':' then a ';'-separated template body",
+            &[],
+        ));
+    };
+    let mut header_toks = header.split_whitespace();
+    let name = header_toks
+        .next()
+        .ok_or_else(|| wrong_err("pblock", "a block name", &[]))?
+        .to_string();
+    let mut params = Vec::new();
+    for tok in header_toks {
+        let Some((k, v)) = tok.split_once('=') else {
+            return Err(wrong_err("pblock", "params as name=default", &[tok]));
+        };
+        if k.is_empty() {
+            return Err(wrong_err("pblock", "a non-empty param name", &[tok]));
+        }
+        params.push(itsjustcad_doc::ParamBlockParam {
+            name: k.to_string(),
+            default: v.to_string(),
+        });
+    }
+    let body: Vec<String> = body_str
+        .split(';')
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if body.is_empty() {
+        return Err(wrong_err("pblock", "at least one template body line", &[]));
+    }
+    Ok(Command::BlockParamDefine { name, params, body })
 }
 
 /// `grid <name> x A:0 B:5 ... y 1:0 2:4 ... [levels 0,3,6]`

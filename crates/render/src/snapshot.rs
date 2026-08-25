@@ -276,7 +276,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
             }
             Geometry::Annotation(_) => {}
             // Block instances: resolved to constituent geometry at render time.
-            Geometry::Instance { block, position, rotation_deg, scale } => {
+            Geometry::Instance { block, position, rotation_deg, scale, .. } => {
                 if let Some(defs) = doc.blocks.get(block) {
                     let s = *scale;
                     let rot = rotation_deg.to_radians();
@@ -660,6 +660,8 @@ mod tests {
                 position: DVec3::new(5.0, 0.0, 0.0),
                 rotation_deg: 0.0,
                 scale: 1.0,
+                source: None,
+                params: Default::default(),
             },
         });
         let scene = snapshot(&doc, Theme::Dark);

@@ -88,6 +88,79 @@ pub enum BlockGeometry {
     Annotation(Annotation),
 }
 
+/// One declared parameter of a parametric (dynamic) block: a name plus a
+/// default value (as a string, substituted verbatim into the command template).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParamBlockParam {
+    pub name: String,
+    pub default: String,
+}
+
+/// A parametric block DEFINITION. Its geometry is a template of command lines
+/// (the same `{param}` substitution used by plugin macros); instances bake the
+/// template at their own param values. Stored on the `Document`; instances that
+/// reference it via `Geometry::Instance { source, params, .. }` re-derive their
+/// baked geometry when a param changes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParamBlockDef {
+    pub params: Vec<ParamBlockParam>,
+    /// Command-template lines. `{name}` tokens are replaced by param values.
+    pub body: Vec<String>,
+}
+
+impl ParamBlockDef {
+    /// Default param values as an ordered `name -> value` map.
+    pub fn default_values(&self) -> std::collections::BTreeMap<String, String> {
+        self.params
+            .iter()
+            .map(|p| (p.name.clone(), p.default.clone()))
+            .collect()
+    }
+
+    /// Resolve effective param values: defaults, overridden by `overrides`
+    /// (unknown override keys are ignored — the definition owns the param set).
+    pub fn resolve_values(
+        &self,
+        overrides: &std::collections::BTreeMap<String, String>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut vals = self.default_values();
+        for (k, v) in overrides {
+            if vals.contains_key(k) {
+                vals.insert(k.clone(), v.clone());
+            }
+        }
+        vals
+    }
+
+    /// Expand the template body, replacing `{name}` tokens with `values[name]`.
+    /// Unknown `{tokens}` are left verbatim.
+    pub fn expand(&self, values: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+        self.body.iter().map(|line| subst(line, values)).collect()
+    }
+}
+
+/// Replace `{name}` tokens in `line` using `values`; unknown tokens survive.
+fn subst(line: &str, values: &std::collections::BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        if let Some(close_rel) = rest[open..].find('}') {
+            let token = &rest[open + 1..open + close_rel];
+            match values.get(token) {
+                Some(v) => out.push_str(v),
+                None => out.push_str(&rest[open..open + close_rel + 1]),
+            }
+            rest = &rest[open + close_rel + 1..];
+        } else {
+            out.push_str(&rest[open..]);
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 impl BlockGeometry {
     pub fn aabb(&self) -> Aabb {
         match self {
@@ -106,6 +179,11 @@ pub enum Geometry {
     Annotation(Annotation),
     /// Reference to a named block definition, placed at `position` with
     /// optional rotation (degrees CCW about Z) and uniform scale.
+    ///
+    /// For a *dynamic* (parametric) block, `source` names the parametric
+    /// definition and `params` holds this instance's param values; `block` then
+    /// points at a per-instance baked entry in `Document::blocks`. Plain blocks
+    /// leave `source` `None` and `params` empty (old files load unchanged).
     Instance {
         block: String,
         position: DVec3,
@@ -113,6 +191,12 @@ pub enum Geometry {
         rotation_deg: f64,
         #[serde(default = "one", skip_serializing_if = "is_one")]
         scale: f64,
+        /// Parametric source-block name, when this is a dynamic-block instance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// This instance's param values (empty for plain blocks).
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        params: std::collections::BTreeMap<String, String>,
     },
     /// Decimated point cloud from a LAS import. Positions are world-space
     /// after applying LAS scale factors and offsets.
@@ -458,6 +542,48 @@ pub struct SceneObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn param_block_expand_substitutes_and_resolves() {
+        let def = ParamBlockDef {
+            params: vec![
+                ParamBlockParam { name: "w".into(), default: "0.9".into() },
+                ParamBlockParam { name: "h".into(), default: "2.0".into() },
+            ],
+            body: vec!["rect 0,0,0 {w} {h}".into(), "note {unknown}".into()],
+        };
+        // Defaults.
+        let out = def.expand(&def.default_values());
+        assert_eq!(out[0], "rect 0,0,0 0.9 2.0");
+        // Unknown token survives verbatim.
+        assert_eq!(out[1], "note {unknown}");
+        // Override wins; unknown override keys ignored.
+        let mut ov = std::collections::BTreeMap::new();
+        ov.insert("w".to_string(), "1.5".to_string());
+        ov.insert("bogus".to_string(), "9".to_string());
+        let vals = def.resolve_values(&ov);
+        assert_eq!(vals.get("w").map(String::as_str), Some("1.5"));
+        assert_eq!(vals.get("h").map(String::as_str), Some("2.0"));
+        assert!(!vals.contains_key("bogus"), "unknown override key dropped");
+    }
+
+    /// Pre-dynamic-block instance JSON (no `source`/`params`) must still load,
+    /// defaulting to a plain block instance.
+    #[test]
+    fn pre_dynamic_instance_json_loads() {
+        let json = r#"{ "geo": "instance", "block": "tree",
+            "position": [1.0, 2.0, 0.0] }"#;
+        let g: Geometry = serde_json::from_str(json).unwrap();
+        match g {
+            Geometry::Instance { source, params, scale, rotation_deg, .. } => {
+                assert_eq!(source, None);
+                assert!(params.is_empty());
+                assert_eq!(scale, 1.0);
+                assert_eq!(rotation_deg, 0.0);
+            }
+            g => panic!("expected instance, got {g:?}"),
+        }
+    }
 
     #[test]
     fn material_preset_parse_and_pbr() {
