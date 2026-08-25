@@ -63,8 +63,8 @@
 use glam::{DMat4, DVec3};
 use kernel_mesh::Mesh;
 use itsjustcad_doc::{
-    Document, FrameKind, Geometry, LoadGeometry, RestraintKind, Section, StructLoad, StructSupport,
-    Units, METERS_PER_FOOT, METERS_PER_INCH,
+    AreaKind, Document, FrameKind, Geometry, LoadGeometry, RestraintKind, Section, StructLoad,
+    StructSupport, Units, METERS_PER_FOOT, METERS_PER_INCH,
 };
 
 // ============================================================================
@@ -79,11 +79,19 @@ struct Part {
     faces: Vec<[u32; 3]>,
 }
 
-/// Collect mesh objects in document order. Curves and annotations are dropped
-/// (IFC has no lightweight place for our wireframe primitives).
+/// Collect plain mesh objects in document order. Curves and annotations are
+/// dropped (IFC has no lightweight place for our wireframe primitives). Frame
+/// and area members are **skipped** here: they are exported instead as *typed*
+/// physical products (`IfcBeam`/`IfcColumn`/`IfcSlab`/`IfcWall`) by
+/// [`write_typed_members`], so a semantic importer can reconstruct them.
 fn collect(doc: &Document) -> Vec<Part> {
     let mut parts = Vec::new();
     for obj in doc.objects() {
+        // Typed structural members get a dedicated typed product; do not also
+        // flatten them to an anonymous proxy mesh.
+        if matches!(obj.geometry, Geometry::Frame { .. } | Geometry::Area { .. }) {
+            continue;
+        }
         if let Some(m) = obj.geometry.mesh() {
             if m.faces().is_empty() {
                 continue;
@@ -116,6 +124,7 @@ struct FrameMember {
 /// One area (slab/wall) member captured for the structural analysis model.
 struct AreaMember {
     name: String,
+    kind: AreaKind,
     boundary: Vec<DVec3>,
     thickness: f64,
     material: Option<String>,
@@ -149,6 +158,7 @@ fn collect_structural(doc: &Document) -> (Vec<FrameMember>, Vec<AreaMember>) {
                     .unwrap_or_else(|| format!("{}_{}", kind.label(), areas.len()));
                 areas.push(AreaMember {
                     name,
+                    kind: *kind,
                     boundary: boundary.clone(),
                     thickness: *thickness,
                     material: material.clone(),
@@ -324,6 +334,24 @@ pub fn export(doc: &Document, path: &str) -> Result<(Vec<u8>, String), String> {
         );
     }
 
+    // --- typed physical structural members (IfcBeam/Column/Slab/Wall) ---
+    // These are the semantic products a BIM importer reconstructs into typed
+    // members. Each is placed on its story (by elevation), carries an
+    // IfcExtrudedAreaSolid body (so it renders in viewers) and a profile +
+    // material so the shape/material round-trip.
+    write_typed_members(
+        &mut body,
+        &mut ids,
+        doc,
+        owner_history,
+        context,
+        world_origin,
+        building,
+        bldg_place,
+        storey,
+        storey_place,
+    );
+
     // --- structural analysis model (IfcStructuralAnalysisModel) ---
     let struct_counts = write_structural_model(
         &mut body,
@@ -377,6 +405,378 @@ fn plural(n: usize) -> &'static str {
     } else {
         "s"
     }
+}
+
+/// Emit the *typed physical products* — `IfcBeam`, `IfcColumn`, `IfcSlab`,
+/// `IfcWall` — one per structural frame/area member, each with a swept-solid
+/// body (`IfcExtrudedAreaSolid`), a profile, an associated material, and a
+/// placement on the member's story. These are what a semantic importer maps
+/// back to typed members (as opposed to anonymous proxy meshes).
+///
+/// Members are contained in the story whose elevation is closest to the
+/// member's base Z. Defined `doc.stories` are exported as extra
+/// `IfcBuildingStorey`s (aggregated under the building); a member with no
+/// matching story falls back to the default "Ground Floor" story.
+#[allow(clippy::too_many_arguments)]
+fn write_typed_members(
+    body: &mut String,
+    ids: &mut Ids,
+    doc: &Document,
+    owner_history: u64,
+    context: u64,
+    world_origin: u64,
+    building: u64,
+    bldg_place: u64,
+    default_storey: u64,
+    default_storey_place: u64,
+) {
+    let (frames, areas) = collect_structural(doc);
+    if frames.is_empty() && areas.is_empty() {
+        return;
+    }
+
+    // Shared materials: one IfcMaterial per named material, emitted once.
+    let mut material_ids: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    for name in doc.materials.keys() {
+        let m = ids.next();
+        line(body, m, &format!("IFCMATERIAL('{}',$,$)", step_string(name)));
+        material_ids.insert(name.clone(), m);
+    }
+
+    // Additional stories (beyond the default "Ground Floor"). Each is placed
+    // relative to the building at its elevation and aggregated under it.
+    // We keep a list of (elevation, storey_id, storey_place) for member
+    // assignment. When the document defines its own stories, members assign to
+    // *those* (the default "Ground Floor" is used only as a fallback when no
+    // story is defined).
+    let mut story_slots: Vec<(f64, u64, u64)> = Vec::new();
+    if doc.stories.is_empty() {
+        story_slots.push((0.0, default_storey, default_storey_place));
+    }
+    let mut extra_story_refs: Vec<u64> = Vec::new();
+    for st in &doc.stories {
+        let axis_pt = ids.next();
+        line(
+            body,
+            axis_pt,
+            &format!("IFCCARTESIANPOINT((0.,0.,{}))", num(st.elevation)),
+        );
+        let axis = ids.next();
+        line(body, axis, &format!("IFCAXIS2PLACEMENT3D(#{axis_pt},$,$)"));
+        let place = ids.next();
+        line(body, place, &format!("IFCLOCALPLACEMENT(#{bldg_place},#{axis})"));
+        let storey = ids.next();
+        line(
+            body,
+            storey,
+            &format!(
+                "IFCBUILDINGSTOREY('{}',#{owner_history},'{}',$,$,#{place},$,$,.ELEMENT.,{})",
+                guid(storey),
+                step_string(&st.name),
+                num(st.elevation)
+            ),
+        );
+        story_slots.push((st.elevation, storey, place));
+        extra_story_refs.push(storey);
+    }
+    if !extra_story_refs.is_empty() {
+        let rel = ids.next();
+        let refs = extra_story_refs
+            .iter()
+            .map(|s| format!("#{s}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        line(
+            body,
+            rel,
+            &format!(
+                "IFCRELAGGREGATES('{}',#{owner_history},$,$,#{building},({refs}))",
+                guid(rel)
+            ),
+        );
+    }
+
+    // Pick the story whose elevation is nearest a given Z.
+    let story_for = |z: f64| -> (u64, u64) {
+        let mut best = (story_slots[0].1, story_slots[0].2);
+        let mut best_d = f64::INFINITY;
+        for (elev, sid, splace) in &story_slots {
+            let d = (z - elev).abs();
+            if d < best_d {
+                best_d = d;
+                best = (*sid, *splace);
+            }
+        }
+        best
+    };
+
+    // Group members by story so containment relationships are per-story.
+    let mut by_story: std::collections::BTreeMap<u64, Vec<u64>> =
+        std::collections::BTreeMap::new();
+
+    for fm in &frames {
+        let base_z = fm.a.z.min(fm.b.z);
+        let (storey, storey_place) = story_for(base_z);
+        let element = write_typed_frame(
+            body, ids, owner_history, context, world_origin, storey_place, fm,
+            &material_ids,
+        );
+        by_story.entry(storey).or_default().push(element);
+    }
+    for am in &areas {
+        let base_z = am.boundary.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+        let (storey, storey_place) = story_for(base_z);
+        let element = write_typed_area(
+            body, ids, owner_history, context, world_origin, storey_place, am,
+            &material_ids,
+        );
+        by_story.entry(storey).or_default().push(element);
+    }
+
+    for (storey, elements) in by_story {
+        if elements.is_empty() {
+            continue;
+        }
+        let rel = ids.next();
+        let refs = elements
+            .iter()
+            .map(|e| format!("#{e}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        line(
+            body,
+            rel,
+            &format!(
+                "IFCRELCONTAINEDINSPATIALSTRUCTURE('{}',#{owner_history},$,$,({refs}),#{storey})",
+                guid(rel)
+            ),
+        );
+    }
+}
+
+/// Emit one typed frame member (`IfcBeam` or `IfcColumn`). The body is an
+/// `IfcExtrudedAreaSolid`: the section profile swept from endpoint `a` along the
+/// member axis for its length. Placement carries `a` and the axis so the
+/// importer recovers both endpoints. Profile + material round-trip via
+/// `IfcRelAssociatesMaterial(IfcMaterialProfileSet)`.
+#[allow(clippy::too_many_arguments)]
+fn write_typed_frame(
+    body: &mut String,
+    ids: &mut Ids,
+    owner_history: u64,
+    context: u64,
+    world_origin: u64,
+    storey_place: u64,
+    fm: &FrameMember,
+    material_ids: &std::collections::HashMap<String, u64>,
+) -> u64 {
+    let dir = fm.b - fm.a;
+    let length = dir.length().max(1e-9);
+    let z = (dir / length).normalize_or_zero();
+    let z = if z.length_squared() < 1e-12 { DVec3::Z } else { z };
+    // Choose an X reference orthogonal to the axis (deterministic).
+    let seed = if z.x.abs() < 0.9 { DVec3::X } else { DVec3::Y };
+    let x = (seed - z * seed.dot(z)).normalize_or_zero();
+    let x = if x.length_squared() < 1e-12 { DVec3::X } else { x };
+
+    // Object placement: origin at `a`, local Z along the axis, X the reference.
+    let loc = ids.next();
+    line(
+        body,
+        loc,
+        &format!(
+            "IFCCARTESIANPOINT(({},{},{}))",
+            num(fm.a.x),
+            num(fm.a.y),
+            num(fm.a.z)
+        ),
+    );
+    let zdir = ids.next();
+    line(body, zdir, &format!("IFCDIRECTION(({},{},{}))", num(z.x), num(z.y), num(z.z)));
+    let xdir = ids.next();
+    line(body, xdir, &format!("IFCDIRECTION(({},{},{}))", num(x.x), num(x.y), num(x.z)));
+    let axis = ids.next();
+    line(body, axis, &format!("IFCAXIS2PLACEMENT3D(#{loc},#{zdir},#{xdir})"));
+    // Placement carries absolute world coords; it is *not* chained under the
+    // storey placement (containment is a semantic relationship, not a
+    // transform), so member geometry lands where the endpoints say.
+    let _ = storey_place;
+    let placement = ids.next();
+    line(body, placement, &format!("IFCLOCALPLACEMENT($,#{axis})"));
+
+    // Swept-solid body: profile at the local origin, extruded +Z for `length`.
+    let profile = write_profile(body, ids, &fm.section, &fm.name);
+    let solid_pos = ids.next();
+    line(body, solid_pos, &format!("IFCAXIS2PLACEMENT3D(#{world_origin},$,$)"));
+    let extrude_dir = ids.next();
+    line(body, extrude_dir, "IFCDIRECTION((0.,0.,1.))");
+    let solid = ids.next();
+    line(
+        body,
+        solid,
+        &format!(
+            "IFCEXTRUDEDAREASOLID(#{profile},#{solid_pos},#{extrude_dir},{})",
+            num(length)
+        ),
+    );
+    let shape = ids.next();
+    line(
+        body,
+        shape,
+        &format!("IFCSHAPEREPRESENTATION(#{context},'Body','SweptSolid',(#{solid}))"),
+    );
+    let prod_shape = ids.next();
+    line(body, prod_shape, &format!("IFCPRODUCTDEFINITIONSHAPE($,$,(#{shape}))"));
+
+    let element = ids.next();
+    let (entity, predef) = match fm.kind {
+        FrameKind::Beam => ("IFCBEAM", ".BEAM."),
+        FrameKind::Column => ("IFCCOLUMN", ".COLUMN."),
+    };
+    line(
+        body,
+        element,
+        &format!(
+            "{entity}('{}',#{owner_history},'{}',$,$,#{placement},#{prod_shape},$,{predef})",
+            guid(element),
+            step_string(&fm.name)
+        ),
+    );
+
+    // Profile + material association (same shape as the analysis members).
+    let mat_id = fm.material.as_ref().and_then(|m| material_ids.get(m)).copied();
+    let mat_ref = mat_id.map(|m| format!("#{m}")).unwrap_or_else(|| "$".to_string());
+    let mat_profile = ids.next();
+    line(
+        body,
+        mat_profile,
+        &format!(
+            "IFCMATERIALPROFILE('{}',$,{mat_ref},#{profile},$,$)",
+            step_string(&fm.name)
+        ),
+    );
+    let mat_profile_set = ids.next();
+    line(
+        body,
+        mat_profile_set,
+        &format!(
+            "IFCMATERIALPROFILESET('{}',$,(#{mat_profile}),$)",
+            step_string(&fm.name)
+        ),
+    );
+    let rel = ids.next();
+    line(
+        body,
+        rel,
+        &format!(
+            "IFCRELASSOCIATESMATERIAL('{}',#{owner_history},$,$,(#{element}),#{mat_profile_set})",
+            guid(rel)
+        ),
+    );
+
+    element
+}
+
+/// Emit one typed area member (`IfcSlab` or `IfcWall`). The body is an
+/// `IfcExtrudedAreaSolid` over an `IfcArbitraryClosedProfileDef` (the boundary
+/// polyline), extruded by the member thickness. Placement is identity at the
+/// world origin (the boundary already carries world coords). Material
+/// round-trips via a direct `IfcRelAssociatesMaterial`.
+#[allow(clippy::too_many_arguments)]
+fn write_typed_area(
+    body: &mut String,
+    ids: &mut Ids,
+    owner_history: u64,
+    context: u64,
+    world_origin: u64,
+    storey_place: u64,
+    am: &AreaMember,
+    material_ids: &std::collections::HashMap<String, u64>,
+) -> u64 {
+    // Boundary as an IfcPolyline of cartesian points (closed).
+    let mut pt_refs = Vec::new();
+    for p in &am.boundary {
+        let pt = ids.next();
+        line(
+            body,
+            pt,
+            &format!("IFCCARTESIANPOINT(({},{},{}))", num(p.x), num(p.y), num(p.z)),
+        );
+        pt_refs.push(pt);
+    }
+    // Close the polyline by repeating the first point.
+    if let Some(first) = pt_refs.first().copied() {
+        pt_refs.push(first);
+    }
+    let polyline = ids.next();
+    let pts = pt_refs.iter().map(|p| format!("#{p}")).collect::<Vec<_>>().join(",");
+    line(body, polyline, &format!("IFCPOLYLINE(({pts}))"));
+    let profile = ids.next();
+    line(
+        body,
+        profile,
+        &format!("IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,'{}',#{polyline})", step_string(&am.name)),
+    );
+
+    let solid_pos = ids.next();
+    line(body, solid_pos, &format!("IFCAXIS2PLACEMENT3D(#{world_origin},$,$)"));
+    let extrude_dir = ids.next();
+    line(body, extrude_dir, "IFCDIRECTION((0.,0.,1.))");
+    let solid = ids.next();
+    line(
+        body,
+        solid,
+        &format!(
+            "IFCEXTRUDEDAREASOLID(#{profile},#{solid_pos},#{extrude_dir},{})",
+            num(am.thickness)
+        ),
+    );
+    let shape = ids.next();
+    line(
+        body,
+        shape,
+        &format!("IFCSHAPEREPRESENTATION(#{context},'Body','SweptSolid',(#{solid}))"),
+    );
+    let prod_shape = ids.next();
+    line(body, prod_shape, &format!("IFCPRODUCTDEFINITIONSHAPE($,$,(#{shape}))"));
+
+    let axis = ids.next();
+    line(body, axis, &format!("IFCAXIS2PLACEMENT3D(#{world_origin},$,$)"));
+    // Identity world placement (boundary already carries world coords); not
+    // chained under the storey (see write_typed_frame).
+    let _ = storey_place;
+    let placement = ids.next();
+    line(body, placement, &format!("IFCLOCALPLACEMENT($,#{axis})"));
+
+    let element = ids.next();
+    let (entity, predef) = match am.kind {
+        AreaKind::Slab => ("IFCSLAB", ".FLOOR."),
+        AreaKind::Wall => ("IFCWALL", ".STANDARD."),
+    };
+    line(
+        body,
+        element,
+        &format!(
+            "{entity}('{}',#{owner_history},'{}',$,$,#{placement},#{prod_shape},$,{predef})",
+            guid(element),
+            step_string(&am.name)
+        ),
+    );
+
+    if let Some(mat_id) = am.material.as_ref().and_then(|m| material_ids.get(m)).copied() {
+        let rel = ids.next();
+        line(
+            body,
+            rel,
+            &format!(
+                "IFCRELASSOCIATESMATERIAL('{}',#{owner_history},$,$,(#{element}),#{mat_id})",
+                guid(rel)
+            ),
+        );
+    }
+
+    element
 }
 
 /// Emit the full `IfcStructuralAnalysisModel` graph — members, surfaces,
@@ -1455,6 +1855,584 @@ pub fn import(bytes: &[u8]) -> Result<Vec<(String, Mesh)>, String> {
     Ok(out)
 }
 
+// ============================================================================
+// SEMANTIC IMPORT — reconstruct typed structural members (not just meshes)
+// ============================================================================
+
+/// A recovered material: its name and mechanical properties (defaults when the
+/// file only names a material without `IfcMechanicalMaterialProperties`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportedMaterial {
+    pub name: String,
+    pub elastic_modulus_e: f64,
+    pub density: f64,
+}
+
+/// A recovered building story/level.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportedStory {
+    pub name: String,
+    pub elevation: f64,
+}
+
+/// One element recovered from an IFC file. Typed structural products
+/// (`IfcBeam`/`IfcColumn`/`IfcSlab`/`IfcWall`) reconstruct into `Frame`/`Area`;
+/// everything else falls back to `Mesh` (on the `ifc` layer, current behavior).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImportedElement {
+    Frame {
+        name: String,
+        kind: FrameKind,
+        a: DVec3,
+        b: DVec3,
+        /// Synthesized section name (matches an entry in [`SemanticImport::sections`]).
+        section: String,
+        material: Option<String>,
+        story: Option<String>,
+    },
+    Area {
+        name: String,
+        kind: AreaKind,
+        boundary: Vec<DVec3>,
+        thickness: f64,
+        material: Option<String>,
+        story: Option<String>,
+    },
+    Mesh {
+        name: String,
+        mesh: Mesh,
+    },
+}
+
+/// The whole semantic import: definitions to declare first (materials, sections,
+/// stories) plus the ordered elements. `sections` maps a synthesized section
+/// name → `Section` so the caller can emit `DefSection` before members.
+#[derive(Clone, Debug, Default)]
+pub struct SemanticImport {
+    pub materials: Vec<ImportedMaterial>,
+    pub stories: Vec<ImportedStory>,
+    /// (synthesized name, section) pairs, deduplicated by geometry.
+    pub sections: Vec<(String, Section)>,
+    pub elements: Vec<ImportedElement>,
+}
+
+/// Semantic IFC import: reconstruct typed structural members with their
+/// sections, materials and stories, falling back to meshes for anything else.
+///
+/// This is the replay-safe path: the caller ([`crate::exec`]) turns each result
+/// into a *logged substrate command* (`DefMaterial`/`DefSection`/`DefStory`/
+/// `FrameMember`/`AreaMember`/`MeshLiteral`), so the whole import is history.
+pub fn import_semantic(bytes: &[u8]) -> Result<SemanticImport, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "IFC file is not valid UTF-8".to_string())?;
+    let records = parse_spf(text);
+    let mut out = SemanticImport::default();
+
+    let mut ids: Vec<u64> = records.keys().copied().collect();
+    ids.sort_unstable();
+
+    // --- materials: name → properties, recovered from IfcMaterial (+ optional
+    // IfcMechanicalMaterialProperties / density property). ---
+    let materials = collect_materials(&records, &ids);
+    // Which material an element associates, via IfcRelAssociatesMaterial.
+    let elem_material = collect_element_materials(&records, &ids);
+    // Story elevations + which storey contains each element.
+    let stories = collect_stories(&records, &ids);
+    let elem_story = collect_element_stories(&records, &ids);
+
+    // Track section geometry → synthesized name so identical profiles share a
+    // single DefSection.
+    let mut section_names: Vec<(Section, String)> = Vec::new();
+    let mut section_for = |sec: Section, out: &mut SemanticImport| -> String {
+        for (s, n) in &section_names {
+            if sections_equal(s, &sec) {
+                return n.clone();
+            }
+        }
+        let name = format!("S{}", section_names.len() + 1);
+        section_names.push((sec, name.clone()));
+        out.sections.push((name.clone(), sec));
+        name
+    };
+
+    // Only surface materials/stories that are actually referenced by a typed
+    // member (keeps the import lean and deterministic).
+    let mut used_materials: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut used_stories: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut emitted_geom: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    for id in &ids {
+        let rec = &records[id];
+        let (kind_frame, kind_area) = match rec.entity.as_str() {
+            "IFCBEAM" => (Some(FrameKind::Beam), None),
+            "IFCCOLUMN" => (Some(FrameKind::Column), None),
+            "IFCSLAB" => (None, Some(AreaKind::Slab)),
+            "IFCWALL" | "IFCWALLSTANDARDCASE" => (None, Some(AreaKind::Wall)),
+            _ => (None, None),
+        };
+        if kind_frame.is_none() && kind_area.is_none() {
+            continue;
+        }
+        let args = split_args(&rec.args);
+        if args.len() < 7 {
+            continue;
+        }
+        let name = strip_step_string(&args[2]).unwrap_or_else(|| rec.entity.clone());
+        let placement = as_ref(&args[5])
+            .map(|p| placement_matrix(&records, p, 0))
+            .unwrap_or(DMat4::IDENTITY);
+        let Some(repr) = as_ref(&args[6]) else { continue };
+        let solid = shape_geometry_ids(&records, repr)
+            .into_iter()
+            .find(|g| records.get(g).map(|r| r.entity == "IFCEXTRUDEDAREASOLID").unwrap_or(false));
+
+        let material = elem_material.get(id).and_then(|m| materials.get(m)).map(|m| m.name.clone());
+        let story = elem_story.get(id).cloned();
+
+        if let Some(kind) = kind_frame {
+            // Frame: recover endpoints from placement + extruded solid depth.
+            let Some(solid) = solid else {
+                // No swept solid → fall back to any mesh under the repr.
+                push_mesh_fallback(&records, repr, placement, &name, &mut out, &mut emitted_geom);
+                continue;
+            };
+            let Some((section, depth)) = extruded_frame(&records, solid) else {
+                push_mesh_fallback(&records, repr, placement, &name, &mut out, &mut emitted_geom);
+                continue;
+            };
+            // The extrusion is along local +Z for `depth`; placement maps local
+            // origin → a and local +Z → member axis.
+            let a = placement.transform_point3(DVec3::ZERO);
+            let b = placement.transform_point3(DVec3::Z * depth);
+            let sec_name = section_for(section, &mut out);
+            if let Some(m) = &material {
+                used_materials.insert(m.clone());
+            }
+            if let Some(st) = &story {
+                used_stories.insert(st.clone());
+            }
+            out.elements.push(ImportedElement::Frame {
+                name,
+                kind,
+                a,
+                b,
+                section: sec_name,
+                material,
+                story,
+            });
+        } else if let Some(kind) = kind_area {
+            let Some(solid) = solid else {
+                push_mesh_fallback(&records, repr, placement, &name, &mut out, &mut emitted_geom);
+                continue;
+            };
+            let Some((boundary, thickness)) = extruded_area(&records, solid, placement) else {
+                push_mesh_fallback(&records, repr, placement, &name, &mut out, &mut emitted_geom);
+                continue;
+            };
+            if let Some(m) = &material {
+                used_materials.insert(m.clone());
+            }
+            if let Some(st) = &story {
+                used_stories.insert(st.clone());
+            }
+            out.elements.push(ImportedElement::Area {
+                name,
+                kind,
+                boundary,
+                thickness,
+                material,
+                story,
+            });
+        }
+    }
+
+    // --- fallback meshes for every other product / orphan geometry (unchanged
+    // behavior: unknown entities land on the 'ifc' layer as MeshLiteral). ---
+    for id in &ids {
+        let rec = &records[id];
+        if matches!(
+            rec.entity.as_str(),
+            "IFCBEAM" | "IFCCOLUMN" | "IFCSLAB" | "IFCWALL" | "IFCWALLSTANDARDCASE"
+        ) {
+            continue; // handled above
+        }
+        if !is_product(&rec.entity) {
+            continue;
+        }
+        let args = split_args(&rec.args);
+        if args.len() < 7 {
+            continue;
+        }
+        let name = strip_step_string(&args[2]).unwrap_or_else(|| rec.entity.clone());
+        let placement = as_ref(&args[5])
+            .map(|p| placement_matrix(&records, p, 0))
+            .unwrap_or(DMat4::IDENTITY);
+        let Some(repr) = as_ref(&args[6]) else { continue };
+        for gid in shape_geometry_ids(&records, repr) {
+            if emitted_geom.contains(&gid) {
+                continue;
+            }
+            if let Some(mesh) = mesh_from_geometry(&records, gid, placement) {
+                emitted_geom.insert(gid);
+                out.elements.push(ImportedElement::Mesh { name: name.clone(), mesh });
+            }
+        }
+    }
+    for id in &ids {
+        if emitted_geom.contains(id) {
+            continue;
+        }
+        let rec = &records[id];
+        if (rec.entity == "IFCTRIANGULATEDFACESET" || rec.entity == "IFCFACETEDBREP")
+            && let Some(mesh) = mesh_from_geometry(&records, *id, DMat4::IDENTITY)
+        {
+            out.elements.push(ImportedElement::Mesh { name: "ifc".to_string(), mesh });
+        }
+    }
+
+    // Keep only referenced materials/stories, in a stable order.
+    out.materials = materials
+        .into_values()
+        .filter(|m| used_materials.contains(&m.name))
+        .collect();
+    out.materials.sort_by(|a, b| a.name.cmp(&b.name));
+    out.stories = stories.into_iter().filter(|s| used_stories.contains(&s.name)).collect();
+
+    Ok(out)
+}
+
+/// True when two sections are geometrically identical (same variant + dims,
+/// within a tight tolerance so float round-trips still match).
+fn sections_equal(a: &Section, b: &Section) -> bool {
+    let eq = |x: f64, y: f64| (x - y).abs() < 1e-9;
+    match (a, b) {
+        (Section::Rectangular { w: w1, h: h1 }, Section::Rectangular { w: w2, h: h2 }) => {
+            eq(*w1, *w2) && eq(*h1, *h2)
+        }
+        (Section::Circular { d: d1 }, Section::Circular { d: d2 }) => eq(*d1, *d2),
+        (Section::Pipe { d: d1, t: t1 }, Section::Pipe { d: d2, t: t2 }) => {
+            eq(*d1, *d2) && eq(*t1, *t2)
+        }
+        (
+            Section::IWideFlange { d: d1, bf: bf1, tf: tf1, tw: tw1 },
+            Section::IWideFlange { d: d2, bf: bf2, tf: tf2, tw: tw2 },
+        ) => eq(*d1, *d2) && eq(*bf1, *bf2) && eq(*tf1, *tf2) && eq(*tw1, *tw2),
+        _ => false,
+    }
+}
+
+/// Recover named materials with their mechanical properties. Missing E/density
+/// default to steel-ish values so members still import when a file names a
+/// material without properties.
+fn collect_materials(
+    records: &Records,
+    ids: &[u64],
+) -> std::collections::HashMap<u64, ImportedMaterial> {
+    let mut out = std::collections::HashMap::new();
+    // First pass: IfcMaterial id → name.
+    for id in ids {
+        let rec = &records[id];
+        if rec.entity != "IFCMATERIAL" {
+            continue;
+        }
+        let args = split_args(&rec.args);
+        let name = args.first().and_then(|a| strip_step_string(a)).unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        out.insert(
+            *id,
+            ImportedMaterial { name, elastic_modulus_e: 0.0, density: 0.0 },
+        );
+    }
+    // Second pass: IfcMechanicalMaterialProperties(Material, ..., YoungModulus,..)
+    for id in ids {
+        let rec = &records[id];
+        if rec.entity == "IFCMECHANICALMATERIALPROPERTIES" {
+            let args = split_args(&rec.args);
+            if let Some(mat_id) = args.first().and_then(|a| as_ref(a))
+                && let Some(mat) = out.get_mut(&mat_id)
+            {
+                // args: Material, DynamicViscosity, YoungModulus, ...
+                if let Some(e) = args.get(2).and_then(|a| as_num(a)) {
+                    mat.elastic_modulus_e = e;
+                }
+            }
+        }
+    }
+    // Third pass: density carried as IfcMaterialProperties → IfcPropertySingleValue
+    // ('MassDensity', ..., IFCMASSDENSITYMEASURE(x)). Scan property sets whose
+    // last arg references a material.
+    for id in ids {
+        let rec = &records[id];
+        if rec.entity != "IFCMATERIALPROPERTIES" {
+            continue;
+        }
+        let args = split_args(&rec.args);
+        // IfcMaterialProperties(Name, Desc, Properties=[..], Material)
+        let Some(mat_id) = args.last().and_then(|a| as_ref(a)) else { continue };
+        let Some(mat) = out.get_mut(&mat_id) else { continue };
+        // Properties list is the arg before the material.
+        if args.len() >= 4 {
+            for prop_id in ref_list(&args[2]) {
+                if let Some(prop) = records.get(&prop_id)
+                    && prop.entity == "IFCPROPERTYSINGLEVALUE"
+                {
+                    let pa = split_args(&prop.args);
+                    if let Some(v) = pa.get(2)
+                        && let Some(inner) = v.find('(').and_then(|o| outer_parens(&v[o..]))
+                        && let Some(d) = as_num(&inner)
+                    {
+                        mat.density = d;
+                    }
+                }
+            }
+        }
+    }
+    // Apply defaults for any property left at zero.
+    for mat in out.values_mut() {
+        if mat.elastic_modulus_e <= 0.0 {
+            mat.elastic_modulus_e = 2.0e11;
+        }
+        if mat.density <= 0.0 {
+            mat.density = 7850.0;
+        }
+    }
+    out
+}
+
+/// Map element id → the IfcMaterial id it associates (walking
+/// IfcRelAssociatesMaterial, resolving IfcMaterialProfileSet →
+/// IfcMaterialProfile → IfcMaterial when needed).
+fn collect_element_materials(records: &Records, ids: &[u64]) -> std::collections::HashMap<u64, u64> {
+    let mut out = std::collections::HashMap::new();
+    for id in ids {
+        let rec = &records[id];
+        if rec.entity != "IFCRELASSOCIATESMATERIAL" {
+            continue;
+        }
+        // IfcRelAssociatesMaterial(GlobalId, Owner, Name, Desc, RelatedObjects=[..],
+        //   RelatingMaterial)
+        let args = split_args(&rec.args);
+        if args.len() < 6 {
+            continue;
+        }
+        let objects = ref_list(&args[4]);
+        let Some(mat_ref) = as_ref(&args[5]) else { continue };
+        let mat_id = resolve_material(records, mat_ref);
+        let Some(mat_id) = mat_id else { continue };
+        for obj in objects {
+            out.insert(obj, mat_id);
+        }
+    }
+    out
+}
+
+/// Resolve a RelatingMaterial reference to an IfcMaterial id: direct, or via
+/// IfcMaterialProfileSet → IfcMaterialProfile.Material.
+fn resolve_material(records: &Records, id: u64) -> Option<u64> {
+    let rec = records.get(&id)?;
+    match rec.entity.as_str() {
+        "IFCMATERIAL" => Some(id),
+        "IFCMATERIALPROFILESET" => {
+            let args = split_args(&rec.args);
+            // (Name, Desc, MaterialProfiles=[..], CompositeProfile)
+            let profiles = args.get(2).map(|a| ref_list(a)).unwrap_or_default();
+            for p in profiles {
+                if let Some(mp) = records.get(&p)
+                    && mp.entity == "IFCMATERIALPROFILE"
+                {
+                    let pa = split_args(&mp.args);
+                    // (Name, Desc, Material, Profile, Priority, Category)
+                    if let Some(m) = pa.get(2).and_then(|a| as_ref(a)) {
+                        return Some(m);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Recover all IfcBuildingStorey names + elevations.
+fn collect_stories(records: &Records, ids: &[u64]) -> Vec<ImportedStory> {
+    let mut out = Vec::new();
+    for id in ids {
+        let rec = &records[id];
+        if rec.entity != "IFCBUILDINGSTOREY" {
+            continue;
+        }
+        let args = split_args(&rec.args);
+        let name = args.get(2).and_then(|a| strip_step_string(a)).unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        // IfcBuildingStorey(...,CompositionType, Elevation) — elevation is last.
+        let elevation = args.last().and_then(|a| as_num(a)).unwrap_or(0.0);
+        out.push(ImportedStory { name, elevation });
+    }
+    out
+}
+
+/// Map element id → the storey name that contains it (via
+/// IfcRelContainedInSpatialStructure).
+fn collect_element_stories(records: &Records, ids: &[u64]) -> std::collections::HashMap<u64, String> {
+    // storey id → name.
+    let mut storey_name: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for id in ids {
+        let rec = &records[id];
+        if rec.entity == "IFCBUILDINGSTOREY" {
+            let args = split_args(&rec.args);
+            if let Some(n) = args.get(2).and_then(|a| strip_step_string(a)) {
+                storey_name.insert(*id, n);
+            }
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for id in ids {
+        let rec = &records[id];
+        if rec.entity != "IFCRELCONTAINEDINSPATIALSTRUCTURE" {
+            continue;
+        }
+        // (GlobalId, Owner, Name, Desc, RelatedElements=[..], RelatingStructure)
+        let args = split_args(&rec.args);
+        if args.len() < 6 {
+            continue;
+        }
+        let elements = ref_list(&args[4]);
+        let Some(structure) = as_ref(&args[5]) else { continue };
+        let Some(name) = storey_name.get(&structure) else { continue };
+        for e in elements {
+            out.insert(e, name.clone());
+        }
+    }
+    out
+}
+
+/// From an `IfcExtrudedAreaSolid` used as a *frame* body, recover the swept
+/// `Section` and the extrusion depth (member length). The profile is one of the
+/// parametric `IfcProfileDef`s written by [`write_profile`].
+fn extruded_frame(records: &Records, solid_id: u64) -> Option<(Section, f64)> {
+    let rec = records.get(&solid_id)?;
+    if rec.entity != "IFCEXTRUDEDAREASOLID" {
+        return None;
+    }
+    // IfcExtrudedAreaSolid(SweptArea, Position, ExtrudedDirection, Depth)
+    let args = split_args(&rec.args);
+    if args.len() < 4 {
+        return None;
+    }
+    let profile_id = as_ref(&args[0])?;
+    let section = profile_to_section(records, profile_id)?;
+    let depth = as_num(&args[3])?;
+    Some((section, depth))
+}
+
+/// Map a parametric `IfcProfileDef` back to a [`Section`].
+fn profile_to_section(records: &Records, id: u64) -> Option<Section> {
+    let rec = records.get(&id)?;
+    let args = split_args(&rec.args);
+    match rec.entity.as_str() {
+        // (ProfileType, Name, Position, XDim, YDim)
+        "IFCRECTANGLEPROFILEDEF" => {
+            let w = as_num(args.get(3)?)?;
+            let h = as_num(args.get(4)?)?;
+            Some(Section::Rectangular { w, h })
+        }
+        // (ProfileType, Name, Position, Radius)
+        "IFCCIRCLEPROFILEDEF" => {
+            let r = as_num(args.get(3)?)?;
+            Some(Section::Circular { d: r * 2.0 })
+        }
+        // (ProfileType, Name, Position, Radius, WallThickness)
+        "IFCCIRCLEHOLLOWPROFILEDEF" => {
+            let r = as_num(args.get(3)?)?;
+            let t = as_num(args.get(4)?)?;
+            Some(Section::Pipe { d: r * 2.0, t })
+        }
+        // (ProfileType, Name, Position, OverallWidth, OverallDepth,
+        //  WebThickness, FlangeThickness, ...)
+        "IFCISHAPEPROFILEDEF" => {
+            let bf = as_num(args.get(3)?)?;
+            let d = as_num(args.get(4)?)?;
+            let tw = as_num(args.get(5)?)?;
+            let tf = as_num(args.get(6)?)?;
+            Some(Section::IWideFlange { d, bf, tf, tw })
+        }
+        _ => None,
+    }
+}
+
+/// From an `IfcExtrudedAreaSolid` used as an *area* body, recover the boundary
+/// polygon (world coords, via `placement`) and the thickness (extrusion depth).
+fn extruded_area(records: &Records, solid_id: u64, placement: DMat4) -> Option<(Vec<DVec3>, f64)> {
+    let rec = records.get(&solid_id)?;
+    if rec.entity != "IFCEXTRUDEDAREASOLID" {
+        return None;
+    }
+    let args = split_args(&rec.args);
+    if args.len() < 4 {
+        return None;
+    }
+    let profile_id = as_ref(&args[0])?;
+    let depth = as_num(&args[3])?;
+    // Profile is an IfcArbitraryClosedProfileDef(ProfileType, Name, OuterCurve).
+    let profile = records.get(&profile_id)?;
+    if profile.entity != "IFCARBITRARYCLOSEDPROFILEDEF" {
+        return None;
+    }
+    let pargs = split_args(&profile.args);
+    let curve_id = as_ref(pargs.get(2)?)?;
+    let curve = records.get(&curve_id)?;
+    if curve.entity != "IFCPOLYLINE" {
+        return None;
+    }
+    // IfcPolyline(Points=[IfcCartesianPoint..]).
+    let ca = split_args(&curve.args);
+    let pts = ref_list(ca.first()?);
+    let mut boundary: Vec<DVec3> = Vec::new();
+    for p in pts {
+        if let Some(pt) = cartesian_point(records, p) {
+            boundary.push(placement.transform_point3(pt));
+        }
+    }
+    // Drop the closing repeat point if present (first == last).
+    if boundary.len() >= 2 {
+        let first = boundary[0];
+        let last = *boundary.last().unwrap();
+        if (first - last).length() < 1e-9 {
+            boundary.pop();
+        }
+    }
+    if boundary.len() < 3 {
+        return None;
+    }
+    Some((boundary, depth))
+}
+
+/// Emit meshes under a representation as `Mesh` fallback elements (used when a
+/// typed member's body cannot be interpreted as a swept solid).
+fn push_mesh_fallback(
+    records: &Records,
+    repr: u64,
+    placement: DMat4,
+    name: &str,
+    out: &mut SemanticImport,
+    emitted: &mut std::collections::HashSet<u64>,
+) {
+    for gid in shape_geometry_ids(records, repr) {
+        if emitted.contains(&gid) {
+            continue;
+        }
+        if let Some(mesh) = mesh_from_geometry(records, gid, placement) {
+            emitted.insert(gid);
+            out.elements.push(ImportedElement::Mesh { name: name.to_string(), mesh });
+        }
+    }
+}
+
 /// Entity keywords we treat as placeable, named products carrying a shape.
 fn is_product(entity: &str) -> bool {
     matches!(
@@ -2017,8 +2995,13 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         assert_eq!(text.matches("IFCSTRUCTURALPOINTACTION(").count(), 1);
         assert_eq!(text.matches("IFCSTRUCTURALLOADSINGLEFORCE(").count(), 1);
 
-        // Physical geometry export still present (dual export).
-        assert!(text.contains("IFCBUILDINGELEMENTPROXY("), "physical proxies dropped");
+        // Physical geometry export now uses *typed* products (IfcBeam/Column/
+        // Slab) rather than anonymous proxies, so a semantic importer can
+        // reconstruct typed members.
+        assert_eq!(text.matches("IFCBEAM(").count(), 1);
+        assert_eq!(text.matches("IFCCOLUMN(").count(), 2);
+        assert_eq!(text.matches("IFCSLAB(").count(), 1);
+        assert!(text.contains("IFCEXTRUDEDAREASOLID("), "typed members carry swept solids");
         assert!(text.contains("FILE_SCHEMA(('IFC4'))"));
 
         // Detail echo mentions the analysis tally.
@@ -2031,12 +3014,14 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         let s = portal();
         let (bytes, _) = export(&s.doc, "/tmp/prof.ifc").unwrap();
         let text = String::from_utf8(bytes).unwrap();
-        // Each section family maps to its IfcProfileDef.
-        assert_eq!(text.matches("IFCISHAPEPROFILEDEF(").count(), 1);
-        assert_eq!(text.matches("IFCRECTANGLEPROFILEDEF(").count(), 2); // two columns share COL, emitted per member
-        // (COL rect used on both columns → one profile per member = 2)
+        // Each section family maps to its IfcProfileDef. Profiles are emitted
+        // per member, once for the typed physical product and once for the
+        // analysis member: the beam I-section → 2 IfcIShapeProfileDef, the two
+        // columns' rect → 4 IfcRectangleProfileDef.
+        assert_eq!(text.matches("IFCISHAPEPROFILEDEF(").count(), 2);
+        assert_eq!(text.matches("IFCRECTANGLEPROFILEDEF(").count(), 4);
         // The pipe section is defined but unused by any member; unused sections
-        // are not emitted (profiles are emitted per member, on demand).
+        // are not emitted.
         assert_eq!(text.matches("IFCCIRCLEHOLLOWPROFILEDEF(").count(), 0);
     }
 
@@ -2045,7 +3030,8 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         let s = portal();
         let (bytes, _) = export(&s.doc, "/tmp/mat.ifc").unwrap();
         let text = String::from_utf8(bytes).unwrap();
-        assert_eq!(text.matches("IFCMATERIAL(").count(), 1);
+        // One IfcMaterial for the analysis model, one for the typed products.
+        assert_eq!(text.matches("IFCMATERIAL(").count(), 2);
         assert!(text.contains("'steel'"), "material name missing");
         // Mechanical properties carry Young's modulus.
         assert_eq!(text.matches("IFCMECHANICALMATERIALPROPERTIES(").count(), 1);
@@ -2140,6 +3126,177 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         let result = import(ifc.as_bytes()).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].1.faces().len(), 1);
+    }
+
+    // ========================================================================
+    // Semantic BIM import — typed member reconstruction
+    // ========================================================================
+
+    /// (a) Round-trip: export a structural frame to IFC, import it back, and
+    /// assert the SAME typed members, positions, sections, materials and
+    /// stories reconstruct — as typed members, not meshes.
+    #[test]
+    fn semantic_round_trip_reconstructs_typed_members() {
+        let mut s = portal();
+        // Give the members a story so IfcBuildingStorey round-trips too.
+        run(&mut s, "story L1 0");
+        run(&mut s, "story Roof 3");
+        let (bytes, _) = export(&s.doc, "/tmp/portal_rt.ifc").unwrap();
+
+        let sem = import_semantic(&bytes).unwrap();
+
+        // Frame members: 2 columns + 1 beam.
+        let frames: Vec<_> = sem
+            .elements
+            .iter()
+            .filter(|e| matches!(e, ImportedElement::Frame { .. }))
+            .collect();
+        assert_eq!(frames.len(), 3, "3 frame members reconstruct");
+        let beams = frames
+            .iter()
+            .filter(|e| matches!(e, ImportedElement::Frame { kind: FrameKind::Beam, .. }))
+            .count();
+        let cols = frames
+            .iter()
+            .filter(|e| matches!(e, ImportedElement::Frame { kind: FrameKind::Column, .. }))
+            .count();
+        assert_eq!(beams, 1, "one beam");
+        assert_eq!(cols, 2, "two columns");
+
+        // Area member: the slab.
+        let areas: Vec<_> = sem
+            .elements
+            .iter()
+            .filter(|e| matches!(e, ImportedElement::Area { kind: AreaKind::Slab, .. }))
+            .collect();
+        assert_eq!(areas.len(), 1, "one slab");
+
+        // No mesh fallback — everything reconstructed typed.
+        assert!(
+            !sem.elements.iter().any(|e| matches!(e, ImportedElement::Mesh { .. })),
+            "typed members must not fall back to meshes"
+        );
+
+        // Positions: find the beam and check its endpoints (0,0,3)-(5,0,3).
+        let beam = frames
+            .iter()
+            .find(|e| matches!(e, ImportedElement::Frame { kind: FrameKind::Beam, .. }))
+            .unwrap();
+        if let ImportedElement::Frame { a, b, section, material, .. } = beam {
+            let (a, b) = (*a, *b);
+            let ends_match = ((a - DVec3::new(0., 0., 3.)).length() < 1e-6
+                && (b - DVec3::new(5., 0., 3.)).length() < 1e-6)
+                || ((b - DVec3::new(0., 0., 3.)).length() < 1e-6
+                    && (a - DVec3::new(5., 0., 3.)).length() < 1e-6);
+            assert!(ends_match, "beam endpoints wrong: {a:?} {b:?}");
+            // Section: the W12 I-section (d=0.3, bf=0.2, tf=0.015, tw=0.01).
+            let sec = sem.sections.iter().find(|(n, _)| n == section).unwrap().1;
+            assert_eq!(
+                sec,
+                Section::IWideFlange { d: 0.3, bf: 0.2, tf: 0.015, tw: 0.01 },
+                "I-section dims round-trip"
+            );
+            assert_eq!(material.as_deref(), Some("steel"), "beam material round-trips");
+        }
+
+        // Material properties reconstruct (E=2e11, density=7850).
+        let steel = sem.materials.iter().find(|m| m.name == "steel").unwrap();
+        assert!((steel.elastic_modulus_e - 2.0e11).abs() < 1.0);
+        assert!((steel.density - 7850.0).abs() < 1e-6);
+
+        // Stories reconstruct and members are assigned by elevation.
+        assert!(sem.stories.iter().any(|st| st.name == "L1"));
+        assert!(sem.stories.iter().any(|st| st.name == "Roof"));
+        // The beam at z=3 lands on the "Roof" story.
+        if let ImportedElement::Frame { story, .. } = beam {
+            assert_eq!(story.as_deref(), Some("Roof"), "beam assigned to Roof story");
+        }
+    }
+
+    /// Full logged-command path: the exec-level IFC import turns typed members
+    /// into `FrameMember`/`AreaMember`/`DefSection`/`DefMaterial`/`DefStory`
+    /// substrate commands, so the reconstructed document holds real typed
+    /// `Geometry::Frame` / `Geometry::Area` objects (replay-safe).
+    #[test]
+    fn semantic_import_creates_typed_geometry_via_logged_commands() {
+        let mut s = portal();
+        let path = std::env::temp_dir().join("portal_exec_rt.ifc");
+        let (bytes, _) = export(&s.doc, path.to_str().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Import into a fresh session via the substrate command.
+        let mut t = Session::default();
+        t.run(crate::Command::Import { path: path.to_string_lossy().into_owned() })
+            .unwrap();
+
+        let frames = t
+            .doc
+            .objects()
+            .filter(|o| matches!(o.geometry, Geometry::Frame { .. }))
+            .count();
+        let areas = t
+            .doc
+            .objects()
+            .filter(|o| matches!(o.geometry, Geometry::Area { .. }))
+            .count();
+        assert_eq!(frames, 3, "3 typed frame members created");
+        assert_eq!(areas, 1, "1 typed area member created");
+        assert!(t.doc.materials.contains_key("steel"), "material defined");
+        assert!(!t.doc.sections.is_empty(), "sections defined");
+        let _ = &mut s;
+    }
+
+    /// (b) An unknown IFC entity (a bare proxy mesh) still imports as a mesh on
+    /// the 'ifc' layer.
+    #[test]
+    fn semantic_unknown_entity_falls_back_to_mesh() {
+        // A proxy with a triangulated face set — not a typed structural member.
+        let ifc = "\
+ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));\n\
+#2=IFCTRIANGULATEDFACESET(#1,$,.T.,((1,2,3)),$);\n\
+#3=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#2));\n\
+#4=IFCPRODUCTDEFINITIONSHAPE($,$,(#3));\n\
+#5=IFCBUILDINGELEMENTPROXY('guid',$,'widget',$,$,$,#4,$,$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+        let sem = import_semantic(ifc.as_bytes()).unwrap();
+        assert_eq!(sem.elements.len(), 1);
+        assert!(matches!(&sem.elements[0], ImportedElement::Mesh { .. }));
+
+        // And through the exec path it lands on the 'ifc' layer.
+        let path = std::env::temp_dir().join("proxy_only.ifc");
+        std::fs::write(&path, ifc).unwrap();
+        let mut t = Session::default();
+        t.run(crate::Command::Import { path: path.to_string_lossy().into_owned() })
+            .unwrap();
+        assert!(
+            t.doc.objects().any(|o| o.layer == "ifc"),
+            "unknown geometry lands on the 'ifc' layer"
+        );
+    }
+
+    /// (c) A malformed IFC is tolerated: no panic, and a file with no geometry
+    /// yields a clear error rather than crashing.
+    #[test]
+    fn semantic_malformed_ifc_is_tolerated() {
+        // Truncated / garbage content — must not panic.
+        let junk = "ISO-10303-21;\nHEADER;\n#broken=IFCBEAM(oops\nno closing paren";
+        let sem = import_semantic(junk.as_bytes()).unwrap();
+        assert!(sem.elements.is_empty(), "no elements from garbage");
+
+        // A beam that references a missing profile/placement must degrade
+        // gracefully (skip, do not panic).
+        let partial = "\
+ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#5=IFCBEAM('g',$,'b',$,$,#99,#98,$,.BEAM.);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+        let sem = import_semantic(partial.as_bytes()).unwrap();
+        // The dangling beam has no resolvable body → dropped, no panic.
+        assert!(sem.elements.is_empty());
+
+        // Non-UTF-8 bytes give a clear error, not a panic.
+        let bad = [0xff, 0xfe, 0x00, 0x01];
+        assert!(import_semantic(&bad).is_err());
     }
 }
 

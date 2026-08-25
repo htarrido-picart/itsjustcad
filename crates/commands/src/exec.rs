@@ -742,43 +742,117 @@ impl Session {
         })
     }
 
-    /// Import an IFC4 (or IFC2x3) file: each recovered mesh becomes one
-    /// `MeshLiteral` op on the `ifc` layer, so the op-log — not the IFC file —
-    /// is the record. Storey/element names carry through as the object name.
+    /// Semantic IFC4 (or IFC2x3) import: reconstruct *typed* structural members
+    /// rather than flattening everything to meshes.
+    ///
+    /// `IfcBeam`/`IfcColumn` → `FrameMember`; `IfcSlab`/`IfcWall` → `AreaMember`;
+    /// their `IfcProfileDef` → the member's `Section`; `IfcMaterial` → the
+    /// member's material; `IfcBuildingStorey` → the story it is placed on.
+    /// Everything else falls back to a `MeshLiteral` on the `ifc` layer (the old
+    /// behavior). Every element is emitted as a *logged substrate command*
+    /// (`DefMaterial`/`DefSection`/`DefStory`/`FrameMember`/`AreaMember`/
+    /// `MeshLiteral`), so the whole import is replay-safe — the op-log, not the
+    /// IFC file, is the record.
     fn import_ifc(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
         let bytes = std::fs::read(&path)
             .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
-        let parts = crate::ifc::import(&bytes)
+        let sem = crate::ifc::import_semantic(&bytes)
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
-        if parts.is_empty() {
+        if sem.elements.is_empty() {
             return Err(ExecError::Invalid(format!(
                 "'{path}' contains no importable IFC geometry"
             )));
         }
-        let prev_layer = self.doc.current_layer.clone();
-        if self.doc.current_layer != "ifc" {
-            self.run(Command::Layer { name: "ifc".to_string() })?;
-        }
-        let total = parts.len();
+
         let mut created = Vec::new();
-        for (name, mesh) in parts {
-            let positions = mesh.positions().to_vec();
-            let faces = mesh.faces().to_vec();
-            let out = self.run(Command::MeshLiteral {
-                id: None,
-                positions,
-                faces,
-                name: Some(name),
+
+        // 1) Definitions first (members reference sections/materials by name).
+        for mat in &sem.materials {
+            self.run(Command::DefMaterial {
+                name: mat.name.clone(),
+                elastic_modulus_e: mat.elastic_modulus_e,
+                density: mat.density,
             })?;
-            created.extend(out.created);
         }
-        if self.doc.current_layer != prev_layer {
-            self.run(Command::Layer { name: prev_layer })?;
+        for (name, section) in &sem.sections {
+            self.run(Command::DefSection { name: name.clone(), section: *section })?;
         }
+        for story in &sem.stories {
+            self.run(Command::DefStory {
+                name: story.name.clone(),
+                elevation: story.elevation,
+            })?;
+        }
+
+        // 2) Elements, in file order. Typed members map to typed commands; the
+        //    story becomes the current layer so members land on their level, and
+        //    mesh fallbacks land on the 'ifc' layer.
+        let prev_layer = self.doc.current_layer.clone();
+        let mut frames = 0usize;
+        let mut areas = 0usize;
+        let mut meshes = 0usize;
+        for el in sem.elements {
+            match el {
+                crate::ifc::ImportedElement::Frame {
+                    kind, a, b, section, material, story, ..
+                } => {
+                    self.switch_layer(story.as_deref().unwrap_or("ifc"))?;
+                    let out = self.run(Command::FrameMember {
+                        id: None,
+                        kind,
+                        a,
+                        b,
+                        section,
+                        material,
+                        orientation_deg: None,
+                    })?;
+                    created.extend(out.created);
+                    frames += 1;
+                }
+                crate::ifc::ImportedElement::Area {
+                    kind, boundary, thickness, material, story, ..
+                } => {
+                    self.switch_layer(story.as_deref().unwrap_or("ifc"))?;
+                    let out = self.run(Command::AreaMember {
+                        id: None,
+                        kind,
+                        boundary,
+                        thickness,
+                        material,
+                    })?;
+                    created.extend(out.created);
+                    areas += 1;
+                }
+                crate::ifc::ImportedElement::Mesh { name, mesh } => {
+                    self.switch_layer("ifc")?;
+                    let out = self.run(Command::MeshLiteral {
+                        id: None,
+                        positions: mesh.positions().to_vec(),
+                        faces: mesh.faces().to_vec(),
+                        name: Some(name),
+                    })?;
+                    created.extend(out.created);
+                    meshes += 1;
+                }
+            }
+        }
+        self.switch_layer(&prev_layer)?;
+
         Ok(ApplyOutcome {
             created,
-            message: format!("imported {total} mesh(es) from {path} — one MeshLiteral op each"),
+            message: format!(
+                "imported {path}: {frames} frame member(s), {areas} area member(s), \
+                 {meshes} mesh(es) — logged as substrate commands"
+            ),
         })
+    }
+
+    /// Switch the current layer via a logged `Layer` op if it differs.
+    fn switch_layer(&mut self, layer: &str) -> Result<(), ExecError> {
+        if self.doc.current_layer != layer {
+            self.run(Command::Layer { name: layer.to_string() })?;
+        }
+        Ok(())
     }
 
     /// Import an EPW (EnergyPlus Weather) file: parse the LOCATION header for
