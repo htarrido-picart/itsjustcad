@@ -317,6 +317,8 @@ pub struct App {
     panel_visible: bool,
     /// Whether the Help → About dialog is open.
     show_about: bool,
+    /// Whether the Edit → "Edit history…" modal (op-log / amend panel) is open.
+    show_history: bool,
     /// Whether to show the first-run template picker on next frame.
     show_template_picker: bool,
     template_units: TemplateUnits,
@@ -472,6 +474,7 @@ impl App {
             panel_tabs: crate::tabstrip::TabState::default(),
             panel_visible: true,
             show_about: false,
+            show_history: false,
             show_template_picker: !load_template_done(),
             template_units: TemplateUnits::Meters,
             template_scale: TemplateScale::Building,
@@ -558,6 +561,19 @@ impl App {
                 }
             }
             Some("open") => self.open(words.next().map(Into::into)),
+            // Import/Export: WITH a path they run unchanged through the substrate
+            // (headless/scripts always pass one). A BARE `import`/`export` typed
+            // interactively pops a native dialog first, then runs with the path.
+            Some(verb @ ("import" | "export")) => {
+                match words.next() {
+                    Some(p) => {
+                        self.command_line
+                            .execute(&mut self.session, &format!("{verb} {p}"));
+                    }
+                    None if verb == "import" => self.import(None),
+                    None => self.export(None),
+                }
+            }
             Some("recover") => self.recover(),
             Some("ze" | "zoomextents") => self.zoom_extents(),
             // Display mode of the active viewport. View state, never logged.
@@ -1024,6 +1040,69 @@ impl App {
         }
     }
 
+    /// Import a model file THROUGH THE SUBSTRATE. With no path (menu click or a
+    /// bare `import` typed interactively) a native rfd open dialog is popped to
+    /// choose the file first; the op-log/replay is unchanged because the command
+    /// still carries the chosen path. Guarded so headless/`--shot` frames never
+    /// block on a dialog.
+    fn import(&mut self, path: Option<std::path::PathBuf>) {
+        let path = path.or_else(|| {
+            if self.headless_no_dialog() {
+                return None;
+            }
+            rfd::FileDialog::new()
+                .add_filter("DXF", &["dxf"])
+                .add_filter("IFC", &["ifc"])
+                .add_filter("OBJ", &["obj"])
+                .add_filter("STL", &["stl"])
+                .add_filter("glTF / GLB", &["gltf", "glb"])
+                .add_filter("Collada", &["dae"])
+                .add_filter("Point cloud (LAS/LAZ)", &["las", "laz"])
+                .add_filter("E57", &["e57"])
+                .add_filter("Rhino 3DM", &["3dm"])
+                .pick_file()
+        });
+        let Some(path) = path else { return };
+        // Route through the command line so it parses to Command::Import and
+        // dispatches via the substrate (op-log records the import, not the file).
+        self.command_line
+            .execute(&mut self.session, &format!("import {}", path.display()));
+    }
+
+    /// Export the document THROUGH THE SUBSTRATE. With no path a native rfd save
+    /// dialog is popped; the chosen filename's extension selects the format
+    /// (exec dispatches by extension). Guarded against headless blocking.
+    fn export(&mut self, path: Option<std::path::PathBuf>) {
+        let path = path.or_else(|| {
+            if self.headless_no_dialog() {
+                return None;
+            }
+            rfd::FileDialog::new()
+                .add_filter("DXF", &["dxf"])
+                .add_filter("SVG", &["svg"])
+                .add_filter("CSV", &["csv"])
+                .add_filter("glTF / GLB", &["gltf", "glb"])
+                .add_filter("OBJ", &["obj"])
+                .add_filter("STL", &["stl"])
+                .add_filter("PDF", &["pdf"])
+                .add_filter("IFC", &["ifc"])
+                .add_filter("SAF", &["xml", "saf"])
+                .set_file_name("export.dxf")
+                .save_file()
+        });
+        let Some(path) = path else { return };
+        self.command_line
+            .execute(&mut self.session, &format!("export {}", path.display()));
+    }
+
+    /// True when a native file dialog MUST NOT be shown because we are running a
+    /// non-interactive/screenshot frame (mirrors how `--shot`/`ITSJUSTCAD_SHOT`
+    /// drives the GUI loop without a real user). Keeps headless + tests from
+    /// blocking on a modal picker.
+    fn headless_no_dialog(&self) -> bool {
+        self.shot_path.is_some() || self.startup_script.is_some()
+    }
+
     fn handle_dev_screenshot(&mut self, ctx: &egui::Context) {
         let Some(path) = self.shot_path.clone() else {
             return;
@@ -1314,10 +1393,6 @@ impl App {
             self.box_drag = None;
         }
 
-        // Display/color-mode chips stay as a compact floating overlay in the
-        // top-left of the active viewport (per-viewport state, no overlap with
-        // the docked panels). Standard views moved to the bottom viewport tabs.
-        self.view_overlay(ui, full);
     }
 
     /// Overlay pass for dimension and text annotations: world points project
@@ -2006,68 +2081,6 @@ impl App {
         });
     }
 
-    /// Compact display/color-mode + layout chips, floating in the top-left of
-    /// the viewport frame. Standard-view switching lives in the bottom viewport
-    /// tab bar (`viewport_tab_bar`), so this overlay is small and never collides
-    /// with the docked panels or the top command line.
-    fn view_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        egui::Area::new(egui::Id::new("view_overlay"))
-            .fixed_pos(rect.left_top() + egui::vec2(8.0, 8.0))
-            .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("ZE").on_hover_text("zoom extents").clicked() {
-                            self.zoom_extents();
-                        }
-                        ui.separator();
-                        // Display mode and color mode of the active pane's camera slot.
-                        let slot = self.layout.camera_index(self.active_pane);
-                        egui::ComboBox::from_id_salt("display_mode")
-                            .selected_text(self.display_modes[slot].label())
-                            .show_ui(ui, |ui| {
-                                for mode in DisplayMode::ALL {
-                                    ui.selectable_value(
-                                        &mut self.display_modes[slot],
-                                        mode,
-                                        mode.label(),
-                                    );
-                                }
-                            });
-                        egui::ComboBox::from_id_salt("color_mode")
-                            .selected_text(self.color_modes[slot].label())
-                            .show_ui(ui, |ui| {
-                                for mode in ColorMode::ALL {
-                                    let prev = self.color_modes[slot];
-                                    ui.selectable_value(
-                                        &mut self.color_modes[slot],
-                                        mode,
-                                        mode.label(),
-                                    );
-                                    // Force re-upload when mode changes.
-                                    if self.color_modes[slot] != prev {
-                                        self.uploaded_color_mode = None;
-                                    }
-                                }
-                            });
-                        ui.separator();
-                        for (label, layout) in [
-                            ("1", ViewportLayout::Single),
-                            ("2", ViewportLayout::Two),
-                            ("4", ViewportLayout::Four),
-                        ] {
-                            if ui
-                                .selectable_label(self.layout == layout, label)
-                                .on_hover_text(format!("{label} viewport(s)"))
-                                .clicked()
-                            {
-                                self.set_layout(layout);
-                            }
-                        }
-                    });
-                });
-            });
-    }
-
     /// Bottom viewport tab bar (Rhino convention): Persp/Top/Front/Right plus
     /// any saved named views. Clicking a tab sets the active pane's view (or
     /// restores a named view). Rendered as a `TopBottomPanel::bottom` inside the
@@ -2086,17 +2099,59 @@ impl App {
                     chosen = Some(verb.clone());
                 }
             }
+            // View controls, right-aligned on the same row (de-floated from the
+            // old canvas overlay): 1/2/4 layout, color mode, display mode, ZE.
+            // right_to_left lays out in reverse, so paint them in reverse order
+            // to read `ZE | Shaded▾ | ByLayer▾ | 1 2 4` left→right.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let slot = self.layout.camera_index(self.active_pane);
+                for (label, layout) in [
+                    ("4", ViewportLayout::Four),
+                    ("2", ViewportLayout::Two),
+                    ("1", ViewportLayout::Single),
+                ] {
+                    if ui
+                        .selectable_label(self.layout == layout, label)
+                        .on_hover_text(format!("{label} viewport(s)"))
+                        .clicked()
+                    {
+                        self.set_layout(layout);
+                    }
+                }
+                ui.separator();
+                egui::ComboBox::from_id_salt("color_mode")
+                    .selected_text(self.color_modes[slot].label())
+                    .show_ui(ui, |ui| {
+                        for mode in ColorMode::ALL {
+                            let prev = self.color_modes[slot];
+                            ui.selectable_value(&mut self.color_modes[slot], mode, mode.label());
+                            if self.color_modes[slot] != prev {
+                                self.uploaded_color_mode = None;
+                            }
+                        }
+                    });
+                egui::ComboBox::from_id_salt("display_mode")
+                    .selected_text(self.display_modes[slot].label())
+                    .show_ui(ui, |ui| {
+                        for mode in DisplayMode::ALL {
+                            ui.selectable_value(&mut self.display_modes[slot], mode, mode.label());
+                        }
+                    });
+                ui.separator();
+                if ui.small_button("ZE").on_hover_text("zoom extents").clicked() {
+                    self.zoom_extents();
+                }
+            });
         });
         if let Some(verb) = chosen {
             self.execute_line(verb);
         }
     }
 
-    /// Command-line panel body. `at_top` positions the autosuggest popup and
-    /// history: a top-docked line scrolls history downward with the popup
-    /// opening *below* the input; a bottom-docked line keeps the Rhino/AutoCAD
-    /// layout with history above and the popup above the input.
-    fn command_line_body(&mut self, ui: &mut egui::Ui, at_top: bool) {
+    /// Command-line panel body. Docked at the bottom of the right panel: history
+    /// (op-log scrollback) sits above the input and the autosuggest popup opens
+    /// upward — the Rhino/AutoCAD layout.
+    fn command_line_body(&mut self, ui: &mut egui::Ui) {
         let object_names: Vec<String> = self
             .session
             .doc
@@ -2104,16 +2159,17 @@ impl App {
             .filter_map(|o| o.name.clone())
             .collect();
         let aliases = self.active_aliases();
-        if let Some(line) = self.command_line.ui(ui, &object_names, aliases, at_top) {
+        if let Some(line) = self.command_line.ui(ui, &object_names, aliases) {
             self.execute_line(line);
         }
     }
 
     /// Right docked tab panel (Layer 2): a hand-rolled tab strip over
-    /// Layers / Properties / History / Deck. Clicking the active tab collapses
-    /// the panel to just the strip; a chevron also toggles it. The deck keeps
-    /// its resize behavior (the whole panel is resizable) and background
-    /// streaming (tick runs every frame in `ui`, independent of visibility).
+    /// Layers / Properties / Chat, with the command line docked at the bottom
+    /// (always visible, panel width). Clicking the active tab collapses the panel
+    /// to just the strip; a chevron also toggles it. The Chat tab keeps its
+    /// resize behavior (the whole panel is resizable) and background streaming
+    /// (tick runs every frame in `ui`, independent of visibility).
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         use crate::tabstrip::PanelTab;
         if !self.panel_visible {
@@ -2154,14 +2210,22 @@ impl App {
             if self.panel_tabs.is_collapsed() {
                 return;
             }
-            match self.panel_tabs.active() {
-                PanelTab::Layers => self.layers_tab(ui, theme),
-                PanelTab::Properties => self.properties_panel(ui),
-                PanelTab::History => self.history_panel(ui),
-                PanelTab::Deck => {
-                    self.deck_pane.ui(ui, &mut self.session, &self.tokio);
+            // The command line is docked at the BOTTOM of the right panel and is
+            // ALWAYS visible (panel width), under whatever tab is active — it is
+            // the op-log scrollback + input for every mode, not just Chat.
+            egui::Panel::bottom("command_line")
+                .resizable(false)
+                .show(ui, |ui| self.command_line_body(ui));
+            // Tab body fills the remaining space above the command line.
+            egui::CentralPanel::default().show(ui, |ui| {
+                match self.panel_tabs.active() {
+                    PanelTab::Layers => self.layers_tab(ui, theme),
+                    PanelTab::Properties => self.properties_panel(ui),
+                    PanelTab::Deck => {
+                        self.deck_pane.ui(ui, &mut self.session, &self.tokio);
+                    }
                 }
-            }
+            });
         });
     }
 
@@ -2205,6 +2269,9 @@ impl App {
             }
             MenuAction::About => self.show_about = true,
             MenuAction::ModelSetup => self.show_model_setup = true,
+            MenuAction::EditHistory => self.show_history = true,
+            MenuAction::ImportDialog => self.import(None),
+            MenuAction::ExportDialog => self.export(None),
         }
     }
 
@@ -2920,6 +2987,23 @@ impl eframe::App for App {
             }
         }
 
+        // Edit → "Edit history…" modal. The command line is the op-log
+        // scrollback; this on-demand popover exposes step-jump + amend (the old
+        // History tab's body) as a floating window.
+        if self.show_history {
+            let mut open = true;
+            egui::Window::new("Edit history")
+                .collapsible(false)
+                .resizable(true)
+                .default_size([320.0, 380.0])
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ui.ctx(), |ui| self.history_panel(ui));
+            if !open {
+                self.show_history = false;
+            }
+        }
+
         // Tools → Model Setup panel (also the onboarding "download a local
         // model" entry point). Renders any time show_model_setup is set.
         self.model_setup_ui(ui.ctx());
@@ -3018,37 +3102,23 @@ impl eframe::App for App {
 
         // ── Fixed docked slots (Layer 2) ─────────────────────────────────
         // Panel order matters: the first-declared panel is outermost. We build
-        // the menu bar at the very top, then the command line (top OR bottom by
-        // preset), the status bar (always very bottom), then the right tab
-        // panel, and finally the central viewport frame with its bottom tab bar.
-        let preset = preset::preset_for(self.cad_origin);
-        let cmd_top = preset.command_line_pos == preset::CommandLinePos::Top;
+        // the menu bar at the very top, the status bar (always very bottom),
+        // then the right tab panel — which now hosts the command line docked at
+        // its own bottom — and finally the central viewport frame with its
+        // bottom tab bar.
 
         // 1. Menu bar (Layer 3) — always the topmost strip.
         self.menu_bar(ui);
 
-        // 2. Command line at TOP (Rhino default), directly under the menu bar.
-        if cmd_top {
-            egui::Panel::top("command_line")
-                .resizable(false)
-                .show(ui, |ui| self.command_line_body(ui, true));
-        }
-
-        // 3. Status bar — always at the very bottom.
+        // 2. Status bar — always at the very bottom.
         egui::Panel::bottom("statusbar")
             .resizable(false)
             .show(ui, |ui| self.status_bar(ui));
 
-        // 4. Command line at BOTTOM (AutoCAD), above the status bar.
-        if !cmd_top {
-            egui::Panel::bottom("command_line")
-                .resizable(false)
-                .show(ui, |ui| self.command_line_body(ui, false));
-        }
-
-        // 5. Right docked tab panel: Layers / Properties / History / Deck.
-        // The deck lives here as a tab; its tick() still runs every frame above
-        // regardless of visibility, so background streaming keeps progressing.
+        // 3. Right docked tab panel: Layers / Properties / Chat, with the
+        // command line docked at its bottom (always visible, panel width).
+        // The deck lives here as the Chat tab; its tick() still runs every frame
+        // above regardless of visibility, so background streaming progresses.
         self.right_panel(ui);
 
         // A `view <name>` restore (command line, deck or script) parks the

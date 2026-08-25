@@ -37,6 +37,15 @@ pub enum MenuAction {
     /// Open the Model Setup panel (download/manage local models). Available any
     /// time from Tools, not just at first run.
     ModelSetup,
+    /// Open the Edit history / amend panel as a modal (the command line is the
+    /// op-log scrollback; this exposes step-jump + amend on demand).
+    EditHistory,
+    /// Pop a native file-open dialog for import, then run `import <path>` through
+    /// the substrate. Fired by the File → Import… menu item.
+    ImportDialog,
+    /// Pop a native file-save dialog for export, then run `export <path>` through
+    /// the substrate. Fired by the File → Export… menu item.
+    ExportDialog,
 }
 
 /// Draw-tool verbs (mirror `draw_tool::try_start`). A menu pick of one of these
@@ -48,6 +57,14 @@ const DRAW_VERBS: [&str; 4] = ["line", "polyline", "rect", "circle"];
 pub fn menu_action(verb: &str) -> MenuAction {
     if DRAW_VERBS.contains(&verb) {
         return MenuAction::StartDraw(verb.to_string());
+    }
+    // Import/Export need a path; picking them from a menu pops a native file
+    // dialog first, then runs the command WITH the chosen path through the
+    // substrate (rather than prefilling the command line for typing).
+    match verb {
+        "import" => return MenuAction::ImportDialog,
+        "export" => return MenuAction::ExportDialog,
+        _ => {}
     }
     // No angle-bracket placeholder in the usage ⇒ the verb takes no required
     // argument, so it can run straight away.
@@ -139,6 +156,10 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
                             action = Some(MenuAction::Execute(verb.to_string()));
                             ui.close();
                         }
+                    }
+                    if ui.button("Edit history…").clicked() {
+                        action = Some(MenuAction::EditHistory);
+                        ui.close();
                     }
                     ui.separator();
                 } else if title == "Tools" {
@@ -308,6 +329,15 @@ mod tests {
         // `box` needs a corner + size; the menu prefills for typing.
         assert_eq!(menu_action("box"), MenuAction::Insert("box ".to_string()));
         assert_eq!(menu_action("move"), MenuAction::Insert("move ".to_string()));
+    }
+
+    #[test]
+    fn import_export_route_to_native_dialog() {
+        // Picking Import/Export from a menu pops a native file dialog first
+        // (rather than prefilling the command line), then runs through the
+        // substrate with the chosen path.
+        assert_eq!(menu_action("import"), MenuAction::ImportDialog);
+        assert_eq!(menu_action("export"), MenuAction::ExportDialog);
     }
 
     #[test]

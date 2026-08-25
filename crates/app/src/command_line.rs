@@ -360,14 +360,13 @@ impl CommandLine {
         ui: &mut egui::Ui,
         object_names: &[String],
         preset_aliases: &'static [(&'static str, &'static str)],
-        at_top: bool,
     ) -> Option<String> {
         // Recompute suggestions if input changed.
         self.refresh_suggestions(object_names, preset_aliases);
 
-        // History (~3 rows). For a BOTTOM-docked command line the history sits
-        // ABOVE the input (Rhino/AutoCAD look) and the popup opens upward; for a
-        // TOP-docked line the input comes first and history/popup open DOWNWARD.
+        // Bottom-docked layout (under the right panel): history (op-log
+        // scrollback) sits ABOVE the input (Rhino/AutoCAD look) and the popup
+        // opens upward.
         let history_block = |cl: &Self, ui: &mut egui::Ui| {
             egui::ScrollArea::vertical()
                 .id_salt("cmd_history")
@@ -380,15 +379,6 @@ impl CommandLine {
                 });
         };
 
-        if at_top {
-            // Input first, then popup + history below it.
-            let submitted = self.input_row(ui);
-            self.suggestion_block(ui, false);
-            history_block(self, ui);
-            return submitted;
-        }
-
-        // Bottom-docked (original layout): history, popup, then input.
         history_block(self, ui);
         self.suggestion_block(ui, true);
         self.input_row(ui)

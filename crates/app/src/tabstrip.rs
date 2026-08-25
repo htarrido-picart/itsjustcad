@@ -3,32 +3,32 @@
 
 //! Hand-rolled tab-strip state machine + a thin egui renderer.
 //!
-//! Used by the right docked panel (Layers / Properties / History / Deck) and,
+//! Used by the right docked panel (Layers / Properties / Chat) and,
 //! in a simpler form, by the viewport tab bar. The *state* — which tab is
 //! active, whether the panel is collapsed — is a pure value type with no egui
 //! dependency, so its transitions are unit-tested standalone. The `ui` helper
 //! only draws the strip and reports clicks back.
 
-/// The four tabs of the right docked panel.
+/// The tabs of the right docked panel. The `Deck` variant keeps its internal
+/// name (module/type churn avoided) but is shown to the user as "Chat".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelTab {
     Layers,
     Properties,
-    History,
     Deck,
 }
 
 impl PanelTab {
     /// All tabs in display order.
-    pub const ALL: [PanelTab; 4] =
-        [PanelTab::Layers, PanelTab::Properties, PanelTab::History, PanelTab::Deck];
+    pub const ALL: [PanelTab; 3] = [PanelTab::Layers, PanelTab::Properties, PanelTab::Deck];
 
     pub fn label(self) -> &'static str {
         match self {
             PanelTab::Layers => "Layers",
             PanelTab::Properties => "Properties",
-            PanelTab::History => "History",
-            PanelTab::Deck => "Deck",
+            // The `Deck` tab is the embedded LLM chat; the user-facing label is
+            // "Chat" (the deck/cassette internals keep their names).
+            PanelTab::Deck => "Chat",
         }
     }
 }
@@ -165,9 +165,21 @@ mod tests {
     #[test]
     fn click_other_tab_activates_it() {
         let mut s = TabState::default();
-        s.click(PanelTab::History);
-        assert_eq!(s.active(), PanelTab::History);
+        s.click(PanelTab::Properties);
+        assert_eq!(s.active(), PanelTab::Properties);
         assert!(!s.is_collapsed());
+    }
+
+    #[test]
+    fn no_history_tab_and_chat_label() {
+        // The History tab was dropped (the command line is the op-log); the Deck
+        // tab is user-visible as "Chat".
+        assert_eq!(PanelTab::ALL.len(), 3);
+        let labels: Vec<_> = PanelTab::ALL.iter().map(|t| t.label()).collect();
+        assert!(!labels.contains(&"History"));
+        assert!(!labels.contains(&"Deck"));
+        assert!(labels.contains(&"Chat"));
+        assert_eq!(PanelTab::Deck.label(), "Chat");
     }
 
     #[test]
