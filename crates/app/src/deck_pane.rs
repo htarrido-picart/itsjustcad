@@ -353,6 +353,11 @@ pub struct DeckPane {
     /// The critique button was clicked; the app owns the viewport screenshot so
     /// it polls and clears this, then drives the capture + `send_critique`.
     critique_requested: bool,
+    /// A user-attached image to analyze on the NEXT send: the claude-code
+    /// cassette gets a Read scoped to exactly this file (same mechanism as the
+    /// vision critique). Only offered for vision-capable cassettes. Cleared once
+    /// the turn is sent.
+    attached_image: Option<std::path::PathBuf>,
     /// Deck-emitted side-effecting commands (export/print/import/…) awaiting an
     /// explicit human [run]/[skip]. They never touch the filesystem until the
     /// user confirms (security C-2 / H-7).
@@ -411,6 +416,7 @@ impl Default for DeckPane {
             markdown: CommonMarkCache::default(),
             vision_turn: false,
             critique_requested: false,
+            attached_image: None,
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
             sandbox_root: None,
@@ -437,6 +443,24 @@ impl DeckPane {
     /// opened/saved. `None` (unknown) makes every deck path require confirmation.
     pub fn set_sandbox_root(&mut self, root: Option<std::path::PathBuf>) {
         self.sandbox_root = root;
+    }
+
+    /// Start a fresh chat session: abort any in-flight turn, drop the provider
+    /// conversation handle, and clear the transcript + message history. Used by
+    /// File → "New file session". The selected cassette/model are kept.
+    pub fn new_session(&mut self) {
+        self.stop_turn();
+        self.session_id = None;
+        self.messages.clear();
+        self.transcript.clear();
+        self.current_response.clear();
+        self.streaming_chat.clear();
+        self.current_commands.clear();
+        self.errors_this_turn.clear();
+        self.input.clear();
+        self.attached_image = None;
+        self.view = PaneView::Chat;
+        self.persist_chat();
     }
 
     /// Snapshot the chat to disk so an idle/quit/crash can be revived later.
@@ -672,13 +696,18 @@ impl DeckPane {
         );
         if self.vision_turn {
             // SECURITY (H-1): grant NO unscoped Read. Instead point the adapter
-            // at the single fixed critique screenshot; it derives a Read scoped
-            // to exactly that file (no arbitrary read, no `decks.json` key
-            // exfiltration via an attacker-controlled scene name). A 2nd agentic
-            // step lets the model open the shot then answer. Claude-code cassette
-            // only; HTTP adapters ignore these fields (vision there is a cut).
-            req.vision_shot_path =
-                Some(crate::app::critique_shot_path().display().to_string());
+            // at a SINGLE fixed image — either the user-attached image or the
+            // critique screenshot — and it derives a Read scoped to exactly that
+            // file (no arbitrary read, no `decks.json` key exfiltration via an
+            // attacker-controlled scene name). A 2nd agentic step lets the model
+            // open the shot then answer. Claude-code cassette only; HTTP adapters
+            // ignore these fields (vision there is a cut).
+            let shot = self
+                .attached_image
+                .take()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| crate::app::critique_shot_path().display().to_string());
+            req.vision_shot_path = Some(shot);
             req.max_turns = 2;
         }
         let (tx, rx) = unbounded_channel();
@@ -717,6 +746,11 @@ impl DeckPane {
             return;
         }
         self.retries = 0;
+        // A user-attached image makes this a vision turn (scoped Read of that
+        // one file, prose-only reply — same security envelope as a critique).
+        if self.attached_image.is_some() {
+            self.vision_turn = true;
+        }
         self.transcript.push(Entry::User(text.to_string()));
         self.messages.push(ChatMessage {
             role: Role::User,
@@ -1070,16 +1104,8 @@ impl DeckPane {
         }
 
         ui.horizontal(|ui| {
-            egui::widgets::global_theme_preference_switch(ui);
-            let zoom = ui.ctx().zoom_factor();
-            if ui.button("A−").on_hover_text("smaller text (Cmd -)").clicked() {
-                ui.ctx().set_zoom_factor((zoom - 0.1).max(0.5));
-            }
-            if ui.button("A+").on_hover_text("bigger text (Cmd =)").clicked() {
-                ui.ctx().set_zoom_factor((zoom + 0.1).min(3.0));
-            }
-            ui.label(format!("{:.0}%", zoom * 100.0));
-            ui.separator();
+            // Theme + text-size moved to the menu bar (appearance group); the
+            // chat header now starts with the local-only + deck controls.
             // Local-only toggle: when on, only localhost cassettes are shown and
             // cloud sends are blocked.
             let mut local_only = self.decks.local_only;
@@ -1178,13 +1204,8 @@ impl DeckPane {
                 }
                 ui.colored_label(color, state.caption());
             }
-            if ui
-                .add_enabled(!self.busy() && self.ready(), egui::Button::new("critique").small())
-                .on_hover_text("screenshot the viewport and ask the deck to assess it")
-                .clicked()
-            {
-                self.critique_requested = true;
-            }
+            // No critique button: `critique` is a command-line/chat verb, not a
+            // toolbar affordance (the app still honours `critique_requested`).
             if ui.small_button("clear").clicked() {
                 self.transcript.clear();
                 self.messages.clear();
@@ -1344,7 +1365,44 @@ impl DeckPane {
         self.side_effect_confirm_ui(ui, session);
 
         ui.separator();
-        let hint = if self.ready() {
+        // Image attach: only for vision-capable cassettes (we never ship an
+        // image to a blind model). Reuses the scoped-Read vision mechanism.
+        let vision = self
+            .decks
+            .decks
+            .get(self.decks.active)
+            .map(|c| c.supports_vision())
+            .unwrap_or(false);
+        ui.horizontal(|ui| {
+            if vision {
+                if ui
+                    .add_enabled(!self.busy(), egui::Button::new("🖼"))
+                    .on_hover_text("attach an image for the model to analyze")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif"])
+                        .pick_file()
+                {
+                    self.attached_image = Some(path);
+                }
+                if let Some(img) = self.attached_image.clone() {
+                    let name = img
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ui.label(egui::RichText::new(format!("🖼 {name}")).weak());
+                    if ui.small_button("✕").on_hover_text("remove attachment").clicked() {
+                        self.attached_image = None;
+                    }
+                }
+            } else {
+                ui.add_enabled(false, egui::Button::new("🖼"))
+                    .on_hover_text("this cassette has no vision — pick a vision-capable model to attach images");
+            }
+        });
+        let hint = if self.attached_image.is_some() {
+            "ask about the attached image… (Enter sends, Shift+Enter newline)"
+        } else if self.ready() {
             "describe what to draw… (Enter sends, Shift+Enter newline)"
         } else if matches!(self.warm, WarmState::Warming { .. }) {
             "loading model — chat enables when warm"
@@ -1398,6 +1456,7 @@ mod side_effect_gate_tests {
             markdown: CommonMarkCache::default(),
             vision_turn: false,
             critique_requested: false,
+            attached_image: None,
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
             sandbox_root: None,

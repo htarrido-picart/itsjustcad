@@ -40,6 +40,11 @@ pub enum MenuAction {
     /// Open the Edit history / amend panel as a modal (the command line is the
     /// op-log scrollback; this exposes step-jump + amend on demand).
     EditHistory,
+    /// Start a new empty document (fresh model, keeps the current chat session).
+    NewDocument,
+    /// Start a new file session: fresh document AND a fresh chat/deck session
+    /// (drops the provider conversation handle and transcript).
+    NewSession,
     /// Pop a native file-open dialog for import, then run `import <path>` through
     /// the substrate. Fired by the File → Import… menu item.
     ImportDialog,
@@ -51,6 +56,75 @@ pub enum MenuAction {
 /// Draw-tool verbs (mirror `draw_tool::try_start`). A menu pick of one of these
 /// starts the interactive picker rather than typing text.
 const DRAW_VERBS: [&str; 4] = ["line", "polyline", "rect", "circle"];
+
+// ── Menu iconography ─────────────────────────────────────────────────────────
+// Lightweight, dependency-free glyph icons (egui bundles emoji coverage) give
+// the menus an AutoCAD-style scannable icon column. One glyph per action /
+// per registry category so related verbs read as a group.
+const ICON_NEW: &str = "📄";
+const ICON_NEW_SESSION: &str = "🆕";
+const ICON_OPEN: &str = "📂";
+const ICON_SAVE: &str = "💾";
+const ICON_IMPORT: &str = "📥";
+const ICON_EXPORT: &str = "📤";
+const ICON_PRINT: &str = "🖨";
+const ICON_UNDO: &str = "↩";
+const ICON_REDO: &str = "↪";
+const ICON_HISTORY: &str = "🕘";
+const ICON_MODEL: &str = "🤖";
+const ICON_HELP: &str = "❓";
+const ICON_ABOUT: &str = "ℹ";
+
+/// A glyph for a registry verb, chosen by its [`Category`] so every verb in a
+/// menu group shares an icon (scannable AutoCAD-style hierarchy). Draw/curve
+/// verbs, solids, transforms etc. each get a distinct mark.
+fn verb_icon(verb: &str) -> &'static str {
+    // A few high-traffic verbs get a specific glyph; the rest fall back to the
+    // category icon so the whole menu stays visually grouped.
+    match verb {
+        "line" | "polyline" => return "╱",
+        "rect" => return "▭",
+        "circle" => return "◯",
+        "box" => return "◻",
+        "move" => return "✥",
+        "copy" => return "⧉",
+        "rotate" => return "⟳",
+        "scale" => return "⤢",
+        "mirror" => return "◫",
+        _ => {}
+    }
+    registry()
+        .iter()
+        .find(|s| s.name == verb)
+        .map(|s| category_icon(s.category))
+        .unwrap_or("•")
+}
+
+/// One glyph per command [`Category`] — the group mark used when a verb has no
+/// specific icon.
+fn category_icon(cat: Category) -> &'static str {
+    match cat {
+        Category::File => ICON_OPEN,
+        Category::Edit => "✎",
+        Category::View => "👁",
+        Category::Draw2d => "╱",
+        Category::Curve => "〰",
+        Category::Solid => "◻",
+        Category::Boolean => "⧉",
+        Category::Transform => "✥",
+        Category::Annotate => "🅰",
+        Category::Dimension => "📏",
+        Category::Analyze => "🔍",
+        Category::Structure => "🏗",
+        Category::Tools => "🔧",
+    }
+}
+
+/// Render one menu row as `<icon>  <label>`, so every menu item carries a
+/// leading glyph in a consistent column. Returns the button [`Response`].
+fn item(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
+    ui.button(format!("{icon}  {label}"))
+}
 
 /// Classify a registry verb into a [`MenuAction`]. Pure: depends only on the
 /// verb name and its registry usage string.
@@ -135,68 +209,118 @@ pub fn ui(ui: &mut egui::Ui, style: MenuStyle) -> Option<MenuAction> {
     egui::MenuBar::new().ui(ui, |ui| {
         for (title, cats) in top_menus(style) {
             ui.menu_button(title, |ui| {
-                // File / Edit get their app-wired actions first.
+                // File / Edit get their app-wired actions first. Leading glyphs
+                // give the menu an AutoCAD-style scannable icon column.
                 if title == "File" {
-                    for (label, verb) in [
-                        ("Open…", "open"),
-                        ("Save…", "save"),
-                        ("Import…", "import"),
-                        ("Export…", "export"),
-                        ("Print…", "print"),
+                    // New group.
+                    if item(ui, ICON_NEW, "New").clicked() {
+                        action = Some(MenuAction::NewDocument);
+                        ui.close();
+                    }
+                    if item(ui, ICON_NEW_SESSION, "New file session").clicked() {
+                        action = Some(MenuAction::NewSession);
+                        ui.close();
+                    }
+                    ui.separator();
+                    for (icon, label, verb) in [
+                        (ICON_OPEN, "Open…", "open"),
+                        (ICON_SAVE, "Save…", "save"),
+                        (ICON_IMPORT, "Import…", "import"),
+                        (ICON_EXPORT, "Export…", "export"),
+                        (ICON_PRINT, "Print…", "print"),
                     ] {
-                        if ui.button(label).clicked() {
+                        if item(ui, icon, label).clicked() {
                             action = Some(menu_action(verb));
                             ui.close();
                         }
                     }
                     ui.separator();
                 } else if title == "Edit" {
-                    for (label, verb) in [("Undo", "undo"), ("Redo", "redo")] {
-                        if ui.button(label).clicked() {
+                    for (icon, label, verb) in
+                        [(ICON_UNDO, "Undo", "undo"), (ICON_REDO, "Redo", "redo")]
+                    {
+                        if item(ui, icon, label).clicked() {
                             action = Some(MenuAction::Execute(verb.to_string()));
                             ui.close();
                         }
                     }
-                    if ui.button("Edit history…").clicked() {
+                    if item(ui, ICON_HISTORY, "Edit history…").clicked() {
                         action = Some(MenuAction::EditHistory);
                         ui.close();
                     }
                     ui.separator();
                 } else if title == "Tools" {
                     // App-wired: opens the Model Setup panel (download/manage a
-                    // local model) at any time.
-                    if ui.button("Model Setup…").clicked() {
+                    // local model) at any time — this is the "download a local
+                    // model" entry point users can reach from the menu bar.
+                    if item(ui, ICON_MODEL, "Model Setup…").clicked() {
+                        action = Some(MenuAction::ModelSetup);
+                        ui.close();
+                    }
+                    if item(ui, ICON_MODEL, "Download local model…").clicked() {
                         action = Some(MenuAction::ModelSetup);
                         ui.close();
                     }
                     ui.separator();
                 }
-                for verb in verbs_in(&cats) {
-                    // File/Edit already surfaced their wired verbs above; skip
-                    // the duplicates but still list the rest of the category.
-                    if title == "File" && matches!(verb, "open" | "save" | "import" | "export" | "print") {
+                // List verbs grouped BY CATEGORY, a separator between groups, so
+                // a multi-category menu (e.g. Curve = Draw2d + Curve) reads as
+                // distinct AutoCAD-style sub-groups rather than one flat list.
+                let mut first_group = true;
+                for cat in &cats {
+                    let verbs: Vec<&str> = verbs_in(std::slice::from_ref(cat))
+                        .into_iter()
+                        .filter(|verb| {
+                            // File/Edit already surfaced their wired verbs above.
+                            !(title == "File"
+                                && matches!(
+                                    *verb,
+                                    "open" | "save" | "import" | "export" | "print"
+                                ))
+                                && !(title == "Edit" && matches!(*verb, "undo" | "redo"))
+                        })
+                        .collect();
+                    if verbs.is_empty() {
                         continue;
                     }
-                    if title == "Edit" && matches!(verb, "undo" | "redo") {
-                        continue;
+                    if !first_group {
+                        ui.separator();
                     }
-                    if ui.button(verb).clicked() {
-                        action = Some(menu_action(verb));
-                        ui.close();
+                    first_group = false;
+                    for verb in verbs {
+                        if item(ui, verb_icon(verb), verb).clicked() {
+                            action = Some(menu_action(verb));
+                            ui.close();
+                        }
                     }
                 }
             });
         }
         // Help is synthetic (not a registry category).
         ui.menu_button("Help", |ui| {
-            if ui.button("Command reference").clicked() {
+            if item(ui, ICON_HELP, "Command reference").clicked() {
                 action = Some(MenuAction::Help);
                 ui.close();
             }
-            if ui.button("About ItsJustCAD").clicked() {
+            if item(ui, ICON_ABOUT, "About ItsJustCAD").clicked() {
                 action = Some(MenuAction::About);
                 ui.close();
             }
+        });
+
+        // Appearance controls, right-aligned on the menu bar (relocated from the
+        // chat pane): dark/light toggle + text-size stepper apply app-wide.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let zoom = ui.ctx().zoom_factor();
+            if ui.small_button("A+").on_hover_text("bigger text (Cmd =)").clicked() {
+                ui.ctx().set_zoom_factor((zoom + 0.1).min(3.0));
+            }
+            ui.label(format!("{:.0}%", zoom * 100.0));
+            if ui.small_button("A−").on_hover_text("smaller text (Cmd -)").clicked() {
+                ui.ctx().set_zoom_factor((zoom - 0.1).max(0.5));
+            }
+            ui.separator();
+            egui::widgets::global_theme_preference_switch(ui);
         });
     });
     action
@@ -218,7 +342,7 @@ pub fn demo_open(ctx: &egui::Context, style: MenuStyle, title: &str, at: egui::P
                 ui.label(egui::RichText::new(title).strong());
                 ui.separator();
                 for verb in verbs_in(&cats) {
-                    let _ = ui.button(verb);
+                    let _ = item(ui, verb_icon(verb), verb);
                 }
             });
         });
@@ -338,6 +462,16 @@ mod tests {
         // substrate with the chosen path.
         assert_eq!(menu_action("import"), MenuAction::ImportDialog);
         assert_eq!(menu_action("export"), MenuAction::ExportDialog);
+    }
+
+    #[test]
+    fn every_registry_verb_has_a_menu_icon() {
+        // No verb falls through to the empty placeholder; each category and each
+        // specific verb resolves to a non-empty glyph so the menu icon column is
+        // always populated.
+        for spec in registry() {
+            assert!(!verb_icon(spec.name).is_empty(), "verb {} has no icon", spec.name);
+        }
     }
 
     #[test]

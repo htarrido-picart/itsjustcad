@@ -27,9 +27,11 @@ pub enum Theme {
 
 impl Theme {
     /// Viewport clear color (the app returns this from `eframe::App::clear_color`).
+    /// Dark mode is a near-black off-grey so the 3D model space reads as black
+    /// (Rhino/AutoCAD dark-theme convention), not a washed-out mid-grey.
     pub fn background(self) -> [f32; 4] {
         match self {
-            Theme::Dark => [0.13, 0.14, 0.16, 1.0],
+            Theme::Dark => [0.05, 0.05, 0.06, 1.0],
             Theme::Light => [0.83, 0.85, 0.87, 1.0],
         }
     }

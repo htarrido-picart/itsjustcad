@@ -319,6 +319,9 @@ pub struct App {
     show_about: bool,
     /// Whether the Edit → "Edit history…" modal (op-log / amend panel) is open.
     show_history: bool,
+    /// ITSJUSTCAD_THEME pin: Some(true)=dark, Some(false)=light, None=follow OS.
+    /// Re-applied every frame so eframe's per-frame system-theme read can't win.
+    forced_dark: Option<bool>,
     /// Whether to show the first-run template picker on next frame.
     show_template_picker: bool,
     template_units: TemplateUnits,
@@ -402,6 +405,14 @@ impl App {
         };
         cc.egui_ctx.style_mut_of(egui::Theme::Dark, set_cad_fonts);
         cc.egui_ctx.style_mut_of(egui::Theme::Light, set_cad_fonts);
+        // ITSJUSTCAD_THEME=dark|light: initial pin (also re-applied every frame in
+        // `ui`, since eframe re-reads the OS theme each frame). Otherwise the OS
+        // preference is followed as usual.
+        match std::env::var("ITSJUSTCAD_THEME").ok().as_deref() {
+            Some("dark") => cc.egui_ctx.set_theme(egui::Theme::Dark),
+            Some("light") => cc.egui_ctx.set_theme(egui::Theme::Light),
+            _ => {}
+        }
 
         let deck_visible = load_deck_visible().unwrap_or(true);
         let cad_origin = load_cad_origin().unwrap_or_default();
@@ -475,6 +486,11 @@ impl App {
             panel_visible: true,
             show_about: false,
             show_history: false,
+            forced_dark: match std::env::var("ITSJUSTCAD_THEME").ok().as_deref() {
+                Some("dark") => Some(true),
+                Some("light") => Some(false),
+                _ => None,
+            },
             show_template_picker: !load_template_done(),
             template_units: TemplateUnits::Meters,
             template_scale: TemplateScale::Building,
@@ -1017,6 +1033,24 @@ impl App {
             }
             Err(e) => self.command_line.push_line(format!("error: {e}")),
         }
+    }
+
+    /// Start a new empty document (File → New). Replaces the session with a
+    /// fresh one; the chat/deck session is untouched.
+    fn new_document(&mut self) {
+        self.session = Session::default();
+        self.uploaded_generation = None;
+        self.journaled_generation = None;
+        self.deck_pane.set_sandbox_root(None);
+        self.command_line.push_line("new document");
+    }
+
+    /// Start a new file session (File → New file session): a fresh document AND
+    /// a fresh chat/deck session (drops the provider conversation + transcript).
+    fn new_session(&mut self) {
+        self.new_document();
+        self.deck_pane.new_session();
+        self.command_line.push_line("new file session");
     }
 
     fn open(&mut self, path: Option<std::path::PathBuf>) {
@@ -2272,6 +2306,8 @@ impl App {
             MenuAction::EditHistory => self.show_history = true,
             MenuAction::ImportDialog => self.import(None),
             MenuAction::ExportDialog => self.export(None),
+            MenuAction::NewDocument => self.new_document(),
+            MenuAction::NewSession => self.new_session(),
         }
     }
 
@@ -2823,15 +2859,17 @@ impl eframe::App for App {
         if active_mode == itsjustcad_render::DisplayMode::Pencil {
             return itsjustcad_render::DisplayMode::pencil_background();
         }
-        // Legacy-CAD preset background overrides theme when active.
+        // Dark mode wins for the 3D model space: a near-black off-grey, even
+        // under a legacy-CAD preset (whose fixed light-grey/white bg would
+        // otherwise ignore the dark theme).
+        if visuals.dark_mode {
+            return scene::Theme::Dark.background();
+        }
+        // Light mode: honour the active legacy-CAD preset background.
         if self.cad_origin != CadOrigin::None {
             return preset::preset_for(self.cad_origin).bg_color;
         }
-        if visuals.dark_mode {
-            scene::Theme::Dark.background()
-        } else {
-            scene::Theme::Light.background()
-        }
+        scene::Theme::Light.background()
     }
 
     fn on_exit(&mut self) {
@@ -2842,6 +2880,14 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // ITSJUSTCAD_THEME pins the theme every frame (eframe otherwise re-reads
+        // the OS theme each frame and would override a one-shot pin at startup).
+        if let Some(dark) = self.forced_dark {
+            let want = if dark { egui::Theme::Dark } else { egui::Theme::Light };
+            if ui.ctx().theme() != want {
+                ui.ctx().set_theme(want);
+            }
+        }
         self.run_startup_script();
         // ITSJUSTCAD_TYPE: pre-fill command input (dev hook for autosuggest screenshots).
         if let Some(text) = self.type_script.take() {

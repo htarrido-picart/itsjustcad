@@ -56,6 +56,33 @@ pub struct DeckConfig {
 }
 
 impl DeckConfig {
+    /// Whether this cassette can analyze an attached image. Claude (subscription
+    /// CLI) and Anthropic API are multimodal; OpenAI-compatible endpoints only
+    /// when the selected model is a known vision model. Local grammar cassettes
+    /// (llama.cpp text models) are treated as text-only. The image-attach button
+    /// in the chat is gated on this so we never send an image to a blind model.
+    pub fn supports_vision(&self) -> bool {
+        match self.kind {
+            DeckKind::ClaudeCode | DeckKind::Anthropic => true,
+            DeckKind::OpenaiCompat => {
+                // Grammar-constrained local text models can't see images.
+                if self.grammar {
+                    return false;
+                }
+                let m = self.model.to_ascii_lowercase();
+                m.contains("vl")
+                    || m.contains("vision")
+                    || m.contains("-v")
+                    || m.contains("4o")
+                    || m.contains("gpt-4-turbo")
+                    || m.contains("llava")
+                    || m.contains("gemini")
+                    || m.contains("pixtral")
+                    || m.contains("qwen2.5-vl")
+            }
+        }
+    }
+
     pub fn resolved_key(&self) -> Option<String> {
         match self.api_key.as_deref() {
             Some(k) if k.starts_with("env:") => std::env::var(&k[4..]).ok(),
@@ -229,6 +256,27 @@ mod tests {
         // Switch active to "claude" (index 2, remote) → Err.
         df.active = 2;
         assert!(df.check_local_only().is_err());
+    }
+
+    #[test]
+    fn vision_capability_gating() {
+        let mk = |kind, model: &str, grammar| DeckConfig {
+            name: "x".into(),
+            kind,
+            base_url: String::new(),
+            model: model.into(),
+            api_key: None,
+            grammar,
+        };
+        // Claude (CLI + API) is always multimodal.
+        assert!(mk(DeckKind::ClaudeCode, "sonnet", false).supports_vision());
+        assert!(mk(DeckKind::Anthropic, "claude-sonnet-4-6", false).supports_vision());
+        // OpenAI-compat: vision only for known vision models, never for a
+        // grammar-constrained local text model.
+        assert!(mk(DeckKind::OpenaiCompat, "gpt-4o", false).supports_vision());
+        assert!(mk(DeckKind::OpenaiCompat, "qwen2.5-vl-7b", false).supports_vision());
+        assert!(!mk(DeckKind::OpenaiCompat, "qwen3", true).supports_vision());
+        assert!(!mk(DeckKind::OpenaiCompat, "llama3", false).supports_vision());
     }
 
     #[test]
