@@ -1177,7 +1177,12 @@ impl DeckPane {
     /// Each queued command shows "deck wants to: export → /path  [run] [skip]".
     /// A path that escaped the sandbox is flagged so the user knows the deck is
     /// touching a file outside the document's directory (security C-2/H-7).
-    fn side_effect_confirm_ui(&mut self, ui: &mut egui::Ui, session: &mut Session) {
+    fn side_effect_confirm_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &mut Session,
+        icons: &crate::icons::Icons,
+    ) {
         if self.pending_side_effects.is_empty() {
             return;
         }
@@ -1215,10 +1220,16 @@ impl DeckPane {
                         );
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("run").clicked() {
+                        if icons
+                            .icon_button(ui, crate::icons::Icon::Run, "run this action")
+                            .clicked()
+                        {
                             run_idx = Some(i);
                         }
-                        if ui.button("skip").clicked() {
+                        if icons
+                            .icon_button(ui, crate::icons::Icon::Skip, "skip this action")
+                            .clicked()
+                        {
                             skip_idx = Some(i);
                         }
                     });
@@ -1268,12 +1279,23 @@ impl DeckPane {
     /// stored chats. A search field lists matching sessions with a snippet;
     /// clicking a session loads its transcript (jumping to the matched turn).
     /// Collapsed by default so it never crowds the live chat.
-    fn session_browser_ui(&mut self, ui: &mut egui::Ui) {
+    fn session_browser_ui(&mut self, ui: &mut egui::Ui, icons: &crate::icons::Icons) {
         let Some(store) = self.store.as_ref() else { return };
         let count = store.sessions.len();
-        egui::CollapsingHeader::new(format!("💬 sessions ({count})"))
+        // A Lucide "sessions" mark, tinted to the header text, drawn in the
+        // header's disclosure-icon slot (replacing the bare 💬 emoji). The mark
+        // is cheap to re-decode via the shared raster cache; painting it in the
+        // icon slot keeps one aligned "<icon> sessions (n)" row.
+        let tex = icons.texture_id(ui.ctx(), crate::icons::Icon::Sessions);
+        egui::CollapsingHeader::new(format!("sessions ({count})"))
             .id_salt("deck_sessions")
             .default_open(count > 0)
+            .icon(move |ui, _openness, resp| {
+                let c = ui.visuals().text_color();
+                egui::Image::new((tex, resp.rect.size()))
+                    .tint(c)
+                    .paint_at(ui, resp.rect);
+            })
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("search:");
@@ -1353,6 +1375,7 @@ impl DeckPane {
         ui: &mut egui::Ui,
         session: &mut Session,
         handle: &tokio::runtime::Handle,
+        icons: &crate::icons::Icons,
     ) {
         self.drain(session, handle);
         if self.busy()
@@ -1471,7 +1494,10 @@ impl DeckPane {
             }
             if self.busy() {
                 ui.spinner();
-                if ui.small_button("stop").clicked() {
+                if icons
+                    .icon_button(ui, crate::icons::Icon::Stop, "stop this turn")
+                    .clicked()
+                {
                     self.stop_turn();
                 }
             }
@@ -1561,7 +1587,7 @@ impl DeckPane {
         }
         ui.separator();
 
-        self.session_browser_ui(ui);
+        self.session_browser_ui(ui, icons);
 
         // Child pane: full command code view with a back button.
         if let Some(commands_view) = match self.view {
@@ -1648,7 +1674,7 @@ impl DeckPane {
             self.view = view;
         }
 
-        self.side_effect_confirm_ui(ui, session);
+        self.side_effect_confirm_ui(ui, session, icons);
 
         ui.separator();
         // Image attach: only for vision-capable cassettes (we never ship an
@@ -1661,8 +1687,17 @@ impl DeckPane {
             .unwrap_or(false);
         ui.horizontal(|ui| {
             if vision {
+                let sz = ui.text_style_height(&egui::TextStyle::Body);
+                let fg = ui.visuals().text_color();
+                let attach = egui::Button::image(icons.image(
+                    ui.ctx(),
+                    crate::icons::Icon::Image,
+                    sz,
+                    fg,
+                ))
+                .frame(true);
                 if ui
-                    .add_enabled(!self.busy(), egui::Button::new("🖼"))
+                    .add_enabled(!self.busy(), attach)
                     .on_hover_text("attach an image for the model to analyze")
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
@@ -1676,13 +1711,25 @@ impl DeckPane {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    ui.label(egui::RichText::new(format!("🖼 {name}")).weak());
-                    if ui.small_button("✕").on_hover_text("remove attachment").clicked() {
+                    ui.label(egui::RichText::new(name).weak());
+                    if icons
+                        .icon_button(ui, crate::icons::Icon::Close, "remove attachment")
+                        .clicked()
+                    {
                         self.attached_image = None;
                     }
                 }
             } else {
-                ui.add_enabled(false, egui::Button::new("🖼"))
+                let sz = ui.text_style_height(&egui::TextStyle::Body);
+                let fg = ui.visuals().weak_text_color();
+                let disabled = egui::Button::image(icons.image(
+                    ui.ctx(),
+                    crate::icons::Icon::Image,
+                    sz,
+                    fg,
+                ))
+                .frame(true);
+                ui.add_enabled(false, disabled)
                     .on_hover_text("this cassette has no vision — pick a vision-capable model to attach images");
             }
         });

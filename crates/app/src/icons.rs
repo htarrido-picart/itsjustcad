@@ -30,6 +30,7 @@ pub enum Icon {
     Import,
     Export,
     Print,
+    Download,
     // Edit
     Undo,
     Redo,
@@ -73,13 +74,27 @@ pub enum Icon {
     Minus,
     Settings,
     CircleDot,
+    // Deck / chrome controls
+    Sessions,
+    Run,
+    Stop,
+    Skip,
+    Close,
+    Image,
+    // Panel + viewport controls
+    PanelOpen,
+    PanelClose,
+    Maximize,
+    Layout1,
+    Layout2,
+    Layout4,
 }
 
 impl Icon {
     /// Every icon, for exhaustiveness (embedding + tests). Part of the module's
     /// public surface; exercised by the raster-validation tests.
     #[allow(dead_code)]
-    pub const ALL: [Icon; 44] = [
+    pub const ALL: [Icon; 57] = [
         Icon::New,
         Icon::NewSession,
         Icon::Open,
@@ -87,6 +102,7 @@ impl Icon {
         Icon::Import,
         Icon::Export,
         Icon::Print,
+        Icon::Download,
         Icon::Undo,
         Icon::Redo,
         Icon::History,
@@ -124,6 +140,18 @@ impl Icon {
         Icon::Minus,
         Icon::Settings,
         Icon::CircleDot,
+        Icon::Sessions,
+        Icon::Run,
+        Icon::Stop,
+        Icon::Skip,
+        Icon::Close,
+        Icon::Image,
+        Icon::PanelOpen,
+        Icon::PanelClose,
+        Icon::Maximize,
+        Icon::Layout1,
+        Icon::Layout2,
+        Icon::Layout4,
     ];
 
     /// Stable cache key / Lucide source name.
@@ -133,9 +161,10 @@ impl Icon {
             Icon::NewSession => "copy-plus",
             Icon::Open => "folder-open",
             Icon::Save => "save",
-            Icon::Import => "download",
+            Icon::Import => "import",
             Icon::Export => "upload",
             Icon::Print => "printer",
+            Icon::Download => "download",
             Icon::Undo => "undo-2",
             Icon::Redo => "redo-2",
             Icon::History => "clock",
@@ -146,20 +175,20 @@ impl Icon {
             Icon::EditCat => "pencil",
             Icon::View => "eye",
             Icon::Curve => "spline",
-            Icon::Solid => "box",
+            Icon::Solid => "package",
             Icon::Boolean => "combine",
-            Icon::Transform => "move",
+            Icon::Transform => "axis-3d",
             Icon::Annotate => "type",
             Icon::Dimension => "ruler",
             Icon::Analyze => "search",
             Icon::Structure => "building-2",
             Icon::ToolsCat => "wrench",
-            Icon::Line => "slash",
-            Icon::Rect => "square-dashed",
+            Icon::Line => "pen-line",
+            Icon::Rect => "square",
             Icon::CircleShape => "circle",
             Icon::BoxShape => "box",
             Icon::Move => "move",
-            Icon::Copy => "copy-plus",
+            Icon::Copy => "copy",
             Icon::Rotate => "rotate-cw",
             Icon::Scale => "scaling",
             Icon::Mirror => "flip-horizontal-2",
@@ -173,6 +202,18 @@ impl Icon {
             Icon::Minus => "minus",
             Icon::Settings => "settings",
             Icon::CircleDot => "circle-dot",
+            Icon::Sessions => "messages-square",
+            Icon::Run => "play",
+            Icon::Stop => "circle-stop",
+            Icon::Skip => "skip-forward",
+            Icon::Close => "x",
+            Icon::Image => "image",
+            Icon::PanelOpen => "panel-right-open",
+            Icon::PanelClose => "panel-right-close",
+            Icon::Maximize => "maximize-2",
+            Icon::Layout1 => "square-dashed",
+            Icon::Layout2 => "columns-2",
+            Icon::Layout4 => "grid-2x2",
         }
     }
 
@@ -188,9 +229,10 @@ impl Icon {
             Icon::NewSession => png!("copy-plus"),
             Icon::Open => png!("folder-open"),
             Icon::Save => png!("save"),
-            Icon::Import => png!("download"),
+            Icon::Import => png!("import"),
             Icon::Export => png!("upload"),
             Icon::Print => png!("printer"),
+            Icon::Download => png!("download"),
             Icon::Undo => png!("undo-2"),
             Icon::Redo => png!("redo-2"),
             Icon::History => png!("clock"),
@@ -201,20 +243,20 @@ impl Icon {
             Icon::EditCat => png!("pencil"),
             Icon::View => png!("eye"),
             Icon::Curve => png!("spline"),
-            Icon::Solid => png!("box"),
+            Icon::Solid => png!("package"),
             Icon::Boolean => png!("combine"),
-            Icon::Transform => png!("move"),
+            Icon::Transform => png!("axis-3d"),
             Icon::Annotate => png!("type"),
             Icon::Dimension => png!("ruler"),
             Icon::Analyze => png!("search"),
             Icon::Structure => png!("building-2"),
             Icon::ToolsCat => png!("wrench"),
-            Icon::Line => png!("slash"),
-            Icon::Rect => png!("square-dashed"),
+            Icon::Line => png!("pen-line"),
+            Icon::Rect => png!("square"),
             Icon::CircleShape => png!("circle"),
             Icon::BoxShape => png!("box"),
             Icon::Move => png!("move"),
-            Icon::Copy => png!("copy-plus"),
+            Icon::Copy => png!("copy"),
             Icon::Rotate => png!("rotate-cw"),
             Icon::Scale => png!("scaling"),
             Icon::Mirror => png!("flip-horizontal-2"),
@@ -228,6 +270,18 @@ impl Icon {
             Icon::Minus => png!("minus"),
             Icon::Settings => png!("settings"),
             Icon::CircleDot => png!("circle-dot"),
+            Icon::Sessions => png!("messages-square"),
+            Icon::Run => png!("play"),
+            Icon::Stop => png!("circle-stop"),
+            Icon::Skip => png!("skip-forward"),
+            Icon::Close => png!("x"),
+            Icon::Image => png!("image"),
+            Icon::PanelOpen => png!("panel-right-open"),
+            Icon::PanelClose => png!("panel-right-close"),
+            Icon::Maximize => png!("maximize-2"),
+            Icon::Layout1 => png!("square-dashed"),
+            Icon::Layout2 => png!("columns-2"),
+            Icon::Layout4 => png!("grid-2x2"),
         }
     }
 }
@@ -256,6 +310,14 @@ impl Icons {
         handle
     }
 
+    /// The raw [`egui::TextureId`] for `icon` (decoding/uploading on first use).
+    /// For call sites that must paint into a `'static` closure (e.g. a
+    /// [`egui::CollapsingHeader`] disclosure-icon slot) where the `&Icons` borrow
+    /// cannot be captured.
+    pub fn texture_id(&self, ctx: &egui::Context, icon: Icon) -> egui::TextureId {
+        self.texture(ctx, icon).id()
+    }
+
     /// An [`egui::Image`] for `icon`, sized to `size` logical px and tinted to
     /// `color` (the raster is white, so tint recolors it wholesale).
     pub fn image(
@@ -269,6 +331,23 @@ impl Icons {
         egui::Image::new(&tex)
             .fit_to_exact_size(egui::vec2(size, size))
             .tint(color)
+    }
+
+    /// An icon-only clickable button, tinted to the current foreground and sized
+    /// to the adjacent Body text height (so the mark tracks the text-style height
+    /// everywhere). `hover` is the mandatory tooltip / accessibility label — every
+    /// icon-only control must name its action for screen readers and mouse users.
+    pub fn icon_button(
+        &self,
+        ui: &mut egui::Ui,
+        icon: Icon,
+        hover: &str,
+    ) -> egui::Response {
+        let size = ui.text_style_height(&egui::TextStyle::Body);
+        let color = ui.visuals().text_color();
+        let img = self.image(ui.ctx(), icon, size, color);
+        ui.add(egui::Button::image(img).frame(true))
+            .on_hover_text(hover)
     }
 
     /// Draw a menu row `<icon>  <label>`, tinting the icon to the current
@@ -341,6 +420,38 @@ mod tests {
             }
             assert!(solid_white > 0, "{ic:?} raster has no solid stroke");
         }
+    }
+
+    #[test]
+    fn no_two_actions_share_a_glyph() {
+        // Design invariant (Batch B): every distinct action/role maps to a
+        // *distinct* Lucide glyph, so nothing reads ambiguously in the chrome.
+        // Regression guard against the old overloads (Copy/NewSession=copy-plus,
+        // Solid/BoxShape=box, Transform/Move=move).
+        let mut by_glyph: std::collections::HashMap<&str, Icon> = std::collections::HashMap::new();
+        for ic in Icon::ALL {
+            if let Some(prev) = by_glyph.insert(ic.name(), ic) {
+                panic!(
+                    "glyph {:?} shared by {:?} and {:?}",
+                    ic.name(),
+                    prev,
+                    ic
+                );
+            }
+        }
+        assert_eq!(by_glyph.len(), Icon::ALL.len());
+    }
+
+    #[test]
+    fn deduped_overloads_are_now_distinct() {
+        // The specific pairs the report called out no longer collide.
+        assert_ne!(Icon::Copy.name(), Icon::NewSession.name());
+        assert_ne!(Icon::Solid.name(), Icon::BoxShape.name());
+        assert_ne!(Icon::Transform.name(), Icon::Move.name());
+        assert_ne!(Icon::Import.name(), Icon::Download.name());
+        // Line must not be a slash (reads as "cancel").
+        assert_eq!(Icon::Line.name(), "pen-line");
+        assert_ne!(Icon::Line.name(), "slash");
     }
 
     #[test]

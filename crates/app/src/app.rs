@@ -2675,7 +2675,11 @@ impl App {
                         }
                     });
                 ui.separator();
-                if ui.small_button("ZE").on_hover_text("zoom extents").clicked() {
+                if self
+                    .icons
+                    .icon_button(ui, crate::icons::Icon::Maximize, "zoom extents")
+                    .clicked()
+                {
                     self.zoom_extents();
                 }
             });
@@ -2715,7 +2719,11 @@ impl App {
             egui::Area::new(egui::Id::new("panel_show_btn"))
                 .fixed_pos(egui::pos2(vr.right() - 28.0, vr.top() + 88.0))
                 .show(ui.ctx(), |ui| {
-                    if ui.small_button("◂").on_hover_text("show panel (Cmd+\\)").clicked() {
+                    if self
+                        .icons
+                        .icon_button(ui, crate::icons::Icon::PanelOpen, "show panel (Cmd+\\)")
+                        .clicked()
+                    {
                         self.panel_visible = true;
                     }
                 });
@@ -2743,7 +2751,11 @@ impl App {
         panel.show(ui, |ui| {
             // Header row: chevron + tab strip.
             ui.horizontal(|ui| {
-                if ui.small_button("▸").on_hover_text("hide panel (Cmd+\\)").clicked() {
+                if self
+                    .icons
+                    .icon_button(ui, crate::icons::Icon::PanelClose, "hide panel (Cmd+\\)")
+                    .clicked()
+                {
                     self.panel_visible = false;
                 }
                 if let Some(tab) = crate::tabstrip::strip_ui(ui, &self.icons, self.panel_tabs) {
@@ -2791,7 +2803,7 @@ impl App {
                         });
                     }
                     PanelTab::Deck => {
-                        self.deck_pane.ui(ui, &mut self.session, &self.tokio);
+                        self.deck_pane.ui(ui, &mut self.session, &self.tokio, &self.icons);
                     }
                 }
             });
@@ -3133,14 +3145,21 @@ impl App {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        let fg = ui.visuals().text_color();
+                        let sz = ui.text_style_height(&egui::TextStyle::Body);
+                        ui.add(self.icons.image(ui.ctx(), crate::icons::Icon::Download, sz, fg));
                         if ui
-                            .button(format!("⬇ {label}  {pct}%"))
+                            .button(format!("{label}  {pct}%"))
                             .on_hover_text("Downloading — click to open Model Setup")
                             .clicked()
                         {
                             reopen = true;
                         }
-                        if ui.small_button("✕").on_hover_text("Cancel download").clicked() {
+                        if self
+                            .icons
+                            .icon_button(ui, crate::icons::Icon::Close, "Cancel download")
+                            .clicked()
+                        {
                             cancel = true;
                         }
                     });
