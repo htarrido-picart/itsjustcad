@@ -379,6 +379,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Annotate,
         },
         CommandSpec {
+            name: "lineweight",
+            usage: "lineweight <selector> <mm | iso-name | off>",
+            summary: "Set or clear a per-object lineweight override. Beats the layer lineweight in PDF/DXF/SVG export and in the viewport when showweights is on. Accepts raw mm values or ISO pen names: 0.13/0.18/0.25/0.35/0.50/0.70/1.00/1.40/2.00. 'lineweight last off' clears it. Example: lineweight last 0.35 · lineweight walls 0.50 · lineweight last off",
+            category: Category::Annotate,
+        },
+        CommandSpec {
+            name: "showweights",
+            usage: "showweights <on|off>",
+            summary: "Toggle viewport lineweight display. When on, strokes render at their real lineweight (per-object or layer); when off they render as 1-pixel hairlines. Example: showweights on · showweights off",
+            category: Category::View,
+        },
+        CommandSpec {
             name: "color",
             usage: "color <selector> <r,g,b | off>",
             summary: "Set or clear a per-object color override (0-1 or 0-255 values). Beats the layer color. 'color last off' clears it. Example: color last 1,0.3,0 · color walls off",

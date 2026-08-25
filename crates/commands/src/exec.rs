@@ -78,6 +78,10 @@ enum Inverse {
     LayerStyle { layer: String, prev: LayerStyle },
     /// `hideobj`/`showobj`: restore each object's previous visible flag.
     ObjectVisibility(Vec<(ObjectId, bool)>),
+    /// `lineweight`/`lineweightoff`: restore each object's previous lineweight override.
+    ObjectLineweight(Vec<(ObjectId, Option<f64>)>),
+    /// `showweights`: restore the previous show_lineweights flag.
+    ShowWeights { prev: bool },
     /// `color`/`coloroff`: restore each object's previous color override.
     ObjectColor(Vec<(ObjectId, Option<[f32; 3]>)>),
     /// `material2`/`material2off`: restore each object's previous material.
@@ -306,6 +310,18 @@ impl Session {
                         obj.visible = visible;
                     }
                 }
+            }
+            Inverse::ObjectLineweight(prev) => {
+                for (id, lw) in prev.clone() {
+                    if let Some(obj) = self.doc.get_mut(id) {
+                        obj.lineweight_mm = lw;
+                    }
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::ShowWeights { prev } => {
+                self.doc.show_lineweights = *prev;
+                self.doc.generation += 1;
             }
             Inverse::ObjectColor(prev) => {
                 for (id, color) in prev.clone() {
@@ -1168,6 +1184,7 @@ fn insert_curve(
         layer: doc.current_layer.clone(),
         color: None,
         material: None,
+        lineweight_mm: None,
         geometry: Geometry::Curve(curve),
     });
     let outcome = ApplyOutcome {
@@ -1294,6 +1311,7 @@ fn replace_with_result(
         layer,
         color: None,
         material: None,
+        lineweight_mm: None,
         geometry: Geometry::Mesh(result),
     });
     Ok((
@@ -1530,6 +1548,7 @@ fn section_meshes(
             layer: SECTIONS_LAYER.to_string(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Curve(Curve::Polyline { points, closed: true }),
         });
     }
@@ -1541,6 +1560,7 @@ fn section_meshes(
             layer: SECTIONS_PROJ_LAYER.to_string(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -1688,6 +1708,7 @@ fn exec_shadow_study(
             layer: poly.layer.clone(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Curve(Curve::Polyline { points: poly.pts.clone(), closed: true }),
         });
     }
@@ -1849,6 +1870,7 @@ fn exec_sun_hours(
             layer: ANALYSIS_LAYER.to_string(),
             color: Some(color),
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Mesh(mesh),
         });
     }
@@ -1938,6 +1960,7 @@ fn elevation_meshes(
             layer: ELEVATIONS_LAYER.to_string(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -2004,6 +2027,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Mesh(kernel_mesh::make_box(corner, size)),
             });
             Ok((
@@ -2043,6 +2067,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Mesh(extrude_profile(&profile2d, base_z, height)),
             });
             Ok((
@@ -2088,6 +2113,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2126,6 +2152,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2164,6 +2191,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2199,6 +2227,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2241,6 +2270,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2278,6 +2308,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -2510,6 +2541,7 @@ fn apply_forward(
                 layer: obj.layer.clone(),
                 color: obj.color,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Curve(rebuilt),
             });
             Ok((
@@ -2536,6 +2568,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Annotation(Annotation::LinearDim { a, b, offset }),
             });
             Ok((
@@ -2562,6 +2595,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Annotation(Annotation::Text {
                     pos,
                     text: text.clone(),
@@ -2619,6 +2653,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Annotation(Annotation::Hatch {
                     boundary,
                     pattern: pattern.clone(),
@@ -2885,6 +2920,7 @@ fn apply_forward(
                     layer: obj.layer.clone(),
                     color: None,
                     material: None,
+                    lineweight_mm: None,
                     geometry: Geometry::Curve(piece),
                 });
             }
@@ -2954,6 +2990,7 @@ fn apply_forward(
                 layer: obj.layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Curve(kept),
             });
             Ok((
@@ -3030,7 +3067,7 @@ fn apply_forward(
                 }
             }
             let id = id.unwrap_or_default();
-            doc.insert(SceneObject { id, name, layer, visible: true, color: None, material: None, geometry: Geometry::Curve(joined) });
+            doc.insert(SceneObject { id, name, layer, visible: true, color: None, material: None, lineweight_mm: None, geometry: Geometry::Curve(joined) });
             Ok((
                 Command::Join { id: Some(id), targets },
                 Inverse::Replace { created: vec![id], consumed },
@@ -3088,6 +3125,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Curve(arc),
             });
             Ok((
@@ -3133,6 +3171,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Curve(offset),
             });
             Ok((
@@ -3508,6 +3547,55 @@ fn apply_forward(
                 ApplyOutcome {
                     created: Vec::new(),
                     message: format!("showed {} object(s)", ids.len()),
+                },
+            ))
+        }
+        Command::Lineweight { targets, mm } => {
+            let ids = resolve(doc, &targets)?;
+            let mut prev = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let obj = doc.get_mut(*id).expect("resolved");
+                prev.push((*id, obj.lineweight_mm));
+                obj.lineweight_mm = Some(mm);
+            }
+            doc.generation += 1;
+            Ok((
+                Command::Lineweight { targets, mm },
+                Inverse::ObjectLineweight(prev),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("lineweight {mm:.3} mm on {} object(s)", ids.len()),
+                },
+            ))
+        }
+        Command::LinweightOff { targets } => {
+            let ids = resolve(doc, &targets)?;
+            let mut prev = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let obj = doc.get_mut(*id).expect("resolved");
+                prev.push((*id, obj.lineweight_mm));
+                obj.lineweight_mm = None;
+            }
+            doc.generation += 1;
+            Ok((
+                Command::LinweightOff { targets },
+                Inverse::ObjectLineweight(prev),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("cleared lineweight on {} object(s)", ids.len()),
+                },
+            ))
+        }
+        Command::ShowWeights { on } => {
+            let prev = doc.show_lineweights;
+            doc.show_lineweights = on;
+            doc.generation += 1;
+            Ok((
+                Command::ShowWeights { on },
+                Inverse::ShowWeights { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("viewport lineweights {}", if on { "on" } else { "off" }),
                 },
             ))
         }
@@ -4200,6 +4288,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -4229,6 +4318,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Points { positions: positions.clone() },
             });
             Ok((
@@ -4304,6 +4394,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Instance {
                     block: name.clone(),
                     position,
@@ -4497,6 +4588,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Frame {
                     kind,
                     a,
@@ -4558,6 +4650,7 @@ fn apply_forward(
                 layer: doc.current_layer.clone(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Area {
                     kind,
                     boundary: boundary.clone(),
@@ -4725,6 +4818,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Show { .. } => "show",
         Command::HideObj { .. } => "hideobj",
         Command::ShowObj { .. } => "showobj",
+        Command::Lineweight { .. } => "lineweight",
+        Command::LinweightOff { .. } => "lineweightoff",
+        Command::ShowWeights { .. } => "showweights",
         Command::Color { .. } => "color",
         Command::ColorOff { .. } => "coloroff",
         Command::Material2 { .. } => "material2",
@@ -8031,5 +8127,181 @@ mod tests {
         let json1 = crate::io::to_json(&s);
         let json2 = crate::io::to_json(&crate::io::from_json(&json1).unwrap());
         assert_eq!(json1, json2);
+    }
+
+    // ── lineweight tests ─────────────────────────────────────────────────────
+
+    /// Parse round-trip for the three new lineweight commands.
+    #[test]
+    fn lineweight_parse_round_trip() {
+        use crate::parse;
+
+        // Raw mm value
+        let cmd = parse("lineweight last 0.35").unwrap();
+        assert!(matches!(cmd, Command::Lineweight { mm, .. } if (mm - 0.35).abs() < 1e-9));
+
+        // ISO pen name: "0.50" snaps to 0.50
+        let cmd = parse("lineweight last 0.50").unwrap();
+        assert!(matches!(cmd, Command::Lineweight { mm, .. } if (mm - 0.50).abs() < 1e-9));
+
+        // ISO pen via iso-prefix + hundredths: "iso35" → 0.35
+        let cmd = parse("lineweight last iso35").unwrap();
+        assert!(matches!(cmd, Command::Lineweight { mm, .. } if (mm - 0.35).abs() < 1e-9));
+
+        // "off" → LinweightOff
+        let cmd = parse("lineweight last off").unwrap();
+        assert!(matches!(cmd, Command::LinweightOff { .. }));
+
+        // showweights on / off
+        assert!(matches!(parse("showweights on").unwrap(), Command::ShowWeights { on: true }));
+        assert!(matches!(parse("showweights off").unwrap(), Command::ShowWeights { on: false }));
+
+        // JSON round-trip for Lineweight
+        let cmd = parse("lineweight last 0.35").unwrap();
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+
+        // JSON round-trip for ShowWeights
+        let cmd2 = parse("showweights on").unwrap();
+        let json2 = serde_json::to_string(&cmd2).unwrap();
+        let back2: Command = serde_json::from_str(&json2).unwrap();
+        assert_eq!(cmd2, back2);
+    }
+
+    /// ISO pen name parsing: named integer forms resolve to the right mm value.
+    #[test]
+    fn iso_pen_names_snap_to_correct_mm() {
+        use crate::parse;
+
+        // Standard ISO 128 pen widths by decimal string
+        for (s, expected) in [
+            ("0.13", 0.13), ("0.18", 0.18), ("0.25", 0.25), ("0.35", 0.35),
+            ("0.50", 0.50), ("0.70", 0.70), ("1.00", 1.00), ("1.40", 1.40), ("2.00", 2.00),
+        ] {
+            let cmd = parse(&format!("lineweight last {s}")).unwrap();
+            let Command::Lineweight { mm, .. } = cmd else { panic!("expected Lineweight") };
+            assert!((mm - expected).abs() < 1e-9, "'{s}' → {mm}, expected {expected}");
+        }
+        // iso-prefix forms
+        for (s, expected) in [("iso13", 0.13), ("iso18", 0.18), ("iso100", 1.00), ("iso140", 1.40)] {
+            let cmd = parse(&format!("lineweight last {s}")).unwrap();
+            let Command::Lineweight { mm, .. } = cmd else { panic!("expected Lineweight") };
+            assert!((mm - expected).abs() < 1e-9, "'{s}' → {mm}, expected {expected}");
+        }
+        // Near-miss snaps: 0.349 should snap to 0.35
+        let cmd = parse("lineweight last 0.349").unwrap();
+        let Command::Lineweight { mm, .. } = cmd else { panic!() };
+        assert!((mm - 0.35).abs() < 1e-9, "0.349 should snap to 0.35, got {mm}");
+    }
+
+    /// exec + undo + redo for `lineweight`, `lineweightoff`, and `showweights`.
+    #[test]
+    fn lineweight_exec_undo_redo() {
+        use crate::parse;
+
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 5,0,0");
+        let id = s.doc.objects().next().unwrap().id;
+
+        // Initially no per-object override; default layer is 0.18.
+        assert!(s.doc.objects().next().unwrap().lineweight_mm.is_none());
+        assert!((s.doc.effective_lineweight(s.doc.get(id).unwrap()) - 0.18).abs() < 1e-9);
+
+        // Set lineweight.
+        let out = run(&mut s, "lineweight last 0.50");
+        assert!(out.message.contains("0.500"));
+        assert!((s.doc.get(id).unwrap().lineweight_mm.unwrap() - 0.50).abs() < 1e-9);
+        assert!((s.doc.effective_lineweight(s.doc.get(id).unwrap()) - 0.50).abs() < 1e-9);
+
+        // Undo restores None.
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).unwrap().lineweight_mm.is_none());
+
+        // Redo re-applies.
+        run(&mut s, "redo");
+        assert!((s.doc.get(id).unwrap().lineweight_mm.unwrap() - 0.50).abs() < 1e-9);
+
+        // lineweightoff clears the override.
+        run(&mut s, "lineweightoff last");
+        assert!(s.doc.get(id).unwrap().lineweight_mm.is_none());
+        run(&mut s, "undo");
+        assert!((s.doc.get(id).unwrap().lineweight_mm.unwrap() - 0.50).abs() < 1e-9);
+        run(&mut s, "redo");
+        assert!(s.doc.get(id).unwrap().lineweight_mm.is_none());
+
+        // showweights toggle.
+        assert!(!s.doc.show_lineweights);
+        run(&mut s, "showweights on");
+        assert!(s.doc.show_lineweights);
+        run(&mut s, "undo");
+        assert!(!s.doc.show_lineweights);
+        run(&mut s, "redo");
+        assert!(s.doc.show_lineweights);
+        run(&mut s, "showweights off");
+        assert!(!s.doc.show_lineweights);
+    }
+
+    /// Per-object lineweight beats layer lineweight in effective_lineweight().
+    #[test]
+    fn per_object_lineweight_beats_layer() {
+        use crate::parse;
+
+        let mut s = Session::default();
+        run(&mut s, "layer walls");
+        s.run(parse("layerweight walls 0.35").unwrap()).unwrap();
+        run(&mut s, "line 0,0,0 1,0,0"); // on "walls" layer (current layer)
+        let id = s.doc.objects().next().unwrap().id;
+
+        // Without per-object override, effective = layer weight 0.35.
+        assert!((s.doc.effective_lineweight(s.doc.get(id).unwrap()) - 0.35).abs() < 1e-9);
+
+        // Set per-object override to 1.00 — must beat the layer's 0.35.
+        run(&mut s, "lineweight last 1.00");
+        assert!((s.doc.effective_lineweight(s.doc.get(id).unwrap()) - 1.00).abs() < 1e-9);
+
+        // After lineweightoff, reverts to layer weight.
+        run(&mut s, "lineweightoff last");
+        assert!((s.doc.effective_lineweight(s.doc.get(id).unwrap()) - 0.35).abs() < 1e-9);
+    }
+
+    /// Replay stability: lineweight commands survive to_json → from_json → to_json
+    /// with byte-identical JSON and stable ids.
+    #[test]
+    fn lineweight_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 5,0,0");
+        run(&mut s, "line 0,0,0 0,5,0");
+        run(&mut s, "lineweight last 2 0.70");
+        run(&mut s, "showweights on");
+        assert_replay_stable(&s);
+    }
+
+    /// Pre-lineweight serde compatibility: a SceneObject JSON without the
+    /// `lineweight_mm` field must still deserialize, defaulting it to None.
+    #[test]
+    fn pre_lineweight_scene_object_loads() {
+        let json = r#"{
+            "id": "00000000000000000000000000000002",
+            "name": null,
+            "layer": "default",
+            "visible": true,
+            "geometry": { "geo": "points", "positions": [] }
+        }"#;
+        let obj: itsjustcad_doc::SceneObject = serde_json::from_str(json).unwrap();
+        assert!(obj.lineweight_mm.is_none(), "missing lineweight_mm must default to None");
+        // Re-serialized object must omit the field (skip_serializing_if None).
+        let back = serde_json::to_value(&obj).unwrap();
+        assert!(back.get("lineweight_mm").is_none(), "None lineweight_mm must not serialize");
+    }
+
+    /// Pre-show_lineweights Document JSON must load cleanly, defaulting to false.
+    #[test]
+    fn pre_show_lineweights_document_loads() {
+        // A minimal file without `show_lineweights` in the doc snapshot
+        // must load without error and default to false.
+        let json = r#"{"itsjustcad":1,"ops":[]}"#;
+        let s = crate::io::from_json(json).unwrap();
+        assert!(!s.doc.show_lineweights, "missing show_lineweights must default to false");
     }
 }

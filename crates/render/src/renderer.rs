@@ -261,15 +261,21 @@ pub struct SceneData {
     /// `[0.5, 0.0]` (mid-rough dielectric) when the object has no `material2`.
     pub meshes: Vec<(RenderMesh, [f32; 4], [f32; 2])>,
     /// Line strips: consecutive points, `closed` handled by repeating the seam
-    /// point on the CPU side.
-    pub lines: Vec<(Vec<[f32; 3]>, [f32; 4])>,
+    /// point on the CPU side. The `f32` is the effective lineweight in mm
+    /// (per-object override or layer weight, whichever wins). Used to generate
+    /// fat-line quads when `show_lineweights` is on.
+    pub lines: Vec<(Vec<[f32; 3]>, [f32; 4], f32)>,
     /// Mesh feature edges as flat segment lists (point pairs), drawn in the
-    /// wireframe/x-ray/ghosted display modes.
-    pub edges: Vec<(Vec<[f32; 3]>, [f32; 4])>,
+    /// wireframe/x-ray/ghosted display modes. Lineweight follows the object's
+    /// effective weight.
+    pub edges: Vec<(Vec<[f32; 3]>, [f32; 4], f32)>,
     /// Point clouds: flat list of positions, rendered as PointList.
     pub points: Vec<(Vec<[f32; 3]>, [f32; 4])>,
     /// Optional raster reference image on the ground plane.
     pub underlay: Option<UnderlayData>,
+    /// When true the renderer draws fat-line quads for lines with
+    /// non-hairline weights; when false all strokes are 1-pixel hairlines.
+    pub show_lineweights: bool,
 }
 
 /// Owns all wgpu resources; lives in egui-wgpu's `CallbackResources` type map.
@@ -787,9 +793,14 @@ impl SceneRenderer {
         generation: u64,
     ) {
         use wgpu::util::DeviceExt as _;
+        // The `show_lineweights` flag controls an egui overlay drawn by the app;
+        // the wgpu pipeline always renders 1-pixel hairlines (wgpu does not support
+        // variable line width per-draw-call on WebGPU/Metal/Vulkan). The app reads
+        // `scene.show_lineweights` and draws a thick-stroke egui overlay on top.
         self.set_meshes(device, &scene.meshes, generation);
+
         self.lines.clear();
-        for (points, color) in &scene.lines {
+        for (points, color, _lw_mm) in &scene.lines {
             if points.len() < 2 {
                 continue;
             }
@@ -805,7 +816,7 @@ impl SceneRenderer {
             });
         }
         self.edges.clear();
-        for (points, color) in &scene.edges {
+        for (points, color, _lw_mm) in &scene.edges {
             if points.len() < 2 {
                 continue;
             }

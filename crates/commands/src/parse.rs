@@ -625,6 +625,31 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("coloroff", rest, &args)?;
             Ok(Command::ColorOff { targets: sel })
         }
+        "lineweight" => {
+            let (sel, rest) = selector(&args, "lineweight")?;
+            match rest {
+                ["off"] => Ok(Command::LinweightOff { targets: sel }),
+                [mm_or_name] => {
+                    let mm = iso_pen_mm(mm_or_name).ok_or_else(|| {
+                        wrong_err("lineweight", "a positive mm value or ISO pen name (0.13/0.18/0.25/0.35/0.50/0.70/1.00/1.40/2.00) or 'off'", &args)
+                    })?;
+                    Ok(Command::Lineweight { targets: sel, mm })
+                }
+                _ => wrong("lineweight", "a selector then a mm value or 'off'", &args),
+            }
+        }
+        "linweightoff" | "lineweightoff" => {
+            let (sel, rest) = selector(&args, "lineweightoff")?;
+            expect_empty("lineweightoff", rest, &args)?;
+            Ok(Command::LinweightOff { targets: sel })
+        }
+        "showweights" => {
+            match args.as_slice() {
+                ["on"] => Ok(Command::ShowWeights { on: true }),
+                ["off"] => Ok(Command::ShowWeights { on: false }),
+                _ => wrong("showweights", "'on' or 'off'", &args),
+            }
+        }
         "material2" => {
             let (sel, rest) = selector(&args, "material2")?;
             material2_body(sel, rest, &args)
@@ -1357,6 +1382,39 @@ fn material2_body(
             })
         }
     }
+}
+
+/// Parse an ISO 128 pen width by name or raw mm value.
+/// Named picks: 0.13 / 0.18 / 0.25 / 0.35 / 0.50 / 0.70 / 1.00 / 1.40 / 2.00.
+/// Also accepts the alternate "iso13", "iso18", … form.
+/// Returns `None` if the string is not a valid ISO pen or positive number.
+fn iso_pen_mm(s: &str) -> Option<f64> {
+    const ISO_PENS: [f64; 9] = [0.13, 0.18, 0.25, 0.35, 0.50, 0.70, 1.00, 1.40, 2.00];
+    // Strip optional "iso" prefix for "iso13", "iso18", "iso25" etc.
+    let bare = s.strip_prefix("iso").unwrap_or(s);
+    // Try named ISO pen: integer hundredths ("13" → 0.13, "25" → 0.25, "100" → 1.00)
+    if let Ok(hundredths) = bare.parse::<u32>() {
+        let mm = hundredths as f64 / 100.0;
+        if ISO_PENS.iter().any(|&p| (p - mm).abs() < 1e-9) {
+            return Some(mm);
+        }
+    }
+    // Try as a raw decimal mm value.
+    if let Ok(mm) = bare.parse::<f64>()
+        && mm > 0.0
+    {
+        // Snap to nearest ISO pen if within 5% tolerance; otherwise accept raw value.
+        let nearest = ISO_PENS.iter().copied().min_by(|a, b| {
+            (a - mm).abs().partial_cmp(&(b - mm).abs()).unwrap()
+        });
+        if let Some(n) = nearest
+            && (n - mm).abs() / mm < 0.05
+        {
+            return Some(n);
+        }
+        return Some(mm);
+    }
+    None
 }
 
 fn color3(s: &str) -> Result<[f32; 3], ParseError> {

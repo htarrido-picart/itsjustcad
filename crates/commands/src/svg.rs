@@ -119,12 +119,14 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
     let dir = DEFAULT_DIR; // always top-down for now (no live camera in export path)
 
     // Collect all projected 2D segments per layer.
+    // Each segment carries its effective lineweight in mm (per-object beats layer).
     // Text annotations are tessellated by collect_segments via the Hershey
     // stroke font and flow through as regular line segments.
     struct LayerData {
         name: String,
         style: LayerStyle,
-        segs: Vec<(DVec2, DVec2)>,
+        /// (projected_a, projected_b, effective_lineweight_mm)
+        segs: Vec<(DVec2, DVec2, f64)>,
     }
 
     // Gather layers in document layer order (alphabetical + default first).
@@ -157,6 +159,7 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
         if !obj.visible || !doc.layer_visible(&obj.layer) {
             continue;
         }
+        let eff_lw = doc.effective_lineweight(obj);
         let layer_data = layers
             .iter_mut()
             .find(|l| l.name == obj.layer)
@@ -168,7 +171,7 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
             let pb = project(dir, *b);
             all_pts.push(pa);
             all_pts.push(pb);
-            layer_data.segs.push((pa, pb));
+            layer_data.segs.push((pa, pb, eff_lw));
         }
         total_segs += world_segs.len();
     }
@@ -220,20 +223,29 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
         }
         layer_count += 1;
         let stroke = css_color(layer.style.color);
-        let sw = layer.style.lineweight_mm / 1000.0; // mm → meters (SVG user-units)
+        let layer_sw = layer.style.lineweight_mm / 1000.0; // mm → meters (SVG user-units)
         svg.push_str(&format!(
             "  <g id=\"{}\" stroke=\"{}\" stroke-width=\"{}\" fill=\"none\">\n",
             xml_escape(&layer.name),
             stroke,
-            svg_num(sw),
+            svg_num(layer_sw),
         ));
 
-        // Emit each segment as a separate `<line>`.
-        for (a, b) in &layer.segs {
+        // Emit each segment as a separate `<line>`. Per-object lineweight
+        // overrides are expressed as a `stroke-width` attribute on the element
+        // when they differ from the layer default.
+        for (a, b, eff_lw) in &layer.segs {
+            let seg_sw = eff_lw / 1000.0;
+            let override_attr = if (seg_sw - layer_sw).abs() > 1e-9 {
+                format!(" stroke-width=\"{}\"", svg_num(seg_sw))
+            } else {
+                String::new()
+            };
             svg.push_str(&format!(
-                "    <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\"/>\n",
+                "    <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\"{}/>\n",
                 svg_num(a.x), svg_num(a.y),
                 svg_num(b.x), svg_num(b.y),
+                override_attr,
             ));
             path_count += 1;
         }

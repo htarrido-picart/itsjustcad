@@ -167,6 +167,7 @@ mod tests {
             layer: itsjustcad_doc::DEFAULT_LAYER.to_string(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry,
         });
         doc
@@ -269,6 +270,7 @@ mod tests {
                 layer: itsjustcad_doc::DEFAULT_LAYER.to_string(),
                 color: None,
                 material: None,
+                lineweight_mm: None,
                 geometry: Geometry::Mesh(kernel_mesh::make_box(corner, corner + DVec3::ONE)),
             });
         }

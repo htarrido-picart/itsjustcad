@@ -241,6 +241,7 @@ pub fn render_headless(
     path: &std::path::Path,
     view: &HeadlessView,
 ) -> Result<(), String> {
+    use glam::DVec3;
     use itsjustcad_render::{
         SceneRenderer, Theme, camera_uniform_with_mode, snapshot, DEPTH_FORMAT,
     };
@@ -261,7 +262,60 @@ pub fn render_headless(
             .map_err(|e| e.to_string())?;
 
     let mut renderer = SceneRenderer::new(&device, FORMAT);
-    let scene = snapshot(&session.doc, theme);
+    let mut scene = snapshot(&session.doc, theme);
+
+    // When show_lineweights is on, add thick-line quad meshes for each line
+    // with a non-hairline lineweight. In headless mode the egui painter overlay
+    // is unavailable, so we tessellate fat lines into mesh geometry instead.
+    if session.doc.show_lineweights {
+        // Scale: 1 mm lineweight → 0.05 m world-space half-width. At typical
+        // building scale (lines spanning metres) a 2 mm pen produces a 10 cm
+        // wide ribbon, clearly distinct from a 0.18 mm hairline.
+        const HALF_WIDTH_PER_MM: f64 = 0.05;
+        let hairline_mm = 0.18_f32;
+        for (pts, color, lw_mm) in scene.lines.iter().filter(|(_, _, lw)| *lw > hairline_mm) {
+            let half = (*lw_mm as f64) * HALF_WIDTH_PER_MM;
+            if pts.len() < 2 {
+                continue;
+            }
+            // Build ribbon quads per segment: two perpendicular ribbons form a
+            // cross-section so the fat line is visible from any camera angle.
+            let mut positions = Vec::new();
+            let mut faces: Vec<[u32; 3]> = Vec::new();
+            // Two-sided quad: push both winding orders so the ribbon is visible
+            // from either side regardless of camera angle (no culling needed).
+            let push_quad = |positions: &mut Vec<DVec3>, faces: &mut Vec<[u32; 3]>,
+                              a: DVec3, b: DVec3, perp: DVec3| {
+                let i = positions.len() as u32;
+                positions.push(a - perp); // 0
+                positions.push(a + perp); // 1
+                positions.push(b + perp); // 2
+                positions.push(b - perp); // 3
+                // Front face (counter-clockwise when viewed from perp direction).
+                faces.push([i, i + 1, i + 2]);
+                faces.push([i, i + 2, i + 3]);
+                // Back face (reverse winding) — makes ribbon visible from both sides.
+                faces.push([i, i + 2, i + 1]);
+                faces.push([i, i + 3, i + 2]);
+            };
+            for pair in pts.windows(2) {
+                let a = DVec3::new(pair[0][0] as f64, pair[0][1] as f64, pair[0][2] as f64);
+                let b = DVec3::new(pair[1][0] as f64, pair[1][1] as f64, pair[1][2] as f64);
+                let dir = (b - a).normalize_or_zero();
+                // XY-plane perpendicular ribbon (visible from above).
+                let perp_xy = DVec3::new(-dir.y, dir.x, 0.0) * half;
+                push_quad(&mut positions, &mut faces, a, b, perp_xy);
+                // Z-direction ribbon (visible from the side).
+                let perp_z = DVec3::new(0.0, 0.0, 1.0) * half;
+                push_quad(&mut positions, &mut faces, a, b, perp_z);
+            }
+            if !faces.is_empty() {
+                let mesh = kernel_mesh::Mesh::new(positions, faces);
+                scene.meshes.push((mesh.to_render(), *color, [0.0_f32, 0.0_f32]));
+            }
+        }
+    }
+
     renderer.set_scene(&device, &queue, &scene, 0);
 
     let aspect = W as f32 / H as f32;

@@ -447,6 +447,11 @@ pub struct SceneObject {
     /// Serde default keeps pre-material JSON loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub material: Option<ObjectMaterial>,
+    /// Per-object lineweight override in mm (`lineweight` command). `None`
+    /// defers to the layer lineweight. Serde default keeps pre-lineweight
+    /// JSON loading (old files have no field → None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineweight_mm: Option<f64>,
     pub geometry: Geometry,
 }
 

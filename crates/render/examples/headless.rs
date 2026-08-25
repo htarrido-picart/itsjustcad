@@ -76,9 +76,10 @@ fn main() {
                 (box_b.to_render(), mesh_color, [0.5, 0.0]),
             ],
             lines: vec![],
-            edges: vec![(edges_a, edge_color), (edges_b, edge_color)],
+            edges: vec![(edges_a, edge_color, 0.18), (edges_b, edge_color, 0.18)],
             points: vec![],
             underlay: None,
+            show_lineweights: false,
         };
         renderer.set_scene(&device, &queue, &scene, 0);
         camera.target = glam::Vec3::new(0.5, 0.0, 2.5);

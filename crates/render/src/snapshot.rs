@@ -57,8 +57,12 @@ impl Theme {
     }
 }
 
+/// A scene line entry: (points, rgba, lineweight_mm).
+type SceneLine = (Vec<[f32; 3]>, [f32; 4], f32);
+
 /// Push segment pairs as 2-point line strips into the scene lines list.
-fn push_hatch_segs(lines: &mut Vec<(Vec<[f32; 3]>, [f32; 4])>, segs: Vec<[DVec3; 2]>, color: [f32; 4]) {
+/// `lw_mm` is the effective lineweight in mm for the owning object.
+fn push_hatch_segs(lines: &mut Vec<SceneLine>, segs: Vec<[DVec3; 2]>, color: [f32; 4], lw_mm: f32) {
     for [a, b] in segs {
         lines.push((
             vec![
@@ -66,6 +70,7 @@ fn push_hatch_segs(lines: &mut Vec<(Vec<[f32; 3]>, [f32; 4])>, segs: Vec<[DVec3;
                 [b.x as f32, b.y as f32, b.z as f32],
             ],
             color,
+            lw_mm,
         ));
     }
 }
@@ -160,6 +165,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
         // The underlay image is decoded app-side (the app owns the `image`
         // dependency) and attached to the returned scene.
         underlay: None,
+        show_lineweights: doc.show_lineweights,
     };
     for obj in doc.objects() {
         if !obj.visible {
@@ -171,6 +177,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
         }
         let layer_color = style.and_then(|s| s.color);
         let selected = doc.selection.contains(&obj.id);
+        let lw_mm = doc.effective_lineweight(obj) as f32;
         match &obj.geometry {
             // Frame/area structural members carry a derived mesh; render them
             // exactly like a solid mesh.
@@ -191,7 +198,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                         ]
                     })
                     .collect();
-                scene.edges.push((segments, edge_color));
+                scene.edges.push((segments, edge_color, lw_mm));
             }
             Geometry::Curve(curve) => {
                 let color = resolve_color(obj, layer_color, theme, selected, mode, false);
@@ -205,7 +212,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                 {
                     pts.push(first); // close the strip
                 }
-                scene.lines.push((pts, color));
+                scene.lines.push((pts, color, lw_mm));
             }
             // Hatches are scene geometry (fill triangles / pattern lines);
             // dimensions and text are drawn as an egui overlay by the app.
@@ -230,23 +237,23 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                         }
                     }
                     HatchPattern::Lines { angle_deg, spacing } => {
-                        push_hatch_segs(&mut scene.lines, hatch_lines(boundary, *angle_deg, *spacing), color);
+                        push_hatch_segs(&mut scene.lines, hatch_lines(boundary, *angle_deg, *spacing), color, lw_mm);
                     }
                     HatchPattern::Crosshatch { angle_deg, spacing } => {
-                        push_hatch_segs(&mut scene.lines, hatch_lines(boundary, *angle_deg, *spacing), color);
-                        push_hatch_segs(&mut scene.lines, hatch_lines(boundary, *angle_deg + 90.0, *spacing), color);
+                        push_hatch_segs(&mut scene.lines, hatch_lines(boundary, *angle_deg, *spacing), color, lw_mm);
+                        push_hatch_segs(&mut scene.lines, hatch_lines(boundary, *angle_deg + 90.0, *spacing), color, lw_mm);
                     }
                     HatchPattern::Brick { spacing } => {
-                        push_hatch_segs(&mut scene.lines, hatch_brick(boundary, *spacing), color);
+                        push_hatch_segs(&mut scene.lines, hatch_brick(boundary, *spacing), color, lw_mm);
                     }
                     HatchPattern::Concrete { spacing } => {
-                        push_hatch_segs(&mut scene.lines, hatch_concrete(boundary, *spacing), color);
+                        push_hatch_segs(&mut scene.lines, hatch_concrete(boundary, *spacing), color, lw_mm);
                     }
                     HatchPattern::Insulation { spacing } => {
-                        push_hatch_segs(&mut scene.lines, hatch_insulation(boundary, *spacing), color);
+                        push_hatch_segs(&mut scene.lines, hatch_insulation(boundary, *spacing), color, lw_mm);
                     }
                     HatchPattern::Earth { spacing } => {
-                        push_hatch_segs(&mut scene.lines, hatch_earth(boundary, *spacing), color);
+                        push_hatch_segs(&mut scene.lines, hatch_earth(boundary, *spacing), color, lw_mm);
                     }
                 }
             }
@@ -263,7 +270,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                         .map(|p| [p[0] as f32, p[1] as f32, pos.z as f32])
                         .collect();
                     if pts.len() >= 2 {
-                        scene.lines.push((pts, color));
+                        scene.lines.push((pts, color, lw_mm));
                     }
                 }
             }
@@ -302,7 +309,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                                         ]
                                     })
                                     .collect();
-                                scene.edges.push((segments, color));
+                                scene.edges.push((segments, color, lw_mm));
                             }
                             itsjustcad_doc::BlockGeometry::Curve(c) => {
                                 let mut pts: Vec<[f32; 3]> = c
@@ -318,7 +325,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                                 {
                                     pts.push(first);
                                 }
-                                scene.lines.push((pts, color));
+                                scene.lines.push((pts, color, lw_mm));
                             }
                             itsjustcad_doc::BlockGeometry::Annotation(_) => {
                                 // Annotations in block definitions are not rendered in
@@ -358,6 +365,7 @@ mod tests {
             layer: layer.to_string(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Mesh(mesh),
         };
         let id = obj.id;
@@ -399,6 +407,7 @@ mod tests {
             layer: "default".into(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Mesh(kernel_mesh::make_box(
                 DVec3::ZERO,
                 DVec3::new(2.0, 1.0, 3.0),
@@ -447,6 +456,7 @@ mod tests {
             layer: "default".into(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Hatch {
                 boundary: square.clone(),
                 pattern: itsjustcad_doc::HatchPattern::Solid,
@@ -464,6 +474,7 @@ mod tests {
             layer: "default".into(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Hatch {
                 boundary: square,
                 pattern: itsjustcad_doc::HatchPattern::Lines { angle_deg: 0.0, spacing: 0.5 },
@@ -473,7 +484,7 @@ mod tests {
         assert!(scene.meshes.is_empty());
         // horizontal lines at y = 0.5, 1.0, 1.5, 2.0 that survive clipping
         assert!(!scene.lines.is_empty());
-        for (strip, _) in &scene.lines {
+        for (strip, _, _) in &scene.lines {
             assert_eq!(strip.len(), 2);
         }
     }
@@ -489,6 +500,7 @@ mod tests {
             layer: "default".into(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::LinearDim {
                 a: DVec3::ZERO,
                 b: DVec3::X,
@@ -508,6 +520,7 @@ mod tests {
             layer: "default".into(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Text {
                 pos: DVec3::ZERO,
                 text: "note".into(),
@@ -641,6 +654,7 @@ mod tests {
             layer: "default".into(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Instance {
                 block: "tri".to_string(),
                 position: DVec3::new(5.0, 0.0, 0.0),
@@ -687,6 +701,7 @@ mod tests {
             layer: "default".into(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
                 points: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
                 closed: true,

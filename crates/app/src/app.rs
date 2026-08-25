@@ -1286,6 +1286,12 @@ impl App {
             self.draw_annotations(ui, rect, view_proj, theme);
             // Structural loads (arrows) and supports (symbols) overlay.
             self.draw_struct_overlays(ui, rect, view_proj);
+            // Lineweight overlay: when showweights is on, re-draw curves with
+            // physical stroke widths via the egui painter (wgpu cannot vary
+            // line width per-draw-call on WebGPU/Metal/Vulkan).
+            if self.session.doc.show_lineweights {
+                self.draw_lineweights_overlay(ui, rect, view_proj, theme);
+            }
 
             if panes.len() > 1 {
                 let color = if pane == self.active_pane {
@@ -1580,6 +1586,72 @@ impl App {
                 egui::FontId::proportional(10.0),
                 support_color,
             );
+        }
+    }
+
+    /// Lineweight overlay: when `showweights on` is active, project all visible
+    /// curve objects to screen space and draw them with their effective stroke
+    /// width via the egui painter. This supplements the wgpu 1-pixel hairlines
+    /// (which cannot vary in width per-object on WebGPU/Metal/Vulkan) so that
+    /// weight differences are visible in the live 3D view.
+    ///
+    /// Display scale: 1 mm of lineweight → 4 screen pixels. This is intentionally
+    /// above physical accuracy so differences are clearly legible on typical monitors.
+    fn draw_lineweights_overlay(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        view_proj: glam::Mat4,
+        theme: itsjustcad_render::Theme,
+    ) {
+        use itsjustcad_doc::Geometry;
+        const DISPLAY_TOL: f64 = 0.005;
+        const PX_PER_MM: f32 = 4.0; // exaggerated for legibility
+
+        let painter = ui.painter_at(rect);
+        let doc = &self.session.doc;
+
+        for obj in doc.objects() {
+            if !obj.visible || !doc.layer_visible(&obj.layer) {
+                continue;
+            }
+            let lw_mm = doc.effective_lineweight(obj) as f32;
+            // Only draw objects with non-hairline weight; hairlines are already
+            // rendered by the wgpu pipeline.
+            if lw_mm <= 0.18 {
+                continue;
+            }
+            let width_px = lw_mm * PX_PER_MM;
+            // Resolve display color (simplified: use layer color or theme default).
+            let layer_color = doc.layers.get(&obj.layer).and_then(|s| s.color);
+            let base_color = obj.color
+                .map(|[r, g, b]| [r, g, b, 1.0])
+                .or(layer_color)
+                .unwrap_or(theme.curve());
+            let egui_color = egui::Color32::from_rgba_unmultiplied(
+                (base_color[0] * 255.0) as u8,
+                (base_color[1] * 255.0) as u8,
+                (base_color[2] * 255.0) as u8,
+                (base_color[3] * 255.0) as u8,
+            );
+            let stroke = egui::Stroke::new(width_px, egui_color);
+
+            // Project curve points to screen and draw.
+            if let Geometry::Curve(curve) = &obj.geometry {
+                let pts: Vec<egui::Pos2> = curve
+                    .tessellate(DISPLAY_TOL)
+                    .iter()
+                    .filter_map(|&p| project(view_proj, rect, p))
+                    .collect();
+                for pair in pts.windows(2) {
+                    painter.line_segment([pair[0], pair[1]], stroke);
+                }
+                if curve.is_closed()
+                    && let (Some(&first), Some(&last)) = (pts.first(), pts.last())
+                {
+                    painter.line_segment([last, first], stroke);
+                }
+            }
         }
     }
 

@@ -8,7 +8,7 @@
 
 use glam::{DVec2, DVec3};
 use itsjustcad_doc::{
-    Annotation, Document, Geometry, LayerStyle, ScheduleRow, Sheet, SheetDim, SheetView,
+    Annotation, Document, Geometry, ScheduleRow, Sheet, SheetDim, SheetView,
     ViewDirection,
 };
 
@@ -185,11 +185,6 @@ fn render_sheet_dim(d: &SheetDim, view_scale: f64, content: &mut String) {
     emit_dim_text(a_off, b_off, &label, content);
 }
 
-/// Default fallback style when a layer has no explicit entry.
-fn default_style() -> LayerStyle {
-    LayerStyle::default()
-}
-
 /// Liang-Barsky clip of a 2D segment to an axis-aligned rect. Returns the
 /// clipped endpoints, or `None` when fully outside.
 fn clip(a: DVec2, b: DVec2, min: DVec2, max: DVec2) -> Option<(DVec2, DVec2)> {
@@ -262,20 +257,17 @@ fn render_view(
         view.scale
     ));
 
-    // Collect (lineweight_mm, world-segment) pairs, preserving layer weight.
+    // Collect (lineweight_mm, world-segment) pairs.
+    // Per-object lineweight beats layer lineweight (mirror the color override pattern).
     let mut weighted_segs: Vec<(f64, DVec3, DVec3)> = Vec::new();
     for obj in doc.objects() {
         if obj.visible && doc.layer_visible(&obj.layer) {
-            let fallback = default_style();
-            let style = doc.layers.get(&obj.layer).unwrap_or(&fallback);
-            let w = style.lineweight_mm;
-            let base = weighted_segs.len();
+            let w = doc.effective_lineweight(obj);
             let mut tmp = Vec::new();
             geometry_segments(&obj.geometry, &mut tmp);
             for (a, b) in tmp {
                 weighted_segs.push((w, a, b));
             }
-            let _ = base; // silence unused-variable
         }
     }
     if weighted_segs.is_empty() {

@@ -32,6 +32,7 @@ fn box_obj(min: DVec3, size: DVec3, layer: &str) -> SceneObject {
         visible: true,
         color: None,
         material: None,
+        lineweight_mm: None,
         geometry: Geometry::Mesh(kernel_mesh::make_box(min, size)),
     }
 }

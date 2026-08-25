@@ -426,6 +426,22 @@ pub enum Command {
     ShowObj {
         targets: Selector,
     },
+    // -- per-object lineweight --
+    /// Set a per-object lineweight override in mm. Beats layer lineweight.
+    /// Accepts raw mm values (e.g. 0.35) or ISO pen names (iso13 → 0.13 mm).
+    Lineweight {
+        targets: Selector,
+        mm: f64,
+    },
+    /// Clear per-object lineweight override (reverts to layer lineweight).
+    LinweightOff {
+        targets: Selector,
+    },
+    /// Toggle viewport lineweight display (on|off). When on, strokes render
+    /// at their real weight; when off they render as 1-pixel hairlines.
+    ShowWeights {
+        on: bool,
+    },
     // -- per-object color --
     /// Set a per-object color override (RGB 0..1 or 0..255). Beats layer color.
     Color {

@@ -202,7 +202,7 @@ fn check_or_bless(actual: &image::RgbaImage, name: &str) {
 fn make_renderer(
     ctx: &GpuContext,
     meshes: Vec<(kernel_mesh::RenderMesh, [f32; 4], [f32; 2])>,
-    lines: Vec<(Vec<[f32; 3]>, [f32; 4])>,
+    lines: Vec<(Vec<[f32; 3]>, [f32; 4], f32)>,
     camera: &OrbitCamera,
 ) -> SceneRenderer {
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
@@ -214,6 +214,7 @@ fn make_renderer(
             edges: vec![],
             points: vec![],
             underlay: None,
+            show_lineweights: false,
         };
         renderer.set_scene(&ctx.device, &ctx.queue, &data, 0);
     }
@@ -315,6 +316,7 @@ fn golden_underlay_dark() {
         edges: vec![],
         points: vec![],
         underlay: Some(underlay),
+        show_lineweights: false,
     };
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
     renderer.set_scene(&ctx.device, &ctx.queue, &data, 0);

@@ -80,6 +80,12 @@ pub struct Document {
     /// pre-support files loading cleanly.
     #[serde(default)]
     pub supports: Vec<StructSupport>,
+    /// When `true`, the viewport renders curve strokes at their real lineweight
+    /// instead of 1-pixel hairlines. Toggled by `showweights on|off`. Logged
+    /// so saved files replay with the same setting. `serde(default)` keeps old
+    /// files loading (they default to `false` = hairlines, the old behaviour).
+    #[serde(default)]
+    pub show_lineweights: bool,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -107,6 +113,7 @@ impl Default for Document {
             stories: Vec::new(),
             loads: Vec::new(),
             supports: Vec::new(),
+            show_lineweights: false,
             generation: 0,
         }
     }
@@ -116,6 +123,15 @@ impl Document {
     /// Visibility of the layer an object sits on (unknown layers are visible).
     pub fn layer_visible(&self, layer: &str) -> bool {
         self.layers.get(layer).is_none_or(|l| l.visible)
+    }
+
+    /// Effective lineweight for an object: per-object override beats layer weight.
+    /// Falls back to 0.18 mm (ISO thin) if neither is set.
+    pub fn effective_lineweight(&self, obj: &SceneObject) -> f64 {
+        if let Some(w) = obj.lineweight_mm {
+            return w;
+        }
+        self.layers.get(&obj.layer).map(|s| s.lineweight_mm).unwrap_or(0.18)
     }
 
     pub fn objects(&self) -> impl Iterator<Item = &SceneObject> {
@@ -273,6 +289,7 @@ mod tests {
             layer: DEFAULT_LAYER.to_string(),
             color: None,
             material: None,
+            lineweight_mm: None,
             geometry: Geometry::Mesh(mesh),
         }
     }
