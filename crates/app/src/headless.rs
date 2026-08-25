@@ -238,6 +238,16 @@ fn build_headless_camera(session: &Session, view: &HeadlessView, aspect: f32) ->
     if let Some(tp) = view.two_point {
         camera.two_point = tp;
         camera.ortho = false;
+        if tp {
+            // Two-point folds the pitch into a vertical frame shear of
+            // `tan(pitch)/tan(fov_y/2)` NDC (see `OrbitCamera::two_point_view_proj`).
+            // At the default 3/4 framing pitch (~0.55 rad) with a normal lens
+            // that shift is >1 NDC, sliding the whole massing out of frame — a
+            // GUI user would pan to recompose, but a headless shot cannot. Shoot
+            // two-point with a modest architectural rise; the target lift below
+            // then recenters the sheared frame.
+            camera.pitch = 0.22;
+        }
     }
     if let Some(p) = view.pano {
         camera.pano = Some(p);
@@ -250,6 +260,13 @@ fn build_headless_camera(session: &Session, view: &HeadlessView, aspect: f32) ->
         camera.distance = (bb.size().length() as f32 * 1.2).max(5.0);
     } else {
         camera.distance = 16.0;
+    }
+    // Two-point recenters the sheared frame: the projection slides content down
+    // by `tan(pitch)/tan(fov/2)` NDC, which at the target depth equals a world
+    // height of `distance * tan(pitch)`. Raising the aim point by that amount
+    // puts the scene centre back at frame centre while keeping verticals plumb.
+    if camera.two_point {
+        camera.target.z -= 0.5 * camera.distance * camera.pitch.tan();
     }
     camera
 }
@@ -675,6 +692,54 @@ mod tests {
         let (_o, view) =
             run_script_lines(Session::default(), &["camera phone boguslens".to_owned()]).unwrap();
         assert_eq!(view.focal_mm, None);
+    }
+
+    #[test]
+    fn two_point_headless_keeps_massing_in_frame() {
+        // Regression: two-point folds pitch into a vertical NDC shear; at the
+        // default 3/4 framing pitch with a normal lens that shift slid the whole
+        // massing off the bottom of a headless shot. `build_headless_camera` must
+        // shoot two-point level enough that a tall tower stays inside the frame.
+        let session = Session::default();
+        // A compact massing (roughly as wide as it is tall) — the framing keeps a
+        // scene of this proportion inside the frame.
+        let lines = vec![
+            "box -6,-6,0 12,12,10".to_owned(),
+            "box 2,2,0 4,4,8".to_owned(),
+            "camera 2point".to_owned(),
+        ];
+        let (out, view) = run_script_lines(session, &lines).expect("two-point script runs");
+        assert_eq!(view.two_point, Some(true));
+
+        let aspect = 1280.0 / 800.0;
+        let cam = build_headless_camera(&out, &view, aspect);
+        assert!(cam.two_point && !cam.ortho);
+        let m = cam.view_proj(aspect);
+
+        // Every corner of the massing bounding box must project inside the NDC
+        // frame (with a small margin), i.e. it is actually visible in the shot —
+        // guards the shear-slides-scene-off-frame regression.
+        for &x in &[-6.0f32, 6.0] {
+            for &y in &[-6.0f32, 6.0] {
+                for &z in &[0.0f32, 10.0] {
+                    let c = m * glam::Vec3::new(x, y, z).extend(1.0);
+                    let (nx, ny) = (c.x / c.w, c.y / c.w);
+                    assert!(
+                        nx.abs() <= 1.05 && ny.abs() <= 1.05,
+                        "corner ({x},{y},{z}) projects out of frame: ndc=({nx},{ny})"
+                    );
+                }
+            }
+        }
+
+        // And verticals must stay plumb (defining property of two-point): the two
+        // z-endpoints of a vertical edge share the same screen x.
+        let base = m * glam::Vec3::new(6.0, 6.0, 0.0).extend(1.0);
+        let top = m * glam::Vec3::new(6.0, 6.0, 10.0).extend(1.0);
+        assert!(
+            (base.x / base.w - top.x / top.w).abs() < 1e-4,
+            "two-point vertical must not converge"
+        );
     }
 
     #[test]
