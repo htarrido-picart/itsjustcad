@@ -6,6 +6,9 @@ struct Camera {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     eye: vec4<f32>,
+    misc: vec4<f32>,
+    // x = lighting mode, y = background gradient flag (1 = sky/ground gradient).
+    light: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -46,18 +49,46 @@ fn grid_factor(coord: vec2<f32>, spacing: f32) -> f32 {
     return 1.0 - min(line, 1.0);
 }
 
+// Sky/ground gradient for the SketchUp-style background. `up` is the world-ray
+// z component in [-1,1]: a light sky above the horizon fading to a warm ground
+// haze below.
+fn sky_ground(up: f32) -> vec3<f32> {
+    let sky = vec3<f32>(0.62, 0.72, 0.86);
+    let horizon = vec3<f32>(0.86, 0.88, 0.90);
+    let ground = vec3<f32>(0.52, 0.50, 0.47);
+    if (up >= 0.0) {
+        return mix(horizon, sky, clamp(up * 1.4, 0.0, 1.0));
+    }
+    return mix(horizon, ground, clamp(-up * 1.4, 0.0, 1.0));
+}
+
 @fragment
 fn fs_main(in: VsOut) -> FsOut {
     let near = unproject(in.ndc, 0.0);
     let far = unproject(in.ndc, 1.0);
     let dir = far - near;
 
+    let gradient = camera.light.y > 0.5;
+
     // Intersect z = 0
     if (abs(dir.z) < 1e-9) {
+        if (gradient) {
+            var out: FsOut;
+            out.color = vec4(sky_ground(normalize(dir).z), 1.0);
+            out.depth = 0.9999;
+            return out;
+        }
         discard;
     }
     let t = -near.z / dir.z;
     if (t <= 0.0 || t >= 1.0) {
+        // Ray does not hit the ground within the view frustum → sky region.
+        if (gradient) {
+            var out: FsOut;
+            out.color = vec4(sky_ground(normalize(dir).z), 1.0);
+            out.depth = 0.9999;
+            return out;
+        }
         discard;
     }
     let hit = near + dir * t;
@@ -85,6 +116,18 @@ fn fs_main(in: VsOut) -> FsOut {
         color = mix(color, vec3(0.25, 0.75, 0.30), ay);
         alpha = max(alpha, ay * 0.8 * fade);
     }
+    if (gradient) {
+        // Composite the grid lines over an opaque gradient ground so the sky
+        // and ground read as one continuous background (SketchUp look). The
+        // ground colour comes from the down-facing gradient, lifted slightly.
+        let ground = sky_ground(-clamp(fade, 0.0, 1.0)) + vec3<f32>(0.03, 0.03, 0.03);
+        let lit = mix(ground, color, clamp(alpha, 0.0, 1.0));
+        var out: FsOut;
+        out.color = vec4(lit, 1.0); // opaque
+        out.depth = depth;
+        return out;
+    }
+
     if (alpha < 0.003) {
         discard;
     }

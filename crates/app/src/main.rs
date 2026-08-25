@@ -41,7 +41,8 @@ fn cli_help_text() -> String {
          \x20 --headless                  No window (required for --shot without a display)\n\
          \n\
          Scripts may also use app-level verbs: ze/zoomextents, the standard views\n\
-         (top/front/persp/…), camera <lens>, display <mode>, save [path], help [verb].\n\
+         (top/front/persp/…), camera <lens>, display <mode>, lightmode <mode>,\n\
+         profileedges [on|off], sketchup, save [path], help [verb].\n\
          These frame/style the --shot render. GUI-only verbs (template, critique) are\n\
          ignored with a warning.\n\
          \n\

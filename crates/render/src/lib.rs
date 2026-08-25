@@ -21,7 +21,8 @@ pub use pano::{
 };
 pub use layout::ViewportLayout;
 pub use renderer::{
-    hue_from_seed, CameraUniform, ColorMode, DisplayMode, SceneData, SceneRenderer, UnderlayData,
+    hue_from_seed, CameraUniform, ColorMode, DisplayMode, LightMode, SceneData, SceneRenderer,
+    UnderlayData,
 };
 pub use snapshot::{snapshot, snapshot_with_mode, ColorModeSnapshot, Theme};
 pub use viewport_callback::ViewportCallback;
@@ -30,17 +31,47 @@ pub fn camera_uniform(view_proj: glam::Mat4, eye: glam::Vec3) -> CameraUniform {
     camera_uniform_with_mode(view_proj, eye, DisplayMode::default())
 }
 
-/// Build a camera uniform encoding the given display mode and no sun.
+/// Build a camera uniform encoding the given display mode, the default
+/// (Working) lighting mode, and no sun.
 pub fn camera_uniform_with_mode(
     view_proj: glam::Mat4,
     eye: glam::Vec3,
     mode: DisplayMode,
 ) -> CameraUniform {
+    camera_uniform_full(view_proj, eye, mode, LightMode::default(), None)
+}
+
+/// Build a camera uniform with an explicit lighting mode and optional sun
+/// direction (unit vector, X=East Y=North Z=Up). `sun_dir` is only consulted
+/// by the Sun lighting mode in the shader; pass `None` for the others.
+pub fn camera_uniform_full(
+    view_proj: glam::Mat4,
+    eye: glam::Vec3,
+    mode: DisplayMode,
+    light: LightMode,
+    sun_dir: Option<[f32; 3]>,
+) -> CameraUniform {
+    camera_uniform_ex(view_proj, eye, mode, light, sun_dir, false)
+}
+
+/// Full camera-uniform builder. `background_gradient` turns on the sky/ground
+/// gradient the grid shader paints behind the scene (the SketchUp look);
+/// when false the flat clear colour shows through.
+pub fn camera_uniform_ex(
+    view_proj: glam::Mat4,
+    eye: glam::Vec3,
+    mode: DisplayMode,
+    light: LightMode,
+    sun_dir: Option<[f32; 3]>,
+    background_gradient: bool,
+) -> CameraUniform {
+    let (sx, sy, sz) = sun_dir.map(|d| (d[0], d[1], d[2])).unwrap_or((0.0, 0.0, 0.0));
     CameraUniform {
         view_proj: view_proj.to_cols_array_2d(),
         inv_view_proj: view_proj.inverse().to_cols_array_2d(),
         eye: [eye.x, eye.y, eye.z, 1.0],
-        misc: [mode.fill_alpha(), 0.0, 0.0, 0.0],
+        misc: [mode.fill_alpha(), sx, sy, sz],
+        light: [light.shader_flag(), if background_gradient { 1.0 } else { 0.0 }, 0.0, 0.0],
     }
 }
 

@@ -13,6 +13,69 @@ use crate::renderer::{hue_from_seed, ColorMode, SceneData};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ColorModeSnapshot {
     pub color_mode: ColorMode,
+    /// When true, mesh feature edges are classified into profile (silhouette /
+    /// sharp crease) vs interior, and profile edges are emitted as thick ribbon
+    /// outlines (`SceneData::profile_edges`) — the SketchUp "objects have
+    /// lineweight" look. Interior edges stay as thin lines. Off by default so
+    /// existing render paths are unchanged.
+    pub profile_edges: bool,
+}
+
+/// Dark "ink" color for SketchUp-style profile edges — a near-black charcoal
+/// that reads as a bold outline on both dark viewports and the light sky/ground
+/// gradient background.
+const PROFILE_INK: [f32; 4] = [0.08, 0.08, 0.10, 1.0];
+
+/// Ribbon half-width (world units) for profile edges. ~2 cm at building scale
+/// reads as a bold outline against the thin (1-pixel) interior edges without
+/// swamping small detail.
+const PROFILE_HALF_WIDTH: f32 = 0.02;
+
+/// Dihedral threshold: faces meeting at a sharper angle than this are a
+/// form-defining crease → profile edge. cos(30°) ≈ 0.866; normals whose dot is
+/// below this (angle > 30°) count as sharp. Boundary edges are always profile.
+const PROFILE_CREASE_COS: f64 = 0.866;
+
+/// Classify a mesh's feature edges into (profile, interior) segment lists.
+/// Mirrors `kernel_mesh::feature_edges` but keeps the adjacency so we can tell a
+/// silhouette/crease edge (thick) from a soft interior edge (thin). An edge is
+/// PROFILE when it is a boundary edge (belongs to one face) or the two adjacent
+/// faces meet at a sharp dihedral angle; otherwise it is INTERIOR.
+fn classify_edges(mesh: &kernel_mesh::Mesh) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+    use std::collections::BTreeMap;
+    let pos = mesh.positions();
+    let mut edges: BTreeMap<(u32, u32), Vec<DVec3>> = BTreeMap::new();
+    for face in mesh.faces() {
+        let [a, b, c] = face.map(|i| pos[i as usize]);
+        let n = (b - a).cross(c - a).normalize_or_zero();
+        for (i, j) in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
+            edges.entry((i.min(j), i.max(j))).or_default().push(n);
+        }
+    }
+    let mut profile = Vec::new();
+    let mut interior = Vec::new();
+    for ((i, j), normals) in edges {
+        // Coplanar interior diagonal (2 faces, same normal): not a feature edge
+        // at all — matches feature_edges, skip entirely.
+        let coplanar = normals.len() == 2 && normals[0].dot(normals[1]) > 1.0 - 1e-9;
+        if coplanar {
+            continue;
+        }
+        let a = pos[i as usize];
+        let b = pos[j as usize];
+        let seg = [
+            [a.x as f32, a.y as f32, a.z as f32],
+            [b.x as f32, b.y as f32, b.z as f32],
+        ];
+        let is_profile = normals.len() != 2 // boundary / non-manifold edge
+            || normals[0].dot(normals[1]) < PROFILE_CREASE_COS; // sharp crease
+        if is_profile {
+            profile.extend_from_slice(&seg);
+        } else {
+            interior.extend_from_slice(&seg);
+        }
+    }
+    (profile, interior)
 }
 
 /// Chord tolerance for display tessellation of curves.
@@ -163,6 +226,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
         meshes: Vec::new(),
         lines: Vec::new(),
         edges: Vec::new(),
+        profile_edges: Vec::new(),
         points: Vec::new(),
         // The underlay image is decoded app-side (the app owns the `image`
         // dependency) and attached to the returned scene.
@@ -191,16 +255,29 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                 scene.meshes.push((mesh.to_render(), color, rm));
                 // Feature edges for the wireframe/x-ray/ghosted display modes.
                 let edge_color = if selected { theme.selected() } else { theme.curve() };
-                let segments: Vec<[f32; 3]> = kernel_mesh::feature_edges(mesh)
-                    .iter()
-                    .flat_map(|(a, b)| {
-                        [
-                            [a.x as f32, a.y as f32, a.z as f32],
-                            [b.x as f32, b.y as f32, b.z as f32],
-                        ]
-                    })
-                    .collect();
-                scene.edges.push((segments, edge_color, lw_mm));
+                if cms.profile_edges {
+                    // SketchUp look: thin interior edges + thick profile ribbons.
+                    // Profile ribbons are drawn in dark "ink" (unless selected)
+                    // so they read as bold outlines on the light gradient
+                    // background — theme.curve() would be near-white and vanish.
+                    let (profile, interior) = classify_edges(mesh);
+                    scene.edges.push((interior, edge_color, lw_mm));
+                    if !profile.is_empty() {
+                        let ink = if selected { theme.selected() } else { PROFILE_INK };
+                        scene.profile_edges.push((profile, ink, PROFILE_HALF_WIDTH));
+                    }
+                } else {
+                    let segments: Vec<[f32; 3]> = kernel_mesh::feature_edges(mesh)
+                        .iter()
+                        .flat_map(|(a, b)| {
+                            [
+                                [a.x as f32, a.y as f32, a.z as f32],
+                                [b.x as f32, b.y as f32, b.z as f32],
+                            ]
+                        })
+                        .collect();
+                    scene.edges.push((segments, edge_color, lw_mm));
+                }
             }
             Geometry::Curve(curve) => {
                 let color = resolve_color(obj, layer_color, theme, selected, mode, false);
@@ -397,6 +474,46 @@ mod tests {
         let scene = snapshot(&doc, Theme::Dark);
         assert_eq!(scene.meshes.len(), 1);
         assert_eq!(scene.edges.len(), 1, "hidden mesh contributes no edges");
+    }
+
+    #[test]
+    fn box_all_edges_are_profile_creases() {
+        // A box's 12 edges are all 90° creases → all profile, none interior.
+        let b = kernel_mesh::make_box(DVec3::ZERO, DVec3::new(2.0, 1.0, 3.0));
+        let (profile, interior) = super::classify_edges(&b);
+        // 12 edges → 24 endpoints in the profile list.
+        assert_eq!(profile.len(), 24, "all box edges are sharp profile edges");
+        assert!(interior.is_empty(), "a box has no soft interior edges");
+    }
+
+    #[test]
+    fn profile_mode_populates_profile_edges_and_thins_interior() {
+        let mut doc = Document::default();
+        doc.insert(SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: "default".into(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Mesh(kernel_mesh::make_box(
+                DVec3::ZERO,
+                DVec3::new(2.0, 1.0, 3.0),
+            )),
+        });
+        // Default (profile off): all edges in scene.edges, none profile.
+        let off = snapshot(&doc, Theme::Dark);
+        assert!(off.profile_edges.is_empty());
+        assert_eq!(off.edges[0].0.len(), 24);
+
+        // Profile on: profile list populated, interior edge list empty for a box.
+        let cms = ColorModeSnapshot { profile_edges: true, ..Default::default() };
+        let on = snapshot_with_mode(&doc, Theme::Dark, cms);
+        assert_eq!(on.profile_edges.len(), 1, "one mesh → one profile entry");
+        assert_eq!(on.profile_edges[0].0.len(), 24, "12 profile edges");
+        assert!(on.profile_edges[0].2 > 0.0, "profile ribbons carry a half-width");
+        assert!(on.edges[0].0.is_empty(), "box has no thin interior edges");
     }
 
     #[test]
@@ -685,7 +802,7 @@ mod tests {
         let id = doc.all_ids()[0];
         doc.get_mut(id).unwrap().color = Some([1.0, 0.0, 0.0]);
 
-        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::ByObject };
+        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::ByObject, ..Default::default() };
         let scene = snapshot_with_mode(&doc, Theme::Dark, cms);
         // First object should be red (object color wins)
         assert_eq!(scene.meshes[0].1, [1.0, 0.0, 0.0, 1.0]);
@@ -712,7 +829,7 @@ mod tests {
             }),
         });
 
-        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::ByType };
+        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::ByType, ..Default::default() };
         let scene = snapshot_with_mode(&doc, Theme::Dark, cms);
         assert!(!scene.meshes.is_empty());
         assert!(!scene.lines.is_empty());
@@ -725,7 +842,7 @@ mod tests {
     #[test]
     fn random_mode_differs_per_object() {
         let doc = two_mesh_doc();
-        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::Random };
+        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::Random, ..Default::default() };
         let scene = snapshot_with_mode(&doc, Theme::Dark, cms);
         assert_eq!(scene.meshes.len(), 2);
         // Two distinct objects should (almost certainly) get different random colors.
@@ -736,7 +853,7 @@ mod tests {
     #[test]
     fn random_mode_is_stable_across_calls() {
         let doc = two_mesh_doc();
-        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::Random };
+        let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::Random, ..Default::default() };
         let scene1 = snapshot_with_mode(&doc, Theme::Dark, cms);
         let scene2 = snapshot_with_mode(&doc, Theme::Dark, cms);
         assert_eq!(scene1.meshes[0].1, scene2.meshes[0].1, "random color must be stable");

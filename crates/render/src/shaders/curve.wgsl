@@ -7,6 +7,7 @@ struct Camera {
     inv_view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     misc: vec4<f32>,
+    light: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;

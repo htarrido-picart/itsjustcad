@@ -252,6 +252,10 @@ pub struct App {
     display_modes: [DisplayMode; 4],
     /// Color mode per camera slot (view state; never logged).
     color_modes: [ColorMode; 4],
+    /// Lighting model for mesh fills (Working / Sun / Presentation). View state.
+    light_mode: itsjustcad_render::LightMode,
+    /// SketchUp-style thick profile / silhouette edges. View state.
+    profile_edges: bool,
     layout: ViewportLayout,
     /// Last hovered pane; view commands and tools target its camera.
     active_pane: usize,
@@ -261,6 +265,8 @@ pub struct App {
     uploaded_theme: Option<scene::Theme>,
     /// Color mode of the last GPU upload; mode changes force a re-upload.
     uploaded_color_mode: Option<ColorMode>,
+    /// Profile-edge flag of the last GPU upload; toggling forces a re-upload.
+    uploaded_profile_edges: Option<bool>,
     /// Last zoom factor written to ui.json (avoid rewriting every frame).
     saved_zoom: f32,
     /// Dev self-verification: ITSJUSTCAD_SHOT=<path.png> captures a frame and exits.
@@ -454,6 +460,8 @@ impl App {
             },
             display_modes: [DisplayMode::default(); 4],
             color_modes: [ColorMode::default(); 4],
+            light_mode: itsjustcad_render::LightMode::default(),
+            profile_edges: false,
             layout: match preset::preset_for(cad_origin).default_viewports {
                 4 => ViewportLayout::Four,
                 2 => ViewportLayout::Two,
@@ -463,6 +471,7 @@ impl App {
             uploaded_generation: None,
             uploaded_theme: None,
             uploaded_color_mode: None,
+            uploaded_profile_edges: None,
             saved_zoom: zoom,
             shot_path: std::env::var("ITSJUSTCAD_SHOT").ok(),
             startup_script: std::env::var("ITSJUSTCAD_RUN").ok(),
@@ -605,6 +614,43 @@ impl App {
                         .push_line("usage: display shaded|wireframe|xray|ghosted|pencil");
                 }
             },
+            // Lighting model (Working hemispheric / Sun / Presentation). View
+            // state, never logged.
+            Some("lightmode" | "light") => {
+                match words.next().and_then(itsjustcad_render::LightMode::parse) {
+                    Some(m) => {
+                        self.light_mode = m;
+                        self.command_line
+                            .push_line(format!("lightmode: {}", m.label().to_lowercase()));
+                    }
+                    None => {
+                        self.command_line
+                            .push_line("usage: lightmode working|sun|presentation");
+                    }
+                }
+            }
+            // Toggle SketchUp-style thick profile / silhouette edges.
+            Some("profileedges" | "profiles") => {
+                let on = match words.next() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => !self.profile_edges, // bare toggle
+                };
+                self.profile_edges = on;
+                self.command_line
+                    .push_line(format!("profile edges: {}", if on { "on" } else { "off" }));
+            }
+            // "SketchUp" display preset: Working hemispheric shading + thick
+            // profile edges + shaded display. Combines the ergonomics of the
+            // default lighting with the recognisable profile-edge look.
+            Some("sketchup" | "su") => {
+                self.light_mode = itsjustcad_render::LightMode::Working;
+                self.profile_edges = true;
+                self.display_modes[self.layout.camera_index(self.active_pane)] =
+                    DisplayMode::Shaded;
+                self.command_line
+                    .push_line("preset: sketchup (working light + profile edges)");
+            }
             Some("viewports" | "vp") => {
                 match words.next() {
                     Some("1") => self.set_layout(ViewportLayout::Single),
@@ -1228,17 +1274,22 @@ impl App {
         let active_color_mode = self.color_modes[self.layout.camera_index(self.active_pane)];
         let stale = self.uploaded_generation != Some(generation)
             || self.uploaded_theme != Some(theme)
-            || self.uploaded_color_mode != Some(active_color_mode);
+            || self.uploaded_color_mode != Some(active_color_mode)
+            || self.uploaded_profile_edges != Some(self.profile_edges);
         // Scene is uploaded once (renderer shared); only the first pane's
         // callback carries the snapshot, the rest just set their camera.
         let mut scene = if stale {
             self.uploaded_generation = Some(generation);
             self.uploaded_theme = Some(theme);
             self.uploaded_color_mode = Some(active_color_mode);
+            self.uploaded_profile_edges = Some(self.profile_edges);
             let mut s = scene::snapshot_with_mode(
                 &self.session.doc,
                 theme,
-                itsjustcad_render::ColorModeSnapshot { color_mode: active_color_mode },
+                itsjustcad_render::ColorModeSnapshot {
+                    color_mode: active_color_mode,
+                    profile_edges: self.profile_edges,
+                },
             );
             s.underlay = self.decode_underlay();
             Some(s)
@@ -1391,6 +1442,8 @@ impl App {
                     viewport: pane,
                     mode: self.display_modes[cam_idx],
                     sun_dir,
+                    light: self.light_mode,
+                    background_gradient: self.profile_edges,
                 },
             ));
 

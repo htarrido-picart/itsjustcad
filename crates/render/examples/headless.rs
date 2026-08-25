@@ -77,6 +77,7 @@ fn main() {
             ],
             lines: vec![],
             edges: vec![(edges_a, edge_color, 0.18), (edges_b, edge_color, 0.18)],
+            profile_edges: vec![],
             points: vec![],
             underlay: None,
             show_lineweights: false,
@@ -205,5 +206,7 @@ fn main() {
         viewport: 0,
         mode,
         sun_dir: None,
+        light: itsjustcad_render::LightMode::default(),
+        background_gradient: false,
     };
 }

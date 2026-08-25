@@ -8,7 +8,7 @@
 
 use crate::app_verbs::{self, AppVerb};
 use itsjustcad_commands::{Session, parse};
-use itsjustcad_render::{DisplayMode, OrbitCamera, PanoProjection, StandardView};
+use itsjustcad_render::{DisplayMode, LightMode, OrbitCamera, PanoProjection, StandardView};
 
 // ── Headless view state ─────────────────────────────────────────────────────────
 
@@ -28,6 +28,11 @@ pub struct HeadlessView {
     pub pano: Option<PanoProjection>,
     /// Display mode, from `display <mode>`.
     pub display: DisplayMode,
+    /// Lighting model, from `lightmode <mode>`.
+    pub light: LightMode,
+    /// SketchUp-style thick profile edges + gradient background, from
+    /// `profileedges [on|off]` or the `sketchup` preset.
+    pub profile_edges: bool,
 }
 
 // ── Script parsing ────────────────────────────────────────────────────────────
@@ -76,6 +81,15 @@ pub fn run_script_lines(
             }
             Some(AppVerb::View(v)) => view.view = Some(v),
             Some(AppVerb::Display(mode)) => view.display = mode,
+            Some(AppVerb::Light(m)) => view.light = m,
+            Some(AppVerb::ProfileEdges(on)) => {
+                view.profile_edges = on.unwrap_or(!view.profile_edges)
+            }
+            Some(AppVerb::SketchUp) => {
+                view.light = LightMode::Working;
+                view.profile_edges = true;
+                view.display = DisplayMode::Shaded;
+            }
             Some(AppVerb::Camera(arg, arg2)) => {
                 apply_camera(&mut view, arg.as_deref(), arg2.as_deref())
             }
@@ -243,7 +257,8 @@ pub fn render_headless(
 ) -> Result<(), String> {
     use glam::DVec3;
     use itsjustcad_render::{
-        SceneRenderer, Theme, camera_uniform_with_mode, snapshot, DEPTH_FORMAT,
+        camera_uniform_ex, snapshot_with_mode, ColorModeSnapshot, SceneRenderer, Theme,
+        DEPTH_FORMAT,
     };
 
     const W: u32 = 1280;
@@ -262,7 +277,11 @@ pub fn render_headless(
             .map_err(|e| e.to_string())?;
 
     let mut renderer = SceneRenderer::new(&device, FORMAT);
-    let mut scene = snapshot(&session.doc, theme);
+    let mut scene = snapshot_with_mode(
+        &session.doc,
+        theme,
+        ColorModeSnapshot { profile_edges: view.profile_edges, ..Default::default() },
+    );
 
     // When show_lineweights is on, add thick-line quad meshes for each line
     // with a non-hairline lineweight. In headless mode the egui painter overlay
@@ -341,7 +360,18 @@ pub fn render_headless(
 
     let view_proj = camera.view_proj(aspect);
     let eye = camera.eye();
-    let cam = camera_uniform_with_mode(view_proj, eye, mode);
+    let sun_dir = session
+        .doc
+        .sun
+        .map(|s| itsjustcad_solar::sun_direction(s.azimuth_deg, s.altitude_deg));
+    let cam = camera_uniform_ex(
+        view_proj,
+        eye,
+        mode,
+        view.light,
+        sun_dir,
+        view.profile_edges, // SketchUp preset → gradient background
+    );
     renderer.write_camera(&device, &queue, 0, &cam);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
@@ -486,6 +516,33 @@ mod tests {
         assert_eq!(view.view, Some(StandardView::Front));
         assert_eq!(view.focal_mm, Some(35.0));
         assert_eq!(view.display, DisplayMode::Pencil);
+    }
+
+    #[test]
+    fn lightmode_and_profile_verbs_accumulate() {
+        let session = Session::default();
+        let lines = vec![
+            "lightmode sun".to_owned(),
+            "profileedges on".to_owned(),
+        ];
+        let (_out, view) = run_script_lines(session, &lines).expect("light verbs run");
+        assert_eq!(view.light, LightMode::Sun);
+        assert!(view.profile_edges);
+    }
+
+    #[test]
+    fn sketchup_preset_sets_working_light_and_profiles() {
+        let session = Session::default();
+        // Start from a non-default state to prove the preset overrides it.
+        let lines = vec![
+            "lightmode presentation".to_owned(),
+            "display wireframe".to_owned(),
+            "sketchup".to_owned(),
+        ];
+        let (_out, view) = run_script_lines(session, &lines).expect("preset runs");
+        assert_eq!(view.light, LightMode::Working);
+        assert_eq!(view.display, DisplayMode::Shaded);
+        assert!(view.profile_edges);
     }
 
     #[test]

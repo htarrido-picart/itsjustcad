@@ -4,7 +4,7 @@
 use egui_wgpu::CallbackTrait;
 use glam::Mat4;
 
-use crate::renderer::{CameraUniform, DisplayMode, SceneData, SceneRenderer};
+use crate::renderer::{CameraUniform, DisplayMode, LightMode, SceneData, SceneRenderer};
 
 /// Per-frame paint callback for the 3D viewport. Uploads the camera, rebuilds
 /// scene buffers when the document generation changed, then draws the scene.
@@ -19,9 +19,14 @@ pub struct ViewportCallback {
     pub viewport: usize,
     /// Display mode of this pane (shaded/wireframe/x-ray/ghosted).
     pub mode: DisplayMode,
-    /// Unit vector toward the sun (X=East, Y=North, Z=Up). When `None` the
-    /// shader falls back to the headlight (eye-direction) shading.
+    /// Unit vector toward the sun (X=East, Y=North, Z=Up). Only consulted by
+    /// the `Sun` lighting mode; `None` leaves the sun slot zeroed.
     pub sun_dir: Option<[f32; 3]>,
+    /// Lighting model for the mesh fill (Working / Sun / Presentation).
+    pub light: LightMode,
+    /// When true the grid shader paints a sky/ground gradient background behind
+    /// the scene (SketchUp look) instead of the flat clear colour.
+    pub background_gradient: bool,
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -34,8 +39,8 @@ impl CallbackTrait for ViewportCallback {
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let renderer: &mut SceneRenderer = resources.get_mut().expect("SceneRenderer registered");
-        // misc[0] = fill_alpha (display mode)
-        // misc[1..3] = sun direction xyz (0 = headlight fallback)
+        // misc[0] = fill_alpha (display mode); misc[1..3] = sun direction xyz.
+        // light[0] = lighting mode flag.
         let (sx, sy, sz) = self
             .sun_dir
             .map(|d| (d[0], d[1], d[2]))
@@ -45,6 +50,12 @@ impl CallbackTrait for ViewportCallback {
             inv_view_proj: self.view_proj.inverse().to_cols_array_2d(),
             eye: [self.eye.x, self.eye.y, self.eye.z, 1.0],
             misc: [self.mode.fill_alpha(), sx, sy, sz],
+            light: [
+                self.light.shader_flag(),
+                if self.background_gradient { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
         };
         renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene

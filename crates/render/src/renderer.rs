@@ -12,8 +12,63 @@ pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
     pub inv_view_proj: [[f32; 4]; 4],
     pub eye: [f32; 4],
-    /// x = mesh fill alpha multiplier (display mode); y,z,w spare.
+    /// x = mesh fill alpha multiplier (display mode).
+    /// y,z,w = sun direction xyz (all-zero = no sun / headlight fallback).
     pub misc: [f32; 4],
+    /// x = lighting mode (0 = Working hemispheric, 1 = Sun, 2 = Presentation).
+    /// y,z,w spare. GPU-only view state; never serialized (no replay concern).
+    pub light: [f32; 4],
+}
+
+/// Lighting model applied to mesh fills. Decoupled from [`DisplayMode`]: a pane
+/// can be Shaded *and* in any lighting mode. View state — never logged.
+///
+/// * `Working` (default): hemispheric sky/ground ambient fill + one soft 3/4
+///   directional key, matte. The ambient floor guarantees no face reads fully
+///   black (accessibility min-luminance floor) so geometry stays readable while
+///   orienting the model. No specular.
+/// * `Sun`: the real SPA solar direction is the key light (for shadow / solar
+///   studies) but a hemispheric ambient floor still lifts grazing faces off
+///   black. No specular.
+/// * `Presentation`: adds Blinn-Phong specular driven by the material presets
+///   (glass shiny, concrete matte) on top of the Working fill.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LightMode {
+    #[default]
+    Working,
+    Sun,
+    Presentation,
+}
+
+impl LightMode {
+    pub const ALL: [LightMode; 3] = [LightMode::Working, LightMode::Sun, LightMode::Presentation];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LightMode::Working => "Working",
+            LightMode::Sun => "Sun",
+            LightMode::Presentation => "Presentation",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "working" | "work" => Some(LightMode::Working),
+            "sun" | "solar" => Some(LightMode::Sun),
+            "presentation" | "present" | "pbr" => Some(LightMode::Presentation),
+            _ => None,
+        }
+    }
+
+    /// Value written to `camera.light.x`, read by the mesh shader to branch the
+    /// lighting model.
+    pub fn shader_flag(self) -> f32 {
+        match self {
+            LightMode::Working => 0.0,
+            LightMode::Sun => 1.0,
+            LightMode::Presentation => 2.0,
+        }
+    }
 }
 
 /// Per-viewport display mode. View state, not model state: never logged.
@@ -130,6 +185,57 @@ impl ColorMode {
     }
 }
 
+/// A CPU ribbon mesh (flat f32 buffers) for a fat profile edge.
+struct EdgeRibbon {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    indices: Vec<u32>,
+}
+
+/// Tessellate a segment list (consecutive point pairs) into a fat-line ribbon:
+/// for each segment, two perpendicular quads (an XY-plane ribbon and a Z-plane
+/// ribbon) forming a `+` cross-section, so the thick outline is visible from any
+/// camera angle. `half` is the ribbon half-width in world units. The points
+/// come in as pairs (`edge` segment soup); odd trailing points are ignored.
+fn build_edge_ribbon(points: &[[f32; 3]], half: f32) -> EdgeRibbon {
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut push_quad = |a: glam::Vec3, b: glam::Vec3, perp: glam::Vec3| {
+        let n = perp.normalize_or_zero().to_array();
+        let i = positions.len() as u32;
+        for p in [a - perp, a + perp, b + perp, b - perp] {
+            positions.push(p.to_array());
+            normals.push(n);
+        }
+        // Front + back winding so the ribbon shows from either side.
+        indices.extend_from_slice(&[i, i + 1, i + 2, i, i + 2, i + 3]);
+        indices.extend_from_slice(&[i, i + 2, i + 1, i, i + 3, i + 2]);
+    };
+    let n = points.len() / 2 * 2;
+    let mut k = 0;
+    while k + 1 < n {
+        let a = glam::Vec3::from_array(points[k]);
+        let b = glam::Vec3::from_array(points[k + 1]);
+        k += 2;
+        let dir = (b - a).normalize_or_zero();
+        if dir == glam::Vec3::ZERO {
+            continue;
+        }
+        // XY-plane perpendicular (visible from above).
+        let perp_xy = glam::Vec3::new(-dir.y, dir.x, 0.0).normalize_or_zero() * half;
+        // A perpendicular that has a Z component (visible from the side).
+        let perp_z = dir.cross(perp_xy).normalize_or_zero() * half;
+        if perp_xy != glam::Vec3::ZERO {
+            push_quad(a, b, perp_xy);
+        }
+        if perp_z != glam::Vec3::ZERO {
+            push_quad(a, b, perp_z);
+        }
+    }
+    EdgeRibbon { positions, normals, indices }
+}
+
 /// Stable hue for a given u64 seed (e.g. hash of object id bytes).
 /// Returns a fully-saturated, medium-lightness RGBA color.
 pub fn hue_from_seed(seed: u64) -> [f32; 4] {
@@ -158,7 +264,69 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::DisplayMode;
+    use super::{DisplayMode, LightMode};
+
+    #[test]
+    fn light_mode_default_is_working() {
+        assert_eq!(LightMode::default(), LightMode::Working);
+    }
+
+    #[test]
+    fn light_mode_parse_round_trip() {
+        for (s, expected) in [
+            ("working", LightMode::Working),
+            ("work", LightMode::Working),
+            ("sun", LightMode::Sun),
+            ("solar", LightMode::Sun),
+            ("presentation", LightMode::Presentation),
+            ("present", LightMode::Presentation),
+            ("pbr", LightMode::Presentation),
+        ] {
+            assert_eq!(LightMode::parse(s), Some(expected), "parse({s:?})");
+        }
+        assert_eq!(LightMode::parse("nope"), None);
+    }
+
+    #[test]
+    fn light_mode_labels_parse_back() {
+        for m in LightMode::ALL {
+            // label lowercased must parse back to the same mode.
+            assert_eq!(LightMode::parse(&m.label().to_lowercase()), Some(m));
+        }
+    }
+
+    #[test]
+    fn light_mode_shader_flags_distinct() {
+        let flags: Vec<f32> = LightMode::ALL.iter().map(|m| m.shader_flag()).collect();
+        assert_eq!(flags, vec![0.0, 1.0, 2.0]);
+    }
+
+    // Mirror of the mesh.wgsl hemispheric fill so the ambient-floor invariant is
+    // checked in pure Rust on every `cargo test` (the shader itself only runs on
+    // a GPU). If you change the constants in mesh.wgsl, change them here too.
+    fn hemispheric_ambient(nz: f32) -> f32 {
+        let up = (nz * 0.5 + 0.5).clamp(0.0, 1.0);
+        0.30 + (0.65 - 0.30) * up // mix(0.30, 0.65, up)
+    }
+    fn diffuse_floor(nz: f32, key: f32) -> f32 {
+        // diffuse = ambient + 0.55 * max(dot(n, key_dir), 0)
+        hemispheric_ambient(nz) + 0.55 * key.max(0.0)
+    }
+
+    #[test]
+    fn ambient_floor_keeps_faces_off_black() {
+        // A face pointing straight DOWN (nz=-1) with ZERO key contribution still
+        // gets the ground-bounce ambient — luminance must be strictly positive.
+        let lum = diffuse_floor(-1.0, 0.0);
+        assert!(lum > 0.0, "downward face fully unlit must not be black: {lum}");
+        assert!((lum - 0.30).abs() < 1e-6, "ground floor is 0.30, got {lum}");
+
+        // A face turned fully AWAY from the key light (negative dot) still reads
+        // by its hemispheric ambient — no crush to black at any orientation.
+        for nz in [-1.0_f32, -0.5, 0.0, 0.5, 1.0] {
+            assert!(diffuse_floor(nz, -1.0) > 0.0, "nz={nz} away-from-key went black");
+        }
+    }
 
     #[test]
     fn pencil_parse_round_trip() {
@@ -269,6 +437,13 @@ pub struct SceneData {
     /// wireframe/x-ray/ghosted display modes. Lineweight follows the object's
     /// effective weight.
     pub edges: Vec<(Vec<[f32; 3]>, [f32; 4], f32)>,
+    /// PROFILE / silhouette feature edges — the subset of `edges` that lie on
+    /// the object's outline (boundary edges or sharp creases). Drawn THICKER
+    /// than interior edges to get the SketchUp "objects have lineweight" look.
+    /// Each entry is `(segment points, rgba, half_width_world)` where the ribbon
+    /// half-width has already been baked so the renderer can build fat-line
+    /// quads. Empty when profile edges are disabled for the pane.
+    pub profile_edges: Vec<(Vec<[f32; 3]>, [f32; 4], f32)>,
     /// Point clouds: flat list of positions, rendered as PointList.
     pub points: Vec<(Vec<[f32; 3]>, [f32; 4])>,
     /// Optional raster reference image on the ground plane.
@@ -301,6 +476,9 @@ pub struct SceneRenderer {
     meshes: Vec<GpuMesh>,
     lines: Vec<GpuLine>,
     edges: Vec<GpuLine>,
+    /// Profile / silhouette edges tessellated into fat-line ribbon meshes so
+    /// they render visibly thicker than the 1-pixel interior edge lines.
+    profile_ribbons: Vec<GpuMesh>,
     point_clouds: Vec<GpuLine>,
     underlay: Option<GpuUnderlay>,
     /// Document generation the GPU buffers were built from.
@@ -681,6 +859,7 @@ impl SceneRenderer {
             meshes: Vec::new(),
             lines: Vec::new(),
             edges: Vec::new(),
+            profile_ribbons: Vec::new(),
             point_clouds: Vec::new(),
             underlay: None,
             generation: u64::MAX,
@@ -832,6 +1011,58 @@ impl SceneRenderer {
             });
         }
 
+        // Profile edges → fat-line ribbon meshes. Each segment becomes a small
+        // cross of two perpendicular quads so the thick outline reads from any
+        // camera angle, matching the SketchUp silhouette look.
+        self.profile_ribbons.clear();
+        for (points, color, half) in &scene.profile_edges {
+            if points.len() < 2 || *half <= 0.0 {
+                continue;
+            }
+            let ribbon = build_edge_ribbon(points, *half);
+            if ribbon.indices.is_empty() {
+                continue;
+            }
+            let mut vertices = Vec::with_capacity(ribbon.positions.len() * 6);
+            for (p, n) in ribbon.positions.iter().zip(&ribbon.normals) {
+                vertices.extend_from_slice(p);
+                vertices.extend_from_slice(n);
+            }
+            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("profile_vb"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("profile_ib"),
+                contents: bytemuck::cast_slice(&ribbon.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            // Flatten via material — ribbons want a solid ink look, so we mark
+            // them fully matte; the shader still applies the ambient floor which
+            // keeps a dark, readable outline.
+            let params = ObjectParams { color: *color, material: [1.0, 0.0, 0.0, 0.0] };
+            let object_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("profile_ubo"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let object_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("profile_bg"),
+                layout: &self.object_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: object_buf.as_entire_binding(),
+                }],
+            });
+            self.profile_ribbons.push(GpuMesh {
+                vertex_buf,
+                index_buf,
+                index_count: ribbon.indices.len() as u32,
+                object_bind_group,
+            });
+        }
+
         self.point_clouds.clear();
         for (points, color) in &scene.points {
             if points.is_empty() {
@@ -978,6 +1209,20 @@ impl SceneRenderer {
                 render_pass.set_bind_group(1, &edge.object_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, edge.vertex_buf.slice(..));
                 render_pass.draw(0..edge.vertex_count, 0..1);
+            }
+        }
+
+        // Profile / silhouette ribbons: thick outline meshes. Drawn with the
+        // solid mesh pipeline (depth-writing) so they read as fat ink edges on
+        // top of the fill. Present only when the snapshot populated them.
+        if !self.profile_ribbons.is_empty() {
+            render_pass.set_pipeline(&self.mesh_pipeline);
+            for ribbon in &self.profile_ribbons {
+                render_pass.set_bind_group(1, &ribbon.object_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, ribbon.vertex_buf.slice(..));
+                render_pass
+                    .set_index_buffer(ribbon.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..ribbon.index_count, 0, 0..1);
             }
         }
 

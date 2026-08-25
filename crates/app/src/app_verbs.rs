@@ -17,7 +17,7 @@
 //!     camera, prints `help`, honours `save`, and warns-and-ignores GUI-only
 //!     verbs instead of erroring.
 
-use itsjustcad_render::{DisplayMode, StandardView};
+use itsjustcad_render::{DisplayMode, LightMode, StandardView};
 
 /// An app-level verb that the substrate parser does not own.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +34,14 @@ pub enum AppVerb {
     Camera(Option<String>, Option<String>),
     /// Display mode of the active viewport (`display shaded|wireframe|…`).
     Display(DisplayMode),
+    /// Lighting model (`lightmode working|sun|presentation`).
+    Light(LightMode),
+    /// Toggle SketchUp-style thick profile edges (`profileedges [on|off]`).
+    /// `None` means bare toggle.
+    ProfileEdges(Option<bool>),
+    /// SketchUp display preset (`sketchup`): working light + profile edges +
+    /// gradient background.
+    SketchUp,
     /// Persist the document (`save [path]`). Argument is the optional path.
     Save(Option<String>),
     /// Command reference (`help [verb]`).
@@ -66,6 +74,14 @@ pub fn classify(line: &str) -> Option<AppVerb> {
     Some(match verb {
         "ze" | "zoomextents" => AppVerb::ZoomExtents,
         "display" => AppVerb::Display(words.next().and_then(DisplayMode::parse)?),
+        "lightmode" | "light" => AppVerb::Light(words.next().and_then(LightMode::parse)?),
+        "profileedges" | "profiles" => AppVerb::ProfileEdges(match words.next() {
+            Some("on" | "true" | "1") => Some(true),
+            Some("off" | "false" | "0") => Some(false),
+            None => None,
+            _ => return None,
+        }),
+        "sketchup" | "su" => AppVerb::SketchUp,
         "camera" => AppVerb::Camera(
             words.next().map(str::to_ascii_lowercase),
             words.next().map(str::to_ascii_lowercase),
@@ -100,6 +116,20 @@ mod tests {
             classify("camera fisheye 120"),
             Some(AppVerb::Camera(Some("fisheye".into()), Some("120".into())))
         );
+    }
+
+    #[test]
+    fn classifies_lighting_and_preset_verbs() {
+        assert_eq!(classify("lightmode sun"), Some(AppVerb::Light(LightMode::Sun)));
+        assert_eq!(classify("light working"), Some(AppVerb::Light(LightMode::Working)));
+        // Unknown light mode falls through (not an app verb).
+        assert_eq!(classify("lightmode bogus"), None);
+        assert_eq!(classify("profileedges on"), Some(AppVerb::ProfileEdges(Some(true))));
+        assert_eq!(classify("profileedges off"), Some(AppVerb::ProfileEdges(Some(false))));
+        assert_eq!(classify("profiles"), Some(AppVerb::ProfileEdges(None)));
+        assert_eq!(classify("profileedges garbage"), None);
+        assert_eq!(classify("sketchup"), Some(AppVerb::SketchUp));
+        assert_eq!(classify("su"), Some(AppVerb::SketchUp));
     }
 
     #[test]
