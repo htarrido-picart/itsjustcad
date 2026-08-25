@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright © 2026 Hector Tarrido-Picart
+#![cfg(not(target_os = "linux"))]
 
 //! True native OS menu bar via the `muda` crate (Tauri's menu lib).
 //!

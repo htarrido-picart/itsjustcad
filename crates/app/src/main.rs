@@ -18,6 +18,7 @@ mod keymap;
 mod local_runtime;
 mod menu;
 mod model_catalog;
+#[cfg(not(target_os = "linux"))]
 mod native_menu;
 mod osnap;
 mod point_edit;

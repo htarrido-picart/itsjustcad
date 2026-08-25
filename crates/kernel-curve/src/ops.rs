@@ -507,7 +507,7 @@ pub fn fillet_lines(
     }
     let cos_theta = u.dot(v).clamp(-1.0, 1.0);
     let theta = cos_theta.acos();
-    if theta < 1e-6 || theta > std::f64::consts::PI - 1e-6 {
+    if !(1e-6..=std::f64::consts::PI - 1e-6).contains(&theta) {
         return None; // colinear: no corner to round
     }
     let t = radius / (theta / 2.0).tan();

@@ -363,9 +363,12 @@ pub struct App {
     /// `None` in headless/tests or where native attach is unavailable — the app
     /// then falls back to the in-window egui menu bar. Attached lazily on the
     /// first interactive frame (macOS needs the NSApp to exist first).
+    /// Not compiled on Linux (no muda dependency there).
+    #[cfg(not(target_os = "linux"))]
     native_menu: Option<crate::native_menu::NativeMenuBar>,
     /// Whether we've already tried to attach the native menu bar (once), so a
     /// failed/headless attach isn't retried every frame.
+    #[cfg(not(target_os = "linux"))]
     native_menu_tried: bool,
 }
 
@@ -538,7 +541,9 @@ impl App {
             catalog: crate::model_catalog::Catalog::load(),
             active_download: None,
             icons: crate::icons::Icons::new(),
+            #[cfg(not(target_os = "linux"))]
             native_menu: None,
+            #[cfg(not(target_os = "linux"))]
             native_menu_tried: false,
         }
     }
@@ -549,6 +554,8 @@ impl App {
     /// window, so the native bar is skipped and the in-window egui bar is used.
     /// macOS needs the `NSApplication` to exist first, which it does by the time
     /// the first `ui` runs; hence lazy rather than in `new`.
+    /// Not compiled on Linux (no muda/gtk dependency there).
+    #[cfg(not(target_os = "linux"))]
     fn ensure_native_menu(&mut self, frame: &eframe::Frame) {
         if self.native_menu_tried {
             return;
@@ -2410,6 +2417,8 @@ impl App {
         // File/Edit/… verb menus; the in-window strip then carries only the
         // egui-only Appearance controls (which can't be native items). Verb
         // dispatch arrives from the native bar's event channel (polled in `ui`).
+        // On Linux muda is not compiled in, so this branch is omitted.
+        #[cfg(not(target_os = "linux"))]
         if self.native_menu.is_some() {
             egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
                 crate::menu::appearance_only(ui, icons);
@@ -3056,7 +3065,10 @@ impl eframe::App for App {
         // channel each frame and route any pick through the substrate, exactly
         // like the in-window bar. Request a repaint so native clicks (which don't
         // otherwise wake egui) are handled promptly.
+        // Linux: muda/gtk not available; in-window bar is always used.
+        #[cfg(not(target_os = "linux"))]
         self.ensure_native_menu(frame);
+        #[cfg(not(target_os = "linux"))]
         if let Some(native) = &self.native_menu {
             let action = native.poll();
             if let Some(action) = action {
