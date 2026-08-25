@@ -12,6 +12,21 @@ use crate::{
     DEFAULT_LAYER,
 };
 
+/// Seed the layer table for a brand-new document: "Default" plus
+/// "Layer 01".."Layer 05" (6 layers total). `order` keeps "Default" first,
+/// then the numbered layers in sequence, in the Layers panel.
+fn seed_default_layers() -> BTreeMap<String, LayerStyle> {
+    let mut layers =
+        BTreeMap::from([(DEFAULT_LAYER.to_string(), LayerStyle::default())]);
+    for i in 1..=5 {
+        layers.insert(
+            format!("Layer {i:02}"),
+            LayerStyle { order: i, ..LayerStyle::default() },
+        );
+    }
+    layers
+}
+
 /// Scene state. Mutation happens exclusively through `commands::Session`.
 ///
 /// `Serialize`/`Deserialize` exist only for the optional checkpoint sidecar
@@ -111,7 +126,7 @@ impl Default for Document {
             objects: BTreeMap::new(),
             creation_order: Vec::new(),
             selection: BTreeSet::new(),
-            layers: BTreeMap::from([(DEFAULT_LAYER.to_string(), LayerStyle::default())]),
+            layers: seed_default_layers(),
             current_layer: DEFAULT_LAYER.to_string(),
             sheets: Vec::new(),
             units: Units::default(),
@@ -140,6 +155,17 @@ impl Document {
     /// Visibility of the layer an object sits on (unknown layers are visible).
     pub fn layer_visible(&self, layer: &str) -> bool {
         self.layers.get(layer).is_none_or(|l| l.visible)
+    }
+
+    /// True if `layer` is locked (objects on it are not selectable/editable).
+    /// Unknown layers read unlocked.
+    pub fn layer_locked(&self, layer: &str) -> bool {
+        self.layers.get(layer).is_some_and(|l| l.locked)
+    }
+
+    /// True if the object with `id` sits on a locked layer.
+    pub fn object_locked(&self, id: ObjectId) -> bool {
+        self.objects.get(&id).is_some_and(|o| self.layer_locked(&o.layer))
     }
 
     /// Effective lineweight for an object: per-object override beats layer weight.
@@ -365,6 +391,41 @@ mod tests {
         assert_eq!(style, LayerStyle::default());
         let hidden: LayerStyle = serde_json::from_str(r#"{"visible": false}"#).unwrap();
         assert!(!hidden.visible);
+    }
+
+    #[test]
+    fn pre_lock_linetype_layer_style_json_loads() {
+        // A style saved before lock/linetype existed omits both keys.
+        let mut v = serde_json::to_value(LayerStyle::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("locked");
+        obj.remove("linetype");
+        let back: LayerStyle = serde_json::from_value(v).unwrap();
+        assert!(!back.locked, "old files load unlocked");
+        assert_eq!(back.linetype, crate::LineType::Continuous, "old files load Continuous");
+        assert_eq!(back, LayerStyle::default());
+    }
+
+    #[test]
+    fn default_style_omits_lock_and_linetype_in_json() {
+        // Defaults skip-serialize so on-disk JSON stays compact and pre-order.
+        let v = serde_json::to_value(LayerStyle::default()).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("locked"));
+        assert!(!obj.contains_key("linetype"));
+    }
+
+    #[test]
+    fn new_document_seeds_six_layers() {
+        let doc = Document::default();
+        assert_eq!(doc.layers.len(), 6, "Default + Layer 01..05");
+        assert!(doc.layers.contains_key(DEFAULT_LAYER));
+        for i in 1..=5 {
+            assert!(doc.layers.contains_key(&format!("Layer {i:02}")));
+        }
+        // Default sorts first, then numbered layers by ascending order key.
+        assert_eq!(doc.layers.get(DEFAULT_LAYER).unwrap().order, 0);
+        assert_eq!(doc.layers.get("Layer 05").unwrap().order, 5);
     }
 
     #[test]

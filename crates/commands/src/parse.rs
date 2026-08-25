@@ -568,8 +568,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             })
         }
         "layer" => {
-            let [name] = take::<1>("layer", "a layer name", &args)?;
-            Ok(Command::Layer { name: name.to_string() })
+            Ok(Command::Layer { name: layer_name_all("layer", &args)? })
         }
         "tolayer" => {
             let (sel, rest) = selector(&args, "tolayer")?;
@@ -580,40 +579,62 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             })
         }
         "layercolor" => {
-            let [layer, c] = take::<2>("layercolor", "a layer name and an r,g,b color", &args)?;
-            Ok(Command::LayerColor {
-                layer: layer.to_string(),
-                color: color3(c)?,
-            })
+            let (layer, c) =
+                layer_name_and_value("layercolor", "a layer name and an r,g,b color", &args)?;
+            Ok(Command::LayerColor { layer, color: color3(c)? })
         }
         "layerweight" => {
-            let [layer, mm] = take::<2>("layerweight", "a layer name and a lineweight in mm", &args)?;
+            let (layer, mm) =
+                layer_name_and_value("layerweight", "a layer name and a lineweight in mm", &args)?;
             let mm = number(mm)?;
             if mm <= 0.0 {
                 return wrong("layerweight", "a positive lineweight in mm", &args);
             }
-            Ok(Command::LayerWeight { layer: layer.to_string(), mm })
+            Ok(Command::LayerWeight { layer, mm })
         }
         "layerrename" => {
             let [from, to] = take::<2>("layerrename", "the current layer name and the new name", &args)?;
             Ok(Command::LayerRename { from: from.to_string(), to: to.to_string() })
         }
         "layerdelete" => {
-            let [layer] = take::<1>("layerdelete", "a layer name", &args)?;
-            Ok(Command::LayerDelete { layer: layer.to_string() })
+            Ok(Command::LayerDelete { layer: layer_name_all("layerdelete", &args)? })
         }
         "layerorder" => {
-            let [layer, order] = take::<2>("layerorder", "a layer name and an integer order", &args)?;
+            let (layer, order) =
+                layer_name_and_value("layerorder", "a layer name and an integer order", &args)?;
             let order = number(order)? as i32;
-            Ok(Command::LayerOrder { layer: layer.to_string(), order })
+            Ok(Command::LayerOrder { layer, order })
+        }
+        "layerlock" => {
+            let (layer, state) =
+                layer_name_and_value("layerlock", "a layer name and 'on' or 'off'", &args)?;
+            let locked = match state.to_ascii_lowercase().as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return wrong("layerlock", "'on' or 'off'", &args),
+            };
+            Ok(Command::LayerLock { layer, locked })
+        }
+        "layerlinetype" => {
+            let (layer, lt) = layer_name_and_value(
+                "layerlinetype",
+                "a layer name and one of continuous|dashed|dotted|dashdot",
+                &args,
+            )?;
+            let Some(linetype) = itsjustcad_doc::LineType::parse_token(lt) else {
+                return wrong(
+                    "layerlinetype",
+                    "one of continuous|dashed|dotted|dashdot",
+                    &args,
+                );
+            };
+            Ok(Command::LayerLinetype { layer, linetype })
         }
         "hide" => {
-            let [layer] = take::<1>("hide", "a layer name", &args)?;
-            Ok(Command::Hide { layer: layer.to_string() })
+            Ok(Command::Hide { layer: layer_name_all("hide", &args)? })
         }
         "show" => {
-            let [layer] = take::<1>("show", "a layer name", &args)?;
-            Ok(Command::Show { layer: layer.to_string() })
+            Ok(Command::Show { layer: layer_name_all("show", &args)? })
         }
         "hideobj" => {
             let (sel, rest) = selector(&args, "hideobj")?;
@@ -1291,6 +1312,32 @@ fn take<'a, const N: usize>(
     args: &[&'a str],
 ) -> Result<[&'a str; N], ParseError> {
     <[&str; N]>::try_from(args.to_vec()).map_err(|_| wrong_err(command, expected, args))
+}
+
+/// All args joined with single spaces as one layer name. Lets layer names
+/// contain spaces (Rhino allows this, e.g. the seeded "Layer 01"). Rejects an
+/// empty name. Round-trips: a name is re-parsed to the same joined string.
+fn layer_name_all(
+    command: &'static str,
+    args: &[&str],
+) -> Result<String, ParseError> {
+    if args.is_empty() {
+        return Err(wrong_err(command, "a layer name", args));
+    }
+    Ok(args.join(" "))
+}
+
+/// Split a `<layer…> <value>` argument list: the last token is the value, the
+/// rest joins into the (possibly multi-word) layer name. Both must be present.
+fn layer_name_and_value<'a>(
+    command: &'static str,
+    expected: &'static str,
+    args: &[&'a str],
+) -> Result<(String, &'a str), ParseError> {
+    match args.split_last() {
+        Some((value, head)) if !head.is_empty() => Ok((head.join(" "), value)),
+        _ => Err(wrong_err(command, expected, args)),
+    }
 }
 
 fn wrong<T>(command: &'static str, expected: &'static str, args: &[&str]) -> Result<T, ParseError> {
@@ -2533,6 +2580,43 @@ mod tests {
         assert_eq!(color, [1.0, 0.0, 128.0 / 255.0]);
         assert_eq!(parse("hide walls").unwrap(), Command::Hide { layer: "walls".into() });
         assert_eq!(parse("show walls").unwrap(), Command::Show { layer: "walls".into() });
+        // Multi-word layer names (seeded "Layer 01" style) join across tokens.
+        assert_eq!(
+            parse("layer Layer 01").unwrap(),
+            Command::Layer { name: "Layer 01".into() }
+        );
+        assert_eq!(
+            parse("hide Layer 01").unwrap(),
+            Command::Hide { layer: "Layer 01".into() }
+        );
+        assert_eq!(
+            parse("layerdelete Layer 01").unwrap(),
+            Command::LayerDelete { layer: "Layer 01".into() }
+        );
+        // For "<layer> <value>" the trailing token is the value; the rest is name.
+        assert_eq!(
+            parse("layercolor Layer 01 0.8,0.2,0.1").unwrap(),
+            Command::LayerColor { layer: "Layer 01".into(), color: [0.8, 0.2, 0.1] }
+        );
+        assert_eq!(
+            parse("layerlock Layer 01 on").unwrap(),
+            Command::LayerLock { layer: "Layer 01".into(), locked: true }
+        );
+        assert_eq!(
+            parse("layerlinetype Layer 01 dashed").unwrap(),
+            Command::LayerLinetype {
+                layer: "Layer 01".into(),
+                linetype: itsjustcad_doc::LineType::Dashed
+            }
+        );
+        assert!(
+            (match parse("layerweight Layer 01 0.35").unwrap() {
+                Command::LayerWeight { layer, mm } if layer == "Layer 01" => mm,
+                _ => panic!("expected layerweight"),
+            } - 0.35)
+                .abs()
+                < 1e-9
+        );
         assert_eq!(
             parse("hideobj last 2").unwrap(),
             Command::HideObj { targets: Selector::Last { n: 2 } }

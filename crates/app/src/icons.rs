@@ -65,13 +65,21 @@ pub enum Icon {
     Layers,
     Properties,
     Chat,
+    // Layers panel controls
+    Lightbulb,
+    Lock,
+    LockOpen,
+    Plus,
+    Minus,
+    Settings,
+    CircleDot,
 }
 
 impl Icon {
     /// Every icon, for exhaustiveness (embedding + tests). Part of the module's
     /// public surface; exercised by the raster-validation tests.
     #[allow(dead_code)]
-    pub const ALL: [Icon; 37] = [
+    pub const ALL: [Icon; 44] = [
         Icon::New,
         Icon::NewSession,
         Icon::Open,
@@ -109,6 +117,13 @@ impl Icon {
         Icon::Layers,
         Icon::Properties,
         Icon::Chat,
+        Icon::Lightbulb,
+        Icon::Lock,
+        Icon::LockOpen,
+        Icon::Plus,
+        Icon::Minus,
+        Icon::Settings,
+        Icon::CircleDot,
     ];
 
     /// Stable cache key / Lucide source name.
@@ -151,6 +166,13 @@ impl Icon {
             Icon::Layers => "layers",
             Icon::Properties => "sliders-horizontal",
             Icon::Chat => "message-square",
+            Icon::Lightbulb => "lightbulb",
+            Icon::Lock => "lock",
+            Icon::LockOpen => "lock-open",
+            Icon::Plus => "plus",
+            Icon::Minus => "minus",
+            Icon::Settings => "settings",
+            Icon::CircleDot => "circle-dot",
         }
     }
 
@@ -199,6 +221,13 @@ impl Icon {
             Icon::Layers => png!("layers"),
             Icon::Properties => png!("sliders-horizontal"),
             Icon::Chat => png!("message-square"),
+            Icon::Lightbulb => png!("lightbulb"),
+            Icon::Lock => png!("lock"),
+            Icon::LockOpen => png!("lock-open"),
+            Icon::Plus => png!("plus"),
+            Icon::Minus => png!("minus"),
+            Icon::Settings => png!("settings"),
+            Icon::CircleDot => png!("circle-dot"),
         }
     }
 }

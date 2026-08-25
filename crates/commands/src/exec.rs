@@ -1633,19 +1633,28 @@ impl Session {
 }
 
 fn resolve(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
-    let ids = match sel {
+    let raw: Vec<ObjectId> = match sel {
         Selector::Ids { ids } => ids.clone(),
         Selector::Named { name } => doc.find_named(name),
         Selector::Last { n } => doc.last_ids(*n),
         Selector::All => doc.all_ids(),
         Selector::Selected => doc.selection.iter().copied().collect(),
     };
-    if ids.is_empty() {
+    if raw.is_empty() {
         return Err(ExecError::EmptySelection(match sel {
             Selector::Named { name } => format!("no object named '{name}'"),
             Selector::Selected => "selection is empty".to_string(),
             _ => format!("document has {} objects", doc.len()),
         }));
+    }
+    // Objects on a locked layer are not selectable/editable: drop them so no
+    // edit/transform/delete command can touch them. `layerlock <layer> off`
+    // restores access.
+    let ids: Vec<ObjectId> = raw.iter().copied().filter(|id| !doc.object_locked(*id)).collect();
+    if ids.is_empty() {
+        return Err(ExecError::Invalid(
+            "target objects are on a locked layer (layerlock <layer> off to edit)".to_string(),
+        ));
     }
     Ok(ids)
 }
@@ -4275,6 +4284,37 @@ fn apply_forward(
                 },
             ))
         }
+        Command::LayerLock { layer, locked } => {
+            let style = layer_style_mut(doc, &layer)?;
+            let prev = style.clone();
+            style.locked = locked;
+            doc.generation += 1;
+            Ok((
+                Command::LayerLock { layer: layer.clone(), locked },
+                Inverse::LayerStyle { layer: layer.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "layer '{layer}' {}",
+                        if locked { "locked" } else { "unlocked" }
+                    ),
+                },
+            ))
+        }
+        Command::LayerLinetype { layer, linetype } => {
+            let style = layer_style_mut(doc, &layer)?;
+            let prev = style.clone();
+            style.linetype = linetype;
+            doc.generation += 1;
+            Ok((
+                Command::LayerLinetype { layer: layer.clone(), linetype },
+                Inverse::LayerStyle { layer: layer.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("layer '{layer}' linetype set to {}", linetype.label()),
+                },
+            ))
+        }
         Command::Hide { layer } => {
             let style = layer_style_mut(doc, &layer)?;
             let prev = style.clone();
@@ -5743,6 +5783,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LayerRename { .. } => "layerrename",
         Command::LayerDelete { .. } => "layerdelete",
         Command::LayerOrder { .. } => "layerorder",
+        Command::LayerLock { .. } => "layerlock",
+        Command::LayerLinetype { .. } => "layerlinetype",
         Command::Hide { .. } => "hide",
         Command::Show { .. } => "show",
         Command::HideObj { .. } => "hideobj",
@@ -7521,6 +7563,128 @@ mod tests {
         assert!(
             (replayed.doc.layers["sections"].lineweight_mm - 0.50).abs() < 1e-9
         );
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "replay-stable log"
+        );
+    }
+
+    #[test]
+    fn layerlock_parse_exec_undo_redo() {
+        let mut s = Session::default();
+        run(&mut s, "layer walls");
+        assert!(!s.doc.layers["walls"].locked, "default unlocked");
+        let out = run(&mut s, "layerlock walls on");
+        assert!(out.message.contains("locked"), "{}", out.message);
+        assert!(s.doc.layers["walls"].locked);
+        // Undo restores unlocked.
+        run(&mut s, "undo");
+        assert!(!s.doc.layers["walls"].locked);
+        // Redo re-locks.
+        run(&mut s, "redo");
+        assert!(s.doc.layers["walls"].locked);
+        // Unlock again.
+        let out = run(&mut s, "layerlock walls off");
+        assert!(out.message.contains("unlocked"), "{}", out.message);
+        assert!(!s.doc.layers["walls"].locked);
+    }
+
+    #[test]
+    fn layerlock_parse_and_errors() {
+        assert_eq!(
+            parse("layerlock walls on").unwrap(),
+            Command::LayerLock { layer: "walls".into(), locked: true }
+        );
+        assert_eq!(
+            parse("layerlock walls OFF").unwrap(),
+            Command::LayerLock { layer: "walls".into(), locked: false }
+        );
+        assert!(parse("layerlock walls").is_err(), "missing state");
+        assert!(parse("layerlock walls maybe").is_err(), "bad state");
+        let mut s = Session::default();
+        let err = s.run(parse("layerlock ghost on").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no layer 'ghost'"), "{err}");
+    }
+
+    #[test]
+    fn locked_layer_objects_are_not_editable() {
+        let mut s = Session::default();
+        run(&mut s, "layer walls");
+        run(&mut s, "box 0,0,0 1,1,1");
+        // Lock the layer the box lives on.
+        run(&mut s, "layerlock walls on");
+        // A transform targeting it is rejected.
+        let err = s.run(parse("move all 1,0,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("locked layer"), "{err}");
+        // Unlock and the same edit now succeeds.
+        run(&mut s, "layerlock walls off");
+        run(&mut s, "move all 1,0,0");
+    }
+
+    #[test]
+    fn layerlock_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "layer walls");
+        run(&mut s, "layerlock walls on");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert!(replayed.doc.layers["walls"].locked);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "replay-stable log"
+        );
+    }
+
+    #[test]
+    fn layerlinetype_parse_exec_undo_redo() {
+        use itsjustcad_doc::LineType;
+        let mut s = Session::default();
+        run(&mut s, "layer grid");
+        assert_eq!(s.doc.layers["grid"].linetype, LineType::Continuous);
+        let out = run(&mut s, "layerlinetype grid dashed");
+        assert!(out.message.contains("Dashed"), "{}", out.message);
+        assert_eq!(s.doc.layers["grid"].linetype, LineType::Dashed);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.layers["grid"].linetype, LineType::Continuous);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.layers["grid"].linetype, LineType::Dashed);
+    }
+
+    #[test]
+    fn layerlinetype_parse_all_variants_and_errors() {
+        use itsjustcad_doc::LineType;
+        for (tok, lt) in [
+            ("continuous", LineType::Continuous),
+            ("dashed", LineType::Dashed),
+            ("dotted", LineType::Dotted),
+            ("dashdot", LineType::DashDot),
+        ] {
+            assert_eq!(
+                parse(&format!("layerlinetype grid {tok}")).unwrap(),
+                Command::LayerLinetype { layer: "grid".into(), linetype: lt }
+            );
+        }
+        assert!(parse("layerlinetype grid").is_err(), "missing linetype");
+        assert!(parse("layerlinetype grid squiggly").is_err(), "bad linetype");
+        let mut s = Session::default();
+        let err = s.run(parse("layerlinetype ghost dashed").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no layer 'ghost'"), "{err}");
+    }
+
+    #[test]
+    fn layerlinetype_replay_stable() {
+        use itsjustcad_doc::LineType;
+        let mut s = Session::default();
+        run(&mut s, "layer grid");
+        run(&mut s, "layerlinetype grid dotted");
+        run(&mut s, "layer edge");
+        run(&mut s, "layerlinetype edge dashdot");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(replayed.doc.layers["grid"].linetype, LineType::Dotted);
+        assert_eq!(replayed.doc.layers["edge"].linetype, LineType::DashDot);
         assert_eq!(
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap(),

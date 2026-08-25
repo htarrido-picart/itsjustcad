@@ -299,6 +299,12 @@ pub struct App {
     /// Layer color being edited in the panel; the `layercolor` command is
     /// issued once, when the mouse is released (avoids one op per drag frame).
     pending_layer_color: Option<(String, [f32; 3])>,
+    /// Row selected in the Layers table (delete/settings target). Name only;
+    /// falls back to the current layer when unset or stale.
+    selected_layer: Option<String>,
+    /// Default color for layers created via the Layers-panel ＋ button, set in
+    /// the ⚙ settings menu. `None` uses the theme default (no `layercolor`).
+    new_layer_default_color: Option<[f32; 3]>,
     /// Last executed command line; Enter/Space on the canvas repeats it.
     last_line: Option<String>,
     /// A `critique` request awaiting its viewport screenshot. Holds the
@@ -508,6 +514,8 @@ impl App {
             frame_count: 0,
             shot_saved: false,
             pending_layer_color: None,
+            selected_layer: None,
+            new_layer_default_color: None,
             last_line: None,
             pending_critique: None,
             clipboard_armed: false,
@@ -2102,68 +2110,239 @@ impl App {
         }
     }
 
-    /// Layers tab body: visibility toggle, color swatch, current-layer switch.
-    /// Every edit goes through the command substrate so it is logged/undoable.
-    /// Rendered inside the docked right panel (no floating Area).
+    /// Layers tab body: a Rhino-style organized table with aligned columns
+    /// (Name / On / Lock / Color / Linetype / Print Width), a current-layer dot
+    /// on the leading edge, and a bottom toolbar (＋ add, － delete, ⚙ settings).
+    /// Every mutation goes through the command substrate so it is logged/undoable.
     fn layers_panel(&mut self, ui: &mut egui::Ui, theme: scene::Theme) {
-        // Title comes from the enclosing CollapsingHeader in the Model workspace.
+        use itsjustcad_doc::LineType;
+        // Print-width dropdown choices (mm); "Default" maps to the ISO-thin 0.18.
+        const PRINT_WIDTHS: [f64; 10] =
+            [0.18, 0.13, 0.18, 0.25, 0.35, 0.50, 0.70, 1.00, 1.40, 2.00];
+
         let mut lines: Vec<String> = Vec::new();
+        let current = self.session.doc.current_layer.clone();
+        // Snapshot layers sorted by (order, name) so the panel matches the
+        // render sort; storage stays alphabetical (BTreeMap).
+        let mut layers: Vec<(String, itsjustcad_doc::LayerStyle)> = self
+            .session
+            .doc
+            .layers
+            .iter()
+            .map(|(n, s)| (n.clone(), s.clone()))
+            .collect();
+        layers.sort_by(|a, b| a.1.order.cmp(&b.1.order).then_with(|| a.0.cmp(&b.0)));
+
+        let fg = ui.visuals().text_color();
+        let icon_sz = ui.text_style_height(&egui::TextStyle::Body);
+
+        // Bottom toolbar first: a reserved bottom panel keeps the ＋ － ⚙ row
+        // pinned and visible no matter how tall the (scrolling) table grows.
+        egui::Panel::bottom("layers_toolbar")
+            .show_separator_line(true)
+            .show(ui, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let add = self.icons.image(ui.ctx(), crate::icons::Icon::Plus, icon_sz, fg);
+                    if ui
+                        .add(egui::Button::image(add).frame(true))
+                        .on_hover_text("add layer")
+                        .clicked()
+                    {
+                        let name = next_free_layer_name(&self.session.doc);
+                        lines.push(format!("layer {name}"));
+                        if let Some(c) = self.new_layer_default_color {
+                            lines.push(format!(
+                                "layercolor {name} {:.3},{:.3},{:.3}",
+                                c[0], c[1], c[2]
+                            ));
+                        }
+                        self.selected_layer = Some(name);
+                    }
+                    let del = self.icons.image(ui.ctx(), crate::icons::Icon::Minus, icon_sz, fg);
+                    let target =
+                        self.selected_layer.clone().unwrap_or_else(|| current.clone());
+                    let deletable = target != itsjustcad_doc::DEFAULT_LAYER;
+                    if ui
+                        .add_enabled(deletable, egui::Button::image(del).frame(true))
+                        .on_hover_text(if deletable {
+                            "delete selected layer"
+                        } else {
+                            "the default layer cannot be deleted"
+                        })
+                        .clicked()
+                    {
+                        lines.push(format!("layerdelete {target}"));
+                        self.selected_layer = None;
+                    }
+
+                    // ⚙ settings menu: purge empty layers + new-layer default color.
+                    let gear = self.icons.image(ui.ctx(), crate::icons::Icon::Settings, icon_sz, fg);
+                    ui.menu_image_button(gear, |ui| {
+                        if ui.button("Purge empty layers").clicked() {
+                            for name in empty_deletable_layers(&self.session.doc) {
+                                lines.push(format!("layerdelete {name}"));
+                            }
+                            ui.close();
+                        }
+                        ui.separator();
+                        ui.label("New-layer default color");
+                        let mut c = self.new_layer_default_color.unwrap_or_else(|| {
+                            let m = theme.mesh();
+                            [m[0], m[1], m[2]]
+                        });
+                        if ui.color_edit_button_rgb(&mut c).changed() {
+                            self.new_layer_default_color = Some(c);
+                        }
+                        if ui.button("Clear default color").clicked() {
+                            self.new_layer_default_color = None;
+                            ui.close();
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+            });
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let layers: Vec<(String, itsjustcad_doc::LayerStyle)> = self
-                    .session
-                    .doc
-                    .layers
-                    .iter()
-                    .map(|(n, s)| (n.clone(), s.clone()))
-                    .collect();
-                let current = self.session.doc.current_layer.clone();
-                for (name, style) in layers {
-                    ui.horizontal(|ui| {
-                        let mut visible = style.visible;
-                        if ui
-                            .checkbox(&mut visible, "")
-                            .on_hover_text("visible")
-                            .changed()
-                        {
-                            let verb = if visible { "show" } else { "hide" };
-                            lines.push(format!("{verb} {name}"));
-                        }
-                        let fallback = theme.mesh();
-                        let mut rgb = self
-                            .pending_layer_color
-                            .as_ref()
-                            .filter(|(n, _)| *n == name)
-                            .map(|(_, c)| *c)
-                            .or_else(|| style.color.map(|c| [c[0], c[1], c[2]]))
-                            .unwrap_or([fallback[0], fallback[1], fallback[2]]);
-                        if ui.color_edit_button_rgb(&mut rgb).changed() {
-                            self.pending_layer_color = Some((name.clone(), rgb));
-                        }
-                        let is_current = name == current;
-                        if ui
-                            .selectable_label(is_current, &name)
-                            .on_hover_text("set current layer")
-                            .clicked()
-                            && !is_current
-                        {
-                            lines.push(format!("layer {name}"));
+                egui::Grid::new("layers_table")
+                    .num_columns(7)
+                    .spacing(egui::vec2(8.0, 6.0))
+                    .striped(true)
+                    .show(ui, |ui| {
+                        // Header row (panel_title weight via strong).
+                        ui.label("");
+                        ui.strong("Name");
+                        ui.strong("On");
+                        ui.strong("Lock");
+                        ui.strong("Color");
+                        ui.strong("Linetype");
+                        ui.strong("Print");
+                        ui.end_row();
+
+                        for (name, style) in &layers {
+                            let is_current = *name == current;
+                            let is_selected = self
+                                .selected_layer
+                                .as_deref()
+                                .map(|s| s == name)
+                                .unwrap_or(false);
+
+                            // Leading edge: current-layer dot (click = set current).
+                            let dot = if is_current {
+                                self.icons.image(ui.ctx(), crate::icons::Icon::CircleDot, icon_sz, ui.visuals().selection.bg_fill)
+                            } else {
+                                self.icons.image(ui.ctx(), crate::icons::Icon::CircleDot, icon_sz, ui.visuals().weak_text_color())
+                            };
+                            if ui
+                                .add(egui::Button::image(dot).frame(false))
+                                .on_hover_text("set current layer")
+                                .clicked()
+                                && !is_current
+                            {
+                                lines.push(format!("layer {name}"));
+                            }
+
+                            // Name (middle-truncated, stable selection highlight).
+                            let shown = middle_truncate(name, 18);
+                            if ui
+                                .selectable_label(is_selected, shown)
+                                .on_hover_text(name.as_str())
+                                .clicked()
+                            {
+                                self.selected_layer = Some(name.clone());
+                            }
+
+                            // On/Off lightbulb (visibility → hide/show).
+                            let bulb_color = if style.visible { fg } else { ui.visuals().weak_text_color() };
+                            let bulb = self.icons.image(ui.ctx(), crate::icons::Icon::Lightbulb, icon_sz, bulb_color);
+                            if ui
+                                .add(egui::Button::image(bulb).frame(false))
+                                .on_hover_text(if style.visible { "on (click to hide)" } else { "off (click to show)" })
+                                .clicked()
+                            {
+                                let verb = if style.visible { "hide" } else { "show" };
+                                lines.push(format!("{verb} {name}"));
+                            }
+
+                            // Lock padlock (layerlock).
+                            let (lock_icon, lock_color) = if style.locked {
+                                (crate::icons::Icon::Lock, ui.visuals().warn_fg_color)
+                            } else {
+                                (crate::icons::Icon::LockOpen, ui.visuals().weak_text_color())
+                            };
+                            let lock = self.icons.image(ui.ctx(), lock_icon, icon_sz, lock_color);
+                            if ui
+                                .add(egui::Button::image(lock).frame(false))
+                                .on_hover_text(if style.locked { "locked (click to unlock)" } else { "unlocked (click to lock)" })
+                                .clicked()
+                            {
+                                let state = if style.locked { "off" } else { "on" };
+                                lines.push(format!("layerlock {name} {state}"));
+                            }
+
+                            // Color swatch (layercolor), committed on release.
+                            let fallback = theme.mesh();
+                            let mut rgb = self
+                                .pending_layer_color
+                                .as_ref()
+                                .filter(|(n, _)| n == name)
+                                .map(|(_, c)| *c)
+                                .or_else(|| style.color.map(|c| [c[0], c[1], c[2]]))
+                                .unwrap_or([fallback[0], fallback[1], fallback[2]]);
+                            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                self.pending_layer_color = Some((name.clone(), rgb));
+                            }
+
+                            // Linetype dropdown (layerlinetype).
+                            let mut lt = style.linetype;
+                            egui::ComboBox::from_id_salt(("lt", name))
+                                .selected_text(lt.label())
+                                .width(96.0)
+                                .show_ui(ui, |ui| {
+                                    for opt in LineType::ALL {
+                                        ui.selectable_value(&mut lt, opt, opt.label());
+                                    }
+                                });
+                            if lt != style.linetype {
+                                lines.push(format!("layerlinetype {name} {}", lt.token()));
+                            }
+
+                            // Print-width dropdown (layerweight).
+                            let cur_mm = style.lineweight_mm;
+                            let cur_label = print_width_label(cur_mm);
+                            let mut chosen: Option<f64> = None;
+                            egui::ComboBox::from_id_salt(("pw", name))
+                                .selected_text(cur_label)
+                                .width(90.0)
+                                .show_ui(ui, |ui| {
+                                    for (i, mm) in PRINT_WIDTHS.iter().enumerate() {
+                                        let label = if i == 0 { "Default".to_string() } else { format!("{mm:.2}") };
+                                        if ui.selectable_label(false, label).clicked() {
+                                            chosen = Some(*mm);
+                                        }
+                                    }
+                                });
+                            if let Some(mm) = chosen
+                                && (mm - cur_mm).abs() > 1e-9
+                            {
+                                lines.push(format!("layerweight {name} {mm}"));
+                            }
+                            ui.end_row();
                         }
                     });
-                }
             });
+
         // Commit the color edit once the mouse is released — one logged op
         // per edit instead of one per drag frame.
         if let Some((name, c)) = self.pending_layer_color.clone()
             && !ui.input(|i| i.pointer.any_down())
         {
-            lines.push(format!(
-                "layercolor {name} {:.3},{:.3},{:.3}",
-                c[0], c[1], c[2]
-            ));
+            lines.push(format!("layercolor {name} {:.3},{:.3},{:.3}", c[0], c[1], c[2]));
             self.pending_layer_color = None;
         }
+
         for line in lines {
             self.execute_line(line);
         }
@@ -2533,10 +2712,9 @@ impl App {
                         egui::CentralPanel::default().show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 section_icon(ui, &self.icons, crate::icons::Icon::Layers);
-                                egui::CollapsingHeader::new("Layers")
-                                    .default_open(true)
-                                    .show(ui, |ui| self.layers_tab(ui, theme));
+                                ui.strong("Layers");
                             });
+                            self.layers_tab(ui, theme);
                         });
                     }
                     PanelTab::Deck => {
@@ -3236,6 +3414,54 @@ pub(crate) fn screen_ray(
     (origin, dir)
 }
 
+/// Middle-truncate a layer name to `max` chars, inserting an ellipsis so the
+/// head and tail both stay readable (Rhino-style long-name handling).
+fn middle_truncate(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let head_s: String = chars[..head].iter().collect();
+    let tail_s: String = chars[chars.len() - tail..].iter().collect();
+    format!("{head_s}…{tail_s}")
+}
+
+/// Label for the print-width dropdown: the ISO-thin default reads "Default",
+/// everything else its millimetre value.
+fn print_width_label(mm: f64) -> String {
+    if (mm - 0.18).abs() < 1e-9 {
+        "Default".to_string()
+    } else {
+        format!("{mm:.2}")
+    }
+}
+
+/// First free "Layer NN" name for the ＋ button (skips names already taken).
+fn next_free_layer_name(doc: &itsjustcad_doc::Document) -> String {
+    for i in 1..1000 {
+        let candidate = format!("Layer {i:02}");
+        if !doc.layers.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    "Layer".to_string()
+}
+
+/// Deletable layers with no objects on them (for the ⚙ "purge empty" action).
+/// The default layer is never purged.
+fn empty_deletable_layers(doc: &itsjustcad_doc::Document) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let used: BTreeSet<&str> = doc.objects().map(|o| o.layer.as_str()).collect();
+    doc.layers
+        .keys()
+        .filter(|n| n.as_str() != itsjustcad_doc::DEFAULT_LAYER && !used.contains(n.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Screen position -> point on the z=0 ground plane.
 fn ground_point(view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> Option<glam::DVec3> {
     let (origin, dir) = screen_ray(view_proj, rect, pos);
@@ -3763,6 +3989,44 @@ fn pano_from_view(v: itsjustcad_doc::PanoView) -> itsjustcad_render::PanoProject
 mod tests {
     use super::*;
     use itsjustcad_commands::registry;
+
+    #[test]
+    fn middle_truncate_keeps_head_and_tail() {
+        assert_eq!(middle_truncate("short", 18), "short");
+        let long = "ExteriorMasonryWall-North";
+        let out = middle_truncate(long, 18);
+        assert!(out.chars().count() <= 18, "capped: {out}");
+        assert!(out.contains('…'));
+        assert!(out.starts_with("Exter"));
+        assert!(out.ends_with("orth"));
+    }
+
+    #[test]
+    fn print_width_label_maps_default() {
+        assert_eq!(print_width_label(0.18), "Default");
+        assert_eq!(print_width_label(0.35), "0.35");
+        assert_eq!(print_width_label(1.00), "1.00");
+    }
+
+    #[test]
+    fn next_free_layer_name_skips_seeded() {
+        let doc = itsjustcad_doc::Document::default();
+        // Seeded doc already has Layer 01..05, so the next free is Layer 06.
+        assert_eq!(next_free_layer_name(&doc), "Layer 06");
+    }
+
+    #[test]
+    fn empty_deletable_layers_excludes_default_and_used() {
+        use itsjustcad_commands::{parse, Session};
+        let mut s = Session::default();
+        // Put an object on Layer 01 so it is no longer empty.
+        s.run(parse("layer Layer 01").unwrap()).unwrap();
+        s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        let empty = empty_deletable_layers(&s.doc);
+        assert!(!empty.contains(&itsjustcad_doc::DEFAULT_LAYER.to_string()));
+        assert!(!empty.iter().any(|n| n == "Layer 01"), "used layer excluded");
+        assert!(empty.iter().any(|n| n == "Layer 05"), "empty seeded layer purgeable");
+    }
 
     #[test]
     fn config_migration_only_when_old_present_and_new_absent() {

@@ -268,7 +268,10 @@ mod tests {
         assert_eq!(s.doc.len(), 1);
         assert_eq!(s.doc.current_layer, itsjustcad_doc::DEFAULT_LAYER);
         assert!(s.doc.objects().all(|o| o.layer == itsjustcad_doc::DEFAULT_LAYER));
-        assert_eq!(s.doc.layers.len(), 1);
+        // A pre-layer file introduces no layer ops, so the loaded document
+        // carries only the seeded default layers (Default + Layer 01..05).
+        assert_eq!(s.doc.layers.len(), 6);
+        assert!(s.doc.layers.contains_key(itsjustcad_doc::DEFAULT_LAYER));
     }
 
     #[test]

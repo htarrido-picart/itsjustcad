@@ -508,15 +508,87 @@ pub struct LayerStyle {
     /// default 0 keeps pre-order JSON loading (ties break by name, as before).
     #[serde(default, skip_serializing_if = "is_default_order")]
     pub order: i32,
+    /// When true, objects on this layer are not selectable/editable (`layerlock`).
+    /// Serde default `false` keeps pre-lock JSON loading (old files → unlocked).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
+    /// Layer linetype (`layerlinetype`). Serde default `Continuous` keeps
+    /// pre-linetype JSON loading (old files have no field → Continuous).
+    #[serde(default, skip_serializing_if = "LineType::is_default")]
+    pub linetype: LineType,
 }
 
 fn is_default_order(o: &i32) -> bool {
     *o == 0
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Layer linetype pattern. Stored per layer; used by render/export where
+/// feasible and shown in the Layers-panel dropdown.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LineType {
+    #[default]
+    Continuous,
+    Dashed,
+    Dotted,
+    DashDot,
+}
+
+impl LineType {
+    fn is_default(&self) -> bool {
+        matches!(self, LineType::Continuous)
+    }
+
+    /// Canonical lowercase token used by the `layerlinetype` command and serde.
+    pub fn token(self) -> &'static str {
+        match self {
+            LineType::Continuous => "continuous",
+            LineType::Dashed => "dashed",
+            LineType::Dotted => "dotted",
+            LineType::DashDot => "dashdot",
+        }
+    }
+
+    /// Human-readable label for the Layers-panel dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            LineType::Continuous => "Continuous",
+            LineType::Dashed => "Dashed",
+            LineType::Dotted => "Dotted",
+            LineType::DashDot => "DashDot",
+        }
+    }
+
+    /// Parse a case-insensitive token (`continuous|dashed|dotted|dashdot`).
+    pub fn parse_token(s: &str) -> Option<LineType> {
+        match s.to_ascii_lowercase().as_str() {
+            "continuous" => Some(LineType::Continuous),
+            "dashed" => Some(LineType::Dashed),
+            "dotted" => Some(LineType::Dotted),
+            "dashdot" => Some(LineType::DashDot),
+            _ => None,
+        }
+    }
+
+    /// All variants in display order (for the dropdown).
+    pub const ALL: [LineType; 4] =
+        [LineType::Continuous, LineType::Dashed, LineType::Dotted, LineType::DashDot];
+}
+
 impl Default for LayerStyle {
     fn default() -> Self {
-        Self { color: None, visible: true, lineweight_mm: 0.18, order: 0 }
+        Self {
+            color: None,
+            visible: true,
+            lineweight_mm: 0.18,
+            order: 0,
+            locked: false,
+            linetype: LineType::Continuous,
+        }
     }
 }
 

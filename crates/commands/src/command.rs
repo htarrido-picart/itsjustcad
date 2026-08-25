@@ -429,6 +429,17 @@ pub enum Command {
         layer: String,
         order: i32,
     },
+    /// Lock/unlock a layer. Objects on a locked layer are not selectable or
+    /// editable (enforced in selection/edit paths).
+    LayerLock {
+        layer: String,
+        locked: bool,
+    },
+    /// Set a layer's linetype (`continuous|dashed|dotted|dashdot`).
+    LayerLinetype {
+        layer: String,
+        linetype: itsjustcad_doc::LineType,
+    },
     Hide {
         layer: String,
     },

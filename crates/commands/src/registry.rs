@@ -373,6 +373,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Annotate,
         },
         CommandSpec {
+            name: "layerlock",
+            usage: "layerlock <layer> <on|off>",
+            summary: "Lock/unlock a layer; objects on a locked layer cannot be selected or edited. Example: layerlock walls on",
+            category: Category::Annotate,
+        },
+        CommandSpec {
+            name: "layerlinetype",
+            usage: "layerlinetype <layer> <continuous|dashed|dotted|dashdot>",
+            summary: "Set a layer's linetype pattern (shown in the Layers panel; used by render/export where feasible). Example: layerlinetype grid dashed",
+            category: Category::Annotate,
+        },
+        CommandSpec {
             name: "hide",
             usage: "hide <layer>",
             summary: "Hide a layer (objects stay in the model, invisible). Example: hide walls",
