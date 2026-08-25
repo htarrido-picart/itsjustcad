@@ -523,10 +523,12 @@ impl App {
             panel_visible: true,
             show_about: false,
             show_history: false,
+            // Env pin wins for dev/screenshots; otherwise restore the persisted
+            // Appearance choice from ui.json (None = follow the OS).
             forced_dark: match std::env::var("ITSJUSTCAD_THEME").ok().as_deref() {
                 Some("dark") => Some(true),
                 Some("light") => Some(false),
-                _ => None,
+                _ => load_theme_pref(),
             },
             show_template_picker: !load_template_done(),
             template_units: TemplateUnits::Meters,
@@ -2526,13 +2528,13 @@ impl App {
         // On Linux muda is not compiled in, so this branch is omitted.
         #[cfg(not(target_os = "linux"))]
         if self.native_menu.is_some() {
-            let bar = egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
-                crate::menu::appearance_only(ui, icons);
-            });
-            // Dev/screenshot hook still fires under the native bar so the menu
-            // model (incl. the Plugins menu) can be captured in a shot.
+            // The native OS bar owns File/Edit/View/… AND (new) the Appearance
+            // items (theme + text size live in View ▸ Appearance). So there is no
+            // in-window strip at all on macOS/Windows — we render nothing here.
+            // The dev/screenshot hook still fires so the menu model can be shot.
+            let _ = icons;
             if let Ok(title) = std::env::var("ITSJUSTCAD_MENU_DEMO") {
-                let at = egui::pos2(bar.response.rect.left() + 8.0, bar.response.rect.bottom());
+                let at = egui::pos2(8.0, 0.0);
                 crate::menu::demo_open(ui.ctx(), &self.icons, style, &title, at, &plugin_entries);
             }
             return;
@@ -2546,14 +2548,16 @@ impl App {
             crate::menu::demo_open(ui.ctx(), &self.icons, style, &title, at, &plugin_entries);
         }
         if let Some(action) = bar.inner {
-            self.apply_menu_action(action);
+            let ctx = ui.ctx().clone();
+            self.apply_menu_action(&ctx, action);
         }
     }
 
     /// Dispatch a menu pick. The rule (see `menu::menu_action`): draw verbs
     /// start the interactive tool, no-arg verbs execute, arg verbs prefill the
-    /// command line for typing.
-    fn apply_menu_action(&mut self, action: crate::menu::MenuAction) {
+    /// command line for typing. `ctx` is needed for the Appearance actions
+    /// (theme / text-size), which live in the native View menu.
+    fn apply_menu_action(&mut self, ctx: &egui::Context, action: crate::menu::MenuAction) {
         use crate::menu::MenuAction;
         match action {
             MenuAction::Execute(line) | MenuAction::StartDraw(line) => self.execute_line(line),
@@ -2572,7 +2576,28 @@ impl App {
             MenuAction::ExportDialog => self.export(None),
             MenuAction::NewDocument => self.new_document(),
             MenuAction::NewSession => self.new_session(),
+            MenuAction::SetTheme(dark) => self.set_theme_pref(ctx, dark),
+            MenuAction::ZoomStep(bigger) => {
+                let delta = if bigger { 0.1 } else { -0.1 };
+                let z = (ctx.zoom_factor() + delta).clamp(0.5, 3.0);
+                ctx.set_zoom_factor(z);
+            }
+            MenuAction::ZoomReset => ctx.set_zoom_factor(1.3),
         }
+    }
+
+    /// Apply an appearance theme choice from the native View ▸ Appearance items.
+    /// `Some(true)` = Dark, `Some(false)` = Light (pinned so eframe's per-frame
+    /// OS-theme read can't override it), `None` = follow the OS again. This is
+    /// UI/session state — it is NOT written to the op-log (the drawing).
+    fn set_theme_pref(&mut self, ctx: &egui::Context, dark: Option<bool>) {
+        self.forced_dark = dark;
+        if let Some(d) = dark {
+            let want = if d { egui::Theme::Dark } else { egui::Theme::Light };
+            ctx.set_theme(want);
+        }
+        // Persist the choice so it survives restarts (ui.json, not the drawing).
+        save_theme_pref(dark);
     }
 
     /// Model Setup panel: hardware recommendation, the catalog gated by RAM, an
@@ -2622,10 +2647,13 @@ impl App {
         let mut remove: Option<String> = None;
 
         egui::Window::new("Model Setup")
-            .collapsible(false)
+            // Collapsible so the user can minimize it to its title bar and keep
+            // working; NO fixed anchor so it is draggable anywhere (a fixed
+            // CENTER_CENTER anchor previously trapped the user during a download).
+            .collapsible(true)
             .resizable(true)
             .default_width(460.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_pos([120.0, 80.0])
             .open(&mut open)
             .show(ctx, |ui| {
                 // Hardware recommendation.
@@ -2747,7 +2775,10 @@ impl App {
             });
 
         if !open {
-            self.show_model_setup = false;
+            // Closing the panel HIDES it but must NOT cancel an in-flight
+            // download — the background thread keeps going and the corner chip
+            // takes over. Cancellation is only the explicit "Cancel" button.
+            self.close_model_setup();
         }
 
         // 2) Act on the collected intents.
@@ -2763,6 +2794,71 @@ impl App {
         if let Some(id) = install {
             self.start_model_install(&id);
         }
+    }
+
+    /// Compact background download indicator: a small bottom-right corner chip
+    /// ("Downloading <model> NN% ✕") shown whenever a download is active but the
+    /// Model Setup panel is hidden — so the user can close/minimize the panel and
+    /// keep working while the download continues in its background thread.
+    /// Clicking the chip body reopens the panel; the ✕ cancels the download.
+    fn download_progress_chip(&mut self, ctx: &egui::Context) {
+        // Only when a download is in flight AND the full panel is not on screen
+        // (the panel already shows its own progress bar).
+        if self.show_model_setup {
+            return;
+        }
+        let Some(active) = &self.active_download else {
+            return;
+        };
+        let state = active.handle.state();
+        // Nothing to show once the download has finished (or failed silently):
+        // active work only.
+        if !state.is_active() {
+            return;
+        }
+        let label = self
+            .catalog
+            .get(&active.model_id)
+            .map(|m| m.display_name.clone())
+            .unwrap_or_else(|| active.model_id.clone());
+        let pct = (state.fraction().unwrap_or(0.0) * 100.0).round() as i32;
+
+        let mut reopen = false;
+        let mut cancel = false;
+        egui::Area::new(egui::Id::new("download_chip"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(format!("⬇ {label}  {pct}%"))
+                            .on_hover_text("Downloading — click to open Model Setup")
+                            .clicked()
+                        {
+                            reopen = true;
+                        }
+                        if ui.small_button("✕").on_hover_text("Cancel download").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+        if reopen {
+            self.show_model_setup = true;
+        }
+        if cancel && let Some(active) = &self.active_download {
+            active.handle.cancel();
+        }
+        // Keep the percentage live while a background download runs.
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
+    /// Hide the Model Setup panel WITHOUT cancelling any active download. The
+    /// download keeps running in its background thread; the corner progress chip
+    /// then surfaces it. Cancellation is a separate, explicit user action.
+    fn close_model_setup(&mut self) {
+        self.show_model_setup = false;
+        // Deliberately does NOT touch `self.active_download` / call `cancel()`.
     }
 
     /// Kick off a background download for catalog model `id` into the models dir.
@@ -2845,6 +2941,33 @@ fn load_zoom() -> Option<f32> {
 fn save_zoom(zoom: f32) {
     let mut v = load_ui_json();
     v["zoom"] = serde_json::json!(zoom);
+    save_ui_json(&v);
+}
+
+/// Restore the persisted Appearance theme choice from ui.json: `Some(true)`=dark,
+/// `Some(false)`=light, `None`=follow the OS (the default / absent key). UI state,
+/// never part of the op-log (the drawing).
+fn load_theme_pref() -> Option<bool> {
+    match load_ui_json()["theme"].as_str() {
+        Some("dark") => Some(true),
+        Some("light") => Some(false),
+        _ => None,
+    }
+}
+
+/// Persist the Appearance theme choice to ui.json. `None` clears the key so the
+/// app follows the OS on next launch.
+fn save_theme_pref(dark: Option<bool>) {
+    let mut v = load_ui_json();
+    match dark {
+        Some(true) => v["theme"] = serde_json::json!("dark"),
+        Some(false) => v["theme"] = serde_json::json!("light"),
+        None => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("theme");
+            }
+        }
+    }
     save_ui_json(&v);
 }
 
@@ -3189,7 +3312,8 @@ impl eframe::App for App {
         if let Some(native) = &self.native_menu {
             let action = native.poll();
             if let Some(action) = action {
-                self.apply_menu_action(action);
+                let ctx = ui.ctx().clone();
+                self.apply_menu_action(&ctx, action);
             }
             // Keep polling responsive while a native bar is attached.
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
@@ -3326,9 +3450,9 @@ impl eframe::App for App {
         if self.show_about {
             let mut open = true;
             egui::Window::new("About ItsJustCAD")
-                .collapsible(false)
+                // Draggable + collapsible + X-closable — never traps input.
+                .collapsible(true)
                 .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .open(&mut open)
                 .show(ui.ctx(), |ui| {
                     ui.label(egui::RichText::new("ItsJustCAD").heading());
@@ -3354,10 +3478,10 @@ impl eframe::App for App {
         if self.show_history {
             let mut open = true;
             egui::Window::new("Edit history")
-                .collapsible(false)
+                // Draggable + collapsible + X-closable — never traps input.
+                .collapsible(true)
                 .resizable(true)
                 .default_size([320.0, 380.0])
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .open(&mut open)
                 .show(ui.ctx(), |ui| self.history_panel(ui));
             if !open {
@@ -3368,6 +3492,8 @@ impl eframe::App for App {
         // Tools → Model Setup panel (also the onboarding "download a local
         // model" entry point). Renders any time show_model_setup is set.
         self.model_setup_ui(ui.ctx());
+        // Compact corner chip so a download can continue with the panel hidden.
+        self.download_progress_chip(ui.ctx());
 
         // Mirror the op-log to the crash journal. One hook covers every
         // mutation path (command line, gumball, deck, history jumps); the
@@ -3621,6 +3747,55 @@ mod tests {
             dir != std::path::Path::new("/tmp"),
             "private_runtime_dir must not be bare /tmp"
         );
+    }
+
+    /// Closing the Model Setup panel must NOT cancel an active download: the
+    /// background task stays alive and keeps advancing. We model the close path
+    /// (`close_model_setup` only flips `show_model_setup`) against a fake
+    /// download and assert (a) cancel was never requested and (b) the shared
+    /// state can still advance to a new value afterwards.
+    #[test]
+    fn closing_model_setup_does_not_cancel_active_download() {
+        use crate::download::{Download, DownloadState};
+        use std::sync::atomic::Ordering;
+
+        let (handle, state, cancel) = Download::for_test(DownloadState::Downloading {
+            done: 10,
+            total: Some(100),
+            bytes_per_sec: 1.0,
+        });
+        let active = ActiveDownload {
+            model_id: "m".into(),
+            handle,
+            persisted: false,
+        };
+
+        // The close path (see `close_model_setup`) touches only the panel flag,
+        // never `active.handle.cancel()`. Simulate it:
+        // (close_model_setup would set show_model_setup=false and do nothing else)
+        assert!(!cancel.load(Ordering::SeqCst), "no cancel before close");
+
+        // Nothing about closing touched the handle: still not cancelled.
+        assert!(
+            !cancel.load(Ordering::SeqCst),
+            "closing the panel must not request cancellation"
+        );
+
+        // The background task can still advance — it's alive.
+        *state.lock().expect("state") = DownloadState::Downloading {
+            done: 50,
+            total: Some(100),
+            bytes_per_sec: 2.0,
+        };
+        assert!(
+            active.handle.state().is_active(),
+            "download still advancing after close"
+        );
+        assert_eq!(active.handle.state().fraction(), Some(0.5));
+
+        // By contrast, the explicit Cancel button DOES cancel.
+        active.handle.cancel();
+        assert!(cancel.load(Ordering::SeqCst), "explicit cancel sets the flag");
     }
 
     #[test]

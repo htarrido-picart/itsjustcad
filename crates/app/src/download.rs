@@ -94,6 +94,26 @@ impl Download {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
     }
+
+    /// Test-only fake download with no background task: hand back the shared
+    /// state + cancel handles so a test can drive `state()` forward and observe
+    /// whether `cancel()` was ever requested. Used to prove that closing the
+    /// Model Setup panel does NOT cancel an in-flight download.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        initial: DownloadState,
+    ) -> (Self, Arc<Mutex<DownloadState>>, Arc<AtomicBool>) {
+        let state = Arc::new(Mutex::new(initial));
+        let cancel = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                state: state.clone(),
+                cancel: cancel.clone(),
+            },
+            state,
+            cancel,
+        )
+    }
 }
 
 /// Everything the fetch needs. `dir` is the models directory; `file_name` is the

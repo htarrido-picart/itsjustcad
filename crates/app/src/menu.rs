@@ -52,6 +52,15 @@ pub enum MenuAction {
     /// Pop a native file-save dialog for export, then run `export <path>` through
     /// the substrate. Fired by the File → Export… menu item.
     ExportDialog,
+    /// Set the app appearance theme from the native View ▸ Appearance items.
+    /// `Some(true)` = Dark, `Some(false)` = Light, `None` = follow the OS.
+    /// UI/session state (not the op-log): drives the existing theme pin.
+    SetTheme(Option<bool>),
+    /// Step the app text size (egui zoom factor) one notch, clamped 0.5–3.0.
+    /// `true` = larger (⌘+), `false` = smaller (⌘-). UI state, not op-log.
+    ZoomStep(bool),
+    /// Reset the app text size (egui zoom factor) to the default (⌘0).
+    ZoomReset,
 }
 
 /// Draw-tool verbs (mirror `draw_tool::try_start`). A menu pick of one of these
@@ -261,6 +270,23 @@ pub struct NativeMenu {
 /// Note: rich, egui-only rows (Appearance dark/light toggle + text-size stepper,
 /// color swatches) are intentionally NOT here — those stay in-window because they
 /// cannot be native menu items. Standard verb menus go native.
+/// The Appearance rows injected into the native View menu: theme (Light / Dark /
+/// System) followed by the text-size stepper (Increase / Decrease / Reset). Each
+/// is `(id_suffix, label, MenuAction)` and routes through `apply_menu_action`,
+/// the same substrate dispatch every other menu pick uses. These replace the old
+/// in-window Appearance strip on macOS/Windows (Linux keeps the strip — no native
+/// bar). Kept as a standalone fn so it is unit-testable.
+pub fn appearance_native_items() -> Vec<(&'static str, &'static str, MenuAction)> {
+    vec![
+        ("theme_light", "Appearance: Light", MenuAction::SetTheme(Some(false))),
+        ("theme_dark", "Appearance: Dark", MenuAction::SetTheme(Some(true))),
+        ("theme_system", "Appearance: System", MenuAction::SetTheme(None)),
+        ("text_bigger", "Text Size: Increase", MenuAction::ZoomStep(true)),
+        ("text_smaller", "Text Size: Decrease", MenuAction::ZoomStep(false)),
+        ("text_reset", "Text Size: Reset", MenuAction::ZoomReset),
+    ]
+}
+
 pub fn native_model(style: MenuStyle) -> Vec<NativeMenu> {
     let mut menus: Vec<NativeMenu> = Vec::new();
     for (title, cats) in top_menus(style) {
@@ -292,6 +318,14 @@ pub fn native_model(style: MenuStyle) -> Vec<NativeMenu> {
             items.push(NativeItem::Separator);
         } else if title == "Tools" {
             items.push(leaf("model_setup", "Model Setup…", MenuAction::ModelSetup));
+            items.push(NativeItem::Separator);
+        } else if title == "View" {
+            // Appearance lives in the native View menu (macOS/Windows have no
+            // in-window strip). Theme is three radio-style items (Light/Dark/
+            // System); text size is a stepper. All route via apply_menu_action.
+            for (id, label, action) in appearance_native_items() {
+                items.push(leaf(id, label, action));
+            }
             items.push(NativeItem::Separator);
         }
         // Registry verbs grouped by category, a separator between groups — the
@@ -524,16 +558,6 @@ fn appearance_controls(ui: &mut egui::Ui, icons: &Icons) {
         let size = ui.text_style_height(&egui::TextStyle::Body);
         let color = ui.visuals().weak_text_color();
         ui.add(icons.image(ui.ctx(), Icon::Theme, size, color));
-    });
-}
-
-/// Slim in-window bar shown when the native OS menu bar owns the File/Edit/…
-/// verbs: it carries only the egui-only Appearance controls (dark/light +
-/// text-size), which can't live in a native menu. Returns no [`MenuAction`] —
-/// verb dispatch comes from the native bar's event channel.
-pub fn appearance_only(ui: &mut egui::Ui, icons: &Icons) {
-    egui::MenuBar::new().ui(ui, |ui| {
-        appearance_controls(ui, icons);
     });
 }
 
@@ -891,6 +915,64 @@ mod tests {
                 ls.iter().any(|(_, l, _)| l == v),
                 "View menu missing verb {v}"
             );
+        }
+    }
+
+    #[test]
+    fn native_view_menu_has_appearance_items() {
+        // Appearance (theme + text size) lives in the native View menu now, not
+        // an in-window strip. All three theme choices and all three text-size
+        // actions must be present and route to the right MenuAction.
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            let view = native_model(style)
+                .into_iter()
+                .find(|m| m.title == "View")
+                .expect("View menu");
+            let ls = leaves(&[view]);
+            let has = |a: &MenuAction| ls.iter().any(|(_, _, act)| act == a);
+            assert!(has(&MenuAction::SetTheme(Some(false))), "Light missing {style:?}");
+            assert!(has(&MenuAction::SetTheme(Some(true))), "Dark missing {style:?}");
+            assert!(has(&MenuAction::SetTheme(None)), "System missing {style:?}");
+            assert!(has(&MenuAction::ZoomStep(true)), "Increase missing {style:?}");
+            assert!(has(&MenuAction::ZoomStep(false)), "Decrease missing {style:?}");
+            assert!(has(&MenuAction::ZoomReset), "Reset missing {style:?}");
+        }
+    }
+
+    #[test]
+    fn view_menu_gathers_display_and_layout_verbs() {
+        // The View menu must be non-empty and carry the registry View verbs
+        // (display modes / viewport layout / zoom / lighting) — the user's
+        // "View does nothing" complaint. Assert it holds real verbs beyond the
+        // Appearance rows.
+        let view = native_model(MenuStyle::Rhino)
+            .into_iter()
+            .find(|m| m.title == "View")
+            .expect("View menu");
+        let ls = leaves(&[view]);
+        let verb_leaves = ls
+            .iter()
+            .filter(|(_, _, a)| {
+                !matches!(a, MenuAction::SetTheme(_) | MenuAction::ZoomStep(_) | MenuAction::ZoomReset)
+            })
+            .count();
+        assert!(verb_leaves > 0, "View menu carries no registry verbs");
+        for v in verbs_in(&[Category::View]) {
+            assert!(ls.iter().any(|(_, l, _)| l == v), "View missing verb {v}");
+        }
+    }
+
+    #[test]
+    fn no_show_tab_bar_item_anywhere() {
+        // "Show Tab Bar" / "Show All Tabs" are AppKit auto-injections we suppress
+        // via allowsAutomaticWindowTabbing=NO; our own model must never define
+        // such items itself.
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            for (_, label, _) in leaves(&native_model(style)) {
+                let l = label.to_lowercase();
+                assert!(!l.contains("tab bar"), "found tab-bar item: {label}");
+                assert!(!l.contains("all tabs"), "found all-tabs item: {label}");
+            }
         }
     }
 

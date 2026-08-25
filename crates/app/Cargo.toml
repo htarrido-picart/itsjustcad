@@ -44,3 +44,11 @@ raw-window-handle = "0.6"
 # which requires system libraries CI does not install.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 muda = "0.19"
+
+# macOS-only: disable AppKit's automatic window tabbing (kills the auto-injected
+# "Show Tab Bar" / "Show All Tabs" View items). objc2 is already in the tree via
+# muda; declaring it here makes the AppKit call explicit and version-pinned.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"

@@ -64,6 +64,9 @@ impl NativeMenuBar {
         {
             // Global screen-top NSMenu bar. winit has created the NSApp already.
             menu.init_for_nsapp();
+            // Kill AppKit's auto-injected "Show Tab Bar" / "Show All Tabs" View
+            // items: a single-window CAD app has no use for window tabs.
+            disable_automatic_window_tabbing();
             Some(Self { _menu: menu, routes })
         }
 
@@ -99,6 +102,21 @@ impl NativeMenuBar {
             }
         }
         chosen
+    }
+}
+
+/// macOS: turn OFF `NSWindow.allowsAutomaticWindowTabbing`. AppKit otherwise
+/// auto-injects "Show Tab Bar" / "Show All Tabs" into the View menu for any
+/// document-style window; a single-window CAD app has no tabs, so those items are
+/// dead weight. Must run on the main thread (it does — we're called from the
+/// interactive `ui` frame, which winit drives on the main thread).
+#[cfg(target_os = "macos")]
+fn disable_automatic_window_tabbing() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSWindow;
+    // Safe: the interactive menu attach runs on winit's main thread.
+    if let Some(mtm) = MainThreadMarker::new() {
+        NSWindow::setAllowsAutomaticWindowTabbing(false, mtm);
     }
 }
 
