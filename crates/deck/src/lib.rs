@@ -15,6 +15,7 @@ mod openai_compat;
 mod probe;
 mod prompt;
 mod tool_loop;
+mod which;
 
 pub use claude_code::{scoped_allowed_tools, turn_allowed_tools};
 pub use config::{is_local_url, DeckConfig, DeckKind, DecksFile};
@@ -25,3 +26,4 @@ pub use prompt::system_prompt;
 pub use tool_loop::{
     run_tool_loop, AgentCassette, LoopOutcome, StepDecision, ToolCall, ToolDispatch, ToolResult,
 };
+pub use which::{augmented_path_env, resolve_claude_binary};

@@ -52,6 +52,15 @@ fn is_spawnable_local(
         && catalog.get(&config.model).is_some()
 }
 
+/// Point `decks.active` at the cassette named `name`, returning its index (or
+/// `None` if no such cassette). Pure over `decks` so the auto-activate rule is
+/// unit-testable without touching disk or a tokio runtime.
+fn select_active_by_name(decks: &mut itsjustcad_deck::DecksFile, name: &str) -> Option<usize> {
+    let idx = decks.decks.iter().position(|d| d.name == name)?;
+    decks.active = idx;
+    Some(idx)
+}
+
 /// The outcome of ensuring a local runtime for a turn.
 enum LocalReady {
     /// The server is healthy; the string is the live base URL to talk to.
@@ -463,6 +472,41 @@ impl DeckPane {
     /// opened/saved. `None` (unknown) makes every deck path require confirmation.
     pub fn set_sandbox_root(&mut self, root: Option<std::path::PathBuf>) {
         self.sandbox_root = root;
+    }
+
+    /// A model just finished downloading (and its cassette was written to
+    /// `decks.json`). Reload decks from disk so this running pane sees the new
+    /// cassette, make it the ACTIVE deck, eagerly spawn its local runtime (so the
+    /// very next chat turn works with no further user action), and announce it in
+    /// the transcript. Returns the cassette name that became active, if found.
+    ///
+    /// This is the Priority A "download → chat just works" hand-off: without it,
+    /// the freshly-installed cassette lives only on disk while the pane keeps
+    /// pointing at whatever was active before.
+    pub fn activate_installed_model(
+        &mut self,
+        cassette_name: &str,
+        handle: &tokio::runtime::Handle,
+    ) -> Option<String> {
+        // Reload so the on-disk cassette (written by Model Setup) is visible.
+        self.decks = DecksFile::load_or_default();
+        let idx = select_active_by_name(&mut self.decks, cassette_name)?;
+        self.decks.save();
+        // Force a re-probe of the newly-active deck on the next frame.
+        self.probed_deck = None;
+
+        let config = self.decks.decks.get(idx).cloned()?;
+        // Eagerly bring the local runtime up so the first turn isn't spent
+        // waiting on a cold spawn. Ignore the Pending/Ready/Failed outcome here —
+        // the pane polls the runtime state each frame and surfaces failures.
+        if is_spawnable_local(&config, &self.catalog) {
+            let _ = self.ensure_local_runtime(&config, handle);
+        }
+        self.transcript.push(Entry::Status(format!(
+            "Active deck is now '{cassette_name}'. Starting its local runtime — \
+             your next message will use it."
+        )));
+        Some(cassette_name.to_string())
     }
 
     /// Start a fresh chat session: abort any in-flight turn, drop the provider
@@ -1920,5 +1964,42 @@ mod side_effect_gate_tests {
         assert!(!path_within(root, Path::new("/etc/passwd")));
         // sneaky: climb out then back to a sibling
         assert!(!path_within(root, Path::new("../proj-evil/x")));
+    }
+
+    // --- auto-activate (Priority A): flip the active deck to a new cassette ---
+
+    fn deck(name: &str) -> itsjustcad_deck::DeckConfig {
+        itsjustcad_deck::DeckConfig {
+            name: name.into(),
+            kind: itsjustcad_deck::DeckKind::OpenaiCompat,
+            base_url: "http://localhost:8080/v1".into(),
+            model: name.into(),
+            api_key: None,
+            grammar: true,
+        }
+    }
+
+    #[test]
+    fn select_active_by_name_flips_active_to_the_installed_cassette() {
+        let mut decks = DecksFile {
+            decks: vec![deck("cloud"), deck("local-qwen"), deck("other")],
+            active: 0,
+            local_only: false,
+        };
+        // The just-downloaded cassette becomes active regardless of prior index.
+        let idx = select_active_by_name(&mut decks, "local-qwen");
+        assert_eq!(idx, Some(1));
+        assert_eq!(decks.active, 1);
+    }
+
+    #[test]
+    fn select_active_by_name_unknown_is_none_and_leaves_active() {
+        let mut decks = DecksFile {
+            decks: vec![deck("a"), deck("b")],
+            active: 1,
+            local_only: false,
+        };
+        assert_eq!(select_active_by_name(&mut decks, "nope"), None);
+        assert_eq!(decks.active, 1, "active must be untouched on a miss");
     }
 }

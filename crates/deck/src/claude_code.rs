@@ -168,8 +168,18 @@ impl ClaudeCodeDeck {
             args.push("--resume".into());
             args.push(session.clone());
         }
-        let mut child = tokio::process::Command::new("claude")
+        // Resolve the absolute `claude` path (a Finder-launched .app has a
+        // stripped PATH without /usr/local/bin etc.), and augment the child's
+        // PATH so anything the CLI shells out to is also findable.
+        let bin = crate::which::resolve_claude_binary().ok_or_else(|| {
+            DeckError::Stream(
+                "claude CLI not found — install Claude Code (https://claude.com/claude-code)"
+                    .to_string(),
+            )
+        })?;
+        let mut child = tokio::process::Command::new(&bin)
             .args(&args)
+            .env("PATH", crate::which::augmented_path_env())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())

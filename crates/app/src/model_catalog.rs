@@ -193,10 +193,10 @@ mod tests {
     #[test]
     fn runnable_gate_by_ram() {
         let cat = Catalog::load();
-        // 8 GB → only the 3B is runnable.
-        let at8: Vec<&str> = cat.runnable_at(Some(8)).iter().map(|m| m.id.as_str()).collect();
-        assert!(at8.iter().any(|id| id.contains("3b")), "{at8:?}");
-        assert!(!at8.iter().any(|id| id.contains("7b")), "{at8:?}");
+        // 8 GB → only the small-tier entry is runnable, not the 7B.
+        let at8 = cat.runnable_at(Some(8));
+        assert!(at8.iter().any(|m| m.tier == TierTag::Small3B), "{at8:?}");
+        assert!(!at8.iter().any(|m| m.tier == TierTag::Mid7B), "{at8:?}");
         // 16 GB → both are runnable.
         let at16 = cat.runnable_at(Some(16));
         assert_eq!(at16.len(), cat.models.len());

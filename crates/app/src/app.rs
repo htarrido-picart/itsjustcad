@@ -2585,27 +2585,31 @@ impl App {
             return;
         }
 
-        // 1) Poll the active download; on a fresh Done, persist the cassette once.
-        let mut done_msg: Option<String> = None;
+        // 1) Poll the active download; on a fresh Done, persist the cassette AND
+        //    auto-activate it (Priority A: "download → chat just works"). We
+        //    collect the cassette name here and activate after the borrow ends.
+        let mut activate: Option<(String, String)> = None; // (cassette_name, model_label)
         if let Some(active) = &mut self.active_download {
             let state = active.handle.state();
             if matches!(state, crate::download::DownloadState::Done { .. }) && !active.persisted {
                 active.persisted = true;
                 if let Some(entry) = self.catalog.get(&active.model_id).cloned() {
                     let mut decks = itsjustcad_deck::DecksFile::load_or_default();
-                    install_catalog_deck(&mut decks, &entry);
+                    install_catalog_deck(&mut decks, &entry); // sets active in-file
                     decks.save();
-                    done_msg = Some(format!(
-                        "Installed {} and enabled cassette '{}'. \
-                         Start the local runtime to use it.",
-                        entry.display_name,
-                        cassette_name_for(&entry.id),
-                    ));
+                    activate = Some((cassette_name_for(&entry.id), entry.display_name.clone()));
                 }
             }
         }
-        if let Some(msg) = done_msg {
-            tracing::info!("{msg}");
+        if let Some((cassette, label)) = activate {
+            // Reload the pane's decks, flip the active deck, and eagerly start
+            // the local runtime so the next chat turn works with zero extra steps.
+            self.deck_pane.activate_installed_model(&cassette, &self.tokio);
+            tracing::info!(
+                "Installed {}; active deck is now '{}' and its runtime is starting.",
+                label,
+                cassette
+            );
         }
 
         let mut open = true;
@@ -2733,8 +2737,9 @@ impl App {
                 ui.label(
                     egui::RichText::new(
                         "Downloads stream to ~/.config/itsjustcad/models and are \
-                         SHA-256 verified. Installing enables a local cassette; \
-                         start the runtime to use it.",
+                         SHA-256 verified. When a download finishes it becomes \
+                         the active deck automatically and its runtime starts — \
+                         just start chatting.",
                     )
                     .weak()
                     .small(),

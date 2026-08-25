@@ -51,6 +51,33 @@ impl OpenAiCompatDeck {
         body
     }
 
+    /// Best-effort fetch of the endpoint's advertised model ids (`GET /models`),
+    /// used to enrich a "model not found" turn failure. Never errors — an empty
+    /// list just means we couldn't enumerate (the message degrades gracefully).
+    async fn list_models(&self) -> Vec<String> {
+        let mut request = self.client.get(format!("{}/models", self.base_url));
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let Ok(resp) = request.send().await else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(body) = resp.json::<Value>().await else {
+            return Vec::new();
+        };
+        body["data"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m["id"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     async fn stream_inner(
         &self,
         req: ChatRequest,
@@ -73,12 +100,30 @@ impl OpenAiCompatDeck {
             request = request.bearer_auth(key);
         }
 
-        let response = request.send().await?;
+        let response = request.send().await.map_err(|e| {
+            // Connection refused / DNS / TLS: the server isn't reachable. Say so
+            // plainly instead of leaking a raw reqwest error — the deck must
+            // never fail a turn silently or cryptically.
+            DeckError::Stream(format!(
+                "can't reach {} — is the runtime/Ollama running? ({e})",
+                self.base_url
+            ))
+        })?;
         if !response.status().is_success() {
-            return Err(DeckError::Api {
-                status: response.status().as_u16(),
-                body: response.text().await.unwrap_or_default(),
-            });
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            // A missing model is the single most common silent failure (Ollama
+            // 404, vLLM/llama.cpp 400/404). Turn it into an actionable message
+            // that lists what the endpoint DOES serve.
+            if is_model_missing(status, &body) {
+                let available = self.list_models().await;
+                return Err(DeckError::Stream(model_not_found_message(
+                    &self.model,
+                    &self.base_url,
+                    &available,
+                )));
+            }
+            return Err(DeckError::Api { status, body });
         }
 
         let mut events = response.bytes_stream().eventsource();
@@ -96,6 +141,39 @@ impl OpenAiCompatDeck {
             }
         }
         Ok(())
+    }
+}
+
+/// Heuristic: does this error status+body indicate the requested model isn't
+/// served by the endpoint? Ollama answers 404 with "model ... not found";
+/// llama.cpp/vLLM/OpenAI answer 400/404 with a body mentioning the model. Pure
+/// so the classification is unit-testable.
+fn is_model_missing(status: u16, body: &str) -> bool {
+    if status == 404 {
+        return true;
+    }
+    // Some servers use 400 for an unknown model — sniff the body.
+    if status == 400 || status == 422 {
+        let b = body.to_lowercase();
+        return b.contains("model") && (b.contains("not found") || b.contains("does not exist"));
+    }
+    false
+}
+
+/// The actionable "model not found" message, listing what the endpoint serves.
+/// Pure so the wording is unit-testable without a live endpoint.
+fn model_not_found_message(model: &str, base_url: &str, available: &[String]) -> String {
+    if available.is_empty() {
+        format!(
+            "model '{model}' not found on {base_url} — and no models are listed there. \
+             Pull it (e.g. `ollama pull {model}`) or start the right runtime."
+        )
+    } else {
+        format!(
+            "model '{model}' not found on {base_url} — available: {}. \
+             Pull it or pick one of those.",
+            available.join(", ")
+        )
     }
 }
 
@@ -168,5 +246,54 @@ mod tests {
         let wire = serde_json::to_string(&body).expect("serializes");
         assert!(wire.contains("\"grammar\""), "wire JSON lacks grammar field");
         assert!(wire.contains("```draft"), "wire JSON lacks the draft fence rule");
+    }
+
+    // ── model-missing classification (Priority C) ──────────────────────────
+
+    #[test]
+    fn ollama_404_is_model_missing() {
+        assert!(is_model_missing(
+            404,
+            r#"{"error":"model 'qwen3' not found, try pulling it first"}"#
+        ));
+    }
+
+    #[test]
+    fn bad_request_mentioning_missing_model_is_model_missing() {
+        assert!(is_model_missing(
+            400,
+            "The model `foo` does not exist or you do not have access"
+        ));
+        assert!(is_model_missing(422, "model not found"));
+    }
+
+    #[test]
+    fn generic_400_is_not_model_missing() {
+        // A 400 that isn't about a model (e.g. bad params) must NOT be
+        // misclassified — it should surface as a plain Api error.
+        assert!(!is_model_missing(400, "invalid temperature value"));
+        // 500s are server errors, not missing-model.
+        assert!(!is_model_missing(500, "model blew up internally"));
+        assert!(!is_model_missing(401, "model unauthorized"));
+    }
+
+    #[test]
+    fn not_found_message_lists_available_models() {
+        let msg = model_not_found_message(
+            "qwen3",
+            "http://localhost:11434/v1",
+            &["llama3.2".into(), "phi4".into()],
+        );
+        assert!(msg.contains("qwen3"), "{msg}");
+        assert!(msg.contains("http://localhost:11434/v1"), "{msg}");
+        assert!(msg.contains("llama3.2"), "{msg}");
+        assert!(msg.contains("phi4"), "{msg}");
+    }
+
+    #[test]
+    fn not_found_message_handles_empty_list() {
+        let msg = model_not_found_message("qwen3", "http://localhost:11434/v1", &[]);
+        assert!(msg.contains("qwen3"), "{msg}");
+        assert!(msg.contains("no models are listed"), "{msg}");
     }
 }

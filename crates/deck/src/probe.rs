@@ -79,13 +79,24 @@ pub async fn probe(config: &DeckConfig) -> Result<ProbeInfo, String> {
 
     match config.kind {
         DeckKind::ClaudeCode => {
-            let output = tokio::process::Command::new("claude")
+            // A Finder-launched .app has a stripped PATH without /usr/local/bin
+            // etc., so a bare `claude` is invisible even when installed. Resolve
+            // the absolute path from the well-known install locations first.
+            let bin = crate::which::resolve_claude_binary().ok_or_else(|| {
+                "claude CLI not found — install Claude Code (https://claude.com/claude-code)"
+                    .to_string()
+            })?;
+            let output = tokio::process::Command::new(&bin)
                 .arg("--version")
+                .env("PATH", crate::which::augmented_path_env())
                 .output()
                 .await
-                .map_err(|_| {
-                    "claude CLI not found — install Claude Code (https://claude.com/claude-code)"
-                        .to_string()
+                .map_err(|e| {
+                    format!(
+                        "claude CLI at {} failed to run: {e} — reinstall Claude Code \
+                         (https://claude.com/claude-code)",
+                        bin.display()
+                    )
                 })?;
             if !output.status.success() {
                 return Err("claude CLI errored on --version".to_string());
