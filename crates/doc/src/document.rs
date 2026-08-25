@@ -154,6 +154,13 @@ impl Document {
         self.objects.get(&id)
     }
 
+    /// Mutable iterator over every object (unordered). Bumps the generation so
+    /// callers need not remember to; used by bulk edits like layer rename/delete.
+    pub fn objects_mut(&mut self) -> impl Iterator<Item = &mut SceneObject> {
+        self.generation += 1;
+        self.objects.values_mut()
+    }
+
     pub fn get_mut(&mut self, id: ObjectId) -> Option<&mut SceneObject> {
         self.generation += 1;
         self.objects.get_mut(&id)

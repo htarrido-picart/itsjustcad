@@ -412,6 +412,23 @@ pub enum Command {
         layer: String,
         mm: f64,
     },
+    /// Rename a layer. Every object on it (and the current-layer pointer) moves
+    /// to the new name; the old name must exist and the new one must be free.
+    LayerRename {
+        from: String,
+        to: String,
+    },
+    /// Delete a layer, reassigning its objects to the default layer. The default
+    /// layer itself cannot be deleted.
+    LayerDelete {
+        layer: String,
+    },
+    /// Set a layer's display-order sort key (lower shows first in the Layers
+    /// panel). Storage order is unchanged; only the panel sort is affected.
+    LayerOrder {
+        layer: String,
+        order: i32,
+    },
     Hide {
         layer: String,
     },

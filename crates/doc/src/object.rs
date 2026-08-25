@@ -503,11 +503,20 @@ pub struct LayerStyle {
     /// Print lineweight in millimetres. Default 0.18 mm (ISO thin).
     #[serde(default = "default_lineweight", skip_serializing_if = "is_default_lineweight")]
     pub lineweight_mm: f64,
+    /// Display-order sort key for the Layers panel (lower shows first). Storage
+    /// stays alphabetical (BTreeMap); the UI sorts by this then by name. Serde
+    /// default 0 keeps pre-order JSON loading (ties break by name, as before).
+    #[serde(default, skip_serializing_if = "is_default_order")]
+    pub order: i32,
+}
+
+fn is_default_order(o: &i32) -> bool {
+    *o == 0
 }
 
 impl Default for LayerStyle {
     fn default() -> Self {
-        Self { color: None, visible: true, lineweight_mm: 0.18 }
+        Self { color: None, visible: true, lineweight_mm: 0.18, order: 0 }
     }
 }
 

@@ -594,6 +594,19 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             }
             Ok(Command::LayerWeight { layer: layer.to_string(), mm })
         }
+        "layerrename" => {
+            let [from, to] = take::<2>("layerrename", "the current layer name and the new name", &args)?;
+            Ok(Command::LayerRename { from: from.to_string(), to: to.to_string() })
+        }
+        "layerdelete" => {
+            let [layer] = take::<1>("layerdelete", "a layer name", &args)?;
+            Ok(Command::LayerDelete { layer: layer.to_string() })
+        }
+        "layerorder" => {
+            let [layer, order] = take::<2>("layerorder", "a layer name and an integer order", &args)?;
+            let order = number(order)? as i32;
+            Ok(Command::LayerOrder { layer: layer.to_string(), order })
+        }
         "hide" => {
             let [layer] = take::<1>("hide", "a layer name", &args)?;
             Ok(Command::Hide { layer: layer.to_string() })

@@ -355,6 +355,24 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Annotate,
         },
         CommandSpec {
+            name: "layerrename",
+            usage: "layerrename <from> <to>",
+            summary: "Rename a layer; its objects and the current-layer pointer follow. Example: layerrename walls exterior",
+            category: Category::Annotate,
+        },
+        CommandSpec {
+            name: "layerdelete",
+            usage: "layerdelete <layer>",
+            summary: "Delete a layer; its objects move to the default layer. The default layer cannot be deleted. Example: layerdelete scratch",
+            category: Category::Annotate,
+        },
+        CommandSpec {
+            name: "layerorder",
+            usage: "layerorder <layer> <n>",
+            summary: "Set a layer's sort order in the Layers panel (lower shows first). Example: layerorder walls -1",
+            category: Category::Annotate,
+        },
+        CommandSpec {
             name: "hide",
             usage: "hide <layer>",
             summary: "Hide a layer (objects stay in the model, invisible). Example: hide walls",

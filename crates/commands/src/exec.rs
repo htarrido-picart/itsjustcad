@@ -74,8 +74,18 @@ enum Inverse {
         prev: Vec<(ObjectId, String)>,
         created: Option<String>,
     },
-    /// `layercolor`/`hide`/`show`: restore the previous layer style.
+    /// `layercolor`/`hide`/`show`/`layerorder`: restore the previous layer style.
     LayerStyle { layer: String, prev: LayerStyle },
+    /// `layerrename`: rename back, moving objects + current-layer pointer.
+    LayerRename { from: String, to: String },
+    /// `layerdelete`: recreate the deleted layer with its style, and put the
+    /// reassigned objects back on it (plus the current-layer pointer if it moved).
+    LayerDelete {
+        layer: String,
+        style: LayerStyle,
+        moved: Vec<ObjectId>,
+        prev_current: Option<String>,
+    },
     /// `hideobj`/`showobj`: restore each object's previous visible flag.
     ObjectVisibility(Vec<(ObjectId, bool)>),
     /// `lineweight`/`lineweightoff`: restore each object's previous lineweight override.
@@ -377,6 +387,33 @@ impl Session {
             Inverse::LayerStyle { layer, prev } => {
                 if let Some(style) = self.doc.layers.get_mut(layer) {
                     *style = prev.clone();
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::LayerRename { from, to } => {
+                // Undo a rename `from`→`to` by renaming `to`→`from`.
+                if let Some(style) = self.doc.layers.remove(to) {
+                    self.doc.layers.insert(from.clone(), style);
+                }
+                for obj in self.doc.objects_mut() {
+                    if &obj.layer == to {
+                        obj.layer = from.clone();
+                    }
+                }
+                if &self.doc.current_layer == to {
+                    self.doc.current_layer = from.clone();
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::LayerDelete { layer, style, moved, prev_current } => {
+                self.doc.layers.insert(layer.clone(), style.clone());
+                for id in moved.clone() {
+                    if let Some(obj) = self.doc.get_mut(id) {
+                        obj.layer = layer.clone();
+                    }
+                }
+                if let Some(prev) = prev_current {
+                    self.doc.current_layer = prev.clone();
                 }
                 self.doc.generation += 1;
             }
@@ -3632,6 +3669,97 @@ fn apply_forward(
                 },
             ))
         }
+        Command::LayerRename { from, to } => {
+            if from == to {
+                return Err(ExecError::Invalid("layerrename: names are identical".into()));
+            }
+            if !doc.layers.contains_key(&from) {
+                let known: Vec<&str> = doc.layers.keys().map(String::as_str).collect();
+                return Err(ExecError::Invalid(format!(
+                    "no layer '{from}' (layers: {})",
+                    known.join(", ")
+                )));
+            }
+            if doc.layers.contains_key(&to) {
+                return Err(ExecError::Invalid(format!("layer '{to}' already exists")));
+            }
+            let style = doc.layers.remove(&from).expect("checked");
+            doc.layers.insert(to.clone(), style);
+            for obj in doc.objects_mut() {
+                if obj.layer == from {
+                    obj.layer = to.clone();
+                }
+            }
+            if doc.current_layer == from {
+                doc.current_layer = to.clone();
+            }
+            doc.generation += 1;
+            Ok((
+                Command::LayerRename { from: from.clone(), to: to.clone() },
+                Inverse::LayerRename { from: from.clone(), to: to.clone() },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("layer '{from}' renamed to '{to}'"),
+                },
+            ))
+        }
+        Command::LayerDelete { layer } => {
+            if layer == itsjustcad_doc::DEFAULT_LAYER {
+                return Err(ExecError::Invalid(
+                    "cannot delete the default layer".into(),
+                ));
+            }
+            let Some(style) = doc.layers.get(&layer).cloned() else {
+                let known: Vec<&str> = doc.layers.keys().map(String::as_str).collect();
+                return Err(ExecError::Invalid(format!(
+                    "no layer '{layer}' (layers: {})",
+                    known.join(", ")
+                )));
+            };
+            // Reassign objects on this layer to the default layer (recorded for undo).
+            let moved: Vec<ObjectId> = doc
+                .objects()
+                .filter(|o| o.layer == layer)
+                .map(|o| o.id)
+                .collect();
+            for id in &moved {
+                if let Some(obj) = doc.get_mut(*id) {
+                    obj.layer = itsjustcad_doc::DEFAULT_LAYER.to_string();
+                }
+            }
+            let prev_current = (doc.current_layer == layer).then(|| {
+                let prev = doc.current_layer.clone();
+                doc.current_layer = itsjustcad_doc::DEFAULT_LAYER.to_string();
+                prev
+            });
+            doc.layers.remove(&layer);
+            doc.generation += 1;
+            Ok((
+                Command::LayerDelete { layer: layer.clone() },
+                Inverse::LayerDelete { layer: layer.clone(), style, moved: moved.clone(), prev_current },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "layer '{layer}' deleted ({} object(s) → default)",
+                        moved.len()
+                    ),
+                },
+            ))
+        }
+        Command::LayerOrder { layer, order } => {
+            let style = layer_style_mut(doc, &layer)?;
+            let prev = style.clone();
+            style.order = order;
+            doc.generation += 1;
+            Ok((
+                Command::LayerOrder { layer: layer.clone(), order },
+                Inverse::LayerStyle { layer: layer.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("layer '{layer}' order set to {order}"),
+                },
+            ))
+        }
         Command::Hide { layer } => {
             let style = layer_style_mut(doc, &layer)?;
             let prev = style.clone();
@@ -5094,6 +5222,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::ToLayer { .. } => "tolayer",
         Command::LayerColor { .. } => "layercolor",
         Command::LayerWeight { .. } => "layerweight",
+        Command::LayerRename { .. } => "layerrename",
+        Command::LayerDelete { .. } => "layerdelete",
+        Command::LayerOrder { .. } => "layerorder",
         Command::Hide { .. } => "hide",
         Command::Show { .. } => "show",
         Command::HideObj { .. } => "hideobj",
