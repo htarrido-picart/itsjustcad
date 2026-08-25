@@ -359,6 +359,14 @@ pub struct App {
     /// Lucide line-icon texture cache for the chrome (menu bar, tab strip).
     /// Decodes + uploads each icon once, on first draw.
     icons: crate::icons::Icons,
+    /// True native OS menu bar (muda): global NSMenu on macOS, HMENU on Windows.
+    /// `None` in headless/tests or where native attach is unavailable — the app
+    /// then falls back to the in-window egui menu bar. Attached lazily on the
+    /// first interactive frame (macOS needs the NSApp to exist first).
+    native_menu: Option<crate::native_menu::NativeMenuBar>,
+    /// Whether we've already tried to attach the native menu bar (once), so a
+    /// failed/headless attach isn't retried every frame.
+    native_menu_tried: bool,
 }
 
 /// A running install: which model, plus the [`crate::download::Download`] handle
@@ -530,7 +538,29 @@ impl App {
             catalog: crate::model_catalog::Catalog::load(),
             active_download: None,
             icons: crate::icons::Icons::new(),
+            native_menu: None,
+            native_menu_tried: false,
         }
+    }
+
+    /// Lazily attach the true native OS menu bar (muda) the first interactive
+    /// frame, then never retry. Only runs when eframe hands us a live winit
+    /// window (`frame.window_handle()` succeeds) — headless/`--shot` has no
+    /// window, so the native bar is skipped and the in-window egui bar is used.
+    /// macOS needs the `NSApplication` to exist first, which it does by the time
+    /// the first `ui` runs; hence lazy rather than in `new`.
+    fn ensure_native_menu(&mut self, frame: &eframe::Frame) {
+        if self.native_menu_tried {
+            return;
+        }
+        self.native_menu_tried = true;
+        use raw_window_handle::HasWindowHandle as _;
+        // No window ⇒ headless / offscreen; keep the in-window bar.
+        if frame.window_handle().is_err() {
+            return;
+        }
+        let style = preset::preset_for(self.cad_origin).menu_style;
+        self.native_menu = crate::native_menu::NativeMenuBar::attach(style, frame);
     }
 
     /// Active alias map from the current preset (used by autosuggest + execute_line).
@@ -2371,6 +2401,16 @@ impl App {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let style = preset::preset_for(self.cad_origin).menu_style;
         let icons = &self.icons;
+        // When the true native OS menu bar (muda) is attached, it owns the
+        // File/Edit/… verb menus; the in-window strip then carries only the
+        // egui-only Appearance controls (which can't be native items). Verb
+        // dispatch arrives from the native bar's event channel (polled in `ui`).
+        if self.native_menu.is_some() {
+            egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
+                crate::menu::appearance_only(ui, icons);
+            });
+            return;
+        }
         let bar = egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
             crate::menu::ui(ui, icons, style)
         });
@@ -2977,7 +3017,22 @@ impl eframe::App for App {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // Attach the true native OS menu bar (muda) on the first interactive
+        // frame — no-op in headless/`--shot` (no window) — then drain its click
+        // channel each frame and route any pick through the substrate, exactly
+        // like the in-window bar. Request a repaint so native clicks (which don't
+        // otherwise wake egui) are handled promptly.
+        self.ensure_native_menu(frame);
+        if let Some(native) = &self.native_menu {
+            let action = native.poll();
+            if let Some(action) = action {
+                self.apply_menu_action(action);
+            }
+            // Keep polling responsive while a native bar is attached.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
         // ITSJUSTCAD_THEME pins the theme every frame (eframe otherwise re-reads
         // the OS theme each frame and would override a one-shot pin at startup).
         if let Some(dark) = self.forced_dark {

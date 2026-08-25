@@ -182,6 +182,126 @@ pub fn top_menus(style: MenuStyle) -> Vec<(&'static str, Vec<Category>)> {
     }
 }
 
+// ── Native menu model (muda) ─────────────────────────────────────────────────
+// The in-window egui menu bar (`ui` below) and the true native OS menu bar
+// (`crate::native_menu`, muda) render from ONE description so they never drift.
+// A `NativeMenuModel` is a pure, egui-free tree: top-level menus, each holding
+// items (leaf verbs / wired actions) and separators. Each leaf carries a stable
+// string `id` and the `MenuAction` it dispatches through the substrate — the
+// same actions `apply_menu_action` already routes. This function is unit-tested
+// standalone; the muda layer merely walks it.
+
+/// One row in a native menu: a clickable leaf, or a separator between groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeItem {
+    /// A clickable menu entry: stable `id` (used as the muda `MenuId`), the label
+    /// shown, and the [`MenuAction`] dispatched when chosen.
+    Leaf {
+        id: String,
+        label: String,
+        action: MenuAction,
+    },
+    /// A visual divider between item groups.
+    Separator,
+}
+
+/// A top-level native menu (e.g. "File") and its ordered rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeMenu {
+    pub title: String,
+    pub items: Vec<NativeItem>,
+}
+
+/// The complete native menu bar: the ordered top-level menus.
+///
+/// Built from the SAME source as the in-window bar — [`top_menus`] grouping plus
+/// the wired File/Edit/Tools/Help actions — so the two bars stay identical. The
+/// muda layer ([`crate::native_menu`]) walks this to build the OS menu; picking
+/// an item emits its [`NativeItem::Leaf`] `action` through the op-log path.
+///
+/// Note: rich, egui-only rows (Appearance dark/light toggle + text-size stepper,
+/// color swatches) are intentionally NOT here — those stay in-window because they
+/// cannot be native menu items. Standard verb menus go native.
+pub fn native_model(style: MenuStyle) -> Vec<NativeMenu> {
+    let mut menus: Vec<NativeMenu> = Vec::new();
+    for (title, cats) in top_menus(style) {
+        let mut items: Vec<NativeItem> = Vec::new();
+        let leaf = |id: &str, label: &str, action: MenuAction| NativeItem::Leaf {
+            id: format!("{title}/{id}"),
+            label: label.to_string(),
+            action,
+        };
+        // File / Edit / Tools prepend their app-wired actions, mirroring `ui`.
+        if title == "File" {
+            items.push(leaf("new", "New", MenuAction::NewDocument));
+            items.push(leaf("new_session", "New file session", MenuAction::NewSession));
+            items.push(NativeItem::Separator);
+            for (label, verb) in [
+                ("Open…", "open"),
+                ("Save…", "save"),
+                ("Import…", "import"),
+                ("Export…", "export"),
+                ("Print…", "print"),
+            ] {
+                items.push(leaf(verb, label, menu_action(verb)));
+            }
+            items.push(NativeItem::Separator);
+        } else if title == "Edit" {
+            items.push(leaf("undo", "Undo", MenuAction::Execute("undo".into())));
+            items.push(leaf("redo", "Redo", MenuAction::Execute("redo".into())));
+            items.push(leaf("history", "Edit history…", MenuAction::EditHistory));
+            items.push(NativeItem::Separator);
+        } else if title == "Tools" {
+            items.push(leaf("model_setup", "Model Setup…", MenuAction::ModelSetup));
+            items.push(NativeItem::Separator);
+        }
+        // Registry verbs grouped by category, a separator between groups — the
+        // File/Edit wired verbs already surfaced above are skipped.
+        let mut first_group = true;
+        for cat in &cats {
+            let verbs: Vec<&str> = verbs_in(std::slice::from_ref(cat))
+                .into_iter()
+                .filter(|verb| {
+                    !(title == "File"
+                        && matches!(*verb, "open" | "save" | "import" | "export" | "print"))
+                        && !(title == "Edit" && matches!(*verb, "undo" | "redo"))
+                })
+                .collect();
+            if verbs.is_empty() {
+                continue;
+            }
+            if !first_group {
+                items.push(NativeItem::Separator);
+            }
+            first_group = false;
+            for verb in verbs {
+                items.push(leaf(verb, verb, menu_action(verb)));
+            }
+        }
+        menus.push(NativeMenu {
+            title: title.to_string(),
+            items,
+        });
+    }
+    // Help is synthetic (not a registry category), same as the in-window bar.
+    menus.push(NativeMenu {
+        title: "Help".to_string(),
+        items: vec![
+            NativeItem::Leaf {
+                id: "Help/reference".into(),
+                label: "Command reference".into(),
+                action: MenuAction::Help,
+            },
+            NativeItem::Leaf {
+                id: "Help/about".into(),
+                label: "About ItsJustCAD".into(),
+                action: MenuAction::About,
+            },
+        ],
+    });
+    menus
+}
+
 /// Registry verbs belonging to any of `cats`, in registry order.
 pub fn verbs_in(cats: &[Category]) -> Vec<&'static str> {
     registry()
@@ -295,34 +415,51 @@ pub fn ui(ui: &mut egui::Ui, icons: &Icons, style: MenuStyle) -> Option<MenuActi
             }
         });
 
-        // Appearance controls, right-aligned on the menu bar (relocated from the
-        // chat pane): dark/light toggle + text-size stepper apply app-wide.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let zoom = ui.ctx().zoom_factor();
-            if ui
-                .small_button("A+")
-                .on_hover_text("bigger text (Cmd =)")
-                .clicked()
-            {
-                ui.ctx().set_zoom_factor((zoom + 0.1).min(3.0));
-            }
-            ui.label(format!("{:.0}%", zoom * 100.0));
-            if ui
-                .small_button("A−")
-                .on_hover_text("smaller text (Cmd -)")
-                .clicked()
-            {
-                ui.ctx().set_zoom_factor((zoom - 0.1).max(0.5));
-            }
-            ui.separator();
-            egui::widgets::global_theme_preference_switch(ui);
-            // Lucide sun-moon mark labelling the light/dark toggle.
-            let size = ui.text_style_height(&egui::TextStyle::Body);
-            let color = ui.visuals().weak_text_color();
-            ui.add(icons.image(ui.ctx(), Icon::Theme, size, color));
-        });
+        appearance_controls(ui, icons);
     });
     action
+}
+
+/// Right-aligned Appearance controls: dark/light toggle + text-size stepper,
+/// applied app-wide. Factored out because these are egui-only widgets that
+/// CANNOT be native menu items — when the true native OS menu bar (muda) is
+/// attached, we still render this slim in-window strip for them (see
+/// [`appearance_only`]).
+fn appearance_controls(ui: &mut egui::Ui, icons: &Icons) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let zoom = ui.ctx().zoom_factor();
+        if ui
+            .small_button("A+")
+            .on_hover_text("bigger text (Cmd =)")
+            .clicked()
+        {
+            ui.ctx().set_zoom_factor((zoom + 0.1).min(3.0));
+        }
+        ui.label(format!("{:.0}%", zoom * 100.0));
+        if ui
+            .small_button("A−")
+            .on_hover_text("smaller text (Cmd -)")
+            .clicked()
+        {
+            ui.ctx().set_zoom_factor((zoom - 0.1).max(0.5));
+        }
+        ui.separator();
+        egui::widgets::global_theme_preference_switch(ui);
+        // Lucide sun-moon mark labelling the light/dark toggle.
+        let size = ui.text_style_height(&egui::TextStyle::Body);
+        let color = ui.visuals().weak_text_color();
+        ui.add(icons.image(ui.ctx(), Icon::Theme, size, color));
+    });
+}
+
+/// Slim in-window bar shown when the native OS menu bar owns the File/Edit/…
+/// verbs: it carries only the egui-only Appearance controls (dark/light +
+/// text-size), which can't live in a native menu. Returns no [`MenuAction`] —
+/// verb dispatch comes from the native bar's event channel.
+pub fn appearance_only(ui: &mut egui::Ui, icons: &Icons) {
+    egui::MenuBar::new().ui(ui, |ui| {
+        appearance_controls(ui, icons);
+    });
 }
 
 /// Dev/screenshot hook: render a given top-level menu's grouped items as an
@@ -547,6 +684,128 @@ mod tests {
                 seen.insert(category_icon(c)),
                 "category {c:?} icon collides"
             );
+        }
+    }
+
+    // ── Native menu model (muda) tests ───────────────────────────────────────
+
+    /// Collect all leaf (id, label, action) triples from a native model.
+    fn leaves(menus: &[NativeMenu]) -> Vec<(String, String, MenuAction)> {
+        menus
+            .iter()
+            .flat_map(|m| &m.items)
+            .filter_map(|it| match it {
+                NativeItem::Leaf { id, label, action } => {
+                    Some((id.clone(), label.clone(), action.clone()))
+                }
+                NativeItem::Separator => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn native_model_has_same_top_titles_as_in_window_bar() {
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            let native: Vec<String> = native_model(style).iter().map(|m| m.title.clone()).collect();
+            let mut expected: Vec<String> =
+                top_menus(style).iter().map(|(t, _)| t.to_string()).collect();
+            expected.push("Help".to_string());
+            assert_eq!(native, expected, "native titles differ for {style:?}");
+        }
+    }
+
+    #[test]
+    fn native_file_menu_contains_expected_verbs_and_actions() {
+        let file = native_model(MenuStyle::Rhino)
+            .into_iter()
+            .find(|m| m.title == "File")
+            .expect("File menu");
+        let ls = leaves(&[file]);
+        // Wired File actions map to the right MenuAction.
+        assert!(ls.iter().any(|(_, l, a)| l == "New" && *a == MenuAction::NewDocument));
+        assert!(ls.iter().any(|(_, l, a)| l == "New file session" && *a == MenuAction::NewSession));
+        assert!(ls.iter().any(|(_, l, a)| l == "Open…" && *a == MenuAction::Insert("open ".into())));
+        // Import/Export route through the native file dialog, not the command line.
+        assert!(ls.iter().any(|(_, l, a)| l == "Import…" && *a == MenuAction::ImportDialog));
+        assert!(ls.iter().any(|(_, l, a)| l == "Export…" && *a == MenuAction::ExportDialog));
+    }
+
+    #[test]
+    fn native_edit_menu_has_undo_redo_history() {
+        let edit = native_model(MenuStyle::Rhino)
+            .into_iter()
+            .find(|m| m.title == "Edit")
+            .expect("Edit menu");
+        let ls = leaves(&[edit]);
+        assert!(ls.iter().any(|(_, l, a)| l == "Undo" && *a == MenuAction::Execute("undo".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == "Redo" && *a == MenuAction::Execute("redo".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == "Edit history…" && *a == MenuAction::EditHistory));
+    }
+
+    #[test]
+    fn native_view_menu_gathers_view_verbs() {
+        let view = native_model(MenuStyle::Rhino)
+            .into_iter()
+            .find(|m| m.title == "View")
+            .expect("View menu");
+        let ls = leaves(&[view]);
+        // Every registry View verb appears as a leaf.
+        for v in verbs_in(&[Category::View]) {
+            assert!(
+                ls.iter().any(|(_, l, _)| l == v),
+                "View menu missing verb {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_help_menu_is_synthetic() {
+        let help = native_model(MenuStyle::AutoCAD)
+            .into_iter()
+            .find(|m| m.title == "Help")
+            .expect("Help menu");
+        let ls = leaves(&[help]);
+        assert!(ls.iter().any(|(_, l, a)| l == "Command reference" && *a == MenuAction::Help));
+        assert!(ls.iter().any(|(_, l, a)| l == "About ItsJustCAD" && *a == MenuAction::About));
+    }
+
+    #[test]
+    fn native_leaf_ids_are_unique_and_map_back_to_actions() {
+        // The muda layer keys a HashMap<id, MenuAction> off these ids, so every
+        // leaf id must be unique within the bar.
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            let ls = leaves(&native_model(style));
+            let ids: HashSet<&String> = ls.iter().map(|(id, _, _)| id).collect();
+            assert_eq!(ids.len(), ls.len(), "duplicate native menu id for {style:?}");
+        }
+    }
+
+    #[test]
+    fn native_model_covers_every_registry_verb_once() {
+        // Mirrors the in-window guarantee: every registry verb surfaces exactly
+        // once. Most verbs use their name as the leaf label; the wired File/Edit
+        // verbs get a nicer label ("Open…") but the same MenuAction, so match by
+        // the action the leaf dispatches, not just the label text.
+        let action_verb = |a: &MenuAction| -> Option<String> {
+            match a {
+                MenuAction::Execute(v) | MenuAction::StartDraw(v) => Some(v.clone()),
+                MenuAction::Insert(p) => Some(p.trim_end().to_string()),
+                MenuAction::ImportDialog => Some("import".into()),
+                MenuAction::ExportDialog => Some("export".into()),
+                _ => None,
+            }
+        };
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            let ls = leaves(&native_model(style));
+            let verbs: Vec<String> = ls.iter().filter_map(|(_, _, a)| action_verb(a)).collect();
+            for spec in registry() {
+                let count = verbs.iter().filter(|v| *v == spec.name).count();
+                assert_eq!(
+                    count, 1,
+                    "verb '{}' appears {count} times in native model for {style:?}",
+                    spec.name
+                );
+            }
         }
     }
 

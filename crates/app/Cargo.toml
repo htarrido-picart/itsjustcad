@@ -36,6 +36,11 @@ serde_json.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = "0.4"
 egui_commonmark = "0.24"
+# True native OS menus (macOS global NSMenu bar / Windows HMENU / Linux gtk),
+# built from the same registry-driven menu model as the in-window bar. Only
+# attached in interactive windowed mode; headless/tests never touch it.
+muda = "0.19"
+raw-window-handle = "0.6"
 
 [dev-dependencies]
 uuid.workspace = true

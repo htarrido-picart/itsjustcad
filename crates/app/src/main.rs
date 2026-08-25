@@ -17,6 +17,7 @@ mod keymap;
 mod local_runtime;
 mod menu;
 mod model_catalog;
+mod native_menu;
 mod osnap;
 mod point_edit;
 mod precise;
