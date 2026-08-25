@@ -27,11 +27,6 @@ jobs:
             artifact: itsjustcad-macos-aarch64
             binary: itsjustcad
 
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact: itsjustcad-macos-x86_64
-            binary: itsjustcad
-
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: itsjustcad-windows-x86_64

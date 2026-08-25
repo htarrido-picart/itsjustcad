@@ -30,7 +30,6 @@ that draws with the exact same commands you type.
 | Your OS | Download | First launch |
 |---|---|---|
 | **macOS** (Apple Silicon) | [⬇ `ItsJustCAD.app`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-macos-aarch64-app.tar.gz) | Unpack, then right‑click the app → **Open** (once) |
-| **macOS** (Intel) | [⬇ `ItsJustCAD.app`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-macos-x86_64-app.tar.gz) | Unpack, then right‑click the app → **Open** (once) |
 | **Windows** (x86‑64) | [⬇ `itsjustcad.exe`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-windows-x86_64.zip) | Unzip → double‑click → **More info → Run anyway** (once) |
 | **Linux** (x86‑64) | [⬇ `itsjustcad`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-linux-x86_64.tar.gz) | `tar xzf`, `chmod +x itsjustcad`, then run |
 
