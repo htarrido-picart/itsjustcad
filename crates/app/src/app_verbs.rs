@@ -55,6 +55,70 @@ pub enum AppVerb {
     /// GUI-only verb with no headless meaning (`template`, `critique`, …).
     /// Carried so the headless runner can warn about the specific name.
     GuiOnly(&'static str),
+    /// Georeferenced satellite/OSM basemap underlay
+    /// (`basemap [osm|sat] [span_m] [opacity]` | `basemap off`). View/session
+    /// state, opt-in, NEVER logged. Carries the parsed options for the front-end
+    /// to fetch/stitch (the GUI reaches the network; headless uses the cache).
+    Basemap(BasemapArgs),
+}
+
+/// Parsed `basemap` options. Defaults chosen for a site-scale context image.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BasemapArgs {
+    /// `true` clears the basemap (`basemap off|clear|none`).
+    pub clear: bool,
+    /// Provider slug (`osm` default, or `sat`).
+    pub provider: String,
+    /// Side length of the covered square in meters.
+    pub span_m: f64,
+    /// Blend opacity 0..1.
+    pub opacity: f32,
+}
+
+impl Default for BasemapArgs {
+    fn default() -> Self {
+        Self {
+            clear: false,
+            provider: "osm".into(),
+            span_m: 500.0,
+            opacity: 0.85,
+        }
+    }
+}
+
+/// Parse the tokens after the `basemap` verb into [`BasemapArgs`]. Accepts, in
+/// any order after the optional provider: a span in meters and an opacity in
+/// `0..=1`. `off`/`clear`/`none` requests removal.
+pub fn parse_basemap_args<'a>(mut words: impl Iterator<Item = &'a str>) -> BasemapArgs {
+    let mut args = BasemapArgs::default();
+    if let Some(first) = words.next() {
+        match first.to_ascii_lowercase().as_str() {
+            "off" | "clear" | "none" => {
+                args.clear = true;
+                return args;
+            }
+            "osm" | "sat" | "satellite" | "imagery" | "esri" => {
+                args.provider = first.to_ascii_lowercase();
+            }
+            other => apply_numeric(&mut args, other),
+        }
+    }
+    for w in words {
+        apply_numeric(&mut args, w);
+    }
+    args
+}
+
+/// Fold one numeric token into the args: a value in `0..=1` is opacity, a larger
+/// value is a span in meters.
+fn apply_numeric(args: &mut BasemapArgs, tok: &str) {
+    if let Ok(v) = tok.parse::<f64>() {
+        if (0.0..=1.0).contains(&v) {
+            args.opacity = v as f32;
+        } else if v > 1.0 {
+            args.span_m = v;
+        }
+    }
 }
 
 /// Map a standard-view verb name to its [`StandardView`].
@@ -103,6 +167,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
         "help" => AppVerb::Help(words.next().map(str::to_owned)),
         "template" => AppVerb::GuiOnly("template"),
         "critique" => AppVerb::GuiOnly("critique"),
+        "basemap" => AppVerb::Basemap(parse_basemap_args(words)),
         other => AppVerb::View(standard_view(other)?),
     })
 }
@@ -165,6 +230,44 @@ mod tests {
         assert_eq!(classify("help box"), Some(AppVerb::Help(Some("box".into()))));
         assert_eq!(classify("template"), Some(AppVerb::GuiOnly("template")));
         assert_eq!(classify("critique looks off"), Some(AppVerb::GuiOnly("critique")));
+    }
+
+    #[test]
+    fn classifies_basemap_defaults_and_options() {
+        // Bare verb → defaults (osm, 500 m, 0.85).
+        let a = match classify("basemap").unwrap() {
+            AppVerb::Basemap(a) => a,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(a, BasemapArgs::default());
+        // Provider + span + opacity, order-independent.
+        let a = match classify("basemap sat 1200 0.5").unwrap() {
+            AppVerb::Basemap(a) => a,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(a.provider, "sat");
+        assert_eq!(a.span_m, 1200.0);
+        assert_eq!(a.opacity, 0.5);
+        assert!(!a.clear);
+        // Opacity before span still classifies each by magnitude.
+        let a = match classify("basemap 0.3 800").unwrap() {
+            AppVerb::Basemap(a) => a,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(a.opacity, 0.3);
+        assert_eq!(a.span_m, 800.0);
+        assert_eq!(a.provider, "osm");
+    }
+
+    #[test]
+    fn classifies_basemap_off() {
+        let a = match classify("basemap off").unwrap() {
+            AppVerb::Basemap(a) => a,
+            other => panic!("{other:?}"),
+        };
+        assert!(a.clear);
+        assert!(matches!(classify("basemap clear"), Some(AppVerb::Basemap(b)) if b.clear));
+        assert!(matches!(classify("basemap none"), Some(AppVerb::Basemap(b)) if b.clear));
     }
 
     #[test]

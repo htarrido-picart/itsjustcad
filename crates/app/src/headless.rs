@@ -36,6 +36,86 @@ pub(crate) fn basemap_scene_data(
     })
 }
 
+/// Apply a headless `basemap` verb: set or clear the transient basemap on the
+/// document. OFFLINE by default (cache-only) so scripts/tests never hit the
+/// network; set `ITSJUSTCAD_BASEMAP_NET=1` to permit live tile fetches. Needs a
+/// site location (`location`/`sun`/EPW) to georeference against.
+fn apply_basemap(
+    session: &mut Session,
+    args: &crate::app_verbs::BasemapArgs,
+) -> Result<(), String> {
+    use crate::basemap::{
+        build_basemap, default_cache_root, provider_by_name, CachedHttpTileSource,
+    };
+    if args.clear {
+        session.doc.basemap = None;
+        return Ok(());
+    }
+    let loc = session
+        .doc
+        .location
+        .ok_or("basemap needs a site location — run `location <lat> <lon>` first")?;
+    let allow_net = std::env::var("ITSJUSTCAD_BASEMAP_NET").as_deref() == Ok("1");
+    let provider = provider_by_name(&args.provider);
+    let slug = provider.slug().to_string();
+    // A small runtime just for the blocking tile GETs (only used when network
+    // is allowed; a cache-only run never awaits).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let source = CachedHttpTileSource::new(provider, default_cache_root(), rt.handle().clone(), allow_net);
+    let b = build_basemap(loc, args.span_m, args.opacity, &slug, &source)?;
+    session.doc.basemap = Some(b);
+    Ok(())
+}
+
+/// Seed the on-disk tile cache with a solid-colour tile for every tile in the
+/// current location's basemap grid, so a subsequent `basemap` verb stitches an
+/// image with NO network. Used by the offline sanity path. `spec` is an
+/// optional `"span_m [r g b]"`; defaults to a warm sand tone at 500 m.
+fn seed_basemap_cache(session: &Session, spec: &str) -> Result<(), String> {
+    use crate::basemap::{
+        default_cache_root, solid_tile_png, tile_cache_path, TileGrid,
+    };
+    let loc = session
+        .doc
+        .location
+        .ok_or("basemapseed needs a location first")?;
+    let mut it = spec.split_whitespace();
+    let span_m: f64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(500.0);
+    let rgba: [u8; 4] = {
+        let v: Vec<u8> = it.filter_map(|s| s.parse().ok()).collect();
+        if v.len() >= 3 {
+            [v[0], v[1], v[2], 255]
+        } else {
+            [206, 186, 150, 255]
+        }
+    };
+    let z = crate::basemap::pick_zoom(loc.lat_deg, span_m, 1024.0);
+    let half = span_m / 2.0;
+    let dlat = half / 111_320.0;
+    let dlon = half / (111_320.0 * loc.lat_deg.to_radians().cos()).max(1.0);
+    let grid = TileGrid::covering(
+        loc.lon_deg - dlon,
+        loc.lat_deg - dlat,
+        loc.lon_deg + dlon,
+        loc.lat_deg + dlat,
+        z,
+        0,
+    );
+    let png = solid_tile_png(rgba);
+    let root = default_cache_root();
+    for t in grid.tiles() {
+        let path = tile_cache_path(&root, "osm", t);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, &png).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ── Headless view state ─────────────────────────────────────────────────────────
 
 /// View-affecting state accumulated by app-level verbs while a headless script
@@ -144,6 +224,16 @@ pub fn run_script_lines(
             }
             Some(AppVerb::GuiOnly(name)) => {
                 eprintln!("warning: '{name}' is GUI-only; ignored in headless mode");
+            }
+            Some(AppVerb::Basemap(args)) => {
+                apply_basemap(&mut session, &args).map_err(|e| (line.clone(), e))?;
+            }
+            None if line.starts_with("basemapseed") => {
+                // Offline sanity helper: seed the local tile cache with a solid
+                // colour for the current location's grid, so a following
+                // `basemap` renders WITHOUT any network. Not a user verb.
+                seed_basemap_cache(&session, line.strip_prefix("basemapseed").unwrap().trim())
+                    .map_err(|e| (line.clone(), e))?;
             }
             None => {
                 // `controlimages <prefix>` needs the GPU view; the substrate

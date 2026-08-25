@@ -783,6 +783,13 @@ impl App {
                     self.command_line.push_line(line);
                 }
             }
+            // Georeferenced satellite/OSM basemap underlay. View/session state,
+            // NEVER logged. Opt-in network: this is the moment the user asks, so
+            // the GUI is allowed to reach the tile server (and cache locally).
+            Some("basemap") => {
+                let args = crate::app_verbs::parse_basemap_args(words);
+                self.set_basemap(args);
+            }
             Some("template") => {
                 self.show_template_picker = true;
             }
@@ -886,6 +893,49 @@ impl App {
             ],
             opacity: b.opacity,
         })
+    }
+
+    /// Set (or clear) the georeferenced basemap underlay. Requires a site
+    /// location (`location`/`sun`/EPW) — without one there is nothing to
+    /// georeference against. This is where the opt-in network fetch happens: the
+    /// tiles are fetched (or read from the local cache) and stitched into a
+    /// transient [`itsjustcad_doc::Basemap`] on the document (never logged).
+    fn set_basemap(&mut self, args: crate::app_verbs::BasemapArgs) {
+        use crate::basemap::{
+            build_basemap, provider_by_name, CachedHttpTileSource, default_cache_root,
+        };
+        if args.clear {
+            self.session.doc.basemap = None;
+            self.command_line.push_line("basemap cleared");
+            return;
+        }
+        let Some(loc) = self.session.doc.location else {
+            self.command_line
+                .push_line("basemap needs a site location first — run `location <lat> <lon>`");
+            return;
+        };
+        let provider = provider_by_name(&args.provider);
+        let slug = provider.slug().to_string();
+        let attribution = provider.attribution().to_string();
+        // The user asked for the basemap now → network is permitted.
+        let source = CachedHttpTileSource::new(
+            provider,
+            default_cache_root(),
+            self.tokio.clone(),
+            true,
+        );
+        match build_basemap(loc, args.span_m, args.opacity, &slug, &source) {
+            Ok(b) => {
+                self.command_line.push_line(format!(
+                    "basemap: {} · {:.0} m span · {attribution}",
+                    b.label, args.span_m
+                ));
+                self.session.doc.basemap = Some(b);
+            }
+            Err(e) => {
+                self.command_line.push_line(format!("basemap failed: {e}"));
+            }
+        }
     }
 
     /// Camera of the active (last hovered) pane.

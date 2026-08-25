@@ -3,6 +3,7 @@
 
 mod app;
 mod app_verbs;
+mod basemap;
 mod boxsel;
 mod chat_store;
 mod command_line;
