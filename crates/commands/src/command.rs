@@ -220,6 +220,55 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nv: Option<u32>,
     },
+    // -- form-finding (dynamic-relaxation shape-finding; still generative
+    //    GEOMETRY — the equilibrium FORM — never structural analysis / FEA) --
+    /// Funicular / hanging-chain: hang a cable of `segments` links between two
+    /// supports under gravity `load`; dynamic relaxation finds the catenary
+    /// (funicular) equilibrium shape. `slack` (>1) sets how deep it hangs. With
+    /// `invert`, the found tension form is flipped about its apex into the pure-
+    /// compression arch/shell (Gaudí / Hooke: hang the chain, stand the arch).
+    /// One logged mesh object (the strut line).
+    Funicular {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        support_a: DVec3,
+        support_b: DVec3,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        segments: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        load: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slack: Option<f64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        invert: bool,
+    },
+    /// Tensegrity: isolated compression struts floating in a continuous tension
+    /// cable network; dynamic relaxation form-finds the stable prestressed
+    /// equilibrium. `struts` = number of struts (the classic preset is 3, the
+    /// T-prism). One logged mesh (thick struts + thin cables merged).
+    Tensegrity {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        struts: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        radius: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        twist_deg: Option<f64>,
+    },
+    /// Cable-net / minimal surface: relax an `n×n` net stretched over four
+    /// corner anchors to a taut tensile (Frei Otto) surface. One logged mesh
+    /// (the relaxed net of struts).
+    Cablenet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        corners: [DVec3; 4],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        n: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sag: Option<f64>,
+    },
     // -- 2D primitives (create Curve objects) --
     Line {
         #[serde(default, skip_serializing_if = "Option::is_none")]

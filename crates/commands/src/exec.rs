@@ -3157,6 +3157,107 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Funicular {
+            id,
+            support_a,
+            support_b,
+            segments,
+            load,
+            slack,
+            invert,
+        } => {
+            if (support_b - support_a).length() < 1e-6 {
+                return Err(ExecError::Invalid(
+                    "funicular supports must be distinct points".into(),
+                ));
+            }
+            let seg = segments.unwrap_or(24).max(2);
+            let ld = load.unwrap_or(1.0).max(0.0);
+            let sl = slack.unwrap_or(1.4);
+            let mut pts = kernel_mesh::funicular_chain(support_a, support_b, seg, ld, sl);
+            if invert {
+                pts = kernel_mesh::invert_funicular(&pts);
+            }
+            let segsv: Vec<(glam::DVec3, glam::DVec3)> =
+                pts.windows(2).map(|w| (w[0], w[1])).collect();
+            let span = (support_b - support_a).length();
+            let strut = (span * 0.02).clamp(0.02, 0.4);
+            let mesh = kernel_mesh::strut_lattice(&segsv, strut);
+            let id = mesh_object(doc, id, mesh);
+            Ok((
+                Command::Funicular {
+                    id: Some(id),
+                    support_a,
+                    support_b,
+                    segments,
+                    load,
+                    slack,
+                    invert,
+                },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "funicular {id} ({seg} links{})",
+                        if invert { ", inverted → compression arch" } else { "" }
+                    ),
+                },
+            ))
+        }
+        Command::Tensegrity { id, struts, radius, height, twist_deg } => {
+            if struts < 3 {
+                return Err(ExecError::Invalid("tensegrity needs >= 3 struts".into()));
+            }
+            let r = radius.unwrap_or(1.0);
+            let h = height.unwrap_or(2.0);
+            if r <= 0.0 || h <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "tensegrity radius and height must be positive".into(),
+                ));
+            }
+            // Default twist is the antiprism stability twist π(1/2 − 1/n).
+            let tw = match twist_deg {
+                Some(d) => d.to_radians(),
+                None => {
+                    std::f64::consts::PI * (0.5 - 1.0 / struts as f64)
+                }
+            };
+            let t = kernel_mesh::tensegrity_prism(struts, r, h, tw);
+            // Thick struts (compression) + thin cables (tension) merged into one.
+            let mut mesh = kernel_mesh::strut_lattice(&t.net.strut_segments(), (r * 0.08).max(0.03));
+            let cables = kernel_mesh::strut_lattice(&t.net.cable_segments(), (r * 0.03).max(0.012));
+            mesh.merge(&cables);
+            let id = mesh_object(doc, id, mesh);
+            Ok((
+                Command::Tensegrity { id: Some(id), struts, radius, height, twist_deg },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("tensegrity {id} ({struts}-strut prism)"),
+                },
+            ))
+        }
+        Command::Cablenet { id, corners, n, sag } => {
+            let nn = n.unwrap_or(8).max(1);
+            let sg = sag.unwrap_or(1.5);
+            let (_, _, segsv) = kernel_mesh::cable_net(corners, nn, sg);
+            if segsv.is_empty() {
+                return Err(ExecError::Invalid("cablenet produced no links".into()));
+            }
+            // Strut side scales with the net span.
+            let span = (corners[1] - corners[0]).length().max(1e-3);
+            let strut = (span * 0.01).clamp(0.01, 0.2);
+            let mesh = kernel_mesh::strut_lattice(&segsv, strut);
+            let id = mesh_object(doc, id, mesh);
+            Ok((
+                Command::Cablenet { id: Some(id), corners, n, sag },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("cablenet {id} ({nn}x{nn} net)"),
+                },
+            ))
+        }
         Command::Line { id, a, b } => {
             let (id, outcome) = insert_curve(doc, id, Curve::Line { a, b }, "line");
             Ok((
@@ -5875,6 +5976,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Hypar { .. } => "hypar",
         Command::GaussVault { .. } => "gaussvault",
         Command::Gridshell { .. } => "gridshell",
+        Command::Funicular { .. } => "funicular",
+        Command::Tensegrity { .. } => "tensegrity",
+        Command::Cablenet { .. } => "cablenet",
         Command::Line { .. } => "line",
         Command::Polyline { .. } => "polyline",
         Command::Rectangle { .. } => "rect",
@@ -9679,6 +9783,77 @@ mod tests {
         assert_replay_stable(&s);
         run(&mut s, "undo");
         assert!(s.doc.get(v).is_none());
+    }
+
+    #[test]
+    fn funicular_exec_undo_redo_replay() {
+        let mut s = Session::default();
+        let out = run(&mut s, "funicular -5,0,0 5,0,0 20 1 1.4");
+        let id = out.created[0];
+        let m = mesh_of(&s, id);
+        // 20 links → 20 strut prisms × 8 verts.
+        assert_eq!(m.positions().len(), 20 * 8);
+        // The hanging chain sags below the springing line (z < 0 somewhere).
+        let zmin = m.positions().iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        assert!(zmin < -0.5, "funicular should sag, zmin={zmin}");
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).is_none());
+        run(&mut s, "redo");
+        assert!(s.doc.get(id).is_some());
+    }
+
+    #[test]
+    fn funicular_invert_stands_the_arch() {
+        let mut s = Session::default();
+        let hung = run(&mut s, "funicular -5,0,0 5,0,0 20 1 1.4").created[0];
+        let arch = run(&mut s, "funicular -5,0,0 5,0,0 20 1 1.4 invert").created[0];
+        let hz = mesh_of(&s, hung).positions().iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        let az = mesh_of(&s, arch).positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        // Hung form dips below the supports; inverted form rises above them.
+        assert!(hz < 0.0 && az > 0.0, "hung zmin={hz}, arch zmax={az}");
+        assert_replay_stable(&s);
+    }
+
+    #[test]
+    fn tensegrity_exec_undo_redo_replay() {
+        let mut s = Session::default();
+        let out = run(&mut s, "tensegrity 3 1 2");
+        let id = out.created[0];
+        let m = mesh_of(&s, id);
+        assert_eq!(m.positions().len() % 8, 0, "8 verts per strut prism");
+        // Spans z from ~0 (bottom ring) to ~2 (top ring).
+        let zmax = m.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        assert!(zmax > 1.5, "tensegrity height ~2, zmax={zmax}");
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).is_none());
+        run(&mut s, "redo");
+        assert!(s.doc.get(id).is_some());
+    }
+
+    #[test]
+    fn tensegrity_rejects_too_few_struts() {
+        let mut s = Session::default();
+        assert!(s.run(parse("tensegrity 2").unwrap()).is_err());
+    }
+
+    #[test]
+    fn cablenet_exec_undo_redo_replay() {
+        let mut s = Session::default();
+        let out = run(&mut s, "cablenet 0,0,0 8,0,0 8,8,3 0,8,3 5 1.5");
+        let id = out.created[0];
+        let m = mesh_of(&s, id);
+        assert_eq!(m.positions().len() % 8, 0);
+        assert!(!m.positions().is_empty());
+        // Net lives inside the corner bounding box in z.
+        let zmax = m.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        assert!(zmax <= 3.5, "net within corner span, zmax={zmax}");
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).is_none());
+        run(&mut s, "redo");
+        assert!(s.doc.get(id).is_some());
     }
 
     #[test]

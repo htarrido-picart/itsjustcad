@@ -200,6 +200,9 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             })
         }
         "gridshell" => parse_gridshell(&args),
+        "funicular" | "hangchain" => parse_funicular(&args),
+        "tensegrity" => parse_tensegrity(&args),
+        "cablenet" | "minimalsurface" => parse_cablenet(&args),
         "line" => {
             let [a, b] = take::<2>("line", "two points", &args)?;
             Ok(Command::Line {
@@ -1571,6 +1574,94 @@ fn parse_gridshell(args: &[&str]) -> Result<Command, ParseError> {
     }
 }
 
+/// `funicular <support a> <support b> [segments] [load] [slack] [invert]`.
+/// Keyword `invert` (or `arch`) anywhere in the tail flips the found tension
+/// form into the pure-compression arch.
+fn parse_funicular(args: &[&str]) -> Result<Command, ParseError> {
+    let expected = "<support a x,y,z> <support b x,y,z> [segments] [load] [slack] [invert]";
+    // Pull off the optional trailing keyword.
+    let mut rest: Vec<&str> = args.to_vec();
+    let mut invert = false;
+    rest.retain(|&a| {
+        if a == "invert" || a == "arch" || a == "compress" {
+            invert = true;
+            false
+        } else {
+            true
+        }
+    });
+    let (a, b, seg, load, slack) = match rest.as_slice() {
+        [a, b] => (a, b, None, None, None),
+        [a, b, s] => (a, b, Some(integer(s, "funicular")?), None, None),
+        [a, b, s, l] => (a, b, Some(integer(s, "funicular")?), Some(number(l)?), None),
+        [a, b, s, l, sl] => (
+            a,
+            b,
+            Some(integer(s, "funicular")?),
+            Some(number(l)?),
+            Some(number(sl)?),
+        ),
+        _ => return wrong("funicular", expected, args),
+    };
+    Ok(Command::Funicular {
+        id: None,
+        support_a: point(a)?,
+        support_b: point(b)?,
+        segments: seg,
+        load,
+        slack,
+        invert,
+    })
+}
+
+/// `tensegrity <struts> [radius] [height] [twist_deg]` (preset: struts=3).
+fn parse_tensegrity(args: &[&str]) -> Result<Command, ParseError> {
+    let expected = "<struts> [radius] [height] [twist degrees]  (e.g. tensegrity 3)";
+    // Accept a named preset that expands to a strut count.
+    let (struts, radius, height, twist) = match args {
+        ["tprism"] | ["t-prism"] => (3, None, None, None),
+        [s] => (integer(s, "tensegrity")?, None, None, None),
+        [s, r] => (integer(s, "tensegrity")?, Some(number(r)?), None, None),
+        [s, r, h] => (
+            integer(s, "tensegrity")?,
+            Some(number(r)?),
+            Some(number(h)?),
+            None,
+        ),
+        [s, r, h, t] => (
+            integer(s, "tensegrity")?,
+            Some(number(r)?),
+            Some(number(h)?),
+            Some(number(t)?),
+        ),
+        _ => return wrong("tensegrity", expected, args),
+    };
+    Ok(Command::Tensegrity {
+        id: None,
+        struts,
+        radius,
+        height,
+        twist_deg: twist,
+    })
+}
+
+/// `cablenet <c0> <c1> <c2> <c3> [n] [sag]` — four corner anchors in order.
+fn parse_cablenet(args: &[&str]) -> Result<Command, ParseError> {
+    let expected = "<c0> <c1> <c2> <c3> [n] [sag]  (four corner points in CCW order)";
+    let (c0, c1, c2, c3, n, sag) = match args {
+        [a, b, c, d] => (a, b, c, d, None, None),
+        [a, b, c, d, n] => (a, b, c, d, Some(integer(n, "cablenet")?), None),
+        [a, b, c, d, n, s] => (a, b, c, d, Some(integer(n, "cablenet")?), Some(number(s)?)),
+        _ => return wrong("cablenet", expected, args),
+    };
+    Ok(Command::Cablenet {
+        id: None,
+        corners: [point(c0)?, point(c1)?, point(c2)?, point(c3)?],
+        n,
+        sag,
+    })
+}
+
 /// Numbers accept unit suffixes (mm, cm, m, ft, in, and feet-inches as
 /// "12ft6in"); bare numbers are meters. Results are always meters.
 pub fn number(s: &str) -> Result<f64, ParseError> {
@@ -2138,6 +2229,108 @@ mod tests {
                 nu: Some(10),
                 nv: Some(20),
             }
+        );
+    }
+
+    #[test]
+    fn parse_funicular_variants() {
+        assert_eq!(
+            parse("funicular -5,0,0 5,0,0").unwrap(),
+            Command::Funicular {
+                id: None,
+                support_a: DVec3::new(-5.0, 0.0, 0.0),
+                support_b: DVec3::new(5.0, 0.0, 0.0),
+                segments: None,
+                load: None,
+                slack: None,
+                invert: false,
+            }
+        );
+        assert_eq!(
+            parse("funicular -5,0,0 5,0,0 24 1 1.4 invert").unwrap(),
+            Command::Funicular {
+                id: None,
+                support_a: DVec3::new(-5.0, 0.0, 0.0),
+                support_b: DVec3::new(5.0, 0.0, 0.0),
+                segments: Some(24),
+                load: Some(1.0),
+                slack: Some(1.4),
+                invert: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_tensegrity_and_cablenet() {
+        assert_eq!(
+            parse("tensegrity 3 1 2").unwrap(),
+            Command::Tensegrity {
+                id: None,
+                struts: 3,
+                radius: Some(1.0),
+                height: Some(2.0),
+                twist_deg: None,
+            }
+        );
+        assert_eq!(
+            parse("tensegrity tprism").unwrap(),
+            Command::Tensegrity {
+                id: None,
+                struts: 3,
+                radius: None,
+                height: None,
+                twist_deg: None,
+            }
+        );
+        assert_eq!(
+            parse("cablenet 0,0,0 8,0,0 8,8,3 0,8,3 5 1.5").unwrap(),
+            Command::Cablenet {
+                id: None,
+                corners: [
+                    DVec3::new(0.0, 0.0, 0.0),
+                    DVec3::new(8.0, 0.0, 0.0),
+                    DVec3::new(8.0, 8.0, 3.0),
+                    DVec3::new(0.0, 8.0, 3.0),
+                ],
+                n: Some(5),
+                sag: Some(1.5),
+            }
+        );
+    }
+
+    /// Serde: new commands survive a JSON round-trip, and older logs that
+    /// predate the optional fields (only the required ones present) still
+    /// deserialize with the defaults.
+    #[test]
+    fn serde_roundtrip_and_pre_optional_fields() {
+        let cmds = [
+            parse("funicular -5,0,0 5,0,0 24 1 1.4 invert").unwrap(),
+            parse("tensegrity 3 1 2").unwrap(),
+            parse("cablenet 0,0,0 8,0,0 8,8,3 0,8,3 5 1.5").unwrap(),
+        ];
+        for c in &cmds {
+            let js = serde_json::to_string(c).unwrap();
+            let back: Command = serde_json::from_str(&js).unwrap();
+            assert_eq!(*c, back);
+        }
+        // pre_* : a minimal funicular log (only supports) → defaults elsewhere.
+        let pre = r#"{"cmd":"funicular","support_a":[-5.0,0.0,0.0],"support_b":[5.0,0.0,0.0]}"#;
+        assert_eq!(
+            serde_json::from_str::<Command>(pre).unwrap(),
+            Command::Funicular {
+                id: None,
+                support_a: DVec3::new(-5.0, 0.0, 0.0),
+                support_b: DVec3::new(5.0, 0.0, 0.0),
+                segments: None,
+                load: None,
+                slack: None,
+                invert: false,
+            }
+        );
+        let pre_t = r#"{"cmd":"tensegrity","struts":3}"#;
+        assert_eq!(
+            serde_json::from_str::<Command>(pre_t).unwrap(),
+            Command::Tensegrity { id: None, struts: 3, radius: None, height: None, twist_deg: None }
         );
     }
 

@@ -133,6 +133,24 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Structure,
         },
         CommandSpec {
+            name: "funicular",
+            usage: "funicular <support a> <support b> [segments] [load] [slack] [invert]",
+            summary: "Form-finding (dynamic relaxation): hang a chain between two supports under gravity to find the catenary/funicular shape; add 'invert' to flip it into the pure-compression arch/shell (Gaudí: hang the chain, stand the arch). Example: funicular -5,0,0 5,0,0 24 1 1.4 invert",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "tensegrity",
+            usage: "tensegrity <struts> [radius] [height] [twist deg]",
+            summary: "Form-finding: isolated compression struts in a continuous tension cable net, relaxed to the stable prestressed equilibrium. Preset 'tensegrity 3' is the classic 3-strut T-prism. Example: tensegrity 3 1 2",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "cablenet",
+            usage: "cablenet <c0> <c1> <c2> <c3> [n] [sag]",
+            summary: "Form-finding: relax an n×n net stretched over four corner anchors to a taut tensile minimal surface (Frei Otto). Example: cablenet 0,0,0 8,0,0 8,8,3 0,8,3 8 1.5",
+            category: Category::Structure,
+        },
+        CommandSpec {
             name: "line",
             usage: "line <a x,y,z> <b x,y,z>",
             summary: "Line segment. Example: line 0,0,0 10,0,0",

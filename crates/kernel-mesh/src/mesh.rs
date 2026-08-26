@@ -36,6 +36,15 @@ impl Mesh {
         &self.faces
     }
 
+    /// Append another mesh into this one, offsetting the other's face indices.
+    /// The two vertex sets are concatenated; no welding is performed.
+    pub fn merge(&mut self, other: &Mesh) {
+        let base = self.positions.len() as u32;
+        self.positions.extend_from_slice(&other.positions);
+        self.faces
+            .extend(other.faces.iter().map(|f| [f[0] + base, f[1] + base, f[2] + base]));
+    }
+
     pub fn transform(&mut self, m: DMat4) {
         for p in &mut self.positions {
             *p = m.transform_point3(*p);
