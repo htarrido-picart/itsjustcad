@@ -1038,6 +1038,22 @@ impl DeckPane {
                             });
                             continue;
                         }
+                        // SECURITY: `save <path>` is an app-verb, NOT a substrate
+                        // `Command`, so it bypasses the fs side-effect gate that
+                        // protects `export`/`print`/`import`. A deck-emitted
+                        // `save /Users/victim/.zshrc` would otherwise write to an
+                        // arbitrary path with no confirmation (an fs-write
+                        // primitive reachable via prompt-injection). Refuse it on
+                        // the deck plane; the user must save from the command line.
+                        if matches!(verb, crate::app_verbs::AppVerb::Save(_)) {
+                            self.current_commands.push(ExecutedCommand {
+                                line: line.clone(),
+                                result: Err(
+                                    "save writes to the filesystem — run it yourself from the command line".to_string(),
+                                ),
+                            });
+                            continue;
+                        }
                         self.current_commands.push(ExecutedCommand {
                             line: line.clone(),
                             result: Ok("applied (view/camera)".to_string()),
@@ -2139,6 +2155,35 @@ mod side_effect_gate_tests {
             pane.current_commands.iter().any(|c| c.line == "basemap sat 800 0.6"
                 && c.result.as_ref().is_err_and(|e| e.contains("network"))),
             "basemap fetch must be recorded as a network-blocked failure"
+        );
+    }
+
+    #[test]
+    fn deck_save_verb_is_blocked_never_queued() {
+        // SECURITY: `save <path>` is an app-verb, not a substrate Command, so it
+        // bypasses the fs side-effect gate. A deck-emitted `save /path` would be
+        // an arbitrary-file-write primitive (reachable via prompt-injection). It
+        // must be dropped with an error and NEVER reach the app-verb queue (which
+        // App::update drains unconditionally into execute_line → io::save_file).
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![
+                ExtractEvent::Command("save /Users/victim/.zshrc".to_string()),
+                ExtractEvent::Command("save ../../../etc/anything".to_string()),
+            ],
+            &mut session,
+        );
+        assert!(
+            pane.take_app_verbs().is_empty(),
+            "save must NEVER be queued as an app verb — it writes to the fs"
+        );
+        assert!(
+            pane.current_commands.iter().all(|c| c
+                .result
+                .as_ref()
+                .is_err_and(|e| e.contains("filesystem"))),
+            "each save line must be recorded as a filesystem-blocked failure"
         );
     }
 
