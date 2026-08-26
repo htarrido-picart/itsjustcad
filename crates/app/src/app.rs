@@ -3040,7 +3040,7 @@ impl App {
         // tab switches. `tabstrip::dock_width` proves the width is tab-agnostic.
         // Width bounds: floor at DOCK_MIN (280px); cap at half the window width so
         // the dock never eats more than half the screen. Clamp the stored width too.
-        let max_w = (ui.ctx().screen_rect().width() * 0.5).max(crate::tabstrip::DOCK_MIN);
+        let max_w = (ui.ctx().viewport_rect().width() * 0.5).max(crate::tabstrip::DOCK_MIN);
         let width = crate::tabstrip::dock_width(self.panel_tabs.active(), self.dock_width)
             .clamp(crate::tabstrip::DOCK_MIN, max_w);
         panel = if collapsed {
