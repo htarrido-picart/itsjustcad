@@ -1736,6 +1736,31 @@ fn mesh_object(doc: &mut Document, id: Option<ObjectId>, mesh: kernel_mesh::Mesh
     id
 }
 
+/// Upper bound on a single grid dimension for procedural surface/lattice
+/// generators. `MAX_GRID² ≈ 4M` cells keeps the worst-case mesh bounded while
+/// being far beyond any sane design resolution.
+const MAX_GRID: u32 = 2048;
+
+/// Upper bound on geodesic subdivision frequency. Node count grows as
+/// `10·f² + 2`, so `f = 256` caps it near 650k nodes — plenty for a frame while
+/// preventing an integer-overflow / OOM from a hostile `freq`.
+const MAX_GEODESIC_FREQ: u32 = 256;
+
+/// Reject NaN / infinity in a user-supplied float parameter. Non-finite values
+/// slip past `<= 0.0` checks and poison downstream geometry with NaNs.
+fn finite(v: f64, what: &str) -> Result<f64, ExecError> {
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        Err(ExecError::Invalid(format!("{what} must be a finite number")))
+    }
+}
+
+/// Clamp a grid resolution into `[1, MAX_GRID]`.
+fn clamp_grid(n: u32) -> u32 {
+    n.clamp(1, MAX_GRID)
+}
+
 /// Apply `linear` about `center` (targets' combined AABB center when `None`)
 /// to every resolved target, snapshotting geometry for exact undo.
 fn apply_about_center(
@@ -3138,6 +3163,12 @@ fn apply_forward(
             if frequency == 0 {
                 return Err(ExecError::Invalid("geodesic frequency must be >= 1".into()));
             }
+            if frequency > MAX_GEODESIC_FREQ {
+                return Err(ExecError::Invalid(format!(
+                    "geodesic frequency must be <= {MAX_GEODESIC_FREQ}"
+                )));
+            }
+            let radius = finite(radius, "geodesic radius")?;
             if radius <= 0.0 {
                 return Err(ExecError::Invalid("geodesic radius must be positive".into()));
             }
@@ -3181,13 +3212,15 @@ fn apply_forward(
             ))
         }
         Command::Hypar { id, a, b, c, nu, nv } => {
+            let (a, b, c) = (finite(a, "hypar a")?, finite(b, "hypar b")?, finite(c, "hypar c")?);
             if a <= 0.0 || b <= 0.0 {
                 return Err(ExecError::Invalid("hypar a and b must be positive".into()));
             }
             if c == 0.0 {
                 return Err(ExecError::Invalid("hypar c must be non-zero".into()));
             }
-            let (nu_v, nv_v) = (nu.unwrap_or(12).max(1), nv.unwrap_or(12).max(1));
+            let (nu_v, nv_v) =
+                (clamp_grid(nu.unwrap_or(12)), clamp_grid(nv.unwrap_or(12)));
             let mesh = kernel_mesh::hypar_surface(a, b, c, nu_v, nv_v);
             let id = mesh_object(doc, id, mesh);
             Ok((
@@ -3200,6 +3233,9 @@ fn apply_forward(
             ))
         }
         Command::GaussVault { id, span, length, rise, undulate } => {
+            let span = finite(span, "gaussvault span")?;
+            let length = finite(length, "gaussvault length")?;
+            let rise = finite(rise, "gaussvault rise")?;
             if span <= 0.0 || length <= 0.0 || rise <= 0.0 {
                 return Err(ExecError::Invalid(
                     "gaussvault span, length and rise must be positive".into(),
@@ -3220,17 +3256,24 @@ fn apply_forward(
             ))
         }
         Command::Gridshell { id, surface, nu, nv } => {
-            let (nu_v, nv_v) = (nu.unwrap_or(12).max(1), nv.unwrap_or(12).max(1));
+            let (nu_v, nv_v) =
+                (clamp_grid(nu.unwrap_or(12)), clamp_grid(nv.unwrap_or(12)));
             // Validate surface parameters up front.
             match surface {
                 crate::GridshellSurfaceSpec::Hypar { a, b, c } => {
+                    finite(a, "gridshell a")?;
+                    finite(b, "gridshell b")?;
+                    finite(c, "gridshell c")?;
                     if a <= 0.0 || b <= 0.0 || c == 0.0 {
                         return Err(ExecError::Invalid(
                             "gridshell hypar needs a>0, b>0, c!=0".into(),
                         ));
                     }
                 }
-                crate::GridshellSurfaceSpec::Vault { span, length, rise, .. } => {
+                crate::GridshellSurfaceSpec::Vault { span, length, rise, undulate: _ } => {
+                    finite(span, "gridshell span")?;
+                    finite(length, "gridshell length")?;
+                    finite(rise, "gridshell rise")?;
                     if span <= 0.0 || length <= 0.0 || rise <= 0.0 {
                         return Err(ExecError::Invalid(
                             "gridshell vault needs span>0, length>0, rise>0".into(),
@@ -3258,12 +3301,17 @@ fn apply_forward(
             slack,
             invert,
         } => {
+            if !support_a.is_finite() || !support_b.is_finite() {
+                return Err(ExecError::Invalid(
+                    "funicular supports must be finite points".into(),
+                ));
+            }
             if (support_b - support_a).length() < 1e-6 {
                 return Err(ExecError::Invalid(
                     "funicular supports must be distinct points".into(),
                 ));
             }
-            let seg = segments.unwrap_or(24).max(2);
+            let seg = segments.unwrap_or(24).clamp(2, MAX_GRID);
             let ld = load.unwrap_or(1.0).max(0.0);
             let sl = slack.unwrap_or(1.4);
             let mut pts = kernel_mesh::funicular_chain(support_a, support_b, seg, ld, sl);
@@ -3300,8 +3348,13 @@ fn apply_forward(
             if struts < 3 {
                 return Err(ExecError::Invalid("tensegrity needs >= 3 struts".into()));
             }
-            let r = radius.unwrap_or(1.0);
-            let h = height.unwrap_or(2.0);
+            if struts > MAX_GRID {
+                return Err(ExecError::Invalid(format!(
+                    "tensegrity struts must be <= {MAX_GRID}"
+                )));
+            }
+            let r = finite(radius.unwrap_or(1.0), "tensegrity radius")?;
+            let h = finite(height.unwrap_or(2.0), "tensegrity height")?;
             if r <= 0.0 || h <= 0.0 {
                 return Err(ExecError::Invalid(
                     "tensegrity radius and height must be positive".into(),
@@ -3309,7 +3362,7 @@ fn apply_forward(
             }
             // Default twist is the antiprism stability twist π(1/2 − 1/n).
             let tw = match twist_deg {
-                Some(d) => d.to_radians(),
+                Some(d) => finite(d, "tensegrity twist")?.to_radians(),
                 None => {
                     std::f64::consts::PI * (0.5 - 1.0 / struts as f64)
                 }
@@ -3330,8 +3383,11 @@ fn apply_forward(
             ))
         }
         Command::Cablenet { id, corners, n, sag } => {
-            let nn = n.unwrap_or(8).max(1);
-            let sg = sag.unwrap_or(1.5);
+            if corners.iter().any(|c| !c.is_finite()) {
+                return Err(ExecError::Invalid("cablenet corners must be finite".into()));
+            }
+            let nn = clamp_grid(n.unwrap_or(8));
+            let sg = finite(sag.unwrap_or(1.5), "cablenet sag")?;
             let (_, _, segsv) = kernel_mesh::cable_net(corners, nn, sg);
             if segsv.is_empty() {
                 return Err(ExecError::Invalid("cablenet produced no links".into()));
@@ -10014,6 +10070,35 @@ mod tests {
         let mut s = Session::default();
         assert!(s.run(parse("geodesic 0 5").unwrap()).is_err());
         assert!(s.run(parse("geodesic 3 -1").unwrap()).is_err());
+    }
+
+    #[test]
+    fn generators_reject_hostile_params_no_oom() {
+        // A hostile frequency would allocate ~10·f²·2 nodes → integer overflow /
+        // OOM. Must be rejected, not attempted.
+        let mut s = Session::default();
+        assert!(
+            s.run(parse("geodesic 100000 5").unwrap()).is_err(),
+            "huge geodesic frequency must be rejected"
+        );
+        // NaN slips past `<= 0.0` checks and poisons geometry with NaNs.
+        assert!(
+            s.run(parse("hypar nan 5 5").unwrap()).is_err(),
+            "NaN hypar param must be rejected"
+        );
+        assert!(
+            s.run(parse("hypar 5 inf 5").unwrap()).is_err(),
+            "infinite hypar param must be rejected"
+        );
+        // Huge grid resolutions are clamped, not OOM'd: this must succeed and
+        // stay bounded at MAX_GRID² rather than 10^10 vertices.
+        let out = s.run(parse("hypar 5 5 5 100000 100000").unwrap());
+        assert!(out.is_ok(), "huge nu/nv clamp instead of erroring");
+        // Huge tensegrity strut count is rejected.
+        assert!(
+            s.run(parse("tensegrity 100000").unwrap()).is_err(),
+            "huge tensegrity strut count must be rejected"
+        );
     }
 
     #[test]

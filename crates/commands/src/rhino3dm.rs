@@ -234,6 +234,18 @@ impl<'a> Cur<'a> {
         }
         Some(())
     }
+    /// Bytes left in the buffer from the current position.
+    fn remaining(&self) -> usize {
+        self.d.len().saturating_sub(self.p)
+    }
+    /// A safe `Vec::with_capacity` hint for reading `count` records of
+    /// `bytes_each` bytes: never larger than what the remaining buffer could
+    /// possibly hold. Prevents a header claiming billions of records from
+    /// pre-allocating gigabytes before the read loop fails on truncated data.
+    fn cap_hint(&self, count: usize, bytes_each: usize) -> usize {
+        let max_possible = self.remaining() / bytes_each.max(1);
+        count.min(max_possible)
+    }
     /// openNURBS `WriteString`: u32 element count (0 or len+1), then that many
     /// little-endian UTF-16 code units (last is a 0 terminator).
     fn string(&mut self) -> Option<String> {
@@ -507,7 +519,7 @@ fn read_nurbs_curve(data: &[u8]) -> Option<Imported> {
     }
     // openNURBS omits the two superfluous end knots; clamp back to n+degree+1 by
     // duplicating the first/last so kernel_curve gets a full clamped knot vector.
-    let mut mid = Vec::with_capacity(knot_count as usize);
+    let mut mid = Vec::with_capacity(c.cap_hint(knot_count as usize, 8));
     for _ in 0..knot_count {
         mid.push(c.f64()?);
     }
@@ -518,8 +530,9 @@ fn read_nurbs_curve(data: &[u8]) -> Option<Imported> {
     debug_assert_eq!(knots.len(), cv_count + degree + 1);
 
     let _cv_count2 = c.i32()?;
-    let mut control = Vec::with_capacity(cv_count);
-    let mut weights = Vec::with_capacity(cv_count);
+    let cv_cap = c.cap_hint(cv_count, cv_dim * 8);
+    let mut control = Vec::with_capacity(cv_cap);
+    let mut weights = Vec::with_capacity(cv_cap);
     for _ in 0..cv_count {
         let mut coords = [0.0f64; 4];
         for coord in coords.iter_mut().take(cv_dim) {
@@ -599,7 +612,9 @@ fn read_mesh(data: &[u8]) -> Option<Mesh> {
 }
 
 fn read_faces(c: &mut Cur, fcount: usize, i_size: i32) -> Option<Vec<[u32; 3]>> {
-    let mut tris = Vec::with_capacity(fcount * 2);
+    let bytes_each = 4 * (i_size.max(0) as usize);
+    // Two tris per face worst-case, but never more than the buffer can hold.
+    let mut tris = Vec::with_capacity(c.cap_hint(fcount, bytes_each).saturating_mul(2));
     let read_idx = |c: &mut Cur| -> Option<u32> {
         match i_size {
             1 => c.u8().map(|v| v as u32),
@@ -641,7 +656,7 @@ fn read_compressed_f32_points(c: &mut Cur, vcount: usize) -> Option<Vec<[f32; 3]
     if method != 0 {
         return None; // deflate not supported on read
     }
-    let mut pts = Vec::with_capacity(vcount);
+    let mut pts = Vec::with_capacity(c.cap_hint(vcount, 12));
     for _ in 0..vcount {
         pts.push([c.f32()?, c.f32()?, c.f32()?]);
     }
@@ -1101,6 +1116,48 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    // --- Hostile-header allocation guards (P1 OOM regressions) ---------------
+
+    #[test]
+    fn read_faces_huge_count_on_tiny_buffer_no_oom() {
+        // A face array header claiming 50M faces but only a few bytes follow.
+        // Must not pre-allocate gigabytes and must fail gracefully (None).
+        let mut c = Cur::new(&[0u8; 8]);
+        let out = read_faces(&mut c, 50_000_000, 4);
+        assert!(out.is_none(), "truncated face array must return None, not OOM");
+    }
+
+    #[test]
+    fn read_compressed_points_huge_vcount_no_oom() {
+        // size field equals vcount*12 (passes the size check) but the buffer is
+        // truncated: the cap hint must bound the pre-allocation to the buffer.
+        let vcount = 50_000_000usize;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&((vcount * 12) as u32).to_le_bytes()); // size
+        buf.extend_from_slice(&0u32.to_le_bytes()); // crc
+        buf.push(0); // method = raw
+        // no point data follows
+        let mut c = Cur::new(&buf);
+        let out = read_compressed_f32_points(&mut c, vcount);
+        assert!(out.is_none(), "truncated point buffer must return None, not OOM");
+    }
+
+    #[test]
+    fn read_nurbs_curve_huge_cv_count_no_oom() {
+        // ver, dim=3, is_rat=0, order=4, cv_count=10M, r0, r1, bbox(6d)
+        let mut b = Vec::new();
+        b.push(0u8); // ver
+        for v in [3i32, 0, 4, 10_000_000, 0, 0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&[0u8; 6 * 8]); // bbox
+        // knot_count = order + cv_count - 2 (passes the equality check), then EOF.
+        let knot_count = 4 + 10_000_000 - 2i32;
+        b.extend_from_slice(&knot_count.to_le_bytes());
+        let out = read_nurbs_curve(&b);
+        assert!(out.is_none(), "truncated NURBS knots must return None, not OOM");
     }
 }
 
