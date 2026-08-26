@@ -244,6 +244,9 @@ pub fn run_script_lines(
                     println!("{l}");
                 }
             }
+            Some(AppVerb::Gumball(_)) => {
+                // No gizmo in headless mode — silently accepted.
+            }
             Some(AppVerb::ReduceMotion(_)) => {
                 // No animated UI in headless mode — silently accepted.
             }

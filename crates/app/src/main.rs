@@ -212,6 +212,13 @@ fn append_crash_record(path: &std::path::Path, record: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = f.write_all(record.as_bytes());
     }
+    // Restrict permissions to owner-only (0600) so doc paths / hostile imported
+    // strings in crash records are not world-readable on multi-user systems.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 /// Install a panic hook that appends a full crash record (message + location +
@@ -381,5 +388,21 @@ mod tests {
         assert!(text.contains("--headless"));
         assert!(text.contains("--out"));
         assert!(text.contains("--shot"));
+    }
+
+    /// On Unix, crash.log must be created with 0600 permissions.
+    #[test]
+    #[cfg(unix)]
+    fn crash_log_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir()
+            .join(format!("ijc_crash_perm_test_{}", std::process::id()));
+        let path = dir.join("crash.log");
+        let _ = std::fs::remove_file(&path);
+        append_crash_record(&path, "test\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        // mode & 0o777 gives the rwx bits; must be exactly 0600 (owner rw, no others).
+        assert_eq!(mode & 0o777, 0o600, "crash.log should be 0600, got {mode:#o}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

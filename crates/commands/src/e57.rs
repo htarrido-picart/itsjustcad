@@ -116,6 +116,11 @@ pub fn parse(data: &[u8]) -> Result<E57Points, E57Error> {
                 _ => continue, // invalid/direction-only cartesian: skip
             };
 
+            // Guard against non-finite coordinates (corrupt or synthetic files).
+            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                continue;
+            }
+
             positions.push(DVec3::new(x, y, z));
 
             if has_color {
@@ -351,6 +356,21 @@ mod tests {
         let data = make_e57_xyz(&[(0.0, 0.0, 0.0)]);
         let pts = parse(&data).unwrap();
         assert_eq!(pts.skipped_sections, 0);
+    }
+
+    #[test]
+    fn nan_cartesian_points_skipped() {
+        // Build a valid E57 with two finite points and one NaN point.
+        // We write all three as "valid" cartesian in the file, then patch the
+        // bytes of the NaN point after writing.  Since E57 uses IEEE 754 doubles
+        // we can just write NaN directly.
+        let good = make_e57_xyz(&[(1.0, 2.0, 3.0), (f64::NAN, 0.0, 0.0), (4.0, 5.0, 6.0)]);
+        let pts = parse(&good).unwrap();
+        // The NaN point must be filtered; only the two finite points survive.
+        assert_eq!(pts.positions.len(), 2, "NaN point should be skipped");
+        for p in &pts.positions {
+            assert!(p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
+        }
     }
 
     /// Writes a small colored E57 to /tmp/sanity.e57 for the headless sanity check.

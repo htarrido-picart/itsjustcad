@@ -51,6 +51,9 @@ pub enum AppVerb {
     /// Tune the sketchy edge effect (`edgefx jitter=.. extension=.. …`).
     /// Carries the raw `key=value` tokens for the front-end to apply.
     EdgeFx(Vec<String>),
+    /// Toggle the transform gumball/gizmo (`gumball [on|off|toggle]` / G hotkey).
+    /// `None` means bare toggle.
+    Gumball(Option<bool>),
     /// Toggle Reduce Motion for animated progress bars (`reducemotion [on|off]`).
     /// `None` means bare toggle.
     ReduceMotion(Option<bool>),
@@ -171,6 +174,12 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             _ => return None,
         }),
         "edgefx" => AppVerb::EdgeFx(words.map(str::to_owned).collect()),
+        "gumball" | "gizmo" => AppVerb::Gumball(match words.next() {
+            Some("on" | "true" | "1") => Some(true),
+            Some("off" | "false" | "0") => Some(false),
+            Some("toggle") | None => None,
+            _ => return None,
+        }),
         "reducemotion" => AppVerb::ReduceMotion(match words.next() {
             Some("on" | "true" | "1") => Some(true),
             Some("off" | "false" | "0") => Some(false),
@@ -243,6 +252,16 @@ mod tests {
             Some(AppVerb::EdgeFx(vec!["jitter=.05".into(), "extension=.1".into()]))
         );
         assert_eq!(classify("edgefx"), Some(AppVerb::EdgeFx(vec![])));
+    }
+
+    #[test]
+    fn classifies_gumball() {
+        assert_eq!(classify("gumball on"), Some(AppVerb::Gumball(Some(true))));
+        assert_eq!(classify("gumball off"), Some(AppVerb::Gumball(Some(false))));
+        assert_eq!(classify("gumball toggle"), Some(AppVerb::Gumball(None)));
+        assert_eq!(classify("gumball"), Some(AppVerb::Gumball(None)));
+        assert_eq!(classify("gizmo on"), Some(AppVerb::Gumball(Some(true))));
+        assert_eq!(classify("gumball garbage"), None);
     }
 
     #[test]

@@ -31,6 +31,9 @@ Display mode (how solids are drawn):
 Lighting:
   light working|sun|presentation                lighting model (alias: lightmode)                        e.g. light sun
 
+Transform gizmo:
+  gumball on|off|toggle                         show/hide the transform gumball (G hotkey = bare toggle) e.g. gumball on
+
 Non-photoreal (NPR) styling:
   sketchy on|off                                hand-drawn 'sketchy edges' character                     e.g. sketchy on
   edgefx jitter=.. extension=.. depthcue=..     tune the sketchy edge effect (key=value tokens)          e.g. edgefx jitter=.05 extension=.1
@@ -216,5 +219,9 @@ mod tests {
         assert!(p.contains("galaxy-tele"));
         // Basemap.
         assert!(p.contains("basemap [osm|sat]"));
+        // Gumball — must be advertised so the model stops saying it doesn't exist.
+        assert!(p.contains("gumball on|off|toggle"), "gumball missing from VIEW_VERB_HELP");
+        assert!(p.contains("G hotkey"), "gumball G-hotkey note missing");
     }
+
 }

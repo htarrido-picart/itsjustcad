@@ -30,6 +30,8 @@ pub enum LasError {
     UnsupportedVersion { major: u8, minor: u8 },
     #[error("point data offset {offset} is past end of file ({len} bytes)")]
     BadOffset { offset: u32, len: usize },
+    #[error("LAS header contains non-finite scale or offset values (file is corrupt)")]
+    NonFiniteHeader,
 }
 
 /// Parsed output: world-space positions (after applying scale and offset) and
@@ -110,6 +112,13 @@ pub fn parse(data: &[u8]) -> Result<LasPoints, LasError> {
     let oy = f64::from_le_bytes(data[163..171].try_into().unwrap());
     let oz = f64::from_le_bytes(data[171..179].try_into().unwrap());
 
+    // Reject non-finite header values — a NaN/Inf scale or offset makes every
+    // computed point coordinate non-finite; better to fail clearly.
+    if !sx.is_finite() || !sy.is_finite() || !sz.is_finite()
+        || !ox.is_finite() || !oy.is_finite() || !oz.is_finite()
+    {
+        return Err(LasError::NonFiniteHeader);
+    }
     // Clamp scale factors: a zero scale factor (malformed file) would produce NaN.
     let sx = if sx == 0.0 { 0.001 } else { sx };
     let sy = if sy == 0.0 { 0.001 } else { sy };
@@ -307,5 +316,23 @@ mod tests {
             let pts = parse(&data).unwrap_or_else(|e| panic!("format {fmt} should parse: {e}"));
             assert_eq!(pts.positions.len(), 3, "format {fmt}");
         }
+    }
+
+    #[test]
+    fn nan_scale_rejected() {
+        let mut data = make_las(3, 0.001, 0.0);
+        // Write NaN into the X scale factor at byte 131.
+        data[131..139].copy_from_slice(&f64::NAN.to_le_bytes());
+        let err = parse(&data).unwrap_err();
+        assert!(matches!(err, LasError::NonFiniteHeader), "got: {err}");
+    }
+
+    #[test]
+    fn inf_offset_rejected() {
+        let mut data = make_las(3, 0.001, 0.0);
+        // Write +Inf into the X offset at byte 155.
+        data[155..163].copy_from_slice(&f64::INFINITY.to_le_bytes());
+        let err = parse(&data).unwrap_err();
+        assert!(matches!(err, LasError::NonFiniteHeader), "got: {err}");
     }
 }

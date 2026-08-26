@@ -151,16 +151,34 @@ pub fn default_dir() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".config").join("itsjustcad").join("journal"))
 }
 
+/// How recently a journal must have been untouched to be considered from a
+/// truly-crashed (not currently-writing) session. Journals modified within
+/// this window are skipped so we never replay a live peer's journal.
+const STALE_SECS: u64 = 5;
+
 /// Journals left by other (crashed) sessions, newest first by mtime.
+///
+/// Journals that were modified within the last [`STALE_SECS`] seconds are
+/// excluded: they may belong to a concurrently-running session that is still
+/// writing. Only truly-stale journals from crashed processes are returned.
 pub fn recoverable(dir: &Path, exclude: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
+    let now = std::time::SystemTime::now();
     let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl") && p != exclude)
-        .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p)))
+        .filter_map(|p| {
+            let mtime = p.metadata().ok()?.modified().ok()?;
+            // Skip journals that are still being actively written.
+            let age_secs = now.duration_since(mtime).ok()?.as_secs();
+            if age_secs < STALE_SECS {
+                return None;
+            }
+            Some((mtime, p))
+        })
         .collect();
     found.sort_by_key(|a| std::cmp::Reverse(a.0));
     found.into_iter().map(|(_, p)| p).collect()
@@ -279,16 +297,37 @@ mod tests {
         let dir = temp_path("scan");
         std::fs::create_dir_all(&dir).unwrap();
         let old = dir.join("old.jsonl");
-        let new = dir.join("new.jsonl");
+        let newer = dir.join("newer.jsonl");
         let own = dir.join("own.jsonl");
+        // All candidate journals must be stale (older than STALE_SECS).
+        let older_past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let newer_past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         std::fs::write(&old, "x\n").unwrap();
-        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        std::fs::File::open(&old).unwrap().set_modified(past).unwrap();
-        std::fs::write(&new, "x\n").unwrap();
+        std::fs::File::open(&old).unwrap().set_modified(older_past).unwrap();
+        std::fs::write(&newer, "x\n").unwrap();
+        std::fs::File::open(&newer).unwrap().set_modified(newer_past).unwrap();
         std::fs::write(&own, "x\n").unwrap();
+        std::fs::File::open(&own).unwrap().set_modified(older_past).unwrap();
+        let found = recoverable(&dir, &own);
+        // newest stale first, own excluded.
+        assert_eq!(found, vec![newer.clone(), old.clone()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recoverable_skips_recently_modified_journals() {
+        // A journal written just now looks like a live session — must be excluded.
+        let dir = temp_path("liveness");
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.jsonl");
+        let own = dir.join("own.jsonl");
+        // Write and leave mtime = now (within STALE_SECS window).
+        std::fs::write(&live, "x\n").unwrap();
+        std::fs::write(&own, "x\n").unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
         std::fs::File::open(&own).unwrap().set_modified(past).unwrap();
         let found = recoverable(&dir, &own);
-        assert_eq!(found, vec![new.clone(), old.clone()]);
+        assert!(found.is_empty(), "live journal should not be offered for recovery: {found:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
