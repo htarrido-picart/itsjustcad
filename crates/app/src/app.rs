@@ -2851,8 +2851,9 @@ impl App {
             }
             return;
         }
+        let has_selection = !self.session.doc.selection.is_empty();
         let bar = egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
-            crate::menu::ui(ui, icons, style, &plugin_entries)
+            crate::menu::ui(ui, icons, style, &plugin_entries, has_selection)
         });
         // Dev/screenshot hook: force one menu open to show grouped items.
         if let Ok(title) = std::env::var("ITSJUSTCAD_MENU_DEMO") {
@@ -3701,14 +3702,20 @@ impl eframe::App for App {
         #[cfg(not(target_os = "linux"))]
         self.ensure_native_menu(frame);
         #[cfg(not(target_os = "linux"))]
-        if let Some(native) = &self.native_menu {
-            let action = native.poll();
-            if let Some(action) = action {
-                let ctx = ui.ctx().clone();
-                self.apply_menu_action(&ctx, action);
+        {
+            let has_selection = !self.session.doc.selection.is_empty();
+            if let Some(native) = &mut self.native_menu {
+                // Disable-don't-hide: keep the selection-dependent native items'
+                // enabled state in sync with the current selection.
+                native.sync_selection(has_selection);
+                let action = native.poll();
+                if let Some(action) = action {
+                    let ctx = ui.ctx().clone();
+                    self.apply_menu_action(&ctx, action);
+                }
+                // Keep polling responsive while a native bar is attached.
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             }
-            // Keep polling responsive while a native bar is attached.
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // ITSJUSTCAD_THEME pins the theme every frame (eframe otherwise re-reads

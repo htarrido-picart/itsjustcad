@@ -354,15 +354,44 @@ impl Icons {
     /// foreground so it tracks light/dark. Returns the row's click response.
     /// Mirrors the plain-text `item` layout the menus used before.
     pub fn menu_item(&self, ui: &mut egui::Ui, icon: Icon, label: &str) -> egui::Response {
+        self.menu_item_ex(ui, icon, label, None, true)
+    }
+
+    /// A menu row with an optional right-aligned keyboard `shortcut` (e.g.
+    /// `"Cmd+S"`) and an `enabled` flag. When disabled the whole row is dimmed
+    /// and does not respond to clicks — disable-don't-hide, so a selection-
+    /// dependent verb still teaches its capability. The shortcut is drawn weak so
+    /// it reads as an affordance hint, not a second label.
+    pub fn menu_item_ex(
+        &self,
+        ui: &mut egui::Ui,
+        icon: Icon,
+        label: &str,
+        shortcut: Option<&str>,
+        enabled: bool,
+    ) -> egui::Response {
         let size = ui.text_style_height(&egui::TextStyle::Body);
-        let color = ui.visuals().text_color();
+        let color = if enabled {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
         let img = self.image(ui.ctx(), icon, size, color);
-        // A borderless, full-width-ish row: icon + label with grid spacing.
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.x = ui.spacing().item_spacing.x.max(8.0);
-            ui.horizontal(|ui| {
-                ui.add(img);
-                ui.label(label)
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = ui.spacing().item_spacing.x.max(8.0);
+                ui.horizontal(|ui| {
+                    ui.add(img);
+                    let resp = ui.label(label);
+                    if let Some(sc) = shortcut {
+                        // Push the shortcut to the right edge, drawn weak/small.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new(sc).weak().small());
+                        });
+                    }
+                    resp
+                })
+                .inner
             })
             .inner
         })

@@ -67,6 +67,77 @@ pub enum MenuAction {
 /// starts the interactive picker rather than typing text.
 const DRAW_VERBS: [&str; 4] = ["line", "polyline", "rect", "circle"];
 
+/// The keyboard shortcut shown next to a menu item, if it has one. This is the
+/// SINGLE source of truth for menu accelerators — both the in-window bar and the
+/// native (muda) bar read it, and every string here mirrors an actual binding in
+/// [`crate::keymap::keymap`] so the two never drift (asserted in tests).
+///
+/// The display uses the macOS convention (`Cmd`, `Shift`, `Delete`); the native
+/// layer parses the same string into a muda [`muda::accelerator::Accelerator`].
+/// Bare single-letter draw shortcuts (L/C/P/R, G) are intentionally NOT surfaced
+/// in menus — they are modeless tool hotkeys, not menu accelerators, and showing
+/// them would clutter every draw item with a lone letter.
+pub fn menu_shortcut(verb: &str) -> Option<&'static str> {
+    match verb {
+        "save" => Some("Cmd+S"),
+        "undo" => Some("Cmd+Z"),
+        "redo" => Some("Cmd+Shift+Z"),
+        "select all" | "selectall" => Some("Cmd+A"),
+        "copyselection" | "copy" => Some("Cmd+C"),
+        "pasteselection" => Some("Cmd+V"),
+        "delete" => Some("Delete"),
+        _ => None,
+    }
+}
+
+/// The accelerator shown for a wired app action (as opposed to a registry verb)
+/// keyed by its [`MenuAction`]. Zoom (⌘= / ⌘- / ⌘0) and Settings (⌘,) live here
+/// because they are app verbs, not registry verbs. Kept beside [`menu_shortcut`]
+/// so all menu accelerators have one home.
+pub fn action_shortcut(action: &MenuAction) -> Option<&'static str> {
+    match action {
+        MenuAction::ZoomStep(true) => Some("Cmd+="),
+        MenuAction::ZoomStep(false) => Some("Cmd+-"),
+        MenuAction::ZoomReset => Some("Cmd+0"),
+        MenuAction::ModelSetup => Some("Cmd+,"),
+        MenuAction::Execute(v) if v == "undo" => Some("Cmd+Z"),
+        MenuAction::Execute(v) if v == "redo" => Some("Cmd+Shift+Z"),
+        _ => None,
+    }
+}
+
+/// Whether a registry verb operates on the current selection, so a menu should
+/// DIM (disable) rather than hide it when nothing is selected. This teaches
+/// capability: the user sees Move/Rotate/… exist but greyed until they pick
+/// something. Curated to the modify/transform/boolean verbs that consume a
+/// selection; drawing and file/view verbs stay always-enabled.
+pub fn needs_selection(verb: &str) -> bool {
+    matches!(
+        verb,
+        "move"
+            | "copy"
+            | "rotate"
+            | "scale"
+            | "mirror"
+            | "array"
+            | "polararray"
+            | "delete"
+            | "trim"
+            | "extend"
+            | "split"
+            | "join"
+            | "fillet"
+            | "offset"
+            | "group"
+            | "ungroup"
+            | "union"
+            | "difference"
+            | "intersect"
+            | "hideobj"
+            | "showobj"
+    )
+}
+
 /// One user-plugin verb surfaced in the "Plugins" menu. Built from the session
 /// [`itsjustcad_commands::plugin::Plugin`] registry (name, its declared menu
 /// group, whether it takes params, and a one-line summary for the tooltip).
@@ -248,9 +319,36 @@ pub enum NativeItem {
         id: String,
         label: String,
         action: MenuAction,
+        /// Keyboard accelerator string (e.g. `"Cmd+S"`), sourced from the keymap
+        /// via [`menu_shortcut`] / [`action_shortcut`] so menus stay in sync.
+        /// `None` for items with no binding.
+        shortcut: Option<String>,
+        /// False ⇒ the item renders DIMMED (disabled). Selection-dependent verbs
+        /// (see [`needs_selection`]) are disabled when nothing is selected — the
+        /// menu still teaches the capability instead of hiding it.
+        enabled: bool,
     },
+    /// A native predefined item (macOS Minimize / Zoom / Bring All to Front, etc).
+    /// Carried in the model so tests can see the Window menu; the muda layer maps
+    /// each kind to a [`muda::PredefinedMenuItem`]. Has no [`MenuAction`] — the OS
+    /// handles it.
+    Predefined(PredefinedKind),
     /// A visual divider between item groups.
     Separator,
+}
+
+/// A macOS-standard predefined menu item the OS implements directly (no
+/// [`MenuAction`]). Used for the Window menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredefinedKind {
+    /// Minimize the window (⌘M).
+    Minimize,
+    /// Zoom (macOS green-button behaviour).
+    Zoom,
+    /// Bring all app windows to the front.
+    BringAllToFront,
+    /// Enter/Exit Full Screen (⌃⌘F on macOS; label toggles natively).
+    Fullscreen,
 }
 
 /// A top-level native menu (e.g. "File") and its ordered rows.
@@ -287,13 +385,17 @@ pub fn appearance_native_items() -> Vec<(&'static str, &'static str, MenuAction)
     ]
 }
 
-pub fn native_model(style: MenuStyle) -> Vec<NativeMenu> {
+pub fn native_model(style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
     let mut menus: Vec<NativeMenu> = Vec::new();
     for (title, cats) in top_menus(style) {
         let mut items: Vec<NativeItem> = Vec::new();
+        // A wired app-action leaf: shortcut sourced from `action_shortcut`,
+        // always enabled (these are not selection-dependent).
         let leaf = |id: &str, label: &str, action: MenuAction| NativeItem::Leaf {
             id: format!("{title}/{id}"),
             label: label.to_string(),
+            shortcut: action_shortcut(&action).map(str::to_string),
+            enabled: true,
             action,
         };
         // File / Edit / Tools prepend their app-wired actions, mirroring `ui`.
@@ -308,7 +410,14 @@ pub fn native_model(style: MenuStyle) -> Vec<NativeMenu> {
                 ("Export…", "export"),
                 ("Print…", "print"),
             ] {
-                items.push(leaf(verb, label, menu_action(verb)));
+                let action = menu_action(verb);
+                items.push(NativeItem::Leaf {
+                    id: format!("{title}/{verb}"),
+                    label: label.to_string(),
+                    shortcut: menu_shortcut(verb).map(str::to_string),
+                    enabled: true,
+                    action,
+                });
             }
             items.push(NativeItem::Separator);
         } else if title == "Edit" {
@@ -317,7 +426,18 @@ pub fn native_model(style: MenuStyle) -> Vec<NativeMenu> {
             items.push(leaf("history", "Edit history…", MenuAction::EditHistory));
             items.push(NativeItem::Separator);
         } else if title == "Tools" {
-            items.push(leaf("model_setup", "Model Setup…", MenuAction::ModelSetup));
+            // Model Setup opens the panel but carries no accelerator (⌘, is
+            // reserved for Settings below, the macOS Preferences convention).
+            items.push(NativeItem::Leaf {
+                id: format!("{title}/model_setup"),
+                label: "Model Setup…".to_string(),
+                shortcut: None,
+                enabled: true,
+                action: MenuAction::ModelSetup,
+            });
+            // Settings/Preferences via the macOS ⌘, convention (opens the same
+            // preferences panel). Shortcut from `action_shortcut` ⇒ "Cmd+,".
+            items.push(leaf("settings", "Settings…", MenuAction::ModelSetup));
             items.push(NativeItem::Separator);
         } else if title == "View" {
             // Appearance lives in the native View menu (macOS/Windows have no
@@ -348,7 +468,16 @@ pub fn native_model(style: MenuStyle) -> Vec<NativeMenu> {
             }
             first_group = false;
             for verb in verbs {
-                items.push(leaf(verb, verb, menu_action(verb)));
+                // Selection-dependent verbs are DIMMED (disabled) when nothing is
+                // selected — disable-don't-hide, so the menu still teaches them.
+                let enabled = !needs_selection(verb) || has_selection;
+                items.push(NativeItem::Leaf {
+                    id: format!("{title}/{verb}"),
+                    label: verb.to_string(),
+                    shortcut: menu_shortcut(verb).map(str::to_string),
+                    enabled,
+                    action: menu_action(verb),
+                });
             }
         }
         menus.push(NativeMenu {
@@ -356,6 +485,20 @@ pub fn native_model(style: MenuStyle) -> Vec<NativeMenu> {
             items,
         });
     }
+    // macOS Window menu: standard OS-handled items (Minimize ⌘M / Zoom / Bring
+    // All to Front / Full Screen). No MenuAction — AppKit implements them.
+    #[cfg(target_os = "macos")]
+    menus.push(NativeMenu {
+        title: "Window".to_string(),
+        items: vec![
+            NativeItem::Predefined(PredefinedKind::Minimize),
+            NativeItem::Predefined(PredefinedKind::Zoom),
+            NativeItem::Separator,
+            NativeItem::Predefined(PredefinedKind::Fullscreen),
+            NativeItem::Separator,
+            NativeItem::Predefined(PredefinedKind::BringAllToFront),
+        ],
+    });
     // Help is synthetic (not a registry category), same as the in-window bar.
     menus.push(NativeMenu {
         title: "Help".to_string(),
@@ -364,11 +507,15 @@ pub fn native_model(style: MenuStyle) -> Vec<NativeMenu> {
                 id: "Help/reference".into(),
                 label: "Command reference".into(),
                 action: MenuAction::Help,
+                shortcut: None,
+                enabled: true,
             },
             NativeItem::Leaf {
                 id: "Help/about".into(),
                 label: "About ItsJustCAD".into(),
                 action: MenuAction::About,
+                shortcut: None,
+                enabled: true,
             },
         ],
     });
@@ -392,13 +539,15 @@ pub fn ui(
     icons: &Icons,
     style: MenuStyle,
     plugins: &[PluginMenuEntry],
+    has_selection: bool,
 ) -> Option<MenuAction> {
     let mut action = None;
     egui::MenuBar::new().ui(ui, |ui| {
         for (title, cats) in top_menus(style) {
             ui.menu_button(title, |ui| {
                 // File / Edit get their app-wired actions first. Leading Lucide
-                // icons give the menu a clean, scannable column.
+                // icons give the menu a clean, scannable column; shortcut hints
+                // are sourced from the keymap so they never drift.
                 if title == "File" {
                     // New group.
                     if item(ui, icons, Icon::New, "New").clicked() {
@@ -417,7 +566,10 @@ pub fn ui(
                         (Icon::Export, "Export…", "export"),
                         (Icon::Print, "Print…", "print"),
                     ] {
-                        if item(ui, icons, icon, label).clicked() {
+                        if icons
+                            .menu_item_ex(ui, icon, label, menu_shortcut(verb), true)
+                            .clicked()
+                        {
                             action = Some(menu_action(verb));
                             ui.close();
                         }
@@ -427,7 +579,10 @@ pub fn ui(
                     for (icon, label, verb) in
                         [(Icon::Undo, "Undo", "undo"), (Icon::Redo, "Redo", "redo")]
                     {
-                        if item(ui, icons, icon, label).clicked() {
+                        if icons
+                            .menu_item_ex(ui, icon, label, menu_shortcut(verb), true)
+                            .clicked()
+                        {
                             action = Some(MenuAction::Execute(verb.to_string()));
                             ui.close();
                         }
@@ -445,7 +600,11 @@ pub fn ui(
                         action = Some(MenuAction::ModelSetup);
                         ui.close();
                     }
-                    if item(ui, icons, Icon::Model, "Download local model…").clicked() {
+                    // Settings via the macOS Preferences convention (⌘,).
+                    if icons
+                        .menu_item_ex(ui, Icon::Model, "Settings…", Some("Cmd+,"), true)
+                        .clicked()
+                    {
                         action = Some(MenuAction::ModelSetup);
                         ui.close();
                     }
@@ -473,7 +632,13 @@ pub fn ui(
                     }
                     first_group = false;
                     for verb in verbs {
-                        if item(ui, icons, verb_icon(verb), verb).clicked() {
+                        // Disable-don't-hide: selection-dependent verbs render
+                        // dimmed (and unclickable) when nothing is selected.
+                        let enabled = !needs_selection(verb) || has_selection;
+                        if icons
+                            .menu_item_ex(ui, verb_icon(verb), verb, menu_shortcut(verb), enabled)
+                            .clicked()
+                        {
                             action = Some(menu_action(verb));
                             ui.close();
                         }
@@ -602,11 +767,14 @@ pub fn demo_open(
         .fixed_pos(at)
         .show(ctx, |ui| {
             egui::Frame::menu(ui.style()).show(ui, |ui| {
-                ui.set_min_width(160.0);
+                ui.set_min_width(200.0);
                 ui.label(egui::RichText::new(title).strong());
                 ui.separator();
+                // Demo with an EMPTY selection so the disable-not-hide behaviour
+                // (dimmed Move/Rotate/… with their shortcut hints) is visible.
                 for verb in verbs_in(&cats) {
-                    let _ = item(ui, icons, verb_icon(verb), verb);
+                    let enabled = !needs_selection(verb);
+                    let _ = icons.menu_item_ex(ui, verb_icon(verb), verb, menu_shortcut(verb), enabled);
                 }
             });
         });
@@ -855,10 +1023,10 @@ mod tests {
             .iter()
             .flat_map(|m| &m.items)
             .filter_map(|it| match it {
-                NativeItem::Leaf { id, label, action } => {
+                NativeItem::Leaf { id, label, action, .. } => {
                     Some((id.clone(), label.clone(), action.clone()))
                 }
-                NativeItem::Separator => None,
+                NativeItem::Separator | NativeItem::Predefined(_) => None,
             })
             .collect()
     }
@@ -866,9 +1034,12 @@ mod tests {
     #[test]
     fn native_model_has_same_top_titles_as_in_window_bar() {
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            let native: Vec<String> = native_model(style).iter().map(|m| m.title.clone()).collect();
+            let native: Vec<String> = native_model(style, true).iter().map(|m| m.title.clone()).collect();
             let mut expected: Vec<String> =
                 top_menus(style).iter().map(|(t, _)| t.to_string()).collect();
+            // macOS gets a standard Window menu before Help.
+            #[cfg(target_os = "macos")]
+            expected.push("Window".to_string());
             expected.push("Help".to_string());
             assert_eq!(native, expected, "native titles differ for {style:?}");
         }
@@ -876,7 +1047,7 @@ mod tests {
 
     #[test]
     fn native_file_menu_contains_expected_verbs_and_actions() {
-        let file = native_model(MenuStyle::Rhino)
+        let file = native_model(MenuStyle::Rhino, true)
             .into_iter()
             .find(|m| m.title == "File")
             .expect("File menu");
@@ -892,7 +1063,7 @@ mod tests {
 
     #[test]
     fn native_edit_menu_has_undo_redo_history() {
-        let edit = native_model(MenuStyle::Rhino)
+        let edit = native_model(MenuStyle::Rhino, true)
             .into_iter()
             .find(|m| m.title == "Edit")
             .expect("Edit menu");
@@ -904,7 +1075,7 @@ mod tests {
 
     #[test]
     fn native_view_menu_gathers_view_verbs() {
-        let view = native_model(MenuStyle::Rhino)
+        let view = native_model(MenuStyle::Rhino, true)
             .into_iter()
             .find(|m| m.title == "View")
             .expect("View menu");
@@ -924,7 +1095,7 @@ mod tests {
         // an in-window strip. All three theme choices and all three text-size
         // actions must be present and route to the right MenuAction.
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            let view = native_model(style)
+            let view = native_model(style, true)
                 .into_iter()
                 .find(|m| m.title == "View")
                 .expect("View menu");
@@ -945,7 +1116,7 @@ mod tests {
         // (display modes / viewport layout / zoom / lighting) — the user's
         // "View does nothing" complaint. Assert it holds real verbs beyond the
         // Appearance rows.
-        let view = native_model(MenuStyle::Rhino)
+        let view = native_model(MenuStyle::Rhino, true)
             .into_iter()
             .find(|m| m.title == "View")
             .expect("View menu");
@@ -968,7 +1139,7 @@ mod tests {
         // via allowsAutomaticWindowTabbing=NO; our own model must never define
         // such items itself.
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            for (_, label, _) in leaves(&native_model(style)) {
+            for (_, label, _) in leaves(&native_model(style, true)) {
                 let l = label.to_lowercase();
                 assert!(!l.contains("tab bar"), "found tab-bar item: {label}");
                 assert!(!l.contains("all tabs"), "found all-tabs item: {label}");
@@ -978,7 +1149,7 @@ mod tests {
 
     #[test]
     fn native_help_menu_is_synthetic() {
-        let help = native_model(MenuStyle::AutoCAD)
+        let help = native_model(MenuStyle::AutoCAD, true)
             .into_iter()
             .find(|m| m.title == "Help")
             .expect("Help menu");
@@ -992,7 +1163,7 @@ mod tests {
         // The muda layer keys a HashMap<id, MenuAction> off these ids, so every
         // leaf id must be unique within the bar.
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            let ls = leaves(&native_model(style));
+            let ls = leaves(&native_model(style, true));
             let ids: HashSet<&String> = ls.iter().map(|(id, _, _)| id).collect();
             assert_eq!(ids.len(), ls.len(), "duplicate native menu id for {style:?}");
         }
@@ -1014,7 +1185,7 @@ mod tests {
             }
         };
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            let ls = leaves(&native_model(style));
+            let ls = leaves(&native_model(style, true));
             let verbs: Vec<String> = ls.iter().filter_map(|(_, _, a)| action_verb(a)).collect();
             for spec in registry() {
                 let count = verbs.iter().filter(|v| *v == spec.name).count();
@@ -1033,5 +1204,154 @@ mod tests {
         assert!(solids.contains(&"box"));
         assert!(solids.contains(&"extrude"));
         assert!(!solids.contains(&"line"));
+    }
+
+    // ── Design Batch C: Window menu, shortcuts, disable-not-hide, Settings ────
+
+    /// The macOS Window menu is present with the standard OS-handled items.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn window_menu_present_with_standard_items() {
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            let win = native_model(style, false)
+                .into_iter()
+                .find(|m| m.title == "Window")
+                .expect("Window menu present");
+            let kinds: Vec<PredefinedKind> = win
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    NativeItem::Predefined(k) => Some(*k),
+                    _ => None,
+                })
+                .collect();
+            assert!(kinds.contains(&PredefinedKind::Minimize), "Minimize missing");
+            assert!(kinds.contains(&PredefinedKind::Zoom), "Zoom missing");
+            assert!(
+                kinds.contains(&PredefinedKind::BringAllToFront),
+                "Bring All to Front missing"
+            );
+            assert!(kinds.contains(&PredefinedKind::Fullscreen), "Full Screen missing");
+        }
+    }
+
+    /// Menu items with a binding carry their shortcut string: Save ⌘S, Undo ⌘Z,
+    /// Redo ⇧⌘Z, Delete, and the Settings ⌘, item. Sourced from the keymap.
+    #[test]
+    fn menu_items_carry_shortcut_strings() {
+        // Registry-verb shortcuts.
+        assert_eq!(menu_shortcut("save"), Some("Cmd+S"));
+        assert_eq!(menu_shortcut("undo"), Some("Cmd+Z"));
+        assert_eq!(menu_shortcut("redo"), Some("Cmd+Shift+Z"));
+        assert_eq!(menu_shortcut("delete"), Some("Delete"));
+        assert_eq!(menu_shortcut("line"), None);
+        // In the native model, the Save leaf carries the ⌘S string.
+        let file = native_model(MenuStyle::Rhino, true)
+            .into_iter()
+            .find(|m| m.title == "File")
+            .unwrap();
+        let save = file.items.iter().find_map(|it| match it {
+            NativeItem::Leaf { label, shortcut, .. } if label == "Save…" => Some(shortcut.clone()),
+            _ => None,
+        });
+        assert_eq!(save, Some(Some("Cmd+S".to_string())));
+        // Undo carries ⌘Z, Redo carries ⇧⌘Z.
+        let edit = native_model(MenuStyle::Rhino, true)
+            .into_iter()
+            .find(|m| m.title == "Edit")
+            .unwrap();
+        let sc = |lbl: &str| {
+            edit.items.iter().find_map(|it| match it {
+                NativeItem::Leaf { label, shortcut, .. } if label == lbl => Some(shortcut.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(sc("Undo"), Some(Some("Cmd+Z".into())));
+        assert_eq!(sc("Redo"), Some(Some("Cmd+Shift+Z".into())));
+    }
+
+    /// Zoom and Settings accelerators come from `action_shortcut` and appear on
+    /// the native leaves (⌘= / ⌘- / ⌘0 in View, ⌘, on Settings in Tools).
+    #[test]
+    fn cmd_comma_maps_to_settings_and_zoom_shortcuts_present() {
+        let tools = native_model(MenuStyle::Rhino, true)
+            .into_iter()
+            .find(|m| m.title == "Tools")
+            .unwrap();
+        // A Settings leaf exists, opens ModelSetup, and carries ⌘,.
+        let settings = tools.items.iter().find_map(|it| match it {
+            NativeItem::Leaf { label, action, shortcut, .. } if label == "Settings…" => {
+                Some((action.clone(), shortcut.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            settings,
+            Some((MenuAction::ModelSetup, Some("Cmd+,".to_string())))
+        );
+        assert_eq!(action_shortcut(&MenuAction::ModelSetup), Some("Cmd+,"));
+        assert_eq!(action_shortcut(&MenuAction::ZoomStep(true)), Some("Cmd+="));
+        assert_eq!(action_shortcut(&MenuAction::ZoomStep(false)), Some("Cmd+-"));
+        assert_eq!(action_shortcut(&MenuAction::ZoomReset), Some("Cmd+0"));
+    }
+
+    /// Disable-don't-hide: with an EMPTY selection the selection-dependent verbs
+    /// (move/rotate/scale/mirror/delete/…) are STILL PRESENT but marked disabled;
+    /// with a selection they become enabled. Non-selection verbs stay enabled.
+    #[test]
+    fn selection_verbs_disabled_when_empty_present_either_way() {
+        let sel_verbs = ["move", "rotate", "scale", "mirror", "delete", "copy"];
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            let empty = native_model(style, false);
+            let filled = native_model(style, true);
+            let enabled_of = |menus: &[NativeMenu], verb: &str| -> Option<bool> {
+                menus.iter().flat_map(|m| &m.items).find_map(|it| match it {
+                    NativeItem::Leaf { label, enabled, .. } if label == verb => Some(*enabled),
+                    _ => None,
+                })
+            };
+            for v in sel_verbs {
+                assert_eq!(
+                    enabled_of(&empty, v),
+                    Some(false),
+                    "{v} should be present-but-disabled with empty selection ({style:?})"
+                );
+                assert_eq!(
+                    enabled_of(&filled, v),
+                    Some(true),
+                    "{v} should be enabled with a selection ({style:?})"
+                );
+            }
+            // A non-selection verb (line via StartDraw) stays enabled regardless.
+            assert_eq!(enabled_of(&empty, "arc"), Some(true));
+        }
+    }
+
+    /// The menu shortcut table never advertises a binding the keymap doesn't
+    /// actually implement: each `menu_shortcut` entry resolves to the same command
+    /// its keymap chord produces. This is the "sourced from the keymap" guarantee.
+    #[test]
+    fn menu_shortcuts_match_the_keymap() {
+        use crate::keymap::{KeyContext, keymap};
+        use egui::{Key, Modifiers};
+        let cmd = Modifiers::COMMAND;
+        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        let ctx = KeyContext {
+            typing: false,
+            draw_active: false,
+            has_selection: true,
+            last_command: None,
+        };
+        // (verb, key, mods) → the keymap must yield a line whose verb matches.
+        assert_eq!(keymap(Key::S, cmd, ctx).as_deref(), Some("save"));
+        assert_eq!(menu_shortcut("save"), Some("Cmd+S"));
+        assert_eq!(keymap(Key::Z, cmd, ctx).as_deref(), Some("undo"));
+        assert_eq!(menu_shortcut("undo"), Some("Cmd+Z"));
+        assert_eq!(keymap(Key::Z, cmd_shift, ctx).as_deref(), Some("redo"));
+        assert_eq!(menu_shortcut("redo"), Some("Cmd+Shift+Z"));
+        assert_eq!(keymap(Key::Delete, Modifiers::NONE, ctx).as_deref(), Some("delete sel"));
+        assert_eq!(menu_shortcut("delete"), Some("Delete"));
+        assert_eq!(keymap(Key::A, cmd, ctx).as_deref(), Some("select all"));
+        assert_eq!(menu_shortcut("select all"), Some("Cmd+A"));
     }
 }
