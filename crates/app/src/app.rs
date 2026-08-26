@@ -1913,9 +1913,15 @@ impl App {
 
         // Empty-document next-actions: instead of a bare viewport, offer the
         // first things a user reaches for (draw / import / example). Only when
-        // the document is truly empty and no tool is mid-flight, and only over
-        // the active pane so multi-view layouts stay uncluttered.
-        if show_empty_document(&self.session.doc, self.draw_tool.active()) {
+        // the document is truly empty, no tool is mid-flight, and the user has
+        // NOT yet completed first-run onboarding. Returning users with an empty
+        // doc see a clean viewport — the overlay is a one-time first-run guide.
+        // Only rendered over the active pane so multi-view layouts stay uncluttered.
+        if show_empty_document(
+            &self.session.doc,
+            self.draw_tool.active(),
+            load_onboarding_done(),
+        ) {
             let pane_rect = panes.get(self.active_pane).copied().unwrap_or(full);
             self.empty_document_overlay(ui, pane_rect);
         }
@@ -3812,6 +3818,23 @@ fn save_template_done() {
     save_ui_json(&v);
 }
 
+/// Returns `true` once the user has completed first-run onboarding (i.e.
+/// dismissed/completed the template picker at least once). After that the
+/// empty-document overlay is suppressed so a returning user with an empty doc
+/// sees a clean viewport instead of a re-onboarding prompt.
+fn load_onboarding_done() -> bool {
+    // Reuse the same flag as the template picker: if the user has ever clicked
+    // "Start" (which writes `template_done = true`), onboarding is done.
+    load_template_done()
+}
+
+/// Mark onboarding as complete so the empty-document overlay will never show
+/// again on subsequent launches. Call this whenever the template picker is
+/// successfully dismissed.
+fn save_onboarding_done() {
+    save_template_done();
+}
+
 fn load_cad_origin() -> Option<CadOrigin> {
     let v = load_ui_json();
     let s = v["cad_origin"].as_str()?;
@@ -4019,11 +4042,21 @@ pub(crate) fn screen_ray(
     (origin, dir)
 }
 
-/// Whether to paint the empty-document next-actions overlay: the drawing has
-/// no geometry AND no draw tool is mid-flight (a tool in progress means the
-/// user is already placing the first object, so the prompt would be noise).
-fn show_empty_document(doc: &itsjustcad_doc::Document, tool_active: bool) -> bool {
-    doc.is_empty() && !tool_active
+/// Whether to paint the empty-document next-actions overlay.
+///
+/// Conditions (all must hold):
+/// - The document has no geometry.
+/// - No draw tool is mid-flight (a tool in progress means the user is already
+///   placing the first object, so the prompt would be noise).
+/// - Onboarding has NOT yet been completed (`onboarding_done == false`), i.e.
+///   this is a genuine first-run session. After onboarding the user gets a
+///   clean viewport on empty opens — they know what to do.
+fn show_empty_document(
+    doc: &itsjustcad_doc::Document,
+    tool_active: bool,
+    onboarding_done: bool,
+) -> bool {
+    doc.is_empty() && !tool_active && !onboarding_done
 }
 
 /// Middle-truncate a layer name to `max` chars, inserting an ellipsis so the
@@ -4352,7 +4385,7 @@ impl eframe::App for App {
                 });
             if done {
                 self.show_template_picker = false;
-                save_template_done();
+                save_onboarding_done();
                 save_cad_origin(self.cad_origin);
                 save_deck_brain(self.deck_brain);
                 apply_deck_brain(self.deck_brain, self.hardware.tier());
@@ -4676,16 +4709,29 @@ mod tests {
     #[test]
     fn empty_document_overlay_only_on_empty_idle_doc() {
         use itsjustcad_commands::{parse, Session};
-        // Fresh doc, no tool → show the next-actions prompt.
+        // Fresh doc, no tool, first-run (onboarding_done=false) → show prompt.
         let mut s = Session::default();
         assert!(s.doc.is_empty());
-        assert!(show_empty_document(&s.doc, false));
-        // A tool mid-flight suppresses it even while empty (user is placing #1).
-        assert!(!show_empty_document(&s.doc, true));
+        assert!(show_empty_document(&s.doc, false, false));
+        // A tool mid-flight suppresses it even on first-run (user is placing #1).
+        assert!(!show_empty_document(&s.doc, true, false));
         // Once geometry exists it never shows again.
         s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
         assert!(!s.doc.is_empty());
-        assert!(!show_empty_document(&s.doc, false));
+        assert!(!show_empty_document(&s.doc, false, false));
+    }
+
+    #[test]
+    fn empty_document_overlay_hidden_after_onboarding() {
+        use itsjustcad_commands::Session;
+        // After onboarding is done, an empty doc with no tool must NOT show the
+        // overlay. This is the "second launch / returning user" scenario.
+        let s = Session::default();
+        assert!(s.doc.is_empty());
+        // onboarding_done = true → overlay suppressed regardless of doc state.
+        assert!(!show_empty_document(&s.doc, false, true));
+        // Confirming: tool active + onboarding done → also suppressed.
+        assert!(!show_empty_document(&s.doc, true, true));
     }
 
     #[test]
