@@ -312,6 +312,9 @@ impl CommandLine {
     pub fn prefill(&mut self, text: String) {
         self.input = text;
         self.suggest_for.clear(); // force suggestion refresh
+        // Focus the input so a prefill (menu / command palette) is ready to type
+        // into without a second click.
+        self.focus_next_frame = true;
     }
 
     /// Recompute suggestions when `input` has changed.

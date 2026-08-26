@@ -220,6 +220,7 @@ fn predefined(kind: PredefinedKind) -> PredefinedMenuItem {
         PredefinedKind::Zoom => PredefinedMenuItem::maximize(None),
         PredefinedKind::BringAllToFront => PredefinedMenuItem::bring_all_to_front(None),
         PredefinedKind::Fullscreen => PredefinedMenuItem::fullscreen(None),
+        PredefinedKind::Quit => PredefinedMenuItem::quit(None),
     }
 }
 

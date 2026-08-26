@@ -353,6 +353,7 @@ impl Icons {
     /// Draw a menu row `<icon>  <label>`, tinting the icon to the current
     /// foreground so it tracks light/dark. Returns the row's click response.
     /// Mirrors the plain-text `item` layout the menus used before.
+    #[allow(dead_code)] // convenience wrapper kept for callers/tests
     pub fn menu_item(&self, ui: &mut egui::Ui, icon: Icon, label: &str) -> egui::Response {
         self.menu_item_ex(ui, icon, label, None, true)
     }

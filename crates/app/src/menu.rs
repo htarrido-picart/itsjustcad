@@ -61,6 +61,8 @@ pub enum MenuAction {
     ZoomStep(bool),
     /// Reset the app text size (egui zoom factor) to the default (⌘0).
     ZoomReset,
+    /// Open the ⌘K command palette overlay (fuzzy-search every verb).
+    CommandPalette,
 }
 
 /// Draw-tool verbs (mirror `draw_tool::try_start`). A menu pick of one of these
@@ -100,6 +102,7 @@ pub fn action_shortcut(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ZoomStep(false) => Some("Cmd+-"),
         MenuAction::ZoomReset => Some("Cmd+0"),
         MenuAction::ModelSetup => Some("Cmd+,"),
+        MenuAction::CommandPalette => Some("Cmd+K"),
         MenuAction::Execute(v) if v == "undo" => Some("Cmd+Z"),
         MenuAction::Execute(v) if v == "redo" => Some("Cmd+Shift+Z"),
         _ => None,
@@ -116,6 +119,8 @@ pub fn needs_selection(verb: &str) -> bool {
         verb,
         "move"
             | "copy"
+            | "cut"
+            | "deselect"
             | "rotate"
             | "scale"
             | "mirror"
@@ -138,44 +143,6 @@ pub fn needs_selection(verb: &str) -> bool {
     )
 }
 
-/// One user-plugin verb surfaced in the "Plugins" menu. Built from the session
-/// [`itsjustcad_commands::plugin::Plugin`] registry (name, its declared menu
-/// group, whether it takes params, and a one-line summary for the tooltip).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginMenuEntry {
-    pub name: String,
-    pub category: String,
-    /// True when the plugin declares parameters — picking it prefills the
-    /// command line (so the user can supply args) instead of executing at once.
-    pub has_params: bool,
-    pub summary: String,
-}
-
-/// The [`MenuAction`] a plugin menu pick dispatches: a parameterless plugin runs
-/// immediately; a parameterised one is prefilled for the user to complete. Both
-/// still lower to substrate commands through the ordinary command-line path.
-pub fn plugin_action(entry: &PluginMenuEntry) -> MenuAction {
-    if entry.has_params {
-        MenuAction::Insert(format!("{} ", entry.name))
-    } else {
-        MenuAction::Execute(entry.name.clone())
-    }
-}
-
-/// Group plugin entries by their menu category, preserving first-seen order of
-/// groups and entry order within each. Feeds both the in-window and (test-only)
-/// menu models so plugins appear grouped under "Plugins ▸ <category>".
-pub fn plugin_groups(entries: &[PluginMenuEntry]) -> Vec<(String, Vec<PluginMenuEntry>)> {
-    let mut groups: Vec<(String, Vec<PluginMenuEntry>)> = Vec::new();
-    for e in entries {
-        if let Some(g) = groups.iter_mut().find(|(k, _)| *k == e.category) {
-            g.1.push(e.clone());
-        } else {
-            groups.push((e.category.clone(), vec![e.clone()]));
-        }
-    }
-    groups
-}
 
 // ── Menu iconography ─────────────────────────────────────────────────────────
 // Lucide (ISC-licensed, FOSS) line icons give the menus a clean, consistent-
@@ -225,13 +192,6 @@ fn category_icon(cat: Category) -> Icon {
     }
 }
 
-/// Render one menu row as `<icon>  <label>` with a Lucide icon tinted to the
-/// current foreground, so every menu item carries a leading mark in a consistent
-/// column. Returns the row's click [`Response`].
-fn item(ui: &mut egui::Ui, icons: &Icons, icon: Icon, label: &str) -> egui::Response {
-    icons.menu_item(ui, icon, label)
-}
-
 /// Classify a registry verb into a [`MenuAction`]. Pure: depends only on the
 /// verb name and its registry usage string.
 pub fn menu_action(verb: &str) -> MenuAction {
@@ -260,46 +220,14 @@ pub fn menu_action(verb: &str) -> MenuAction {
     }
 }
 
-/// Top-level menu titles and the categories each gathers, for a given preset
-/// style. Every [`Category`] appears in exactly one menu (checked by
-/// `categories_partition_all` in tests). File/Edit/Help are special — File and
-/// Edit still gather their registry categories but the bar also wires the
-/// app-level save/open/undo/redo/export/import/print actions; Help is synthetic.
-pub fn top_menus(style: MenuStyle) -> Vec<(&'static str, Vec<Category>)> {
-    match style {
-        // Rhino: File / Edit / View / Curve / Solid / Transform / Dimension /
-        // Analyze / Tools / Help.
-        MenuStyle::Rhino => vec![
-            ("File", vec![Category::File]),
-            ("Edit", vec![Category::Edit]),
-            ("View", vec![Category::View]),
-            ("Curve", vec![Category::Draw2d, Category::Curve]),
-            ("Solid", vec![Category::Solid, Category::Boolean]),
-            ("Transform", vec![Category::Transform]),
-            ("Dimension", vec![Category::Dimension]),
-            ("Analyze", vec![Category::Analyze]),
-            ("Structure", vec![Category::Structure]),
-            ("Tools", vec![Category::Annotate, Category::Tools]),
-        ],
-        // AutoCAD: File / Edit / View / Draw / Modify / Dimension / Format /
-        // Tools / Help.
-        MenuStyle::AutoCAD => vec![
-            ("File", vec![Category::File]),
-            ("Edit", vec![Category::Edit]),
-            ("View", vec![Category::View]),
-            (
-                "Draw",
-                vec![Category::Draw2d, Category::Curve, Category::Solid],
-            ),
-            ("Modify", vec![Category::Transform, Category::Boolean]),
-            ("Dimension", vec![Category::Dimension]),
-            ("Format", vec![Category::Annotate]),
-            ("Structure", vec![Category::Structure]),
-            // AutoCAD groups inquiry/analysis tools under Tools.
-            ("Tools", vec![Category::Tools, Category::Analyze]),
-        ],
-    }
-}
+/// The minimal menu bar's top-level titles, in order (before the platform Window
+/// menu and the synthetic Help). Deliberately SHORT: the command palette (⌘K),
+/// the command line, and the LLM deck do the heavy lifting — the menu bar is NOT
+/// a command catalog. The geometry category menus (Draw / Curve / Solid /
+/// Transform / …) were removed; the registry still drives the palette, deck
+/// prompt, and autosuggest.
+#[allow(dead_code)] // documented contract; referenced by tests
+pub const TOP_TITLES: [&str; 3] = ["File", "Edit", "View"];
 
 // ── Native menu model (muda) ─────────────────────────────────────────────────
 // The in-window egui menu bar (`ui` below) and the true native OS menu bar
@@ -349,6 +277,10 @@ pub enum PredefinedKind {
     BringAllToFront,
     /// Enter/Exit Full Screen (⌃⌘F on macOS; label toggles natively).
     Fullscreen,
+    /// Quit the application (⌘Q). On macOS the app menu owns Quit; on other
+    /// platforms it is surfaced at the foot of the File menu.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Quit,
 }
 
 /// A top-level native menu (e.g. "File") and its ordered rows.
@@ -385,108 +317,193 @@ pub fn appearance_native_items() -> Vec<(&'static str, &'static str, MenuAction)
     ]
 }
 
-pub fn native_model(style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
+/// Build one leaf whose accelerator comes from [`action_shortcut`] for `action`.
+fn wired_leaf(title: &str, id: &str, label: &str, action: MenuAction) -> NativeItem {
+    NativeItem::Leaf {
+        id: format!("{title}/{id}"),
+        label: label.to_string(),
+        shortcut: action_shortcut(&action).map(str::to_string),
+        enabled: true,
+        action,
+    }
+}
+
+/// The minimal menu bar model — the SINGLE source both the native (muda) bar and
+/// the in-window fallback render from, so the two never drift.
+///
+/// Exactly five menus: **File / Edit / View** (built here), the platform
+/// **Window** menu (macOS), and the synthetic **Help**. No geometry category
+/// menus — the registry still drives the ⌘K palette, the deck prompt, and
+/// autosuggest, but the bar is intentionally lean.
+///
+/// `has_selection` drives disable-don't-hide on the selection-dependent Edit
+/// items (Cut/Copy/Paste/Delete/Deselect): they stay visible but dimmed when
+/// nothing is selected, teaching the capability. The `_style` argument is kept
+/// for signature stability (the minimal bar is identical across presets).
+pub fn native_model(_style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
     let mut menus: Vec<NativeMenu> = Vec::new();
-    for (title, cats) in top_menus(style) {
-        let mut items: Vec<NativeItem> = Vec::new();
-        // A wired app-action leaf: shortcut sourced from `action_shortcut`,
-        // always enabled (these are not selection-dependent).
-        let leaf = |id: &str, label: &str, action: MenuAction| NativeItem::Leaf {
-            id: format!("{title}/{id}"),
-            label: label.to_string(),
-            shortcut: action_shortcut(&action).map(str::to_string),
-            enabled: true,
-            action,
-        };
-        // File / Edit / Tools prepend their app-wired actions, mirroring `ui`.
-        if title == "File" {
-            items.push(leaf("new", "New", MenuAction::NewDocument));
-            items.push(leaf("new_session", "New file session", MenuAction::NewSession));
-            items.push(NativeItem::Separator);
-            for (label, verb) in [
-                ("Open…", "open"),
-                ("Save…", "save"),
-                ("Import…", "import"),
-                ("Export…", "export"),
-                ("Print…", "print"),
-            ] {
-                let action = menu_action(verb);
-                items.push(NativeItem::Leaf {
-                    id: format!("{title}/{verb}"),
-                    label: label.to_string(),
-                    shortcut: menu_shortcut(verb).map(str::to_string),
-                    enabled: true,
-                    action,
-                });
-            }
-            items.push(NativeItem::Separator);
-        } else if title == "Edit" {
-            items.push(leaf("undo", "Undo", MenuAction::Execute("undo".into())));
-            items.push(leaf("redo", "Redo", MenuAction::Execute("redo".into())));
-            items.push(leaf("history", "Edit history…", MenuAction::EditHistory));
-            items.push(NativeItem::Separator);
-        } else if title == "Tools" {
-            // Model Setup opens the panel but carries no accelerator (⌘, is
-            // reserved for Settings below, the macOS Preferences convention).
-            items.push(NativeItem::Leaf {
-                id: format!("{title}/model_setup"),
-                label: "Model Setup…".to_string(),
+
+    // ── File ────────────────────────────────────────────────────────────────
+    // New, Open…, Save, Save As…, Import…, Export…, Settings (⌘,), Quit.
+    {
+        let t = "File";
+        #[cfg_attr(target_os = "macos", allow(unused_mut))]
+        let mut items = vec![
+            wired_leaf(t, "new", "New", MenuAction::NewDocument),
+            wired_leaf(t, "new_session", "New file session", MenuAction::NewSession),
+            NativeItem::Separator,
+            NativeItem::Leaf {
+                id: format!("{t}/open"),
+                label: "Open…".into(),
+                shortcut: menu_shortcut("open").map(str::to_string),
+                enabled: true,
+                action: menu_action("open"),
+            },
+            NativeItem::Leaf {
+                id: format!("{t}/save"),
+                label: "Save".into(),
+                shortcut: menu_shortcut("save").map(str::to_string),
+                enabled: true,
+                action: menu_action("save"),
+            },
+            NativeItem::Leaf {
+                id: format!("{t}/saveas"),
+                label: "Save As…".into(),
                 shortcut: None,
                 enabled: true,
-                action: MenuAction::ModelSetup,
-            });
-            // Settings/Preferences via the macOS ⌘, convention (opens the same
-            // preferences panel). Shortcut from `action_shortcut` ⇒ "Cmd+,".
-            items.push(leaf("settings", "Settings…", MenuAction::ModelSetup));
+                // `save ` prefilled so the user supplies a path (Save As).
+                action: MenuAction::Insert("save ".into()),
+            },
+            NativeItem::Separator,
+            NativeItem::Leaf {
+                id: format!("{t}/import"),
+                label: "Import…".into(),
+                shortcut: None,
+                enabled: true,
+                action: MenuAction::ImportDialog,
+            },
+            NativeItem::Leaf {
+                id: format!("{t}/export"),
+                label: "Export…".into(),
+                shortcut: None,
+                enabled: true,
+                action: MenuAction::ExportDialog,
+            },
+            NativeItem::Separator,
+            wired_leaf(t, "settings", "Settings…", MenuAction::ModelSetup),
+        ];
+        // macOS puts Quit in the app menu automatically; on other platforms we
+        // surface it here. AppKit still offers ⌘Q regardless.
+        #[cfg(not(target_os = "macos"))]
+        {
             items.push(NativeItem::Separator);
-        } else if title == "View" {
-            // Appearance lives in the native View menu (macOS/Windows have no
-            // in-window strip). Theme is three radio-style items (Light/Dark/
-            // System); text size is a stepper. All route via apply_menu_action.
-            for (id, label, action) in appearance_native_items() {
-                items.push(leaf(id, label, action));
-            }
-            items.push(NativeItem::Separator);
+            items.push(NativeItem::Predefined(PredefinedKind::Quit));
         }
-        // Registry verbs grouped by category, a separator between groups — the
-        // File/Edit wired verbs already surfaced above are skipped.
-        let mut first_group = true;
-        for cat in &cats {
-            let verbs: Vec<&str> = verbs_in(std::slice::from_ref(cat))
-                .into_iter()
-                .filter(|verb| {
-                    !(title == "File"
-                        && matches!(*verb, "open" | "save" | "import" | "export" | "print"))
-                        && !(title == "Edit" && matches!(*verb, "undo" | "redo"))
-                })
-                .collect();
-            if verbs.is_empty() {
-                continue;
-            }
-            if !first_group {
-                items.push(NativeItem::Separator);
-            }
-            first_group = false;
-            for verb in verbs {
-                // Selection-dependent verbs are DIMMED (disabled) when nothing is
-                // selected — disable-don't-hide, so the menu still teaches them.
-                let enabled = !needs_selection(verb) || has_selection;
-                items.push(NativeItem::Leaf {
-                    id: format!("{title}/{verb}"),
-                    label: verb.to_string(),
-                    shortcut: menu_shortcut(verb).map(str::to_string),
-                    enabled,
-                    action: menu_action(verb),
-                });
-            }
-        }
-        menus.push(NativeMenu {
-            title: title.to_string(),
-            items,
-        });
+        menus.push(NativeMenu { title: t.into(), items });
     }
-    // macOS Window menu: standard OS-handled items (Minimize ⌘M / Zoom / Bring
-    // All to Front / Full Screen). No MenuAction — AppKit implements them.
+
+    // ── Edit ────────────────────────────────────────────────────────────────
+    // Undo, Redo, Cut, Copy, Paste, Delete, Select All, Deselect, Edit history…
+    {
+        let t = "Edit";
+        // A selection-dependent Edit leaf: dimmed when nothing is selected.
+        let sel_leaf = |id: &str, label: &str, action: MenuAction, shortcut: Option<&str>| {
+            NativeItem::Leaf {
+                id: format!("{t}/{id}"),
+                label: label.into(),
+                shortcut: shortcut.map(str::to_string),
+                enabled: has_selection,
+                action,
+            }
+        };
+        let items = vec![
+            wired_leaf(t, "undo", "Undo", MenuAction::Execute("undo".into())),
+            wired_leaf(t, "redo", "Redo", MenuAction::Execute("redo".into())),
+            NativeItem::Separator,
+            // Cut = copy-selection then delete-selection (app clipboard verbs).
+            sel_leaf("cut", "Cut", MenuAction::Execute("cut".into()), Some("Cmd+X")),
+            sel_leaf("copy", "Copy", MenuAction::Execute("copyselection".into()), Some("Cmd+C")),
+            NativeItem::Leaf {
+                id: format!("{t}/paste"),
+                label: "Paste".into(),
+                shortcut: Some("Cmd+V".into()),
+                enabled: true, // paste doesn't need a selection
+                action: MenuAction::Execute("pasteselection".into()),
+            },
+            sel_leaf("delete", "Delete", MenuAction::Execute("delete sel".into()), Some("Delete")),
+            NativeItem::Separator,
+            NativeItem::Leaf {
+                id: format!("{t}/selectall"),
+                label: "Select All".into(),
+                shortcut: menu_shortcut("select all").map(str::to_string),
+                enabled: true,
+                action: MenuAction::Execute("select all".into()),
+            },
+            sel_leaf("deselect", "Deselect", MenuAction::Execute("selectnone".into()), None),
+            NativeItem::Separator,
+            NativeItem::Leaf {
+                id: format!("{t}/history"),
+                label: "Edit history…".into(),
+                shortcut: None,
+                enabled: true,
+                action: MenuAction::EditHistory,
+            },
+        ];
+        menus.push(NativeMenu { title: t.into(), items });
+    }
+
+    // ── View ─────────────────────────────────────────────────────────────────
+    // Display mode, lighting mode, viewports 1/2/4, standard views, Zoom
+    // Extents, Appearance (Light/Dark/System), Text Size, Command Palette.
+    {
+        let t = "View";
+        let ex = |id: &str, label: &str, line: &str| NativeItem::Leaf {
+            id: format!("{t}/{id}"),
+            label: label.into(),
+            shortcut: None,
+            enabled: true,
+            action: MenuAction::Execute(line.into()),
+        };
+        let mut items = vec![
+            // Command palette is the primary discoverability surface.
+            wired_leaf(t, "palette", "Command Palette…", MenuAction::CommandPalette),
+            NativeItem::Separator,
+            // Display modes.
+            ex("disp_shaded", "Display: Shaded", "display shaded"),
+            ex("disp_wire", "Display: Wireframe", "display wireframe"),
+            ex("disp_xray", "Display: X-ray", "display xray"),
+            ex("disp_pencil", "Display: Pencil", "display pencil"),
+            NativeItem::Separator,
+            // Lighting modes.
+            ex("light_working", "Lighting: Working", "lightmode working"),
+            ex("light_sun", "Lighting: Sun", "lightmode sun"),
+            ex("light_present", "Lighting: Presentation", "lightmode presentation"),
+            NativeItem::Separator,
+            // Viewport layout.
+            ex("vp1", "Viewports: 1", "viewports 1"),
+            ex("vp2", "Viewports: 2", "viewports 2"),
+            ex("vp4", "Viewports: 4", "viewports 4"),
+            NativeItem::Separator,
+            // Standard views.
+            ex("v_top", "Top", "top"),
+            ex("v_front", "Front", "front"),
+            ex("v_right", "Right", "right"),
+            ex("v_persp", "Perspective", "persp"),
+            NativeItem::Separator,
+            ex("ze", "Zoom Extents", "ze"),
+            NativeItem::Separator,
+        ];
+        // Appearance (theme + text size) — egui-only in-window elsewhere, but the
+        // native bar carries them as ordinary routed leaves.
+        for (id, label, action) in appearance_native_items() {
+            items.push(wired_leaf(t, id, label, action));
+        }
+        menus.push(NativeMenu { title: t.into(), items });
+    }
+
+    // ── Window (macOS) ────────────────────────────────────────────────────────
+    // Standard OS-handled items: Minimize ⌘M / Zoom / Bring All to Front / Full
+    // Screen. No MenuAction — AppKit implements them.
     #[cfg(target_os = "macos")]
     menus.push(NativeMenu {
         title: "Window".to_string(),
@@ -499,10 +516,19 @@ pub fn native_model(style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
             NativeItem::Predefined(PredefinedKind::BringAllToFront),
         ],
     });
-    // Help is synthetic (not a registry category), same as the in-window bar.
+
+    // ── Help ───────────────────────────────────────────────────────────────────
+    // Docs, Command reference, About.
     menus.push(NativeMenu {
         title: "Help".to_string(),
         items: vec![
+            NativeItem::Leaf {
+                id: "Help/docs".into(),
+                label: "Docs".into(),
+                action: MenuAction::Insert("help ".into()),
+                shortcut: None,
+                enabled: true,
+            },
             NativeItem::Leaf {
                 id: "Help/reference".into(),
                 label: "Command reference".into(),
@@ -510,6 +536,15 @@ pub fn native_model(style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
                 shortcut: None,
                 enabled: true,
             },
+            NativeItem::Separator,
+            NativeItem::Leaf {
+                id: "Help/palette".into(),
+                label: "Command Palette…".into(),
+                action: MenuAction::CommandPalette,
+                shortcut: action_shortcut(&MenuAction::CommandPalette).map(str::to_string),
+                enabled: true,
+            },
+            NativeItem::Separator,
             NativeItem::Leaf {
                 id: "Help/about".into(),
                 label: "About ItsJustCAD".into(),
@@ -522,7 +557,10 @@ pub fn native_model(style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
     menus
 }
 
-/// Registry verbs belonging to any of `cats`, in registry order.
+/// Registry verbs belonging to any of `cats`, in registry order. Test-only now
+/// that the menu bar no longer groups by category (the registry still feeds the
+/// palette / deck prompt directly).
+#[cfg(test)]
 pub fn verbs_in(cats: &[Category]) -> Vec<&'static str> {
     registry()
         .iter()
@@ -531,168 +569,74 @@ pub fn verbs_in(cats: &[Category]) -> Vec<&'static str> {
         .collect()
 }
 
-/// Draw the menu bar. Returns the action the user picked this frame, if any.
-/// File/Edit menus prepend the app-wired actions (save/open/…); Help is added
-/// as the last menu.
+/// A Lucide [`Icon`] for a menu leaf, chosen by its label / id so the in-window
+/// bar keeps a scannable icon column. Falls back to a neutral mark.
+fn leaf_icon(id: &str, label: &str) -> Icon {
+    match label {
+        "New" => return Icon::New,
+        "New file session" => return Icon::NewSession,
+        "Open…" => return Icon::Open,
+        "Save" | "Save As…" => return Icon::Save,
+        "Import…" => return Icon::Import,
+        "Export…" => return Icon::Export,
+        "Settings…" => return Icon::Model,
+        "Undo" => return Icon::Undo,
+        "Redo" => return Icon::Redo,
+        "Edit history…" => return Icon::History,
+        "Command reference" | "Docs" => return Icon::Help,
+        "About ItsJustCAD" => return Icon::About,
+        _ => {}
+    }
+    verb_icon(id.rsplit('/').next().unwrap_or(""))
+}
+
+/// Draw the minimal menu bar in-window (fallback when no native OS bar). Renders
+/// the SAME [`native_model`] the native bar uses, so the two never drift. Returns
+/// the action the user picked this frame, if any.
 pub fn ui(
     ui: &mut egui::Ui,
     icons: &Icons,
     style: MenuStyle,
-    plugins: &[PluginMenuEntry],
     has_selection: bool,
 ) -> Option<MenuAction> {
     let mut action = None;
+    let model = native_model(style, has_selection);
     egui::MenuBar::new().ui(ui, |ui| {
-        for (title, cats) in top_menus(style) {
-            ui.menu_button(title, |ui| {
-                // File / Edit get their app-wired actions first. Leading Lucide
-                // icons give the menu a clean, scannable column; shortcut hints
-                // are sourced from the keymap so they never drift.
-                if title == "File" {
-                    // New group.
-                    if item(ui, icons, Icon::New, "New").clicked() {
-                        action = Some(MenuAction::NewDocument);
-                        ui.close();
-                    }
-                    if item(ui, icons, Icon::NewSession, "New file session").clicked() {
-                        action = Some(MenuAction::NewSession);
-                        ui.close();
-                    }
-                    ui.separator();
-                    for (icon, label, verb) in [
-                        (Icon::Open, "Open…", "open"),
-                        (Icon::Save, "Save…", "save"),
-                        (Icon::Import, "Import…", "import"),
-                        (Icon::Export, "Export…", "export"),
-                        (Icon::Print, "Print…", "print"),
-                    ] {
-                        if icons
-                            .menu_item_ex(ui, icon, label, menu_shortcut(verb), true)
-                            .clicked()
-                        {
-                            action = Some(menu_action(verb));
-                            ui.close();
+        for menu in &model {
+            ui.menu_button(&menu.title, |ui| {
+                for it in &menu.items {
+                    match it {
+                        NativeItem::Separator => {
+                            ui.separator();
                         }
-                    }
-                    ui.separator();
-                } else if title == "Edit" {
-                    for (icon, label, verb) in
-                        [(Icon::Undo, "Undo", "undo"), (Icon::Redo, "Redo", "redo")]
-                    {
-                        if icons
-                            .menu_item_ex(ui, icon, label, menu_shortcut(verb), true)
-                            .clicked()
-                        {
-                            action = Some(MenuAction::Execute(verb.to_string()));
-                            ui.close();
+                        NativeItem::Predefined(kind) => {
+                            let label = match kind {
+                                PredefinedKind::Minimize => "Minimize",
+                                PredefinedKind::Zoom => "Zoom",
+                                PredefinedKind::BringAllToFront => "Bring All to Front",
+                                PredefinedKind::Fullscreen => "Toggle Full Screen",
+                                PredefinedKind::Quit => "Quit",
+                            };
+                            let _ = ui.button(label);
                         }
-                    }
-                    if item(ui, icons, Icon::History, "Edit history…").clicked() {
-                        action = Some(MenuAction::EditHistory);
-                        ui.close();
-                    }
-                    ui.separator();
-                } else if title == "Tools" {
-                    // App-wired: opens the Model Setup panel (download/manage a
-                    // local model) at any time — this is the "download a local
-                    // model" entry point users can reach from the menu bar.
-                    if item(ui, icons, Icon::Model, "Model Setup…").clicked() {
-                        action = Some(MenuAction::ModelSetup);
-                        ui.close();
-                    }
-                    // Settings via the macOS Preferences convention (⌘,).
-                    if icons
-                        .menu_item_ex(ui, Icon::Model, "Settings…", Some("Cmd+,"), true)
-                        .clicked()
-                    {
-                        action = Some(MenuAction::ModelSetup);
-                        ui.close();
-                    }
-                    ui.separator();
-                }
-                // List verbs grouped BY CATEGORY, a separator between groups, so
-                // a multi-category menu (e.g. Curve = Draw2d + Curve) reads as
-                // distinct AutoCAD-style sub-groups rather than one flat list.
-                let mut first_group = true;
-                for cat in &cats {
-                    let verbs: Vec<&str> = verbs_in(std::slice::from_ref(cat))
-                        .into_iter()
-                        .filter(|verb| {
-                            // File/Edit already surfaced their wired verbs above.
-                            !(title == "File"
-                                && matches!(*verb, "open" | "save" | "import" | "export" | "print"))
-                                && !(title == "Edit" && matches!(*verb, "undo" | "redo"))
-                        })
-                        .collect();
-                    if verbs.is_empty() {
-                        continue;
-                    }
-                    if !first_group {
-                        ui.separator();
-                    }
-                    first_group = false;
-                    for verb in verbs {
-                        // Disable-don't-hide: selection-dependent verbs render
-                        // dimmed (and unclickable) when nothing is selected.
-                        let enabled = !needs_selection(verb) || has_selection;
-                        if icons
-                            .menu_item_ex(ui, verb_icon(verb), verb, menu_shortcut(verb), enabled)
-                            .clicked()
-                        {
-                            action = Some(menu_action(verb));
-                            ui.close();
+                        NativeItem::Leaf { id, label, action: a, shortcut, enabled } => {
+                            if icons
+                                .menu_item_ex(ui, leaf_icon(id, label), label, shortcut.as_deref(), *enabled)
+                                .clicked()
+                            {
+                                action = Some(a.clone());
+                                ui.close();
+                            }
                         }
                     }
                 }
             });
         }
-        // User plugins get their own top-level menu, grouped by declared
-        // category. Only shown when at least one plugin is loaded so the bar
-        // stays clean on a fresh install.
-        if !plugins.is_empty() {
-            ui.menu_button("Plugins", |ui| {
-                let mut first_group = true;
-                for (group, entries) in plugin_groups(plugins) {
-                    if !first_group {
-                        ui.separator();
-                    }
-                    first_group = false;
-                    // A non-default group name gets a faint header row.
-                    if group != "Plugins" {
-                        ui.label(egui::RichText::new(group).weak().small());
-                    }
-                    for entry in entries {
-                        let resp = item(ui, icons, Icon::ToolsCat, &entry.name);
-                        let resp = if entry.summary.is_empty() {
-                            resp
-                        } else {
-                            resp.on_hover_text(&entry.summary)
-                        };
-                        if resp.clicked() {
-                            action = Some(plugin_action(&entry));
-                            ui.close();
-                        }
-                    }
-                }
-            });
-        }
-
-        // Help is synthetic (not a registry category).
-        ui.menu_button("Help", |ui| {
-            if item(ui, icons, Icon::Help, "Command reference").clicked() {
-                action = Some(MenuAction::Help);
-                ui.close();
-            }
-            if item(ui, icons, Icon::About, "About ItsJustCAD").clicked() {
-                action = Some(MenuAction::About);
-                ui.close();
-            }
-        });
-
         appearance_controls(ui, icons);
     });
     action
 }
+
 
 /// Right-aligned Appearance controls: dark/light toggle + text-size stepper,
 /// applied app-wide. Factored out because these are egui-only widgets that
@@ -726,217 +670,206 @@ fn appearance_controls(ui: &mut egui::Ui, icons: &Icons) {
     });
 }
 
-/// Dev/screenshot hook: render a given top-level menu's grouped items as an
-/// open dropdown-style panel just under the bar, so `ITSJUSTCAD_SHOT` frames can
-/// show the grouping without a live click. Set `ITSJUSTCAD_MENU_DEMO=<title>`
-/// (e.g. `Solid`). Faithful — it lists exactly `verbs_in(categories)`.
+/// Dev/screenshot hook: render one top-level menu of the minimal bar as an open
+/// dropdown-style panel just under the bar, so `ITSJUSTCAD_SHOT` frames can show
+/// a menu without a live click. Set `ITSJUSTCAD_MENU_DEMO=<title>` (File / Edit /
+/// View / Help). Faithful — it walks the same [`native_model`] the real bar does.
 pub fn demo_open(
     ctx: &egui::Context,
     icons: &Icons,
     style: MenuStyle,
     title: &str,
     at: egui::Pos2,
-    plugins: &[PluginMenuEntry],
 ) {
-    // The synthetic "Plugins" menu is demoed from the plugin list, not from a
-    // registry category — used by the sanity screenshot.
-    if title == "Plugins" {
-        egui::Area::new(egui::Id::new("menu_demo"))
-            .fixed_pos(at)
-            .show(ctx, |ui| {
-                egui::Frame::menu(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(180.0);
-                    ui.label(egui::RichText::new("Plugins").strong());
-                    ui.separator();
-                    for (group, entries) in plugin_groups(plugins) {
-                        if group != "Plugins" {
-                            ui.label(egui::RichText::new(group).weak().small());
-                        }
-                        for entry in entries {
-                            let _ = item(ui, icons, Icon::ToolsCat, &entry.name);
-                        }
-                    }
-                });
-            });
-        return;
-    }
-    let Some((_, cats)) = top_menus(style).into_iter().find(|(t, _)| *t == title) else {
+    // Demo with an EMPTY selection so disable-not-hide (dimmed Cut/Copy/Delete
+    // with their shortcut hints) is visible in the shot.
+    let Some(menu) = native_model(style, false).into_iter().find(|m| m.title == title) else {
         return;
     };
     egui::Area::new(egui::Id::new("menu_demo"))
         .fixed_pos(at)
         .show(ctx, |ui| {
             egui::Frame::menu(ui.style()).show(ui, |ui| {
-                ui.set_min_width(200.0);
-                ui.label(egui::RichText::new(title).strong());
+                ui.set_min_width(220.0);
+                ui.label(egui::RichText::new(&menu.title).strong());
                 ui.separator();
-                // Demo with an EMPTY selection so the disable-not-hide behaviour
-                // (dimmed Move/Rotate/… with their shortcut hints) is visible.
-                for verb in verbs_in(&cats) {
-                    let enabled = !needs_selection(verb);
-                    let _ = icons.menu_item_ex(ui, verb_icon(verb), verb, menu_shortcut(verb), enabled);
+                for it in &menu.items {
+                    match it {
+                        NativeItem::Separator => {
+                            ui.separator();
+                        }
+                        NativeItem::Predefined(_) => {}
+                        NativeItem::Leaf { id, label, shortcut, enabled, .. } => {
+                            let _ = icons.menu_item_ex(
+                                ui,
+                                leaf_icon(id, label),
+                                label,
+                                shortcut.as_deref(),
+                                *enabled,
+                            );
+                        }
+                    }
                 }
             });
         });
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn entry(name: &str, cat: &str, has_params: bool) -> PluginMenuEntry {
-        PluginMenuEntry {
-            name: name.into(),
-            category: cat.into(),
-            has_params,
-            summary: String::new(),
-        }
+    /// Collect all leaf (id, label, action) triples from a native model.
+    fn leaves(menus: &[NativeMenu]) -> Vec<(String, String, MenuAction)> {
+        menus
+            .iter()
+            .flat_map(|m| &m.items)
+            .filter_map(|it| match it {
+                NativeItem::Leaf { id, label, action, .. } => {
+                    Some((id.clone(), label.clone(), action.clone()))
+                }
+                NativeItem::Separator | NativeItem::Predefined(_) => None,
+            })
+            .collect()
     }
 
-    /// A parameterless plugin executes immediately; a parameterised one prefills.
-    #[test]
-    fn plugin_action_executes_or_prefills_by_params() {
-        assert_eq!(
-            plugin_action(&entry("greek-column", "Classical", false)),
-            MenuAction::Execute("greek-column".into())
-        );
-        assert_eq!(
-            plugin_action(&entry("grid", "Plugins", true)),
-            MenuAction::Insert("grid ".into())
-        );
-    }
-
-    /// Grouping preserves first-seen group order and collates entries per group.
-    #[test]
-    fn plugin_groups_collate_by_category() {
-        let entries = vec![
-            entry("a", "Classical", false),
-            entry("b", "Plugins", false),
-            entry("c", "Classical", true),
-        ];
-        let groups = plugin_groups(&entries);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].0, "Classical");
-        assert_eq!(groups[0].1.len(), 2);
-        assert_eq!(groups[1].0, "Plugins");
-        assert_eq!(groups[1].1.len(), 1);
-    }
-
-    /// The 13 categories, for exhaustiveness checks.
-    const ALL_CATEGORIES: [Category; 13] = [
-        Category::File,
-        Category::Edit,
-        Category::View,
-        Category::Draw2d,
-        Category::Curve,
-        Category::Solid,
-        Category::Boolean,
-        Category::Transform,
-        Category::Annotate,
-        Category::Dimension,
-        Category::Analyze,
-        Category::Structure,
-        Category::Tools,
-    ];
-
-    fn assert_partition(style: MenuStyle) {
-        let mut seen: Vec<Category> = Vec::new();
-        for (_, cats) in top_menus(style) {
-            for c in cats {
-                assert!(
-                    !seen.contains(&c),
-                    "category {c:?} appears in two menus for {style:?}"
-                );
-                seen.push(c);
-            }
-        }
-        let seen_set: HashSet<_> = seen.iter().copied().collect();
-        for c in ALL_CATEGORIES {
-            assert!(
-                seen_set.contains(&c),
-                "category {c:?} missing from menus for {style:?}"
-            );
-        }
-        assert_eq!(
-            seen.len(),
-            ALL_CATEGORIES.len(),
-            "categories not a clean partition"
-        );
-    }
+    // MENU BAR IS MINIMAL: exactly File / Edit / View (+ Window on macOS) + Help.
+    // No geometry category menus.
 
     #[test]
-    fn rhino_menus_partition_all_categories() {
-        assert_partition(MenuStyle::Rhino);
-    }
-
-    #[test]
-    fn autocad_menus_partition_all_categories() {
-        assert_partition(MenuStyle::AutoCAD);
-    }
-
-    /// The core guarantee: EVERY registry verb maps to exactly one menu, no
-    /// orphans, for both preset styles.
-    #[test]
-    fn every_registry_verb_lands_in_exactly_one_menu() {
+    fn menu_bar_is_exactly_five_menus() {
+        // The three geometry-free top titles are the documented contract.
+        assert_eq!(TOP_TITLES, ["File", "Edit", "View"]);
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            for spec in registry() {
-                let menus: Vec<&str> = top_menus(style)
-                    .into_iter()
-                    .filter(|(_, cats)| cats.contains(&spec.category))
-                    .map(|(t, _)| t)
-                    .collect();
-                assert_eq!(
-                    menus.len(),
-                    1,
-                    "verb '{}' (category {:?}) maps to {menus:?} for {style:?}",
-                    spec.name,
-                    spec.category
-                );
+            let titles: Vec<String> =
+                native_model(style, true).iter().map(|m| m.title.clone()).collect();
+            let mut expected = vec!["File".to_string(), "Edit".into(), "View".into()];
+            #[cfg(target_os = "macos")]
+            expected.push("Window".to_string());
+            expected.push("Help".to_string());
+            assert_eq!(titles, expected, "menu titles differ for {style:?}");
+        }
+    }
+
+    #[test]
+    fn no_geometry_category_menus_present() {
+        // The removed category menus (Draw/Curve/Solid/Transform/Modify/Dimension/
+        // Analyze/Structure/Tools/Format) must not appear as top-level menus.
+        let banned = [
+            "Draw", "Curve", "Solid", "Transform", "Modify", "Dimension", "Annotate",
+            "Analyze", "Structure", "Tools", "Format", "Boolean", "Plugins",
+        ];
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            for m in native_model(style, true) {
+                assert!(!banned.contains(&m.title.as_str()), "banned menu {} present", m.title);
             }
         }
     }
 
     #[test]
-    fn rhino_and_autocad_have_expected_titles() {
-        let rhino: Vec<_> = top_menus(MenuStyle::Rhino)
-            .iter()
-            .map(|(t, _)| *t)
-            .collect();
-        assert_eq!(
-            rhino,
-            [
-                "File",
-                "Edit",
-                "View",
-                "Curve",
-                "Solid",
-                "Transform",
-                "Dimension",
-                "Analyze",
-                "Structure",
-                "Tools"
-            ]
-        );
-        let acad: Vec<_> = top_menus(MenuStyle::AutoCAD)
-            .iter()
-            .map(|(t, _)| *t)
-            .collect();
-        assert_eq!(
-            acad,
-            [
-                "File",
-                "Edit",
-                "View",
-                "Draw",
-                "Modify",
-                "Dimension",
-                "Format",
-                "Structure",
-                "Tools"
-            ]
-        );
+    fn menu_bar_identical_across_presets() {
+        // The minimal bar ignores the preset style.
+        assert_eq!(native_model(MenuStyle::Rhino, true), native_model(MenuStyle::AutoCAD, true));
     }
+
+    #[test]
+    fn file_menu_has_curated_items() {
+        let file = native_model(MenuStyle::Rhino, true)
+            .into_iter()
+            .find(|m| m.title == "File")
+            .unwrap();
+        let ls = leaves(&[file]);
+        let has = |label: &str| ls.iter().any(|(_, l, _)| l == label);
+        assert!(has("New"));
+        assert!(has("Open\u{2026}"));
+        assert!(has("Save"));
+        assert!(has("Save As\u{2026}"));
+        assert!(has("Import\u{2026}"));
+        assert!(has("Export\u{2026}"));
+        assert!(has("Settings\u{2026}"));
+        // Import/Export route to native dialogs.
+        assert!(ls.iter().any(|(_, l, a)| l == "Import\u{2026}" && *a == MenuAction::ImportDialog));
+        assert!(ls.iter().any(|(_, l, a)| l == "Export\u{2026}" && *a == MenuAction::ExportDialog));
+        // Save As prefills `save ` for a path.
+        assert!(ls.iter().any(|(_, l, a)| l == "Save As\u{2026}" && *a == MenuAction::Insert("save ".into())));
+    }
+
+    #[test]
+    fn edit_menu_has_curated_items() {
+        let edit = native_model(MenuStyle::Rhino, true)
+            .into_iter()
+            .find(|m| m.title == "Edit")
+            .unwrap();
+        let ls = leaves(&[edit]);
+        for label in ["Undo", "Redo", "Cut", "Copy", "Paste", "Delete", "Select All", "Deselect", "Edit history\u{2026}"] {
+            assert!(ls.iter().any(|(_, l, _)| l == label), "Edit missing {label}");
+        }
+        assert!(ls.iter().any(|(_, l, a)| l == "Undo" && *a == MenuAction::Execute("undo".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == "Copy" && *a == MenuAction::Execute("copyselection".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == "Paste" && *a == MenuAction::Execute("pasteselection".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == "Delete" && *a == MenuAction::Execute("delete sel".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == "Select All" && *a == MenuAction::Execute("select all".into())));
+    }
+
+    #[test]
+    fn view_menu_has_display_lighting_viewports_views_and_palette() {
+        let view = native_model(MenuStyle::Rhino, true)
+            .into_iter()
+            .find(|m| m.title == "View")
+            .unwrap();
+        let ls = leaves(&[view]);
+        let by_action = |a: &MenuAction| ls.iter().any(|(_, _, act)| act == a);
+        assert!(by_action(&MenuAction::Execute("display shaded".into())), "display mode missing");
+        assert!(by_action(&MenuAction::Execute("lightmode sun".into())), "lighting missing");
+        assert!(by_action(&MenuAction::Execute("viewports 4".into())), "viewport layout missing");
+        assert!(by_action(&MenuAction::Execute("top".into())), "standard view missing");
+        assert!(by_action(&MenuAction::Execute("ze".into())), "zoom extents missing");
+        assert!(by_action(&MenuAction::CommandPalette), "command palette entry missing");
+        // Appearance rows still present.
+        assert!(by_action(&MenuAction::SetTheme(Some(true))), "dark theme missing");
+        assert!(by_action(&MenuAction::ZoomStep(true)), "text size step missing");
+    }
+
+    #[test]
+    fn help_menu_has_docs_reference_palette_about() {
+        let help = native_model(MenuStyle::AutoCAD, true)
+            .into_iter()
+            .find(|m| m.title == "Help")
+            .unwrap();
+        let ls = leaves(&[help]);
+        assert!(ls.iter().any(|(_, l, _)| l == "Docs"));
+        assert!(ls.iter().any(|(_, l, a)| l == "Command reference" && *a == MenuAction::Help));
+        assert!(ls.iter().any(|(_, _, a)| *a == MenuAction::CommandPalette));
+        assert!(ls.iter().any(|(_, l, a)| l == "About ItsJustCAD" && *a == MenuAction::About));
+    }
+
+    #[test]
+    fn command_palette_bound_to_cmd_k() {
+        assert_eq!(action_shortcut(&MenuAction::CommandPalette), Some("Cmd+K"));
+    }
+
+    #[test]
+    fn native_leaf_ids_are_unique() {
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            let ls = leaves(&native_model(style, true));
+            let ids: HashSet<&String> = ls.iter().map(|(id, _, _)| id).collect();
+            assert_eq!(ids.len(), ls.len(), "duplicate native menu id for {style:?}");
+        }
+    }
+
+    #[test]
+    fn no_show_tab_bar_item_anywhere() {
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            for (_, label, _) in leaves(&native_model(style, true)) {
+                let l = label.to_lowercase();
+                assert!(!l.contains("tab bar"), "found tab-bar item: {label}");
+                assert!(!l.contains("all tabs"), "found all-tabs item: {label}");
+            }
+        }
+    }
+
+    // ── menu_action classification (registry verbs, used by the palette) ──────
 
     #[test]
     fn draw_verbs_start_the_draw_tool() {
@@ -954,248 +887,14 @@ mod tests {
 
     #[test]
     fn arg_verbs_are_inserted_with_trailing_space() {
-        // `box` needs a corner + size; the menu prefills for typing.
         assert_eq!(menu_action("box"), MenuAction::Insert("box ".to_string()));
         assert_eq!(menu_action("move"), MenuAction::Insert("move ".to_string()));
     }
 
     #[test]
     fn import_export_route_to_native_dialog() {
-        // Picking Import/Export from a menu pops a native file dialog first
-        // (rather than prefilling the command line), then runs through the
-        // substrate with the chosen path.
         assert_eq!(menu_action("import"), MenuAction::ImportDialog);
         assert_eq!(menu_action("export"), MenuAction::ExportDialog);
-    }
-
-    #[test]
-    fn every_registry_verb_has_a_menu_icon() {
-        // Each category and each specific verb resolves to a Lucide [`Icon`] with
-        // a non-empty stable name, so the menu icon column is always populated.
-        for spec in registry() {
-            assert!(
-                !verb_icon(spec.name).name().is_empty(),
-                "verb {} has no icon",
-                spec.name
-            );
-        }
-    }
-
-    #[test]
-    fn category_icons_are_distinct_per_category() {
-        // Each registry category maps to its own group mark (no two categories
-        // collapse to the same icon), so menu groups stay visually separable.
-        use std::collections::HashSet;
-        let cats = [
-            Category::File,
-            Category::Edit,
-            Category::View,
-            Category::Draw2d,
-            Category::Curve,
-            Category::Solid,
-            Category::Boolean,
-            Category::Transform,
-            Category::Annotate,
-            Category::Dimension,
-            Category::Analyze,
-            Category::Structure,
-            Category::Tools,
-        ];
-        let mut seen = HashSet::new();
-        for c in cats {
-            // File and Tools may share their category-default with a wired action
-            // icon, but the 11 drawing/analysis categories must be distinct.
-            if matches!(c, Category::File | Category::Tools) {
-                continue;
-            }
-            assert!(
-                seen.insert(category_icon(c)),
-                "category {c:?} icon collides"
-            );
-        }
-    }
-
-    // ── Native menu model (muda) tests ───────────────────────────────────────
-
-    /// Collect all leaf (id, label, action) triples from a native model.
-    fn leaves(menus: &[NativeMenu]) -> Vec<(String, String, MenuAction)> {
-        menus
-            .iter()
-            .flat_map(|m| &m.items)
-            .filter_map(|it| match it {
-                NativeItem::Leaf { id, label, action, .. } => {
-                    Some((id.clone(), label.clone(), action.clone()))
-                }
-                NativeItem::Separator | NativeItem::Predefined(_) => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn native_model_has_same_top_titles_as_in_window_bar() {
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            let native: Vec<String> = native_model(style, true).iter().map(|m| m.title.clone()).collect();
-            let mut expected: Vec<String> =
-                top_menus(style).iter().map(|(t, _)| t.to_string()).collect();
-            // macOS gets a standard Window menu before Help.
-            #[cfg(target_os = "macos")]
-            expected.push("Window".to_string());
-            expected.push("Help".to_string());
-            assert_eq!(native, expected, "native titles differ for {style:?}");
-        }
-    }
-
-    #[test]
-    fn native_file_menu_contains_expected_verbs_and_actions() {
-        let file = native_model(MenuStyle::Rhino, true)
-            .into_iter()
-            .find(|m| m.title == "File")
-            .expect("File menu");
-        let ls = leaves(&[file]);
-        // Wired File actions map to the right MenuAction.
-        assert!(ls.iter().any(|(_, l, a)| l == "New" && *a == MenuAction::NewDocument));
-        assert!(ls.iter().any(|(_, l, a)| l == "New file session" && *a == MenuAction::NewSession));
-        assert!(ls.iter().any(|(_, l, a)| l == "Open…" && *a == MenuAction::Insert("open ".into())));
-        // Import/Export route through the native file dialog, not the command line.
-        assert!(ls.iter().any(|(_, l, a)| l == "Import…" && *a == MenuAction::ImportDialog));
-        assert!(ls.iter().any(|(_, l, a)| l == "Export…" && *a == MenuAction::ExportDialog));
-    }
-
-    #[test]
-    fn native_edit_menu_has_undo_redo_history() {
-        let edit = native_model(MenuStyle::Rhino, true)
-            .into_iter()
-            .find(|m| m.title == "Edit")
-            .expect("Edit menu");
-        let ls = leaves(&[edit]);
-        assert!(ls.iter().any(|(_, l, a)| l == "Undo" && *a == MenuAction::Execute("undo".into())));
-        assert!(ls.iter().any(|(_, l, a)| l == "Redo" && *a == MenuAction::Execute("redo".into())));
-        assert!(ls.iter().any(|(_, l, a)| l == "Edit history…" && *a == MenuAction::EditHistory));
-    }
-
-    #[test]
-    fn native_view_menu_gathers_view_verbs() {
-        let view = native_model(MenuStyle::Rhino, true)
-            .into_iter()
-            .find(|m| m.title == "View")
-            .expect("View menu");
-        let ls = leaves(&[view]);
-        // Every registry View verb appears as a leaf.
-        for v in verbs_in(&[Category::View]) {
-            assert!(
-                ls.iter().any(|(_, l, _)| l == v),
-                "View menu missing verb {v}"
-            );
-        }
-    }
-
-    #[test]
-    fn native_view_menu_has_appearance_items() {
-        // Appearance (theme + text size) lives in the native View menu now, not
-        // an in-window strip. All three theme choices and all three text-size
-        // actions must be present and route to the right MenuAction.
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            let view = native_model(style, true)
-                .into_iter()
-                .find(|m| m.title == "View")
-                .expect("View menu");
-            let ls = leaves(&[view]);
-            let has = |a: &MenuAction| ls.iter().any(|(_, _, act)| act == a);
-            assert!(has(&MenuAction::SetTheme(Some(false))), "Light missing {style:?}");
-            assert!(has(&MenuAction::SetTheme(Some(true))), "Dark missing {style:?}");
-            assert!(has(&MenuAction::SetTheme(None)), "System missing {style:?}");
-            assert!(has(&MenuAction::ZoomStep(true)), "Increase missing {style:?}");
-            assert!(has(&MenuAction::ZoomStep(false)), "Decrease missing {style:?}");
-            assert!(has(&MenuAction::ZoomReset), "Reset missing {style:?}");
-        }
-    }
-
-    #[test]
-    fn view_menu_gathers_display_and_layout_verbs() {
-        // The View menu must be non-empty and carry the registry View verbs
-        // (display modes / viewport layout / zoom / lighting) — the user's
-        // "View does nothing" complaint. Assert it holds real verbs beyond the
-        // Appearance rows.
-        let view = native_model(MenuStyle::Rhino, true)
-            .into_iter()
-            .find(|m| m.title == "View")
-            .expect("View menu");
-        let ls = leaves(&[view]);
-        let verb_leaves = ls
-            .iter()
-            .filter(|(_, _, a)| {
-                !matches!(a, MenuAction::SetTheme(_) | MenuAction::ZoomStep(_) | MenuAction::ZoomReset)
-            })
-            .count();
-        assert!(verb_leaves > 0, "View menu carries no registry verbs");
-        for v in verbs_in(&[Category::View]) {
-            assert!(ls.iter().any(|(_, l, _)| l == v), "View missing verb {v}");
-        }
-    }
-
-    #[test]
-    fn no_show_tab_bar_item_anywhere() {
-        // "Show Tab Bar" / "Show All Tabs" are AppKit auto-injections we suppress
-        // via allowsAutomaticWindowTabbing=NO; our own model must never define
-        // such items itself.
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            for (_, label, _) in leaves(&native_model(style, true)) {
-                let l = label.to_lowercase();
-                assert!(!l.contains("tab bar"), "found tab-bar item: {label}");
-                assert!(!l.contains("all tabs"), "found all-tabs item: {label}");
-            }
-        }
-    }
-
-    #[test]
-    fn native_help_menu_is_synthetic() {
-        let help = native_model(MenuStyle::AutoCAD, true)
-            .into_iter()
-            .find(|m| m.title == "Help")
-            .expect("Help menu");
-        let ls = leaves(&[help]);
-        assert!(ls.iter().any(|(_, l, a)| l == "Command reference" && *a == MenuAction::Help));
-        assert!(ls.iter().any(|(_, l, a)| l == "About ItsJustCAD" && *a == MenuAction::About));
-    }
-
-    #[test]
-    fn native_leaf_ids_are_unique_and_map_back_to_actions() {
-        // The muda layer keys a HashMap<id, MenuAction> off these ids, so every
-        // leaf id must be unique within the bar.
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            let ls = leaves(&native_model(style, true));
-            let ids: HashSet<&String> = ls.iter().map(|(id, _, _)| id).collect();
-            assert_eq!(ids.len(), ls.len(), "duplicate native menu id for {style:?}");
-        }
-    }
-
-    #[test]
-    fn native_model_covers_every_registry_verb_once() {
-        // Mirrors the in-window guarantee: every registry verb surfaces exactly
-        // once. Most verbs use their name as the leaf label; the wired File/Edit
-        // verbs get a nicer label ("Open…") but the same MenuAction, so match by
-        // the action the leaf dispatches, not just the label text.
-        let action_verb = |a: &MenuAction| -> Option<String> {
-            match a {
-                MenuAction::Execute(v) | MenuAction::StartDraw(v) => Some(v.clone()),
-                MenuAction::Insert(p) => Some(p.trim_end().to_string()),
-                MenuAction::ImportDialog => Some("import".into()),
-                MenuAction::ExportDialog => Some("export".into()),
-                _ => None,
-            }
-        };
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            let ls = leaves(&native_model(style, true));
-            let verbs: Vec<String> = ls.iter().filter_map(|(_, _, a)| action_verb(a)).collect();
-            for spec in registry() {
-                let count = verbs.iter().filter(|v| *v == spec.name).count();
-                assert_eq!(
-                    count, 1,
-                    "verb '{}' appears {count} times in native model for {style:?}",
-                    spec.name
-                );
-            }
-        }
     }
 
     #[test]
@@ -1206,130 +905,79 @@ mod tests {
         assert!(!solids.contains(&"line"));
     }
 
-    // ── Design Batch C: Window menu, shortcuts, disable-not-hide, Settings ────
+    // ── Disable-don't-hide on selection-dependent Edit items ─────────────────
 
-    /// The macOS Window menu is present with the standard OS-handled items.
+    #[test]
+    fn selection_edit_items_disabled_when_empty() {
+        let sel_labels = ["Cut", "Copy", "Delete", "Deselect"];
+        let empty = native_model(MenuStyle::Rhino, false);
+        let filled = native_model(MenuStyle::Rhino, true);
+        let enabled_of = |menus: &[NativeMenu], label: &str| -> Option<bool> {
+            menus.iter().flat_map(|m| &m.items).find_map(|it| match it {
+                NativeItem::Leaf { label: l, enabled, .. } if l == label => Some(*enabled),
+                _ => None,
+            })
+        };
+        for l in sel_labels {
+            assert_eq!(enabled_of(&empty, l), Some(false), "{l} should be disabled when empty");
+            assert_eq!(enabled_of(&filled, l), Some(true), "{l} should be enabled with a selection");
+        }
+        // Paste and Select All stay enabled regardless.
+        assert_eq!(enabled_of(&empty, "Paste"), Some(true));
+        assert_eq!(enabled_of(&empty, "Select All"), Some(true));
+    }
+
+    // ── Window menu (macOS) ──────────────────────────────────────────────────
+
     #[cfg(target_os = "macos")]
     #[test]
     fn window_menu_present_with_standard_items() {
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            let win = native_model(style, false)
-                .into_iter()
-                .find(|m| m.title == "Window")
-                .expect("Window menu present");
-            let kinds: Vec<PredefinedKind> = win
-                .items
-                .iter()
-                .filter_map(|it| match it {
-                    NativeItem::Predefined(k) => Some(*k),
-                    _ => None,
-                })
-                .collect();
-            assert!(kinds.contains(&PredefinedKind::Minimize), "Minimize missing");
-            assert!(kinds.contains(&PredefinedKind::Zoom), "Zoom missing");
-            assert!(
-                kinds.contains(&PredefinedKind::BringAllToFront),
-                "Bring All to Front missing"
-            );
-            assert!(kinds.contains(&PredefinedKind::Fullscreen), "Full Screen missing");
-        }
+        let win = native_model(MenuStyle::Rhino, false)
+            .into_iter()
+            .find(|m| m.title == "Window")
+            .expect("Window menu present");
+        let kinds: Vec<PredefinedKind> = win
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                NativeItem::Predefined(k) => Some(*k),
+                _ => None,
+            })
+            .collect();
+        assert!(kinds.contains(&PredefinedKind::Minimize));
+        assert!(kinds.contains(&PredefinedKind::Zoom));
+        assert!(kinds.contains(&PredefinedKind::BringAllToFront));
+        assert!(kinds.contains(&PredefinedKind::Fullscreen));
     }
 
-    /// Menu items with a binding carry their shortcut string: Save ⌘S, Undo ⌘Z,
-    /// Redo ⇧⌘Z, Delete, and the Settings ⌘, item. Sourced from the keymap.
+    // ── Shortcut strings sourced from the keymap ─────────────────────────────
+
     #[test]
     fn menu_items_carry_shortcut_strings() {
-        // Registry-verb shortcuts.
         assert_eq!(menu_shortcut("save"), Some("Cmd+S"));
         assert_eq!(menu_shortcut("undo"), Some("Cmd+Z"));
         assert_eq!(menu_shortcut("redo"), Some("Cmd+Shift+Z"));
         assert_eq!(menu_shortcut("delete"), Some("Delete"));
         assert_eq!(menu_shortcut("line"), None);
-        // In the native model, the Save leaf carries the ⌘S string.
         let file = native_model(MenuStyle::Rhino, true)
             .into_iter()
             .find(|m| m.title == "File")
             .unwrap();
         let save = file.items.iter().find_map(|it| match it {
-            NativeItem::Leaf { label, shortcut, .. } if label == "Save…" => Some(shortcut.clone()),
+            NativeItem::Leaf { label, shortcut, .. } if label == "Save" => Some(shortcut.clone()),
             _ => None,
         });
         assert_eq!(save, Some(Some("Cmd+S".to_string())));
-        // Undo carries ⌘Z, Redo carries ⇧⌘Z.
-        let edit = native_model(MenuStyle::Rhino, true)
-            .into_iter()
-            .find(|m| m.title == "Edit")
-            .unwrap();
-        let sc = |lbl: &str| {
-            edit.items.iter().find_map(|it| match it {
-                NativeItem::Leaf { label, shortcut, .. } if label == lbl => Some(shortcut.clone()),
-                _ => None,
-            })
-        };
-        assert_eq!(sc("Undo"), Some(Some("Cmd+Z".into())));
-        assert_eq!(sc("Redo"), Some(Some("Cmd+Shift+Z".into())));
     }
 
-    /// Zoom and Settings accelerators come from `action_shortcut` and appear on
-    /// the native leaves (⌘= / ⌘- / ⌘0 in View, ⌘, on Settings in Tools).
     #[test]
-    fn cmd_comma_maps_to_settings_and_zoom_shortcuts_present() {
-        let tools = native_model(MenuStyle::Rhino, true)
-            .into_iter()
-            .find(|m| m.title == "Tools")
-            .unwrap();
-        // A Settings leaf exists, opens ModelSetup, and carries ⌘,.
-        let settings = tools.items.iter().find_map(|it| match it {
-            NativeItem::Leaf { label, action, shortcut, .. } if label == "Settings…" => {
-                Some((action.clone(), shortcut.clone()))
-            }
-            _ => None,
-        });
-        assert_eq!(
-            settings,
-            Some((MenuAction::ModelSetup, Some("Cmd+,".to_string())))
-        );
+    fn zoom_and_settings_shortcuts_present() {
         assert_eq!(action_shortcut(&MenuAction::ModelSetup), Some("Cmd+,"));
         assert_eq!(action_shortcut(&MenuAction::ZoomStep(true)), Some("Cmd+="));
         assert_eq!(action_shortcut(&MenuAction::ZoomStep(false)), Some("Cmd+-"));
         assert_eq!(action_shortcut(&MenuAction::ZoomReset), Some("Cmd+0"));
     }
 
-    /// Disable-don't-hide: with an EMPTY selection the selection-dependent verbs
-    /// (move/rotate/scale/mirror/delete/…) are STILL PRESENT but marked disabled;
-    /// with a selection they become enabled. Non-selection verbs stay enabled.
-    #[test]
-    fn selection_verbs_disabled_when_empty_present_either_way() {
-        let sel_verbs = ["move", "rotate", "scale", "mirror", "delete", "copy"];
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            let empty = native_model(style, false);
-            let filled = native_model(style, true);
-            let enabled_of = |menus: &[NativeMenu], verb: &str| -> Option<bool> {
-                menus.iter().flat_map(|m| &m.items).find_map(|it| match it {
-                    NativeItem::Leaf { label, enabled, .. } if label == verb => Some(*enabled),
-                    _ => None,
-                })
-            };
-            for v in sel_verbs {
-                assert_eq!(
-                    enabled_of(&empty, v),
-                    Some(false),
-                    "{v} should be present-but-disabled with empty selection ({style:?})"
-                );
-                assert_eq!(
-                    enabled_of(&filled, v),
-                    Some(true),
-                    "{v} should be enabled with a selection ({style:?})"
-                );
-            }
-            // A non-selection verb (line via StartDraw) stays enabled regardless.
-            assert_eq!(enabled_of(&empty, "arc"), Some(true));
-        }
-    }
-
-    /// The menu shortcut table never advertises a binding the keymap doesn't
-    /// actually implement: each `menu_shortcut` entry resolves to the same command
-    /// its keymap chord produces. This is the "sourced from the keymap" guarantee.
     #[test]
     fn menu_shortcuts_match_the_keymap() {
         use crate::keymap::{KeyContext, keymap};
@@ -1342,7 +990,6 @@ mod tests {
             has_selection: true,
             last_command: None,
         };
-        // (verb, key, mods) → the keymap must yield a line whose verb matches.
         assert_eq!(keymap(Key::S, cmd, ctx).as_deref(), Some("save"));
         assert_eq!(menu_shortcut("save"), Some("Cmd+S"));
         assert_eq!(keymap(Key::Z, cmd, ctx).as_deref(), Some("undo"));
@@ -1353,5 +1000,12 @@ mod tests {
         assert_eq!(menu_shortcut("delete"), Some("Delete"));
         assert_eq!(keymap(Key::A, cmd, ctx).as_deref(), Some("select all"));
         assert_eq!(menu_shortcut("select all"), Some("Cmd+A"));
+    }
+
+    #[test]
+    fn every_registry_verb_has_a_menu_icon() {
+        for spec in registry() {
+            assert!(!verb_icon(spec.name).name().is_empty(), "verb {} has no icon", spec.name);
+        }
     }
 }

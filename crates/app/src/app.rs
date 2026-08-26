@@ -356,6 +356,13 @@ pub struct App {
     show_about: bool,
     /// Whether the Edit → "Edit history…" modal (op-log / amend panel) is open.
     show_history: bool,
+    /// Command palette (⌘K) overlay state: whether it's open, the current fuzzy
+    /// query, and the highlighted row index. The candidate set is rebuilt from
+    /// the registry each time it opens (cheap, keeps it in sync).
+    show_palette: bool,
+    palette_query: String,
+    palette_sel: usize,
+    palette_entries: Vec<crate::palette::PaletteEntry>,
     /// ITSJUSTCAD_THEME pin: Some(true)=dark, Some(false)=light, None=follow OS.
     /// Re-applied every frame so eframe's per-frame system-theme read can't win.
     forced_dark: Option<bool>,
@@ -563,6 +570,10 @@ impl App {
             reduce_motion: load_reduce_motion(),
             show_about: false,
             show_history: false,
+            show_palette: false,
+            palette_query: String::new(),
+            palette_sel: 0,
+            palette_entries: Vec::new(),
             // Env pin wins for dev/screenshots; otherwise restore the persisted
             // Appearance choice from ui.json (None = follow the OS).
             forced_dark: match std::env::var("ITSJUSTCAD_THEME").ok().as_deref() {
@@ -757,6 +768,19 @@ impl App {
                     self.command_line.execute(&mut self.session, "copy sel 1,1,0");
                 } else {
                     self.command_line.push_line("nothing to paste");
+                }
+            }
+            // Edit ▸ Cut: arm the clipboard from the current selection, then
+            // delete it (copy + delete), so a later Paste re-inserts it.
+            Some("cut") => {
+                let n = self.session.doc.selection.len();
+                if n == 0 {
+                    self.command_line.push_line("nothing selected to cut");
+                } else {
+                    self.clipboard_armed = true;
+                    self.command_line.execute(&mut self.session, "delete sel");
+                    self.command_line
+                        .push_line(format!("cut {n} object(s) — Cmd+V pastes"));
                 }
             }
             Some("controlimages") => {
@@ -3069,18 +3093,6 @@ impl App {
     /// [`Self::apply_menu_action`].
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let style = preset::preset_for(self.cad_origin).menu_style;
-        // Snapshot user plugins for the Plugins menu (grouped by category).
-        let plugin_entries: Vec<crate::menu::PluginMenuEntry> = self
-            .session
-            .plugins
-            .iter()
-            .map(|p| crate::menu::PluginMenuEntry {
-                name: p.name.clone(),
-                category: p.menu_category().to_string(),
-                has_params: !p.params.is_empty(),
-                summary: p.summary(),
-            })
-            .collect();
         let icons = &self.icons;
         // When the true native OS menu bar (muda) is attached, it owns the
         // File/Edit/… verb menus; the in-window strip then carries only the
@@ -3096,18 +3108,18 @@ impl App {
             let _ = icons;
             if let Ok(title) = std::env::var("ITSJUSTCAD_MENU_DEMO") {
                 let at = egui::pos2(8.0, 0.0);
-                crate::menu::demo_open(ui.ctx(), &self.icons, style, &title, at, &plugin_entries);
+                crate::menu::demo_open(ui.ctx(), &self.icons, style, &title, at);
             }
             return;
         }
         let has_selection = !self.session.doc.selection.is_empty();
         let bar = egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
-            crate::menu::ui(ui, icons, style, &plugin_entries, has_selection)
+            crate::menu::ui(ui, icons, style, has_selection)
         });
         // Dev/screenshot hook: force one menu open to show grouped items.
         if let Ok(title) = std::env::var("ITSJUSTCAD_MENU_DEMO") {
             let at = egui::pos2(bar.response.rect.left() + 8.0, bar.response.rect.bottom());
-            crate::menu::demo_open(ui.ctx(), &self.icons, style, &title, at, &plugin_entries);
+            crate::menu::demo_open(ui.ctx(), &self.icons, style, &title, at);
         }
         if let Some(action) = bar.inner {
             let ctx = ui.ctx().clone();
@@ -3145,6 +3157,138 @@ impl App {
                 ctx.set_zoom_factor(z);
             }
             MenuAction::ZoomReset => ctx.set_zoom_factor(1.3),
+            MenuAction::CommandPalette => self.open_palette(),
+        }
+    }
+
+    /// Open the ⌘K command palette: rebuild the candidate set from the registry
+    /// (+ app verbs) and reset the query / selection.
+    fn open_palette(&mut self) {
+        self.palette_entries = crate::palette::entries();
+        self.palette_query.clear();
+        self.palette_sel = 0;
+        self.show_palette = true;
+    }
+
+    /// The ⌘K command palette: a centered overlay fuzzy-searching EVERY verb
+    /// (registry + app verbs). A single text field drives the query; Up/Down move
+    /// the highlight, Enter runs the highlighted row (execute a no-arg verb, or
+    /// prefill the command line for a verb needing args), Esc closes. Keyboard
+    /// model mirrors the command-line autosuggest.
+    fn command_palette_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_palette {
+            return;
+        }
+        let tk = preset::preset_for(self.cad_origin).tokens();
+        let elevated = crate::theme::to_color32(tk.colors.surface_elevated);
+        let weak = crate::theme::to_color32(tk.colors.on_surface_variant);
+
+        // Rank the current query against the candidate set (cap the visible rows).
+        const MAX_ROWS: usize = 12;
+        let hits: Vec<crate::palette::PaletteEntry> =
+            crate::palette::search(&self.palette_query, &self.palette_entries, MAX_ROWS)
+                .into_iter()
+                .cloned()
+                .collect();
+        if self.palette_sel >= hits.len() {
+            self.palette_sel = hits.len().saturating_sub(1);
+        }
+
+        // Keyboard navigation, read before the widgets consume events.
+        let (up, down, enter, esc) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if up {
+            self.palette_sel = self.palette_sel.saturating_sub(1);
+        }
+        if down && !hits.is_empty() {
+            self.palette_sel = (self.palette_sel + 1).min(hits.len() - 1);
+        }
+
+        let mut chosen: Option<crate::palette::PaletteEntry> = None;
+        let mut close = false;
+
+        egui::Area::new(egui::Id::new("command_palette"))
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 96.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(elevated)
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(520.0);
+                        // Query field — focused each frame while open.
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.palette_query)
+                                .id(egui::Id::new("command_palette_query"))
+                                .desired_width(f32::INFINITY)
+                                .hint_text("Search commands…  (↑↓ to move, ↵ to run, esc to close)"),
+                        );
+                        resp.request_focus();
+                        ui.add_space(6.0);
+                        // Result rows.
+                        for (i, e) in hits.iter().enumerate() {
+                            let selected = i == self.palette_sel;
+                            let row = egui::Frame::NONE
+                                .fill(if selected {
+                                    ui.visuals().selection.bg_fill
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                })
+                                .inner_margin(egui::Margin::symmetric(6, 3))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(&e.name).strong());
+                                        ui.label(
+                                            egui::RichText::new(&e.category).small().color(weak),
+                                        );
+                                        if !e.usage.is_empty() {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(&e.usage)
+                                                            .monospace()
+                                                            .small()
+                                                            .color(weak),
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    });
+                                });
+                            let r = row.response.interact(egui::Sense::click());
+                            if r.clicked() {
+                                chosen = Some(e.clone());
+                            }
+                            if r.hovered() {
+                                self.palette_sel = i;
+                            }
+                        }
+                        if hits.is_empty() {
+                            ui.label(egui::RichText::new("no matches").color(weak));
+                        }
+                    });
+            });
+
+        if enter && let Some(e) = hits.get(self.palette_sel) {
+            chosen = Some(e.clone());
+        }
+        if esc {
+            close = true;
+        }
+
+        if let Some(entry) = chosen {
+            let action = crate::palette::enter_action(&entry);
+            self.show_palette = false;
+            self.apply_menu_action(ctx, action);
+        } else if close {
+            self.show_palette = false;
         }
     }
 
@@ -4049,6 +4193,14 @@ impl eframe::App for App {
         {
             self.show_about = true;
         }
+        // ITSJUSTCAD_PALETTE=<query>: open the ⌘K command palette with a query
+        // typed, so a --shot/GUI-shot captures the overlay. Dev-only hook.
+        if self.frame_count == 0
+            && let Ok(q) = std::env::var("ITSJUSTCAD_PALETTE")
+        {
+            self.open_palette();
+            self.palette_query = q;
+        }
 
         if self.show_template_picker {
             let mut done = false;
@@ -4298,6 +4450,20 @@ impl eframe::App for App {
                 self.deck_visible = true;
             }
             save_deck_visible(self.deck_visible);
+        }
+
+        // ⌘K opens the command palette. Consumed here (not via the keymap, which
+        // maps to command strings) so it fires even when the command line has
+        // focus — the palette is a global launcher.
+        let open_palette_key =
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K));
+        if open_palette_key {
+            self.open_palette();
+        }
+        // Render the palette overlay (dispatches the chosen action).
+        {
+            let ctx = ui.ctx().clone();
+            self.command_palette_ui(&ctx);
         }
 
         // Canvas shortcuts: pure keymap resolves each key press to a command

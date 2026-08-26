@@ -22,6 +22,7 @@ mod model_catalog;
 #[cfg(not(target_os = "linux"))]
 mod native_menu;
 mod osnap;
+mod palette;
 mod point_edit;
 mod precise;
 mod preset;
