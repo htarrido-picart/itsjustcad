@@ -389,6 +389,22 @@ pub struct App {
     /// failed/headless attach isn't retried every frame.
     #[cfg(not(target_os = "linux"))]
     native_menu_tried: bool,
+    /// Op-log cursor at the last successful save/open (`0` for a fresh doc). The
+    /// unsaved-changes guard compares this to `session.history().1` — see
+    /// [`crate::widgets::is_dirty`]. UI/session state, never in the op-log.
+    saved_cursor: usize,
+    /// A pending destructive navigation (New/Open/Quit) parked behind the
+    /// unsaved-changes alert. `Some` while the alert is up; taken when the user
+    /// picks Discard.
+    pending_nav: Option<PendingNav>,
+}
+
+/// A navigation intent deferred behind the unsaved-changes guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingNav {
+    New,
+    Open,
+    Quit,
 }
 
 /// A running install: which model, plus the [`crate::download::Download`] handle
@@ -572,7 +588,87 @@ impl App {
             native_menu: None,
             #[cfg(not(target_os = "linux"))]
             native_menu_tried: false,
+            saved_cursor: 0,
+            // Dev hook: ITSJUSTCAD_UNSAVED_ALERT=1 parks a New behind the
+            // unsaved-changes guard on startup so ITSJUSTCAD_SHOT frames can
+            // capture the alert without a click (pair with ITSJUSTCAD_RUN to
+            // dirty the doc first).
+            pending_nav: std::env::var("ITSJUSTCAD_UNSAVED_ALERT")
+                .is_ok()
+                .then_some(PendingNav::New),
         }
+    }
+
+    /// Whether the document has unsaved edits since the last save/open — the
+    /// signal the New/Open/Quit guard consults. Pure delegation to
+    /// [`crate::widgets::is_dirty`] over the op-log cursor.
+    pub(crate) fn is_dirty(&self) -> bool {
+        crate::widgets::is_dirty(self.session.history().1, self.saved_cursor)
+    }
+
+    /// Mark the document clean at its current op-log cursor (called after a
+    /// successful save/open, and on a fresh New).
+    fn mark_saved(&mut self) {
+        self.saved_cursor = self.session.history().1;
+    }
+
+    /// Route a destructive navigation (New/Open/Quit) through the unsaved-changes
+    /// guard: if the doc is dirty, park the intent and raise the alert; otherwise
+    /// perform it immediately.
+    fn guarded_nav(&mut self, ctx: &egui::Context, nav: PendingNav) {
+        if self.is_dirty() {
+            self.pending_nav = Some(nav);
+        } else {
+            self.perform_nav(ctx, nav);
+        }
+    }
+
+    /// Actually perform a (confirmed or clean) navigation intent.
+    fn perform_nav(&mut self, ctx: &egui::Context, nav: PendingNav) {
+        match nav {
+            PendingNav::New => {
+                self.new_document();
+                self.mark_saved();
+            }
+            PendingNav::Open => self.open(None),
+            PendingNav::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    /// Render the unsaved-changes alert when a navigation is parked behind it,
+    /// and act on the user's choice. Discard performs the parked nav; Cancel
+    /// drops it. Returns `true` while the alert is up (so a close-request can be
+    /// held off until the user decides).
+    fn unsaved_guard_ui(&mut self, ctx: &egui::Context) -> bool {
+        let Some(nav) = self.pending_nav else {
+            return false;
+        };
+        let tokens = preset::preset_for(self.cad_origin).tokens();
+        let verb = match nav {
+            PendingNav::New => "start a new document",
+            PendingNav::Open => "open another document",
+            PendingNav::Quit => "quit",
+        };
+        let choice = crate::widgets::alert(
+            ctx,
+            &tokens.colors,
+            tokens.dark,
+            "Unsaved changes",
+            &format!("You have unsaved changes. If you {verb}, they will be lost."),
+            "Discard",
+            crate::widgets::ButtonRole::Destructive,
+        );
+        match choice {
+            Some(crate::widgets::AlertChoice::Confirm) => {
+                self.pending_nav = None;
+                self.perform_nav(ctx, nav);
+            }
+            Some(crate::widgets::AlertChoice::Cancel) => {
+                self.pending_nav = None;
+            }
+            None => {}
+        }
+        self.pending_nav.is_some()
     }
 
     /// Lazily attach the true native OS menu bar (muda) the first interactive
@@ -1266,6 +1362,8 @@ impl App {
                     j.discard();
                 }
                 self.journaled_generation = Some(self.session.doc.generation);
+                // The document is now clean at the current op-log cursor.
+                self.mark_saved();
                 // Confine deck-originated fs paths to this document's directory.
                 self.deck_pane
                     .set_sandbox_root(path.parent().map(|p| p.to_path_buf()));
@@ -1314,6 +1412,8 @@ impl App {
         self.uploaded_generation = None;
         self.journaled_generation = None;
         self.deck_pane.set_sandbox_root(None);
+        // A fresh document is clean at cursor 0.
+        self.saved_cursor = 0;
         self.command_line.push_line("new document");
     }
 
@@ -1336,6 +1436,8 @@ impl App {
             Ok(session) => {
                 self.session = session;
                 self.uploaded_generation = None;
+                // A freshly-opened document is clean at its loaded op-log cursor.
+                self.mark_saved();
                 // Confine deck-originated fs paths to this document's directory.
                 self.deck_pane
                     .set_sandbox_root(path.parent().map(|p| p.to_path_buf()));
@@ -2195,6 +2297,9 @@ impl App {
 
         let fg = ui.visuals().text_color();
         let icon_sz = ui.text_style_height(&egui::TextStyle::Body);
+        // Destructive tint for the layer-delete/purge affordances (system-red).
+        let tk = preset::preset_for(self.cad_origin).tokens();
+        let destructive = crate::theme::to_color32(tk.colors.destructive);
 
         // Bottom toolbar first: a reserved bottom panel keeps the ＋ － ⚙ row
         // pinned and visible no matter how tall the (scrolling) table grows.
@@ -2219,10 +2324,14 @@ impl App {
                         }
                         self.selected_layer = Some(name);
                     }
-                    let del = self.icons.image(ui.ctx(), crate::icons::Icon::Minus, icon_sz, fg);
                     let target =
                         self.selected_layer.clone().unwrap_or_else(|| current.clone());
                     let deletable = target != itsjustcad_doc::DEFAULT_LAYER;
+                    // Destructive-red mark when the delete is armed, dimmed otherwise.
+                    let del_tint = if deletable { destructive } else { fg };
+                    let del = self
+                        .icons
+                        .image(ui.ctx(), crate::icons::Icon::Minus, icon_sz, del_tint);
                     if ui
                         .add_enabled(deletable, egui::Button::image(del).frame(true))
                         .on_hover_text(if deletable {
@@ -2239,7 +2348,15 @@ impl App {
                     // ⚙ settings menu: purge empty layers + new-layer default color.
                     let gear = self.icons.image(ui.ctx(), crate::icons::Icon::Settings, icon_sz, fg);
                     ui.menu_image_button(gear, |ui| {
-                        if ui.button("Purge empty layers").clicked() {
+                        if crate::widgets::role_button(
+                            ui,
+                            &tk.colors,
+                            tk.dark,
+                            crate::widgets::ButtonRole::Destructive,
+                            "Purge empty layers",
+                        )
+                        .clicked()
+                        {
                             for name in empty_deletable_layers(&self.session.doc) {
                                 lines.push(format!("layerdelete {name}"));
                             }
@@ -2624,36 +2741,52 @@ impl App {
     /// central viewport frame so it never overlaps the canvas.
     fn viewport_tab_bar(&mut self, ui: &mut egui::Ui) {
         let named: Vec<String> = self.session.doc.named_views.keys().cloned().collect();
-        let tabs = crate::tabstrip::viewport_tabs(&named);
+        let roles = preset::preset_for(self.cad_origin).tokens().colors;
         // Highlight the tab matching the active pane's current view.
         let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
         let current = crate::statusbar::view_label(cam.yaw, cam.pitch, cam.ortho);
         let mut chosen: Option<String> = None;
         ui.horizontal(|ui| {
-            for (label, verb) in &tabs {
-                let selected = label.eq_ignore_ascii_case(current);
-                if ui.selectable_label(selected, label).clicked() {
-                    chosen = Some(verb.clone());
+            // Standard views (Persp/Top/Front/Right) as a real segmented control:
+            // equal-width, one type, selection-only.
+            let std_labels: Vec<&str> =
+                crate::tabstrip::STANDARD_VIEW_TABS.iter().map(|(l, _)| *l).collect();
+            let cur_std = crate::tabstrip::STANDARD_VIEW_TABS
+                .iter()
+                .position(|(l, _)| l.eq_ignore_ascii_case(current))
+                .unwrap_or(usize::MAX);
+            if let Some(i) = crate::widgets::segmented(ui, &roles, &std_labels, cur_std) {
+                chosen = Some(crate::tabstrip::STANDARD_VIEW_TABS[i].1.to_string());
+            }
+            // Named saved views stay as individual selectable tabs after the group.
+            for name in &named {
+                let lower = name.to_ascii_lowercase();
+                if crate::tabstrip::STANDARD_VIEW_TABS.iter().any(|(_, v)| *v == lower) {
+                    continue;
+                }
+                let selected = name.eq_ignore_ascii_case(current);
+                if ui.selectable_label(selected, name).clicked() {
+                    chosen = Some(format!("view {name}"));
                 }
             }
             // View controls, right-aligned on the same row (de-floated from the
             // old canvas overlay): 1/2/4 layout, color mode, display mode, ZE.
             // right_to_left lays out in reverse, so paint them in reverse order
-            // to read `ZE | Shaded▾ | ByLayer▾ | 1 2 4` left→right.
+            // to read `ZE | Shaded▾ | ByLayer▾ | [1 2 4]` left→right.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let slot = self.layout.camera_index(self.active_pane);
-                for (label, layout) in [
-                    ("4", ViewportLayout::Four),
-                    ("2", ViewportLayout::Two),
-                    ("1", ViewportLayout::Single),
-                ] {
-                    if ui
-                        .selectable_label(self.layout == layout, label)
-                        .on_hover_text(format!("{label} viewport(s)"))
-                        .clicked()
-                    {
-                        self.set_layout(layout);
-                    }
+                // Layout 1/2/4 as a segmented control (single-select, equal-width).
+                let layout_variants =
+                    [ViewportLayout::Single, ViewportLayout::Two, ViewportLayout::Four];
+                let layout_labels = ["1", "2", "4"];
+                let cur_layout = layout_variants
+                    .iter()
+                    .position(|l| *l == self.layout)
+                    .unwrap_or(0);
+                if let Some(i) =
+                    crate::widgets::segmented(ui, &roles, &layout_labels, cur_layout)
+                {
+                    self.set_layout(layout_variants[i]);
                 }
                 ui.separator();
                 egui::ComboBox::from_id_salt("color_mode")
@@ -2674,7 +2807,8 @@ impl App {
                             ui.selectable_value(&mut self.display_modes[slot], mode, mode.label());
                         }
                     });
-                ui.separator();
+                // Fixed space between the icon group (ZE, rightmost) and the text
+                // group (display/color/layout) — a deliberate gap, not a divider.
                 if self
                     .icons
                     .icon_button(ui, crate::icons::Icon::Maximize, "zoom extents")
@@ -2682,6 +2816,7 @@ impl App {
                 {
                     self.zoom_extents();
                 }
+                ui.add_space(crate::theme::Spacing::SM);
             });
         });
         if let Some(verb) = chosen {
@@ -2803,7 +2938,15 @@ impl App {
                         });
                     }
                     PanelTab::Deck => {
-                        self.deck_pane.ui(ui, &mut self.session, &self.tokio, &self.icons);
+                        let tk = preset::preset_for(self.cad_origin).tokens();
+                        self.deck_pane.ui(
+                            ui,
+                            &mut self.session,
+                            &self.tokio,
+                            &self.icons,
+                            &tk.colors,
+                            tk.dark,
+                        );
                     }
                 }
             });
@@ -2887,7 +3030,7 @@ impl App {
             MenuAction::EditHistory => self.show_history = true,
             MenuAction::ImportDialog => self.import(None),
             MenuAction::ExportDialog => self.export(None),
-            MenuAction::NewDocument => self.new_document(),
+            MenuAction::NewDocument => self.guarded_nav(ctx, PendingNav::New),
             MenuAction::NewSession => self.new_session(),
             MenuAction::SetTheme(dark) => self.set_theme_pref(ctx, dark),
             MenuAction::ZoomStep(bigger) => {
@@ -2958,6 +3101,9 @@ impl App {
         let mut install: Option<String> = None;
         let mut cancel = false;
         let mut remove: Option<String> = None;
+        // Token roles for the destructive Remove button (never a filled-red CTA).
+        let roles = preset::preset_for(self.cad_origin).tokens().colors;
+        let dark = preset::preset_for(self.cad_origin).tokens().dark;
 
         egui::Window::new("Model Setup")
             // Collapsible so the user can minimize it to its title bar and keep
@@ -3057,7 +3203,15 @@ impl App {
                                 if ui.button("Re-download").clicked() {
                                     install = Some(entry.id.clone());
                                 }
-                                if ui.button("Remove").clicked() {
+                                if crate::widgets::role_button(
+                                    ui,
+                                    &roles,
+                                    dark,
+                                    crate::widgets::ButtonRole::Destructive,
+                                    "Remove",
+                                )
+                                .clicked()
+                                {
                                     remove = Some(entry.id.clone());
                                 }
                             });
@@ -3718,6 +3872,23 @@ impl eframe::App for App {
             }
         }
 
+        // Unsaved-changes guard on window close (Quit): if a close was requested
+        // and the doc is dirty, cancel the close and park a Quit intent behind the
+        // alert. A confirmed Discard re-sends Close; Cancel drops it.
+        {
+            let ctx = ui.ctx().clone();
+            let close_requested = ctx.input(|i| i.viewport().close_requested());
+            // Clean doc lets the close proceed unimpeded; a dirty doc cancels it
+            // and parks the Quit behind the alert.
+            if close_requested
+                && self.pending_nav != Some(PendingNav::Quit)
+                && self.is_dirty()
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.pending_nav = Some(PendingNav::Quit);
+            }
+        }
+
         // ITSJUSTCAD_THEME pins the theme every frame (eframe otherwise re-reads
         // the OS theme each frame and would override a one-shot pin at startup).
         if let Some(dark) = self.forced_dark {
@@ -3928,7 +4099,8 @@ impl eframe::App for App {
         let open_key =
             ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O));
         if open_key {
-            self.open(None);
+            let ctx = ui.ctx().clone();
+            self.guarded_nav(&ctx, PendingNav::Open);
         }
 
         // Deck pane tick: must run every frame regardless of visibility so
@@ -4069,6 +4241,11 @@ impl eframe::App for App {
                     .show(ui, |ui| self.viewport_tab_bar(ui));
                 self.viewport(ui);
             });
+
+        // Unsaved-changes alert: modal on top of everything when a New/Open/Quit
+        // is parked behind the guard.
+        let ctx = ui.ctx().clone();
+        self.unsaved_guard_ui(&ctx);
     }
 }
 

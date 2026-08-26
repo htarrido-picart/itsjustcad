@@ -1376,6 +1376,8 @@ impl DeckPane {
         session: &mut Session,
         handle: &tokio::runtime::Handle,
         icons: &crate::icons::Icons,
+        roles: &crate::theme::ColorRoles,
+        dark: bool,
     ) {
         self.drain(session, handle);
         if self.busy()
@@ -1516,7 +1518,16 @@ impl DeckPane {
             }
             // No critique button: `critique` is a command-line/chat verb, not a
             // toolbar affordance (the app still honours `critique_requested`).
-            if ui.small_button("clear").clicked() {
+            // Destructive: clearing the chat discards the transcript + history.
+            if crate::widgets::role_button(
+                ui,
+                roles,
+                dark,
+                crate::widgets::ButtonRole::Destructive,
+                "clear",
+            )
+            .clicked()
+            {
                 self.transcript.clear();
                 self.messages.clear();
                 self.session_id = None;

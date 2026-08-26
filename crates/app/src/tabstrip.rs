@@ -141,6 +141,10 @@ pub const STANDARD_VIEW_TABS: [(&str, &str); 4] = [
 /// saved named views (deduped against the standard names, case-insensitively).
 /// Returns `(label, view_verb)` pairs; for a named view the verb restores it
 /// via `view <name>`, for a standard view it is the bare view name.
+// Pure helper retained for the ordered-tab contract + tests; the viewport bar
+// now composes the standard views via a segmented control and appends named
+// views itself, so this has no live UI caller.
+#[allow(dead_code)]
 pub fn viewport_tabs(named: &[String]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = STANDARD_VIEW_TABS
         .iter()

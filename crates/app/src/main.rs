@@ -31,6 +31,7 @@ mod suggest;
 mod tabstrip;
 mod theme;
 mod ui_plane;
+mod widgets;
 
 fn cli_help_text() -> String {
     let mut out = String::new();
