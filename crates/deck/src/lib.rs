@@ -14,6 +14,7 @@ mod extract;
 mod openai_compat;
 mod probe;
 mod prompt;
+mod render_deck;
 mod tool_loop;
 mod which;
 
@@ -23,6 +24,12 @@ pub use deck::{make_deck, ChatMessage, ChatRequest, DeckDelta, DeckError, LlmDec
 pub use extract::{Extractor, ExtractEvent};
 pub use probe::{probe, warm_model, ProbeInfo, WarmOutcome};
 pub use prompt::{system_prompt, VIEW_VERB_HELP};
+pub use render_deck::{
+    make_render_deck, render_config_path, Automatic1111RenderDeck, CloudRenderDeck,
+    ComfyRenderDeck, ControlImages, MockRenderDeck, RenderConfig, RenderDeck, RenderDeckError,
+    RenderDecksFile, RenderKind, RenderRequest, RenderedImage, UnconfiguredRenderDeck,
+    NO_BACKEND_MESSAGE,
+};
 pub use tool_loop::{
     run_tool_loop, AgentCassette, LoopOutcome, StepDecision, ToolCall, ToolDispatch, ToolResult,
 };
