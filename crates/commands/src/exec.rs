@@ -13,7 +13,7 @@ use itsjustcad_doc::{
 use std::collections::BTreeMap;
 
 use crate::error::ExecError;
-use crate::{Command, CompassDir, MirrorPlane, OptionOp, Selector};
+use crate::{BoolKind, Command, CompassDir, MirrorPlane, OptionOp, Selector};
 
 /// Chord tolerance used when tessellating profile curves for extrusion.
 const PROFILE_TOL: f64 = 0.01;
@@ -1776,6 +1776,39 @@ fn fold_csg(
     let mut iter = meshes.into_iter();
     let first = iter.next().expect("callers guarantee at least one mesh");
     iter.fold(first, |acc, m| op(&acc, &m))
+}
+
+/// Exact boolean of two axis-aligned boxes, preferring the opt-in OCCT exact
+/// kernel and falling back to the pure-Rust mesh kernel when the `kernel-occt`
+/// feature is not compiled in. Returns `(mesh, volume, used_exact_kernel)`.
+///
+/// The exact path reports the exact analytic volume; the fallback reports the
+/// mesh's signed volume (identical for these polyhedral results).
+fn exact_or_mesh_boolean(
+    op: BoolKind,
+    a_corner: DVec3,
+    a_size: DVec3,
+    b_corner: DVec3,
+    b_size: DVec3,
+) -> (kernel_mesh::Mesh, f64, bool) {
+    let occ_op = match op {
+        BoolKind::Union => kernel_occt::BoolOp::Union,
+        BoolKind::Difference => kernel_occt::BoolOp::Difference,
+        BoolKind::Intersection => kernel_occt::BoolOp::Intersection,
+    };
+    if let Some(exact) = kernel_occt::box_boolean(a_corner, a_size, b_corner, b_size, occ_op) {
+        return (exact.mesh, exact.volume, true);
+    }
+    // Fallback: build the two boxes as meshes and run the mesh CSG kernel.
+    let a = kernel_mesh::make_box(a_corner, a_size);
+    let b = kernel_mesh::make_box(b_corner, b_size);
+    let result = match op {
+        BoolKind::Union => kernel_mesh::csg_union(&a, &b),
+        BoolKind::Difference => kernel_mesh::csg_difference(&a, &b),
+        BoolKind::Intersection => kernel_mesh::csg_intersection(&a, &b),
+    };
+    let volume = kernel_mesh::signed_volume(&result).abs();
+    (result, volume, false)
 }
 
 /// Consume the input objects and insert the boolean result. Errors (leaving
@@ -3677,6 +3710,41 @@ fn apply_forward(
                 Command::Intersect { id: Some(id), targets },
                 inverse,
                 ApplyOutcome { created: vec![id], message },
+            ))
+        }
+        Command::ExactBoolean { id, op, a_corner, a_size, b_corner, b_size } => {
+            let (mesh, volume, exact) =
+                exact_or_mesh_boolean(op, a_corner, a_size, b_corner, b_size);
+            if mesh.faces().is_empty() {
+                return Err(ExecError::Invalid(format!(
+                    "{op} of the two boxes is empty (they do not overlap)"
+                )));
+            }
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: "solids".to_string(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Mesh(mesh),
+            });
+            let path = if exact {
+                "exact OCCT kernel"
+            } else {
+                "mesh kernel (OCCT feature off — fallback)"
+            };
+            Ok((
+                Command::ExactBoolean { id: Some(id), op, a_corner, a_size, b_corner, b_size },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "exact {op} of two boxes -> {id} (volume {volume:.4}, via {path})"
+                    ),
+                },
             ))
         }
         Command::Section { ids, targets, point, normal } => {
@@ -5997,6 +6065,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Union { .. } => "union",
         Command::Difference { .. } => "difference",
         Command::Intersect { .. } => "intersect",
+        Command::ExactBoolean { .. } => "exact_boolean",
         Command::Section { .. } => "section",
         Command::Plan { .. } => "plan",
         Command::Elevation { .. } => "elevation",
@@ -8429,6 +8498,93 @@ mod tests {
         run(&mut s, "undo");
         let log = s.save_log();
         assert_eq!(log.len(), 1); // only the surviving box
+    }
+
+    // ── exact-BREP tier (kernel-occt) ───────────────────────────────────────
+
+    /// The signed volume of the single mesh a boolean produced. Works for both
+    /// the exact and the mesh-fallback path since box booleans are polyhedral.
+    fn only_mesh_volume(s: &Session, id: ObjectId) -> f64 {
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Mesh(m) => kernel_mesh::signed_volume(m).abs(),
+            g => panic!("expected mesh, got {g:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_boolean_difference_volume_is_correct_either_kernel() {
+        // 10^3 box minus a 4x4 column punched through z: 1000 - 160 = 840.
+        // Whether the exact OCCT kernel or the mesh fallback runs, the answer is
+        // the same (polyhedral result), so this test is kernel-agnostic.
+        let mut s = Session::default();
+        let out = run(
+            &mut s,
+            "exact_boolean difference 0,0,0 10,10,10 3,3,-5 4,4,20",
+        );
+        let id = out.created[0];
+        let vol = only_mesh_volume(&s, id);
+        assert!((vol - 840.0).abs() < 1e-6, "difference volume {vol} != 840");
+        // The result advertises which kernel path ran.
+        assert!(
+            out.message.contains("exact OCCT kernel")
+                || out.message.contains("mesh kernel"),
+            "message should name the kernel path: {}",
+            out.message
+        );
+        // With the feature off (default CI build) it must be the fallback; with
+        // it on it must be exact. Assert consistency with the compiled feature.
+        assert_eq!(
+            out.message.contains("exact OCCT kernel"),
+            kernel_occt::available(),
+            "kernel path must match compiled feature"
+        );
+    }
+
+    #[test]
+    fn exact_boolean_union_and_intersection_volumes() {
+        let mut s = Session::default();
+        // disjoint 2^3 cubes -> 16
+        let u = run(&mut s, "exact_boolean union 0,0,0 2,2,2 5,0,0 2,2,2");
+        assert!((only_mesh_volume(&s, u.created[0]) - 16.0).abs() < 1e-6);
+        // 10^3 ∩ 4x4x20 column = 160
+        let i = run(
+            &mut s,
+            "exact_boolean intersection 0,0,0 10,10,10 3,3,-5 4,4,20",
+        );
+        assert!((only_mesh_volume(&s, i.created[0]) - 160.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn exact_boolean_undo_redo_round_trips() {
+        let mut s = Session::default();
+        let before = s.doc.all_ids().len();
+        let out = run(
+            &mut s,
+            "exact_boolean union 0,0,0 2,2,2 5,0,0 2,2,2",
+        );
+        let id = out.created[0];
+        assert!(s.doc.get(id).is_some());
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).is_none(), "undo removes the result");
+        assert_eq!(s.doc.all_ids().len(), before);
+        run(&mut s, "redo");
+        // redo re-inserts a solid with the same (recorded) id.
+        assert!(s.doc.get(id).is_some(), "redo restores the result");
+        assert!((only_mesh_volume(&s, id) - 16.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn exact_boolean_non_overlapping_difference_errors() {
+        // difference of two disjoint boxes leaves box A intact -> non-empty,
+        // so instead test intersection of disjoint boxes which IS empty.
+        let mut s = Session::default();
+        let err = s
+            .run(parse("exact_boolean intersection 0,0,0 1,1,1 5,5,5 1,1,1").unwrap())
+            .unwrap_err();
+        assert!(
+            matches!(err, ExecError::Invalid(_)),
+            "empty intersection must error: {err:?}"
+        );
     }
 
     /// Write a `w`x`h` PNG to a temp path and return it.

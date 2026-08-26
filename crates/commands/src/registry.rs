@@ -259,6 +259,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Boolean,
         },
         CommandSpec {
+            name: "exact_boolean",
+            usage: "exact_boolean <union|difference|intersection> <a_corner x,y,z> <a_size x,y,z> <b_corner x,y,z> <b_size x,y,z>",
+            summary: "Exact-BREP boolean of two axis-aligned boxes using the opt-in OCCT kernel (feature 'kernel-occt'); falls back to the mesh kernel when OCCT is not compiled in, noting the fallback. Retains an exact volume. Example: exact_boolean difference 0,0,0 10,10,10 3,3,-5 4,4,20",
+            category: Category::Boolean,
+        },
+        CommandSpec {
             name: "section",
             usage: "section <selector> <plane point x,y,z> <normal x,y,z>  |  section <name> rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t>",
             summary: "Two uses. (1) Plane cut: cut meshes with a plane; each closed loop becomes a heavy polyline on layer 'sections'. Example: section all 0,0,1.2 0,0,1. (2) Structural section: define a named cross-section (profile) for beam/column members, chosen by a shape keyword in second position — rect (solid rectangle), circle, iwf (I / wide-flange: depth, flange width, flange thickness, web thickness), pipe (hollow round). Example: section W12 iwf 0.31 0.2 0.013 0.008 · section col rect 0.4 0.4",

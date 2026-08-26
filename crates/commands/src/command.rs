@@ -53,6 +53,27 @@ impl std::fmt::Display for CompassDir {
     }
 }
 
+/// Which boolean an [`Command::ExactBoolean`] performs. A serde-stable mirror
+/// of `kernel_occt::BoolOp` (kept here so the command surface does not depend on
+/// the feature-gated exact kernel being compiled in).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoolKind {
+    Union,
+    Difference,
+    Intersection,
+}
+
+impl std::fmt::Display for BoolKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BoolKind::Union => "union",
+            BoolKind::Difference => "difference",
+            BoolKind::Intersection => "intersection",
+        })
+    }
+}
+
 /// Which doubly-curved surface a [`Command::Gridshell`] lattice rides on. A
 /// serde-stable mirror of `kernel_mesh::GridshellSurface`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -370,6 +391,20 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
         targets: Selector,
+    },
+    /// Exact-BREP boolean of two axis-aligned boxes (given by corner + size),
+    /// producing one solid. Uses the opt-in OCCT exact kernel when it is
+    /// compiled in (feature `kernel-occt`); otherwise falls back to the pure-
+    /// Rust mesh kernel and notes the fallback in the result message. The exact
+    /// path retains an exact volume; both paths tessellate into the document.
+    ExactBoolean {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        op: BoolKind,
+        a_corner: DVec3,
+        a_size: DVec3,
+        b_corner: DVec3,
+        b_size: DVec3,
     },
     // -- sections (mesh/plane cuts -> polylines on layer "sections") --
     /// Cut meshes with a plane; each closed intersection loop becomes a

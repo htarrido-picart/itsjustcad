@@ -1,0 +1,25 @@
+# The exact-BREP tier. This crate ONLY compiles when the `occt` feature is
+# enabled (opt-in); by default it is an empty stub so the normal build and the
+# Linux build never need OpenCASCADE, CMake, or a C++ toolchain.
+[package]
+name = "kernel-occt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# OFF by default. When on, pulls in the `opencascade` crate which statically
+# builds OCCT from source (via occt-sys) — needs CMake + a C++ toolchain, but
+# NO system OCCT install and NO runtime shared libs.
+default = []
+occt = ["dep:opencascade", "dep:oc-glam"]
+
+[dependencies]
+glam.workspace = true
+kernel-mesh.workspace = true
+opencascade = { version = "0.3", optional = true }
+# opencascade 0.3 pins glam 0.24 in its public API (Shape::box_from_corners,
+# mesh vertices). Our workspace is on glam 0.30, so we take 0.24 under an alias
+# purely to build inputs / read outputs at the OCCT boundary and convert
+# component-wise to our glam. Only pulled in with the `occt` feature.
+oc-glam = { package = "glam", version = "0.24", optional = true }

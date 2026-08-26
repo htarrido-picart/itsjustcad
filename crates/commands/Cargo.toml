@@ -4,11 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Opt-in exact-BREP tier. Forwards to kernel-occt's `occt` feature, which
+# statically builds OpenCASCADE. OFF by default so the normal build and the
+# Linux build never require CMake, a C++ toolchain, or OCCT.
+kernel-occt = ["kernel-occt/occt"]
+
 [dependencies]
 itsjustcad-doc.workspace = true
 itsjustcad-solar.workspace = true
 kernel-mesh.workspace = true
 kernel-curve.workspace = true
+kernel-occt = { workspace = true }
 glam.workspace = true
 serde.workspace = true
 serde_json.workspace = true

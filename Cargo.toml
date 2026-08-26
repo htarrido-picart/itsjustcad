@@ -4,6 +4,7 @@ members = [
     "crates/kernel-mesh",
     "crates/kernel-curve",
     "crates/kernel-brep",
+    "crates/kernel-occt",
     "crates/doc",
     "crates/commands",
     "crates/deck",
@@ -46,6 +47,7 @@ dirs = "6"
 # internal crates
 kernel-mesh = { path = "crates/kernel-mesh" }
 kernel-curve = { path = "crates/kernel-curve" }
+kernel-occt = { path = "crates/kernel-occt" }
 itsjustcad-doc = { path = "crates/doc" }
 itsjustcad-commands = { path = "crates/commands" }
 itsjustcad-deck = { path = "crates/deck" }

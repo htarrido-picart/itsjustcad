@@ -71,6 +71,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anstyle"
+version = "1.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
+
+[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -572,12 +578,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap"
+version = "4.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
+dependencies = [
+ "clap_builder",
+]
+
+[[package]]
+name = "clap_builder"
+version = "4.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
+dependencies = [
+ "anstyle",
+ "clap_lex",
+ "strsim",
+]
+
+[[package]]
+name = "clap_lex"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
 dependencies = [
  "error-code",
+]
+
+[[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -722,6 +763,68 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
+
+[[package]]
+name = "cxx"
+version = "1.0.199"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "824894a4a85dca76d4c95c2b9098c036f5a29f627b30c12780774f6654e60974"
+dependencies = [
+ "cc",
+ "cxx-build",
+ "cxxbridge-cmd",
+ "cxxbridge-flags",
+ "cxxbridge-macro",
+ "foldhash 0.2.0",
+ "link-cplusplus",
+]
+
+[[package]]
+name = "cxx-build"
+version = "1.0.199"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1ae0b651ea5b0000b19513aef5a03f194d7e3486f2d9258b658da8677fe9036"
+dependencies = [
+ "cc",
+ "codespan-reporting",
+ "indexmap",
+ "proc-macro2",
+ "quote",
+ "scratch",
+ "syn 3.0.3",
+]
+
+[[package]]
+name = "cxxbridge-cmd"
+version = "1.0.199"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb05f91d3fb8435d9bab6ac5ce6ac1868be774325fb7fb2a91be39393b21388e"
+dependencies = [
+ "clap",
+ "codespan-reporting",
+ "indexmap",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
+name = "cxxbridge-flags"
+version = "1.0.199"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf293202e0e3e98495785745389e8d0755b217e66f19194a5c695c25e03282ef"
+
+[[package]]
+name = "cxxbridge-macro"
+version = "1.0.199"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca001d746947c7249ed9d332a10f7a59daedbafeb0ec68c5c18a7db7a93f6ccc"
+dependencies = [
+ "indexmap",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
 
 [[package]]
 name = "digest"
@@ -1510,6 +1613,15 @@ dependencies = [
 
 [[package]]
 name = "glam"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5418c17512bdf42730f9032c74e1ae39afc408745ebb2acf72fbc4691c17945"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "glam"
 version = "0.30.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
@@ -2105,7 +2217,7 @@ dependencies = [
  "egui-wgpu",
  "egui_commonmark",
  "futures",
- "glam",
+ "glam 0.30.10",
  "hex",
  "image",
  "itsjustcad-commands",
@@ -2139,12 +2251,13 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "e57",
- "glam",
+ "glam 0.30.10",
  "image",
  "itsjustcad-doc",
  "itsjustcad-solar",
  "kernel-curve",
  "kernel-mesh",
+ "kernel-occt",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -2172,7 +2285,7 @@ dependencies = [
 name = "itsjustcad-doc"
 version = "0.1.0"
 dependencies = [
- "glam",
+ "glam 0.30.10",
  "kernel-curve",
  "kernel-mesh",
  "serde",
@@ -2188,7 +2301,7 @@ dependencies = [
  "bytemuck",
  "egui",
  "egui-wgpu",
- "glam",
+ "glam 0.30.10",
  "image",
  "itsjustcad-commands",
  "itsjustcad-doc",
@@ -2289,7 +2402,7 @@ version = "0.1.0"
 name = "kernel-curve"
 version = "0.1.0"
 dependencies = [
- "glam",
+ "glam 0.30.10",
  "serde",
 ]
 
@@ -2297,8 +2410,18 @@ dependencies = [
 name = "kernel-mesh"
 version = "0.1.0"
 dependencies = [
- "glam",
+ "glam 0.30.10",
  "serde",
+]
+
+[[package]]
+name = "kernel-occt"
+version = "0.1.0"
+dependencies = [
+ "glam 0.24.2",
+ "glam 0.30.10",
+ "kernel-mesh",
+ "opencascade",
 ]
 
 [[package]]
@@ -2405,6 +2528,15 @@ name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4a5ff6bcca6c4867b1c4fd4ef63e4db7436ef363e0ad7531d1558856bae64f4"
+
+[[package]]
+name = "link-cplusplus"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f78c730aaa7d0b9336a299029ea49f9ee53b0ed06e9202e8cb7db9bae7b8c82"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "linux-raw-sys"
@@ -3040,10 +3172,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "occt-sys"
+version = "7.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d2199ccf5331d261cf293abbc6b6b6ca1eb7187ef2113c181c49f9365cd9ae"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "opencascade"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6e9b350ed6cc9b368519c3a745ef6e834cf2fd1c84c863fd483e59b1d87cbdc"
+dependencies = [
+ "cxx",
+ "glam 0.24.2",
+ "opencascade-kicad-parser",
+ "opencascade-sys",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "opencascade-kicad-parser"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb38fde1353688465e08c898d24a0aebdad52c1cbc7c1585250da0015465c16c"
+dependencies = [
+ "sexp",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "opencascade-sys"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f29448a0152b2b23812c4887c3fe9ee79ecb6ba8a72dfecb40b155769b168acc"
+dependencies = [
+ "cmake",
+ "cxx",
+ "cxx-build",
+ "occt-sys",
+]
 
 [[package]]
 name = "option-ext"
@@ -3856,6 +4032,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "scratch"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68f2ec51b097e4c1a75b681a8bec621909b5e91f15bb7b840c4f2f7b01148b2"
+
+[[package]]
 name = "self_cell"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3941,6 +4123,12 @@ dependencies = [
  "ryu",
  "serde",
 ]
+
+[[package]]
+name = "sexp"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c8fa7ac9df84000b0238cf497cb2d3056bac2ff2a7d8cf179d2803b4b58571f"
 
 [[package]]
 name = "sha2"
@@ -4139,6 +4327,12 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "strsim"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subtle"

@@ -28,7 +28,7 @@ pub mod saf;
 pub mod svg;
 
 pub use command::{
-    Command, CompassDir, GridshellSurfaceSpec, MirrorPlane, OptionOp, Selector,
+    BoolKind, Command, CompassDir, GridshellSurfaceSpec, MirrorPlane, OptionOp, Selector,
 };
 pub use error::{ExecError, ParseError};
 pub use exec::{ApplyOutcome, Session, MAIN_BRANCH};

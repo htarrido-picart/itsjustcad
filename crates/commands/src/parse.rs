@@ -9,7 +9,7 @@ use itsjustcad_doc::{
 
 use crate::error::ParseError;
 use crate::registry::registry;
-use crate::{Command, CompassDir, MirrorPlane, OptionOp, Selector};
+use crate::{BoolKind, Command, CompassDir, MirrorPlane, OptionOp, Selector};
 
 /// Hand-rolled `verb arg arg...` parser. Chosen over a combinator library
 /// because error message quality feeds the LLM retry loop.
@@ -417,6 +417,32 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let (sel, rest) = selector(&args, "intersect")?;
             expect_empty("intersect", rest, &args)?;
             Ok(Command::Intersect { id: None, targets: sel })
+        }
+        "exact_boolean" | "exactbool" => {
+            // exact_boolean <union|difference|intersection> <a_corner> <a_size> <b_corner> <b_size>
+            let [op, ac, asz, bc, bsz] =
+                take::<5>("exact_boolean", "an op and two box corner+size pairs", &args)?;
+            let op = match op.to_lowercase().as_str() {
+                "union" | "u" => BoolKind::Union,
+                "difference" | "diff" | "subtract" | "d" => BoolKind::Difference,
+                "intersection" | "intersect" | "i" => BoolKind::Intersection,
+                other => {
+                    return Err(ParseError::WrongArgs {
+                        command: "exact_boolean",
+                        expected: "op = union|difference|intersection",
+                        got: other.to_string(),
+                        usage: "exact_boolean union 0,0,0 10,10,10 3,3,-5 4,4,20",
+                    });
+                }
+            };
+            Ok(Command::ExactBoolean {
+                id: None,
+                op,
+                a_corner: point(ac)?,
+                a_size: point(asz)?,
+                b_corner: point(bc)?,
+                b_size: point(bsz)?,
+            })
         }
         "section" => {
             // Two commands share the "section" verb: the structural section
@@ -2157,6 +2183,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_exact_boolean_round_trip() {
+        assert_eq!(
+            parse("exact_boolean difference 0,0,0 10,10,10 3,3,-5 4,4,20").unwrap(),
+            Command::ExactBoolean {
+                id: None,
+                op: BoolKind::Difference,
+                a_corner: DVec3::ZERO,
+                a_size: DVec3::new(10.0, 10.0, 10.0),
+                b_corner: DVec3::new(3.0, 3.0, -5.0),
+                b_size: DVec3::new(4.0, 4.0, 20.0),
+            }
+        );
+        // op aliases resolve
+        assert!(matches!(
+            parse("exact_boolean u 0,0,0 1,1,1 0,0,0 1,1,1").unwrap(),
+            Command::ExactBoolean { op: BoolKind::Union, .. }
+        ));
+        assert!(matches!(
+            parse("exactbool i 0,0,0 1,1,1 0,0,0 1,1,1").unwrap(),
+            Command::ExactBoolean { op: BoolKind::Intersection, .. }
+        ));
+    }
+
+    #[test]
+    fn parse_exact_boolean_rejects_bad_op() {
+        assert!(parse("exact_boolean nope 0,0,0 1,1,1 0,0,0 1,1,1").is_err());
+    }
+
+    #[test]
     fn parse_geodesic_variants() {
         assert_eq!(
             parse("geodesic 3 5").unwrap(),
@@ -2709,6 +2764,26 @@ mod tests {
             let back: Command = serde_json::from_str(&json).unwrap();
             assert_eq!(cmd, back, "{line}");
         }
+    }
+
+    #[test]
+    fn exact_boolean_json_roundtrip() {
+        // op-log replay-stability: the command must survive JSON round-trip.
+        for line in [
+            "exact_boolean union 0,0,0 2,2,2 5,0,0 2,2,2",
+            "exact_boolean difference 0,0,0 10,10,10 3,3,-5 4,4,20",
+            "exact_boolean intersection 1,1,1 4,4,4 2,2,2 4,4,4",
+        ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
+        // The op tag is snake_case and stable.
+        let cmd = parse("exact_boolean difference 0,0,0 1,1,1 0,0,0 1,1,1").unwrap();
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"exact_boolean\""), "cmd tag: {json}");
+        assert!(json.contains("\"difference\""), "op tag: {json}");
     }
 
     #[test]

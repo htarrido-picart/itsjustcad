@@ -8,6 +8,13 @@ license.workspace = true
 name = "itsjustcad"
 path = "src/main.rs"
 
+[features]
+default = []
+# Opt-in exact-BREP tier: forwards to itsjustcad-commands' `kernel-occt` feature
+# (statically links OpenCASCADE). OFF by default; the normal app build never
+# needs CMake, a C++ toolchain, or OCCT.
+kernel-occt = ["itsjustcad-commands/kernel-occt"]
+
 [dependencies]
 itsjustcad-doc.workspace = true
 itsjustcad-solar.workspace = true
