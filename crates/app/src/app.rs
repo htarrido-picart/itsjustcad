@@ -3453,9 +3453,13 @@ impl App {
                             }
                             if entry.is_placeholder() {
                                 ui.label(
-                                    egui::RichText::new("· PLACEHOLDER")
+                                    egui::RichText::new("· unverified build")
                                         .weak()
                                         .italics(),
+                                )
+                                .on_hover_text(
+                                    "No SHA-256 checksum on record — \
+                                     install at your own risk.",
                                 );
                             }
                         });

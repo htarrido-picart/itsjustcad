@@ -428,6 +428,17 @@ pub fn render_control_images_headless(
 
 // ── Offscreen PNG renderer ────────────────────────────────────────────────────
 
+/// Resolve the render theme from `ITSJUSTCAD_THEME` env var.
+///
+/// Accepted values: `"light"` → [`itsjustcad_render::Theme::Light`]; anything
+/// else (including unset) → [`itsjustcad_render::Theme::Dark`].
+pub(crate) fn theme_from_env() -> itsjustcad_render::Theme {
+    match std::env::var("ITSJUSTCAD_THEME").ok().as_deref() {
+        Some("light") => itsjustcad_render::Theme::Light,
+        _ => itsjustcad_render::Theme::Dark,
+    }
+}
+
 /// Render the document to `path` using the headless wgpu path (no window).
 ///
 /// `view` carries the accumulated `view`/`camera`/`display` state from the
@@ -439,15 +450,15 @@ pub fn render_headless(
 ) -> Result<(), String> {
     use glam::DVec3;
     use itsjustcad_render::{
-        camera_uniform_ex, snapshot_with_mode, ColorModeSnapshot, SceneRenderer, Theme,
-        DEPTH_FORMAT,
+        camera_uniform_ex, snapshot_with_mode, ColorModeSnapshot, SceneRenderer, DEPTH_FORMAT,
     };
 
     const W: u32 = 1280;
     const H: u32 = 800;
     const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-    let theme = Theme::Dark;
+    // Honour ITSJUSTCAD_THEME=dark|light (default: dark).
+    let theme = theme_from_env();
     let mode = view.display;
 
     let instance = wgpu::Instance::default();
@@ -926,5 +937,47 @@ mod tests {
             Ok(_) => panic!("expected error"),
             Err((line, _)) => assert_eq!(line, "bad_verb"),
         }
+    }
+
+    /// Serialise env-var mutation tests so they don't race each other.
+    ///
+    /// `std::env::set_var` / `remove_var` are process-global; running them
+    /// concurrently across threads is UB in Rust ≥ 1.80 and produces flaky
+    /// results even on older toolchains.  A single `Mutex` serialises the
+    /// three `theme_from_env` tests inside one test binary.
+    fn with_theme_env<F: FnOnce()>(value: Option<&str>, f: F) {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("ITSJUSTCAD_THEME").ok();
+        match value {
+            Some(v) => unsafe { std::env::set_var("ITSJUSTCAD_THEME", v) },
+            None => unsafe { std::env::remove_var("ITSJUSTCAD_THEME") },
+        }
+        f();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("ITSJUSTCAD_THEME", &v) },
+            None => unsafe { std::env::remove_var("ITSJUSTCAD_THEME") },
+        }
+    }
+
+    #[test]
+    fn theme_env_dark_is_default() {
+        use itsjustcad_render::Theme;
+        with_theme_env(None, || assert_eq!(theme_from_env(), Theme::Dark));
+    }
+
+    #[test]
+    fn theme_env_light_when_set() {
+        use itsjustcad_render::Theme;
+        with_theme_env(Some("light"), || assert_eq!(theme_from_env(), Theme::Light));
+    }
+
+    #[test]
+    fn theme_env_unknown_value_falls_back_to_dark() {
+        use itsjustcad_render::Theme;
+        with_theme_env(Some("solarized"), || {
+            assert_eq!(theme_from_env(), Theme::Dark);
+        });
     }
 }
