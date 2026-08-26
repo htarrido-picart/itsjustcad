@@ -24,7 +24,7 @@ pub use config::{is_local_url, DeckConfig, DeckKind, DecksFile};
 pub use deck::{make_deck, ChatMessage, ChatRequest, DeckDelta, DeckError, LlmDeck, Role};
 pub use extract::{Extractor, ExtractEvent};
 pub use probe::{probe, warm_model, ProbeInfo, WarmOutcome};
-pub use prompt::{system_prompt, VIEW_VERB_HELP};
+pub use prompt::{system_prompt, UI_VERB_HELP, VIEW_VERB_HELP};
 pub use render_deck::{
     make_render_deck, render_config_path, Automatic1111RenderDeck, CloudRenderDeck,
     ComfyRenderDeck, ControlImages, MockRenderDeck, RenderConfig, RenderDeck, RenderDeckError,

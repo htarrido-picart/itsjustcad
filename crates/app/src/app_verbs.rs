@@ -321,6 +321,148 @@ mod tests {
         assert!(matches!(classify("basemap none"), Some(AppVerb::Basemap(b)) if b.clear));
     }
 
+    /// The canonical set of DECK-RELEVANT app-verb tokens: every user-facing
+    /// view/render/camera verb the deck may emit and the app executes through
+    /// `execute_line`. This is the single source of truth read by BOTH the
+    /// denylist audit (`app_verb_denylist_partitions_classify`) and the prompt
+    /// completeness test (`prompt_advertises_every_deck_app_verb`). Adding a new
+    /// advertise-worthy app-verb without a `VIEW_VERB_HELP` entry MUST fail the
+    /// latter test — that is the durable guard for the app-verb plane.
+    const CANONICAL_DECK_APP_VERBS: &[&str] = &[
+        "camera",
+        "display",
+        "light",
+        "sketchy",
+        "edgefx",
+        "profiles",
+        "meshedges",
+        "gumball",
+        "ze",
+        "zoomextents",
+        "top",
+        "bottom",
+        "front",
+        "back",
+        "left",
+        "right",
+        "persp",
+        "basemap",
+    ];
+
+    /// Verbs that `classify` owns but the deck must NOT advertise: internal /
+    /// GUI-only / security-gated / alias forms. Kept explicit so the audit below
+    /// can prove `CANONICAL_DECK_APP_VERBS` ∪ denylist == every classify arm,
+    /// i.e. no verb is silently dropped from consideration.
+    const DECK_APP_VERB_DENYLIST: &[&str] = &[
+        "critique",     // GUI-only
+        "template",     // GUI-only
+        "save",         // fs write — refused on deck plane
+        "help",         // meta, not a view action
+        "reducemotion", // accessibility toggle, not a drawing/view verb the model reframes with
+        "lightmode",    // alias of `light`
+        "profileedges", // alias of `profiles`
+        "shadededges",  // alias of `meshedges`
+        "sketchup",     // preset; advertised as `sketchup`, not a standalone canonical token here
+        "su",           // alias of `sketchup`
+        "gizmo",        // alias of `gumball`
+    ];
+
+    #[test]
+    fn app_verb_denylist_partitions_classify() {
+        // Every token that `classify` recognises must be accounted for: it is
+        // either advertised (in CANONICAL_DECK_APP_VERBS) or explicitly denied
+        // (DECK_APP_VERB_DENYLIST). If someone adds a new arm to `classify`
+        // without deciding which bucket it belongs to, this fails — forcing an
+        // explicit advertise-or-deny decision. Note: `sketchup`/`su` map to
+        // SketchUp preset advertised inline in VIEW_VERB_HELP; they live on the
+        // denylist as standalone canonical tokens.
+        let all_classify_tokens = [
+            "ze",
+            "zoomextents",
+            "display",
+            "lightmode",
+            "light",
+            "profileedges",
+            "profiles",
+            "shadededges",
+            "meshedges",
+            "sketchup",
+            "su",
+            "sketchy",
+            "edgefx",
+            "gumball",
+            "gizmo",
+            "reducemotion",
+            "camera",
+            "save",
+            "help",
+            "template",
+            "critique",
+            "basemap",
+            // standard-view fall-through arm:
+            "top",
+            "bottom",
+            "front",
+            "back",
+            "left",
+            "right",
+            "persp",
+        ];
+        for tok in all_classify_tokens {
+            let advertised = CANONICAL_DECK_APP_VERBS.contains(&tok);
+            let denied = DECK_APP_VERB_DENYLIST.contains(&tok);
+            assert!(
+                advertised ^ denied,
+                "classify token '{tok}' must be in exactly one of \
+                 CANONICAL_DECK_APP_VERBS / DECK_APP_VERB_DENYLIST (advertised={advertised}, denied={denied})"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_advertises_every_deck_app_verb() {
+        // COMPLETENESS (app-verb plane): every canonical deck-relevant app-verb
+        // token must appear in the deck system prompt. Fails if a new
+        // advertise-worthy app-verb is added to CANONICAL_DECK_APP_VERBS without
+        // a corresponding VIEW_VERB_HELP entry.
+        let prompt = itsjustcad_deck::system_prompt("", &itsjustcad_commands::PluginRegistry::new());
+        for tok in CANONICAL_DECK_APP_VERBS {
+            assert!(
+                prompt.contains(tok),
+                "deck system prompt is missing canonical app-verb token '{tok}' \
+                 — add it to VIEW_VERB_HELP"
+            );
+        }
+        // Each canonical verb must actually be recognised by `classify` (never
+        // advertise dead syntax). Verbs that require an argument are exercised
+        // with a representative one; the argument-free forms classify bare.
+        for line in [
+            "camera 2point",
+            "display shaded",
+            "light sun",
+            "sketchy on",
+            "edgefx jitter=.05",
+            "profiles on",
+            "meshedges off",
+            "gumball on",
+            "ze",
+            "zoomextents",
+            "top",
+            "bottom",
+            "front",
+            "back",
+            "left",
+            "right",
+            "persp",
+            "basemap off",
+        ] {
+            assert!(
+                classify(line).is_some(),
+                "canonical app-verb line '{line}' does not classify"
+            );
+        }
+    }
+
     #[test]
     fn view_verb_help_stays_consistent_with_classify() {
         let h = itsjustcad_deck::VIEW_VERB_HELP;

@@ -3,6 +3,20 @@
 
 use itsjustcad_commands::{registry, PluginRegistry, SELECTOR_HELP};
 
+// INVARIANT — three deck-executable planes, three prompt advertisements, three
+// completeness tests. The deck can drive geometry through THREE disjoint tool
+// planes, and each MUST be (a) advertised in this system prompt and (b) guarded
+// by a completeness test so a newly-added action can never silently become
+// unreachable-by-the-model:
+//   1. registry plane (substrate `Command`s) — advertised from `registry()`;
+//      test `system_prompt_lists_every_registry_command`.
+//   2. app-verb plane (view/camera/display via `app_verbs::classify`) —
+//      advertised in `VIEW_VERB_HELP`; test `prompt_advertises_every_deck_app_verb`.
+//   3. UI/session plane (`ui_plane::UiAction` via `parse_ui_action`) —
+//      advertised in `UI_VERB_HELP`; test `prompt_advertises_every_ui_action`.
+// Any new deck-executable plane must add BOTH a prompt advertisement and a
+// completeness test. Do not break this 3-plane / 3-test symmetry.
+
 /// The "View & camera commands" section of the deck system prompt.
 ///
 /// These are *app verbs*, not substrate [`registry`] commands: they change what
@@ -31,6 +45,10 @@ Display mode (how solids are drawn):
 Lighting:
   light working|sun|presentation                lighting model (alias: lightmode)                        e.g. light sun
 
+Feature edges:
+  meshedges on|off                              show/hide the default shaded feature edges (alias:       e.g. meshedges off
+                                                shadededges)
+
 Transform gizmo:
   gumball on|off|toggle                         show/hide the transform gumball (G hotkey = bare toggle) e.g. gumball on
 
@@ -53,6 +71,30 @@ Camera projection & lens:
 Site context:
   basemap [osm|sat] [span_m] [opacity]          georeferenced satellite/OSM underlay (basemap off        e.g. basemap sat 800 0.6
                                                 clears)
+";
+
+/// The "UI/session commands" section of the deck system prompt.
+///
+/// These are *UI-plane actions* (`itsjustcad::ui_plane::UiAction`), a THIRD tool
+/// plane distinct from both substrate [`registry`] commands and the view/camera
+/// app-verbs in [`VIEW_VERB_HELP`]. They change only the *window layout* — panel
+/// visibility, dock side, viewport split, active workspace, theme — persisted to
+/// `ui.json`, never the drawing or the op-log (so they never replay or undo).
+///
+/// The app parses each line with `itsjustcad::ui_plane::parse_ui_action` and
+/// applies it via `ui_plane::apply`. We advertise exactly the tokens that parser
+/// accepts, one example each, so the model can drive layout without being told
+/// syntax the dispatcher rejects. A completeness test asserts every `UiAction`
+/// variant's verb appears here.
+pub const UI_VERB_HELP: &str = "\
+## UI/session commands (app verbs — same ```draft block; change the window, not the model)
+These change only the window LAYOUT (panels, docking, viewport split, workspace, theme) — they persist to ui.json and NEVER touch the drawing or the op-log (no replay, no undo). Emit them inside the same ```draft block as everything else. Use them only when the user asks to rearrange the interface, not to draw.
+
+  panel show|hide                               show or hide the docked side panel                       e.g. panel hide
+  dock left|right                               move the docked panel to a side                          e.g. dock right
+  split 1|2|4                                   set the viewport split (1 / 2 / 4-up)                    e.g. split 4
+  workspace <name>                              switch workspace (e.g. model, layout, deck)              e.g. workspace layout
+  theme dark|light                              set the UI theme                                         e.g. theme dark
 ";
 
 /// Build the system prompt from the command registry (single source of truth)
@@ -92,6 +134,7 @@ Emit commands inside a ```draft fenced block, ONE command per line. Commands exe
 {plugin_block}
 
 {view_verbs}
+{ui_verbs}
 ## Rules
 - Points are x,y,z or x,y (z=0). No spaces inside a point. Units: bare numbers are meters; 250cm and 500mm also work.
 - 'last' refers to the most recently created object; 'last N' to the N most recent. After a command that creates an object, that object is 'last'.
@@ -121,6 +164,7 @@ box 10,0,0 4,4,3
         selectors = SELECTOR_HELP,
         plugin_block = plugin_block,
         view_verbs = VIEW_VERB_HELP,
+        ui_verbs = UI_VERB_HELP,
         scene = if scene_digest.is_empty() {
             "(empty)"
         } else {
@@ -222,6 +266,30 @@ mod tests {
         // Gumball — must be advertised so the model stops saying it doesn't exist.
         assert!(p.contains("gumball on|off|toggle"), "gumball missing from VIEW_VERB_HELP");
         assert!(p.contains("G hotkey"), "gumball G-hotkey note missing");
+        // meshedges — advertised app-verb (shadededges alias) so the model can
+        // toggle the default shaded feature edges.
+        assert!(p.contains("meshedges on|off"), "meshedges missing from VIEW_VERB_HELP");
     }
 
+    #[test]
+    fn prompt_advertises_ui_session_plane() {
+        // The UI/session plane (third deck-executable plane) is injected as its
+        // own section with the exact tokens `parse_ui_action` accepts. The
+        // authoritative variant-by-variant completeness test lives in the app
+        // crate (`ui_plane::tests::prompt_advertises_every_ui_action`), where the
+        // `UiAction` enum and its parser are in scope; here we assert the section
+        // is present and injected so the deck crate guards its own advertisement.
+        let p = system_prompt("", &PluginRegistry::new());
+        assert!(p.contains(UI_VERB_HELP), "UI_VERB_HELP not injected");
+        assert!(p.contains("## UI/session commands"));
+        for line in [
+            "panel show|hide",
+            "dock left|right",
+            "split 1|2|4",
+            "workspace <name>",
+            "theme dark|light",
+        ] {
+            assert!(p.contains(line), "UI section missing grammar '{line}'");
+        }
+    }
 }

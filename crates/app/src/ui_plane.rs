@@ -252,6 +252,51 @@ mod tests {
     }
 
     #[test]
+    fn prompt_advertises_every_ui_action() {
+        // COMPLETENESS (UI/session plane): every UiAction variant's verb must be
+        // advertised in the deck system prompt, and every advertised token must
+        // actually parse via `parse_ui_action` (never advertise dead syntax).
+        // This is the third of the three plane-completeness tests; see the
+        // 3-plane / 3-test invariant documented in `itsjustcad_deck::prompt`.
+        let prompt =
+            itsjustcad_deck::system_prompt("", &itsjustcad_commands::PluginRegistry::new());
+
+        // The whole dedicated UI section is embedded verbatim.
+        assert!(
+            prompt.contains(itsjustcad_deck::UI_VERB_HELP),
+            "UI_VERB_HELP not injected into the system prompt"
+        );
+        assert!(prompt.contains("## UI/session commands"));
+
+        // Each variant's grammar line is present with the EXACT tokens
+        // `parse_ui_action` accepts.
+        for line in [
+            "panel show|hide",
+            "dock left|right",
+            "split 1|2|4",
+            "workspace <name>",
+            "theme dark|light",
+        ] {
+            assert!(prompt.contains(line), "prompt missing UI grammar '{line}'");
+        }
+
+        // Every advertised example must actually parse — the model is never told
+        // syntax the dispatcher rejects. This exercises all five UiAction verbs.
+        for example in [
+            "panel hide",
+            "dock right",
+            "split 4",
+            "workspace layout",
+            "theme dark",
+        ] {
+            assert!(
+                parse_ui_action(example).is_ok(),
+                "prompt advertises '{example}' but parse_ui_action rejects it"
+            );
+        }
+    }
+
+    #[test]
     fn action_json_round_trips() {
         let a = UiAction::Workspace { name: "deck".into() };
         let s = serde_json::to_string(&a).unwrap();
