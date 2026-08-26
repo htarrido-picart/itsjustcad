@@ -317,6 +317,52 @@ fn commands_card(ui: &mut egui::Ui, commands: &[ExecutedCommand]) -> bool {
     .clicked()
 }
 
+/// One clickable SESSION card for the Sessions tab: TITLE (panel-title weight)
+/// over a 1-2 line SUMMARY (secondary color) with a trailing DATE (tertiary).
+/// The whole card is a click target; returns `true` when clicked (→ load it).
+fn session_card(
+    ui: &mut egui::Ui,
+    session: &crate::chat_store::ChatSession,
+    secondary: egui::Color32,
+    tertiary: egui::Color32,
+    outline: egui::Color32,
+) -> bool {
+    // A short fallback summary if none was derived/generated yet.
+    let summary = if session.summary.trim().is_empty() {
+        session
+            .turns
+            .iter()
+            .find(|t| t.role == "user")
+            .map(|t| t.content.clone())
+            .unwrap_or_else(|| "(empty conversation)".to_string())
+    } else {
+        session.summary.clone()
+    };
+    let date = crate::chat_store::fmt_date(session.updated);
+
+    let resp = egui::Frame::group(ui.style())
+        .stroke(egui::Stroke::new(1.0, outline))
+        .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Title — panel-title weight (semibold-ish via .strong()).
+            ui.label(egui::RichText::new(&session.title).strong().size(15.0));
+            // Summary — secondary color, wraps to 1-2 lines.
+            ui.label(egui::RichText::new(summary).color(secondary).size(12.0));
+            // Date — tertiary, right-aligned metadata.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(date).color(tertiary).size(11.0));
+            });
+        })
+        .response;
+    let resp = resp.interact(egui::Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.add_space(4.0);
+    resp.clicked()
+}
+
 /// Full formatted code view for the detail pane.
 fn render_command_code(ui: &mut egui::Ui, commands: &[ExecutedCommand]) {
     let font = egui::TextStyle::Monospace.resolve(ui.style());
@@ -621,6 +667,10 @@ impl DeckPane {
             };
             session.push(role, &m.content, now);
         }
+        // Auto-generate title + summary. The fallback (first prompt + a preview
+        // of the first exchange) never calls a model, so headless/tests are
+        // safe. A lightweight LLM pass may replace this later (guarded).
+        session.derive_meta();
         store.sessions.push(session);
         store.sort_recent();
         store.save();
@@ -1300,74 +1350,98 @@ impl DeckPane {
         let mut a = crate::chat_store::ChatSession::new(200);
         a.push("user", "make a five by five office core with a stair", 200);
         a.push("assistant", "Drew the core and a stair to level 2.", 201);
+        a.derive_meta();
         let mut b = crate::chat_store::ChatSession::new(100);
         b.push("user", "add a curtain wall facade to the north side", 100);
         b.push("assistant", "Added a glass facade along the north edge.", 101);
+        b.derive_meta();
         store.sessions.push(a);
         store.sessions.push(b);
         store.sort_recent();
     }
 
-    /// Multi-session switcher + full-text search over the current document's
-    /// stored chats. A search field lists matching sessions with a snippet;
-    /// clicking a session loads its transcript (jumping to the matched turn).
-    /// Collapsed by default so it never crowds the live chat.
-    fn session_browser_ui(&mut self, ui: &mut egui::Ui, icons: &crate::icons::Icons) {
-        let Some(store) = self.store.as_ref() else { return };
-        let count = store.sessions.len();
-        // A Lucide "sessions" mark, tinted to the header text, drawn in the
-        // header's disclosure-icon slot (replacing the bare 💬 emoji). The mark
-        // is cheap to re-decode via the shared raster cache; painting it in the
-        // icon slot keeps one aligned "<icon> sessions (n)" row.
-        let tex = icons.texture_id(ui.ctx(), crate::icons::Icon::Sessions);
-        egui::CollapsingHeader::new(format!("sessions ({count})"))
-            .id_salt("deck_sessions")
-            .default_open(count > 0)
-            .icon(move |ui, _openness, resp| {
-                let c = ui.visuals().text_color();
-                egui::Image::new((tex, resp.rect.size()))
-                    .tint(c)
-                    .paint_at(ui, resp.rect);
-            })
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("search:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.session_search)
-                            .hint_text("find across this doc's chats")
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                let mut load_session: Option<String> = None;
-                // Re-borrow the store immutably for the results (search_field is
-                // a separate field, so this does not alias).
-                let store = self.store.as_ref().expect("store present");
-                if !self.session_search.trim().is_empty() {
-                    let hits = store.search(&self.session_search);
-                    if hits.is_empty() {
-                        ui.label(egui::RichText::new("no matches").weak().italics());
-                    }
-                    for hit in hits.iter().take(20) {
-                        let label = format!("{} — {}", hit.session_title, hit.snippet);
-                        if ui.selectable_label(false, label).clicked() {
-                            load_session = Some(hit.session_id.clone());
-                        }
-                    }
-                } else {
-                    for s in store.sessions.iter().take(20) {
-                        let turns = s.turns.len();
-                        if ui
-                            .selectable_label(false, format!("{} ({turns})", s.title))
-                            .clicked()
-                        {
-                            load_session = Some(s.id.clone());
-                        }
+    /// The **Sessions** tab body: a full-text SEARCH field at the top, then this
+    /// document's stored chats as CARDS (title + 1-2 line summary + date),
+    /// newest→oldest. Clicking a card loads it into the live Chat pane; the
+    /// caller switches the active tab to Chat when this returns `true`.
+    ///
+    /// This was promoted OUT of the Chat pane (`session_browser_ui`) into its own
+    /// tab. Returns `true` iff a session was loaded this frame.
+    #[must_use]
+    pub fn sessions_tab_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        roles: &crate::theme::ColorRoles,
+    ) -> bool {
+        if self.store.is_none() {
+            ui.label(egui::RichText::new("no chats yet for this document").weak().italics());
+            return false;
+        }
+        // Ensure newest-first ordering for the card list.
+        if let Some(store) = self.store.as_mut() {
+            store.sort_recent();
+        }
+        let secondary = crate::theme::to_color32(roles.on_surface_variant);
+        let tertiary = crate::theme::to_color32(roles.on_surface_tertiary);
+        let outline = crate::theme::to_color32(roles.outline);
+
+        ui.horizontal(|ui| {
+            ui.label("search:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.session_search)
+                    .hint_text("find across this doc's chats")
+                    .desired_width(f32::INFINITY),
+            );
+        });
+        ui.add_space(4.0);
+
+        let mut load_session: Option<String> = None;
+        let store = self.store.as_ref().expect("store present");
+        let query = self.session_search.trim().to_string();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if !query.is_empty() {
+                // Filter cards to sessions with a matching title/summary/message.
+                let hits = store.search(&query);
+                let ql = query.to_lowercase();
+                let matched: Vec<&crate::chat_store::ChatSession> = store
+                    .sessions
+                    .iter()
+                    .filter(|s| {
+                        hits.iter().any(|h| h.session_id == s.id)
+                            || s.title.to_lowercase().contains(&ql)
+                            || s.summary.to_lowercase().contains(&ql)
+                    })
+                    .collect();
+                if matched.is_empty() {
+                    ui.label(egui::RichText::new("no matches").weak().italics());
+                }
+                for s in matched {
+                    if session_card(ui, s, secondary, tertiary, outline) {
+                        load_session = Some(s.id.clone());
                     }
                 }
-                if let Some(id) = load_session {
-                    self.load_stored_session(&id);
+            } else if store.sessions.is_empty() {
+                ui.label(
+                    egui::RichText::new("no chats yet for this document")
+                        .weak()
+                        .italics(),
+                );
+            } else {
+                for s in store.sessions.iter() {
+                    if session_card(ui, s, secondary, tertiary, outline) {
+                        load_session = Some(s.id.clone());
+                    }
                 }
-            });
+            }
+        });
+
+        if let Some(id) = load_session {
+            self.load_stored_session(&id);
+            true
+        } else {
+            false
+        }
     }
 
     /// Load a stored session's turns into the live transcript for viewing /
@@ -1633,7 +1707,9 @@ impl DeckPane {
         }
         ui.separator();
 
-        self.session_browser_ui(ui, icons);
+        // The session browser used to live here inside the Chat pane; it has
+        // been promoted OUT into its own "Sessions" tab (see `sessions_tab_ui`),
+        // so the Chat pane is now just the live conversation.
 
         // Child pane: full command code view with a back button.
         if let Some(commands_view) = match self.view {
@@ -1890,6 +1966,59 @@ mod side_effect_gate_tests {
     }
 
     // --- Opt-in web search gating at the request-build boundary ---
+
+    #[test]
+    fn archive_derives_title_and_summary() {
+        // Archiving the live conversation must auto-fill title + summary (the
+        // fallback, no model) so the Sessions cards are populated.
+        let mut pane = blank_pane();
+        pane.store = Some(crate::chat_store::DocSessions::new(
+            "11112222-3333-4444-5555-666677778888".into(),
+        ));
+        pane.messages = vec![
+            ChatMessage { role: Role::User, content: "make a five by five core".into() },
+            ChatMessage { role: Role::Assistant, content: "Drew the core.".into() },
+        ];
+        pane.archive_current_session();
+        let store = pane.store.as_ref().unwrap();
+        assert_eq!(store.sessions.len(), 1);
+        let s = &store.sessions[0];
+        assert_eq!(s.title, "make a five by five core");
+        assert!(s.summary.contains("core"), "summary populated: {}", s.summary);
+        assert!(!s.summary.is_empty());
+    }
+
+    #[test]
+    fn load_stored_session_replaces_live_transcript() {
+        // Clicking a session card loads that session's turns into the live Chat
+        // (state change), archiving whatever was live first so nothing is lost.
+        let mut pane = blank_pane();
+        let mut store = crate::chat_store::DocSessions::new(
+            "aaaa1111-2222-3333-4444-555566667777".into(),
+        );
+        let mut a = crate::chat_store::ChatSession::new(10);
+        a.push("user", "stored ask", 10);
+        a.push("assistant", "stored reply", 11);
+        a.derive_meta();
+        let id = a.id.clone();
+        store.sessions.push(a);
+        pane.store = Some(store);
+
+        // A different live conversation is present.
+        pane.messages = vec![ChatMessage { role: Role::User, content: "live one".into() }];
+
+        pane.load_stored_session(&id);
+        // The live transcript is now the stored session's turns.
+        assert_eq!(pane.messages.len(), 2);
+        assert_eq!(pane.messages[0].content, "stored ask");
+        assert_eq!(pane.messages[1].content, "stored reply");
+        assert!(matches!(pane.view, PaneView::Chat));
+        // The previously-live conversation was archived (not lost).
+        assert!(
+            pane.store.as_ref().unwrap().sessions.iter().any(|s| s.title == "live one"),
+            "prior live conversation must be archived"
+        );
+    }
 
     #[test]
     fn web_search_flag_defaults_off_and_mirrors_into_request() {

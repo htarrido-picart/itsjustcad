@@ -31,6 +31,12 @@ pub struct ChatSession {
     pub id: String,
     /// Human-facing title (defaults to the first user line, truncated).
     pub title: String,
+    /// A 1-2 line summary of the conversation, shown on the session CARD under
+    /// the title. Serde-defaults to empty for stores written before this field
+    /// existed; [`ChatSession::derive_meta`] fills a fallback from the first
+    /// exchange (a lightweight LLM pass may replace it later).
+    #[serde(default)]
+    pub summary: String,
     /// Unix seconds of the last update; drives newest-first ordering.
     pub updated: u64,
     pub turns: Vec<Turn>,
@@ -42,6 +48,7 @@ impl ChatSession {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             title: "New chat".to_string(),
+            summary: String::new(),
             updated: now,
             turns: Vec::new(),
         }
@@ -56,6 +63,17 @@ impl ChatSession {
         self.turns.push(Turn { role: role.into(), content: content.into() });
         self.updated = now;
     }
+
+    /// Fallback title + summary from the first exchange, used whenever no LLM
+    /// pass has run (headless, tests, offline, or before the session grows).
+    /// Title = first user prompt (truncated); summary = the first user prompt
+    /// plus a short preview of the first assistant reply. Never calls a model.
+    pub fn derive_meta(&mut self) {
+        if let Some(first_user) = self.turns.iter().find(|t| t.role == "user") {
+            self.title = title_from(&first_user.content);
+        }
+        self.summary = summary_from_turns(&self.turns);
+    }
 }
 
 /// First line of `content`, trimmed to 48 chars, as a session title.
@@ -66,6 +84,32 @@ fn title_from(content: &str) -> String {
     } else {
         let cut: String = first.chars().take(47).collect();
         format!("{cut}…")
+    }
+}
+
+/// Short preview (≤ `max` chars, single line) of a message body.
+fn preview(content: &str, max: usize) -> String {
+    let flat: String = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+/// Fallback summary: the first user ask, then a preview of the first assistant
+/// reply (when present), joined into a 1-2 line blurb.
+fn summary_from_turns(turns: &[Turn]) -> String {
+    let user = turns.iter().find(|t| t.role == "user");
+    let assistant = turns.iter().find(|t| t.role == "assistant");
+    match (user, assistant) {
+        (Some(u), Some(a)) => {
+            format!("{} → {}", preview(&u.content, 60), preview(&a.content, 80))
+        }
+        (Some(u), None) => preview(&u.content, 120),
+        (None, Some(a)) => preview(&a.content, 120),
+        (None, None) => String::new(),
     }
 }
 
@@ -166,6 +210,25 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// Format a Unix-seconds timestamp as a UTC `YYYY-MM-DD` date for a session
+/// card. Pure civil-date arithmetic (no chrono dep) so it is unit-testable and
+/// deterministic. Based on Howard Hinnant's days-from-civil algorithm.
+pub fn fmt_date(unix: u64) -> String {
+    let days = (unix / 86_400) as i64;
+    // Shift epoch to 0000-03-01 so leap days land at the end of the era.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// App-local path for a document's chat store: `~/.config/itsjustcad/chats/<uuid>.json`.
@@ -302,6 +365,57 @@ mod tests {
         let back: DocSessions = serde_json::from_str(&json).unwrap();
         assert_eq!(back, docs);
         assert_eq!(back.doc_uuid, docs.doc_uuid);
+    }
+
+    #[test]
+    fn derive_meta_builds_fallback_title_and_summary() {
+        let mut s = ChatSession::new(0);
+        s.push("user", "make a five by five office core with a stair", 0);
+        s.push("assistant", "Drew the core and added a stair to level 2.", 1);
+        s.derive_meta();
+        assert_eq!(s.title, "make a five by five office core with a stair");
+        assert!(s.summary.contains("office core"), "summary keeps the ask: {}", s.summary);
+        assert!(s.summary.contains('→'), "summary joins ask→reply: {}", s.summary);
+        assert!(s.summary.contains("stair"), "summary previews the reply: {}", s.summary);
+    }
+
+    #[test]
+    fn derive_meta_user_only_summary() {
+        let mut s = ChatSession::new(0);
+        s.push("user", "add a curtain wall", 0);
+        s.derive_meta();
+        assert_eq!(s.title, "add a curtain wall");
+        assert_eq!(s.summary, "add a curtain wall");
+    }
+
+    #[test]
+    fn summary_field_serde_defaults_when_absent() {
+        // A store written BEFORE `summary` existed: the field is absent from the
+        // JSON. Deserialize must succeed and default the summary to "".
+        let legacy = r#"{
+            "doc_uuid": "11112222-3333-4444-5555-666677778888",
+            "sessions": [
+                {
+                    "id": "aaaa",
+                    "title": "old session",
+                    "updated": 42,
+                    "turns": [{ "role": "user", "content": "hi" }]
+                }
+            ]
+        }"#;
+        let docs: DocSessions = serde_json::from_str(legacy).expect("legacy load");
+        assert_eq!(docs.sessions.len(), 1);
+        assert_eq!(docs.sessions[0].summary, "", "missing summary defaults to empty");
+        assert_eq!(docs.sessions[0].title, "old session");
+    }
+
+    #[test]
+    fn fmt_date_formats_known_epochs() {
+        assert_eq!(fmt_date(0), "1970-01-01");
+        // 2021-01-01 00:00:00 UTC = 1609459200
+        assert_eq!(fmt_date(1_609_459_200), "2021-01-01");
+        // 2020-02-29 (leap day) 00:00:00 UTC = 1582934400
+        assert_eq!(fmt_date(1_582_934_400), "2020-02-29");
     }
 
     #[test]

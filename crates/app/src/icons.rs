@@ -314,6 +314,7 @@ impl Icons {
     /// For call sites that must paint into a `'static` closure (e.g. a
     /// [`egui::CollapsingHeader`] disclosure-icon slot) where the `&Icons` borrow
     /// cannot be captured.
+    #[allow(dead_code)] // retained API for `'static` icon painters (no live caller after Sessions tab)
     pub fn texture_id(&self, ctx: &egui::Context, icon: Icon) -> egui::TextureId {
         self.texture(ctx, icon).id()
     }

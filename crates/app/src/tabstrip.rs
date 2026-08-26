@@ -9,36 +9,57 @@
 //! dependency, so its transitions are unit-tested standalone. The `ui` helper
 //! only draws the strip and reports clicks back.
 
-/// The tabs of the right docked panel. Two workspaces:
-///   - `Model`: Layers **and** Properties shown together as stacked,
-///     independently-collapsible sections (Rhino-style — both visible at once,
-///     not one-or-the-other).
-///   - `Deck`: the embedded LLM chat, shown to the user as "Chat" (the
-///     deck/cassette internals keep their names — no module/type churn).
+/// The tabs of the right docked panel, in display order:
+///   - `Deck` (**Chat**): the embedded LLM chat. FIRST and default-selected on
+///     open. The deck/cassette internals keep their names — no module churn.
+///   - `Sessions`: a browser of this document's stored chats as cards
+///     (title + summary + date), with full-text search. Clicking a card loads
+///     it into the Chat tab. Promoted OUT of the Chat pane into its own tab.
+///   - `Layers` (was "Model"): Layers **and** Properties shown together as
+///     stacked, independently-collapsible sections (Rhino-style).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelTab {
-    Model,
     Deck,
+    Sessions,
+    Model,
 }
 
 impl PanelTab {
-    /// All tabs in display order.
-    pub const ALL: [PanelTab; 2] = [PanelTab::Model, PanelTab::Deck];
+    /// All tabs in display order (Chat first).
+    pub const ALL: [PanelTab; 3] = [PanelTab::Deck, PanelTab::Sessions, PanelTab::Model];
 
     pub fn label(self) -> &'static str {
         match self {
-            PanelTab::Model => "Model",
             PanelTab::Deck => "Chat",
+            PanelTab::Sessions => "Sessions",
+            PanelTab::Model => "Layers",
         }
     }
 
     /// The Lucide [`crate::icons::Icon`] shown beside this tab's label.
     pub fn icon(self) -> crate::icons::Icon {
         match self {
-            PanelTab::Model => crate::icons::Icon::Layers,
             PanelTab::Deck => crate::icons::Icon::Chat,
+            PanelTab::Sessions => crate::icons::Icon::Sessions,
+            PanelTab::Model => crate::icons::Icon::Layers,
         }
     }
+}
+
+/// The ONE constant width (points) the right dock renders at for ALL tabs.
+/// This is the Layers panel's width; Chat and Sessions render at the same
+/// width so switching tabs never resizes the dock. The user may still drag to
+/// resize (the dragged width persists across tab switches), but a tab switch
+/// alone always leaves the width unchanged — see [`dock_width`].
+pub const DOCK_WIDTH: f32 = 320.0;
+
+/// The dock's render width for a given tab and a (possibly user-dragged) stored
+/// width. The width is INDEPENDENT of which tab is active: every tab renders at
+/// the same `stored` width (seeded from [`DOCK_WIDTH`]). This is the single
+/// source of truth the panel reads, so a tab switch can never change the width.
+pub fn dock_width(_tab: PanelTab, stored: f32) -> f32 {
+    // Deliberately ignores `tab`: constant width across all tabs.
+    stored
 }
 
 /// Panel tab-strip state: the active tab and a collapsed flag. Pure; the
@@ -51,8 +72,9 @@ pub struct TabState {
 
 impl Default for TabState {
     fn default() -> Self {
+        // Chat is the default-selected tab on open.
         Self {
-            active: PanelTab::Model,
+            active: PanelTab::Deck,
             collapsed: false,
         }
     }
@@ -196,70 +218,99 @@ mod tests {
     }
 
     #[test]
-    fn default_is_model_open() {
+    fn default_is_chat_open() {
         let s = TabState::default();
-        assert_eq!(s.active(), PanelTab::Model);
+        assert_eq!(s.active(), PanelTab::Deck); // "Chat"
         assert!(!s.is_collapsed());
     }
 
     #[test]
     fn click_other_tab_activates_it() {
         let mut s = TabState::default();
-        s.click(PanelTab::Deck);
-        assert_eq!(s.active(), PanelTab::Deck);
+        s.click(PanelTab::Model);
+        assert_eq!(s.active(), PanelTab::Model);
         assert!(!s.is_collapsed());
     }
 
     #[test]
-    fn two_tabs_model_and_chat_no_history_no_deck_label() {
-        // Rhino-style: Layers+Properties live TOGETHER under one "Model"
-        // workspace; the only tabs are Model and Chat. History was dropped (the
-        // command line is the op-log); the Deck variant shows as "Chat".
-        assert_eq!(PanelTab::ALL.len(), 2);
+    fn three_tabs_chat_first_then_sessions_then_layers() {
+        // Chat is FIRST (and default). Sessions is its own tab. "Model" now
+        // shows as "Layers". No History/Deck/Model labels leak.
+        assert_eq!(PanelTab::ALL.len(), 3);
         let labels: Vec<_> = PanelTab::ALL.iter().map(|t| t.label()).collect();
-        assert_eq!(labels, ["Model", "Chat"]);
+        assert_eq!(labels, ["Chat", "Sessions", "Layers"]);
+        assert_eq!(labels[0], "Chat", "Chat must be the first tab");
         assert!(!labels.contains(&"History"));
-        assert!(!labels.contains(&"Layers"));
+        assert!(!labels.contains(&"Model"));
         assert!(!labels.contains(&"Deck"));
-        assert_eq!(PanelTab::Deck.label(), "Chat");
     }
 
     #[test]
     fn click_active_tab_collapses_then_expands() {
         let mut s = TabState::default();
-        s.click(PanelTab::Model); // active → collapse
+        s.click(PanelTab::Deck); // active (Chat) → collapse
         assert!(s.is_collapsed());
-        assert_eq!(s.active(), PanelTab::Model);
-        s.click(PanelTab::Model); // active again → expand
+        assert_eq!(s.active(), PanelTab::Deck);
+        s.click(PanelTab::Deck); // active again → expand
         assert!(!s.is_collapsed());
     }
 
     #[test]
     fn click_different_tab_while_collapsed_expands() {
         let mut s = TabState::default();
-        s.click(PanelTab::Model); // collapse
+        s.click(PanelTab::Deck); // collapse (Chat is active)
         assert!(s.is_collapsed());
-        s.click(PanelTab::Deck); // switch → must expand
-        assert_eq!(s.active(), PanelTab::Deck);
+        s.click(PanelTab::Model); // switch → must expand
+        assert_eq!(s.active(), PanelTab::Model);
         assert!(!s.is_collapsed());
     }
 
     #[test]
     fn show_forces_tab_open() {
         let mut s = TabState::default();
-        s.click(PanelTab::Model); // collapse
-        s.show(PanelTab::Deck);
-        assert_eq!(s.active(), PanelTab::Deck);
+        s.click(PanelTab::Deck); // collapse
+        s.show(PanelTab::Model);
+        assert_eq!(s.active(), PanelTab::Model);
+        assert!(!s.is_collapsed());
+    }
+
+    #[test]
+    fn dock_width_is_constant_across_tab_switches() {
+        // The width source must return the SAME width for every tab, so
+        // switching tabs never resizes the dock.
+        let stored = DOCK_WIDTH;
+        let w_chat = dock_width(PanelTab::Deck, stored);
+        let w_sessions = dock_width(PanelTab::Sessions, stored);
+        let w_layers = dock_width(PanelTab::Model, stored);
+        assert_eq!(w_chat, w_sessions);
+        assert_eq!(w_sessions, w_layers);
+        assert_eq!(w_chat, DOCK_WIDTH);
+    }
+
+    #[test]
+    fn dock_width_preserves_user_drag_across_tabs() {
+        // A user-dragged width persists identically for every tab.
+        let dragged = 412.0;
+        for tab in PanelTab::ALL {
+            assert_eq!(dock_width(tab, dragged), dragged);
+        }
+    }
+
+    #[test]
+    fn sessions_tab_is_selectable() {
+        let mut s = TabState::default();
+        s.show(PanelTab::Sessions);
+        assert_eq!(s.active(), PanelTab::Sessions);
         assert!(!s.is_collapsed());
     }
 
     #[test]
     fn toggle_collapsed_keeps_active() {
-        let mut s = TabState::default();
-        s.click(PanelTab::Deck);
+        let mut s = TabState::default(); // Chat active
+        s.click(PanelTab::Model); // switch to a non-active tab (Layers)
         s.toggle_collapsed();
         assert!(s.is_collapsed());
-        assert_eq!(s.active(), PanelTab::Deck);
+        assert_eq!(s.active(), PanelTab::Model);
     }
 
     #[test]

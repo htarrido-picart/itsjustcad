@@ -344,8 +344,13 @@ pub struct App {
     /// Retained for the `critique` verb (reveals the Deck tab); the right panel's
     /// own visibility is governed by `panel_tabs`.
     deck_visible: bool,
-    /// Right docked panel tab state (Layers/Properties/History/Deck).
+    /// Right docked panel tab state (Chat/Sessions/Layers).
     panel_tabs: crate::tabstrip::TabState,
+    /// The ONE dock width (points) shared by ALL tabs. Seeded from
+    /// [`crate::tabstrip::DOCK_WIDTH`]; a user drag updates it, but switching
+    /// tabs never changes it (the panel always renders at this width). This is
+    /// the single width source of truth — see `right_panel`.
+    dock_width: f32,
     /// Whether the right docked panel is shown at all (Cmd+\ hides/shows).
     panel_visible: bool,
     /// When true, all animated progress bars (warm-up, download) run without
@@ -566,6 +571,7 @@ impl App {
             underlay_cache: None,
             deck_visible,
             panel_tabs: crate::tabstrip::TabState::default(),
+            dock_width: crate::tabstrip::DOCK_WIDTH,
             panel_visible: true,
             reduce_motion: load_reduce_motion(),
             show_about: false,
@@ -727,10 +733,23 @@ impl App {
             self.deck_pane
                 .send_text(&prompt, &self.session, &self.tokio);
         } else if std::env::var("ITSJUSTCAD_DECK_PANE").is_ok() {
-            // Dev hook: reveal the Deck tab (no send) so ITSJUSTCAD_SHOT frames
-            // capture the chat pane chrome — session switcher/search + the
-            // opt-in web-search toggle — without needing a live model.
-            self.panel_tabs.show(crate::tabstrip::PanelTab::Deck);
+            // Dev hook: reveal the Sessions tab (no send) so ITSJUSTCAD_SHOT
+            // frames capture the promoted session browser — search field + the
+            // newest-first session CARDS (title/summary/date) — without a model.
+            self.panel_tabs.show(crate::tabstrip::PanelTab::Sessions);
+        }
+        // Dev/screenshot hook: force a specific right-dock tab so each tab can be
+        // shot at the (constant) dock width. chat|sessions|layers.
+        if let Ok(tab) = std::env::var("ITSJUSTCAD_PANEL_TAB") {
+            let t = match tab.to_ascii_lowercase().as_str() {
+                "sessions" => Some(crate::tabstrip::PanelTab::Sessions),
+                "layers" | "model" => Some(crate::tabstrip::PanelTab::Model),
+                "chat" | "deck" => Some(crate::tabstrip::PanelTab::Deck),
+                _ => None,
+            };
+            if let Some(t) = t {
+                self.panel_tabs.show(t);
+            }
         }
     }
 
@@ -3007,12 +3026,21 @@ impl App {
                     4,
                 )),
         );
+        // FIXED PANEL WIDTH: the dock renders at ONE constant width for ALL tabs
+        // (Chat/Sessions/Layers). `dock_width` is the single source of truth
+        // (seeded from `tabstrip::DOCK_WIDTH`); switching tabs never changes it.
+        // The user may still drag to resize — we read the resulting width back
+        // into `dock_width` after `show`, so the dragged width persists across
+        // tab switches. `tabstrip::dock_width` proves the width is tab-agnostic.
+        let width = crate::tabstrip::dock_width(self.panel_tabs.active(), self.dock_width);
         panel = if collapsed {
-            panel.default_size(120.0).min_size(90.0)
+            // Even collapsed, hold the same width so toggling collapse/tabs
+            // never jumps the dock edge.
+            panel.exact_size(width)
         } else {
-            panel.default_size(320.0).min_size(240.0)
+            panel.default_size(width).min_size(240.0)
         };
-        panel.show(ui, |ui| {
+        let panel_resp = panel.show(ui, |ui| {
             // Header row: chevron + tab strip.
             ui.horizontal(|ui| {
                 if self
@@ -3066,6 +3094,21 @@ impl App {
                             self.layers_tab(ui, theme);
                         });
                     }
+                    PanelTab::Sessions => {
+                        // Promoted session browser: search + newest-first cards.
+                        // A card click loads that session into the live Chat and
+                        // switches the active tab to Chat.
+                        let tk = preset::preset_for(self.cad_origin).tokens();
+                        ui.horizontal(|ui| {
+                            section_icon(ui, &self.icons, crate::icons::Icon::Sessions);
+                            ui.strong("Sessions");
+                        });
+                        ui.add_space(4.0);
+                        if self.deck_pane.sessions_tab_ui(ui, &tk.colors) {
+                            self.panel_tabs.show(PanelTab::Deck);
+                            self.deck_visible = true;
+                        }
+                    }
                     PanelTab::Deck => {
                         let tk = preset::preset_for(self.cad_origin).tokens();
                         self.deck_pane.ui(
@@ -3081,6 +3124,15 @@ impl App {
                 }
             });
         });
+        // Read back the (possibly user-dragged) width so the drag persists
+        // across tab switches. The panel keeps the SAME id for every tab, so
+        // this width is shared by all tabs — a tab switch alone never changes it.
+        if !collapsed {
+            let w = panel_resp.response.rect.width();
+            if w.is_finite() && w > 1.0 {
+                self.dock_width = w;
+            }
+        }
     }
 
     /// Layers tab wrapper: runs the layers UI then commits any pending edits.
@@ -4404,7 +4456,9 @@ impl eframe::App for App {
         // private — never written into the shared drawing.
         let doc_uuid = self.ensure_doc_uuid();
         self.deck_pane.sync_store(&doc_uuid);
-        if std::env::var("ITSJUSTCAD_DECK_PANE").is_ok() {
+        if std::env::var("ITSJUSTCAD_DECK_PANE").is_ok()
+            || std::env::var("ITSJUSTCAD_PANEL_TAB").as_deref() == Ok("sessions")
+        {
             self.deck_pane.seed_demo_sessions();
         }
 
