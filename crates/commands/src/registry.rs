@@ -103,6 +103,36 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Solid,
         },
         CommandSpec {
+            name: "geodesic",
+            usage: "geodesic <frequency> <radius> [dome|full]",
+            summary: "Geodesic dome/sphere (Buckminster Fuller): subdivide an icosahedron 'frequency' times, project to a sphere of 'radius', render edges as struts. 'dome' (default) keeps the upper hemisphere; 'full' builds the whole sphere. Example: geodesic 3 5 dome",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "spaceframe",
+            usage: "spaceframe <nx> <ny> <bay> <depth>",
+            summary: "Double-layer space-frame grid: nx×ny bays at 'bay' spacing, top and offset bottom chord layers 'depth' apart, tied by pyramid diagonals. Example: spaceframe 6 4 3 1.5",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "hypar",
+            usage: "hypar <a> <b> <c> [nu] [nv]",
+            summary: "Hyperbolic-paraboloid (Candela) saddle shell z = x*y/c over [-a,a]×[-b,b], meshed nu×nv (default 12). Example: hypar 5 5 5",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "gaussvault",
+            usage: "gaussvault <span> <length> <rise> [undulate]",
+            summary: "Gaussian catenary brick vault (Dieste): a catenary section of 'span'/'rise' swept along 'length'; add 'undulate' for the signature sinusoidal double-curvature. Example: gaussvault 6 12 3 undulate",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "gridshell",
+            usage: "gridshell hypar <a> <b> <c> [nu] [nv] | gridshell vault <span> <length> <rise> [undulate] [nu] [nv]",
+            summary: "Lattice of laths on a doubly-curved surface (a hypar or a gauss vault), rendered as a reciprocal net of struts. Example: gridshell hypar 5 5 5 · gridshell vault 6 12 3 undulate",
+            category: Category::Structure,
+        },
+        CommandSpec {
             name: "line",
             usage: "line <a x,y,z> <b x,y,z>",
             summary: "Line segment. Example: line 0,0,0 10,0,0",

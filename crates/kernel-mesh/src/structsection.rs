@@ -24,6 +24,15 @@ pub enum Section {
     IWideFlange { d: f64, bf: f64, tf: f64, tw: f64 },
     /// Hollow circular pipe: outer diameter `d`, wall thickness `t`.
     Pipe { d: f64, t: f64 },
+    /// Engineered-timber member (glulam / CLT panel edge): a solid rectangle
+    /// `w` wide by `h` deep. Modeled geometrically like a rectangle; the variant
+    /// records that it is timber for scheduling and material takeoff.
+    Timber { w: f64, h: f64 },
+    /// Guadua / bamboo culm: a round hollow section, outer diameter `d`, wall
+    /// thickness `t`. Geometrically the same outer ring as a pipe; kept distinct
+    /// so downstream takeoff/labels read "bamboo" and to reserve room for a
+    /// tapered variant later.
+    Guadua { d: f64, t: f64 },
 }
 
 impl Section {
@@ -45,7 +54,17 @@ impl Section {
             }
             Section::Circular { d } => circle(d * 0.5, 32),
             Section::Pipe { d, .. } => circle(d * 0.5, 32),
+            Section::Guadua { d, .. } => circle(d * 0.5, 32),
             Section::IWideFlange { d, bf, tf, tw } => iwf(d, bf, tf, tw),
+            Section::Timber { w, h } => {
+                let (x, y) = (w * 0.5, h * 0.5);
+                vec![
+                    DVec2::new(-x, -y),
+                    DVec2::new(x, -y),
+                    DVec2::new(x, y),
+                    DVec2::new(-x, y),
+                ]
+            }
         }
     }
 
@@ -63,6 +82,12 @@ impl Section {
             Section::IWideFlange { d, bf, tf, tw } => {
                 // Two flanges + web between them.
                 2.0 * bf * tf + (d - 2.0 * tf).max(0.0) * tw
+            }
+            Section::Timber { w, h } => w * h,
+            Section::Guadua { d, t } => {
+                let ro = d * 0.5;
+                let ri = (ro - t).max(0.0);
+                std::f64::consts::PI * (ro * ro - ri * ri)
             }
         }
     }
@@ -133,5 +158,20 @@ mod tests {
         assert!(
             (Section::Pipe { d: 2.0, t: 0.1 }.area() - std::f64::consts::PI * 0.19).abs() < 1e-12
         );
+    }
+
+    #[test]
+    fn timber_and_guadua_boundary_and_area() {
+        // Timber is a rectangle: 4 corners, area w*h.
+        let t = Section::Timber { w: 0.2, h: 0.4 };
+        assert_eq!(t.boundary().len(), 4);
+        assert!((t.area() - 0.08).abs() < 1e-12);
+        // Guadua is a round hollow culm: 32-gon outer ring, hollow-tube area.
+        let g = Section::Guadua { d: 0.1, t: 0.01 };
+        assert_eq!(g.boundary().len(), 32);
+        let ro = 0.05;
+        let ri = 0.04;
+        let expected = std::f64::consts::PI * (ro * ro - ri * ri);
+        assert!((g.area() - expected).abs() < 1e-12);
     }
 }

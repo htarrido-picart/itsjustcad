@@ -1172,6 +1172,18 @@ fn write_profile(body: &mut String, ids: &mut Ids, section: &Section, name: &str
             num(tw),
             num(tf)
         ),
+        // Timber glulam/CLT edge → rectangle profile (material carries "timber").
+        Section::Timber { w, h } => format!(
+            "IFCRECTANGLEPROFILEDEF(.AREA.,'{label}',$,{},{})",
+            num(w),
+            num(h)
+        ),
+        // Guadua/bamboo culm → hollow circle profile.
+        Section::Guadua { d, t } => format!(
+            "IFCCIRCLEHOLLOWPROFILEDEF(.AREA.,'{label}',$,{},{})",
+            num(d * 0.5),
+            num(t)
+        ),
     };
     line(body, profile, &entity);
     profile
@@ -2118,6 +2130,12 @@ fn sections_equal(a: &Section, b: &Section) -> bool {
             Section::IWideFlange { d: d1, bf: bf1, tf: tf1, tw: tw1 },
             Section::IWideFlange { d: d2, bf: bf2, tf: tf2, tw: tw2 },
         ) => eq(*d1, *d2) && eq(*bf1, *bf2) && eq(*tf1, *tf2) && eq(*tw1, *tw2),
+        (Section::Timber { w: w1, h: h1 }, Section::Timber { w: w2, h: h2 }) => {
+            eq(*w1, *w2) && eq(*h1, *h2)
+        }
+        (Section::Guadua { d: d1, t: t1 }, Section::Guadua { d: d2, t: t2 }) => {
+            eq(*d1, *d2) && eq(*t1, *t2)
+        }
         _ => false,
     }
 }

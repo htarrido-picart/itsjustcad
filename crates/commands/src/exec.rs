@@ -1683,6 +1683,23 @@ fn insert_curve(
     (id, outcome)
 }
 
+/// Insert a plain mesh object on the current layer, returning its id. Used by
+/// the expressive-structure generators, which each produce one mesh.
+fn mesh_object(doc: &mut Document, id: Option<ObjectId>, mesh: kernel_mesh::Mesh) -> ObjectId {
+    let id = id.unwrap_or_default();
+    doc.insert(SceneObject {
+        visible: true,
+        id,
+        name: None,
+        layer: doc.current_layer.clone(),
+        color: None,
+        material: None,
+        lineweight_mm: None,
+        geometry: Geometry::Mesh(mesh),
+    });
+    id
+}
+
 /// Apply `linear` about `center` (targets' combined AABB center when `None`)
 /// to every resolved target, snapshotting geometry for exact undo.
 fn apply_about_center(
@@ -3022,6 +3039,121 @@ fn apply_forward(
                 ApplyOutcome {
                     created: vec![id],
                     message: format!("piped {curve_id} -> {id}"),
+                },
+            ))
+        }
+        Command::Geodesic { id, frequency, radius, full } => {
+            if frequency == 0 {
+                return Err(ExecError::Invalid("geodesic frequency must be >= 1".into()));
+            }
+            if radius <= 0.0 {
+                return Err(ExecError::Invalid("geodesic radius must be positive".into()));
+            }
+            let (_, segs) = kernel_mesh::geodesic_network(frequency, radius, !full);
+            // Strut side scales gently with radius so the frame reads at any size.
+            let strut = (radius * 0.02).clamp(0.01, 0.5);
+            let mesh = kernel_mesh::strut_lattice(&segs, strut);
+            let id = mesh_object(doc, id, mesh);
+            Ok((
+                Command::Geodesic { id: Some(id), frequency, radius, full },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "geodesic {id} (freq {frequency}, r={radius}, {})",
+                        if full { "sphere" } else { "dome" }
+                    ),
+                },
+            ))
+        }
+        Command::SpaceFrame { id, nx, ny, bay, depth } => {
+            if nx == 0 || ny == 0 {
+                return Err(ExecError::Invalid("space frame nx and ny must be >= 1".into()));
+            }
+            if bay <= 0.0 || depth <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "space frame bay and depth must be positive".into(),
+                ));
+            }
+            let segs = kernel_mesh::spaceframe_struts(nx, ny, bay, depth);
+            let strut = (bay * 0.04).clamp(0.02, 0.3);
+            let mesh = kernel_mesh::strut_lattice(&segs, strut);
+            let id = mesh_object(doc, id, mesh);
+            Ok((
+                Command::SpaceFrame { id: Some(id), nx, ny, bay, depth },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("spaceframe {id} ({nx}x{ny}, bay={bay}, depth={depth})"),
+                },
+            ))
+        }
+        Command::Hypar { id, a, b, c, nu, nv } => {
+            if a <= 0.0 || b <= 0.0 {
+                return Err(ExecError::Invalid("hypar a and b must be positive".into()));
+            }
+            if c == 0.0 {
+                return Err(ExecError::Invalid("hypar c must be non-zero".into()));
+            }
+            let (nu_v, nv_v) = (nu.unwrap_or(12).max(1), nv.unwrap_or(12).max(1));
+            let mesh = kernel_mesh::hypar_surface(a, b, c, nu_v, nv_v);
+            let id = mesh_object(doc, id, mesh);
+            Ok((
+                Command::Hypar { id: Some(id), a, b, c, nu, nv },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("hypar {id} (a={a}, b={b}, c={c})"),
+                },
+            ))
+        }
+        Command::GaussVault { id, span, length, rise, undulate } => {
+            if span <= 0.0 || length <= 0.0 || rise <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "gaussvault span, length and rise must be positive".into(),
+                ));
+            }
+            let mesh = kernel_mesh::gaussvault_surface(span, length, rise, 24, 24, undulate);
+            let id = mesh_object(doc, id, mesh);
+            Ok((
+                Command::GaussVault { id: Some(id), span, length, rise, undulate },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "gaussvault {id} (span={span}, len={length}, rise={rise}{})",
+                        if undulate { ", undulating" } else { "" }
+                    ),
+                },
+            ))
+        }
+        Command::Gridshell { id, surface, nu, nv } => {
+            let (nu_v, nv_v) = (nu.unwrap_or(12).max(1), nv.unwrap_or(12).max(1));
+            // Validate surface parameters up front.
+            match surface {
+                crate::GridshellSurfaceSpec::Hypar { a, b, c } => {
+                    if a <= 0.0 || b <= 0.0 || c == 0.0 {
+                        return Err(ExecError::Invalid(
+                            "gridshell hypar needs a>0, b>0, c!=0".into(),
+                        ));
+                    }
+                }
+                crate::GridshellSurfaceSpec::Vault { span, length, rise, .. } => {
+                    if span <= 0.0 || length <= 0.0 || rise <= 0.0 {
+                        return Err(ExecError::Invalid(
+                            "gridshell vault needs span>0, length>0, rise>0".into(),
+                        ));
+                    }
+                }
+            }
+            let mesh = kernel_mesh::gridshell(surface.to_kernel(), nu_v, nv_v, 0.06);
+            let id = mesh_object(doc, id, mesh);
+            Ok((
+                Command::Gridshell { id: Some(id), surface, nu, nv },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("gridshell {id} ({nu_v}x{nv_v} lattice)"),
                 },
             ))
         }
@@ -5738,6 +5870,11 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Sweep2 { .. } => "sweep2",
         Command::RailRevolve { .. } => "railrevolve",
         Command::Pipe { .. } => "pipe",
+        Command::Geodesic { .. } => "geodesic",
+        Command::SpaceFrame { .. } => "spaceframe",
+        Command::Hypar { .. } => "hypar",
+        Command::GaussVault { .. } => "gaussvault",
+        Command::Gridshell { .. } => "gridshell",
         Command::Line { .. } => "line",
         Command::Polyline { .. } => "polyline",
         Command::Rectangle { .. } => "rect",
@@ -9433,6 +9570,133 @@ mod tests {
             }
         }
         assert!(!bal.is_empty() && bal.values().all(|&v| v == 0), "beam mesh watertight");
+        assert_replay_stable(&s);
+    }
+
+    // ── expressive parametric structures ────────────────────────────────────
+
+    fn mesh_of(s: &Session, id: ObjectId) -> &kernel_mesh::Mesh {
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Mesh(m) => m,
+            g => panic!("expected mesh geometry, got {g:?}"),
+        }
+    }
+
+    #[test]
+    fn geodesic_exec_undo_redo_replay() {
+        let mut s = Session::default();
+        let out = run(&mut s, "geodesic 3 5 dome");
+        let id = out.created[0];
+        // A freq-3 dome has struts; the mesh is a non-empty strut lattice
+        // (8 verts per strut).
+        let m = mesh_of(&s, id);
+        assert!(!m.positions().is_empty());
+        assert_eq!(m.positions().len() % 8, 0, "8 verts per strut prism");
+        // All vertices lie near the sphere radius (dome projected onto r=5),
+        // allowing for the strut cross-section thickness (~0.1 side).
+        let rmax = m.positions().iter().map(|p| p.length()).fold(0.0, f64::max);
+        assert!(rmax <= 5.0 + 0.2, "verts near r=5, got rmax={rmax}");
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).is_none());
+        run(&mut s, "redo");
+        assert!(s.doc.get(id).is_some());
+    }
+
+    #[test]
+    fn geodesic_full_sphere_encloses_more_than_dome() {
+        let mut s = Session::default();
+        let dome = run(&mut s, "geodesic 3 5 dome").created[0];
+        let full = run(&mut s, "geodesic 3 5 full").created[0];
+        assert!(mesh_of(&s, full).positions().len() > mesh_of(&s, dome).positions().len());
+    }
+
+    #[test]
+    fn geodesic_rejects_bad_params() {
+        let mut s = Session::default();
+        assert!(s.run(parse("geodesic 0 5").unwrap()).is_err());
+        assert!(s.run(parse("geodesic 3 -1").unwrap()).is_err());
+    }
+
+    #[test]
+    fn spaceframe_exec_undo_redo_replay() {
+        let mut s = Session::default();
+        let out = run(&mut s, "spaceframe 4 3 3 1.5");
+        let id = out.created[0];
+        let m = mesh_of(&s, id);
+        assert_eq!(m.positions().len() % 8, 0);
+        // Top chord at z=1.5; strut prisms add a little half-thickness on top.
+        let zmax = m.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        assert!((zmax - 1.5).abs() < 0.2, "top chord near z=1.5, got {zmax}");
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).is_none());
+        run(&mut s, "redo");
+        assert!(s.doc.get(id).is_some());
+    }
+
+    #[test]
+    fn hypar_exec_saddle_undo_replay() {
+        let mut s = Session::default();
+        let out = run(&mut s, "hypar 5 5 5 6 6");
+        let id = out.created[0];
+        let m = mesh_of(&s, id);
+        assert_eq!(m.positions().len(), 49); // (6+1)^2
+        // Saddle: opposite corners at +z and -z (z = a*b/c = 25/5 = 5).
+        let zmax = m.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        let zmin = m.positions().iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        assert!((zmax - 5.0).abs() < 1e-9 && (zmin + 5.0).abs() < 1e-9);
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).is_none());
+    }
+
+    #[test]
+    fn gaussvault_exec_undo_replay() {
+        let mut s = Session::default();
+        let out = run(&mut s, "gaussvault 6 12 3 undulate");
+        let id = out.created[0];
+        let m = mesh_of(&s, id);
+        // 24×24 default grid → 25^2 verts.
+        assert_eq!(m.positions().len(), 625);
+        let zmin = m.positions().iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        assert!(zmin.abs() < 1e-9, "springings on the ground");
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).is_none());
+        run(&mut s, "redo");
+        assert!(s.doc.get(id).is_some());
+    }
+
+    #[test]
+    fn gridshell_hypar_and_vault_exec_replay() {
+        let mut s = Session::default();
+        let h = run(&mut s, "gridshell hypar 5 5 5 4 4").created[0];
+        assert_eq!(mesh_of(&s, h).positions().len() % 8, 0);
+        assert_replay_stable(&s);
+        let v = run(&mut s, "gridshell vault 6 12 3 undulate 5 5").created[0];
+        assert_eq!(mesh_of(&s, v).positions().len() % 8, 0);
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.get(v).is_none());
+    }
+
+    #[test]
+    fn timber_and_guadua_beams_have_expected_area() {
+        let mut s = Session::default();
+        run(&mut s, "section glb timber 0.2 0.6");
+        run(&mut s, "section culm guadua 0.1 0.01");
+        let tb = run(&mut s, "beam 0,0,0 4,0,0 glb").created[0];
+        let Geometry::Frame { section, .. } = &s.doc.get(tb).unwrap().geometry else {
+            panic!("beam is a Frame");
+        };
+        assert!((section.area() - 0.12).abs() < 1e-9); // 0.2*0.6
+        let gb = run(&mut s, "beam 0,1,0 4,1,0 culm").created[0];
+        let Geometry::Frame { section, .. } = &s.doc.get(gb).unwrap().geometry else {
+            panic!("beam is a Frame");
+        };
+        let expected = std::f64::consts::PI * (0.05 * 0.05 - 0.04 * 0.04);
+        assert!((section.area() - expected).abs() < 1e-9);
         assert_replay_stable(&s);
     }
 

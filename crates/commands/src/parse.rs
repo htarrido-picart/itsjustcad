@@ -116,6 +116,90 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             };
             Ok(Command::Pipe { id: None, curve, radius, end_radius })
         }
+        "geodesic" | "geodome" => {
+            // geodesic <frequency> <radius> [dome|full]   (dome is the default)
+            let (freq, radius, mode) = match args.as_slice() {
+                [f, r] => (f, r, None),
+                [f, r, m] => (f, r, Some(*m)),
+                _ => {
+                    return wrong(
+                        "geodesic",
+                        "a frequency, a radius and an optional dome|full",
+                        &args,
+                    )
+                }
+            };
+            let full = match mode {
+                None | Some("dome") => false,
+                Some("full") | Some("sphere") => true,
+                Some(_) => return wrong("geodesic", "dome or full as the third argument", &args),
+            };
+            Ok(Command::Geodesic {
+                id: None,
+                frequency: integer(freq, "geodesic")?,
+                radius: number(radius)?,
+                full,
+            })
+        }
+        "spaceframe" => {
+            let [nx, ny, bay, depth] =
+                take::<4>("spaceframe", "nx, ny, a bay spacing and a depth", &args)?;
+            Ok(Command::SpaceFrame {
+                id: None,
+                nx: integer(nx, "spaceframe")?,
+                ny: integer(ny, "spaceframe")?,
+                bay: number(bay)?,
+                depth: number(depth)?,
+            })
+        }
+        "hypar" => {
+            // hypar <a> <b> <c> [nu] [nv]
+            let (a, b, c, nu, nv) = match args.as_slice() {
+                [a, b, c] => (a, b, c, None, None),
+                [a, b, c, nu] => (a, b, c, Some(integer(nu, "hypar")?), None),
+                [a, b, c, nu, nv] => {
+                    (a, b, c, Some(integer(nu, "hypar")?), Some(integer(nv, "hypar")?))
+                }
+                _ => return wrong("hypar", "a, b, c and optional nu, nv", &args),
+            };
+            Ok(Command::Hypar {
+                id: None,
+                a: number(a)?,
+                b: number(b)?,
+                c: number(c)?,
+                nu,
+                nv,
+            })
+        }
+        "gaussvault" => {
+            // gaussvault <span> <length> <rise> [curve]   (curve = undulate)
+            let (span, length, rise, mode) = match args.as_slice() {
+                [s, l, r] => (s, l, r, None),
+                [s, l, r, m] => (s, l, r, Some(*m)),
+                _ => {
+                    return wrong(
+                        "gaussvault",
+                        "a span, a length, a rise and an optional undulate|straight",
+                        &args,
+                    )
+                }
+            };
+            let undulate = match mode {
+                None | Some("straight") | Some("catenary") => false,
+                Some("undulate") | Some("curve") | Some("wavy") => true,
+                Some(_) => {
+                    return wrong("gaussvault", "undulate or straight as the fourth argument", &args)
+                }
+            };
+            Ok(Command::GaussVault {
+                id: None,
+                span: number(span)?,
+                length: number(length)?,
+                rise: number(rise)?,
+                undulate,
+            })
+        }
+        "gridshell" => parse_gridshell(&args),
         "line" => {
             let [a, b] = take::<2>("line", "two points", &args)?;
             Ok(Command::Line {
@@ -336,9 +420,9 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             // definition ("section <name> rect|circle|iwf|pipe ...") and the
             // mesh plane-cut ("section <selector> <point> <normal>"). Disambiguate
             // on the shape keyword in the second position.
-            const SHAPES: [&str; 8] = [
+            const SHAPES: [&str; 13] = [
                 "rect", "rectangular", "circle", "circular", "iwf", "wideflange", "pipe",
-                "square",
+                "square", "timber", "glulam", "clt", "guadua", "bamboo",
             ];
             if args.get(1).is_some_and(|t| SHAPES.contains(t)) {
                 return parse_section(&args);
@@ -1124,10 +1208,16 @@ fn parse_section(args: &[&str]) -> Result<Command, ParseError> {
             tw: number(tw)?,
         },
         ["pipe", d, t] => StructSection::Pipe { d: number(d)?, t: number(t)? },
+        ["timber", w, h] | ["glulam", w, h] | ["clt", w, h] => {
+            StructSection::Timber { w: number(w)?, h: number(h)? }
+        }
+        ["guadua", d, t] | ["bamboo", d, t] => {
+            StructSection::Guadua { d: number(d)?, t: number(t)? }
+        }
         _ => {
             return wrong(
                 "section",
-                "a name then rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t>",
+                "a name then rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t> | timber <w> <h> | guadua <d> <t>",
                 args,
             )
         }
@@ -1402,6 +1492,82 @@ fn about(
         [] => Ok(None),
         ["about", p] => Ok(Some(point(p)?)),
         _ => Err(wrong_err(command, "optionally 'about <point>' at the end", args)),
+    }
+}
+
+/// Parse a non-negative integer count (frequency, grid divisions). Reuses the
+/// `BadNumber` error kind so command error messages stay uniform.
+fn integer(s: &str, _command: &'static str) -> Result<u32, ParseError> {
+    s.parse::<u32>().map_err(|_| ParseError::BadNumber(s.to_string()))
+}
+
+/// `gridshell hypar <a> <b> <c> [nu] [nv]` | `gridshell vault <span> <length>
+/// <rise> [undulate] [nu] [nv]`.
+fn parse_gridshell(args: &[&str]) -> Result<Command, ParseError> {
+    use crate::GridshellSurfaceSpec;
+    let expected =
+        "hypar <a> <b> <c> [nu] [nv] | vault <span> <length> <rise> [undulate] [nu] [nv]";
+    let (kind, rest) = args
+        .split_first()
+        .ok_or_else(|| wrong_err("gridshell", expected, args))?;
+    match *kind {
+        "hypar" => {
+            let (a, b, c, nu, nv) = match rest {
+                [a, b, c] => (a, b, c, None, None),
+                [a, b, c, nu] => (a, b, c, Some(integer(nu, "gridshell")?), None),
+                [a, b, c, nu, nv] => (
+                    a,
+                    b,
+                    c,
+                    Some(integer(nu, "gridshell")?),
+                    Some(integer(nv, "gridshell")?),
+                ),
+                _ => return wrong("gridshell", expected, args),
+            };
+            Ok(Command::Gridshell {
+                id: None,
+                surface: GridshellSurfaceSpec::Hypar {
+                    a: number(a)?,
+                    b: number(b)?,
+                    c: number(c)?,
+                },
+                nu,
+                nv,
+            })
+        }
+        "vault" => {
+            // Optional 'undulate' flag may appear right after the three numbers.
+            let (span, length, rise, tail) = match rest {
+                [s, l, r, tail @ ..] => (s, l, r, tail),
+                _ => return wrong("gridshell", expected, args),
+            };
+            let (undulate, tail) = match tail.split_first() {
+                Some((&"undulate", t)) | Some((&"wavy", t)) => (true, t),
+                Some((&"straight", t)) => (false, t),
+                _ => (false, tail),
+            };
+            let (nu, nv) = match tail {
+                [] => (None, None),
+                [nu] => (Some(integer(nu, "gridshell")?), None),
+                [nu, nv] => (
+                    Some(integer(nu, "gridshell")?),
+                    Some(integer(nv, "gridshell")?),
+                ),
+                _ => return wrong("gridshell", expected, args),
+            };
+            Ok(Command::Gridshell {
+                id: None,
+                surface: GridshellSurfaceSpec::Vault {
+                    span: number(span)?,
+                    length: number(length)?,
+                    rise: number(rise)?,
+                    undulate,
+                },
+                nu,
+                nv,
+            })
+        }
+        _ => wrong("gridshell", expected, args),
     }
 }
 
@@ -1895,6 +2061,108 @@ mod tests {
                 id: None,
                 corner: DVec3::ZERO,
                 size: DVec3::new(5.0, 5.0, 3.0)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_geodesic_variants() {
+        assert_eq!(
+            parse("geodesic 3 5").unwrap(),
+            Command::Geodesic { id: None, frequency: 3, radius: 5.0, full: false }
+        );
+        assert_eq!(
+            parse("geodesic 2 4 dome").unwrap(),
+            Command::Geodesic { id: None, frequency: 2, radius: 4.0, full: false }
+        );
+        assert_eq!(
+            parse("geodesic 4 10 full").unwrap(),
+            Command::Geodesic { id: None, frequency: 4, radius: 10.0, full: true }
+        );
+        assert!(parse("geodesic 3 5 bogus").is_err());
+    }
+
+    #[test]
+    fn parse_spaceframe() {
+        assert_eq!(
+            parse("spaceframe 6 4 3 1.5").unwrap(),
+            Command::SpaceFrame { id: None, nx: 6, ny: 4, bay: 3.0, depth: 1.5 }
+        );
+    }
+
+    #[test]
+    fn parse_hypar_with_and_without_divisions() {
+        assert_eq!(
+            parse("hypar 5 5 5").unwrap(),
+            Command::Hypar { id: None, a: 5.0, b: 5.0, c: 5.0, nu: None, nv: None }
+        );
+        assert_eq!(
+            parse("hypar 5 6 2 8 10").unwrap(),
+            Command::Hypar { id: None, a: 5.0, b: 6.0, c: 2.0, nu: Some(8), nv: Some(10) }
+        );
+    }
+
+    #[test]
+    fn parse_gaussvault_straight_and_undulate() {
+        assert_eq!(
+            parse("gaussvault 6 12 3").unwrap(),
+            Command::GaussVault { id: None, span: 6.0, length: 12.0, rise: 3.0, undulate: false }
+        );
+        assert_eq!(
+            parse("gaussvault 6 12 3 undulate").unwrap(),
+            Command::GaussVault { id: None, span: 6.0, length: 12.0, rise: 3.0, undulate: true }
+        );
+    }
+
+    #[test]
+    fn parse_gridshell_hypar_and_vault() {
+        assert_eq!(
+            parse("gridshell hypar 5 5 5").unwrap(),
+            Command::Gridshell {
+                id: None,
+                surface: crate::GridshellSurfaceSpec::Hypar { a: 5.0, b: 5.0, c: 5.0 },
+                nu: None,
+                nv: None,
+            }
+        );
+        assert_eq!(
+            parse("gridshell vault 6 12 3 undulate 10 20").unwrap(),
+            Command::Gridshell {
+                id: None,
+                surface: crate::GridshellSurfaceSpec::Vault {
+                    span: 6.0,
+                    length: 12.0,
+                    rise: 3.0,
+                    undulate: true,
+                },
+                nu: Some(10),
+                nv: Some(20),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_timber_and_guadua_sections() {
+        assert_eq!(
+            parse("section glb timber 0.2 0.6").unwrap(),
+            Command::DefSection {
+                name: "glb".into(),
+                section: StructSection::Timber { w: 0.2, h: 0.6 },
+            }
+        );
+        assert_eq!(
+            parse("section culm guadua 0.1 0.01").unwrap(),
+            Command::DefSection {
+                name: "culm".into(),
+                section: StructSection::Guadua { d: 0.1, t: 0.01 },
+            }
+        );
+        // Aliases resolve to the same variants.
+        assert_eq!(
+            parse("section p bamboo 0.09 0.008").unwrap(),
+            Command::DefSection {
+                name: "p".into(),
+                section: StructSection::Guadua { d: 0.09, t: 0.008 },
             }
         );
     }

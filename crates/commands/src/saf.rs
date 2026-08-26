@@ -256,6 +256,8 @@ fn section_name(sec: &Section) -> String {
             format!("IWF_{:.0}x{:.0}", d * 1000.0, bf * 1000.0)
         }
         Section::Pipe { d, t } => format!("PIPE_{:.0}x{:.0}", d * 1000.0, t * 1000.0),
+        Section::Timber { w, h } => format!("TIMBER_{:.0}x{:.0}", w * 1000.0, h * 1000.0),
+        Section::Guadua { d, t } => format!("GUADUA_{:.0}x{:.0}", d * 1000.0, t * 1000.0),
     }
 }
 
@@ -265,7 +267,9 @@ fn section_type(sec: &Section) -> &'static str {
         Section::Rectangular { .. }
         | Section::Circular { .. }
         | Section::Pipe { .. }
-        | Section::IWideFlange { .. } => "Parametric",
+        | Section::IWideFlange { .. }
+        | Section::Timber { .. }
+        | Section::Guadua { .. } => "Parametric",
     }
 }
 
@@ -276,6 +280,8 @@ fn section_shape(sec: &Section) -> &'static str {
         Section::Circular { .. } => "Circle",
         Section::Pipe { .. } => "Circle hollow",
         Section::IWideFlange { .. } => "I or H",
+        Section::Timber { .. } => "Rectangle",
+        Section::Guadua { .. } => "Circle hollow",
     }
 }
 
@@ -292,6 +298,8 @@ fn section_params(sec: &Section) -> String {
             tf * 1000.0,
             tw * 1000.0
         ),
+        Section::Timber { w, h } => format!("{:.1};{:.1}", w * 1000.0, h * 1000.0),
+        Section::Guadua { d, t } => format!("{:.1};{:.1}", d * 1000.0, t * 1000.0),
     }
 }
 

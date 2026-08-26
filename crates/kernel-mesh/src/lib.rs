@@ -11,6 +11,7 @@ mod csg;
 mod delaunay;
 mod earcut;
 mod edges;
+mod expressive;
 mod mesh;
 mod primitives;
 mod section;
@@ -23,6 +24,10 @@ pub use csg::{csg_difference, csg_intersection, csg_union, signed_volume, weld};
 pub use delaunay::triangulate;
 pub use earcut::{earcut, signed_area};
 pub use edges::{feature_edges, project_edges_behind, project_edges_onto};
+pub use expressive::{
+    gaussvault_surface, geodesic_network, gridshell, hypar_surface, spaceframe_struts,
+    strut_lattice, GridshellSurface,
+};
 pub use mesh::{Mesh, RenderMesh};
 pub use primitives::{extrude_profile, make_box};
 pub use section::slice;

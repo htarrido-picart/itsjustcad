@@ -53,6 +53,37 @@ impl std::fmt::Display for CompassDir {
     }
 }
 
+/// Which doubly-curved surface a [`Command::Gridshell`] lattice rides on. A
+/// serde-stable mirror of `kernel_mesh::GridshellSurface`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "surface", rename_all = "snake_case")]
+pub enum GridshellSurfaceSpec {
+    /// Hypar `z = x*y/c` over `[-a,a]×[-b,b]`.
+    Hypar { a: f64, b: f64, c: f64 },
+    /// Gauss catenary vault over `[0,span]×[0,length]`.
+    Vault {
+        span: f64,
+        length: f64,
+        rise: f64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        undulate: bool,
+    },
+}
+
+impl GridshellSurfaceSpec {
+    /// Convert to the kernel surface descriptor.
+    pub fn to_kernel(self) -> kernel_mesh::GridshellSurface {
+        match self {
+            GridshellSurfaceSpec::Hypar { a, b, c } => {
+                kernel_mesh::GridshellSurface::Hypar { a, b, c }
+            }
+            GridshellSurfaceSpec::Vault { span, length, rise, undulate } => {
+                kernel_mesh::GridshellSurface::Vault { span, length, rise, undulate }
+            }
+        }
+    }
+}
+
 /// The shared command language. `id`/`ids` fields are `None` when typed or
 /// emitted; they are filled at apply time and written back into the logged op
 /// so replay reproduces identical ids.
@@ -127,6 +158,67 @@ pub enum Command {
         radius: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         end_radius: Option<f64>,
+    },
+    // -- expressive parametric structures (generative geometry; each is one
+    //    logged, replay-safe mesh object) --
+    /// Geodesic dome / sphere (Buckminster Fuller): an icosahedron subdivided
+    /// `frequency` times and projected to a sphere of `radius`, its edges
+    /// rendered as thin square-section struts. `full` builds the whole sphere;
+    /// otherwise only the upper hemisphere (dome).
+    Geodesic {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        frequency: u32,
+        radius: f64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        full: bool,
+    },
+    /// Double-layer space-frame grid: `nx × ny` bays of `bay` spacing, a top and
+    /// an offset bottom chord layer `depth` apart, tied by pyramid diagonals.
+    /// Rendered as one strut-lattice mesh.
+    SpaceFrame {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        nx: u32,
+        ny: u32,
+        bay: f64,
+        depth: f64,
+    },
+    /// Hyperbolic-paraboloid (Candela) shell `z = x*y/c` over `[-a,a]×[-b,b]`,
+    /// meshed as a `nu × nv` quad grid. The doubly-ruled anticlastic saddle.
+    Hypar {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        a: f64,
+        b: f64,
+        c: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nu: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nv: Option<u32>,
+    },
+    /// Gaussian catenary brick vault (Eladio Dieste): a catenary section of
+    /// `span`/`rise` swept along `length`; `undulate` gives the signature
+    /// sinusoidal double-curvature directrix. Meshed as a surface.
+    GaussVault {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        span: f64,
+        length: f64,
+        rise: f64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        undulate: bool,
+    },
+    /// Gridshell: a lattice of laths on a doubly-curved surface (a hypar or a
+    /// gauss vault), rendered as a reciprocal net of square-section struts.
+    Gridshell {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        surface: GridshellSurfaceSpec,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nu: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nv: Option<u32>,
     },
     // -- 2D primitives (create Curve objects) --
     Line {

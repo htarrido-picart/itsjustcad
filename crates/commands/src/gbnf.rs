@@ -36,6 +36,7 @@ const ALIASES: &[&str] = &[
     "dist",         // distance
     "vol",          // volume
     "level",        // story
+    "geodome",      // geodesic
 ];
 
 /// Every verb the grammar admits: canonical registry names plus parser aliases,
