@@ -1737,14 +1737,17 @@ fn mesh_object(doc: &mut Document, id: Option<ObjectId>, mesh: kernel_mesh::Mesh
 }
 
 /// Upper bound on a single grid dimension for procedural surface/lattice
-/// generators. `MAX_GRID² ≈ 4M` cells keeps the worst-case mesh bounded while
-/// being far beyond any sane design resolution.
-const MAX_GRID: u32 = 2048;
+/// generators. A `256×256` surface is ~66k vertices — far beyond any sane
+/// design resolution, yet small enough that the resulting GPU vertex buffer
+/// stays well under wgpu's per-buffer limits (a `2048²` surface would blow the
+/// buffer limit and crash the renderer). Bounds worst-case mesh size and OOM.
+const MAX_GRID: u32 = 256;
 
 /// Upper bound on geodesic subdivision frequency. Node count grows as
-/// `10·f² + 2`, so `f = 256` caps it near 650k nodes — plenty for a frame while
-/// preventing an integer-overflow / OOM from a hostile `freq`.
-const MAX_GEODESIC_FREQ: u32 = 256;
+/// `10·f² + 2` and the strut lattice thickens each node, so `f = 64` caps it
+/// near 41k nodes — plenty for a frame while preventing integer-overflow / OOM
+/// and keeping the thickened lattice within GPU buffer limits.
+const MAX_GEODESIC_FREQ: u32 = 64;
 
 /// Reject NaN / infinity in a user-supplied float parameter. Non-finite values
 /// slip past `<= 0.0` checks and poison downstream geometry with NaNs.

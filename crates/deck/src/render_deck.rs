@@ -272,9 +272,14 @@ impl RenderDecksFile {
 
     pub fn save(&self) {
         if let Some(path) = render_config_path() {
-            let _ = std::fs::create_dir_all(path.parent().expect("has parent"));
-            // 0600 so any literal cloud key is not world-readable.
-            let _ = write_private(&path, &serde_json::to_string_pretty(self).expect("serializes"));
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // 0600 so any literal cloud key is not world-readable. Best-effort:
+            // a serialization failure must not panic the app on save.
+            if let Ok(json) = serde_json::to_string_pretty(self) {
+                let _ = write_private(&path, &json);
+            }
         }
     }
 
