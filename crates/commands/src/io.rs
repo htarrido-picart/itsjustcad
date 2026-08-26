@@ -117,9 +117,37 @@ fn checkpoint_json(session: &Session) -> String {
 /// already saved and the cache is optional. Deleting the checkpoint is always
 /// safe — the next open just replays the op-log.
 pub fn save_file(session: &Session, path: &std::path::Path) -> Result<(), IoError> {
-    std::fs::write(path, to_json(session))?;
+    // ATOMIC: write to a sibling `<path>.tmp`, fsync, then rename over the
+    // target. `std::fs::write` truncates the destination up front, so a crash /
+    // SIGKILL / full disk mid-write would leave the user's existing document
+    // zero-length or half-written. The temp+rename discipline (rename is atomic
+    // on the same filesystem) means the on-disk file is always either the old
+    // complete document or the new complete document — never a torn one.
+    write_atomic(path, to_json(session).as_bytes())?;
     // Best-effort: never let a checkpoint problem fail an otherwise-good save.
-    let _ = std::fs::write(checkpoint_path(path), checkpoint_json(session));
+    let _ = write_atomic(&checkpoint_path(path), checkpoint_json(session).as_bytes());
+    Ok(())
+}
+
+/// Durably write `bytes` to `path` via a temp file + fsync + atomic rename.
+/// On any error the target is left untouched (the temp file is cleaned up).
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    // Scope the file handle so it is flushed/closed before the rename.
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -452,6 +480,39 @@ mod tests {
         assert_eq!(fast.doc, replayed.doc, "snapshot doc == replay doc");
         assert_eq!(fast.save_log(), replayed.save_log(), "same forward log");
         assert_eq!(objects_of(&fast), objects_of(&replayed));
+    }
+
+    #[test]
+    fn save_is_atomic_no_tmp_left_and_old_content_intact_on_failure() {
+        // Successful save leaves NO `.tmp` sibling and produces a loadable file.
+        let dir = std::env::temp_dir().join(format!("itsjustcad_atomic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scene.mydrafter");
+        let s = built_session();
+        save_file(&s, &path).unwrap();
+
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        assert!(
+            !std::path::Path::new(&tmp).exists(),
+            "the temp file must be renamed away, never left behind"
+        );
+        assert!(load_file(&path).is_ok(), "the renamed file is a complete document");
+
+        // A failed write_atomic must NOT touch the existing target: point at a
+        // path whose `<path>.tmp` cannot be created (its parent is a FILE, not a
+        // dir), and confirm the original bytes survive untouched.
+        let original = std::fs::read(&path).unwrap();
+        let blocked = path.join("child.mydrafter"); // parent `path` is a file
+        let err = write_atomic(&blocked, b"new bytes");
+        assert!(err.is_err(), "write into a non-directory parent must fail");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "a failed atomic write leaves the original file byte-for-byte intact"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

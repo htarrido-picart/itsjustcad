@@ -3862,6 +3862,23 @@ fn apply_forward(
             ))
         }
         Command::ExactBoolean { id, op, a_corner, a_size, b_corner, b_size } => {
+            // Reject non-finite coordinates (NaN/Inf). Left unchecked they flow
+            // into make_box -> NaN mesh vertices, and NaN/Inf serialize to JSON
+            // `null` on save — which then fails to deserialize into f64 on reload,
+            // permanently bricking the saved op-log. The sibling generators
+            // (geodesic/hypar/…) already guard with finite(); this one was missed.
+            for (v, what) in [
+                (a_corner, "exact_boolean a_corner"),
+                (a_size, "exact_boolean a_size"),
+                (b_corner, "exact_boolean b_corner"),
+                (b_size, "exact_boolean b_size"),
+            ] {
+                if !v.is_finite() {
+                    return Err(ExecError::Invalid(format!(
+                        "{what} must have finite coordinates"
+                    )));
+                }
+            }
             let (mesh, volume, exact) =
                 exact_or_mesh_boolean(op, a_corner, a_size, b_corner, b_size);
             if mesh.faces().is_empty() {
@@ -8859,6 +8876,28 @@ mod tests {
             matches!(err, ExecError::Invalid(_)),
             "empty intersection must error: {err:?}"
         );
+    }
+
+    #[test]
+    fn exact_boolean_rejects_non_finite_coords() {
+        // SECURITY: a non-finite coordinate (NaN/Inf) flows into a NaN mesh, and
+        // NaN/Inf serialize to JSON `null` on save — which then fails to reload
+        // into f64, permanently bricking the op-log. The command must error
+        // BEFORE inserting anything, so the doc stays clean and re-loadable.
+        for line in [
+            "exact_boolean union nan,0,0 10,10,10 3,3,-5 4,4,20",
+            "exact_boolean union 0,0,0 inf,10,10 3,3,-5 4,4,20",
+            "exact_boolean union 0,0,0 10,10,10 3,3,-5 4,-inf,20",
+        ] {
+            let mut s = Session::default();
+            let before = s.doc.len();
+            let err = s.run(parse(line).unwrap()).unwrap_err();
+            assert!(
+                matches!(err, ExecError::Invalid(_)),
+                "non-finite exact_boolean must error cleanly: {line} -> {err:?}"
+            );
+            assert_eq!(s.doc.len(), before, "no object inserted on rejection: {line}");
+        }
     }
 
     /// Write a `w`x`h` PNG to a temp path and return it.

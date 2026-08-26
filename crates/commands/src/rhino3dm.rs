@@ -253,7 +253,9 @@ impl<'a> Cur<'a> {
         if count == 0 {
             return Some(String::new());
         }
-        let mut units = Vec::with_capacity(count);
+        // Each code unit is 2 bytes on disk; a hostile count (e.g. 0xFFFFFFFF)
+        // must not drive an ~8GiB pre-allocation before the read loop fails.
+        let mut units = Vec::with_capacity(self.cap_hint(count, 2));
         for _ in 0..count {
             let lo = self.u8()? as u16;
             let hi = self.u8()? as u16;
@@ -1158,6 +1160,21 @@ mod tests {
         b.extend_from_slice(&knot_count.to_le_bytes());
         let out = read_nurbs_curve(&b);
         assert!(out.is_none(), "truncated NURBS knots must return None, not OOM");
+    }
+
+    #[test]
+    fn string_huge_count_on_tiny_buffer_no_oom() {
+        // SECURITY: a WriteString element-count of 0xFFFFFFFF (from a hostile
+        // layer/object name) previously drove `Vec::with_capacity(count)` — an
+        // ~8.5 GiB reservation (2 bytes/unit) — before the read loop could fail
+        // on truncated data. The cap_hint must bound the pre-allocation to what
+        // the tiny buffer can hold, so this returns None instead of OOMing.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // count = u32::MAX
+        // no code-unit bytes follow
+        let mut c = Cur::new(&buf);
+        let out = c.string();
+        assert!(out.is_none(), "truncated hostile string must return None, not OOM");
     }
 }
 
