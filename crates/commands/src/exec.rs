@@ -1086,6 +1086,7 @@ impl Session {
             "dxf" => self.import_dxf(path),
             "obj" | "stl" | "gltf" | "glb" | "dae" => self.import_mesh(path),
             "3dm" => self.import_3dm(path),
+            "step" | "stp" => self.import_step(path),
             "ifc" => self.import_ifc(path),
             "epw" => self.import_epw(path),
             "geojson" | "json" => self.import_geojson(path),
@@ -1095,9 +1096,44 @@ impl Session {
                 "LAZ is compressed; decompress to .las first (e.g. laszip)".to_string(),
             )),
             other => Err(ExecError::Invalid(format!(
-                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .dae, .3dm, .ifc, .epw, .geojson, .las, .e57)"
+                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .dae, .3dm, .step, .stp, .ifc, .epw, .geojson, .las, .e57)"
             ))),
         }
+    }
+
+    /// STEP AP242 (also AP203/214) import through the exact-BREP tier (OCCT).
+    ///
+    /// STEP carries exact analytic BREP solids; OCCT reads them exactly and we
+    /// tessellate into a document `Mesh`, emitted as one logged `MeshLiteral` so
+    /// the import replays from the op-log without the STEP file. The exact volume
+    /// is reported in the echo. Requires the `kernel-occt` feature — without it
+    /// there is no STEP reader, so we return a clear error rather than a stub.
+    fn import_step(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let Some(result) = kernel_occt::read_step(&path) else {
+            return Err(ExecError::Invalid(format!(
+                "STEP import needs the exact-BREP tier — rebuild with the 'kernel-occt' feature (cannot read '{path}')"
+            )));
+        };
+        let exact = result.map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+        let name = path
+            .rsplit(['/', '\\'])
+            .next()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        let out = self.run(Command::MeshLiteral {
+            id: None,
+            positions: exact.mesh.positions().to_vec(),
+            faces: exact.mesh.faces().to_vec(),
+            name,
+        })?;
+        Ok(ApplyOutcome {
+            created: out.created,
+            message: format!(
+                "imported exact STEP solid from {path} (volume {:.4}, tessellated to {} triangles) — one MeshLiteral op",
+                exact.volume,
+                exact.mesh.faces().len()
+            ),
+        })
     }
 
     fn import_dxf(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
@@ -1737,6 +1773,29 @@ fn tessellation_note(count: usize) -> String {
     } else {
         format!(", {count} curve(s) tessellated to polylines")
     }
+}
+
+/// Flatten every triangle mesh in the document into one shared position list and
+/// a single face list indexing into it. Used by the STEP exporter (each triangle
+/// becomes a faceted BREP face). Non-mesh geometry (curves, annotations, points,
+/// instances) is skipped — STEP here carries only surface/solid triangles.
+fn flatten_doc_meshes(doc: &Document) -> (Vec<DVec3>, Vec<[u32; 3]>) {
+    let mut positions: Vec<DVec3> = Vec::new();
+    let mut faces: Vec<[u32; 3]> = Vec::new();
+    for obj in doc.objects() {
+        let mesh = match &obj.geometry {
+            Geometry::Mesh(m) | Geometry::Frame { mesh: m, .. } | Geometry::Area { mesh: m, .. } => {
+                m
+            }
+            _ => continue,
+        };
+        let base = positions.len() as u32;
+        positions.extend_from_slice(mesh.positions());
+        for f in mesh.faces() {
+            faces.push([f[0] + base, f[1] + base, f[2] + base]);
+        }
+    }
+    (positions, faces)
 }
 
 /// Collect mesh clones for a boolean; curves are rejected with a hint the
@@ -5064,6 +5123,29 @@ fn apply_forward(
                     let (b, detail) = crate::saf::export(doc).map_err(ExecError::Invalid)?;
                     (b, detail)
                 }
+                "step" | "stp" => {
+                    // STEP export goes through OCCT. The document stores meshes
+                    // (no persisted analytic BREP), so this writes a FACETED STEP
+                    // part — one planar face per triangle — not exact analytic
+                    // surfaces. OCCT itself writes the file at its own path, so we
+                    // hand it the target directly and read the bytes back for the
+                    // uniform write/echo below.
+                    let (positions, faces) = flatten_doc_meshes(doc);
+                    if faces.is_empty() {
+                        return Err(ExecError::Invalid(
+                            "no triangle meshes to export to STEP".to_string(),
+                        ));
+                    }
+                    let Some(res) = kernel_occt::write_mesh_step(&positions, &faces, &path) else {
+                        return Err(ExecError::Invalid(
+                            "STEP export needs the exact-BREP tier — rebuild with the 'kernel-occt' feature".to_string(),
+                        ));
+                    };
+                    let n = res.map_err(ExecError::Invalid)?;
+                    let bytes = std::fs::read(&path)
+                        .map_err(|e| ExecError::Invalid(format!("cannot read written '{path}': {e}")))?;
+                    (bytes, format!("STEP (faceted), {n} faces"))
+                }
                 _ => {
                     let (bytes, count) = crate::mesh_export::export(doc, &path)
                         .map_err(ExecError::Invalid)?;
@@ -8325,6 +8407,62 @@ mod tests {
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap()
         );
+    }
+
+    // ── STEP AP242 (via OCCT) ────────────────────────────────────────────────
+
+    /// Without the `kernel-occt` feature there is no STEP reader/writer, so both
+    /// directions must fail with a clear, actionable message (never a silent stub
+    /// or a bogus file). This is the default-build behavior.
+    #[cfg(not(feature = "kernel-occt"))]
+    #[test]
+    fn step_import_export_reports_feature_needed_when_off() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "extrude last 3");
+        let path = std::env::temp_dir().join("ijc_step_off.step");
+        let p = path.to_string_lossy().to_string();
+
+        let err = s.run(parse(&format!("export {p}")).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("kernel-occt"), "{err}");
+
+        // Write a dummy file so import has something to open; it must still
+        // refuse on the missing feature, not on a read error.
+        std::fs::write(&path, b"ISO-10303-21;\n").unwrap();
+        let err = s.run(parse(&format!("import {p}")).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("kernel-occt"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// With the exact-BREP tier compiled in, a document solid exports to STEP and
+    /// re-imports as a mesh with the same volume — the AP242 handoff round-trips.
+    /// The import is one logged `MeshLiteral`, so it replays from the op-log.
+    #[cfg(feature = "kernel-occt")]
+    #[test]
+    fn step_round_trip_through_document() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,3,4"); // a solid of volume 24
+        let path = std::env::temp_dir().join("ijc_step_doc_rt.step");
+        let p = path.to_string_lossy().to_string();
+
+        let out = run(&mut s, &format!("export {p}"));
+        assert!(out.message.contains("STEP"), "{}", out.message);
+        assert!(std::path::Path::new(&p).exists());
+
+        let before = s.doc.objects().count();
+        let out = run(&mut s, &format!("import {p}"));
+        assert!(out.message.contains("STEP"), "{}", out.message);
+        assert_eq!(s.doc.objects().count(), before + 1, "one MeshLiteral added");
+
+        // The import is logged and replay-stable.
+        let log = s.save_log();
+        assert!(log.iter().any(|c| matches!(c, Command::MeshLiteral { .. })));
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

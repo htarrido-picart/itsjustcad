@@ -571,8 +571,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "export",
-            usage: "export <path.{dxf|stl|obj|gltf|glb|svg|csv|ifc|saf}>",
-            summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), OBJ (meshes plus curves as polylines), SVG, CSV, IFC4 openBIM, or SAF (Structural Analysis Format — ZIP of CSVs matching SAF 2.2.0 sheet names, for handoff to RFEM/SCIA/FEM-Design). Example: export /tmp/model.saf",
+            usage: "export <path.{dxf|stl|obj|gltf|glb|svg|csv|ifc|saf|step|stp}>",
+            summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), OBJ (meshes plus curves as polylines), SVG, CSV, IFC4 openBIM, SAF (Structural Analysis Format — ZIP of CSVs matching SAF 2.2.0 sheet names, for handoff to RFEM/SCIA/FEM-Design), or STEP/STP (AP242 via OCCT — FACETED, one BREP face per triangle; needs the 'kernel-occt' feature). Example: export /tmp/model.saf",
             category: Category::File,
         },
         CommandSpec {
@@ -583,8 +583,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "import",
-            usage: "import <path.{dxf|obj|stl|gltf|glb|dae|3dm|ifc|epw|geojson|las|e57}>",
-            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, Rhino .3dm (openNURBS: meshes → MeshLiteral, lines/polylines/NURBS curves → Polyline, on their Rhino layer; breps/surfaces skipped), IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0.5m marker circle; properties.name → object name; lon/lat projected to local meters when a location is set, else treated as local xy), LAS 1.2–1.4 point cloud (formats 0–3; decimated to ≤200k points; stored on layer 'pointcloud'; LAZ not supported), or E57 point cloud (ASTM E2807; Cartesian + optional RGB/intensity; all sections merged; decimated to ≤200k; stored on layer 'pointcloud'). Example: import /tmp/site.las · import /tmp/scan.e57",
+            usage: "import <path.{dxf|obj|stl|gltf|glb|dae|3dm|step|stp|ifc|epw|geojson|las|e57}>",
+            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, Rhino .3dm (openNURBS: meshes → MeshLiteral, lines/polylines/NURBS curves → Polyline, on their Rhino layer; breps/surfaces skipped), STEP/STP (AP242/AP203/AP214 exact BREP solids via OCCT — read exactly then tessellated to a MeshLiteral with the exact volume reported; needs the 'kernel-occt' feature), IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0.5m marker circle; properties.name → object name; lon/lat projected to local meters when a location is set, else treated as local xy), LAS 1.2–1.4 point cloud (formats 0–3; decimated to ≤200k points; stored on layer 'pointcloud'; LAZ not supported), or E57 point cloud (ASTM E2807; Cartesian + optional RGB/intensity; all sections merged; decimated to ≤200k; stored on layer 'pointcloud'). Example: import /tmp/site.las · import /tmp/scan.e57",
             category: Category::File,
         },
         CommandSpec {

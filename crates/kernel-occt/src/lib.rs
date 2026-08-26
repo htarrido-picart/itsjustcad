@@ -95,12 +95,68 @@ pub fn box_difference_filleted(
     }
 }
 
+/// Read a STEP (AP203/214/242) file through OCCT. STEP carries **exact** BREP
+/// solids; OCCT reads the analytic geometry and we tessellate it into our
+/// [`kernel_mesh::Mesh`] (with the exact volume from the boundary integral) so
+/// it round-trips into the document like any other imported solid.
+///
+/// Returns `None` when the `occt` feature is not compiled in — the caller must
+/// then report that STEP needs the exact-BREP tier (there is no pure-Rust STEP
+/// reader here). `Some(Err(..))` is a genuine read/tessellation failure.
+pub fn read_step(path: &str) -> Option<Result<ExactResult, String>> {
+    #[cfg(not(feature = "occt"))]
+    {
+        let _ = path;
+        None
+    }
+    #[cfg(feature = "occt")]
+    {
+        Some(imp::read_step(path))
+    }
+}
+
+/// Write triangle-mesh geometry to a STEP file through OCCT as a **faceted**
+/// shell (one planar BREP face per triangle). This is a valid STEP AP242 part,
+/// but it is faceted, not analytic — the document stores meshes, so there is no
+/// exact surface to emit. Callers must not present this as exact-BREP export.
+///
+/// Returns the number of faces written. `None` when the feature is off.
+pub fn write_mesh_step(
+    positions: &[DVec3],
+    faces: &[[u32; 3]],
+    path: &str,
+) -> Option<Result<usize, String>> {
+    #[cfg(not(feature = "occt"))]
+    {
+        let _ = (positions, faces, path);
+        None
+    }
+    #[cfg(feature = "occt")]
+    {
+        Some(imp::write_mesh_step(positions, faces, path))
+    }
+}
+
+/// Write an exact axis-aligned box solid to STEP (exact BREP). Used to prove the
+/// exact STEP round-trip; `None` when the feature is off.
+pub fn write_box_step(corner: DVec3, size: DVec3, path: &str) -> Option<Result<(), String>> {
+    #[cfg(not(feature = "occt"))]
+    {
+        let _ = (corner, size, path);
+        None
+    }
+    #[cfg(feature = "occt")]
+    {
+        Some(imp::write_box_step(corner, size, path))
+    }
+}
+
 #[cfg(feature = "occt")]
 mod imp {
     use super::{BoolOp, ExactResult};
     use glam::DVec3;
     use kernel_mesh::Mesh;
-    use opencascade::primitives::Shape;
+    use opencascade::primitives::{Compound, Shape, Wire};
 
     // opencascade 0.3's API speaks glam 0.24; convert at the boundary.
     fn to_oc(v: DVec3) -> oc_glam::DVec3 {
@@ -166,6 +222,61 @@ mod imp {
         let volume = kernel_mesh::signed_volume(&mesh).abs();
         ExactResult { mesh, volume }
     }
+
+    pub fn read_step(path: &str) -> Result<ExactResult, String> {
+        let shape = Shape::read_step(path).map_err(|e| format!("STEP read failed: {e}"))?;
+        let occ = shape
+            .mesh_with_tolerance(0.01)
+            .map_err(|e| format!("STEP tessellation failed: {e}"))?;
+        let mesh = to_mesh(&occ);
+        if mesh.faces().is_empty() {
+            return Err("STEP file contained no tessellable solid/shell".to_string());
+        }
+        let volume = kernel_mesh::signed_volume(&mesh).abs();
+        Ok(ExactResult { mesh, volume })
+    }
+
+    /// One planar BREP face per triangle, collected into a compound. A compound
+    /// of faces is a valid STEP part; it is faceted (not analytic) geometry.
+    pub fn write_mesh_step(
+        positions: &[DVec3],
+        faces: &[[u32; 3]],
+        path: &str,
+    ) -> Result<usize, String> {
+        if faces.is_empty() {
+            return Err("no triangles to write to STEP".to_string());
+        }
+        let mut face_shapes: Vec<Shape> = Vec::with_capacity(faces.len());
+        for t in faces {
+            let pts: Vec<DVec3> = t.iter().map(|&i| positions[i as usize]).collect();
+            // Skip degenerate triangles (a wire from collapsed points can't face).
+            if pts[0] == pts[1] || pts[1] == pts[2] || pts[0] == pts[2] {
+                continue;
+            }
+            let wire = match Wire::from_ordered_points(pts.iter().map(|p| to_oc(*p))) {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+            face_shapes.push(wire.to_face().into());
+        }
+        if face_shapes.is_empty() {
+            return Err("all triangles were degenerate; nothing to write".to_string());
+        }
+        let count = face_shapes.len();
+        let compound = Compound::from_shapes(face_shapes.iter());
+        let shape: Shape = compound.into();
+        shape
+            .write_step(path)
+            .map_err(|e| format!("STEP write failed: {e}"))?;
+        Ok(count)
+    }
+
+    pub fn write_box_step(corner: DVec3, size: DVec3, path: &str) -> Result<(), String> {
+        let shape = shape_box(corner, size);
+        shape
+            .write_step(path)
+            .map_err(|e| format!("STEP write failed: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +299,86 @@ mod tests {
             BoolOp::Union,
         );
         assert!(r.is_none(), "exact tier must be inert when feature is off");
+    }
+
+    #[cfg(not(feature = "occt"))]
+    #[test]
+    fn step_helpers_are_inert_without_feature() {
+        assert!(read_step("/nonexistent.step").is_none());
+        assert!(write_mesh_step(&[], &[], "/tmp/x.step").is_none());
+        assert!(write_box_step(DVec3::ZERO, DVec3::splat(1.0), "/tmp/x.step").is_none());
+    }
+
+    // -- exact STEP round-trip (only with the exact kernel compiled in) --
+
+    #[cfg(feature = "occt")]
+    #[test]
+    fn exact_box_step_round_trip_preserves_volume() {
+        // Write an exact 2x3x4 box solid to STEP, read it back, and confirm the
+        // exact-BREP volume survives the AP242 round-trip (= 24, analytic).
+        let path = std::env::temp_dir().join("ijc_step_rt_box.step");
+        let p = path.to_string_lossy().to_string();
+        write_box_step(DVec3::new(1.0, 2.0, 3.0), DVec3::new(2.0, 3.0, 4.0), &p)
+            .expect("feature on")
+            .expect("write ok");
+        let back = read_step(&p).expect("feature on").expect("read ok");
+        assert!(
+            (back.volume - 24.0).abs() < 1e-6,
+            "STEP round-trip volume {} != 24",
+            back.volume
+        );
+        assert!(!back.mesh.faces().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "occt")]
+    #[test]
+    fn exact_boolean_result_step_round_trip() {
+        // The exact difference (volume 840) written to STEP and re-read keeps its
+        // volume — a boolean BREP survives the exact handoff, not just a box.
+        let path = std::env::temp_dir().join("ijc_step_rt_bool.step");
+        let p = path.to_string_lossy().to_string();
+        // Build the exact difference shape directly and write it.
+        {
+            use opencascade::primitives::Shape;
+            let a = Shape::box_from_corners(
+                oc_glam::dvec3(0.0, 0.0, 0.0),
+                oc_glam::dvec3(10.0, 10.0, 10.0),
+            );
+            let b = Shape::box_from_corners(
+                oc_glam::dvec3(3.0, 3.0, -5.0),
+                oc_glam::dvec3(7.0, 7.0, 15.0),
+            );
+            a.subtract(&b).shape.write_step(&p).expect("write ok");
+        }
+        let back = read_step(&p).expect("feature on").expect("read ok");
+        assert!(
+            (back.volume - 840.0).abs() < 1e-6,
+            "STEP boolean round-trip volume {} != 840",
+            back.volume
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "occt")]
+    #[test]
+    fn faceted_mesh_step_writes_and_reads_back() {
+        // A single triangle mesh written as a faceted STEP part reads back with
+        // faces (it is a shell of planar faces, faceted not analytic).
+        let path = std::env::temp_dir().join("ijc_step_facet.step");
+        let p = path.to_string_lossy().to_string();
+        let positions = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+        ];
+        let faces = vec![[0u32, 1, 2]];
+        let n = write_mesh_step(&positions, &faces, &p)
+            .expect("feature on")
+            .expect("write ok");
+        assert_eq!(n, 1);
+        assert!(std::path::Path::new(&p).exists());
+        let _ = std::fs::remove_file(&path);
     }
 
     // -- exact-op tests (only when the exact kernel is compiled in) --
