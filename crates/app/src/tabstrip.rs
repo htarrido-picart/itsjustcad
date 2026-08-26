@@ -53,6 +53,10 @@ impl PanelTab {
 /// alone always leaves the width unchanged — see [`dock_width`].
 pub const DOCK_WIDTH: f32 = 320.0;
 
+/// Minimum dock width (px) — the resize floor. The dock never shrinks below
+/// this; its maximum is half the window width (enforced in `right_panel`).
+pub const DOCK_MIN: f32 = 280.0;
+
 /// The dock's render width for a given tab and a (possibly user-dragged) stored
 /// width. The width is INDEPENDENT of which tab is active: every tab renders at
 /// the same `stored` width (seeded from [`DOCK_WIDTH`]). This is the single

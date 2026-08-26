@@ -3038,13 +3038,20 @@ impl App {
         // The user may still drag to resize — we read the resulting width back
         // into `dock_width` after `show`, so the dragged width persists across
         // tab switches. `tabstrip::dock_width` proves the width is tab-agnostic.
-        let width = crate::tabstrip::dock_width(self.panel_tabs.active(), self.dock_width);
+        // Width bounds: floor at DOCK_MIN (280px); cap at half the window width so
+        // the dock never eats more than half the screen. Clamp the stored width too.
+        let max_w = (ui.ctx().screen_rect().width() * 0.5).max(crate::tabstrip::DOCK_MIN);
+        let width = crate::tabstrip::dock_width(self.panel_tabs.active(), self.dock_width)
+            .clamp(crate::tabstrip::DOCK_MIN, max_w);
         panel = if collapsed {
             // Even collapsed, hold the same width so toggling collapse/tabs
             // never jumps the dock edge.
             panel.exact_size(width)
         } else {
-            panel.default_size(width).min_size(240.0)
+            panel
+                .default_size(width)
+                .min_size(crate::tabstrip::DOCK_MIN)
+                .max_size(max_w)
         };
         let panel_resp = panel.show(ui, |ui| {
             // Header row: chevron + tab strip.
@@ -3136,7 +3143,8 @@ impl App {
         if !collapsed {
             let w = panel_resp.response.rect.width();
             if w.is_finite() && w > 1.0 {
-                self.dock_width = w;
+                // Persist within the same [floor, half-window] bounds.
+                self.dock_width = w.clamp(crate::tabstrip::DOCK_MIN, max_w);
             }
         }
     }
