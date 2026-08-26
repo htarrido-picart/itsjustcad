@@ -3,8 +3,9 @@
 
 //! Token-backed reusable UI components for the ItsJustCAD app: button *roles*
 //! (prominent / normal / destructive), a real segmented control (equal-width,
-//! single-select, all-one-type), and a reusable confirmation alert (Cancel
-//! leading / primary trailing). Plus the pure `is_dirty` predicate that decides
+//! single-select, all-one-type), and a reusable confirmation alert (grouped
+//! [Discard] [Cancel] row) plus a shared padded dialog frame. Plus the pure
+//! `is_dirty` predicate that decides
 //! whether a New/Open/Quit needs the unsaved-changes guard.
 //!
 //! The *policy* pieces (button-role → colors, alert button order, is_dirty) are
@@ -306,19 +307,23 @@ pub enum AlertChoice {
     Confirm,
 }
 
-/// Alert button layout: **Cancel leading, primary trailing** (HIG/macOS order).
-/// Pure so the ordering contract is unit-tested. Returns `(leading, trailing)`
-/// labels for the given confirm verb.
+/// Alert button layout: **confirm (Discard) leading, Cancel trailing**, GROUPED
+/// (drawn next to each other, not spread to opposite edges). Pure so the ordering
+/// contract is unit-tested. Returns `(leading, trailing)` labels for the given
+/// confirm verb — `(confirm_label, "Cancel")`.
 pub fn alert_button_order(confirm_label: &str) -> (&str, &str) {
-    ("Cancel", confirm_label)
+    (confirm_label, "Cancel")
 }
 
-/// A reusable modal confirmation alert. Neutral `title`, a `message`, a leading
-/// **Cancel** (NOT the default) and a trailing destructive-styled confirm
-/// button. Returns `Some(choice)` once the user acts; `None` while open.
+/// A reusable modal confirmation alert. Neutral `title`, a `message`, and a
+/// single grouped button row: the destructive-tinted confirm (e.g. **Discard**)
+/// on the LEFT, a normal **Cancel** on the RIGHT, next to each other with a
+/// small gap — neither pushed to an edge, neither a loud filled primary so
+/// prominence stays balanced. Returns `Some(choice)` once the user acts; `None`
+/// while open. Esc = Cancel (safe path), Enter = the confirm/Discard action.
 ///
 /// `confirm_role` lets the caller mark the confirm action destructive (unsaved
-/// discard, delete) so it reads red.
+/// discard, delete) so it reads with a red tint (but never a filled-red button).
 pub fn alert(
     ctx: &egui::Context,
     roles: &ColorRoles,
@@ -329,33 +334,117 @@ pub fn alert(
     confirm_role: ButtonRole,
 ) -> Option<AlertChoice> {
     let mut choice = None;
-    egui::Modal::new(egui::Id::new(("itsjustcad_alert", title))).show(ctx, |ui| {
-        ui.set_max_width(360.0);
-        ui.vertical(|ui| {
-            ui.heading(title);
-            ui.add_space(theme::Spacing::S);
-            ui.label(message);
-            ui.add_space(theme::Spacing::M);
-            // Cancel LEADING, primary TRAILING. Cancel is NOT the default: we do
-            // not request focus for it and Enter maps to the confirm action.
+    egui::Modal::new(egui::Id::new(("itsjustcad_alert", title)))
+        // Paint the modal frame from OUR tokens (surface_elevated fill + outline
+        // + shadow) so it never inherits egui's theme-dependent popup fill, which
+        // can diverge from the preset and render text-on-same-color. Text colors
+        // below come from the SAME `roles`, so contrast is guaranteed.
+        .frame(dialog_modal_frame(roles))
+        .show(ctx, |ui| {
+        dialog_body(ui, roles, 400.0, |ui| {
+            dialog_title(ui, roles, title);
+            ui.add_space(theme::Spacing::SM);
+            dialog_text(ui, roles, message);
+            ui.add_space(theme::Spacing::L);
+            // ONE grouped, left-aligned row: [Discard] [Cancel], a small gap
+            // between them — NOT spread to opposite edges. Order comes from
+            // `alert_button_order` (confirm/Discard leading).
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = theme::Spacing::SM;
                 let (leading, trailing) = alert_button_order(confirm_label);
-                if role_button(ui, roles, dark, ButtonRole::Normal, leading).clicked() {
+                if role_button(ui, roles, dark, confirm_role, leading).clicked() {
+                    choice = Some(AlertChoice::Confirm);
+                }
+                if role_button(ui, roles, dark, ButtonRole::Normal, trailing).clicked() {
                     choice = Some(AlertChoice::Cancel);
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if role_button(ui, roles, dark, confirm_role, trailing).clicked() {
-                        choice = Some(AlertChoice::Confirm);
-                    }
-                });
             });
         });
     });
-    // Esc dismisses as Cancel (the safe path).
-    if choice.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        choice = Some(AlertChoice::Cancel);
+    if choice.is_none() {
+        ctx.input(|i| {
+            // Esc dismisses as Cancel (the safe path); Enter fires the confirm
+            // (Discard) action so the keyboard default matches the leading button.
+            if i.key_pressed(egui::Key::Escape) {
+                choice = Some(AlertChoice::Cancel);
+            } else if i.key_pressed(egui::Key::Enter) {
+                choice = Some(AlertChoice::Confirm);
+            }
+        });
     }
     choice
+}
+
+// ── Shared dialog frame / typography ─────────────────────────────────────
+
+/// Comfortable inner padding used inside every dialog/popup so content never
+/// sits cramped against the frame. Applied on all four sides.
+pub const DIALOG_PADDING: f32 = theme::Spacing::L;
+
+/// The modal/dialog frame painted from OUR tokens: `surface_elevated` fill, an
+/// `outline` stroke and a soft `shadow`, rounded to the medium radius. Using an
+/// explicit frame (instead of egui's `Frame::popup`) means the dialog fill never
+/// diverges from the preset when the OS/`ITSJUSTCAD_THEME` egui theme differs —
+/// the fill and the token text colors always come from the same `roles`, so
+/// contrast holds in every theme.
+pub fn dialog_modal_frame(roles: &ColorRoles) -> egui::Frame {
+    egui::Frame::NONE
+        .fill(theme::to_color32(roles.surface_elevated))
+        .stroke(egui::Stroke::new(1.0, theme::to_color32(roles.outline)))
+        .corner_radius(egui::CornerRadius::same(theme::Radii::default().medium as u8))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 4],
+            blur: 16,
+            spread: 0,
+            color: theme::to_color32(roles.shadow),
+        })
+}
+
+/// Lay out a dialog body inside a consistently-padded, width-capped column.
+/// Wraps `add_contents` in a vertical layout with `DIALOG_PADDING` inset on all
+/// sides and a `max_width` cap so messages get room to breathe. Use this from
+/// every dialog so their padding cannot drift apart.
+pub fn dialog_body<R>(
+    ui: &mut egui::Ui,
+    _roles: &ColorRoles,
+    max_width: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.set_max_width(max_width + DIALOG_PADDING * 2.0);
+    egui::Frame::NONE
+        .inner_margin(egui::Margin::same(DIALOG_PADDING as i8))
+        .show(ui, |ui| {
+            ui.set_max_width(max_width);
+            ui.vertical(|ui| add_contents(ui)).inner
+        })
+        .inner
+}
+
+/// Draw a dialog title using the title token (semibold, ~20px) in `on_surface`.
+pub fn dialog_title(ui: &mut egui::Ui, roles: &ColorRoles, title: &str) {
+    let size = ui.style().text_styles
+        .get(&egui::TextStyle::Heading)
+        .map(|f| f.size)
+        .unwrap_or(20.0);
+    ui.label(
+        egui::RichText::new(title)
+            .size(size)
+            .strong()
+            .color(theme::to_color32(roles.on_surface)),
+    );
+}
+
+/// Draw dialog body copy at body size in the STRONG `on_surface` role (not the
+/// weak `on_surface_variant`) with wrapping + a touch of extra line spacing, so
+/// it clears the WCAG 4.5:1 floor on the elevated dialog fill in both themes.
+pub fn dialog_text(ui: &mut egui::Ui, roles: &ColorRoles, text: &str) {
+    let prev = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = (prev * 1.3).max(prev);
+    ui.label(
+        egui::RichText::new(text)
+            .color(theme::to_color32(roles.on_surface)),
+    );
+    ui.spacing_mut().item_spacing.y = prev;
 }
 
 // ── Unsaved-changes predicate ───────────────────────────────────────────
@@ -427,15 +516,29 @@ mod tests {
     // ── Alert ────────────────────────────────────────────────────────────
 
     #[test]
-    fn alert_order_is_cancel_leading_primary_trailing() {
+    fn alert_order_is_discard_leading_cancel_trailing() {
         let (leading, trailing) = alert_button_order("Discard");
-        assert_eq!(leading, "Cancel", "Cancel must lead");
-        assert_eq!(trailing, "Discard", "primary/confirm must trail");
+        assert_eq!(leading, "Discard", "confirm/Discard must lead (on the left)");
+        assert_eq!(trailing, "Cancel", "Cancel must trail (on the right)");
     }
 
     #[test]
     fn alert_choice_variants_distinct() {
         assert_ne!(AlertChoice::Cancel, AlertChoice::Confirm);
+    }
+
+    #[test]
+    fn dialog_body_text_clears_wcag_on_elevated_fill_both_themes() {
+        // Dialog body copy uses on_surface; verify it clears the 4.5:1 floor
+        // against the ELEVATED dialog fill in both a dark and a light skin.
+        for surface in [[0.13, 0.14, 0.16, 1.0], [0.96, 0.96, 0.97, 1.0]] {
+            let r = theme::roles_from(surface, [0.0, 0.63, 0.95, 1.0]);
+            let c = theme::contrast_ratio(r.on_surface, r.surface_elevated);
+            assert!(
+                c >= 4.5,
+                "dialog body text must clear WCAG AA on the elevated fill (got {c:.2})"
+            );
+        }
     }
 
     // ── is_dirty ─────────────────────────────────────────────────────────

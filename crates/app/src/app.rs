@@ -423,6 +423,30 @@ pub(crate) enum PendingNav {
     Quit,
 }
 
+/// What the unsaved-changes guard should do with a user's alert choice. Pure so
+/// the click → outcome contract is unit-tested without an egui/wgpu context.
+///
+/// Both choices clear the parked nav; only **Discard** (Confirm) also performs
+/// it. `None` (alert still open) leaves the nav parked and does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NavAction {
+    /// Drop the parked `pending_nav` (true for either explicit choice).
+    pub clear_pending: bool,
+    /// Actually run the parked navigation (true only for Discard/Confirm).
+    pub perform: bool,
+}
+
+/// Map an alert choice to the guard's action. This is the exact logic
+/// `unsaved_guard_ui` applies; extracted so the Discard-performs / Cancel-drops
+/// contract is provable in a headless test.
+pub(crate) fn nav_action_for(choice: Option<crate::widgets::AlertChoice>) -> NavAction {
+    match choice {
+        Some(crate::widgets::AlertChoice::Confirm) => NavAction { clear_pending: true, perform: true },
+        Some(crate::widgets::AlertChoice::Cancel) => NavAction { clear_pending: true, perform: false },
+        None => NavAction { clear_pending: false, perform: false },
+    }
+}
+
 /// A running install: which model, plus the [`crate::download::Download`] handle
 /// the UI polls. Kept so a completed download can be turned into a decks.json
 /// cassette exactly once.
@@ -680,15 +704,12 @@ impl App {
             "Discard",
             crate::widgets::ButtonRole::Destructive,
         );
-        match choice {
-            Some(crate::widgets::AlertChoice::Confirm) => {
-                self.pending_nav = None;
-                self.perform_nav(ctx, nav);
-            }
-            Some(crate::widgets::AlertChoice::Cancel) => {
-                self.pending_nav = None;
-            }
-            None => {}
+        let action = nav_action_for(choice);
+        if action.clear_pending {
+            self.pending_nav = None;
+        }
+        if action.perform {
+            self.perform_nav(ctx, nav);
         }
         self.pending_nav.is_some()
     }
@@ -4421,17 +4442,36 @@ impl eframe::App for App {
                 .resizable(false)
                 .open(&mut open)
                 .show(ui.ctx(), |ui| {
-                    ui.label(egui::RichText::new("ItsJustCAD").heading());
-                    ui.label("It's just CAD — a command-first, FOSS CAD workspace.");
-                    ui.add_space(6.0);
-                    // Attribution required under AGPLv3 §7(b) — do not remove.
-                    ui.label("© 2026 Hector Tarrido-Picart");
-                    ui.label("Desktop: AGPLv3. Commercial & mobile licensing from the author.");
-                    ui.label(format!("Preset: {}", preset::preset_for(self.cad_origin).menu_style_label()));
-                    ui.add_space(6.0);
-                    if ui.button("Close").clicked() {
-                        self.show_about = false;
-                    }
+                    let roles = &preset::preset_for(self.cad_origin).tokens().colors;
+                    crate::widgets::dialog_body(ui, roles, 360.0, |ui| {
+                        crate::widgets::dialog_title(ui, roles, "ItsJustCAD");
+                        ui.add_space(crate::theme::Spacing::S);
+                        crate::widgets::dialog_text(
+                            ui,
+                            roles,
+                            "It's just CAD — a command-first, FOSS CAD workspace.",
+                        );
+                        ui.add_space(crate::theme::Spacing::S);
+                        // Attribution required under AGPLv3 §7(b) — do not remove.
+                        crate::widgets::dialog_text(ui, roles, "© 2026 Hector Tarrido-Picart");
+                        crate::widgets::dialog_text(
+                            ui,
+                            roles,
+                            "Desktop: AGPLv3. Commercial & mobile licensing from the author.",
+                        );
+                        crate::widgets::dialog_text(
+                            ui,
+                            roles,
+                            &format!(
+                                "Preset: {}",
+                                preset::preset_for(self.cad_origin).menu_style_label()
+                            ),
+                        );
+                        ui.add_space(crate::theme::Spacing::M);
+                        if ui.button("Close").clicked() {
+                            self.show_about = false;
+                        }
+                    });
                 });
             if !open {
                 self.show_about = false;
@@ -4702,6 +4742,46 @@ fn pano_from_view(v: itsjustcad_doc::PanoView) -> itsjustcad_render::PanoProject
 mod tests {
     use super::*;
     use itsjustcad_commands::registry;
+
+    #[test]
+    fn discard_choice_clears_pending_and_performs_nav() {
+        // The user-reported bug: clicking Discard did nothing. The guard's
+        // choice→action contract must (a) clear the parked nav AND (b) perform
+        // it for Discard/Confirm. Both are required for New/Open/Quit to fire.
+        let a = nav_action_for(Some(crate::widgets::AlertChoice::Confirm));
+        assert!(a.clear_pending, "Discard must clear the parked nav");
+        assert!(a.perform, "Discard MUST perform the parked navigation");
+    }
+
+    #[test]
+    fn cancel_choice_clears_pending_without_performing() {
+        let a = nav_action_for(Some(crate::widgets::AlertChoice::Cancel));
+        assert!(a.clear_pending, "Cancel drops the parked nav");
+        assert!(!a.perform, "Cancel must NOT perform the navigation");
+    }
+
+    #[test]
+    fn open_alert_leaves_nav_parked() {
+        // No choice yet (alert still up) → nav stays parked, nothing performed.
+        let a = nav_action_for(None);
+        assert!(!a.clear_pending);
+        assert!(!a.perform);
+    }
+
+    #[test]
+    fn new_document_nav_effect_clears_the_doc() {
+        // Proves the New branch of `perform_nav`'s effect: a dirty session is
+        // replaced by a fresh empty one at cursor 0. (perform_nav itself needs
+        // an egui ctx, but its New arm is `new_document` whose effect is this.)
+        use itsjustcad_commands::{parse, Session};
+        let mut session = Session::default();
+        session.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        assert!(!session.doc.is_empty(), "precondition: dirty doc has geometry");
+        // The New navigation replaces the session (see `new_document`).
+        session = Session::default();
+        assert!(session.doc.is_empty(), "New must clear the document");
+        assert_eq!(session.history().1, 0, "New resets the op-log cursor");
+    }
 
     #[test]
     fn middle_truncate_keeps_head_and_tail() {

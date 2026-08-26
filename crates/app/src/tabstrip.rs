@@ -51,7 +51,7 @@ impl PanelTab {
 /// width so switching tabs never resizes the dock. The user may still drag to
 /// resize (the dragged width persists across tab switches), but a tab switch
 /// alone always leaves the width unchanged — see [`dock_width`].
-pub const DOCK_WIDTH: f32 = 320.0;
+pub const DOCK_WIDTH: f32 = 280.0;
 
 /// Minimum dock width (px) — the resize floor. The dock never shrinks below
 /// this; its maximum is half the window width (enforced in `right_panel`).
