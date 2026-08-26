@@ -1019,6 +1019,25 @@ impl DeckPane {
                     if let Some(verb) = crate::app_verbs::classify(&line)
                         && !matches!(verb, crate::app_verbs::AppVerb::GuiOnly(_))
                     {
+                        // SECURITY: app-verbs bypass the fs side-effect gate
+                        // because they carry no `Command`. Almost all are pure
+                        // view/camera state — but a `basemap <provider>` fetch
+                        // reaches the NETWORK (tile servers) to stitch an
+                        // underlay. A deck-emitted basemap must NOT silently
+                        // egress: drop the fetching form and tell the user to run
+                        // it from the command line. `basemap off/clear` performs
+                        // no network I/O, so it still passes through.
+                        if let crate::app_verbs::AppVerb::Basemap(b) = &verb
+                            && !b.clear
+                        {
+                            self.current_commands.push(ExecutedCommand {
+                                line: line.clone(),
+                                result: Err(
+                                    "basemap fetch reaches the network — run it yourself from the command line".to_string(),
+                                ),
+                            });
+                            continue;
+                        }
                         self.current_commands.push(ExecutedCommand {
                             line: line.clone(),
                             result: Ok("applied (view/camera)".to_string()),
@@ -2091,6 +2110,36 @@ mod side_effect_gate_tests {
             ]
         );
         assert!(pane.errors_this_turn.is_empty());
+    }
+
+    #[test]
+    fn deck_basemap_fetch_is_blocked_but_clear_passes() {
+        // SECURITY: `basemap sat` reaches the network to fetch tiles. A
+        // deck-emitted fetch must NOT auto-egress — it is dropped with an error
+        // and never queued as an app verb. `basemap off` (no network) still
+        // passes through so the model can clear the underlay.
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![
+                ExtractEvent::Command("basemap sat 800 0.6".to_string()),
+                ExtractEvent::Command("basemap off".to_string()),
+            ],
+            &mut session,
+        );
+        // Only the clearing form reached the app-verb queue.
+        assert_eq!(pane.take_app_verbs(), vec!["basemap off".to_string()]);
+        // The fetch was reported as an error this turn (surfaced to the user).
+        assert!(
+            pane.errors_this_turn.is_empty(),
+            "a dropped app-verb is recorded on the command, not as a retry-triggering error"
+        );
+        // The command list carries the fetch as a failed command with a reason.
+        assert!(
+            pane.current_commands.iter().any(|c| c.line == "basemap sat 800 0.6"
+                && c.result.as_ref().is_err_and(|e| e.contains("network"))),
+            "basemap fetch must be recorded as a network-blocked failure"
+        );
     }
 
     #[test]

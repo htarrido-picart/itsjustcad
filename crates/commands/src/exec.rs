@@ -25,6 +25,47 @@ fn image_aspect(path: &str) -> Option<f64> {
     (h > 0).then(|| w as f64 / h as f64)
 }
 
+/// Hard ceiling on the size of an import file we will load into memory (512 MiB).
+///
+/// SECURITY: every importer previously called `std::fs::read`, which loads the
+/// whole file into RAM *before* any per-format cap (point-count strides, etc.)
+/// can apply. A crafted or hostile file — a decompression-bomb-sized point cloud
+/// pointed at by an LLM-emitted `import`/`terrain`/`osm` — would OOM the process
+/// at the read, not the parse. We stat first and refuse anything over the cap,
+/// so an oversized file fails cleanly with a message instead of taking the app
+/// down. 512 MiB comfortably covers legitimate CAD/scan files.
+const MAX_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Whether `len` is within the import ceiling. Pure so the rule is unit-tested
+/// without touching the filesystem.
+fn import_size_ok(len: u64) -> bool {
+    len <= MAX_IMPORT_BYTES
+}
+
+/// Read an import file into memory with a size ceiling. Stats the file first so
+/// an oversized file is refused *before* it is loaded (no OOM), then reads it.
+/// A race that grows the file between stat and read is still bounded because the
+/// read is a one-shot of the now-known length. Returns a clear `ExecError` on a
+/// missing/unreadable/oversized file.
+fn read_import_bytes(path: &str) -> Result<Vec<u8>, ExecError> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+    if !import_size_ok(meta.len()) {
+        return Err(ExecError::Invalid(format!(
+            "'{path}' is {} bytes — over the {} MiB import limit; refusing to load",
+            meta.len(),
+            MAX_IMPORT_BYTES / (1024 * 1024)
+        )));
+    }
+    std::fs::read(path).map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))
+}
+
+/// Like [`read_import_bytes`] but returns UTF-8 text (for DXF, CSV, EPW).
+fn read_import_string(path: &str) -> Result<String, ExecError> {
+    let bytes = read_import_bytes(path)?;
+    String::from_utf8(bytes).map_err(|_| ExecError::Invalid(format!("'{path}' is not valid UTF-8")))
+}
+
 #[derive(Debug)]
 pub struct ApplyOutcome {
     /// Ids of objects created by this command.
@@ -1137,8 +1178,7 @@ impl Session {
     }
 
     fn import_dxf(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let text = read_import_string(&path)?;
         let parsed = crate::dxf::parse_dxf(&text)
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
         let prev_layer = self.doc.current_layer.clone();
@@ -1163,8 +1203,7 @@ impl Session {
     }
 
     fn import_mesh(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let bytes = read_import_bytes(&path)?;
         let parts = crate::mesh_import::import(&path, &bytes)
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
         if parts.is_empty() {
@@ -1199,8 +1238,7 @@ impl Session {
     /// emitted as one logged substrate command, so the import replays from the
     /// op-log without the `.3dm` file.
     fn import_3dm(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let bytes = read_import_bytes(&path)?;
         let parsed = crate::rhino3dm::import(&bytes)
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
         if parsed.objects.is_empty() {
@@ -1258,8 +1296,7 @@ impl Session {
     /// `MeshLiteral`), so the whole import is replay-safe — the op-log, not the
     /// IFC file, is the record.
     fn import_ifc(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let bytes = read_import_bytes(&path)?;
         let sem = crate::ifc::import_semantic(&bytes)
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
         if sem.elements.is_empty() {
@@ -1364,8 +1401,7 @@ impl Session {
     /// summarize the 8760 hourly rows (nothing heavy is retained). Only the
     /// `location` op is logged; the weather rows are reported, not stored.
     fn import_epw(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let text = read_import_string(&path)?;
         let s = itsjustcad_solar::parse_epw(&text)
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
         // Log the location so saved files replay the site without the EPW file.
@@ -1402,8 +1438,7 @@ impl Session {
     /// point primitive). `properties.name` becomes the object name. Each op is
     /// logged individually so the op-log — not the GeoJSON file — is the record.
     fn import_geojson(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let bytes = read_import_bytes(&path)?;
         let feats = crate::geo::parse_geojson(&bytes, self.geo_origin())
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
         if feats.is_empty() {
@@ -1456,8 +1491,7 @@ impl Session {
     /// Import a LAS 1.2–1.4 point cloud. Decimates to ≤200k points and stores
     /// as a single `PointLiteral` op on layer "pointcloud". LAZ gets an error.
     fn import_las(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let bytes = read_import_bytes(&path)?;
         let pts = crate::las::parse(&bytes)
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
         if pts.positions.is_empty() {
@@ -1483,8 +1517,7 @@ impl Session {
     /// sections, extracts Cartesian positions + optional colors, decimates to
     /// ≤200k, and stores on layer "pointcloud" as a single `PointLiteral` op.
     fn import_e57(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let bytes = read_import_bytes(&path)?;
         let pts = crate::e57::parse(&bytes)
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
 
@@ -1521,8 +1554,7 @@ impl Session {
     /// (elevation contour LineStrings) file. Delaunay-triangulates the points
     /// and adds one MeshLiteral op on layer "terrain".
     fn terrain(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let bytes = read_import_bytes(&path)?;
         let ext = path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).unwrap_or_default();
         let mesh = match ext.as_str() {
             "csv" | "txt" => {
@@ -1571,8 +1603,7 @@ impl Session {
     /// building footprint is extruded (height tag or 9 m default) into a
     /// MeshLiteral op on layer "context".
     fn osmfile(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| ExecError::Invalid(format!("cannot read '{path}': {e}")))?;
+        let bytes = read_import_bytes(&path)?;
         let buildings = crate::geo::parse_overpass(&bytes, self.geo_origin())
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
         if buildings.is_empty() {
@@ -6309,6 +6340,52 @@ mod tests {
 
     fn run(s: &mut Session, line: &str) -> ApplyOutcome {
         s.run(parse(line).unwrap()).unwrap()
+    }
+
+    // ── import size ceiling (decompression-bomb / OOM defense) ──────────────
+
+    #[test]
+    fn import_size_rule_caps_at_512_mib() {
+        assert!(import_size_ok(0));
+        assert!(import_size_ok(MAX_IMPORT_BYTES));
+        assert!(import_size_ok(MAX_IMPORT_BYTES - 1));
+        // One byte over the ceiling is refused.
+        assert!(!import_size_ok(MAX_IMPORT_BYTES + 1));
+        // A multi-GB "bomb" is refused.
+        assert!(!import_size_ok(8 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn read_import_bytes_refuses_oversized_file_without_loading() {
+        // A sparse file whose *length* exceeds the cap: `set_len` grows the
+        // metadata length without writing 512 MiB, so the test is cheap. The
+        // reader must refuse on the stat, never attempting the full read.
+        let dir = std::env::temp_dir().join(format!("ijc_import_cap_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bomb.las");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_IMPORT_BYTES + 4096).unwrap();
+        drop(f);
+        let err = read_import_bytes(path.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("import limit"), "wrong error: {msg}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_import_bytes_reads_a_small_file() {
+        let dir = std::env::temp_dir().join(format!("ijc_import_ok_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ok.bin");
+        std::fs::write(&path, b"hello").unwrap();
+        assert_eq!(read_import_bytes(path.to_str().unwrap()).unwrap(), b"hello");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_import_bytes_missing_file_is_clean_error() {
+        let err = read_import_bytes("/nonexistent/ijc/does-not-exist.las").unwrap_err();
+        assert!(err.to_string().contains("cannot read"), "{err}");
     }
 
     // ── dynamic (parametric) blocks ─────────────────────────────────────────

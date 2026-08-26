@@ -1,3 +1,21 @@
+[advisories]
+# These are all `unmaintained` advisories (not vulnerabilities — no known
+# exploit) pulled in transitively by `muda`, the native menu-bar crate, through
+# the gtk-rs GTK3 bindings on Linux. They are confined to the desktop menu path,
+# carry no CVE, and there is no maintained drop-in replacement for muda's GTK3
+# backend yet. Reviewed 2026-08-26 in the security sweep; revisit when muda
+# moves off GTK3. Each id is pinned so a NEW advisory still fails the check.
+ignore = [
+    "RUSTSEC-2024-0370", # proc-macro-error unmaintained (glib-macros build dep)
+    "RUSTSEC-2024-0412", # gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0413", # gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0415", # gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0416", # gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0418", # gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0419", # gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0420", # gtk-rs GTK3 bindings unmaintained
+]
+
 [licenses]
 allow = [
     "MIT",
