@@ -3,7 +3,6 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::DeckConfig;
@@ -184,20 +183,19 @@ impl ClaudeCodeDeck {
                     .to_string(),
             )
         })?;
-        let mut child = tokio::process::Command::new(&bin)
-            .args(&args)
-            .env("PATH", crate::which::augmented_path_env())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| DeckError::Stream(format!("cannot launch claude CLI: {e}")))?;
+        // Spawn the CLI child. On macOS this disclaims TCC responsibility so the
+        // child's permission requests (e.g. its notification/sound path brushing
+        // the media library) are NOT attributed to our app — killing the
+        // spurious "ItsJustCAD would like to access Apple Music" prompt. Every
+        // other platform spawns a plain tokio child. See `claude_spawn`.
+        let mut child = crate::claude_spawn::spawn_claude(
+            &bin,
+            &args,
+            &crate::which::augmented_path_env(),
+        )?;
 
-        let stdout = child.stdout.take().expect("piped stdout");
-        let mut lines = BufReader::new(stdout).lines();
         let mut got_result = false;
-        while let Ok(Some(line)) = lines.next_line().await {
+        while let Some(line) = child.next_line().await {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
@@ -228,7 +226,7 @@ impl ClaudeCodeDeck {
                 _ => {}
             }
         }
-        let _ = child.wait().await;
+        child.wait().await;
         if !got_result {
             return Err(DeckError::Stream(
                 "claude CLI ended without a result event".into(),

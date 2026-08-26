@@ -16,3 +16,8 @@ futures.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
 tracing.workspace = true
+
+# macOS-only: raw posix_spawn + responsibility_spawnattrs_setdisclaim to spawn
+# the `claude` child with TCC responsibility disclaimed (see claude_spawn.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

@@ -8,6 +8,7 @@
 
 mod anthropic;
 mod claude_code;
+mod claude_spawn;
 mod config;
 mod deck;
 mod extract;
