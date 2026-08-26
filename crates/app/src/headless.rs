@@ -244,6 +244,9 @@ pub fn run_script_lines(
                     println!("{l}");
                 }
             }
+            Some(AppVerb::ReduceMotion(_)) => {
+                // No animated UI in headless mode — silently accepted.
+            }
             Some(AppVerb::GuiOnly(name)) => {
                 eprintln!("warning: '{name}' is GUI-only; ignored in headless mode");
             }

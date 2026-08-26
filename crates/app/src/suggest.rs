@@ -55,6 +55,7 @@ pub const APP_VERBS: &[&str] = &[
     "critique",
     "copyselection",
     "pasteselection",
+    "reducemotion",
 ];
 
 /// A single autocomplete candidate.

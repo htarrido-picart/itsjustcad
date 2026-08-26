@@ -348,6 +348,10 @@ pub struct App {
     panel_tabs: crate::tabstrip::TabState,
     /// Whether the right docked panel is shown at all (Cmd+\ hides/shows).
     panel_visible: bool,
+    /// When true, all animated progress bars (warm-up, download) run without
+    /// egui's built-in animation (no indeterminate shimmer). Persisted to
+    /// `ui.json`; honours accessibility / Reduce Motion preference.
+    reduce_motion: bool,
     /// Whether the Help → About dialog is open.
     show_about: bool,
     /// Whether the Edit → "Edit history…" modal (op-log / amend panel) is open.
@@ -556,6 +560,7 @@ impl App {
             deck_visible,
             panel_tabs: crate::tabstrip::TabState::default(),
             panel_visible: true,
+            reduce_motion: load_reduce_motion(),
             show_about: false,
             show_history: false,
             // Env pin wins for dev/screenshots; otherwise restore the persisted
@@ -877,6 +882,19 @@ impl App {
                     self.sketchy.depthcue,
                     self.sketchy.endpoints,
                 ));
+            }
+            // Toggle Reduce Motion: disables animated progress bars.
+            // View/session state, never logged; persisted to ui.json.
+            Some("reducemotion") => {
+                let on = match words.next() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => !self.reduce_motion, // bare toggle
+                };
+                self.reduce_motion = on;
+                save_reduce_motion(on);
+                self.command_line
+                    .push_line(format!("reduce motion: {}", if on { "on" } else { "off" }));
             }
             Some("viewports" | "vp") => {
                 match words.next() {
@@ -2921,7 +2939,8 @@ impl App {
             .filter_map(|o| o.name.clone())
             .collect();
         let aliases = self.active_aliases();
-        if let Some(line) = self.command_line.ui(ui, &object_names, aliases) {
+        let panel_h = ui.available_height();
+        if let Some(line) = self.command_line.ui(ui, &object_names, aliases, panel_h) {
             self.execute_line(line);
         }
     }
@@ -3032,6 +3051,7 @@ impl App {
                             &self.icons,
                             &tk.colors,
                             tk.dark,
+                            self.reduce_motion,
                         );
                     }
                 }
@@ -3275,7 +3295,20 @@ impl App {
                             );
                             ui.label(crate::download::progress_caption(state));
                             if state.is_active() {
-                                if ui.button("Cancel").clicked() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Warning: cancelling will discard the partial file.",
+                                    )
+                                    .small()
+                                    .color(ui.visuals().warn_fg_color),
+                                );
+                                if ui
+                                    .button("Cancel")
+                                    .on_hover_text(
+                                        "The partially downloaded .part file will be discarded.",
+                                    )
+                                    .clicked()
+                                {
                                     cancel = true;
                                 }
                             } else if let crate::download::DownloadState::Failed { msg } = state {
@@ -3399,6 +3432,9 @@ impl App {
                         if self
                             .icons
                             .icon_button(ui, crate::icons::Icon::Close, "Cancel download")
+                            .on_hover_text(
+                                "Cancel download — the partial file will be discarded.",
+                            )
                             .clicked()
                         {
                             cancel = true;
@@ -3605,6 +3641,17 @@ fn load_deck_brain() -> Option<DeckBrain> {
         "skip" => Some(DeckBrain::Skip),
         _ => None,
     }
+}
+
+/// Restore the persisted Reduce Motion toggle (default OFF when absent).
+fn load_reduce_motion() -> bool {
+    load_ui_json()["reduce_motion"].as_bool().unwrap_or(false)
+}
+
+fn save_reduce_motion(on: bool) {
+    let mut v = load_ui_json();
+    v["reduce_motion"] = serde_json::json!(on);
+    save_ui_json(&v);
 }
 
 /// Model id to seed the local cassette with for a given hardware tier.

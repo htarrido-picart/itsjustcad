@@ -1403,6 +1403,7 @@ impl DeckPane {
         self.persist_chat();
     }
 
+    #[allow(clippy::too_many_arguments)] // fixed signature; splitting further aids nothing
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -1411,6 +1412,7 @@ impl DeckPane {
         icons: &crate::icons::Icons,
         roles: &crate::theme::ColorRoles,
         dark: bool,
+        reduce_motion: bool,
     ) {
         self.drain(session, handle);
         if self.busy()
@@ -1585,7 +1587,7 @@ impl DeckPane {
                         ui.add(
                             egui::ProgressBar::new(progress)
                                 .desired_height(6.0)
-                                .animate(true),
+                                .animate(!reduce_motion),
                         );
                     }
                     WarmState::Failed(e) => {

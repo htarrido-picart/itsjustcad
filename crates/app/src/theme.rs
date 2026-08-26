@@ -52,12 +52,20 @@ impl Spacing {
     /// 32px — major regions.
     pub const XL: f32 = 32.0;
 
-    /// 80px (10× grid unit) — the docked command-history scrollback height.
-    /// Not on the 4/8 exposed ramp (it is a region size, not an inter-widget
-    /// gap), but still derived from the grid so it stays token-driven.
+    /// 80px (10× grid unit) — the docked command-history scrollback height,
+    /// used as the default / minimum when no panel height is available.
+    /// Prefer [`Spacing::history_h_for`] for a token-relative height.
     pub const HISTORY_H: f32 = Self::S * 10.0;
     /// 64px (8× grid unit) — the deck chat input row reserve.
     pub const CHAT_INPUT_H: f32 = Self::S * 8.0;
+
+    /// Token-relative history height: 30% of `panel_h`, clamped to
+    /// `[HISTORY_H, 240px]`. Grows naturally when the command-line panel is
+    /// taller (bottom panel + window resize) while keeping a sensible floor so
+    /// a tiny window never collapses it to nothing.
+    pub fn history_h_for(panel_h: f32) -> f32 {
+        (panel_h * 0.30).clamp(Self::HISTORY_H, 240.0)
+    }
 
     /// 28px — the min interactive height for PRIMARY chrome controls
     /// (toolbar buttons, dialog buttons, combos). HIG/SwiftUI comfortable
@@ -757,8 +765,41 @@ mod tests {
         }
         // And the tokens must actually be referenced where we wired them.
         assert!(deck.contains("Spacing::CHAT_INPUT_H"));
-        assert!(cmd.contains("Spacing::HISTORY_H"));
+        // command_line uses history_h_for (which delegates to HISTORY_H) for
+        // token-relative height; either form satisfies the no-raw-literals rule.
+        assert!(
+            cmd.contains("history_h_for") || cmd.contains("Spacing::HISTORY_H"),
+            "command_line.rs must use history_h_for or Spacing::HISTORY_H"
+        );
         assert!(app.contains("Spacing::SM"));
+    }
+
+    #[test]
+    fn history_h_for_clamps_and_scales() {
+        // Floor: tiny panels never drop below HISTORY_H.
+        assert_eq!(
+            Spacing::history_h_for(0.0),
+            Spacing::HISTORY_H,
+            "floor must be HISTORY_H"
+        );
+        assert_eq!(
+            Spacing::history_h_for(200.0),
+            Spacing::HISTORY_H,
+            "200px panel: 30% = 60 < HISTORY_H, so clamp to floor"
+        );
+        // 30% of a 400px panel = 120, within [80, 240].
+        let h = Spacing::history_h_for(400.0);
+        assert!((h - 120.0).abs() < 0.1, "400px→30%=120, got {h}");
+        // Ceiling: very tall panels cap at 240.
+        assert_eq!(Spacing::history_h_for(1200.0), 240.0, "ceiling must be 240");
+        // Result is always in [HISTORY_H, 240].
+        for pct in [0, 100, 300, 500, 800, 1200] {
+            let h = Spacing::history_h_for(pct as f32);
+            assert!(
+                (Spacing::HISTORY_H..=240.0).contains(&h),
+                "history_h_for({pct}) = {h} out of range"
+            );
+        }
     }
 
     #[test]

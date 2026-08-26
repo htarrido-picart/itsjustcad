@@ -364,22 +364,26 @@ impl CommandLine {
     /// `object_names` — names of named objects in the current document; used
     /// to populate selector suggestions.
     /// `preset_aliases` — active legacy-CAD alias map from `preset::preset_for`.
+    /// `panel_h` — current height of the containing panel in logical pixels; used
+    /// to compute the token-relative history scrollback height.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         object_names: &[String],
         preset_aliases: &'static [(&'static str, &'static str)],
+        panel_h: f32,
     ) -> Option<String> {
         // Recompute suggestions if input changed.
         self.refresh_suggestions(object_names, preset_aliases);
 
         // Bottom-docked layout (under the right panel): history (op-log
         // scrollback) sits ABOVE the input (Rhino/AutoCAD look) and the popup
-        // opens upward.
+        // opens upward. History height grows with the panel (token-relative).
+        let history_h = crate::theme::Spacing::history_h_for(panel_h);
         let history_block = |cl: &Self, ui: &mut egui::Ui| {
             egui::ScrollArea::vertical()
                 .id_salt("cmd_history")
-                .max_height(crate::theme::Spacing::HISTORY_H)
+                .max_height(history_h)
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     for line in &cl.history {
@@ -424,21 +428,33 @@ impl CommandLine {
 
         if self.popup_visible() {
             let sel = self.suggest_sel.unwrap_or(usize::MAX);
+            let accent_fill = ui.visuals().selection.bg_fill;
+            let accent_stroke = ui.visuals().selection.stroke.color;
+            let on_accent = egui::Color32::WHITE;
             for (i, s) in self.suggestions.iter().enumerate() {
                 let label = if let Some(u) = &s.usage {
                     format!("{:<20} {}", s.completion, u)
                 } else {
                     s.completion.clone()
                 };
-                let text = if i == sel {
-                    egui::RichText::new(label)
+                if i == sel {
+                    // Selected row: accent background fill + white text (menu style).
+                    let text = egui::RichText::new(&label)
                         .monospace()
                         .strong()
-                        .color(ui.visuals().selection.stroke.color)
+                        .color(on_accent);
+                    egui::Frame::new()
+                        .fill(accent_fill)
+                        .corner_radius(egui::CornerRadius::same(3))
+                        .inner_margin(egui::Margin::symmetric(4, 1))
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(text).extend());
+                        });
+                    let _ = accent_stroke; // kept for clarity, not needed now
                 } else {
-                    egui::RichText::new(label).monospace().weak()
-                };
-                ui.label(text);
+                    let text = egui::RichText::new(&label).monospace().weak();
+                    ui.label(text);
+                }
             }
             ui.separator();
         }

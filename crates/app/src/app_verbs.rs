@@ -51,6 +51,9 @@ pub enum AppVerb {
     /// Tune the sketchy edge effect (`edgefx jitter=.. extension=.. …`).
     /// Carries the raw `key=value` tokens for the front-end to apply.
     EdgeFx(Vec<String>),
+    /// Toggle Reduce Motion for animated progress bars (`reducemotion [on|off]`).
+    /// `None` means bare toggle.
+    ReduceMotion(Option<bool>),
     /// Persist the document (`save [path]`). Argument is the optional path.
     Save(Option<String>),
     /// Command reference (`help [verb]`).
@@ -168,6 +171,12 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             _ => return None,
         }),
         "edgefx" => AppVerb::EdgeFx(words.map(str::to_owned).collect()),
+        "reducemotion" => AppVerb::ReduceMotion(match words.next() {
+            Some("on" | "true" | "1") => Some(true),
+            Some("off" | "false" | "0") => Some(false),
+            None => None,
+            _ => return None,
+        }),
         "camera" => AppVerb::Camera(
             words.next().map(str::to_ascii_lowercase),
             words.next().map(str::to_ascii_lowercase),
@@ -234,6 +243,16 @@ mod tests {
             Some(AppVerb::EdgeFx(vec!["jitter=.05".into(), "extension=.1".into()]))
         );
         assert_eq!(classify("edgefx"), Some(AppVerb::EdgeFx(vec![])));
+    }
+
+    #[test]
+    fn classifies_reduce_motion() {
+        assert_eq!(classify("reducemotion on"), Some(AppVerb::ReduceMotion(Some(true))));
+        assert_eq!(classify("reducemotion off"), Some(AppVerb::ReduceMotion(Some(false))));
+        assert_eq!(classify("reducemotion 1"), Some(AppVerb::ReduceMotion(Some(true))));
+        assert_eq!(classify("reducemotion 0"), Some(AppVerb::ReduceMotion(Some(false))));
+        assert_eq!(classify("reducemotion"), Some(AppVerb::ReduceMotion(None)));
+        assert_eq!(classify("reducemotion garbage"), None);
     }
 
     #[test]
