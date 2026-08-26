@@ -88,6 +88,22 @@ enum Entry {
     Commands(Vec<ExecutedCommand>),
 }
 
+/// Starter prompts shown as tappable chips over an empty chat transcript. Kept
+/// short and concrete so a first-time user sees what "describe what to draw"
+/// actually means. Tapping seeds the input; it never auto-sends.
+const CHAT_EXAMPLES: &[&str] = &[
+    "Draw a 4×4 m room with a door",
+    "Add a 2 m circle at the origin",
+    "Make a simple L-shaped floor plan",
+];
+
+/// The chat is in its empty state when there is no transcript entry and nothing
+/// is mid-stream — the point at which we show the starter prompt + chips rather
+/// than a blank scrollback.
+fn chat_is_empty(transcript: &[Entry], streaming: &str) -> bool {
+    transcript.is_empty() && streaming.trim().is_empty()
+}
+
 /// Chat state that survives app restarts — the provider-side session handle
 /// plus the local transcript. The `claude` CLI keeps its session on disk, so
 /// `--resume session_id` revives the conversation (and its prompt cache) even
@@ -177,6 +193,23 @@ mod saved_chat_tests {
         assert!(serde_json::from_str::<SavedChat>("{bad json").is_err());
         let empty: SavedChat = serde_json::from_str("{}").unwrap_or_default();
         assert!(empty.session_id.is_none() && empty.transcript.is_empty());
+    }
+
+    #[test]
+    fn chat_empty_state_predicate() {
+        // No transcript and nothing streaming → show the starter prompt+chips.
+        assert!(chat_is_empty(&[], ""));
+        assert!(chat_is_empty(&[], "   \n"));
+        // A single entry or a live stream both exit the empty state.
+        assert!(!chat_is_empty(&[Entry::User("hi".into())], ""));
+        assert!(!chat_is_empty(&[], "partial reply…"));
+    }
+
+    #[test]
+    fn chat_examples_are_present_and_nonempty() {
+        // The empty-state chips must exist and be concrete starter prompts.
+        assert!(CHAT_EXAMPLES.len() >= 2);
+        assert!(CHAT_EXAMPLES.iter().all(|e| !e.trim().is_empty()));
     }
 }
 
@@ -1629,10 +1662,33 @@ impl DeckPane {
 
         let mut open_detail: Option<PaneView> = None;
         let input_height = crate::theme::Spacing::CHAT_INPUT_H;
+        // Empty transcript: a low-key prompt + a few example chips instead of a
+        // blank void. Clicking a chip fills the input (never auto-sends — the
+        // user reviews/edits, then hits Enter). The input row below is shared.
+        let empty_chat = chat_is_empty(&self.transcript, &self.streaming_chat) && !self.busy();
+        let mut chip_fill: Option<String> = None;
         egui::ScrollArea::vertical()
-            .stick_to_bottom(true)
+            .stick_to_bottom(!empty_chat)
             .max_height(ui.available_height() - input_height)
             .show(ui, |ui| {
+                if empty_chat {
+                    ui.add_space(crate::theme::Spacing::M);
+                    ui.label(
+                        egui::RichText::new("Describe what to draw, and I'll build it.")
+                            .weak(),
+                    );
+                    ui.add_space(crate::theme::Spacing::S);
+                    for example in CHAT_EXAMPLES {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new(*example).small()))
+                            .on_hover_text("use this as a starting prompt")
+                            .clicked()
+                        {
+                            chip_fill = Some((*example).to_string());
+                        }
+                        ui.add_space(crate::theme::Spacing::XS);
+                    }
+                }
                 for (i, entry) in self.transcript.iter().enumerate() {
                     match entry {
                         Entry::User(t) => {
@@ -1683,6 +1739,11 @@ impl DeckPane {
             });
         if let Some(view) = open_detail {
             self.view = view;
+        }
+        // A tapped example chip seeds the input and focuses it for editing.
+        if let Some(text) = chip_fill {
+            self.input = text;
+            ui.memory_mut(|m| m.request_focus(egui::Id::new("deck_chat_input")));
         }
 
         self.side_effect_confirm_ui(ui, session, icons);

@@ -58,6 +58,11 @@ impl Spacing {
     pub const HISTORY_H: f32 = Self::S * 10.0;
     /// 64px (8× grid unit) — the deck chat input row reserve.
     pub const CHAT_INPUT_H: f32 = Self::S * 8.0;
+
+    /// 28px — the min interactive height for PRIMARY chrome controls
+    /// (toolbar buttons, dialog buttons, combos). HIG/SwiftUI comfortable
+    /// target sits ~28–32; dense list rows may still drop to `L` (24).
+    pub const HIT_TARGET: f32 = 28.0;
 }
 
 impl Default for Spacing {
@@ -368,8 +373,14 @@ pub fn apply_to_style(style: &mut egui::Style, t: &Tokens) {
     style.spacing.indent = sp.m;
     // ── Accessibility: minimum hit-target ──────────────────────────────
     // SwiftUI/HIG floor is ~44pt; egui's default (~14) is too small. Raise the
-    // interactive minimum so every button/toggle meets a comfortable target.
-    style.spacing.interact_size.y = style.spacing.interact_size.y.max(sp.l);
+    // interactive minimum so every PRIMARY chrome control (toolbar/dialog
+    // buttons, combos, fields) meets a comfortable ~28px target. Dense list
+    // rows that want to stay at 24 opt down locally with `interact_size`.
+    style.spacing.interact_size.y = style
+        .spacing
+        .interact_size
+        .y
+        .max(Spacing::HIT_TARGET);
     style.spacing.button_padding.y = style.spacing.button_padding.y.max(sp.xs);
 
     // ── Color roles → egui visuals ─────────────────────────────────────
@@ -483,8 +494,10 @@ mod tests {
             dark: true,
         };
         apply_to_style(&mut style, &tokens);
-        // Min hit-target height meets the grid's `l` (24) floor for a11y.
-        assert!(style.spacing.interact_size.y >= tokens.spacing.l);
+        // Min hit-target height meets the ~28px PRIMARY-chrome floor for a11y
+        // (above the old 24 group-spacing floor).
+        assert!(style.spacing.interact_size.y >= Spacing::HIT_TARGET);
+        assert!(Spacing::HIT_TARGET >= tokens.spacing.l);
         // Idle controls are borderless (no outline until hover).
         assert_eq!(style.visuals.widgets.inactive.bg_stroke, egui::Stroke::NONE);
         // Focus/selection ring is a visible 2px accent.

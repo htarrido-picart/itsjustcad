@@ -1850,6 +1850,82 @@ impl App {
             self.box_drag = None;
         }
 
+        // Empty-document next-actions: instead of a bare viewport, offer the
+        // first things a user reaches for (draw / import / example). Only when
+        // the document is truly empty and no tool is mid-flight, and only over
+        // the active pane so multi-view layouts stay uncluttered.
+        if show_empty_document(&self.session.doc, self.draw_tool.active()) {
+            let pane_rect = panes.get(self.active_pane).copied().unwrap_or(full);
+            self.empty_document_overlay(ui, pane_rect);
+        }
+    }
+
+    /// Centered next-actions shown over an empty document viewport. Wires the
+    /// three most common first moves through the same substrate/verb paths the
+    /// menus use, so nothing here is a bespoke code path.
+    fn empty_document_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let tk = preset::preset_for(self.cad_origin).tokens();
+        let mut import_now = false;
+        let mut draw_line = false;
+        let mut draw_box = false;
+        egui::Area::new(egui::Id::new("empty_doc_overlay"))
+            .fixed_pos(rect.center() - egui::vec2(150.0, 70.0))
+            .order(egui::Order::Middle)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::same(crate::theme::Spacing::L as i8))
+                    .show(ui, |ui| {
+                        ui.set_width(300.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("Empty drawing")
+                                    .heading()
+                                    .color(ui.visuals().text_color()),
+                            );
+                            ui.add_space(crate::theme::Spacing::XS);
+                            ui.label(
+                                egui::RichText::new("Start with a shape, or bring in a model.")
+                                    .weak(),
+                            );
+                            ui.add_space(crate::theme::Spacing::M);
+                            draw_line = crate::widgets::role_button(
+                                ui,
+                                &tk.colors,
+                                tk.dark,
+                                crate::widgets::ButtonRole::Prominent,
+                                "New line",
+                            )
+                            .clicked();
+                            ui.add_space(crate::theme::Spacing::S);
+                            draw_box = crate::widgets::role_button(
+                                ui,
+                                &tk.colors,
+                                tk.dark,
+                                crate::widgets::ButtonRole::Normal,
+                                "Draw an example box",
+                            )
+                            .clicked();
+                            ui.add_space(crate::theme::Spacing::S);
+                            import_now = crate::widgets::role_button(
+                                ui,
+                                &tk.colors,
+                                tk.dark,
+                                crate::widgets::ButtonRole::Normal,
+                                "Import a model…",
+                            )
+                            .clicked();
+                        });
+                    });
+            });
+        if draw_line {
+            self.execute_line("line".to_string());
+        }
+        if draw_box {
+            self.execute_line("box 0,0,0 4,4,4".to_string());
+        }
+        if import_now {
+            self.import(None);
+        }
     }
 
     /// Overlay pass for dimension and text annotations: world points project
@@ -2252,7 +2328,14 @@ impl App {
                 None => bb,
             });
         }
-        ui.label(format!("layer(s): {}", layers.into_iter().collect::<Vec<_>>().join(", ")));
+        // Middle-truncate each layer name (preserve head+tail) so a long name
+        // never blows out the narrow Properties column.
+        let shown = layers
+            .into_iter()
+            .map(|n| middle_truncate(n, 18))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.label(format!("layer(s): {shown}"));
         if let Some(bb) = aabb {
             let s = bb.size();
             ui.separator();
@@ -2383,6 +2466,9 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Dense list rows opt back down to the 24px group floor: the
+                // ~28px PRIMARY-chrome min would over-inflate a multi-row table.
+                ui.spacing_mut().interact_size.y = crate::theme::Spacing::L;
                 egui::Grid::new("layers_table")
                     .num_columns(7)
                     .spacing(egui::vec2(8.0, 6.0))
@@ -3686,6 +3772,13 @@ pub(crate) fn screen_ray(
     (origin, dir)
 }
 
+/// Whether to paint the empty-document next-actions overlay: the drawing has
+/// no geometry AND no draw tool is mid-flight (a tool in progress means the
+/// user is already placing the first object, so the prompt would be noise).
+fn show_empty_document(doc: &itsjustcad_doc::Document, tool_active: bool) -> bool {
+    doc.is_empty() && !tool_active
+}
+
 /// Middle-truncate a layer name to `max` chars, inserting an ellipsis so the
 /// head and tail both stay readable (Rhino-style long-name handling).
 fn middle_truncate(s: &str, max: usize) -> String {
@@ -4307,6 +4400,35 @@ mod tests {
         assert!(out.contains('…'));
         assert!(out.starts_with("Exter"));
         assert!(out.ends_with("orth"));
+    }
+
+    #[test]
+    fn empty_document_overlay_only_on_empty_idle_doc() {
+        use itsjustcad_commands::{parse, Session};
+        // Fresh doc, no tool → show the next-actions prompt.
+        let mut s = Session::default();
+        assert!(s.doc.is_empty());
+        assert!(show_empty_document(&s.doc, false));
+        // A tool mid-flight suppresses it even while empty (user is placing #1).
+        assert!(!show_empty_document(&s.doc, true));
+        // Once geometry exists it never shows again.
+        s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        assert!(!s.doc.is_empty());
+        assert!(!show_empty_document(&s.doc, false));
+    }
+
+    #[test]
+    fn focus_ring_is_two_px_accent_on_focusable_controls() {
+        // The keyboard focus cue egui paints on any focused widget (fields,
+        // combos, list rows) is the 2px accent selection stroke.
+        let mut style = egui::Style::default();
+        let tokens = crate::preset::preset_for(crate::preset::CadOrigin::Rhino).tokens();
+        crate::theme::apply_to_style(&mut style, &tokens);
+        assert_eq!(style.visuals.selection.stroke.width, 2.0);
+        assert_eq!(
+            style.visuals.selection.stroke.color,
+            crate::theme::to_color32(tokens.colors.primary)
+        );
     }
 
     #[test]
