@@ -454,8 +454,10 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: w.max(1),
-            height: h.max(1),
+            // Clamp host-supplied dims to the GPU limit: a 0 or absurd value
+            // would make `configure` / the depth texture panic or over-allocate.
+            width: clamp_dim(w, &device),
+            height: clamp_dim(h, &device),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
@@ -536,14 +538,26 @@ pub unsafe extern "C" fn ijc_free(h: *mut AppHandle) {
     })
 }
 
+/// Clamp a host-supplied drawable dimension into `[1, max_texture_dimension_2d]`.
+///
+/// A 0 dimension makes wgpu reject the surface config / depth texture; a huge
+/// one (the host can pass any `u32`) exceeds the GPU's `max_texture_dimension_2d`
+/// and makes `surface.configure` / `create_texture` panic or try an absurd
+/// allocation. The renderer only ever sees a bounded, non-zero size (finding:
+/// `ijc_resize` 0/huge dimensions must not crash or over-allocate).
+fn clamp_dim(v: u32, device: &wgpu::Device) -> u32 {
+    v.clamp(1, device.limits().max_texture_dimension_2d)
+}
+
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_resize(h: *mut AppHandle, w: u32, h_px: u32) {
     guard_ffi((), || {
         let Some(mut app) = (unsafe { handle_mut(h) }) else { return };
-        app.config.width = w.max(1);
-        app.config.height = h_px.max(1);
+        let app: &mut AppHandle = &mut app;
+        app.config.width = clamp_dim(w, &app.device);
+        app.config.height = clamp_dim(h_px, &app.device);
         app.surface.configure(&app.device, &app.config);
         app.depth_view = make_depth(&app.device, app.config.width, app.config.height);
     })
@@ -600,22 +614,43 @@ fn frame_camera(app: &mut AppHandle) {
 
 /// Queue a single command line (typed in the chat box). Applied next frame.
 ///
+/// Returns `true` if the line was queued, `false` if it was rejected: a null /
+/// non-UTF-8 string, an unparseable verb, or — per the side-effect gate below —
+/// a filesystem/network command.
+///
+/// # Side-effect containment (finding: host-typed command gate)
+/// The FFI is the trust boundary: the host is untrusted and there is no fs
+/// sandbox or human-confirm affordance on this path. A host-submitted line like
+/// `import /etc/passwd` or `export /some/path` would otherwise reach
+/// `session.run`, which performs real `std::fs` reads/writes. The deck (LLM)
+/// path already refuses [`Command::is_side_effecting`] ops outright; we apply
+/// the SAME gate here so a host-typed fs/net command is rejected rather than
+/// silently executed. Pure geometry/camera verbs are unaffected.
+///
 /// # Safety
 /// `h` must be null or a live handle; `line` must be null or a valid
 /// NUL-terminated C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char) {
-    guard_ffi((), || {
-        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char) -> bool {
+    guard_ffi(false, || {
+        let Some(app) = (unsafe { handle_ref(h) }) else { return false };
         if line.is_null() {
-            return;
+            return false;
         }
-        let Ok(s) = (unsafe { CStr::from_ptr(line) }).to_str() else { return };
-        if let Some(op) = route_line(s)
-            && let Ok(mut pending) = app.pending.lock()
+        let Ok(s) = (unsafe { CStr::from_ptr(line) }).to_str() else { return false };
+        let Some(op) = route_line(s) else { return false };
+        // Gate side-effecting commands (fs/net) exactly as the deck path does.
+        if let PendingOp::Cmd(cmd) = &op
+            && cmd.is_side_effecting()
         {
-            pending.push(op);
+            eprintln!("[ijc] refused side-effecting host command (filesystem/network not allowed)");
+            return false;
         }
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(op);
+            return true;
+        }
+        false
     })
 }
 
@@ -970,7 +1005,7 @@ mod tests {
             ijc_resize(nil, 100, 100);
             ijc_render_frame(nil);
             assert!(!ijc_open_json(nil, b"{}".as_ptr(), 2));
-            ijc_run_command(nil, c"box 0,0,0 1,1,1".as_ptr());
+            assert!(!ijc_run_command(nil, c"box 0,0,0 1,1,1".as_ptr()));
             assert!(!ijc_deck_configure(nil, 0, std::ptr::null(), std::ptr::null(), std::ptr::null()));
         }
     }
@@ -1068,6 +1103,73 @@ mod tests {
             Some(PendingOp::Cmd(cmd)) => assert!(!cmd.is_side_effecting()),
             other => panic!("box did not parse: {other:?}"),
         }
+    }
+
+    // ---- Host-typed command gate: side-effecting host commands are refused ----
+
+    #[test]
+    fn host_command_gate_matches_deck_gate() {
+        // `ijc_run_command` gates the identical `is_side_effecting` set the deck
+        // path refuses. A host-typed fs command must be classified for refusal;
+        // a pure geometry/camera verb must pass.
+        for line in ["import /etc/passwd", "export /tmp/exfil.dxf"] {
+            match route_line(line) {
+                Some(PendingOp::Cmd(cmd)) => assert!(
+                    cmd.is_side_effecting(),
+                    "'{line}' must be gated (refused) on the host-typed path"
+                ),
+                other => panic!("'{line}' did not parse to a command: {other:?}"),
+            }
+        }
+        // Pure ops the host path still allows through.
+        assert!(matches!(route_line("box 0,0,0 1,1,1"),
+            Some(PendingOp::Cmd(c)) if !c.is_side_effecting()));
+        assert!(matches!(route_line("view top"), Some(PendingOp::Camera(_))));
+    }
+
+    #[test]
+    fn null_and_bad_line_return_false_on_null_handle() {
+        let nil = std::ptr::null_mut::<AppHandle>();
+        unsafe {
+            // Null handle → false (before touching `line`).
+            assert!(!ijc_run_command(nil, std::ptr::null()));
+            assert!(!ijc_run_command(nil, c"box 0,0,0 1,1,1".as_ptr()));
+        }
+    }
+
+    // ---- ijc_open_json: hostile / malformed blobs fail cleanly ----
+
+    #[test]
+    fn open_json_rejects_garbage_and_leaves_doc_intact() {
+        // The FFI only assigns `app.session` on `Ok`; a malformed op-log must
+        // fail (`io::from_json` -> Err) so the existing document is untouched.
+        // We exercise the parse contract directly (the assignment is gated on it).
+        for bad in [
+            "",                    // empty
+            "not json at all",     // garbage bytes
+            "{",                   // truncated
+            "[1,2,3]",             // valid json, wrong shape
+            "{\"unexpected\":true}",
+            "\u{feff}garbage",
+        ] {
+            assert!(
+                io::from_json(bad).is_err(),
+                "malformed blob {bad:?} must be rejected, not partially applied"
+            );
+        }
+        // A well-formed op-log still parses.
+        let mut s = Session::default();
+        s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        let good = io::to_json(&s);
+        assert!(io::from_json(&good).is_ok());
+    }
+
+    #[test]
+    fn open_json_len_bound_is_pinned() {
+        // `ijc_open_json` rejects `len == 0` or `len > MAX_JSON_LEN` before any
+        // `from_raw_parts`. Pin the bound so it can't silently grow to an absurd
+        // acceptable size. (usize::MAX rejection is covered by the null-handle test.)
+        assert_eq!(MAX_JSON_LEN, 256 * 1024 * 1024);
     }
 
     // ---- Finding #7: SSRF / credential-leak containment on base_url ----
