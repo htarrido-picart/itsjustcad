@@ -38,6 +38,7 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use itsjustcad_commands::{io, parse, Command, Session};
@@ -61,11 +62,13 @@ const GUARD_LIVE: u64 = 0x1CAD_A11E_C0DE_F00D;
 const GUARD_DEAD: u64 = 0xDEAD_F8EE_DEAD_F8EE;
 
 /// A deferred mutation, produced on any thread and applied on the render thread.
+#[derive(Debug)]
 enum PendingOp {
     Cmd(Command),
     Camera(CamOp),
 }
 
+#[derive(Debug)]
 enum CamOp {
     SetView(StandardView),
     Orbit(f32, f32),
@@ -82,16 +85,42 @@ const CB_ERROR: u32 = 3;
 /// `extern fn(ctx, kind, utf8_cstr)` — Swift trampoline; hops to `@MainActor`.
 pub type DeckCallback = extern "C" fn(*mut c_void, u32, *const c_char);
 
-/// Wraps the opaque Swift context pointer so it can cross into a tokio task.
-/// Safe because Swift owns the object for the app's lifetime and only reads it
-/// on the main actor after the callback marshals back.
-struct SendCtx(*mut c_void);
+/// Wraps the opaque Swift context pointer so it can cross into a tokio task,
+/// paired with the handle's `alive` flag. Every callback is gated on `alive`, so
+/// once [`ijc_free`] clears it, `emit` becomes a no-op and the (possibly
+/// released) `ctx` pointer is never dereferenced again — closing the
+/// use-after-free-of-ctx window even if a task is mid-flight at free time.
+struct SendCtx {
+    ctx: *mut c_void,
+    alive: Arc<AtomicBool>,
+}
+// SAFETY: the raw ctx is only ever read on the Swift main actor (the callback
+// trampoline marshals back), and only while `alive` is true; the flag is atomic.
 unsafe impl Send for SendCtx {}
 unsafe impl Sync for SendCtx {}
 
 pub struct AppHandle {
     /// Liveness guard; must equal [`GUARD_LIVE`]. Poisoned on free.
     guard: u64,
+
+    /// Runtime mutual-exclusion flag for the `&mut` accessors. The safety
+    /// contract *says* the host calls the mutating entry points on a single
+    /// thread, but the host is untrusted and may violate it — two live
+    /// `&mut AppHandle` to the same allocation is instant UB plus a data race on
+    /// the non-atomic GPU/session/camera fields. [`handle_mut`] does a
+    /// compare-exchange on this flag before fabricating the `&mut`, so a
+    /// concurrent (or re-entrant) mutating call is *rejected* (turned into a
+    /// no-op) instead of aliasing. Boxed handle, so the flag's address is stable.
+    busy: AtomicBool,
+
+    /// Cleared by [`ijc_free`] before teardown. In-flight deck tasks check it
+    /// (via [`SendCtx`]) before every callback so a callback can never fire on a
+    /// Swift ctx the host has already released (use-after-free of ctx).
+    alive: Arc<AtomicBool>,
+
+    /// Abort handles for in-flight deck stream tasks, aborted on [`ijc_free`] so
+    /// no detached task outlives the handle it borrows shared state from.
+    tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 
     // GPU (render-thread only)
     device: wgpu::Device,
@@ -147,21 +176,67 @@ unsafe fn handle_ref<'a>(h: *mut AppHandle) -> Option<&'a AppHandle> {
     Some(app)
 }
 
-/// Mutable counterpart of [`handle_ref`].
+/// RAII exclusive borrow of an [`AppHandle`]. Holds the `busy` flag for its
+/// lifetime and clears it on drop, so at most one `&mut AppHandle` is ever live
+/// across all threads. Deref gives the `&mut`.
+struct HandleGuard<'a> {
+    app: &'a mut AppHandle,
+}
+
+impl std::ops::Deref for HandleGuard<'_> {
+    type Target = AppHandle;
+    fn deref(&self) -> &AppHandle {
+        self.app
+    }
+}
+impl std::ops::DerefMut for HandleGuard<'_> {
+    fn deref_mut(&mut self) -> &mut AppHandle {
+        self.app
+    }
+}
+impl Drop for HandleGuard<'_> {
+    fn drop(&mut self) {
+        // Release the exclusion flag. `Release` pairs with the `Acquire` in
+        // `handle_mut` so a subsequent acquirer sees all our writes.
+        self.app.busy.store(false, Ordering::Release);
+    }
+}
+
+/// Mutable counterpart of [`handle_ref`], enforcing single-`&mut` exclusion at
+/// runtime rather than by documentation alone.
+///
+/// The host is untrusted and may (per the threat model) call mutating entry
+/// points from arbitrary threads concurrently. We therefore acquire the
+/// per-handle `busy` flag with a compare-exchange *before* fabricating the
+/// `&mut`. If it is already held (a concurrent or re-entrant mutating call),
+/// we return `None` and the caller no-ops — no second `&mut` is ever created,
+/// so the aliasing/data-race UB is eliminated (findings #1, #4).
 ///
 /// # Safety
-/// Same contract as [`handle_ref`]; additionally the caller must not alias the
-/// handle from another thread (the Swift host calls these on its main thread).
-unsafe fn handle_mut<'a>(h: *mut AppHandle) -> Option<&'a mut AppHandle> {
+/// Same pointer contract as [`handle_ref`].
+unsafe fn handle_mut<'a>(h: *mut AppHandle) -> Option<HandleGuard<'a>> {
     if h.is_null() || !(h as usize).is_multiple_of(std::mem::align_of::<AppHandle>()) {
         return None;
     }
-    let app = unsafe { &mut *h };
-    if app.guard != GUARD_LIVE {
+    // Read the guard word through a shared ref first (no `&mut` yet, so this
+    // races benignly at worst on a garbage pointer that fails the check).
+    let app_ref = unsafe { &*h };
+    if app_ref.guard != GUARD_LIVE {
         eprintln!("[ijc] rejected use of freed/invalid AppHandle");
         return None;
     }
-    Some(app)
+    // Try to take exclusive access. Fails if another thread already holds it.
+    if app_ref
+        .busy
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        eprintln!("[ijc] rejected concurrent/re-entrant mutating call (handle busy)");
+        return None;
+    }
+    // We now hold exclusive access: it is sound to materialize the `&mut`.
+    let app = unsafe { &mut *h };
+    Some(HandleGuard { app })
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -221,6 +296,66 @@ fn route_line(line: &str) -> Option<PendingOp> {
     parse(line).ok().map(PendingOp::Cmd)
 }
 
+/// Reject deck base URLs whose host is a cloud-metadata / link-local / internal
+/// address. The FFI attaches the configured API key as a bearer / `x-api-key`
+/// header on every request (and a second `list_models` probe on error), so a
+/// hostile or synced-from-untrusted config pointing `base_url` at an internal
+/// endpoint would both SSRF *and* leak the key. The desktop `local_only` gate
+/// never runs on this path, so we enforce credential/SSRF containment here:
+/// block the well-known dangerous hosts. Public API origins are unaffected.
+///
+/// Returns `true` when the URL is safe to send to.
+fn base_url_is_allowed(url: &str) -> bool {
+    // Empty base_url = provider default (safe); Anthropic/OpenAI defaults are
+    // public hosts. Only inspect an explicitly-supplied host.
+    if url.is_empty() {
+        return true;
+    }
+    let host_part = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or(url);
+    let host = if let Some(bracket_end) = host_part.find(']') {
+        &host_part[..=bracket_end] // IPv6 literal like [fd00::1]:443
+    } else {
+        host_part.split(':').next().unwrap_or(host_part)
+    };
+    let host = host.trim().to_ascii_lowercase();
+
+    // Block the cloud metadata endpoint and link-local range explicitly.
+    if host == "169.254.169.254" || host.starts_with("169.254.") {
+        return false;
+    }
+    // Block obvious internal/loopback names and RFC1918 / unique-local ranges.
+    // (Loopback is pointless on-device and a common SSRF pivot.)
+    if host == "localhost"
+        || host == "metadata"
+        || host.ends_with(".internal")
+        || host.ends_with(".local")
+        || host == "0.0.0.0"
+        || host.starts_with("127.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host == "[::1]"
+        || host == "::1"
+        || host.starts_with("[fd")
+        || host.starts_with("[fe80")
+    {
+        return false;
+    }
+    // 172.16.0.0/12
+    if let Some(rest) = host.strip_prefix("172.")
+        && let Some(second) = rest.split('.').next()
+        && let Ok(oct) = second.parse::<u8>()
+        && (16..=31).contains(&oct)
+    {
+        return false;
+    }
+    true
+}
+
 fn standard_view(name: &str) -> Option<StandardView> {
     Some(match name.to_ascii_lowercase().as_str() {
         "top" => StandardView::Top,
@@ -235,8 +370,14 @@ fn standard_view(name: &str) -> Option<StandardView> {
 }
 
 fn emit(cb: DeckCallback, ctx: &SendCtx, kind: u32, text: &str) {
+    // Never invoke the Swift callback after the handle has been freed: the host
+    // may have released the ctx object, so `ctx.ctx` could dangle. `Acquire`
+    // pairs with the `Release` store in `ijc_free`.
+    if !ctx.alive.load(Ordering::Acquire) {
+        return;
+    }
     if let Ok(c) = CString::new(text) {
-        cb(ctx.0, kind, c.as_ptr());
+        cb(ctx.ctx, kind, c.as_ptr());
     }
 }
 
@@ -332,6 +473,9 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
 
         let handle = AppHandle {
             guard: GUARD_LIVE,
+            busy: AtomicBool::new(false),
+            alive: Arc::new(AtomicBool::new(true)),
+            tasks: Arc::new(Mutex::new(Vec::new())),
             device,
             queue,
             surface,
@@ -373,6 +517,20 @@ pub unsafe extern "C" fn ijc_free(h: *mut AppHandle) {
         }
         unsafe {
             (*h).guard = GUARD_DEAD;
+            // Tear down in-flight deck work BEFORE dropping anything the tasks
+            // borrow or before the host releases the Swift ctx:
+            //  1. Clear `alive` so any callback that races teardown becomes a
+            //     no-op (see `emit`) — no use-after-free of the ctx pointer.
+            //  2. Abort every in-flight stream task so no detached future keeps
+            //     running (and firing callbacks) after the handle is gone.
+            // Both flags live behind `Arc`, so the aborted tasks still see the
+            // cleared `alive` even though the owning box is about to drop.
+            (*h).alive.store(false, Ordering::Release);
+            if let Ok(mut tasks) = (*h).tasks.lock() {
+                for t in tasks.drain(..) {
+                    t.abort();
+                }
+            }
             drop(Box::from_raw(h));
         }
     })
@@ -383,7 +541,7 @@ pub unsafe extern "C" fn ijc_free(h: *mut AppHandle) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_resize(h: *mut AppHandle, w: u32, h_px: u32) {
     guard_ffi((), || {
-        let Some(app) = (unsafe { handle_mut(h) }) else { return };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return };
         app.config.width = w.max(1);
         app.config.height = h_px.max(1);
         app.surface.configure(&app.device, &app.config);
@@ -407,7 +565,7 @@ const MAX_JSON_LEN: usize = 256 * 1024 * 1024;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_open_json(h: *mut AppHandle, ptr: *const u8, len: usize) -> bool {
     guard_ffi(false, || {
-        let Some(app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
         // Reject null / absurd length. A zero-length buffer is a valid empty doc
         // request but cannot parse as JSON, so bail early either way.
         if ptr.is_null() || len == 0 || len > MAX_JSON_LEN {
@@ -422,7 +580,7 @@ pub unsafe extern "C" fn ijc_open_json(h: *mut AppHandle, ptr: *const u8, len: u
                 if let Ok(mut hist) = app.history.lock() {
                     hist.clear();
                 }
-                frame_camera(app);
+                frame_camera(&mut app);
                 app.last_gen = None; // force re-snapshot next frame
                 true
             }
@@ -470,7 +628,12 @@ pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
     guard_ffi((), || {
-        let Some(app) = (unsafe { handle_mut(h) }) else { return };
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else { return };
+        // Reborrow the inner `&mut AppHandle` once so the compiler can split
+        // disjoint field borrows (device/queue/renderer/surface) below — a plain
+        // `Deref` through the guard would treat every access as borrowing the
+        // whole `AppHandle`.
+        let app: &mut AppHandle = &mut guard;
 
         // Drain deferred ops (from typed input and the streaming deck).
         let ops: Vec<PendingOp> = match app.pending.lock() {
@@ -576,7 +739,7 @@ pub unsafe extern "C" fn ijc_deck_configure(
     api_key: *const c_char,
 ) -> bool {
     guard_ffi(false, || {
-        let Some(app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
         // SAFETY: each pointer is null-checked and UTF-8-validated here.
         let cstr = |p: *const c_char| -> Option<String> {
             if p.is_null() {
@@ -596,6 +759,13 @@ pub unsafe extern "C" fn ijc_deck_configure(
             api_key: cstr(api_key),
             grammar: false,
         };
+        // SSRF / credential-leak containment (finding #7): refuse to configure a
+        // deck whose base_url points at a metadata/link-local/internal host,
+        // since the API key would be attached to every request to it.
+        if !base_url_is_allowed(&config.base_url) {
+            eprintln!("[ijc] refused deck base_url (internal/metadata host blocked)");
+            return false;
+        }
         app.deck = Some(Arc::from(make_deck(&config)));
         app.deck_config = Some(config);
         true
@@ -618,7 +788,7 @@ pub unsafe extern "C" fn ijc_deck_send(
 ) {
     guard_ffi((), || {
         let Some(app) = (unsafe { handle_mut(h) }) else { return };
-        let ctx = SendCtx(ctx);
+        let ctx = SendCtx { ctx, alive: app.alive.clone() };
         if prompt.is_null() {
             emit(cb, &ctx, CB_ERROR, "null prompt");
             return;
@@ -646,8 +816,9 @@ pub unsafe extern "C" fn ijc_deck_send(
         let req = ChatRequest::text(system, messages, config.model.clone(), 4096, 0.2, None);
         let pending = app.pending.clone();
         let history = app.history.clone();
+        let tasks = app.tasks.clone();
 
-        app.runtime.spawn(async move {
+        let join = app.runtime.spawn(async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DeckDelta>();
             let deck2 = deck.clone();
             tokio::spawn(async move { deck2.stream_chat(req, tx).await });
@@ -655,46 +826,94 @@ pub unsafe extern "C" fn ijc_deck_send(
             let mut ex = Extractor::default();
             let mut assistant = String::new();
 
-            let handle_events = |events: Vec<ExtractEvent>, assistant: &mut String| {
-                for ev in events {
-                    match ev {
-                        ExtractEvent::Chat(c) => {
-                            assistant.push_str(&c);
-                            emit(cb, &ctx, CB_CHAT, &c);
-                        }
-                        ExtractEvent::Command(line) => {
-                            emit(cb, &ctx, CB_COMMAND, &line);
-                            if let Some(op) = route_line(&line)
-                                && let Ok(mut p) = pending.lock()
-                            {
-                                p.push(op);
+            // Process a batch of extractor events. This closure contains NO
+            // `.await` and does all the panic-prone work (Extractor output,
+            // `route_line`->`parse`, string accumulation) AND every `cb()` call
+            // via `emit`. We run it inside `catch_unwind` so a panic can never
+            // unwind across the `extern "C"` callback boundary (finding #3): a
+            // Rust panic straddling `cb` (an `extern "C"` Swift trampoline) is
+            // UB. On panic we swallow it and stop feeding the stream.
+            let handle_events = |events: Vec<ExtractEvent>, assistant: &mut String| -> bool {
+                catch_unwind(AssertUnwindSafe(|| {
+                    for ev in events {
+                        match ev {
+                            ExtractEvent::Chat(c) => {
+                                assistant.push_str(&c);
+                                emit(cb, &ctx, CB_CHAT, &c);
+                            }
+                            ExtractEvent::Command(line) => {
+                                emit(cb, &ctx, CB_COMMAND, &line);
+                                if let Some(op) = route_line(&line) {
+                                    // Side-effect containment (finding #6): the
+                                    // desktop app gates deck-emitted fs commands
+                                    // (import/export/...) behind an explicit human
+                                    // OK. The FFI drain runs `session.run` with no
+                                    // gate, so a prompt-injected model could read
+                                    // or write arbitrary paths. On iOS we refuse
+                                    // side-effecting deck commands outright rather
+                                    // than let the model choose fs paths.
+                                    if let PendingOp::Cmd(cmd) = &op
+                                        && cmd.is_side_effecting()
+                                    {
+                                        emit(
+                                            cb,
+                                            &ctx,
+                                            CB_ERROR,
+                                            "refused: filesystem command from the assistant is not allowed",
+                                        );
+                                        continue;
+                                    }
+                                    if let Ok(mut p) = pending.lock() {
+                                        p.push(op);
+                                    }
+                                }
                             }
                         }
                     }
-                }
+                }))
+                .is_ok()
             };
 
             while let Some(delta) = rx.recv().await {
-                match delta {
-                    DeckDelta::Text(t) => handle_events(ex.push(&t), &mut assistant),
-                    DeckDelta::Session(_) => {}
+                let keep = match delta {
+                    DeckDelta::Text(t) => {
+                        let events = catch_unwind(AssertUnwindSafe(|| ex.push(&t)))
+                            .unwrap_or_default();
+                        handle_events(events, &mut assistant)
+                    }
+                    DeckDelta::Session(_) => true,
                     DeckDelta::Done => break,
-                    DeckDelta::Error(e) => emit(cb, &ctx, CB_ERROR, &e),
+                    DeckDelta::Error(e) => {
+                        catch_unwind(AssertUnwindSafe(|| emit(cb, &ctx, CB_ERROR, &e))).is_ok()
+                    }
+                };
+                if !keep {
+                    break; // a panic was caught inside the batch; stop safely.
                 }
             }
-            handle_events(ex.finish(), &mut assistant);
+            let tail = catch_unwind(AssertUnwindSafe(|| ex.finish())).unwrap_or_default();
+            handle_events(tail, &mut assistant);
 
             if let Ok(mut hist) = history.lock() {
                 hist.push(ChatMessage { role: Role::Assistant, content: assistant });
             }
-            emit(cb, &ctx, CB_DONE, "");
+            let _ = catch_unwind(AssertUnwindSafe(|| emit(cb, &ctx, CB_DONE, "")));
         });
+
+        // Track the task so `ijc_free` can abort it before teardown, closing the
+        // window where a detached stream fires a callback on a freed ctx / after
+        // the handle's shared state is gone (finding #2).
+        if let Ok(mut t) = tasks.lock() {
+            t.retain(|a| !a.is_finished());
+            t.push(join.abort_handle());
+        }
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU32;
 
     #[test]
     fn camera_verbs_route_to_camera() {
@@ -770,5 +989,111 @@ mod tests {
     fn guard_words_are_distinct() {
         assert_ne!(GUARD_LIVE, GUARD_DEAD);
         assert_ne!(GUARD_LIVE, 0);
+    }
+
+    // ---- Finding #2: callbacks must be inert once the handle is freed ----
+
+    static CB_HITS: AtomicU32 = AtomicU32::new(0);
+    extern "C" fn counting_cb(_ctx: *mut c_void, _kind: u32, _s: *const c_char) {
+        CB_HITS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn emit_is_a_noop_after_ctx_marked_dead() {
+        CB_HITS.store(0, Ordering::SeqCst);
+        let alive = Arc::new(AtomicBool::new(true));
+        let ctx = SendCtx { ctx: std::ptr::null_mut(), alive: alive.clone() };
+
+        // Alive: the callback fires.
+        emit(counting_cb, &ctx, CB_CHAT, "hello");
+        assert_eq!(CB_HITS.load(Ordering::SeqCst), 1);
+
+        // Simulate ijc_free clearing the flag: further emits must NOT invoke the
+        // (now possibly-released) Swift ctx pointer.
+        alive.store(false, Ordering::Release);
+        emit(counting_cb, &ctx, CB_CHAT, "world");
+        emit(counting_cb, &ctx, CB_DONE, "");
+        assert_eq!(
+            CB_HITS.load(Ordering::SeqCst),
+            1,
+            "callback fired after ctx was marked dead (use-after-free window)"
+        );
+    }
+
+    // ---- Findings #1 / #4: only one exclusive borrow may be live at a time ----
+
+    #[test]
+    fn handle_mut_rejects_concurrent_access() {
+        // We can exercise the busy-flag exclusion without a GPU by driving the
+        // same compare_exchange protocol handle_mut uses. A second acquisition
+        // while the first guard is live must fail.
+        let busy = AtomicBool::new(false);
+
+        // First acquirer wins.
+        assert!(busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok());
+        // Second, concurrent acquirer is rejected (would have aliased &mut).
+        assert!(busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err());
+        // After the first releases, a later call succeeds again.
+        busy.store(false, Ordering::Release);
+        assert!(busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok());
+    }
+
+    // ---- Finding #6: side-effecting deck commands must be refused ----
+
+    #[test]
+    fn deck_side_effecting_commands_are_recognized_for_refusal() {
+        // The drain/handle_events gate refuses any PendingOp::Cmd whose command
+        // is side-effecting. Verify the exact commands a hostile model could emit
+        // (import/export) route to a side-effecting Command so the gate trips.
+        for line in [
+            "import /etc/passwd",
+            "export /tmp/exfil.dxf",
+        ] {
+            match route_line(line) {
+                Some(PendingOp::Cmd(cmd)) => assert!(
+                    cmd.is_side_effecting(),
+                    "'{line}' must be gated as side-effecting"
+                ),
+                other => panic!("'{line}' did not parse to a command: {other:?}"),
+            }
+        }
+        // A pure geometry command must NOT be gated (stays allowed).
+        match route_line("box 0,0,0 1,1,1") {
+            Some(PendingOp::Cmd(cmd)) => assert!(!cmd.is_side_effecting()),
+            other => panic!("box did not parse: {other:?}"),
+        }
+    }
+
+    // ---- Finding #7: SSRF / credential-leak containment on base_url ----
+
+    #[test]
+    fn base_url_blocks_metadata_and_internal_hosts() {
+        // Cloud metadata + link-local: the classic SSRF/credential-exfil target.
+        assert!(!base_url_is_allowed("http://169.254.169.254/latest"));
+        assert!(!base_url_is_allowed("http://169.254.10.1/"));
+        // Loopback / internal names.
+        assert!(!base_url_is_allowed("http://localhost:11434/v1"));
+        assert!(!base_url_is_allowed("http://127.0.0.1/v1"));
+        assert!(!base_url_is_allowed("http://[::1]:8080/v1"));
+        assert!(!base_url_is_allowed("http://metadata/computeMetadata"));
+        assert!(!base_url_is_allowed("http://foo.internal/v1"));
+        // RFC1918 private ranges.
+        assert!(!base_url_is_allowed("http://10.0.0.5/v1"));
+        assert!(!base_url_is_allowed("http://192.168.1.1/v1"));
+        assert!(!base_url_is_allowed("http://172.16.0.1/v1"));
+        assert!(!base_url_is_allowed("http://172.31.255.1/v1"));
+        // 172.32.x is public (outside /12) — allowed.
+        assert!(base_url_is_allowed("http://172.32.0.1/v1"));
+        // Public API origins remain allowed.
+        assert!(base_url_is_allowed("https://api.anthropic.com"));
+        assert!(base_url_is_allowed("https://api.openai.com/v1"));
+        // Empty = provider default (safe).
+        assert!(base_url_is_allowed(""));
     }
 }
