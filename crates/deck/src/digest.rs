@@ -17,7 +17,7 @@ use itsjustcad_doc::{Document, Geometry};
 /// point: strip control characters and backtick runs, collapse whitespace, cap
 /// length, and wrap the result in explicit untrusted delimiters so the model can
 /// never confuse a name with an instruction or a fence.
-fn sanitize_name(raw: &str) -> String {
+pub(crate) fn sanitize_name(raw: &str) -> String {
     const MAX_LEN: usize = 64;
     let mut cleaned = String::with_capacity(raw.len().min(MAX_LEN));
     let mut prev_space = false;
