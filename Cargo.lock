@@ -2273,6 +2273,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "itsjustcad-commands",
+ "itsjustcad-doc",
  "libc",
  "reqwest",
  "serde",
@@ -2293,6 +2294,22 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "itsjustcad-ffi"
+version = "0.1.0"
+dependencies = [
+ "glam 0.30.10",
+ "image",
+ "itsjustcad-commands",
+ "itsjustcad-deck",
+ "itsjustcad-doc",
+ "itsjustcad-render",
+ "pollster",
+ "raw-window-handle",
+ "tokio",
+ "wgpu",
 ]
 
 [[package]]

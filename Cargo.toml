@@ -11,6 +11,7 @@ members = [
     "crates/render",
     "crates/solar",
     "crates/app",
+    "crates/ffi",
 ]
 
 [workspace.package]
