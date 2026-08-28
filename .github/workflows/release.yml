@@ -27,6 +27,14 @@ jobs:
             artifact: itsjustcad-macos-aarch64
             binary: itsjustcad
 
+          # Intel macOS: cross-compiled on the healthy Apple-Silicon runner
+          # (GitHub's native Intel macos-13 runners queue indefinitely). The
+          # macOS SDK targets both arches, so `cargo build --target x86_64` works.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: itsjustcad-macos-x86_64
+            binary: itsjustcad
+
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: itsjustcad-windows-x86_64
