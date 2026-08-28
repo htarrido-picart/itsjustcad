@@ -2208,7 +2208,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "itsjustcad"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2247,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "itsjustcad-commands"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "e57",
@@ -2266,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "itsjustcad-deck"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "dirs",
@@ -2285,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "itsjustcad-doc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.30.10",
  "kernel-curve",
@@ -2298,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "itsjustcad-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.30.10",
  "image",
@@ -2314,7 +2314,7 @@ dependencies = [
 
 [[package]]
 name = "itsjustcad-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "egui",
@@ -2331,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "itsjustcad-solar"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "jni"
@@ -2414,11 +2414,11 @@ dependencies = [
 
 [[package]]
 name = "kernel-brep"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "kernel-curve"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.30.10",
  "serde",
@@ -2426,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "kernel-mesh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.30.10",
  "serde",
@@ -2434,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "kernel-occt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.24.2",
  "glam 0.30.10",
