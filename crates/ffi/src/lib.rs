@@ -113,6 +113,16 @@ pub struct AppHandle {
     /// no-op) instead of aliasing. Boxed handle, so the flag's address is stable.
     busy: AtomicBool,
 
+    /// One-shot free latch. [`ijc_free`] does a single `compare_exchange`
+    /// `false -> true` on this; exactly one caller wins the alive->freeing
+    /// transition and proceeds to drop the box, every concurrent or re-entrant
+    /// `ijc_free` on the same pointer loses the CAS and returns without touching
+    /// the (about-to-be / already) freed allocation. This closes the double-free
+    /// TOCTOU that a plain non-atomic `guard` read-then-write could not: the
+    /// `guard` word is only advisory (best-effort stale-pointer detection); the
+    /// *authority* on "who frees" is this atomic latch.
+    freeing: AtomicBool,
+
     /// Cleared by [`ijc_free`] before teardown. In-flight deck tasks check it
     /// (via [`SendCtx`]) before every callback so a callback can never fire on a
     /// Swift ctx the host has already released (use-after-free of ctx).
@@ -225,13 +235,29 @@ unsafe fn handle_mut<'a>(h: *mut AppHandle) -> Option<HandleGuard<'a>> {
         eprintln!("[ijc] rejected use of freed/invalid AppHandle");
         return None;
     }
-    // Try to take exclusive access. Fails if another thread already holds it.
+    // Try to take exclusive access. Fails if another thread already holds it
+    // (a concurrent mutator, or `ijc_free` mid-teardown).
     if app_ref
         .busy
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
         eprintln!("[ijc] rejected concurrent/re-entrant mutating call (handle busy)");
+        return None;
+    }
+    // Re-check the guard now that we hold `busy`. This closes the free-vs-mutator
+    // TOCTOU: `ijc_free` poisons the guard *while holding `busy`*, so if a free
+    // began after our first guard read but before our CAS, one of two things is
+    // true here — either the free already holds `busy` (our CAS above failed and
+    // we returned), or it has not yet acquired `busy`, in which case it is still
+    // spinning and has NOT yet poisoned the guard or dropped the box, so this
+    // read is valid and sees `GUARD_LIVE`; the free then waits for us to release
+    // `busy`. The remaining case — free won `busy` first and already poisoned the
+    // guard — cannot reach here because our CAS would have failed. We keep this
+    // re-check as defense in depth against any future reordering of the two.
+    if app_ref.guard != GUARD_LIVE {
+        app_ref.busy.store(false, Ordering::Release);
+        eprintln!("[ijc] rejected use of freed/invalid AppHandle (freed under us)");
         return None;
     }
     // We now hold exclusive access: it is sound to materialize the `&mut`.
@@ -476,6 +502,7 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
         let handle = AppHandle {
             guard: GUARD_LIVE,
             busy: AtomicBool::new(false),
+            freeing: AtomicBool::new(false),
             alive: Arc::new(AtomicBool::new(true)),
             tasks: Arc::new(Mutex::new(Vec::new())),
             device,
@@ -499,24 +526,75 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
     })
 }
 
-/// Destroy a handle created by [`ijc_init`]. Null-safe and idempotent-safe: the
-/// guard word is poisoned before the drop so a subsequent stray call on the same
-/// pointer is rejected by [`handle_ref`]/[`handle_mut`] rather than freeing twice.
+/// Destroy a handle created by [`ijc_init`]. Null-safe and safe against a
+/// concurrent / re-entrant / double `ijc_free`, and against a free racing an
+/// in-flight `*_mut` mutator.
+///
+/// Two hazards are defended here (see field docs on [`AppHandle::freeing`] and
+/// [`AppHandle::busy`]):
+///
+/// 1. **Double-free TOCTOU.** The old guard was a plain `u64`: a check-then-poison
+///    is not atomic, so two concurrent `ijc_free(h)` could both observe
+///    `GUARD_LIVE` and both `Box::from_raw` → double-free/UB. We now settle "who
+///    frees" with a single `compare_exchange` on the atomic `freeing` latch:
+///    exactly one caller wins the `false -> true` transition and drops; every
+///    loser returns immediately without touching the allocation.
+/// 2. **Free-during-mutator (UAF).** A mutator entry point (`ijc_render_frame`,
+///    `ijc_resize`, `ijc_open_json`, `ijc_deck_send`) fabricates a `&mut` while
+///    holding `busy`. Dropping the box out from under that live `&mut` is UAF.
+///    The free winner therefore *acquires the same `busy` flag* (spin-waiting for
+///    any in-flight mutator to release it) before poisoning the guard and
+///    dropping. Because we poison `guard` to [`GUARD_DEAD`] while holding `busy`,
+///    any *subsequent* mutator fails its guard check and bails — so no new `&mut`
+///    can be born after we start tearing down.
 ///
 /// # Safety
-/// `h` must be null or a live handle from [`ijc_init`] that is not concurrently
-/// in use; after this call the pointer is dangling and must not be reused.
+/// `h` must be null or a live handle from [`ijc_init`]. After this call the
+/// pointer is dangling and must not be reused (a stray reuse is caught
+/// best-effort by the poisoned guard / lost `freeing` CAS).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_free(h: *mut AppHandle) {
     guard_ffi((), || {
         if h.is_null() || !(h as usize).is_multiple_of(std::mem::align_of::<AppHandle>()) {
             return;
         }
-        // Reject double-free / free-of-garbage: only drop a live handle.
+        // Best-effort stale/garbage-pointer rejection *before* we dereference the
+        // atomics: a freed allocation has a poisoned guard, so this catches the
+        // common re-free-of-old-pointer case without racing on freed memory.
+        // (The authoritative one-shot decision is the `freeing` CAS below; this
+        // is only the cheap advisory pre-filter shared with `handle_ref`.)
         if unsafe { (*h).guard } != GUARD_LIVE {
             eprintln!("[ijc] ijc_free on freed/invalid handle ignored");
             return;
         }
+        // One-shot latch: exactly one caller wins alive->freeing. `AcqRel` so the
+        // winner's later teardown writes are ordered after this, and a losing
+        // racer that observes `true` has an `Acquire` view. The loser MUST return
+        // without freeing — the winner owns the drop.
+        if unsafe { &*h }
+            .freeing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            eprintln!("[ijc] concurrent/double ijc_free ignored (already freeing)");
+            return;
+        }
+
+        // We are the sole freer. Serialize against any in-flight `*_mut` mutator
+        // by acquiring the SAME `busy` flag `handle_mut` uses: spin until it is
+        // free, so we never drop the box while a live `&mut AppHandle` exists.
+        // A mutator holds `busy` only for the duration of one entry point (a
+        // render frame / resize / json load / send setup), so this is bounded.
+        while unsafe { &*h }
+            .busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        // `busy` is now held by us; no mutator holds a `&mut`, and none can be
+        // created after we poison the guard below (they fail the guard check).
+
         unsafe {
             (*h).guard = GUARD_DEAD;
             // Tear down in-flight deck work BEFORE dropping anything the tasks
@@ -533,6 +611,12 @@ pub unsafe extern "C" fn ijc_free(h: *mut AppHandle) {
                     t.abort();
                 }
             }
+            // Drop exactly once. We hold `busy` (excludes mutators) and won the
+            // `freeing` CAS (excludes other frees), so this is the unique drop.
+            // The `busy` flag is dropped along with the box; that is fine because
+            // no other thread can legitimately still be spinning for it (any
+            // concurrent mutator either finished before us or is now bailing on
+            // the poisoned guard, and any concurrent free lost the `freeing` CAS).
             drop(Box::from_raw(h));
         }
     })
@@ -948,7 +1032,7 @@ pub unsafe extern "C" fn ijc_deck_send(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
 
     #[test]
     fn camera_verbs_route_to_camera() {
@@ -1077,6 +1161,110 @@ mod tests {
         assert!(busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok());
+    }
+
+    // ---- ijc_free hardening: one-shot free latch + free/mutator serialization
+
+    #[test]
+    fn freeing_latch_is_one_shot() {
+        // Models the `freeing` compare_exchange in `ijc_free`: exactly one caller
+        // may transition alive->freeing and proceed to drop; every other returns
+        // without freeing (no double-free). Single-thread ordering first.
+        let freeing = AtomicBool::new(false);
+        assert!(
+            freeing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "first free must win the latch"
+        );
+        assert!(
+            freeing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err(),
+            "second free must lose the latch (would be a double-free)"
+        );
+    }
+
+    #[test]
+    fn freeing_latch_yields_exactly_one_winner_under_threads() {
+        // Hammer the latch from many threads at once; precisely one must win the
+        // alive->freeing transition. That winner is the sole caller that would
+        // run `Box::from_raw`, so this pins "no concurrent double-free".
+        use std::sync::Barrier;
+        for _ in 0..200 {
+            let freeing = Arc::new(AtomicBool::new(false));
+            let winners = Arc::new(AtomicU32::new(0));
+            let n = 8;
+            let barrier = Arc::new(Barrier::new(n));
+            let mut hs = Vec::new();
+            for _ in 0..n {
+                let freeing = freeing.clone();
+                let winners = winners.clone();
+                let barrier = barrier.clone();
+                hs.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    if freeing
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                }));
+            }
+            for h in hs {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                winners.load(Ordering::SeqCst),
+                1,
+                "exactly one thread may win the free latch"
+            );
+        }
+    }
+
+    #[test]
+    fn free_waits_for_busy_then_poisons_guard() {
+        // Models the free/mutator serialization: `ijc_free` acquires the SAME
+        // `busy` flag the mutators use, spinning until the in-flight mutator
+        // releases it, and only then poisons the guard + drops. A mutator that
+        // holds `busy` must therefore never be dropped out from under; and once
+        // the guard is poisoned (under `busy`), a later mutator bails.
+        let busy = Arc::new(AtomicBool::new(false));
+        let guard = Arc::new(AtomicU64::new(GUARD_LIVE));
+
+        // Mutator takes `busy` first (as `handle_mut` would).
+        assert!(busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok());
+
+        let busy2 = busy.clone();
+        let guard2 = guard.clone();
+        let freer = std::thread::spawn(move || {
+            // `ijc_free`'s spin-acquire of `busy`: must block until the mutator
+            // releases, so it cannot poison/drop while the `&mut` is live.
+            while busy2
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                std::hint::spin_loop();
+            }
+            // Only now — with `busy` held — do we poison the guard.
+            guard2.store(GUARD_DEAD, Ordering::Release);
+        });
+
+        // While the mutator holds `busy`, the guard must still be LIVE: the freer
+        // is provably still spinning, not tearing down.
+        for _ in 0..1000 {
+            assert_eq!(
+                guard.load(Ordering::Acquire),
+                GUARD_LIVE,
+                "guard poisoned while a mutator still held busy (UAF window)"
+            );
+        }
+        // Release `busy` (mutator done). The freer may now proceed.
+        busy.store(false, Ordering::Release);
+        freer.join().unwrap();
+        assert_eq!(guard.load(Ordering::Acquire), GUARD_DEAD);
     }
 
     // ---- Finding #6: side-effecting deck commands must be refused ----
