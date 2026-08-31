@@ -368,12 +368,15 @@ pub fn apply(ctx: &egui::Context, tokens: &Tokens) {
     });
 
     let t = *tokens;
-    let set = move |style: &mut egui::Style| apply_to_style(style, &t);
-    if tokens.dark {
-        ctx.style_mut_of(egui::Theme::Dark, set);
-    } else {
-        ctx.style_mut_of(egui::Theme::Light, set);
-    }
+    // Style BOTH themes' Style objects, not just the active one. egui keeps a
+    // SEPARATE Style per Theme; previously we styled only the current theme, so
+    // switching to the other theme at runtime dropped our design tokens and fell
+    // back to egui defaults. That default TextEdit metric rendered ~1px beyond its
+    // allocation each frame, and since a resizable panel stores its content's
+    // rendered rect as its height, the command line grew ~1px/frame in the
+    // unstyled theme (the dark↔light "command line keeps growing" bug).
+    ctx.style_mut_of(egui::Theme::Dark, move |style| apply_to_style(style, &t));
+    ctx.style_mut_of(egui::Theme::Light, move |style| apply_to_style(style, &t));
 }
 
 /// Pure(-ish) core of [`apply`]: mutate a `Style` in place from tokens.
