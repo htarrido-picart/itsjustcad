@@ -5652,7 +5652,14 @@ fn apply_forward(
         }
         Command::BlockDefine { targets, name, geometries } => {
             use itsjustcad_doc::BlockGeometry;
-            let ids = resolve(doc, &targets)?;
+            // Replay / import path supplies geometry directly and needs NO source
+            // objects — skip selector resolution (which would error on an empty
+            // selector). Only the live "define from selection" path resolves ids.
+            let ids = if geometries.is_some() {
+                Vec::new()
+            } else {
+                resolve(doc, &targets)?
+            };
             // Snapshot geometry from source objects.
             let snaps: Vec<BlockGeometry> = if let Some(g) = geometries {
                 // Replay path: use stored snapshots.

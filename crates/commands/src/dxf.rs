@@ -236,48 +236,101 @@ pub struct DxfEntities {
 /// LWPOLYLINE, POLYLINE/VERTEX/SEQEND, CIRCLE, ARC, TEXT. Everything else is
 /// skipped silently and counted.
 pub fn parse_dxf(text: &str) -> Result<DxfEntities, String> {
-    // The whole file is "group code line, value line" pairs.
+    // The whole file is "group code line, value line" pairs. Be RESILIENT: real
+    // exporters (e.g. LibreDWG's DWG→DXF) emit multi-line string values (an MTEXT
+    // group-1/3 disclaimer, a wrapped TEXT). Those continuation lines land where a
+    // group code is expected and are NOT integers. A strict parser aborts the
+    // whole import on the first one; instead we SKIP a non-integer "code" line and
+    // resync on the next — losing at most the tail of one string, never the file.
     let mut pairs: Vec<(i32, &str)> = Vec::new();
     let mut lines = text.lines();
     while let Some(code) = lines.next() {
         let code = code.trim();
-        if code.is_empty() && lines.clone().next().is_none() {
-            break; // tolerate a trailing blank line
+        if code.is_empty() {
+            continue; // tolerate blank lines anywhere
         }
-        let Some(value) = lines.next() else {
-            return Err("truncated DXF: group code without a value line".to_string());
+        let Ok(code) = code.parse::<i32>() else {
+            // Stray line: a continuation of a preceding multi-line string value
+            // (or junk). Drop it and try the next line as a code — this resyncs
+            // after one skip rather than failing the whole import.
+            continue;
         };
-        let code: i32 = code
-            .parse()
-            .map_err(|_| format!("not a DXF: expected an integer group code, got '{code}'"))?;
+        let Some(value) = lines.next() else {
+            break; // truncated tail — keep everything parsed so far
+        };
         pairs.push((code, value.trim()));
     }
 
-    // Cut the ENTITIES section into records: each starts at a 0 code.
+    // Cut the ENTITIES and BLOCKS sections into records (each starts at a 0 code).
+    // ENTITIES holds the drawing; BLOCKS holds block DEFINITIONS that INSERT
+    // entities reference — we need both to instance blocks.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Sec {
+        None,
+        Entities,
+        Blocks,
+    }
     let mut records: Vec<(&str, Vec<(i32, &str)>)> = Vec::new();
-    let mut in_entities = false;
+    let mut blk_records: Vec<(&str, Vec<(i32, &str)>)> = Vec::new();
+    let mut sec = Sec::None;
     let mut awaiting_section_name = false;
+    let mut saw_entities = false;
     for &(code, value) in &pairs {
         match code {
             0 if value == "SECTION" => awaiting_section_name = true,
             2 if awaiting_section_name => {
-                in_entities = value == "ENTITIES";
+                sec = match value {
+                    "ENTITIES" => Sec::Entities,
+                    "BLOCKS" => Sec::Blocks,
+                    _ => Sec::None,
+                };
+                saw_entities |= sec == Sec::Entities;
                 awaiting_section_name = false;
             }
-            0 if value == "ENDSEC" => in_entities = false,
-            0 if in_entities => records.push((value, Vec::new())),
-            _ if in_entities => {
-                if let Some((_, fields)) = records.last_mut() {
-                    fields.push((code, value));
+            0 if value == "ENDSEC" => sec = Sec::None,
+            0 => match sec {
+                Sec::Entities => records.push((value, Vec::new())),
+                Sec::Blocks => blk_records.push((value, Vec::new())),
+                Sec::None => {}
+            },
+            _ => match sec {
+                Sec::Entities => {
+                    if let Some((_, fields)) = records.last_mut() {
+                        fields.push((code, value));
+                    }
                 }
-            }
-            _ => {}
+                Sec::Blocks => {
+                    if let Some((_, fields)) = blk_records.last_mut() {
+                        fields.push((code, value));
+                    }
+                }
+                Sec::None => {}
+            },
         }
     }
+
+    // Resilience vs. gibberish: an empty-but-valid DXF (SECTION/ENTITIES/ENDSEC
+    // with no entities) is fine, but a file that never even reached an ENTITIES
+    // section is not a DXF — surface a friendly error instead of importing nothing.
+    if !saw_entities {
+        return Err(
+            "not a DXF: no ENTITIES section found (wrong format or corrupt file?)".to_string(),
+        );
+    }
+
+    // Block definitions, keyed by name. INSERT entities are instanced against
+    // these; a BlockDefine op is emitted (before any insert) for each.
+    let blocks = parse_blocks(blk_records);
 
     // Fold records into commands; VERTEX/SEQEND attach to the open POLYLINE.
     let mut out = DxfEntities { entities: Vec::new(), skipped: 0 };
     let mut open_poly: Option<(String, bool, Vec<DVec3>)> = None; // layer, closed, points
+    // POINT and 3DFACE are AGGREGATED per layer: a survey DXF has tens of
+    // thousands of each, so one point cloud / one mesh per layer beats creating
+    // 50k individual objects (and 50k logged ops). Emitted after the fold.
+    use std::collections::BTreeMap;
+    let mut points_by_layer: BTreeMap<String, Vec<DVec3>> = BTreeMap::new();
+    let mut mesh_by_layer: BTreeMap<String, (Vec<DVec3>, Vec<[u32; 3]>)> = BTreeMap::new();
     for (name, fields) in records {
         if let Some((layer, closed, points)) = &mut open_poly {
             match name {
@@ -308,6 +361,69 @@ pub fn parse_dxf(text: &str) -> Result<DxfEntities, String> {
                 }
             }
         }
+        // Aggregated kinds handled here (record_entity returns one command each;
+        // these fold into shared per-layer buffers instead).
+        match name {
+            "INSERT" => {
+                // Instance a block definition. Name (2) + insertion point (10) +
+                // uniform scale (41; DXF's non-uniform 42/43 collapse to it) +
+                // rotation (50). Unknown/empty blocks are skipped.
+                let bname = fields.iter().find(|(c, _)| *c == 2).map(|(_, v)| v.to_string());
+                match bname {
+                    Some(bn) if blocks.contains_key(&bn) => {
+                        let position = record_point(&fields, 10).unwrap_or(DVec3::ZERO);
+                        let scale = record_num(&fields, 41).filter(|s| *s > 0.0).unwrap_or(1.0);
+                        let rotation_deg = record_num(&fields, 50).unwrap_or(0.0);
+                        out.entities.push((
+                            record_layer(&fields),
+                            crate::Command::BlockInsert {
+                                id: None,
+                                name: bn,
+                                position,
+                                rotation_deg: Some(rotation_deg),
+                                scale: Some(scale),
+                                params: Default::default(),
+                            },
+                        ));
+                    }
+                    _ => out.skipped += 1,
+                }
+                continue;
+            }
+            "POINT" => {
+                match record_point(&fields, 10) {
+                    Some(p) => points_by_layer.entry(record_layer(&fields)).or_default().push(p),
+                    None => out.skipped += 1,
+                }
+                continue;
+            }
+            "3DFACE" => {
+                // Corners 10/11/12/13; a triangle when the 4th equals the 3rd.
+                match (
+                    record_point(&fields, 10),
+                    record_point(&fields, 11),
+                    record_point(&fields, 12),
+                ) {
+                    (Some(a), Some(b), Some(c)) => {
+                        let (pos, faces) =
+                            mesh_by_layer.entry(record_layer(&fields)).or_default();
+                        let base = pos.len() as u32;
+                        pos.extend([a, b, c]);
+                        faces.push([base, base + 1, base + 2]);
+                        if let Some(d) = record_point(&fields, 13)
+                            && (d - c).length() > 1e-9
+                        {
+                            let di = pos.len() as u32;
+                            pos.push(d);
+                            faces.push([base, base + 2, di]);
+                        }
+                    }
+                    _ => out.skipped += 1,
+                }
+                continue;
+            }
+            _ => {}
+        }
         match record_entity(name, &fields, &mut open_poly) {
             RecordOutcome::Entity(layer, cmd) => out.entities.push((layer, cmd)),
             RecordOutcome::PolyOpened => {}
@@ -317,7 +433,183 @@ pub fn parse_dxf(text: &str) -> Result<DxfEntities, String> {
     if open_poly.is_some() {
         out.skipped += 1; // POLYLINE never closed by SEQEND before EOF
     }
+    // Emit the aggregates: one point cloud and one mesh per layer.
+    for (layer, positions) in points_by_layer {
+        if !positions.is_empty() {
+            out.entities
+                .push((layer, crate::Command::PointLiteral { id: None, positions }));
+        }
+    }
+    for (layer, (positions, faces)) in mesh_by_layer {
+        if !faces.is_empty() {
+            out.entities.push((
+                layer,
+                crate::Command::MeshLiteral {
+                    id: None,
+                    positions,
+                    faces,
+                    name: Some("dxf 3dfaces".to_string()),
+                },
+            ));
+        }
+    }
+    // Prepend one BlockDefine per block so every BlockInsert resolves against an
+    // already-defined block (import applies commands in order). Empty selector —
+    // exec's replay path takes the geometry verbatim, no source objects needed.
+    if !blocks.is_empty() {
+        let mut defs: Vec<(String, crate::Command)> = blocks
+            .into_iter()
+            .map(|(name, geometries)| {
+                (
+                    "0".to_string(),
+                    crate::Command::BlockDefine {
+                        targets: crate::Selector::Ids { ids: Vec::new() },
+                        name,
+                        geometries: Some(geometries),
+                    },
+                )
+            })
+            .collect();
+        defs.append(&mut out.entities);
+        out.entities = defs;
+    }
     Ok(out)
+}
+
+/// Parse the BLOCKS-section records into block definitions. Each `BLOCK`…`ENDBLK`
+/// span is one named definition; its entities become [`BlockGeometry`] translated
+/// so the block base point (group 10 of `BLOCK`) sits at the origin (INSERT's
+/// insertion point then places it). Point clouds, meshes and NESTED inserts inside
+/// a block are dropped (v1) — most real blocks are flat curve/text symbols.
+fn parse_blocks(
+    records: Vec<(&str, Vec<(i32, &str)>)>,
+) -> std::collections::BTreeMap<String, Vec<itsjustcad_doc::BlockGeometry>> {
+    use itsjustcad_doc::BlockGeometry;
+    use kernel_curve::Curve;
+    let mut blocks = std::collections::BTreeMap::new();
+    let mut cur: Option<(String, DVec3, Vec<BlockGeometry>)> = None; // name, base, geoms
+    let mut open_poly: Option<(String, bool, Vec<DVec3>)> = None;
+    for (name, fields) in records {
+        match name {
+            "BLOCK" => {
+                let bname = fields
+                    .iter()
+                    .find(|(c, _)| *c == 2)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
+                let base = record_point(&fields, 10).unwrap_or(DVec3::ZERO);
+                cur = Some((bname, base, Vec::new()));
+                open_poly = None;
+            }
+            "ENDBLK" => {
+                // Flush a still-open POLYLINE, then commit the block.
+                if let (Some((_, _, geoms)), Some((_, closed, pts))) =
+                    (cur.as_mut(), open_poly.take())
+                    && pts.len() >= 2
+                {
+                    geoms.push(BlockGeometry::Curve(Curve::Polyline { points: pts, closed }));
+                }
+                if let Some((bname, base, mut geoms)) = cur.take() {
+                    for g in geoms.iter_mut() {
+                        translate_block_geom(g, -base);
+                    }
+                    if !bname.is_empty() && !geoms.is_empty() {
+                        blocks.insert(bname, geoms);
+                    }
+                }
+            }
+            _ => {
+                let Some((_, _, geoms)) = cur.as_mut() else {
+                    continue;
+                };
+                // POLYLINE vertex folding, mirroring the ENTITIES path.
+                if let Some((_, closed, pts)) = open_poly.as_mut() {
+                    match name {
+                        "VERTEX" => {
+                            if let Some(p) = record_point(&fields, 10) {
+                                pts.push(p);
+                            }
+                            continue;
+                        }
+                        "SEQEND" => {
+                            let (closed, pts) = (*closed, std::mem::take(pts));
+                            open_poly = None;
+                            if pts.len() >= 2 {
+                                geoms.push(BlockGeometry::Curve(Curve::Polyline {
+                                    points: pts,
+                                    closed,
+                                }));
+                            }
+                            continue;
+                        }
+                        _ => open_poly = None, // unterminated: drop, fall through
+                    }
+                }
+                if name == "POLYLINE" {
+                    let closed = record_num(&fields, 70).unwrap_or(0.0) as i64 & 1 != 0;
+                    open_poly = Some((String::new(), closed, Vec::new()));
+                    continue;
+                }
+                let mut dummy = None;
+                if let RecordOutcome::Entity(_, cmd) = record_entity(name, &fields, &mut dummy)
+                    && let Some(g) = command_to_block_geometry(&cmd)
+                {
+                    geoms.push(g);
+                }
+            }
+        }
+    }
+    blocks
+}
+
+/// Convert a parsed entity command into block geometry (curve/annotation). Point
+/// clouds and meshes return `None` — dropped from block definitions.
+fn command_to_block_geometry(cmd: &crate::Command) -> Option<itsjustcad_doc::BlockGeometry> {
+    use crate::Command;
+    use itsjustcad_doc::{Annotation, BlockGeometry};
+    use kernel_curve::Curve;
+    Some(match cmd {
+        Command::Line { a, b, .. } => BlockGeometry::Curve(Curve::Line { a: *a, b: *b }),
+        Command::Polyline { points, closed, .. } => {
+            BlockGeometry::Curve(Curve::Polyline { points: points.clone(), closed: *closed })
+        }
+        Command::Circle { center, radius, .. } => BlockGeometry::Curve(Curve::Arc {
+            center: *center,
+            radius: *radius,
+            start: 0.0,
+            end: std::f64::consts::TAU,
+        }),
+        Command::Arc { center, radius, start_deg, end_deg, .. } => BlockGeometry::Curve(Curve::Arc {
+            center: *center,
+            radius: *radius,
+            start: start_deg.to_radians(),
+            end: end_deg.to_radians(),
+        }),
+        Command::Text { pos, text, height, .. } => {
+            BlockGeometry::Annotation(Annotation::Text { pos: *pos, text: text.clone(), height: *height })
+        }
+        Command::Dim { a, b, offset, .. } => {
+            BlockGeometry::Annotation(Annotation::LinearDim { a: *a, b: *b, offset: *offset })
+        }
+        _ => return None,
+    })
+}
+
+/// Shift block geometry by `d` (used to re-origin a block on its base point).
+fn translate_block_geom(g: &mut itsjustcad_doc::BlockGeometry, d: DVec3) {
+    use itsjustcad_doc::{Annotation, BlockGeometry};
+    match g {
+        BlockGeometry::Curve(c) => c.translate(d),
+        BlockGeometry::Annotation(Annotation::Text { pos, .. }) => *pos += d,
+        BlockGeometry::Annotation(Annotation::LinearDim { a, b, .. }) => {
+            *a += d;
+            *b += d;
+        }
+        BlockGeometry::Annotation(Annotation::Hatch { boundary, .. }) => {
+            boundary.iter_mut().for_each(|p| *p += d);
+        }
+        BlockGeometry::Mesh(_) => {}
+    }
 }
 
 enum RecordOutcome {
@@ -394,12 +686,147 @@ fn record_entity(
             *open_poly = Some((layer, closed, Vec::new()));
             return RecordOutcome::PolyOpened;
         }
+        "MTEXT" => match (record_point(fields, 10), record_num(fields, 40)) {
+            // Insertion point (10), char height (40). Body is the group-3 chunks
+            // (250-char continuations) followed by the group-1 tail; inline MTEXT
+            // formatting codes (\P, {\f…;}, \H…;) are stripped to plain text.
+            (Some(pos), Some(height)) if height > 0.0 => {
+                let mut raw = String::new();
+                for (c, v) in fields {
+                    if *c == 3 {
+                        raw.push_str(v);
+                    }
+                }
+                if let Some((_, v)) = fields.iter().find(|(c, _)| *c == 1) {
+                    raw.push_str(v);
+                }
+                let text = mtext_plain(&raw);
+                (!text.is_empty()).then_some(Command::Text { id: None, pos, text, height })
+            }
+            _ => None,
+        },
+        "DIMENSION" => {
+            // Linear/aligned only (group-70 low 3 bits: 0 = rotated, 1 = aligned).
+            // Extension-line origins are 13/14; the dimension-line point is 10.
+            // Offset = signed perpendicular distance from 10 to the 13→14 line.
+            let dtype = record_num(fields, 70).unwrap_or(0.0) as i64 & 7;
+            match (
+                dtype,
+                record_point(fields, 13),
+                record_point(fields, 14),
+                record_point(fields, 10),
+            ) {
+                (0 | 1, Some(a), Some(b), Some(dimline)) => {
+                    let ab = b - a;
+                    let offset = if ab.length() > 1e-9 {
+                        let n = DVec3::new(-ab.y, ab.x, 0.0).normalize();
+                        (dimline - a).dot(n)
+                    } else {
+                        0.0
+                    };
+                    Some(Command::Dim { id: None, a, b, offset })
+                }
+                _ => None,
+            }
+        }
+        "ELLIPSE" => {
+            // center (10), major-axis endpoint RELATIVE to center (11/21), ratio
+            // minor/major (40), param range (41/42, radians; default full turn).
+            // Our Ellipse command is axis-aligned, so a possibly-rotated DXF
+            // ellipse is tessellated to a polyline (also handles partial arcs).
+            match (
+                record_point(fields, 10),
+                record_num(fields, 11),
+                record_num(fields, 21),
+                record_num(fields, 40),
+            ) {
+                (Some(center), Some(mx), Some(my), Some(ratio)) => {
+                    let start = record_num(fields, 41).unwrap_or(0.0);
+                    let end = record_num(fields, 42).unwrap_or(std::f64::consts::TAU);
+                    let major = DVec3::new(mx, my, 0.0);
+                    let minor = DVec3::new(-major.y, major.x, 0.0) * ratio;
+                    let closed = (end - start - std::f64::consts::TAU).abs() < 1e-6;
+                    let steps = 64usize;
+                    let n = if closed { steps } else { steps + 1 };
+                    let pts: Vec<DVec3> = (0..n)
+                        .map(|i| {
+                            let t = start + (end - start) * (i as f64 / steps as f64);
+                            center + major * t.cos() + minor * t.sin()
+                        })
+                        .collect();
+                    (pts.len() >= 2).then_some(Command::Polyline { id: None, points: pts, closed })
+                }
+                _ => None,
+            }
+        }
+        "HATCH" => {
+            // Import the hatch BOUNDARY as a closed polyline (the fill pattern is
+            // dropped — Command::Hatch fills by selector, not raw geometry). Verts
+            // are the 10/20 pairs inside the boundary-path block: after group 91
+            // (path count) and before group 75 (hatch style, which begins the
+            // pattern/seed section that ALSO uses 10/20).
+            let mut pts = Vec::new();
+            let mut in_boundary = false;
+            let mut x: Option<f64> = None;
+            for (code, value) in fields {
+                match code {
+                    91 => in_boundary = true,
+                    75 => in_boundary = false,
+                    10 if in_boundary => x = value.parse::<f64>().ok(),
+                    20 if in_boundary => {
+                        if let (Some(px), Ok(py)) = (x.take(), value.parse::<f64>()) {
+                            pts.push(DVec3::new(px, py, 0.0));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (pts.len() >= 2).then_some(Command::Polyline { id: None, points: pts, closed: true })
+        }
         _ => None,
     };
     match cmd {
         Some(cmd) => RecordOutcome::Entity(layer, cmd),
         None => RecordOutcome::Skipped,
     }
+}
+
+/// Strip MTEXT inline formatting to plain text. Handles the common codes: `\P`
+/// (paragraph → space), `\~` (nbsp → space), escaped `\\ \{ \}`, `{ }` grouping
+/// braces, and arg-bearing commands (`\A1;`, `\fArial|…;`, `\H2.5x;`, `\C1;`, …)
+/// whose payload runs to the next `;`. Non-arg toggles (`\L`, `\O`, `\K`) drop the
+/// letter only. Not a full MTEXT parser — good enough to recover readable labels.
+fn mtext_plain(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.peek().copied() {
+                Some('P') | Some('p') | Some('~') => {
+                    out.push(' ');
+                    chars.next();
+                }
+                Some('\\') | Some('{') | Some('}') => {
+                    out.push(chars.next().unwrap());
+                }
+                Some(cmd) => {
+                    chars.next(); // consume the command letter
+                    // Arg-bearing commands consume up to (and including) a ';'.
+                    if matches!(cmd, 'A' | 'C' | 'c' | 'H' | 'W' | 'T' | 'Q' | 'F' | 'f' | 'p' | 'S') {
+                        for n in chars.by_ref() {
+                            if n == ';' {
+                                break;
+                            }
+                        }
+                    }
+                }
+                None => {}
+            },
+            '{' | '}' => {} // drop grouping braces
+            _ => out.push(c),
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Layer (code 8), lowercased to match the document's naming style — our own
@@ -705,8 +1132,11 @@ mod tests {
             0\nINSERT\n2\nCHAIR\n10\n0\n20\n0\n\
             0\nENDSEC\n0\nEOF\n";
         let parsed = parse_dxf(text).unwrap();
-        assert_eq!(parsed.skipped, 3);
-        assert_eq!(parsed.entities.len(), 1);
+        // SPLINE + INSERT are still unsupported → skipped. POINT is now imported
+        // (aggregated into a cloud), so it is no longer counted as skipped.
+        assert_eq!(parsed.skipped, 2);
+        // The LINE (folded in place) is first; the aggregated POINT cloud is
+        // appended after the fold.
         let (layer, cmd) = &parsed.entities[0];
         assert_eq!(layer, "walls");
         assert_eq!(
@@ -717,6 +1147,229 @@ mod tests {
                 b: DVec3::new(5.0, 1.0, 0.0),
             }
         );
+        // The lone POINT became a one-point cloud.
+        assert!(
+            parsed.entities.iter().any(|(_, c)| matches!(
+                c,
+                Command::PointLiteral { positions, .. } if positions.len() == 1
+            )),
+            "POINT should aggregate into a 1-point cloud"
+        );
+    }
+
+    #[test]
+    fn mtext_imports_as_text_with_formatting_stripped() {
+        let text = "0\nSECTION\n2\nENTITIES\n\
+            0\nMTEXT\n8\nNOTES\n10\n5\n20\n7\n30\n0\n40\n2.5\n\
+            1\n{\\fArial|b1;\\H2.5;Hello}\\PWorld\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        assert_eq!(parsed.entities.len(), 1, "MTEXT should import");
+        let (layer, cmd) = &parsed.entities[0];
+        assert_eq!(layer, "notes");
+        match cmd {
+            Command::Text { pos, text, height, .. } => {
+                assert_eq!(*pos, DVec3::new(5.0, 7.0, 0.0));
+                assert!((height - 2.5).abs() < 1e-9);
+                assert_eq!(text, "Hello World", "formatting codes must be stripped");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dimension_linear_imports_as_dim() {
+        // Horizontal dim: extension origins (13,14) at y=0, dim line (10) at y=3.
+        let text = "0\nSECTION\n2\nENTITIES\n\
+            0\nDIMENSION\n8\nDIMS\n70\n0\n\
+            13\n0\n23\n0\n33\n0\n14\n10\n24\n0\n34\n0\n\
+            10\n5\n20\n3\n30\n0\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        assert_eq!(parsed.entities.len(), 1, "linear DIMENSION should import");
+        match &parsed.entities[0].1 {
+            Command::Dim { a, b, offset, .. } => {
+                assert_eq!(*a, DVec3::new(0.0, 0.0, 0.0));
+                assert_eq!(*b, DVec3::new(10.0, 0.0, 0.0));
+                assert!((offset - 3.0).abs() < 1e-9, "offset {offset}");
+            }
+            other => panic!("expected Dim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hatch_boundary_imports_as_closed_polyline() {
+        // A solid hatch over a triangular polyline boundary; seed point after 75
+        // must NOT be picked up as a boundary vertex.
+        let text = "0\nSECTION\n2\nENTITIES\n\
+            0\nHATCH\n8\nFILLS\n10\n0\n20\n0\n30\n0\n2\nSOLID\n70\n1\n71\n0\n\
+            91\n1\n92\n2\n72\n0\n73\n1\n93\n3\n\
+            10\n0\n20\n0\n10\n4\n20\n0\n10\n2\n20\n3\n\
+            75\n0\n76\n1\n98\n1\n10\n2\n20\n1\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        assert_eq!(parsed.entities.len(), 1, "HATCH boundary should import");
+        match &parsed.entities[0].1 {
+            Command::Polyline { points, closed, .. } => {
+                assert!(closed, "hatch boundary is closed");
+                assert_eq!(
+                    *points,
+                    vec![
+                        DVec3::new(0.0, 0.0, 0.0),
+                        DVec3::new(4.0, 0.0, 0.0),
+                        DVec3::new(2.0, 3.0, 0.0),
+                    ],
+                    "only the 3 boundary verts, not the seed point (2,1)"
+                );
+            }
+            other => panic!("expected Polyline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn points_aggregate_into_one_cloud_per_layer() {
+        let text = "0\nSECTION\n2\nENTITIES\n\
+            0\nPOINT\n8\nSURVEY\n10\n1\n20\n2\n30\n0\n\
+            0\nPOINT\n8\nSURVEY\n10\n3\n20\n4\n30\n0\n\
+            0\nPOINT\n8\nGRID\n10\n5\n20\n6\n30\n0\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        // One cloud per layer (2 layers), NOT 3 separate point objects.
+        let clouds: Vec<_> = parsed
+            .entities
+            .iter()
+            .filter_map(|(l, c)| match c {
+                Command::PointLiteral { positions, .. } => Some((l.as_str(), positions.len())),
+                _ => None,
+            })
+            .collect();
+        assert!(clouds.contains(&("survey", 2)), "survey cloud of 2: {clouds:?}");
+        assert!(clouds.contains(&("grid", 1)), "grid cloud of 1: {clouds:?}");
+        assert_eq!(clouds.len(), 2, "exactly one cloud per layer");
+    }
+
+    #[test]
+    fn threedface_aggregates_into_one_mesh() {
+        // One quad (4 distinct corners) → 4 verts, 2 triangles; one triangle
+        // (4th == 3rd) → 3 verts, 1 triangle. Both fold into ONE mesh per layer.
+        let text = "0\nSECTION\n2\nENTITIES\n\
+            0\n3DFACE\n8\nTIN\n10\n0\n20\n0\n30\n0\n11\n1\n21\n0\n31\n0\n12\n1\n22\n1\n32\n0\n13\n0\n23\n1\n33\n0\n\
+            0\n3DFACE\n8\nTIN\n10\n2\n20\n0\n30\n0\n11\n3\n21\n0\n31\n0\n12\n3\n22\n1\n32\n0\n13\n3\n23\n1\n33\n0\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        let meshes: Vec<_> = parsed
+            .entities
+            .iter()
+            .filter_map(|(l, c)| match c {
+                Command::MeshLiteral { positions, faces, .. } => {
+                    Some((l.as_str(), positions.len(), faces.len()))
+                }
+                _ => None,
+            })
+            .collect();
+        // quad=4v/2f + tri=3v/1f → 7 verts, 3 faces, ONE mesh.
+        assert_eq!(meshes, vec![("tin", 7, 3)], "one aggregated mesh: {meshes:?}");
+    }
+
+    #[test]
+    fn ellipse_tessellates_to_closed_polyline() {
+        // Full ellipse: center (5,5), major axis 4 along +x, ratio 0.5 → ry=2.
+        let text = "0\nSECTION\n2\nENTITIES\n\
+            0\nELLIPSE\n8\nE\n10\n5\n20\n5\n30\n0\n11\n4\n21\n0\n31\n0\n40\n0.5\n41\n0\n42\n6.283185307\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        assert_eq!(parsed.entities.len(), 1);
+        match &parsed.entities[0].1 {
+            Command::Polyline { points, closed, .. } => {
+                assert!(closed, "full ellipse is a closed loop");
+                assert!(points.len() >= 32, "densely tessellated");
+                // Extents: x in [1,9], y in [3,7] (rx=4, ry=2 about (5,5)).
+                let xmax = points.iter().map(|p| p.x).fold(f64::MIN, f64::max);
+                let ymax = points.iter().map(|p| p.y).fold(f64::MIN, f64::max);
+                assert!((xmax - 9.0).abs() < 0.1, "xmax {xmax}");
+                assert!((ymax - 7.0).abs() < 0.1, "ymax {ymax}");
+            }
+            other => panic!("expected Polyline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_instances_a_block_definition() {
+        // A block "TREE" (one circle) defined in BLOCKS, referenced twice by
+        // INSERT in ENTITIES. Expect: one BlockDefine (first) + two BlockInsert.
+        let text = "0\nSECTION\n2\nBLOCKS\n\
+            0\nBLOCK\n2\nTREE\n10\n0\n20\n0\n30\n0\n\
+            0\nCIRCLE\n8\n0\n10\n0\n20\n0\n40\n1\n\
+            0\nENDBLK\n\
+            0\nENDSEC\n\
+            0\nSECTION\n2\nENTITIES\n\
+            0\nINSERT\n8\nSYMBOLS\n2\nTREE\n10\n5\n20\n5\n30\n0\n41\n2\n50\n90\n\
+            0\nINSERT\n8\nSYMBOLS\n2\nTREE\n10\n8\n20\n1\n30\n0\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        // First command must be the block definition.
+        match &parsed.entities[0].1 {
+            Command::BlockDefine { name, geometries, .. } => {
+                assert_eq!(name, "TREE");
+                assert_eq!(geometries.as_ref().unwrap().len(), 1, "one circle in TREE");
+            }
+            other => panic!("expected BlockDefine first, got {other:?}"),
+        }
+        // Then two inserts, with transform carried through.
+        let inserts: Vec<_> = parsed
+            .entities
+            .iter()
+            .filter_map(|(l, c)| match c {
+                Command::BlockInsert { name, position, rotation_deg, scale, .. } => {
+                    Some((l.as_str(), name.as_str(), *position, *rotation_deg, *scale))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inserts.len(), 2, "two TREE inserts");
+        assert_eq!(inserts[0].0, "symbols");
+        assert_eq!(inserts[0].2, DVec3::new(5.0, 5.0, 0.0));
+        assert_eq!(inserts[0].3, Some(90.0));
+        assert_eq!(inserts[0].4, Some(2.0));
+        assert_eq!(inserts[1].4, Some(1.0), "default scale 1 when 41 absent");
+    }
+
+    #[test]
+    fn insert_of_unknown_block_is_skipped() {
+        let text = "0\nSECTION\n2\nENTITIES\n\
+            0\nINSERT\n8\nA\n2\nNOPE\n10\n0\n20\n0\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        assert!(parsed.entities.is_empty(), "unknown block insert imports nothing");
+        assert_eq!(parsed.skipped, 1);
+    }
+
+    #[test]
+    fn multiline_string_value_does_not_abort_import() {
+        // Regression: a real DWG→DXF (LibreDWG) wrote a TEXT/MTEXT whose value is a
+        // multi-line disclaimer. The wrapped continuation lines are NOT integer
+        // group codes; the old strict parser errored the WHOLE file on the first
+        // one ("expected an integer group code, got 'OR USE OF ... PROHIBITED'").
+        // The parser must skip stray continuation lines, resync, and still import
+        // the geometry that follows.
+        let text = "0\nSECTION\n2\nENTITIES\n\
+            0\nTEXT\n8\nNOTES\n10\n0\n20\n0\n40\n2.5\n\
+            1\nCopyright notice line one\n\
+            UNAUTHORIZED REPRODUCTION OR USE\n\
+            IS THEREFORE EXPRESSLY PROHIBITED\n\
+            0\nLINE\n8\nWALLS\n10\n0\n20\n0\n30\n0\n11\n5\n21\n1\n31\n0\n\
+            0\nCIRCLE\n8\nHOLES\n10\n3\n20\n3\n40\n2\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).expect("multi-line string must not fail the parse");
+        // The LINE and CIRCLE after the runaway text still import — proof of resync.
+        let has_line = parsed.entities.iter().any(|(l, c)| {
+            l == "walls" && matches!(c, Command::Line { .. })
+        });
+        let has_circle = parsed.entities.iter().any(|(l, c)| {
+            l == "holes" && matches!(c, Command::Circle { .. })
+        });
+        assert!(has_line, "LINE after multi-line text should import: {:?}", parsed.entities);
+        assert!(has_circle, "CIRCLE after multi-line text should import");
     }
 
     #[test]
@@ -792,13 +1445,15 @@ mod tests {
         let err = s.run(parse("import /nonexistent/nope.dxf").unwrap()).unwrap_err();
         assert!(err.to_string().contains("cannot read"), "{err}");
 
-        // A file named .dxf but with garbage content should fail with a parse error.
+        // A file named .dxf but with garbage content should fail with a friendly
+        // parse error (no ENTITIES section) — the resilient parser skips stray
+        // lines, so genuine gibberish yields "not a DXF", not a group-code abort.
         let path = std::env::temp_dir().join("itsjustcad_not_a_dxf.dxf");
         std::fs::write(&path, "hello\nworld\nagain\n").unwrap();
         let err = s
             .run(Command::Import { path: path.display().to_string() })
             .unwrap_err();
-        assert!(err.to_string().contains("group code"), "{err}");
+        assert!(err.to_string().contains("not a DXF"), "{err}");
         assert_eq!(s.doc.len(), 0, "failed import leaves nothing behind");
     }
 }
