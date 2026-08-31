@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/htarrido/itsjustcad"
@@ -61,3 +61,25 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 opt-level = "z"
+
+# ── Fast local iteration (previews + dist testing) ──────────────────────────
+# macOS: keep debuginfo in the .o files (skip the slow dsymutil dSYM pack).
+[profile.dev]
+split-debuginfo = "unpacked"
+
+# The preview snapshot loop runs under the `test` profile — trim debuginfo to
+# line tables so linking the ~120 MB test binary is quick.
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+# `quick`: a FAST local build of the shippable binary for dist UI-testing — NOT
+# the release artifact (GitHub CI still uses [profile.release] with fat LTO).
+# LTO off + many codegen units + light opt cuts the dist rebuild dramatically on
+# this Intel box. Build/copy from `target/quick/itsjustcad`.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = 1
+strip = false
