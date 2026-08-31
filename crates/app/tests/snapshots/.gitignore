@@ -1,0 +1,4 @@
+# egui_kittest transient render artifacts (keep only the *.png baselines)
+*.old.png
+*.diff.png
+*.new.png
