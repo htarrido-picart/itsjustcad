@@ -386,6 +386,11 @@ pub struct App {
     /// Whether the Tools → Model Setup panel is open (works any time, not just
     /// first-run).
     show_model_setup: bool,
+    /// A DXF import running in time-boxed batches (progress modal). `None` when
+    /// no import is in flight.
+    import_job: Option<ImportJob>,
+    /// Completion message from the last import, shown in a dismissable popup.
+    import_result: Option<String>,
     /// Bundled catalog of downloadable local models, parsed once.
     catalog: crate::model_catalog::Catalog,
     /// The download in flight from the Model Setup panel, if any. The UI polls
@@ -431,6 +436,36 @@ pub(crate) enum PendingNav {
     New,
     Open,
     Quit,
+}
+
+/// A DXF import in progress, applied in time-boxed batches across frames so a
+/// large file (tens of thousands of entities → one logged op each) never freezes
+/// the UI. The app drives it in `step_import`, shows a progress modal, and on
+/// completion posts a message + zoom-extents-all. Parsing is done up front (fast
+/// for DXF); the batched part is applying the ops.
+pub(crate) struct ImportJob {
+    /// Source path, for the progress/completion messages.
+    path: String,
+    /// Remaining `(layer, command)` pairs to apply, consumed from `cursor`.
+    entities: Vec<(String, itsjustcad_commands::Command)>,
+    /// Index of the next entity to apply.
+    cursor: usize,
+    /// Total entities to apply (for the progress fraction).
+    total: usize,
+    /// Entities the parser dropped (unsupported types) — reported at the end.
+    skipped: usize,
+    /// The layer to restore once every entity is applied.
+    prev_layer: String,
+}
+
+impl ImportJob {
+    fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            1.0
+        } else {
+            self.cursor as f32 / self.total as f32
+        }
+    }
 }
 
 /// What the unsaved-changes guard should do with a user's alert choice. Pure so
@@ -651,6 +686,8 @@ impl App {
             // Dev hook: ITSJUSTCAD_MODEL_SETUP=1 opens the Model Setup panel on
             // startup so ITSJUSTCAD_SHOT frames can capture it without a click.
             show_model_setup: std::env::var("ITSJUSTCAD_MODEL_SETUP").is_ok(),
+            import_job: None,
+            import_result: None,
             catalog: crate::model_catalog::Catalog::load(),
             active_download: None,
             icons: crate::icons::Icons::new(),
@@ -868,6 +905,7 @@ impl App {
             // interactively pops a native dialog first, then runs with the path.
             Some(verb @ ("import" | "export")) => {
                 match words.next() {
+                    Some(p) if verb == "import" => self.begin_import(p.into()),
                     Some(p) => {
                         self.command_line
                             .execute(&mut self.session, &format!("{verb} {p}"));
@@ -1363,6 +1401,156 @@ impl App {
         }
     }
 
+    /// Zoom-extents ALL viewports to the whole scene. Same framing math as
+    /// [`Self::zoom_extents`] but applied to every camera — used after an import
+    /// so each pane frames the freshly-loaded geometry.
+    fn zoom_extents_all(&mut self) {
+        if let Some(bb) = self.session.doc.scene_aabb() {
+            let c = bb.center();
+            let center = glam::Vec3::new(c.x as f32, c.y as f32, c.z as f32);
+            let distance = (bb.size().length() as f32 * 1.2).max(5.0);
+            for cam in &mut self.cameras {
+                cam.target = center;
+                cam.distance = distance;
+            }
+        }
+    }
+
+    /// Draw the import progress modal (while a job runs) and the completion
+    /// popup (after it finishes). The progress window is non-closable — the
+    /// import always runs to completion; the result popup has an OK button.
+    fn import_ui(&mut self, ctx: &egui::Context) {
+        if let Some(job) = &self.import_job {
+            egui::Window::new("Importing…")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(320.0);
+                    ui.label(
+                        egui::RichText::new(format!("Importing {}", job.path))
+                            .strong(),
+                    );
+                    ui.add(egui::ProgressBar::new(job.fraction()).show_percentage());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} / {} entities",
+                            job.cursor, job.total
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                });
+        }
+        // Completion popup — shown until the user dismisses it.
+        let mut dismiss = false;
+        if let Some(msg) = &self.import_result {
+            egui::Window::new("Import complete")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(300.0);
+                    ui.label(egui::RichText::new("✔ Successful import").strong());
+                    ui.label(egui::RichText::new(msg).weak());
+                    ui.add_space(6.0);
+                    if ui.button("OK").clicked() {
+                        dismiss = true;
+                    }
+                });
+        }
+        if dismiss {
+            self.import_result = None;
+        }
+    }
+
+    /// Begin importing `path`. DXF files (potentially tens of thousands of
+    /// entities) are applied in time-boxed batches with a progress modal (see
+    /// [`Self::step_import`]) so the UI never freezes; other formats run
+    /// synchronously through the substrate, then also get the popup + zoom-all.
+    fn begin_import(&mut self, path: std::path::PathBuf) {
+        let is_dxf = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("dxf"));
+        if !is_dxf {
+            self.command_line
+                .execute(&mut self.session, &format!("import {}", path.display()));
+            self.zoom_extents_all();
+            self.import_result = Some(format!("Imported {}", path.display()));
+            return;
+        }
+        // Parse up front (fast); the slow part — one logged op per entity — is
+        // chunked across frames.
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.command_line
+                    .push_line(format!("import failed: cannot read {}: {e}", path.display()));
+                return;
+            }
+        };
+        match itsjustcad_commands::dxf::parse_dxf(&text) {
+            Ok(parsed) => {
+                let total = parsed.entities.len();
+                self.command_line
+                    .push_line(format!("importing {} — {total} entities…", path.display()));
+                self.import_job = Some(ImportJob {
+                    path: path.display().to_string(),
+                    entities: parsed.entities,
+                    cursor: 0,
+                    total,
+                    skipped: parsed.skipped,
+                    prev_layer: self.session.doc.current_layer.clone(),
+                });
+            }
+            Err(e) => self
+                .command_line
+                .push_line(format!("import failed: {} — {e}", path.display())),
+        }
+    }
+
+    /// Advance the in-flight DXF import by one ~8 ms batch, keeping frames live.
+    /// On the final batch: restore the layer, post the success message (command
+    /// line + popup), and zoom-extents every viewport onto the import.
+    fn step_import(&mut self, ctx: &egui::Context) {
+        let Some(mut job) = self.import_job.take() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(8);
+        while job.cursor < job.total {
+            let (layer, cmd) = job.entities[job.cursor].clone();
+            if self.session.doc.current_layer != layer {
+                let _ = self
+                    .session
+                    .run(itsjustcad_commands::Command::Layer { name: layer });
+            }
+            let _ = self.session.run(cmd);
+            job.cursor += 1;
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        if job.cursor >= job.total {
+            if self.session.doc.current_layer != job.prev_layer {
+                let _ = self.session.run(itsjustcad_commands::Command::Layer {
+                    name: job.prev_layer.clone(),
+                });
+            }
+            let msg = format!(
+                "Imported {} entities from {} ({} skipped).",
+                job.total, job.path, job.skipped
+            );
+            self.command_line.push_line(msg.clone());
+            self.import_result = Some(msg);
+            self.zoom_extents_all();
+            // job dropped — import complete.
+        } else {
+            self.import_job = Some(job);
+            ctx.request_repaint(); // keep stepping next frame
+        }
+    }
+
     /// Click-select: ray through the clicked pixel vs object AABBs. Unless
     /// `expand` is off (Cmd held), the hit expands to its whole group.
     fn pick(
@@ -1584,10 +1772,9 @@ impl App {
                 .pick_file()
         });
         let Some(path) = path else { return };
-        // Route through the command line so it parses to Command::Import and
-        // dispatches via the substrate (op-log records the import, not the file).
-        self.command_line
-            .execute(&mut self.session, &format!("import {}", path.display()));
+        // DXF imports go through the batched job (progress modal); other formats
+        // run synchronously. Both end with the popup + zoom-extents-all.
+        self.begin_import(path);
     }
 
     /// Export the document THROUGH THE SUBSTRATE. With no path a native rfd save
@@ -3286,9 +3473,6 @@ impl App {
                     }
                     PanelTab::Deck => {
                         let tk = preset::preset_for(self.cad_origin).tokens();
-                        // Offer the default local model in the LLM menu if the
-                        // user skipped onboarding and hasn't downloaded it.
-                        self.deck_pane.default_model_offer = self.default_model_offer();
                         self.deck_pane.ui(
                             ui,
                             &mut self.session,
@@ -3298,9 +3482,6 @@ impl App {
                             tk.dark,
                             self.reduce_motion,
                         );
-                        if let Some(id) = self.deck_pane.pending_model_download.take() {
-                            self.start_model_install(&id);
-                        }
                     }
                 }
             });
@@ -3348,7 +3529,16 @@ impl App {
         }
         let has_selection = !self.session.doc.selection.is_empty();
         let bar = egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
-            crate::menu::ui(ui, icons, style, has_selection)
+            crate::menu::ui(
+                ui,
+                icons,
+                style,
+                has_selection,
+                crate::menu::MenuToggles {
+                    local_only: self.deck_pane.local_only(),
+                    web_search: self.deck_pane.allow_web_search(),
+                },
+            )
         });
         // Dev/screenshot hook: force one menu open to show grouped items.
         if let Ok(title) = std::env::var("ITSJUSTCAD_MENU_DEMO") {
@@ -3392,6 +3582,23 @@ impl App {
             }
             MenuAction::ZoomReset => ctx.set_zoom_factor(1.3),
             MenuAction::CommandPalette => self.open_palette(),
+            MenuAction::RevealModelsFolder => {
+                if let Some(dir) = crate::download::models_dir() {
+                    reveal_folder(&dir);
+                }
+            }
+            MenuAction::DownloadDefaultModel => {
+                // Only when one is actually offered (not installed, no download in
+                // flight, no healthy local deck); otherwise open Model Setup so the
+                // user can pick manually.
+                if let Some((id, _name)) = self.default_model_offer() {
+                    self.start_model_install(&id);
+                } else {
+                    self.show_model_setup = true;
+                }
+            }
+            MenuAction::ToggleLocalOnly => self.deck_pane.toggle_local_only(),
+            MenuAction::ToggleWebSearch => self.deck_pane.toggle_web_search(),
         }
     }
 
@@ -3700,9 +3907,33 @@ impl App {
                                 }
                             }
                         } else if installed {
+                            // Where the download lives + its on-disk size, so the
+                            // user can find (or reclaim) a multi-GB file.
+                            let on_disk = installed_model_file(entry);
+                            if let Some(path) = &on_disk {
+                                let size =
+                                    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "On disk: {} · {}",
+                                        crate::download::fmt_bytes(size),
+                                        path.display()
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 if ui.button("Re-download").clicked() {
                                     install = Some(entry.id.clone());
+                                }
+                                if let Some(path) = &on_disk
+                                    && ui
+                                        .button("Reveal")
+                                        .on_hover_text("Show the model file in the file manager")
+                                        .clicked()
+                                {
+                                    reveal_in_file_manager(path);
                                 }
                                 if crate::widgets::role_button(
                                     ui,
@@ -3710,6 +3941,9 @@ impl App {
                                     dark,
                                     crate::widgets::ButtonRole::Destructive,
                                     "Remove",
+                                )
+                                .on_hover_text(
+                                    "Removes the deck and DELETES the downloaded file.",
                                 )
                                 .clicked()
                                 {
@@ -3730,6 +3964,16 @@ impl App {
                 }
 
                 ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Reveal Models Folder…")
+                        .on_hover_text("Open ~/.config/itsjustcad/models in the file manager")
+                        .clicked()
+                        && let Some(dir) = crate::download::models_dir()
+                    {
+                        reveal_folder(&dir);
+                    }
+                });
                 ui.label(
                     egui::RichText::new(
                         "Downloads stream to ~/.config/itsjustcad/models and are \
@@ -3754,6 +3998,13 @@ impl App {
             active.handle.cancel();
         }
         if let Some(id) = remove {
+            // Delete the downloaded FILE too — not just the deck entry. Removing
+            // only the cassette is what orphans multi-GB files on disk.
+            if let Some(entry) = self.catalog.get(&id).cloned()
+                && let Some(dir) = crate::download::models_dir()
+            {
+                let _ = std::fs::remove_file(dir.join(entry.file_name()));
+            }
             let mut decks = itsjustcad_deck::DecksFile::load_or_default();
             if remove_catalog_deck(&mut decks, &id) {
                 decks.save();
@@ -4150,6 +4401,42 @@ fn cassette_name_for(model_id: &str) -> String {
     format!("local-{model_id}")
 }
 
+/// Absolute path of a catalog model's downloaded file, if it exists on disk.
+/// The file lives at `models_dir()/<file_name>` (see [`download::models_dir`]).
+fn installed_model_file(entry: &crate::model_catalog::ModelEntry) -> Option<std::path::PathBuf> {
+    let p = crate::download::models_dir()?.join(entry.file_name());
+    p.exists().then_some(p)
+}
+
+/// Reveal a file in the OS file manager, selecting it. Best-effort — a failure
+/// to spawn the helper is silently ignored (nothing to recover).
+fn reveal_in_file_manager(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // xdg-open cannot select a file; open the containing directory instead.
+        let dir = path.parent().unwrap_or(path);
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+/// Open a folder in the OS file manager. Creates it first so an empty models
+/// directory still opens rather than failing.
+fn reveal_folder(dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(dir);
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(dir).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+}
+
 /// Build the local cassette for an installed catalog model. Pure so the shape is
 /// unit-tested. `openai_compat` kind, localhost runtime base URL, grammar on
 /// (local models get grammar-constrained decoding), model = the catalog id.
@@ -4428,10 +4715,16 @@ impl eframe::App for App {
         #[cfg(not(target_os = "linux"))]
         {
             let has_selection = !self.session.doc.selection.is_empty();
+            // Read live LLM-toggle state before the mutable native borrow.
+            let local_only = self.deck_pane.local_only();
+            let web_search = self.deck_pane.allow_web_search();
             if let Some(native) = &mut self.native_menu {
                 // Disable-don't-hide: keep the selection-dependent native items'
                 // enabled state in sync with the current selection.
                 native.sync_selection(has_selection);
+                // Mirror the live Local Only / Allow Web Search state onto the
+                // native checkable LLM items.
+                native.sync_toggles(local_only, web_search);
                 let action = native.poll();
                 if let Some(action) = action {
                     let ctx = ui.ctx().clone();
@@ -4670,6 +4963,10 @@ impl eframe::App for App {
         self.model_setup_ui(ui.ctx());
         // Compact corner chip so a download can continue with the panel hidden.
         self.download_progress_chip(ui.ctx());
+
+        // Drive an in-flight DXF import one batch per frame, then draw its modal.
+        self.step_import(ui.ctx());
+        self.import_ui(ui.ctx());
 
         // Mirror the op-log to the crash journal. One hook covers every
         // mutation path (command line, gumball, deck, history jumps); the
@@ -4935,6 +5232,26 @@ fn pano_from_view(v: itsjustcad_doc::PanoView) -> itsjustcad_render::PanoProject
 mod tests {
     use super::*;
     use itsjustcad_commands::registry;
+
+    #[test]
+    fn import_job_fraction_tracks_progress() {
+        let mut job = ImportJob {
+            path: "x.dxf".into(),
+            entities: Vec::new(),
+            cursor: 0,
+            total: 200,
+            skipped: 5,
+            prev_layer: "0".into(),
+        };
+        assert_eq!(job.fraction(), 0.0);
+        job.cursor = 100;
+        assert!((job.fraction() - 0.5).abs() < 1e-6);
+        job.cursor = 200;
+        assert_eq!(job.fraction(), 1.0);
+        // Empty import is treated as complete (avoids a 0/0 progress bar).
+        job.total = 0;
+        assert_eq!(job.fraction(), 1.0);
+    }
 
     /// Whole-app-window previews (SwiftUI-#Preview style) rendered off-screen via
     /// egui_kittest's eframe integration: `build_eframe` hands `App::new` a real

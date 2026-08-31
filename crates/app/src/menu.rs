@@ -63,6 +63,19 @@ pub enum MenuAction {
     ZoomReset,
     /// Open the ⌘K command palette overlay (fuzzy-search every verb).
     CommandPalette,
+    /// Open the models directory (`~/.config/itsjustcad/models`) in the OS file
+    /// manager. Fired by the LLM ▸ Reveal Models Folder item.
+    RevealModelsFolder,
+    /// Download the recommended default local model, if one is offered (not
+    /// already installed / no download running / no healthy local deck). Fired by
+    /// the LLM ▸ Download Default Model item.
+    DownloadDefaultModel,
+    /// Toggle "local only" (hide non-local decks / block remote calls). Checkable
+    /// LLM-menu item; the app owns the live state and syncs the checkmark.
+    ToggleLocalOnly,
+    /// Toggle "allow web search" for the next turn. Checkable LLM-menu item;
+    /// forced off (and disabled) while local-only is on.
+    ToggleWebSearch,
 }
 
 /// Draw-tool verbs (mirror `draw_tool::try_start`). A menu pick of one of these
@@ -227,7 +240,7 @@ pub fn menu_action(verb: &str) -> MenuAction {
 /// Transform / …) were removed; the registry still drives the palette, deck
 /// prompt, and autosuggest.
 #[allow(dead_code)] // documented contract; referenced by tests
-pub const TOP_TITLES: [&str; 3] = ["File", "Edit", "View"];
+pub const TOP_TITLES: [&str; 5] = ["File", "Edit", "View", "Theme", "LLM"];
 
 // ── Native menu model (muda) ─────────────────────────────────────────────────
 // The in-window egui menu bar (`ui` below) and the true native OS menu bar
@@ -261,6 +274,17 @@ pub enum NativeItem {
     /// each kind to a [`muda::PredefinedMenuItem`]. Has no [`MenuAction`] — the OS
     /// handles it.
     Predefined(PredefinedKind),
+    /// A checkable menu entry (rendered with a checkmark). `checked`/`enabled` in
+    /// the model are INITIAL values; the app syncs the live state onto the native
+    /// item's handle each frame (see `NativeMenuBar::sync_toggles`). The in-window
+    /// bar reads the live state passed into [`ui`].
+    Check {
+        id: String,
+        label: String,
+        action: MenuAction,
+        checked: bool,
+        enabled: bool,
+    },
     /// A visual divider between item groups.
     Separator,
 }
@@ -300,11 +324,11 @@ pub struct NativeMenu {
 /// Note: rich, egui-only rows (Appearance dark/light toggle + text-size stepper,
 /// color swatches) are intentionally NOT here — those stay in-window because they
 /// cannot be native menu items. Standard verb menus go native.
-/// The Appearance rows injected into the native View menu: theme (Light / Dark /
+/// The rows that populate the top-level **Theme** menu: theme (Light / Dark /
 /// System) followed by the text-size stepper (Increase / Decrease / Reset). Each
 /// is `(id_suffix, label, MenuAction)` and routes through `apply_menu_action`,
-/// the same substrate dispatch every other menu pick uses. These replace the old
-/// in-window Appearance strip on macOS/Windows (Linux keeps the strip — no native
+/// the same substrate dispatch every other menu pick uses. On macOS/Windows these
+/// are the native Theme menu's items (Linux keeps the in-window strip — no native
 /// bar). Kept as a standalone fn so it is unit-testable.
 pub fn appearance_native_items() -> Vec<(&'static str, &'static str, MenuAction)> {
     vec![
@@ -454,7 +478,7 @@ pub fn native_model(_style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
 
     // ── View ─────────────────────────────────────────────────────────────────
     // Display mode, lighting mode, viewports 1/2/4, standard views, Zoom
-    // Extents, Appearance (Light/Dark/System), Text Size, Command Palette.
+    // Extents, Command Palette. (Appearance + Text Size live in the Theme menu.)
     {
         let t = "View";
         let ex = |id: &str, label: &str, line: &str| NativeItem::Leaf {
@@ -464,7 +488,7 @@ pub fn native_model(_style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
             enabled: true,
             action: MenuAction::Execute(line.into()),
         };
-        let mut items = vec![
+        let items = vec![
             // Command palette is the primary discoverability surface.
             wired_leaf(t, "palette", "Command Palette…", MenuAction::CommandPalette),
             NativeItem::Separator,
@@ -491,13 +515,67 @@ pub fn native_model(_style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
             ex("v_persp", "Perspective", "persp"),
             NativeItem::Separator,
             ex("ze", "Zoom Extents", "ze"),
-            NativeItem::Separator,
         ];
-        // Appearance (theme + text size) — egui-only in-window elsewhere, but the
-        // native bar carries them as ordinary routed leaves.
-        for (id, label, action) in appearance_native_items() {
+        menus.push(NativeMenu { title: t.into(), items });
+    }
+
+    // ── Theme ─────────────────────────────────────────────────────────────────
+    // A dedicated top-level menu (same rank as View) carrying the egui-only
+    // Appearance (Light / Dark / System) and Text Size (Increase / Decrease /
+    // Reset) controls. Sourced from `appearance_native_items()` so the native
+    // bar and the in-window fallback never drift; a separator splits the theme
+    // group from the text-size group.
+    {
+        let t = "Theme";
+        let mut items = Vec::new();
+        for (i, (id, label, action)) in appearance_native_items().into_iter().enumerate() {
+            if i == 3 {
+                items.push(NativeItem::Separator);
+            }
             items.push(wired_leaf(t, id, label, action));
         }
+        menus.push(NativeMenu { title: t.into(), items });
+    }
+
+    // ── LLM ─────────────────────────────────────────────────────────────────────
+    // The local-model hub: open Model Setup (download / reveal / delete), reveal
+    // the models folder, download the recommended default, and the two per-turn
+    // toggles (Local Only / Allow Web Search). The toggles are checkable; the app
+    // syncs their live state onto the native items each frame.
+    {
+        let t = "LLM";
+        let items = vec![
+            wired_leaf(t, "model_setup", "Model Setup…", MenuAction::ModelSetup),
+            NativeItem::Leaf {
+                id: format!("{t}/reveal_models"),
+                label: "Reveal Models Folder…".into(),
+                shortcut: None,
+                enabled: true,
+                action: MenuAction::RevealModelsFolder,
+            },
+            NativeItem::Leaf {
+                id: format!("{t}/download_default"),
+                label: "Download Default Model".into(),
+                shortcut: None,
+                enabled: true,
+                action: MenuAction::DownloadDefaultModel,
+            },
+            NativeItem::Separator,
+            NativeItem::Check {
+                id: format!("{t}/local_only"),
+                label: "Local Only".into(),
+                action: MenuAction::ToggleLocalOnly,
+                checked: false, // synced live by the app
+                enabled: true,
+            },
+            NativeItem::Check {
+                id: format!("{t}/web_search"),
+                label: "Allow Web Search".into(),
+                action: MenuAction::ToggleWebSearch,
+                checked: false, // synced live by the app
+                enabled: true,
+            },
+        ];
         menus.push(NativeMenu { title: t.into(), items });
     }
 
@@ -598,6 +676,7 @@ pub fn ui(
     icons: &Icons,
     style: MenuStyle,
     has_selection: bool,
+    toggles: MenuToggles,
 ) -> Option<MenuAction> {
     let mut action = None;
     let model = native_model(style, has_selection);
@@ -628,6 +707,23 @@ pub fn ui(
                                 ui.close();
                             }
                         }
+                        NativeItem::Check { label, action: a, enabled, .. } => {
+                            // Live state comes from `toggles`, not the model's
+                            // placeholder `checked`. Web-search is disabled while
+                            // local-only is on.
+                            let (checked, live_enabled) = toggles.for_action(a, *enabled);
+                            let mark = if checked { "☑ " } else { "☐ " };
+                            if ui
+                                .add_enabled(
+                                    live_enabled,
+                                    egui::Button::new(format!("{mark}{label}")),
+                                )
+                                .clicked()
+                            {
+                                action = Some(a.clone());
+                                ui.close();
+                            }
+                        }
                     }
                 }
             });
@@ -635,6 +731,26 @@ pub fn ui(
         appearance_controls(ui, icons);
     });
     action
+}
+
+/// Live state for the checkable LLM-menu toggles, passed into [`ui`] so the
+/// in-window bar shows the real checkmarks (the native bar syncs via handles).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MenuToggles {
+    pub local_only: bool,
+    pub web_search: bool,
+}
+
+impl MenuToggles {
+    /// Resolve `(checked, enabled)` for a toggle action. Web-search is forced
+    /// off-looking and disabled while local-only is on.
+    fn for_action(&self, action: &MenuAction, model_enabled: bool) -> (bool, bool) {
+        match action {
+            MenuAction::ToggleLocalOnly => (self.local_only, model_enabled),
+            MenuAction::ToggleWebSearch => (self.web_search && !self.local_only, !self.local_only),
+            _ => (false, model_enabled),
+        }
+    }
 }
 
 
@@ -708,6 +824,13 @@ pub fn demo_open(
                                 *enabled,
                             );
                         }
+                        NativeItem::Check { label, checked, enabled, .. } => {
+                            let mark = if *checked { "☑ " } else { "☐ " };
+                            let _ = ui.add_enabled(
+                                *enabled,
+                                egui::Button::new(format!("{mark}{label}")),
+                            );
+                        }
                     }
                 }
             });
@@ -726,7 +849,8 @@ mod tests {
             .iter()
             .flat_map(|m| &m.items)
             .filter_map(|it| match it {
-                NativeItem::Leaf { id, label, action, .. } => {
+                NativeItem::Leaf { id, label, action, .. }
+                | NativeItem::Check { id, label, action, .. } => {
                     Some((id.clone(), label.clone(), action.clone()))
                 }
                 NativeItem::Separator | NativeItem::Predefined(_) => None,
@@ -734,17 +858,23 @@ mod tests {
             .collect()
     }
 
-    // MENU BAR IS MINIMAL: exactly File / Edit / View (+ Window on macOS) + Help.
-    // No geometry category menus.
+    // MENU BAR IS MINIMAL: exactly File / Edit / View / Theme / LLM (+ Window on
+    // macOS) + Help. No geometry category menus.
 
     #[test]
-    fn menu_bar_is_exactly_five_menus() {
-        // The three geometry-free top titles are the documented contract.
-        assert_eq!(TOP_TITLES, ["File", "Edit", "View"]);
+    fn menu_bar_top_titles() {
+        // The geometry-free top titles are the documented contract.
+        assert_eq!(TOP_TITLES, ["File", "Edit", "View", "Theme", "LLM"]);
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
             let titles: Vec<String> =
                 native_model(style, true).iter().map(|m| m.title.clone()).collect();
-            let mut expected = vec!["File".to_string(), "Edit".into(), "View".into()];
+            let mut expected = vec![
+                "File".to_string(),
+                "Edit".into(),
+                "View".into(),
+                "Theme".into(),
+                "LLM".into(),
+            ];
             #[cfg(target_os = "macos")]
             expected.push("Window".to_string());
             expected.push("Help".to_string());
@@ -826,9 +956,52 @@ mod tests {
         assert!(by_action(&MenuAction::Execute("top".into())), "standard view missing");
         assert!(by_action(&MenuAction::Execute("ze".into())), "zoom extents missing");
         assert!(by_action(&MenuAction::CommandPalette), "command palette entry missing");
-        // Appearance rows still present.
-        assert!(by_action(&MenuAction::SetTheme(Some(true))), "dark theme missing");
-        assert!(by_action(&MenuAction::ZoomStep(true)), "text size step missing");
+        // Appearance + Text Size are NOT in View anymore — they live in Theme.
+        assert!(!by_action(&MenuAction::SetTheme(Some(true))), "theme leaked into View");
+        assert!(!by_action(&MenuAction::ZoomStep(true)), "text size leaked into View");
+    }
+
+    #[test]
+    fn llm_menu_has_setup_reveal_download_and_toggles() {
+        let llm = native_model(MenuStyle::Rhino, true)
+            .into_iter()
+            .find(|m| m.title == "LLM")
+            .expect("LLM menu present at top level");
+        // Leaves: Model Setup, Reveal Models Folder, Download Default Model.
+        let ls = leaves(&[llm.clone()]);
+        let by_action = |a: &MenuAction| ls.iter().any(|(_, _, act)| act == a);
+        assert!(by_action(&MenuAction::ModelSetup), "Model Setup missing");
+        assert!(by_action(&MenuAction::RevealModelsFolder), "Reveal Models Folder missing");
+        assert!(by_action(&MenuAction::DownloadDefaultModel), "Download Default missing");
+        // Two checkable toggles with stable ids the app syncs against.
+        let checks: Vec<&str> = llm
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                NativeItem::Check { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(checks.contains(&"LLM/local_only"), "Local Only toggle missing");
+        assert!(checks.contains(&"LLM/web_search"), "Allow Web Search toggle missing");
+    }
+
+    #[test]
+    fn theme_menu_has_appearance_and_text_size() {
+        let theme = native_model(MenuStyle::Rhino, true)
+            .into_iter()
+            .find(|m| m.title == "Theme")
+            .expect("Theme menu present at top level");
+        let ls = leaves(&[theme]);
+        let by_action = |a: &MenuAction| ls.iter().any(|(_, _, act)| act == a);
+        // All three appearance choices.
+        assert!(by_action(&MenuAction::SetTheme(Some(false))), "Light missing");
+        assert!(by_action(&MenuAction::SetTheme(Some(true))), "Dark missing");
+        assert!(by_action(&MenuAction::SetTheme(None)), "System missing");
+        // All three text-size steps.
+        assert!(by_action(&MenuAction::ZoomStep(true)), "Increase missing");
+        assert!(by_action(&MenuAction::ZoomStep(false)), "Decrease missing");
+        assert!(by_action(&MenuAction::ZoomReset), "Reset missing");
     }
 
     #[test]

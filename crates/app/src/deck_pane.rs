@@ -548,14 +548,6 @@ pub struct DeckPane {
     /// [`DeckPane::take_app_verbs`] and runs them through the same app-verb-aware
     /// path as the human command line (`App::execute_line`). Never op-logged.
     pending_app_verbs: Vec<String>,
-    /// Set by `App` each frame: the default local model to OFFER for download in
-    /// the LLM menu (`(catalog id, display name)`) — `None` when it is already
-    /// installed, a download is in flight, or the catalog has none. Lets the user
-    /// grab the default local model from the LLM menu if they skipped onboarding.
-    pub(crate) default_model_offer: Option<(String, String)>,
-    /// Set by the LLM menu when the user clicks "Download …"; `App` takes it and
-    /// calls `start_model_install`.
-    pub(crate) pending_model_download: Option<String>,
 }
 
 impl Default for DeckPane {
@@ -603,8 +595,6 @@ impl Default for DeckPane {
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
-            default_model_offer: None,
-            pending_model_download: None,
         }
     }
 }
@@ -679,6 +669,61 @@ impl DeckPane {
     /// Start a fresh chat session: abort any in-flight turn, drop the provider
     /// conversation handle, and clear the transcript + message history. Used by
     /// File → "New file session". The selected cassette/model are kept.
+    /// Current "local only" state (cloud decks hidden, remote sends blocked).
+    pub fn local_only(&self) -> bool {
+        self.decks.local_only
+    }
+
+    /// Current "allow web search" state for the next turn.
+    pub fn allow_web_search(&self) -> bool {
+        self.allow_web_search
+    }
+
+    /// Set "local only". When turning it ON, if the active deck is a remote one
+    /// it becomes hidden, so switch to the first visible (local) cassette and
+    /// drop the provider session. Persists `decks.json`. Driven by the LLM menu.
+    pub fn set_local_only(&mut self, on: bool) {
+        if self.decks.local_only == on {
+            return;
+        }
+        self.decks.local_only = on;
+        if on {
+            let active_is_remote = !itsjustcad_deck::is_local_url(
+                self.decks
+                    .decks
+                    .get(self.decks.active)
+                    .map(|d| d.base_url.as_str())
+                    .unwrap_or(""),
+            );
+            let first_local = self.decks.visible_decks().map(|(i, _)| i).next();
+            if active_is_remote
+                && let Some(idx) = first_local
+            {
+                self.decks.active = idx;
+                self.session_id = None;
+                self.persist_chat();
+            }
+            // Local-only forbids remote calls — web search cannot apply.
+            self.allow_web_search = false;
+        }
+        self.decks.save();
+    }
+
+    /// Flip "local only" (LLM menu).
+    pub fn toggle_local_only(&mut self) {
+        self.set_local_only(!self.decks.local_only);
+    }
+
+    /// Flip "allow web search" (LLM menu). No-op under local-only, which forbids
+    /// remote calls anyway.
+    pub fn toggle_web_search(&mut self) {
+        if self.decks.local_only {
+            self.allow_web_search = false;
+            return;
+        }
+        self.allow_web_search = !self.allow_web_search;
+    }
+
     pub fn new_session(&mut self) {
         // Archive the outgoing conversation into the per-document store before
         // clearing it, so switching sessions never loses history.
@@ -1685,76 +1730,9 @@ impl DeckPane {
         let status_modal_id = egui::Id::new("deck_status_modal");
 
         ui.horizontal(|ui| {
-            // Theme + text-size moved to the menu bar (appearance group); the
-            // chat header now starts with the local-only + deck controls.
-            // Local-only toggle: when on, only localhost cassettes are shown and
-            // cloud sends are blocked.
-            // The "local only" + "allow web search" toggles live under a single
-            // "LLM" menu button to keep the chat header uncluttered (they are
-            // set-once options, not per-turn affordances). Styled as a WHITE
-            // button with a soft shadow (raised chip).
-            header_chip_frame(ui.visuals().dark_mode).show(ui, |ui| {
-                // Transparent button background so the frame's white shows.
-                ui.style_mut().visuals.widgets.inactive.weak_bg_fill =
-                    egui::Color32::TRANSPARENT;
-                ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                ui.menu_button("LLM", |ui| {
-                let mut local_only = self.decks.local_only;
-                if ui
-                    .checkbox(&mut local_only, "local only")
-                    .on_hover_text("hide cloud decks and block remote sends")
-                    .changed()
-                {
-                    self.decks.local_only = local_only;
-                    // If the active deck became hidden, switch to the first visible one.
-                    if local_only {
-                        let active_is_remote = !itsjustcad_deck::is_local_url(
-                            self.decks.decks.get(self.decks.active)
-                                .map(|d| d.base_url.as_str())
-                                .unwrap_or(""),
-                        );
-                        let first_local = self.decks.visible_decks().map(|(i, _)| i).next();
-                        if active_is_remote
-                            && let Some(idx) = first_local
-                        {
-                            self.decks.active = idx;
-                            self.session_id = None;
-                            self.persist_chat();
-                        }
-                    }
-                    self.decks.save();
-                }
-                // Opt-in web search toggle. Default OFF. Only meaningful for cloud
-                // cassettes (anthropic server-side tool, claude-code WebSearch);
-                // disabled under local-only, which forbids remote calls anyway.
-                let web_capable = !self.decks.local_only;
-                ui.add_enabled_ui(web_capable, |ui| {
-                    ui.checkbox(&mut self.allow_web_search, "allow web search")
-                        .on_hover_text(
-                            "let the model search/fetch the web this turn (cloud cassettes only); off by default to stay sealed",
-                        );
-                });
-                if !web_capable {
-                    self.allow_web_search = false;
-                }
-                // Offer the default local model download (only when App says it
-                // isn't installed yet) — for users who skipped onboarding.
-                if let Some((id, name)) = self.default_model_offer.clone() {
-                    ui.separator();
-                    if ui
-                        .button(format!("Download {name} (default local model)"))
-                        .on_hover_text(
-                            "download the recommended local model so you can run offline",
-                        )
-                        .clicked()
-                    {
-                        self.pending_model_download = Some(id);
-                        ui.close();
-                    }
-                }
-                });
-            });
-            ui.separator();
+            // Theme + text-size AND the LLM controls (local only / web search /
+            // download default) moved to the top-level LLM menu (see `menu.rs`).
+            // The chat header now starts directly with the deck/model selectors.
             // Only show cassettes permitted by the current local_only setting.
             let visible_decks: Vec<(usize, String)> = self
                 .decks
@@ -2384,8 +2362,6 @@ mod side_effect_gate_tests {
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
-            default_model_offer: None,
-            pending_model_download: None,
         }
     }
 

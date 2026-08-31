@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use muda::accelerator::Accelerator;
-use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
 use crate::menu::{MenuAction, NativeItem, PredefinedKind, native_model, needs_selection};
 use crate::preset::MenuStyle;
@@ -47,6 +47,12 @@ pub struct NativeMenuBar {
     /// Last selection-presence we pushed to `set_enabled`, so we only touch the
     /// native items when it actually changes.
     last_has_selection: Option<bool>,
+    /// Live handles to the checkable LLM toggles (Local Only / Allow Web Search),
+    /// keyed by muda id, so the app can sync their checked/enabled state each
+    /// frame from the real deck state.
+    check_items: HashMap<String, CheckMenuItem>,
+    /// Last `(local_only, web_search)` we pushed, to skip redundant native calls.
+    last_toggles: Option<(bool, bool)>,
 }
 
 impl NativeMenuBar {
@@ -69,7 +75,7 @@ impl NativeMenuBar {
     {
         // Build with no selection initially; `sync_selection` enables items once
         // the app has a selection.
-        let (menu, routes, selection_items) = build_menu(style)?;
+        let (menu, routes, selection_items, check_items) = build_menu(style)?;
 
         #[cfg(target_os = "macos")]
         {
@@ -83,6 +89,8 @@ impl NativeMenuBar {
                 routes,
                 selection_items,
                 last_has_selection: None,
+                check_items,
+                last_toggles: None,
             })
         }
 
@@ -100,6 +108,8 @@ impl NativeMenuBar {
                 routes,
                 selection_items,
                 last_has_selection: None,
+                check_items,
+                last_toggles: None,
             })
         }
 
@@ -107,7 +117,7 @@ impl NativeMenuBar {
         // so we do not attach a native bar; the in-window egui bar remains.
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            let _ = (menu, routes, selection_items);
+            let _ = (menu, routes, selection_items, check_items);
             None
         }
     }
@@ -122,6 +132,23 @@ impl NativeMenuBar {
         self.last_has_selection = Some(has_selection);
         for it in &self.selection_items {
             it.set_enabled(has_selection);
+        }
+    }
+
+    /// Push the live LLM-toggle state onto the native checkable items. Web-search
+    /// is forced unchecked + disabled while local-only is on (offline/sealed).
+    /// Idempotent — only touches the OS menu when a value actually changes.
+    pub fn sync_toggles(&mut self, local_only: bool, web_search: bool) {
+        if self.last_toggles == Some((local_only, web_search)) {
+            return;
+        }
+        self.last_toggles = Some((local_only, web_search));
+        if let Some(it) = self.check_items.get("LLM/local_only") {
+            it.set_checked(local_only);
+        }
+        if let Some(it) = self.check_items.get("LLM/web_search") {
+            it.set_checked(web_search && !local_only);
+            it.set_enabled(!local_only);
         }
     }
 
@@ -160,10 +187,16 @@ fn disable_automatic_window_tabbing() {
 #[allow(clippy::type_complexity)]
 fn build_menu(
     style: MenuStyle,
-) -> Option<(Menu, HashMap<String, MenuAction>, Vec<MenuItem>)> {
+) -> Option<(
+    Menu,
+    HashMap<String, MenuAction>,
+    Vec<MenuItem>,
+    HashMap<String, CheckMenuItem>,
+)> {
     let menu = Menu::new();
     let mut routes: HashMap<String, MenuAction> = HashMap::new();
     let mut selection_items: Vec<MenuItem> = Vec::new();
+    let mut check_items: HashMap<String, CheckMenuItem> = HashMap::new();
 
     // Selection-dependent items start disabled (built with no selection); the
     // app's per-frame `sync_selection` enables them once something is selected.
@@ -198,11 +231,17 @@ fn build_menu(
                     let pi = predefined(*kind);
                     submenu.append(&pi).ok()?;
                 }
+                NativeItem::Check { id, label, action, checked, enabled } => {
+                    let ci = CheckMenuItem::with_id(id.as_str(), label, *enabled, *checked, None);
+                    submenu.append(&ci).ok()?;
+                    routes.insert(id.clone(), action.clone());
+                    check_items.insert(id.clone(), ci);
+                }
             }
         }
         menu.append(&submenu).ok()?;
     }
-    Some((menu, routes, selection_items))
+    Some((menu, routes, selection_items, check_items))
 }
 
 /// Whether a native leaf id (`"<Menu>/<verb>"`) is a selection-dependent verb,
