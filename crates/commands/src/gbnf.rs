@@ -68,22 +68,21 @@ pub fn command_grammar() -> String {
         .join(" | ");
 
     // GBNF notes:
-    // - `root` is the entry rule (required by llama.cpp).
-    // - The model may lead with prose, then emit >=1 draft block, each
-    //   optionally followed by more prose.
-    // - A draft block is the literal fence `` ```draft `` on its own line, one
-    //   or more command lines, then a closing `` ``` `` fence.
-    // - A command line is a verb, then a permissive tail of any non-newline
-    //   chars (argument shapes are left to the parser + retry loop).
-    // - `prose` excludes backtick to avoid ambiguity with the fence markers.
+    // - `root` is the entry rule (required by llama.cpp). It forces a draft block
+    //   IMMEDIATELY — no leading prose. The previous grammar allowed unbounded
+    //   leading `prose`, so a small local model would ramble forever (`<think>…`)
+    //   and never be pushed into the fence. Local turns are commands-only.
+    // - A draft block is the literal fence `` ```draft `` on its own line, one or
+    //   more command lines, then a closing `` ``` `` fence.
+    // - A command line is a real verb then an argument tail. The tail excludes
+    //   `<` and `>` so the model cannot emit placeholder junk like `<centerline>`
+    //   (a common small-model failure) — args must be literal coords/selectors.
     format!(
-        r#"root      ::= prose ( draft prose )+
-draft     ::= "```draft" nl command-line+ "```" nl
+        r#"root      ::= draft
+draft     ::= "```draft" nl command-line+ "```"
 command-line ::= verb tail nl
 verb      ::= {verb_alts}
-tail      ::= [^\n]*
-prose     ::= prose-char*
-prose-char ::= [^`]
+tail      ::= [^\n<>]*
 nl        ::= "\n"
 "#
     )

@@ -104,6 +104,54 @@ These change only the window LAYOUT (panels, docking, viewport split, workspace,
 /// `plugins` are user/LLM-authored macros — the LLM must see them so it can
 /// call plugin verbs directly (`<pluginname> args...`) and author new ones via
 /// the `plugin define` command.
+/// A FOCUSED, short system prompt for small LOCAL models (e.g. a 0.6–4B
+/// llamafile). The full [`system_prompt`] lists every registry command (~33 KB)
+/// which overwhelms a tiny model — it rambles and never emits commands. This
+/// brief teaches only the draft convention + the common commands + one worked
+/// example; the GBNF grammar backstops the full verb set at the token level.
+/// Keep it terse: small models stay on-task and burn far fewer tokens.
+pub fn brief_system_prompt(scene_digest: &str) -> String {
+    let digest = if scene_digest.trim().is_empty() {
+        "(the document is empty)"
+    } else {
+        scene_digest
+    };
+    format!(
+        r#"You are the CAD engine of ItsJustCAD. Output ONLY a ```draft block: one command per line, no prose, no explanation. Units are meters, Z is up, the ground plane is z=0. Selectors count back from newest: `last`, `last 2`, `last 3`, or `all`.
+
+Common commands (args are literal numbers/selectors — never placeholders):
+  box <x,y,z> <sx,sy,sz>        circle <x,y,z> <r>           line <x,y,z> <x,y,z>
+  rect <x,y,z> <w> <h>          polyline <x,y> <x,y> ... [closed]
+  arc <x,y,z> <r> <a0> <a1>     extrude <sel> <height>       revolve <sel>
+  loft <sel>                    difference <target> <tools>  union <sel>   intersect <sel>
+  move <sel> <dx,dy,dz>         copy <sel> <dx,dy,dz>        rotate <sel> <deg> [x|y|z]
+  scale <sel> <factor>          mirror <sel> <xy|yz|xz>      delete <sel>
+
+ALWAYS create every object (box, circle, line, ...) BEFORE you reference it. `last`, `last 2`, `union`, `difference` only act on objects you already emitted this turn — never combine things you have not drawn yet.
+To cut a hole: box the solid, then box a slightly TALLER void, then `difference last 2 last`.
+
+Examples (follow this exact syntax):
+"a 10x10x3 slab with a 4x4 courtyard" ->
+```draft
+box 0,0,0 10,10,3
+box 3,3,-1 4,4,5
+difference last 2 last
+```
+"a 5m circle at the origin and a 2m cube at x=10" ->
+```draft
+circle 0,0,0 5
+box 10,0,0 2,2,2
+```
+"extrude the last curve 3m tall, then move it 4m along x" ->
+```draft
+extrude last 3
+move last 4,0,0
+```
+
+Current scene: {digest}"#
+    )
+}
+
 pub fn system_prompt(scene_digest: &str, plugins: &PluginRegistry) -> String {
     let mut commands = String::new();
     for spec in registry() {

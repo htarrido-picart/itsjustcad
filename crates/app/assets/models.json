@@ -2,22 +2,22 @@
   "_comment": "Curated local-model catalog for ItsJustCAD's Model Setup. Entries are LLAMAFILE builds (Justine Tunney / Mozilla): a single self-contained executable that IS the server — no external llama.cpp/llama-server on PATH, cross-platform. The app spawns the downloaded file with `--server --port <p> --nobrowser` (see local_runtime.rs). VERIFIED against the live HuggingFace repo: URL serves bytes (206 on a ranged GET), size = git-LFS `size`, sha256 = the git-LFS `oid sha256:` from the /raw/main/<file> pointer. To add/refresh: GET https://huggingface.co/<repo>/raw/main/<file> and copy the oid + size. `tier` gates the UI recommendation; `ram_gb_min` gates the Install button. `runtime=llamafile` selects the self-contained spawn path; gguf remains supported in code but is not shipped in the catalog because the app does not bundle a llama-server.",
   "models": [
     {
-      "id": "qwen2.5-0.5b-instruct-q6k-llamafile",
-      "display_name": "Qwen2.5 0.5B Instruct (llamafile, Q6_K)",
+      "id": "qwen3-0.6b-q6k-llamafile",
+      "display_name": "JustCadModel Mini (Qwen 0.6B)",
       "tier": "Small3B",
-      "url": "https://huggingface.co/mozilla-ai/Qwen2.5-0.5B-Instruct-llamafile/resolve/main/Qwen2.5-0.5B-Instruct-Q6_K.llamafile",
-      "size_bytes": 813455385,
-      "sha256": "c4e991af9ea7077339b8768e349da486a76392e72b3ef47ad372e6582779a8dd",
+      "url": "https://huggingface.co/mozilla-ai/Qwen3-0.6B-llamafile/resolve/main/Qwen_Qwen3-0.6B-Q6_K.llamafile",
+      "size_bytes": 930568209,
+      "sha256": "0f81c5f31d44b9a665d8c03b68039b6b496c49632e747bfbdd7333eaba9f2e7a",
       "runtime": "llamafile",
       "ram_gb_min": 8
     },
     {
-      "id": "qwen2.5-7b-instruct-1m-q4km-llamafile",
-      "display_name": "Qwen2.5 7B Instruct 1M (llamafile, Q4_K_M)",
+      "id": "qwen3-4b-q4km-llamafile",
+      "display_name": "JustCadModel (Qwen 4B)",
       "tier": "Mid7B",
-      "url": "https://huggingface.co/mozilla-ai/Qwen2.5-7B-Instruct-1M-llamafile/resolve/main/Qwen2.5-7B-Instruct-1M-Q4_K_M.llamafile",
-      "size_bytes": 4990851103,
-      "sha256": "06ccfc9e9dcedb138e71969556c1a7f514b70867f5b2e3246e4016d72d16704e",
+      "url": "https://huggingface.co/mozilla-ai/Qwen3-4B-llamafile/resolve/main/Qwen_Qwen3-4B-Q4_K_M.llamafile",
+      "size_bytes": 2805094417,
+      "sha256": "f093926f4ab3f7dba039527f72111159e047fdd52bbe5a40876f4a1ec43a14db",
       "runtime": "llamafile",
       "ram_gb_min": 16
     }

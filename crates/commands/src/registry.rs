@@ -668,7 +668,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "pblock",
             usage: "pblock <name> [param=default ...] : templ ; templ ; ...",
-            summary: "Define a dynamic (parametric) block: named params with defaults plus a command-template body ({param} substitution). Instances bake geometry at their own param values, editable via 'param'. Example: pblock pdoor width=0.9 : rect 0,0,0 {width},0.05 ; line {width},0,0 {width},{width},0",
+            summary: "Define a dynamic (parametric) block: named params with defaults plus a command-template body ({param} substitution). Instances bake geometry at their own param values, editable via 'param'. Example: pblock pdoor width=0.9 : rect 0,0,0 {width} 0.05 ; line {width},0,0 {width},{width},0",
             category: Category::Annotate,
         },
         CommandSpec {
