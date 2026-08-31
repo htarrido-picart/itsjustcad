@@ -81,6 +81,9 @@ pub enum Icon {
     Skip,
     Close,
     Image,
+    Send,
+    ChevronUp,
+    ChevronDown,
     // Panel + viewport controls
     PanelOpen,
     PanelClose,
@@ -94,7 +97,7 @@ impl Icon {
     /// Every icon, for exhaustiveness (embedding + tests). Part of the module's
     /// public surface; exercised by the raster-validation tests.
     #[allow(dead_code)]
-    pub const ALL: [Icon; 57] = [
+    pub const ALL: [Icon; 60] = [
         Icon::New,
         Icon::NewSession,
         Icon::Open,
@@ -146,6 +149,9 @@ impl Icon {
         Icon::Skip,
         Icon::Close,
         Icon::Image,
+        Icon::Send,
+        Icon::ChevronUp,
+        Icon::ChevronDown,
         Icon::PanelOpen,
         Icon::PanelClose,
         Icon::Maximize,
@@ -208,6 +214,9 @@ impl Icon {
             Icon::Skip => "skip-forward",
             Icon::Close => "x",
             Icon::Image => "image",
+            Icon::Send => "send",
+            Icon::ChevronUp => "chevron-up",
+            Icon::ChevronDown => "chevron-down",
             Icon::PanelOpen => "panel-right-open",
             Icon::PanelClose => "panel-right-close",
             Icon::Maximize => "maximize-2",
@@ -276,6 +285,9 @@ impl Icon {
             Icon::Skip => png!("skip-forward"),
             Icon::Close => png!("x"),
             Icon::Image => png!("image"),
+            Icon::Send => png!("send"),
+            Icon::ChevronUp => png!("chevron-up"),
+            Icon::ChevronDown => png!("chevron-down"),
             Icon::PanelOpen => png!("panel-right-open"),
             Icon::PanelClose => png!("panel-right-close"),
             Icon::Maximize => png!("maximize-2"),

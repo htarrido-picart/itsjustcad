@@ -379,25 +379,35 @@ impl CommandLine {
         // Recompute suggestions if input changed.
         self.refresh_suggestions(object_names, preset_aliases);
 
-        // Bottom-docked layout (under the right panel): history (op-log
-        // scrollback) sits ABOVE the input (Rhino/AutoCAD look) and the popup
-        // opens upward. History height grows with the panel (token-relative).
+        // Bottom-docked layout (Rhino/AutoCAD look): the input row is LOCKED to
+        // the very bottom via a `bottom_up` layout, the suggestion popup sits
+        // just above it, and the op-log history fills the space above (scroll).
+        // The history is CAPPED at `panel_h - input reserve` (bounded by the
+        // panel's real height passed in) — with `auto_shrink(false)` filling it
+        // exactly. Without this cap the fill grows the resizable panel each frame
+        // in a feedback loop until it hit the max (the "grows and grows" bug).
         let history_h = crate::theme::Spacing::history_h_for(panel_h);
-        let history_block = |cl: &Self, ui: &mut egui::Ui| {
+        let mut submitted = None;
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            submitted = self.input_row(ui);
+            self.suggestion_block(ui, true);
             egui::ScrollArea::vertical()
                 .id_salt("cmd_history")
                 .max_height(history_h)
+                .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    for line in &cl.history {
-                        ui.monospace(line);
-                    }
+                    // Force top-down INSIDE the scroll area — the outer bottom_up
+                    // layout would otherwise render the log lines bottom-to-top
+                    // (newest first), reversing the scrollback.
+                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        for line in &self.history {
+                            ui.monospace(line);
+                        }
+                    });
                 });
-        };
-
-        history_block(self, ui);
-        self.suggestion_block(ui, true);
-        self.input_row(ui)
+        });
+        submitted
     }
 
     /// True when the autosuggest popup should be visible for the current input.

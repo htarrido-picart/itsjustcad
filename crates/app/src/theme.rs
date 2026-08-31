@@ -56,15 +56,21 @@ impl Spacing {
     /// used as the default / minimum when no panel height is available.
     /// Prefer [`Spacing::history_h_for`] for a token-relative height.
     pub const HISTORY_H: f32 = Self::S * 10.0;
-    /// 64px (8× grid unit) — the deck chat input row reserve.
-    pub const CHAT_INPUT_H: f32 = Self::S * 8.0;
 
-    /// Token-relative history height: 30% of `panel_h`, clamped to
-    /// `[HISTORY_H, 240px]`. Grows naturally when the command-line panel is
-    /// taller (bottom panel + window resize) while keeping a sensible floor so
-    /// a tiny window never collapses it to nothing.
+    /// Command-history scrollback height: fill the command-line panel, leaving
+    /// `INPUT_RESERVE` for the prompt/input row below, with a `HISTORY_H` floor
+    /// so a tiny window never collapses it. Because it tracks `panel_h` with no
+    /// upper cap, dragging the panel taller actually shows MORE history (rather
+    /// than opening dead space under a fixed-height scrollback).
     pub fn history_h_for(panel_h: f32) -> f32 {
-        (panel_h * 0.30).clamp(Self::HISTORY_H, 240.0)
+        const INPUT_RESERVE: f32 = 44.0;
+        // Small floor only (one line) — NOT the old ~80px floor, which made the
+        // history content exceed a dragged-small panel and forced egui to SNAP
+        // the resizable command-line panel to that content-minimum instead of
+        // honouring an in-between drag height. The ~5-line default now comes from
+        // the panel's `default_size`, and the history fills whatever height the
+        // user drags to.
+        (panel_h - INPUT_RESERVE).max(24.0)
     }
 
     /// 28px — the min interactive height for PRIMARY chrome controls
@@ -267,6 +273,27 @@ pub fn to_color32(c: Rgba) -> egui::Color32 {
         (c[2] * 255.0).round() as u8,
         (c[3] * 255.0).round() as u8,
     )
+}
+
+/// Colors for the ACTIVE viewport's name tag — a Rhino-style title highlight.
+/// The tag fills with a blue chip and paints its label in a contrasting blue.
+/// Returned as `(chip_fill, label_text)`; both clear WCAG AA (≥4.5:1) against
+/// each other in both themes, so the active viewport is obvious WITHOUT relying
+/// on a thin border (which we removed as visual noise). See the contrast test.
+pub fn viewport_active_tag(dark: bool) -> (egui::Color32, egui::Color32) {
+    if dark {
+        // Deep-blue chip, light-blue label.
+        (
+            egui::Color32::from_rgb(30, 58, 95),
+            egui::Color32::from_rgb(191, 219, 254),
+        )
+    } else {
+        // Light-blue chip, deep-blue label.
+        (
+            egui::Color32::from_rgb(191, 219, 254),
+            egui::Color32::from_rgb(23, 49, 130),
+        )
+    }
 }
 
 /// Derive a full set of color roles from just a surface color and an accent.
@@ -523,6 +550,29 @@ mod tests {
     // ── WCAG contrast ────────────────────────────────────────────────────
 
     #[test]
+    fn viewport_active_tag_meets_wcag_aa() {
+        // The active-viewport tag is the ONLY active indicator now (the thin
+        // border was removed), so its chip/label contrast must clear WCAG AA
+        // (≥4.5:1) in BOTH themes to stay readable/accessible.
+        let to_rgba = |c: egui::Color32| -> Rgba {
+            [
+                c.r() as f32 / 255.0,
+                c.g() as f32 / 255.0,
+                c.b() as f32 / 255.0,
+                1.0,
+            ]
+        };
+        for dark in [true, false] {
+            let (chip, fg) = viewport_active_tag(dark);
+            let ratio = contrast_ratio(to_rgba(chip), to_rgba(fg));
+            assert!(
+                ratio >= 4.5,
+                "active viewport tag (dark={dark}) contrast {ratio:.2} < 4.5 (WCAG AA)"
+            );
+        }
+    }
+
+    #[test]
     fn contrast_ratio_extremes() {
         // Black on white is the 21:1 ceiling; identical colors are 1:1.
         let bw = contrast_ratio([0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
@@ -763,42 +813,42 @@ mod tests {
                 "raw spacing literal `{pat}` reintroduced — use a Spacing token"
             );
         }
-        // And the tokens must actually be referenced where we wired them.
-        assert!(deck.contains("Spacing::CHAT_INPUT_H"));
-        // command_line uses history_h_for (which delegates to HISTORY_H) for
-        // token-relative height; either form satisfies the no-raw-literals rule.
+        // And the tokens must actually be referenced where we wired them. The
+        // chat input is its OWN bottom panel (never clipped), with a per-state id
+        // so collapsed/expanded keep independent cached heights (no float).
+        assert!(deck.contains("Panel::bottom(deck_input_id)"));
+        // command_line pins the input to the bottom via a bottom_up layout (the
+        // history fills above) — no raw pixel height, and the input can't jitter
+        // during a panel resize.
         assert!(
-            cmd.contains("history_h_for") || cmd.contains("Spacing::HISTORY_H"),
-            "command_line.rs must use history_h_for or Spacing::HISTORY_H"
+            cmd.contains("Layout::bottom_up"),
+            "command_line.rs must pin its input with a bottom_up layout"
         );
         assert!(app.contains("Spacing::SM"));
     }
 
     #[test]
-    fn history_h_for_clamps_and_scales() {
-        // Floor: tiny panels never drop below HISTORY_H.
-        assert_eq!(
-            Spacing::history_h_for(0.0),
-            Spacing::HISTORY_H,
-            "floor must be HISTORY_H"
-        );
-        assert_eq!(
-            Spacing::history_h_for(200.0),
-            Spacing::HISTORY_H,
-            "200px panel: 30% = 60 < HISTORY_H, so clamp to floor"
-        );
-        // 30% of a 400px panel = 120, within [80, 240].
-        let h = Spacing::history_h_for(400.0);
-        assert!((h - 120.0).abs() < 0.1, "400px→30%=120, got {h}");
-        // Ceiling: very tall panels cap at 240.
-        assert_eq!(Spacing::history_h_for(1200.0), 240.0, "ceiling must be 240");
-        // Result is always in [HISTORY_H, 240].
-        for pct in [0, 100, 300, 500, 800, 1200] {
-            let h = Spacing::history_h_for(pct as f32);
+    fn history_h_for_tracks_panel_with_tiny_floor() {
+        // Small 24px floor (one line) — deliberately NOT the old ~80px floor,
+        // which forced content above a dragged-small panel and broke resize.
+        assert_eq!(Spacing::history_h_for(0.0), 24.0, "tiny floor");
+        // Content = panel - input reserve, so it NEVER exceeds the panel height
+        // (the property that keeps the resizable command line snap-free).
+        assert!((Spacing::history_h_for(100.0) - 56.0).abs() < 0.1);
+        assert!((Spacing::history_h_for(400.0) - 356.0).abs() < 0.1);
+        assert!((Spacing::history_h_for(1200.0) - 1156.0).abs() < 0.1);
+        for h in [90.0, 150.0, 300.0, 800.0] {
             assert!(
-                (Spacing::HISTORY_H..=240.0).contains(&h),
-                "history_h_for({pct}) = {h} out of range"
+                Spacing::history_h_for(h) <= h,
+                "history must fit within the panel at {h}"
             );
+        }
+        // Monotonic non-decreasing in panel height.
+        let mut prev = 0.0;
+        for h in [0.0, 100.0, 300.0, 500.0, 800.0, 1200.0] {
+            let v = Spacing::history_h_for(h);
+            assert!(v >= prev - 0.1, "must not shrink as panel grows");
+            prev = v;
         }
     }
 

@@ -52,6 +52,22 @@ fn is_spawnable_local(
         && catalog.get(&config.model).is_some()
 }
 
+/// Human label for a cassette in the deck dropdown. Installed local models are
+/// keyed `local-<catalog-id>` (a stable lookup key, ugly to show). Resolve that
+/// key to the catalog's `display_name` so the dropdown reads "JustCadModel
+/// (Qwen 4B)". Non-local decks (and unknown ids) render their raw name.
+/// Mirrors crates/app/assets/models.json — kept a plain lookup so it stays in
+/// sync with the shipped catalog without threading `&Catalog` through the UI.
+fn deck_display_name(name: &str) -> String {
+    match name.strip_prefix("local-") {
+        Some(id) => crate::model_catalog::Catalog::load()
+            .get(id)
+            .map(|m| m.display_name.clone())
+            .unwrap_or_else(|| id.to_string()),
+        None => name.to_string(),
+    }
+}
+
 /// Point `decks.active` at the cassette named `name`, returning its index (or
 /// `None` if no such cassette). Pure over `decks` so the auto-activate rule is
 /// unit-testable without touching disk or a tokio runtime.
@@ -102,6 +118,28 @@ const CHAT_EXAMPLES: &[&str] = &[
 /// than a blank scrollback.
 fn chat_is_empty(transcript: &[Entry], streaming: &str) -> bool {
     transcript.is_empty() && streaming.trim().is_empty()
+}
+
+/// A raised WHITE chip frame with a soft shadow (dark-neutral in dark mode).
+/// Used for the header controls — the "LLM" button and the deck/model selectors
+/// — so they read as raised buttons on the white dock. Wrap a widget in this and
+/// set `visuals.widgets.inactive.weak_bg_fill = TRANSPARENT` inside so the
+/// widget's own grey fill doesn't cover the chip white.
+fn header_chip_frame(dark: bool) -> egui::Frame {
+    egui::Frame::NONE
+        .fill(if dark {
+            egui::Color32::from_rgb(48, 48, 52)
+        } else {
+            egui::Color32::WHITE
+        })
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::XS as i8, 2))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 1],
+            blur: 6,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(50),
+        })
 }
 
 /// Chat state that survives app restarts — the provider-side session handle
@@ -193,6 +231,24 @@ mod saved_chat_tests {
         assert!(serde_json::from_str::<SavedChat>("{bad json").is_err());
         let empty: SavedChat = serde_json::from_str("{}").unwrap_or_default();
         assert!(empty.session_id.is_none() && empty.transcript.is_empty());
+    }
+
+    #[test]
+    fn deck_display_name_resolves_local_cassettes() {
+        // A `local-<catalog-id>` key renders as the catalog's brand display name.
+        assert_eq!(
+            deck_display_name("local-qwen3-4b-q4km-llamafile"),
+            "JustCadModel (Qwen 4B)"
+        );
+        assert_eq!(
+            deck_display_name("local-qwen3-0.6b-q6k-llamafile"),
+            "JustCadModel Mini (Qwen 0.6B)"
+        );
+        // Unknown local id falls back to the bare id (prefix stripped, no crash).
+        assert_eq!(deck_display_name("local-mystery"), "mystery");
+        // Non-local decks render their raw name unchanged.
+        assert_eq!(deck_display_name("ollama"), "ollama");
+        assert_eq!(deck_display_name("claude-code"), "claude-code");
     }
 
     #[test]
@@ -492,6 +548,14 @@ pub struct DeckPane {
     /// [`DeckPane::take_app_verbs`] and runs them through the same app-verb-aware
     /// path as the human command line (`App::execute_line`). Never op-logged.
     pending_app_verbs: Vec<String>,
+    /// Set by `App` each frame: the default local model to OFFER for download in
+    /// the LLM menu (`(catalog id, display name)`) — `None` when it is already
+    /// installed, a download is in flight, or the catalog has none. Lets the user
+    /// grab the default local model from the LLM menu if they skipped onboarding.
+    pub(crate) default_model_offer: Option<(String, String)>,
+    /// Set by the LLM menu when the user clicks "Download …"; `App` takes it and
+    /// calls `start_model_install`.
+    pub(crate) pending_model_download: Option<String>,
 }
 
 impl Default for DeckPane {
@@ -539,6 +603,8 @@ impl Default for DeckPane {
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
+            default_model_offer: None,
+            pending_model_download: None,
         }
     }
 }
@@ -546,6 +612,20 @@ impl Default for DeckPane {
 impl DeckPane {
     pub fn busy(&self) -> bool {
         self.rx.is_some()
+    }
+
+    /// True when the ACTIVE deck is a healthy LOCAL endpoint (probe Ready) — e.g.
+    /// the user already has Ollama running on localhost. Used by `App` to hide
+    /// the "download the default local model" offer: no point pushing a download
+    /// when a working local model is already available.
+    pub(crate) fn has_ready_local_deck(&self) -> bool {
+        matches!(self.probe, ProbeState::Ready(_))
+            && self
+                .decks
+                .decks
+                .get(self.decks.active)
+                .map(|d| itsjustcad_deck::is_local_url(&d.base_url))
+                .unwrap_or(false)
     }
 
     /// Poll+clear the critique button. The app drives the viewport screenshot
@@ -899,8 +979,19 @@ impl DeckPane {
             }
         }
         let deck = make_deck(&config);
+        // Local (small) models get a FOCUSED, short prompt + `/no_think`: the full
+        // registry prompt (~33 KB) drowns a 0.6–4B model — it rambles and never
+        // emits commands. The brief teaches the draft convention + common verbs +
+        // worked examples; the GBNF grammar backstops the full verb set. `/no_think`
+        // suppresses Qwen3's <think> block so the turn is commands, not reasoning.
+        let digest = crate::scene::digest(&session.doc);
+        let prompt = if itsjustcad_deck::is_local_url(&config.base_url) {
+            format!("{}\n\n/no_think", itsjustcad_deck::brief_system_prompt(&digest))
+        } else {
+            system_prompt(&digest, &session.plugins)
+        };
         let mut req = ChatRequest::text(
-            system_prompt(&crate::scene::digest(&session.doc), &session.plugins),
+            prompt,
             self.messages.clone(),
             String::new(),
             4096,
@@ -1520,8 +1611,8 @@ impl DeckPane {
         handle: &tokio::runtime::Handle,
         icons: &crate::icons::Icons,
         roles: &crate::theme::ColorRoles,
-        dark: bool,
-        reduce_motion: bool,
+        _dark: bool,
+        _reduce_motion: bool,
     ) {
         self.drain(session, handle);
         if self.busy()
@@ -1543,77 +1634,162 @@ impl DeckPane {
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
 
+        // Uniform chat surface: paint the WHOLE pane white (dark-neutral in dark
+        // mode) so the LLM toolbar, transcript, and input card all sit on ONE
+        // background with consistent padding — not a tinted transcript band
+        // inside a grey panel. The dock's own inner margin supplies the padding.
+        let pane_bg = if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(32, 32, 34)
+        } else {
+            egui::Color32::WHITE
+        };
+        ui.painter().rect_filled(ui.max_rect(), 0.0, pane_bg);
+
+        // Deck status collapsed to a single traffic-light dot next to the model
+        // picker (green = ready, red = unavailable/failed, orange = probing or
+        // loading). Clicking the dot opens a modal with the full message. Compute
+        // the (color, message, offer-retry) tuple here — owned values — so the
+        // header closure below can still borrow `self` mutably.
+        const STATUS_ORANGE: egui::Color32 = egui::Color32::from_rgb(230, 160, 60);
+        let (dot_color, status_msg, status_retry): (egui::Color32, String, bool) =
+            match &self.probe {
+                ProbeState::Ready(info) => match &self.warm {
+                    WarmState::Warming { started, .. } => (
+                        STATUS_ORANGE,
+                        format!(
+                            "loading model into memory… {}s (first use of a model takes 30-60s)",
+                            started.elapsed().as_secs()
+                        ),
+                        false,
+                    ),
+                    WarmState::Failed(e) => {
+                        (ERR_COLOR, format!("model load failed: {e}"), false)
+                    }
+                    _ => {
+                        let warm_tag = if matches!(self.warm, WarmState::Warm) {
+                            " · model warm"
+                        } else {
+                            ""
+                        };
+                        (OK_COLOR, format!("{}{warm_tag}", info.detail), false)
+                    }
+                },
+                ProbeState::Unavailable(reason) => (ERR_COLOR, reason.clone(), true),
+                ProbeState::Checking(_) => {
+                    (STATUS_ORANGE, "checking deck…".to_string(), false)
+                }
+                ProbeState::Unknown => {
+                    (STATUS_ORANGE, "idle — no deck probe yet".to_string(), false)
+                }
+            };
+        let status_modal_id = egui::Id::new("deck_status_modal");
+
         ui.horizontal(|ui| {
             // Theme + text-size moved to the menu bar (appearance group); the
             // chat header now starts with the local-only + deck controls.
             // Local-only toggle: when on, only localhost cassettes are shown and
             // cloud sends are blocked.
-            let mut local_only = self.decks.local_only;
-            if ui
-                .checkbox(&mut local_only, "local only")
-                .on_hover_text("hide cloud decks and block remote sends")
-                .changed()
-            {
-                self.decks.local_only = local_only;
-                // If the active deck became hidden, switch to the first visible one.
-                if local_only {
-                    let active_is_remote = !itsjustcad_deck::is_local_url(
-                        self.decks.decks.get(self.decks.active)
-                            .map(|d| d.base_url.as_str())
-                            .unwrap_or(""),
-                    );
-                    let first_local = self.decks.visible_decks().map(|(i, _)| i).next();
-                    if active_is_remote
-                        && let Some(idx) = first_local
+            // The "local only" + "allow web search" toggles live under a single
+            // "LLM" menu button to keep the chat header uncluttered (they are
+            // set-once options, not per-turn affordances). Styled as a WHITE
+            // button with a soft shadow (raised chip).
+            header_chip_frame(ui.visuals().dark_mode).show(ui, |ui| {
+                // Transparent button background so the frame's white shows.
+                ui.style_mut().visuals.widgets.inactive.weak_bg_fill =
+                    egui::Color32::TRANSPARENT;
+                ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                ui.menu_button("LLM", |ui| {
+                let mut local_only = self.decks.local_only;
+                if ui
+                    .checkbox(&mut local_only, "local only")
+                    .on_hover_text("hide cloud decks and block remote sends")
+                    .changed()
+                {
+                    self.decks.local_only = local_only;
+                    // If the active deck became hidden, switch to the first visible one.
+                    if local_only {
+                        let active_is_remote = !itsjustcad_deck::is_local_url(
+                            self.decks.decks.get(self.decks.active)
+                                .map(|d| d.base_url.as_str())
+                                .unwrap_or(""),
+                        );
+                        let first_local = self.decks.visible_decks().map(|(i, _)| i).next();
+                        if active_is_remote
+                            && let Some(idx) = first_local
+                        {
+                            self.decks.active = idx;
+                            self.session_id = None;
+                            self.persist_chat();
+                        }
+                    }
+                    self.decks.save();
+                }
+                // Opt-in web search toggle. Default OFF. Only meaningful for cloud
+                // cassettes (anthropic server-side tool, claude-code WebSearch);
+                // disabled under local-only, which forbids remote calls anyway.
+                let web_capable = !self.decks.local_only;
+                ui.add_enabled_ui(web_capable, |ui| {
+                    ui.checkbox(&mut self.allow_web_search, "allow web search")
+                        .on_hover_text(
+                            "let the model search/fetch the web this turn (cloud cassettes only); off by default to stay sealed",
+                        );
+                });
+                if !web_capable {
+                    self.allow_web_search = false;
+                }
+                // Offer the default local model download (only when App says it
+                // isn't installed yet) — for users who skipped onboarding.
+                if let Some((id, name)) = self.default_model_offer.clone() {
+                    ui.separator();
+                    if ui
+                        .button(format!("Download {name} (default local model)"))
+                        .on_hover_text(
+                            "download the recommended local model so you can run offline",
+                        )
+                        .clicked()
                     {
-                        self.decks.active = idx;
-                        self.session_id = None;
-                        self.persist_chat();
+                        self.pending_model_download = Some(id);
+                        ui.close();
                     }
                 }
-                self.decks.save();
-            }
-            // Opt-in web search toggle. Default OFF. Only meaningful for cloud
-            // cassettes (anthropic server-side tool, claude-code WebSearch);
-            // disabled under local-only, which forbids remote calls anyway.
-            let web_capable = !self.decks.local_only;
-            ui.add_enabled_ui(web_capable, |ui| {
-                ui.checkbox(&mut self.allow_web_search, "allow web search")
-                    .on_hover_text(
-                        "let the model search/fetch the web this turn (cloud cassettes only); off by default to stay sealed",
-                    );
+                });
             });
-            if !web_capable {
-                self.allow_web_search = false;
-            }
             ui.separator();
-            ui.label("deck:");
             // Only show cassettes permitted by the current local_only setting.
             let visible_decks: Vec<(usize, String)> = self
                 .decks
                 .visible_decks()
                 .map(|(i, d)| (i, d.name.clone()))
                 .collect();
-            egui::ComboBox::from_id_salt("deck_select")
-                .selected_text(
-                    self.decks
-                        .decks
-                        .get(self.decks.active)
-                        .map(|d| d.name.clone())
-                        .unwrap_or_else(|| "—".into()),
-                )
-                .show_ui(ui, |ui| {
-                    for (i, name) in &visible_decks {
-                        if ui
-                            .selectable_value(&mut self.decks.active, *i, name)
-                            .clicked()
-                        {
-                            self.decks.save();
-                            self.session_id = None;
-                            self.persist_chat();
+            header_chip_frame(ui.visuals().dark_mode).show(ui, |ui| {
+                ui.style_mut().visuals.widgets.inactive.weak_bg_fill =
+                    egui::Color32::TRANSPARENT;
+                ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                egui::ComboBox::from_id_salt("deck_select")
+                    .selected_text(
+                        self.decks
+                            .decks
+                            .get(self.decks.active)
+                            .map(|d| deck_display_name(&d.name))
+                            .unwrap_or_else(|| "—".into()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (i, name) in &visible_decks {
+                            if ui
+                                .selectable_value(
+                                    &mut self.decks.active,
+                                    *i,
+                                    deck_display_name(name),
+                                )
+                                .clicked()
+                            {
+                                self.decks.save();
+                                self.session_id = None;
+                                self.persist_chat();
+                            }
                         }
-                    }
-                });
+                    });
+            });
             // Model picker fed by the probe's model list (Ollama: installed
             // models; Anthropic: available models).
             let probe_models = match &self.probe {
@@ -1624,27 +1800,39 @@ impl DeckPane {
                 && let Some(config) = self.decks.decks.get_mut(self.decks.active)
             {
                 let mut model = config.model.clone();
-                egui::ComboBox::from_id_salt("model_select")
-                    .selected_text(&model)
-                    .width(120.0)
-                    .show_ui(ui, |ui| {
-                        for m in &probe_models {
-                            ui.selectable_value(&mut model, m.clone(), m);
-                        }
-                    });
+                header_chip_frame(ui.visuals().dark_mode).show(ui, |ui| {
+                    ui.style_mut().visuals.widgets.inactive.weak_bg_fill =
+                        egui::Color32::TRANSPARENT;
+                    ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                    egui::ComboBox::from_id_salt("model_select")
+                        .selected_text(&model)
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for m in &probe_models {
+                                ui.selectable_value(&mut model, m.clone(), m);
+                            }
+                        });
+                });
                 if model != config.model {
                     config.model = model;
                     self.decks.save();
                     self.probe = ProbeState::Unknown; // re-probe with new model
                 }
             }
-            if self.busy() {
-                ui.spinner();
-                if icons
-                    .icon_button(ui, crate::icons::Icon::Stop, "stop this turn")
+            // Traffic-light status dot (a real filled circle — the `●` glyph is
+            // absent from egui's default font and renders as a tofu box), right
+            // next to the model picker. Click opens the status modal. No spinner
+            // here: the ONLY waiting indicator lives in the chat transcript.
+            {
+                let d = ui.text_style_height(&egui::TextStyle::Body) * 0.6;
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::click());
+                ui.painter().circle_filled(rect.center(), d * 0.5, dot_color);
+                if resp
+                    .on_hover_text("deck status — click for details")
                     .clicked()
                 {
-                    self.stop_turn();
+                    ui.ctx().data_mut(|d| d.insert_temp(status_modal_id, true));
                 }
             }
             // Local model server status (only when one is starting/failed/ready).
@@ -1662,83 +1850,43 @@ impl DeckPane {
             }
             // No critique button: `critique` is a command-line/chat verb, not a
             // toolbar affordance (the app still honours `critique_requested`).
-            // Destructive: clearing the chat discards the transcript + history.
-            if crate::widgets::role_button(
-                ui,
-                roles,
-                dark,
-                crate::widgets::ButtonRole::Destructive,
-                "clear",
-            )
-            .clicked()
-            {
-                self.transcript.clear();
-                self.messages.clear();
-                self.session_id = None;
-                self.persist_chat();
-            }
+            // No "clear" button either — starting a new session (Sessions tab)
+            // supersedes it; a stray destructive control in the header invited
+            // accidental transcript loss.
         });
-        match &self.probe {
-            ProbeState::Ready(info) => {
-                match &self.warm {
-                    WarmState::Warming { started, .. } => {
-                        // Ollama exposes no load progress — pseudo-progress
-                        // asymptotic to 95% keeps the bar honest but alive.
-                        let t = started.elapsed().as_secs_f32();
-                        let progress = 0.95 * (1.0 - (-t / 25.0).exp());
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "loading model into memory… {:.0}s (first use of a model takes 30-60s)",
-                                t
-                            ))
-                            .small(),
-                        );
-                        ui.add(
-                            egui::ProgressBar::new(progress)
-                                .desired_height(6.0)
-                                .animate(!reduce_motion),
-                        );
-                    }
-                    WarmState::Failed(e) => {
-                        ui.label(
-                            egui::RichText::new(format!("● model load failed: {e}"))
-                                .color(egui::Color32::from_rgb(200, 80, 70))
-                                .small(),
-                        );
-                    }
-                    _ => {
-                        let warm_tag = if matches!(self.warm, WarmState::Warm) {
-                            " · model warm"
-                        } else {
-                            ""
-                        };
-                        ui.label(
-                            egui::RichText::new(format!("● {}{warm_tag}", info.detail))
-                                .color(egui::Color32::from_rgb(70, 160, 90))
-                                .small(),
-                        );
-                    }
-                }
+        // Status detail now lives in a modal opened by the dot (above). Render it
+        // when the dot has been clicked; a `retry` button appears for a dead deck.
+        {
+            let mut open = ui
+                .ctx()
+                .data(|d| d.get_temp::<bool>(status_modal_id).unwrap_or(false));
+            if open {
+                egui::Window::new("Deck status")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ui.ctx(), |ui| {
+                        ui.horizontal(|ui| {
+                            let d = ui.text_style_height(&egui::TextStyle::Body) * 0.6;
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), d * 0.5, dot_color);
+                            ui.label(&status_msg);
+                        });
+                        ui.add_space(crate::theme::Spacing::M);
+                        ui.horizontal(|ui| {
+                            if status_retry && ui.button("retry").clicked() {
+                                self.probe = ProbeState::Unknown;
+                                open = false;
+                            }
+                            if ui.button("close").clicked() {
+                                open = false;
+                            }
+                        });
+                    });
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(status_modal_id, open));
             }
-            ProbeState::Unavailable(reason) => {
-                let reason = reason.clone();
-                let mut retry = false;
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("● {reason}"))
-                            .color(egui::Color32::from_rgb(200, 80, 70))
-                            .small(),
-                    );
-                    retry = ui.small_button("retry").clicked();
-                });
-                if retry {
-                    self.probe = ProbeState::Unknown;
-                }
-            }
-            ProbeState::Checking(_) => {
-                ui.label(egui::RichText::new("● checking deck…").weak().small());
-            }
-            ProbeState::Unknown => {}
         }
         ui.separator();
 
@@ -1774,181 +1922,420 @@ impl DeckPane {
         }
 
         let mut open_detail: Option<PaneView> = None;
-        let input_height = crate::theme::Spacing::CHAT_INPUT_H;
-        // Empty transcript: a low-key prompt + a few example chips instead of a
-        // blank void. Clicking a chip fills the input (never auto-sends — the
-        // user reviews/edits, then hits Enter). The input row below is shared.
-        let empty_chat = chat_is_empty(&self.transcript, &self.streaming_chat) && !self.busy();
         let mut chip_fill: Option<String> = None;
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(!empty_chat)
-            .max_height(ui.available_height() - input_height)
-            .show(ui, |ui| {
-                if empty_chat {
-                    ui.add_space(crate::theme::Spacing::M);
-                    ui.label(
-                        egui::RichText::new("Describe what to draw, and I'll build it.")
-                            .weak(),
-                    );
-                    ui.add_space(crate::theme::Spacing::S);
-                    for example in CHAT_EXAMPLES {
-                        if ui
-                            .add(egui::Button::new(egui::RichText::new(*example).small()))
-                            .on_hover_text("use this as a starting prompt")
-                            .clicked()
-                        {
-                            chip_fill = Some((*example).to_string());
-                        }
-                        ui.add_space(crate::theme::Spacing::XS);
-                    }
-                }
-                for (i, entry) in self.transcript.iter().enumerate() {
-                    match entry {
-                        Entry::User(t) => {
-                            ui.label(egui::RichText::new(format!("you: {t}")).strong());
-                        }
-                        Entry::Deck(t) => {
-                            CommonMarkViewer::new().show(ui, &mut self.markdown, t.trim());
-                        }
-                        Entry::Commands(commands) => {
-                            if commands_card(ui, commands) {
-                                open_detail = Some(PaneView::Detail(i));
-                            }
-                        }
-                        Entry::Status(t) => {
-                            ui.label(egui::RichText::new(t).weak().italics());
-                        }
-                    }
-                }
-                if !self.streaming_chat.trim().is_empty() {
-                    CommonMarkViewer::new().show(
-                        ui,
-                        &mut self.markdown,
-                        self.streaming_chat.trim(),
-                    );
-                }
-                // Live turn feedback: waiting → elapsed; streaming → char count.
-                if self.busy() {
-                    if !self.current_commands.is_empty()
-                        && commands_card(ui, &self.current_commands)
-                    {
-                        open_detail = Some(PaneView::LiveDetail);
-                    }
-                    let elapsed = self
-                        .turn_started
-                        .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(0);
-                    let received = self.current_response.len();
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        let status = if received == 0 {
-                            format!("waiting for model… {elapsed}s")
-                        } else {
-                            format!("streaming… {received} chars, {elapsed}s")
-                        };
-                        ui.label(egui::RichText::new(status).weak().italics());
-                    });
-                }
-            });
-        if let Some(view) = open_detail {
-            self.view = view;
-        }
-        // A tapped example chip seeds the input and focuses it for editing.
-        if let Some(text) = chip_fill {
-            self.input = text;
-            ui.memory_mut(|m| m.request_focus(egui::Id::new("deck_chat_input")));
-        }
+        let mut do_send = false;
+        let mut do_stop = false;
+        let empty_chat = chat_is_empty(&self.transcript, &self.streaming_chat) && !self.busy();
 
-        self.side_effect_confirm_ui(ui, session, icons);
-
-        ui.separator();
-        // Image attach: only for vision-capable cassettes (we never ship an
-        // image to a blind model). Reuses the scoped-Read vision mechanism.
+        // ── Bottom-docked input ────────────────────────────────────────────
+        // The input lives in its OWN bottom panel so it is never clipped by the
+        // transcript (the old fixed `input_height` reserve under-counted the
+        // 5-row field and cut off its lower edge). The transcript then fills all
+        // remaining space above it.
         let vision = self
             .decks
             .decks
             .get(self.decks.active)
             .map(|c| c.supports_vision())
             .unwrap_or(false);
-        ui.horizontal(|ui| {
-            if vision {
-                let sz = ui.text_style_height(&egui::TextStyle::Body);
-                let fg = ui.visuals().text_color();
-                let attach = egui::Button::image(icons.image(
-                    ui.ctx(),
-                    crate::icons::Icon::Image,
-                    sz,
-                    fg,
-                ))
-                .frame(true);
-                if ui
-                    .add_enabled(!self.busy(), attach)
-                    .on_hover_text("attach an image for the model to analyze")
-                    .clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif"])
-                        .pick_file()
-                {
-                    self.attached_image = Some(path);
-                }
-                if let Some(img) = self.attached_image.clone() {
-                    let name = img
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    ui.label(egui::RichText::new(name).weak());
-                    if icons
-                        .icon_button(ui, crate::icons::Icon::Close, "remove attachment")
-                        .clicked()
-                    {
-                        self.attached_image = None;
-                    }
-                }
-            } else {
-                let sz = ui.text_style_height(&egui::TextStyle::Body);
-                let fg = ui.visuals().weak_text_color();
-                let disabled = egui::Button::image(icons.image(
-                    ui.ctx(),
-                    crate::icons::Icon::Image,
-                    sz,
-                    fg,
-                ))
-                .frame(true);
-                ui.add_enabled(false, disabled)
-                    .on_hover_text("this cassette has no vision — pick a vision-capable model to attach images");
-            }
-        });
         let hint = if self.attached_image.is_some() {
-            "ask about the attached image… (Enter sends, Shift+Enter newline)"
+            "ask about the attached image…  (Enter = new line · Cmd+Enter to send)"
         } else if self.ready() {
-            "describe what to draw… (Enter sends, Shift+Enter newline)"
+            "describe what to draw…  (Enter = new line · Cmd+Enter to send)"
         } else if matches!(self.warm, WarmState::Warming { .. }) {
             "loading model — chat enables when warm"
         } else {
             "deck unavailable — fix the connection above"
         };
-        // Stable, explicit id so focus survives layout/enablement changes across
-        // frames (prevents flicker + dropped keystrokes).
         let input_id = egui::Id::new("deck_chat_input");
-        // Enable when the deck is ready and idle — BUT never disable the field
-        // out from under the user while it holds focus (a turn that starts, or a
-        // `ready()`/`busy()` toggle, mid-type would otherwise steal focus and
-        // flicker). `send()` still gates on `busy()`, so keeping it enabled is
-        // safe: nothing is sent until the field is actually ready.
         let has_focus = ui.memory(|m| m.has_focus(input_id));
         let enabled = (!self.busy() && self.ready()) || has_focus;
-        let response = ui.add_enabled(
-            enabled,
-            egui::TextEdit::multiline(&mut self.input)
-                .id(input_id)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .hint_text(hint),
-        );
-        let enter = response.has_focus()
-            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-        if enter {
-            // remove the newline the TextEdit just inserted
+        let can_send = !self.busy() && self.ready() && !self.input.trim().is_empty();
+        let input_radius =
+            egui::CornerRadius::same(crate::theme::Radii::default().medium as u8);
+
+        // The input panel uses a DIFFERENT id per state so collapsed and expanded
+        // each keep their own cached height. Without this, egui reuses the prior
+        // frame's panel height (`PanelState`), so after expand→collapse the short
+        // input floats at the top of a still-tall panel with empty space below.
+        let input_expanded = ui
+            .ctx()
+            .data(|d| d.get_temp::<bool>(egui::Id::new("deck_input_expanded")).unwrap_or(false));
+        let deck_input_id = if input_expanded {
+            "deck_input_expanded_panel"
+        } else {
+            "deck_input_collapsed_panel"
+        };
+
+        egui::Panel::bottom(deck_input_id)
+            .resizable(false)
+            .frame(egui::Frame::NONE)
+            // No separator line — the soft top shadow (painted below the card) is
+            // the only visual break between the transcript and the input.
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                // Side-effect confirmation sits directly above the input card.
+                self.side_effect_confirm_ui(ui, session, icons);
+                // Attachment chip (name + remove) above the input card.
+                if let Some(img) = self.attached_image.clone() {
+                    ui.horizontal(|ui| {
+                        let name = img
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        ui.label(egui::RichText::new(format!("📎 {name}")).weak());
+                        if icons
+                            .icon_button(ui, crate::icons::Icon::Close, "remove attachment")
+                            .clicked()
+                        {
+                            self.attached_image = None;
+                        }
+                    });
+                }
+                // Card fill matches the pane (white) so its top edge does NOT
+                // read as a line above the chevron — the only top separation is
+                // the soft drop shadow painted below. No horizontal inner margin
+                // so the input's edges line up with the toolbar and transcript.
+                // Soft drop shadow biased UPWARD so the input reads as floating
+                // above the transcript — no hard separator line. The card fill
+                // matches the pane (white) so only the shadow marks the boundary.
+                let input_frame = egui::Frame::NONE
+                    .fill(pane_bg)
+                    .corner_radius(input_radius)
+                    .inner_margin(egui::Margin::symmetric(0, crate::theme::Spacing::XS as i8))
+                    // Soft top shadow: visible but blurred so it reads as a lift,
+                    // not a hard 1px line. Offset up + a moderate alpha.
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, -2],
+                        blur: 16,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(45),
+                    });
+                // Signal-style modular input: COLLAPSED is a single-line row with
+                // a chevron-up to expand; EXPANDED is a tall multi-line box with a
+                // chevron-down (collapse) on top and the action buttons below.
+                let expand_id = egui::Id::new("deck_input_expanded");
+                let expanded = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<bool>(expand_id).unwrap_or(false));
+                input_frame.show(ui, |ui| {
+                    let icon_sz = ui.text_style_height(&egui::TextStyle::Body);
+                    // Shared button renderers (macro to avoid threading closures
+                    // through the borrow checker with `self` also borrowed for the
+                    // text field).
+                    macro_rules! send_or_stop {
+                        ($ui:expr) => {
+                            if self.busy() {
+                                let stop = egui::Button::image(icons.image(
+                                    $ui.ctx(),
+                                    crate::icons::Icon::Stop,
+                                    icon_sz,
+                                    ERR_COLOR,
+                                ))
+                                .frame(true);
+                                if $ui.add(stop).on_hover_text("stop this turn").clicked() {
+                                    do_stop = true;
+                                }
+                            } else {
+                                let send_fg = if can_send {
+                                    $ui.visuals().text_color()
+                                } else {
+                                    $ui.visuals().weak_text_color()
+                                };
+                                let send_btn = egui::Button::image(icons.image(
+                                    $ui.ctx(),
+                                    crate::icons::Icon::Send,
+                                    icon_sz,
+                                    send_fg,
+                                ))
+                                .frame(true);
+                                if $ui
+                                    .add_enabled(can_send, send_btn)
+                                    .on_hover_text("send message (Cmd+Enter)")
+                                    .clicked()
+                                {
+                                    do_send = true;
+                                }
+                            }
+                        };
+                    }
+                    macro_rules! photo {
+                        ($ui:expr) => {
+                            if vision {
+                                let attach = egui::Button::image(icons.image(
+                                    $ui.ctx(),
+                                    crate::icons::Icon::Image,
+                                    icon_sz,
+                                    $ui.visuals().text_color(),
+                                ))
+                                .frame(true);
+                                if $ui
+                                    .add_enabled(!self.busy(), attach)
+                                    .on_hover_text("attach an image for the model to analyze")
+                                    .clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif"])
+                                        .pick_file()
+                                {
+                                    self.attached_image = Some(path);
+                                }
+                            } else {
+                                let disabled = egui::Button::image(icons.image(
+                                    $ui.ctx(),
+                                    crate::icons::Icon::Image,
+                                    icon_sz,
+                                    $ui.visuals().weak_text_color(),
+                                ))
+                                .frame(true);
+                                $ui.add_enabled(false, disabled).on_hover_text(
+                                    "this cassette has no vision — pick a vision-capable model to attach images",
+                                );
+                            }
+                        };
+                    }
+                    macro_rules! submit_on_chord {
+                        ($resp:expr, $ui:expr) => {
+                            if $resp.has_focus()
+                                && $ui.input(|i| {
+                                    i.key_pressed(egui::Key::Enter)
+                                        && (i.modifiers.mac_cmd || i.modifiers.ctrl)
+                                })
+                            {
+                                do_send = true;
+                            }
+                        };
+                    }
+
+                    // Chevron ALWAYS top-center, a SIMPLE frameless button (no grey
+                    // button background): up = expand, down = collapse.
+                    ui.vertical_centered(|ui| {
+                        let chev = if expanded {
+                            crate::icons::Icon::ChevronDown
+                        } else {
+                            crate::icons::Icon::ChevronUp
+                        };
+                        let btn = egui::Button::image(icons.image(
+                            ui.ctx(),
+                            chev,
+                            icon_sz,
+                            ui.visuals().weak_text_color(),
+                        ))
+                        .frame(false);
+                        let tip = if expanded { "collapse" } else { "expand input" };
+                        if ui.add(btn).on_hover_text(tip).clicked() {
+                            ui.ctx().data_mut(|d| d.insert_temp(expand_id, !expanded));
+                        }
+                    });
+                    if expanded {
+                        // Tall field (vertical padding only → full-width aligned).
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(
+                                0,
+                                crate::theme::Spacing::XS as i8,
+                            ))
+                            .show(ui, |ui| {
+                                let response = ui.add_enabled(
+                                    enabled,
+                                    egui::TextEdit::multiline(&mut self.input)
+                                        .id(input_id)
+                                        .desired_rows(8)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text(hint),
+                                );
+                                submit_on_chord!(response, ui);
+                            });
+                        // Buttons: photo + send together, right-aligned, below.
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                send_or_stop!(ui);
+                                photo!(ui);
+                            },
+                        );
+                    } else {
+                        // Single-line row below the chevron: text fills; photo +
+                        // send hug the right.
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                send_or_stop!(ui);
+                                photo!(ui);
+                                // Two-line field in the collapsed state (expand
+                                // with the chevron for a tall composer).
+                                let response = ui.add_enabled(
+                                    enabled,
+                                    egui::TextEdit::multiline(&mut self.input)
+                                        .id(input_id)
+                                        .desired_rows(2)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text(hint),
+                                );
+                                submit_on_chord!(response, ui);
+                            },
+                        );
+                    }
+                });
+            });
+
+        // ── Transcript fills the remaining space ───────────────────────────
+        // Same white surface as the rest of the pane (uniform background).
+        // WhatsApp/Signal-style bubbles: user messages align RIGHT (blue), the
+        // model's align LEFT (a light grey chip so it reads against the white).
+        let transcript_bg = pane_bg;
+        let (user_bg, deck_bg) = if ui.visuals().dark_mode {
+            (
+                egui::Color32::from_rgb(30, 58, 95),
+                egui::Color32::from_rgb(52, 52, 55),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(219, 234, 254),
+                egui::Color32::from_rgb(238, 239, 242),
+            )
+        };
+        let bubble_radius = egui::CornerRadius::same(10);
+        let bubble_txt = crate::theme::to_color32(roles.on_surface);
+        egui::Frame::NONE
+            .fill(transcript_bg)
+            .inner_margin(egui::Margin::ZERO)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(!empty_chat)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if empty_chat {
+                            ui.add_space(crate::theme::Spacing::M);
+                            ui.label(
+                                egui::RichText::new("Describe what to draw, and I'll build it.")
+                                    .weak(),
+                            );
+                            ui.add_space(crate::theme::Spacing::S);
+                            for example in CHAT_EXAMPLES {
+                                if ui
+                                    .add(egui::Button::new(egui::RichText::new(*example).small()))
+                                    .on_hover_text("use this as a starting prompt")
+                                    .clicked()
+                                {
+                                    chip_fill = Some((*example).to_string());
+                                }
+                                ui.add_space(crate::theme::Spacing::XS);
+                            }
+                        }
+                        for (i, entry) in self.transcript.iter().enumerate() {
+                            match entry {
+                                Entry::User(t) => {
+                                    // Right-aligned user bubble.
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Min),
+                                        |ui| {
+                                            egui::Frame::NONE
+                                                .fill(user_bg)
+                                                .corner_radius(bubble_radius)
+                                                .inner_margin(egui::Margin::symmetric(10, 6))
+                                                .show(ui, |ui| {
+                                                    ui.set_max_width(ui.available_width() * 0.82);
+                                                    ui.label(
+                                                        egui::RichText::new(t).color(bubble_txt),
+                                                    );
+                                                });
+                                        },
+                                    );
+                                }
+                                Entry::Deck(t) => {
+                                    // Left-aligned model bubble.
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Min),
+                                        |ui| {
+                                            egui::Frame::NONE
+                                                .fill(deck_bg)
+                                                .corner_radius(bubble_radius)
+                                                .inner_margin(egui::Margin::symmetric(10, 6))
+                                                .show(ui, |ui| {
+                                                    ui.set_max_width(ui.available_width() * 0.82);
+                                                    CommonMarkViewer::new().show(
+                                                        ui,
+                                                        &mut self.markdown,
+                                                        t.trim(),
+                                                    );
+                                                });
+                                        },
+                                    );
+                                }
+                                Entry::Commands(commands) => {
+                                    if commands_card(ui, commands) {
+                                        open_detail = Some(PaneView::Detail(i));
+                                    }
+                                }
+                                Entry::Status(t) => {
+                                    // Centered, low-key system line (e.g. the
+                                    // "turn done in Ns" response-time note).
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(t).weak().italics().small(),
+                                        );
+                                    });
+                                }
+                            }
+                            ui.add_space(crate::theme::Spacing::XS);
+                        }
+                        // In-flight model reply streams as a left bubble.
+                        if !self.streaming_chat.trim().is_empty() {
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Min),
+                                |ui| {
+                                    egui::Frame::NONE
+                                        .fill(deck_bg)
+                                        .corner_radius(bubble_radius)
+                                        .inner_margin(egui::Margin::symmetric(10, 6))
+                                        .show(ui, |ui| {
+                                            ui.set_max_width(ui.available_width() * 0.82);
+                                            CommonMarkViewer::new().show(
+                                                ui,
+                                                &mut self.markdown,
+                                                self.streaming_chat.trim(),
+                                            );
+                                        });
+                                },
+                            );
+                        }
+                        // The ONLY waiting indicator (the header has none now).
+                        if self.busy() {
+                            if !self.current_commands.is_empty()
+                                && commands_card(ui, &self.current_commands)
+                            {
+                                open_detail = Some(PaneView::LiveDetail);
+                            }
+                            let elapsed = self
+                                .turn_started
+                                .map(|t| t.elapsed().as_secs())
+                                .unwrap_or(0);
+                            let received = self.current_response.len();
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                let status = if received == 0 {
+                                    format!("waiting for model… {elapsed}s")
+                                } else {
+                                    format!("streaming… {received} chars, {elapsed}s")
+                                };
+                                ui.label(egui::RichText::new(status).weak().italics());
+                            });
+                        }
+                    });
+            });
+
+        if let Some(view) = open_detail {
+            self.view = view;
+        }
+        // A tapped example chip seeds the input and focuses it for editing.
+        if let Some(text) = chip_fill {
+            self.input = text;
+            ui.memory_mut(|m| m.request_focus(input_id));
+        }
+        if do_stop {
+            self.stop_turn();
+        }
+        if do_send {
+            // Strip any newline the submit chord may have inserted before sending.
             self.input = self.input.trim_end_matches('\n').to_string();
             self.send(session, handle);
         }
@@ -1997,7 +2384,218 @@ mod side_effect_gate_tests {
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
+            default_model_offer: None,
+            pending_model_download: None,
         }
+    }
+
+    // ── SwiftUI-style component previews ────────────────────────────────────
+    // Render the chat pane OFF-SCREEN via egui_kittest (wgpu) into PNGs under
+    // `crates/app/tests/snapshots/`. This is our stand-in for a SwiftUI #Preview
+    // canvas: edit the UI, regenerate, look at the image — no full app launch.
+    // The PNGs double as visual regression baselines (a later UI change fails
+    // the test until re-approved). Ignored by default because it needs a GPU
+    // adapter (like the render tests). Generate / refresh with:
+    //
+    //   UPDATE_SNAPSHOTS=1 cargo test -p itsjustcad chat_preview -- --ignored
+    //
+    // then view / diff `crates/app/tests/snapshots/chat_*.png`.
+
+    /// A deck pane whose header reads "ready" (green dot) with a warm model, so
+    /// previews show the normal, connected state.
+    #[cfg(test)]
+    fn ready_pane() -> DeckPane {
+        let mut p = blank_pane();
+        p.probe = ProbeState::Ready(ProbeInfo {
+            detail: "sonnet via Claude Code".into(),
+            models: vec!["sonnet".into()],
+        });
+        p.warm = WarmState::Warm;
+        // Pin warmed_model to the active deck's model so poll_warm sees it as
+        // fresh and does NOT kick a (repaint-inducing) warm-up during previews.
+        p.warmed_model = p
+            .decks
+            .decks
+            .get(p.decks.active)
+            .map(|c| c.model.clone());
+        // Pin probed_deck so poll_probe does NOT re-probe (which would overwrite
+        // the Ready state with Checking and flip the dot orange + disable input).
+        p.probed_deck = Some(p.decks.active);
+        p
+    }
+
+    /// Render `pane` at a phone-ish chat width in the given theme and write
+    /// snapshot `name`. `keepalive` holds anything that must outlive the render
+    /// (e.g. a channel sender that keeps a faked in-flight turn's receiver open).
+    #[cfg(test)]
+    fn snapshot_pane(name: &str, mut pane: DeckPane, dark: bool, _keepalive: impl std::any::Any) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let colors = if dark {
+            crate::preset::preset_for(crate::preset::CadOrigin::None)
+                .tokens()
+                .colors
+        } else {
+            // Light skin: near-white surface, blue accent.
+            crate::theme::roles_from([0.98, 0.98, 0.97, 1.0], [0.20, 0.50, 1.0, 1.0])
+        };
+        let icons = crate::icons::Icons::new();
+        let mut session = Session::default();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(360.0, 700.0))
+            .wgpu()
+            .build_ui(|ui| {
+                pane.ui(ui, &mut session, &handle, &icons, &colors, dark, false);
+            });
+        // Match egui's own visuals to the requested theme (the transcript bg /
+        // bubble colors key off `ui.visuals().dark_mode`).
+        harness
+            .ctx
+            .set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+        // A busy pane repaints forever (spinner), so render a FIXED number of
+        // frames rather than running until the UI "settles".
+        harness.run_steps(4);
+        harness.snapshot(name);
+        // Leak harness + runtime: their Drop impls panic inside kittest's
+        // pollster/wgpu block_on context (esp. when many previews run in one
+        // process). Snapshot is already written; the test process is short-lived.
+        std::mem::forget(harness);
+        std::mem::forget(rt);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate chat previews"]
+    fn chat_preview_empty() {
+        // Empty transcript → starter prompt + example chips.
+        snapshot_pane("chat_empty", ready_pane(), true, ());
+        snapshot_pane("chat_empty_light", ready_pane(), false, ());
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate chat previews"]
+    fn chat_preview_conversation() {
+        // Fresh pane per theme (DeckPane isn't Clone — channels/tasks).
+        let build = || {
+            let mut p = ready_pane();
+            p.transcript = vec![
+                Entry::User("make a 10×10×3 slab with a 4×4 courtyard".into()),
+                Entry::Deck(
+                    "Done — cut a **4×4** courtyard out of the slab with `difference`. \
+                     The inputs are consumed and one result mesh remains. Want a parapet next?"
+                        .into(),
+                ),
+                Entry::Status("turn done in 2.1s".into()),
+            ];
+            p
+        };
+        snapshot_pane("chat_conversation", build(), true, ());
+        snapshot_pane("chat_conversation_light", build(), false, ());
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate chat previews"]
+    fn chat_preview_busy() {
+        // A live-but-idle channel fakes an in-flight turn: busy() is rx.is_some(),
+        // so the STOP button replaces the airplane and the waiting spinner shows.
+        let build = || {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DeckDelta>();
+            let mut p = ready_pane();
+            p.transcript = vec![Entry::User("extrude the footprint 3m".into())];
+            p.rx = Some(rx);
+            p.turn_started = Some(std::time::Instant::now());
+            p.current_response = "Extrud".into();
+            (p, tx) // return tx so the channel stays open through the render
+        };
+        let (p, tx) = build();
+        snapshot_pane("chat_busy", p, true, tx);
+        let (p, tx) = build();
+        snapshot_pane("chat_busy_light", p, false, tx);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate chat previews"]
+    fn chat_preview_error() {
+        // Dead deck → red status dot, disabled input.
+        let build = || {
+            let mut p = blank_pane();
+            p.probe =
+                ProbeState::Unavailable("connection refused (localhost:11434)".into());
+            p.probed_deck = Some(p.decks.active); // keep Unavailable (don't re-probe)
+            p
+        };
+        snapshot_pane("chat_error", build(), true, ());
+        snapshot_pane("chat_error_light", build(), false, ());
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate chat previews"]
+    fn chat_preview_expanded() {
+        // The Signal-style EXPANDED input: tall box + chevron-down (collapse) on
+        // top + action buttons below. Set via egui memory before rendering.
+        for (name, dark) in [("chat_expanded", true), ("chat_expanded_light", false)] {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let handle = rt.handle().clone();
+            let colors = if dark {
+                crate::preset::preset_for(crate::preset::CadOrigin::None)
+                    .tokens()
+                    .colors
+            } else {
+                crate::theme::roles_from([0.98, 0.98, 0.97, 1.0], [0.20, 0.50, 1.0, 1.0])
+            };
+            let icons = crate::icons::Icons::new();
+            let mut session = Session::default();
+            let mut pane = ready_pane();
+            pane.transcript = vec![Entry::User("draw a spiral stair".into())];
+            pane.input = "make it 3 metres tall with 18 treads".to_string();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(360.0, 700.0))
+                .wgpu()
+                .build_ui(|ui| {
+                    pane.ui(ui, &mut session, &handle, &icons, &colors, dark, false);
+                });
+            harness
+                .ctx
+                .set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+            harness
+                .ctx
+                .data_mut(|d| d.insert_temp(egui::Id::new("deck_input_expanded"), true));
+            harness.run_steps(4);
+            harness.snapshot(name);
+            std::mem::forget(harness);
+            std::mem::forget(rt);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate chat previews"]
+    fn chat_preview_toggle_back() {
+        // Reproduce the reported bug: EXPAND then COLLAPSE across frames and
+        // snapshot the FINAL collapsed state — the input must return to the
+        // BOTTOM (not float in the middle).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let colors = crate::theme::roles_from([0.98, 0.98, 0.97, 1.0], [0.20, 0.50, 1.0, 1.0]);
+        let icons = crate::icons::Icons::new();
+        let mut session = Session::default();
+        let mut pane = ready_pane();
+        pane.transcript = vec![Entry::User("draw a spiral stair".into())];
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(360.0, 700.0))
+            .wgpu()
+            .build_ui(|ui| {
+                pane.ui(ui, &mut session, &handle, &icons, &colors, false, false);
+            });
+        harness.ctx.set_theme(egui::Theme::Light);
+        let id = egui::Id::new("deck_input_expanded");
+        // Expand, render a few frames…
+        harness.ctx.data_mut(|d| d.insert_temp(id, true));
+        harness.run_steps(4);
+        // …then collapse and render again.
+        harness.ctx.data_mut(|d| d.insert_temp(id, false));
+        harness.run_steps(4);
+        harness.snapshot("chat_toggle_back");
+        std::mem::forget(harness);
+        std::mem::forget(rt);
     }
 
     // --- Opt-in web search gating at the request-build boundary ---

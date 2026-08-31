@@ -55,7 +55,7 @@ pub const DOCK_WIDTH: f32 = 280.0;
 
 /// Minimum dock width (px) — the resize floor. The dock never shrinks below
 /// this; its maximum is half the window width (enforced in `right_panel`).
-pub const DOCK_MIN: f32 = 280.0;
+pub const DOCK_MIN: f32 = 200.0;
 
 /// The dock's render width for a given tab and a (possibly user-dragged) stored
 /// width. The width is INDEPENDENT of which tab is active: every tab renders at
@@ -127,25 +127,57 @@ pub fn strip_ui(
     state: TabState,
 ) -> Option<PanelTab> {
     let mut clicked = None;
+    // Folder-style tabs: rounded TOP corners only; the SELECTED tab is WHITE with
+    // a soft shadow (raised), unselected tabs are a recessed off-white. Reads like
+    // a row of file folders sitting on the panel below.
+    let dark = ui.visuals().dark_mode;
+    let (sel_fill, unsel_fill) = if dark {
+        (
+            egui::Color32::from_rgb(52, 52, 56),
+            egui::Color32::from_rgb(34, 34, 36),
+        )
+    } else {
+        // Unselected clearly grey so the WHITE selected tab pops against its
+        // neighbours (a white-on-white dock gives the selected tab no contrast
+        // otherwise).
+        (egui::Color32::WHITE, egui::Color32::from_rgb(220, 220, 224))
+    };
+    let top_round = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
         for tab in PanelTab::ALL {
             let selected = tab == state.active && !state.collapsed;
-            // Icon tinted to accent when selected, foreground otherwise — a
-            // borderless segmented-control look (icon + label, no chrome).
             let size = ui.text_style_height(&egui::TextStyle::Body);
-            let color = if selected {
-                ui.visuals().selection.bg_fill
+            let fg = if selected {
+                ui.visuals().strong_text_color()
             } else {
                 ui.visuals().weak_text_color()
             };
-            let img = icons.image(ui.ctx(), tab.icon(), size, color);
-            let resp = ui
-                .horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.add(img);
-                    ui.selectable_label(selected, tab.label())
+            let mut frame = egui::Frame::NONE
+                .fill(if selected { sel_fill } else { unsel_fill })
+                .corner_radius(top_round)
+                .inner_margin(egui::Margin::symmetric(
+                    crate::theme::Spacing::SM as i8,
+                    crate::theme::Spacing::XS as i8,
+                ));
+            if selected {
+                frame = frame.shadow(egui::epaint::Shadow {
+                    offset: [0, 1],
+                    blur: 6,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(50),
+                });
+            }
+            let resp = frame
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.add(icons.image(ui.ctx(), tab.icon(), size, fg));
+                        ui.label(egui::RichText::new(tab.label()).color(fg));
+                    });
                 })
-                .inner;
+                .response
+                .interact(egui::Sense::click());
             if resp.clicked() {
                 clicked = Some(tab);
             }

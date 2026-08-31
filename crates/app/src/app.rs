@@ -413,6 +413,16 @@ pub struct App {
     /// unsaved-changes alert. `Some` while the alert is up; taken when the user
     /// picks Discard.
     pending_nav: Option<PendingNav>,
+    /// Set true when a confirmed Discard-quit sends `ViewportCommand::Close`, so
+    /// the close-request handler lets that close through instead of re-parking a
+    /// fresh Quit (the doc is still dirty). Without it, Discard loops forever and
+    /// the app never actually exits.
+    force_close: bool,
+    /// Test/preview only: skip the wgpu 3D viewport paint callback so the full
+    /// window can be snapshot off-screen via egui_kittest (whose egui render
+    /// pass has no depth attachment, which the scene callback requires). All the
+    /// egui chrome — menus, dock, command line, viewport name tags — still draws.
+    preview_no_viewport: bool,
 }
 
 /// A navigation intent deferred behind the unsaved-changes guard.
@@ -445,6 +455,20 @@ pub(crate) fn nav_action_for(choice: Option<crate::widgets::AlertChoice>) -> Nav
         Some(crate::widgets::AlertChoice::Cancel) => NavAction { clear_pending: true, perform: false },
         None => NavAction { clear_pending: false, perform: false },
     }
+}
+
+/// Whether a window close-request should be intercepted (cancelled + a Quit
+/// parked behind the unsaved-changes alert). A close proceeds unimpeded when the
+/// doc is clean, when a Quit is already parked, or when `force_close` is set — the
+/// last is the confirmed-Discard case, where the doc is still dirty but the user
+/// has already chosen to abandon it, so re-parking would loop forever.
+pub(crate) fn should_intercept_close(
+    close_requested: bool,
+    force_close: bool,
+    quit_already_parked: bool,
+    dirty: bool,
+) -> bool {
+    close_requested && !force_close && !quit_already_parked && dirty
 }
 
 /// A running install: which model, plus the [`crate::download::Download`] handle
@@ -642,6 +666,8 @@ impl App {
             pending_nav: std::env::var("ITSJUSTCAD_UNSAVED_ALERT")
                 .is_ok()
                 .then_some(PendingNav::New),
+            force_close: false,
+            preview_no_viewport: false,
         }
     }
 
@@ -677,7 +703,12 @@ impl App {
                 self.mark_saved();
             }
             PendingNav::Open => self.open(None),
-            PendingNav::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            PendingNav::Quit => {
+                // Mark the close as intentional so the close-request handler does
+                // not re-park a fresh Quit (the doc is still dirty after Discard).
+                self.force_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -1667,8 +1698,13 @@ impl App {
         if self.active_pane >= self.layout.pane_count() {
             self.active_pane = 0;
         }
-        // Active viewport = last hovered: tools and view commands follow the cursor.
-        if let Some(pos) = ui.ctx().pointer_latest_pos()
+        // Active viewport is STICKY (Rhino-style): it changes only on an explicit
+        // click in a pane (see the per-pane loop) or a click on a pane's name tag
+        // — no hover flicker. EXCEPTION: while a draw tool is armed, the pane under
+        // the cursor becomes active so points can be picked in ANY viewport
+        // mid-command (Rhino lets you pick across viewports during a command).
+        if self.draw_tool.active()
+            && let Some(pos) = ui.ctx().pointer_latest_pos()
             && let Some(pane) = self.layout.pane_at(full, pos)
         {
             self.active_pane = pane;
@@ -1730,6 +1766,15 @@ impl App {
         for (pane, rect) in panes.iter().copied().enumerate() {
             let cam_idx = self.layout.camera_index(pane);
             let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
+            // Click (or drag/RMB) inside a pane makes it the active viewport,
+            // Rhino-style: sticky, no hover flicker.
+            if response.clicked()
+                || response.secondary_clicked()
+                || response.dragged()
+            {
+                self.active_pane = pane;
+            }
 
             // Rhino muscle memory: RMB orbit, Shift+RMB pan, scroll dolly.
             if response.dragged_by(egui::PointerButton::Secondary)
@@ -1866,36 +1911,85 @@ impl App {
             let sun_dir = self.session.doc.sun.map(|s| {
                 itsjustcad_solar::sun_direction(s.azimuth_deg, s.altitude_deg)
             });
-            ui.painter().add(egui_wgpu::Callback::new_paint_callback(
-                rect,
-                ViewportCallback {
-                    view_proj,
-                    eye: self.cameras[cam_idx].eye(),
-                    generation,
-                    scene: scene.take(),
-                    viewport: pane,
-                    mode: self.display_modes[cam_idx],
-                    sun_dir,
-                    light: self.light_mode,
-                    background_gradient: self.profile_edges,
-                    edges_enabled: self.shaded_edges,
-                },
-            ));
+            // Skip the wgpu 3D callback in off-screen preview snapshots (no depth
+            // attachment in kittest's egui pass). `scene.take()` still runs so the
+            // one-shot snapshot isn't leaked to a later pane.
+            let scene_snapshot = scene.take();
+            if !self.preview_no_viewport {
+                ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    ViewportCallback {
+                        view_proj,
+                        eye: self.cameras[cam_idx].eye(),
+                        generation,
+                        scene: scene_snapshot,
+                        viewport: pane,
+                        mode: self.display_modes[cam_idx],
+                        sun_dir,
+                        light: self.light_mode,
+                        background_gradient: self.profile_edges,
+                        edges_enabled: self.shaded_edges,
+                    },
+                ));
+            }
 
-            // Per-pane view-name annotation (Rhino/SketchUp): a small,
-            // unobtrusive, theme-colored, non-interactive label in the pane's
-            // top-left corner. Drawn for every pane in single/2/4 layouts; the
-            // bottom tab bar carries the interactive view controls, so this
-            // top-left overlay never overlaps them.
+            // Per-pane view-name TAG (Rhino/SketchUp): the pane's name in its
+            // top-left corner. It is the ACTIVE-viewport indicator AND a click
+            // target — clicking the tag activates that viewport (Rhino
+            // title-click). Active: a blue chip with a high-contrast blue label
+            // (WCAG AA, see `theme::viewport_active_tag`); inactive: plain weak
+            // text. This replaces the old thin pane border, which added noise.
             {
                 let cam = &self.cameras[cam_idx];
                 let label = crate::statusbar::view_label(cam.yaw, cam.pitch, cam.ortho);
+                let active = pane == self.active_pane;
+                let font = egui::TextStyle::Small.resolve(ui.style());
+                // Measure the label so the chip / hit-area fit it exactly.
+                let size = ui
+                    .painter()
+                    .layout_no_wrap(label.to_string(), font.clone(), egui::Color32::WHITE)
+                    .size();
+                let pad = egui::vec2(6.0, 3.0);
+                let tag_rect = egui::Rect::from_min_size(
+                    rect.left_top() + egui::vec2(6.0, 6.0),
+                    size + pad * 2.0,
+                );
+                // Tag click activates the pane without disturbing the scene
+                // selection (added on top, so it captures the click before the
+                // pane's pick logic).
+                let tag_resp = ui.interact(
+                    tag_rect,
+                    ui.id().with(("view_tag", pane)),
+                    egui::Sense::click(),
+                );
+                if tag_resp.clicked() {
+                    self.active_pane = pane;
+                }
+                let text_color = if active {
+                    let (chip, fg) =
+                        crate::theme::viewport_active_tag(ui.visuals().dark_mode);
+                    // Drop shadow ONLY on the active tag's chip (lifts it off the
+                    // 3D); inactive tags are plain text, no shadow.
+                    ui.painter().add(
+                        egui::epaint::Shadow {
+                            offset: [0, 1],
+                            blur: 4,
+                            spread: 0,
+                            color: egui::Color32::from_black_alpha(70),
+                        }
+                        .as_shape(tag_rect, egui::CornerRadius::same(4)),
+                    );
+                    ui.painter().rect_filled(tag_rect, 4.0, chip);
+                    fg
+                } else {
+                    ui.visuals().weak_text_color()
+                };
                 ui.painter_at(rect).text(
-                    rect.left_top() + egui::vec2(8.0, 6.0),
+                    tag_rect.min + pad,
                     egui::Align2::LEFT_TOP,
                     label,
-                    egui::TextStyle::Small.resolve(ui.style()),
-                    ui.visuals().weak_text_color(),
+                    font,
+                    text_color,
                 );
             }
 
@@ -1911,18 +2005,40 @@ impl App {
                 self.draw_lineweights_overlay(ui, rect, view_proj, theme);
             }
 
-            if panes.len() > 1 {
-                let color = if pane == self.active_pane {
-                    ui.visuals().selection.stroke.color
-                } else {
-                    ui.visuals().weak_text_color()
-                };
-                ui.painter().rect_stroke(
-                    rect.shrink(0.5),
-                    0.0,
-                    egui::Stroke::new(1.0, color),
-                    egui::StrokeKind::Inside,
-                );
+            // (The full per-pane border was removed — it added visual noise. The
+            // active viewport is shown by its blue name tag, above; internal
+            // dividers between panes are drawn once, below.)
+        }
+
+        // Internal viewport dividers (Rhino-style cross): a single subtle grey
+        // line on every pane edge that TOUCHES another pane — i.e. interior to
+        // the viewport region, never on its outer boundary. For a 2×2 layout this
+        // is a centered cross; for 2-up, one line. Helps the eye separate panes
+        // without re-introducing the noisy full border. Drawn after the wgpu
+        // callbacks so it composites on top of the 3D. Skipped in preview
+        // snapshots' chrome-only mode is unnecessary — these are cheap egui lines.
+        if panes.len() > 1 {
+            let divider = if ui.visuals().dark_mode {
+                egui::Color32::from_gray(90) // lighter line on dark viewports
+            } else {
+                egui::Color32::from_gray(165) // darker line on light viewports
+            };
+            let stroke = egui::Stroke::new(1.0, divider);
+            let eps = 0.5;
+            let painter = ui.painter();
+            for rect in panes.iter().copied() {
+                if rect.left() > full.left() + eps {
+                    painter.vline(rect.left(), rect.y_range(), stroke);
+                }
+                if rect.right() < full.right() - eps {
+                    painter.vline(rect.right(), rect.y_range(), stroke);
+                }
+                if rect.top() > full.top() + eps {
+                    painter.hline(rect.x_range(), rect.top(), stroke);
+                }
+                if rect.bottom() < full.bottom() - eps {
+                    painter.hline(rect.x_range(), rect.bottom(), stroke);
+                }
             }
         }
 
@@ -3024,10 +3140,16 @@ impl App {
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         use crate::tabstrip::PanelTab;
         if !self.panel_visible {
-            // Collapsed to nothing: a small ▸ handle at the top-right edge.
+            // Collapsed to nothing: a small ▸ handle at the top-right edge, at the
+            // SAME height the collapse button had (stored while the panel was
+            // visible) so the button doesn't jump vertically on toggle.
             let vr = ui.ctx().viewport_rect();
+            let y = ui
+                .ctx()
+                .data(|d| d.get_temp::<f32>(egui::Id::new("panel_toggle_y")))
+                .unwrap_or(vr.top() + 52.0);
             egui::Area::new(egui::Id::new("panel_show_btn"))
-                .fixed_pos(egui::pos2(vr.right() - 28.0, vr.top() + 88.0))
+                .fixed_pos(egui::pos2(vr.right() - 28.0, y))
                 .show(ui.ctx(), |ui| {
                     if self
                         .icons
@@ -3045,9 +3167,18 @@ impl App {
         let mut panel = egui::Panel::right("right_panel").resizable(!collapsed);
         // A small inner margin off the 8pt grid so icon+label rows (tab strip,
         // section headers) aren't flush against the dock edge (SwiftUI-style
-        // breathing room). Keeps the default panel fill/stroke.
+        // breathing room). The dock fill is WHITE (dark-neutral in dark mode) so
+        // the ENTIRE dock — tab strip, chat, layers — reads as one clean surface
+        // rather than a grey panel with a white card inside it. Keeps the default
+        // left stroke that separates the dock from the viewport.
+        let dock_fill = if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(32, 32, 34)
+        } else {
+            egui::Color32::WHITE
+        };
         panel = panel.frame(
             egui::Frame::side_top_panel(ui.style())
+                .fill(dock_fill)
                 .inner_margin(egui::Margin::symmetric(
                     crate::theme::Spacing::default().s as i8,
                     4,
@@ -3077,11 +3208,18 @@ impl App {
         let panel_resp = panel.show(ui, |ui| {
             // Header row: chevron + tab strip.
             ui.horizontal(|ui| {
-                if self
-                    .icons
-                    .icon_button(ui, crate::icons::Icon::PanelClose, "hide panel (Cmd+\\)")
-                    .clicked()
-                {
+                let close = self.icons.icon_button(
+                    ui,
+                    crate::icons::Icon::PanelClose,
+                    "hide panel (Cmd+\\)",
+                );
+                // Remember this button's screen-y so the reshow button (when the
+                // panel is hidden) sits at the SAME height — tapping collapse must
+                // not move the button vertically.
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new("panel_toggle_y"), close.rect.top())
+                });
+                if close.clicked() {
                     self.panel_visible = false;
                 }
                 if let Some(tab) = crate::tabstrip::strip_ui(ui, &self.icons, self.panel_tabs) {
@@ -3100,8 +3238,11 @@ impl App {
             // bottom of the window (see `command_line_panel` in `ui()`), which
             // fixes the flicker/dropped-keystroke bug caused by a bottom panel
             // nested inside the resizable right panel. The tab body now fills the
-            // full right panel.
-            egui::CentralPanel::default().show(ui, |ui| {
+            // full right panel. Transparent frame so the WHITE dock fill shows
+            // through for every tab (no grey card inside a white dock).
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
                 match self.panel_tabs.active() {
                     // Rhino-style "Model" workspace: Layers AND Properties shown
                     // together as stacked, independently-collapsible sections
@@ -3145,6 +3286,9 @@ impl App {
                     }
                     PanelTab::Deck => {
                         let tk = preset::preset_for(self.cad_origin).tokens();
+                        // Offer the default local model in the LLM menu if the
+                        // user skipped onboarding and hasn't downloaded it.
+                        self.deck_pane.default_model_offer = self.default_model_offer();
                         self.deck_pane.ui(
                             ui,
                             &mut self.session,
@@ -3154,6 +3298,9 @@ impl App {
                             tk.dark,
                             self.reduce_motion,
                         );
+                        if let Some(id) = self.deck_pane.pending_model_download.take() {
+                            self.start_model_install(&id);
+                        }
                     }
                 }
             });
@@ -3693,6 +3840,27 @@ impl App {
     fn close_model_setup(&mut self) {
         self.show_model_setup = false;
         // Deliberately does NOT touch `self.active_download` / call `cancel()`.
+    }
+
+    /// The default local model to OFFER in the LLM menu — `(id, display_name)` —
+    /// or `None` when it's already installed, a download is running, or the
+    /// catalog has none. For users who skipped onboarding: a one-tap way to grab
+    /// the recommended local model.
+    fn default_model_offer(&self) -> Option<(String, String)> {
+        if self.active_download.is_some() {
+            return None;
+        }
+        // Already have a working local model (e.g. Ollama running) → no download.
+        if self.deck_pane.has_ready_local_deck() {
+            return None;
+        }
+        let entry = self.catalog.recommended_for(self.hardware.tier())?;
+        let dir = crate::download::models_dir()?;
+        // Already downloaded → don't offer it.
+        if dir.join(entry.file_name()).exists() {
+            return None;
+        }
+        Some((entry.id.clone(), entry.display_name.clone()))
     }
 
     /// Kick off a background download for catalog model `id` into the models dir.
@@ -4282,10 +4450,12 @@ impl eframe::App for App {
             let close_requested = ctx.input(|i| i.viewport().close_requested());
             // Clean doc lets the close proceed unimpeded; a dirty doc cancels it
             // and parks the Quit behind the alert.
-            if close_requested
-                && self.pending_nav != Some(PendingNav::Quit)
-                && self.is_dirty()
-            {
+            if should_intercept_close(
+                close_requested,
+                self.force_close,
+                self.pending_nav == Some(PendingNav::Quit),
+                self.is_dirty(),
+            ) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.pending_nav = Some(PendingNav::Quit);
             }
@@ -4656,20 +4826,43 @@ impl eframe::App for App {
         // visible: it is the op-log scrollback + input for every mode. Moving it
         // out of the nested right panel fixes the input flicker/dropped-keystroke
         // bug (an unstable bottom panel inside a resizable right panel).
+        // Resizable so the user can drag the top edge to grow the op-log
+        // scrollback. Default height shows ~5 history lines plus the input row;
+        // the history block reserves that space even when scrollback is sparse.
+        // Resizable: drag the top edge to grow the op-log scrollback up to 60%
+        // of the window (the history fills the extra height — see
+        // `history_h_for`). Floor keeps ~5 lines + input visible.
+        let cmd_max = (ui.ctx().viewport_rect().height() * 0.6).max(150.0);
+        // White background (dark-neutral in dark mode) so the command line reads
+        // as a clean surface like the chat dock — not a grey strip.
+        let cmd_fill = if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(32, 32, 34)
+        } else {
+            egui::Color32::WHITE
+        };
         egui::Panel::bottom("command_line")
-            .resizable(false)
+            .resizable(true)
+            // ~5 lines of history (≈16pt/line) + the input row reserve.
+            .default_size(5.0 * 16.0 + 44.0)
+            .min_size(90.0)
+            .max_size(cmd_max)
+            .frame(
+                egui::Frame::side_top_panel(ui.style())
+                    .fill(cmd_fill)
+                    .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::S as i8, 4)),
+            )
             .show(ui, |ui| self.command_line_body(ui));
 
         // 3. Status bar — directly above the command line.
+        // Right dock is declared BEFORE the statusbar so it spans the full height
+        // down to the command line — its bottom edge TOUCHES the command line
+        // instead of stopping at a full-width statusbar. The statusbar (declared
+        // after) then only spans the remaining VIEWPORT width, not under the dock.
+        self.right_panel(ui);
+
         egui::Panel::bottom("statusbar")
             .resizable(false)
             .show(ui, |ui| self.status_bar(ui));
-
-        // 3. Right docked tab panel: Layers / Properties / Chat, with the
-        // command line docked at its bottom (always visible, panel width).
-        // The deck lives here as the Chat tab; its tick() still runs every frame
-        // above regardless of visibility, so background streaming progresses.
-        self.right_panel(ui);
 
         // A `view <name>` restore (command line, deck or script) parks the
         // saved camera in the document mailbox; drive the active viewport.
@@ -4743,6 +4936,139 @@ mod tests {
     use super::*;
     use itsjustcad_commands::registry;
 
+    /// Whole-app-window previews (SwiftUI-#Preview style) rendered off-screen via
+    /// egui_kittest's eframe integration: `build_eframe` hands `App::new` a real
+    /// `CreationContext` carrying kittest's wgpu render state, so the full window
+    /// — menu bar, viewports, right dock, command line — renders in BOTH themes.
+    /// `setup` seeds per-preview state (populate layers, raise a dialog, …).
+    /// Ignored by default (needs a GPU adapter). Generate / refresh with:
+    ///
+    ///   UPDATE_SNAPSHOTS=1 cargo test -p itsjustcad preview -- --ignored --test-threads=1
+    ///
+    /// then view `crates/app/tests/snapshots/{app,layers,dialog}_*.png`.
+    #[cfg(test)]
+    fn snapshot_app(name: &str, dark: bool, setup: impl Fn(&mut App)) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 900.0))
+            .wgpu()
+            .build_eframe(|cc| App::new(cc, handle.clone()));
+        {
+            let app = harness.state_mut();
+            // Chrome-only: skip the 3D wgpu callback (kittest's egui pass has no
+            // depth attachment). Pin the theme via the app's own `forced_dark`
+            // (a plain `ctx.set_theme` gets reset by eframe's per-frame OS read).
+            app.preview_no_viewport = true;
+            app.forced_dark = Some(dark);
+            setup(app);
+        }
+        harness.run_steps(4);
+        harness.snapshot(name);
+        // Leak the harness + runtime: their Drop impls panic inside kittest's
+        // pollster/wgpu block_on context (wgpu device teardown; "cannot drop a
+        // runtime …"). The snapshot is already written and the test process is
+        // short-lived, so leaking is harmless and keeps the run green.
+        std::mem::forget(harness);
+        std::mem::forget(rt);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate app-window previews"]
+    fn app_preview_panel_toggle() {
+        // Verify the collapse/reshow button DOESN'T move vertically. Render with
+        // the panel visible (the collapse button records its y), then hide the
+        // panel — the floating reshow button must appear at that same y.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 900.0))
+            .wgpu()
+            .build_eframe(|cc| App::new(cc, handle.clone()));
+        {
+            let app = harness.state_mut();
+            app.preview_no_viewport = true;
+            app.forced_dark = Some(false);
+        }
+        harness.run_steps(4); // visible → collapse button stores its y
+        harness.state_mut().panel_visible = false;
+        harness.run_steps(4); // hidden → reshow button at the stored y
+        harness.snapshot("app_panel_collapsed");
+        std::mem::forget(harness);
+        std::mem::forget(rt);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate app-window previews"]
+    fn app_preview_chat_toggle() {
+        // Reproduce the input-float bug in the REAL nested layout (deck pane
+        // inside the dock CentralPanel inside Panel::right): EXPAND the chat
+        // input, render frames, then COLLAPSE and render again. The final
+        // snapshot must show the input back at the BOTTOM of the dock.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 900.0))
+            .wgpu()
+            .build_eframe(|cc| App::new(cc, handle.clone()));
+        {
+            let app = harness.state_mut();
+            app.preview_no_viewport = true;
+            app.forced_dark = Some(false);
+        }
+        let id = egui::Id::new("deck_input_expanded");
+        harness.ctx.data_mut(|d| d.insert_temp(id, true));
+        harness.run_steps(4);
+        harness.ctx.data_mut(|d| d.insert_temp(id, false));
+        harness.run_steps(4);
+        harness.snapshot("app_chat_toggle");
+        std::mem::forget(harness);
+        std::mem::forget(rt);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate app-window previews"]
+    fn app_preview_window() {
+        snapshot_app("app_dark", true, |_| {});
+        snapshot_app("app_light", false, |_| {});
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate app-window previews"]
+    fn app_preview_layers() {
+        // Seed a few layers + objects and switch the right dock to the Layers tab.
+        let seed = |app: &mut App| {
+            for line in [
+                "box 0,0,0 5,5,3",
+                "layer walls",
+                "tolayer last walls",
+                "layer structure",
+                "layercolor structure 0.2,0.5,1",
+                "box 1,1,0 2,2,4",
+                "circle 0,0,0 2",
+                "layer grid",
+            ] {
+                app.execute_line(line.to_string());
+            }
+            app.panel_tabs.show(crate::tabstrip::PanelTab::Model); // "Layers"
+        };
+        snapshot_app("layers_dark", true, &seed);
+        snapshot_app("layers_light", false, &seed);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate app-window previews"]
+    fn app_preview_dialog() {
+        // Make an edit (dirty doc), then park a New behind the unsaved-changes
+        // guard so `unsaved_guard_ui` renders the modal alert over the window.
+        let seed = |app: &mut App| {
+            app.execute_line("box 0,0,0 5,5,3".to_string());
+            app.pending_nav = Some(PendingNav::New);
+        };
+        snapshot_app("dialog_dark", true, &seed);
+        snapshot_app("dialog_light", false, &seed);
+    }
+
     #[test]
     fn discard_choice_clears_pending_and_performs_nav() {
         // The user-reported bug: clicking Discard did nothing. The guard's
@@ -4751,6 +5077,31 @@ mod tests {
         let a = nav_action_for(Some(crate::widgets::AlertChoice::Confirm));
         assert!(a.clear_pending, "Discard must clear the parked nav");
         assert!(a.perform, "Discard MUST perform the parked navigation");
+    }
+
+    #[test]
+    fn discard_quit_does_not_loop_forever() {
+        // Regression: after Discard on Quit, perform_nav sets force_close and
+        // sends Close. The next frame's close-request handler must let that close
+        // THROUGH (not re-park a Quit), even though the doc is still dirty —
+        // otherwise the app loops on the alert and never exits.
+        //
+        // Frame with close_requested, dirty, no Quit parked, force_close unset:
+        // intercept (park the Quit + raise the alert).
+        assert!(
+            should_intercept_close(true, false, false, true),
+            "dirty close with no override must be intercepted"
+        );
+        // After Discard: force_close set → the follow-up Close proceeds.
+        assert!(
+            !should_intercept_close(true, true, false, true),
+            "force_close must let the confirmed Discard-quit close through"
+        );
+        // A clean doc never intercepts; a close with no request never intercepts.
+        assert!(!should_intercept_close(true, false, false, false));
+        assert!(!should_intercept_close(false, false, false, true));
+        // A Quit already parked (alert up) must not double-park.
+        assert!(!should_intercept_close(true, false, true, true));
     }
 
     #[test]
