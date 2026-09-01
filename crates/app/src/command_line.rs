@@ -317,6 +317,19 @@ impl CommandLine {
         self.focus_next_frame = true;
     }
 
+    /// Request keyboard focus on the input next frame. Used to keep the command
+    /// line focused-by-default while modelling (Rhino-style: typing in the scene
+    /// goes straight to the command line, no click required).
+    pub fn focus(&mut self) {
+        self.focus_next_frame = true;
+    }
+
+    /// True when the input buffer is empty — the app fires modeless hotkeys
+    /// (Delete, G) only on an empty command line so they don't hijack mid-word.
+    pub fn is_empty(&self) -> bool {
+        self.input.is_empty()
+    }
+
     /// Recompute suggestions when `input` has changed.
     fn refresh_suggestions(
         &mut self,

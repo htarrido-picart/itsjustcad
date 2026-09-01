@@ -917,6 +917,7 @@ impl App {
             }
             Some("recover") => self.recover(),
             Some("ze" | "zoomextents") => self.zoom_extents(),
+            Some("zs" | "zoomselected") => self.zoom_selected(),
             // Display mode of the active viewport. View state, never logged.
             // Verb/mode mapping is shared with the headless runner via app_verbs.
             Some("display") => match words.next().and_then(DisplayMode::parse) {
@@ -1399,6 +1400,100 @@ impl App {
             let cam = self.active_camera();
             cam.target = glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32);
             cam.distance = (bb.size().length() as f32 * 1.2).max(5.0);
+        }
+    }
+
+    /// Modeless-hotkey exceptions (Rhino-style) that STILL fire even though the
+    /// command line is focused-by-default: Delete/Backspace = delete selection,
+    /// Esc = deselect, G = toggle gumball. They act ONLY on an EMPTY command line
+    /// (so typing a word is never hijacked), with focus on the command input or
+    /// nothing, no modal open, and no draw tool active. Runs BEFORE any widget so
+    /// the matched key/text events can be consumed — otherwise the focused input
+    /// would also eat the letter. Everything NOT in this whitelist types normally.
+    fn early_hotkeys(&mut self, ctx: &egui::Context) {
+        let modal = self.show_palette
+            || self.show_about
+            || self.show_history
+            || self.show_model_setup
+            || self.show_template_picker
+            || self.import_job.is_some()
+            || self.import_result.is_some()
+            || self.pending_nav.is_some();
+        let cmd_id = egui::Id::new("command_line_input");
+        let focused = ctx.memory(|m| m.focused());
+        let on_cmd_or_none = focused.is_none() || focused == Some(cmd_id);
+        if modal || self.draw_tool.active() || !on_cmd_or_none || !self.command_line.is_empty() {
+            return;
+        }
+        const EXCEPTIONS: &[egui::Key] = &[
+            egui::Key::Delete,
+            egui::Key::Backspace,
+            egui::Key::Escape,
+            egui::Key::G,
+        ];
+        let pressed: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if EXCEPTIONS.contains(key) => Some((*key, *modifiers)),
+                    _ => None,
+                })
+                .collect()
+        });
+        if pressed.is_empty() {
+            return;
+        }
+        let mut fired_g = false;
+        for (key, mods) in &pressed {
+            let line = keymap::keymap(
+                *key,
+                *mods,
+                keymap::KeyContext {
+                    typing: false,
+                    draw_active: false,
+                    has_selection: !self.session.doc.selection.is_empty(),
+                    last_command: self.last_line.as_deref(),
+                },
+            );
+            if let Some(line) = line {
+                if *key == egui::Key::G {
+                    fired_g = true;
+                }
+                self.execute_line(line);
+            }
+        }
+        // Consume the matched key events (and the 'g' text) so the focused command
+        // input never also receives the keystroke that just drove an action.
+        ctx.input_mut(|i| {
+            i.events.retain(|e| match e {
+                egui::Event::Key { key, .. } => !EXCEPTIONS.contains(key),
+                egui::Event::Text(t) if fired_g => !t.eq_ignore_ascii_case("g"),
+                _ => true,
+            })
+        });
+    }
+
+    /// Rhino "zoom selected" (`zs`): frame ONLY the current selection in the
+    /// active viewport. No selection → a status hint (don't silently reframe to
+    /// the whole scene). Same framing math as [`Self::zoom_extents`].
+    fn zoom_selected(&mut self) {
+        match self.session.doc.selection_aabb() {
+            Some(bb) => {
+                let center = bb.center();
+                let cam = self.active_camera();
+                cam.target =
+                    glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32);
+                cam.distance = (bb.size().length() as f32 * 1.2).max(2.0);
+            }
+            None => self
+                .command_line
+                .push_line("zoom selected: nothing selected (try 'select all' first)"),
         }
     }
 
@@ -4784,6 +4879,10 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // Modeless-hotkey exceptions run BEFORE any widget so their key/text
+        // events can be consumed (the command line is focused-by-default, so the
+        // input would otherwise eat the letter).
+        self.early_hotkeys(&ui.ctx().clone());
         // Attach the true native OS menu bar (muda) on the first interactive
         // frame — no-op in headless/`--shot` (no window) — then drain its click
         // channel each frame and route any pick through the substrate, exactly
@@ -5260,6 +5359,28 @@ impl eframe::App for App {
         // is parked behind the guard.
         let ctx = ui.ctx().clone();
         self.unsaved_guard_ui(&ctx);
+
+        // COMMAND LINE ALWAYS LISTENS (Rhino-style): whenever nothing else owns
+        // the keyboard — e.g. after clicking the viewport, which leaves focus on
+        // no text field — re-focus the command input so typing goes straight to
+        // it without a click. Skip while a draw tool owns the keyboard (numeric
+        // input) or a modal/overlay with its own focus is open (palette, dialogs,
+        // Model Setup) — and never steal from another focused field (the deck
+        // chat input keeps focus because `focused()` is then `Some`).
+        let modal_open = self.show_palette
+            || self.show_about
+            || self.show_history
+            || self.show_model_setup
+            || self.show_template_picker
+            || self.import_job.is_some()
+            || self.import_result.is_some()
+            || self.pending_nav.is_some();
+        if !modal_open
+            && !self.draw_tool.active()
+            && ctx.memory(|m| m.focused()).is_none()
+        {
+            self.command_line.focus();
+        }
     }
 }
 

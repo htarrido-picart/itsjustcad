@@ -34,6 +34,7 @@ These NEVER modify the drawing or the op-log; they frame/style the active viewpo
 
 Framing & standard views:
   ze                                           zoom to fit all geometry (alias: zoomextents)             e.g. ze
+  zs                                           zoom to fit the current SELECTION (alias: zoomselected)   e.g. zs
   top|bottom|front|back|left|right|persp        set a standard view direction                            e.g. top
   view <name>                                   same, by name (perspective = persp)                      e.g. view front
 

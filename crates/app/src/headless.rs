@@ -207,6 +207,10 @@ pub fn run_script_lines(
                 // Framing always tracks the scene extents in headless render;
                 // `ze` is a no-op accumulator (kept for script parity).
             }
+            Some(AppVerb::ZoomSelected) => {
+                // Headless render frames the whole scene; `zs` (zoom selected) has
+                // no per-selection framing here — no-op for script parity.
+            }
             Some(AppVerb::View(v)) => view.view = Some(v),
             Some(AppVerb::Display(mode)) => view.display = mode,
             Some(AppVerb::Light(m)) => view.light = m,

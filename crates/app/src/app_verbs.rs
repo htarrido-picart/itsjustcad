@@ -24,6 +24,8 @@ use itsjustcad_render::{DisplayMode, LightMode, StandardView};
 pub enum AppVerb {
     /// Frame the scene extents (`ze` / `zoomextents`).
     ZoomExtents,
+    /// Frame only the current selection (`zs` / `zoomselected`).
+    ZoomSelected,
     /// Standard view direction (`top`/`front`/`persp`/…).
     View(StandardView),
     /// Camera projection / lens
@@ -152,6 +154,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
     let verb = words.next()?;
     Some(match verb {
         "ze" | "zoomextents" => AppVerb::ZoomExtents,
+        "zs" | "zoomselected" => AppVerb::ZoomSelected,
         "display" => AppVerb::Display(words.next().and_then(DisplayMode::parse)?),
         "lightmode" | "light" => AppVerb::Light(words.next().and_then(LightMode::parse)?),
         "profileedges" | "profiles" => AppVerb::ProfileEdges(match words.next() {
@@ -207,6 +210,8 @@ mod tests {
     fn classifies_view_verbs() {
         assert_eq!(classify("ze"), Some(AppVerb::ZoomExtents));
         assert_eq!(classify("zoomextents"), Some(AppVerb::ZoomExtents));
+        assert_eq!(classify("zs"), Some(AppVerb::ZoomSelected));
+        assert_eq!(classify("zoomselected"), Some(AppVerb::ZoomSelected));
         assert_eq!(classify("front"), Some(AppVerb::View(StandardView::Front)));
         assert_eq!(classify("persp"), Some(AppVerb::View(StandardView::Perspective)));
     }
@@ -339,6 +344,8 @@ mod tests {
         "gumball",
         "ze",
         "zoomextents",
+        "zs",
+        "zoomselected",
         "top",
         "bottom",
         "front",
@@ -379,6 +386,8 @@ mod tests {
         let all_classify_tokens = [
             "ze",
             "zoomextents",
+            "zs",
+            "zoomselected",
             "display",
             "lightmode",
             "light",

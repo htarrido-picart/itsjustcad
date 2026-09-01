@@ -298,6 +298,15 @@ impl Document {
             .map(|o| o.geometry.aabb())
             .reduce(Aabb::union)
     }
+
+    /// AABB over the currently-SELECTED objects (Rhino "zoom selected"). `None`
+    /// when nothing is selected.
+    pub fn selection_aabb(&self) -> Option<Aabb> {
+        self.objects()
+            .filter(|o| self.selection.contains(&o.id))
+            .map(|o| o.geometry.aabb())
+            .reduce(Aabb::union)
+    }
 }
 
 /// Pure pick expansion: `id` plus the members of every group containing it.
