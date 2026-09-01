@@ -275,6 +275,19 @@ pub fn to_color32(c: Rgba) -> egui::Color32 {
     )
 }
 
+/// A RECESSED panel surface: noticeably DARKER than `surface` in dark mode (a
+/// light neutral grey in light mode). Used for the docked panel's content area
+/// and its active (folder) tab so the whole active panel reads as one distinct,
+/// darker block against the surrounding app chrome / viewport — while unselected
+/// tabs stay on the lighter `surface` and appear raised behind it.
+pub fn recessed_fill(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgb(22, 22, 25)
+    } else {
+        egui::Color32::from_rgb(228, 230, 234)
+    }
+}
+
 /// Colors for the ACTIVE viewport's name tag — a Rhino-style title highlight.
 /// The tag fills with a blue chip and paints its label in a contrasting blue.
 /// Returned as `(chip_fill, label_text)`; both clear WCAG AA (≥4.5:1) against

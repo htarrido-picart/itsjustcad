@@ -121,6 +121,10 @@ impl TabState {
 
 /// Draw the panel tab strip. Returns the tab clicked this frame, if any. The
 /// caller applies the click to its [`TabState`] and paints the active body.
+/// Vertical inner padding of a tab (px). Shared so the hide-panel button beside
+/// the strip can be forced to the SAME height (`body text + 2×TAB_V_PAD`).
+pub const TAB_V_PAD: f32 = 6.0;
+
 pub fn strip_ui(
     ui: &mut egui::Ui,
     icons: &crate::icons::Icons,
@@ -135,12 +139,16 @@ pub fn strip_ui(
     // (`window_fill`) so it reads raised, unselected tabs use the recessed inset
     // (`faint_bg_color` = surface_variant). Both stay coherent with the dock in
     // dark and light without magic numbers.
-    // Folder look: the SELECTED tab uses the PANEL surface (same fill as the dock
-    // content below it) so it reads as one continuous folder surface wrapping the
-    // panel — no seam between the active tab and its content. Unselected tabs use
-    // the recessed inset so they sit "behind".
-    let sel_fill = ui.visuals().panel_fill;
-    let unsel_fill = ui.visuals().faint_bg_color;
+    // Folder look. DARK: selected tab = recessed (darker) surface matching the
+    // dock content so it wraps as one dark block; unselected = the lighter panel
+    // surface (raised behind). LIGHT was already good — selected = panel surface,
+    // unselected = the recessed inset.
+    let dark = ui.visuals().dark_mode;
+    let (sel_fill, unsel_fill) = if dark {
+        (crate::theme::recessed_fill(true), ui.visuals().panel_fill)
+    } else {
+        (ui.visuals().panel_fill, ui.visuals().faint_bg_color)
+    };
     let top_round = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
@@ -152,12 +160,14 @@ pub fn strip_ui(
             } else {
                 ui.visuals().weak_text_color()
             };
+            // Vertical padding = 6 (see TAB_V_PAD): tabs get a little more presence
+            // and the hide-panel button matches this exact height.
             let mut frame = egui::Frame::NONE
                 .fill(if selected { sel_fill } else { unsel_fill })
                 .corner_radius(top_round)
                 .inner_margin(egui::Margin::symmetric(
                     crate::theme::Spacing::SM as i8,
-                    crate::theme::Spacing::XS as i8,
+                    crate::tabstrip::TAB_V_PAD as i8,
                 ));
             if selected {
                 frame = frame.shadow(egui::epaint::Shadow {

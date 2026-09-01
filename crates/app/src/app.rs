@@ -2871,7 +2871,13 @@ impl App {
                 ui.add_space(2.0);
             });
 
-        egui::ScrollArea::vertical()
+        // BOTH-axis scroll: the 7-column table (with Linetype/Print combos) is
+        // wider than the dock's DOCK_MIN. A vertical-only scroll let that content
+        // width force the panel wider than Chat/Sessions and blocked resizing it
+        // narrow. Allowing horizontal scroll decouples the table width from the
+        // panel width, so the Layers tab resizes like the others (wide table just
+        // scrolls sideways).
+        egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // Dense list rows opt back down to the 24px group floor: the
@@ -3195,14 +3201,29 @@ impl App {
 
     /// Bottom strip: cursor coords, active layer, counts, snap state, view.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        // Compute the gumball chip's theme colours BEFORE borrowing doc/cam — a
-        // `&self` method call (live_roles) inside the closure would conflict with
-        // the `cam` borrow (E0500).
-        let gumball_roles = self.live_roles(ui.visuals().dark_mode);
         let doc = &self.session.doc;
         let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
         ui.horizontal(|ui| {
-            ui.monospace(crate::statusbar::format_cursor(doc.units, self.status_cursor));
+            // Fixed-width slot for the x/y/z readout so growing coordinate values
+            // never widen it and shift the rest of the status bar. The text is
+            // left-aligned within a constant 260px region (overflow clips rather
+            // than pushing the toolbar).
+            ui.allocate_ui_with_layout(
+                egui::vec2(260.0, ui.available_height()),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(crate::statusbar::format_cursor(
+                                doc.units,
+                                self.status_cursor,
+                            ))
+                            .monospace(),
+                        )
+                        .truncate(),
+                    );
+                },
+            );
             ui.separator();
             ui.label(format!("layer: {}", doc.current_layer));
             ui.separator();
@@ -3224,21 +3245,20 @@ impl App {
             // wrong in dark): ON = accent fill + on-accent text; OFF = transparent
             // + dimmed text. Colours come from the LIVE theme, not a fixed preset.
             let on = self.show_gumball;
-            let roles = gumball_roles;
-            let (fill, txt) = if on {
-                (crate::theme::to_color32(roles.primary), egui::Color32::WHITE)
-            } else {
-                (
-                    egui::Color32::TRANSPARENT,
-                    crate::theme::to_color32(roles.on_surface_variant),
-                )
-            };
+            // ON = filled chip in the tuned viewport-active blue (SAME blue as the
+            // user chat bubble — the raw accent read washed/light in dark). OFF =
+            // FRAMELESS dimmed text (`frame(false)` — a transparent fill alone
+            // still leaves egui's widget frame, which read as a wrong grey box).
+            let (on_fill, on_txt) = crate::theme::viewport_active_tag(ui.visuals().dark_mode);
+            let txt = if on { on_txt } else { ui.visuals().weak_text_color() };
+            let mut btn = egui::Button::new(egui::RichText::new("gumball").color(txt))
+                .frame(on)
+                .corner_radius(egui::CornerRadius::same(4));
+            if on {
+                btn = btn.fill(on_fill);
+            }
             if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("gumball").color(txt))
-                        .fill(fill)
-                        .corner_radius(egui::CornerRadius::same(4)),
-                )
+                .add(btn)
                 .on_hover_text("Toggle transform gizmo (G)")
                 .clicked()
             {
@@ -3407,10 +3427,14 @@ impl App {
         // Route the dock fill through the MODE-CORRECT surface role (dark ramp
         // base ≈ rgb 36,36,40; light ≈ white) rather than a hardcoded magic
         // number, so the dock, chat, and command line share one coherent surface.
-        let accent = preset::preset_for(self.cad_origin).tokens().colors.primary;
-        let dock_fill = crate::theme::to_color32(
-            crate::theme::roles_for_mode(ui.visuals().dark_mode, accent).surface,
-        );
+        // DARK ONLY: a recessed (darker) surface so the whole docked panel reads
+        // as one distinct block against the viewport. Light mode was already good
+        // — leave it on the normal panel surface.
+        let dock_fill = if ui.visuals().dark_mode {
+            crate::theme::recessed_fill(true)
+        } else {
+            ui.visuals().panel_fill
+        };
         panel = panel.frame(
             egui::Frame::side_top_panel(ui.style())
                 .fill(dock_fill)
@@ -3443,10 +3467,10 @@ impl App {
         let panel_resp = panel.show(ui, |ui| {
             // Header row: chevron + tab strip.
             ui.horizontal(|ui| {
-                // Match the folder-tab height so the hide button lines up with the
-                // strip (tab = body text + 2×XS margin).
+                // Match the folder-tab height exactly (tab = body text + 2×the
+                // shared tab vertical padding).
                 let tab_h = ui.text_style_height(&egui::TextStyle::Body)
-                    + 2.0 * crate::theme::Spacing::XS;
+                    + 2.0 * crate::tabstrip::TAB_V_PAD;
                 let close = self.icons.icon_button_min_h(
                     ui,
                     crate::icons::Icon::PanelClose,
@@ -3472,6 +3496,9 @@ impl App {
             if self.panel_tabs.is_collapsed() {
                 return;
             }
+            // Breathing room below the tab strip so each tab's top content (deck
+            // selectors, search field, Layers header) doesn't hug the tabs.
+            ui.add_space(crate::theme::Spacing::SM);
             // The command line USED to be docked at the bottom of this right panel.
             // It now lives as a top-level, full-width bottom panel at the very
             // bottom of the window (see `command_line_panel` in `ui()`), which

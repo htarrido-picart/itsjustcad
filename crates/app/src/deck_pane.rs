@@ -558,8 +558,30 @@ impl Default for DeckPane {
                 &sid[..sid.len().min(8)]
             )));
         }
+        let mut decks = DecksFile::load_or_default();
+        // Prune DANGLING local cassettes: a `local-<id>` deck whose model is no
+        // longer in the catalog (e.g. a removed/renamed model) is an orphan — its
+        // weights were likely deleted and it just clutters the deck list under
+        // "local only". Drop those + clamp the active index. Persist so it stays
+        // gone even if the app previously re-saved it from memory.
+        {
+            let catalog = crate::model_catalog::Catalog::load();
+            let before = decks.decks.len();
+            decks.decks.retain(|d| {
+                match d.name.strip_prefix("local-") {
+                    Some(id) => catalog.get(id).is_some(), // known model → keep
+                    None => true,                          // not a local cassette → keep
+                }
+            });
+            if decks.decks.len() != before {
+                if decks.active >= decks.decks.len() {
+                    decks.active = decks.decks.len().saturating_sub(1);
+                }
+                decks.save();
+            }
+        }
         Self {
-            decks: DecksFile::load_or_default(),
+            decks,
             input: String::new(),
             transcript,
             messages: saved.messages,
@@ -1041,10 +1063,12 @@ impl DeckPane {
             0.2,
             self.session_id.clone(),
         );
-        // Opt-in web search: only set when the user toggled it on. Off keeps the
-        // request tool-free (offline/sealed). Cassettes that don't support it
-        // ignore the flag.
-        req.web_search = self.allow_web_search;
+        // Opt-in web search: only when the user toggled it on AND we are not in
+        // local-only mode. Local-only means SEALED/offline — it must hard-block
+        // web search regardless of the toggle's last state (the toggle can be
+        // stale-on if local-only was enabled after it was set). This is the
+        // request-level guarantee, independent of the UI disabling the toggle.
+        req.web_search = self.allow_web_search && !self.decks.local_only;
         if self.vision_turn {
             // SECURITY (H-1): grant NO unscoped Read. Instead point the adapter
             // at a SINGLE fixed image — either the user-attached image or the
@@ -1683,7 +1707,13 @@ impl DeckPane {
         // inside a grey panel. In dark mode this is the ramp base (≈ rgb 36,36,40)
         // — a distinct, slightly-lifted panel, NOT pure black — matching the dock
         // and command line. The dock's own inner margin supplies the padding.
-        let pane_bg = crate::theme::to_color32(roles.surface);
+        // Dark: match the dock's RECESSED surface (one dark block). Light: the
+        // normal surface (light mode was already correct).
+        let pane_bg = if ui.visuals().dark_mode {
+            crate::theme::recessed_fill(true)
+        } else {
+            crate::theme::to_color32(roles.surface)
+        };
         ui.painter().rect_filled(ui.max_rect(), 0.0, pane_bg);
 
         // Deck status collapsed to a single traffic-light dot next to the model
@@ -2156,11 +2186,11 @@ impl DeckPane {
         // the model's align LEFT (the ELEVATED role — a lifted grey/white chip
         // that reads against the panel surface in both themes).
         let transcript_bg = pane_bg;
-        // User bubble uses the app's ONE accent (theme `primary`) so every blue in
-        // the UI — selection highlight, active state, the user chip — is the SAME
-        // blue. Deck bubble uses the elevated grey surface.
-        let user_bg = crate::theme::to_color32(roles.primary);
-        let user_txt = egui::Color32::WHITE; // on the saturated accent
+        // User bubble uses the tuned viewport-active-tag blue pair (a nice deep
+        // blue in dark, light-blue in light) — the SAME blue the gumball-active
+        // chip uses, so the app's chat/accent blue is consistent and reads well in
+        // dark (the raw bright accent looked washed there). Deck bubble = elevated.
+        let (user_bg, user_txt) = crate::theme::viewport_active_tag(ui.visuals().dark_mode);
         let deck_bg = crate::theme::to_color32(roles.surface_elevated);
         let bubble_radius = egui::CornerRadius::same(10);
         egui::Frame::NONE
