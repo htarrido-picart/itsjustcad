@@ -342,6 +342,13 @@ impl CommandLine {
     /// current token in the input and appending a trailing space.
     fn accept_suggestion(&mut self) {
         let idx = self.suggest_sel.unwrap_or(0);
+        self.accept_suggestion_at(idx);
+    }
+
+    /// Accept the suggestion at `idx` (used by both keyboard accept and mouse
+    /// click), completing the current token in the input and appending a
+    /// trailing space.
+    fn accept_suggestion_at(&mut self, idx: usize) {
         if let Some(s) = self.suggestions.get(idx) {
             let completion = s.completion.clone();
             // Replace the last whitespace-delimited token with the completion.
@@ -360,6 +367,8 @@ impl CommandLine {
             self.suggest_dismissed = true; // hide popup after accepting
             self.suggestions.clear();
             self.suggest_sel = None;
+            // Re-focus the input so the user can keep typing after a click.
+            self.focus_next_frame = true;
         }
     }
 
@@ -444,33 +453,87 @@ impl CommandLine {
             let accent_fill = ui.visuals().selection.bg_fill;
             let accent_stroke = ui.visuals().selection.stroke.color;
             let on_accent = egui::Color32::WHITE;
+            // Which entry, if any, the user clicked — applied after the loop so we
+            // don't mutate `self` while borrowing `self.suggestions`.
+            let mut clicked: Option<usize> = None;
             for (i, s) in self.suggestions.iter().enumerate() {
                 let label = if let Some(u) = &s.usage {
                     format!("{:<20} {}", s.completion, u)
                 } else {
                     s.completion.clone()
                 };
-                if i == sel {
+                let response = if i == sel {
                     // Selected row: accent background fill + white text (menu style).
                     let text = egui::RichText::new(&label)
                         .monospace()
                         .strong()
                         .color(on_accent);
-                    egui::Frame::new()
+                    let inner = egui::Frame::new()
                         .fill(accent_fill)
                         .corner_radius(egui::CornerRadius::same(3))
                         .inner_margin(egui::Margin::symmetric(4, 1))
                         .show(ui, |ui| {
-                            ui.add(egui::Label::new(text).extend());
+                            ui.add(
+                                egui::Label::new(text)
+                                    .extend()
+                                    .sense(egui::Sense::click()),
+                            )
                         });
                     let _ = accent_stroke; // kept for clarity, not needed now
+                    // Make the whole framed row (incl. margin) clickable.
+                    inner
+                        .response
+                        .interact(egui::Sense::click())
+                        .union(inner.inner)
                 } else {
                     let text = egui::RichText::new(&label).monospace().weak();
-                    ui.label(text);
+                    ui.add(egui::Label::new(text).sense(egui::Sense::click()))
+                };
+                // Pointer cursor + click-to-accept: mirrors Tab/accept.
+                let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if response.clicked() {
+                    clicked = Some(i);
                 }
+            }
+            if let Some(i) = clicked {
+                self.accept_suggestion_at(i);
             }
             ui.separator();
         }
+    }
+
+    /// Up-arrow history recall: step towards older entries. From the live
+    /// (empty) line, the first Up lands on the newest recall entry.
+    fn recall_prev(&mut self) {
+        if self.recall.is_empty() {
+            return;
+        }
+        let pos = match self.recall_pos {
+            Some(p) if p > 0 => p - 1,
+            Some(p) => p, // already at oldest — stay
+            None => self.recall.len() - 1,
+        };
+        self.recall_pos = Some(pos);
+        self.input = self.recall[pos].clone();
+        self.suggest_for.clear();
+    }
+
+    /// Down-arrow history recall: step towards newer entries. Pressing Down at
+    /// the newest recalled entry cycles back to the live (empty) line — so the
+    /// user always returns to "latest". A no-op when not currently recalling.
+    fn recall_next(&mut self) {
+        let Some(p) = self.recall_pos else {
+            return;
+        };
+        if p + 1 < self.recall.len() {
+            self.recall_pos = Some(p + 1);
+            self.input = self.recall[p + 1].clone();
+        } else {
+            // At the newest recalled entry: cycle back to the live line.
+            self.recall_pos = None;
+            self.input.clear();
+        }
+        self.suggest_for.clear();
     }
 
     /// The prompt + text input row, with history recall, popup navigation and
@@ -511,25 +574,11 @@ impl CommandLine {
                 // Only engage history when the popup is not showing, to avoid
                 // conflicts between the two navigation modes.
                 if !show_popup {
-                    if up && !self.recall.is_empty() {
-                        let pos = match self.recall_pos {
-                            Some(p) if p > 0 => p - 1,
-                            Some(p) => p,
-                            None => self.recall.len() - 1,
-                        };
-                        self.recall_pos = Some(pos);
-                        self.input = self.recall[pos].clone();
-                        self.suggest_for.clear();
+                    if up {
+                        self.recall_prev();
                     }
-                    if down && let Some(p) = self.recall_pos {
-                        if p + 1 < self.recall.len() {
-                            self.recall_pos = Some(p + 1);
-                            self.input = self.recall[p + 1].clone();
-                        } else {
-                            self.recall_pos = None;
-                            self.input.clear();
-                        }
-                        self.suggest_for.clear();
+                    if down {
+                        self.recall_next();
                     }
                 } else {
                     // ── Popup navigation (Up/Down while popup is visible) ─
@@ -683,6 +732,92 @@ mod tests {
         cl.suggest_sel = Some(0);
         cl.accept_suggestion();
         assert!(cl.suggest_dismissed, "popup should be dismissed after accept");
+    }
+
+    // ── History recall state machine ────────────────────────────────────────
+
+    /// A CommandLine primed with three recall entries and a live (empty) line.
+    fn recall_cl() -> CommandLine {
+        CommandLine {
+            recall: vec!["a".into(), "b".into(), "c".into()],
+            recall_pos: None,
+            ..CommandLine::default()
+        }
+    }
+
+    #[test]
+    fn recall_up_walks_from_newest_to_oldest() {
+        let mut cl = recall_cl();
+        cl.recall_prev();
+        assert_eq!((cl.recall_pos, cl.input.as_str()), (Some(2), "c"));
+        cl.recall_prev();
+        assert_eq!((cl.recall_pos, cl.input.as_str()), (Some(1), "b"));
+        cl.recall_prev();
+        assert_eq!((cl.recall_pos, cl.input.as_str()), (Some(0), "a"));
+        // At the oldest, further Up stays put.
+        cl.recall_prev();
+        assert_eq!((cl.recall_pos, cl.input.as_str()), (Some(0), "a"));
+    }
+
+    #[test]
+    fn recall_down_at_newest_cycles_back_to_latest() {
+        let mut cl = recall_cl();
+        // Recall the newest entry, then Down should return to the live line.
+        cl.recall_prev();
+        assert_eq!((cl.recall_pos, cl.input.as_str()), (Some(2), "c"));
+        cl.recall_next();
+        assert_eq!(cl.recall_pos, None, "Down at newest cycles back to latest");
+        assert_eq!(cl.input, "", "live line is empty after cycling back");
+    }
+
+    #[test]
+    fn recall_down_steps_toward_newer_then_cycles() {
+        let mut cl = recall_cl();
+        // Walk up to the oldest, then Down should move newer each press...
+        cl.recall_prev(); // c
+        cl.recall_prev(); // b
+        cl.recall_prev(); // a
+        cl.recall_next();
+        assert_eq!((cl.recall_pos, cl.input.as_str()), (Some(1), "b"));
+        cl.recall_next();
+        assert_eq!((cl.recall_pos, cl.input.as_str()), (Some(2), "c"));
+        // ...and finally cycle back to the live line.
+        cl.recall_next();
+        assert_eq!(cl.recall_pos, None);
+        assert_eq!(cl.input, "");
+    }
+
+    #[test]
+    fn recall_down_on_live_line_is_noop() {
+        let mut cl = recall_cl();
+        cl.recall_next();
+        assert_eq!(cl.recall_pos, None);
+        assert_eq!(cl.input, "");
+    }
+
+    #[test]
+    fn recall_prev_empty_history_is_noop() {
+        let mut cl = CommandLine::default();
+        cl.recall_prev();
+        assert_eq!(cl.recall_pos, None);
+        assert_eq!(cl.input, "");
+    }
+
+    #[test]
+    fn accept_suggestion_at_index_completes_and_refocuses() {
+        // Mirrors the click path: accept a specific suggestion by index.
+        let mut cl = CommandLine { input: "bo".to_string(), ..CommandLine::default() };
+        cl.refresh_suggestions(&[], &[]);
+        let idx = cl
+            .suggestions
+            .iter()
+            .position(|s| s.completion == "box")
+            .expect("box suggestion present");
+        cl.focus_next_frame = false;
+        cl.accept_suggestion_at(idx);
+        assert_eq!(cl.input, "box ");
+        assert!(cl.suggest_dismissed, "popup dismissed after click-accept");
+        assert!(cl.focus_next_frame, "input re-focused after click-accept");
     }
 
     // ── Plugins ─────────────────────────────────────────────────────────────

@@ -883,8 +883,19 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             Ok(Command::ControlImages { prefix: prefix.to_string() })
         }
         "import" => {
-            let [path] = take::<1>("import", "an input path (.dxf/.obj/.stl/.gltf/.glb/.dae/.geojson/.las/.e57)", &args)?;
-            Ok(Command::Import { path: path.to_string() })
+            // Join all args into one path so paths containing spaces (e.g.
+            // "Casa Dos Mangos.3dm") survive whitespace tokenization. Same
+            // approach as `layer_name_all` for Rhino layer names with spaces.
+            // The extension list here must stay in sync with the accepted set
+            // dispatched in exec.rs::import (and the registry usage string).
+            if args.is_empty() {
+                return Err(wrong_err(
+                    "import",
+                    "an input path (.dxf/.obj/.stl/.gltf/.glb/.dae/.3dm/.step/.stp/.ifc/.epw/.geojson/.las/.e57)",
+                    &args,
+                ));
+            }
+            Ok(Command::Import { path: args.join(" ") })
         }
         "terrain" => {
             let [path] = take::<1>("terrain", "a .csv or .geojson path", &args)?;
@@ -3350,7 +3361,20 @@ mod tests {
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, back);
         assert!(parse("import").unwrap_err().to_string().contains("path"));
-        assert!(parse("import a b").unwrap_err().to_string().contains("path"));
+
+        // Paths containing spaces must survive tokenization (Rhino files often
+        // live under spaced directory names, e.g. "Casa Dos Mangos").
+        assert_eq!(
+            parse("import /Users/me/Casa Dos Mangos/Casa Dos Mangos.3dm").unwrap(),
+            Command::Import { path: "/Users/me/Casa Dos Mangos/Casa Dos Mangos.3dm".into() },
+        );
+
+        // A bare `.3dm` path parses to an Import (dispatch by extension happens
+        // in exec.rs; here we only confirm parse accepts it).
+        assert_eq!(
+            parse("import /tmp/model.3dm").unwrap(),
+            Command::Import { path: "/tmp/model.3dm".into() },
+        );
     }
 
     #[test]
