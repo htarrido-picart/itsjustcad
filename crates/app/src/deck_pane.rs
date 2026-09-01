@@ -125,13 +125,11 @@ fn chat_is_empty(transcript: &[Entry], streaming: &str) -> bool {
 /// — so they read as raised buttons on the white dock. Wrap a widget in this and
 /// set `visuals.widgets.inactive.weak_bg_fill = TRANSPARENT` inside so the
 /// widget's own grey fill doesn't cover the chip white.
-fn header_chip_frame(dark: bool) -> egui::Frame {
+fn header_chip_frame(roles: &crate::theme::ColorRoles) -> egui::Frame {
+    // A raised chip on the chat surface: the ELEVATED role (dark ≈ rgb 46,46,50;
+    // light = white) so it reads lifted above the panel in both themes.
     egui::Frame::NONE
-        .fill(if dark {
-            egui::Color32::from_rgb(48, 48, 52)
-        } else {
-            egui::Color32::WHITE
-        })
+        .fill(crate::theme::to_color32(roles.surface_elevated))
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::XS as i8, 2))
         .shadow(egui::epaint::Shadow {
@@ -1679,15 +1677,13 @@ impl DeckPane {
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
 
-        // Uniform chat surface: paint the WHOLE pane white (dark-neutral in dark
-        // mode) so the LLM toolbar, transcript, and input card all sit on ONE
+        // Uniform chat surface: paint the WHOLE pane with the panel `surface`
+        // role so the LLM toolbar, transcript, and input card all sit on ONE
         // background with consistent padding — not a tinted transcript band
-        // inside a grey panel. The dock's own inner margin supplies the padding.
-        let pane_bg = if ui.visuals().dark_mode {
-            egui::Color32::from_rgb(32, 32, 34)
-        } else {
-            egui::Color32::WHITE
-        };
+        // inside a grey panel. In dark mode this is the ramp base (≈ rgb 36,36,40)
+        // — a distinct, slightly-lifted panel, NOT pure black — matching the dock
+        // and command line. The dock's own inner margin supplies the padding.
+        let pane_bg = crate::theme::to_color32(roles.surface);
         ui.painter().rect_filled(ui.max_rect(), 0.0, pane_bg);
 
         // Deck status collapsed to a single traffic-light dot next to the model
@@ -1739,7 +1735,7 @@ impl DeckPane {
                 .visible_decks()
                 .map(|(i, d)| (i, d.name.clone()))
                 .collect();
-            header_chip_frame(ui.visuals().dark_mode).show(ui, |ui| {
+            header_chip_frame(roles).show(ui, |ui| {
                 ui.style_mut().visuals.widgets.inactive.weak_bg_fill =
                     egui::Color32::TRANSPARENT;
                 ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
@@ -1778,7 +1774,7 @@ impl DeckPane {
                 && let Some(config) = self.decks.decks.get_mut(self.decks.active)
             {
                 let mut model = config.model.clone();
-                header_chip_frame(ui.visuals().dark_mode).show(ui, |ui| {
+                header_chip_frame(roles).show(ui, |ui| {
                     ui.style_mut().visuals.widgets.inactive.weak_bg_fill =
                         egui::Color32::TRANSPARENT;
                     ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
@@ -1866,7 +1862,6 @@ impl DeckPane {
                     .data_mut(|d| d.insert_temp(status_modal_id, open));
             }
         }
-        ui.separator();
 
         // The session browser used to live here inside the Chat pane; it has
         // been promoted OUT into its own "Sessions" tab (see `sessions_tab_ui`),
@@ -2156,23 +2151,18 @@ impl DeckPane {
             });
 
         // ── Transcript fills the remaining space ───────────────────────────
-        // Same white surface as the rest of the pane (uniform background).
-        // WhatsApp/Signal-style bubbles: user messages align RIGHT (blue), the
-        // model's align LEFT (a light grey chip so it reads against the white).
+        // Same `surface` as the rest of the pane (uniform background).
+        // WhatsApp/Signal-style bubbles: user messages align RIGHT (a blue chip),
+        // the model's align LEFT (the ELEVATED role — a lifted grey/white chip
+        // that reads against the panel surface in both themes).
         let transcript_bg = pane_bg;
-        let (user_bg, deck_bg) = if ui.visuals().dark_mode {
-            (
-                egui::Color32::from_rgb(30, 58, 95),
-                egui::Color32::from_rgb(52, 52, 55),
-            )
-        } else {
-            (
-                egui::Color32::from_rgb(219, 234, 254),
-                egui::Color32::from_rgb(238, 239, 242),
-            )
-        };
+        // User bubble uses the app's ONE accent (theme `primary`) so every blue in
+        // the UI — selection highlight, active state, the user chip — is the SAME
+        // blue. Deck bubble uses the elevated grey surface.
+        let user_bg = crate::theme::to_color32(roles.primary);
+        let user_txt = egui::Color32::WHITE; // on the saturated accent
+        let deck_bg = crate::theme::to_color32(roles.surface_elevated);
         let bubble_radius = egui::CornerRadius::same(10);
-        let bubble_txt = crate::theme::to_color32(roles.on_surface);
         egui::Frame::NONE
             .fill(transcript_bg)
             .inner_margin(egui::Margin::ZERO)
@@ -2213,7 +2203,7 @@ impl DeckPane {
                                                 .show(ui, |ui| {
                                                     ui.set_max_width(ui.available_width() * 0.82);
                                                     ui.label(
-                                                        egui::RichText::new(t).color(bubble_txt),
+                                                        egui::RichText::new(t).color(user_txt),
                                                     );
                                                 });
                                         },

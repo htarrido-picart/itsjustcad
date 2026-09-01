@@ -130,18 +130,17 @@ pub fn strip_ui(
     // Folder-style tabs: rounded TOP corners only; the SELECTED tab is WHITE with
     // a soft shadow (raised), unselected tabs are a recessed off-white. Reads like
     // a row of file folders sitting on the panel below.
-    let dark = ui.visuals().dark_mode;
-    let (sel_fill, unsel_fill) = if dark {
-        (
-            egui::Color32::from_rgb(52, 52, 56),
-            egui::Color32::from_rgb(34, 34, 36),
-        )
-    } else {
-        // Unselected clearly grey so the WHITE selected tab pops against its
-        // neighbours (a white-on-white dock gives the selected tab no contrast
-        // otherwise).
-        (egui::Color32::WHITE, egui::Color32::from_rgb(220, 220, 224))
-    };
+    // Route tab fills through the LIVE theme's surface ramp (set by
+    // `theme::apply_colors`): the SELECTED tab uses the ELEVATED role
+    // (`window_fill`) so it reads raised, unselected tabs use the recessed inset
+    // (`faint_bg_color` = surface_variant). Both stay coherent with the dock in
+    // dark and light without magic numbers.
+    // Folder look: the SELECTED tab uses the PANEL surface (same fill as the dock
+    // content below it) so it reads as one continuous folder surface wrapping the
+    // panel — no seam between the active tab and its content. Unselected tabs use
+    // the recessed inset so they sit "behind".
+    let sel_fill = ui.visuals().panel_fill;
+    let unsel_fill = ui.visuals().faint_bg_color;
     let top_round = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;

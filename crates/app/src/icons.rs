@@ -356,10 +356,23 @@ impl Icons {
         icon: Icon,
         hover: &str,
     ) -> egui::Response {
+        self.icon_button_min_h(ui, icon, hover, 0.0)
+    }
+
+    /// Like [`Self::icon_button`] but forces a minimum button HEIGHT — used to
+    /// line the hide-panel button up with the folder tab strip beside it (which
+    /// is taller than a default framed icon button).
+    pub fn icon_button_min_h(
+        &self,
+        ui: &mut egui::Ui,
+        icon: Icon,
+        hover: &str,
+        min_h: f32,
+    ) -> egui::Response {
         let size = ui.text_style_height(&egui::TextStyle::Body);
         let color = ui.visuals().text_color();
         let img = self.image(ui.ctx(), icon, size, color);
-        ui.add(egui::Button::image(img).frame(true))
+        ui.add(egui::Button::image(img).frame(true).min_size(egui::vec2(0.0, min_h)))
             .on_hover_text(hover)
     }
 

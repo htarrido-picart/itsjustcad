@@ -300,6 +300,30 @@ pub fn viewport_active_tag(dark: bool) -> (egui::Color32, egui::Color32) {
 /// Used by skins that only pin a background + accent (grid/crosshair aside):
 /// the on-surface, variant, and outline roles are computed by luminance offset
 /// so light and dark skins stay internally consistent.
+/// Canonical DARK-mode chrome surface (rgb 36,36,40). The dark elevation ramp
+/// is derived from this: dock/panel `surface` ≈ (36,36,40), inset
+/// `surface_variant` ≈ (49,49,53), and elevated chips/bubbles
+/// `surface_elevated` ≈ (46,46,50) — a coherent "not pure-black" ramp that
+/// replaces the old scattered `rgb(32,32,34)` magic numbers.
+pub const DARK_SURFACE: Rgba = [36.0 / 255.0, 36.0 / 255.0, 40.0 / 255.0, 1.0];
+
+/// Canonical LIGHT-mode chrome surface (near-white). Overlays lift to pure white
+/// via `surface_elevated`.
+pub const LIGHT_SURFACE: Rgba = [0.93, 0.93, 0.94, 1.0];
+
+/// Build the color roles for a given *theme mode* (dark/light), keeping the
+/// skin's `accent`. This is the mode-correct entry point used by [`apply`] and
+/// by draw code that must follow the LIVE egui theme (`ui.visuals().dark_mode`),
+/// NOT the preset's default mode. Using a preset's single palette for both
+/// themes is what painted off-whites onto dark surfaces.
+pub fn roles_for_mode(dark: bool, accent: Rgba) -> ColorRoles {
+    if dark {
+        roles_from(DARK_SURFACE, accent)
+    } else {
+        roles_from(LIGHT_SURFACE, accent)
+    }
+}
+
 pub fn roles_from(surface: Rgba, accent: Rgba) -> ColorRoles {
     let dark = is_dark(surface);
     // Offset a channel toward white (dark bg) or black (light bg).
@@ -333,7 +357,12 @@ pub fn roles_from(surface: Rgba, accent: Rgba) -> ColorRoles {
     // Elevated surface: lighter than `surface` on dark skins (elevation-by-color),
     // near-white on light skins so overlays lift off the panel.
     let surface_elevated = if dark {
-        shift(surface, 0.06)
+        // A clearly-lifted top tier (elevation-by-color): chips, cards, popovers,
+        // the selected tab, and the assistant chat bubble read as raised ABOVE
+        // the panel `surface`. A wider step than `surface_variant` (0.05) so the
+        // ramp surface → variant → elevated is legible, not three near-identical
+        // greys.
+        shift(surface, 0.10)
     } else {
         [1.0, 1.0, 1.0, surface[3]]
     };
@@ -368,20 +397,45 @@ pub fn apply(ctx: &egui::Context, tokens: &Tokens) {
     });
 
     let t = *tokens;
-    // Style BOTH themes' Style objects, not just the active one. egui keeps a
-    // SEPARATE Style per Theme; previously we styled only the current theme, so
-    // switching to the other theme at runtime dropped our design tokens and fell
-    // back to egui defaults. That default TextEdit metric rendered ~1px beyond its
-    // allocation each frame, and since a resizable panel stores its content's
-    // rendered rect as its height, the command line grew ~1px/frame in the
-    // unstyled theme (the dark↔light "command line keeps growing" bug).
-    ctx.style_mut_of(egui::Theme::Dark, move |style| apply_to_style(style, &t));
-    ctx.style_mut_of(egui::Theme::Light, move |style| apply_to_style(style, &t));
+
+    // METRICS are theme-INDEPENDENT (spacing, type scale, hit-target, radii) and
+    // MUST be stamped onto BOTH themes' Style objects. egui keeps a SEPARATE
+    // Style per Theme; if the inactive theme runs on egui DEFAULT metrics, its
+    // TextEdit renders ~1px beyond its allocation each frame and the resizable
+    // command-line panel (which stores its content's rendered rect as its height)
+    // grows ~1px/frame after a theme switch (the "command line keeps growing"
+    // bug). So metrics go to both, unconditionally.
+    ctx.style_mut_of(egui::Theme::Dark, move |style| apply_metrics(style, &t));
+    ctx.style_mut_of(egui::Theme::Light, move |style| apply_metrics(style, &t));
+
+    // COLORS are per-theme. `t.colors` is a SINGLE palette (the preset's default
+    // mode). Painting it onto BOTH egui themes put the LIGHT surface roles under
+    // the DARK theme → off-whites in dark mode. Instead, derive a MODE-CORRECT
+    // role set for each theme (dark base for Dark, light base for Light), keeping
+    // the skin's accent.
+    let accent = t.colors.primary;
+    let dark_colors = roles_for_mode(true, accent);
+    let light_colors = roles_for_mode(false, accent);
+    ctx.style_mut_of(egui::Theme::Dark, move |style| {
+        apply_colors(style, &dark_colors, t.radii)
+    });
+    ctx.style_mut_of(egui::Theme::Light, move |style| {
+        apply_colors(style, &light_colors, t.radii)
+    });
 }
 
-/// Pure(-ish) core of [`apply`]: mutate a `Style` in place from tokens.
-/// Separated so tests can assert the mapping without a live `Context`.
+/// Full mapping (metrics + colors) for the token set's OWN mode. Kept so tests
+/// can assert the complete mapping without a live `Context`, and so any caller
+/// that wants a single-mode `Style` (snapshots) gets the matching palette.
+#[allow(dead_code)] // used by tests + single-mode snapshot callers
 pub fn apply_to_style(style: &mut egui::Style, t: &Tokens) {
+    apply_metrics(style, t);
+    apply_colors(style, &t.colors, t.radii);
+}
+
+/// Theme-INDEPENDENT half of the mapping: type scale, spacing, hit-target, and
+/// text metrics. Safe to stamp onto every theme's `Style` (see [`apply`]).
+pub fn apply_metrics(style: &mut egui::Style, t: &Tokens) {
     // ── Type scale → egui text styles ──────────────────────────────────
     let ts = t.type_scale;
     style.text_styles.insert(
@@ -420,10 +474,19 @@ pub fn apply_to_style(style: &mut egui::Style, t: &Tokens) {
         .y
         .max(Spacing::HIT_TARGET);
     style.spacing.button_padding.y = style.spacing.button_padding.y.max(sp.xs);
+}
 
-    // ── Color roles → egui visuals ─────────────────────────────────────
-    let c = t.colors;
+/// Theme-DEPENDENT half of the mapping: the `style.visuals.*` color roles (plus
+/// corner radii, which live on the same widget-visual structs). Called PER THEME
+/// with a mode-correct palette so dark and light each get their own surface ramp
+/// — the fix for the "off-whites in dark mode" regression.
+pub fn apply_colors(style: &mut egui::Style, c: &ColorRoles, radii: Radii) {
+    let c = *c;
     let v = &mut style.visuals;
+    // Keep egui's `dark_mode` flag consistent with the palette we're painting, so
+    // widgets that branch on `visuals().dark_mode` (and our own draw code) match
+    // the surface ramp they're sitting on.
+    v.dark_mode = is_dark(c.surface);
     let primary = to_color32(c.primary);
     let surface = to_color32(c.surface);
     let surface_variant = to_color32(c.surface_variant);
@@ -474,8 +537,8 @@ pub fn apply_to_style(style: &mut egui::Style, t: &Tokens) {
     v.selection.stroke = egui::Stroke::new(2.0, primary);
 
     // ── Corner radii ───────────────────────────────────────────────────
-    let small = egui::CornerRadius::same(t.radii.small as u8);
-    let medium = egui::CornerRadius::same(t.radii.medium as u8);
+    let small = egui::CornerRadius::same(radii.small as u8);
+    let medium = egui::CornerRadius::same(radii.medium as u8);
     v.widgets.noninteractive.corner_radius = small;
     v.widgets.inactive.corner_radius = small;
     v.widgets.hovered.corner_radius = small;
@@ -572,6 +635,71 @@ mod tests {
                 ratio >= 4.5,
                 "active viewport tag (dark={dark}) contrast {ratio:.2} < 4.5 (WCAG AA)"
             );
+        }
+    }
+
+    /// The mode-correct dark palette (the fix for off-whites in dark mode) must
+    /// clear WCAG AA for body text on every surface tier, and the light palette
+    /// too. Reuses `contrast_ratio` (the same helper the viewport-tag test uses).
+    #[test]
+    fn mode_palettes_meet_wcag_aa() {
+        for dark in [true, false] {
+            let r = roles_for_mode(dark, [0.35, 0.65, 1.0, 1.0]);
+            // Body text (on_surface) vs each surface tier ≥ 4.5:1.
+            for (bg, name) in [
+                (r.surface, "surface"),
+                (r.surface_variant, "surface_variant"),
+                (r.surface_elevated, "surface_elevated"),
+            ] {
+                let c = contrast_ratio(r.on_surface, bg);
+                assert!(c >= 4.5, "dark={dark}: on_surface vs {name} {c:.2} < 4.5");
+            }
+            // Secondary text (on_variant) vs surface AND its own inset ≥ 4.5:1.
+            let v_s = contrast_ratio(r.on_surface_variant, r.surface);
+            let v_v = contrast_ratio(r.on_surface_variant, r.surface_variant);
+            assert!(v_s >= 4.5, "dark={dark}: on_variant vs surface {v_s:.2} < 4.5");
+            assert!(v_v >= 4.5, "dark={dark}: on_variant vs variant {v_v:.2} < 4.5");
+        }
+    }
+
+    /// The dark surface ramp must be a coherent, monotonically-lifting elevation
+    /// scale (surface < variant < elevated), NOT three near-identical greys or an
+    /// off-white — the visual regression this batch fixes. Also: the ramp base is
+    /// clearly above pure black (the "chat too dark" complaint).
+    #[test]
+    fn dark_surface_ramp_is_coherent() {
+        let r = roles_for_mode(true, [0.35, 0.65, 1.0, 1.0]);
+        assert!(is_dark(r.surface), "dark surface must read dark");
+        assert!(
+            luminance(r.surface_variant) > luminance(r.surface),
+            "variant must lift above surface"
+        );
+        assert!(
+            luminance(r.surface_elevated) > luminance(r.surface_variant),
+            "elevated must lift above variant (a real 3-step ramp)"
+        );
+        // Not pure black: the ramp base sits at ~rgb 36 (0.14), well above 0.
+        assert!(
+            r.surface[0] > 0.10 && r.surface[0] < 0.25,
+            "dark ramp base must be a lifted grey, not black/off-white: {:?}",
+            r.surface
+        );
+    }
+
+    /// Status colors (deck dot) and the accent must stay legible on the dark
+    /// surface at the UI-component floor (3:1).
+    #[test]
+    fn dark_status_and_accent_legible_on_surface() {
+        let r = roles_for_mode(true, [0.35, 0.65, 1.0, 1.0]);
+        let to = |c: egui::Color32| -> Rgba {
+            [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
+        };
+        let err = to(egui::Color32::from_rgb(200, 80, 70));
+        let orange = to(egui::Color32::from_rgb(230, 160, 60));
+        let ok = to(egui::Color32::from_rgb(70, 160, 90));
+        for (c, name) in [(err, "ERR"), (orange, "ORANGE"), (ok, "OK"), (r.primary, "accent")] {
+            let ratio = contrast_ratio(c, r.surface);
+            assert!(ratio >= 3.0, "{name} vs dark surface {ratio:.2} < 3.0");
         }
     }
 
@@ -719,6 +847,59 @@ mod tests {
         // The three weights are distinct and ordered light→heavy; no sub-Regular.
         assert_ne!(Weight::Regular, Weight::Medium);
         assert_ne!(Weight::Medium, Weight::Semibold);
+    }
+
+    /// Regression guard for BOTH bugs at once:
+    /// 1. `apply` must stamp METRICS onto both egui themes (the command-line
+    ///    growth fix) — so neither theme falls back to egui's default TextEdit
+    ///    metric after a runtime theme switch.
+    /// 2. `apply` must stamp MODE-CORRECT colors: the Dark theme's `panel_fill`
+    ///    is the dark surface, the Light theme's is the light surface — never the
+    ///    same palette on both (the off-whites-in-dark regression).
+    #[test]
+    fn apply_stamps_metrics_on_both_and_mode_correct_colors() {
+        let ctx = egui::Context::default();
+        // A LIGHT preset token set: previously this would paint its light surface
+        // onto the Dark theme too.
+        let tokens = Tokens {
+            spacing: Spacing::default(),
+            type_scale: TypeScale::default(),
+            colors: roles_from([0.93, 0.93, 0.94, 1.0], [0.0, 0.44, 0.75, 1.0]),
+            radii: Radii::default(),
+            dark: false,
+        };
+        apply(&ctx, &tokens);
+
+        let dark_style = ctx.style_of(egui::Theme::Dark);
+        let light_style = ctx.style_of(egui::Theme::Light);
+
+        // (1) Metrics identical and non-default on BOTH themes.
+        assert_eq!(dark_style.spacing.item_spacing, light_style.spacing.item_spacing);
+        assert!(dark_style.spacing.interact_size.y >= Spacing::HIT_TARGET);
+        assert!(light_style.spacing.interact_size.y >= Spacing::HIT_TARGET);
+
+        // (2) Mode-correct colors: dark theme is dark, light theme is light.
+        assert!(
+            is_dark([
+                dark_style.visuals.panel_fill.r() as f32 / 255.0,
+                dark_style.visuals.panel_fill.g() as f32 / 255.0,
+                dark_style.visuals.panel_fill.b() as f32 / 255.0,
+                1.0,
+            ]),
+            "Dark theme panel_fill must be a dark surface, got {:?}",
+            dark_style.visuals.panel_fill
+        );
+        assert!(
+            !is_dark([
+                light_style.visuals.panel_fill.r() as f32 / 255.0,
+                light_style.visuals.panel_fill.g() as f32 / 255.0,
+                light_style.visuals.panel_fill.b() as f32 / 255.0,
+                1.0,
+            ]),
+            "Light theme panel_fill must be a light surface, got {:?}",
+            light_style.visuals.panel_fill
+        );
+        assert_ne!(dark_style.visuals.panel_fill, light_style.visuals.panel_fill);
     }
 
     #[test]

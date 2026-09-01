@@ -297,11 +297,12 @@ pub const ITSJUSTCAD_DEFAULT: UiPreset = UiPreset {
     cmd_font_px: 13.0,
     right_click_repeat_last: false,
     aliases: &[],
-    // ItsJustCAD default adopts the Rhino-style arrangement (task M-uilayout):
-    // command line on top, right tab panel, 4-up viewports, Rhino menu grouping.
+    // ItsJustCAD default: command line on top, right tab panel, Rhino menu
+    // grouping. Boots to a SINGLE perspective viewport (user preference) — the
+    // 2/4-up split is one `viewports` command / View-menu click away.
     command_line_pos: CommandLinePos::Top,
     panel_side: PanelSide::Right,
-    default_viewports: 4,
+    default_viewports: 1,
     menu_style: MenuStyle::Rhino,
 };
 
@@ -581,7 +582,8 @@ mod tests {
     fn itsjustcad_default_is_rhino_arrangement() {
         // Task M-uilayout: Rhino-default arrangement even for the ItsJustCAD skin.
         assert_eq!(ITSJUSTCAD_DEFAULT.command_line_pos, CommandLinePos::Top);
-        assert_eq!(ITSJUSTCAD_DEFAULT.default_viewports, 4);
+        // Boots to a single perspective viewport (user preference).
+        assert_eq!(ITSJUSTCAD_DEFAULT.default_viewports, 1);
         assert_eq!(ITSJUSTCAD_DEFAULT.menu_style, MenuStyle::Rhino);
     }
 

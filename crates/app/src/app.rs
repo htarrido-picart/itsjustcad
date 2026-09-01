@@ -253,7 +253,7 @@ pub struct App {
     gumball: Gumball,
     point_edit: crate::point_edit::PointEdit,
     tokio: tokio::runtime::Handle,
-    /// Camera slots shared across layouts: 0 Persp, 1 Top, 2 Front, 3 Right.
+    /// Camera slots shared across layouts: 0 Persp, 1 Top, 2 Front, 3 Back.
     cameras: [OrbitCamera; 4],
     /// Display mode per camera slot (view state, follows the camera across
     /// layout switches; never logged).
@@ -611,7 +611,7 @@ impl App {
                 let mut cams = [OrbitCamera::default(); 4];
                 cams[1].set_view(StandardView::Top);
                 cams[2].set_view(StandardView::Front);
-                cams[3].set_view(StandardView::Right);
+                cams[3].set_view(StandardView::Back);
                 cams
             },
             display_modes: [DisplayMode::default(); 4],
@@ -757,7 +757,8 @@ impl App {
         let Some(nav) = self.pending_nav else {
             return false;
         };
-        let tokens = preset::preset_for(self.cad_origin).tokens();
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let roles = self.live_roles(dark);
         let verb = match nav {
             PendingNav::New => "start a new document",
             PendingNav::Open => "open another document",
@@ -765,8 +766,8 @@ impl App {
         };
         let choice = crate::widgets::alert(
             ctx,
-            &tokens.colors,
-            tokens.dark,
+            &roles,
+            dark,
             "Unsaved changes",
             &format!("You have unsaved changes. If you {verb}, they will be lost."),
             "Discard",
@@ -1648,8 +1649,15 @@ impl App {
             .push_line(format!("{kind} select: {n} object(s)"));
     }
 
+    /// Save the document. With no path (File ▸ Save, ⌘S, or a bare `save` typed
+    /// interactively) a native rfd save dialog is popped DIRECTLY — the user is
+    /// never asked to type a path. With a path (Save As, scripts) it runs
+    /// straight away. Guarded against headless blocking, mirroring import/export.
     fn save(&mut self, path: Option<std::path::PathBuf>) {
         let path = path.or_else(|| {
+            if self.headless_no_dialog() {
+                return None;
+            }
             rfd::FileDialog::new()
                 .add_filter("ItsJustCAD", &["itsjustcad.json", "mydrafter.json", "json"])
                 .set_file_name("untitled.itsjustcad.json")
@@ -1726,8 +1734,15 @@ impl App {
         self.command_line.push_line("new file session");
     }
 
+    /// Open a document. With no path (File ▸ Open…, ⌘O, or a bare `open` typed
+    /// interactively) a native rfd open dialog is popped DIRECTLY — no typing.
+    /// With a path (scripts) it loads straight away. Guarded against headless
+    /// blocking, mirroring import/export.
     fn open(&mut self, path: Option<std::path::PathBuf>) {
         let path = path.or_else(|| {
+            if self.headless_no_dialog() {
+                return None;
+            }
             rfd::FileDialog::new()
                 .add_filter("ItsJustCAD", &["itsjustcad.json", "mydrafter.json", "json"])
                 .pick_file()
@@ -2255,7 +2270,8 @@ impl App {
     /// three most common first moves through the same substrate/verb paths the
     /// menus use, so nothing here is a bespoke code path.
     fn empty_document_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let tk = preset::preset_for(self.cad_origin).tokens();
+        let dark = ui.visuals().dark_mode;
+        let roles = self.live_roles(dark);
         let mut import_now = false;
         let mut draw_line = false;
         let mut draw_box = false;
@@ -2281,8 +2297,8 @@ impl App {
                             ui.add_space(crate::theme::Spacing::M);
                             draw_line = crate::widgets::role_button(
                                 ui,
-                                &tk.colors,
-                                tk.dark,
+                                &roles,
+                                dark,
                                 crate::widgets::ButtonRole::Prominent,
                                 "New line",
                             )
@@ -2290,8 +2306,8 @@ impl App {
                             ui.add_space(crate::theme::Spacing::S);
                             draw_box = crate::widgets::role_button(
                                 ui,
-                                &tk.colors,
-                                tk.dark,
+                                &roles,
+                                dark,
                                 crate::widgets::ButtonRole::Normal,
                                 "Draw an example box",
                             )
@@ -2299,8 +2315,8 @@ impl App {
                             ui.add_space(crate::theme::Spacing::S);
                             import_now = crate::widgets::role_button(
                                 ui,
-                                &tk.colors,
-                                tk.dark,
+                                &roles,
+                                dark,
                                 crate::widgets::ButtonRole::Normal,
                                 "Import a model…",
                             )
@@ -2772,8 +2788,9 @@ impl App {
         let fg = ui.visuals().text_color();
         let icon_sz = ui.text_style_height(&egui::TextStyle::Body);
         // Destructive tint for the layer-delete/purge affordances (system-red).
-        let tk = preset::preset_for(self.cad_origin).tokens();
-        let destructive = crate::theme::to_color32(tk.colors.destructive);
+        let dark = ui.visuals().dark_mode;
+        let roles = self.live_roles(dark);
+        let destructive = crate::theme::to_color32(roles.destructive);
 
         // Bottom toolbar first: a reserved bottom panel keeps the ＋ － ⚙ row
         // pinned and visible no matter how tall the (scrolling) table grows.
@@ -2824,8 +2841,8 @@ impl App {
                     ui.menu_image_button(gear, |ui| {
                         if crate::widgets::role_button(
                             ui,
-                            &tk.colors,
-                            tk.dark,
+                            &roles,
+                            dark,
                             crate::widgets::ButtonRole::Destructive,
                             "Purge empty layers",
                         )
@@ -3178,6 +3195,10 @@ impl App {
 
     /// Bottom strip: cursor coords, active layer, counts, snap state, view.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        // Compute the gumball chip's theme colours BEFORE borrowing doc/cam — a
+        // `&self` method call (live_roles) inside the closure would conflict with
+        // the `cam` borrow (E0500).
+        let gumball_roles = self.live_roles(ui.visuals().dark_mode);
         let doc = &self.session.doc;
         let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
         ui.horizontal(|ui| {
@@ -3198,18 +3219,43 @@ impl App {
             ));
             ui.separator();
             // Gumball toggle chip (Rhino-style): selectable state mirrors the
-            // `gumball` verb / `G` hotkey so all three stay in sync.
-            let mut on = self.show_gumball;
+            // `gumball` verb / `G` hotkey so all three stay in sync. Explicitly
+            // theme-aware (a bare selectable_label filled with the raw accent read
+            // wrong in dark): ON = accent fill + on-accent text; OFF = transparent
+            // + dimmed text. Colours come from the LIVE theme, not a fixed preset.
+            let on = self.show_gumball;
+            let roles = gumball_roles;
+            let (fill, txt) = if on {
+                (crate::theme::to_color32(roles.primary), egui::Color32::WHITE)
+            } else {
+                (
+                    egui::Color32::TRANSPARENT,
+                    crate::theme::to_color32(roles.on_surface_variant),
+                )
+            };
             if ui
-                .selectable_label(on, "gumball")
+                .add(
+                    egui::Button::new(egui::RichText::new("gumball").color(txt))
+                        .fill(fill)
+                        .corner_radius(egui::CornerRadius::same(4)),
+                )
                 .on_hover_text("Toggle transform gizmo (G)")
                 .clicked()
             {
-                on = !on;
-                self.show_gumball = on;
-                save_gumball_visible(on);
+                self.show_gumball = !on;
+                save_gumball_visible(!on);
             }
         });
+    }
+
+    /// Mode-correct semantic color roles for the LIVE egui theme. The preset
+    /// fixes the *accent*, but dark/light is a runtime choice (View ▸ Appearance),
+    /// so draw code must read its surface ramp from the live theme — not from the
+    /// preset's single default-mode palette (which painted off-whites in dark
+    /// mode). Callers pass `ui.visuals().dark_mode`.
+    fn live_roles(&self, dark: bool) -> crate::theme::ColorRoles {
+        let accent = preset::preset_for(self.cad_origin).tokens().colors.primary;
+        crate::theme::roles_for_mode(dark, accent)
     }
 
     /// Bottom viewport tab bar (Rhino convention): Persp/Top/Front/Right plus
@@ -3218,7 +3264,7 @@ impl App {
     /// central viewport frame so it never overlaps the canvas.
     fn viewport_tab_bar(&mut self, ui: &mut egui::Ui) {
         let named: Vec<String> = self.session.doc.named_views.keys().cloned().collect();
-        let roles = preset::preset_for(self.cad_origin).tokens().colors;
+        let roles = self.live_roles(ui.visuals().dark_mode);
         // Highlight the tab matching the active pane's current view.
         let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
         let current = crate::statusbar::view_label(cam.yaw, cam.pitch, cam.ortho);
@@ -3358,11 +3404,13 @@ impl App {
         // the ENTIRE dock — tab strip, chat, layers — reads as one clean surface
         // rather than a grey panel with a white card inside it. Keeps the default
         // left stroke that separates the dock from the viewport.
-        let dock_fill = if ui.visuals().dark_mode {
-            egui::Color32::from_rgb(32, 32, 34)
-        } else {
-            egui::Color32::WHITE
-        };
+        // Route the dock fill through the MODE-CORRECT surface role (dark ramp
+        // base ≈ rgb 36,36,40; light ≈ white) rather than a hardcoded magic
+        // number, so the dock, chat, and command line share one coherent surface.
+        let accent = preset::preset_for(self.cad_origin).tokens().colors.primary;
+        let dock_fill = crate::theme::to_color32(
+            crate::theme::roles_for_mode(ui.visuals().dark_mode, accent).surface,
+        );
         panel = panel.frame(
             egui::Frame::side_top_panel(ui.style())
                 .fill(dock_fill)
@@ -3395,10 +3443,15 @@ impl App {
         let panel_resp = panel.show(ui, |ui| {
             // Header row: chevron + tab strip.
             ui.horizontal(|ui| {
-                let close = self.icons.icon_button(
+                // Match the folder-tab height so the hide button lines up with the
+                // strip (tab = body text + 2×XS margin).
+                let tab_h = ui.text_style_height(&egui::TextStyle::Body)
+                    + 2.0 * crate::theme::Spacing::XS;
+                let close = self.icons.icon_button_min_h(
                     ui,
                     crate::icons::Icon::PanelClose,
                     "hide panel (Cmd+\\)",
+                    tab_h,
                 );
                 // Remember this button's screen-y so the reshow button (when the
                 // panel is hidden) sits at the SAME height — tapping collapse must
@@ -3416,7 +3469,6 @@ impl App {
                     }
                 }
             });
-            ui.separator();
             if self.panel_tabs.is_collapsed() {
                 return;
             }
@@ -3449,10 +3501,8 @@ impl App {
                                 });
                             });
                         egui::CentralPanel::default().show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                section_icon(ui, &self.icons, crate::icons::Icon::Layers);
-                                ui.strong("Layers");
-                            });
+                            // No redundant "Layers" title — the active tab already
+                            // names it.
                             self.layers_tab(ui, theme);
                         });
                     }
@@ -3460,26 +3510,23 @@ impl App {
                         // Promoted session browser: search + newest-first cards.
                         // A card click loads that session into the live Chat and
                         // switches the active tab to Chat.
-                        let tk = preset::preset_for(self.cad_origin).tokens();
-                        ui.horizontal(|ui| {
-                            section_icon(ui, &self.icons, crate::icons::Icon::Sessions);
-                            ui.strong("Sessions");
-                        });
-                        ui.add_space(4.0);
-                        if self.deck_pane.sessions_tab_ui(ui, &tk.colors) {
+                        let roles = self.live_roles(ui.visuals().dark_mode);
+                        // No redundant "Sessions" title — the active tab names it.
+                        if self.deck_pane.sessions_tab_ui(ui, &roles) {
                             self.panel_tabs.show(PanelTab::Deck);
                             self.deck_visible = true;
                         }
                     }
                     PanelTab::Deck => {
-                        let tk = preset::preset_for(self.cad_origin).tokens();
+                        let dark = ui.visuals().dark_mode;
+                        let roles = self.live_roles(dark);
                         self.deck_pane.ui(
                             ui,
                             &mut self.session,
                             &self.tokio,
                             &self.icons,
-                            &tk.colors,
-                            tk.dark,
+                            &roles,
+                            dark,
                             self.reduce_motion,
                         );
                     }
@@ -3620,9 +3667,6 @@ impl App {
         if !self.show_palette {
             return;
         }
-        let tk = preset::preset_for(self.cad_origin).tokens();
-        let elevated = crate::theme::to_color32(tk.colors.surface_elevated);
-        let weak = crate::theme::to_color32(tk.colors.on_surface_variant);
 
         // Rank the current query against the candidate set (cap the visible rows).
         const MAX_ROWS: usize = 12;
@@ -3658,6 +3702,14 @@ impl App {
             .anchor(egui::Align2::CENTER_TOP, [0.0, 96.0])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
+                // Theme-aware colors: read from the LIVE egui visuals (which track
+                // the active dark/light theme) rather than a fixed preset, so the
+                // palette stays readable in dark mode. Popup body uses the window
+                // fill; the query field uses the extreme (input) background; weak
+                // text uses the theme's dimmed text color.
+                let elevated = ui.visuals().window_fill();
+                let field_bg = ui.visuals().extreme_bg_color;
+                let weak = ui.visuals().weak_text_color();
                 egui::Frame::popup(ui.style())
                     .fill(elevated)
                     .inner_margin(egui::Margin::same(10))
@@ -3668,6 +3720,7 @@ impl App {
                             egui::TextEdit::singleline(&mut self.palette_query)
                                 .id(egui::Id::new("command_palette_query"))
                                 .desired_width(f32::INFINITY)
+                                .background_color(field_bg)
                                 .hint_text("Search commands…  (↑↓ to move, ↵ to run, esc to close)"),
                         );
                         resp.request_focus();
@@ -3793,8 +3846,8 @@ impl App {
         let mut cancel = false;
         let mut remove: Option<String> = None;
         // Token roles for the destructive Remove button (never a filled-red CTA).
-        let roles = preset::preset_for(self.cad_origin).tokens().colors;
-        let dark = preset::preset_for(self.cad_origin).tokens().dark;
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let roles = self.live_roles(dark);
 
         egui::Window::new("Model Setup")
             // Collapsible so the user can minimize it to its title bar and keep
@@ -4905,7 +4958,7 @@ impl eframe::App for App {
                 .resizable(false)
                 .open(&mut open)
                 .show(ui.ctx(), |ui| {
-                    let roles = &preset::preset_for(self.cad_origin).tokens().colors;
+                    let roles = &self.live_roles(ui.visuals().dark_mode);
                     crate::widgets::dialog_body(ui, roles, 360.0, |ui| {
                         crate::widgets::dialog_title(ui, roles, "ItsJustCAD");
                         ui.add_space(crate::theme::Spacing::S);
@@ -5132,11 +5185,10 @@ impl eframe::App for App {
         let cmd_max = (ui.ctx().viewport_rect().height() * 0.6).max(150.0);
         // White background (dark-neutral in dark mode) so the command line reads
         // as a clean surface like the chat dock — not a grey strip.
-        let cmd_fill = if ui.visuals().dark_mode {
-            egui::Color32::from_rgb(32, 32, 34)
-        } else {
-            egui::Color32::WHITE
-        };
+        let cmd_accent = preset::preset_for(self.cad_origin).tokens().colors.primary;
+        let cmd_fill = crate::theme::to_color32(
+            crate::theme::roles_for_mode(ui.visuals().dark_mode, cmd_accent).surface,
+        );
         egui::Panel::bottom("command_line")
             .resizable(true)
             // ~5 lines of history (≈16pt/line) + the input row reserve.
