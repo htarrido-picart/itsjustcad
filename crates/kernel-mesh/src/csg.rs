@@ -430,6 +430,79 @@ mod tests {
         assert_volume(&csg_difference(&slab, &core), 300.0 - 48.0);
     }
 
+    /// Count connected components by welding vertices and unioning faces that
+    /// share a (welded) vertex. A single hollow slab is ONE component; two
+    /// disjoint L-shapes would be TWO.
+    fn component_count(mesh: &Mesh) -> usize {
+        let w = weld(mesh, 1e-6);
+        let n = w.positions().len();
+        if n == 0 {
+            return 0;
+        }
+        // Union-find over vertices connected through shared faces.
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(p: &mut Vec<usize>, mut x: usize) -> usize {
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        for f in w.faces() {
+            let (a, b, c) = (f[0] as usize, f[1] as usize, f[2] as usize);
+            let ra = find(&mut parent, a);
+            let rb = find(&mut parent, b);
+            let rc = find(&mut parent, c);
+            parent[rb] = ra;
+            parent[rc] = ra;
+        }
+        // Only count vertices that are actually used by a face.
+        let mut used = vec![false; n];
+        for f in w.faces() {
+            for &i in f {
+                used[i as usize] = true;
+            }
+        }
+        let mut roots = std::collections::HashSet::new();
+        for i in 0..n {
+            if used[i] {
+                roots.insert(find(&mut parent, i));
+            }
+        }
+        roots.len()
+    }
+
+    #[test]
+    fn difference_exact_user_case_single_hollow_slab() {
+        // The exact reported failure:
+        //   box 0,0,0 8,8,3
+        //   box 2,2,-1 4,4,5
+        //   difference last 2 last
+        // Expect an 8×8×3 slab with a 4×4 through-hole: 192 − 48 = 144,
+        // and a SINGLE connected shell (not two L-shapes).
+        let slab = make_box(DVec3::ZERO, DVec3::new(8.0, 8.0, 3.0));
+        let void = make_box(DVec3::new(2.0, 2.0, -1.0), DVec3::new(4.0, 4.0, 5.0));
+        let result = csg_difference(&slab, &void);
+        assert_volume(&result, 192.0 - 48.0);
+        assert_eq!(
+            component_count(&result),
+            1,
+            "hollow slab must be one connected shell, not split into pieces"
+        );
+    }
+
+    #[test]
+    fn difference_flush_through_hole_stays_connected() {
+        // Void flush with BOTH top and bottom faces (z 0..3 exactly). Coplanar
+        // top/bottom tool faces are the stress case for BSP coplanar handling;
+        // must still be a single hollow slab, not two L-shapes.
+        let slab = make_box(DVec3::ZERO, DVec3::new(8.0, 8.0, 3.0));
+        let void = make_box(DVec3::new(2.0, 2.0, 0.0), DVec3::new(4.0, 4.0, 3.0));
+        let result = csg_difference(&slab, &void);
+        assert_volume(&result, 192.0 - 48.0);
+        assert_eq!(component_count(&result), 1);
+    }
+
     #[test]
     fn difference_flush_face() {
         // Tool flush with the top face: 2×2×2 minus 1×1×1 sitting on top half.

@@ -108,13 +108,17 @@ fn fs_main(in: VsOut) -> FsOut {
 
     var alpha = max(minor * 0.18, major * 0.42) * fade;
     var color = vec3(0.62, 0.64, 0.68);
+    // Origin axes = the zero datum lines (X at y=0, Y at x=0, both on z=0). Draw
+    // them WITHOUT the distance fade so the datum stays clearly marked in every
+    // view — including Front/Back elevations, where the ground plane is edge-on
+    // and the X axis reads as the horizontal z=0 datum line.
     if (ax > 0.0) {
         color = mix(color, vec3(0.85, 0.25, 0.25), ax);
-        alpha = max(alpha, ax * 0.8 * fade);
+        alpha = max(alpha, ax * 0.9);
     }
     if (ay > 0.0) {
         color = mix(color, vec3(0.25, 0.75, 0.30), ay);
-        alpha = max(alpha, ay * 0.8 * fade);
+        alpha = max(alpha, ay * 0.9);
     }
     if (gradient) {
         // Composite the grid lines over an opaque gradient ground so the sky
