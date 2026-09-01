@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/logo-transparent.png">
-    <source media="(prefers-color-scheme: light)" srcset="assets/logo/logo-appstore.png">
-    <img alt="ItsJustCAD" src="assets/logo/logo-appstore.png" width="180">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/logo-squircle-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo/logo-squircle.png">
+    <img alt="ItsJustCAD" src="assets/logo/logo-squircle.png" width="180">
   </picture>
 </p>
 
