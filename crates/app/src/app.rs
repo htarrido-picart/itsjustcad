@@ -1419,10 +1419,19 @@ impl App {
             || self.import_job.is_some()
             || self.import_result.is_some()
             || self.pending_nav.is_some();
-        let cmd_id = egui::Id::new("command_line_input");
+        // Block ONLY when a real text field is actively composing: the command
+        // line with content, or the deck chat input. When focus is on the
+        // viewport, the gumball gizmo, or nothing, the exceptions still fire
+        // (that focus is not text entry) — this is why Esc/Delete kept failing
+        // right after a selection, which hands focus to the gizmo.
+        let chat_id = egui::Id::new("deck_chat_input");
         let focused = ctx.memory(|m| m.focused());
-        let on_cmd_or_none = focused.is_none() || focused == Some(cmd_id);
-        if modal || self.draw_tool.active() || !on_cmd_or_none || !self.command_line.is_empty() {
+        let chat_composing = focused == Some(chat_id);
+        if modal
+            || self.draw_tool.active()
+            || chat_composing
+            || !self.command_line.is_empty()
+        {
             return;
         }
         const EXCEPTIONS: &[egui::Key] = &[
@@ -3959,7 +3968,7 @@ impl App {
             );
         }
 
-        let mut open = true;
+        let mut wants_close = false;
         let hw = self.hardware;
         let catalog = self.catalog.clone();
         let decks = itsjustcad_deck::DecksFile::load_or_default();
@@ -3971,16 +3980,20 @@ impl App {
         let dark = ctx.theme() == egui::Theme::Dark;
         let roles = self.live_roles(dark);
 
-        egui::Window::new("Model Setup")
-            // Collapsible so the user can minimize it to its title bar and keep
-            // working; NO fixed anchor so it is draggable anywhere (a fixed
-            // CENTER_CENTER anchor previously trapped the user during a download).
-            .collapsible(true)
-            .resizable(true)
-            .default_width(460.0)
-            .default_pos([120.0, 80.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
+        // Model Setup is a REAL top-level OS window (its own egui viewport), not
+        // an in-app floating panel — so it never overlaps the viewport/chat, can
+        // be dragged outside the app bounds, and minimizes to the Dock natively.
+        // Immediate mode so the body can borrow `self` (download intents etc.).
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("model_setup_window"),
+            egui::ViewportBuilder::default()
+                .with_title("Model Setup")
+                .with_inner_size([480.0, 640.0])
+                .with_min_inner_size([400.0, 320.0])
+                .with_resizable(true),
+            |vctx, _class| {
+              egui::CentralPanel::default().show(vctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 // Hardware recommendation.
                 ui.label(egui::RichText::new(hw.recommendation()).strong());
                 ui.label(
@@ -4159,10 +4172,17 @@ impl App {
                     .weak()
                     .small(),
                 );
-            });
+                });
+              });
+              // Native window close button (or Cmd+W) requests viewport close.
+              if vctx.input(|i| i.viewport().close_requested()) {
+                  wants_close = true;
+              }
+            },
+        );
 
-        if !open {
-            // Closing the panel HIDES it but must NOT cancel an in-flight
+        if wants_close {
+            // Closing the window HIDES it but must NOT cancel an in-flight
             // download — the background thread keeps going and the corner chip
             // takes over. Cancellation is only the explicit "Cancel" button.
             self.close_model_setup();

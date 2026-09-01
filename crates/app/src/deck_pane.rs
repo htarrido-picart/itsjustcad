@@ -2005,7 +2005,13 @@ impl DeckPane {
                 let input_frame = egui::Frame::NONE
                     .fill(pane_bg)
                     .corner_radius(input_radius)
-                    .inner_margin(egui::Margin::symmetric(0, crate::theme::Spacing::XS as i8))
+                    // Horizontal margin matches the transcript so the input box
+                    // isn't clipped against the pane edge and lines up with the
+                    // chat rows above it.
+                    .inner_margin(egui::Margin::symmetric(
+                        crate::theme::Spacing::S as i8,
+                        crate::theme::Spacing::XS as i8,
+                    ))
                     // Soft top shadow: visible but blurred so it reads as a lift,
                     // not a hard 1px line. Offset up + a moderate alpha.
                     .shadow(egui::epaint::Shadow {
@@ -2195,7 +2201,9 @@ impl DeckPane {
         let bubble_radius = egui::CornerRadius::same(10);
         egui::Frame::NONE
             .fill(transcript_bg)
-            .inner_margin(egui::Margin::ZERO)
+            // Horizontal inner margin so bubbles/rows don't clip against the
+            // pane edge (was Margin::ZERO → ~2px cut off on the right).
+            .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::S as i8, 0))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(!empty_chat)
