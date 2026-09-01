@@ -783,6 +783,81 @@ impl App {
         self.pending_nav.is_some()
     }
 
+    /// Render the ask-on-continue session-conflict modal when the deck pane has a
+    /// parked decision: continuing a loaded chat that gained new turns, then
+    /// triggering New Session or load-another. Three grouped choices — **Update
+    /// this chat** (update the loaded session in place), **Save as new** (fork a
+    /// fresh session), **Cancel** (keep editing, drop the parked action). Mirrors
+    /// the unsaved-changes guard's shape. Returns `true` while the modal is up.
+    fn session_conflict_ui(&mut self, ctx: &egui::Context) -> bool {
+        if self.deck_pane.needs_session_decision().is_none() {
+            return false;
+        }
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let roles = self.live_roles(dark);
+        let mut resolved = false;
+        egui::Modal::new(egui::Id::new("itsjustcad_session_conflict"))
+            .frame(crate::widgets::dialog_modal_frame(&roles))
+            .show(ctx, |ui| {
+                crate::widgets::dialog_body(ui, &roles, 400.0, |ui| {
+                    crate::widgets::dialog_title(ui, &roles, "Continue this chat?");
+                    ui.add_space(crate::theme::Spacing::SM);
+                    crate::widgets::dialog_text(
+                        ui,
+                        &roles,
+                        "You added to a saved chat. Update that chat, or keep it and \
+                         save this as a new one?",
+                    );
+                    ui.add_space(crate::theme::Spacing::L);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = crate::theme::Spacing::SM;
+                        if crate::widgets::role_button(
+                            ui,
+                            &roles,
+                            dark,
+                            crate::widgets::ButtonRole::Prominent,
+                            "Update this chat",
+                        )
+                        .clicked()
+                        {
+                            self.deck_pane.resolve_session_decision(true);
+                            resolved = true;
+                        }
+                        if crate::widgets::role_button(
+                            ui,
+                            &roles,
+                            dark,
+                            crate::widgets::ButtonRole::Normal,
+                            "Save as new",
+                        )
+                        .clicked()
+                        {
+                            self.deck_pane.resolve_session_decision(false);
+                            resolved = true;
+                        }
+                        if crate::widgets::role_button(
+                            ui,
+                            &roles,
+                            dark,
+                            crate::widgets::ButtonRole::Normal,
+                            "Cancel",
+                        )
+                        .clicked()
+                        {
+                            self.deck_pane.cancel_session_decision();
+                            resolved = true;
+                        }
+                    });
+                });
+            });
+        // Esc = Cancel (safe path — keep editing).
+        if !resolved && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.deck_pane.cancel_session_decision();
+            resolved = true;
+        }
+        !resolved && self.deck_pane.needs_session_decision().is_some()
+    }
+
     /// Lazily attach the true native OS menu bar (muda) the first interactive
     /// frame, then never retry. Only runs when eframe hands us a live winit
     /// window (`frame.window_handle()` succeeds) — headless/`--shot` has no
@@ -1777,6 +1852,11 @@ impl App {
                 self.journaled_generation = Some(self.session.doc.generation);
                 // The document is now clean at the current op-log cursor.
                 self.mark_saved();
+                // Archive the live conversation into per-document history on save
+                // (Auto: update-in-place or fresh; no-op when empty) so saving the
+                // document also durably lands the current chat.
+                self.deck_pane
+                    .archive_active(crate::deck_pane::ArchiveMode::Auto);
                 // Confine deck-originated fs paths to this document's directory.
                 self.deck_pane
                     .set_sandbox_root(path.parent().map(|p| p.to_path_buf()));
@@ -4892,6 +4972,11 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        // Archive the live conversation into per-document history before quitting
+        // so a quit mid-chat is not lost. Auto mode updates the loaded session in
+        // place (no fork) or pushes a fresh one; it is a no-op when empty.
+        self.deck_pane
+            .archive_active(crate::deck_pane::ArchiveMode::Auto);
         // Clean exit: nothing crashed, nothing to recover.
         if let Some(j) = &mut self.journal {
             j.discard();
@@ -5379,6 +5464,9 @@ impl eframe::App for App {
         // is parked behind the guard.
         let ctx = ui.ctx().clone();
         self.unsaved_guard_ui(&ctx);
+        // Ask-on-continue: modal when continuing a loaded chat that diverged and
+        // the user then triggered New Session / load-another.
+        self.session_conflict_ui(&ctx);
 
         // COMMAND LINE ALWAYS LISTENS (Rhino-style): whenever nothing else owns
         // the keyboard — e.g. after clicking the viewport, which leaves focus on

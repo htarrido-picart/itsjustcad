@@ -171,6 +171,32 @@ impl DocSessions {
     pub fn get(&self, id: &str) -> Option<&ChatSession> {
         self.sessions.iter().find(|s| s.id == id)
     }
+
+    /// Insert `session`, or REPLACE the existing one with the same id in place —
+    /// then re-sort newest-first. This is the dedup-free archive path: continuing
+    /// a loaded session updates it rather than forking a fresh copy. Caller saves.
+    pub fn upsert(&mut self, session: ChatSession) {
+        if let Some(slot) = self.sessions.iter_mut().find(|s| s.id == session.id) {
+            *slot = session;
+        } else {
+            self.sessions.push(session);
+        }
+        self.sort_recent();
+    }
+
+    /// Refine a stored session's title/summary by id (the async LLM pass). Both
+    /// are only applied when non-empty so a partial model reply never blanks a
+    /// good deterministic label. No-op when the id is gone. Caller saves.
+    pub fn set_meta(&mut self, id: &str, title: &str, summary: &str) {
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+            if !title.trim().is_empty() {
+                s.title = title.trim().to_string();
+            }
+            if !summary.trim().is_empty() {
+                s.summary = summary.trim().to_string();
+            }
+        }
+    }
 }
 
 /// A ±30-char context window around a byte match, on char boundaries, with
@@ -407,6 +433,60 @@ mod tests {
         assert_eq!(docs.sessions.len(), 1);
         assert_eq!(docs.sessions[0].summary, "", "missing summary defaults to empty");
         assert_eq!(docs.sessions[0].title, "old session");
+    }
+
+    #[test]
+    fn upsert_replaces_by_id_without_dup_and_sorts_newest_first() {
+        let mut docs = doc_with_two_sessions();
+        let existing_id = docs.sessions[0].id.clone(); // session a (updated 101)
+        let before = docs.sessions.len();
+        // Upsert a session reusing an existing id but with a newer timestamp.
+        let mut updated = ChatSession::new(500);
+        updated.id = existing_id.clone();
+        updated.push("user", "the continued conversation", 500);
+        docs.upsert(updated);
+        // No duplicate: same count, exactly one session with that id.
+        assert_eq!(docs.sessions.len(), before, "upsert must not add a dup");
+        assert_eq!(
+            docs.sessions.iter().filter(|s| s.id == existing_id).count(),
+            1
+        );
+        // Replaced in place (new content) and re-sorted newest-first.
+        assert_eq!(docs.sessions[0].id, existing_id);
+        assert_eq!(docs.sessions[0].updated, 500);
+        assert_eq!(docs.sessions[0].turns[0].content, "the continued conversation");
+        // The OTHER session is preserved.
+        assert!(docs.sessions.iter().any(|s| s.title.contains("curtain wall")));
+    }
+
+    #[test]
+    fn upsert_pushes_a_fresh_id() {
+        let mut docs = doc_with_two_sessions();
+        let before = docs.sessions.len();
+        let mut fresh = ChatSession::new(999);
+        fresh.push("user", "brand new chat", 999);
+        docs.upsert(fresh);
+        assert_eq!(docs.sessions.len(), before + 1);
+        assert_eq!(docs.sessions[0].updated, 999, "newest sorts first");
+    }
+
+    #[test]
+    fn set_meta_updates_by_id_and_ignores_blanks() {
+        let mut docs = doc_with_two_sessions();
+        let id = docs.sessions[0].id.clone();
+        let old_title = docs.sessions[0].title.clone();
+        docs.set_meta(&id, "Office core", "A five-by-five core with a stair.");
+        let s = docs.get(&id).unwrap();
+        assert_eq!(s.title, "Office core");
+        assert_eq!(s.summary, "A five-by-five core with a stair.");
+        // Blank title/summary must NOT clobber a good label.
+        docs.set_meta(&id, "   ", "");
+        let s = docs.get(&id).unwrap();
+        assert_eq!(s.title, "Office core", "blank title left the label intact");
+        assert_eq!(s.summary, "A five-by-five core with a stair.");
+        // A missing id is a no-op (no panic, nothing else changes).
+        docs.set_meta("no-such-id", "X", "Y");
+        assert_ne!(old_title, docs.get(&id).unwrap().title);
     }
 
     #[test]

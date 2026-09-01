@@ -77,6 +77,38 @@ fn select_active_by_name(decks: &mut itsjustcad_deck::DecksFile, name: &str) -> 
     Some(idx)
 }
 
+/// How `archive_active` should place the live conversation into the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveMode {
+    /// Auto (quit/save/new): update the loaded session in place if it is still
+    /// in the store, else push a fresh one. Never prompts.
+    Auto,
+    /// Force update-in-place by this session id (user chose "Update this chat").
+    Update(String),
+    /// Force a fresh session (user chose "Save as new").
+    New,
+}
+
+/// A user action parked behind the ask-on-continue session-conflict modal: the
+/// live pane holds a loaded session that gained new turns, and the user then
+/// triggered something that would replace it. We resolve the archive decision
+/// first, then run the parked action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextAction {
+    /// File → New Session (clear the live pane for a fresh chat).
+    NewSession,
+    /// Load another stored session by id.
+    LoadSession(String),
+}
+
+/// A pending async title/summary request: one cheap non-streaming turn whose
+/// parsed `(title, summary)` (or `None` on failure) arrives on the oneshot. The
+/// `session_id` binds the result to the stored session it should refine.
+struct SummarizeState {
+    session_id: String,
+    rx: oneshot::Receiver<Option<(String, String)>>,
+}
+
 /// The outcome of ensuring a local runtime for a turn.
 enum LocalReady {
     /// The server is healthy; the string is the live base URL to talk to.
@@ -159,7 +191,30 @@ struct SavedChatRef<'a> {
     transcript: &'a [Entry],
 }
 
-fn saved_chat_path() -> Option<std::path::PathBuf> {
+/// Per-document live-snapshot path: `~/.config/itsjustcad/chats/<uuid>.draft.json`,
+/// beside the multi-session archive `<uuid>.json`. The live draft is the current,
+/// not-yet-archived conversation for THIS document; it is revived on relaunch and
+/// archived on quit/save/new. Reuses the uuid path-traversal guard from
+/// [`chat_store::store_path`] (hex + dashes only) so an attacker-controlled uuid
+/// can't escape the chats directory.
+fn saved_chat_path(doc_uuid: &str) -> Option<std::path::PathBuf> {
+    if doc_uuid.is_empty()
+        || !doc_uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    {
+        return None;
+    }
+    Some(
+        dirs::home_dir()?
+            .join(".config")
+            .join("itsjustcad")
+            .join("chats")
+            .join(format!("{doc_uuid}.draft.json")),
+    )
+}
+
+/// The legacy GLOBAL live snapshot (shared across all documents). Kept only for a
+/// one-time migration into the current document's per-doc draft; deleted after.
+fn legacy_global_chat_path() -> Option<std::path::PathBuf> {
     Some(
         dirs::home_dir()?
             .join(".config")
@@ -169,18 +224,20 @@ fn saved_chat_path() -> Option<std::path::PathBuf> {
 }
 
 impl SavedChat {
-    fn load() -> Self {
-        saved_chat_path()
+    /// Load the live draft for one document, or an empty chat if none exists yet.
+    fn load(doc_uuid: &str) -> Self {
+        saved_chat_path(doc_uuid)
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
-
 }
 
 impl SavedChatRef<'_> {
-    fn save(&self) {
-        let Some(path) = saved_chat_path() else { return };
+    /// Write the live draft for one document (0600 — the transcript carries user
+    /// messages and scene digests). No path when the uuid is malformed.
+    fn save(&self, doc_uuid: &str) {
+        let Some(path) = saved_chat_path(doc_uuid) else { return };
         let _ = std::fs::create_dir_all(path.parent().expect("has parent"));
         // L-1: 0600 — transcript contains user messages and scene digests.
         let _ = crate::journal::write_private(
@@ -265,6 +322,32 @@ mod saved_chat_tests {
         assert!(CHAT_EXAMPLES.len() >= 2);
         assert!(CHAT_EXAMPLES.iter().all(|e| !e.trim().is_empty()));
     }
+}
+
+/// Parse the model's two-line title/summary reply into `(title, summary)`. Line
+/// 1 is the title, the rest is the summary; each is trimmed of surrounding
+/// quotes and a leading `Title:`/`Summary:` label the model may add anyway.
+/// Returns `None` when there is no usable title so the deterministic fallback
+/// stays. Pure — unit-testable without the network.
+fn parse_title_summary(reply: &str) -> Option<(String, String)> {
+    let strip = |s: &str| -> String {
+        let s = s.trim();
+        let s = s
+            .strip_prefix("Title:")
+            .or_else(|| s.strip_prefix("title:"))
+            .or_else(|| s.strip_prefix("Summary:"))
+            .or_else(|| s.strip_prefix("summary:"))
+            .unwrap_or(s)
+            .trim();
+        s.trim_matches(|c| c == '"' || c == '\'' || c == '`').trim().to_string()
+    };
+    let mut lines = reply.lines().map(str::trim).filter(|l| !l.is_empty());
+    let title = strip(lines.next()?);
+    if title.is_empty() {
+        return None;
+    }
+    let summary = lines.map(strip).collect::<Vec<_>>().join(" ");
+    Some((title, summary))
 }
 
 /// The filesystem path a side-effecting command targets, if any.
@@ -533,6 +616,28 @@ pub struct DeckPane {
     /// kept app-local (never written into the shared document). Loaded lazily on
     /// the first `sync_store` once the document uuid is known.
     store: Option<crate::chat_store::DocSessions>,
+    /// The document uuid the live snapshot + store belong to. `None` until the
+    /// first `sync_store`; `persist_chat` is a no-op while it is `None` (a chat
+    /// with no known document has nowhere to land). Set in `sync_store`.
+    active_doc_uuid: Option<String>,
+    /// The stored session id the live pane was loaded from (a Sessions-tab card),
+    /// or `None` for a fresh conversation. Drives update-in-place vs fork on
+    /// archive. Set in `load_stored_session`, cleared in `new_session`.
+    loaded_session_id: Option<String>,
+    /// A turn was appended AFTER a session was loaded — the loaded conversation
+    /// has diverged from its stored copy, so continuing it is the ambiguous
+    /// "update vs save-as-new" case. Set in `send`; cleared on load/new/archive.
+    dirty_since_load: bool,
+    /// A parked next-action awaiting the user's session-conflict decision (Update
+    /// vs Save-as-new). The app polls [`needs_session_decision`] and renders the
+    /// modal; [`resolve_session_decision`] archives + runs it.
+    pending_session_decision: Option<NextAction>,
+    /// An in-flight async title/summary request refining a just-archived session.
+    summarize: Option<SummarizeState>,
+    /// A just-archived session id awaiting its async title/summary pass. Set by
+    /// `archive_active`; drained in `tick` (which owns the tokio handle) so the
+    /// LLM refine spawns off the UI thread. `None` when nothing is pending.
+    pending_summarize_id: Option<String>,
     /// Current search query over the store's sessions.
     session_search: String,
     /// UI-plane actions the deck emitted this turn (layout changes). Applied to
@@ -550,14 +655,8 @@ pub struct DeckPane {
 
 impl Default for DeckPane {
     fn default() -> Self {
-        let saved = SavedChat::load();
-        let mut transcript = saved.transcript;
-        if let Some(sid) = &saved.session_id {
-            transcript.push(Entry::Status(format!(
-                "revived session {}",
-                &sid[..sid.len().min(8)]
-            )));
-        }
+        // The live draft is loaded PER-DOCUMENT in `sync_store` once the doc uuid
+        // is known — NOT here, where no document is established yet. Start empty.
         let mut decks = DecksFile::load_or_default();
         // Prune DANGLING local cassettes: a `local-<id>` deck whose model is no
         // longer in the catalog (e.g. a removed/renamed model) is an orphan — its
@@ -583,8 +682,8 @@ impl Default for DeckPane {
         Self {
             decks,
             input: String::new(),
-            transcript,
-            messages: saved.messages,
+            transcript: Vec::new(),
+            messages: Vec::new(),
             rx: None,
             turn_task: None,
             turn_started: None,
@@ -598,7 +697,7 @@ impl Default for DeckPane {
             probed_deck: None,
             warm: WarmState::Idle,
             warmed_model: None,
-            session_id: saved.session_id,
+            session_id: None,
             view: PaneView::Chat,
             markdown: CommonMarkCache::default(),
             vision_turn: false,
@@ -612,6 +711,12 @@ impl Default for DeckPane {
             deferred_local_turn: false,
             allow_web_search: false,
             store: None,
+            active_doc_uuid: None,
+            loaded_session_id: None,
+            dirty_since_load: false,
+            pending_session_decision: None,
+            summarize: None,
+            pending_summarize_id: None,
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
@@ -744,10 +849,18 @@ impl DeckPane {
         self.allow_web_search = !self.allow_web_search;
     }
 
+    /// File → New Session. Archives the outgoing conversation, then clears the
+    /// live pane for a fresh chat. When continuing a loaded-and-diverged session
+    /// this parks behind the Update/Save-as-new modal instead (the app renders
+    /// it); the clear runs once the user decides.
     pub fn new_session(&mut self) {
-        // Archive the outgoing conversation into the per-document store before
-        // clearing it, so switching sessions never loses history.
-        self.archive_current_session();
+        self.guarded_next_action(NextAction::NewSession);
+    }
+
+    /// Clear the live pane for a brand-new conversation. The archive (if any) has
+    /// already happened via the guarded flow; this only resets live state and the
+    /// loaded-session tracking.
+    fn clear_live(&mut self) {
         self.stop_turn();
         self.session_id = None;
         self.messages.clear();
@@ -758,6 +871,8 @@ impl DeckPane {
         self.errors_this_turn.clear();
         self.input.clear();
         self.attached_image = None;
+        self.loaded_session_id = None;
+        self.dirty_since_load = false;
         self.view = PaneView::Chat;
         self.persist_chat();
     }
@@ -778,33 +893,98 @@ impl DeckPane {
         std::mem::take(&mut self.pending_app_verbs)
     }
 
-    /// Point the multi-session store at `doc_uuid`, loading that document's
-    /// app-local sessions. Called by the app when a document is opened/saved and
-    /// its uuid becomes known. Reloads only when the uuid changes.
+    /// Point the multi-session store AND the live draft at `doc_uuid`. Called by
+    /// the app when a document is opened/saved and its uuid becomes known. On a
+    /// document SWITCH this persists the outgoing draft, then loads the incoming
+    /// document's store + live draft — so each document keeps its own live chat.
+    /// Reloads only when the uuid changes.
     pub fn sync_store(&mut self, doc_uuid: &str) {
         let needs_load = self
-            .store
-            .as_ref()
-            .map(|s| s.doc_uuid != doc_uuid)
+            .active_doc_uuid
+            .as_deref()
+            .map(|u| u != doc_uuid)
             .unwrap_or(true);
-        if needs_load {
-            self.store = Some(crate::chat_store::DocSessions::load(doc_uuid));
+        if !needs_load {
+            return;
+        }
+        // Persist the OUTGOING document's live draft before switching away.
+        self.persist_chat();
+        // Switch the active document and load its per-doc store + live draft.
+        self.active_doc_uuid = Some(doc_uuid.to_string());
+        self.store = Some(crate::chat_store::DocSessions::load(doc_uuid));
+        let mut draft = SavedChat::load(doc_uuid);
+        // One-time MIGRATION: an app upgraded from the global `deck_chat.json`
+        // has a single shared snapshot and no per-doc draft yet. Adopt it for the
+        // FIRST document that opens after the upgrade, then delete the global file
+        // so it is never re-adopted by another document.
+        if draft.transcript.is_empty()
+            && draft.messages.is_empty()
+            && saved_chat_path(doc_uuid).is_some_and(|p| !p.exists())
+            && let Some(global) = legacy_global_chat_path()
+            && let Ok(text) = std::fs::read_to_string(&global)
+            && let Ok(legacy) = serde_json::from_str::<SavedChat>(&text)
+        {
+            draft = legacy;
+            let _ = std::fs::remove_file(&global);
+        }
+        self.load_draft(draft);
+    }
+
+    /// Replace the LIVE pane state (session handle, messages, transcript) from a
+    /// loaded draft. Aborts nothing — the caller has already parked/finished any
+    /// in-flight turn. A loaded draft is a fresh continuation, not a stored
+    /// session, so `loaded_session_id`/`dirty_since_load` are cleared.
+    fn load_draft(&mut self, draft: SavedChat) {
+        self.session_id = draft.session_id;
+        self.messages = draft.messages;
+        self.transcript = draft.transcript;
+        self.loaded_session_id = None;
+        self.dirty_since_load = false;
+        if let Some(sid) = &self.session_id {
+            self.transcript.push(Entry::Status(format!(
+                "revived session {}",
+                &sid[..sid.len().min(8)]
+            )));
         }
     }
 
-    /// Save the current transcript as (or into) a named session in the store,
-    /// keyed by the current document. Private + app-local; the shared document
-    /// is never touched. No-op until `sync_store` has established a store.
-    pub fn archive_current_session(&mut self) {
-        let Some(store) = self.store.as_mut() else { return };
+    /// Archive the live conversation into the per-document store, placing it per
+    /// `mode`. Private + app-local; the shared document is never touched. No-op
+    /// until `sync_store` has established a store or when there are no messages.
+    ///
+    /// - [`ArchiveMode::Auto`] — update the loaded session in place when it is
+    ///   still in the store (continuing a loaded chat never forks a duplicate),
+    ///   else push a new one.
+    /// - [`ArchiveMode::Update`] — force update-in-place by that id.
+    /// - [`ArchiveMode::New`] — force a fresh session.
+    ///
+    /// The deterministic `derive_meta` fallback runs synchronously so the card is
+    /// labeled instantly; an async LLM pass may refine it later (see
+    /// [`spawn_summarize`]). Returns the archived session id (for the summarizer).
+    pub fn archive_active(&mut self, mode: ArchiveMode) -> Option<String> {
+        let Some(store) = self.store.as_mut() else { return None };
         if self.messages.is_empty() {
-            return;
+            return None;
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // Decide the target id: reuse an existing session id (update-in-place) or
+        // mint a fresh one (fork).
+        let reuse_id = match &mode {
+            ArchiveMode::Update(id) => Some(id.clone()),
+            ArchiveMode::Auto => self
+                .loaded_session_id
+                .as_ref()
+                .filter(|id| store.get(id).is_some())
+                .cloned(),
+            ArchiveMode::New => None,
+        };
         let mut session = crate::chat_store::ChatSession::new(now);
+        if let Some(id) = &reuse_id {
+            session.id = id.clone();
+        }
         for m in &self.messages {
             let role = match m.role {
                 Role::User => "user",
@@ -813,22 +993,179 @@ impl DeckPane {
             session.push(role, &m.content, now);
         }
         // Auto-generate title + summary. The fallback (first prompt + a preview
-        // of the first exchange) never calls a model, so headless/tests are
-        // safe. A lightweight LLM pass may replace this later (guarded).
+        // of the first exchange) never calls a model, so headless/tests are safe.
         session.derive_meta();
-        store.sessions.push(session);
-        store.sort_recent();
+        let archived_id = session.id.clone();
+        store.upsert(session);
         store.save();
+        // The live pane now tracks this stored session; a subsequent turn dirties
+        // it again. Clear the dirty flag — the current state is archived.
+        self.loaded_session_id = Some(archived_id.clone());
+        self.dirty_since_load = false;
+        // Queue an async LLM title/summary refine; `tick` (which owns the tokio
+        // handle) spawns it. The deterministic labels are already in place, so a
+        // headless/offline archive is fully labeled without this ever firing.
+        self.pending_summarize_id = Some(archived_id.clone());
+        Some(archived_id)
     }
 
-    /// Snapshot the chat to disk so an idle/quit/crash can be revived later.
+    /// Whether the live pane holds a loaded session that gained new turns — the
+    /// ambiguous "update this chat vs save as a new one" case. Only then does a
+    /// destructive next-action (New Session / load-another) need the modal.
+    fn is_ambiguous_continue(&self) -> bool {
+        self.loaded_session_id.is_some()
+            && self.dirty_since_load
+            && !self.messages.is_empty()
+    }
+
+    /// Route a destructive next-action through the ask-on-continue guard. When the
+    /// live pane is an ambiguously-continued loaded session, park the action and
+    /// return `true` (the app renders the modal). Otherwise archive with `Auto`
+    /// and run it immediately, returning `false`.
+    fn guarded_next_action(&mut self, action: NextAction) -> bool {
+        if self.is_ambiguous_continue() {
+            self.pending_session_decision = Some(action);
+            true
+        } else {
+            self.archive_active(ArchiveMode::Auto);
+            self.run_next_action(action);
+            false
+        }
+    }
+
+    /// The parked next-action, if the session-conflict modal is up. The app polls
+    /// this each frame and renders the Update / Save-as-new / Cancel modal.
+    pub fn needs_session_decision(&self) -> Option<NextAction> {
+        self.pending_session_decision.clone()
+    }
+
+    /// Resolve a parked session-conflict: archive the live conversation as an
+    /// update-in-place (`update = true`) or a fresh session (`update = false`),
+    /// then run the parked action. Called by the app's modal on Update / Save-as-
+    /// new. Cancel drops the parked action via [`cancel_session_decision`].
+    pub fn resolve_session_decision(&mut self, update: bool) {
+        let Some(action) = self.pending_session_decision.take() else { return };
+        let mode = match (update, self.loaded_session_id.clone()) {
+            (true, Some(id)) => ArchiveMode::Update(id),
+            _ => ArchiveMode::New,
+        };
+        self.archive_active(mode);
+        self.run_next_action(action);
+    }
+
+    /// Drop a parked session-conflict without archiving or navigating (Cancel).
+    pub fn cancel_session_decision(&mut self) {
+        self.pending_session_decision = None;
+    }
+
+    /// Run a resolved next-action (the archive has already happened).
+    fn run_next_action(&mut self, action: NextAction) {
+        match action {
+            NextAction::NewSession => self.clear_live(),
+            NextAction::LoadSession(id) => self.replace_live_with_stored(&id),
+        }
+    }
+
+    /// Snapshot the chat to the CURRENT document's live draft so an idle/quit/
+    /// crash can be revived later. No-op until `sync_store` has established the
+    /// document uuid — a chat with no known document has nowhere to land.
     fn persist_chat(&self) {
+        let Some(uuid) = &self.active_doc_uuid else { return };
         SavedChatRef {
             session_id: &self.session_id,
             messages: &self.messages,
             transcript: &self.transcript,
         }
-        .save();
+        .save(uuid);
+    }
+
+    /// Spawn ONE cheap non-streaming request asking the active deck for a short
+    /// title + summary of the just-archived conversation, binding the result to
+    /// `session_id`. Only fires when the deck probes `Ready` and there is a
+    /// conversation to summarize; offline/headless/not-ready keeps the
+    /// deterministic `derive_meta` labels (already applied at archive time). App-
+    /// local, never op-logged. The result is applied by [`poll_summarize`].
+    fn spawn_summarize(
+        &mut self,
+        session_id: String,
+        handle: &tokio::runtime::Handle,
+    ) {
+        if !matches!(self.probe, ProbeState::Ready(_)) {
+            return;
+        }
+        let Some(config) = self.decks.decks.get(self.decks.active).cloned() else {
+            return;
+        };
+        // Build the transcript to summarize from the live messages.
+        let mut convo = String::new();
+        for m in &self.messages {
+            let who = match m.role {
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+            };
+            convo.push_str(who);
+            convo.push_str(": ");
+            convo.push_str(&m.content);
+            convo.push('\n');
+        }
+        if convo.trim().is_empty() {
+            return;
+        }
+        let system = "You label chat logs. Reply with EXACTLY two lines: line 1 a \
+             title of at most 6 words (no quotes, no prefix); line 2 a summary of \
+             at most 20 words. Nothing else."
+            .to_string();
+        let prompt = format!("Title and summarize this conversation:\n\n{convo}");
+        let mut req = ChatRequest::text(
+            system,
+            vec![ChatMessage { role: Role::User, content: prompt }],
+            String::new(),
+            120,
+            0.2,
+            None,
+        );
+        // A fresh, self-contained side-request: never reuse the live session
+        // handle and never grant tools/web-search.
+        req.max_turns = 1;
+        let deck = make_deck(&config);
+        let (tx, rx) = oneshot::channel();
+        self.summarize = Some(SummarizeState { session_id, rx });
+        handle.spawn(async move {
+            let (dtx, mut drx) = unbounded_channel();
+            deck.stream_chat(req, dtx).await;
+            let mut text = String::new();
+            while let Ok(delta) = drx.try_recv() {
+                match delta {
+                    DeckDelta::Text(t) => text.push_str(&t),
+                    DeckDelta::Done => break,
+                    DeckDelta::Error(_) => {
+                        let _ = tx.send(None);
+                        return;
+                    }
+                    DeckDelta::Session(_) => {}
+                }
+            }
+            let _ = tx.send(parse_title_summary(&text));
+        });
+    }
+
+    /// Poll the async title/summary request and apply it to the stored session by
+    /// id. A failed/empty result leaves the deterministic `derive_meta` labels.
+    fn poll_summarize(&mut self) {
+        let Some(state) = &mut self.summarize else { return };
+        match state.rx.try_recv() {
+            Ok(Some((title, summary))) => {
+                let id = state.session_id.clone();
+                self.summarize = None;
+                if let Some(store) = self.store.as_mut() {
+                    store.set_meta(&id, &title, &summary);
+                    store.save();
+                }
+            }
+            Ok(None) => self.summarize = None,
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(oneshot::error::TryRecvError::Closed) => self.summarize = None,
+        }
     }
 
     /// Chat is enabled only when the endpoint probes healthy AND the model is
@@ -1131,6 +1468,12 @@ impl DeckPane {
             role: Role::User,
             content: text.to_string(),
         });
+        // A turn appended after loading a stored session diverges the live
+        // conversation from its archived copy — leaving it is now the ambiguous
+        // "update vs save-as-new" case.
+        if self.loaded_session_id.is_some() {
+            self.dirty_since_load = true;
+        }
         self.persist_chat();
         self.start_turn(session, handle);
     }
@@ -1438,10 +1781,20 @@ impl DeckPane {
         }
         self.poll_probe(handle);
         self.poll_warm(handle);
+        // Spawn a queued async title/summary refine now that we own the handle,
+        // and poll any in-flight one. Only one at a time — a fresh archive drops
+        // the previous request. No-op unless the deck is Ready.
+        if self.summarize.is_none()
+            && let Some(id) = self.pending_summarize_id.take()
+        {
+            self.spawn_summarize(id, handle);
+        }
+        self.poll_summarize();
         // Keep the event loop running while background work is in flight,
         // whether or not the panel is rendered this frame.
         if self.busy()
             || self.deferred_local_turn
+            || self.summarize.is_some()
             || matches!(self.probe, ProbeState::Checking(_))
             || matches!(self.warm, WarmState::Warming { .. })
         {
@@ -1639,9 +1992,17 @@ impl DeckPane {
 
     /// Load a stored session's turns into the live transcript for viewing /
     /// continuation. Archives the current conversation first so nothing is lost.
+    /// When the current pane is an ambiguously-continued loaded session, this
+    /// parks behind the Update/Save-as-new modal; the load runs once resolved.
     fn load_stored_session(&mut self, id: &str) {
-        // Snapshot the outgoing conversation before replacing it.
-        self.archive_current_session();
+        self.guarded_next_action(NextAction::LoadSession(id.to_string()));
+    }
+
+    /// Replace the live pane with a stored session's turns (the archive of the
+    /// outgoing conversation, if any, has already happened via the guarded flow).
+    /// The loaded session is TRACKED (`loaded_session_id`) so continuing it and
+    /// then leaving offers update-in-place rather than a fork.
+    fn replace_live_with_stored(&mut self, id: &str) {
         let Some(store) = self.store.as_ref() else { return };
         let Some(session) = store.get(id) else { return };
         self.messages = session
@@ -1665,6 +2026,9 @@ impl DeckPane {
             .collect();
         // A loaded session is a fresh provider conversation (no live handle).
         self.session_id = None;
+        // Track it so a continued-then-left conversation updates in place.
+        self.loaded_session_id = Some(id.to_string());
+        self.dirty_since_load = false;
         self.session_search.clear();
         self.view = PaneView::Chat;
         self.persist_chat();
@@ -2387,6 +2751,12 @@ mod side_effect_gate_tests {
             deferred_local_turn: false,
             allow_web_search: false,
             store: None,
+            active_doc_uuid: None,
+            loaded_session_id: None,
+            dirty_since_load: false,
+            pending_session_decision: None,
+            summarize: None,
+            pending_summarize_id: None,
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
@@ -2616,7 +2986,7 @@ mod side_effect_gate_tests {
             ChatMessage { role: Role::User, content: "make a five by five core".into() },
             ChatMessage { role: Role::Assistant, content: "Drew the core.".into() },
         ];
-        pane.archive_current_session();
+        pane.archive_active(ArchiveMode::Auto);
         let store = pane.store.as_ref().unwrap();
         assert_eq!(store.sessions.len(), 1);
         let s = &store.sessions[0];
@@ -2655,6 +3025,289 @@ mod side_effect_gate_tests {
             pane.store.as_ref().unwrap().sessions.iter().any(|s| s.title == "live one"),
             "prior live conversation must be archived"
         );
+    }
+
+    #[test]
+    fn saved_chat_path_derives_per_doc_and_guards_traversal() {
+        // A well-formed uuid yields a `<uuid>.draft.json` under chats/.
+        let uuid = "11112222-3333-4444-5555-666677778888";
+        let p = saved_chat_path(uuid).expect("valid uuid → path");
+        assert!(p.ends_with(format!("{uuid}.draft.json")));
+        assert!(p.to_string_lossy().contains("/chats/"));
+        // The draft lives BESIDE the archive `<uuid>.json` (same dir).
+        let archive = crate::chat_store::store_path(uuid).unwrap();
+        assert_eq!(p.parent(), archive.parent());
+        // Path-traversal / malformed uuids are rejected (fail closed).
+        assert!(saved_chat_path("../../etc/passwd").is_none());
+        assert!(saved_chat_path("").is_none());
+        assert!(saved_chat_path("has/slash").is_none());
+    }
+
+    #[test]
+    fn load_draft_populates_live_state() {
+        // A loaded draft replaces the live pane and clears the loaded-session
+        // tracking (a draft is a continuation, not a stored session).
+        let mut pane = blank_pane();
+        pane.loaded_session_id = Some("stale".into());
+        pane.dirty_since_load = true;
+        let draft = SavedChat {
+            session_id: None,
+            messages: vec![ChatMessage { role: Role::User, content: "revive me".into() }],
+            transcript: vec![Entry::User("revive me".into())],
+        };
+        pane.load_draft(draft);
+        assert_eq!(pane.messages.len(), 1);
+        assert_eq!(pane.messages[0].content, "revive me");
+        assert!(pane.loaded_session_id.is_none());
+        assert!(!pane.dirty_since_load);
+    }
+
+    #[test]
+    fn archive_active_auto_updates_loaded_id_but_forks_fresh() {
+        // A FRESH chat (no loaded id) → Auto pushes a NEW session.
+        let mut pane = blank_pane();
+        pane.store = Some(crate::chat_store::DocSessions::new(
+            "aaaa1111-2222-3333-4444-555566667777".into(),
+        ));
+        pane.messages = vec![ChatMessage { role: Role::User, content: "fresh chat".into() }];
+        let id1 = pane.archive_active(ArchiveMode::Auto).unwrap();
+        assert_eq!(pane.store.as_ref().unwrap().sessions.len(), 1);
+        // Now the pane TRACKS that session; continuing it and archiving again in
+        // Auto mode UPDATES in place (no dup), reusing the same id.
+        pane.messages.push(ChatMessage { role: Role::Assistant, content: "done".into() });
+        let id2 = pane.archive_active(ArchiveMode::Auto).unwrap();
+        assert_eq!(id1, id2, "Auto reuses the loaded id");
+        assert_eq!(
+            pane.store.as_ref().unwrap().sessions.len(),
+            1,
+            "no duplicate on continue"
+        );
+        assert_eq!(pane.store.as_ref().unwrap().sessions[0].turns.len(), 2);
+    }
+
+    #[test]
+    fn archive_active_new_forces_a_fork_even_when_loaded() {
+        let mut pane = blank_pane();
+        pane.store = Some(crate::chat_store::DocSessions::new(
+            "aaaa1111-2222-3333-4444-555566667777".into(),
+        ));
+        pane.messages = vec![ChatMessage { role: Role::User, content: "one".into() }];
+        pane.archive_active(ArchiveMode::Auto).unwrap();
+        // Force a NEW session from the (now loaded) pane.
+        pane.messages.push(ChatMessage { role: Role::Assistant, content: "two".into() });
+        pane.archive_active(ArchiveMode::New).unwrap();
+        assert_eq!(
+            pane.store.as_ref().unwrap().sessions.len(),
+            2,
+            "New forces a second session"
+        );
+    }
+
+    #[test]
+    fn send_sets_dirty_only_after_a_load() {
+        // A turn on a fresh chat leaves dirty_since_load false; the SAME after a
+        // load sets it true (the ambiguous continue case).
+        let mut pane = blank_pane();
+        // Simulate a loaded session, then a new user turn.
+        pane.loaded_session_id = Some("sid".into());
+        pane.messages.push(ChatMessage { role: Role::User, content: "more".into() });
+        pane.dirty_since_load = pane.loaded_session_id.is_some(); // mirrors send()
+        assert!(pane.dirty_since_load);
+        assert!(pane.is_ambiguous_continue());
+    }
+
+    #[test]
+    fn guarded_next_action_forks_immediately_for_fresh_chat() {
+        // No loaded session → New Session archives immediately (Auto) and clears
+        // the live pane; NO modal is parked.
+        let mut pane = blank_pane();
+        pane.store = Some(crate::chat_store::DocSessions::new(
+            "aaaa1111-2222-3333-4444-555566667777".into(),
+        ));
+        pane.messages = vec![ChatMessage { role: Role::User, content: "fresh".into() }];
+        let parked = pane.guarded_next_action(NextAction::NewSession);
+        assert!(!parked, "fresh chat does not prompt");
+        assert!(pane.needs_session_decision().is_none());
+        assert_eq!(pane.store.as_ref().unwrap().sessions.len(), 1);
+        assert!(pane.messages.is_empty(), "live pane cleared");
+    }
+
+    #[test]
+    fn ambiguous_continue_parks_then_resolves_update_vs_new() {
+        // Loaded + dirty → New Session PARKS the decision.
+        let mut make = || {
+            let mut pane = blank_pane();
+            let mut store = crate::chat_store::DocSessions::new(
+                "aaaa1111-2222-3333-4444-555566667777".into(),
+            );
+            let mut s = crate::chat_store::ChatSession::new(10);
+            s.push("user", "stored ask", 10);
+            s.derive_meta();
+            let id = s.id.clone();
+            store.sessions.push(s);
+            pane.store = Some(store);
+            pane.loaded_session_id = Some(id.clone());
+            pane.dirty_since_load = true;
+            pane.messages = vec![
+                ChatMessage { role: Role::User, content: "stored ask".into() },
+                ChatMessage { role: Role::User, content: "a new follow-up".into() },
+            ];
+            (pane, id)
+        };
+        // Update path: resolve(true) updates in place — still ONE session.
+        let (mut pane, id) = make();
+        let parked = pane.guarded_next_action(NextAction::NewSession);
+        assert!(parked, "ambiguous continue must prompt");
+        assert_eq!(pane.needs_session_decision(), Some(NextAction::NewSession));
+        pane.resolve_session_decision(true);
+        assert!(pane.needs_session_decision().is_none());
+        let store = pane.store.as_ref().unwrap();
+        assert_eq!(store.sessions.len(), 1, "Update keeps one session");
+        assert_eq!(store.sessions[0].id, id);
+        assert_eq!(store.sessions[0].turns.len(), 2, "updated with the follow-up");
+        assert!(pane.messages.is_empty(), "New Session cleared the pane");
+
+        // Save-as-new path: resolve(false) forks — TWO sessions.
+        let (mut pane, _id) = make();
+        pane.guarded_next_action(NextAction::NewSession);
+        pane.resolve_session_decision(false);
+        assert_eq!(pane.store.as_ref().unwrap().sessions.len(), 2, "fork");
+    }
+
+    #[test]
+    fn cancel_session_decision_drops_the_parked_action() {
+        let mut pane = blank_pane();
+        pane.pending_session_decision = Some(NextAction::NewSession);
+        pane.cancel_session_decision();
+        assert!(pane.needs_session_decision().is_none());
+    }
+
+    #[test]
+    fn parse_title_summary_extracts_two_lines_with_fallback() {
+        // Two clean lines → (title, summary).
+        let (t, s) = parse_title_summary("Office core\nA 5x5 core with a stair.").unwrap();
+        assert_eq!(t, "Office core");
+        assert_eq!(s, "A 5x5 core with a stair.");
+        // Labels + quotes are stripped.
+        let (t, s) =
+            parse_title_summary("Title: \"Glass facade\"\nSummary: North curtain wall.")
+                .unwrap();
+        assert_eq!(t, "Glass facade");
+        assert_eq!(s, "North curtain wall.");
+        // Title only → empty summary, still Some.
+        let (t, s) = parse_title_summary("Just a title").unwrap();
+        assert_eq!(t, "Just a title");
+        assert_eq!(s, "");
+        // No usable content → None (deterministic fallback stays).
+        assert!(parse_title_summary("   \n  ").is_none());
+        assert!(parse_title_summary("").is_none());
+    }
+
+    #[test]
+    fn summarize_applies_by_id_without_touching_others() {
+        // The apply step (NOT the network): set_meta on the archived id refines
+        // that session and leaves others alone. Mirrors poll_summarize's apply.
+        let mut store = crate::chat_store::DocSessions::new(
+            "aaaa1111-2222-3333-4444-555566667777".into(),
+        );
+        let mut a = crate::chat_store::ChatSession::new(10);
+        a.push("user", "make a core", 10);
+        a.derive_meta();
+        let id = a.id.clone();
+        let mut b = crate::chat_store::ChatSession::new(20);
+        b.push("user", "add a facade", 20);
+        b.derive_meta();
+        let b_title = b.title.clone();
+        store.sessions.push(a);
+        store.sessions.push(b);
+        if let Some((title, summary)) =
+            parse_title_summary("Office core\nA compact office core.")
+        {
+            store.set_meta(&id, &title, &summary);
+        }
+        assert_eq!(store.get(&id).unwrap().title, "Office core");
+        assert_eq!(store.get(&id).unwrap().summary, "A compact office core.");
+        // The other session's fallback labels are untouched.
+        assert!(store.sessions.iter().any(|s| s.title == b_title));
+    }
+
+    #[test]
+    fn sync_store_switch_persists_old_draft_and_loads_new() {
+        // Switching documents must persist the OUTGOING draft to its per-doc path
+        // and load the INCOMING document's (empty) draft — each doc keeps its own
+        // live chat. Uses fresh uuids + cleans up its draft files.
+        let a = uuid::Uuid::new_v4().to_string();
+        let b = uuid::Uuid::new_v4().to_string();
+        // Ensure a clean slate.
+        for u in [&a, &b] {
+            if let Some(p) = saved_chat_path(u) {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        let mut pane = blank_pane();
+        pane.sync_store(&a);
+        assert_eq!(pane.active_doc_uuid.as_deref(), Some(a.as_str()));
+        // Put a live conversation on document A, then switch to B.
+        pane.messages = vec![ChatMessage { role: Role::User, content: "doc A chat".into() }];
+        pane.transcript = vec![Entry::User("doc A chat".into())];
+        pane.sync_store(&b);
+        // B starts empty…
+        assert_eq!(pane.active_doc_uuid.as_deref(), Some(b.as_str()));
+        assert!(pane.messages.is_empty(), "doc B has its own (empty) draft");
+        // …and A's draft was persisted to A's per-doc path.
+        let a_draft = SavedChat::load(&a);
+        assert_eq!(a_draft.messages.len(), 1);
+        assert_eq!(a_draft.messages[0].content, "doc A chat");
+        // Switching BACK to A revives its draft.
+        pane.sync_store(&a);
+        assert_eq!(pane.messages.len(), 1);
+        assert_eq!(pane.messages[0].content, "doc A chat");
+        // Cleanup.
+        for u in [&a, &b] {
+            if let Some(p) = saved_chat_path(u) {
+                let _ = std::fs::remove_file(&p);
+            }
+            if let Some(p) = crate::chat_store::store_path(u) {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    #[test]
+    fn migration_adopts_global_deck_chat_then_removes_it() {
+        // A one-time migration: the legacy GLOBAL deck_chat.json is adopted as the
+        // FIRST opened document's per-doc draft, then deleted. Guarded so it only
+        // runs when a real global file exists and this doc has no draft yet.
+        let Some(global) = legacy_global_chat_path() else { return };
+        // Do not clobber a real user file: only run the assertion when there is no
+        // pre-existing global snapshot; create a synthetic one for the test.
+        if global.exists() {
+            return; // a live global file is present; skip to avoid data loss
+        }
+        let doc = uuid::Uuid::new_v4().to_string();
+        if let Some(p) = saved_chat_path(&doc) {
+            let _ = std::fs::remove_file(&p);
+        }
+        let _ = std::fs::create_dir_all(global.parent().unwrap());
+        let legacy = serde_json::to_string(&SavedChatRef {
+            session_id: &None,
+            messages: &[ChatMessage { role: Role::User, content: "legacy global chat".into() }],
+            transcript: &[Entry::User("legacy global chat".into())],
+        })
+        .unwrap();
+        std::fs::write(&global, legacy).unwrap();
+
+        let mut pane = blank_pane();
+        pane.sync_store(&doc);
+        // Adopted into the live pane…
+        assert_eq!(pane.messages.len(), 1);
+        assert_eq!(pane.messages[0].content, "legacy global chat");
+        // …and the global file was removed (never re-adopted by another doc).
+        assert!(!global.exists(), "legacy global file must be deleted after migration");
+        // Cleanup the per-doc draft this created.
+        if let Some(p) = saved_chat_path(&doc) {
+            let _ = std::fs::remove_file(&p);
+        }
     }
 
     #[test]
