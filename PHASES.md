@@ -52,6 +52,25 @@ HIG-grounded design revision, run as sequential batches. All six landed.
   - *Plan-execute harness* (Claude-Code/DeepSeek-style loop for prolonged tasks): model first emits a PLAN (numbered steps, shown as checklist in transcript) → executes step-by-step, each step = commands + reads results/errors → self-corrects on error (retry/replan, bounded) → verifies end state (query objects, counts) → summarizes. Op-log stays the substrate; plan state persists in chat session so an interrupted plan resumes. Bounded iterations + user cancel.
   - Architecture: extend the existing tool_loop in crates/deck (already threads error results back) into plan/step/verify states; grammar (GBNF) gains plan/question/step message types so small local models emit them reliably.
 
+## Compliance plugins (planned 2026-09-02 — NOT started; plan only)
+
+Shared foundation first, then two rule packs riding it. Advisory only — every
+report carries "advisory pre-check, not a code review; verify with a licensed
+professional / AHJ". Rule packs are data (JSON), never hardcoded, so editions
+update without code and the deck LLM can read/extend them.
+
+- [ ] **M-checkengine** — declarative compliance-check engine (prereq for both packs):
+  - Check-plugin plane alongside the existing JSON macro plugins: a rule = JSON (id, code ref, severity, query over typed model, geometric predicate, threshold, message template). Engine evaluates rules against the document (typed members, stories, blocks, terrain, paths) and emits a structured `ComplianceReport` (pass/fail/warn + object ids + locations + measured vs required) — same shape/plumbing as the M-enviro `AnalysisReport` + `report` verb.
+  - Geometry probes library: clear-width along path, slope of ramp/path, riser/tread extraction from stair geometry, door clear opening, headroom, turning-circle fit (60" circle), travel-distance along route, count-by-type per story.
+  - Verbs: `codecheck <pack> [story|sel]`, `report codecheck`; failures optionally highlighted on an 'compliance' layer (red markers). Deck-callable + prompt section so the LLM runs checks and critiques grounded in rule ids ("stair S2 riser 8.1in > IBC 1011.5.2 max 7in").
+  - Rule packs user-loadable/LLM-authorable like plugins (`plugin` infra precedent); unit-test engine + each probe hard (known geometry → known verdict).
+- [ ] **M-ibc** — International Building Code pack (IBC 2021 edition, data-driven so 2024 swaps in):
+  - Stairs (riser 4–7in, tread ≥11in, headroom, handrail height/continuity, guard ≥42in), corridor/exit widths, ceiling heights, door widths, occupant-load calc (area ÷ table 1004.5 factors per space type), exit count vs occupant load, common-path/travel-distance approximations, story height triggers.
+  - Needs space/room semantics for occupancy — minimal `room <poly> <occupancy-type>` tagging verb ships with this pack.
+- [ ] **M-ada** — ADA pack (2010 ADA Standards / ICC A117.1):
+  - Ramps ≤1:12 + landing intervals/size, accessible route ≥36in clear (32in at points), door clear width ≥32in + maneuvering clearances, 60in turning space, thresholds ≤½in, reach ranges, accessible parking count vs total, restroom fixture clearances, stair handrail extensions.
+  - Reuses M-landscape ramp/slope math (ADA 1:12 warning already planned there) and check-engine probes; site + building both.
+
 ## Interop (M7 remainder) — COMPLETE ✅ (audited + closed 2026-09-02)
 
 Audit found nearly all of M7 had already shipped; the two real gaps (LAZ,
