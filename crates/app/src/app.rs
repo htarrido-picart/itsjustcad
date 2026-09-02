@@ -3811,6 +3811,7 @@ impl App {
             return;
         }
         let has_selection = !self.session.doc.selection.is_empty();
+        let view = self.view_state();
         let bar = egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
             crate::menu::ui(
                 ui,
@@ -3821,6 +3822,7 @@ impl App {
                     local_only: self.deck_pane.local_only(),
                     web_search: self.deck_pane.allow_web_search(),
                 },
+                view,
             )
         });
         // Dev/screenshot hook: force one menu open to show grouped items.
@@ -3832,6 +3834,49 @@ impl App {
             let ctx = ui.ctx().clone();
             self.apply_menu_action(&ctx, action);
         }
+    }
+
+    /// Current View-menu state (active display / lighting mode + panel
+    /// visibility) so the View menu's radio + flip items read as stateful. Maps
+    /// the render enums onto the menu-local tags [`crate::menu`] uses so `menu.rs`
+    /// stays render-dep-free.
+    fn view_state(&self) -> crate::menu::ViewState {
+        use crate::menu::{DisplayModeTag, LightModeTag};
+        use itsjustcad_render::{DisplayMode, LightMode};
+        let disp = self.display_modes[self.layout.camera_index(self.active_pane)];
+        let display = match disp {
+            DisplayMode::Shaded => Some(DisplayModeTag::Shaded),
+            DisplayMode::Wireframe => Some(DisplayModeTag::Wireframe),
+            DisplayMode::XRay => Some(DisplayModeTag::XRay),
+            DisplayMode::Pencil => Some(DisplayModeTag::Pencil),
+            // Ghosted has no menu entry; nothing is checked for it.
+            DisplayMode::Ghosted => None,
+        };
+        let lighting = match self.light_mode {
+            LightMode::Working => Some(LightModeTag::Working),
+            LightMode::Sun => Some(LightModeTag::Sun),
+            LightMode::Presentation => Some(LightModeTag::Presentation),
+        };
+        crate::menu::ViewState { display, lighting, panel_visible: self.panel_visible }
+    }
+
+    /// Toggle the right docked panel from the View menu, mirroring the ⌘\
+    /// Deck-tab-aware hotkey: if the Deck tab is the active, visible panel, hide
+    /// the panel; otherwise show it and focus the Deck tab.
+    fn toggle_panel(&mut self) {
+        use crate::tabstrip::PanelTab;
+        let deck_showing = self.panel_visible
+            && !self.panel_tabs.is_collapsed()
+            && self.panel_tabs.active() == PanelTab::Deck;
+        if deck_showing {
+            self.panel_visible = false;
+            self.deck_visible = false;
+        } else {
+            self.panel_visible = true;
+            self.panel_tabs.show(PanelTab::Deck);
+            self.deck_visible = true;
+        }
+        save_deck_visible(self.deck_visible);
     }
 
     /// Dispatch a menu pick. The rule (see `menu::menu_action`): draw verbs
@@ -3882,6 +3927,7 @@ impl App {
             }
             MenuAction::ToggleLocalOnly => self.deck_pane.toggle_local_only(),
             MenuAction::ToggleWebSearch => self.deck_pane.toggle_web_search(),
+            MenuAction::TogglePanel => self.toggle_panel(),
         }
     }
 
@@ -5027,6 +5073,9 @@ impl eframe::App for App {
             // Read live LLM-toggle state before the mutable native borrow.
             let local_only = self.deck_pane.local_only();
             let web_search = self.deck_pane.allow_web_search();
+            // Live View state (active display / lighting mode + panel visibility)
+            // for the stateful View menu radios + Panel flip.
+            let view = self.view_state();
             if let Some(native) = &mut self.native_menu {
                 // Disable-don't-hide: keep the selection-dependent native items'
                 // enabled state in sync with the current selection.
@@ -5034,6 +5083,9 @@ impl eframe::App for App {
                 // Mirror the live Local Only / Allow Web Search state onto the
                 // native checkable LLM items.
                 native.sync_toggles(local_only, web_search);
+                // Mirror the active display/lighting mode + panel visibility onto
+                // the native View menu (radio checks + Hide/Show Panel label).
+                native.sync_view_state(view);
                 let action = native.poll();
                 if let Some(action) = action {
                     let ctx = ui.ctx().clone();
@@ -5352,19 +5404,7 @@ impl eframe::App for App {
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::Backslash)
         });
         if toggle_deck {
-            use crate::tabstrip::PanelTab;
-            let deck_showing = self.panel_visible
-                && !self.panel_tabs.is_collapsed()
-                && self.panel_tabs.active() == PanelTab::Deck;
-            if deck_showing {
-                self.panel_visible = false;
-                self.deck_visible = false;
-            } else {
-                self.panel_visible = true;
-                self.panel_tabs.show(PanelTab::Deck);
-                self.deck_visible = true;
-            }
-            save_deck_visible(self.deck_visible);
+            self.toggle_panel();
         }
 
         // ⌘K opens the command palette. Consumed here (not via the keymap, which

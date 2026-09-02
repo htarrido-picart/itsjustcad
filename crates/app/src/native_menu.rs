@@ -27,7 +27,7 @@ use std::str::FromStr;
 use muda::accelerator::Accelerator;
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
-use crate::menu::{MenuAction, NativeItem, PredefinedKind, native_model, needs_selection};
+use crate::menu::{MenuAction, NativeItem, PredefinedKind, ViewState, native_model, needs_selection};
 use crate::preset::MenuStyle;
 
 /// A live native menu bar attached to the OS, plus the id→action routing table.
@@ -53,6 +53,12 @@ pub struct NativeMenuBar {
     check_items: HashMap<String, CheckMenuItem>,
     /// Last `(local_only, web_search)` we pushed, to skip redundant native calls.
     last_toggles: Option<(bool, bool)>,
+    /// Live handle to the View ▸ Panel item so its label flips
+    /// "Hide Panel" ⇄ "Show Panel" as the panel toggles.
+    panel_item: Option<MenuItem>,
+    /// Last View state we pushed (active display / lighting mode + panel
+    /// visibility), so we only touch the OS menu when it changes.
+    last_view: Option<crate::menu::ViewState>,
 }
 
 impl NativeMenuBar {
@@ -75,7 +81,7 @@ impl NativeMenuBar {
     {
         // Build with no selection initially; `sync_selection` enables items once
         // the app has a selection.
-        let (menu, routes, selection_items, check_items) = build_menu(style)?;
+        let (menu, routes, selection_items, check_items, panel_item) = build_menu(style)?;
 
         #[cfg(target_os = "macos")]
         {
@@ -91,6 +97,8 @@ impl NativeMenuBar {
                 last_has_selection: None,
                 check_items,
                 last_toggles: None,
+                panel_item,
+                last_view: None,
             })
         }
 
@@ -110,6 +118,8 @@ impl NativeMenuBar {
                 last_has_selection: None,
                 check_items,
                 last_toggles: None,
+                panel_item,
+                last_view: None,
             })
         }
 
@@ -117,7 +127,7 @@ impl NativeMenuBar {
         // so we do not attach a native bar; the in-window egui bar remains.
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            let _ = (menu, routes, selection_items, check_items);
+            let _ = (menu, routes, selection_items, check_items, panel_item);
             None
         }
     }
@@ -149,6 +159,43 @@ impl NativeMenuBar {
         if let Some(it) = self.check_items.get("LLM/web_search") {
             it.set_checked(web_search && !local_only);
             it.set_enabled(!local_only);
+        }
+    }
+
+    /// Push the live View state onto the native View menu: the active display /
+    /// lighting radio carries the check, and the Panel item's label flips
+    /// "Hide Panel" ⇄ "Show Panel". Idempotent — only touches the OS menu when the
+    /// state actually changes.
+    pub fn sync_view_state(&mut self, view: crate::menu::ViewState) {
+        use crate::menu::{DisplayModeTag, LightModeTag};
+        if self.last_view == Some(view) {
+            return;
+        }
+        self.last_view = Some(view);
+        // Display radios: exactly the active one checked.
+        for (id, tag) in [
+            ("View/disp_shaded", DisplayModeTag::Shaded),
+            ("View/disp_wire", DisplayModeTag::Wireframe),
+            ("View/disp_xray", DisplayModeTag::XRay),
+            ("View/disp_pencil", DisplayModeTag::Pencil),
+        ] {
+            if let Some(it) = self.check_items.get(id) {
+                it.set_checked(view.display == Some(tag));
+            }
+        }
+        // Lighting radios: exactly the active one checked.
+        for (id, tag) in [
+            ("View/light_working", LightModeTag::Working),
+            ("View/light_sun", LightModeTag::Sun),
+            ("View/light_present", LightModeTag::Presentation),
+        ] {
+            if let Some(it) = self.check_items.get(id) {
+                it.set_checked(view.lighting == Some(tag));
+            }
+        }
+        // Panel item label flip.
+        if let Some(it) = &self.panel_item {
+            it.set_text(if view.panel_visible { "Hide Panel" } else { "Show Panel" });
         }
     }
 
@@ -192,15 +239,18 @@ fn build_menu(
     HashMap<String, MenuAction>,
     Vec<MenuItem>,
     HashMap<String, CheckMenuItem>,
+    Option<MenuItem>,
 )> {
     let menu = Menu::new();
     let mut routes: HashMap<String, MenuAction> = HashMap::new();
     let mut selection_items: Vec<MenuItem> = Vec::new();
     let mut check_items: HashMap<String, CheckMenuItem> = HashMap::new();
+    // Live handle to the View ▸ Panel item, so its label can flip each frame.
+    let mut panel_item: Option<MenuItem> = None;
 
     // Selection-dependent items start disabled (built with no selection); the
     // app's per-frame `sync_selection` enables them once something is selected.
-    for top in native_model(style, false) {
+    for top in native_model(style, false, ViewState::default()) {
         let submenu = Submenu::new(&top.title, true);
         for item in &top.items {
             match item {
@@ -224,6 +274,10 @@ fn build_menu(
                     if selection_dependent(id) {
                         selection_items.push(mi.clone());
                     }
+                    // Track the Panel item so its label flips Hide ⇄ Show live.
+                    if id == "View/panel" {
+                        panel_item = Some(mi.clone());
+                    }
                     submenu.append(&mi).ok()?;
                     routes.insert(id.clone(), action.clone());
                 }
@@ -241,7 +295,7 @@ fn build_menu(
         }
         menu.append(&submenu).ok()?;
     }
-    Some((menu, routes, selection_items, check_items))
+    Some((menu, routes, selection_items, check_items, panel_item))
 }
 
 /// Whether a native leaf id (`"<Menu>/<verb>"`) is a selection-dependent verb,
@@ -276,7 +330,7 @@ mod tests {
     fn every_native_leaf_id_routes_to_its_action() {
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
             let mut expected: HashMap<String, MenuAction> = HashMap::new();
-            for top in native_model(style, true) {
+            for top in native_model(style, true, ViewState::default()) {
                 for item in &top.items {
                     if let NativeItem::Leaf { id, action, .. } = item {
                         assert!(
@@ -298,7 +352,7 @@ mod tests {
     #[test]
     fn every_native_shortcut_parses() {
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            for top in native_model(style, true) {
+            for top in native_model(style, true, ViewState::default()) {
                 for item in &top.items {
                     if let NativeItem::Leaf { shortcut: Some(s), label, .. } = item {
                         assert!(

@@ -76,6 +76,10 @@ pub enum MenuAction {
     /// Toggle "allow web search" for the next turn. Checkable LLM-menu item;
     /// forced off (and disabled) while local-only is on.
     ToggleWebSearch,
+    /// Toggle the right docked panel (Deck/chat + inspectors) visibility. The
+    /// View menu shows this as a stateful "Hide Panel" ⇄ "Show Panel" flip and
+    /// mirrors the ⌘\ hotkey. UI state, not op-log.
+    TogglePanel,
 }
 
 /// Draw-tool verbs (mirror `draw_tool::try_start`). A menu pick of one of these
@@ -117,6 +121,7 @@ pub fn action_shortcut(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ZoomReset => Some("Cmd+0"),
         MenuAction::ModelSetup => Some("Cmd+,"),
         MenuAction::CommandPalette => Some("Cmd+K"),
+        MenuAction::TogglePanel => Some("Cmd+\\"),
         MenuAction::Execute(v) if v == "undo" => Some("Cmd+Z"),
         MenuAction::Execute(v) if v == "redo" => Some("Cmd+Shift+Z"),
         _ => None,
@@ -308,6 +313,43 @@ pub enum PredefinedKind {
     Quit,
 }
 
+/// Live View-menu state that drives the stateful (radio / flip) items so the
+/// menu reads as toggles, not fire-and-forget commands. Threaded into
+/// [`native_model`] so the in-window bar renders the marks directly; the native
+/// (muda) bar syncs these onto its check handles each frame
+/// (`NativeMenuBar::sync_view_state`), mirroring the LLM-toggle pattern.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewState {
+    /// Active display mode of the focused viewport (`Some` ⇒ that radio item is
+    /// checked). Matched by the `display <mode>` command string.
+    pub display: Option<DisplayModeTag>,
+    /// Active lighting mode (`Some` ⇒ that radio item is checked). Matched by the
+    /// `lightmode <mode>` command string.
+    pub lighting: Option<LightModeTag>,
+    /// Whether the right docked panel is currently shown; flips the Panel item's
+    /// label between "Hide Panel" and "Show Panel".
+    pub panel_visible: bool,
+}
+
+/// The display-mode radio choices the View menu offers, in menu order. A copy of
+/// the render enum's identity kept menu-local so `menu.rs` needs no render dep;
+/// the `cmd` is the command-line string each fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayModeTag {
+    Shaded,
+    Wireframe,
+    XRay,
+    Pencil,
+}
+
+/// The lighting-mode radio choices the View menu offers, in menu order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightModeTag {
+    Working,
+    Sun,
+    Presentation,
+}
+
 /// A top-level native menu (e.g. "File") and its ordered rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeMenu {
@@ -365,7 +407,7 @@ fn wired_leaf(title: &str, id: &str, label: &str, action: MenuAction) -> NativeI
 /// items (Cut/Copy/Paste/Delete/Deselect): they stay visible but dimmed when
 /// nothing is selected, teaching the capability. The `_style` argument is kept
 /// for signature stability (the minimal bar is identical across presets).
-pub fn native_model(_style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
+pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> Vec<NativeMenu> {
     let mut menus: Vec<NativeMenu> = Vec::new();
 
     // ── File ────────────────────────────────────────────────────────────────
@@ -495,20 +537,41 @@ pub fn native_model(_style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
             enabled: true,
             action: MenuAction::Execute(line.into()),
         };
+        // A radio-style display/lighting choice: shows a check when it is the
+        // active mode. Rendered as a `Check`, the same mechanism the Theme menu's
+        // Light/Dark/System items use, so the active mode is unmistakable.
+        let radio = |id: &str, label: &str, line: &str, on: bool| NativeItem::Check {
+            id: format!("{t}/{id}"),
+            label: label.into(),
+            action: MenuAction::Execute(line.into()),
+            checked: on,
+            enabled: true,
+        };
+        // Panel visibility is a stateful flip, not a fire-and-forget verb.
+        let panel_item = NativeItem::Leaf {
+            id: format!("{t}/panel"),
+            label: if view.panel_visible { "Hide Panel".into() } else { "Show Panel".into() },
+            shortcut: action_shortcut(&MenuAction::TogglePanel).map(str::to_string),
+            enabled: true,
+            action: MenuAction::TogglePanel,
+        };
         let items = vec![
             // Command palette is the primary discoverability surface.
             wired_leaf(t, "palette", "Command Palette…", MenuAction::CommandPalette),
             NativeItem::Separator,
-            // Display modes.
-            ex("disp_shaded", "Display: Shaded", "display shaded"),
-            ex("disp_wire", "Display: Wireframe", "display wireframe"),
-            ex("disp_xray", "Display: X-ray", "display xray"),
-            ex("disp_pencil", "Display: Pencil", "display pencil"),
+            // Panel visibility as a stateful "Hide Panel" ⇄ "Show Panel" flip.
+            panel_item,
             NativeItem::Separator,
-            // Lighting modes.
-            ex("light_working", "Lighting: Working", "lightmode working"),
-            ex("light_sun", "Lighting: Sun", "lightmode sun"),
-            ex("light_present", "Lighting: Presentation", "lightmode presentation"),
+            // Display modes — radio: the active one carries a check.
+            radio("disp_shaded", "Display: Shaded", "display shaded", view.display == Some(DisplayModeTag::Shaded)),
+            radio("disp_wire", "Display: Wireframe", "display wireframe", view.display == Some(DisplayModeTag::Wireframe)),
+            radio("disp_xray", "Display: X-ray", "display xray", view.display == Some(DisplayModeTag::XRay)),
+            radio("disp_pencil", "Display: Pencil", "display pencil", view.display == Some(DisplayModeTag::Pencil)),
+            NativeItem::Separator,
+            // Lighting modes — radio: the active one carries a check.
+            radio("light_working", "Lighting: Working", "lightmode working", view.lighting == Some(LightModeTag::Working)),
+            radio("light_sun", "Lighting: Sun", "lightmode sun", view.lighting == Some(LightModeTag::Sun)),
+            radio("light_present", "Lighting: Presentation", "lightmode presentation", view.lighting == Some(LightModeTag::Presentation)),
             NativeItem::Separator,
             // Viewport layout.
             ex("vp1", "Viewports: 1", "viewports 1"),
@@ -684,9 +747,10 @@ pub fn ui(
     style: MenuStyle,
     has_selection: bool,
     toggles: MenuToggles,
+    view: ViewState,
 ) -> Option<MenuAction> {
     let mut action = None;
-    let model = native_model(style, has_selection);
+    let model = native_model(style, has_selection, view);
     egui::MenuBar::new().ui(ui, |ui| {
         for menu in &model {
             ui.menu_button(&menu.title, |ui| {
@@ -714,11 +778,17 @@ pub fn ui(
                                 ui.close();
                             }
                         }
-                        NativeItem::Check { label, action: a, enabled, .. } => {
-                            // Live state comes from `toggles`, not the model's
-                            // placeholder `checked`. Web-search is disabled while
-                            // local-only is on.
-                            let (checked, live_enabled) = toggles.for_action(a, *enabled);
+                        NativeItem::Check { label, action: a, checked: model_checked, enabled, .. } => {
+                            // LLM toggles read their live state from `toggles`; all
+                            // other checks (View display/lighting radios) render the
+                            // model's `checked`, which the caller already resolved
+                            // from the live ViewState.
+                            let (checked, live_enabled) = match a {
+                                MenuAction::ToggleLocalOnly | MenuAction::ToggleWebSearch => {
+                                    toggles.for_action(a, *enabled)
+                                }
+                                _ => (*model_checked, *enabled),
+                            };
                             let mark = if checked { "☑ " } else { "☐ " };
                             if ui
                                 .add_enabled(
@@ -805,8 +875,10 @@ pub fn demo_open(
     at: egui::Pos2,
 ) {
     // Demo with an EMPTY selection so disable-not-hide (dimmed Cut/Copy/Delete
-    // with their shortcut hints) is visible in the shot.
-    let Some(menu) = native_model(style, false).into_iter().find(|m| m.title == title) else {
+    // with their shortcut hints) is visible in the shot. A default ViewState
+    // (panel shown, Shaded/Working active) drives the stateful View items.
+    let view = ViewState { display: Some(DisplayModeTag::Shaded), lighting: Some(LightModeTag::Working), panel_visible: true };
+    let Some(menu) = native_model(style, false, view).into_iter().find(|m| m.title == title) else {
         return;
     };
     egui::Area::new(egui::Id::new("menu_demo"))
@@ -874,7 +946,7 @@ mod tests {
         assert_eq!(TOP_TITLES, ["File", "Edit", "View", "Theme", "LLM"]);
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
             let titles: Vec<String> =
-                native_model(style, true).iter().map(|m| m.title.clone()).collect();
+                native_model(style, true, ViewState::default()).iter().map(|m| m.title.clone()).collect();
             let mut expected = vec![
                 "File".to_string(),
                 "Edit".into(),
@@ -898,7 +970,7 @@ mod tests {
             "Analyze", "Structure", "Tools", "Format", "Boolean", "Plugins",
         ];
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            for m in native_model(style, true) {
+            for m in native_model(style, true, ViewState::default()) {
                 assert!(!banned.contains(&m.title.as_str()), "banned menu {} present", m.title);
             }
         }
@@ -907,12 +979,12 @@ mod tests {
     #[test]
     fn menu_bar_identical_across_presets() {
         // The minimal bar ignores the preset style.
-        assert_eq!(native_model(MenuStyle::Rhino, true), native_model(MenuStyle::AutoCAD, true));
+        assert_eq!(native_model(MenuStyle::Rhino, true, ViewState::default()), native_model(MenuStyle::AutoCAD, true, ViewState::default()));
     }
 
     #[test]
     fn file_menu_has_curated_items() {
-        let file = native_model(MenuStyle::Rhino, true)
+        let file = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == "File")
             .unwrap();
@@ -934,7 +1006,7 @@ mod tests {
 
     #[test]
     fn edit_menu_has_curated_items() {
-        let edit = native_model(MenuStyle::Rhino, true)
+        let edit = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == "Edit")
             .unwrap();
@@ -951,7 +1023,7 @@ mod tests {
 
     #[test]
     fn view_menu_has_display_lighting_viewports_views_and_palette() {
-        let view = native_model(MenuStyle::Rhino, true)
+        let view = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == "View")
             .unwrap();
@@ -970,7 +1042,7 @@ mod tests {
 
     #[test]
     fn llm_menu_has_setup_reveal_download_and_toggles() {
-        let llm = native_model(MenuStyle::Rhino, true)
+        let llm = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == "LLM")
             .expect("LLM menu present at top level");
@@ -995,7 +1067,7 @@ mod tests {
 
     #[test]
     fn theme_menu_has_appearance_and_text_size() {
-        let theme = native_model(MenuStyle::Rhino, true)
+        let theme = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == "Theme")
             .expect("Theme menu present at top level");
@@ -1013,7 +1085,7 @@ mod tests {
 
     #[test]
     fn help_menu_has_docs_reference_palette_about() {
-        let help = native_model(MenuStyle::AutoCAD, true)
+        let help = native_model(MenuStyle::AutoCAD, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == "Help")
             .unwrap();
@@ -1032,7 +1104,7 @@ mod tests {
     #[test]
     fn native_leaf_ids_are_unique() {
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            let ls = leaves(&native_model(style, true));
+            let ls = leaves(&native_model(style, true, ViewState::default()));
             let ids: HashSet<&String> = ls.iter().map(|(id, _, _)| id).collect();
             assert_eq!(ids.len(), ls.len(), "duplicate native menu id for {style:?}");
         }
@@ -1041,7 +1113,7 @@ mod tests {
     #[test]
     fn no_show_tab_bar_item_anywhere() {
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
-            for (_, label, _) in leaves(&native_model(style, true)) {
+            for (_, label, _) in leaves(&native_model(style, true, ViewState::default())) {
                 let l = label.to_lowercase();
                 assert!(!l.contains("tab bar"), "found tab-bar item: {label}");
                 assert!(!l.contains("all tabs"), "found all-tabs item: {label}");
@@ -1090,8 +1162,8 @@ mod tests {
     #[test]
     fn selection_edit_items_disabled_when_empty() {
         let sel_labels = ["Cut", "Copy", "Delete", "Deselect"];
-        let empty = native_model(MenuStyle::Rhino, false);
-        let filled = native_model(MenuStyle::Rhino, true);
+        let empty = native_model(MenuStyle::Rhino, false, ViewState::default());
+        let filled = native_model(MenuStyle::Rhino, true, ViewState::default());
         let enabled_of = |menus: &[NativeMenu], label: &str| -> Option<bool> {
             menus.iter().flat_map(|m| &m.items).find_map(|it| match it {
                 NativeItem::Leaf { label: l, enabled, .. } if l == label => Some(*enabled),
@@ -1107,12 +1179,80 @@ mod tests {
         assert_eq!(enabled_of(&empty, "Select All"), Some(true));
     }
 
+    // ── Stateful View menu (radios + Panel flip) ─────────────────────────────
+
+    /// Helper: the `checked` flag of a View check leaf by id.
+    fn view_check(view: ViewState, id: &str) -> Option<bool> {
+        native_model(MenuStyle::Rhino, true, view)
+            .into_iter()
+            .find(|m| m.title == "View")?
+            .items
+            .iter()
+            .find_map(|it| match it {
+                NativeItem::Check { id: i, checked, .. } if i == id => Some(*checked),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn view_display_mode_is_radio_checked() {
+        let v = ViewState { display: Some(DisplayModeTag::Wireframe), ..Default::default() };
+        // Exactly the active display mode carries the check.
+        assert_eq!(view_check(v, "View/disp_wire"), Some(true));
+        assert_eq!(view_check(v, "View/disp_shaded"), Some(false));
+        assert_eq!(view_check(v, "View/disp_xray"), Some(false));
+        assert_eq!(view_check(v, "View/disp_pencil"), Some(false));
+    }
+
+    #[test]
+    fn view_lighting_mode_is_radio_checked() {
+        let v = ViewState { lighting: Some(LightModeTag::Sun), ..Default::default() };
+        assert_eq!(view_check(v, "View/light_sun"), Some(true));
+        assert_eq!(view_check(v, "View/light_working"), Some(false));
+        assert_eq!(view_check(v, "View/light_present"), Some(false));
+    }
+
+    #[test]
+    fn view_panel_item_flips_label_and_carries_shortcut() {
+        let panel_of = |view: ViewState| -> (String, Option<String>) {
+            native_model(MenuStyle::Rhino, true, view)
+                .into_iter()
+                .find(|m| m.title == "View")
+                .unwrap()
+                .items
+                .iter()
+                .find_map(|it| match it {
+                    NativeItem::Leaf { id, label, shortcut, action, .. }
+                        if id == "View/panel" =>
+                    {
+                        assert_eq!(*action, MenuAction::TogglePanel);
+                        Some((label.clone(), shortcut.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("View/panel present")
+        };
+        let (shown, sc) = panel_of(ViewState { panel_visible: true, ..Default::default() });
+        assert_eq!(shown, "Hide Panel");
+        assert_eq!(sc, Some("Cmd+\\".to_string()));
+        let (hidden, _) = panel_of(ViewState { panel_visible: false, ..Default::default() });
+        assert_eq!(hidden, "Show Panel");
+    }
+
+    #[test]
+    fn toggle_panel_shortcut_present() {
+        // The native (muda) layer's `every_native_shortcut_parses` asserts the
+        // Panel leaf's "Cmd+\\" parses as an accelerator; here we just pin the
+        // string so the View flip and the ⌘\ hotkey stay in sync.
+        assert_eq!(action_shortcut(&MenuAction::TogglePanel), Some("Cmd+\\"));
+    }
+
     // ── Window menu (macOS) ──────────────────────────────────────────────────
 
     #[cfg(target_os = "macos")]
     #[test]
     fn window_menu_present_with_standard_items() {
-        let win = native_model(MenuStyle::Rhino, false)
+        let win = native_model(MenuStyle::Rhino, false, ViewState::default())
             .into_iter()
             .find(|m| m.title == "Window")
             .expect("Window menu present");
@@ -1139,7 +1279,7 @@ mod tests {
         assert_eq!(menu_shortcut("redo"), Some("Cmd+Shift+Z"));
         assert_eq!(menu_shortcut("delete"), Some("Delete"));
         assert_eq!(menu_shortcut("line"), None);
-        let file = native_model(MenuStyle::Rhino, true)
+        let file = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == "File")
             .unwrap();
