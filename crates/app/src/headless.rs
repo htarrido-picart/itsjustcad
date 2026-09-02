@@ -257,6 +257,13 @@ pub fn run_script_lines(
             Some(AppVerb::GuiOnly(name)) => {
                 eprintln!("warning: '{name}' is GUI-only; ignored in headless mode");
             }
+            Some(AppVerb::Render(_)) => {
+                // Needs the GUI's async job plumbing + a configured diffusion
+                // backend; the substrate never reaches the network.
+                eprintln!(
+                    "warning: 'render' needs the GUI (diffusion backend); ignored in headless mode"
+                );
+            }
             Some(AppVerb::Basemap(args)) => {
                 apply_basemap(&mut session, &args).map_err(|e| (line.clone(), e))?;
             }

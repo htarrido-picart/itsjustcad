@@ -313,6 +313,58 @@ pub fn make_render_deck(config: &RenderConfig) -> Box<dyn RenderDeck> {
     }
 }
 
+/// The cheap GET endpoint `test_connection` probes for each backend kind.
+/// Pure (unit-testable); `None` for the unconfigured backend.
+pub fn probe_url(config: &RenderConfig) -> Option<String> {
+    let base = config.base_url.trim_end_matches('/');
+    match config.kind {
+        RenderKind::None => None,
+        RenderKind::Comfy => Some(format!("{base}/system_stats")),
+        RenderKind::Automatic1111 => Some(format!("{base}/sdapi/v1/options")),
+        RenderKind::Cloud => Some(format!("{base}/account")),
+    }
+}
+
+/// `render test`: one cheap GET against the backend's probe endpoint. Returns a
+/// human-readable verdict either way — reachable (`Ok`) or a clear "cannot
+/// reach X at <url> — is it running?" / missing-key guidance (`Err`). This is
+/// the ONLY network call outside [`RenderDeck::render`], and it too only fires
+/// on an explicit user request.
+pub async fn test_connection(config: &RenderConfig) -> Result<String, String> {
+    let Some(url) = probe_url(config) else {
+        return Err(NO_BACKEND_MESSAGE.to_string());
+    };
+    if config.kind == RenderKind::Cloud && config.resolved_key().is_none() {
+        return Err(format!(
+            "cloud backend '{}' has no API key — set api_key (literal or env:VAR) in render_decks.json",
+            config.name
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.get(&url);
+    if let Some(key) = config.resolved_key() {
+        req = req.bearer_auth(key);
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => Ok(format!(
+            "'{}' is reachable at {} (HTTP {})",
+            config.name,
+            config.base_url,
+            resp.status().as_u16()
+        )),
+        Ok(resp) => Err(format!(
+            "'{}' answered HTTP {} at {url} — the server is up but rejected the probe \
+             (check base_url, API flags, or the key)",
+            config.name,
+            resp.status().as_u16()
+        )),
+        Err(e) => Err(unreachable_hint(&config.name, &config.base_url, e).to_string()),
+    }
+}
+
 // ── Unconfigured backend (the ship default) ──────────────────────────────────
 
 /// The default cassette: no backend. Every `render()` returns the guidance
@@ -1181,6 +1233,101 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("is it running?"), "{msg}");
         assert!(msg.contains(&base), "hint names the URL: {msg}");
+    }
+
+    #[test]
+    fn probe_url_per_kind() {
+        assert_eq!(probe_url(&RenderConfig::none()), None);
+        let comfy = RenderConfig {
+            name: "c".into(), kind: RenderKind::Comfy,
+            base_url: "http://localhost:8188/".into(), model: "m".into(), api_key: None,
+        };
+        // Trailing slash is normalised away.
+        assert_eq!(probe_url(&comfy).as_deref(), Some("http://localhost:8188/system_stats"));
+        let a = RenderConfig { kind: RenderKind::Automatic1111, ..comfy.clone() };
+        assert_eq!(
+            probe_url(&a).as_deref(),
+            Some("http://localhost:8188/sdapi/v1/options")
+        );
+        let cloud = RenderConfig { kind: RenderKind::Cloud, ..comfy };
+        assert_eq!(probe_url(&cloud).as_deref(), Some("http://localhost:8188/account"));
+    }
+
+    #[tokio::test]
+    async fn test_connection_unconfigured_gives_guidance() {
+        let err = test_connection(&RenderConfig::none()).await.unwrap_err();
+        assert!(err.contains("no render backend configured"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_connection_cloud_without_key_names_the_fix() {
+        let cfg = RenderConfig {
+            name: "cloud".into(), kind: RenderKind::Cloud,
+            base_url: "https://api.replicate.com/v1".into(), model: "m".into(),
+            api_key: Some("env:ITSJUSTCAD_UNSET_CLOUD_KEY_DEF".into()),
+        };
+        let err = test_connection(&cfg).await.unwrap_err();
+        assert!(err.contains("no API key"), "{err}");
+        assert!(err.contains("render_decks.json"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_connection_reachable_and_unreachable() {
+        // Reachable: mock A1111 answers the options probe.
+        let (listener, base) = bind_mock();
+        serve_mock(listener, |line, _| {
+            assert!(line.starts_with("GET /sdapi/v1/options"), "unexpected {line}");
+            (200, "application/json", b"{}".to_vec())
+        });
+        let cfg = RenderConfig {
+            name: "a1111".into(), kind: RenderKind::Automatic1111,
+            base_url: base, model: String::new(), api_key: None,
+        };
+        let ok = test_connection(&cfg).await.expect("mock reachable");
+        assert!(ok.contains("reachable"), "{ok}");
+
+        // Unreachable: bound-then-dropped port → the "is it running?" hint.
+        let (listener, base) = bind_mock();
+        drop(listener);
+        let cfg = RenderConfig { base_url: base.clone(), ..cfg };
+        let err = test_connection(&cfg).await.unwrap_err();
+        assert!(err.contains("is it running?"), "{err}");
+        assert!(err.contains(&base), "hint names the URL: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_connection_reachable_but_rejecting_is_honest() {
+        // A server that is up but 404s the probe (e.g. A1111 without --api):
+        // the verdict must say reachable-but-rejected, not "is it running?".
+        let (listener, base) = bind_mock();
+        serve_mock(listener, |_, _| (404, "text/plain", b"not found".to_vec()));
+        let cfg = RenderConfig {
+            name: "a1111".into(), kind: RenderKind::Automatic1111,
+            base_url: base, model: String::new(), api_key: None,
+        };
+        let err = test_connection(&cfg).await.unwrap_err();
+        assert!(err.contains("HTTP 404"), "{err}");
+        assert!(err.contains("rejected the probe"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_connection_cloud_sends_bearer_key() {
+        let (listener, base) = bind_mock();
+        let log = serve_mock(listener, |line, _| {
+            assert!(line.starts_with("GET /account"), "unexpected {line}");
+            (200, "application/json", b"{}".to_vec())
+        });
+        let cfg = RenderConfig {
+            name: "cloud".into(), kind: RenderKind::Cloud,
+            base_url: base, model: "m".into(), api_key: Some("sekrit-123".into()),
+        };
+        test_connection(&cfg).await.expect("mock cloud probe");
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().any(|h| h.contains("authorization: Bearer sekrit-123")
+                || h.contains("Authorization: Bearer sekrit-123")),
+            "bearer key on the probe: {log:?}"
+        );
     }
 
     #[tokio::test]

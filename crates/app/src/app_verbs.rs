@@ -66,6 +66,12 @@ pub enum AppVerb {
     /// GUI-only verb with no headless meaning (`template`, `critique`, …).
     /// Carried so the headless runner can warn about the specific name.
     GuiOnly(&'static str),
+    /// AI diffusion render of the current view (`render <prompt…>` /
+    /// `render cancel`). Carries the raw words after the verb; the GUI parses
+    /// them (`diffusion::parse_render_words`), captures the control images and
+    /// drives the configured render cassette. Network reaches ONLY the
+    /// user-configured backend in render_decks.json; ships unconfigured.
+    Render(Vec<String>),
     /// Georeferenced satellite/OSM basemap underlay
     /// (`basemap [osm|sat] [span_m] [opacity]` | `basemap off`). View/session
     /// state, opt-in, NEVER logged. Carries the parsed options for the front-end
@@ -195,6 +201,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
         ),
         "save" => AppVerb::Save(words.next().map(str::to_owned)),
         "help" => AppVerb::Help(words.next().map(str::to_owned)),
+        "render" => AppVerb::Render(words.map(str::to_owned).collect()),
         "template" => AppVerb::GuiOnly("template"),
         "critique" => AppVerb::GuiOnly("critique"),
         "basemap" => AppVerb::Basemap(parse_basemap_args(words)),
@@ -354,6 +361,7 @@ mod tests {
         "right",
         "persp",
         "basemap",
+        "render",
     ];
 
     /// Verbs that `classify` owns but the deck must NOT advertise: internal /
@@ -408,6 +416,7 @@ mod tests {
             "template",
             "critique",
             "basemap",
+            "render",
             // standard-view fall-through arm:
             "top",
             "bottom",
@@ -464,6 +473,8 @@ mod tests {
             "right",
             "persp",
             "basemap off",
+            "render glass pavilion at dusk",
+            "render cancel",
         ] {
             assert!(
                 classify(line).is_some(),
@@ -503,6 +514,8 @@ mod tests {
             "camera phone iphone-ultrawide",
             "basemap sat 800 0.6",
             "basemap off",
+            "render glass pavilion at dusk",
+            "render cancel",
         ] {
             assert!(classify(line).is_some(), "help advertises '{line}' but classify rejects it");
         }

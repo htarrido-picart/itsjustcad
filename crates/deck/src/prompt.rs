@@ -72,6 +72,13 @@ Camera projection & lens:
 Site context:
   basemap [osm|sat] [span_m] [opacity]          georeferenced satellite/OSM underlay (basemap off        e.g. basemap sat 800 0.6
                                                 clears)
+
+AI diffusion render (only if the user configured a render cassette; ships off):
+  render <prompt...>                            AI-render the CURRENT view: depth/edge/mask control      e.g. render glass pavilion at dusk, photoreal
+                                                images go to the user's diffusion backend (ComfyUI /
+                                                A1111 / Draw Things / cloud) and the result opens in a
+                                                window. render cancel aborts. Describe materials, mood
+                                                and light in the prompt; the geometry comes from the view.
 ";
 
 /// The "UI/session commands" section of the deck system prompt.

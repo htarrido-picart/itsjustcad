@@ -152,6 +152,12 @@ reads across the form. Be specific and direct; no flattery."
 /// event is routed to the critique handler, not the dev-shot exit path.
 const CRITIQUE_TAG: &str = "critique";
 
+/// Control-image raster size (depth / edge / mask), shared by the
+/// `controlimages` verb and the diffusion `render` flow. 1280×800 keeps the
+/// viewport-ish aspect and both sides divisible by 8 (SD-friendly).
+const CONTROL_W: u32 = 1280;
+const CONTROL_H: u32 = 800;
+
 /// Draw a small Lucide section-header icon, tinted to the dimmed foreground and
 /// vertically centered against the collapsing-header title it precedes.
 fn section_icon(ui: &mut egui::Ui, icons: &crate::icons::Icons, icon: crate::icons::Icon) {
@@ -245,6 +251,15 @@ pub(crate) fn help_lines(verb: Option<&str>) -> Vec<String> {
     }
 }
 
+/// A finished diffusion render ready to show: the uploaded texture plus the
+/// provenance the "AI Render" window captions (prompt, backend, on-disk PNG).
+struct RenderResultView {
+    texture: egui::TextureHandle,
+    path: std::path::PathBuf,
+    prompt: String,
+    backend: String,
+}
+
 pub struct App {
     session: Session,
     command_line: CommandLine,
@@ -320,6 +335,14 @@ pub struct App {
     /// optional user question; once the tagged Screenshot event lands, the PNG
     /// is written and a vision deck turn (Read tool enabled) is fired.
     pending_critique: Option<String>,
+    /// In-flight AI diffusion render (`render <prompt…>`), polled each frame.
+    /// `render cancel` aborts the spawned task. See `diffusion.rs`.
+    render_job: Option<crate::diffusion::RenderJob>,
+    /// In-flight `render test` backend connection probe.
+    render_conn_test: Option<crate::diffusion::ConnTest>,
+    /// Last finished diffusion render, shown in the floating "AI Render"
+    /// window (closing the window drops it; the PNG stays on disk).
+    render_result: Option<RenderResultView>,
     /// Cmd+C pressed with a selection; Cmd+V then runs `copy sel 1,1,0`.
     clipboard_armed: bool,
     /// In-progress drag-box selection: anchor position of the drag.
@@ -688,6 +711,9 @@ impl App {
             new_layer_default_color: None,
             last_line: None,
             pending_critique: None,
+            render_job: None,
+            render_conn_test: None,
+            render_result: None,
             clipboard_armed: false,
             box_drag: None,
             journal,
@@ -1206,6 +1232,13 @@ impl App {
                 let args = crate::app_verbs::parse_basemap_args(words);
                 self.set_basemap(args);
             }
+            // AI diffusion render of the current view. Opt-in network: only the
+            // user-configured backend in render_decks.json is ever reached, and
+            // only at this explicit request. Ships with NO backend active.
+            Some("render") => {
+                let words: Vec<String> = words.map(str::to_owned).collect();
+                self.handle_render(words);
+            }
             Some("template") => {
                 self.show_template_picker = true;
             }
@@ -1369,9 +1402,29 @@ impl App {
     /// / mask) from the active viewport's camera. Uses an on-demand wgpu device
     /// so it does not need the egui paint callback's render state. Not logged.
     fn export_control_images(&mut self, prefix: &str) {
-        const W: u32 = 1280;
-        const H: u32 = 800;
-        let aspect = W as f32 / H as f32;
+        let result = self.capture_control_images(prefix, CONTROL_W, CONTROL_H);
+        match result {
+            Ok(paths) => self.command_line.push_line(format!(
+                "control images -> {} , {} , {}",
+                paths.depth.display(),
+                paths.edge.display(),
+                paths.mask.display()
+            )),
+            Err(e) => self.command_line.push_line(format!("controlimages failed: {e}")),
+        }
+    }
+
+    /// Render the three CAD control maps (depth / edge / mask) from the active
+    /// viewport's camera to `<prefix>_{depth,edge,mask}.png`. Shared by the
+    /// `controlimages` verb and the `render` diffusion flow. Uses an on-demand
+    /// wgpu device so it does not need the egui paint callback's render state.
+    fn capture_control_images(
+        &mut self,
+        prefix: &str,
+        w: u32,
+        h: u32,
+    ) -> Result<itsjustcad_render::ControlImagePaths, String> {
+        let aspect = w as f32 / h as f32;
         let cam_idx = self.layout.camera_index(self.active_pane);
         let camera = self.cameras[cam_idx];
         let view_proj = camera.view_proj(aspect);
@@ -1387,38 +1440,195 @@ impl App {
             None => (0.1, 100.0),
         };
 
-        let result = (|| -> Result<itsjustcad_render::ControlImagePaths, String> {
-            let instance = wgpu::Instance::default();
-            let adapter = pollster::block_on(
-                instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-            )
-            .map_err(|e| format!("no wgpu adapter: {e:?}"))?;
-            let (device, queue) = pollster::block_on(
-                adapter.request_device(&wgpu::DeviceDescriptor::default()),
-            )
-            .map_err(|e| e.to_string())?;
-            itsjustcad_render::render_control_images(
-                &device,
-                &queue,
-                &self.session.doc,
-                view_proj,
-                eye,
-                near,
-                far,
-                W,
-                H,
-                prefix,
-            )
-        })();
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        )
+        .map_err(|e| format!("no wgpu adapter: {e:?}"))?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .map_err(|e| e.to_string())?;
+        itsjustcad_render::render_control_images(
+            &device, &queue, &self.session.doc, view_proj, eye, near, far, w, h, prefix,
+        )
+    }
 
-        match result {
-            Ok(paths) => self.command_line.push_line(format!(
-                "control images -> {} , {} , {}",
-                paths.depth.display(),
-                paths.edge.display(),
-                paths.mask.display()
-            )),
-            Err(e) => self.command_line.push_line(format!("controlimages failed: {e}")),
+    /// The `render` verb: AI-diffuse the current view via the active cassette
+    /// in `render_decks.json`, plus its setup subcommands (backends/use/test).
+    /// Every outcome lands on the command line — never silent.
+    fn handle_render(&mut self, words: Vec<String>) {
+        use crate::diffusion::{parse_render_words, RenderAction};
+        match parse_render_words(&words) {
+            RenderAction::Usage => {
+                for l in crate::diffusion::USAGE {
+                    self.command_line.push_line(*l);
+                }
+            }
+            RenderAction::Cancel => match self.render_job.take() {
+                Some(job) => {
+                    job.cancel();
+                    self.command_line.push_line("render canceled");
+                }
+                None => self.command_line.push_line("no render in flight"),
+            },
+            RenderAction::Backends => {
+                let decks = itsjustcad_deck::RenderDecksFile::load_or_default();
+                for l in crate::diffusion::backends_lines(&decks) {
+                    self.command_line.push_line(l);
+                }
+                self.command_line
+                    .push_line("`render use <name>` picks one; `render test` checks it");
+            }
+            RenderAction::Use(name) => {
+                let mut decks = itsjustcad_deck::RenderDecksFile::load_or_default();
+                match crate::diffusion::select_backend(&mut decks, &name) {
+                    Ok(msg) => {
+                        decks.save();
+                        self.command_line.push_line(msg);
+                    }
+                    Err(e) => self.command_line.push_line(e),
+                }
+            }
+            RenderAction::Test => {
+                let config =
+                    itsjustcad_deck::RenderDecksFile::load_or_default().active_config();
+                self.command_line
+                    .push_line(format!("render test: probing '{}'…", config.name));
+                self.render_conn_test =
+                    Some(crate::diffusion::ConnTest::start(&self.tokio, &config));
+            }
+            RenderAction::Prompt(prompt) => {
+                if self.render_job.is_some() {
+                    self.command_line
+                        .push_line("a render is already in flight — `render cancel` aborts it");
+                    return;
+                }
+                let config =
+                    itsjustcad_deck::RenderDecksFile::load_or_default().active_config();
+                if !config.is_configured() {
+                    self.command_line.push_line(itsjustcad_deck::NO_BACKEND_MESSAGE);
+                    self.command_line.push_line(
+                        "`render backends` lists cassettes; `render use <name>` picks one; \
+                         `render test` checks it",
+                    );
+                    return;
+                }
+                // Capture the control images from the active view into the
+                // private runtime dir (0700), then hand the bytes to the job.
+                let prefix = private_runtime_dir().join("render_control");
+                let prefix = prefix.to_string_lossy().to_string();
+                let control = match self
+                    .capture_control_images(&prefix, CONTROL_W, CONTROL_H)
+                    .map_err(|e| format!("control image capture failed: {e}"))
+                    .and_then(|_| {
+                        itsjustcad_deck::ControlImages::from_prefix(&prefix)
+                            .map_err(|e| format!("control images unreadable: {e}"))
+                    }) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.command_line.push_line(format!("render: {e}"));
+                        return;
+                    }
+                };
+                let req = itsjustcad_deck::RenderRequest::new(
+                    prompt, control, CONTROL_W, CONTROL_H,
+                );
+                let job = crate::diffusion::RenderJob::start(&self.tokio, &config, req);
+                self.command_line.push_line(format!(
+                    "render started on '{}' — diffusing the current view… (`render cancel` aborts)",
+                    job.backend
+                ));
+                self.render_job = Some(job);
+            }
+        }
+    }
+
+    /// Per-frame poll of the diffusion job + connection test. Results and
+    /// failures land on the command line; a finished image is written to the
+    /// private runtime dir and opened in the "AI Render" window.
+    fn poll_render(&mut self, ctx: &egui::Context) {
+        if let Some(t) = &mut self.render_conn_test {
+            match t.poll() {
+                Some(verdict) => {
+                    self.render_conn_test = None;
+                    let msg = match verdict {
+                        Ok(m) => format!("render test: {m}"),
+                        Err(m) => format!("render test failed: {m}"),
+                    };
+                    self.command_line.push_line(msg);
+                }
+                None => ctx.request_repaint_after(std::time::Duration::from_millis(150)),
+            }
+        }
+        let Some(mut job) = self.render_job.take() else { return };
+        match job.poll() {
+            crate::diffusion::RenderPoll::Pending => {
+                // Keep polling even while the user isn't interacting.
+                ctx.request_repaint_after(std::time::Duration::from_millis(150));
+                self.render_job = Some(job);
+            }
+            crate::diffusion::RenderPoll::Failed(e) => {
+                self.command_line.push_line(format!("render failed: {e}"));
+            }
+            crate::diffusion::RenderPoll::Done(img) => {
+                let path = crate::diffusion::result_path();
+                if let Err(e) = img.save(&path) {
+                    self.command_line
+                        .push_line(format!("render: could not write {}: {e}", path.display()));
+                }
+                let secs = job.started.elapsed().as_secs();
+                self.command_line.push_line(format!(
+                    "render done in {secs}s via '{}' → {}",
+                    job.backend,
+                    path.display()
+                ));
+                match crate::diffusion::decode_png(&img.png) {
+                    Ok(ci) => {
+                        let texture =
+                            ctx.load_texture("ai_render_result", ci, egui::TextureOptions::LINEAR);
+                        self.render_result = Some(RenderResultView {
+                            texture,
+                            path,
+                            prompt: job.prompt.clone(),
+                            backend: job.backend.clone(),
+                        });
+                    }
+                    Err(e) => self
+                        .command_line
+                        .push_line(format!("render: result image did not decode: {e}")),
+                }
+            }
+        }
+    }
+
+    /// Floating "AI Render" window showing the last diffusion result, scaled to
+    /// fit. Draggable + resizable + X-closable — never traps input. Closing
+    /// drops the texture; the PNG stays on disk at the captioned path.
+    fn render_result_window(&mut self, ctx: &egui::Context) {
+        let Some(view) = &self.render_result else { return };
+        let mut open = true;
+        egui::Window::new("AI Render")
+            .collapsible(true)
+            .resizable(true)
+            .default_size([640.0, 480.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} — via '{}'", view.prompt, view.backend))
+                        .weak(),
+                );
+                ui.label(
+                    egui::RichText::new(view.path.display().to_string()).weak().small(),
+                );
+                let size = view.texture.size_vec2();
+                let avail = ui.available_size();
+                let scale = (avail.x / size.x).min(avail.y / size.y).clamp(0.05, 1.0);
+                ui.add(
+                    egui::Image::new(&view.texture).fit_to_exact_size(size * scale),
+                );
+            });
+        if !open {
+            self.render_result = None;
         }
     }
 
@@ -5589,6 +5799,12 @@ impl eframe::App for App {
         // Deck pane tick: must run every frame regardless of visibility so
         // streaming turns and probes keep making progress while the pane is hidden.
         self.deck_pane.tick(&mut self.session, &self.tokio, ui.ctx());
+
+        // Diffusion render: poll the in-flight job / connection test and draw
+        // the floating result window. Must run every frame so progress and
+        // failures surface even while the user is idle.
+        self.poll_render(ui.ctx());
+        self.render_result_window(ui.ctx());
 
         // Multi-session store: key the deck's per-document chats off a stable
         // document uuid (stamped lazily if the file never had one). App-local,
