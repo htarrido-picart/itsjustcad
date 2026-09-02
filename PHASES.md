@@ -36,9 +36,17 @@ HIG-grounded design revision, run as sequential batches. All six landed.
 - [ ] **M-structural** — BIM structural members (grid/story/beam/column/slab/wall/section/material/load/support), then **IFC-structural / SAF** open-format handoff to ETABS/SAP2000/Robot. Interop only — never claim to analyze. Then **M-bim-import** (typed members from IFC).
 - [ ] **M-expressive** — generative/form-finding structures (Candela hypar, Dieste gauss-vault, geodesic domes, tensegrity, Frei Otto minimal surfaces, Gaudí funicular). One shared form-finding engine (dynamic relaxation) unlocks the whole family.
 
-## Interop (M7 remainder)
+## Interop (M7 remainder) — COMPLETE ✅ (audited + closed 2026-09-02)
 
-- [ ] IFC import/export, 3DM (openNURBS opt-in download), SVG/CSV export, point-cloud LAS/LAZ/E57, mesh import (OBJ/STL/glTF/Collada), STEP AP242 (needs kernel-brep).
+Audit found nearly all of M7 had already shipped; the two real gaps (LAZ,
+.3dm export) closed this session.
+
+- [x] **IFC** — import (IFC4/IFC2x3, meshes → 'ifc' layer, semantic variant for M-bim-import) + export (IFC4). *(already shipped)*
+- [x] **3DM** — pure-Rust openNURBS reader (meshes/lines/polylines/NURBS curves with names + layers; breps skipped) — no opt-in download needed. Export shipped 25d004a: the spec-conformant V5 writer promoted from test-only to `export .3dm`.
+- [x] **SVG / CSV export** — shipped earlier (svg.rs, csv.rs, wired to dialog + registry).
+- [x] **Point clouds** — LAS 1.2–1.4 (hand-rolled) + E57 (e57 crate) already in; **LAZ decompression added b5223c4** via laz-rs (Apache-2.0), batch-decompressed so decimation to ≤200k never materializes the cloud.
+- [x] **Mesh import** — OBJ/STL/glTF/GLB/Collada .dae all shipped (mesh_import.rs, hand-rolled parsers with size caps).
+- [x] STEP AP242 import + faceted export — implemented via OCCT, but **gated behind the opt-in 'kernel-occt' feature** (M-kernel); default builds report a clear "needs the exact-BREP tier" error.
 - DWG / SKP / RVT: bridge via open exchange only (no proprietary readers — license clean).
 
 ## Long-term / research
