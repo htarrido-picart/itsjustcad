@@ -2353,7 +2353,11 @@ impl DeckPane {
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        ui.label(egui::RichText::new(format!("📎 {name}")).weak());
+                        let fg = ui.visuals().weak_text_color();
+                        let sz = ui.text_style_height(&egui::TextStyle::Body);
+                        ui.add(icons.image(ui.ctx(), crate::icons::Icon::Paperclip, sz, fg))
+                            .on_hover_text("attached image");
+                        ui.label(egui::RichText::new(name).weak());
                         if icons
                             .icon_button(ui, crate::icons::Icon::Close, "remove attachment")
                             .clicked()

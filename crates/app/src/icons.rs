@@ -81,6 +81,7 @@ pub enum Icon {
     Skip,
     Close,
     Image,
+    Paperclip,
     Send,
     ChevronUp,
     ChevronDown,
@@ -97,7 +98,7 @@ impl Icon {
     /// Every icon, for exhaustiveness (embedding + tests). Part of the module's
     /// public surface; exercised by the raster-validation tests.
     #[allow(dead_code)]
-    pub const ALL: [Icon; 60] = [
+    pub const ALL: [Icon; 61] = [
         Icon::New,
         Icon::NewSession,
         Icon::Open,
@@ -149,6 +150,7 @@ impl Icon {
         Icon::Skip,
         Icon::Close,
         Icon::Image,
+        Icon::Paperclip,
         Icon::Send,
         Icon::ChevronUp,
         Icon::ChevronDown,
@@ -214,6 +216,7 @@ impl Icon {
             Icon::Skip => "skip-forward",
             Icon::Close => "x",
             Icon::Image => "image",
+            Icon::Paperclip => "paperclip",
             Icon::Send => "send",
             Icon::ChevronUp => "chevron-up",
             Icon::ChevronDown => "chevron-down",
@@ -285,6 +288,7 @@ impl Icon {
             Icon::Skip => png!("skip-forward"),
             Icon::Close => png!("x"),
             Icon::Image => png!("image"),
+            Icon::Paperclip => png!("paperclip"),
             Icon::Send => png!("send"),
             Icon::ChevronUp => png!("chevron-up"),
             Icon::ChevronDown => png!("chevron-down"),

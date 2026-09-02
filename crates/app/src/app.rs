@@ -4316,10 +4316,10 @@ impl App {
     }
 
     /// Compact background download indicator: a small bottom-right corner chip
-    /// ("Downloading <model> NN% ✕") shown whenever a download is active but the
+    /// ("[download] <model> NN% [x]") shown whenever a download is active but the
     /// Model Setup panel is hidden — so the user can close/minimize the panel and
     /// keep working while the download continues in its background thread.
-    /// Clicking the chip body reopens the panel; the ✕ cancels the download.
+    /// Clicking the chip body reopens the panel; the close icon cancels the download.
     fn download_progress_chip(&mut self, ctx: &egui::Context) {
         // Only when a download is in flight AND the full panel is not on screen
         // (the panel already shows its own progress bar).
