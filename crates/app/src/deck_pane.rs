@@ -2617,6 +2617,14 @@ impl DeckPane {
                                                 .inner_margin(egui::Margin::symmetric(10, 6))
                                                 .show(ui, |ui| {
                                                     ui.set_max_width(ui.available_width() * 0.82);
+                                                    // Bubbles live in a horizontal
+                                                    // (right/left) layout whose default
+                                                    // wrap mode is Extend — long/pasted
+                                                    // text would render one clipped line
+                                                    // instead of wrapping and growing the
+                                                    // bubble height. Force wrap.
+                                                    ui.style_mut().wrap_mode =
+                                                        Some(egui::TextWrapMode::Wrap);
                                                     ui.label(
                                                         egui::RichText::new(t).color(user_txt),
                                                     );
@@ -2635,6 +2643,8 @@ impl DeckPane {
                                                 .inner_margin(egui::Margin::symmetric(10, 6))
                                                 .show(ui, |ui| {
                                                     ui.set_max_width(ui.available_width() * 0.82);
+                                                    ui.style_mut().wrap_mode =
+                                                        Some(egui::TextWrapMode::Wrap);
                                                     CommonMarkViewer::new().show(
                                                         ui,
                                                         &mut self.markdown,
@@ -2672,6 +2682,8 @@ impl DeckPane {
                                         .inner_margin(egui::Margin::symmetric(10, 6))
                                         .show(ui, |ui| {
                                             ui.set_max_width(ui.available_width() * 0.82);
+                                            ui.style_mut().wrap_mode =
+                                                Some(egui::TextWrapMode::Wrap);
                                             CommonMarkViewer::new().show(
                                                 ui,
                                                 &mut self.markdown,
