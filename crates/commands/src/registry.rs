@@ -254,8 +254,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "hatch",
-            usage: "hatch <selector> [solid | lines [angle spacing] | crosshatch [angle spacing] | brick [spacing] | concrete [spacing] | insulation [spacing] | earth [spacing]]",
-            summary: "Hatch the region of a closed curve. Patterns: solid (fill), lines (parallel, default 45° 0.25m), crosshatch (two perpendicular sets), brick (running bond, horizontal courses), concrete (dash-dot scatter), insulation (batt zigzag), earth (45° short dashes). Example: hatch last · hatch last brick 0.2 · hatch last insulation 0.3",
+            usage: "hatch <selector> [solid | lines [angle spacing] | crosshatch [angle spacing] | brick [spacing] | concrete [spacing] | insulation [spacing] | earth [spacing] | ansi31..ansi38 [spacing]]",
+            summary: "Hatch the region of a closed curve. Patterns: solid (fill), lines (parallel, default 45° 0.25m), crosshatch (two perpendicular sets), brick (running bond, horizontal courses), concrete (dash-dot scatter), insulation (batt zigzag), earth (45° short dashes), ANSI standard set ansi31-ansi38 (31 iron, 32 steel, 33 bronze/brass, 34 plastic/rubber, 35 fire brick, 36 marble/glass, 37 lead/zinc, 38 aluminum; default spacing 0.2m). Example: hatch last · hatch last brick 0.2 · hatch last ansi32",
             category: Category::Annotate,
         },
         CommandSpec {

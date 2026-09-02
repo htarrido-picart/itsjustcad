@@ -52,6 +52,9 @@ pub enum HatchPattern {
     Insulation { spacing: f64 },
     /// Earth fill: 45° short dashes (standard drafting earth hatch).
     Earth { spacing: f64 },
+    /// ANSI standard material hatch, codes 31–38 (iron, steel, bronze,
+    /// plastic, fire brick, marble, lead, aluminum). See `hatch::hatch_ansi`.
+    Ansi { code: u8, spacing: f64 },
 }
 
 /// Drafting objects: they live in the document like geometry (layers,
@@ -349,7 +352,8 @@ impl Geometry {
                             | HatchPattern::Brick { spacing }
                             | HatchPattern::Concrete { spacing }
                             | HatchPattern::Insulation { spacing }
-                            | HatchPattern::Earth { spacing } => *spacing *= s,
+                            | HatchPattern::Earth { spacing }
+                            | HatchPattern::Ansi { spacing, .. } => *spacing *= s,
                             HatchPattern::Solid => {}
                         }
                     }

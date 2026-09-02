@@ -4240,9 +4240,17 @@ fn apply_forward(
                 | itsjustcad_doc::HatchPattern::Brick { spacing }
                 | itsjustcad_doc::HatchPattern::Concrete { spacing }
                 | itsjustcad_doc::HatchPattern::Insulation { spacing }
-                | itsjustcad_doc::HatchPattern::Earth { spacing } => Some(*spacing),
+                | itsjustcad_doc::HatchPattern::Earth { spacing }
+                | itsjustcad_doc::HatchPattern::Ansi { spacing, .. } => Some(*spacing),
                 itsjustcad_doc::HatchPattern::Solid => None,
             };
+            if let itsjustcad_doc::HatchPattern::Ansi { code, .. } = &pattern
+                && !(31..=38).contains(code)
+            {
+                return Err(ExecError::Invalid(format!(
+                    "unknown ANSI hatch code {code} (use 31..38)"
+                )));
+            }
             if let Some(sp) = pattern_spacing
                 && sp <= 0.0
             {
@@ -9031,6 +9039,23 @@ mod tests {
 
         // zero spacing rejected
         let err = s.run(parse("hatch last lines 45 0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("spacing"), "{err}");
+
+        // ANSI patterns store code + spacing and replay stably.
+        run(&mut s, "hatch last ansi33 0.15");
+        let obj = s.doc.objects().last().unwrap();
+        assert!(matches!(
+            &obj.geometry,
+            Geometry::Annotation(Annotation::Hatch {
+                pattern: itsjustcad_doc::HatchPattern::Ansi { code: 33, spacing },
+                ..
+            }) if *spacing == 0.15
+        ));
+        let json = crate::io::to_json(&s);
+        let loaded = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&loaded), json, "replay-stable");
+        run(&mut s, "undo"); // back to the bare rect so `last` is the boundary
+        let err = s.run(parse("hatch last ansi33 0").unwrap()).unwrap_err();
         assert!(err.to_string().contains("spacing"), "{err}");
     }
 

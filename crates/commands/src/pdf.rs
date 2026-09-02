@@ -82,7 +82,7 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
         }
         Geometry::Annotation(Annotation::Hatch { boundary, pattern }) => {
             use itsjustcad_doc::{
-                hatch::{hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
+                hatch::{hatch_ansi, hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
                 HatchPattern,
             };
             let segs: Vec<[glam::DVec3; 2]> = match pattern {
@@ -103,6 +103,7 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
                 HatchPattern::Concrete { spacing } => hatch_concrete(boundary, *spacing),
                 HatchPattern::Insulation { spacing } => hatch_insulation(boundary, *spacing),
                 HatchPattern::Earth { spacing } => hatch_earth(boundary, *spacing),
+                HatchPattern::Ansi { code, spacing } => hatch_ansi(boundary, *code, *spacing),
             };
             for [a, b] in segs {
                 out.push((a, b));

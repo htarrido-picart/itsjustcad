@@ -439,10 +439,23 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 ["insulation", spacing] => HatchPattern::Insulation { spacing: number(spacing)? },
                 ["earth"] => HatchPattern::Earth { spacing: 0.25 },
                 ["earth", spacing] => HatchPattern::Earth { spacing: number(spacing)? },
+                // ANSI standard set: ansi31 .. ansi38 with optional spacing.
+                [pat] if pat.strip_prefix("ansi").is_some_and(|c| matches!(c.parse::<u8>(), Ok(31..=38))) => {
+                    HatchPattern::Ansi {
+                        code: pat.strip_prefix("ansi").expect("guard").parse().expect("guard"),
+                        spacing: 0.2,
+                    }
+                }
+                [pat, spacing] if pat.strip_prefix("ansi").is_some_and(|c| matches!(c.parse::<u8>(), Ok(31..=38))) => {
+                    HatchPattern::Ansi {
+                        code: pat.strip_prefix("ansi").expect("guard").parse().expect("guard"),
+                        spacing: number(spacing)?,
+                    }
+                }
                 _ => {
                     return wrong(
                         "hatch",
-                        "an optional pattern: solid, lines [a s], crosshatch [a s], brick [s], concrete [s], insulation [s], earth [s]",
+                        "an optional pattern: solid, lines [a s], crosshatch [a s], brick [s], concrete [s], insulation [s], earth [s], ansi31..ansi38 [s]",
                         &args,
                     )
                 }
@@ -3357,6 +3370,18 @@ mod tests {
             parse("hatch last lines").unwrap(),
             Command::Hatch { pattern: HatchPattern::Lines { .. }, .. }
         ));
+        assert!(matches!(
+            parse("hatch last ansi32").unwrap(),
+            Command::Hatch { pattern: HatchPattern::Ansi { code: 32, spacing }, .. }
+                if spacing == 0.2
+        ));
+        assert!(matches!(
+            parse("hatch last ansi37 0.1").unwrap(),
+            Command::Hatch { pattern: HatchPattern::Ansi { code: 37, spacing }, .. }
+                if spacing == 0.1
+        ));
+        assert!(parse("hatch last ansi30").is_err()); // outside the standard set
+        assert!(parse("hatch last ansi39").is_err());
         assert!(parse("hatch last dots").is_err());
     }
 

@@ -3,7 +3,7 @@
 
 use glam::{DVec2, DVec3};
 use itsjustcad_doc::{
-    hatch::{hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
+    hatch::{hatch_ansi, hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
     Annotation, Document, Geometry, HatchPattern, SceneObject,
 };
 
@@ -360,6 +360,9 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                     }
                     HatchPattern::Earth { spacing } => {
                         push_hatch_segs(&mut scene.lines, hatch_earth(boundary, *spacing), color, lw_mm);
+                    }
+                    HatchPattern::Ansi { code, spacing } => {
+                        push_hatch_segs(&mut scene.lines, hatch_ansi(boundary, *code, *spacing), color, lw_mm);
                     }
                 }
             }

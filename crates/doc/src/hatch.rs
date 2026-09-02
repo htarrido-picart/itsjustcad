@@ -208,6 +208,118 @@ pub fn hatch_earth(boundary: &[DVec3], spacing: f64) -> Vec<[DVec3; 2]> {
         .collect()
 }
 
+/// Parallel hatch lines with a phase offset perpendicular to the line
+/// direction (shifts which rails the family sits on).
+fn hatch_lines_phase(
+    boundary: &[DVec3],
+    angle_deg: f64,
+    spacing: f64,
+    phase: f64,
+) -> Vec<[DVec3; 2]> {
+    let (sin, cos) = angle_deg.to_radians().sin_cos();
+    let shift = DVec3::new(-sin, cos, 0.0) * phase;
+    let moved: Vec<DVec3> = boundary.iter().map(|p| *p - shift).collect();
+    hatch_lines(&moved, angle_deg, spacing)
+        .into_iter()
+        .map(|[a, b]| [a + shift, b + shift])
+        .collect()
+}
+
+/// Split segments into `dash`-long pieces separated by `gap`.
+fn dash_segments(segs: Vec<[DVec3; 2]>, dash: f64, gap: f64) -> Vec<[DVec3; 2]> {
+    if dash <= 0.0 || gap < 0.0 {
+        return segs;
+    }
+    let period = dash + gap;
+    let mut out = Vec::new();
+    for [a, b] in segs {
+        let span = (b - a).length();
+        if span < 1e-9 {
+            continue;
+        }
+        let dir = (b - a) / span;
+        let mut t0 = 0.0;
+        while t0 < span {
+            let t1 = (t0 + dash).min(span);
+            if t1 - t0 > 1e-9 {
+                out.push([a + dir * t0, a + dir * t1]);
+            }
+            t0 += period;
+        }
+    }
+    out
+}
+
+/// ANSI standard hatch set (ANSI31–ANSI38), drawn at the drafting-standard
+/// 45° with `spacing` between line rails. Faithful in reading, approximate in
+/// exact dash metrics:
+///
+/// - 31 iron / general: single 45° lines
+/// - 32 steel: paired 45° lines (second family phase-offset)
+/// - 33 bronze / brass / copper: 45° lines alternating solid and dashed
+/// - 34 plastic / rubber: grouped triple 45° lines
+/// - 35 fire brick / refractory: solid + coarse-dashed 45° lines
+/// - 36 marble / glass: dash-scattered 45° lines
+/// - 37 lead / zinc / babbitt: 45° crosshatch
+/// - 38 aluminum: solid + long-dashed 45° lines
+///
+/// Unknown codes return an empty set.
+pub fn hatch_ansi(boundary: &[DVec3], code: u8, spacing: f64) -> Vec<[DVec3; 2]> {
+    if boundary.len() < 3 || spacing <= 0.0 {
+        return Vec::new();
+    }
+    let s = spacing;
+    match code {
+        31 => hatch_lines(boundary, 45.0, s),
+        32 => {
+            let mut v = hatch_lines_phase(boundary, 45.0, s, 0.0);
+            v.extend(hatch_lines_phase(boundary, 45.0, s, s * 0.25));
+            v
+        }
+        33 => {
+            let mut v = hatch_lines(boundary, 45.0, s);
+            v.extend(dash_segments(
+                hatch_lines_phase(boundary, 45.0, s, s * 0.5),
+                s * 0.25,
+                s * 0.125,
+            ));
+            v
+        }
+        34 => {
+            let group = s * 1.5;
+            let mut v = hatch_lines_phase(boundary, 45.0, group, 0.0);
+            v.extend(hatch_lines_phase(boundary, 45.0, group, s * 0.25));
+            v.extend(hatch_lines_phase(boundary, 45.0, group, s * 0.5));
+            v
+        }
+        35 => {
+            let mut v = hatch_lines(boundary, 45.0, s);
+            v.extend(dash_segments(
+                hatch_lines_phase(boundary, 45.0, s, s * 0.5),
+                s * 0.35,
+                s * 0.2,
+            ));
+            v
+        }
+        36 => dash_segments(hatch_lines(boundary, 45.0, s), s * 0.4, s * 0.2),
+        37 => {
+            let mut v = hatch_lines(boundary, 45.0, s);
+            v.extend(hatch_lines(boundary, 135.0, s));
+            v
+        }
+        38 => {
+            let mut v = hatch_lines(boundary, 45.0, s);
+            v.extend(dash_segments(
+                hatch_lines_phase(boundary, 45.0, s, s * 0.5),
+                s * 0.7,
+                s * 0.3,
+            ));
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Even-odd point-in-polygon test (XY plane).
 pub fn point_in_poly(pts: &[DVec2], p: DVec2) -> bool {
     let mut inside = false;
@@ -286,6 +398,68 @@ mod tests {
         let sq = unit_square();
         assert!(!hatch_insulation(&sq, 0.3).is_empty());
         assert!(hatch_insulation(&sq, 0.0).is_empty());
+    }
+
+    #[test]
+    fn ansi_codes_produce_segments_unknown_is_empty() {
+        let sq = unit_square();
+        for code in 31..=38u8 {
+            assert!(!hatch_ansi(&sq, code, 0.2).is_empty(), "ANSI{code} empty");
+        }
+        assert!(hatch_ansi(&sq, 30, 0.2).is_empty());
+        assert!(hatch_ansi(&sq, 39, 0.2).is_empty());
+        assert!(hatch_ansi(&sq, 31, 0.0).is_empty());
+    }
+
+    #[test]
+    fn ansi37_crosshatches_both_diagonals() {
+        let sq = unit_square();
+        let segs = hatch_ansi(&sq, 37, 0.25);
+        let mut pos = 0;
+        let mut neg = 0;
+        for [a, b] in &segs {
+            let d = *b - *a;
+            let slope = d.y / d.x;
+            if slope > 0.0 {
+                pos += 1;
+            } else {
+                neg += 1;
+            }
+        }
+        assert!(pos > 0 && neg > 0, "want both diagonals: +{pos} -{neg}");
+    }
+
+    #[test]
+    fn ansi32_doubles_ansi31_line_count() {
+        let sq = unit_square();
+        let single = hatch_ansi(&sq, 31, 0.2).len();
+        let double = hatch_ansi(&sq, 32, 0.2).len();
+        assert!(double > single, "paired steel hatch must add a family");
+    }
+
+    #[test]
+    fn ansi36_dashes_are_shorter_than_solid_lines() {
+        let sq = unit_square();
+        let total = |segs: Vec<[DVec3; 2]>| -> f64 {
+            segs.iter().map(|[a, b]| a.distance(*b)).sum()
+        };
+        let solid = total(hatch_ansi(&sq, 31, 0.2));
+        let dashed = total(hatch_ansi(&sq, 36, 0.2));
+        assert!(dashed < solid, "dashed total {dashed} !< solid {solid}");
+        assert!(dashed > 0.0);
+    }
+
+    #[test]
+    fn ansi_segments_stay_inside_boundary() {
+        let sq = unit_square();
+        for code in [32u8, 33, 36, 38] {
+            for [a, b] in hatch_ansi(&sq, code, 0.2) {
+                for p in [a, b] {
+                    assert!(p.x > -1e-6 && p.x < 1.0 + 1e-6, "ANSI{code} x={}", p.x);
+                    assert!(p.y > -1e-6 && p.y < 1.0 + 1e-6, "ANSI{code} y={}", p.y);
+                }
+            }
+        }
     }
 
     #[test]

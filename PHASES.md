@@ -49,19 +49,19 @@ Audit found nearly all of M7 had already shipped; the two real gaps (LAZ,
 - [x] STEP AP242 import + faceted export — implemented via OCCT, but **gated behind the opt-in 'kernel-occt' feature** (M-kernel); default builds report a clear "needs the exact-BREP tier" error.
 - DWG / SKP / RVT: bridge via open exchange only (no proprietary readers — license clean).
 
-## Long-term / research
+## Long-term / research (audited 2026-09-02 — most had ALREADY shipped)
 
-- [ ] **M-kernel** — opt-in OCCT exact-BREP tier (mesh kernel stays default; ~50MB download).
-- [ ] **M-plugins** — LLM-authored plugins (DeepSeek-harness model: everything pluggable, deck writes new commands/generators mid-chat, persist to disk).
-- [ ] **M-nurbs** — interpolated curves, control-point editing, knot insert, curvature graph.
-- [ ] **M-solids2** — sweep2, rail revolve, loft w/ guides, blend, variable pipe.
-- [ ] **M-constraints** — dimensional constraint solver (SolveSpace-style). Heavy.
-- [ ] **M-site / M-basemap** — terrain from contours, GeoJSON/OSM import, satellite basemaps (Esri/OSM no-key default).
-- [ ] **M-assets** — block library, hatch patterns, drafting fonts.
-- [ ] **M-dynblocks** — parametric/dynamic blocks (params + grips), LLM-authored.
-- [ ] **M-cloudfiles** — atomic saves, external-change detection, Dropbox conflict awareness.
-- [ ] **M-histedit / M-options** — op-log history editing; design-option branches (git-like).
-- [ ] **M-i18n / M-docs** — localization (Spanish first), tutorials + sample files + website.
+- [x] **M-kernel** — DONE as designed: opt-in OCCT tier exists (`kernel-occt` crate behind the `kernel-occt` feature; STEP + exact booleans route through it, default builds report the clear "needs the exact-BREP tier" error). Mesh kernel stays default. No further work planned.
+- [x] **M-plugins** — DONE (was already shipped; verified): declarative JSON macros (params + command-template body, NO native code), persisted to `~/.config/itsjustcad/plugins/`, loaded at startup, `plugin list|reload|save|define|delete` verbs, menu integration, path-traversal + prompt-injection hardening, and the deck system prompt teaches the LLM to author macros mid-chat via `plugin define {json}` (17 tests).
+- [x] **M-nurbs** — COMPLETE this session: interpolation (`interpcurve`) + control-point editing (`setpoint` + draggable UI) were already in; **added knot insertion** (`insertknot`, Boehm on homogeneous coords, shape-exact for rational curves) and **curvature graph** (`curvature` — comb hairs + tip curve on 'analysis', Menger curvature, reports max κ / min radius). Not done (niche): degree elevation; NURBS-output rebuild (rebuild emits polylines).
+- [x] **M-solids2** — COMPLETE this session: sweep2, rail revolve and variable-radius pipe were already in; **added loft with guide curves** (`loft <profiles> guides <sel>` — skin bows through open guides, cosine falloff) and **blend surface** (`blend <a> <b> [bulge]` — Hermite-eased sheet, bulge 1 = ruled).
+- [ ] **M-constraints** — dimensional constraint solver (SolveSpace-style). Heavy; DELIBERATELY DEFERRED.
+- [x] **M-site / M-basemap** — mostly DONE (was already shipped; verified): `terrain <csv|geojson>` from contours, GeoJSON/OSM import, OSM + keyless-satellite slippy-tile basemaps (offline-first, transient, never op-logged), `location` georeferencing.
+- [x] **M-assets** — COMPLETE this session: block library (`blocklib/blockload/blocksave` + 6 seeded starters), 7 drafting hatches and Hershey vector drafting font were already in; **added the ANSI standard hatch set** (`hatch <sel> ansi31..ansi38 [spacing]` — iron/steel/bronze/plastic/fire-brick/marble/lead/aluminum; renders in viewport + PDF, scales with the object, replay-stable). Not done (niche): TrueType drafting fonts, user-defined hatch rules.
+- [x] **M-dynblocks** — DONE (was already shipped; verified): `pblock <name> [param=default ...] : templates` parametric blocks, `insert ... param=value` overrides, `param <sel> key=value` re-derives geometry. No constraint-driven grips (see M-constraints).
+- [x] **M-cloudfiles** — COMPLETE this session: atomic saves (write-temp + fsync + rename) and crash journal were already in; **added external-change detection** (mtime/size watch, throttled 2 s poll, Reload-vs-keep-mine modal, deleted-file notice) and **conflict-copy awareness** (Dropbox "conflicted copy" + numbered-duplicate siblings warned at open/save).
+- [x] **M-histedit / M-options** — DONE (was already shipped; verified): `amend <step> <command>` op-log rewriting with full replay, `option save/list/switch/delete` design-option branches persisted in the file format. Not done: arbitrary rebase-style history surgery (amend-only by design).
+- [ ] **M-i18n / M-docs** — NOT STARTED (audited: no i18n infra, all UI strings hardcoded). Localization (Spanish first), tutorials + sample files + website. Real remaining work.
 
 ## Pre-release
 
