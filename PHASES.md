@@ -11,9 +11,9 @@ HIG-grounded design revision, run as sequential batches (each touches app.rs).
 - [x] **A — Tokens + a11y foundation** — `surface_elevated`/`on_surface_tertiary`/`destructive` roles, WCAG contrast helper + passing ≥4.5:1 body-role tests, type scale (caption/title/weight), spacing guards. *(already implemented; verified)*
 - [x] **B — Iconography** — Lucide clean, de-dup guard, `Line→pen-line`; added `Paperclip` icon replacing 📎. *(shipped ce0d1e1)*
 - [x] **C — Menus + keyboard** — Window menu, shortcuts shown, disable-don't-hide, stateful View menu (Panel Hide/Show ⌘\, display/lighting radios). *(shipped f470de7)*
-- [ ] **D — Component correctness** — button roles (destructive/pressed/"…"), real segmented controls + toolbar grouping, unsaved-changes + neutral-title alerts. *(running)*
-- [ ] **E — Ergonomics + states** — empty states (doc + chat), raise hit targets ~28–32px + focus ring + Tab order, middle-truncate names, alternating rows, add-layer-to-top, disclosure triangles.
-- [ ] **F — Polish** — token-relative history height, autosuggest accent fill, Reduce-Motion, download-cancel partial-file warning.
+- [x] **D — Component correctness** — button roles (destructive/pressed/"…"), segmented controls + toolbar grouping, unsaved-changes + neutral-title alerts. *(already implemented; verified)*
+- [x] **E — Ergonomics + states** — empty-doc viewport hint + add-layer toolbar to top (rest already present: empty chat, hit-target floor, focus ring, middle-truncate, striped rows). *(shipped 36e6418)*
+- [ ] **F — Polish** — token-relative history height, autosuggest accent fill, Reduce-Motion, download-cancel partial-file warning. *(running — final batch)*
 
 ## Queued — small, high-impact
 
