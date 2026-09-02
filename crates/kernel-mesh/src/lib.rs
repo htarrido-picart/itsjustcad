@@ -30,8 +30,9 @@ pub use expressive::{
     strut_lattice, GridshellSurface,
 };
 pub use formfind::{
-    cable_net, dynamic_relaxation, funicular_chain, invert_funicular, tensegrity_prism, Link,
-    Network, RelaxParams, RelaxReport, Tensegrity,
+    cable_net, dynamic_relaxation, force_density, funicular_chain, invert_funicular, max_residual,
+    minimal_surface, minimal_surface_grid, tensegrity_prism, Link, Network, RelaxParams,
+    RelaxReport, Tensegrity,
 };
 pub use mesh::{Mesh, RenderMesh};
 pub use primitives::{extrude_profile, make_box};
