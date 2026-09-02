@@ -45,6 +45,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = "0.4"
 egui_commonmark = "0.24"
 raw-window-handle = "0.6"
+# OS clipboard read for the text-input right-click Paste (egui exposes write via
+# ctx.copy_text but not read). Already in the tree via eframe.
+arboard = "3"
 
 # True native OS menus (macOS global NSMenu bar / Windows HMENU).
 # Linux uses the in-window egui bar instead — muda pulls gtk/glib on Linux

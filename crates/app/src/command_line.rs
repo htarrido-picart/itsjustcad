@@ -570,6 +570,12 @@ impl CommandLine {
                 response.request_focus();
                 self.focus_next_frame = false;
             }
+            // Right-click Cut/Copy/Paste/Select All on the command input.
+            crate::text_context_menu::attach(
+                &response,
+                &mut self.input,
+                egui::Id::new("command_line_input"),
+            );
 
             if response.has_focus() {
                 // Read all relevant keys in one go to avoid multiple borrows.

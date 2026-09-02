@@ -1933,11 +1933,14 @@ impl DeckPane {
 
         ui.horizontal(|ui| {
             ui.label("search:");
-            ui.add(
+            let search_id = egui::Id::new("session_search_input");
+            let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.session_search)
+                    .id(search_id)
                     .hint_text("find across this doc's chats")
                     .desired_width(f32::INFINITY),
             );
+            crate::text_context_menu::attach(&resp, &mut self.session_search, search_id);
         });
         ui.add_space(4.0);
 
@@ -2516,6 +2519,11 @@ impl DeckPane {
                                         .hint_text(hint),
                                 );
                                 submit_on_chord!(response, ui);
+                                crate::text_context_menu::attach(
+                                    &response,
+                                    &mut self.input,
+                                    input_id,
+                                );
                             });
                         // Buttons: photo + send together, right-aligned, below.
                         ui.with_layout(
@@ -2544,6 +2552,11 @@ impl DeckPane {
                                         .hint_text(hint),
                                 );
                                 submit_on_chord!(response, ui);
+                                crate::text_context_menu::attach(
+                                    &response,
+                                    &mut self.input,
+                                    input_id,
+                                );
                             },
                         );
                     }

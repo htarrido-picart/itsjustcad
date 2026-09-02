@@ -2444,6 +2444,7 @@ name = "itsjustcad"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "dirs",
  "eframe",
  "egui",

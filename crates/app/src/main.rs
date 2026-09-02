@@ -30,6 +30,7 @@ mod scene;
 mod statusbar;
 mod suggest;
 mod tabstrip;
+mod text_context_menu;
 mod theme;
 mod ui_plane;
 mod widgets;
