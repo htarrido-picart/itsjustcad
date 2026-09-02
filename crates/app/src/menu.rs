@@ -326,6 +326,10 @@ pub struct ViewState {
     /// Active lighting mode (`Some` ⇒ that radio item is checked). Matched by the
     /// `lightmode <mode>` command string.
     pub lighting: Option<LightModeTag>,
+    /// Active camera projection of the focused viewport (`Some` ⇒ that radio
+    /// item is checked; `None` for ortho standard views). Matched by the
+    /// `camera <mode>` command string.
+    pub camera: Option<CameraTag>,
     /// Whether the right docked panel is currently shown; flips the Panel item's
     /// label between "Hide Panel" and "Show Panel".
     pub panel_visible: bool,
@@ -348,6 +352,17 @@ pub enum LightModeTag {
     Working,
     Sun,
     Presentation,
+}
+
+/// The camera-projection radio choices the View menu offers, in menu order.
+/// Mirrors the `camera <mode>` verb family (perspective / two-point / panorama /
+/// fisheye); ortho standard views check nothing (projection is view-implied).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CameraTag {
+    Perspective,
+    TwoPoint,
+    Panorama,
+    Fisheye,
 }
 
 /// A top-level native menu (e.g. "File") and its ordered rows.
@@ -572,6 +587,15 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             radio("light_working", "Lighting: Working", "lightmode working", view.lighting == Some(LightModeTag::Working)),
             radio("light_sun", "Lighting: Sun", "lightmode sun", view.lighting == Some(LightModeTag::Sun)),
             radio("light_present", "Lighting: Presentation", "lightmode presentation", view.lighting == Some(LightModeTag::Presentation)),
+            NativeItem::Separator,
+            // Camera projections — radio: the active one carries a check. Ortho
+            // standard views (top/front/…) check nothing; the projection there
+            // is implied by the view. Fires the same `camera <mode>` verbs the
+            // command line and the deck use.
+            radio("cam_persp", "Camera: Perspective", "camera persp", view.camera == Some(CameraTag::Perspective)),
+            radio("cam_2point", "Camera: Two-Point", "camera 2point", view.camera == Some(CameraTag::TwoPoint)),
+            radio("cam_pano", "Camera: Panorama 360°", "camera pano", view.camera == Some(CameraTag::Panorama)),
+            radio("cam_fisheye", "Camera: Fisheye", "camera fisheye", view.camera == Some(CameraTag::Fisheye)),
             NativeItem::Separator,
             // Viewport layout.
             ex("vp1", "Viewports: 1", "viewports 1"),
@@ -877,7 +901,12 @@ pub fn demo_open(
     // Demo with an EMPTY selection so disable-not-hide (dimmed Cut/Copy/Delete
     // with their shortcut hints) is visible in the shot. A default ViewState
     // (panel shown, Shaded/Working active) drives the stateful View items.
-    let view = ViewState { display: Some(DisplayModeTag::Shaded), lighting: Some(LightModeTag::Working), panel_visible: true };
+    let view = ViewState {
+        display: Some(DisplayModeTag::Shaded),
+        lighting: Some(LightModeTag::Working),
+        camera: Some(CameraTag::Perspective),
+        panel_visible: true,
+    };
     let Some(menu) = native_model(style, false, view).into_iter().find(|m| m.title == title) else {
         return;
     };
@@ -1210,6 +1239,47 @@ mod tests {
         assert_eq!(view_check(v, "View/light_sun"), Some(true));
         assert_eq!(view_check(v, "View/light_working"), Some(false));
         assert_eq!(view_check(v, "View/light_present"), Some(false));
+    }
+
+    #[test]
+    fn view_camera_projection_is_radio_checked() {
+        let v = ViewState { camera: Some(CameraTag::TwoPoint), ..Default::default() };
+        assert_eq!(view_check(v, "View/cam_2point"), Some(true));
+        assert_eq!(view_check(v, "View/cam_persp"), Some(false));
+        assert_eq!(view_check(v, "View/cam_pano"), Some(false));
+        assert_eq!(view_check(v, "View/cam_fisheye"), Some(false));
+    }
+
+    #[test]
+    fn view_camera_none_checks_no_projection() {
+        // Ortho standard views: no camera radio carries a check.
+        let v = ViewState { camera: None, ..Default::default() };
+        for id in ["View/cam_persp", "View/cam_2point", "View/cam_pano", "View/cam_fisheye"] {
+            assert_eq!(view_check(v, id), Some(false), "{id} must be unchecked");
+        }
+    }
+
+    #[test]
+    fn view_camera_items_fire_camera_verbs() {
+        // Each camera radio dispatches the same `camera <mode>` verb the
+        // command line / deck use, so the menu stays a thin stateful skin.
+        let view = native_model(MenuStyle::Rhino, true, ViewState::default())
+            .into_iter()
+            .find(|m| m.title == "View")
+            .unwrap();
+        let action_of = |id: &str| -> Option<MenuAction> {
+            view.items.iter().find_map(|it| match it {
+                NativeItem::Check { id: i, action, .. } if i == id => Some(action.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(action_of("View/cam_persp"), Some(MenuAction::Execute("camera persp".into())));
+        assert_eq!(action_of("View/cam_2point"), Some(MenuAction::Execute("camera 2point".into())));
+        assert_eq!(action_of("View/cam_pano"), Some(MenuAction::Execute("camera pano".into())));
+        assert_eq!(
+            action_of("View/cam_fisheye"),
+            Some(MenuAction::Execute("camera fisheye".into()))
+        );
     }
 
     #[test]

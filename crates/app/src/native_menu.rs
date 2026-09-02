@@ -167,7 +167,7 @@ impl NativeMenuBar {
     /// "Hide Panel" ⇄ "Show Panel". Idempotent — only touches the OS menu when the
     /// state actually changes.
     pub fn sync_view_state(&mut self, view: crate::menu::ViewState) {
-        use crate::menu::{DisplayModeTag, LightModeTag};
+        use crate::menu::{CameraTag, DisplayModeTag, LightModeTag};
         if self.last_view == Some(view) {
             return;
         }
@@ -191,6 +191,18 @@ impl NativeMenuBar {
         ] {
             if let Some(it) = self.check_items.get(id) {
                 it.set_checked(view.lighting == Some(tag));
+            }
+        }
+        // Camera-projection radios: exactly the active one checked (none for
+        // ortho standard views, where projection is implied by the view).
+        for (id, tag) in [
+            ("View/cam_persp", CameraTag::Perspective),
+            ("View/cam_2point", CameraTag::TwoPoint),
+            ("View/cam_pano", CameraTag::Panorama),
+            ("View/cam_fisheye", CameraTag::Fisheye),
+        ] {
+            if let Some(it) = self.check_items.get(id) {
+                it.set_checked(view.camera == Some(tag));
             }
         }
         // Panel item label flip.

@@ -3894,8 +3894,8 @@ impl App {
     /// the render enums onto the menu-local tags [`crate::menu`] uses so `menu.rs`
     /// stays render-dep-free.
     fn view_state(&self) -> crate::menu::ViewState {
-        use crate::menu::{DisplayModeTag, LightModeTag};
-        use itsjustcad_render::{DisplayMode, LightMode};
+        use crate::menu::{CameraTag, DisplayModeTag, LightModeTag};
+        use itsjustcad_render::{DisplayMode, LightMode, PanoProjection};
         let disp = self.display_modes[self.layout.camera_index(self.active_pane)];
         let display = match disp {
             DisplayMode::Shaded => Some(DisplayModeTag::Shaded),
@@ -3910,7 +3910,21 @@ impl App {
             LightMode::Sun => Some(LightModeTag::Sun),
             LightMode::Presentation => Some(LightModeTag::Presentation),
         };
-        crate::menu::ViewState { display, lighting, panel_visible: self.panel_visible }
+        // Camera projection of the focused viewport: pano/fisheye win (they
+        // replace the pinhole entirely), then two-point, then plain
+        // perspective; ortho standard views check nothing.
+        let cam = self.cameras[self.layout.camera_index(self.active_pane)];
+        let camera = if cam.ortho {
+            None
+        } else {
+            match cam.pano {
+                Some(PanoProjection::Equirect) => Some(CameraTag::Panorama),
+                Some(PanoProjection::Fisheye { .. }) => Some(CameraTag::Fisheye),
+                None if cam.two_point => Some(CameraTag::TwoPoint),
+                None => Some(CameraTag::Perspective),
+            }
+        };
+        crate::menu::ViewState { display, lighting, camera, panel_visible: self.panel_visible }
     }
 
     /// Toggle the right docked panel from the View menu, mirroring the ⌘\
