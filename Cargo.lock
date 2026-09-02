@@ -2507,6 +2507,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "itsjustcad-constraints"
+version = "0.3.0"
+
+[[package]]
 name = "itsjustcad-deck"
 version = "0.3.0"
 dependencies = [

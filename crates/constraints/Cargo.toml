@@ -1,0 +1,9 @@
+[package]
+name = "itsjustcad-constraints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "2D sketch dimensional-constraint solver (SolveSpace-style Newton/Levenberg-Marquardt)"
+
+[dependencies]
