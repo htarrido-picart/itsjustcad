@@ -3308,8 +3308,15 @@ mod side_effect_gate_tests {
         assert!(store.sessions.iter().any(|s| s.title == b_title));
     }
 
+    /// Serializes the tests that call `sync_store`: migration adopts (and
+    /// deletes) the LEGACY GLOBAL chat file, so a concurrent `sync_store` from
+    /// another test can steal it mid-assertion. One shared lock removes the
+    /// flake without weakening either test.
+    static SYNC_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn sync_store_switch_persists_old_draft_and_loads_new() {
+        let _guard = SYNC_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Switching documents must persist the OUTGOING draft to its per-doc path
         // and load the INCOMING document's (empty) draft — each doc keeps its own
         // live chat. Uses fresh uuids + cleans up its draft files.
@@ -3352,6 +3359,7 @@ mod side_effect_gate_tests {
 
     #[test]
     fn migration_adopts_global_deck_chat_then_removes_it() {
+        let _guard = SYNC_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A one-time migration: the legacy GLOBAL deck_chat.json is adopted as the
         // FIRST opened document's per-doc draft, then deleted. Guarded so it only
         // runs when a real global file exists and this doc has no draft yet.

@@ -10,6 +10,7 @@ mod command_line;
 mod deck_pane;
 mod download;
 mod draw_tool;
+mod filewatch;
 mod gumball;
 mod hardware;
 mod headless;

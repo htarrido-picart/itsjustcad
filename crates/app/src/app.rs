@@ -431,6 +431,12 @@ pub struct App {
     /// fresh Quit (the doc is still dirty). Without it, Discard loops forever and
     /// the app never actually exits.
     force_close: bool,
+    /// Snapshot of the saved/opened document file, polled for external changes
+    /// (cloud sync, other apps). `None` until the doc has a path.
+    file_watch: Option<crate::filewatch::FileWatch>,
+    /// A detected external change parked behind the reload alert. `Some` while
+    /// the alert is up.
+    external_change: Option<crate::filewatch::ExternalChange>,
     /// Test/preview only: skip the wgpu 3D viewport paint callback so the full
     /// window can be snapshot off-screen via egui_kittest (whose egui render
     /// pass has no depth attachment, which the scene callback requires). All the
@@ -743,6 +749,8 @@ impl App {
                 .is_ok()
                 .then_some(PendingNav::New),
             force_close: false,
+            file_watch: None,
+            external_change: None,
             preview_no_viewport: false,
         }
     }
@@ -1901,9 +1909,88 @@ impl App {
                     .set_sandbox_root(path.parent().map(|p| p.to_path_buf()));
                 self.command_line
                     .push_line(format!("saved {}", path.display()));
+                // Watch the file for external changes (cloud sync, other apps)
+                // and surface any conflict copies a sync service left behind.
+                self.file_watch = Some(crate::filewatch::FileWatch::new(&path));
+                self.external_change = None;
+                self.report_conflict_copies(&path);
             }
             Err(e) => self.command_line.push_line(format!("error: {e}")),
         }
+    }
+
+    /// Warn (in the command line) about sync-service conflict copies sitting
+    /// next to the document — the user may be losing edits to a fork.
+    fn report_conflict_copies(&mut self, path: &std::path::Path) {
+        for c in crate::filewatch::conflict_siblings(path) {
+            self.command_line.push_line(format!(
+                "warning: sync conflict copy exists: {} — another device's edits may live there",
+                c.display()
+            ));
+        }
+    }
+
+    /// Render the file-changed-on-disk alert and apply the user's choice:
+    /// Reload replaces the session from disk; Cancel keeps the in-memory doc
+    /// (and re-snapshots so the same change isn't re-reported).
+    fn external_change_ui(&mut self, ctx: &egui::Context) -> bool {
+        let Some(change) = self.external_change else {
+            return false;
+        };
+        let Some(watch) = &self.file_watch else {
+            self.external_change = None;
+            return false;
+        };
+        let path = watch.path().to_path_buf();
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let roles = self.live_roles(dark);
+        let (title, message, confirm) = match change {
+            crate::filewatch::ExternalChange::Modified => (
+                "File changed on disk",
+                format!(
+                    "{} was modified outside ItsJustCAD (cloud sync or another app).\n\
+                     Reload to pick up those changes, or keep your version — saving will \
+                     overwrite the file on disk.",
+                    path.display()
+                ),
+                "Reload",
+            ),
+            crate::filewatch::ExternalChange::Deleted => (
+                "File removed on disk",
+                format!(
+                    "{} was moved or deleted outside ItsJustCAD.\n\
+                     Keep working and Save will recreate it.",
+                    path.display()
+                ),
+                "OK",
+            ),
+        };
+        let choice = crate::widgets::alert(
+            ctx,
+            &roles,
+            dark,
+            title,
+            &message,
+            confirm,
+            crate::widgets::ButtonRole::Normal,
+        );
+        match choice {
+            Some(crate::widgets::AlertChoice::Confirm)
+                if change == crate::filewatch::ExternalChange::Modified =>
+            {
+                self.external_change = None;
+                self.open(Some(path));
+            }
+            Some(_) => {
+                // Keep mine / OK: re-snapshot so this change isn't re-reported.
+                if let Some(w) = &mut self.file_watch {
+                    w.refresh();
+                }
+                self.external_change = None;
+            }
+            None => {}
+        }
+        true
     }
 
     /// Replay the newest crash journal from another session into this one.
@@ -1944,6 +2031,8 @@ impl App {
         self.uploaded_generation = None;
         self.journaled_generation = None;
         self.deck_pane.set_sandbox_root(None);
+        self.file_watch = None;
+        self.external_change = None;
         // A fresh document is clean at cursor 0.
         self.saved_cursor = 0;
         self.command_line.push_line("new document");
@@ -1982,6 +2071,9 @@ impl App {
                     .set_sandbox_root(path.parent().map(|p| p.to_path_buf()));
                 self.command_line
                     .push_line(format!("opened {} ({} objects)", path.display(), self.session.doc.len()));
+                self.file_watch = Some(crate::filewatch::FileWatch::new(&path));
+                self.external_change = None;
+                self.report_conflict_copies(&path);
             }
             Err(e) => self.command_line.push_line(format!("error: {e}")),
         }
@@ -5663,6 +5755,16 @@ impl eframe::App for App {
         // is parked behind the guard.
         let ctx = ui.ctx().clone();
         self.unsaved_guard_ui(&ctx);
+        // External-change watch: poll the saved file's mtime/size (throttled to
+        // one stat every 2 s) and park a reload alert when it diverges. Skipped
+        // while any change alert is already up.
+        if self.external_change.is_none()
+            && let Some(w) = &mut self.file_watch
+            && let Some(change) = w.poll(std::time::Duration::from_secs(2))
+        {
+            self.external_change = Some(change);
+        }
+        self.external_change_ui(&ctx);
         // Ask-on-continue: modal when continuing a loaded chat that diverged and
         // the user then triggered New Session / load-another.
         self.session_conflict_ui(&ctx);
