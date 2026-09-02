@@ -60,6 +60,16 @@ HIG-grounded design revision, run as sequential batches. All six landed.
   - Bench before/after on a big model (criterion or simple timing test); expect ~6–10× on M-series for ray-cast loops.
   - *Step 2 — wgpu compute (only if needed)*: occlusion ray casting as compute shader. Costs buffer plumbing + float-determinism care vs replay (analysis bins in op-log shield replay; keep CPU path as reference + test oracle). Deferred until step-1 profiling shows a real remaining hotspot.
 
+## GUI + usability testing (planned 2026-09-02)
+
+- [ ] **M-guitest** — automated GUI tests + automated usability audits (egui_kittest is ALREADY a dev-dep with wgpu/snapshot/eframe features and App has kittest hooks — build on it, don't re-plumb):
+  - *Journey tests* (kittest: AccessKit widget queries + synthetic click/type): onboarding flow, draw box → select → gumball drag → undo, layers panel add/lock/color, command line entry + autosuggest accept, chat send with mocked deck backend (question turn + plan checklist render once M-deckagent lands), import/export dialogs (mock file paths), Model Setup download flow with mock server.
+  - *Snapshot suite* (wgpu off-screen → PNG compare with per-pixel threshold): main window dark + light, each display mode chip, panels open/closed, dialogs — catches visual regressions the way unit tests never will. Store goldens in-repo; update via env flag.
+  - *Automated usability audits* (turn the HIG work into CI checks): every interactive widget ≥ hit-target floor token; WCAG ≥4.5:1 contrast for body roles in BOTH themes (helper exists — run it over the real widget tree, not just tokens); full keyboard-only traversal reaches every control (Tab order sane, focus ring visible); every menu item with a shortcut is unique (no conflicts); disabled-don't-hide invariant; reduce_motion honored (no spinner animation when set).
+  - *Headless*: extend existing `--shot` to capture GUI chrome (not just viewport) for both themes — closes the old "headless hardcodes dark" gap.
+  - CI-able on mac runner (Metal) or software rasterizer elsewhere; snapshot tests marked separately so flaky-pixel platforms can skip while logic journeys always run.
+  - Human usability testing stays manual (checklists per cart) — this phase automates everything automatable.
+
 ## Compliance plugins (planned 2026-09-02 — NOT started; plan only)
 
 Shared foundation first, then two rule packs riding it. Advisory only — every
