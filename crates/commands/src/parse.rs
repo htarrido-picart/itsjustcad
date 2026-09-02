@@ -1080,6 +1080,16 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let (year, month, day) = parse_date(date)?;
             Ok(Command::FaceSunHours { targets, ids: None, year, month, day })
         }
+        // radiation <selector> <path.epw>
+        "radiation" => {
+            let (targets, rest) = selector(&args, "radiation")?;
+            if rest.is_empty() {
+                return wrong("radiation", "a selector and an EPW path", &args);
+            }
+            // Join the remaining args so EPW paths with spaces survive
+            // whitespace tokenization (same approach as `import`).
+            Ok(Command::Radiation { targets, ids: None, path: rest.join(" "), bins: None })
+        }
         // sunpath [radius] [year]
         "sunpath" => {
             let (radius, year) = match args.as_slice() {

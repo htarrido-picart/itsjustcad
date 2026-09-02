@@ -342,6 +342,119 @@ pub fn sun_path_diagram(year: i32, lat_deg: f64, lon_deg: f64, tz_hours: f64) ->
 }
 
 // ---------------------------------------------------------------------------
+// EPW radiation: month×hour irradiance bins + annual per-face insolation.
+// ---------------------------------------------------------------------------
+
+/// Month×hour irradiance bins from an EPW file: `bins[(month-1)*24 + hour]` =
+/// `[dni, dhi]` in Wh/m², the mean Direct-Normal and Diffuse-Horizontal
+/// irradiance for that local-standard clock hour across the month's days.
+/// Always 288 entries (12 months × 24 hours).
+pub type RadiationBins = Vec<[f64; 2]>;
+
+/// Parse the radiation columns of an EPW file into month×hour bins.
+/// EPW data rows: field 3 = hour 1–24 (hour *ending*, local standard time),
+/// field 14 = Direct Normal Radiation (Wh/m²), field 15 = Diffuse Horizontal
+/// Radiation (Wh/m²). The missing-data sentinel 9999 counts as 0.
+pub fn parse_epw_radiation(text: &str) -> Result<RadiationBins, String> {
+    let mut sums = vec![[0.0f64; 2]; 288];
+    let mut counts = vec![0u32; 288];
+    let mut rows = 0usize;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.trim().split(',').collect();
+        let year_ok =
+            fields[0].len() == 4 && fields[0].chars().all(|c| c.is_ascii_digit());
+        if !year_ok || fields.len() < 16 {
+            continue;
+        }
+        let month = fields[1].trim().parse::<usize>().unwrap_or(0);
+        let hour = fields[3].trim().parse::<usize>().unwrap_or(0);
+        if !(1..=12).contains(&month) || !(1..=24).contains(&hour) {
+            continue;
+        }
+        let rad = |i: usize| -> f64 {
+            let v = fields[i].trim().parse::<f64>().unwrap_or(0.0);
+            if !(0.0..9999.0).contains(&v) { 0.0 } else { v }
+        };
+        let idx = (month - 1) * 24 + (hour - 1);
+        sums[idx][0] += rad(14);
+        sums[idx][1] += rad(15);
+        counts[idx] += 1;
+        rows += 1;
+    }
+    if rows == 0 {
+        return Err("no EPW data rows with radiation columns found".into());
+    }
+    Ok(sums
+        .into_iter()
+        .zip(counts)
+        .map(|(s, c)| if c > 0 { [s[0] / c as f64, s[1] / c as f64] } else { [0.0, 0.0] })
+        .collect())
+}
+
+/// Days in each month (non-leap; the ±1 day of leap February is noise at
+/// annual-insolation accuracy).
+pub const DAYS_IN_MONTH: [f64; 12] =
+    [31.0, 28.0, 31.0, 30.0, 31.0, 30.0, 31.0, 31.0, 30.0, 31.0, 30.0, 31.0];
+
+/// Annual insolation on a surface, in kWh/m²·yr.
+///
+/// For every month×hour bin, the sun position at the month's representative
+/// 21st (mid-hour, local standard time) gives the beam direction; the face
+/// receives `DNI·max(0, n·s)` when `occluded(s)` says the sun is visible, plus
+/// isotropic-sky diffuse `DHI·(1+n_z)/2` (unshaded sky-view — obstructions
+/// only block the beam in this first slice). Each bin is weighted by the
+/// month's day count. `normal` must be unit length (Z-up world).
+pub fn annual_face_irradiation(
+    bins: &RadiationBins,
+    year: i32,
+    lat_deg: f64,
+    lon_deg: f64,
+    tz_hours: f64,
+    normal: [f64; 3],
+    mut occluded: impl FnMut([f64; 3]) -> bool,
+) -> f64 {
+    assert_eq!(bins.len(), 288, "bins must be 12 months x 24 hours");
+    let sky_view = (1.0 + normal[2].clamp(-1.0, 1.0)) / 2.0;
+    let mut wh = 0.0f64;
+    for m in 0..12usize {
+        let days = DAYS_IN_MONTH[m];
+        for h in 0..24usize {
+            let [dni, dhi] = bins[m * 24 + h];
+            if dni <= 0.0 && dhi <= 0.0 {
+                continue;
+            }
+            // Diffuse arrives regardless of the sun's position.
+            wh += days * dhi * sky_view;
+            if dni <= 0.0 {
+                continue;
+            }
+            // Mid-hour local standard time → UTC.
+            let local_min = h as f64 * 60.0 + 30.0;
+            let utc = (local_min - tz_hours * 60.0).rem_euclid(1440.0);
+            let pos = solar_position(
+                year,
+                m as u32 + 1,
+                21,
+                (utc / 60.0) as u32,
+                (utc % 60.0) as u32,
+                lat_deg,
+                lon_deg,
+            );
+            if pos.altitude_deg <= 0.0 {
+                continue;
+            }
+            let s = sun_dir_f64(pos.azimuth_deg, pos.altitude_deg);
+            let cos_inc = normal[0] * s[0] + normal[1] * s[1] + normal[2] * s[2];
+            if cos_inc <= 0.0 || occluded(s) {
+                continue;
+            }
+            wh += days * dni * cos_inc;
+        }
+    }
+    wh / 1000.0
+}
+
+// ---------------------------------------------------------------------------
 // Environmental analysis geometry: shadow projection + ray-casting.
 // Pure f64 math, no GPU/doc dependencies, so it lives here beside the SPA and
 // is unit-testable in isolation.
@@ -898,6 +1011,92 @@ DATA PERIODS,1,1,Data,Sunday,1/1,12/31
         assert!(noon.iter().all(|p| p[1] < 0.0), "NYC noon sun is south (−Y)");
         // Midnight curve must not exist at a mid-latitude.
         assert!(!d.hour_curves.iter().any(|(h, _)| *h == 0), "no midnight sun at NYC");
+    }
+
+    // ── EPW radiation + annual insolation ───────────────────────────────────
+
+    /// Synthetic EPW body: LOCATION + header keywords + one data row per
+    /// (month, hour) with the given DNI/DHI for daytime hours 7–17.
+    fn synth_epw() -> String {
+        let mut s = String::from(
+            "LOCATION,Testville,TS,TST,TMY3,000000,40.71,-74.01,-5.0,10.0\n\
+             DESIGN CONDITIONS,0\nTYPICAL/EXTREME PERIODS,0\nGROUND TEMPERATURES,0\n\
+             HOLIDAYS/DAYLIGHT SAVINGS,No,0,0,0\nCOMMENTS 1,x\nCOMMENTS 2,y\n\
+             DATA PERIODS,1,1,Data,Sunday,1/1,12/31\n",
+        );
+        for month in 1..=12 {
+            for hour in 1..=24 {
+                // Daytime (ending hours 8..=17): DNI 500, DHI 100; else dark.
+                let (dni, dhi) = if (8..=17).contains(&hour) { (500, 100) } else { (0, 0) };
+                s.push_str(&format!(
+                    "1999,{month},21,{hour},60,A7,10.0,5.0,80,81100,0,0,300,600,{dni},{dhi}\n"
+                ));
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn epw_radiation_bins_day_bright_night_dark() {
+        let bins = parse_epw_radiation(&synth_epw()).unwrap();
+        assert_eq!(bins.len(), 288);
+        // Ending-hour 12 (index 11) is daytime in every month.
+        for m in 0..12 {
+            assert_eq!(bins[m * 24 + 11], [500.0, 100.0], "month {} noon", m + 1);
+            assert_eq!(bins[m * 24 + 2], [0.0, 0.0], "month {} 03:00 dark", m + 1);
+        }
+    }
+
+    #[test]
+    fn epw_radiation_sentinel_9999_counts_as_zero() {
+        let mut s = String::from(
+            "LOCATION,X,Y,Z,S,0,40.0,-74.0,-5.0,0\nDATA PERIODS,1,1,Data,Sunday,1/1,12/31\n",
+        );
+        s.push_str("1999,6,21,12,60,A7,10,5,80,81100,0,0,300,600,9999,9999\n");
+        let bins = parse_epw_radiation(&s).unwrap();
+        assert_eq!(bins[5 * 24 + 11], [0.0, 0.0]);
+        assert!(parse_epw_radiation("LOCATION,X\n").is_err(), "no rows must error");
+    }
+
+    #[test]
+    fn annual_irradiation_south_beats_north_wall_in_north_hemisphere() {
+        let bins = parse_epw_radiation(&synth_epw()).unwrap();
+        let clear = |_: [f64; 3]| false;
+        let south =
+            annual_face_irradiation(&bins, 2026, 40.71, -74.01, -5.0, [0.0, -1.0, 0.0], clear);
+        let north =
+            annual_face_irradiation(&bins, 2026, 40.71, -74.01, -5.0, [0.0, 1.0, 0.0], clear);
+        // Same diffuse (both vertical), so the gap is pure beam: the NYC sun
+        // spends most of its arc south of the site.
+        assert!(south > north * 1.5, "south {south:.0} vs north {north:.0} kWh/m2yr");
+        assert!(north > 0.0, "north wall still receives diffuse + some beam");
+    }
+
+    #[test]
+    fn annual_irradiation_roof_up_vs_down() {
+        let bins = parse_epw_radiation(&synth_epw()).unwrap();
+        let clear = |_: [f64; 3]| false;
+        let up = annual_face_irradiation(&bins, 2026, 40.71, -74.01, -5.0, [0.0, 0.0, 1.0], clear);
+        let down =
+            annual_face_irradiation(&bins, 2026, 40.71, -74.01, -5.0, [0.0, 0.0, -1.0], clear);
+        assert!(up > 0.0);
+        // A down-facing face sees no sky and no sun: exactly zero.
+        assert_eq!(down, 0.0);
+        // Magnitude sanity: 10 daylight bins × 500/100 W → hundreds of kWh/yr,
+        // not tens of thousands.
+        assert!((300.0..3000.0).contains(&up), "up-roof {up:.0} kWh/m2yr");
+    }
+
+    #[test]
+    fn annual_irradiation_occlusion_keeps_diffuse_only() {
+        let bins = parse_epw_radiation(&synth_epw()).unwrap();
+        let n = [0.0, 0.0, 1.0];
+        let open = annual_face_irradiation(&bins, 2026, 40.71, -74.01, -5.0, n, |_| false);
+        let blocked = annual_face_irradiation(&bins, 2026, 40.71, -74.01, -5.0, n, |_| true);
+        assert!(blocked > 0.0, "diffuse survives full beam occlusion");
+        assert!(blocked < open * 0.6, "losing the beam must cost a lot: {blocked} vs {open}");
+        // Blocked horizontal face = pure diffuse: 100 Wh × 10 bins × 365 d ÷ 1000.
+        assert!((blocked - 365.0).abs() < 1.0, "pure diffuse ≈ 365 kWh: {blocked:.1}");
     }
 
     #[test]

@@ -2391,6 +2391,157 @@ fn exec_shadow_study(
     ))
 }
 
+/// Annual radiation (insolation) study. Per selected face: beam kWh weighted
+/// by the EPW month×hour Direct-Normal bins (representative 21st of each
+/// month, occlusion-tested against the scene BVH) plus isotropic-sky diffuse
+/// from the Diffuse-Horizontal bins. The bins are embedded into the logged
+/// command on first exec so replay never re-reads the EPW file.
+fn exec_radiation(
+    doc: &mut Document,
+    targets: Selector,
+    ids: Option<Vec<ObjectId>>,
+    path: String,
+    bins: Option<Vec<[f64; 2]>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let loc = doc.location.ok_or_else(|| {
+        ExecError::Invalid(
+            "no location set — run `sun <lat> <lon> <date> <time>` or `location <lat> <lon>`, \
+             or `import <file.epw>` first"
+                .into(),
+        )
+    })?;
+    // First exec reads + bins the EPW; replay reuses the embedded bins.
+    let bins: itsjustcad_solar::RadiationBins = match bins {
+        Some(b) if b.len() == 288 => b,
+        Some(_) => return Err(ExecError::Invalid("corrupt radiation bins in op-log".into())),
+        None => {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| ExecError::Invalid(format!("cannot read EPW '{path}': {e}")))?;
+            itsjustcad_solar::parse_epw_radiation(&text)
+                .map_err(|e| ExecError::Invalid(format!("EPW '{path}': {e}")))?
+        }
+    };
+    let target_ids = resolve(doc, &targets)?;
+
+    // World-space triangles of the selected faces (what we score + color).
+    let mut faces: Vec<[DVec3; 3]> = Vec::new();
+    for id in &target_ids {
+        if let Some(obj) = doc.get(*id)
+            && let Geometry::Mesh(m) = &obj.geometry
+        {
+            let pos = m.positions();
+            for f in m.faces() {
+                faces.push([pos[f[0] as usize], pos[f[1] as usize], pos[f[2] as usize]]);
+            }
+        }
+    }
+    if faces.is_empty() {
+        return Err(ExecError::Invalid(
+            "radiation needs a selected mesh (extrude or box first, then select)".into(),
+        ));
+    }
+
+    // Occlusion tested against the whole scene.
+    let tri_bvh = kernel_mesh::TriBvh::build(
+        scene_triangles(doc)
+            .into_iter()
+            .map(|t| {
+                [
+                    DVec3::from_array(t[0]),
+                    DVec3::from_array(t[1]),
+                    DVec3::from_array(t[2]),
+                ]
+            })
+            .collect(),
+    );
+
+    // Year for the representative sun positions: fixed so replay is stable
+    // (annual sun geometry is effectively year-invariant).
+    const RAD_YEAR: i32 = 2026;
+    let mut kwh: Vec<f64> = Vec::with_capacity(faces.len());
+    let mut max_k = 0.0f64;
+    for tri in &faces {
+        let centroid = (tri[0] + tri[1] + tri[2]) / 3.0;
+        let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
+        let nlen = normal.length();
+        if nlen > 1e-12 {
+            normal /= nlen;
+        }
+        let origin = centroid + normal * 1e-3;
+        let k = itsjustcad_solar::annual_face_irradiation(
+            &bins,
+            RAD_YEAR,
+            loc.lat_deg,
+            loc.lon_deg,
+            loc.tz_hours,
+            normal.to_array(),
+            |s| tri_bvh.ray_occluded(origin, DVec3::new(s[0], s[1], s[2])),
+        );
+        max_k = max_k.max(k);
+        kwh.push(k);
+    }
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == faces.len() => ids,
+        _ => (0..faces.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    let mut layers_created = Vec::new();
+    if !doc.layers.contains_key(ANALYSIS_LAYER) {
+        doc.layers
+            .insert(ANALYSIS_LAYER.to_string(), LayerStyle::default());
+        layers_created.push(ANALYSIS_LAYER.to_string());
+    }
+
+    for ((tri, &k), id) in faces.iter().zip(&kwh).zip(&new_ids) {
+        let frac = if max_k > 0.0 { k / max_k } else { 0.0 };
+        let color = [frac as f32, 0.15, (1.0 - frac) as f32];
+        let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
+        let nlen = normal.length();
+        if nlen > 1e-12 {
+            normal /= nlen;
+        }
+        let lift = normal * 5e-3;
+        let mesh = kernel_mesh::Mesh::new(
+            vec![tri[0] + lift, tri[1] + lift, tri[2] + lift],
+            vec![[0, 1, 2]],
+        );
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: None,
+            layer: ANALYSIS_LAYER.to_string(),
+            color: Some(color),
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Mesh(mesh),
+        });
+    }
+    doc.generation += 1;
+
+    let n = kwh.len() as f64;
+    let avg: f64 = kwh.iter().sum::<f64>() / n;
+    let min_k = kwh.iter().cloned().fold(f64::INFINITY, f64::min);
+
+    Ok((
+        Command::Radiation {
+            targets,
+            ids: Some(new_ids.clone()),
+            path,
+            bins: Some(bins),
+        },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome {
+            message: format!(
+                "radiation: {} face(s), annual insolation min {min_k:.0} / avg {avg:.0} / \
+                 max {max_k:.0} kWh/m2-yr on '{ANALYSIS_LAYER}'",
+                new_ids.len()
+            ),
+            created: new_ids,
+        },
+    ))
+}
+
 /// Sun-path diagram: the yearly sun-path dome for the document's location as
 /// open polylines on a golden `sunpath` layer — seven date arcs (Dec 21 → Jun
 /// 21; Jul–Nov retrace them), analemma-style hour curves, plus a horizon
@@ -5230,6 +5381,9 @@ fn apply_forward(
             exec_sun_hours(doc, ids, year, month, day, spacing)
         }
         Command::SunPath { ids, year, radius } => exec_sun_path(doc, ids, year, radius),
+        Command::Radiation { targets, ids, path, bins } => {
+            exec_radiation(doc, targets, ids, path, bins)
+        }
         Command::FaceSunHours { targets, ids, year, month, day } => {
             exec_face_sun_hours(doc, targets, ids, year, month, day)
         }
@@ -6433,6 +6587,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::ShadowStudy { .. } => "shadowstudy",
         Command::SunHours { .. } => "sunhours",
         Command::SunPath { .. } => "sunpath",
+        Command::Radiation { .. } => "radiation",
         Command::FaceSunHours { .. } => "facesunhours",
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
@@ -9373,6 +9528,117 @@ mod tests {
             "shadowstudy log must be replay-stable"
         );
         assert_eq!(s.doc.len(), replayed.doc.len());
+    }
+
+    /// Write a synthetic EPW (NYC-ish location; DNI 500 / DHI 100 for ending
+    /// hours 8–17, dark otherwise) to a temp file and return its path.
+    fn write_synth_epw(name: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("itsjustcad_radiation_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "LOCATION,Testville,TS,TST,TMY3,000000,40.71,-74.01,-5.0,10.0").unwrap();
+        for kw in [
+            "DESIGN CONDITIONS,0",
+            "TYPICAL/EXTREME PERIODS,0",
+            "GROUND TEMPERATURES,0",
+            "HOLIDAYS/DAYLIGHT SAVINGS,No,0,0,0",
+            "COMMENTS 1,x",
+            "COMMENTS 2,y",
+            "DATA PERIODS,1,1,Data,Sunday,1/1,12/31",
+        ] {
+            writeln!(f, "{kw}").unwrap();
+        }
+        for month in 1..=12 {
+            for hour in 1..=24 {
+                let (dni, dhi) = if (8..=17).contains(&hour) { (500, 100) } else { (0, 0) };
+                writeln!(
+                    f,
+                    "1999,{month},21,{hour},60,A7,10.0,5.0,80,81100,0,0,300,600,{dni},{dhi}"
+                )
+                .unwrap();
+            }
+        }
+        path
+    }
+
+    #[test]
+    fn radiation_errors_without_location() {
+        let path = write_synth_epw("noloc.epw");
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        let err = s
+            .run(parse(&format!("radiation last {}", path.display())).unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("no location"), "{err}");
+    }
+
+    #[test]
+    fn radiation_colors_faces_up_gets_more_than_down() {
+        let path = write_synth_epw("site.epw");
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, &format!("import {}", path.display())); // sets location
+        let before = s.doc.len();
+        let out = run(&mut s, &format!("radiation last {}", path.display()));
+        assert!(!out.created.is_empty(), "{}", out.message);
+        assert!(out.message.contains("kWh"), "{}", out.message);
+        // Overlay faces live on 'analysis' and are colored; the roof (top)
+        // faces must be redder (higher insolation) than the bottom faces.
+        let (mut top_red, mut bottom_red) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for id in &out.created {
+            let obj = s.doc.get(*id).unwrap();
+            assert_eq!(obj.layer, "analysis");
+            let red = obj.color.unwrap()[0];
+            let Geometry::Mesh(m) = &obj.geometry else { panic!("mesh expected") };
+            let z_avg: f64 =
+                m.positions().iter().map(|p| p.z).sum::<f64>() / m.positions().len() as f64;
+            if z_avg > 3.9 {
+                top_red = top_red.max(red);
+            } else if z_avg < 0.1 {
+                bottom_red = bottom_red.max(red);
+            }
+        }
+        assert!(
+            top_red > bottom_red + 0.3,
+            "roof must out-collect the underside: top {top_red} vs bottom {bottom_red}"
+        );
+        // Undo removes the overlay.
+        s.run(crate::Command::Undo).unwrap();
+        assert_eq!(s.doc.len(), before);
+    }
+
+    #[test]
+    fn radiation_replays_without_the_epw_file() {
+        // The bins are embedded into the logged command on first exec, so a
+        // saved file replays even after the EPW is gone.
+        let path = write_synth_epw("ephemeral.epw");
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, &format!("import {}", path.display()));
+        run(&mut s, &format!("radiation last {}", path.display()));
+        let log = s.save_log();
+        std::fs::remove_file(&path).unwrap();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "radiation log must be replay-stable without the EPW file"
+        );
+        assert_eq!(s.doc.len(), replayed.doc.len());
+    }
+
+    #[test]
+    fn radiation_parse_requires_selector_and_path() {
+        match parse("radiation last /tmp/site file.epw").unwrap() {
+            Command::Radiation { path, ids, bins, .. } => {
+                assert_eq!(path, "/tmp/site file.epw", "spaces in path survive");
+                assert!(ids.is_none() && bins.is_none());
+            }
+            other => panic!("expected Radiation, got {other:?}"),
+        }
+        assert!(parse("radiation last").is_err(), "path required");
     }
 
     #[test]

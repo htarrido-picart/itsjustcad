@@ -552,6 +552,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "radiation",
+            usage: "radiation <selector> <path.epw>",
+            summary: "Annual radiation study: weight each selected face's beam exposure by the EPW file's hourly Direct-Normal irradiance (occlusion-tested against the scene) plus isotropic-sky diffuse, giving kWh/m2-yr per face. Colors an overlay copy on 'analysis' (blue = least, red = most) and reports min/avg/max. The irradiance bins are embedded in the op-log so replay never needs the EPW again. Needs a location. Example: radiation last site.epw",
+            category: Category::Analyze,
+        },
+        CommandSpec {
             name: "sunpath",
             usage: "sunpath [radius] [year]",
             summary: "Sun-path diagram: draw the yearly sun-path dome for the set location as polylines on the 'sunpath' layer — seven date arcs (Dec 21 through Jun 21; Jul-Nov mirror), analemma hour curves, and a horizon compass circle. Radius defaults to 1.2x the scene bounding radius (min 10 m). Needs a location. Example: sunpath · sunpath 25",

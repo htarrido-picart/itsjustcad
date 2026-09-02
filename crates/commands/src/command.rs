@@ -737,6 +737,26 @@ pub enum Command {
         /// Grid spacing in meters (> 0).
         spacing: f64,
     },
+    /// Annual radiation (insolation) study: for the selected meshes, weight
+    /// each face's beam exposure by the EPW file's hourly Direct-Normal
+    /// irradiance (occlusion-tested) and add isotropic-sky diffuse, giving
+    /// kWh/m²·yr per face. Emits a colored overlay on the `analysis` layer
+    /// (blue = least → red = most). Requires a location.
+    Radiation {
+        /// Objects whose faces are analysed.
+        targets: Selector,
+        /// Ids of the created overlay meshes, filled in on first exec and
+        /// reused on replay for op-log stability.
+        #[serde(default)]
+        ids: Option<Vec<ObjectId>>,
+        /// EPW file the irradiance bins came from (reference only once `bins`
+        /// is embedded).
+        path: String,
+        /// Month×hour `[DNI, DHI]` Wh/m² bins (288 entries), embedded on first
+        /// exec so replay never needs the EPW file again.
+        #[serde(default)]
+        bins: Option<Vec<[f64; 2]>>,
+    },
     /// Sun-path diagram: draw the yearly sun-path dome for the document's
     /// location as polylines on the `sunpath` layer — seven date arcs (Dec 21 →
     /// Jun 21; Jul–Nov mirror), analemma-style hour curves, and a horizon
