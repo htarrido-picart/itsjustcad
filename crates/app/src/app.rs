@@ -351,6 +351,14 @@ pub struct App {
     /// tabs never changes it (the panel always renders at this width). This is
     /// the single width source of truth — see `right_panel`.
     dock_width: f32,
+    /// Screen-space x of the right dock's ACTUAL drawn left edge this frame, or
+    /// `None` when the dock is hidden. The viewport clamps its right edge to this
+    /// so the 3D wgpu callback (painted last, scissored to the central rect) can
+    /// never overpaint the dock during a one-frame layout desync — the panel can
+    /// draw slightly wider than the space it reserved right after a relayout
+    /// (new document, deck turn complete), which briefly let the viewport bleed
+    /// over the chat. Set in `right_panel` (runs before `viewport`).
+    dock_left: Option<f32>,
     /// Whether the right docked panel is shown at all (Cmd+\ hides/shows).
     panel_visible: bool,
     /// When true, all animated progress bars (warm-up, download) run without
@@ -655,6 +663,7 @@ impl App {
             deck_visible,
             panel_tabs: crate::tabstrip::TabState::default(),
             dock_width: crate::tabstrip::DOCK_WIDTH,
+            dock_left: None,
             panel_visible: true,
             reduce_motion: load_reduce_motion(),
             show_about: false,
@@ -2077,7 +2086,18 @@ impl App {
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
-        let full = ui.available_rect_before_wrap();
+        let mut full = ui.available_rect_before_wrap();
+        // Guard against the one-frame dock/viewport width desync: if the dock
+        // drew slightly wider than the space it reserved (right after a relayout),
+        // the leftover `full` can overlap the dock, and the 3D wgpu callback —
+        // painted last and scissored to `full` — would overpaint the chat. Clamp
+        // the right edge to the dock's real left edge so 3D never bleeds over it.
+        if let Some(dock_left) = self.dock_left
+            && dock_left > full.left()
+            && dock_left < full.right()
+        {
+            full.max.x = dock_left;
+        }
         if !self.draw_tool.active() {
             self.status_snap = None; // no tool, no snap marker to report
         }
@@ -3577,6 +3597,8 @@ impl App {
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         use crate::tabstrip::PanelTab;
         if !self.panel_visible {
+            // Dock hidden → no left edge to clamp the viewport against.
+            self.dock_left = None;
             // Collapsed to nothing: a small ▸ handle at the top-right edge, at the
             // SAME height the collapse button had (stored while the panel was
             // visible) so the button doesn't jump vertically on toggle.
@@ -3754,6 +3776,9 @@ impl App {
                 self.dock_width = w.clamp(crate::tabstrip::DOCK_MIN, max_w);
             }
         }
+        // Record the dock's ACTUAL left edge so the viewport (rendered after this,
+        // in the central panel) can clamp its right edge to it — see `dock_left`.
+        self.dock_left = Some(panel_resp.response.rect.left());
     }
 
     /// Layers tab wrapper: runs the layers UI then commits any pending edits.
