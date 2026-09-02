@@ -98,8 +98,9 @@ pub fn menu_shortcut(verb: &str) -> Option<&'static str> {
         "undo" => Some("Cmd+Z"),
         "redo" => Some("Cmd+Shift+Z"),
         "select all" | "selectall" => Some("Cmd+A"),
-        "copyselection" | "copy" => Some("Cmd+C"),
-        "pasteselection" => Some("Cmd+V"),
+        // NB: cut/copy/paste intentionally have NO menu accelerator — a native
+        // ⌘X/⌘C/⌘V would be grabbed by AppKit before the focused text field. The
+        // keymap fires object clipboard on those keys only when not typing.
         "delete" => Some("Delete"),
         _ => None,
     }
@@ -445,12 +446,18 @@ pub fn native_model(_style: MenuStyle, has_selection: bool) -> Vec<NativeMenu> {
             wired_leaf(t, "redo", "Redo", MenuAction::Execute("redo".into())),
             NativeItem::Separator,
             // Cut = copy-selection then delete-selection (app clipboard verbs).
-            sel_leaf("cut", "Cut", MenuAction::Execute("cut".into()), Some("Cmd+X")),
-            sel_leaf("copy", "Copy", MenuAction::Execute("copyselection".into()), Some("Cmd+C")),
+            // NO ⌘X/⌘C/⌘V accelerators here: on macOS a native muda accelerator
+            // is intercepted by AppKit BEFORE the focused text field, which stole
+            // copy/paste from the chat + command-line inputs. The keymap still
+            // fires object cut/copy/paste on ⌘X/⌘C/⌘V when NOT typing (it returns
+            // None while a text field is focused), so text clipboard works in
+            // fields and object clipboard works in the viewport — no conflict.
+            sel_leaf("cut", "Cut", MenuAction::Execute("cut".into()), None),
+            sel_leaf("copy", "Copy", MenuAction::Execute("copyselection".into()), None),
             NativeItem::Leaf {
                 id: format!("{t}/paste"),
                 label: "Paste".into(),
-                shortcut: Some("Cmd+V".into()),
+                shortcut: None,
                 enabled: true, // paste doesn't need a selection
                 action: MenuAction::Execute("pasteselection".into()),
             },
