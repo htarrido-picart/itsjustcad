@@ -13,13 +13,16 @@
 //! user to point at a local ComfyUI / A1111 or add a cloud key — the same
 //! stance as the unconfigured LLM deck.
 //!
-//! Local cassettes (no key): ComfyUI (`/prompt` + ControlNet), A1111/Forge
-//! (`/sdapi/v1/img2img`). Cloud cassettes (scaffolded, `env:` key): Replicate /
-//! fal.ai / Stability — the request shape is built but no key ships.
+//! Local cassettes (no key): ComfyUI (`/upload/image` + `/prompt` graph queue +
+//! `/history` poll), A1111 / Forge / Draw Things (`/sdapi/v1/img2img`, one
+//! blocking POST). Cloud cassette (`env:` key, no key ships): the Replicate
+//! predictions API (create → poll → fetch output URL).
 //!
-//! ALL network is guarded: [`RenderDeck::render`] is `async` and only the
-//! HTTP cassettes touch the wire. Tests use [`MockRenderDeck`], which returns a
-//! canned image with no I/O, proving the plumbing end to end.
+//! ALL network is guarded: [`RenderDeck::render`] is `async` and only the HTTP
+//! cassettes touch the wire; aborting the spawned task cancels a render
+//! mid-poll. Unit tests exercise each wire protocol against in-process mock
+//! HTTP servers (std::net, canned responses) — none require a real SD server —
+//! and [`MockRenderDeck`] proves the app-side plumbing with zero I/O.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -240,6 +243,15 @@ impl Default for RenderDecksFile {
                     api_key: None,
                 },
                 RenderConfig {
+                    // Draw Things (macOS) exposes an A1111-compatible HTTP API
+                    // (Settings > API Server); same cassette, its default port.
+                    name: "drawthings".into(),
+                    kind: RenderKind::Automatic1111,
+                    base_url: "http://127.0.0.1:7860".into(),
+                    model: String::new(),
+                    api_key: None,
+                },
+                RenderConfig {
                     name: "cloud".into(),
                     kind: RenderKind::Cloud,
                     base_url: "https://api.replicate.com/v1".into(),
@@ -326,7 +338,6 @@ pub struct ComfyRenderDeck {
     name: String,
     base_url: String,
     model: String,
-    #[allow(dead_code)]
     client: reqwest::Client,
 }
 
@@ -389,16 +400,91 @@ impl RenderDeck for ComfyRenderDeck {
         if self.base_url.is_empty() {
             return Err(RenderDeckError::NoBackend(NO_BACKEND_MESSAGE.into()));
         }
-        // NETWORK PATH — never reached by tests (which use MockRenderDeck) or
-        // headless (which uses the mock). Guarded behind a live ComfyUI at
-        // base_url. Kept minimal: upload the control images, queue the graph,
-        // poll history, fetch the result. Left as a wired scaffold so no test
-        // ever depends on a running ComfyUI.
-        let _graph = self.build_prompt_graph(&req);
-        Err(RenderDeckError::Other(format!(
-            "ComfyUI live send to {} is a wired scaffold; use the mock or a running instance",
-            self.base_url
-        )))
+        // LIVE NETWORK PATH: upload the control images, queue the graph, poll
+        // history until the sampler finishes, fetch the saved image.
+        let kind = "ComfyUI";
+        for (name, bytes) in [
+            ("itsjustcad_depth.png", &req.control.depth),
+            ("itsjustcad_edge.png", &req.control.edge),
+        ] {
+            let (body, content_type) = multipart_png_upload(name, bytes);
+            let resp = self
+                .client
+                .post(format!("{}/upload/image", self.base_url))
+                .header("content-type", content_type)
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| unreachable_hint(kind, &self.base_url, e))?;
+            json_or_api_error(resp).await?;
+        }
+        // Queue the graph. `build_prompt_graph` already wraps it as {"prompt": …}.
+        let resp = self
+            .client
+            .post(format!("{}/prompt", self.base_url))
+            .json(&self.build_prompt_graph(&req))
+            .send()
+            .await
+            .map_err(|e| unreachable_hint(kind, &self.base_url, e))?;
+        let v = json_or_api_error(resp).await?;
+        let prompt_id = v["prompt_id"]
+            .as_str()
+            .ok_or_else(|| RenderDeckError::Other("ComfyUI returned no prompt_id".into()))?
+            .to_string();
+        // Poll /history/<id> until the SaveImage node reports its output. A
+        // task-level abort (the app's Cancel) drops this future mid-await.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let img = loop {
+            let resp = self
+                .client
+                .get(format!("{}/history/{prompt_id}", self.base_url))
+                .send()
+                .await
+                .map_err(|e| unreachable_hint(kind, &self.base_url, e))?;
+            let hist = json_or_api_error(resp).await?;
+            if let Some(images) = hist[&prompt_id]["outputs"]
+                .as_object()
+                .and_then(|outs| outs.values().find_map(|o| o["images"].as_array()))
+                && let Some(img) = images.first()
+            {
+                break img.clone();
+            }
+            let status = &hist[&prompt_id]["status"];
+            if status["status_str"].as_str() == Some("error") {
+                return Err(RenderDeckError::Other(format!(
+                    "ComfyUI reported an execution error for prompt {prompt_id}"
+                )));
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(RenderDeckError::Other("ComfyUI render timed out (600 s)".into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+        };
+        let (filename, subfolder, ty) = (
+            img["filename"].as_str().unwrap_or_default(),
+            img["subfolder"].as_str().unwrap_or_default(),
+            img["type"].as_str().unwrap_or("output"),
+        );
+        let resp = self
+            .client
+            .get(format!(
+                "{}/view?filename={filename}&subfolder={subfolder}&type={ty}",
+                self.base_url
+            ))
+            .send()
+            .await
+            .map_err(|e| unreachable_hint(kind, &self.base_url, e))?;
+        if !resp.status().is_success() {
+            return Err(RenderDeckError::Api {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default().chars().take(400).collect(),
+            });
+        }
+        let png = resp.bytes().await?.to_vec();
+        if png.is_empty() {
+            return Err(RenderDeckError::NoImage);
+        }
+        Ok(RenderedImage { png, backend: self.name.clone() })
     }
 }
 
@@ -407,7 +493,6 @@ impl RenderDeck for ComfyRenderDeck {
 pub struct Automatic1111RenderDeck {
     name: String,
     base_url: String,
-    #[allow(dead_code)]
     client: reqwest::Client,
 }
 
@@ -458,12 +543,25 @@ impl RenderDeck for Automatic1111RenderDeck {
         if self.base_url.is_empty() {
             return Err(RenderDeckError::NoBackend(NO_BACKEND_MESSAGE.into()));
         }
-        // NETWORK PATH — scaffold; never hit by tests/headless (mock is used).
-        let _body = self.build_body(&req);
-        Err(RenderDeckError::Other(format!(
-            "A1111 live send to {}/sdapi/v1/img2img is a wired scaffold; use the mock or a running instance",
-            self.base_url
-        )))
+        // LIVE NETWORK PATH. One POST; A1111 (and Draw Things / Forge, which
+        // speak the same API) blocks until the image is diffused.
+        let url = format!("{}/sdapi/v1/img2img", self.base_url);
+        let body = self.build_body(&req);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(600))
+            .send()
+            .await
+            .map_err(|e| unreachable_hint("A1111/Draw Things", &self.base_url, e))?;
+        let v = json_or_api_error(resp).await?;
+        let b64 = v["images"][0].as_str().ok_or(RenderDeckError::NoImage)?;
+        // A1111 may prefix a data-URI header; the payload is after the comma.
+        let b64 = b64.rsplit(',').next().unwrap_or(b64);
+        let png = base64_decode(b64)
+            .map_err(|e| RenderDeckError::Other(format!("bad base64 image from A1111: {e}")))?;
+        Ok(RenderedImage { png, backend: self.name.clone() })
     }
 }
 
@@ -474,7 +572,6 @@ pub struct CloudRenderDeck {
     base_url: String,
     model: String,
     api_key: Option<String>,
-    #[allow(dead_code)]
     client: reqwest::Client,
 }
 
@@ -520,7 +617,7 @@ impl RenderDeck for CloudRenderDeck {
     async fn render(&self, req: RenderRequest) -> Result<RenderedImage, RenderDeckError> {
         // Cloud requires a key — none ships. Fail with clear guidance before any
         // network.
-        let Some(_key) = self.api_key.clone() else {
+        let Some(key) = self.api_key.clone() else {
             return Err(RenderDeckError::NoBackend(format!(
                 "cloud render backend '{}' has no key — set the env var referenced in render_decks.json",
                 self.name
@@ -529,12 +626,71 @@ impl RenderDeck for CloudRenderDeck {
         if req.control.is_empty() {
             return Err(RenderDeckError::NoControlImages);
         }
-        // NETWORK PATH — scaffold; never hit by tests (no key ships).
-        let _body = self.build_body(&req);
-        Err(RenderDeckError::Other(format!(
-            "cloud send to {} is a wired scaffold",
-            self.base_url
-        )))
+        // LIVE NETWORK PATH (Replicate predictions API): create the prediction,
+        // poll it until it settles, fetch the output image URL.
+        let kind = "the cloud render API";
+        let resp = self
+            .client
+            .post(format!("{}/predictions", self.base_url))
+            .header("authorization", format!("Bearer {key}"))
+            .json(&self.build_body(&req))
+            .send()
+            .await
+            .map_err(|e| unreachable_hint(kind, &self.base_url, e))?;
+        let v = json_or_api_error(resp).await?;
+        let id = v["id"]
+            .as_str()
+            .ok_or_else(|| RenderDeckError::Other("prediction response had no id".into()))?
+            .to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let output = loop {
+            let resp = self
+                .client
+                .get(format!("{}/predictions/{id}", self.base_url))
+                .header("authorization", format!("Bearer {key}"))
+                .send()
+                .await
+                .map_err(|e| unreachable_hint(kind, &self.base_url, e))?;
+            let p = json_or_api_error(resp).await?;
+            match p["status"].as_str().unwrap_or_default() {
+                "succeeded" => break p["output"].clone(),
+                "failed" | "canceled" => {
+                    return Err(RenderDeckError::Other(format!(
+                        "cloud prediction {id} {}: {}",
+                        p["status"].as_str().unwrap_or("failed"),
+                        p["error"].as_str().unwrap_or("no detail")
+                    )));
+                }
+                _ => {}
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(RenderDeckError::Other("cloud render timed out (600 s)".into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+        };
+        // `output` is a URL string or an array of URL strings.
+        let url = output
+            .as_str()
+            .or_else(|| output.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
+            .ok_or(RenderDeckError::NoImage)?
+            .to_string();
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| unreachable_hint(kind, &url, e))?;
+        if !resp.status().is_success() {
+            return Err(RenderDeckError::Api {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default().chars().take(400).collect(),
+            });
+        }
+        let png = resp.bytes().await?.to_vec();
+        if png.is_empty() {
+            return Err(RenderDeckError::NoImage);
+        }
+        Ok(RenderedImage { png, backend: self.name.clone() })
     }
 }
 
@@ -595,6 +751,97 @@ fn tiny_png() -> Vec<u8> {
         0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82, // IEND
     ];
     BYTES.to_vec()
+}
+
+// ── Shared HTTP plumbing ─────────────────────────────────────────────────────
+
+/// Poll cadence for backends that queue work (ComfyUI history, cloud
+/// predictions).
+const POLL_MS: u64 = 500;
+
+/// Map a transport-level failure to the friendly "is it running?" guidance the
+/// UI shows — never a bare hyper error for the by-far-most-common case (the
+/// local server simply isn't up).
+fn unreachable_hint(kind: &str, base_url: &str, e: reqwest::Error) -> RenderDeckError {
+    if e.is_connect() || e.is_timeout() {
+        RenderDeckError::Other(format!(
+            "cannot reach {kind} at {base_url} — is it running? ({e})"
+        ))
+    } else {
+        RenderDeckError::Http(e)
+    }
+}
+
+/// Success → parsed JSON body; non-2xx → `Api` with the (truncated) body so the
+/// backend's own error text is surfaced, never swallowed.
+async fn json_or_api_error(resp: reqwest::Response) -> Result<serde_json::Value, RenderDeckError> {
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(RenderDeckError::Api {
+            status: status.as_u16(),
+            body: resp.text().await.unwrap_or_default().chars().take(400).collect(),
+        });
+    }
+    Ok(resp.json::<serde_json::Value>().await?)
+}
+
+/// Hand-rolled `multipart/form-data` body for a ComfyUI `/upload/image` PNG
+/// (image field + `overwrite=true`). Avoids enabling reqwest's multipart
+/// feature — zero new deps. Returns `(body, content-type header value)`.
+fn multipart_png_upload(filename: &str, bytes: &[u8]) -> (Vec<u8>, String) {
+    const BOUNDARY: &str = "itsjustcad-render-7f3a9c";
+    let mut body = Vec::with_capacity(bytes.len() + 512);
+    body.extend_from_slice(
+        format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"image\"; \
+             filename=\"{filename}\"\r\nContent-Type: image/png\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(
+        format!(
+            "\r\n--{BOUNDARY}\r\nContent-Disposition: form-data; \
+             name=\"overwrite\"\r\n\r\ntrue\r\n--{BOUNDARY}--\r\n"
+        )
+        .as_bytes(),
+    );
+    (body, format!("multipart/form-data; boundary={BOUNDARY}"))
+}
+
+/// Standard base64 decode (strict, no whitespace). Counterpart of
+/// [`base64_encode`]; hand-rolled for the same zero-new-deps reason.
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Result<u32, String> {
+        match c {
+            b'A'..=b'Z' => Ok((c - b'A') as u32),
+            b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(format!("invalid base64 byte 0x{c:02x}")),
+        }
+    }
+    let input = input.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for chunk in input.chunks(4) {
+        if chunk.len() == 1 {
+            return Err("truncated base64 (dangling single symbol)".into());
+        }
+        let mut n: u32 = 0;
+        for &c in chunk {
+            n = (n << 6) | val(c)?;
+        }
+        n <<= 6 * (4 - chunk.len()) as u32;
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// Standard base64 encode (no line breaks). Hand-rolled to avoid pulling a new
@@ -779,6 +1026,341 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    // ── Mock HTTP servers (std::net on an OS thread — no new deps, no real SD
+    // server; each protocol is exercised against canned wire responses) ──────
+
+    use std::sync::{Arc, Mutex};
+
+    /// Bind an ephemeral local port. Returns the listener plus its base URL.
+    fn bind_mock() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        (listener, base)
+    }
+
+    /// Serve HTTP on `listener` from a detached OS thread. `handler` maps a
+    /// request line ("POST /sdapi/v1/img2img HTTP/1.1") + body to
+    /// (status, content-type, body). Every raw request head is recorded in the
+    /// returned log so tests can assert headers (auth, multipart) arrived.
+    fn serve_mock<F>(listener: std::net::TcpListener, handler: F) -> Arc<Mutex<Vec<String>>>
+    where
+        F: Fn(&str, &[u8]) -> (u16, &'static str, Vec<u8>) + Send + 'static,
+    {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let Some((head, body)) = read_request(&mut s) else { continue };
+                let request_line = head.lines().next().unwrap_or_default().to_string();
+                log2.lock().unwrap().push(head.clone());
+                let (status, ct, resp) = handler(&request_line, &body);
+                use std::io::Write;
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status} MOCK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp.len()
+                );
+                let _ = s.write_all(&resp);
+            }
+        });
+        log
+    }
+
+    /// Read one HTTP request (head + content-length body) off the stream.
+    fn read_request(s: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 8192];
+        let header_end = loop {
+            let n = s.read(&mut tmp).ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let content_length = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + content_length {
+            let n = s.read(&mut tmp).ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        Some((head, buf[header_end..(header_end + content_length).min(buf.len())].to_vec()))
+    }
+
+    fn a1111_deck(base: &str) -> Automatic1111RenderDeck {
+        Automatic1111RenderDeck::new(&RenderConfig {
+            name: "a1111".into(),
+            kind: RenderKind::Automatic1111,
+            base_url: base.into(),
+            model: String::new(),
+            api_key: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a1111_mock_server_end_to_end() {
+        let (listener, base) = bind_mock();
+        let png = tiny_png();
+        let b64 = base64_encode(&png);
+        serve_mock(listener, move |line, body| {
+            assert!(line.starts_with("POST /sdapi/v1/img2img"), "unexpected {line}");
+            // The wire body must carry the prompt and the ControlNet unit.
+            let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(v["prompt"], "a brick warehouse");
+            assert!(v["alwayson_scripts"]["controlnet"]["args"][0]["image"].is_string());
+            (200, "application/json", format!("{{\"images\":[\"{b64}\"]}}").into_bytes())
+        });
+        let deck = a1111_deck(&base);
+        let req = RenderRequest::new("a brick warehouse", dummy_control(), 512, 512);
+        let out = deck.render(req).await.expect("mock a1111 render");
+        assert_eq!(out.png, tiny_png(), "decoded PNG round-trips the wire");
+        assert_eq!(out.backend, "a1111");
+    }
+
+    #[tokio::test]
+    async fn a1111_data_uri_image_is_accepted() {
+        let (listener, base) = bind_mock();
+        let b64 = base64_encode(&tiny_png());
+        serve_mock(listener, move |_, _| {
+            (
+                200,
+                "application/json",
+                format!("{{\"images\":[\"data:image/png;base64,{b64}\"]}}").into_bytes(),
+            )
+        });
+        let out = a1111_deck(&base)
+            .render(RenderRequest::new("x", dummy_control(), 512, 512))
+            .await
+            .expect("data-uri image decodes");
+        assert_eq!(out.png, tiny_png());
+    }
+
+    #[tokio::test]
+    async fn a1111_api_error_body_is_surfaced() {
+        let (listener, base) = bind_mock();
+        serve_mock(listener, |_, _| {
+            (500, "text/plain", b"CUDA out of memory".to_vec())
+        });
+        let err = a1111_deck(&base)
+            .render(RenderRequest::new("x", dummy_control(), 512, 512))
+            .await
+            .unwrap_err();
+        match err {
+            RenderDeckError::Api { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("CUDA out of memory"), "{body}");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unreachable_backend_says_is_it_running() {
+        // Bind then drop, so the port is closed — the classic "server not up".
+        let (listener, base) = bind_mock();
+        drop(listener);
+        let err = a1111_deck(&base)
+            .render(RenderRequest::new("x", dummy_control(), 512, 512))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("is it running?"), "{msg}");
+        assert!(msg.contains(&base), "hint names the URL: {msg}");
+    }
+
+    #[tokio::test]
+    async fn comfy_mock_server_end_to_end() {
+        let (listener, base) = bind_mock();
+        let png = tiny_png();
+        let log = serve_mock(listener, move |line, _body| {
+            if line.starts_with("POST /upload/image") {
+                (200, "application/json", br#"{"name":"ok.png"}"#.to_vec())
+            } else if line.starts_with("POST /prompt") {
+                (200, "application/json", br#"{"prompt_id":"p42"}"#.to_vec())
+            } else if line.starts_with("GET /history/p42") {
+                (
+                    200,
+                    "application/json",
+                    br#"{"p42":{"outputs":{"out":{"images":[{"filename":"r.png","subfolder":"sub","type":"output"}]}},"status":{"status_str":"success"}}}"#.to_vec(),
+                )
+            } else if line.starts_with("GET /view?filename=r.png&subfolder=sub&type=output") {
+                (200, "image/png", png.clone())
+            } else {
+                panic!("unexpected request: {line}");
+            }
+        });
+        let deck = ComfyRenderDeck::new(&RenderConfig {
+            name: "comfy".into(),
+            kind: RenderKind::Comfy,
+            base_url: base,
+            model: "sd_xl_base_1.0.safetensors".into(),
+            api_key: None,
+        });
+        let out = deck
+            .render(RenderRequest::new("a stone tower", dummy_control(), 512, 512))
+            .await
+            .expect("mock comfy render");
+        assert_eq!(out.png, tiny_png());
+        assert_eq!(out.backend, "comfy");
+        // Both control images were uploaded as multipart PNGs before queueing.
+        let log = log.lock().unwrap();
+        let uploads: Vec<_> = log.iter().filter(|h| h.contains("POST /upload/image")).collect();
+        assert_eq!(uploads.len(), 2, "depth + edge uploads");
+        assert!(uploads[0].contains("multipart/form-data; boundary="));
+    }
+
+    #[tokio::test]
+    async fn comfy_execution_error_is_surfaced() {
+        let (listener, base) = bind_mock();
+        serve_mock(listener, |line, _| {
+            if line.starts_with("POST /upload/image") {
+                (200, "application/json", br#"{"name":"ok.png"}"#.to_vec())
+            } else if line.starts_with("POST /prompt") {
+                (200, "application/json", br#"{"prompt_id":"bad"}"#.to_vec())
+            } else {
+                (
+                    200,
+                    "application/json",
+                    br#"{"bad":{"outputs":{},"status":{"status_str":"error"}}}"#.to_vec(),
+                )
+            }
+        });
+        let deck = ComfyRenderDeck::new(&RenderConfig {
+            name: "comfy".into(),
+            kind: RenderKind::Comfy,
+            base_url: base,
+            model: "m".into(),
+            api_key: None,
+        });
+        let err = deck
+            .render(RenderRequest::new("x", dummy_control(), 512, 512))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("execution error"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cloud_replicate_mock_end_to_end() {
+        let (listener, base) = bind_mock();
+        let png = tiny_png();
+        let out_url = format!("{base}/out.png");
+        let log = serve_mock(listener, move |line, body| {
+            if line.starts_with("POST /predictions") {
+                let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+                assert_eq!(v["input"]["prompt"], "a glass pavilion");
+                (
+                    201,
+                    "application/json",
+                    br#"{"id":"pr1","status":"starting"}"#.to_vec(),
+                )
+            } else if line.starts_with("GET /predictions/pr1") {
+                (
+                    200,
+                    "application/json",
+                    format!("{{\"status\":\"succeeded\",\"output\":[\"{out_url}\"]}}").into_bytes(),
+                )
+            } else if line.starts_with("GET /out.png") {
+                (200, "image/png", png.clone())
+            } else {
+                panic!("unexpected request: {line}");
+            }
+        });
+        let deck = CloudRenderDeck::new(&RenderConfig {
+            name: "cloud".into(),
+            kind: RenderKind::Cloud,
+            base_url: base,
+            model: "stability-ai/sdxl".into(),
+            api_key: Some("test-key-123".into()),
+        });
+        let out = deck
+            .render(RenderRequest::new("a glass pavilion", dummy_control(), 512, 512))
+            .await
+            .expect("mock cloud render");
+        assert_eq!(out.png, tiny_png());
+        // The bearer key rode on the prediction requests.
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter()
+                .filter(|h| h.contains("/predictions"))
+                .all(|h| h.to_lowercase().contains("authorization: bearer test-key-123")),
+            "bearer auth on prediction calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_failed_prediction_surfaces_backend_error() {
+        let (listener, base) = bind_mock();
+        serve_mock(listener, |line, _| {
+            if line.starts_with("POST /predictions") {
+                (201, "application/json", br#"{"id":"pr9","status":"starting"}"#.to_vec())
+            } else {
+                (
+                    200,
+                    "application/json",
+                    br#"{"status":"failed","error":"NSFW content detected"}"#.to_vec(),
+                )
+            }
+        });
+        let deck = CloudRenderDeck::new(&RenderConfig {
+            name: "cloud".into(),
+            kind: RenderKind::Cloud,
+            base_url: base,
+            model: "m".into(),
+            api_key: Some("k".into()),
+        });
+        let err = deck
+            .render(RenderRequest::new("x", dummy_control(), 512, 512))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("NSFW content detected"), "{err}");
+    }
+
+    #[test]
+    fn base64_decode_inverts_encode() {
+        for v in [&b""[..], b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar"] {
+            assert_eq!(base64_decode(&base64_encode(v)).unwrap(), v);
+        }
+        // Binary round-trip (the actual payload shape: a PNG).
+        let png = tiny_png();
+        assert_eq!(base64_decode(&base64_encode(&png)).unwrap(), png);
+        // Invalid input errors instead of corrupting silently.
+        assert!(base64_decode("not base64!!").is_err());
+        assert!(base64_decode("Q").is_err(), "dangling single symbol");
+    }
+
+    #[test]
+    fn multipart_upload_body_shape() {
+        let (body, ct) = multipart_png_upload("itsjustcad_depth.png", b"PNGBYTES");
+        let s = String::from_utf8_lossy(&body);
+        assert!(ct.starts_with("multipart/form-data; boundary="));
+        assert!(s.contains("filename=\"itsjustcad_depth.png\""));
+        assert!(s.contains("PNGBYTES"));
+        assert!(s.contains("name=\"overwrite\""));
+        assert!(s.trim_end().ends_with("--"), "closing boundary");
+    }
+
+    #[test]
+    fn default_decks_include_drawthings_preset() {
+        // Draw Things speaks the A1111 API; the preset documents that.
+        let f = RenderDecksFile::default();
+        let dt = f.decks.iter().find(|d| d.name == "drawthings").expect("drawthings preset");
+        assert_eq!(dt.kind, RenderKind::Automatic1111);
+        assert!(dt.api_key.is_none(), "local — no key");
     }
 
     #[test]
