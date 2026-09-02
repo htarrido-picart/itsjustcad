@@ -1650,7 +1650,9 @@ DATA;\n\
 {body}ENDSEC;\n\
 END-ISO-10303-21;\n",
         name = step_string(file_name),
-        note = step_string(unit_note),
+        note = step_string(&format!(
+            "{unit_note}; geometry+topology handoff from ItsJustCAD - no analysis results"
+        )),
     )
 }
 

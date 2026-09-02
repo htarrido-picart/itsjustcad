@@ -5773,7 +5773,9 @@ fn apply_forward(
                     let (b, count) = crate::ifc::export(doc, &path).map_err(ExecError::Invalid)?;
                     (b, format!("IFC4, {count}"))
                 }
-                "saf" => {
+                // SAF 2.2.0 workbook — '.saf' and '.xlsx' both emit the same
+                // genuine OOXML spreadsheet (so 'model.saf.xlsx' works too).
+                "saf" | "xlsx" => {
                     let (b, detail) = crate::saf::export(doc).map_err(ExecError::Invalid)?;
                     (b, detail)
                 }
