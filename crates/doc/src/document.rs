@@ -7,8 +7,8 @@ use kernel_mesh::Aabb;
 
 use crate::{
     Basemap, BlockGeometry, GeoLocation, Grid, LayerStyle, Material, NamedView, ObjectId,
-    ParamBlockDef, SceneObject, Section, Sheet, Story, StructLoad, StructSupport, SunPosition,
-    Underlay, Units,
+    ParamBlockDef, SceneObject, Section, Sheet, SketchConstraint, Story, StructLoad,
+    StructSupport, SunPosition, Underlay, Units,
     DEFAULT_LAYER,
 };
 
@@ -116,6 +116,11 @@ pub struct Document {
     /// files loading (they default to `false` = hairlines, the old behaviour).
     #[serde(default)]
     pub show_lineweights: bool,
+    /// Sketch constraints created by the logged `constrain` command; solved by
+    /// `solveconstraints` (commands crate). Order matters — redundancy blame
+    /// reports the later constraint. `serde(default)` keeps old files loading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<SketchConstraint>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -146,6 +151,7 @@ impl Default for Document {
             loads: Vec::new(),
             supports: Vec::new(),
             show_lineweights: false,
+            constraints: Vec::new(),
             generation: 0,
         }
     }

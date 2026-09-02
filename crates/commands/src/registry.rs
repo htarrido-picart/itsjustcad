@@ -343,6 +343,24 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Curve,
         },
         CommandSpec {
+            name: "constrain",
+            usage: "constrain <kind> <selector> [selector] [value]",
+            summary: "Add a sketch constraint over lines/circles and re-solve immediately. Kinds: coincident, horizontal, vertical, distance, length, angle (deg), parallel, perpendicular, equal, radius, fixed, tangent, midpoint, on. Endpoint pairs resolve nearest-first. Example: constrain horizontal last · constrain length name:l1 5 · constrain perpendicular name:l1 name:l2",
+            category: Category::Curve,
+        },
+        CommandSpec {
+            name: "solveconstraints",
+            usage: "solveconstraints",
+            summary: "Re-run the sketch-constraint solver over all stored constraints and update the geometry. Reports solved/under-/over-constrained status and remaining degrees of freedom. Example: solveconstraints",
+            category: Category::Curve,
+        },
+        CommandSpec {
+            name: "constraints",
+            usage: "constraints [list | delete <n> | clear]",
+            summary: "List stored sketch constraints with solver status (redundant/conflicting flagged), delete one by number, or clear all. Example: constraints · constraints delete 2 · constraints clear",
+            category: Category::Curve,
+        },
+        CommandSpec {
             name: "fillet",
             usage: "fillet <a selector> <b selector> <radius> | fillet <selector matching 2> <radius>",
             summary: "Round the corner between two lines with a tangent arc, trimming both lines to the tangency points. Example: fillet last 2 0.5",

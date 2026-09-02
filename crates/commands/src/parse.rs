@@ -1247,6 +1247,78 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             }
             Ok(Command::BlockParamSet { target: sel, params })
         }
+        // -- sketch constraints --
+        "constrain" => {
+            let Some((kind_tok, rest)) = args.split_first() else {
+                return wrong(
+                    "constrain",
+                    "a kind (coincident|horizontal|vertical|distance|length|angle|parallel|perpendicular|equal|radius|fixed|tangent|midpoint|on) and target selector(s)",
+                    &args,
+                );
+            };
+            let Some(kind) = crate::ConstrainKind::parse(kind_tok) else {
+                return wrong(
+                    "constrain",
+                    "a known kind: coincident|horizontal|vertical|distance|length|angle|parallel|perpendicular|equal|radius|fixed|tangent|midpoint|on",
+                    &args,
+                );
+            };
+            match rest {
+                [a] => Ok(Command::Constrain {
+                    kind,
+                    a: selector_one(a)?,
+                    b: None,
+                    value: None,
+                }),
+                // Second token is either a value ("constrain length l1 5" style
+                // collapses to this with one selector) or a second selector.
+                [a, x] => match number(x) {
+                    Ok(v) => Ok(Command::Constrain {
+                        kind,
+                        a: selector_one(a)?,
+                        b: None,
+                        value: Some(v),
+                    }),
+                    Err(_) => Ok(Command::Constrain {
+                        kind,
+                        a: selector_one(a)?,
+                        b: Some(selector_one(x)?),
+                        value: None,
+                    }),
+                },
+                [a, b, v] => Ok(Command::Constrain {
+                    kind,
+                    a: selector_one(a)?,
+                    b: Some(selector_one(b)?),
+                    value: Some(number(v)?),
+                }),
+                _ => wrong(
+                    "constrain",
+                    "one or two target selectors and an optional value",
+                    &args,
+                ),
+            }
+        }
+        "solveconstraints" => {
+            expect_empty("solveconstraints", &args, &args)?;
+            Ok(Command::SolveConstraints)
+        }
+        // constraints [list] | constraints delete <n> | constraints clear
+        "constraints" => match args.as_slice() {
+            [] | ["list"] => Ok(Command::ConstraintsList),
+            ["delete", n] => {
+                let idx: usize = n
+                    .parse()
+                    .map_err(|_| ParseError::BadNumber(n.to_string()))?;
+                Ok(Command::ConstraintDelete { index: Some(idx) })
+            }
+            ["clear"] => Ok(Command::ConstraintDelete { index: None }),
+            _ => wrong(
+                "constraints",
+                "'list' (default), 'delete <n>' or 'clear'",
+                &args,
+            ),
+        },
         "blocks" => {
             expect_empty("blocks", &args, &args)?;
             Ok(Command::BlocksList)

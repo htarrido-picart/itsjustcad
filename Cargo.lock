@@ -2494,6 +2494,7 @@ dependencies = [
  "e57",
  "glam 0.30.10",
  "image",
+ "itsjustcad-constraints",
  "itsjustcad-doc",
  "itsjustcad-solar",
  "kernel-curve",

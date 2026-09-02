@@ -25,10 +25,12 @@ pub mod plugin;
 mod registry;
 pub mod rhino3dm;
 pub mod saf;
+pub mod sketch;
 pub mod svg;
 
 pub use command::{
-    BoolKind, Command, CompassDir, GridshellSurfaceSpec, MirrorPlane, OptionOp, Selector,
+    BoolKind, Command, CompassDir, ConstrainKind, GridshellSurfaceSpec, MirrorPlane, OptionOp,
+    Selector,
 };
 pub use error::{ExecError, ParseError};
 pub use exec::{ApplyOutcome, Session, MAIN_BRANCH};

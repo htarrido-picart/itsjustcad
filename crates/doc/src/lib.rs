@@ -5,6 +5,7 @@
 //! `commands` crate (which depends on this one); the document knows nothing
 //! about how it is mutated.
 
+mod constraint;
 mod document;
 pub mod hatch;
 pub mod hershey;
@@ -16,6 +17,7 @@ mod underlay;
 mod units;
 mod view;
 
+pub use constraint::{PointRef, SketchConstraint};
 pub use document::Document;
 pub use loads::{LoadGeometry, RestraintKind, StructLoad, StructSupport};
 pub use object::{

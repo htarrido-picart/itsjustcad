@@ -1131,6 +1131,26 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
     },
+    /// Add one sketch constraint over lines/circles (endpoint-level references
+    /// are resolved nearest-first at apply time) and immediately re-solve the
+    /// constrained sketch, writing the solved geometry back.
+    Constrain {
+        kind: ConstrainKind,
+        a: Selector,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        b: Option<Selector>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<f64>,
+    },
+    /// Re-run the sketch-constraint solver over all stored constraints.
+    SolveConstraints,
+    /// List stored constraints with solver status (not logged).
+    ConstraintsList,
+    /// Delete constraint #index (1-based, as listed), or all when `None`.
+    ConstraintDelete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild
@@ -1143,6 +1163,70 @@ pub enum Command {
     /// Design options: named branches of the op-log. Meta-level, like Undo —
     /// mutates the session's branch table (and may replay), never itself logged.
     Option(OptionOp),
+}
+
+/// Constraint kind as typed on the command line. `Equal` and `Tangent` pick
+/// their concrete form (length vs radius, line-circle vs circle-circle) from
+/// the target object types at apply time; `On` becomes point-on-line or
+/// point-on-circle the same way.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstrainKind {
+    Coincident,
+    Horizontal,
+    Vertical,
+    Distance,
+    Length,
+    Angle,
+    Parallel,
+    Perpendicular,
+    Equal,
+    Radius,
+    Fixed,
+    Tangent,
+    Midpoint,
+    On,
+}
+
+impl ConstrainKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "coincident" => ConstrainKind::Coincident,
+            "horizontal" => ConstrainKind::Horizontal,
+            "vertical" => ConstrainKind::Vertical,
+            "distance" => ConstrainKind::Distance,
+            "length" => ConstrainKind::Length,
+            "angle" => ConstrainKind::Angle,
+            "parallel" => ConstrainKind::Parallel,
+            "perpendicular" => ConstrainKind::Perpendicular,
+            "equal" => ConstrainKind::Equal,
+            "radius" => ConstrainKind::Radius,
+            "fixed" => ConstrainKind::Fixed,
+            "tangent" => ConstrainKind::Tangent,
+            "midpoint" => ConstrainKind::Midpoint,
+            "on" => ConstrainKind::On,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ConstrainKind::Coincident => "coincident",
+            ConstrainKind::Horizontal => "horizontal",
+            ConstrainKind::Vertical => "vertical",
+            ConstrainKind::Distance => "distance",
+            ConstrainKind::Length => "length",
+            ConstrainKind::Angle => "angle",
+            ConstrainKind::Parallel => "parallel",
+            ConstrainKind::Perpendicular => "perpendicular",
+            ConstrainKind::Equal => "equal",
+            ConstrainKind::Radius => "radius",
+            ConstrainKind::Fixed => "fixed",
+            ConstrainKind::Tangent => "tangent",
+            ConstrainKind::Midpoint => "midpoint",
+            ConstrainKind::On => "on",
+        }
+    }
 }
 
 /// The four `option` sub-commands. See [`crate::exec::Session::option`] for the
@@ -1187,6 +1271,7 @@ impl Command {
                 | Command::Schedule { .. }
                 | Command::BlocksList
                 | Command::BlockLibList
+                | Command::ConstraintsList
                 | Command::Undo
                 | Command::Redo
                 | Command::Amend { .. }

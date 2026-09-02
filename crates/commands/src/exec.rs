@@ -216,6 +216,12 @@ enum Inverse {
     RemoveLoad(usize),
     /// `support`: remove the support that was appended at the given index.
     RemoveSupport(usize),
+    /// `constrain`: pop the constraint that was appended and restore the
+    /// pre-solve geometry of everything the solve moved.
+    ConstraintAdded { snapshots: Vec<(ObjectId, Geometry)> },
+    /// `constraints delete`: reinsert the removed constraints at their
+    /// (0-based) indices, ascending.
+    ConstraintsRestore(Vec<(usize, itsjustcad_doc::SketchConstraint)>),
 }
 
 /// Owns the document plus its op-log; the single mutation path for both the
@@ -878,6 +884,22 @@ impl Session {
                     self.doc.supports.remove(*idx);
                     self.doc.generation += 1;
                 }
+            }
+            Inverse::ConstraintAdded { snapshots } => {
+                self.doc.constraints.pop();
+                for (id, geometry) in snapshots.clone() {
+                    if let Some(obj) = self.doc.get_mut(id) {
+                        obj.geometry = geometry;
+                    }
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::ConstraintsRestore(removed) => {
+                for (idx, c) in removed.clone() {
+                    let idx = idx.min(self.doc.constraints.len());
+                    self.doc.constraints.insert(idx, c);
+                }
+                self.doc.generation += 1;
             }
         }
         Ok(ApplyOutcome {
@@ -6692,6 +6714,150 @@ fn apply_forward(
                 ApplyOutcome { created: Vec::new(), message: msg },
             ))
         }
+        Command::Constrain { kind, a, b, value } => {
+            let ids_a = resolve(doc, &a)?;
+            let [id_a] = ids_a[..] else {
+                return Err(ExecError::Invalid(format!(
+                    "constrain target must be a single object; selector matched {}",
+                    ids_a.len()
+                )));
+            };
+            let id_b = match &b {
+                Some(sel) => {
+                    let ids = resolve(doc, sel)?;
+                    let [id] = ids[..] else {
+                        return Err(ExecError::Invalid(format!(
+                            "constrain target must be a single object; selector matched {}",
+                            ids.len()
+                        )));
+                    };
+                    Some(id)
+                }
+                None => None,
+            };
+            let constraint = crate::sketch::build_doc_constraint(doc, kind, id_a, id_b, value)?;
+            doc.constraints.push(constraint);
+            doc.generation += 1;
+            let n = doc.constraints.len();
+            // Solve immediately, SolveSpace-style. On an inconsistent system
+            // the constraint is still recorded (delete it to back out) but the
+            // geometry is left untouched.
+            let report = crate::sketch::solve_document(doc)?;
+            let mut snapshots = Vec::new();
+            if report.converged {
+                for (id, geo) in report.changed {
+                    if let Some(obj) = doc.get_mut(id) {
+                        snapshots.push((id, obj.geometry.clone()));
+                        obj.geometry = geo;
+                    }
+                }
+            }
+            Ok((
+                Command::Constrain { kind, a, b, value },
+                Inverse::ConstraintAdded { snapshots },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("constraint #{n} ({}): {}", kind.name(), report.message),
+                },
+            ))
+        }
+        Command::SolveConstraints => {
+            if doc.constraints.is_empty() {
+                return Err(ExecError::Invalid(
+                    "no constraints to solve (add some with 'constrain')".into(),
+                ));
+            }
+            let report = crate::sketch::solve_document(doc)?;
+            let mut snapshots = Vec::new();
+            if report.converged {
+                for (id, geo) in report.changed {
+                    if let Some(obj) = doc.get_mut(id) {
+                        snapshots.push((id, obj.geometry.clone()));
+                        obj.geometry = geo;
+                    }
+                }
+            }
+            let moved = snapshots.len();
+            Ok((
+                Command::SolveConstraints,
+                Inverse::SetGeometry(snapshots),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("{} ({moved} object(s) moved)", report.message),
+                },
+            ))
+        }
+        Command::ConstraintsList => {
+            if doc.constraints.is_empty() {
+                return Ok((
+                    Command::ConstraintsList,
+                    Inverse::SetGeometry(Vec::new()),
+                    ApplyOutcome {
+                        created: Vec::new(),
+                        message: "no constraints (add some with 'constrain')".into(),
+                    },
+                ));
+            }
+            // solve_document only *reports* — write-back is the caller's job —
+            // so listing never mutates geometry.
+            let report = crate::sketch::solve_document(doc)?;
+            let mut lines: Vec<String> = doc
+                .constraints
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let n = i + 1;
+                    let mut line =
+                        format!("#{n} {}", crate::sketch::describe_constraint(doc, c));
+                    if report.redundant.contains(&n) {
+                        line.push_str("  [redundant]");
+                    }
+                    if report.failed.contains(&n) {
+                        line.push_str("  [conflicts]");
+                    }
+                    line
+                })
+                .collect();
+            lines.push(report.message);
+            Ok((
+                Command::ConstraintsList,
+                Inverse::SetGeometry(Vec::new()),
+                ApplyOutcome { created: Vec::new(), message: lines.join("\n") },
+            ))
+        }
+        Command::ConstraintDelete { index } => {
+            if doc.constraints.is_empty() {
+                return Err(ExecError::Invalid("no constraints to delete".into()));
+            }
+            let removed: Vec<(usize, itsjustcad_doc::SketchConstraint)> = match index {
+                Some(n) => {
+                    if n == 0 || n > doc.constraints.len() {
+                        return Err(ExecError::Invalid(format!(
+                            "no constraint #{n}; there are {} (see 'constraints list')",
+                            doc.constraints.len()
+                        )));
+                    }
+                    vec![(n - 1, doc.constraints.remove(n - 1))]
+                }
+                None => std::mem::take(&mut doc.constraints)
+                    .into_iter()
+                    .enumerate()
+                    .collect(),
+            };
+            doc.generation += 1;
+            let message = match index {
+                Some(n) => format!(
+                    "deleted constraint #{n} ({})",
+                    removed[0].1.kind_name()
+                ),
+                None => format!("deleted all {} constraint(s)", removed.len()),
+            };
+            Ok((
+                Command::ConstraintDelete { index },
+                Inverse::ConstraintsRestore(removed),
+                ApplyOutcome { created: Vec::new(), message },
+            ))
+        }
         Command::Undo
         | Command::Redo
         | Command::Amend { .. }
@@ -6727,6 +6893,9 @@ fn wall_normal(boundary: &[DVec3]) -> DVec3 {
 
 fn describe(cmd: &Command) -> &'static str {
     match cmd {
+        Command::Constrain { .. } => "constrain",
+        Command::SolveConstraints => "solveconstraints",
+        Command::ConstraintsList | Command::ConstraintDelete { .. } => "constraints",
         Command::Box { .. } => "box",
         Command::Extrude { .. } => "extrude",
         Command::Revolve { .. } => "revolve",
@@ -11832,4 +12001,198 @@ mod tests {
         let json2 = crate::io::to_json(&loaded);
         assert_eq!(json1, json2, "laz import op-log must replay identically");
     }
+    // ── sketch constraints (constrain / solveconstraints / constraints) ─────
+
+    fn line_xy(s: &Session, name: &str) -> ((f64, f64), (f64, f64)) {
+        let id = s.doc.find_named(name)[0];
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Curve(kernel_curve::Curve::Line { a, b }) => ((a.x, a.y), (b.x, b.y)),
+            other => panic!("expected line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constrain_horizontal_solves_line() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,2,0");
+        run(&mut s, "name last l1");
+        let out = run(&mut s, "constrain horizontal l1");
+        assert!(out.message.contains("solved"), "message: {}", out.message);
+        let ((_, ay), (_, by)) = line_xy(&s, "l1");
+        assert!((ay - by).abs() < 1e-6, "flattened: {ay} vs {by}");
+    }
+
+    #[test]
+    fn constrain_rectangle_via_commands() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 4,0,0");
+        run(&mut s, "name last bottom");
+        run(&mut s, "line 4.1,0.2,0 4.3,2.8,0");
+        run(&mut s, "name last right");
+        run(&mut s, "line 4.2,3.1,0 -0.2,2.9,0");
+        run(&mut s, "name last top");
+        run(&mut s, "line 0.1,3.2,0 0.2,-0.1,0");
+        run(&mut s, "name last left");
+        run(&mut s, "constrain fixed bottom");
+        run(&mut s, "constrain coincident bottom right");
+        run(&mut s, "constrain coincident right top");
+        run(&mut s, "constrain coincident top left");
+        run(&mut s, "constrain coincident left bottom");
+        run(&mut s, "constrain vertical right");
+        run(&mut s, "constrain vertical left");
+        run(&mut s, "constrain horizontal top");
+        let out = run(&mut s, "constrain length right 3");
+        assert!(out.message.contains("solved"), "message: {}", out.message);
+        let ((_, _), (rx, ry)) = line_xy(&s, "right");
+        assert!((rx - 4.0).abs() < 1e-6, "right top corner x: {rx}");
+        assert!((ry - 3.0).abs() < 1e-6, "right top corner y: {ry}");
+        let ((tx, ty), _) = line_xy(&s, "top");
+        assert!((tx - 4.0).abs() < 1e-6 && (ty - 3.0).abs() < 1e-6, "top joins right: {tx},{ty}");
+    }
+
+    #[test]
+    fn constrain_undo_restores_geometry_and_constraint() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,2,0");
+        run(&mut s, "name last l1");
+        let before = line_xy(&s, "l1");
+        run(&mut s, "constrain horizontal l1");
+        assert_eq!(s.doc.constraints.len(), 1);
+        run(&mut s, "undo");
+        assert!(s.doc.constraints.is_empty(), "constraint removed on undo");
+        assert_eq!(line_xy(&s, "l1"), before, "geometry restored on undo");
+        run(&mut s, "redo");
+        assert_eq!(s.doc.constraints.len(), 1, "redo re-adds");
+        let ((_, ay), (_, by)) = line_xy(&s, "l1");
+        assert!((ay - by).abs() < 1e-6, "redo re-solves");
+    }
+
+    #[test]
+    fn constraints_list_delete_and_clear() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,2,0");
+        run(&mut s, "name last l1");
+        run(&mut s, "circle 5,5,0 2");
+        run(&mut s, "name last c1");
+        run(&mut s, "constrain horizontal l1");
+        run(&mut s, "constrain radius c1 3");
+        let out = run(&mut s, "constraints list");
+        assert!(out.message.contains("#1 horizontal"), "list: {}", out.message);
+        assert!(out.message.contains("#2 radius"), "list: {}", out.message);
+        let out = run(&mut s, "constraints delete 1");
+        assert!(out.message.contains("deleted constraint #1"), "{}", out.message);
+        assert_eq!(s.doc.constraints.len(), 1);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.constraints.len(), 2, "delete undone");
+        assert!(matches!(s.doc.constraints[0], itsjustcad_doc::SketchConstraint::Horizontal { .. }));
+        let out = run(&mut s, "constraints clear");
+        assert!(out.message.contains("deleted all 2"), "{}", out.message);
+        assert!(s.doc.constraints.is_empty());
+        run(&mut s, "undo");
+        assert_eq!(s.doc.constraints.len(), 2, "clear undone");
+    }
+
+    #[test]
+    fn conflicting_constraint_leaves_geometry_and_warns() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 4,0,0");
+        run(&mut s, "name last l1");
+        run(&mut s, "constrain fixed l1");
+        let before = line_xy(&s, "l1");
+        let out = run(&mut s, "constrain length l1 9");
+        assert!(out.message.contains("NOT SOLVED"), "message: {}", out.message);
+        assert_eq!(line_xy(&s, "l1"), before, "inconsistent solve leaves geometry");
+        assert_eq!(s.doc.constraints.len(), 2, "constraint still recorded for deletion");
+        let out = run(&mut s, "constraints list");
+        assert!(out.message.contains("[conflicts]"), "list flags conflict: {}", out.message);
+    }
+
+    #[test]
+    fn redundant_constraint_flagged_in_list() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,2,0");
+        run(&mut s, "name last l1");
+        run(&mut s, "constrain horizontal l1");
+        let out = run(&mut s, "constrain horizontal l1");
+        assert!(out.message.contains("redundant"), "message: {}", out.message);
+        let out = run(&mut s, "constraints list");
+        assert!(out.message.contains("[redundant]"), "list: {}", out.message);
+    }
+
+    #[test]
+    fn constrain_tangent_line_circle_via_commands() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "name last ground");
+        run(&mut s, "circle 5,2,0 3");
+        run(&mut s, "name last wheel");
+        run(&mut s, "constrain fixed ground");
+        run(&mut s, "constrain radius wheel 3");
+        let out = run(&mut s, "constrain tangent ground wheel");
+        assert!(out.message.contains("solved"), "message: {}", out.message);
+        let id = s.doc.find_named("wheel")[0];
+        let Geometry::Curve(kernel_curve::Curve::Arc { center, radius, .. }) =
+            &s.doc.get(id).unwrap().geometry
+        else {
+            panic!("wheel is a circle")
+        };
+        assert!((center.y - 3.0).abs() < 1e-6, "center rests one radius up: {}", center.y);
+        assert!((radius - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn constraints_skip_deleted_objects() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,2,0");
+        run(&mut s, "name last l1");
+        run(&mut s, "constrain horizontal l1");
+        run(&mut s, "delete l1");
+        let out = run(&mut s, "constraints list");
+        assert!(out.message.contains("skipped"), "list: {}", out.message);
+    }
+
+    #[test]
+    fn under_constrained_reports_remaining_dof() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,2,0");
+        run(&mut s, "name last l1");
+        let out = run(&mut s, "constrain horizontal l1");
+        assert!(out.message.contains("under-constrained"), "message: {}", out.message);
+        assert!(out.message.contains("3 DOF"), "4 params - 1 eq: {}", out.message);
+    }
+
+    #[test]
+    fn constraint_oplog_replays_identically() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,2,0");
+        run(&mut s, "name last l1");
+        run(&mut s, "line 0,5,0 8,6,0");
+        run(&mut s, "name last l2");
+        run(&mut s, "constrain horizontal l1");
+        run(&mut s, "constrain parallel l1 l2");
+        run(&mut s, "constrain length l2 5");
+        let json1 = crate::io::to_json(&s);
+        let loaded = crate::io::from_json(&json1).unwrap();
+        let json2 = crate::io::to_json(&loaded);
+        assert_eq!(json1, json2, "constraint ops must replay identically");
+        assert_eq!(loaded.doc.constraints, s.doc.constraints);
+    }
+
+    #[test]
+    fn solveconstraints_after_move_restores_dimensions() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 4,0,0");
+        run(&mut s, "name last l1");
+        run(&mut s, "constrain horizontal l1");
+        run(&mut s, "constrain length l1 4");
+        // Nudge one endpoint away via a raw move of the whole line, then
+        // re-solve: length + horizontality must come back.
+        run(&mut s, "move l1 1,1,0");
+        let out = run(&mut s, "solveconstraints");
+        assert!(out.message.contains("solved"), "{}", out.message);
+        let ((ax, ay), (bx, by)) = line_xy(&s, "l1");
+        assert!((ay - by).abs() < 1e-6, "horizontal again");
+        assert!((((bx - ax).powi(2) + (by - ay).powi(2)).sqrt() - 4.0).abs() < 1e-6, "length 4");
+    }
+
 }

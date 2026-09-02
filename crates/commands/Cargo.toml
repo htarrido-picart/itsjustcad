@@ -12,6 +12,7 @@ default = []
 kernel-occt = ["kernel-occt/occt"]
 
 [dependencies]
+itsjustcad-constraints.workspace = true
 itsjustcad-doc.workspace = true
 itsjustcad-solar.workspace = true
 kernel-mesh.workspace = true
