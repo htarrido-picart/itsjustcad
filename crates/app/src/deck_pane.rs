@@ -68,6 +68,19 @@ fn deck_display_name(name: &str) -> String {
     }
 }
 
+/// The static model caption for the chat header when the interactive picker
+/// can't render (the probe hasn't produced a model list — endpoint down, still
+/// checking, or a server that doesn't enumerate models). The active model must
+/// stay visible so the user always knows what the deck would talk to; `None`
+/// only when the picker is present (non-empty list) or there's nothing to show.
+/// Pure — unit-tested.
+fn header_model_caption(probe_models: &[String], model: &str) -> Option<String> {
+    if !probe_models.is_empty() || model.trim().is_empty() {
+        return None;
+    }
+    Some(model.to_string())
+}
+
 /// Point `decks.active` at the cassette named `name`, returning its index (or
 /// `None` if no such cassette). Pure over `decks` so the auto-activate rule is
 /// unit-testable without touching disk or a tokio runtime.
@@ -802,6 +815,14 @@ impl DeckPane {
              your next message will use it."
         )));
         Some(cassette_name.to_string())
+    }
+
+    /// Push a status line into the chat transcript. Used by the app to surface
+    /// out-of-band events (e.g. a background model download failing while the
+    /// Model Setup window is closed) IN the deck UI instead of only in the log.
+    pub fn notify_status(&mut self, msg: String) {
+        self.transcript.push(Entry::Status(msg));
+        self.persist_chat();
     }
 
     /// Start a fresh chat session: abort any in-flight turn, drop the provider
@@ -2202,6 +2223,19 @@ impl DeckPane {
                     self.decks.save();
                     self.probe = ProbeState::Unknown; // re-probe with new model
                 }
+            } else if let Some(caption) = self
+                .decks
+                .decks
+                .get(self.decks.active)
+                .and_then(|c| header_model_caption(&probe_models, &c.model))
+            {
+                // No interactive picker (endpoint down / probing / list not
+                // enumerated): still show WHICH model is configured so the
+                // active deck+model pair is always readable in the header.
+                header_chip_frame(roles).show(ui, |ui| {
+                    ui.label(egui::RichText::new(caption).weak())
+                        .on_hover_text("configured model — picker appears when the endpoint is reachable");
+                });
             }
             // Traffic-light status dot (a real filled circle — the `●` glyph is
             // absent from egui's default font and renders as a tofu box), right
@@ -2760,7 +2794,8 @@ mod side_effect_gate_tests {
     use std::path::{Path, PathBuf};
 
     /// A DeckPane with empty state, isolated from the on-disk chat/decks.
-    fn blank_pane() -> DeckPane {
+    /// `pub(super)` so sibling test modules (e.g. `notify_status_tests`) reuse it.
+    pub(super) fn blank_pane() -> DeckPane {
         DeckPane {
             decks: DecksFile::default(),
             input: String::new(),
@@ -3177,7 +3212,7 @@ mod side_effect_gate_tests {
     #[test]
     fn ambiguous_continue_parks_then_resolves_update_vs_new() {
         // Loaded + dirty → New Session PARKS the decision.
-        let mut make = || {
+        let make = || {
             let mut pane = blank_pane();
             let mut store = crate::chat_store::DocSessions::new(
                 "aaaa1111-2222-3333-4444-555566667777".into(),
@@ -3762,5 +3797,45 @@ mod side_effect_gate_tests {
         };
         assert_eq!(select_active_by_name(&mut decks, "nope"), None);
         assert_eq!(decks.active, 1, "active must be untouched on a miss");
+    }
+
+    // --- active-deck clarity: the model stays visible without a picker ---
+
+    #[test]
+    fn header_caption_shows_model_when_probe_has_no_list() {
+        // Endpoint down / probing / non-enumerating server → static caption.
+        assert_eq!(
+            header_model_caption(&[], "qwen3"),
+            Some("qwen3".to_string())
+        );
+    }
+
+    #[test]
+    fn header_caption_absent_when_picker_renders() {
+        // A non-empty probe list means the interactive picker is shown instead.
+        assert_eq!(header_model_caption(&["qwen3".to_string()], "qwen3"), None);
+    }
+
+    #[test]
+    fn header_caption_absent_for_blank_model() {
+        assert_eq!(header_model_caption(&[], ""), None);
+        assert_eq!(header_model_caption(&[], "   "), None);
+    }
+}
+
+#[cfg(test)]
+mod notify_status_tests {
+    use super::*;
+
+    #[test]
+    fn notify_status_lands_in_the_transcript() {
+        // The app surfaces background events (e.g. a download failing with the
+        // Model Setup window closed) through this — it must be user-visible.
+        let mut pane = super::side_effect_gate_tests::blank_pane();
+        pane.notify_status("Download of X failed: server returned 404".into());
+        assert!(pane.transcript.iter().any(|e| matches!(
+            e,
+            Entry::Status(s) if s.contains("failed") && s.contains("404")
+        )));
     }
 }

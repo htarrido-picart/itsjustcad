@@ -68,6 +68,37 @@ pub enum WarmOutcome {
     NotApplicable,
 }
 
+/// Whether the configured model is served by the endpoint, given the model ids
+/// the endpoint listed. Tolerant of provider suffixes so a configured alias
+/// still matches the listed concrete id:
+/// - Ollama tags: `qwen3` matches `qwen3:latest`.
+/// - Anthropic dated ids: `claude-sonnet-4-6` matches `claude-sonnet-4-6-20250929`.
+/// - Version pins: `model` matches `model@q4`.
+///
+/// An EMPTY list means the endpoint didn't enumerate models (some OpenAI-compat
+/// servers don't) — treated as available, the turn itself will surface a bad
+/// model. A bare prefix without a separator (`qwen3` vs `qwen30b`) is NOT a
+/// match. Pure — the mismatch rule the probe enforces, unit-tested below.
+pub fn model_available(configured: &str, available: &[String]) -> bool {
+    if available.is_empty() {
+        return true;
+    }
+    available.iter().any(|m| {
+        m == configured
+            || m.strip_prefix(configured)
+                .is_some_and(|rest| rest.starts_with([':', '-', '@']))
+    })
+}
+
+/// The human message for a configured-model-not-served mismatch: names the
+/// model, the endpoint, and what IS available so the fix is obvious.
+fn mismatch_error(configured: &str, base: &str, available: &[String]) -> String {
+    format!(
+        "model '{configured}' not found on {base}. Available: {}",
+        available.join(", ")
+    )
+}
+
 /// Check whether a cassette is actually usable before enabling the deck UI:
 /// endpoint reachable, key present/valid, model available.
 pub async fn probe(config: &DeckConfig) -> Result<ProbeInfo, String> {
@@ -132,12 +163,8 @@ pub async fn probe(config: &DeckConfig) -> Result<ProbeInfo, String> {
                         .collect()
                 })
                 .unwrap_or_default();
-            if !models.is_empty() && !models.contains(&config.model) {
-                return Err(format!(
-                    "model '{}' not found on {base}. Available: {}",
-                    config.model,
-                    models.join(", ")
-                ));
+            if !model_available(&config.model, &models) {
+                return Err(mismatch_error(&config.model, base, &models));
             }
             Ok(ProbeInfo {
                 detail: format!("ready — {} @ {base}", config.model),
@@ -173,10 +200,76 @@ pub async fn probe(config: &DeckConfig) -> Result<ProbeInfo, String> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Same mismatch gate as OpenAI-compat: a configured model the API
+            // doesn't serve used to fail silently at send time; surface it here.
+            if !model_available(&config.model, &models) {
+                return Err(mismatch_error(&config.model, base, &models));
+            }
             Ok(ProbeInfo {
                 detail: format!("ready — {} @ {base}", config.model),
                 models,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ── model_available: the probe's mismatch rule ─────────────────────────
+
+    #[test]
+    fn exact_match_is_available() {
+        assert!(model_available("qwen3", &list(&["llama3", "qwen3"])));
+    }
+
+    #[test]
+    fn ollama_tag_suffix_matches() {
+        // Configured alias vs the concrete tag Ollama lists.
+        assert!(model_available("qwen3", &list(&["qwen3:latest"])));
+        assert!(model_available("qwen3", &list(&["qwen3:8b-q4"])));
+    }
+
+    #[test]
+    fn anthropic_dated_id_matches_alias() {
+        assert!(model_available(
+            "claude-sonnet-4-6",
+            &list(&["claude-sonnet-4-6-20250929", "claude-opus-4-2"])
+        ));
+    }
+
+    #[test]
+    fn version_pin_suffix_matches() {
+        assert!(model_available("m", &list(&["m@q4"])));
+    }
+
+    #[test]
+    fn bare_prefix_without_separator_is_not_a_match() {
+        // "qwen3" must NOT match "qwen30b" — that is a different model.
+        assert!(!model_available("qwen3", &list(&["qwen30b"])));
+    }
+
+    #[test]
+    fn absent_model_is_unavailable() {
+        assert!(!model_available("mistral", &list(&["qwen3:latest", "llama3"])));
+    }
+
+    #[test]
+    fn empty_list_is_permissive() {
+        // Endpoints that don't enumerate models can't be mismatch-checked.
+        assert!(model_available("anything", &[]));
+    }
+
+    #[test]
+    fn mismatch_error_names_model_endpoint_and_alternatives() {
+        let msg = mismatch_error("mistral", "http://localhost:8080/v1", &list(&["qwen3", "llama3"]));
+        assert!(msg.contains("mistral"), "{msg}");
+        assert!(msg.contains("http://localhost:8080/v1"), "{msg}");
+        assert!(msg.contains("qwen3, llama3"), "{msg}");
     }
 }

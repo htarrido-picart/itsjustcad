@@ -520,9 +520,39 @@ pub(crate) fn should_intercept_close(
 struct ActiveDownload {
     model_id: String,
     handle: crate::download::Download,
-    /// Set once we've persisted the cassette for a `Done` state, so we do it
-    /// only once.
+    /// Set once the terminal state (Done/Failed) has been handled — the Done
+    /// cassette persisted, or the failure announced — so it happens only once.
     persisted: bool,
+}
+
+/// What a just-finished download demands of the app this frame. `None` while
+/// still running, already handled, or user-cancelled (the cancel path has its
+/// own caption and keeps the `.part` for resume — no extra announcement).
+#[derive(Debug, Clone, PartialEq)]
+enum DownloadOutcome {
+    /// Verified + renamed: persist the cassette and activate the deck.
+    Completed,
+    /// Failed for a real reason (not a cancel): surface it to the user.
+    Failed(String),
+}
+
+/// The once-only terminal-state rule for a polled download. Pure so the
+/// panel-closed hand-off (the old bug: completion was only handled while the
+/// Model Setup window was open) is provable in a unit test.
+fn download_outcome(
+    state: &crate::download::DownloadState,
+    already_handled: bool,
+) -> Option<DownloadOutcome> {
+    if already_handled {
+        return None;
+    }
+    match state {
+        crate::download::DownloadState::Done { .. } => Some(DownloadOutcome::Completed),
+        crate::download::DownloadState::Failed { msg } if msg != "cancelled" => {
+            Some(DownloadOutcome::Failed(msg.clone()))
+        }
+        _ => None,
+    }
 }
 
 impl App {
@@ -4104,41 +4134,65 @@ impl App {
         save_theme_pref(dark);
     }
 
-    /// Model Setup panel: hardware recommendation, the catalog gated by RAM, an
-    /// Install button per model with a live progress bar + speed + cancel, and
-    /// the currently-installed model with Re-download / Remove. On a completed,
-    /// verified download it writes/enables the local `openai_compat` cassette in
-    /// `decks.json` (the runtime spawn is the next agent's job).
-    fn model_setup_ui(&mut self, ctx: &egui::Context) {
-        if !self.show_model_setup {
-            return;
-        }
-
-        // 1) Poll the active download; on a fresh Done, persist the cassette AND
-        //    auto-activate it (Priority A: "download → chat just works"). We
-        //    collect the cassette name here and activate after the borrow ends.
-        let mut activate: Option<(String, String)> = None; // (cassette_name, model_label)
-        if let Some(active) = &mut self.active_download {
-            let state = active.handle.state();
-            if matches!(state, crate::download::DownloadState::Done { .. }) && !active.persisted {
-                active.persisted = true;
-                if let Some(entry) = self.catalog.get(&active.model_id).cloned() {
+    /// Poll the active download's terminal state EVERY frame — panel open or
+    /// not. On a fresh `Done`, persist the cassette and auto-activate it
+    /// (Priority A: "download → chat just works"); on a real failure, announce
+    /// it in the deck transcript so it is never silent. This used to live
+    /// inside [`model_setup_ui`], which early-returns when the window is
+    /// hidden — so a download finishing with the panel closed was never wired
+    /// to the deck and a failure vanished entirely.
+    fn poll_model_download(&mut self) {
+        let outcome = self
+            .active_download
+            .as_mut()
+            .and_then(|active| {
+                let out = download_outcome(&active.handle.state(), active.persisted);
+                if out.is_some() {
+                    active.persisted = true;
+                }
+                out.map(|o| (active.model_id.clone(), o))
+            });
+        match outcome {
+            Some((model_id, DownloadOutcome::Completed)) => {
+                if let Some(entry) = self.catalog.get(&model_id).cloned() {
                     let mut decks = itsjustcad_deck::DecksFile::load_or_default();
                     install_catalog_deck(&mut decks, &entry); // sets active in-file
                     decks.save();
-                    activate = Some((cassette_name_for(&entry.id), entry.display_name.clone()));
+                    let cassette = cassette_name_for(&entry.id);
+                    // Reload the pane's decks, flip the active deck, and eagerly
+                    // start the local runtime so the next chat turn just works.
+                    self.deck_pane.activate_installed_model(&cassette, &self.tokio);
+                    tracing::info!(
+                        "Installed {}; active deck is now '{}' and its runtime is starting.",
+                        entry.display_name,
+                        cassette
+                    );
                 }
             }
+            Some((model_id, DownloadOutcome::Failed(msg))) => {
+                let label = self
+                    .catalog
+                    .get(&model_id)
+                    .map(|m| m.display_name.clone())
+                    .unwrap_or(model_id);
+                tracing::warn!("model download failed: {label}: {msg}");
+                self.deck_pane.notify_status(format!(
+                    "Download of {label} failed: {msg} — open LLM ▸ Model Setup to retry \
+                     (a partial file resumes where it stopped)."
+                ));
+            }
+            None => {}
         }
-        if let Some((cassette, label)) = activate {
-            // Reload the pane's decks, flip the active deck, and eagerly start
-            // the local runtime so the next chat turn works with zero extra steps.
-            self.deck_pane.activate_installed_model(&cassette, &self.tokio);
-            tracing::info!(
-                "Installed {}; active deck is now '{}' and its runtime is starting.",
-                label,
-                cassette
-            );
+    }
+
+    /// Model Setup panel: hardware recommendation, the catalog gated by RAM +
+    /// free disk, an Install button per model with a live progress bar + speed
+    /// + cancel, and the currently-installed model with Re-download / Remove.
+    /// Download completion/failure is handled by [`Self::poll_model_download`]
+    /// (every frame, panel open or not), not here.
+    fn model_setup_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_model_setup {
+            return;
         }
 
         let mut wants_close = false;
@@ -4187,6 +4241,9 @@ impl App {
 
                 for entry in &catalog.models {
                     let runnable = entry.runnable_at(hw.ram_gb);
+                    // Refuse to START a download that would die mid-transfer on
+                    // a full disk (an opaque "write error" otherwise).
+                    let disk_block = entry.disk_shortfall(hw.free_disk_gb);
                     let installed = catalog_deck_installed(&decks, &entry.id);
                     let is_downloading = active_state
                         .as_ref()
@@ -4234,6 +4291,22 @@ impl App {
                                     entry.ram_gb_min
                                 ))
                                 .weak(),
+                            );
+                        }
+                        // RAM undetectable → the gate above can't vouch for this
+                        // model; install stays allowed, but say so out loud.
+                        if let Some(warn) = entry.ram_unknown_warning(hw.ram_gb) {
+                            ui.label(
+                                egui::RichText::new(warn)
+                                    .small()
+                                    .color(ui.visuals().warn_fg_color),
+                            );
+                        }
+                        if let Some(block) = &disk_block {
+                            ui.label(
+                                egui::RichText::new(block.as_str())
+                                    .small()
+                                    .color(ui.visuals().warn_fg_color),
                             );
                         }
 
@@ -4317,11 +4390,14 @@ impl App {
                             let any_active = active_state
                                 .as_ref()
                                 .is_some_and(|(_, s)| s.is_active());
-                            ui.add_enabled_ui(runnable && !any_active, |ui| {
-                                if ui.button("Install").clicked() {
-                                    install = Some(entry.id.clone());
-                                }
-                            });
+                            ui.add_enabled_ui(
+                                runnable && disk_block.is_none() && !any_active,
+                                |ui| {
+                                    if ui.button("Install").clicked() {
+                                        install = Some(entry.id.clone());
+                                    }
+                                },
+                            );
                         }
                     });
                 }
@@ -4436,7 +4512,8 @@ impl App {
                             .icons
                             .icon_button(ui, crate::icons::Icon::Close, "Cancel download")
                             .on_hover_text(
-                                "Cancel download — the partial file will be discarded.",
+                                "Cancel download — the partial file is kept so a \
+                                 later download resumes instead of restarting.",
                             )
                             .clicked()
                         {
@@ -5357,6 +5434,10 @@ impl eframe::App for App {
             }
         }
 
+        // Handle download completion/failure every frame — even with the Model
+        // Setup window closed — so a finished download always becomes the
+        // active deck and a failure is never silent.
+        self.poll_model_download();
         // Tools → Model Setup panel (also the onboarding "download a local
         // model" entry point). Renders any time show_model_setup is set.
         self.model_setup_ui(ui.ctx());
@@ -6067,6 +6148,51 @@ mod tests {
         // By contrast, the explicit Cancel button DOES cancel.
         active.handle.cancel();
         assert!(cancel.load(Ordering::SeqCst), "explicit cancel sets the flag");
+    }
+
+    // ── download terminal-state hand-off (panel open OR closed) ────────────
+    // `poll_model_download` runs every frame regardless of `show_model_setup`,
+    // applying this pure rule — the old bug was polling only inside the panel.
+
+    #[test]
+    fn download_outcome_done_completes_exactly_once() {
+        use crate::download::DownloadState;
+        let done = DownloadState::Done { path: std::path::PathBuf::from("/m.gguf") };
+        assert_eq!(
+            download_outcome(&done, false),
+            Some(DownloadOutcome::Completed)
+        );
+        // Second poll (already handled) must not re-install.
+        assert_eq!(download_outcome(&done, true), None);
+    }
+
+    #[test]
+    fn download_outcome_failure_is_surfaced() {
+        use crate::download::DownloadState;
+        let failed = DownloadState::Failed { msg: "server returned 404".into() };
+        assert_eq!(
+            download_outcome(&failed, false),
+            Some(DownloadOutcome::Failed("server returned 404".into()))
+        );
+        assert_eq!(download_outcome(&failed, true), None, "announce only once");
+    }
+
+    #[test]
+    fn download_outcome_cancel_is_quiet() {
+        use crate::download::DownloadState;
+        // A user cancel already shows its own caption and keeps the .part for
+        // resume — no extra transcript announcement.
+        let cancelled = DownloadState::Failed { msg: "cancelled".into() };
+        assert_eq!(download_outcome(&cancelled, false), None);
+    }
+
+    #[test]
+    fn download_outcome_nonterminal_states_do_nothing() {
+        use crate::download::DownloadState;
+        let running = DownloadState::Downloading { done: 1, total: Some(2), bytes_per_sec: 1.0 };
+        assert_eq!(download_outcome(&running, false), None);
+        assert_eq!(download_outcome(&DownloadState::Verifying, false), None);
+        assert_eq!(download_outcome(&DownloadState::Idle, false), None);
     }
 
     #[test]

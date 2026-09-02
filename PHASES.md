@@ -17,7 +17,7 @@ HIG-grounded design revision, run as sequential batches. All six landed.
 
 ## Queued — small, high-impact
 
-- [ ] **Pending deck usability** — download-that-can't-run, download not wired to active deck, silent model-mismatch, active-deck clarity, surface connection errors.
+- [x] **Pending deck usability** — download-that-can't-run (disk-space gate + unknown-RAM warning; RAM gate was already in), download wired to active deck even with Model Setup closed (per-frame terminal poll), model-mismatch surfaced for Anthropic too + suffix-tolerant matching (`qwen3` ↔ `qwen3:latest`), active model always visible in the chat header, download failures announced in the deck transcript. *(shipped; builds on 5d16875)*
 - [ ] **Local model finetune** — 0.6B too weak; default 4B Qwen; free synthetic training data from the command registry.
 - [ ] **Chat encryption** *(deferred by user)* — encrypt chat-session files at rest, OS-keychain-keyed, transparent auto-unlock. Design drafted (AES-256-GCM, `keyring` crate, plaintext fallback when keyring absent).
 

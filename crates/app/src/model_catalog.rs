@@ -95,6 +95,41 @@ impl ModelEntry {
         }
     }
 
+    /// Why installing this model on a machine with `free_disk_gb` GiB free
+    /// would fail, or `None` when there's room (or free space is unknown).
+    ///
+    /// The download streams to disk, so too little free space fails MID-transfer
+    /// with an opaque "write error" — this gate refuses to start instead. We
+    /// require the model size plus a 1 GiB safety margin (the `.part` → final
+    /// rename is on the same volume, so no doubling). Unknown free space is
+    /// permissive, like the RAM gate. Pure — unit-tested below.
+    pub fn disk_shortfall(&self, free_disk_gb: Option<u64>) -> Option<String> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let free = free_disk_gb?;
+        let needed = self.size_bytes.saturating_add(GIB);
+        if free.saturating_mul(GIB) >= needed {
+            return None;
+        }
+        Some(format!(
+            "Not enough free disk space: needs {} (+1 GB margin), only {} GB free.",
+            crate::download::fmt_bytes(self.size_bytes),
+            free
+        ))
+    }
+
+    /// Warning to show when the machine's RAM could not be detected: the RAM
+    /// gate can't vouch that this model will actually run. `None` when RAM is
+    /// known (the hard `runnable_at` gate applies instead). Pure.
+    pub fn ram_unknown_warning(&self, ram_gb: Option<u64>) -> Option<String> {
+        if ram_gb.is_some() {
+            return None;
+        }
+        Some(format!(
+            "Couldn't detect this machine's RAM — this model needs at least {} GB to run.",
+            self.ram_gb_min
+        ))
+    }
+
     /// True when the entry is an unverified placeholder (empty sha256).
     pub fn is_placeholder(&self) -> bool {
         self.sha256.trim().is_empty()
@@ -252,6 +287,70 @@ mod tests {
             cat.recommended_for(ModelTier::None).unwrap().tier,
             TierTag::Small3B
         );
+    }
+
+    // ── disk gate + unknown-RAM warning ────────────────────────────────────
+
+    fn entry_of_size(size_bytes: u64) -> ModelEntry {
+        ModelEntry {
+            id: "m".into(),
+            display_name: "M".into(),
+            tier: TierTag::Small3B,
+            url: "https://host/model.gguf".into(),
+            size_bytes,
+            sha256: "".into(),
+            runtime: Runtime::Gguf,
+            ram_gb_min: 8,
+        }
+    }
+
+    #[test]
+    fn disk_gate_blocks_when_too_little_free_space() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // A 4 GiB model on a volume with 4 GB free: the +1 GiB margin fails it.
+        let e = entry_of_size(4 * GIB);
+        let msg = e.disk_shortfall(Some(4)).expect("must block");
+        assert!(msg.contains("4.0 GB"), "{msg}");
+        assert!(msg.contains("4 GB free"), "{msg}");
+    }
+
+    #[test]
+    fn disk_gate_allows_with_margin() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let e = entry_of_size(4 * GIB);
+        // 6 GB free ≥ 4 GiB + 1 GiB margin → OK.
+        assert_eq!(e.disk_shortfall(Some(6)), None);
+    }
+
+    #[test]
+    fn disk_gate_boundary_is_size_plus_margin() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let e = entry_of_size(4 * GIB);
+        // Exactly size + margin passes; one GiB less fails.
+        assert_eq!(e.disk_shortfall(Some(5)), None);
+        assert!(e.disk_shortfall(Some(4)).is_some());
+    }
+
+    #[test]
+    fn disk_gate_unknown_free_space_is_permissive() {
+        let e = entry_of_size(u64::MAX / 2);
+        assert_eq!(e.disk_shortfall(None), None);
+    }
+
+    #[test]
+    fn ram_unknown_warns_with_the_requirement() {
+        let e = entry_of_size(1);
+        let msg = e.ram_unknown_warning(None).expect("must warn");
+        assert!(msg.contains("8 GB"), "{msg}");
+        assert!(msg.to_lowercase().contains("ram"), "{msg}");
+    }
+
+    #[test]
+    fn ram_known_has_no_unknown_warning() {
+        // With known RAM the hard runnable_at gate applies; no extra warning.
+        let e = entry_of_size(1);
+        assert_eq!(e.ram_unknown_warning(Some(4)), None);
+        assert_eq!(e.ram_unknown_warning(Some(64)), None);
     }
 
     // ── file name derivation ───────────────────────────────────────────────
