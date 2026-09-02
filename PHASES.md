@@ -29,12 +29,12 @@ HIG-grounded design revision, run as sequential batches. All six landed.
 
 ## Big domain adds
 
-- [ ] **Camera projections** — perspective controls, 2-point, panorama, fisheye; simulate iPhone/Android camera focal lengths + sensor crops.
-- [ ] **Render & colors** — pencil/NPR display mode, SketchUp preset (sun-shading + profile edges + sky/ground gradient), lighting-mode rework (hemispheric-diffuse default, specular opt-in), per-object color + color modes.
-- [ ] **M-enviro** — Ladybug-style: sun-path diagram, shadow studies, sunlight-hours heatmaps, radiation/insolation, EPW import, analysis meshes the deck can critique.
-- [ ] **Diffusion render** — cassette-style SD backends (ComfyUI/A1111/Draw Things local; Replicate/fal/Stability keyed). Ships with NO backend. Control-image export (depth/edge/mask) buildable independently first.
-- [ ] **M-structural** — BIM structural members (grid/story/beam/column/slab/wall/section/material/load/support), then **IFC-structural / SAF** open-format handoff to ETABS/SAP2000/Robot. Interop only — never claim to analyze. Then **M-bim-import** (typed members from IFC).
-- [ ] **M-expressive** — generative/form-finding structures (Candela hypar, Dieste gauss-vault, geodesic domes, tensegrity, Frei Otto minimal surfaces, Gaudí funicular). One shared form-finding engine (dynamic relaxation) unlocks the whole family.
+- [x] **Camera projections** — COMPLETE (audited 2026-09-02; core had already shipped). Perspective FOV via `camera <mm>` full-frame lens math, 2-point (`camera 2point`, projection shear — verticals stay vertical), equirect panorama + equidistant fisheye (cubemap capture + remap), phone-lens sims (iPhone/Pixel/Galaxy ultrawide/main/tele as 35mm equivalents). Gap closed this session: stateful **View ▸ Camera radios** (Perspective / Two-Point / Panorama 360° / Fisheye; checked from the live camera, fire the same `camera` verbs the deck uses).
+- [x] **Render & colors** — COMPLETE (audited 2026-09-02; had already shipped). Pencil display mode + sketchy NPR edges, `sketchup` preset verb (sun shading + profile edges + sky/ground gradient), lighting rework (Working = hemispheric-diffuse default, Sun = SPA key light, Presentation = specular opt-in), per-object `color` + ColorMode (by-layer/by-object/by-type/random).
+- [ ] **M-enviro** — MOSTLY DONE (audited 2026-09-02): `shadowstudy`, `sunhours` grid heatmap, `facesunhours` per-face insolation, EPW import (sets location + reports stats), and **`sunpath` shipped this session** — yearly sun-path dome (7 date arcs Dec→Jun + hour analemmas + horizon ring, golden 'sunpath' layer, undo/replay-stable, deck-callable). Remaining: EPW-weighted radiation (kWh/m² — needs the 8760 radiation columns retained from EPW), deck critique hooks for analysis meshes.
+- [ ] **Diffusion render** — control-image export DONE (`controlimages <prefix>` → depth/edge/mask PNGs from the current view). Remaining: cassette-style SD backends (ComfyUI/A1111/Draw Things local; Replicate/fal/Stability keyed). Ships with NO backend.
+- [ ] **M-structural** — verbs exist (grid/story/beam/column/slab/wall/load/support); remaining: **IFC-structural / SAF** open-format handoff to ETABS/SAP2000/Robot. Interop only — never claim to analyze. Then **M-bim-import** (typed members from IFC).
+- [ ] **M-expressive** — generator verbs exist (geodesic/spaceframe/hypar/gaussvault/gridshell/funicular/tensegrity/cablenet); remaining: unify on one shared dynamic-relaxation form-finding engine + Frei Otto minimal surfaces.
 
 ## Interop (M7 remainder) — COMPLETE ✅ (audited + closed 2026-09-02)
 
