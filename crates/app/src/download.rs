@@ -203,6 +203,11 @@ pub fn progress_caption(state: &DownloadState) -> String {
         }
         DownloadState::Verifying => "Verifying checksum…".to_string(),
         DownloadState::Done { .. } => "Done".to_string(),
+        // A user cancel keeps the `.part` on disk (see module docs) so a later
+        // download resumes — say so, rather than implying total failure.
+        DownloadState::Failed { msg } if msg == "cancelled" => {
+            "Cancelled — partial file kept; re-download resumes".to_string()
+        }
         DownloadState::Failed { msg } => format!("Failed: {msg}"),
     }
 }
@@ -528,9 +533,44 @@ mod tests {
     #[test]
     fn progress_caption_failed_shows_msg() {
         let s = DownloadState::Failed {
+            msg: "server returned 404".into(),
+        };
+        assert_eq!(progress_caption(&s), "Failed: server returned 404");
+    }
+
+    #[test]
+    fn progress_caption_cancelled_notes_partial_is_kept() {
+        // A cancel keeps the `.part` for resume; the caption must say so rather
+        // than reading as an outright failure — this is the surfaced note.
+        let s = DownloadState::Failed {
             msg: "cancelled".into(),
         };
-        assert_eq!(progress_caption(&s), "Failed: cancelled");
+        let cap = progress_caption(&s);
+        assert!(!cap.starts_with("Failed"), "{cap}");
+        assert!(cap.contains("resume"), "{cap}");
+        assert!(cap.contains("partial"), "{cap}");
+    }
+
+    #[test]
+    fn cancel_leaves_part_file_for_resume() {
+        // Documents the intentional resume semantics the UI note relies on:
+        // a `.part` already on disk is what `resume_offset` picks up, and
+        // nothing in the cancel path removes it.
+        let dir = std::env::temp_dir().join("ijc_dl_test_cancel_keeps");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = DownloadSpec {
+            url: "https://example/m.gguf".into(),
+            dir: dir.clone(),
+            file_name: "m.gguf".into(),
+            expected_sha256: None,
+        };
+        let part = spec.part_path();
+        std::fs::write(&part, vec![0u8; 4096]).unwrap();
+        // The cancel flag flips state to Failed but must not touch the file.
+        assert!(part.exists(), "precondition: partial present");
+        assert_eq!(resume_offset(&part), 4096, "resume would pick this up");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── spec paths ─────────────────────────────────────────────────────────

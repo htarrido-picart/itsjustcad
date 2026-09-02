@@ -425,6 +425,19 @@ const OK_COLOR: egui::Color32 = egui::Color32::from_rgb(70, 160, 90);
 const ERR_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 80, 70);
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(90, 160, 255);
 
+/// A busy indicator that honours the reduce-motion preference: the spinning
+/// egui spinner when motion is allowed, or a static accent dot (same footprint,
+/// no animation/repaint) when the user has asked to reduce motion.
+fn busy_indicator(ui: &mut egui::Ui, reduce_motion: bool) {
+    if reduce_motion {
+        let d = ui.spacing().interact_size.y * 0.5;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), d * 0.35, ACCENT);
+    } else {
+        ui.spinner();
+    }
+}
+
 fn commands_header(commands: &[ExecutedCommand]) -> egui::RichText {
     let failed = commands.iter().filter(|c| c.result.is_err()).count();
     if failed > 0 {
@@ -2046,7 +2059,7 @@ impl DeckPane {
         icons: &crate::icons::Icons,
         roles: &crate::theme::ColorRoles,
         _dark: bool,
-        _reduce_motion: bool,
+        reduce_motion: bool,
     ) {
         self.drain(session, handle);
         if self.busy()
@@ -2215,7 +2228,7 @@ impl DeckPane {
                     crate::local_runtime::RuntimeState::Starting => ACCENT,
                 };
                 if matches!(state, crate::local_runtime::RuntimeState::Starting) {
-                    ui.spinner();
+                    busy_indicator(ui, reduce_motion);
                 }
                 ui.colored_label(color, state.caption());
             }
@@ -2710,7 +2723,7 @@ impl DeckPane {
                                 .unwrap_or(0);
                             let received = self.current_response.len();
                             ui.horizontal(|ui| {
-                                ui.spinner();
+                                busy_indicator(ui, reduce_motion);
                                 let status = if received == 0 {
                                     format!("waiting for model… {elapsed}s")
                                 } else {

@@ -52,13 +52,8 @@ impl Spacing {
     /// 32px — major regions.
     pub const XL: f32 = 32.0;
 
-    /// 80px (10× grid unit) — the docked command-history scrollback height,
-    /// used as the default / minimum when no panel height is available.
-    /// Prefer [`Spacing::history_h_for`] for a token-relative height.
-    pub const HISTORY_H: f32 = Self::S * 10.0;
-
     /// Command-history scrollback height: fill the command-line panel, leaving
-    /// `INPUT_RESERVE` for the prompt/input row below, with a `HISTORY_H` floor
+    /// `INPUT_RESERVE` for the prompt/input row below, with a small floor
     /// so a tiny window never collapses it. Because it tracks `panel_h` with no
     /// upper cap, dragging the panel taller actually shows MORE history (rather
     /// than opening dead space under a fixed-height scrollback).

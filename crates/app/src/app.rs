@@ -4247,7 +4247,8 @@ impl App {
                             if state.is_active() {
                                 ui.label(
                                     egui::RichText::new(
-                                        "Warning: cancelling will discard the partial file.",
+                                        "Cancelling keeps the partial .part file on disk; \
+                                         re-downloading resumes from where it stopped.",
                                     )
                                     .small()
                                     .color(ui.visuals().warn_fg_color),
@@ -4255,7 +4256,8 @@ impl App {
                                 if ui
                                     .button("Cancel")
                                     .on_hover_text(
-                                        "The partially downloaded .part file will be discarded.",
+                                        "The partial .part file is kept so a later \
+                                         download resumes instead of restarting.",
                                     )
                                     .clicked()
                                 {

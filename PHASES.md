@@ -4,16 +4,16 @@ Status as of 2026-09-01. Shipped milestones (M2–M5 core, layers, gumball,
 undo, dims/sheets/PDF, DXF/glTF/OBJ/STL, local-LLM onboarding, per-doc chat
 persistence, native menus, clipboard) are omitted — this tracks what's LEFT.
 
-## In progress — Design system (report batches A–F)
+## Design system (report batches A–F) — COMPLETE ✅
 
-HIG-grounded design revision, run as sequential batches (each touches app.rs).
+HIG-grounded design revision, run as sequential batches. All six landed.
 
 - [x] **A — Tokens + a11y foundation** — `surface_elevated`/`on_surface_tertiary`/`destructive` roles, WCAG contrast helper + passing ≥4.5:1 body-role tests, type scale (caption/title/weight), spacing guards. *(already implemented; verified)*
 - [x] **B — Iconography** — Lucide clean, de-dup guard, `Line→pen-line`; added `Paperclip` icon replacing 📎. *(shipped ce0d1e1)*
 - [x] **C — Menus + keyboard** — Window menu, shortcuts shown, disable-don't-hide, stateful View menu (Panel Hide/Show ⌘\, display/lighting radios). *(shipped f470de7)*
 - [x] **D — Component correctness** — button roles (destructive/pressed/"…"), segmented controls + toolbar grouping, unsaved-changes + neutral-title alerts. *(already implemented; verified)*
 - [x] **E — Ergonomics + states** — empty-doc viewport hint + add-layer toolbar to top (rest already present: empty chat, hit-target floor, focus ring, middle-truncate, striped rows). *(shipped 36e6418)*
-- [ ] **F — Polish** — token-relative history height, autosuggest accent fill, Reduce-Motion, download-cancel partial-file warning. *(running — final batch)*
+- [x] **F — Polish** — killed dead `HISTORY_H` (history height already token-relative), wired `reduce_motion` to spinners, corrected download-cancel warning (partial `.part` is kept for resume; autosuggest accent fill already present). *(shipped)*
 
 ## Queued — small, high-impact
 
