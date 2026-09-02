@@ -368,6 +368,28 @@ pub enum Command {
         index: u32,
         position: DVec3,
     },
+    /// Insert a knot into a NURBS curve at normalized parameter `t` (0..1),
+    /// preserving the shape exactly while adding one control point (Boehm).
+    InsertKnot {
+        target: Selector,
+        t: f64,
+    },
+    /// Curvature comb: sample the curve's curvature and draw hair lines
+    /// (length = curvature × scale) plus a tip polyline on the `analysis`
+    /// layer. Reports max curvature / min radius.
+    CurvatureGraph {
+        target: Selector,
+        /// Ids of the created comb objects, filled in on first exec and reused
+        /// on replay for op-log stability.
+        #[serde(default)]
+        ids: Option<Vec<ObjectId>>,
+        /// Hair length in meters per unit curvature (`None` = auto: longest
+        /// hair ≈ 15% of the curve's bounding size).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scale: Option<f64>,
+        /// Number of comb hairs.
+        samples: u32,
+    },
     /// Resample a curve to `count` points (open/closed matching the source).
     Rebuild {
         #[serde(default, skip_serializing_if = "Option::is_none")]

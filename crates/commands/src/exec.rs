@@ -2224,6 +2224,104 @@ fn section_meshes(
 /// Layer for the sunlight-hours heatmap overlay.
 const ANALYSIS_LAYER: &str = "analysis";
 
+/// Curvature comb: sample the target curve's curvature and draw one hair line
+/// per sample (foot on the curve, length = curvature × scale, pointing toward
+/// the center of curvature) plus a polyline joining the hair tips, all on the
+/// `analysis` layer. Auto scale sizes the longest hair to ~15% of the curve's
+/// bounding extent so the comb reads at any zoom.
+fn exec_curvature_graph(
+    doc: &mut Document,
+    target: Selector,
+    ids: Option<Vec<ObjectId>>,
+    scale: Option<f64>,
+    samples: u32,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let resolved = resolve(doc, &target)?;
+    let [tid] = resolved[..] else {
+        return Err(ExecError::Invalid(format!(
+            "curvature target matched {} objects, expected exactly 1",
+            resolved.len()
+        )));
+    };
+    if !(2..=500).contains(&samples) {
+        return Err(ExecError::Invalid("curvature samples must be 2..=500".into()));
+    }
+    let curve = curve_of(doc, tid, "curvature")?;
+    let profile = kernel_curve::curvature_profile(curve, samples as usize, PROFILE_TOL * 0.1);
+    if profile.is_empty() {
+        return Err(ExecError::Invalid("curvature: curve is degenerate".into()));
+    }
+    let kmax = profile.iter().map(|s| s.kappa).fold(0.0, f64::max);
+
+    // Curve extent for auto-scaling.
+    let (mut lo, mut hi) = (profile[0].point, profile[0].point);
+    for s in &profile {
+        lo = lo.min(s.point);
+        hi = hi.max(s.point);
+    }
+    let extent = (hi - lo).length().max(1e-6);
+    let scale_m = match scale {
+        Some(s) if s > 0.0 => s,
+        Some(_) => return Err(ExecError::Invalid("curvature scale must be > 0".into())),
+        None if kmax > 1e-12 => 0.15 * extent / kmax,
+        None => 0.0, // straight curve: zero-length hairs, tip curve overlays it
+    };
+
+    let closed = curve.is_closed();
+    let tips: Vec<DVec3> =
+        profile.iter().map(|s| s.point + s.normal * (s.kappa * scale_m)).collect();
+
+    let count = profile.len() + 1; // hairs + tip polyline
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == count => ids,
+        _ => (0..count).map(|_| ObjectId::new()).collect(),
+    };
+    let mut layers_created = Vec::new();
+    if !doc.layers.contains_key(ANALYSIS_LAYER) {
+        doc.layers
+            .insert(ANALYSIS_LAYER.to_string(), LayerStyle::default());
+        layers_created.push(ANALYSIS_LAYER.to_string());
+    }
+    let mut insert_curve_obj = |id: ObjectId, c: Curve| {
+        doc.insert(SceneObject {
+            visible: true,
+            id,
+            name: None,
+            layer: ANALYSIS_LAYER.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(c),
+        });
+    };
+    for (s, id) in profile.iter().zip(&new_ids) {
+        insert_curve_obj(
+            *id,
+            Curve::Line { a: s.point, b: s.point + s.normal * (s.kappa * scale_m) },
+        );
+    }
+    insert_curve_obj(new_ids[count - 1], Curve::Polyline { points: tips, closed });
+    doc.generation += 1;
+
+    let radius_txt = if kmax > 1e-12 {
+        format!("min radius {:.3} m", 1.0 / kmax)
+    } else {
+        "straight (zero curvature)".to_string()
+    };
+    Ok((
+        Command::CurvatureGraph { target, ids: Some(new_ids.clone()), scale, samples },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome {
+            message: format!(
+                "curvature {tid}: {} hairs on '{ANALYSIS_LAYER}', max curvature {kmax:.4} 1/m, \
+                 {radius_txt}",
+                count - 1
+            ),
+            created: new_ids,
+        },
+    ))
+}
+
 /// Collect every mesh's world-space triangles as `[a,b,c]` f64 vertex triples.
 /// Used by both shadow projection and sun-hours ray-casting.
 fn scene_triangles(doc: &Document) -> Vec<[[f64; 3]; 3]> {
@@ -3904,6 +4002,53 @@ fn apply_forward(
                     message: format!("setpoint {tid} [{i}] -> {position}"),
                 },
             ))
+        }
+        Command::InsertKnot { target, t } => {
+            let ids = resolve(doc, &target)?;
+            let [tid] = ids[..] else {
+                return Err(ExecError::Invalid(format!(
+                    "insertknot target matched {} objects, expected exactly 1",
+                    ids.len()
+                )));
+            };
+            let curve = curve_of(doc, tid, "insertknot")?;
+            let Curve::Nurbs { control, weights, knots, degree } = curve else {
+                return Err(ExecError::Invalid(
+                    "insertknot works on NURBS curves only (try `curve` or `interpcurve`)".into(),
+                ));
+            };
+            if !(0.0..=1.0).contains(&t) {
+                return Err(ExecError::Invalid("insertknot parameter must be in 0..1".into()));
+            }
+            // Map the normalized parameter into the knot domain.
+            let (k0, k1) = (knots[*degree], knots[knots.len() - degree - 1]);
+            let t_dom = k0 + (k1 - k0) * t;
+            let (nc, nw, nk) = kernel_curve::insert_knot(control, weights, knots, *degree, t_dom)
+                .ok_or_else(|| {
+                    ExecError::Invalid(
+                        "insertknot: parameter is at a curve end or the knot is already at full \
+                         multiplicity"
+                            .into(),
+                    )
+                })?;
+            let n_control = nc.len();
+            let new = Curve::Nurbs { control: nc, weights: nw, knots: nk, degree: *degree };
+            let obj = doc.get_mut(tid).expect("resolved");
+            let snapshot = obj.geometry.clone();
+            obj.geometry = Geometry::Curve(new);
+            Ok((
+                Command::InsertKnot { target, t },
+                Inverse::SetGeometry(vec![(tid, snapshot)]),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "insertknot {tid} t={t:.3} -> {n_control} control points (shape unchanged)"
+                    ),
+                },
+            ))
+        }
+        Command::CurvatureGraph { target, ids, scale, samples } => {
+            exec_curvature_graph(doc, target, ids, scale, samples)
         }
         Command::Rebuild { id, target, count } => {
             let ids = resolve(doc, &target)?;
@@ -6529,6 +6674,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::InterpCurve { .. } => "interpcurve",
         Command::Helix { .. } => "helix",
         Command::SetPoint { .. } => "setpoint",
+        Command::InsertKnot { .. } => "insertknot",
+        Command::CurvatureGraph { .. } => "curvature",
         Command::Rebuild { .. } => "rebuild",
         Command::Dim { .. } => "dim",
         Command::Text { .. } => "text",
@@ -10291,6 +10438,89 @@ mod tests {
         let p1 = kernel_curve::nurbs_point(&control, &weights, &knots, degree, 1.0);
         assert!(p0.distance(DVec3::new(0.0, 0.0, 0.0)) < 1e-6);
         assert!(p1.distance(DVec3::new(10.0, 2.0, 0.0)) < 1e-6);
+    }
+
+    #[test]
+    fn insertknot_adds_control_point_shape_unchanged_undo_replay() {
+        let mut s = Session::default();
+        run(&mut s, "curve 0,0 2,4 6,4 8,0");
+        let id = *s.doc.all_ids().last().unwrap();
+        let Curve::Nurbs { control: c0, weights: w0, knots: k0, degree } = curve_of_last(&s)
+        else {
+            panic!("expected nurbs")
+        };
+        run(&mut s, "insertknot last 0.5");
+        let Curve::Nurbs { control, weights, knots, .. } = curve_of_last(&s) else { panic!() };
+        assert_eq!(control.len(), c0.len() + 1);
+        for i in 0..=50 {
+            let t = i as f64 / 50.0;
+            let a = kernel_curve::nurbs_point(&c0, &w0, &k0, degree, t);
+            let b = kernel_curve::nurbs_point(&control, &weights, &knots, degree, t);
+            assert!(a.distance(b) < 1e-9, "shape changed at t={t}");
+        }
+        // Undo restores the original control net.
+        s.run(Command::Undo).unwrap();
+        let Curve::Nurbs { control, .. } = curve_of_last(&s) else { panic!() };
+        assert_eq!(control.len(), c0.len());
+        s.run(Command::Redo).unwrap();
+        assert!(s.doc.get(id).is_some());
+        // Replay from the op-log is stable.
+        let json = crate::io::to_json(&s);
+        let loaded = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&loaded), json, "replay-stable");
+    }
+
+    #[test]
+    fn insertknot_rejects_non_nurbs_and_bad_t() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0 4,0 4,4");
+        assert!(s.run(parse("insertknot last 0.5").unwrap()).is_err());
+        run(&mut s, "curve 0,0 2,4 6,4 8,0");
+        assert!(s.run(parse("insertknot last 0").unwrap()).is_err());
+        assert!(s.run(parse("insertknot last 1.5").unwrap()).is_err());
+    }
+
+    #[test]
+    fn curvature_comb_on_circle_undo_and_replay() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0,0 5");
+        let before = s.doc.all_ids().len();
+        let out = run(&mut s, "curvature last 1 16");
+        // 16 hairs + 1 tip polyline, all on the analysis layer.
+        assert_eq!(out.created.len(), 17);
+        assert!(out.message.contains("min radius 5.000"), "{}", out.message);
+        assert!(s.doc.layers.contains_key("analysis"));
+        for id in &out.created {
+            assert_eq!(s.doc.get(*id).unwrap().layer, "analysis");
+        }
+        // Hair length = kappa * scale = (1/5) * 1 = 0.2 m.
+        let Geometry::Curve(Curve::Line { a, b }) =
+            &s.doc.get(out.created[0]).unwrap().geometry
+        else {
+            panic!("expected hair line")
+        };
+        assert!((a.distance(*b) - 0.2).abs() < 1e-6);
+        // Hairs point inward (tip closer to the center than the foot).
+        assert!(b.length() < a.length());
+        // Undo removes the comb (and the created layer).
+        s.run(Command::Undo).unwrap();
+        assert_eq!(s.doc.all_ids().len(), before);
+        assert!(!s.doc.layers.contains_key("analysis"));
+        s.run(Command::Redo).unwrap();
+        assert_eq!(s.doc.all_ids().len(), before + 17);
+        // Replay from the op-log is stable (ids embedded).
+        let json = crate::io::to_json(&s);
+        let loaded = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&loaded), json, "replay-stable");
+    }
+
+    #[test]
+    fn curvature_rejects_bad_args() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0,0 5");
+        assert!(s.run(parse("curvature last 0").unwrap()).is_err()); // scale must be > 0
+        assert!(s.run(parse("curvature last 1 1").unwrap()).is_err()); // too few samples
+        assert!(s.run(parse("curvature last 1 501").unwrap()).is_err()); // too many
     }
 
     #[test]

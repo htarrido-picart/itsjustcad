@@ -328,6 +328,29 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 position: point(pos)?,
             })
         }
+        "insertknot" => {
+            let [sel, t] = take::<2>("insertknot", "a curve selector and a parameter 0..1", &args)?;
+            Ok(Command::InsertKnot { target: selector_one(sel)?, t: number(t)? })
+        }
+        "curvature" => {
+            let (sel, scale, samples) = match args.as_slice() {
+                [sel] => (*sel, None, 40u32),
+                [sel, sc] => (*sel, Some(number(sc)?), 40),
+                [sel, sc, n] => (
+                    *sel,
+                    Some(number(sc)?),
+                    n.parse().map_err(|_| ParseError::BadNumber(n.to_string()))?,
+                ),
+                _ => {
+                    return wrong(
+                        "curvature",
+                        "a curve selector, optional scale and sample count",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::CurvatureGraph { target: selector_one(sel)?, ids: None, scale, samples })
+        }
         "rebuild" => {
             let [sel, n] = take::<2>("rebuild", "a curve selector and a point count", &args)?;
             Ok(Command::Rebuild {

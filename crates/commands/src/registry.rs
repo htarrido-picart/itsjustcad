@@ -217,6 +217,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Curve,
         },
         CommandSpec {
+            name: "insertknot",
+            usage: "insertknot <curve selector> <t 0..1>",
+            summary: "Insert a knot into a NURBS curve at parameter t — shape unchanged, one control point added for finer local editing. Example: insertknot last 0.5",
+            category: Category::Curve,
+        },
+        CommandSpec {
+            name: "curvature",
+            usage: "curvature <curve selector> [scale] [samples]",
+            summary: "Curvature comb: hair lines (length = curvature x scale) plus a tip curve on the 'analysis' layer; reports max curvature / min radius. Scale defaults to auto, samples to 40. Example: curvature last",
+            category: Category::Curve,
+        },
+        CommandSpec {
             name: "rebuild",
             usage: "rebuild <curve selector> <count>",
             summary: "Resample a curve to N evenly-spaced points (polyline). Example: rebuild last 20",
