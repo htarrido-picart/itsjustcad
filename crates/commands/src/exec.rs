@@ -2391,6 +2391,125 @@ fn exec_shadow_study(
     ))
 }
 
+/// Sun-path diagram: the yearly sun-path dome for the document's location as
+/// open polylines on a golden `sunpath` layer — seven date arcs (Dec 21 → Jun
+/// 21; Jul–Nov retrace them), analemma-style hour curves, plus a horizon
+/// compass circle at the dome's rim. Pure view-of-the-sky geometry centered on
+/// the world origin; scale comes from the scene so the dome reads over the
+/// massing.
+fn exec_sun_path(
+    doc: &mut Document,
+    ids: Option<Vec<ObjectId>>,
+    year: i32,
+    radius: Option<f64>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let loc = doc.location.ok_or_else(|| {
+        ExecError::Invalid(
+            "no location set — run `sun <lat> <lon> <date> <time>` or `location <lat> <lon>`, \
+             or `import <file.epw>` first"
+                .into(),
+        )
+    })?;
+    // Auto radius: 1.2× the scene's bounding radius from the origin, floored at
+    // 10 m so an empty/small scene still gets a readable dome.
+    let r = match radius {
+        Some(r) if r > 0.0 => r,
+        Some(_) => return Err(ExecError::Invalid("sunpath radius must be > 0".into())),
+        None => doc
+            .scene_aabb()
+            .map(|aabb| {
+                let m = aabb
+                    .min
+                    .abs()
+                    .max(aabb.max.abs());
+                (m.x.hypot(m.y) * 1.2).max(10.0)
+            })
+            .unwrap_or(10.0),
+    };
+
+    let diagram =
+        itsjustcad_solar::sun_path_diagram(year, loc.lat_deg, loc.lon_deg, loc.tz_hours);
+    if diagram.day_arcs.is_empty() {
+        return Err(ExecError::Invalid(
+            "sun never rises at this location in any sampled month — no sun path".into(),
+        ));
+    }
+
+    // Scale the unit-hemisphere polylines to the dome radius.
+    let scale = |pts: &[[f64; 3]]| -> Vec<DVec3> {
+        pts.iter().map(|p| DVec3::new(p[0] * r, p[1] * r, p[2] * r)).collect()
+    };
+    struct Line {
+        pts: Vec<DVec3>,
+        closed: bool,
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    let n_arcs = diagram.day_arcs.len();
+    for (_, pts) in &diagram.day_arcs {
+        lines.push(Line { pts: scale(pts), closed: false });
+    }
+    let n_hours = diagram.hour_curves.len();
+    for (_, pts) in &diagram.hour_curves {
+        // A full 12-month analemma loops; a partial (horizon-clipped) one stays
+        // an open curve.
+        let closed = pts.len() == 12;
+        lines.push(Line { pts: scale(pts), closed });
+    }
+    // Horizon compass circle at the dome rim (z = 0).
+    let circle: Vec<DVec3> = (0..64)
+        .map(|i| {
+            let a = (i as f64) / 64.0 * std::f64::consts::TAU;
+            DVec3::new(r * a.cos(), r * a.sin(), 0.0)
+        })
+        .collect();
+    lines.push(Line { pts: circle, closed: true });
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == lines.len() => ids,
+        _ => (0..lines.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    // Golden analysis layer so the dome reads as an overlay, not model geometry.
+    let mut layers_created = Vec::new();
+    if !doc.layers.contains_key("sunpath") {
+        doc.layers.insert(
+            "sunpath".to_string(),
+            LayerStyle { color: Some([0.95, 0.72, 0.2, 1.0]), ..LayerStyle::default() },
+        );
+        layers_created.push("sunpath".to_string());
+    }
+
+    for (line, id) in lines.iter().zip(&new_ids) {
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: None,
+            layer: "sunpath".to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(Curve::Polyline {
+                points: line.pts.clone(),
+                closed: line.closed,
+            }),
+        });
+    }
+    doc.generation += 1;
+
+    Ok((
+        Command::SunPath { ids: Some(new_ids.clone()), year, radius },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome {
+            message: format!(
+                "sunpath {year} @ ({:.2}, {:.2}): {n_arcs} date arc(s) + {n_hours} hour \
+                 curve(s) + horizon circle, radius {r:.1} m on 'sunpath'",
+                loc.lat_deg, loc.lon_deg
+            ),
+            created: new_ids,
+        },
+    ))
+}
+
 /// Sunlight-hours heatmap. Sample a regular XY grid over the scene bounding box
 /// at `z=0`, and for each cell ray-cast toward the sun every 30 min of the date.
 /// A cell counts an hour of sun when no scene triangle occludes the ray. Results
@@ -5110,6 +5229,7 @@ fn apply_forward(
         Command::SunHours { ids, year, month, day, spacing } => {
             exec_sun_hours(doc, ids, year, month, day, spacing)
         }
+        Command::SunPath { ids, year, radius } => exec_sun_path(doc, ids, year, radius),
         Command::FaceSunHours { targets, ids, year, month, day } => {
             exec_face_sun_hours(doc, targets, ids, year, month, day)
         }
@@ -6312,6 +6432,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Location { .. } => "location",
         Command::ShadowStudy { .. } => "shadowstudy",
         Command::SunHours { .. } => "sunhours",
+        Command::SunPath { .. } => "sunpath",
         Command::FaceSunHours { .. } => "facesunhours",
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
@@ -9252,6 +9373,104 @@ mod tests {
             "shadowstudy log must be replay-stable"
         );
         assert_eq!(s.doc.len(), replayed.doc.len());
+    }
+
+    #[test]
+    fn sunpath_errors_without_location() {
+        let mut s = Session::default();
+        let err = s.run(parse("sunpath").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no location"), "{err}");
+    }
+
+    #[test]
+    fn sunpath_draws_dome_on_sunpath_layer_and_undoes() {
+        let mut s = Session::default();
+        run(&mut s, "location 40.71 -74.01 -5");
+        let before = s.doc.len();
+        let out = run(&mut s, "sunpath 20");
+        // 7 date arcs + hour curves + 1 horizon circle, all on 'sunpath'.
+        assert!(out.created.len() > 8, "{}", out.message);
+        assert!(s.doc.layers.contains_key("sunpath"));
+        let mut on_dome = 0usize;
+        let mut closed_circles = 0usize;
+        for id in &out.created {
+            let obj = s.doc.get(*id).unwrap();
+            assert_eq!(obj.layer, "sunpath");
+            match &obj.geometry {
+                Geometry::Curve(Curve::Polyline { points, closed }) => {
+                    assert!(points.len() >= 2);
+                    // Every point sits on (or on the rim of) the radius-20 dome,
+                    // at or above the ground plane.
+                    for p in points {
+                        let d = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
+                        assert!((d - 20.0).abs() < 1e-6, "point off dome: |p|={d}");
+                        assert!(p.z >= -1e-9, "below ground: z={}", p.z);
+                    }
+                    if *closed && points.iter().all(|p| p.z.abs() < 1e-9) {
+                        closed_circles += 1;
+                    }
+                    on_dome += 1;
+                }
+                g => panic!("expected polyline, got {g:?}"),
+            }
+        }
+        assert_eq!(on_dome, out.created.len());
+        assert_eq!(closed_circles, 1, "exactly one horizon compass circle");
+        // Undo removes the dome and its layer.
+        s.run(crate::Command::Undo).unwrap();
+        assert_eq!(s.doc.len(), before);
+        assert!(!s.doc.layers.contains_key("sunpath"), "layer removed on undo");
+    }
+
+    #[test]
+    fn sunpath_auto_radius_scales_with_scene() {
+        // With a big scene, the auto dome radius grows past the 10 m floor.
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 40,40,5");
+        run(&mut s, "location 40.71 -74.01 -5");
+        let out = run(&mut s, "sunpath");
+        let id = out.created.first().unwrap();
+        let obj = s.doc.get(*id).unwrap();
+        let Geometry::Curve(Curve::Polyline { points, .. }) = &obj.geometry else {
+            panic!("polyline expected");
+        };
+        let r = points[0].length();
+        assert!(r > 20.0, "auto radius should exceed the 10 m floor: {r}");
+    }
+
+    #[test]
+    fn sunpath_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "location 40.71 -74.01 -5");
+        run(&mut s, "sunpath 15");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "sunpath log must be replay-stable"
+        );
+        assert_eq!(s.doc.len(), replayed.doc.len());
+    }
+
+    #[test]
+    fn sunpath_parse_round_trip() {
+        match parse("sunpath").unwrap() {
+            Command::SunPath { ids, year, radius } => {
+                assert!(ids.is_none() && radius.is_none());
+                assert_eq!(year, 2026);
+            }
+            other => panic!("expected SunPath, got {other:?}"),
+        }
+        match parse("sunpath 25 2024").unwrap() {
+            Command::SunPath { radius, year, .. } => {
+                assert_eq!(radius, Some(25.0));
+                assert_eq!(year, 2024);
+            }
+            other => panic!("expected SunPath, got {other:?}"),
+        }
+        assert!(parse("sunpath -5").is_err(), "negative radius rejected");
+        assert!(parse("sunpath 10 99").is_err(), "silly year rejected");
     }
 
     #[test]

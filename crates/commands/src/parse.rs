@@ -1080,6 +1080,31 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let (year, month, day) = parse_date(date)?;
             Ok(Command::FaceSunHours { targets, ids: None, year, month, day })
         }
+        // sunpath [radius] [year]
+        "sunpath" => {
+            let (radius, year) = match args.as_slice() {
+                [] => (None, 2026),
+                [r] => {
+                    let radius = number(r)?;
+                    if radius <= 0.0 {
+                        return Err(ParseError::BadNumber(r.to_string()));
+                    }
+                    (Some(radius), 2026)
+                }
+                [r, y] => {
+                    let radius = number(r)?;
+                    let year = y
+                        .parse::<i32>()
+                        .map_err(|_| ParseError::BadNumber(y.to_string()))?;
+                    if radius <= 0.0 || !(1900..=2200).contains(&year) {
+                        return Err(ParseError::BadNumber(format!("{r} {y}")));
+                    }
+                    (Some(radius), year)
+                }
+                _ => return wrong("sunpath", "[radius] [year]", &args),
+            };
+            Ok(Command::SunPath { ids: None, year, radius })
+        }
         // -- blocks --
         // block <selector> <name>
         "block" => {

@@ -552,6 +552,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "sunpath",
+            usage: "sunpath [radius] [year]",
+            summary: "Sun-path diagram: draw the yearly sun-path dome for the set location as polylines on the 'sunpath' layer — seven date arcs (Dec 21 through Jun 21; Jul-Nov mirror), analemma hour curves, and a horizon compass circle. Radius defaults to 1.2x the scene bounding radius (min 10 m). Needs a location. Example: sunpath · sunpath 25",
+            category: Category::Analyze,
+        },
+        CommandSpec {
             name: "sheet",
             usage: "sheet <name> [a4|a3|a2|a1|a0]",
             summary: "Create a named paper sheet, landscape (default a3). Example: sheet plan a1",

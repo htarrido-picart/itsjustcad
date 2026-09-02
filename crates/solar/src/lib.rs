@@ -245,6 +245,103 @@ fn sun_declination(year: i32, month: u32, day: u32) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Sun-path diagram: hemisphere polylines describing the sun's apparent motion
+// over a year at a site (the Ladybug/architectural "sun-path dome"). Pure math
+// — unit direction vectors on the sky hemisphere; callers scale + translate.
+// ---------------------------------------------------------------------------
+
+/// A yearly sun-path diagram as unit-direction polylines on the sky hemisphere
+/// (Z-up, X=East, Y=North, all points `|v|≈1`, `z > 0`). Scale by the dome
+/// radius and translate to the site origin to draw it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SunPathDiagram {
+    /// One arc per representative date (the 21st of Dec…Jun — Jul…Nov mirror),
+    /// sampled sunrise→sunset: `(label, points)`. Dates whose sun never rises
+    /// (polar night) are omitted.
+    pub day_arcs: Vec<(String, Vec<[f64; 3]>)>,
+    /// Analemma-style hour curves: for each local clock hour, the sun position
+    /// on the 21st of every month (only months where the sun is up). Curves
+    /// with fewer than 2 points are omitted: `(hour, points)`.
+    pub hour_curves: Vec<(u32, Vec<[f64; 3]>)>,
+}
+
+/// Unit direction toward the sun in f64 (same convention as [`sun_direction`]:
+/// X=East, Y=North, Z=Up; azimuth clockwise from North).
+fn sun_dir_f64(az_deg: f64, alt_deg: f64) -> [f64; 3] {
+    let az = az_deg.to_radians();
+    let alt = alt_deg.to_radians();
+    [alt.cos() * az.sin(), alt.cos() * az.cos(), alt.sin()]
+}
+
+/// Sun positions across one local day (00:00–24:00 at `step_min` spacing) as
+/// unit directions, keeping only stamps where the sun is above the horizon.
+/// Local clock time is converted to UTC with `tz_hours` (fractional-day
+/// wrap-around matches the shadow-study convention: the date is held fixed).
+pub fn sun_path_day_arc(
+    year: i32,
+    month: u32,
+    day: u32,
+    lat_deg: f64,
+    lon_deg: f64,
+    tz_hours: f64,
+    step_min: u32,
+) -> Vec<[f64; 3]> {
+    let step = step_min.max(1);
+    let mut pts = Vec::new();
+    let mut t = 0u32;
+    while t < 1440 {
+        let utc = (t as f64 - tz_hours * 60.0).rem_euclid(1440.0);
+        let (h, mi) = ((utc / 60.0) as u32, (utc % 60.0) as u32);
+        let pos = solar_position(year, month, day, h, mi, lat_deg, lon_deg);
+        if pos.altitude_deg > 0.0 {
+            pts.push(sun_dir_f64(pos.azimuth_deg, pos.altitude_deg));
+        }
+        t += step;
+    }
+    pts
+}
+
+/// Build the full yearly sun-path diagram for a site: seven day arcs (Dec 21 →
+/// Jun 21; the other half-year mirrors them) plus one hour curve per local
+/// clock hour across the months. All points are unit directions; see
+/// [`SunPathDiagram`].
+pub fn sun_path_diagram(year: i32, lat_deg: f64, lon_deg: f64, tz_hours: f64) -> SunPathDiagram {
+    // Dec + Jan..Jun: the classic 7-arc dome (Jul..Nov retrace Feb..May).
+    const ARC_DATES: [(u32, &str); 7] = [
+        (12, "Dec 21"),
+        (1, "Jan/Nov 21"),
+        (2, "Feb/Oct 21"),
+        (3, "Mar/Sep 21"),
+        (4, "Apr/Aug 21"),
+        (5, "May/Jul 21"),
+        (6, "Jun 21"),
+    ];
+    let mut day_arcs = Vec::new();
+    for (month, label) in ARC_DATES {
+        let pts = sun_path_day_arc(year, month, 21, lat_deg, lon_deg, tz_hours, 10);
+        if pts.len() >= 2 {
+            day_arcs.push((label.to_string(), pts));
+        }
+    }
+    let mut hour_curves = Vec::new();
+    for hour in 0..24u32 {
+        let mut pts = Vec::new();
+        for month in 1..=12u32 {
+            let utc = ((hour * 60) as f64 - tz_hours * 60.0).rem_euclid(1440.0);
+            let (h, mi) = ((utc / 60.0) as u32, (utc % 60.0) as u32);
+            let pos = solar_position(year, month, 21, h, mi, lat_deg, lon_deg);
+            if pos.altitude_deg > 0.0 {
+                pts.push(sun_dir_f64(pos.azimuth_deg, pos.altitude_deg));
+            }
+        }
+        if pts.len() >= 2 {
+            hour_curves.push((hour, pts));
+        }
+    }
+    SunPathDiagram { day_arcs, hour_curves }
+}
+
+// ---------------------------------------------------------------------------
 // Environmental analysis geometry: shadow projection + ray-casting.
 // Pure f64 math, no GPU/doc dependencies, so it lives here beside the SPA and
 // is unit-testable in isolation.
@@ -711,5 +808,105 @@ DATA PERIODS,1,1,Data,Sunday,1/1,12/31
         // New York 40.71°N on the summer solstice: ~15 h of daylight.
         let h = daylight_hours(2024, 6, 21, 40.71);
         assert!(h > 14.8 && h < 15.3, "NY solstice daylight {h:.3} h");
+    }
+
+    // ── sun-path diagram ─────────────────────────────────────────────────────
+
+    const NYC: (f64, f64, f64) = (40.71, -74.01, -5.0);
+
+    fn max_z(pts: &[[f64; 3]]) -> f64 {
+        pts.iter().map(|p| p[2]).fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    #[test]
+    fn sun_path_points_are_unit_and_above_horizon() {
+        let d = sun_path_diagram(2024, NYC.0, NYC.1, NYC.2);
+        assert!(!d.day_arcs.is_empty() && !d.hour_curves.is_empty());
+        for (label, pts) in &d.day_arcs {
+            for p in pts {
+                let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                assert!((len - 1.0).abs() < 1e-9, "{label}: |v|={len}");
+                assert!(p[2] > 0.0, "{label}: below horizon z={}", p[2]);
+            }
+        }
+        for (h, pts) in &d.hour_curves {
+            for p in pts {
+                assert!(p[2] > 0.0, "hour {h}: below horizon");
+            }
+        }
+    }
+
+    #[test]
+    fn sun_path_nyc_june_peaks_above_december() {
+        let d = sun_path_diagram(2024, NYC.0, NYC.1, NYC.2);
+        let arc = |l: &str| {
+            d.day_arcs
+                .iter()
+                .find(|(lab, _)| lab == l)
+                .unwrap_or_else(|| panic!("missing arc {l}"))
+                .1
+                .clone()
+        };
+        let jun = max_z(&arc("Jun 21"));
+        let dec = max_z(&arc("Dec 21"));
+        // Solar-noon altitudes: NYC Jun ≈ 72.7°, Dec ≈ 25.9°.
+        assert!(jun > dec + 0.5, "jun z {jun:.3} vs dec z {dec:.3}");
+        assert!((jun.asin().to_degrees() - 72.7).abs() < 1.0, "jun noon alt");
+        assert!((dec.asin().to_degrees() - 25.9).abs() < 1.0, "dec noon alt");
+        // The June arc is also longer (more daylight stamps at equal spacing).
+        assert!(arc("Jun 21").len() > arc("Dec 21").len());
+    }
+
+    #[test]
+    fn sun_path_all_seven_arcs_at_midlatitude_and_ordered() {
+        let d = sun_path_diagram(2024, NYC.0, NYC.1, NYC.2);
+        assert_eq!(d.day_arcs.len(), 7, "NYC has all seven date arcs");
+        // Peak altitude rises monotonically Dec → Jun.
+        let peaks: Vec<f64> = d.day_arcs.iter().map(|(_, pts)| max_z(pts)).collect();
+        for w in peaks.windows(2) {
+            assert!(w[1] > w[0], "arcs must rise Dec→Jun: {peaks:?}");
+        }
+    }
+
+    #[test]
+    fn sun_path_polar_night_omits_december_arc() {
+        // 78°N: no Dec arc (polar night), but a 24-h June arc (polar day —
+        // every 10-min stamp of the day is above the horizon).
+        let d = sun_path_diagram(2024, 78.0, 15.0, 1.0);
+        assert!(!d.day_arcs.iter().any(|(l, _)| l == "Dec 21"), "polar night arc must be omitted");
+        let jun = &d.day_arcs.iter().find(|(l, _)| l == "Jun 21").expect("June arc").1;
+        assert_eq!(jun.len(), 144, "polar day: all 1440/10 stamps up");
+    }
+
+    #[test]
+    fn sun_path_southern_hemisphere_flips_seasons() {
+        // Sydney (33.87°S): December sun rides higher than June's.
+        let d = sun_path_diagram(2024, -33.87, 151.21, 10.0);
+        let dec = max_z(&d.day_arcs.iter().find(|(l, _)| l == "Dec 21").unwrap().1);
+        let jun = max_z(&d.day_arcs.iter().find(|(l, _)| l == "Jun 21").unwrap().1);
+        assert!(dec > jun + 0.3, "southern summer (Dec) must peak higher");
+        // …and the noon sun sits to the NORTH (+Y) at local noon.
+        let noon = &d.hour_curves.iter().find(|(h, _)| *h == 12).expect("noon curve").1;
+        assert!(noon.iter().all(|p| p[1] > 0.0), "Sydney noon sun is north");
+    }
+
+    #[test]
+    fn sun_path_nyc_noon_curve_full_year_and_south() {
+        let d = sun_path_diagram(2024, NYC.0, NYC.1, NYC.2);
+        let noon = &d.hour_curves.iter().find(|(h, _)| *h == 12).expect("noon curve").1;
+        assert_eq!(noon.len(), 12, "noon sun is up in all 12 months at NYC");
+        assert!(noon.iter().all(|p| p[1] < 0.0), "NYC noon sun is south (−Y)");
+        // Midnight curve must not exist at a mid-latitude.
+        assert!(!d.hour_curves.iter().any(|(h, _)| *h == 0), "no midnight sun at NYC");
+    }
+
+    #[test]
+    fn sun_path_day_arc_morning_east_evening_west() {
+        // NYC equinox: first stamp of the day leans east (+X), last leans west.
+        let arc = sun_path_day_arc(2024, 3, 21, NYC.0, NYC.1, NYC.2, 10);
+        let first = arc.first().unwrap();
+        let last = arc.last().unwrap();
+        assert!(first[0] > 0.0, "sunrise east, got x={}", first[0]);
+        assert!(last[0] < 0.0, "sunset west, got x={}", last[0]);
     }
 }

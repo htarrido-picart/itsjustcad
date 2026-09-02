@@ -737,6 +737,21 @@ pub enum Command {
         /// Grid spacing in meters (> 0).
         spacing: f64,
     },
+    /// Sun-path diagram: draw the yearly sun-path dome for the document's
+    /// location as polylines on the `sunpath` layer — seven date arcs (Dec 21 →
+    /// Jun 21; Jul–Nov mirror), analemma-style hour curves, and a horizon
+    /// compass circle. Requires a location.
+    SunPath {
+        /// Ids of the created polylines, filled in on first exec and reused on
+        /// replay for op-log stability.
+        #[serde(default)]
+        ids: Option<Vec<ObjectId>>,
+        /// Year the arcs are computed for.
+        year: i32,
+        /// Dome radius in meters (`None` = auto: 1.2× the scene bounding
+        /// radius, floored at 10 m).
+        radius: Option<f64>,
+    },
     /// Per-face insolation: for a selected mesh, ray-cast each triangle centroid
     /// toward the sun every 30 min of the day (occlusion-tested against the whole
     /// scene) and count the daylight hours of direct sun each face receives.
