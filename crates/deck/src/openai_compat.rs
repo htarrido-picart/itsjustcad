@@ -208,6 +208,7 @@ mod tests {
             model: "qwen3".into(),
             api_key: None,
             grammar,
+            terse: None,
         }
     }
 
@@ -236,6 +237,18 @@ mod tests {
             body.get("grammar").is_none(),
             "grammar must be absent when the flag is off: {body}"
         );
+    }
+
+    #[test]
+    fn terse_token_cap_reaches_the_wire_body() {
+        // Terse mode's hard cap is plumbed as the request's `max_tokens`: build
+        // a request through `terse_adjusted` and assert the wire body carries it.
+        let deck = OpenAiCompatDeck::new(&config(true));
+        let (system, cap) =
+            crate::prompt::terse_adjusted("sys".into(), 4096, true);
+        let r = ChatRequest::text(system, Vec::new(), String::new(), cap, 0.2, None);
+        let body = deck.build_body(&r, Value::Array(vec![]));
+        assert_eq!(body["max_tokens"], crate::prompt::TERSE_MAX_TOKENS);
     }
 
     #[test]

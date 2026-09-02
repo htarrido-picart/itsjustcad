@@ -4176,6 +4176,7 @@ impl App {
                 crate::menu::MenuToggles {
                     local_only: self.deck_pane.local_only(),
                     web_search: self.deck_pane.allow_web_search(),
+                    terse: self.deck_pane.terse_enabled(),
                 },
                 view,
             )
@@ -4296,6 +4297,7 @@ impl App {
             }
             MenuAction::ToggleLocalOnly => self.deck_pane.toggle_local_only(),
             MenuAction::ToggleWebSearch => self.deck_pane.toggle_web_search(),
+            MenuAction::ToggleTerse => self.deck_pane.toggle_terse(),
             MenuAction::TogglePanel => self.toggle_panel(),
         }
     }
@@ -5140,6 +5142,7 @@ fn deck_brain_into_decks(
         // Local model — grammar-constrained decoding on by default (per the
         // grammar agent's flag) so it can only emit real verbs in draft fences.
         grammar: true,
+        terse: None,
     };
     // Replace an existing cassette of the same name, else append.
     match decks.decks.iter().position(|d| d.name == name) {
@@ -5212,6 +5215,7 @@ fn catalog_deck_entry(entry: &crate::model_catalog::ModelEntry) -> itsjustcad_de
         model: entry.id.clone(),
         api_key: None,
         grammar: true,
+        terse: None,
     }
 }
 
@@ -5505,6 +5509,7 @@ impl eframe::App for App {
             // Read live LLM-toggle state before the mutable native borrow.
             let local_only = self.deck_pane.local_only();
             let web_search = self.deck_pane.allow_web_search();
+            let terse = self.deck_pane.terse_enabled();
             // Live View state (active display / lighting mode + panel visibility)
             // for the stateful View menu radios + Panel flip.
             let view = self.view_state();
@@ -5514,7 +5519,7 @@ impl eframe::App for App {
                 native.sync_selection(has_selection);
                 // Mirror the live Local Only / Allow Web Search state onto the
                 // native checkable LLM items.
-                native.sync_toggles(local_only, web_search);
+                native.sync_toggles(local_only, web_search, terse);
                 // Mirror the active display/lighting mode + panel visibility onto
                 // the native View menu (radio checks + Hide/Show Panel label).
                 native.sync_view_state(view);

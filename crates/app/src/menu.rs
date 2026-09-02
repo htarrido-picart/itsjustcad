@@ -76,6 +76,9 @@ pub enum MenuAction {
     /// Toggle "allow web search" for the next turn. Checkable LLM-menu item;
     /// forced off (and disabled) while local-only is on.
     ToggleWebSearch,
+    /// Toggle "terse replies" for the ACTIVE cassette (style rules + a hard
+    /// max-token cap). Checkable LLM-menu item; defaults ON for local models.
+    ToggleTerse,
     /// Toggle the right docked panel (Deck/chat + inspectors) visibility. The
     /// View menu shows this as a stateful "Hide Panel" ⇄ "Show Panel" flip and
     /// mirrors the ⌘\ hotkey. UI state, not op-log.
@@ -669,6 +672,13 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                 checked: false, // synced live by the app
                 enabled: true,
             },
+            NativeItem::Check {
+                id: format!("{t}/terse"),
+                label: "Terse Replies".into(),
+                action: MenuAction::ToggleTerse,
+                checked: false, // synced live by the app
+                enabled: true,
+            },
         ];
         menus.push(NativeMenu { title: t.into(), items });
     }
@@ -808,7 +818,9 @@ pub fn ui(
                             // model's `checked`, which the caller already resolved
                             // from the live ViewState.
                             let (checked, live_enabled) = match a {
-                                MenuAction::ToggleLocalOnly | MenuAction::ToggleWebSearch => {
+                                MenuAction::ToggleLocalOnly
+                                | MenuAction::ToggleWebSearch
+                                | MenuAction::ToggleTerse => {
                                     toggles.for_action(a, *enabled)
                                 }
                                 _ => (*model_checked, *enabled),
@@ -840,6 +852,7 @@ pub fn ui(
 pub struct MenuToggles {
     pub local_only: bool,
     pub web_search: bool,
+    pub terse: bool,
 }
 
 impl MenuToggles {
@@ -849,6 +862,7 @@ impl MenuToggles {
         match action {
             MenuAction::ToggleLocalOnly => (self.local_only, model_enabled),
             MenuAction::ToggleWebSearch => (self.web_search && !self.local_only, !self.local_only),
+            MenuAction::ToggleTerse => (self.terse, model_enabled),
             _ => (false, model_enabled),
         }
     }
@@ -1092,6 +1106,17 @@ mod tests {
             .collect();
         assert!(checks.contains(&"LLM/local_only"), "Local Only toggle missing");
         assert!(checks.contains(&"LLM/web_search"), "Allow Web Search toggle missing");
+        assert!(checks.contains(&"LLM/terse"), "Terse Replies toggle missing");
+    }
+
+    #[test]
+    fn terse_toggle_state_resolution() {
+        // The Terse Replies checkmark mirrors the live state and stays enabled
+        // regardless of local-only (terse applies to local AND cloud cassettes).
+        let t = MenuToggles { local_only: true, web_search: true, terse: true };
+        assert_eq!(t.for_action(&MenuAction::ToggleTerse, true), (true, true));
+        let t = MenuToggles { local_only: false, web_search: false, terse: false };
+        assert_eq!(t.for_action(&MenuAction::ToggleTerse, true), (false, true));
     }
 
     #[test]

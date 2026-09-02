@@ -51,8 +51,9 @@ pub struct NativeMenuBar {
     /// keyed by muda id, so the app can sync their checked/enabled state each
     /// frame from the real deck state.
     check_items: HashMap<String, CheckMenuItem>,
-    /// Last `(local_only, web_search)` we pushed, to skip redundant native calls.
-    last_toggles: Option<(bool, bool)>,
+    /// Last `(local_only, web_search, terse)` we pushed, to skip redundant
+    /// native calls.
+    last_toggles: Option<(bool, bool, bool)>,
     /// Live handle to the View ▸ Panel item so its label flips
     /// "Hide Panel" ⇄ "Show Panel" as the panel toggles.
     panel_item: Option<MenuItem>,
@@ -148,17 +149,20 @@ impl NativeMenuBar {
     /// Push the live LLM-toggle state onto the native checkable items. Web-search
     /// is forced unchecked + disabled while local-only is on (offline/sealed).
     /// Idempotent — only touches the OS menu when a value actually changes.
-    pub fn sync_toggles(&mut self, local_only: bool, web_search: bool) {
-        if self.last_toggles == Some((local_only, web_search)) {
+    pub fn sync_toggles(&mut self, local_only: bool, web_search: bool, terse: bool) {
+        if self.last_toggles == Some((local_only, web_search, terse)) {
             return;
         }
-        self.last_toggles = Some((local_only, web_search));
+        self.last_toggles = Some((local_only, web_search, terse));
         if let Some(it) = self.check_items.get("LLM/local_only") {
             it.set_checked(local_only);
         }
         if let Some(it) = self.check_items.get("LLM/web_search") {
             it.set_checked(web_search && !local_only);
             it.set_enabled(!local_only);
+        }
+        if let Some(it) = self.check_items.get("LLM/terse") {
+            it.set_checked(terse);
         }
     }
 

@@ -883,6 +883,27 @@ impl DeckPane {
         self.allow_web_search = !self.allow_web_search;
     }
 
+    /// Terse-mode state of the ACTIVE cassette (kind-based default unless the
+    /// user overrode it). Drives the LLM ▸ Terse Replies checkmark.
+    pub fn terse_enabled(&self) -> bool {
+        self.decks
+            .decks
+            .get(self.decks.active)
+            .map(|d| d.terse_enabled())
+            .unwrap_or(false)
+    }
+
+    /// Flip "terse replies" for the ACTIVE cassette (LLM menu). Stores an
+    /// explicit override on that cassette and persists `decks.json`, so a local
+    /// model can opt out and a cloud one can opt in.
+    pub fn toggle_terse(&mut self) {
+        let next = !self.terse_enabled();
+        if let Some(d) = self.decks.decks.get_mut(self.decks.active) {
+            d.terse = Some(next);
+            self.decks.save();
+        }
+    }
+
     /// File → New Session. Archives the outgoing conversation, then clears the
     /// live pane for a fresh chat. When continuing a loaded-and-diverged session
     /// this parks behind the Update/Save-as-new modal instead (the app renders
@@ -1421,16 +1442,26 @@ impl DeckPane {
         // worked examples; the GBNF grammar backstops the full verb set. `/no_think`
         // suppresses Qwen3's <think> block so the turn is commands, not reasoning.
         let digest = crate::scene::digest(&session.doc);
-        let prompt = if itsjustcad_deck::is_local_url(&config.base_url) {
-            format!("{}\n\n/no_think", itsjustcad_deck::brief_system_prompt(&digest))
+        let local_prompt = itsjustcad_deck::is_local_url(&config.base_url);
+        let prompt = if local_prompt {
+            itsjustcad_deck::brief_system_prompt(&digest)
         } else {
             system_prompt(&digest, &session.plugins)
         };
+        // Terse mode: style rules appended to the system prompt + a hard
+        // per-turn max-token cap. Default ON for local cassettes (fewer tokens
+        // = faster inference), OFF for cloud unless the user enabled it.
+        let (mut prompt, max_tokens) =
+            itsjustcad_deck::terse_adjusted(prompt, 4096, config.terse_enabled());
+        if local_prompt {
+            // `/no_think` last so Qwen3's directive stays at the prompt tail.
+            prompt.push_str("\n\n/no_think");
+        }
         let mut req = ChatRequest::text(
             prompt,
             self.messages.clone(),
             String::new(),
-            4096,
+            max_tokens,
             0.2,
             self.session_id.clone(),
         );
@@ -3780,6 +3811,7 @@ mod side_effect_gate_tests {
             model: name.into(),
             api_key: None,
             grammar: true,
+            terse: None,
         }
     }
 

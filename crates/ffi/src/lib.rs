@@ -877,6 +877,7 @@ pub unsafe extern "C" fn ijc_deck_configure(
             model: cstr(model).unwrap_or_default(),
             api_key: cstr(api_key),
             grammar: false,
+            terse: None,
         };
         // SSRF / credential-leak containment (finding #7): refuse to configure a
         // deck whose base_url points at a metadata/link-local/internal host,

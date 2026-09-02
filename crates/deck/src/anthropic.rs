@@ -137,6 +137,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             api_key: None,
             grammar: false,
+            terse: None,
         })
     }
 
@@ -163,6 +164,19 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "web_search");
         assert_eq!(tools[0]["type"], "web_search_20250305");
+    }
+
+    #[test]
+    fn terse_token_cap_reaches_the_wire_body() {
+        // Terse mode's hard cap rides the anthropic body's `max_tokens` field.
+        let (system, cap) = crate::prompt::terse_adjusted("sys".into(), 4096, true);
+        let r = ChatRequest::text(system, Vec::new(), String::new(), cap, 0.2, None);
+        let body = deck().build_body(&r);
+        assert_eq!(body["max_tokens"], crate::prompt::TERSE_MAX_TOKENS);
+        assert!(
+            body["system"].as_str().unwrap().contains("## Response style (terse mode)"),
+            "terse style section must ride the system prompt"
+        );
     }
 
     #[test]

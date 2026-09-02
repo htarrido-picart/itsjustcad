@@ -26,7 +26,10 @@ pub use deck::{make_deck, ChatMessage, ChatRequest, DeckDelta, DeckError, LlmDec
 pub use digest::digest;
 pub use extract::{Extractor, ExtractEvent};
 pub use probe::{probe, warm_model, ProbeInfo, WarmOutcome};
-pub use prompt::{brief_system_prompt, system_prompt, UI_VERB_HELP, VIEW_VERB_HELP};
+pub use prompt::{
+    brief_system_prompt, system_prompt, terse_adjusted, TERSE_MAX_TOKENS, TERSE_STYLE_HELP,
+    UI_VERB_HELP, VIEW_VERB_HELP,
+};
 pub use render_deck::{
     make_render_deck, probe_url, render_config_path, test_connection, Automatic1111RenderDeck,
     CloudRenderDeck,

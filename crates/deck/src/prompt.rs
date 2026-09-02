@@ -123,6 +123,37 @@ After running an environmental analysis (sunhours, facesunhours, radiation, shad
 Ground every observation in a report sample (\"the north face at (0.0,10.0,2.0) gets 0.5 h — don't put the terrace there\") and propose a concrete fix with commands the user could run.
 ";
 
+/// Terse mode's hard per-turn token cap. Fewer tokens = faster local inference;
+/// the style rules below make the model spend them on substance.
+pub const TERSE_MAX_TOKENS: u32 = 512;
+
+/// The "Response style (terse mode)" section, appended to whichever system
+/// prompt is in use when the cassette's terse mode is on. Caveman-style budget:
+/// filler dies, substance stays. Pairs with [`TERSE_MAX_TOKENS`], the hard cap
+/// [`terse_adjusted`] applies to the request.
+pub const TERSE_STYLE_HELP: &str = "\
+## Response style (terse mode)
+Answer like a laconic senior drafter. Hard rules:
+- No pleasantries, no preamble, no filler (never \"Sure!\", \"Great question\", \"I'd be happy to\").
+- No hedging or self-narration (never \"it seems\", \"let me\", \"I will now\").
+- Sentence fragments are fine. Substance is not optional: keep every number, command, warning, and question.
+- Prefer a ```draft block over prose. At most one short line of chat unless the user asked for an explanation.
+";
+
+/// Apply terse mode to a built system prompt + token budget: append the style
+/// rules and clamp the per-turn `max_tokens` to [`TERSE_MAX_TOKENS`]. A no-op
+/// when `terse` is off. Pure, so the plumbing is unit-testable end to end.
+pub fn terse_adjusted(prompt: String, max_tokens: u32, terse: bool) -> (String, u32) {
+    if terse {
+        (
+            format!("{prompt}\n{TERSE_STYLE_HELP}"),
+            max_tokens.min(TERSE_MAX_TOKENS),
+        )
+    } else {
+        (prompt, max_tokens)
+    }
+}
+
 /// Build the system prompt from the command registry (single source of truth)
 /// plus a compact scene digest. Regenerated every turn so the model always
 /// sees current geometry.
@@ -470,6 +501,31 @@ mod tests {
         assert!(ENVIRO_CRITIQUE_HELP.contains("cooling load"));
         assert!(ENVIRO_CRITIQUE_HELP.contains("glazing"));
         assert!(ENVIRO_CRITIQUE_HELP.contains("overshadows"));
+    }
+
+    #[test]
+    fn terse_adjusted_appends_style_rules_and_caps_tokens() {
+        // ON: the style section is appended and the cap clamps the budget.
+        let (p, cap) = terse_adjusted(system_prompt("", &PluginRegistry::new()), 4096, true);
+        assert!(p.contains(TERSE_STYLE_HELP), "terse section missing when enabled");
+        assert!(p.contains("## Response style (terse mode)"));
+        assert_eq!(cap, TERSE_MAX_TOKENS);
+        // A budget already below the cap is left alone.
+        let (_, cap) = terse_adjusted(String::new(), 100, true);
+        assert_eq!(cap, 100);
+        // OFF: prompt and budget pass through untouched.
+        let base = system_prompt("", &PluginRegistry::new());
+        let (p, cap) = terse_adjusted(base.clone(), 4096, false);
+        assert_eq!(p, base);
+        assert!(!p.contains("## Response style (terse mode)"));
+        assert_eq!(cap, 4096);
+    }
+
+    #[test]
+    fn terse_works_on_the_brief_local_prompt_too() {
+        let (p, cap) = terse_adjusted(brief_system_prompt("(empty)"), 4096, true);
+        assert!(p.contains("## Response style (terse mode)"));
+        assert_eq!(cap, TERSE_MAX_TOKENS);
     }
 
     #[test]

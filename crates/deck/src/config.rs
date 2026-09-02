@@ -53,9 +53,24 @@ pub struct DeckConfig {
     /// Leave false for cloud endpoints. Other cassettes ignore this flag.
     #[serde(default)]
     pub grammar: bool,
+    /// Terse mode override. `None` = default by cassette locality: ON for local
+    /// OpenAI-compat models (llamafile/ollama — fewer tokens = faster local
+    /// inference), OFF for cloud cassettes (anthropic/claude-code/remote).
+    /// `Some(_)` is the user's explicit choice from the LLM menu toggle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terse: Option<bool>,
 }
 
 impl DeckConfig {
+    /// Whether terse mode (caveman-style response budget: style rules + a hard
+    /// per-turn max-token cap) applies to this cassette. Explicit user override
+    /// wins; otherwise ON exactly for local OpenAI-compat models.
+    pub fn terse_enabled(&self) -> bool {
+        self.terse.unwrap_or_else(|| {
+            matches!(self.kind, DeckKind::OpenaiCompat) && is_local_url(&self.base_url)
+        })
+    }
+
     /// Whether this cassette can analyze an attached image. Claude (subscription
     /// CLI) and Anthropic API are multimodal; OpenAI-compatible endpoints only
     /// when the selected model is a known vision model. Local grammar cassettes
@@ -140,6 +155,7 @@ impl Default for DecksFile {
                     model: "sonnet".into(),
                     api_key: None,
                     grammar: false,
+                    terse: None,
                 },
                 DeckConfig {
                     name: "ollama".into(),
@@ -149,6 +165,7 @@ impl Default for DecksFile {
                     api_key: None,
                     // Local model — constrain decoding on by default.
                     grammar: true,
+                    terse: None,
                 },
                 DeckConfig {
                     name: "claude".into(),
@@ -157,6 +174,7 @@ impl Default for DecksFile {
                     model: "claude-sonnet-4-6".into(),
                     api_key: Some("env:ANTHROPIC_API_KEY".into()),
                     grammar: false,
+                    terse: None,
                 },
                 DeckConfig {
                     name: "kimi".into(),
@@ -165,6 +183,7 @@ impl Default for DecksFile {
                     model: "kimi-k2-0905-preview".into(),
                     api_key: Some("env:MOONSHOT_API_KEY".into()),
                     grammar: false,
+                    terse: None,
                 },
             ],
             active: 0,
@@ -265,6 +284,7 @@ mod tests {
             model: model.into(),
             api_key: None,
             grammar,
+            terse: None,
         };
         // Claude (CLI + API) is always multimodal.
         assert!(mk(DeckKind::ClaudeCode, "sonnet", false).supports_vision());
@@ -275,6 +295,48 @@ mod tests {
         assert!(mk(DeckKind::OpenaiCompat, "qwen2.5-vl-7b", false).supports_vision());
         assert!(!mk(DeckKind::OpenaiCompat, "qwen3", true).supports_vision());
         assert!(!mk(DeckKind::OpenaiCompat, "llama3", false).supports_vision());
+    }
+
+    #[test]
+    fn terse_defaults_on_for_local_models_off_for_cloud() {
+        let mk = |kind, base_url: &str| DeckConfig {
+            name: "x".into(),
+            kind,
+            base_url: base_url.into(),
+            model: "m".into(),
+            api_key: None,
+            grammar: false,
+            terse: None,
+        };
+        // Local OpenAI-compat (llamafile/ollama) → terse ON by default.
+        assert!(mk(DeckKind::OpenaiCompat, "http://localhost:11434/v1").terse_enabled());
+        assert!(mk(DeckKind::OpenaiCompat, "http://127.0.0.1:8080").terse_enabled());
+        // Cloud cassettes → OFF by default (anthropic, claude-code, remote compat).
+        assert!(!mk(DeckKind::Anthropic, "https://api.anthropic.com").terse_enabled());
+        assert!(!mk(DeckKind::ClaudeCode, "").terse_enabled());
+        assert!(!mk(DeckKind::OpenaiCompat, "https://api.moonshot.ai/v1").terse_enabled());
+        // Explicit override wins in both directions.
+        let mut c = mk(DeckKind::Anthropic, "https://api.anthropic.com");
+        c.terse = Some(true);
+        assert!(c.terse_enabled());
+        let mut c = mk(DeckKind::OpenaiCompat, "http://localhost:11434/v1");
+        c.terse = Some(false);
+        assert!(!c.terse_enabled());
+    }
+
+    #[test]
+    fn terse_field_serde_defaults_none_and_roundtrips() {
+        // Old decks.json without the field → None (kind-based default applies).
+        let json = r#"{"name":"o","kind":"openai_compat","base_url":"http://localhost:11434/v1","model":"qwen3"}"#;
+        let c: DeckConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.terse, None);
+        assert!(c.terse_enabled());
+        // Explicit value survives a save/load roundtrip.
+        let mut c = c;
+        c.terse = Some(false);
+        let back: DeckConfig =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.terse, Some(false));
     }
 
     #[test]
