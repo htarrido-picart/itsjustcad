@@ -3363,7 +3363,7 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Loft { id, targets } => {
+        Command::Loft { id, targets, guides } => {
             let ids = resolve(doc, &targets)?;
             if ids.len() < 2 {
                 return Err(ExecError::BadProfile(format!(
@@ -3381,7 +3381,79 @@ fn apply_forward(
                 }
                 profiles.push(curve.tessellate(PROFILE_TOL));
             }
-            let mesh = kernel_mesh::loft_profiles(&profiles);
+            let mut guide_polys = Vec::new();
+            if let Some(gsel) = &guides {
+                let gids = resolve(doc, gsel)?;
+                if gids.is_empty() {
+                    return Err(ExecError::BadProfile(
+                        "loft guides selector matched no curves".into(),
+                    ));
+                }
+                for gid in &gids {
+                    let curve = curve_of(doc, *gid, "loft")?;
+                    if curve.is_closed() {
+                        return Err(ExecError::BadProfile(format!(
+                            "guide '{gid}' is closed; guides must run openly from the first \
+                             profile to the last"
+                        )));
+                    }
+                    guide_polys.push(curve.tessellate(PROFILE_TOL));
+                }
+            }
+            let mesh = if guide_polys.is_empty() {
+                kernel_mesh::loft_profiles(&profiles)
+            } else {
+                kernel_mesh::loft_profiles_guided(&profiles, &guide_polys, 8)
+            };
+            let n_guides = guide_polys.len();
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Mesh(mesh),
+            });
+            let message = if n_guides > 0 {
+                format!("lofted {} profiles with {n_guides} guide(s) -> {id}", ids.len())
+            } else {
+                format!("lofted {} profiles -> {id}", ids.len())
+            };
+            Ok((
+                Command::Loft { id: Some(id), targets, guides },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome { created: vec![id], message },
+            ))
+        }
+        Command::BlendSurface { id, a, b, bulge } => {
+            let aid = resolve(doc, &a)?;
+            let bid = resolve(doc, &b)?;
+            let ([aid], [bid]) = (&aid[..], &bid[..]) else {
+                return Err(ExecError::Invalid(
+                    "blend needs exactly one curve per selector".into(),
+                ));
+            };
+            let (aid, bid) = (*aid, *bid);
+            if bulge <= 0.0 {
+                return Err(ExecError::Invalid("blend bulge must be > 0".into()));
+            }
+            let ca = curve_of(doc, aid, "blend")?;
+            let cb = curve_of(doc, bid, "blend")?;
+            let closed = match (ca.is_closed(), cb.is_closed()) {
+                (true, true) => true,
+                (false, false) => false,
+                _ => {
+                    return Err(ExecError::BadProfile(
+                        "blend curves must both be open or both closed".into(),
+                    ))
+                }
+            };
+            let pa = ca.tessellate(PROFILE_TOL);
+            let pb = cb.tessellate(PROFILE_TOL);
+            let mesh = kernel_mesh::blend_curves(&pa, &pb, closed, bulge, 16);
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
                 visible: true,
@@ -3394,11 +3466,11 @@ fn apply_forward(
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
-                Command::Loft { id: Some(id), targets },
+                Command::BlendSurface { id: Some(id), a, b, bulge },
                 Inverse::DeleteCreated(vec![id]),
                 ApplyOutcome {
                     created: vec![id],
-                    message: format!("lofted {} profiles -> {id}", ids.len()),
+                    message: format!("blend {aid} <-> {bid} (bulge {bulge}) -> {id}"),
                 },
             ))
         }
@@ -6651,6 +6723,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Extrude { .. } => "extrude",
         Command::Revolve { .. } => "revolve",
         Command::Loft { .. } => "loft",
+        Command::BlendSurface { .. } => "blend",
         Command::Sweep { .. } => "sweep",
         Command::Sweep2 { .. } => "sweep2",
         Command::RailRevolve { .. } => "railrevolve",
@@ -7552,6 +7625,63 @@ mod tests {
         run(&mut s, "line 0,0,0 5,0,0");
         let err = s.run(parse("revolve last").unwrap()).unwrap_err();
         assert!(err.to_string().contains("closed"), "{err}");
+    }
+
+    #[test]
+    fn loft_with_guides_bows_and_replays() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0,0 2");
+        run(&mut s, "circle 0,0,6 2");
+        run(&mut s, "name last 2 rings");
+        // Bowed guide from the +x rim of the bottom circle to the top one.
+        run(&mut s, "interpcurve 2,0,0 4,0,3 2,0,6");
+        run(&mut s, "name last rail");
+        let out = run(&mut s, "loft rings guides rail");
+        assert!(out.message.contains("1 guide"), "{}", out.message);
+        // The guided solid is fatter than a plain cylinder of the same rings.
+        let vol = mesh_volume(&s);
+        assert!(vol > std::f64::consts::PI * 4.0 * 6.0 + 1.0, "vol {vol}");
+        run(&mut s, "undo");
+        run(&mut s, "redo");
+        // Replay from the op-log is stable.
+        let json = crate::io::to_json(&s);
+        let loaded = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&loaded), json, "replay-stable");
+
+        // Closed guides are rejected.
+        run(&mut s, "circle 8,0,3 1");
+        let err = s.run(parse("loft rings guides last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+    }
+
+    #[test]
+    fn blend_between_lines_and_undo() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 8,0,0");
+        run(&mut s, "name last edgea");
+        run(&mut s, "line 0,4,0 8,4,0");
+        run(&mut s, "name last edgeb");
+        let out = run(&mut s, "blend edgea edgeb");
+        assert_eq!(out.created.len(), 1);
+        let Geometry::Mesh(m) = &s.doc.get(out.created[0]).unwrap().geometry else {
+            panic!("expected mesh")
+        };
+        // Flat ruled sheet between the two lines (bulge defaults to 1).
+        assert!(m.positions().iter().all(|p| p.z.abs() < 1e-9));
+        assert!(m
+            .positions()
+            .iter()
+            .all(|p| (-1e-9..=4.0 + 1e-9).contains(&p.y)));
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
+
+        // Mixed open/closed inputs are rejected, as is a bad bulge.
+        run(&mut s, "circle 0,0,0 1");
+        let err = s.run(parse("blend edgea last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("open or both closed"), "{err}");
+        assert!(s.run(parse("blend edgea edgeb -1").unwrap()).is_err());
     }
 
     #[test]

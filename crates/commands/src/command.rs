@@ -143,6 +143,19 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
         targets: Selector,
+        /// Optional open guide curves (first→last profile); the skin bows
+        /// through them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guides: Option<Selector>,
+    },
+    /// Blend surface between two curves: Hermite-eased sheet taking off
+    /// perpendicular to both edges; `bulge` 1 = ruled, >1 eases harder.
+    BlendSurface {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        a: Selector,
+        b: Selector,
+        bulge: f64,
     },
     /// Sweep a closed profile curve along an open rail curve, capped.
     Sweep {

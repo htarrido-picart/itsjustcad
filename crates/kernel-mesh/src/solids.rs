@@ -45,6 +45,12 @@ pub fn revolve_profile(
 /// first loop, seams are rotated to minimize twist, and the ends are capped.
 pub fn loft_profiles(profiles: &[Vec<DVec3>]) -> Mesh {
     assert!(profiles.len() >= 2, "loft needs at least 2 profiles");
+    skin_stack(&aligned_rings(profiles), false)
+}
+
+/// Resample profile loops to a common count, align windings to the first loop
+/// and rotate seams to minimize twist (the loft preprocessing step).
+fn aligned_rings(profiles: &[Vec<DVec3>]) -> Vec<Vec<DVec3>> {
     let n = profiles.iter().map(Vec::len).max().expect("non-empty").max(3);
     let reference = newell(&profiles[0]);
     let mut rings: Vec<Vec<DVec3>> = Vec::with_capacity(profiles.len());
@@ -65,7 +71,159 @@ pub fn loft_profiles(profiles: &[Vec<DVec3>]) -> Mesh {
         }
         rings.push(ring);
     }
-    skin_stack(&rings, false)
+    rings
+}
+
+/// Loft with guide curves. Like [`loft_profiles`], but `sub` intermediate
+/// sections are generated between each pair of adjacent profiles and warped so
+/// the skin follows the guides: each guide is an open curve running from the
+/// first profile to the last; at every station the guide's offset from the
+/// plain (linearly interpolated) section is applied to the section ring with a
+/// cosine falloff around the ring, centered on the ring point nearest the
+/// guide's start. Straight guides between matching profile points reproduce
+/// the plain loft; bowed guides bow the skin through them. Capped, watertight.
+pub fn loft_profiles_guided(
+    profiles: &[Vec<DVec3>],
+    guides: &[Vec<DVec3>],
+    sub: usize,
+) -> Mesh {
+    assert!(profiles.len() >= 2, "loft needs at least 2 profiles");
+    assert!(!guides.is_empty(), "guided loft needs at least 1 guide");
+    let sub = sub.max(1);
+    let rings = aligned_rings(profiles);
+    let n = rings[0].len();
+    let spans = rings.len() - 1;
+    let total = spans * sub + 1;
+
+    // Plain sections: pointwise lerp between the bounding profile rings.
+    let base: Vec<Vec<DVec3>> = (0..total)
+        .map(|j| {
+            let (i, f) = if j == total - 1 {
+                (spans - 1, 1.0)
+            } else {
+                (j / sub, (j % sub) as f64 / sub as f64)
+            };
+            (0..n).map(|k| rings[i][k].lerp(rings[i + 1][k], f)).collect()
+        })
+        .collect();
+
+    // Each guide attaches to the ring index nearest its start point; its
+    // deviation from the plain skin is spread with a cosine^2 falloff whose
+    // half-width shares the ring among the guides.
+    let half_width = (n as f64 / (2.0 * guides.len() as f64)).max(1.0);
+    let mut warped = base.clone();
+    for guide in guides {
+        let g = resample_open(guide, total);
+        let attach = (0..n)
+            .min_by(|&a, &b| {
+                g[0].distance_squared(base[0][a]).total_cmp(&g[0].distance_squared(base[0][b]))
+            })
+            .expect("n >= 3");
+        for j in 0..total {
+            let offset = g[j] - base[j][attach];
+            for k in 0..n {
+                let d = {
+                    let raw = (k as isize - attach as isize).unsigned_abs();
+                    raw.min(n - raw) as f64 // ring distance (wraps)
+                };
+                if d < half_width {
+                    let w = (std::f64::consts::FRAC_PI_2 * d / half_width).cos().powi(2);
+                    warped[j][k] += offset * w;
+                }
+            }
+        }
+    }
+    skin_stack(&warped, false)
+}
+
+/// Blend surface between two curves: a Hermite-eased sheet leaving each curve
+/// along the chord direction with its curve-tangent component removed, so the
+/// sheet takes off perpendicular to both edges. `bulge` scales the takeoff
+/// magnitude relative to the local gap — `1` gives the linear ruled surface,
+/// `>1` eases harder off the edges (an S toward each curve), `<1` tightens.
+/// `closed` wraps the sheet in the along-curve direction (both inputs must
+/// then be loops); the result is an open sheet, not a solid.
+pub fn blend_curves(
+    a_pts: &[DVec3],
+    b_pts: &[DVec3],
+    closed: bool,
+    bulge: f64,
+    stations: usize,
+) -> Mesh {
+    assert!(a_pts.len() >= 2 && b_pts.len() >= 2, "blend curves need 2+ points");
+    let stations = stations.max(1);
+    let n = a_pts.len().max(b_pts.len()).max(if closed { 3 } else { 2 });
+    let (a, mut b) = if closed {
+        (resample_closed(a_pts, n), resample_closed(b_pts, n))
+    } else {
+        (resample_open(a_pts, n), resample_open(b_pts, n))
+    };
+    if closed {
+        // Align winding + seam of b to a (avoid a twisted sheet).
+        if newell(&b).dot(newell(&a)) < 0.0 {
+            b.reverse();
+        }
+        let s = (0..n)
+            .min_by(|&x, &y| {
+                b[x].distance_squared(a[0]).total_cmp(&b[y].distance_squared(a[0]))
+            })
+            .expect("n >= 3");
+        b.rotate_left(s);
+    } else if a[0].distance(b[n - 1]) < a[0].distance(b[0]) {
+        b.reverse(); // anti-parallel inputs would bowtie
+    }
+
+    let tangent_at = |pts: &[DVec3], i: usize| -> DVec3 {
+        let ahead = if i + 1 < n {
+            pts[i + 1] - pts[i]
+        } else if closed {
+            pts[0] - pts[i]
+        } else {
+            DVec3::ZERO
+        };
+        let behind = if i > 0 {
+            pts[i] - pts[i - 1]
+        } else if closed {
+            pts[i] - pts[n - 1]
+        } else {
+            DVec3::ZERO
+        };
+        (ahead.normalize_or_zero() + behind.normalize_or_zero()).normalize_or_zero()
+    };
+
+    let rows = stations + 1;
+    let mut positions = Vec::with_capacity(rows * n);
+    for j in 0..rows {
+        let f = j as f64 / stations as f64;
+        let (f2, f3) = (f * f, f * f * f);
+        let h00 = 2.0 * f3 - 3.0 * f2 + 1.0;
+        let h10 = f3 - 2.0 * f2 + f;
+        let h01 = -2.0 * f3 + 3.0 * f2;
+        let h11 = f3 - f2;
+        for i in 0..n {
+            let chord = b[i] - a[i];
+            let gap = chord.length();
+            let perp = |t: DVec3| {
+                let p = chord - t * chord.dot(t);
+                let l = p.length();
+                if l < 1e-12 { chord } else { p * (gap / l) }
+            };
+            let ma = perp(tangent_at(&a, i)) * bulge;
+            let mb = perp(tangent_at(&b, i)) * bulge;
+            positions.push(a[i] * h00 + ma * h10 + b[i] * h01 + mb * h11);
+        }
+    }
+    let idx = |j: usize, i: usize| (j * n + i) as u32;
+    let cols = if closed { n } else { n - 1 };
+    let mut faces = Vec::with_capacity(stations * cols * 2);
+    for j in 0..stations {
+        for i in 0..cols {
+            let i1 = (i + 1) % n;
+            faces.push([idx(j, i), idx(j, i1), idx(j + 1, i1)]);
+            faces.push([idx(j, i), idx(j + 1, i1), idx(j + 1, i)]);
+        }
+    }
+    Mesh::new(positions, faces)
 }
 
 /// Sweep a closed profile along an open rail polyline using parallel-transport
@@ -485,6 +643,95 @@ mod tests {
                 DVec3::new(r * t.cos(), r * t.sin(), z)
             })
             .collect()
+    }
+
+    fn square_xy(s: f64, z: f64) -> Vec<DVec3> {
+        vec![
+            DVec3::new(-s, -s, z),
+            DVec3::new(s, -s, z),
+            DVec3::new(s, s, z),
+            DVec3::new(-s, s, z),
+        ]
+    }
+
+    #[test]
+    fn guided_loft_with_straight_guides_matches_plain_loft() {
+        let profiles = vec![square_xy(2.0, 0.0), square_xy(2.0, 6.0)];
+        // Straight guides between matching corners: zero deviation everywhere.
+        let guides = vec![
+            vec![DVec3::new(2.0, 2.0, 0.0), DVec3::new(2.0, 2.0, 6.0)],
+            vec![DVec3::new(-2.0, -2.0, 0.0), DVec3::new(-2.0, -2.0, 6.0)],
+        ];
+        let plain = loft_profiles(&profiles);
+        let guided = loft_profiles_guided(&profiles, &guides, 4);
+        assert!(watertight(&guided));
+        let (vp, vg) = (signed_volume(&plain), signed_volume(&guided));
+        assert!((vp - vg).abs() < 1e-6, "volumes differ: {vp} vs {vg}");
+    }
+
+    #[test]
+    fn guided_loft_bows_through_the_guide() {
+        let profiles = vec![circle_xy(2.0, 0.0, 24), circle_xy(2.0, 6.0, 24)];
+        // Guide bows out to x=4 at mid-height from the +x rim point.
+        let guide_mid = DVec3::new(4.0, 0.0, 3.0);
+        let guides = vec![vec![
+            DVec3::new(2.0, 0.0, 0.0),
+            guide_mid,
+            DVec3::new(2.0, 0.0, 6.0),
+        ]];
+        let mesh = loft_profiles_guided(&profiles, &guides, 8);
+        assert!(watertight(&mesh));
+        // Some skin vertex passes (near) the guide's bow point.
+        let nearest = mesh
+            .positions()
+            .iter()
+            .map(|p| p.distance(guide_mid))
+            .fold(f64::MAX, f64::min);
+        assert!(nearest < 0.35, "skin misses the guide: nearest {nearest}");
+        // And the guided solid is fatter than the plain one.
+        assert!(signed_volume(&mesh) > signed_volume(&loft_profiles(&profiles)) + 1.0);
+    }
+
+    #[test]
+    fn blend_rows_interpolate_the_edge_curves() {
+        let a = vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(8.0, 0.0, 0.0)];
+        let b = vec![DVec3::new(0.0, 4.0, 0.0), DVec3::new(8.0, 4.0, 0.0)];
+        let mesh = blend_curves(&a, &b, false, 1.0, 8);
+        let pos = mesh.positions();
+        let n = 2; // resampled count = max(2,2)
+        assert_eq!(pos.len(), 9 * n);
+        assert!(pos[0].distance(a[0]) < 1e-9 && pos[1].distance(a[1]) < 1e-9);
+        assert!(pos[8 * n].distance(b[0]) < 1e-9 && pos[8 * n + 1].distance(b[1]) < 1e-9);
+        // bulge = 1 between parallel edges is the flat ruled sheet: row at
+        // f=0.25 sits exactly a quarter of the way across.
+        assert!((pos[2 * n].y - 1.0).abs() < 1e-9);
+        assert!(pos.iter().all(|p| p.z.abs() < 1e-12));
+    }
+
+    #[test]
+    fn blend_bulge_eases_off_the_edges() {
+        let a = vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(8.0, 0.0, 0.0)];
+        let b = vec![DVec3::new(0.0, 4.0, 0.0), DVec3::new(8.0, 4.0, 0.0)];
+        let mesh = blend_curves(&a, &b, false, 2.0, 8);
+        // Higher bulge pushes the f=0.25 row past the linear position.
+        let y = mesh.positions()[2 * 2].y;
+        assert!(y > 1.2, "expected eased row, got y={y}");
+        // Edge rows are still exact.
+        assert!(mesh.positions()[0].distance(a[0]) < 1e-9);
+    }
+
+    #[test]
+    fn blend_closed_circles_wraps() {
+        let a = circle_xy(2.0, 0.0, 24);
+        let b = circle_xy(4.0, 2.0, 24);
+        let mesh = blend_curves(&a, &b, true, 1.0, 6);
+        assert_eq!(mesh.positions().len(), 7 * 24);
+        assert_eq!(mesh.faces().len(), 6 * 24 * 2); // wrapped in the ring direction
+        for p in mesh.positions() {
+            let r = (p.x * p.x + p.y * p.y).sqrt();
+            assert!((1.99..=4.01).contains(&r), "radius {r} out of band");
+            assert!((-1e-9..=2.0 + 1e-9).contains(&p.z));
+        }
     }
 
     #[test]

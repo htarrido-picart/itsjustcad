@@ -74,8 +74,14 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "loft",
-            usage: "loft <selector>",
-            summary: "Skin 2+ closed curves (stacked in creation order) into one capped solid; profiles are resampled to matching point counts. Example: loft last 3",
+            usage: "loft <selector> [guides <selector>]",
+            summary: "Skin 2+ closed curves (stacked in creation order) into one capped solid; profiles are resampled to matching point counts. Optional open guide curves (first profile -> last) bow the skin through them. Example: loft last 3 · loft name:rings guides name:rail",
+            category: Category::Solid,
+        },
+        CommandSpec {
+            name: "blend",
+            usage: "blend <curve a> <curve b> [bulge]",
+            summary: "Blend surface between two curves (both open or both closed): a Hermite-eased sheet taking off perpendicular to each edge. Bulge 1 (default) = ruled surface, >1 eases harder off the edges. Example: blend name:top name:bottom 1.5",
             category: Category::Solid,
         },
         CommandSpec {

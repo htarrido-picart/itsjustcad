@@ -63,8 +63,32 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }
         "loft" => {
             let (sel, rest) = selector(&args, "loft")?;
-            expect_empty("loft", rest, &args)?;
-            Ok(Command::Loft { id: None, targets: sel })
+            let guides = match rest {
+                [] => None,
+                ["guides", g @ ..] if !g.is_empty() => {
+                    let (gsel, grest) = selector(g, "loft")?;
+                    expect_empty("loft", grest, &args)?;
+                    Some(gsel)
+                }
+                _ => {
+                    return wrong(
+                        "loft",
+                        "a profile selector and optionally 'guides <selector>'",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::Loft { id: None, targets: sel, guides })
+        }
+        "blend" => {
+            let (a, rest) = selector(&args, "blend")?;
+            let (b, rest) = selector(rest, "blend")?;
+            let bulge = match rest {
+                [] => 1.0,
+                [x] => number(x)?,
+                _ => return wrong("blend", "two curve selectors and an optional bulge", &args),
+            };
+            Ok(Command::BlendSurface { id: None, a, b, bulge })
         }
         "sweep" => {
             let (profile, rest) = selector(&args, "sweep")?;
@@ -2960,8 +2984,17 @@ mod tests {
         ));
         assert!(matches!(
             parse("loft last 3").unwrap(),
-            Command::Loft { id: None, targets: Selector::Last { n: 3 } }
+            Command::Loft { id: None, targets: Selector::Last { n: 3 }, guides: None }
         ));
+        assert!(matches!(
+            parse("loft rings guides rail").unwrap(),
+            Command::Loft { id: None, targets: Selector::Named { .. }, guides: Some(Selector::Named { .. }) }
+        ));
+        assert!(matches!(
+            parse("blend a b 1.5").unwrap(),
+            Command::BlendSurface { id: None, bulge, .. } if (bulge - 1.5).abs() < 1e-12
+        ));
+        assert!(parse("blend a").is_err());
         assert!(matches!(
             parse("sweep prof rail").unwrap(),
             Command::Sweep {
