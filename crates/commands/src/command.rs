@@ -972,6 +972,17 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         layer: Option<String>,
     },
+    /// Print the stored structured summaries of environmental analyses
+    /// (`Document::analysis_reports`): stats, distribution bins, and extreme
+    /// sample locations. This is the deck LLM's critique hook — the analysis
+    /// verbs only report min/avg/max in prose; this serves the full compact
+    /// summary. Query only; never logged.
+    EnviroReport {
+        /// Optional kind filter ("sunhours", "facesunhours", "radiation",
+        /// "shadowstudy"); `None` prints every stored report.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+    },
     /// Place a schedule table on a sheet (logged). The table is written into
     /// the PDF at print time; no geometry is created in the 3D scene.
     SheetTable {
@@ -1281,6 +1292,7 @@ impl Command {
                 | Command::Volume { .. }
                 | Command::Bbox { .. }
                 | Command::Schedule { .. }
+                | Command::EnviroReport { .. }
                 | Command::BlocksList
                 | Command::BlockLibList
                 | Command::ConstraintsList

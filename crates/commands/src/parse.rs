@@ -1190,6 +1190,16 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             };
             Ok(Command::SunPath { ids: None, year, radius })
         }
+        // report [analysis] — structured enviro-analysis summary (query)
+        "report" => match args.as_slice() {
+            [] => Ok(Command::EnviroReport { kind: None }),
+            [k] => Ok(Command::EnviroReport { kind: Some((*k).to_string()) }),
+            _ => wrong(
+                "report",
+                "at most one analysis kind (sunhours|facesunhours|radiation|shadowstudy)",
+                &args,
+            ),
+        },
         // -- blocks --
         // block <selector> <name>
         "block" => {

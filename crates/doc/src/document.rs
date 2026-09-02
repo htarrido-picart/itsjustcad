@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_mesh::Aabb;
 
 use crate::{
-    Basemap, BlockGeometry, GeoLocation, Grid, LayerStyle, Material, NamedView, ObjectId,
+    AnalysisReport, Basemap, BlockGeometry, GeoLocation, Grid, LayerStyle, Material, NamedView,
+    ObjectId,
     ParamBlockDef, SceneObject, Section, Sheet, SketchConstraint, Story, StructLoad,
     StructSupport, SunPosition, Underlay, Units,
     DEFAULT_LAYER,
@@ -116,6 +117,13 @@ pub struct Document {
     /// files loading (they default to `false` = hairlines, the old behaviour).
     #[serde(default)]
     pub show_lineweights: bool,
+    /// Structured summaries of environmental analyses (`sunhours`,
+    /// `facesunhours`, `radiation`, `shadowstudy`), keyed by analysis kind —
+    /// latest run of each kind wins. Queried by the read-only `report` command
+    /// (deck critique). Regenerated on op-log replay because the analyses
+    /// re-execute; `serde(default)` keeps pre-report checkpoints loading.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub analysis_reports: BTreeMap<String, AnalysisReport>,
     /// Sketch constraints created by the logged `constrain` command; solved by
     /// `solveconstraints` (commands crate). Order matters — redundancy blame
     /// reports the later constraint. `serde(default)` keeps old files loading.
@@ -151,6 +159,7 @@ impl Default for Document {
             loads: Vec::new(),
             supports: Vec::new(),
             show_lineweights: false,
+            analysis_reports: BTreeMap::new(),
             constraints: Vec::new(),
             generation: 0,
         }

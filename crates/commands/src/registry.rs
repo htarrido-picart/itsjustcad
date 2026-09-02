@@ -606,6 +606,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "report",
+            usage: "report [analysis]",
+            summary: "Structured summary of the stored environmental analyses (sunhours, facesunhours, radiation, shadowstudy): min/avg/max, a distribution, and the worst/best sample locations with their facings. Run it after an analysis to ground design critique in numbers — e.g. a north face under 2 h winter sun is poor for glazing; the hottest radiation faces need shading. Query only, no geometry. Example: report facesunhours",
+            category: Category::Analyze,
+        },
+        CommandSpec {
             name: "sheet",
             usage: "sheet <name> [a4|a3|a2|a1|a0]",
             summary: "Create a named paper sheet, landscape (default a3). Example: sheet plan a1",

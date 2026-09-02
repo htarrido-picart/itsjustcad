@@ -59,3 +59,49 @@ pub struct GeoLocation {
     /// UTC-based; this lets analyses interpret local clock times on a date.
     pub tz_hours: f64,
 }
+
+/// One sampled datum kept inside an [`AnalysisReport`] so the deck LLM can
+/// point AT a place ("the north face at (0, 10, 2) gets 0.5 h"). Only the
+/// extreme few survive — never the raw per-face/per-cell soup.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AnalysisSample {
+    /// Value in the report's `unit`.
+    pub value: f64,
+    /// Sample location, meters (face centroid / grid-cell center /
+    /// shadow-polygon centroid).
+    pub at: [f64; 3],
+    /// What the sample IS: the facing of the sampled surface ("up", "down",
+    /// "north", "southwest", …) for face/cell analyses, or the "HH:MM" time
+    /// stamp for shadow-study polygons.
+    pub tag: String,
+}
+
+/// Compact structured summary of one environmental analysis run (`sunhours`,
+/// `facesunhours`, `radiation`, `shadowstudy`), stored on the document keyed
+/// by kind and served by the read-only `report` command so the deck LLM can
+/// critique results (token-frugal: stats + bins + extreme samples, never raw
+/// data). Regenerated whenever the analysis re-runs, including op-log replay;
+/// an `undo` of the analysis leaves the last report in place (it describes the
+/// last run, not live geometry).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AnalysisReport {
+    /// Analysis verb: "sunhours" | "facesunhours" | "radiation" | "shadowstudy".
+    pub kind: String,
+    /// Human context for the run: date, time window, EPW file.
+    pub context: String,
+    /// Unit of every value in this report ("h", "kWh/m2-yr", "m2").
+    pub unit: String,
+    /// Number of samples (faces / grid cells / shadow polygons).
+    pub count: usize,
+    pub min: f64,
+    pub avg: f64,
+    pub max: f64,
+    /// Distribution: six equal-width bins spanning [0, max], as
+    /// (inclusive upper bound, sample count). Empty when `max` is 0.
+    pub bins: Vec<(f64, usize)>,
+    /// The lowest-value samples, ascending (worst-lit faces, darkest cells).
+    pub lowest: Vec<AnalysisSample>,
+    /// The highest-value samples, descending (sunniest/hottest faces,
+    /// largest shadows).
+    pub highest: Vec<AnalysisSample>,
+}

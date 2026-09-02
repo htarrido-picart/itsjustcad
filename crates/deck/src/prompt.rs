@@ -98,6 +98,24 @@ These change only the window LAYOUT (panels, docking, viewport split, workspace,
   theme dark|light                              set the UI theme                                         e.g. theme dark
 ";
 
+/// The "Environmental critique" section of the deck system prompt.
+///
+/// Teaches the model the analysis → `report` → design-feedback workflow: the
+/// substrate stores a compact [`itsjustcad_doc::AnalysisReport`] after every
+/// environmental analysis, and the read-only `report` registry command serves
+/// it back. This section is interpretation guidance only — the `report` verb
+/// itself is advertised through the registry like every other command — so it
+/// carries the architectural rules of thumb (sun-hour thresholds, radiation
+/// hot/cold faces, shadow coverage) the raw numbers don't.
+pub const ENVIRO_CRITIQUE_HELP: &str = "\
+## Environmental critique (analysis -> report -> design feedback)
+After running an environmental analysis (sunhours, facesunhours, radiation, shadowstudy), emit `report` (or `report <analysis>`) in the same ```draft block to fetch its structured summary: min/avg/max, a distribution, and the lowest/highest sample locations with facings. Use the numbers to critique the DESIGN, not just recite them:
+  - Sun-hours (h): a facade face under ~2 h (especially in winter) is poor for glazing, terraces, or outdoor amenity — suggest moving openings to a sunnier facing; 4+ h suits living spaces; near-zero ground cells mark permanently shaded courtyards or canyon edges.
+  - Radiation (kWh/m2-yr): the hottest faces (usually roofs and south/west in the northern hemisphere) drive cooling load and glare — suggest shading, canopies, deeper reveals, or less glazing there; the coldest faces suit services, stairs, storage.
+  - Shadow study (m2): the largest shadow polygons show when and where the massing overshadows its surroundings — flag neighbours, courtyards, or public space buried at key times.
+Ground every observation in a report sample (\"the north face at (0.0,10.0,2.0) gets 0.5 h — don't put the terrace there\") and propose a concrete fix with commands the user could run.
+";
+
 /// Build the system prompt from the command registry (single source of truth)
 /// plus a compact scene digest. Regenerated every turn so the model always
 /// sees current geometry.
@@ -239,6 +257,7 @@ Examples:
 
 {view_verbs}
 {ui_verbs}
+{enviro}
 ## Rules
 - Points are x,y,z or x,y (z=0). No spaces inside a point. Units: bare numbers are meters; 250cm and 500mm also work.
 - 'last' refers to the most recently created object; 'last N' to the N most recent. After a command that creates an object, that object is 'last'.
@@ -269,6 +288,7 @@ box 10,0,0 4,4,3
         plugin_block = plugin_block,
         view_verbs = VIEW_VERB_HELP,
         ui_verbs = UI_VERB_HELP,
+        enviro = ENVIRO_CRITIQUE_HELP,
         scene = if scene_digest.is_empty() {
             "(empty)"
         } else {
@@ -420,6 +440,29 @@ mod tests {
         // meshedges — advertised app-verb (shadededges alias) so the model can
         // toggle the default shaded feature edges.
         assert!(p.contains("meshedges on|off"), "meshedges missing from VIEW_VERB_HELP");
+    }
+
+    #[test]
+    fn prompt_teaches_enviro_critique() {
+        // The environmental-critique guidance (analysis → `report` → design
+        // feedback) must be injected whole, and must reference every analysis
+        // verb it interprets plus the `report` command it depends on. The
+        // `report` verb itself is covered by the registry completeness test;
+        // this pins the interpretation layer on top of it.
+        let p = system_prompt("", &PluginRegistry::new());
+        assert!(p.contains(ENVIRO_CRITIQUE_HELP), "ENVIRO_CRITIQUE_HELP not injected");
+        assert!(p.contains("## Environmental critique"));
+        for verb in ["sunhours", "facesunhours", "radiation", "shadowstudy", "report"] {
+            assert!(
+                ENVIRO_CRITIQUE_HELP.contains(verb),
+                "critique section missing verb '{verb}'"
+            );
+        }
+        // Architectural rules of thumb the model needs to interpret numbers.
+        assert!(ENVIRO_CRITIQUE_HELP.contains("kWh/m2-yr"));
+        assert!(ENVIRO_CRITIQUE_HELP.contains("cooling load"));
+        assert!(ENVIRO_CRITIQUE_HELP.contains("glazing"));
+        assert!(ENVIRO_CRITIQUE_HELP.contains("overshadows"));
     }
 
     #[test]

@@ -5,7 +5,8 @@ use glam::DVec3;
 use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
 use itsjustcad_doc::{
-    format_area, format_length, format_volume, Annotation, Document, Geometry, Grid, LayerStyle,
+    format_area, format_length, format_volume, AnalysisReport, AnalysisSample, Annotation,
+    Document, Geometry, Grid, LayerStyle,
     LoadGeometry, Material, NamedView, ObjectId, SceneObject, ScheduleRow,
     SheetDim, SheetTable, Story, StructLoad, StructSupport, Underlay, Units,
 };
@@ -2368,6 +2369,131 @@ fn fmt_hhmm(min: u32) -> String {
     format!("{:02}:{:02}", min / 60, min % 60)
 }
 
+/// Compass/vertical facing label for an outward surface normal — the deck LLM
+/// critiques by orientation ("north facade gets no winter sun"), so every kept
+/// analysis sample carries one. `North = +Y, East = +X, Up = +Z` (matches
+/// `itsjustcad_solar::sun_direction`). Near-vertical normals (|z| >= 0.7,
+/// ~45° tilt) read "up"/"down"; otherwise the horizontal azimuth is bucketed
+/// into the eight compass directions.
+fn facing_label(normal: DVec3) -> &'static str {
+    if normal.z >= 0.7 {
+        return "up";
+    }
+    if normal.z <= -0.7 {
+        return "down";
+    }
+    // Azimuth clockwise from +Y (north), like a compass bearing.
+    let az = normal.x.atan2(normal.y).to_degrees().rem_euclid(360.0);
+    const LABELS: [&str; 8] = [
+        "north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest",
+    ];
+    LABELS[(((az + 22.5) / 45.0) as usize) % 8]
+}
+
+/// Number of extreme samples an [`AnalysisReport`] keeps at each end.
+const REPORT_LOWEST_N: usize = 5;
+const REPORT_HIGHEST_N: usize = 3;
+
+/// Build the compact [`AnalysisReport`] for one analysis run from its raw
+/// samples `(value, location, tag)`: min/avg/max, a six-bin distribution over
+/// [0, max], and only the `REPORT_LOWEST_N`/`REPORT_HIGHEST_N` extreme samples
+/// — token-frugal by construction so the whole report fits a deck turn.
+fn build_analysis_report(
+    kind: &str,
+    context: String,
+    unit: &str,
+    mut samples: Vec<(f64, DVec3, String)>,
+) -> AnalysisReport {
+    let count = samples.len();
+    let n = count.max(1) as f64;
+    let sum: f64 = samples.iter().map(|s| s.0).sum();
+    let min = samples.iter().map(|s| s.0).fold(f64::INFINITY, f64::min);
+    let max = samples.iter().map(|s| s.0).fold(0.0f64, f64::max);
+    let min = if min.is_finite() { min } else { 0.0 };
+
+    let mut bins: Vec<(f64, usize)> = Vec::new();
+    if max > 0.0 {
+        let width = max / 6.0;
+        bins = (1..=6).map(|i| (width * i as f64, 0)).collect();
+        for (v, _, _) in &samples {
+            let idx = ((v / width) as usize).min(5);
+            bins[idx].1 += 1;
+        }
+    }
+
+    // NaN-free by construction; total order is fine here.
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let to_sample = |(value, at, tag): &(f64, DVec3, String)| AnalysisSample {
+        value: *value,
+        at: [at.x, at.y, at.z],
+        tag: tag.clone(),
+    };
+    let lowest = samples.iter().take(REPORT_LOWEST_N).map(to_sample).collect();
+    let highest = samples.iter().rev().take(REPORT_HIGHEST_N).map(to_sample).collect();
+
+    AnalysisReport {
+        kind: kind.to_string(),
+        context,
+        unit: unit.to_string(),
+        count,
+        min,
+        avg: sum / n,
+        max,
+        bins,
+        lowest,
+        highest,
+    }
+}
+
+/// Render one stored [`AnalysisReport`] as the compact text the `report`
+/// command prints (and the deck LLM reads back). One decimal for small units
+/// (hours), whole numbers once values reach the hundreds (kWh/m2-yr).
+fn format_analysis_report(r: &AnalysisReport) -> String {
+    let dp = usize::from(r.max < 100.0);
+    let f = |v: f64| format!("{v:.dp$}");
+    let mut out = format!(
+        "{} ({}): {} sample(s), min {} / avg {} / max {} {}\n",
+        r.kind,
+        r.context,
+        r.count,
+        f(r.min),
+        f(r.avg),
+        f(r.max),
+        r.unit
+    );
+    if !r.bins.is_empty() {
+        out.push_str("  distribution:");
+        for (upper, n) in &r.bins {
+            if *n > 0 {
+                out.push_str(&format!(" <={}:{}", f(*upper), n));
+            }
+        }
+        out.push('\n');
+    }
+    let fmt_samples = |label: &str, samples: &[AnalysisSample], out: &mut String| {
+        if samples.is_empty() {
+            return;
+        }
+        out.push_str(&format!("  {label}:"));
+        for s in samples {
+            out.push_str(&format!(
+                " {} {} [{}] at ({:.1},{:.1},{:.1});",
+                f(s.value),
+                r.unit,
+                s.tag,
+                s.at[0],
+                s.at[1],
+                s.at[2]
+            ));
+        }
+        out.pop(); // trailing ';'
+        out.push('\n');
+    };
+    fmt_samples("lowest", &r.lowest, &mut out);
+    fmt_samples("highest", &r.highest, &mut out);
+    out
+}
+
 /// Ground-shadow study. For each time stamp, compute the sun direction from the
 /// document location and project every mesh's silhouette onto `z=0` along the
 /// sun. Each object's projected points are reduced to their 2D convex hull and
@@ -2486,6 +2612,30 @@ fn exec_shadow_study(
             geometry: Geometry::Curve(Curve::Polyline { points: poly.pts.clone(), closed: true }),
         });
     }
+    // Structured summary for the deck's `report` command: one sample per
+    // shadow polygon — value = ground area covered, tag = its "HH:MM" stamp —
+    // so the LLM can flag when the massing overshadows most.
+    let samples: Vec<(f64, DVec3, String)> = polys
+        .iter()
+        .map(|p| {
+            let centroid = p.pts.iter().copied().sum::<DVec3>() / p.pts.len().max(1) as f64;
+            let stamp = p.layer.strip_prefix("shadows-").unwrap_or(&p.layer).to_string();
+            (shoelace_area(&p.pts), centroid, stamp)
+        })
+        .collect();
+    doc.analysis_reports.insert(
+        "shadowstudy".to_string(),
+        build_analysis_report(
+            "shadowstudy",
+            format!(
+                "{year}-{month:02}-{day:02} {}-{} every {step_min} min",
+                fmt_hhmm(from_min),
+                fmt_hhmm(to_min)
+            ),
+            "m2",
+            samples,
+        ),
+    );
     doc.generation += 1;
 
     let n_layers = layers_created.len();
@@ -2579,6 +2729,7 @@ fn exec_radiation(
     // (annual sun geometry is effectively year-invariant).
     const RAD_YEAR: i32 = 2026;
     let mut kwh: Vec<f64> = Vec::with_capacity(faces.len());
+    let mut samples: Vec<(f64, DVec3, String)> = Vec::with_capacity(faces.len());
     let mut max_k = 0.0f64;
     for tri in &faces {
         let centroid = (tri[0] + tri[1] + tri[2]) / 3.0;
@@ -2598,6 +2749,7 @@ fn exec_radiation(
             |s| tri_bvh.ray_occluded(origin, DVec3::new(s[0], s[1], s[2])),
         );
         max_k = max_k.max(k);
+        samples.push((k, centroid, facing_label(normal).to_string()));
         kwh.push(k);
     }
 
@@ -2637,6 +2789,12 @@ fn exec_radiation(
             geometry: Geometry::Mesh(mesh),
         });
     }
+    // Structured summary for the deck's `report` command (per-face insolation
+    // with facings, so the LLM can point at hot/cold faces).
+    doc.analysis_reports.insert(
+        "radiation".to_string(),
+        build_analysis_report("radiation", format!("annual, EPW {path}"), "kWh/m2-yr", samples),
+    );
     doc.generation += 1;
 
     let n = kwh.len() as f64;
@@ -2918,6 +3076,17 @@ fn exec_sun_hours(
             geometry: Geometry::Mesh(mesh),
         });
     }
+    // Structured summary for the deck's `report` command: darkest ground cells
+    // mark permanently shaded courtyards/edges the LLM should call out.
+    doc.analysis_reports.insert(
+        "sunhours".to_string(),
+        build_analysis_report(
+            "sunhours",
+            format!("{year}-{month:02}-{day:02}, {spacing} m ground grid"),
+            "h",
+            cells.iter().map(|&(x, y, h)| (h, DVec3::new(x, y, 0.0), "ground".to_string())).collect(),
+        ),
+    );
     doc.generation += 1;
 
     Ok((
@@ -3022,6 +3191,7 @@ fn exec_face_sun_hours(
     // sun is on the lit side of the face (dot(normal, sun) > 0); a downward- or
     // away-facing surface can't see that sun position at all.
     let mut hours: Vec<f64> = Vec::with_capacity(faces.len());
+    let mut samples: Vec<(f64, DVec3, String)> = Vec::with_capacity(faces.len());
     let mut max_h = 0.0f64;
     for tri in &faces {
         let centroid = (tri[0] + tri[1] + tri[2]) / 3.0;
@@ -3044,6 +3214,7 @@ fn exec_face_sun_hours(
         }
         let h = lit as f64 * 0.5;
         max_h = max_h.max(h);
+        samples.push((h, centroid, facing_label(normal).to_string()));
         hours.push(h);
     }
 
@@ -3085,6 +3256,17 @@ fn exec_face_sun_hours(
             geometry: Geometry::Mesh(mesh),
         });
     }
+    // Structured summary for the deck's `report` command (per-face sun-hours
+    // with facings, so the LLM can critique glazing/amenity placement).
+    doc.analysis_reports.insert(
+        "facesunhours".to_string(),
+        build_analysis_report(
+            "facesunhours",
+            format!("{year}-{month:02}-{day:02}"),
+            "h",
+            samples,
+        ),
+    );
     doc.generation += 1;
 
     let n = hours.len() as f64;
@@ -6067,6 +6249,36 @@ fn apply_forward(
                 ApplyOutcome { created: Vec::new(), message: msg },
             ))
         }
+        Command::EnviroReport { kind } => {
+            if doc.analysis_reports.is_empty() {
+                return Err(ExecError::Invalid(
+                    "no analysis stored — run sunhours, facesunhours, radiation, or \
+                     shadowstudy first, then `report`"
+                        .into(),
+                ));
+            }
+            let mut msg = String::new();
+            for (k, r) in &doc.analysis_reports {
+                if kind.as_deref().is_none_or(|want| want == k) {
+                    msg.push_str(&format_analysis_report(r));
+                }
+            }
+            if msg.is_empty() {
+                return Err(ExecError::Invalid(format!(
+                    "no '{}' report stored (stored: {})",
+                    kind.as_deref().unwrap_or("?"),
+                    doc.analysis_reports.keys().cloned().collect::<Vec<_>>().join(", ")
+                )));
+            }
+            Ok((
+                Command::EnviroReport { kind },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: msg.trim_end().to_string(),
+                },
+            ))
+        }
         Command::SheetTable { sheet, layer } => {
             // Build rows before borrowing the sheet (avoid simultaneous borrows).
             let rows = build_schedule_rows(doc, layer.as_deref());
@@ -7036,6 +7248,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Volume { .. } => "volume",
         Command::Bbox { .. } => "bbox",
         Command::Schedule { .. } => "schedule",
+        Command::EnviroReport { .. } => "report",
         Command::SheetTable { .. } => "sheettable",
         Command::SheetDim { .. } => "sheetdim",
         Command::MeshLiteral { .. } => "mesh_literal",
@@ -10395,6 +10608,221 @@ mod tests {
             "facesunhours log must be replay-stable"
         );
         assert_eq!(s.doc.len(), replayed.doc.len());
+    }
+
+    // --- analysis reports + the `report` critique command ---
+
+    #[test]
+    fn facing_label_buckets_normals() {
+        assert_eq!(facing_label(DVec3::Z), "up");
+        assert_eq!(facing_label(-DVec3::Z), "down");
+        assert_eq!(facing_label(DVec3::Y), "north");
+        assert_eq!(facing_label(-DVec3::Y), "south");
+        assert_eq!(facing_label(DVec3::X), "east");
+        assert_eq!(facing_label(-DVec3::X), "west");
+        assert_eq!(facing_label(DVec3::new(1.0, 1.0, 0.0).normalize()), "northeast");
+        assert_eq!(facing_label(DVec3::new(-1.0, -1.0, 0.0).normalize()), "southwest");
+        // A gently tilted roof still reads "up"; a steep wall reads by compass.
+        assert_eq!(facing_label(DVec3::new(0.0, 0.3, 0.95).normalize()), "up");
+        assert_eq!(facing_label(DVec3::new(0.0, 0.95, 0.3).normalize()), "north");
+    }
+
+    #[test]
+    fn build_analysis_report_stats_bins_and_extremes() {
+        let samples: Vec<(f64, DVec3, String)> = (0..12)
+            .map(|i| (i as f64, DVec3::new(i as f64, 0.0, 0.0), "up".to_string()))
+            .collect();
+        let r = build_analysis_report("facesunhours", "2024-06-21".into(), "h", samples);
+        assert_eq!(r.count, 12);
+        assert_eq!(r.min, 0.0);
+        assert_eq!(r.max, 11.0);
+        assert!((r.avg - 5.5).abs() < 1e-9);
+        assert_eq!(r.bins.len(), 6);
+        assert_eq!(r.bins.iter().map(|b| b.1).sum::<usize>(), 12);
+        // Extremes are the N lowest ascending / N highest descending.
+        assert_eq!(r.lowest.len(), REPORT_LOWEST_N);
+        assert_eq!(r.lowest[0].value, 0.0);
+        assert_eq!(r.highest.len(), REPORT_HIGHEST_N);
+        assert_eq!(r.highest[0].value, 11.0);
+        assert_eq!(r.highest[0].at, [11.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn build_analysis_report_all_zero_has_no_bins() {
+        let r = build_analysis_report(
+            "sunhours",
+            "ctx".into(),
+            "h",
+            vec![(0.0, DVec3::ZERO, "ground".into())],
+        );
+        assert!(r.bins.is_empty());
+        assert_eq!((r.min, r.avg, r.max), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn report_errors_without_analysis() {
+        let mut s = Session::default();
+        let err = s.run(parse("report").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no analysis stored"), "{err}");
+    }
+
+    #[test]
+    fn report_parse_round_trip_and_never_logged() {
+        assert!(matches!(parse("report").unwrap(), Command::EnviroReport { kind: None }));
+        match parse("report sunhours").unwrap() {
+            Command::EnviroReport { kind } => assert_eq!(kind.as_deref(), Some("sunhours")),
+            other => panic!("expected EnviroReport, got {other:?}"),
+        }
+        assert!(parse("report a b").is_err());
+        assert!(!parse("report").unwrap().is_logged(), "report is a query, never logged");
+    }
+
+    #[test]
+    fn facesunhours_report_north_wall_face_is_lowest_south_or_top_highest() {
+        // A long thin wall along X: its two big faces point north (+Y) and
+        // south (-Y). At 40°N on the WINTER solstice the sun never leaves the
+        // southern sky, so the north face and the underside get zero while the
+        // top and south face collect essentially the whole day — exactly the
+        // "north facade gets no winter sun" critique the report must ground.
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 10,0.2,3");
+        run(&mut s, "location 40.0 0.0 0");
+        run(&mut s, "facesunhours last 2024-12-21");
+
+        let r = s.doc.analysis_reports.get("facesunhours").expect("report stored");
+        assert_eq!(r.kind, "facesunhours");
+        assert_eq!(r.context, "2024-12-21");
+        assert_eq!(r.unit, "h");
+        assert_eq!(r.count, 12, "a box tessellates to 12 triangles");
+        assert_eq!(r.min, 0.0, "the underside sees no sun");
+        assert!(r.max > 8.0, "sky-facing top approaches daylight: {}", r.max);
+        assert_eq!(r.bins.iter().map(|b| b.1).sum::<usize>(), 12);
+        assert!(
+            r.lowest.iter().any(|smp| smp.tag == "north"),
+            "north wall face among the lowest: {:?}",
+            r.lowest.iter().map(|smp| &smp.tag).collect::<Vec<_>>()
+        );
+        assert!(
+            r.highest.iter().all(|smp| smp.tag == "up" || smp.tag == "south"),
+            "top/south dominate the highest: {:?}",
+            r.highest.iter().map(|smp| &smp.tag).collect::<Vec<_>>()
+        );
+        // Sample locations are real wall coordinates.
+        for smp in r.lowest.iter().chain(&r.highest) {
+            assert!((-1.0..=11.0).contains(&smp.at[0]), "x in wall span: {:?}", smp.at);
+        }
+    }
+
+    #[test]
+    fn sunhours_stores_ground_report() {
+        let mut s = Session::default();
+        // A tower plus a distant low marker: the marker widens the scene AABB
+        // so the ground grid has open cells (under the tower = 0 h, in the
+        // clear = many hours).
+        run(&mut s, "box 0,0,0 6,6,3");
+        run(&mut s, "box 14,14,0 1,1,1");
+        run(&mut s, "location 40.0 0.0 0");
+        let out = run(&mut s, "sunhours 2024-06-21 2");
+        let r = s.doc.analysis_reports.get("sunhours").expect("report stored");
+        assert_eq!(r.kind, "sunhours");
+        assert_eq!(r.unit, "h");
+        assert_eq!(r.count, out.created.len(), "one sample per grid cell");
+        assert!(r.context.contains("2024-06-21") && r.context.contains("2 m"));
+        assert!(r.lowest.iter().chain(&r.highest).all(|smp| smp.tag == "ground"));
+        // Cells under the box are shaded: the darkest cell is well below max.
+        assert!(r.min < r.max, "min {} < max {}", r.min, r.max);
+    }
+
+    #[test]
+    fn shadowstudy_stores_report_with_time_stamps() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "location 40.71 0.0 0");
+        let out = run(&mut s, "shadowstudy 2024-06-21 09:00 15:00 180");
+        let r = s.doc.analysis_reports.get("shadowstudy").expect("report stored");
+        assert_eq!(r.kind, "shadowstudy");
+        assert_eq!(r.unit, "m2");
+        assert_eq!(r.count, out.created.len(), "one sample per shadow polygon");
+        assert!(r.context.contains("09:00") && r.context.contains("15:00"));
+        // Every sample is tagged with its HH:MM stamp and covers real area.
+        for smp in r.lowest.iter().chain(&r.highest) {
+            assert!(smp.tag.contains(':'), "stamp tag: {}", smp.tag);
+            assert!(smp.value > 0.0, "shadow polygon has area");
+        }
+    }
+
+    #[test]
+    fn radiation_stores_report_with_facings() {
+        let path = write_synth_epw("report.epw");
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 10,0.2,3");
+        run(&mut s, "location 40.71 -74.01 -5");
+        let out = run(&mut s, &format!("radiation last {}", path.display()));
+        assert!(!out.created.is_empty());
+        let r = s.doc.analysis_reports.get("radiation").expect("report stored");
+        assert_eq!(r.kind, "radiation");
+        assert_eq!(r.unit, "kWh/m2-yr");
+        assert_eq!(r.count, 12);
+        assert!(r.context.contains("report.epw"));
+        assert!(r.max > r.min);
+        assert!(
+            r.highest.iter().all(|smp| smp.tag == "up" || smp.tag == "south"),
+            "top/south collect the most annual radiation: {:?}",
+            r.highest.iter().map(|smp| &smp.tag).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn report_command_prints_summary_and_filters_by_kind() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,3");
+        run(&mut s, "location 40.0 0.0 0");
+        run(&mut s, "facesunhours last 2024-06-21");
+        let logged = s.save_log();
+
+        // Unfiltered: prints the stored report with stats + extremes.
+        let out = run(&mut s, "report");
+        assert!(out.message.contains("facesunhours (2024-06-21)"), "{}", out.message);
+        assert!(out.message.contains("min 0.0"), "{}", out.message);
+        assert!(out.message.contains("distribution:"), "{}", out.message);
+        assert!(out.message.contains("lowest:"), "{}", out.message);
+        assert!(out.message.contains("highest:"), "{}", out.message);
+        assert!(out.message.contains("[down]") || out.message.contains("[north]"),
+            "extreme samples carry facings: {}", out.message);
+
+        // Kind filter hits and misses.
+        assert!(run(&mut s, "report facesunhours").message.contains("facesunhours"));
+        let err = s.run(parse("report radiation").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("stored: facesunhours"), "{err}");
+
+        // A query never grows the op-log.
+        assert_eq!(
+            serde_json::to_string(&logged).unwrap(),
+            serde_json::to_string(&s.save_log()).unwrap(),
+            "report must not be logged"
+        );
+    }
+
+    #[test]
+    fn analysis_report_survives_checkpoint_round_trip() {
+        // The checkpoint sidecar serializes `analysis_reports`; an old snapshot
+        // without the field must still load (serde default).
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,3");
+        run(&mut s, "location 40.0 0.0 0");
+        run(&mut s, "facesunhours last 2024-06-21");
+        let json = serde_json::to_string(&s.doc).unwrap();
+        let back: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.analysis_reports, s.doc.analysis_reports);
+
+        let stripped = {
+            let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            v.as_object_mut().unwrap().remove("analysis_reports");
+            v.to_string()
+        };
+        let old: Document = serde_json::from_str(&stripped).unwrap();
+        assert!(old.analysis_reports.is_empty(), "pre-report snapshots load empty");
     }
 
     #[test]
