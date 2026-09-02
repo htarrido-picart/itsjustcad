@@ -123,6 +123,18 @@ After running an environmental analysis (sunhours, facesunhours, radiation, shad
 Ground every observation in a report sample (\"the north face at (0.0,10.0,2.0) gets 0.5 h — don't put the terrace there\") and propose a concrete fix with commands the user could run.
 ";
 
+/// The "Ask before guessing" section: when a request is ambiguous the model
+/// must emit ONE `QUESTION:` line (the explicit message form
+/// `crate::agent::parse_question` recognizes) and no commands that turn,
+/// instead of inventing dimensions or picking a target at random. Injected into
+/// both the full and the brief system prompts.
+pub const CLARIFY_HELP: &str = "\
+## Ask before guessing
+If the request is ambiguous — a missing dimension, an unclear target (\"make it bigger\" with several objects selected), or a placement you would have to invent — do NOT draw. Reply with exactly one line and NO ```draft block:
+QUESTION: <one short clarifying question>
+The user's next message answers it; then proceed normally. Never mix commands and a QUESTION in the same turn, and ask at most one question per turn, only when genuinely needed.
+";
+
 /// Terse mode's hard per-turn token cap. Fewer tokens = faster local inference;
 /// the style rules below make the model spend them on substance.
 pub const TERSE_MAX_TOKENS: u32 = 512;
@@ -207,6 +219,9 @@ split 4
 ```draft
 camera fisheye 120
 ```
+
+If the request is AMBIGUOUS (missing dimension, unclear target like "make it bigger" with several objects), do NOT guess: output exactly one line, no draft block:
+QUESTION: <one short clarifying question>
 
 Examples (follow this exact syntax):
 "a 10x10x3 slab with a 4x4 courtyard" ->
@@ -296,6 +311,7 @@ Examples:
 {view_verbs}
 {ui_verbs}
 {enviro}
+{clarify}
 ## Rules
 - Points are x,y,z or x,y (z=0). No spaces inside a point. Units: bare numbers are meters; 250cm and 500mm also work.
 - 'last' refers to the most recently created object; 'last N' to the N most recent. After a command that creates an object, that object is 'last'.
@@ -327,6 +343,7 @@ box 10,0,0 4,4,3
         view_verbs = VIEW_VERB_HELP,
         ui_verbs = UI_VERB_HELP,
         enviro = ENVIRO_CRITIQUE_HELP,
+        clarify = CLARIFY_HELP,
         scene = if scene_digest.is_empty() {
             "(empty)"
         } else {
@@ -501,6 +518,25 @@ mod tests {
         assert!(ENVIRO_CRITIQUE_HELP.contains("cooling load"));
         assert!(ENVIRO_CRITIQUE_HELP.contains("glazing"));
         assert!(ENVIRO_CRITIQUE_HELP.contains("overshadows"));
+    }
+
+    #[test]
+    fn both_prompts_advertise_clarify_before_act() {
+        // The full prompt embeds the whole section; the brief (local) prompt
+        // carries a condensed rule. Both teach the exact `QUESTION:` form the
+        // parser (`agent::parse_question`) recognizes.
+        let full = system_prompt("", &PluginRegistry::new());
+        assert!(full.contains(CLARIFY_HELP), "CLARIFY_HELP not injected");
+        assert!(full.contains("## Ask before guessing"));
+        assert!(full.contains("QUESTION: <one short clarifying question>"));
+        let brief = brief_system_prompt("");
+        assert!(brief.contains("QUESTION: <one short clarifying question>"));
+        assert!(brief.contains("AMBIGUOUS"));
+        // The advertised form round-trips through the parser.
+        assert_eq!(
+            crate::agent::parse_question("QUESTION: which object?").as_deref(),
+            Some("which object?")
+        );
     }
 
     #[test]

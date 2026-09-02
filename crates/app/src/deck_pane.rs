@@ -147,6 +147,13 @@ enum Entry {
     /// All commands of one turn — rendered as a card; clicking opens the
     /// command detail child pane.
     Commands(Vec<ExecutedCommand>),
+    /// A clarifying question the model asked instead of guessing (the
+    /// `QUESTION:` message form). Rendered distinctly; the user's next message
+    /// answers it and the turn continues naturally.
+    Question(String),
+    /// A numbered plan the model emitted for a prolonged task, snapshotted at
+    /// the moment it advanced — shown as a checklist.
+    Plan(itsjustcad_deck::Plan),
 }
 
 /// Starter prompts shown as tappable chips over an empty chat transcript. Kept
@@ -327,6 +334,28 @@ mod saved_chat_tests {
         // A single entry or a live stream both exit the empty state.
         assert!(!chat_is_empty(&[Entry::User("hi".into())], ""));
         assert!(!chat_is_empty(&[], "partial reply…"));
+    }
+
+    #[test]
+    fn saved_chat_roundtrips_question_and_plan_entries() {
+        // The clarify/plan transcript entries persist in the per-doc draft.
+        let mut plan = itsjustcad_deck::Plan::new(vec!["slab".into(), "cores".into()]);
+        plan.mark_step_done();
+        let entries = vec![
+            Entry::Question("how tall should the wall be?".into()),
+            Entry::Plan(plan.clone()),
+        ];
+        let json = serde_json::to_string(&SavedChatRef {
+            session_id: &None,
+            messages: &[],
+            transcript: &entries,
+        })
+        .unwrap();
+        let back: SavedChat = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(&back.transcript[0], Entry::Question(q) if q == "how tall should the wall be?")
+        );
+        assert!(matches!(&back.transcript[1], Entry::Plan(p) if *p == plan));
     }
 
     #[test]
@@ -1699,8 +1728,16 @@ impl DeckPane {
 
     fn finish_turn(&mut self, session: &Session, handle: &tokio::runtime::Handle) {
         if !self.streaming_chat.trim().is_empty() {
-            self.transcript
-                .push(Entry::Deck(std::mem::take(&mut self.streaming_chat)));
+            let chat = std::mem::take(&mut self.streaming_chat);
+            // Clarify-before-act: a `QUESTION:` turn (with no commands) renders
+            // as a distinct question entry; the user's next message answers it.
+            if self.current_commands.is_empty()
+                && let Some(q) = itsjustcad_deck::parse_question(&chat)
+            {
+                self.transcript.push(Entry::Question(q));
+            } else {
+                self.transcript.push(Entry::Deck(chat));
+            }
         }
         if !self.current_commands.is_empty() {
             // If the user is watching the live detail, follow it to the
@@ -2750,6 +2787,50 @@ impl DeckPane {
                                         );
                                     });
                                 }
+                                Entry::Question(q) => {
+                                    // Clarifying question: left bubble with an
+                                    // accent border + "?" badge so it reads as
+                                    // "the model is waiting on your answer".
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Min),
+                                        |ui| {
+                                            egui::Frame::NONE
+                                                .fill(deck_bg)
+                                                .stroke(egui::Stroke::new(1.5, ACCENT))
+                                                .corner_radius(bubble_radius)
+                                                .inner_margin(egui::Margin::symmetric(10, 6))
+                                                .show(ui, |ui| {
+                                                    ui.set_max_width(ui.available_width() * 0.82);
+                                                    ui.style_mut().wrap_mode =
+                                                        Some(egui::TextWrapMode::Wrap);
+                                                    ui.label(
+                                                        egui::RichText::new("?")
+                                                            .color(ACCENT)
+                                                            .strong(),
+                                                    );
+                                                    ui.label(egui::RichText::new(q));
+                                                });
+                                        },
+                                    );
+                                }
+                                Entry::Plan(plan) => {
+                                    // Plan checklist: monospace card so the
+                                    // [x]/[ ]/[!] marks align.
+                                    egui::Frame::group(ui.style())
+                                        .inner_margin(egui::Margin::same(
+                                            crate::theme::Spacing::S as i8,
+                                        ))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.label(
+                                                egui::RichText::new("Plan").strong().small(),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(plan.checklist())
+                                                    .monospace(),
+                                            );
+                                        });
+                                }
                             }
                             ui.add_space(crate::theme::Spacing::XS);
                         }
@@ -2816,6 +2897,53 @@ impl DeckPane {
             self.input = self.input.trim_end_matches('\n').to_string();
             self.send(session, handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod clarify_tests {
+    use super::*;
+
+    #[test]
+    fn question_turn_renders_as_question_entry() {
+        // A commands-free `QUESTION:` reply becomes a distinct Question entry
+        // (not a plain Deck bubble); the turn ends awaiting the user's answer.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session = Session::default();
+        let mut pane = side_effect_gate_tests::blank_pane();
+        pane.streaming_chat = "QUESTION: how tall should the wall be?".into();
+        pane.current_response = pane.streaming_chat.clone();
+        pane.finish_turn(&session, rt.handle());
+        assert!(
+            pane.transcript
+                .iter()
+                .any(|e| matches!(e, Entry::Question(q) if q == "how tall should the wall be?")),
+            "expected a Question entry"
+        );
+        assert!(
+            !pane.transcript.iter().any(|e| matches!(e, Entry::Deck(_))),
+            "question must not also render as plain chat"
+        );
+        // The raw reply stays in the API messages so the model sees its own
+        // question next turn.
+        assert!(pane.messages.last().unwrap().content.contains("QUESTION:"));
+    }
+
+    #[test]
+    fn question_alongside_commands_stays_plain_chat() {
+        // Mixing commands and a QUESTION violates the advertised contract; we
+        // fail safe by treating the prose as ordinary chat (commands already ran).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session = Session::default();
+        let mut pane = side_effect_gate_tests::blank_pane();
+        pane.streaming_chat = "QUESTION: sure?".into();
+        pane.current_commands.push(ExecutedCommand {
+            line: "box 0,0,0 1,1,1".into(),
+            result: Ok("box abc".into()),
+        });
+        pane.finish_turn(&session, rt.handle());
+        assert!(!pane.transcript.iter().any(|e| matches!(e, Entry::Question(_))));
+        assert!(pane.transcript.iter().any(|e| matches!(e, Entry::Deck(_))));
     }
 }
 
