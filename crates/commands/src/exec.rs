@@ -1131,13 +1131,10 @@ impl Session {
             "ifc" => self.import_ifc(path),
             "epw" => self.import_epw(path),
             "geojson" | "json" => self.import_geojson(path),
-            "las" => self.import_las(path),
+            "las" | "laz" => self.import_las(path),
             "e57" => self.import_e57(path),
-            "laz" => Err(ExecError::Invalid(
-                "LAZ is compressed; decompress to .las first (e.g. laszip)".to_string(),
-            )),
             other => Err(ExecError::Invalid(format!(
-                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .dae, .3dm, .step, .stp, .ifc, .epw, .geojson, .las, .e57)"
+                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .dae, .3dm, .step, .stp, .ifc, .epw, .geojson, .las, .laz, .e57)"
             ))),
         }
     }
@@ -10870,5 +10867,40 @@ mod tests {
         let loaded = crate::io::from_json(&json1).unwrap();
         let json2 = crate::io::to_json(&loaded);
         assert_eq!(json1, json2, "3dm import op-log must replay identically");
+    }
+
+    // ── LAZ point-cloud import ──────────────────────────────────────────────
+
+    /// Full-flow: write a real laz-compressed file to a temp path, import it
+    /// through the `.laz` extension, and check the points land on the
+    /// 'pointcloud' layer with an op-log that replays byte-identically.
+    #[test]
+    fn import_laz_point_cloud_full_flow() {
+        let bytes = crate::las::testutil::make_laz(25, 0.001, 10.0);
+        let mut path = std::env::temp_dir();
+        path.push(format!("itsjustcad_test_{}.laz", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut s = Session::default();
+        let out = run(&mut s, &format!("import {}", path.display()));
+        std::fs::remove_file(&path).ok();
+
+        assert!(out.message.contains("imported 25 points"), "message: {}", out.message);
+
+        let cloud = s
+            .doc
+            .objects()
+            .find(|o| matches!(o.geometry, Geometry::Points { .. }))
+            .expect("point cloud object present");
+        assert_eq!(cloud.layer, "pointcloud");
+        let Geometry::Points { positions, .. } = &cloud.geometry else { unreachable!() };
+        assert_eq!(positions.len(), 25);
+        // Record 0 decodes to the header offset exactly.
+        assert!((positions[0].x - 10.0).abs() < 1e-9, "x0={}", positions[0].x);
+
+        let json1 = crate::io::to_json(&s);
+        let loaded = crate::io::from_json(&json1).unwrap();
+        let json2 = crate::io::to_json(&loaded);
+        assert_eq!(json1, json2, "laz import op-log must replay identically");
     }
 }

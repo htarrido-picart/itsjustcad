@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Minimal LAS 1.2–1.4 parser for point-cloud import.
+//! Minimal LAS 1.2–1.4 parser for point-cloud import, with LAZ decompression.
 //!
 //! Reads the public header block to extract scale/offset and the number of
 //! point records, then decodes X/Y/Z integer triples from point formats 0–3
 //! (which all share the same first 20 bytes: X i32, Y i32, Z i32, intensity u16,
 //! flags/bits, classification, ...).  Returns `(positions, decimation_stride)`.
 //!
-//! Only uncompressed LAS is supported. LAZ files get an honest error asking the
-//! user to decompress first.
+//! Compressed LAZ (point format with bit 7 set) is handled through the pure-Rust
+//! `laz` crate (laz-rs, Apache-2.0): the "laszip encoded" VLR (record 22204) is
+//! located, its payload parsed into a [`laz::LazVlr`], and records are
+//! decompressed chunk-wise so decimation never materializes the whole cloud.
 
 use glam::DVec3;
 
@@ -22,8 +24,10 @@ pub enum LasError {
     TooShort,
     #[error("not a LAS file: signature is {0:?}, expected \"LASF\"")]
     BadSignature([u8; 4]),
-    #[error("LAZ (compressed LAS) is not supported — decompress to .las first")]
-    Laz,
+    #[error("LAZ file has no laszip VLR (record 22204) — cannot locate compression parameters")]
+    LazVlrMissing,
+    #[error("LAZ decompression failed: {0}")]
+    Laz(String),
     #[error("unsupported point data format {0} (supported: 0–3)")]
     UnsupportedFormat(u8),
     #[error("LAS header version {major}.{minor} is not 1.2–1.4")]
@@ -70,12 +74,12 @@ pub fn parse(data: &[u8]) -> Result<LasPoints, LasError> {
 
     // Point data format ID: byte 104.
     let point_format = data[104];
-    // LAZ uses bit 7 set in the format byte (0x80 | format).
-    if point_format & 0x80 != 0 {
-        return Err(LasError::Laz);
-    }
-    if point_format > 3 {
-        return Err(LasError::UnsupportedFormat(point_format));
+    // LAZ sets bit 7 in the format byte (0x80 | format); the low bits keep the
+    // uncompressed record layout.
+    let is_laz = point_format & 0x80 != 0;
+    let raw_format = point_format & 0x7f;
+    if raw_format > 3 {
+        return Err(LasError::UnsupportedFormat(raw_format));
     }
 
     // Point data record length: bytes 105–106.
@@ -124,6 +128,13 @@ pub fn parse(data: &[u8]) -> Result<LasPoints, LasError> {
     let sy = if sy == 0.0 { 0.001 } else { sy };
     let sz = if sz == 0.0 { 0.001 } else { sz };
 
+    let scale = DVec3::new(sx, sy, sz);
+    let offset = DVec3::new(ox, oy, oz);
+
+    if is_laz {
+        return parse_laz(data, header_size, point_offset, total_records, scale, offset);
+    }
+
     let point_data = &data[point_offset..];
     let available = point_data.len() / record_length;
     // Use reported count when it fits in the data; otherwise use available.
@@ -140,14 +151,113 @@ pub fn parse(data: &[u8]) -> Result<LasPoints, LasError> {
         if base + 12 > point_data.len() {
             break;
         }
-        let xi = i32::from_le_bytes(point_data[base..base + 4].try_into().unwrap());
-        let yi = i32::from_le_bytes(point_data[base + 4..base + 8].try_into().unwrap());
-        let zi = i32::from_le_bytes(point_data[base + 8..base + 12].try_into().unwrap());
-        let x = xi as f64 * sx + ox;
-        let y = yi as f64 * sy + oy;
-        let z = zi as f64 * sz + oz;
-        positions.push(DVec3::new(x, y, z));
+        positions.push(decode_xyz(&point_data[base..base + 12], scale, offset));
         i += stride;
+    }
+
+    Ok(LasPoints { positions, stride, total_records })
+}
+
+/// Decode one raw point record's leading 12 bytes (X/Y/Z as i32 LE) into a
+/// world-space position. `raw` must be at least 12 bytes.
+fn decode_xyz(raw: &[u8], scale: DVec3, offset: DVec3) -> DVec3 {
+    let xi = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+    let yi = i32::from_le_bytes(raw[4..8].try_into().unwrap());
+    let zi = i32::from_le_bytes(raw[8..12].try_into().unwrap());
+    DVec3::new(
+        xi as f64 * scale.x + offset.x,
+        yi as f64 * scale.y + offset.y,
+        zi as f64 * scale.z + offset.z,
+    )
+}
+
+/// The laszip VLR record id (per the LAZ specification).
+const LASZIP_RECORD_ID: u16 = 22204;
+/// Records decompressed per batch — keeps peak memory at
+/// `LAZ_BATCH * record_len` bytes regardless of cloud size.
+const LAZ_BATCH: usize = 8192;
+
+/// Walk the VLR block (immediately after the public header) and return the
+/// payload of the laszip VLR. VLR header layout (54 bytes): reserved u16,
+/// user_id [16], record_id u16, record_length_after_header u16, description [32].
+fn find_laszip_vlr(data: &[u8], header_size: usize) -> Option<&[u8]> {
+    let num_vlrs = u32::from_le_bytes(data[100..104].try_into().unwrap()) as usize;
+    let mut at = header_size;
+    for _ in 0..num_vlrs {
+        if at + 54 > data.len() {
+            return None;
+        }
+        let user_id = &data[at + 2..at + 18];
+        let record_id = u16::from_le_bytes(data[at + 18..at + 20].try_into().unwrap());
+        let payload_len =
+            u16::from_le_bytes(data[at + 20..at + 22].try_into().unwrap()) as usize;
+        let payload_start = at + 54;
+        let payload_end = payload_start.checked_add(payload_len)?;
+        if payload_end > data.len() {
+            return None;
+        }
+        if user_id.starts_with(b"laszip encoded") && record_id == LASZIP_RECORD_ID {
+            return Some(&data[payload_start..payload_end]);
+        }
+        at = payload_end;
+    }
+    None
+}
+
+/// Decompress a LAZ point stream, keeping every `stride`-th record.
+///
+/// The cursor spans the whole file (the chunk table offset written at the
+/// start of the point data is an absolute file position) and is seeked to
+/// `point_offset` before handing it to the decompressor. Records are pulled in
+/// [`LAZ_BATCH`]-sized batches; a decompression error mid-stream keeps the
+/// points already decoded (truncated files still import what they can) but an
+/// error before any point decodes is reported.
+fn parse_laz(
+    data: &[u8],
+    header_size: usize,
+    point_offset: usize,
+    total_records: u64,
+    scale: DVec3,
+    offset: DVec3,
+) -> Result<LasPoints, LasError> {
+    let payload = find_laszip_vlr(data, header_size).ok_or(LasError::LazVlrMissing)?;
+    let vlr = laz::LazVlr::from_buffer(payload).map_err(|e| LasError::Laz(e.to_string()))?;
+    let record_len = vlr.items_size() as usize;
+    if record_len < 12 {
+        return Err(LasError::Laz(format!(
+            "laszip VLR reports a {record_len}-byte record, smaller than an X/Y/Z triple"
+        )));
+    }
+
+    let mut cursor = std::io::Cursor::new(data);
+    cursor.set_position(point_offset as u64);
+    let mut dec = laz::LasZipDecompressor::new(cursor, vlr)
+        .map_err(|e| LasError::Laz(e.to_string()))?;
+
+    let record_count = usize::try_from(total_records).unwrap_or(usize::MAX);
+    let stride = (record_count / MAX_POINTS).max(1);
+    let mut positions = Vec::with_capacity(record_count.div_ceil(stride).min(MAX_POINTS + 1));
+
+    let mut buf = vec![0u8; LAZ_BATCH * record_len];
+    let mut done = 0usize;
+    while done < record_count {
+        let batch = LAZ_BATCH.min(record_count - done);
+        let out = &mut buf[..batch * record_len];
+        if let Err(e) = dec.decompress_many(out) {
+            if positions.is_empty() {
+                return Err(LasError::Laz(e.to_string()));
+            }
+            // Truncated/corrupt tail: keep what decoded cleanly.
+            break;
+        }
+        // Resume at the first kept (multiple-of-stride) index in this batch.
+        let mut i = done.next_multiple_of(stride);
+        while i < done + batch {
+            let base = (i - done) * record_len;
+            positions.push(decode_xyz(&out[base..base + 12], scale, offset));
+            i += stride;
+        }
+        done += batch;
     }
 
     Ok(LasPoints { positions, stride, total_records })
@@ -250,11 +360,57 @@ mod tests {
     }
 
     #[test]
-    fn laz_bit_detected() {
+    fn laz_bit_without_vlr_rejected() {
         let mut data = make_las(1, 0.001, 0.0);
-        data[104] = 0x80; // LAZ sentinel
+        data[104] = 0x80; // LAZ sentinel, but no laszip VLR present
         let err = parse(&data).unwrap_err();
-        assert!(matches!(err, LasError::Laz));
+        assert!(matches!(err, LasError::LazVlrMissing), "got: {err}");
+    }
+
+    use super::testutil::make_laz;
+
+    #[test]
+    fn laz_round_trip_positions() {
+        let data = make_laz(10, 0.01, 100.0);
+        let pts = parse(&data).unwrap();
+        assert_eq!(pts.total_records, 10);
+        assert_eq!(pts.stride, 1);
+        assert_eq!(pts.positions.len(), 10);
+        for (i, p) in pts.positions.iter().enumerate() {
+            let i = i as f64;
+            assert!((p.x - (i * 0.01 + 100.0)).abs() < 1e-9, "x[{i}]={}", p.x);
+            assert!((p.y - (2.0 * i * 0.01 + 100.0)).abs() < 1e-9, "y[{i}]={}", p.y);
+            assert!((p.z - (3.0 * i * 0.01 + 100.0)).abs() < 1e-9, "z[{i}]={}", p.z);
+        }
+    }
+
+    #[test]
+    fn laz_multi_batch_decode() {
+        // > LAZ_BATCH (8192) records exercises the batch-resume path.
+        let n = 20_000u32;
+        let data = make_laz(n, 0.001, 0.0);
+        let pts = parse(&data).unwrap();
+        assert_eq!(pts.positions.len(), n as usize);
+        // Spot-check the batch boundaries.
+        for &i in &[0usize, 8191, 8192, 16383, 16384, 19999] {
+            let expect = i as f64 * 0.001;
+            assert!(
+                (pts.positions[i].x - expect).abs() < 1e-9,
+                "x[{i}]={} expect {expect}",
+                pts.positions[i].x
+            );
+        }
+    }
+
+    #[test]
+    fn laz_garbage_vlr_payload_rejected() {
+        let mut data = make_laz(3, 0.001, 0.0);
+        // Stomp the VLR payload (starts at 227 + 54) so LazVlr::from_buffer fails.
+        for b in &mut data[281..291] {
+            *b = 0xFF;
+        }
+        let err = parse(&data).unwrap_err();
+        assert!(matches!(err, LasError::Laz(_)), "got: {err}");
     }
 
     #[test]
@@ -334,5 +490,70 @@ mod tests {
         data[155..163].copy_from_slice(&f64::INFINITY.to_le_bytes());
         let err = parse(&data).unwrap_err();
         assert!(matches!(err, LasError::NonFiniteHeader), "got: {err}");
+    }
+}
+
+
+/// Test-only LAZ builder, shared with the exec-level import test.
+#[cfg(test)]
+pub(crate) mod testutil {
+    /// Build a real LAZ file: LAS 1.2 header + laszip VLR + laz-compressed
+    /// format-0 records at (i, 2i, 3i) integer grid coordinates.
+    pub(crate) fn make_laz(n: u32, scale: f64, offset: f64) -> Vec<u8> {
+        use std::io::Write;
+
+        let items = laz::LazItemRecordBuilder::new()
+            .add_item(laz::LazItemType::Point10)
+            .build();
+        let vlr = laz::LazVlr::from_laz_items(items);
+        let mut payload = Vec::new();
+        vlr.write_to(&mut payload).unwrap();
+
+        let point_offset = 227 + 54 + payload.len();
+        let mut data = vec![0u8; 227];
+        data[0..4].copy_from_slice(b"LASF");
+        data[24] = 1;
+        data[25] = 2;
+        data[94..96].copy_from_slice(&227u16.to_le_bytes());
+        data[96..100].copy_from_slice(&(point_offset as u32).to_le_bytes());
+        data[100..104].copy_from_slice(&1u32.to_le_bytes()); // one VLR
+        data[104] = 0x80; // LAZ bit | format 0
+        data[105..107].copy_from_slice(&20u16.to_le_bytes());
+        data[107..111].copy_from_slice(&n.to_le_bytes());
+        for &off in &[131usize, 139, 147] {
+            data[off..off + 8].copy_from_slice(&scale.to_le_bytes());
+        }
+        for &off in &[155usize, 163, 171] {
+            data[off..off + 8].copy_from_slice(&offset.to_le_bytes());
+        }
+
+        // laszip VLR: reserved u16, user_id[16], record_id u16, payload len u16,
+        // description[32].
+        data.extend_from_slice(&0u16.to_le_bytes());
+        let mut user_id = [0u8; 16];
+        user_id[..14].copy_from_slice(b"laszip encoded");
+        data.extend_from_slice(&user_id);
+        data.extend_from_slice(&super::LASZIP_RECORD_ID.to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        data.extend_from_slice(&[0u8; 32]);
+        data.write_all(&payload).unwrap();
+        assert_eq!(data.len(), point_offset);
+
+        // Compress raw format-0 records into the same stream; the compressor
+        // records absolute stream positions, matching a real file's layout.
+        let mut records = Vec::with_capacity(n as usize * 20);
+        for i in 0..n as i32 {
+            let mut rec = [0u8; 20];
+            rec[0..4].copy_from_slice(&i.to_le_bytes());
+            rec[4..8].copy_from_slice(&(2 * i).to_le_bytes());
+            rec[8..12].copy_from_slice(&(3 * i).to_le_bytes());
+            records.extend_from_slice(&rec);
+        }
+        let mut cursor = std::io::Cursor::new(data);
+        cursor.set_position(point_offset as u64);
+        let mut comp = laz::LasZipCompressor::new(cursor, vlr).unwrap();
+        comp.compress_many(&records).unwrap();
+        comp.done().unwrap();
+        comp.into_inner().into_inner()
     }
 }

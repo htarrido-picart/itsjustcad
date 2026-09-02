@@ -25,3 +25,4 @@ thiserror.workspace = true
 dirs.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 e57 = "0.11.13"
+laz = "0.13"

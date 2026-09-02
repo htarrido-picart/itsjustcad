@@ -1469,12 +1469,13 @@ endsolid test\n\
         assert_eq!(parts[0].1.faces().len(), 2);
     }
 
-    // ---- LAZ actionable error ----
+    // ---- LAZ routes to the LAS/LAZ parser ----
 
     #[test]
-    fn laz_gives_actionable_error_via_exec() {
+    fn laz_routes_to_las_parser_with_clean_error() {
         use crate::{parse, Session};
-        // Write a fake .laz file (content doesn't matter — exec rejects by extension).
+        // A fake .laz now reaches the real LAS/LAZ parser (no extension
+        // rejection); garbage bytes get the parser's clean header error.
         let tmp = std::env::temp_dir().join("test_reject.laz");
         std::fs::write(&tmp, b"fake laz content").unwrap();
         let mut s = Session::default();
@@ -1482,8 +1483,8 @@ endsolid test\n\
         let err = s.run(cmd).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("LAZ") && msg.contains("decompress") && msg.contains(".las"),
-            "error should mention LAZ and decompress: {msg}"
+            msg.contains("too short") || msg.contains("not a LAS file"),
+            "garbage .laz should get the LAS parser's error: {msg}"
         );
     }
 }
