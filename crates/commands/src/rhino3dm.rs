@@ -30,9 +30,10 @@
 //! table rather than panicking, and an unrecognized class UUID is skipped by
 //! chunk length. It never allocates on unchecked counts.
 //!
-//! A matching minimal **writer** ([`write_min`]) lives at the bottom, used only
-//! by the round-trip tests — it emits a spec-conformant archive that openNURBS
-//! itself would read, so the reader is tested against genuine `.3dm` bytes.
+//! A matching minimal **writer** lives at the bottom: [`export`] maps the
+//! document's meshes and curves onto [`write_min`], which emits a
+//! spec-conformant V5 archive that openNURBS itself would read. The round-trip
+//! tests exercise the reader against these genuine `.3dm` bytes.
 
 use glam::DVec3;
 use kernel_mesh::Mesh;
@@ -40,7 +41,6 @@ use kernel_mesh::Mesh;
 // ---- typecodes (opennurbs_3dm.h) ----
 const TCODE_SHORT: u32 = 0x8000_0000;
 
-#[cfg(test)]
 const TCODE_COMMENTBLOCK: u32 = 0x0000_0001;
 const TCODE_ENDOFFILE: u32 = 0x0000_7FFF;
 const TCODE_ENDOFTABLE: u32 = 0xFFFF_FFFF;
@@ -670,7 +670,6 @@ fn read_compressed_f32_points(c: &mut Cur, vcount: usize) -> Option<Vec<[f32; 3]
 // ends of a call; chunk seed is 0). Used only by the minimal writer.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 fn crc32(seed: u32, buf: &[u8]) -> u32 {
     let mut rem = seed ^ 0xFFFF_FFFF;
     for &b in buf {
@@ -679,10 +678,8 @@ fn crc32(seed: u32, buf: &[u8]) -> u32 {
     rem ^ 0xFFFF_FFFF
 }
 
-#[cfg(test)]
 static CRC32_TABLE: [u32; 256] = build_crc_table();
 
-#[cfg(test)]
 const fn build_crc_table() -> [u32; 256] {
     let mut t = [0u32; 256];
     let mut n = 0usize;
@@ -700,13 +697,12 @@ const fn build_crc_table() -> [u32; 256] {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal writer — TEST-ONLY. Emits a spec-conformant V5 (version 50) archive
-// with a layer table and an object table of meshes/curves, so the reader can be
-// exercised against genuine `.3dm` bytes in a round-trip test.
+// Minimal writer. Emits a spec-conformant V5 (version 50) archive with a
+// layer table and an object table of meshes/curves — the archive subset every
+// Rhino release since 5 reads. Backs `export .3dm` and the round-trip tests.
 // ---------------------------------------------------------------------------
 
 /// A geometry item the minimal writer can emit.
-#[cfg(test)]
 pub enum WriteItem {
     Mesh { name: String, layer_index: i32, positions: Vec<DVec3>, tris: Vec<[u32; 3]> },
     Polyline { name: String, layer_index: i32, points: Vec<DVec3> },
@@ -714,8 +710,7 @@ pub enum WriteItem {
 }
 
 /// Write a minimal but spec-conformant `.3dm` (archive version 50) containing
-/// the given layers and geometry. Test-only.
-#[cfg(test)]
+/// the given layers and geometry.
 pub fn write_min(layers: &[&str], items: &[WriteItem]) -> Vec<u8> {
     let mut out = Vec::new();
     // 32-byte header: phrase + spaces, version "50" right-justified in [24..32].
@@ -753,11 +748,9 @@ pub fn write_min(layers: &[&str], items: &[WriteItem]) -> Vec<u8> {
     out
 }
 
-#[cfg(test)]
 const UUID_LAYER: [u8; 16] =
     [0x3C, 0x36, 0x86, 0xCA, 0xF3, 0x03, 0x11, 0xD4, 0x98, 0x1B, 0x88, 0x1C, 0x2A, 0x00, 0x2A, 0x9E];
 
-#[cfg(test)]
 fn write_object_record(out: &mut Vec<u8>, item: &WriteItem) {
     let (name, layer_index) = match item {
         WriteItem::Mesh { name, layer_index, .. } => (name, *layer_index),
@@ -787,7 +780,6 @@ fn write_object_record(out: &mut Vec<u8>, item: &WriteItem) {
     });
 }
 
-#[cfg(test)]
 fn write_opennurbs_class(out: &mut Vec<u8>, uuid: &[u8; 16], data: impl FnOnce(&mut Vec<u8>)) {
     write_big_chunk(out, TCODE_OPENNURBS_CLASS, false, |cls| {
         write_big_chunk(cls, TCODE_OPENNURBS_CLASS_UUID, true, |u| u.extend_from_slice(uuid));
@@ -796,7 +788,6 @@ fn write_opennurbs_class(out: &mut Vec<u8>, uuid: &[u8; 16], data: impl FnOnce(&
     });
 }
 
-#[cfg(test)]
 fn write_layer(out: &mut Vec<u8>, index: i32, name: &str) {
     out.push(0x1F); // chunk version 1.15
     w_i32(out, 0); // obsolete mode
@@ -811,7 +802,6 @@ fn write_layer(out: &mut Vec<u8>, index: i32, name: &str) {
     w_string(out, name); // m_name — reader stops here
 }
 
-#[cfg(test)]
 fn write_attributes(out: &mut Vec<u8>, name: &str, layer_index: i32) {
     out.push(0x2D); // chunk version 2.13
     out.extend_from_slice(&[0u8; 16]); // object uuid
@@ -823,7 +813,6 @@ fn write_attributes(out: &mut Vec<u8>, name: &str, layer_index: i32) {
     out.push(0); // terminator
 }
 
-#[cfg(test)]
 fn write_mesh(out: &mut Vec<u8>, positions: &[DVec3], tris: &[[u32; 3]]) {
     out.push(0x35); // chunk version 3.5 (V5 compressed)
     w_i32(out, positions.len() as i32);
@@ -868,7 +857,6 @@ fn write_mesh(out: &mut Vec<u8>, positions: &[DVec3], tris: &[[u32; 3]]) {
     // The remaining N/T/K/C buffers: empty (size 0). The reader stops after m_V.
 }
 
-#[cfg(test)]
 fn write_compressed_raw(out: &mut Vec<u8>, data: &[u8]) {
     w_i32(out, data.len() as i32); // uncompressed size
     if data.is_empty() {
@@ -879,7 +867,6 @@ fn write_compressed_raw(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(data);
 }
 
-#[cfg(test)]
 fn write_line_curve(out: &mut Vec<u8>, a: DVec3, b: DVec3) {
     out.push(0x10); // 1.0
     for p in [a, b] {
@@ -892,7 +879,6 @@ fn write_line_curve(out: &mut Vec<u8>, a: DVec3, b: DVec3) {
     w_i32(out, 3); // dim
 }
 
-#[cfg(test)]
 fn write_polyline_curve(out: &mut Vec<u8>, points: &[DVec3]) {
     out.push(0x10); // 1.0
     w_i32(out, points.len() as i32);
@@ -910,19 +896,15 @@ fn write_polyline_curve(out: &mut Vec<u8>, points: &[DVec3]) {
 
 // ---- writer primitives ----
 
-#[cfg(test)]
 fn w_i32(out: &mut Vec<u8>, v: i32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-#[cfg(test)]
 fn w_f32(out: &mut Vec<u8>, v: f32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-#[cfg(test)]
 fn w_f64(out: &mut Vec<u8>, v: f64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-#[cfg(test)]
 fn w_string(out: &mut Vec<u8>, s: &str) {
     let units: Vec<u16> = s.encode_utf16().collect();
     if units.is_empty() {
@@ -939,7 +921,6 @@ fn w_string(out: &mut Vec<u8>, s: &str) {
 /// Write a big chunk: typecode, then an 8-byte length placeholder, payload from
 /// `body`, an optional trailing CRC32 (over the payload+CRC), then backpatch the
 /// length (which counts the CRC bytes).
-#[cfg(test)]
 fn write_big_chunk(out: &mut Vec<u8>, typecode: u32, crc: bool, body: impl FnOnce(&mut Vec<u8>)) {
     out.extend_from_slice(&typecode.to_le_bytes());
     let len_pos = out.len();
@@ -955,10 +936,86 @@ fn write_big_chunk(out: &mut Vec<u8>, typecode: u32, crc: bool, body: impl FnOnc
 }
 
 /// Write a SHORT chunk: typecode + 8-byte inline value.
-#[cfg(test)]
 fn write_short_chunk(out: &mut Vec<u8>, typecode: u32, value: u64) {
     out.extend_from_slice(&typecode.to_le_bytes());
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Chord tolerance for tessellating curved curves (meters), matching the DXF
+/// and mesh exporters so wireframe output is consistent across formats.
+const EXPORT_TOL: f64 = 0.005;
+
+/// Export the document as a Rhino `.3dm` (openNURBS V5 archive, which Rhino 5+
+/// and every openNURBS consumer read).
+///
+/// Meshes (plain, frame, area) become `ON_Mesh`; lines become `ON_LineCurve`;
+/// polylines and tessellated arcs/ellipses/NURBS become `ON_PolylineCurve`
+/// (closed curves repeat their first point, which the reader detects as
+/// closed). Each object keeps its name and goes on its own layer; the layer
+/// table lists the document layers actually used, in first-use order.
+/// Annotations, instances and point clouds have no `.3dm` mapping here and are
+/// skipped. Returns the file bytes and a human summary for the command echo.
+pub fn export(doc: &itsjustcad_doc::Document) -> (Vec<u8>, String) {
+    use itsjustcad_doc::Geometry;
+
+    let mut layers: Vec<String> = Vec::new();
+    let layer_index = |name: &str, layers: &mut Vec<String>| -> i32 {
+        match layers.iter().position(|l| l == name) {
+            Some(i) => i as i32,
+            None => {
+                layers.push(name.to_string());
+                (layers.len() - 1) as i32
+            }
+        }
+    };
+
+    let mut items: Vec<WriteItem> = Vec::new();
+    let (mut mesh_count, mut curve_count) = (0usize, 0usize);
+    for obj in doc.objects() {
+        let name = obj.name.clone().unwrap_or_default();
+        match &obj.geometry {
+            Geometry::Mesh(m)
+            | Geometry::Frame { mesh: m, .. }
+            | Geometry::Area { mesh: m, .. } => {
+                let li = layer_index(&obj.layer, &mut layers);
+                items.push(WriteItem::Mesh {
+                    name,
+                    layer_index: li,
+                    positions: m.positions().to_vec(),
+                    tris: m.faces().to_vec(),
+                });
+                mesh_count += 1;
+            }
+            Geometry::Curve(c) => {
+                let li = layer_index(&obj.layer, &mut layers);
+                match c {
+                    kernel_curve::Curve::Line { a, b } => {
+                        items.push(WriteItem::Line { name, layer_index: li, a: *a, b: *b });
+                    }
+                    _ => {
+                        let mut points = match c {
+                            kernel_curve::Curve::Polyline { points, .. } => points.clone(),
+                            _ => c.tessellate(EXPORT_TOL),
+                        };
+                        if points.len() < 2 {
+                            continue;
+                        }
+                        if c.is_closed() && points.first() != points.last() {
+                            points.push(points[0]);
+                        }
+                        items.push(WriteItem::Polyline { name, layer_index: li, points });
+                    }
+                }
+                curve_count += 1;
+            }
+            // No `.3dm` mapping on this minimal writer path.
+            Geometry::Annotation(_) | Geometry::Instance { .. } | Geometry::Points { .. } => {}
+        }
+    }
+
+    let layer_refs: Vec<&str> = layers.iter().map(String::as_str).collect();
+    let bytes = write_min(&layer_refs, &items);
+    (bytes, format!("{mesh_count} mesh(es), {curve_count} curve(s)"))
 }
 
 #[cfg(test)]

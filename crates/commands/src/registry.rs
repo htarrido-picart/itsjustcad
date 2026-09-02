@@ -571,8 +571,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "export",
-            usage: "export <path.{dxf|stl|obj|gltf|glb|svg|csv|ifc|saf|step|stp}>",
-            summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), OBJ (meshes plus curves as polylines), SVG, CSV, IFC4 openBIM, SAF (Structural Analysis Format — ZIP of CSVs matching SAF 2.2.0 sheet names, for handoff to RFEM/SCIA/FEM-Design), or STEP/STP (AP242 via OCCT — FACETED, one BREP face per triangle; needs the 'kernel-occt' feature). Example: export /tmp/model.saf",
+            usage: "export <path.{dxf|stl|obj|gltf|glb|svg|csv|ifc|saf|3dm|step|stp}>",
+            summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), OBJ (meshes plus curves as polylines), SVG, CSV, IFC4 openBIM, SAF (Structural Analysis Format — ZIP of CSVs matching SAF 2.2.0 sheet names, for handoff to RFEM/SCIA/FEM-Design), Rhino 3DM (openNURBS V5 archive: meshes + curves with names and layers; Rhino 5+ opens it), or STEP/STP (AP242 via OCCT — FACETED, one BREP face per triangle; needs the 'kernel-occt' feature). Example: export /tmp/model.saf",
             category: Category::File,
         },
         CommandSpec {

@@ -2033,6 +2033,7 @@ impl App {
                 .add_filter("PDF", &["pdf"])
                 .add_filter("IFC", &["ifc"])
                 .add_filter("SAF", &["xml", "saf"])
+                .add_filter("Rhino 3DM", &["3dm"])
                 .set_file_name("export.dxf")
                 .save_file()
         });

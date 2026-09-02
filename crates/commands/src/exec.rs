@@ -5227,6 +5227,10 @@ fn apply_forward(
                     let (b, detail) = crate::saf::export(doc).map_err(ExecError::Invalid)?;
                     (b, detail)
                 }
+                "3dm" => {
+                    let (b, counts) = crate::rhino3dm::export(doc);
+                    (b, format!("3DM (openNURBS V5), {counts}"))
+                }
                 "step" | "stp" => {
                     // STEP export goes through OCCT. The document stores meshes
                     // (no persisted analytic BREP), so this writes a FACETED STEP
@@ -10867,6 +10871,61 @@ mod tests {
         let loaded = crate::io::from_json(&json1).unwrap();
         let json2 = crate::io::to_json(&loaded);
         assert_eq!(json1, json2, "3dm import op-log must replay identically");
+    }
+
+    // ── Rhino .3dm export ───────────────────────────────────────────────────
+
+    /// Full-flow: model a mesh + line + circle on named layers, `export .3dm`,
+    /// then import the bytes back and check geometry, names and layers survive.
+    #[test]
+    fn export_3dm_round_trips_through_import() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,1,3");
+        run(&mut s, "name last panelbox");
+        run(&mut s, "tolayer last walls");
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "circle 5,5,0 2");
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("itsjustcad_test_export_{}.3dm", std::process::id()));
+        let out = run(&mut s, &format!("export {}", path.display()));
+        assert!(out.message.contains("3DM (openNURBS V5)"), "message: {}", out.message);
+        assert!(out.message.contains("1 mesh(es), 2 curve(s)"), "message: {}", out.message);
+
+        // Read the file back through the real importer.
+        let mut s2 = Session::default();
+        let back = run(&mut s2, &format!("import {}", path.display()));
+        std::fs::remove_file(&path).ok();
+        assert!(back.message.contains("1 mesh(es)"), "message: {}", back.message);
+        assert!(back.message.contains("2 curve(s)"), "message: {}", back.message);
+
+        let mesh_obj = s2
+            .doc
+            .objects()
+            .find(|o| matches!(o.geometry, Geometry::Mesh { .. }))
+            .expect("mesh survives round trip");
+        assert_eq!(mesh_obj.name.as_deref(), Some("panelbox"));
+        assert_eq!(mesh_obj.layer, "walls");
+        let Geometry::Mesh(m) = &mesh_obj.geometry else { unreachable!() };
+        assert_eq!(m.faces().len(), 12, "box mesh keeps its 12 triangles");
+
+        // The circle came back as a closed polyline (the importer detects the
+        // repeated first point and sets the closed flag).
+        let closed = s2.doc.objects().any(|o| {
+            matches!(&o.geometry, Geometry::Curve(Curve::Polyline { points, closed: true })
+                if points.len() > 8)
+        });
+        assert!(closed, "circle survives as a closed dense polyline");
+    }
+
+    /// An empty document still exports a valid (readable) archive.
+    #[test]
+    fn export_3dm_empty_document_is_readable() {
+        let s = Session::default();
+        let (bytes, counts) = crate::rhino3dm::export(&s.doc);
+        assert_eq!(counts, "0 mesh(es), 0 curve(s)");
+        let parsed = crate::rhino3dm::import(&bytes).expect("empty archive parses");
+        assert_eq!(parsed.objects.len(), 0);
     }
 
     // ── LAZ point-cloud import ──────────────────────────────────────────────
