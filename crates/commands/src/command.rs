@@ -303,6 +303,18 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sag: Option<f64>,
     },
+    /// Minimal surface / soap film (Frei Otto): stretch a discrete soap film
+    /// across a selected **closed** curve boundary using the shared
+    /// form-finding engine (force-density harmonic net). One logged surface
+    /// mesh; the source curve is left untouched.
+    MinSurf {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        target: Selector,
+        /// Grid resolution per side (default 16).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        n: Option<u32>,
+    },
     // -- 2D primitives (create Curve objects) --
     Line {
         #[serde(default, skip_serializing_if = "Option::is_none")]

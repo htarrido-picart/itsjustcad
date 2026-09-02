@@ -3899,6 +3899,35 @@ fn apply_forward(
                 },
             ))
         }
+        Command::MinSurf { id, target, n } => {
+            let (tid, curve) = one_curve(doc, &target, "minsurf")?;
+            if !curve.is_closed() {
+                return Err(ExecError::Invalid(format!(
+                    "minsurf needs a closed boundary curve; '{tid}' is open"
+                )));
+            }
+            let mut boundary = curve.tessellate(PROFILE_TOL);
+            // Closed polylines may repeat the first point at the end; the soap
+            // film wants the loop without the duplicate.
+            if boundary.len() >= 2
+                && (boundary[0] - boundary[boundary.len() - 1]).length() < 1e-9
+            {
+                boundary.pop();
+            }
+            let nn = clamp_grid(n.unwrap_or(16)).max(2);
+            let mesh = kernel_mesh::minimal_surface(&boundary, nn).ok_or_else(|| {
+                ExecError::Invalid("minsurf: boundary curve is degenerate".into())
+            })?;
+            let id = mesh_object(doc, id, mesh);
+            Ok((
+                Command::MinSurf { id: Some(id), target, n },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("minsurf {id} (soap film, {nn}x{nn} grid over {tid})"),
+                },
+            ))
+        }
         Command::Line { id, a, b } => {
             let (id, outcome) = insert_curve(doc, id, Curve::Line { a, b }, "line");
             Ok((
@@ -6913,6 +6942,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Funicular { .. } => "funicular",
         Command::Tensegrity { .. } => "tensegrity",
         Command::Cablenet { .. } => "cablenet",
+        Command::MinSurf { .. } => "minsurf",
         Command::Line { .. } => "line",
         Command::Polyline { .. } => "polyline",
         Command::Rectangle { .. } => "rect",
@@ -11399,6 +11429,52 @@ mod tests {
         assert!(s.doc.get(id).is_none());
         run(&mut s, "redo");
         assert!(s.doc.get(id).is_some());
+    }
+
+    #[test]
+    fn minsurf_exec_undo_redo_replay() {
+        let mut s = Session::default();
+        // Saddle wire: closed polyline with alternating corner heights.
+        let wire = run(&mut s, "polyline 0,0,1 6,0,-1 6,6,1 0,6,-1 closed").created[0];
+        let out = run(&mut s, "minsurf last 8");
+        let id = out.created[0];
+        let m = mesh_of(&s, id);
+        // 9×9 grid, 8×8×2 triangles.
+        assert_eq!(m.positions().len(), 81);
+        assert_eq!(m.faces().len(), 128);
+        // Film stays inside the wire's z-range and spans the saddle midplane.
+        for p in m.positions() {
+            assert!(p.z >= -1.0 - 1e-6 && p.z <= 1.0 + 1e-6, "film outside wire: {p}");
+        }
+        // The boundary curve is kept.
+        assert!(s.doc.get(wire).is_some());
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(s.doc.get(id).is_none());
+        run(&mut s, "redo");
+        assert!(s.doc.get(id).is_some());
+    }
+
+    #[test]
+    fn minsurf_rejects_open_curves_and_non_curves() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 5,0,0");
+        assert!(s.run(parse("minsurf last").unwrap()).is_err(), "open curve must fail");
+        run(&mut s, "box 0,0,0 1,1,1");
+        assert!(s.run(parse("minsurf last").unwrap()).is_err(), "mesh must fail");
+    }
+
+    #[test]
+    fn minsurf_works_on_circle_and_soapfilm_alias_parses() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0,2 3");
+        let id = run(&mut s, "soapfilm last").created[0];
+        let m = mesh_of(&s, id);
+        // A planar boundary's harmonic film is planar: all z = 2.
+        for p in m.positions() {
+            assert!((p.z - 2.0).abs() < 1e-6, "planar film off-plane: {p}");
+        }
+        assert_replay_stable(&s);
     }
 
     #[test]

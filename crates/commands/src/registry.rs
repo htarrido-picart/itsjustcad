@@ -157,6 +157,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Structure,
         },
         CommandSpec {
+            name: "minsurf",
+            usage: "minsurf <closed curve selector> [n]",
+            summary: "Form-finding: stretch a soap film (Frei Otto minimal surface) across a selected closed curve — the boundary wire anchors an n×n net of zero-rest-length tension links solved to the harmonic equilibrium surface. The curve is kept. Example: polyline 0,0,1 6,0,-1 6,6,1 0,6,-1 closed then minsurf last",
+            category: Category::Structure,
+        },
+        CommandSpec {
             name: "line",
             usage: "line <a x,y,z> <b x,y,z>",
             summary: "Line segment. Example: line 0,0,0 10,0,0",

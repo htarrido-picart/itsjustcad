@@ -37,6 +37,8 @@ const ALIASES: &[&str] = &[
     "vol",          // volume
     "level",        // story
     "geodome",      // geodesic
+    "soapfilm",     // minsurf
+    "minimalsurface", // minsurf
 ];
 
 /// Every verb the grammar admits: canonical registry names plus parser aliases,

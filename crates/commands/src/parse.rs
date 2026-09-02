@@ -226,7 +226,22 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "gridshell" => parse_gridshell(&args),
         "funicular" | "hangchain" => parse_funicular(&args),
         "tensegrity" => parse_tensegrity(&args),
-        "cablenet" | "minimalsurface" => parse_cablenet(&args),
+        "cablenet" => parse_cablenet(&args),
+        "minsurf" | "soapfilm" | "minimalsurface" => {
+            // minsurf <closed curve selector> [n]
+            let (sel, n) = match args.as_slice() {
+                [sel] => (*sel, None),
+                [sel, n] => (*sel, Some(integer(n, "minsurf")?)),
+                _ => {
+                    return wrong(
+                        "minsurf",
+                        "a closed-curve selector and an optional grid resolution",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::MinSurf { id: None, target: selector_one(sel)?, n })
+        }
         "line" => {
             let [a, b] = take::<2>("line", "two points", &args)?;
             Ok(Command::Line {
