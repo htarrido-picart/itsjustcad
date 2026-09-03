@@ -46,11 +46,11 @@ HIG-grounded design revision, run as sequential batches. All six landed.
   - *Hardscape*: `path <curve> <width>` draped on terrain, stairs/ramp on slope w/ max-slope check (ADA 1:12 style warning), site sections through terrain.
   - Deck-callable throughout; heatmaps/analysis meshes reuse M-enviro plumbing. Pure-math parts (cut/fill, flow, contour extraction) test hard.
 
-- [ ] **M-deckagent** — deck LLM interactivity + agent harness (ties to deck-harness-FOSS goal):
-  - *Terse mode*: caveman-style response budget — system-prompt style rules + hard max-token cap per turn; substance stays, fluff dies. Toggle in settings; default ON for local models (saves tokens = faster local inference).
-  - *Clarify-before-act*: prompt teaches model to ask ONE short clarifying question when the request is ambiguous (missing dimensions, ambiguous selector, unclear target) instead of guessing; UI renders question + user reply continues turn. Test: "make it bigger" with 3 objects selected → question, not random scale.
-  - *Plan-execute harness* (Claude-Code/DeepSeek-style loop for prolonged tasks): model first emits a PLAN (numbered steps, shown as checklist in transcript) → executes step-by-step, each step = commands + reads results/errors → self-corrects on error (retry/replan, bounded) → verifies end state (query objects, counts) → summarizes. Op-log stays the substrate; plan state persists in chat session so an interrupted plan resumes. Bounded iterations + user cancel.
-  - Architecture: extend the existing tool_loop in crates/deck (already threads error results back) into plan/step/verify states; grammar (GBNF) gains plan/question/step message types so small local models emit them reliably.
+- [x] **M-deckagent** — deck LLM interactivity + agent harness (closed 2026-09-02):
+  - *Terse mode* DONE: `TERSE_STYLE_HELP` + `terse_adjusted()` (hard `TERSE_MAX_TOKENS` cap plumbed into the openai_compat/anthropic wire bodies); per-cassette `DeckConfig.terse` override, default ON for local OpenAI-compat, OFF for cloud; LLM ▸ Terse Replies checkable toggle (in-window + native), persisted in decks.json.
+  - *Clarify-before-act* DONE: `QUESTION: <text>` message form (`agent::parse_question`), CLARIFY_HELP in the full prompt + condensed rule in the brief local prompt, accent-bordered Question entry in the transcript; user's next message continues the turn. Mixed commands+QUESTION fails safe to plain chat.
+  - *Plan-execute harness* DONE: `agent::{Plan, PlanStep, parse_plan}` + `tool_loop::run_plan_loop` (Plan/Question step decisions, MAX_STEP_ATTEMPTS per-step retry, mid-run replan, cancel-preserves-state, round budget); streaming path mirrored in deck_pane (checklist Entry::Plan ticks live, step-per-turn auto-continuation, verify turn with bbox/schedule, plan persisted in the per-doc draft → resumes after relaunch, Stop pauses). GBNF root now `draft | question | plan`.
+  - NOT done (deliberate cuts): `run_plan_loop` is not yet the live execution path (the streaming deck_pane driver is; the loop is the future FOSS-harness core and is fully mock-tested); no dedicated per-step GBNF "STEP" form (steps are plain draft blocks — the existing fence grammar covers them).
 
 ## Performance (planned 2026-09-02)
 
