@@ -125,6 +125,20 @@ After running an environmental analysis (sunhours, facesunhours, radiation, shad
 Ground every observation in a report sample (\"the north face at (0.0,10.0,2.0) gets 0.5 h — don't put the terrace there\") and propose a concrete fix with commands the user could run.
 ";
 
+/// The "Compliance pre-checks" section of the deck system prompt.
+///
+/// Teaches the codecheck → `report codecheck` → grounded-critique workflow
+/// (M-checkengine). Like [`ENVIRO_CRITIQUE_HELP`] this is interpretation
+/// guidance — the `codecheck`/`checkrules`/`report` verbs are advertised
+/// through the registry — carrying the rules of thumb AND the mandatory
+/// advisory framing: these are geometric pre-checks, never a code review.
+pub const CODECHECK_HELP: &str = "\
+## Compliance pre-checks (codecheck -> report -> grounded critique)
+Run `codecheck <pack>` (the embedded `demo` pack is always available; `checkrules list` shows more) then `report codecheck` in the same ```draft block to fetch per-rule verdicts: pass/fail/warn/info with measured vs required values, violating object ids, and marker locations (colored circles on the 'compliance' layer). Critique the DESIGN grounded in rule ids and numbers — \"stair ab12cd34 riser 0.21 m > max 0.178 m (stair-riser, cf. IBC 1011.5.2): deepen the run or add a riser\" — and propose concrete fix commands.
+Rule packs are data, not code: a pack is JSON ({\"name\":..,\"rules\":[{\"id\",\"code_ref\",\"severity\":\"error|warn|info\",\"target\":{\"kinds\":[..],\"layer\",\"name_contains\"},\"check\":{\"kind\":\"max_slope|min_door_width|max_riser|min_headroom|min_clear_width|turning_circle|min_count_per_story|guard_drop\",..threshold..},\"message\"}]}). You may AUTHOR a pack for the user: draft the JSON, have them save it, then `checkrules load <path>` and `codecheck <name>`.
+ALWAYS state the disclaimer when presenting results: this is an advisory pre-check, not a code review — verify with a licensed professional / AHJ. Never claim a design \"complies\" with any code.
+";
+
 /// The "Ask before guessing" section: when a request is ambiguous the model
 /// must emit ONE `QUESTION:` line (the explicit message form
 /// `crate::agent::parse_question` recognizes) and no commands that turn,
@@ -342,6 +356,7 @@ Examples:
 {view_verbs}
 {ui_verbs}
 {enviro}
+{codecheck}
 {clarify}
 {plan}
 {tables}
@@ -376,6 +391,7 @@ box 10,0,0 4,4,3
         view_verbs = VIEW_VERB_HELP,
         ui_verbs = UI_VERB_HELP,
         enviro = ENVIRO_CRITIQUE_HELP,
+        codecheck = CODECHECK_HELP,
         clarify = CLARIFY_HELP,
         plan = PLAN_HELP,
         tables = TABLE_HELP,
@@ -573,6 +589,43 @@ mod tests {
         assert!(ENVIRO_CRITIQUE_HELP.contains("cooling load"));
         assert!(ENVIRO_CRITIQUE_HELP.contains("glazing"));
         assert!(ENVIRO_CRITIQUE_HELP.contains("overshadows"));
+    }
+
+    #[test]
+    fn prompt_teaches_codecheck_workflow() {
+        // The compliance-pre-check guidance (codecheck → `report codecheck` →
+        // critique grounded in rule ids) must be injected whole, reference the
+        // verbs it interprets, list every rule-check kind the engine supports
+        // (so the LLM can author packs), and carry the advisory disclaimer.
+        let p = system_prompt("", &PluginRegistry::new());
+        assert!(p.contains(CODECHECK_HELP), "CODECHECK_HELP not injected");
+        assert!(p.contains("## Compliance pre-checks"));
+        for verb in ["codecheck", "checkrules", "report codecheck"] {
+            assert!(
+                CODECHECK_HELP.contains(verb),
+                "codecheck section missing verb '{verb}'"
+            );
+        }
+        // Every engine check kind is authorable from the prompt alone.
+        for kind in [
+            "max_slope",
+            "min_door_width",
+            "max_riser",
+            "min_headroom",
+            "min_clear_width",
+            "turning_circle",
+            "min_count_per_story",
+            "guard_drop",
+        ] {
+            assert!(CODECHECK_HELP.contains(kind), "missing check kind '{kind}'");
+        }
+        // Advisory framing is non-negotiable.
+        assert!(CODECHECK_HELP.contains("advisory pre-check, not a code review"));
+        assert!(CODECHECK_HELP.contains("licensed professional"));
+        assert!(CODECHECK_HELP.contains("Never claim"));
+        // Markers layer + grounded-citation example.
+        assert!(CODECHECK_HELP.contains("'compliance' layer"));
+        assert!(CODECHECK_HELP.contains("stair-riser"));
     }
 
     #[test]
