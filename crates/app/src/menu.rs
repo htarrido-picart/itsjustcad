@@ -877,8 +877,13 @@ impl MenuToggles {
 fn appearance_controls(ui: &mut egui::Ui, icons: &Icons) {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let zoom = ui.ctx().zoom_factor();
+        // Small TEXT, full-size HIT AREA: `small_button` renders ~19px tall,
+        // under the hit-target floor (flagged by the M-guitest hit-target
+        // audit) — keep the compact look but give the button the floor size.
+        let hit = crate::theme::Spacing::HIT_TARGET;
+        let stepper = |t: &str| egui::Button::new(egui::RichText::new(t).small());
         if ui
-            .small_button("A+")
+            .add_sized([hit, hit], stepper("A+"))
             .on_hover_text("bigger text (Cmd =)")
             .clicked()
         {
@@ -886,7 +891,7 @@ fn appearance_controls(ui: &mut egui::Ui, icons: &Icons) {
         }
         ui.label(format!("{:.0}%", zoom * 100.0));
         if ui
-            .small_button("A−")
+            .add_sized([hit, hit], stepper("A−"))
             .on_hover_text("smaller text (Cmd -)")
             .clicked()
         {

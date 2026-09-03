@@ -6660,6 +6660,78 @@ mod tests {
         });
     }
 
+    // ── M-guitest: automated usability audits ────────────────────────────
+
+    /// Every interactive control in the real main window meets the hit-target
+    /// height floor (`Spacing::HIT_TARGET`). Walks the AccessKit tree by role
+    /// rather than trusting the style metrics — a widget that opts out of
+    /// `interact_size` shows up here.
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (usability audits)"]
+    fn audit_hit_targets_meet_floor() {
+        run_app_journey(|h| {
+            use egui::accesskit::Role;
+            use egui_kittest::kittest::{NodeT as _, Queryable as _};
+            let floor = crate::theme::Spacing::HIT_TARGET;
+            let clickable = |r: Role| {
+                matches!(
+                    r,
+                    Role::Button
+                        | Role::CheckBox
+                        | Role::RadioButton
+                        | Role::Switch
+                        | Role::Slider
+                        | Role::ComboBox
+                )
+            };
+            let mut violations: Vec<String> = Vec::new();
+            for n in h.query_all_by(move |n| clickable(n.role())) {
+                let r = n.rect();
+                // Height is the floor that matters for pointer acquisition in a
+                // toolbar-dense CAD UI; width legitimately hugs the label.
+                if r.height() + 0.5 < floor {
+                    let label = n.accesskit_node().label().unwrap_or_default();
+                    violations.push(format!(
+                        "{:?} {label:?} {}x{}",
+                        n.accesskit_node().role(),
+                        r.width().round(),
+                        r.height().round()
+                    ));
+                }
+            }
+            assert!(
+                violations.is_empty(),
+                "interactive widgets below the {floor}px hit-target floor:\n{}",
+                violations.join("\n")
+            );
+        });
+    }
+
+    /// Keyboard-only traversal: from the default focus (the command line), Tab
+    /// must always land SOMEWHERE (no dead ends) and revisit the start within a
+    /// bounded number of presses (the focus order is a cycle, not a one-way
+    /// street).
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (usability audits)"]
+    fn audit_keyboard_traversal_cycles() {
+        run_app_journey(|h| {
+            let start = h.ctx.memory(|m| m.focused());
+            assert!(start.is_some(), "the command line grabs initial focus");
+            let mut revisited = false;
+            for i in 0..64 {
+                h.key_press(egui::Key::Tab);
+                h.run_steps(2);
+                let f = h.ctx.memory(|m| m.focused());
+                assert!(f.is_some(), "focus lost after {i} Tab presses (dead end)");
+                if f == start {
+                    revisited = true;
+                    break;
+                }
+            }
+            assert!(revisited, "Tab traversal never cycled back to the start");
+        });
+    }
+
     #[test]
     fn discard_choice_clears_pending_and_performs_nav() {
         // The user-reported bug: clicking Discard did nothing. The guard's

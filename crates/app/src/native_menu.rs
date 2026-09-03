@@ -362,6 +362,34 @@ mod tests {
         }
     }
 
+    /// M-guitest usability audit: no two menu items with DIFFERENT actions may
+    /// claim the same keyboard shortcut within one menu style — a duplicate
+    /// accelerator makes one of the actions unreachable from the keyboard.
+    /// The same action may legitimately appear under two menus with one
+    /// shortcut (e.g. Settings… in File and LLM ▸ Model Setup… both open the
+    /// settings dialog on ⌘,). Normalizes case so "Cmd+S" and "cmd+s" collide
+    /// as they would in the OS.
+    #[test]
+    fn native_shortcuts_are_unique_per_style() {
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            let mut owner: HashMap<String, MenuAction> = HashMap::new(); // accel → action
+            for top in native_model(style, true, ViewState::default()) {
+                for item in &top.items {
+                    if let NativeItem::Leaf { shortcut: Some(s), action, .. } = item {
+                        let key = s.to_ascii_lowercase();
+                        if let Some(prev) = owner.insert(key, action.clone()) {
+                            assert_eq!(
+                                &prev, action,
+                                "shortcut {s:?} bound to TWO different actions ({style:?})"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(!owner.is_empty(), "menus carry shortcuts to audit");
+        }
+    }
+
     /// Every menu-item accelerator string in the model parses into a muda
     /// [`Accelerator`] — a malformed shortcut would silently vanish from the OS
     /// menu, so we assert none is malformed.
