@@ -214,6 +214,228 @@ pub fn cut_fill(
     (cut, fill)
 }
 
+// ─── planting ────────────────────────────────────────────────────────────────
+
+/// One species in the embedded plant catalog (`assets/plants.json`). Real
+/// nursery-guide figures: mature height, canopy spread, typical growth rate.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PlantSpecies {
+    pub id: String,
+    pub common: String,
+    pub binomial: String,
+    pub mature_height_m: f64,
+    pub canopy_diameter_m: f64,
+    pub growth_m_per_year: f64,
+    pub deciduous: bool,
+    /// Canopy silhouette: "round" (deciduous shade tree), "cone" (conifer /
+    /// pyramidal evergreen), "column" (fastigiate).
+    pub form: String,
+}
+
+/// The embedded plant catalog, parsed once. The JSON is a compile-time asset,
+/// so `plant` stays a pure command (no filesystem read at run time).
+pub fn plant_catalog() -> &'static [PlantSpecies] {
+    static CATALOG: std::sync::OnceLock<Vec<PlantSpecies>> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        serde_json::from_str(include_str!("../assets/plants.json"))
+            .expect("embedded plants.json must parse")
+    })
+}
+
+/// Find a species by exact id, then by case-insensitive substring of the id,
+/// common or botanical name ("oak" → Quercus robur). First match in catalog
+/// order wins, so lookups are deterministic.
+pub fn find_species(query: &str) -> Option<&'static PlantSpecies> {
+    let q = query.to_lowercase();
+    let cat = plant_catalog();
+    cat.iter().find(|s| s.id == q).or_else(|| {
+        cat.iter().find(|s| {
+            s.id.contains(&q)
+                || s.common.to_lowercase().contains(&q)
+                || s.binomial.to_lowercase().contains(&q)
+        })
+    })
+}
+
+/// Height and canopy diameter at `age_years` (None = mature): a linear
+/// height-growth model capped at maturity, canopy scaled proportionally.
+/// Floored at 5% so a newly planted whip still shows up.
+pub fn plant_size(sp: &PlantSpecies, age_years: Option<f64>) -> (f64, f64) {
+    let f = match age_years {
+        None => 1.0,
+        Some(a) => (a * sp.growth_m_per_year / sp.mature_height_m).clamp(0.05, 1.0),
+    };
+    (f * sp.mature_height_m, f * sp.canopy_diameter_m)
+}
+
+/// Append a UV ellipsoid (canopy ball) to a mesh under construction.
+fn push_ellipsoid(
+    pos: &mut Vec<DVec3>,
+    faces: &mut Vec<[u32; 3]>,
+    center: DVec3,
+    rxy: f64,
+    rz: f64,
+) {
+    const SEG: usize = 8; // longitudes
+    const STACK: usize = 6; // latitudes
+    let base = pos.len() as u32;
+    pos.push(center + DVec3::new(0.0, 0.0, rz)); // north pole
+    for j in 1..STACK {
+        let phi = std::f64::consts::PI * j as f64 / STACK as f64;
+        for i in 0..SEG {
+            let th = std::f64::consts::TAU * i as f64 / SEG as f64;
+            pos.push(center + DVec3::new(
+                rxy * phi.sin() * th.cos(),
+                rxy * phi.sin() * th.sin(),
+                rz * phi.cos(),
+            ));
+        }
+    }
+    pos.push(center - DVec3::new(0.0, 0.0, rz)); // south pole
+    let ring = |j: usize, i: usize| base + 1 + ((j - 1) * SEG + i % SEG) as u32;
+    for i in 0..SEG {
+        faces.push([base, ring(1, i + 1), ring(1, i)]);
+    }
+    for j in 1..STACK - 1 {
+        for i in 0..SEG {
+            let (a, b, c, d) = (ring(j, i), ring(j, i + 1), ring(j + 1, i + 1), ring(j + 1, i));
+            faces.push([a, b, c]);
+            faces.push([a, c, d]);
+        }
+    }
+    let south = base + 1 + ((STACK - 1) * SEG) as u32;
+    for i in 0..SEG {
+        faces.push([south, ring(STACK - 1, i), ring(STACK - 1, i + 1)]);
+    }
+}
+
+/// Append a closed cone (conifer canopy) to a mesh under construction.
+fn push_cone(
+    pos: &mut Vec<DVec3>,
+    faces: &mut Vec<[u32; 3]>,
+    base_center: DVec3,
+    radius: f64,
+    height: f64,
+) {
+    const SEG: usize = 8;
+    let b = pos.len() as u32;
+    pos.push(base_center + DVec3::new(0.0, 0.0, height)); // apex
+    pos.push(base_center); // base center
+    for i in 0..SEG {
+        let th = std::f64::consts::TAU * i as f64 / SEG as f64;
+        pos.push(base_center + DVec3::new(radius * th.cos(), radius * th.sin(), 0.0));
+    }
+    for i in 0..SEG as u32 {
+        let (p, q) = (b + 2 + i, b + 2 + (i + 1) % SEG as u32);
+        faces.push([b, p, q]); // side
+        faces.push([b + 1, q, p]); // base
+    }
+}
+
+/// Append a hexagonal prism (trunk) to a mesh under construction.
+fn push_prism(
+    pos: &mut Vec<DVec3>,
+    faces: &mut Vec<[u32; 3]>,
+    base_center: DVec3,
+    radius: f64,
+    height: f64,
+) {
+    const SEG: usize = 6;
+    let b = pos.len() as u32;
+    for ring in 0..2 {
+        let z = height * ring as f64;
+        for i in 0..SEG {
+            let th = std::f64::consts::TAU * i as f64 / SEG as f64;
+            pos.push(base_center + DVec3::new(radius * th.cos(), radius * th.sin(), z));
+        }
+    }
+    let s = SEG as u32;
+    for i in 0..s {
+        let j = (i + 1) % s;
+        faces.push([b + i, b + j, b + s + j]);
+        faces.push([b + i, b + s + j, b + s + i]);
+    }
+    for i in 1..s - 1 {
+        faces.push([b, b + i + 1, b + i]); // bottom cap
+        faces.push([b + s, b + s + i, b + s + i + 1]); // top cap
+    }
+}
+
+/// Trunk + canopy mesh for a species at `base` (ground point), scaled by age.
+/// Deterministic; participates in shadow/sun analyses like any scene mesh.
+pub fn plant_mesh(
+    sp: &PlantSpecies,
+    base: DVec3,
+    age_years: Option<f64>,
+) -> (Vec<DVec3>, Vec<[u32; 3]>) {
+    let (h, canopy_d) = plant_size(sp, age_years);
+    let trunk_frac = match sp.form.as_str() {
+        "cone" => 0.15,
+        "column" => 0.10,
+        _ => 0.35,
+    };
+    let trunk_h = trunk_frac * h;
+    let trunk_r = (0.02 * h).clamp(0.05, 0.5);
+    let mut pos = Vec::new();
+    let mut faces = Vec::new();
+    push_prism(&mut pos, &mut faces, base, trunk_r, trunk_h);
+    let canopy_base = base + DVec3::new(0.0, 0.0, trunk_h);
+    match sp.form.as_str() {
+        "cone" => push_cone(&mut pos, &mut faces, canopy_base, canopy_d / 2.0, h - trunk_h),
+        _ => {
+            let rz = (h - trunk_h) / 2.0;
+            push_ellipsoid(
+                &mut pos,
+                &mut faces,
+                canopy_base + DVec3::new(0.0, 0.0, rz),
+                canopy_d / 2.0,
+                rz,
+            );
+        }
+    }
+    (pos, faces)
+}
+
+/// Planting positions for a row from `a` to `b` at `spacing`: every multiple
+/// of `spacing` along the segment starting at `a` (b included only when the
+/// length is an exact multiple).
+pub fn row_positions(a: DVec3, b: DVec3, spacing: f64) -> Vec<DVec3> {
+    if spacing <= 0.0 || !spacing.is_finite() {
+        return Vec::new();
+    }
+    let len = (b - a).length();
+    if len < 1e-12 {
+        return vec![a];
+    }
+    let dir = (b - a) / len;
+    let n = (len / spacing + 1e-9).floor() as usize + 1;
+    (0..n).map(|i| a + dir * (i as f64 * spacing)).collect()
+}
+
+/// Terrain elevation at `(x, y)` by barycentric interpolation over the first
+/// XY-containing triangle; `None` when outside the terrain footprint.
+pub fn terrain_z_at(positions: &[DVec3], faces: &[[u32; 3]], x: f64, y: f64) -> Option<f64> {
+    for f in faces {
+        let (a, b, c) = (
+            positions[f[0] as usize],
+            positions[f[1] as usize],
+            positions[f[2] as usize],
+        );
+        let det = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+        if det.abs() < 1e-18 {
+            continue;
+        }
+        let u = ((x - a.x) * (c.y - a.y) - (c.x - a.x) * (y - a.y)) / det;
+        let v = ((b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y)) / det;
+        let w = 1.0 - u - v;
+        let eps = -1e-9;
+        if u >= eps && v >= eps && w >= eps {
+            return Some(w * a.z + u * b.z + v * c.z);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +602,90 @@ mod tests {
             (cut - fill).abs() < 0.2,
             "symmetric grading must balance: cut {cut} vs fill {fill}"
         );
+    }
+
+    #[test]
+    fn plant_catalog_parses_twelve_real_species() {
+        let cat = plant_catalog();
+        assert_eq!(cat.len(), 12);
+        for sp in cat {
+            assert!(sp.mature_height_m > 0.0 && sp.canopy_diameter_m > 0.0);
+            assert!(sp.growth_m_per_year > 0.0);
+            assert!(matches!(sp.form.as_str(), "round" | "cone" | "column"), "{}", sp.id);
+            assert!(sp.binomial.contains(' '), "binomial has genus + species");
+        }
+        // Conifers in the catalog are evergreen.
+        assert!(!find_species("picea-abies").unwrap().deciduous);
+        assert!(find_species("quercus-robur").unwrap().deciduous);
+    }
+
+    #[test]
+    fn find_species_by_id_common_and_binomial_substring() {
+        assert_eq!(find_species("quercus-robur").unwrap().id, "quercus-robur");
+        assert_eq!(find_species("oak").unwrap().id, "quercus-robur");
+        assert_eq!(find_species("Betula").unwrap().id, "betula-pendula");
+        assert_eq!(find_species("SPRUCE").unwrap().id, "picea-abies");
+        assert!(find_species("triffid").is_none());
+    }
+
+    #[test]
+    fn canopy_scales_with_age_and_caps_at_maturity() {
+        let oak = find_species("quercus-robur").unwrap(); // 30 m at 0.5 m/yr
+        let (h_mature, d_mature) = plant_size(oak, None);
+        assert_eq!((h_mature, d_mature), (30.0, 25.0));
+        let (h10, d10) = plant_size(oak, Some(10.0)); // 10yr·0.5 = 5 m → f=1/6
+        assert!((h10 - 5.0).abs() < 1e-9);
+        assert!((d10 - 25.0 / 6.0).abs() < 1e-9);
+        // Past maturity the cap holds; a seedling gets the 5% floor.
+        assert_eq!(plant_size(oak, Some(500.0)), (30.0, 25.0));
+        let (h0, _) = plant_size(oak, Some(0.0));
+        assert!((h0 - 1.5).abs() < 1e-9, "5% floor");
+    }
+
+    #[test]
+    fn plant_mesh_spans_ground_to_height_and_canopy_width() {
+        let pine = find_species("pinus-sylvestris").unwrap();
+        let base = DVec3::new(3.0, 4.0, 1.0);
+        let (pos, faces) = plant_mesh(pine, base, None);
+        assert!(!faces.is_empty());
+        let zmin = pos.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+        let zmax = pos.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+        assert!((zmin - 1.0).abs() < 1e-9, "trunk starts at ground");
+        assert!((zmax - (1.0 + 25.0)).abs() < 1e-9, "apex at mature height");
+        let rmax = pos
+            .iter()
+            .map(|p| ((p.x - 3.0).powi(2) + (p.y - 4.0).powi(2)).sqrt())
+            .fold(0.0f64, f64::max);
+        assert!((rmax - 4.5).abs() < 1e-9, "canopy radius = 9/2");
+        // Age-scaled mesh is proportionally smaller.
+        let (pos_y, _) = plant_mesh(pine, base, Some(10.0)); // f = 4/25
+        let zmax_y = pos_y.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+        assert!((zmax_y - (1.0 + 4.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn row_positions_count_and_spacing() {
+        let a = DVec3::ZERO;
+        let b = DVec3::new(10.0, 0.0, 0.0);
+        let row = row_positions(a, b, 2.5);
+        assert_eq!(row.len(), 5, "0, 2.5, 5, 7.5, 10");
+        assert_eq!(*row.last().unwrap(), b, "exact multiple includes b");
+        for (i, p) in row.iter().enumerate() {
+            assert!((p.x - i as f64 * 2.5).abs() < 1e-9);
+        }
+        assert_eq!(row_positions(a, DVec3::new(9.9, 0.0, 0.0), 2.5).len(), 4);
+        assert!(row_positions(a, b, 0.0).is_empty(), "bad spacing → empty");
+        assert_eq!(row_positions(a, a, 2.0).len(), 1, "degenerate row = one plant");
+    }
+
+    #[test]
+    fn terrain_z_interpolates_and_rejects_outside() {
+        let (pos, faces) = grid_terrain(10, 10.0, |x, y| x + 2.0 * y);
+        // Interior, off-vertex point: exact for a piecewise-linear plane.
+        let z = terrain_z_at(&pos, &faces, 3.3, 4.7).unwrap();
+        assert!((z - (3.3 + 9.4)).abs() < 1e-9);
+        assert!(terrain_z_at(&pos, &faces, -1.0, 5.0).is_none());
+        assert!(terrain_z_at(&pos, &faces, 5.0, 11.0).is_none());
     }
 
     #[test]

@@ -672,6 +672,24 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "plant",
+            usage: "plant <species> <x,y[,z]> [age-years]",
+            summary: "Place one plant from the embedded 12-species catalog (ids like quercus-robur, acer-rubrum, betula-pendula, pinus-sylvestris, picea-abies, tilia-cordata; common-name substrings like 'oak' work too): a trunk + canopy mesh named 'plant:<id>' on layer 'planting', draped onto the terrain surface when one exists. [age-years] scales height and canopy along the species growth rate (default mature). Planted canopies occlude sun like any mesh, so shadowstudy/sunhours/radiation account for them. Example: plant oak 10,5 25",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "plantrow",
+            usage: "plantrow <species> <a x,y> <b x,y> <spacing>",
+            summary: "A row of plants from a to b, one every <spacing> meters (b included when the length is an exact multiple). Same catalog, draping and layer as `plant`. Example: plantrow tilia 0,0 30,0 6",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "plantschedule",
+            usage: "plantschedule <path.csv>",
+            summary: "Export a planting schedule CSV (species id, botanical + common name, count, mature height, canopy spread, deciduous flag) counting every 'plant:*' object on layer 'planting', and store an AnalysisReport ('plantschedule', see `report`). Example: plantschedule /tmp/planting.csv",
+            category: Category::Analyze,
+        },
+        CommandSpec {
             name: "osmfile",
             usage: "osmfile <path.json>",
             summary: "Build OpenStreetMap building context from a saved Overpass API JSON export ('out geom;' query): each building-tagged way footprint is extruded (height tag, else building:levels x 3 m, else 9 m) into a mesh on layer 'context'. lon/lat projected to local meters when a location is set. Example: osmfile /tmp/overpass.json",

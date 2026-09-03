@@ -1020,6 +1020,34 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("cutfill", &args, &args)?;
             Ok(Command::CutFill { original_z: None })
         }
+        "plant" => match args.as_slice() {
+            [species, at] => Ok(Command::Plant {
+                species: (*species).to_string(),
+                at: point(at)?,
+                age_years: None,
+            }),
+            [species, at, age] => Ok(Command::Plant {
+                species: (*species).to_string(),
+                at: point(at)?,
+                age_years: Some(number(age)?),
+            }),
+            _ => wrong("plant", "a species, a point and optionally an age in years", &args),
+        },
+        "plantrow" => match args.as_slice() {
+            [species, a, b, spacing] => Ok(Command::PlantRow {
+                species: (*species).to_string(),
+                a: point(a)?,
+                b: point(b)?,
+                spacing: number(spacing)?,
+            }),
+            _ => wrong("plantrow", "a species, two points and a spacing", &args),
+        },
+        "plantschedule" => {
+            if args.is_empty() {
+                return Err(wrong_err("plantschedule", "an output .csv path", &args));
+            }
+            Ok(Command::PlantSchedule { path: args.join(" ") })
+        }
         "view" => match args.as_slice() {
             ["save", name] => Ok(Command::ViewSave {
                 name: (*name).to_string(),

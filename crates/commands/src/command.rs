@@ -941,6 +941,31 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         original_z: Option<Vec<f64>>,
     },
+    /// Place one plant from the embedded species catalog: a trunk + canopy
+    /// mesh at `at` (draped onto the terrain surface when one exists), scaled
+    /// by `age_years` (None = mature). Expands into a single MeshLiteral op
+    /// named "plant:<species-id>" on layer "planting"; the Plant op itself is
+    /// not logged, exactly like Terrain.
+    Plant {
+        species: String,
+        at: DVec3,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        age_years: Option<f64>,
+    },
+    /// A row of plants from `a` to `b` at `spacing` intervals. Expands into
+    /// one MeshLiteral op per plant; not logged itself.
+    PlantRow {
+        species: String,
+        a: DVec3,
+        b: DVec3,
+        spacing: f64,
+    },
+    /// Export a planting schedule CSV (species, count, mature size) for
+    /// everything on layer "planting", and store an AnalysisReport
+    /// ("plantschedule") for the deck. Not logged (fs write, like Export).
+    PlantSchedule {
+        path: String,
+    },
     /// A raw triangle mesh carried verbatim in the op-log. Used by mesh import
     /// (.obj/.stl/.gltf/.glb) so each imported object is one self-contained
     /// logged op — no external file dependency on replay. Not exposed in the
@@ -1324,6 +1349,9 @@ impl Command {
                 | Command::Import { .. }
                 | Command::Terrain { .. }
                 | Command::OsmFile { .. }
+                | Command::Plant { .. }
+                | Command::PlantRow { .. }
+                | Command::PlantSchedule { .. }
                 | Command::Distance { .. }
                 | Command::Area { .. }
                 | Command::Volume { .. }
@@ -1363,6 +1391,7 @@ impl Command {
                 | Command::Import { .. }
                 | Command::Terrain { .. }
                 | Command::OsmFile { .. }
+                | Command::PlantSchedule { .. }
                 | Command::Underlay { .. }
                 | Command::BlockLibLoad { .. }
         )
@@ -1380,6 +1409,7 @@ impl Command {
             Command::Import { path } => Some(format!("import ← {path}")),
             Command::Terrain { path } => Some(format!("terrain ← {path}")),
             Command::OsmFile { path } => Some(format!("osm ← {path}")),
+            Command::PlantSchedule { path } => Some(format!("plantschedule → {path}")),
             Command::Underlay { path, .. } => Some(format!("underlay ← {path}")),
             Command::BlockLibLoad { name, .. } => {
                 Some(format!("blockload ← library:{name}"))
@@ -1408,6 +1438,7 @@ mod classify_tests {
             Command::Import { path: "/etc/passwd".into() },
             Command::Terrain { path: "/tmp/t.csv".into() },
             Command::OsmFile { path: "/tmp/o.json".into() },
+            Command::PlantSchedule { path: "/tmp/plants.csv".into() },
             Command::Underlay { path: "/tmp/p.png".into(), corner: None, width: None, height: None },
         ];
         for c in &cases {

@@ -1,0 +1,14 @@
+[
+  {"id": "quercus-robur", "common": "English oak", "binomial": "Quercus robur", "mature_height_m": 30.0, "canopy_diameter_m": 25.0, "growth_m_per_year": 0.5, "deciduous": true, "form": "round"},
+  {"id": "acer-rubrum", "common": "red maple", "binomial": "Acer rubrum", "mature_height_m": 18.0, "canopy_diameter_m": 12.0, "growth_m_per_year": 0.6, "deciduous": true, "form": "round"},
+  {"id": "betula-pendula", "common": "silver birch", "binomial": "Betula pendula", "mature_height_m": 20.0, "canopy_diameter_m": 9.0, "growth_m_per_year": 0.7, "deciduous": true, "form": "round"},
+  {"id": "pinus-sylvestris", "common": "Scots pine", "binomial": "Pinus sylvestris", "mature_height_m": 25.0, "canopy_diameter_m": 9.0, "growth_m_per_year": 0.4, "deciduous": false, "form": "cone"},
+  {"id": "picea-abies", "common": "Norway spruce", "binomial": "Picea abies", "mature_height_m": 35.0, "canopy_diameter_m": 8.0, "growth_m_per_year": 0.5, "deciduous": false, "form": "cone"},
+  {"id": "tilia-cordata", "common": "littleleaf linden", "binomial": "Tilia cordata", "mature_height_m": 25.0, "canopy_diameter_m": 12.0, "growth_m_per_year": 0.4, "deciduous": true, "form": "round"},
+  {"id": "platanus-acerifolia", "common": "London plane", "binomial": "Platanus x acerifolia", "mature_height_m": 30.0, "canopy_diameter_m": 20.0, "growth_m_per_year": 0.6, "deciduous": true, "form": "round"},
+  {"id": "gleditsia-triacanthos", "common": "honey locust", "binomial": "Gleditsia triacanthos", "mature_height_m": 20.0, "canopy_diameter_m": 12.0, "growth_m_per_year": 0.6, "deciduous": true, "form": "round"},
+  {"id": "prunus-serrulata", "common": "Japanese flowering cherry", "binomial": "Prunus serrulata", "mature_height_m": 8.0, "canopy_diameter_m": 8.0, "growth_m_per_year": 0.3, "deciduous": true, "form": "round"},
+  {"id": "lagerstroemia-indica", "common": "crape myrtle", "binomial": "Lagerstroemia indica", "mature_height_m": 6.0, "canopy_diameter_m": 5.0, "growth_m_per_year": 0.4, "deciduous": true, "form": "round"},
+  {"id": "magnolia-grandiflora", "common": "southern magnolia", "binomial": "Magnolia grandiflora", "mature_height_m": 25.0, "canopy_diameter_m": 12.0, "growth_m_per_year": 0.3, "deciduous": false, "form": "cone"},
+  {"id": "cupressus-sempervirens", "common": "Italian cypress", "binomial": "Cupressus sempervirens", "mature_height_m": 20.0, "canopy_diameter_m": 3.0, "growth_m_per_year": 0.5, "deciduous": false, "form": "column"}
+]

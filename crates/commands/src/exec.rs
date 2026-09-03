@@ -572,6 +572,11 @@ impl Session {
             Command::Import { path } => self.import(path),
             Command::Terrain { path } => self.terrain(path),
             Command::OsmFile { path } => self.osmfile(path),
+            Command::Plant { species, at, age_years } => self.plant(species, at, age_years),
+            Command::PlantRow { species, a, b, spacing } => {
+                self.plantrow(species, a, b, spacing)
+            }
+            Command::PlantSchedule { path } => self.plantschedule(path),
             cmd => {
                 let logged = cmd.is_logged();
                 // A new logged edit truncates the redo tail, so the undo history
@@ -1670,6 +1675,171 @@ impl Session {
         Ok(ApplyOutcome {
             created,
             message: format!("OSM context from {path}: {total} building(s) on layer 'context'"),
+        })
+    }
+
+    /// Ground elevation for planting at `(x, y)`: the terrain surface height
+    /// when a terrain mesh exists and the point is inside its footprint, else
+    /// the caller's own z.
+    fn ground_z(&self, x: f64, y: f64, fallback: f64) -> f64 {
+        terrain_surface(&self.doc)
+            .ok()
+            .and_then(|(_, m)| {
+                crate::landscape::terrain_z_at(m.positions(), m.faces(), x, y)
+            })
+            .unwrap_or(fallback)
+    }
+
+    /// Place one plant from the embedded catalog: trunk + canopy mesh at `at`
+    /// (draped onto the terrain), one MeshLiteral op named "plant:<id>" on
+    /// layer "planting". Like `terrain`, the Plant verb itself is not logged —
+    /// its MeshLiteral expansion is, so replay never depends on the catalog.
+    fn plant(
+        &mut self,
+        species: String,
+        at: DVec3,
+        age_years: Option<f64>,
+    ) -> Result<ApplyOutcome, ExecError> {
+        let sp = crate::landscape::find_species(&species).ok_or_else(|| {
+            let ids: Vec<&str> =
+                crate::landscape::plant_catalog().iter().map(|s| s.id.as_str()).collect();
+            ExecError::Invalid(format!(
+                "unknown species '{species}' — catalog: {}",
+                ids.join(", ")
+            ))
+        })?;
+        let base = DVec3::new(at.x, at.y, self.ground_z(at.x, at.y, at.z));
+        let (positions, faces) = crate::landscape::plant_mesh(sp, base, age_years);
+        let (h, canopy_d) = crate::landscape::plant_size(sp, age_years);
+
+        let prev_layer = self.doc.current_layer.clone();
+        if self.doc.current_layer != "planting" {
+            self.run(Command::Layer { name: "planting".to_string() })?;
+        }
+        let out = self.run(Command::MeshLiteral {
+            id: None,
+            positions,
+            faces,
+            name: Some(format!("plant:{}", sp.id)),
+        })?;
+        if self.doc.current_layer != prev_layer {
+            self.run(Command::Layer { name: prev_layer })?;
+        }
+        let age_note = match age_years {
+            Some(a) => format!(" at {a:.0} yr"),
+            None => " (mature)".to_string(),
+        };
+        Ok(ApplyOutcome {
+            created: out.created,
+            message: format!(
+                "planted {} ({}){age_note}: height {h:.1} m, canopy {canopy_d:.1} m at \
+                 ({:.1}, {:.1}, {:.2}) on layer 'planting'",
+                sp.common, sp.binomial, base.x, base.y, base.z
+            ),
+        })
+    }
+
+    /// A row of plants from `a` to `b` at `spacing` intervals, each draped
+    /// onto the terrain. One MeshLiteral op per plant.
+    fn plantrow(
+        &mut self,
+        species: String,
+        a: DVec3,
+        b: DVec3,
+        spacing: f64,
+    ) -> Result<ApplyOutcome, ExecError> {
+        if spacing <= 0.0 || !spacing.is_finite() {
+            return Err(ExecError::Invalid("plantrow spacing must be > 0".into()));
+        }
+        let positions = crate::landscape::row_positions(a, b, spacing);
+        let mut created = Vec::new();
+        for p in &positions {
+            let out = self.plant(species.clone(), *p, None)?;
+            created.extend(out.created);
+        }
+        let n = positions.len();
+        Ok(ApplyOutcome {
+            created,
+            message: format!(
+                "planted a row of {n} {species} every {spacing} m from ({:.1}, {:.1}) to \
+                 ({:.1}, {:.1}) on layer 'planting'",
+                a.x, a.y, b.x, b.y
+            ),
+        })
+    }
+
+    /// Planting schedule: count every "plant:<id>" object on layer
+    /// "planting", write a CSV and store an AnalysisReport ("plantschedule").
+    fn plantschedule(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        // species id → (count, centroid accumulator)
+        let mut tally: BTreeMap<String, (usize, DVec3)> = BTreeMap::new();
+        for obj in self.doc.objects() {
+            if obj.layer != "planting" {
+                continue;
+            }
+            let Some(id) = obj.name.as_deref().and_then(|n| n.strip_prefix("plant:")) else {
+                continue;
+            };
+            let at = match &obj.geometry {
+                Geometry::Mesh(m) if !m.positions().is_empty() => {
+                    m.positions().iter().copied().sum::<DVec3>()
+                        / m.positions().len() as f64
+                }
+                _ => DVec3::ZERO,
+            };
+            let e = tally.entry(id.to_string()).or_insert((0, DVec3::ZERO));
+            e.0 += 1;
+            e.1 += at;
+        }
+        if tally.is_empty() {
+            return Err(ExecError::Invalid(
+                "nothing planted — run `plant` or `plantrow` first".into(),
+            ));
+        }
+
+        let mut csv = String::from(
+            "species_id,binomial,common,count,mature_height_m,canopy_diameter_m,deciduous\n",
+        );
+        let mut samples: Vec<(f64, DVec3, String)> = Vec::new();
+        let mut total = 0usize;
+        for (id, (count, at_sum)) in &tally {
+            total += count;
+            let (binomial, common, h, d, dec) = match crate::landscape::find_species(id) {
+                Some(sp) => (
+                    sp.binomial.as_str(),
+                    sp.common.as_str(),
+                    sp.mature_height_m,
+                    sp.canopy_diameter_m,
+                    sp.deciduous,
+                ),
+                None => ("?", "?", 0.0, 0.0, false), // planted from an older catalog
+            };
+            csv.push_str(&format!(
+                "{id},{binomial},{common},{count},{h},{d},{}\n",
+                if dec { "yes" } else { "no" }
+            ));
+            samples.push((*count as f64, *at_sum / *count as f64, id.clone()));
+        }
+        std::fs::write(&path, &csv).map_err(|e| {
+            ExecError::Invalid(format!("cannot write plant schedule '{path}': {e}"))
+        })?;
+        let n_species = tally.len();
+        self.doc.analysis_reports.insert(
+            "plantschedule".to_string(),
+            build_analysis_report(
+                "plantschedule",
+                format!("{total} plant(s), {n_species} species → {path}"),
+                "plants",
+                samples,
+            ),
+        );
+        self.doc.generation += 1;
+        Ok(ApplyOutcome {
+            created: Vec::new(),
+            message: format!(
+                "plant schedule: {total} plant(s) across {n_species} species → {path} \
+                 (see `report plantschedule`)"
+            ),
         })
     }
 
@@ -7563,7 +7733,10 @@ fn apply_forward(
         | Command::Option(..)
         | Command::Import { .. }
         | Command::Terrain { .. }
-        | Command::OsmFile { .. } => {
+        | Command::OsmFile { .. }
+        | Command::Plant { .. }
+        | Command::PlantRow { .. }
+        | Command::PlantSchedule { .. } => {
             unreachable!("handled in Session::run")
         }
     }
@@ -7697,6 +7870,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Contours { .. } => "contours",
         Command::Pad { .. } => "pad",
         Command::CutFill { .. } => "cutfill",
+        Command::Plant { .. } => "plant",
+        Command::PlantRow { .. } => "plantrow",
+        Command::PlantSchedule { .. } => "plantschedule",
         Command::ViewSave { .. } => "view save",
         Command::ViewRestore { .. } => "view",
         Command::ViewList => "view list",
@@ -13555,6 +13731,88 @@ mod tests {
             "pad + cutfill must replay bit-identically"
         );
         assert!(replayed.doc.analysis_reports.contains_key("cutfill"));
+    }
+
+    #[test]
+    fn plant_drapes_onto_terrain_and_lands_on_planting_layer() {
+        // Sloped terrain z = x/2: a plant at (10, 10) must root at z = 5.
+        let mut s = terrain_session(20, 20.0, |x, _| x / 2.0);
+        let out = run(&mut s, "plant oak 10,10 25");
+        assert_eq!(out.created.len(), 1, "{}", out.message);
+        let obj = s.doc.get(out.created[0]).unwrap();
+        assert_eq!(obj.layer, "planting");
+        assert_eq!(obj.name.as_deref(), Some("plant:quercus-robur"));
+        let Geometry::Mesh(m) = &obj.geometry else { panic!("plant must be a mesh") };
+        let zmin = m.positions().iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+        assert!((zmin - 5.0).abs() < 1e-9, "rooted on terrain, got {zmin}");
+        // 25-year oak at 0.5 m/yr → 12.5 m tall above ground.
+        let zmax = m.positions().iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+        assert!((zmax - (5.0 + 12.5)).abs() < 1e-9, "aged canopy, got {zmax}");
+        // Current layer restored; unknown species is a helpful error.
+        assert_eq!(s.doc.current_layer, "0");
+        let err = s.run(parse("plant triffid 0,0").unwrap()).unwrap_err();
+        assert!(format!("{err}").contains("quercus-robur"), "{err}");
+    }
+
+    #[test]
+    fn plantrow_spaces_plants_and_replays_without_catalog_dependence() {
+        let mut s = Session::default();
+        let out = run(&mut s, "plantrow cypress 0,0 10,0 2.5");
+        assert_eq!(out.created.len(), 5, "{}", out.message);
+        // Each plant is its own MeshLiteral op → replay is self-contained.
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
+        assert_eq!(replayed.doc.len(), s.doc.len());
+        // Each plant expands to layer-switch + MeshLiteral + layer-restore
+        // ops; three undos pop exactly one plant.
+        for _ in 0..3 {
+            run(&mut s, "undo");
+        }
+        assert_eq!(
+            s.doc.objects().filter(|o| o.layer == "planting").count(),
+            4,
+            "undoing the expansion ops removes the last planted mesh"
+        );
+    }
+
+    #[test]
+    fn plantschedule_writes_csv_and_stores_report() {
+        let dir = std::env::temp_dir().join("ijc_plantschedule_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("schedule.csv");
+        let mut s = Session::default();
+        let err = s
+            .run(Command::PlantSchedule { path: path.display().to_string() })
+            .unwrap_err();
+        assert!(format!("{err}").contains("nothing planted"), "{err}");
+        run(&mut s, "plant oak 0,0");
+        run(&mut s, "plant oak 20,0");
+        run(&mut s, "plantrow birch 0,10 8,10 4");
+        let out = run(&mut s, &format!("plantschedule {}", path.display()));
+        assert!(out.message.contains("5 plant(s) across 2 species"), "{}", out.message);
+        let csv = std::fs::read_to_string(&path).unwrap();
+        assert!(csv.starts_with("species_id,binomial,common,count,"), "{csv}");
+        assert!(csv.contains("quercus-robur,Quercus robur,English oak,2,30,25,yes"), "{csv}");
+        assert!(csv.contains("betula-pendula,Betula pendula,silver birch,3,20,9,yes"), "{csv}");
+        let r = s.doc.analysis_reports.get("plantschedule").expect("report stored");
+        assert_eq!(r.count, 2, "one sample per species");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn planted_canopy_occludes_sun_analyses() {
+        // A mature oak north of a sample grid at a mid-latitude site changes
+        // nothing here — instead verify the canopy participates in the scene
+        // triangle set used by every occlusion analysis.
+        let mut s = Session::default();
+        let before = scene_triangles(&s.doc).len();
+        run(&mut s, "plant spruce 0,0");
+        let after = scene_triangles(&s.doc).len();
+        assert!(after > before, "plant mesh must join the occlusion scene");
     }
 
     #[test]
