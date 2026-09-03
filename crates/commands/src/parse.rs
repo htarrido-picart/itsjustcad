@@ -1286,9 +1286,31 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             [k] => Ok(Command::EnviroReport { kind: Some((*k).to_string()) }),
             _ => wrong(
                 "report",
-                "at most one analysis kind (sunhours|facesunhours|radiation|shadowstudy)",
+                "at most one kind (sunhours|facesunhours|radiation|shadowstudy|codecheck)",
                 &args,
             ),
+        },
+        // codecheck <pack> [story] — evaluate a compliance-check pack (advisory)
+        "codecheck" => match args.as_slice() {
+            [pack] => Ok(Command::CodeCheck {
+                pack: (*pack).to_string(),
+                story: None,
+                rules: None,
+                ids: None,
+            }),
+            [pack, story] => Ok(Command::CodeCheck {
+                pack: (*pack).to_string(),
+                story: Some((*story).to_string()),
+                rules: None,
+                ids: None,
+            }),
+            _ => wrong("codecheck", "a pack name and optionally a story name", &args),
+        },
+        // checkrules list | checkrules load <path>
+        "checkrules" => match args.as_slice() {
+            ["list"] => Ok(Command::CheckRulesList),
+            ["load", path] => Ok(Command::CheckRulesLoad { path: (*path).to_string() }),
+            _ => wrong("checkrules", "'list' or 'load <path.json>'", &args),
         },
         // -- blocks --
         // block <selector> <name>

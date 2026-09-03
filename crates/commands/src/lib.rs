@@ -6,6 +6,7 @@
 //! replay all derive from it.
 
 pub mod blocklib;
+pub mod checkengine;
 mod command;
 pub mod csv;
 pub mod dxf;

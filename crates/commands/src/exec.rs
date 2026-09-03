@@ -244,6 +244,12 @@ pub struct Session {
     /// touches this. Held here so the deck prompt, help and autosuggest can all
     /// consult one authoritative table.
     pub plugins: crate::plugin::PluginRegistry,
+    /// Loaded compliance-check packs (M-checkengine), keyed by pack name.
+    /// Session state like `plugins`, never part of the op-log or file format:
+    /// a `codecheck` run embeds its resolved rules into its own logged op, so
+    /// replay never consults this table. Seeded with the embedded demo pack;
+    /// grown by `checkrules load` and the default checks dir.
+    pub check_packs: BTreeMap<String, crate::checkengine::CheckPack>,
     /// Set only after a checkpoint fast-open ([`Session::from_snapshot`]): the
     /// forward ops whose inverses have not yet been materialized. `None` once
     /// the history is live. Never part of the file format.
@@ -554,6 +560,10 @@ impl Default for Session {
             log: Vec::new(),
             cursor: 0,
             plugins: crate::plugin::PluginRegistry::default(),
+            check_packs: BTreeMap::from([(
+                "demo".to_string(),
+                crate::checkengine::demo_pack(),
+            )]),
             pending_log: None,
             branches: BTreeMap::new(),
             current_branch: MAIN_BRANCH.to_string(),
@@ -577,6 +587,16 @@ impl Session {
                 self.plantrow(species, a, b, spacing)
             }
             Command::PlantSchedule { path } => self.plantschedule(path),
+            // Resolve a check pack by name and embed its rules into the op
+            // before the generic logged path, so replay never needs the pack
+            // table or disk (the CutFill original_z precedent). Ops replayed
+            // from a saved log already carry `rules: Some(..)` and skip this.
+            Command::CodeCheck { pack, story, rules: None, ids } => {
+                let rules = self.check_pack(&pack)?.rules.clone();
+                self.run(Command::CodeCheck { pack, story, rules: Some(rules), ids })
+            }
+            Command::CheckRulesList => Ok(self.checkrules_list()),
+            Command::CheckRulesLoad { path } => self.checkrules_load(path),
             cmd => {
                 let logged = cmd.is_logged();
                 // A new logged edit truncates the redo tail, so the undo history
@@ -1843,6 +1863,80 @@ impl Session {
         })
     }
 
+    /// Resolve a check pack by name: the in-memory table (embedded demo +
+    /// anything `checkrules load`ed) first, then `<default_dir>/<name>.checks.json`
+    /// so packs persisted to the user's config dir work across sessions without
+    /// explicit loading (plugin-startup parity). A disk hit is cached.
+    fn check_pack(&mut self, name: &str) -> Result<&crate::checkengine::CheckPack, ExecError> {
+        // Never join traversal-y names into the config dir.
+        if !self.check_packs.contains_key(name)
+            && !name.contains(['/', '\\', '.'])
+            && let Some(dir) = crate::checkengine::default_dir()
+        {
+            let candidate = dir.join(format!("{name}.checks.json"));
+            if let Ok(s) = std::fs::read_to_string(&candidate) {
+                let pack = crate::checkengine::CheckPack::from_json(&s).map_err(|e| {
+                    ExecError::Invalid(format!("{}: {e}", candidate.display()))
+                })?;
+                self.check_packs.insert(name.to_string(), pack);
+            }
+        }
+        self.check_packs.get(name).ok_or_else(|| {
+            ExecError::Invalid(format!(
+                "unknown check pack '{name}' (loaded: {}; add more with `checkrules load <path>`)",
+                self.check_packs.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))
+        })
+    }
+
+    /// `checkrules list` — the loaded packs plus any discoverable in the
+    /// default checks dir. Query only.
+    fn checkrules_list(&mut self) -> ApplyOutcome {
+        // Surface on-disk packs too (without failing on malformed ones).
+        let mut lines = Vec::new();
+        if let Some(dir) = crate::checkengine::default_dir() {
+            let (disk, warnings) = crate::checkengine::load_dir(&dir);
+            for (name, pack) in disk {
+                self.check_packs.entry(name).or_insert(pack);
+            }
+            lines.extend(warnings.into_iter().map(|w| format!("warning: {w}")));
+        }
+        for p in self.check_packs.values() {
+            lines.push(format!(
+                "{}: {} rule(s){}",
+                p.name,
+                p.rules.len(),
+                if p.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", p.description)
+                }
+            ));
+        }
+        lines.push(format!(
+            "run `codecheck <pack>` to evaluate ({})",
+            crate::checkengine::ADVISORY_NOTE
+        ));
+        ApplyOutcome { created: Vec::new(), message: lines.join("\n") }
+    }
+
+    /// `checkrules load <path>` — read + validate a pack JSON and install it in
+    /// the session table (fs read; never logged).
+    fn checkrules_load(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let s = std::fs::read_to_string(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read check pack '{path}': {e}")))?;
+        let pack = crate::checkengine::CheckPack::from_json(&s)
+            .map_err(|e| ExecError::Invalid(format!("{path}: {e}")))?;
+        let msg = format!(
+            "loaded check pack '{}' ({} rule(s)) — run `codecheck {}`",
+            pack.name,
+            pack.rules.len(),
+            pack.name
+        );
+        self.check_packs.insert(pack.name.clone(), pack);
+        Ok(ApplyOutcome { created: Vec::new(), message: msg })
+    }
+
     /// Effective forward log (up to the undo cursor) — this is the file format.
     /// After a fast-open the inverses are still pending, so the untouched
     /// forward log is returned directly (its cursor sits at the end).
@@ -2880,6 +2974,139 @@ fn format_analysis_report(r: &AnalysisReport) -> String {
     fmt_samples("lowest", &r.lowest, &mut out);
     fmt_samples("highest", &r.highest, &mut out);
     out
+}
+
+/// Render one stored [`itsjustcad_doc::ComplianceReport`] as the compact text
+/// the `report` command prints. One line per rule, grounded in ids/locations
+/// so the deck can critique with citations; the advisory disclaimer rides in
+/// the header (it is part of the report's context) — every rendering carries it.
+fn format_compliance_report(r: &itsjustcad_doc::ComplianceReport) -> String {
+    let mut out = format!("codecheck {}: {}\n", r.pack, r.context);
+    for o in &r.rules {
+        let code = if o.code_ref.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", o.code_ref)
+        };
+        let numbers = match o.measured {
+            Some(m) => format!(
+                " — measured {m:.3} vs required {:.3} {}",
+                o.required.unwrap_or(f64::NAN),
+                o.unit
+            ),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "  {}{code} {}{numbers} ({} checked)",
+            o.rule_id,
+            o.verdict.to_uppercase(),
+            o.checked
+        ));
+        if !o.objects.is_empty() {
+            out.push_str(&format!("; {}", o.message));
+            out.push_str("; at");
+            for (i, loc) in o.locations.iter().take(3).enumerate() {
+                let id = o.objects.get(i.min(o.objects.len() - 1)).cloned().unwrap_or_default();
+                out.push_str(&format!(" {id}({:.1},{:.1},{:.1})", loc[0], loc[1], loc[2]));
+            }
+            if o.locations.len() > 3 {
+                out.push_str(&format!(" +{} more", o.locations.len() - 3));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// `codecheck <pack> [story]` — evaluate the rules embedded in the op against
+/// the document, draw severity-colored failure markers on the 'compliance'
+/// layer (analysis-layer precedent: undo removes them, replay recreates them
+/// via written-back ids), and store the [`itsjustcad_doc::ComplianceReport`]
+/// for the read-only `report` verb. ADVISORY ONLY — see
+/// [`crate::checkengine::ADVISORY_NOTE`].
+fn exec_codecheck(
+    doc: &mut Document,
+    pack: String,
+    story: Option<String>,
+    rules: Option<Vec<crate::checkengine::CheckRule>>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    use crate::checkengine::{self, COMPLIANCE_LAYER};
+    // Session::run embeds the rules before the logged path; a missing list can
+    // only mean a hand-edited file, so fail loudly rather than re-resolving.
+    let rules = rules.ok_or_else(|| {
+        ExecError::Invalid("codecheck op carries no rules (hand-edited file?)".into())
+    })?;
+    let tris: Vec<[DVec3; 3]> = scene_triangles(doc)
+        .into_iter()
+        .map(|t| {
+            [
+                DVec3::from_array(t[0]),
+                DVec3::from_array(t[1]),
+                DVec3::from_array(t[2]),
+            ]
+        })
+        .collect();
+    let (report, markers) =
+        checkengine::evaluate(doc, &pack, story.as_deref(), &rules, &tris)
+            .map_err(ExecError::Invalid)?;
+
+    // Failure markers: a small circle per violation, colored by severity.
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == markers.len() => ids,
+        _ => (0..markers.len()).map(|_| ObjectId::new()).collect(),
+    };
+    let mut layers_created = Vec::new();
+    if !markers.is_empty() && !doc.layers.contains_key(COMPLIANCE_LAYER) {
+        doc.layers
+            .insert(COMPLIANCE_LAYER.to_string(), LayerStyle::default());
+        layers_created.push(COMPLIANCE_LAYER.to_string());
+    }
+    const MARKER_R: f64 = 0.25;
+    for ((at, severity), id) in markers.iter().zip(&new_ids) {
+        let circle: Vec<DVec3> = (0..12)
+            .map(|k| {
+                let a = k as f64 / 12.0 * std::f64::consts::TAU;
+                *at + DVec3::new(MARKER_R * a.cos(), MARKER_R * a.sin(), 0.05)
+            })
+            .collect();
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: Some(format!("codecheck {}", severity.label())),
+            layer: COMPLIANCE_LAYER.to_string(),
+            color: Some(severity.marker_color()),
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(Curve::Polyline { points: circle, closed: true }),
+        });
+    }
+
+    let count = |verdict: &str| report.rules.iter().filter(|r| r.verdict == verdict).count();
+    let (pass, fail, warn, info) = (count("pass"), count("fail"), count("warn"), count("info"));
+    let message = format!(
+        "codecheck {pack}: {} rule(s) — {pass} pass, {fail} fail, {warn} warn, {info} info{} \
+         — see `report codecheck` ({})",
+        report.rules.len(),
+        if markers.is_empty() {
+            String::new()
+        } else {
+            format!("; {} marker(s) on '{COMPLIANCE_LAYER}'", markers.len())
+        },
+        checkengine::ADVISORY_NOTE
+    );
+    doc.compliance_reports.insert(pack.clone(), report);
+    doc.generation += 1;
+    Ok((
+        Command::CodeCheck {
+            pack,
+            story,
+            rules: Some(rules),
+            ids: Some(new_ids.clone()),
+        },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome { message, created: new_ids },
+    ))
 }
 
 /// Ground-shadow study. For each time stamp, compute the sun direction from the
@@ -6715,6 +6942,14 @@ fn apply_forward(
         Command::CutFill { original_z } => exec_cutfill(doc, original_z),
         Command::FlowArrows { n, ids } => exec_flow_arrows(doc, n, ids),
         Command::Ponding { ids } => exec_ponding(doc, ids),
+        Command::CodeCheck { pack, story, rules, ids } => {
+            exec_codecheck(doc, pack, story, rules, ids)
+        }
+        // Handled in Session::run (they touch session state, not the doc) and
+        // never logged, so apply_forward/replay cannot legitimately see them.
+        Command::CheckRulesList | Command::CheckRulesLoad { .. } => Err(ExecError::Invalid(
+            "checkrules is session-level; this is a bug".into(),
+        )),
         Command::SitePath { targets, width, ids } => exec_site_path(doc, targets, width, ids),
         Command::SunOff => {
             let prev = doc.sun.take();
@@ -7121,10 +7356,10 @@ fn apply_forward(
             ))
         }
         Command::EnviroReport { kind } => {
-            if doc.analysis_reports.is_empty() {
+            if doc.analysis_reports.is_empty() && doc.compliance_reports.is_empty() {
                 return Err(ExecError::Invalid(
-                    "no analysis stored — run sunhours, facesunhours, radiation, or \
-                     shadowstudy first, then `report`"
+                    "no analysis stored — run sunhours, facesunhours, radiation, \
+                     shadowstudy, or codecheck first, then `report`"
                         .into(),
                 ));
             }
@@ -7134,11 +7369,24 @@ fn apply_forward(
                     msg.push_str(&format_analysis_report(r));
                 }
             }
+            // Compliance reports ride the same plane: bare `report` includes
+            // them; `report codecheck` (or a pack name) filters to them.
+            for (k, r) in &doc.compliance_reports {
+                if kind.as_deref().is_none_or(|want| want == k || want == "codecheck") {
+                    msg.push_str(&format_compliance_report(r));
+                }
+            }
             if msg.is_empty() {
+                let stored: Vec<String> = doc
+                    .analysis_reports
+                    .keys()
+                    .cloned()
+                    .chain(doc.compliance_reports.keys().map(|k| format!("codecheck:{k}")))
+                    .collect();
                 return Err(ExecError::Invalid(format!(
                     "no '{}' report stored (stored: {})",
                     kind.as_deref().unwrap_or("?"),
-                    doc.analysis_reports.keys().cloned().collect::<Vec<_>>().join(", ")
+                    stored.join(", ")
                 )));
             }
             Ok((
@@ -8172,6 +8420,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Bbox { .. } => "bbox",
         Command::Schedule { .. } => "schedule",
         Command::EnviroReport { .. } => "report",
+        Command::CodeCheck { .. } => "codecheck",
+        Command::CheckRulesList | Command::CheckRulesLoad { .. } => "checkrules",
         Command::SheetTable { .. } => "sheettable",
         Command::SheetDim { .. } => "sheetdim",
         Command::MeshLiteral { .. } => "mesh_literal",
@@ -14235,5 +14485,223 @@ mod tests {
             "contours log must replay bit-identically (ids embedded)"
         );
         assert_eq!(s.doc.len(), replayed.doc.len());
+    }
+
+    // ── M-checkengine: codecheck / checkrules / report codecheck ────────────
+
+    /// A scene tripping most demo rules: a 1:6 ramp, a 0.7 m door, a stair
+    /// with 0.2 m risers, a corridor squeezed to 0.8 m under a 1.8 m ceiling,
+    /// and a raised slab (guard info).
+    fn violating_scene() -> Session {
+        let mut s = Session::default();
+        // Ramp: 6 m run rising 1 m = 1:6 (limit 1:12).
+        run(&mut s, "line 0,0,0 6,0,1");
+        run(&mut s, "name last ramp-a");
+        // Door: parametric door narrowed to 0.7 m (min 0.8128).
+        run(&mut s, "insert pdoor 10,0,0 width=0.7");
+        // Stair: two merged steps with a 0.2 m riser (max 0.1778).
+        run(&mut s, "box 20,0,0 0.4,1,0.2");
+        run(&mut s, "box 20.3,0,0 0.4,1,0.4");
+        run(&mut s, "union last 2");
+        run(&mut s, "name last stair-a");
+        // Corridor at y=50: walls 0.8 m apart (min 0.9144) and a 1.8 m
+        // ceiling (min 2.032) over a 2 m centerline.
+        run(&mut s, "box 0,50.4,0 2,0.3,3");
+        run(&mut s, "box 0,49.3,0 2,0.3,3");
+        run(&mut s, "box 0,49.3,1.8 2,1.4,0.2");
+        run(&mut s, "line 0,50,0 2,50,0");
+        run(&mut s, "name last corridor-a");
+        // Raised slab, top at 1.2 m (> 0.762 guard-drop info threshold).
+        run(&mut s, "slab 30,0,1 32,0,1 32,2,1 30,2,1 thick 0.2");
+        s
+    }
+
+    #[test]
+    fn codecheck_demo_end_to_end() {
+        let mut s = violating_scene();
+        let before = s.doc.len();
+        let out = run(&mut s, "codecheck demo");
+        assert!(out.message.contains("advisory"), "message must carry the disclaimer: {}", out.message);
+        assert!(!out.created.is_empty(), "violations must create markers");
+        // Every marker lands on the compliance layer.
+        assert!(s.doc.layers.contains_key("compliance"));
+        for id in &out.created {
+            assert_eq!(s.doc.get(*id).unwrap().layer, "compliance");
+        }
+        // The stored report has the expected per-rule verdicts.
+        let r = s.doc.compliance_reports.get("demo").expect("report stored");
+        let verdict = |id: &str| {
+            r.rules.iter().find(|o| o.rule_id == id).unwrap_or_else(|| panic!("rule {id}"))
+        };
+        assert_eq!(verdict("ramp-slope").verdict, "fail");
+        assert!(verdict("ramp-slope").measured.unwrap() > 0.16);
+        assert_eq!(verdict("door-width").verdict, "fail");
+        assert!((verdict("door-width").measured.unwrap() - 0.7).abs() < 1e-9);
+        assert_eq!(verdict("stair-riser").verdict, "fail");
+        assert!((verdict("stair-riser").measured.unwrap() - 0.2).abs() < 0.02);
+        assert_eq!(verdict("headroom").verdict, "warn");
+        assert!((verdict("headroom").measured.unwrap() - 1.8).abs() < 0.05);
+        assert_eq!(verdict("corridor-width").verdict, "warn");
+        assert!((verdict("corridor-width").measured.unwrap() - 0.8).abs() < 0.05);
+        assert_eq!(verdict("guard-check").verdict, "info");
+        // Violating rules carry object ids + locations.
+        assert!(!verdict("ramp-slope").objects.is_empty());
+        assert!(!verdict("ramp-slope").locations.is_empty());
+
+        // `report codecheck` serves it, grounded in rule ids + disclaimer.
+        let rep = run(&mut s, "report codecheck").message;
+        for id in ["ramp-slope", "door-width", "stair-riser", "headroom", "corridor-width", "guard-check"] {
+            assert!(rep.contains(id), "report missing rule {id}: {rep}");
+        }
+        assert!(rep.contains("advisory pre-check"), "report missing disclaimer: {rep}");
+        assert!(rep.contains("FAIL") && rep.contains("INFO"));
+        // Bare `report` includes it too.
+        assert!(run(&mut s, "report").message.contains("ramp-slope"));
+
+        // Undo removes markers AND the auto-created layer.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), before);
+        assert!(!s.doc.layers.contains_key("compliance"));
+    }
+
+    #[test]
+    fn codecheck_replay_is_stable_and_disk_free() {
+        let mut s = violating_scene();
+        run(&mut s, "codecheck demo");
+        let log = s.save_log();
+        // The logged op embeds the rules (no pack-table/disk dependency).
+        let logged = log.last().unwrap();
+        match logged {
+            Command::CodeCheck { rules, ids, .. } => {
+                assert!(rules.is_some(), "rules must be embedded in the logged op");
+                assert!(ids.is_some(), "marker ids must be written back");
+            }
+            other => panic!("expected CodeCheck, got {other:?}"),
+        }
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "codecheck must replay bit-identically (rules + ids embedded)"
+        );
+        assert_eq!(s.doc.len(), replayed.doc.len());
+        assert_eq!(
+            s.doc.compliance_reports, replayed.doc.compliance_reports,
+            "replay regenerates the same compliance report"
+        );
+    }
+
+    #[test]
+    fn codecheck_clean_scene_all_pass_no_markers() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 24,0,1"); // 1:24 — gentle
+        run(&mut s, "name last ramp-ok");
+        let before = s.doc.len();
+        let out = run(&mut s, "codecheck demo");
+        assert!(out.created.is_empty(), "no violations, no markers");
+        assert_eq!(s.doc.len(), before);
+        assert!(!s.doc.layers.contains_key("compliance"), "no layer without markers");
+        let r = s.doc.compliance_reports.get("demo").unwrap();
+        assert!(r.rules.iter().all(|o| o.verdict == "pass"), "{:?}", r.rules);
+        assert!(out.message.contains("advisory"));
+    }
+
+    #[test]
+    fn codecheck_story_filter_scopes_targets() {
+        let mut s = violating_scene();
+        run(&mut s, "story L1 0");
+        run(&mut s, "story L2 10");
+        // Everything in the scene sits below z=10 → L2 matches nothing.
+        run(&mut s, "codecheck demo L2");
+        let r = s.doc.compliance_reports.get("demo").unwrap();
+        assert!(r.context.contains("L2"));
+        for o in &r.rules {
+            if o.rule_id == "guard-check" {
+                continue; // count-style rules aside, geometry rules see 0 targets
+            }
+            assert_eq!(o.checked, 0, "rule {} matched targets on empty L2", o.rule_id);
+            assert_eq!(o.verdict, "pass");
+        }
+        // Unknown story is a clear error.
+        let err = s.run(parse("codecheck demo attic").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("unknown story"), "{err}");
+    }
+
+    #[test]
+    fn codecheck_unknown_pack_lists_loaded() {
+        let mut s = Session::default();
+        let err = s.run(parse("codecheck nonexistent").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown check pack"), "{msg}");
+        assert!(msg.contains("demo"), "should list the loaded packs: {msg}");
+    }
+
+    #[test]
+    fn checkrules_load_and_run_custom_pack() {
+        let dir = std::env::temp_dir().join(format!("ijc-checkrules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("strict.checks.json");
+        std::fs::write(
+            &path,
+            r#"{"name":"strict","description":"one strict slope rule","rules":[
+                {"id":"any-slope","code_ref":"TEST 1","severity":"warn",
+                 "target":{"kinds":["curve"]},
+                 "check":{"kind":"max_slope","limit":0.01},
+                 "message":"practically anything sloped"}]}"#,
+        )
+        .unwrap();
+
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,0,1");
+        let out = run(&mut s, &format!("checkrules load {}", path.display()));
+        assert!(out.message.contains("strict"));
+        // list shows demo + the loaded pack + the disclaimer.
+        let listing = run(&mut s, "checkrules list").message;
+        assert!(listing.contains("demo") && listing.contains("strict"));
+        assert!(listing.contains("advisory"));
+        // The loaded pack evaluates.
+        run(&mut s, "codecheck strict");
+        let r = s.doc.compliance_reports.get("strict").unwrap();
+        assert_eq!(r.rules[0].verdict, "warn");
+        // Malformed pack is rejected with the path in the error.
+        let bad = dir.join("bad.checks.json");
+        std::fs::write(&bad, "{ nope").unwrap();
+        let err = s
+            .run(parse(&format!("checkrules load {}", bad.display())).unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("bad.checks.json"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkrules_classification() {
+        // load reads the fs → side-effecting + confirm summary; list is pure.
+        let load = parse("checkrules load /tmp/x.json").unwrap();
+        assert!(load.is_side_effecting());
+        assert!(load.side_effect_summary().unwrap().contains("/tmp/x.json"));
+        assert!(!load.is_logged());
+        let list = parse("checkrules list").unwrap();
+        assert!(!list.is_side_effecting());
+        assert!(!list.is_logged());
+        // codecheck is a pure, LOGGED analysis op (markers must replay).
+        let cc = parse("codecheck demo").unwrap();
+        assert!(!cc.is_side_effecting());
+        assert!(cc.is_logged());
+    }
+
+    #[test]
+    fn compliance_report_survives_snapshot_roundtrip() {
+        // The checkpoint sidecar serializes `compliance_reports`; pre-field
+        // snapshots load empty (serde default) — AnalysisReport precedent.
+        let mut s = violating_scene();
+        run(&mut s, "codecheck demo");
+        let json = serde_json::to_string(&s.doc).unwrap();
+        let back: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.compliance_reports, s.doc.compliance_reports);
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("compliance_reports");
+        let old: Document = serde_json::from_value(v).unwrap();
+        assert!(old.compliance_reports.is_empty(), "pre-compliance snapshots load empty");
     }
 }

@@ -83,6 +83,52 @@ pub struct AnalysisSample {
 /// data). Regenerated whenever the analysis re-runs, including op-log replay;
 /// an `undo` of the analysis leaves the last report in place (it describes the
 /// last run, not live geometry).
+/// One rule's outcome inside a [`ComplianceReport`]: the verdict plus the
+/// numbers that ground it (measured vs required, violating object ids and
+/// locations) so the deck LLM can critique with citations ("stair S2 riser
+/// 0.21 m > max 0.178 m").
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuleOutcome {
+    /// Rule id from the pack (e.g. "ramp-slope").
+    pub rule_id: String,
+    /// The code section the rule cites (e.g. "ADA 405.2"). Informational.
+    pub code_ref: String,
+    /// Declared severity: "error" | "warn" | "info".
+    pub severity: String,
+    /// "pass" when no target violated the rule, otherwise "fail"/"warn"/"info"
+    /// per the declared severity.
+    pub verdict: String,
+    /// The rule's message template (what a violation means).
+    pub message: String,
+    /// Short ids of the violating objects (empty on pass).
+    pub objects: Vec<String>,
+    /// Violation locations, meters (marker positions).
+    pub locations: Vec<[f64; 3]>,
+    /// Worst measured value across targets (`None` when nothing measurable
+    /// matched the rule's target query).
+    pub measured: Option<f64>,
+    /// The rule's threshold, same unit as `measured`.
+    pub required: Option<f64>,
+    /// Unit of `measured`/`required` ("rise/run", "m", "count").
+    pub unit: String,
+    /// How many objects the rule was evaluated against.
+    pub checked: usize,
+}
+
+/// Structured result of one `codecheck` run, stored on the document keyed by
+/// pack name and served by the read-only `report` command (same plumbing as
+/// [`AnalysisReport`]). ADVISORY ONLY: a geometric pre-check, never a code
+/// review — every rendering of this report carries that disclaimer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceReport {
+    /// Check-pack name ("demo", "ibc-2021", …).
+    pub pack: String,
+    /// Human context for the run (story filter, rule count).
+    pub context: String,
+    /// Per-rule outcomes, in pack order.
+    pub rules: Vec<RuleOutcome>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AnalysisReport {
     /// Analysis verb: "sunhours" | "facesunhours" | "radiation" | "shadowstudy".

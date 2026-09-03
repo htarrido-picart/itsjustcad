@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_mesh::Aabb;
 
 use crate::{
-    AnalysisReport, Basemap, BlockGeometry, GeoLocation, Grid, LayerStyle, Material, NamedView,
+    AnalysisReport, Basemap, BlockGeometry, ComplianceReport, GeoLocation, Grid, LayerStyle,
+    Material, NamedView,
     ObjectId,
     ParamBlockDef, SceneObject, Section, Sheet, SketchConstraint, Story, StructLoad,
     StructSupport, SunPosition, Underlay, Units,
@@ -124,6 +125,12 @@ pub struct Document {
     /// re-execute; `serde(default)` keeps pre-report checkpoints loading.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub analysis_reports: BTreeMap<String, AnalysisReport>,
+    /// Structured results of `codecheck` runs, keyed by pack name — latest run
+    /// of each pack wins. Served by the read-only `report` command alongside
+    /// `analysis_reports`. Advisory pre-checks only, never a code review.
+    /// `serde(default)` keeps pre-compliance checkpoints loading.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub compliance_reports: BTreeMap<String, ComplianceReport>,
     /// Sketch constraints created by the logged `constrain` command; solved by
     /// `solveconstraints` (commands crate). Order matters — redundancy blame
     /// reports the later constraint. `serde(default)` keeps old files loading.
@@ -167,6 +174,7 @@ impl Default for Document {
             supports: Vec::new(),
             show_lineweights: false,
             analysis_reports: BTreeMap::new(),
+            compliance_reports: BTreeMap::new(),
             constraints: Vec::new(),
             pregrade_terrain: None,
             generation: 0,
@@ -402,6 +410,10 @@ mod tests {
         assert!(back.materials.is_empty());
         assert!(back.grids.is_empty());
         assert!(back.stories.is_empty());
+        // Pre-compliance snapshots (no `compliance_reports` key) also load
+        // empty — the field is skip-serialized when empty, so a default doc
+        // round-trips without it.
+        assert!(back.compliance_reports.is_empty());
         assert!(back.loads.is_empty());
         assert!(back.supports.is_empty());
     }

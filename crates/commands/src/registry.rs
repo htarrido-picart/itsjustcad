@@ -607,8 +607,20 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "report",
-            usage: "report [analysis]",
-            summary: "Structured summary of the stored environmental analyses (sunhours, facesunhours, radiation, shadowstudy): min/avg/max, a distribution, and the worst/best sample locations with their facings. Run it after an analysis to ground design critique in numbers — e.g. a north face under 2 h winter sun is poor for glazing; the hottest radiation faces need shading. Query only, no geometry. Example: report facesunhours",
+            usage: "report [analysis|codecheck]",
+            summary: "Structured summary of the stored analyses: environmental runs (sunhours, facesunhours, radiation, shadowstudy — min/avg/max, distribution, worst/best sample locations) AND compliance runs (`report codecheck` — per-rule verdicts with measured vs required, violating object ids and locations). Run it after an analysis or codecheck to ground design critique in numbers. Compliance output is an advisory pre-check, not a code review. Query only, no geometry. Example: report facesunhours · report codecheck",
+            category: Category::Analyze,
+        },
+        CommandSpec {
+            name: "codecheck",
+            usage: "codecheck <pack> [story]",
+            summary: "Evaluate a compliance-check pack (declarative JSON rules) against the model: ramp/path slope, door clear width, stair risers, headroom, route clear width, turning circles, counts per story, guard drops. Verdicts land in `report codecheck` (rule id, pass/fail/warn, measured vs required, object ids); failures get colored markers on the 'compliance' layer. The embedded 'demo' pack is always available; load more with `checkrules load`. ADVISORY pre-check only, never a code review — verify with a licensed professional / AHJ. Example: codecheck demo · codecheck demo L1",
+            category: Category::Analyze,
+        },
+        CommandSpec {
+            name: "checkrules",
+            usage: "checkrules list|load <path.json>",
+            summary: "Manage compliance-check packs: `list` shows the loaded packs (embedded demo + any loaded this session + ~/.config/itsjustcad/checks/); `load <path>` reads a pack JSON from disk (a named list of rules: id, code ref, severity, target query, geometric predicate, threshold, message — see the demo pack for the schema). Packs are data, LLM-authorable: draft the JSON, save it, `checkrules load` it, then `codecheck <name>`. Example: checkrules load /tmp/ada.checks.json",
             category: Category::Analyze,
         },
         CommandSpec {

@@ -1,0 +1,54 @@
+{
+  "name": "demo",
+  "description": "Demo accessibility/egress pre-checks proving the check engine. ADVISORY ONLY: a geometric pre-check, not a code review - verify with a licensed professional / AHJ. Thresholds echo common IBC/ADA values but this pack is NOT either code.",
+  "rules": [
+    {
+      "id": "ramp-slope",
+      "code_ref": "cf. ADA 405.2",
+      "severity": "error",
+      "target": { "kinds": ["curve"], "name_contains": "ramp" },
+      "check": { "kind": "max_slope", "limit": 0.08333 },
+      "message": "ramp/path segment steeper than 1:12"
+    },
+    {
+      "id": "door-width",
+      "code_ref": "cf. ADA 404.2.3",
+      "severity": "error",
+      "target": { "kinds": ["door"] },
+      "check": { "kind": "min_door_width", "min": 0.8128 },
+      "message": "door clear width under 32 in (0.813 m)"
+    },
+    {
+      "id": "stair-riser",
+      "code_ref": "cf. IBC 1011.5.2",
+      "severity": "error",
+      "target": { "kinds": ["stair"] },
+      "check": { "kind": "max_riser", "max": 0.1778 },
+      "message": "stair riser over 7 in (0.178 m)"
+    },
+    {
+      "id": "headroom",
+      "code_ref": "cf. IBC 1011.3",
+      "severity": "warn",
+      "target": { "kinds": ["curve"], "name_contains": "corridor" },
+      "check": { "kind": "min_headroom", "min": 2.032 },
+      "message": "headroom under 80 in (2.032 m) along route"
+    },
+    {
+      "id": "corridor-width",
+      "code_ref": "cf. ADA 403.5.1",
+      "severity": "warn",
+      "target": { "kinds": ["curve"], "name_contains": "corridor" },
+      "check": { "kind": "min_clear_width", "min": 0.9144 },
+      "message": "route clear width under 36 in (0.914 m)"
+    },
+    {
+      "id": "guard-check",
+      "code_ref": "cf. IBC 1015.2",
+      "severity": "info",
+      "target": { "kinds": ["slab"] },
+      "check": { "kind": "guard_drop", "drop": 0.762 },
+      "message": "walking surface more than 30 in (0.762 m) up - verify guards"
+    }
+  ]
+}

@@ -1063,9 +1063,35 @@ pub enum Command {
     /// summary. Query only; never logged.
     EnviroReport {
         /// Optional kind filter ("sunhours", "facesunhours", "radiation",
-        /// "shadowstudy"); `None` prints every stored report.
+        /// "shadowstudy", "codecheck", or a codecheck pack name); `None`
+        /// prints every stored report.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+    },
+    /// Evaluate a compliance-check pack against the document (M-checkengine).
+    /// ADVISORY ONLY — geometric pre-checks, never a code review. `rules` is
+    /// `None` when typed; the session resolves the pack (embedded demo, a
+    /// `checkrules load`ed pack, or `~/.config/itsjustcad/checks/`) and embeds
+    /// the rules into the logged op on first exec, so replay never depends on
+    /// disk or the in-memory pack table (the CutFill/radiation precedent).
+    /// Failure markers land on the 'compliance' layer; `ids` are written back
+    /// on first exec so replay recreates identical marker objects.
+    CodeCheck {
+        pack: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        story: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rules: Option<Vec<crate::checkengine::CheckRule>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
+    /// List the loaded check packs (query, never logged).
+    CheckRulesList,
+    /// Load a check-pack JSON file into the session's pack table (fs read;
+    /// not logged — like plugins, packs are session state, and any `codecheck`
+    /// run embeds its rules into its own logged op).
+    CheckRulesLoad {
+        path: String,
     },
     /// Place a schedule table on a sheet (logged). The table is written into
     /// the PDF at print time; no geometry is created in the 3D scene.
@@ -1384,6 +1410,8 @@ impl Command {
                 | Command::Bbox { .. }
                 | Command::Schedule { .. }
                 | Command::EnviroReport { .. }
+                | Command::CheckRulesList
+                | Command::CheckRulesLoad { .. }
                 | Command::BlocksList
                 | Command::BlockLibList
                 | Command::ConstraintsList
@@ -1420,6 +1448,7 @@ impl Command {
                 | Command::PlantSchedule { .. }
                 | Command::Underlay { .. }
                 | Command::BlockLibLoad { .. }
+                | Command::CheckRulesLoad { .. }
         )
     }
 
@@ -1443,6 +1472,7 @@ impl Command {
             Command::BlockLibSave { name, .. } => {
                 Some(format!("blocksave → library:{name}"))
             }
+            Command::CheckRulesLoad { path } => Some(format!("checkrules ← {path}")),
             _ => None,
         }
     }
