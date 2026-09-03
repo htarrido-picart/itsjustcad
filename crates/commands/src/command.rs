@@ -1046,6 +1046,10 @@ pub enum Command {
         target: Selector,
         params: std::collections::BTreeMap<String, String>,
     },
+    /// Delete a block definition (plain or parametric) by name. Refuses while
+    /// instances of it exist in the scene — delete the instances first, so a
+    /// definition can never be orphaned out from under live geometry.
+    BlockDeleteDef { name: String },
     /// List block definitions (query; never logged).
     BlocksList,
     // -- block content library (.block.json on disk) --

@@ -738,6 +738,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Annotate,
         },
         CommandSpec {
+            name: "blockdelete",
+            usage: "blockdelete <name>",
+            summary: "Delete a block definition (plain or parametric). Refuses while instances of it exist — delete the instances first. Example: blockdelete door",
+            category: Category::Annotate,
+        },
+        CommandSpec {
             name: "blocks",
             usage: "blocks",
             summary: "List all block definitions with their geometry counts (query only). Example: blocks",

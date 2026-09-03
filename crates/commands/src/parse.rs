@@ -1348,6 +1348,11 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("blocks", &args, &args)?;
             Ok(Command::BlocksList)
         }
+        // blockdelete <name>
+        "blockdelete" => match args.as_slice() {
+            [name] => Ok(Command::BlockDeleteDef { name: (*name).to_string() }),
+            _ => wrong("blockdelete", "a block definition name", &args),
+        },
         // -- block content library --
         // blocklib list   (same as "blocklib" with no args)
         "blocklib" => {

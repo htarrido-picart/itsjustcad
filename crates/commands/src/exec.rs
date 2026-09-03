@@ -181,6 +181,13 @@ enum Inverse {
         name: String,
         prev: Option<itsjustcad_doc::ParamBlockDef>,
     },
+    /// `blockdelete`: restore the deleted definition (plain and/or parametric —
+    /// a pblock name owns entries in BOTH maps when instances have baked).
+    BlockDeleted {
+        name: String,
+        prev_plain: Option<Vec<itsjustcad_doc::BlockGeometry>>,
+        prev_param: Option<itsjustcad_doc::ParamBlockDef>,
+    },
     /// Dynamic-block `insert`: remove the created instance object AND its
     /// per-instance baked geometry entry in `doc.blocks`.
     CreatedAndBake {
@@ -811,6 +818,15 @@ impl Session {
                     None => {
                         self.doc.param_blocks.remove(name);
                     }
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::BlockDeleted { name, prev_plain, prev_param } => {
+                if let Some(defs) = prev_plain {
+                    self.doc.blocks.insert(name.clone(), defs.clone());
+                }
+                if let Some(def) = prev_param {
+                    self.doc.param_blocks.insert(name.clone(), def.clone());
                 }
                 self.doc.generation += 1;
             }
@@ -6645,6 +6661,46 @@ fn apply_forward(
                 },
             ))
         }
+        Command::BlockDeleteDef { name } => {
+            // Guard: refuse while live instances reference this definition. A
+            // plain-block instance points `block` at the name; a dynamic-block
+            // instance points `source` at it (its `block` is a per-instance
+            // baked key). Never orphan live geometry.
+            let instances = doc
+                .objects()
+                .filter(|o| match &o.geometry {
+                    Geometry::Instance { block, source, .. } => {
+                        source.as_deref() == Some(name.as_str())
+                            || (source.is_none() && *block == name)
+                    }
+                    _ => false,
+                })
+                .count();
+            if instances > 0 {
+                return Err(ExecError::Invalid(format!(
+                    "blockdelete: {instances} instance{} of '{name}' exist{} — delete the instance{} first",
+                    if instances == 1 { "" } else { "s" },
+                    if instances == 1 { "s" } else { "" },
+                    if instances == 1 { "" } else { "s" },
+                )));
+            }
+            let prev_plain = doc.blocks.remove(&name);
+            let prev_param = doc.param_blocks.remove(&name);
+            if prev_plain.is_none() && prev_param.is_none() {
+                return Err(ExecError::Invalid(format!(
+                    "no block named '{name}' (use 'blocks' to list definitions)"
+                )));
+            }
+            doc.generation += 1;
+            Ok((
+                Command::BlockDeleteDef { name: name.clone() },
+                Inverse::BlockDeleted { name: name.clone(), prev_plain, prev_param },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("deleted block definition '{name}'"),
+                },
+            ))
+        }
         Command::BlocksList => {
             let list: Vec<String> = doc
                 .blocks
@@ -7257,6 +7313,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::BlockInsert { .. } => "insert",
         Command::BlockParamDefine { .. } => "pblock",
         Command::BlockParamSet { .. } => "param",
+        Command::BlockDeleteDef { .. } => "blockdelete",
         Command::BlocksList => "blocks",
         Command::BlockLibList => "blocklib",
         Command::BlockLibLoad { .. } => "blockload",
@@ -10960,6 +11017,103 @@ mod tests {
         let log_before = s.save_log().len();
         run(&mut s, "blocks");
         assert_eq!(s.save_log().len(), log_before, "blocks list must not be logged");
+    }
+
+    #[test]
+    fn blockdelete_removes_plain_definition() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last crate");
+        assert!(s.doc.blocks.contains_key("crate"));
+        run(&mut s, "blockdelete crate");
+        assert!(!s.doc.blocks.contains_key("crate"), "definition removed");
+    }
+
+    #[test]
+    fn blockdelete_removes_parametric_definition() {
+        let mut s = Session::default();
+        run(&mut s, "pblock pdoor width=0.9 : rect 0,0,0 {width} 0.05");
+        assert!(s.doc.param_blocks.contains_key("pdoor"));
+        run(&mut s, "blockdelete pdoor");
+        assert!(!s.doc.param_blocks.contains_key("pdoor"));
+    }
+
+    #[test]
+    fn blockdelete_refuses_while_instances_exist() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last tree");
+        run(&mut s, "insert tree 5,0,0");
+        let err = s.run(crate::parse::parse("blockdelete tree").unwrap());
+        assert!(err.is_err(), "must refuse with a live instance");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("1 instance"), "guard names the count: {msg}");
+        assert!(s.doc.blocks.contains_key("tree"), "definition untouched");
+    }
+
+    #[test]
+    fn blockdelete_refuses_while_dynamic_instances_exist() {
+        let mut s = Session::default();
+        run(&mut s, "pblock pwin width=0.5 : rect 0,0,0 {width} 0.05");
+        run(&mut s, "insert pwin 0,0,0");
+        let err = s.run(crate::parse::parse("blockdelete pwin").unwrap());
+        assert!(err.is_err(), "dynamic instances also guard the definition");
+        assert!(s.doc.param_blocks.contains_key("pwin"));
+    }
+
+    #[test]
+    fn blockdelete_allows_after_instances_deleted() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last bench");
+        run(&mut s, "insert bench 5,0,0");
+        run(&mut s, "delete last");
+        run(&mut s, "blockdelete bench");
+        assert!(!s.doc.blocks.contains_key("bench"));
+    }
+
+    #[test]
+    fn blockdelete_undo_restores_definition() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,2");
+        run(&mut s, "block last lamp");
+        let before = s.doc.blocks.get("lamp").unwrap().clone();
+        run(&mut s, "blockdelete lamp");
+        s.run(crate::Command::Undo).unwrap();
+        assert_eq!(s.doc.blocks.get("lamp"), Some(&before), "undo restores the definition");
+    }
+
+    #[test]
+    fn blockdelete_undo_restores_parametric_definition() {
+        let mut s = Session::default();
+        run(&mut s, "pblock pcol h=3 : box 0,0,0 0.3,0.3,{h}");
+        run(&mut s, "blockdelete pcol");
+        assert!(!s.doc.param_blocks.contains_key("pcol"));
+        s.run(crate::Command::Undo).unwrap();
+        assert!(s.doc.param_blocks.contains_key("pcol"), "undo restores the pblock");
+    }
+
+    #[test]
+    fn blockdelete_replay_stability() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last temp");
+        run(&mut s, "blockdelete temp");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert!(!replayed.doc.blocks.contains_key("temp"));
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "blockdelete log must be replay-stable"
+        );
+    }
+
+    #[test]
+    fn blockdelete_unknown_name_errors() {
+        let mut s = Session::default();
+        let result = s.run(crate::parse::parse("blockdelete ghost").unwrap());
+        assert!(result.is_err(), "unknown definition must error");
     }
 
     #[test]
