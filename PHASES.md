@@ -38,13 +38,12 @@ HIG-grounded design revision, run as sequential batches. All six landed.
 
 ## New phases (added 2026-09-02)
 
-- [ ] **M-landscape** — landscape design proper (terrain/OSM/sun exist; design tools don't):
-  - *Grading & earthwork*: `pad <sel> <elev>` building pads with side slopes, `grade` regions to target slope, **cut/fill volumes** vs original terrain (report m³), retaining edge where slope exceeds max.
-  - *Contours OUT*: `contours <interval>` — generate contour polylines FROM terrain mesh (we only ingest contours today); major/minor lines, labels, feed sheets/PDF.
-  - *Planting*: plant catalog (species, mature height/canopy Ø/growth rate — data-driven JSON like models.json), `plant <species> <pt>` / `plantrow` / `plantmass <region> <spacing>`, canopy meshes participate in `shadowstudy`/`sunhours`/`radiation` (deciduous transparency by season), **plant schedule CSV export** (species/count/size — landscape BOM).
-  - *Water & drainage*: steepest-descent **flow arrows** on terrain, watershed/ponding detection, `swale` along path. Analysis-viz only, never claims hydrology engineering.
-  - *Hardscape*: `path <curve> <width>` draped on terrain, stairs/ramp on slope w/ max-slope check (ADA 1:12 style warning), site sections through terrain.
-  - Deck-callable throughout; heatmaps/analysis meshes reuse M-enviro plumbing. Pure-math parts (cut/fill, flow, contour extraction) test hard.
+- [x] **M-landscape** — core landscape design tools SHIPPED 2026-09-03 (aa47c7b…fe315a6; pure math in `commands/src/landscape.rs`, all verbs registry/GBNF/deck-callable, undo + replay-stable, analytic-terrain tested):
+  - *Contours OUT* DONE: `contours <interval> [major-every]` — marching-triangles extraction from the terrain mesh, chained polylines on 'contours'/'contours-major'. NOT done: contour labels, sheet/PDF feed.
+  - *Grading & earthwork* DONE: `pad <x,y> <w> <d> <elev> [slope]` (flat pad + side slopes to daylight, first pad snapshots pre-grading heights) and `cutfill` (cut/fill m³ TIN prism estimate, heights embedded in the logged op, AnalysisReport → `report cutfill`). NOT done: freeform `grade` regions, retaining-edge detection.
+  - *Planting* DONE: embedded 12-species catalog (`assets/plants.json`, real data), `plant <species> <pt> [age-years]` (age-scaled trunk+canopy mesh draped on terrain, layer 'planting', occludes sun analyses automatically), `plantrow <a> <b> <spacing>`, `plantschedule <path.csv>` + AnalysisReport. NOT done: `plantmass <region>`, seasonal deciduous transparency.
+  - *Water & drainage* DONE (advisory-only wording throughout): `flowarrows [n]` steepest-descent glyphs + `ponding` local-minima markers, both with AnalysisReports. NOT done: watershed accumulation, `swale`.
+  - *Hardscape* DONE: `sitepath <curve-sel> <width>` ribbon draped on terrain with 1:12 accessible-slope warning. NOT done: stairs/ramp generators, site sections through terrain.
 
 - [x] **M-deckagent** — deck LLM interactivity + agent harness (closed 2026-09-02):
   - *Terse mode* DONE: `TERSE_STYLE_HELP` + `terse_adjusted()` (hard `TERSE_MAX_TOKENS` cap plumbed into the openai_compat/anthropic wire bodies); per-cassette `DeckConfig.terse` override, default ON for local OpenAI-compat, OFF for cloud; LLM ▸ Terse Replies checkable toggle (in-window + native), persisted in decks.json.
