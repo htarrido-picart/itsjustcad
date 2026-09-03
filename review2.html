@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ItsJustCAD — Review 2: Manual Test &amp; Pending Issues</title>
+<style>
+  :root{
+    --bg:#f7f7f5; --panel:#ffffff; --ink:#1c1c1e; --muted:#6b6b70;
+    --line:#e2e2df; --accent:#2b6cb0; --accent-soft:#eaf1f8;
+    --warn:#b7791f; --warn-soft:#fdf6e7; --err:#c53030; --err-soft:#fdeaea;
+    --ok:#2f855a; --code-bg:#f0f0ee; --radius:10px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink); background:var(--bg);
+  }
+  .wrap{display:flex; align-items:flex-start; max-width:1180px; margin:0 auto;}
+  nav{
+    position:sticky; top:0; align-self:flex-start; width:250px; flex:none;
+    height:100vh; overflow-y:auto; padding:24px 16px 40px; border-right:1px solid var(--line);
+    background:var(--panel);
+  }
+  nav h2{font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:18px 0 6px;}
+  nav a{display:block; color:var(--ink); text-decoration:none; padding:4px 8px; border-radius:6px; font-size:13.5px;}
+  nav a:hover{background:var(--accent-soft); color:var(--accent);}
+  nav .brand{font-weight:700; font-size:15px; margin-bottom:2px;}
+  nav .date{color:var(--muted); font-size:12px; margin-bottom:12px;}
+  main{flex:1; min-width:0; padding:32px 40px 120px;}
+  header.top{margin-bottom:8px;}
+  header.top h1{font-size:26px; margin:0 0 4px;}
+  header.top .sub{color:var(--muted); margin:0 0 6px;}
+  .meta{display:flex; gap:16px; flex-wrap:wrap; font-size:12.5px; color:var(--muted); margin:10px 0 24px;}
+  .meta b{color:var(--ink);}
+  section{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:6px 22px 18px; margin:0 0 20px;}
+  details{border-top:1px solid var(--line); padding:8px 0;}
+  details:first-of-type{border-top:none;}
+  summary{cursor:pointer; font-weight:600; font-size:16px; padding:6px 0; list-style:none; display:flex; align-items:center; gap:8px;}
+  summary::-webkit-details-marker{display:none;}
+  summary::before{content:"▸"; color:var(--muted); transition:transform .15s; font-size:12px;}
+  details[open]>summary::before{transform:rotate(90deg);}
+  h2.sec{font-size:20px; margin:14px 0 2px; padding-top:8px;}
+  .lead{color:var(--muted); font-size:13.5px; margin:2px 0 10px;}
+  ol.steps{list-style:none; counter-reset:step; margin:6px 0 12px; padding:0;}
+  ol.steps li{counter-increment:step; position:relative; padding:6px 6px 6px 34px; border-radius:6px;}
+  ol.steps li::before{
+    content:counter(step); position:absolute; left:4px; top:6px; width:20px; height:20px;
+    background:var(--accent-soft); color:var(--accent); border-radius:50%; font-size:11px; font-weight:700;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .chk{display:flex; gap:9px; align-items:flex-start; padding:5px 6px; border-radius:6px;}
+  .chk:hover{background:#fafafa;}
+  .chk input{margin-top:3px; width:16px; height:16px; flex:none;}
+  .chk label{cursor:pointer;}
+  code{background:var(--code-bg); padding:1.5px 6px; border-radius:5px; font:13px/1.4 "SF Mono",ui-monospace,Menlo,Consolas,monospace;}
+  .cmd{display:block; background:#1c1c1e; color:#e6e6e6; padding:8px 12px; border-radius:7px; margin:5px 0; font:13px/1.5 "SF Mono",ui-monospace,Menlo,Consolas,monospace; overflow-x:auto;}
+  .cmd .p{color:#7fb4e6;}
+  .exp{color:var(--muted); font-size:13px;}
+  .exp b{color:var(--ok); font-weight:600;}
+  .tag{display:inline-block; font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; padding:2px 7px; border-radius:20px; vertical-align:middle;}
+  .tag.err{background:var(--err-soft); color:var(--err);}
+  .tag.warn{background:var(--warn-soft); color:var(--warn);}
+  .tag.ok{background:#e6f4ec; color:var(--ok);}
+  .tag.info{background:var(--accent-soft); color:var(--accent);}
+  .callout{border-left:3px solid var(--accent); background:var(--accent-soft); padding:8px 14px; border-radius:0 7px 7px 0; margin:10px 0; font-size:13.5px;}
+  .callout.warn{border-color:var(--warn); background:var(--warn-soft);}
+  table{border-collapse:collapse; width:100%; font-size:13px; margin:8px 0;}
+  th,td{border:1px solid var(--line); padding:6px 10px; text-align:left; vertical-align:top;}
+  th{background:#fafafa; font-size:12px; text-transform:uppercase; letter-spacing:.03em; color:var(--muted);}
+  .grp-title{font-weight:600; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; margin:16px 0 4px;}
+  .reset{float:right; font-size:12px; color:var(--accent); cursor:pointer; background:none; border:1px solid var(--line); border-radius:6px; padding:3px 10px;}
+  hr{border:none; border-top:1px solid var(--line); margin:14px 0;}
+  .foot{color:var(--muted); font-size:12px; text-align:center; padding:30px 0 0;}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <div class="brand">ItsJustCAD</div>
+  <div class="date">Review 2 · 2026-09-03</div>
+  <button class="reset" onclick="resetChecks()">Reset checks</button>
+  <h2>Overview</h2>
+  <a href="#pending">Pending / Known Issues</a>
+  <a href="#howto">How to test</a>
+  <h2>Manual test plan</h2>
+  <a href="#deck">1 · Deck &amp; Chat</a>
+  <a href="#model">2 · Drawing &amp; Modeling</a>
+  <a href="#analysis">3 · Analysis &amp; Camera</a>
+  <a href="#render">4 · Render</a>
+  <a href="#land">5 · Landscape &amp; Planting</a>
+  <a href="#comply">6 · Compliance</a>
+  <a href="#interop">7 · Interop</a>
+  <a href="#perf">8 · Performance</a>
+  <a href="#ui">9 · UI &amp; Tabs</a>
+  <a href="#crypto">10 · Chat Encryption</a>
+</nav>
+
+<main>
+<header class="top">
+  <h1>ItsJustCAD — Review 2</h1>
+  <p class="sub">Manual test plan &amp; pending-issues audit for the 2026-09-02 → 09-03 work push.</p>
+</header>
+<div class="meta">
+  <span><b>Build under test:</b> <code>dist/ItsJustCAD.app</code></span>
+  <span><b>Branch:</b> main (82 commits ahead of origin)</span>
+  <span><b>Date:</b> 2026-09-03</span>
+</div>
+
+<!-- ============ PENDING ============ -->
+<section id="pending">
+<h2 class="sec">Pending / Known Issues <span class="tag warn">read first</span></h2>
+<p class="lead">Open items, honest limits, and cleanups to schedule before the v0.1 push. None block manual testing.</p>
+
+<div class="grp-title">Clippy — ~13 non-test lints (workspace, <code>--all-targets</code>)</div>
+<p class="lead">Cosmetic/idiomatic only; nothing correctness-affecting. Auto-fixable with <code>cargo clippy --fix</code>.</p>
+<table>
+  <tr><th>Kind</th><th>Where</th></tr>
+  <tr><td>Loop index used to index a slice (<code>needless_range_loop</code>) ×3</td><td><code>kernel-mesh/src/formfind.rs:297,323</code>; <code>edges.rs:393</code></td></tr>
+  <tr><td>Borrowed expr already implements trait (<code>needless_borrow</code>) ×4</td><td><code>app/src/app.rs</code> (2805, ~4773–4774, ~6517–6518, ~6530–6531)</td></tr>
+  <tr><td><code>contains_key</code> then <code>insert</code> on a BTreeMap</td><td><code>kernel-mesh/src/csg.rs:444,467</code></td></tr>
+  <tr><td><code>&amp;mut Vec</code> where <code>&amp;mut [_]</code> would do</td><td><code>kernel-mesh/src/solids.rs:124</code></td></tr>
+  <tr><td>Very complex type — factor into a <code>type</code> alias</td><td><code>commands/src/sketch.rs:133</code></td></tr>
+  <tr><td>Unnecessary <code>copied</code> / <code>clone</code> / <code>let…else</code> / collapsible <code>if</code> / <code>×-1</code></td><td><code>commands/src/sketch.rs:539</code>, <code>app/src/menu.rs:1098</code>, <code>app/src/deck_pane.rs:1140</code></td></tr>
+  <tr><td>Doc list item without indentation ×2</td><td>rustdoc comments (kernel-mesh)</td></tr>
+</table>
+
+<div class="grp-title">TODO / FIXME / HACK in shipped code</div>
+<p class="lead"><span class="tag ok">clean</span> Zero non-test <code>TODO</code>/<code>FIXME</code>/<code>HACK</code> markers found across <code>crates/*/src</code>.</p>
+
+<div class="grp-title">Honest limits (documented in PHASES.md for shipped phases)</div>
+<ul>
+  <li><b>Compliance name-matching:</b> guard-drop, ceiling height, handrail height (IBC &amp; ADA) are <b>name-match only</b> — no geometric guard/handrail/fixture modeling. ADA reach ranges, door maneuvering clearances, restroom fixture clearances, handrail extensions are <b>skipped</b> (model carries no fixture/height/swing geometry).</li>
+  <li><b>Travel distance (IBC 1017.2):</b> straight-line room-centroid → nearest exit, <b>not</b> the routed egress path; exit-count uses a proximity heuristic (exits within the room half-diagonal), not a door-graph.</li>
+  <li><b>Door/threshold checks:</b> door clear width from param-block <code>width</code>×scale, else block-def plan extent; ADA threshold is param-only (no small-step mesh geometry).</li>
+  <li><b>M-perf:</b> Step 2 (wgpu GPU compute) <b>deferred by design</b>. Step-1 rayon deliberately skips <code>minsurf</code>/<code>force_density</code> (Gauss–Seidel, sequential), <code>dynamic_relaxation</code> (order-dependent float scatter), LAZ/E57 streams, OBJ/glTF/Collada stateful parsers.</li>
+  <li><b>M-secreview:</b> DXF and EPW parsers have <b>no dedicated adversarial corpus</b> yet; a broader fuzz harness (cargo-fuzz per importer) is the noted next step.</li>
+  <li><b>M-landscape (partial pieces NOT done):</b> contour labels + sheet/PDF feed, freeform <code>grade</code> regions, retaining-edge detection, <code>plantmass</code>, seasonal deciduous transparency, watershed accumulation, <code>swale</code>, stairs/ramp generators, site sections through terrain.</li>
+  <li><b>Plan symbols NOT done:</b> seasonal deciduous stipple density, per-species custom art, symbol in DXF export.</li>
+  <li><b>M-deckagent:</b> <code>run_plan_loop</code> is mock-tested but <b>not yet the live execution path</b> (the streaming deck_pane driver is); no dedicated per-step GBNF "STEP" form.</li>
+</ul>
+
+<div class="grp-title">Phases explicitly marked partial</div>
+<ul><li><span class="tag warn">[~]</span> <b>M-perf</b> — Step 1 shipped; Step 2 (GPU) deferred.</li></ul>
+
+<div class="grp-title">Uncommitted working-tree files</div>
+<table>
+  <tr><th>Path</th><th>Status</th></tr>
+  <tr><td><code>crates/app/src/chat_crypto.rs</code></td><td>Untracked — chat-encryption work in progress (concurrent).</td></tr>
+  <tr><td><code>crates/app/src/chat_store.rs</code>, <code>main.rs</code>, <code>Cargo.toml</code>, <code>Cargo.lock</code>, <code>PHASES.md</code>, <code>crates/app/Cargo.toml</code></td><td>Modified — chat-encryption wiring.</td></tr>
+  <tr><td><code>.claude/</code></td><td>Untracked tooling dir.</td></tr>
+</table>
+<div class="callout warn">Chat encryption (<code>chat_crypto.rs</code>) is still being finished at review time — its test section (§10) is provisional and only applies once that work lands.</div>
+
+<div class="grp-title">Larger open phases (not part of this push)</div>
+<ul>
+  <li><span class="tag info">[ ]</span> <b>M-i18n / M-docs</b> — not started (no i18n infra; UI strings hardcoded). Spanish first, tutorials, website.</li>
+  <li><span class="tag info">[ ]</span> <b>Local model finetune</b> — 0.6B too weak; default is 4B Qwen.</li>
+  <li><span class="tag info">[ ]</span> <b>PRE-PUSH PASS</b> — README install section, screenshots, repo URL owner fix, push + tag v0.1.</li>
+  <li><span class="tag info">[ ]</span> <b>M-sign</b> (deprioritized), <b>M-legacyskin/uipolish</b> (largely == design batches A–F).</li>
+</ul>
+</section>
+
+<!-- ============ HOWTO ============ -->
+<section id="howto">
+<h2 class="sec">How to run these tests</h2>
+<ol class="steps">
+  <li>Launch <code>dist/ItsJustCAD.app</code>. Start each group from a fresh document (⌘N) unless a step says to build on the previous.</li>
+  <li>Commands are typed in the <b>command line</b> (bottom, full-width) or the <b>deck Chat</b> — both accept the same verbs. Selectors: <code>last</code> = most recent object, <code>sel</code> = current selection, <code>name:foo</code> = by name.</li>
+  <li>Tick each box as you verify the <b>expected result</b>. Boxes persist in this browser (localStorage).</li>
+</ol>
+<div class="callout">Every analysis/compliance/advisory output is intentionally worded as advisory — the app never claims to certify or analyze structurally.</div>
+</section>
+
+<!-- ============ 1 DECK ============ -->
+<section id="deck">
+<details open>
+<summary>1 · Deck &amp; Chat</summary>
+<p class="lead">Terse mode (default), clarify-before-act, plan-execute, markdown rendering, critique/report hooks.</p>
+
+<div class="grp-title">Terse mode (default ON, all backends incl. cloud)</div>
+<div class="chk"><input type="checkbox" id="d1"><label for="d1">Ask the deck a design question (e.g. <i>"give me a massing idea for a corner lot"</i>). <span class="exp"><b>Expect:</b> a short, caveman-terse reply, not a wall of prose.</span></label></div>
+<div class="chk"><input type="checkbox" id="d2"><label for="d2">Open <b>LLM ▸ Terse Replies</b> (menu or in-window toggle); toggle OFF, ask again. <span class="exp"><b>Expect:</b> a longer answer; setting persists across relaunch (stored in decks.json).</span></label></div>
+
+<div class="grp-title">Clarify-before-act (asks ONE question instead of guessing)</div>
+<div class="chk"><input type="checkbox" id="d3"><label for="d3">Give an ambiguous instruction (e.g. <i>"add a door"</i> with nothing selected/placed). <span class="exp"><b>Expect:</b> an accent-bordered <b>Question</b> bubble in the transcript asking one clarifying question.</span></label></div>
+<div class="chk"><input type="checkbox" id="d4"><label for="d4">Answer it in your next message. <span class="exp"><b>Expect:</b> the deck continues the same turn and executes.</span></label></div>
+
+<div class="grp-title">Plan-execute harness</div>
+<div class="chk"><input type="checkbox" id="d5"><label for="d5">Ask for a multi-step task (e.g. <i>"draw a 10×10 slab, add 4 columns, put a beam on top"</i>). <span class="exp"><b>Expect:</b> a <b>Plan</b> checklist entry; items tick <code>[ ]→[x]</code> live, one step per turn.</span></label></div>
+<div class="chk"><input type="checkbox" id="d6"><label for="d6">Press <b>Stop</b> mid-plan, then relaunch the app and reopen the doc. <span class="exp"><b>Expect:</b> Stop pauses cleanly; the plan is persisted in the per-doc draft and resumes.</span></label></div>
+
+<div class="grp-title">Markdown rendering + critique/report</div>
+<div class="chk"><input type="checkbox" id="d7"><label for="d7">Ask the deck to <i>"list the layers as a table"</i> (cloud model). <span class="exp"><b>Expect:</b> a striped grid table; bold/italic, code, lists, headings all render.</span></label></div>
+<div class="chk"><input type="checkbox" id="d8"><label for="d8">Right-click a deck bubble ▸ <b>Copy message</b>, paste into a text editor. <span class="exp"><b>Expect:</b> RAW markdown source (pipes/backticks intact), so tables stay tables.</span></label></div>
+<div class="chk"><input type="checkbox" id="d9"><label for="d9">Run an analysis (e.g. <code class="cmd" style="display:inline">sunhours 2024-06-21</code>) then type <span class="cmd"><span class="p">›</span> report</span> <span class="exp"><b>Expect:</b> a compact structured report (min/avg/max, distribution, worst/best sample locations with facings) the LLM can critique.</span></label></div>
+<div class="chk"><input type="checkbox" id="d10"><label for="d10">Ask <i>"where should I NOT put a terrace based on that sun study?"</i> <span class="exp"><b>Expect:</b> critique grounded in sampled locations (e.g. "north face at (x,y) gets N h").</span></label></div>
+</details>
+</section>
+
+<!-- ============ 2 MODELING ============ -->
+<section id="model">
+<details>
+<summary>2 · Drawing &amp; Modeling</summary>
+<p class="lead">NURBS, solids, constraints, minimal surfaces, hatches, blocks.</p>
+
+<div class="grp-title">M-nurbs — knot insertion + curvature</div>
+<div class="chk"><input type="checkbox" id="m1"><label for="m1">Draw a curve, then <span class="cmd"><span class="p">›</span> insertknot last 0.5</span> <span class="exp"><b>Expect:</b> knot inserted, curve shape unchanged (shape-exact).</span></label></div>
+<div class="chk"><input type="checkbox" id="m2"><label for="m2"><span class="cmd"><span class="p">›</span> curvature last</span> <span class="exp"><b>Expect:</b> curvature comb hairs + tip curve on the <code>analysis</code> layer; reports max κ / min radius.</span></label></div>
+
+<div class="grp-title">M-solids2 — blend + guided loft</div>
+<div class="chk"><input type="checkbox" id="m3"><label for="m3">With two curves named top/bottom: <span class="cmd"><span class="p">›</span> blend name:top name:bottom 1.5</span> <span class="exp"><b>Expect:</b> Hermite-eased blend sheet; bulge 1 = ruled.</span></label></div>
+<div class="chk"><input type="checkbox" id="m4"><label for="m4"><span class="cmd"><span class="p">›</span> loft name:rings guides name:rail</span> <span class="exp"><b>Expect:</b> skin bows through the guide curve.</span></label></div>
+
+<div class="grp-title">M-constraints</div>
+<div class="chk"><input type="checkbox" id="m5"><label for="m5">Draw two lines, then <span class="cmd"><span class="p">›</span> constrain perpendicular name:l1 name:l2</span> <span class="exp"><b>Expect:</b> solves immediately; status prints solved / DOF / conflicts.</span></label></div>
+<div class="chk"><input type="checkbox" id="m6"><label for="m6"><span class="cmd"><span class="p">›</span> constraints list</span> then <span class="cmd"><span class="p">›</span> solveconstraints</span> <span class="exp"><b>Expect:</b> constraint listed; re-solve stable. Undo reverts.</span></label></div>
+
+<div class="grp-title">M-expressive — minimal surface</div>
+<div class="chk"><input type="checkbox" id="m7"><label for="m7">Draw a closed boundary curve, select it, then <span class="cmd"><span class="p">›</span> minsurf last</span> (aliases <code>soapfilm</code>/<code>minimalsurface</code>) <span class="exp"><b>Expect:</b> a soap-film minimal surface spanning the boundary; undo/replay stable.</span></label></div>
+
+<div class="grp-title">M-assets — ANSI hatches</div>
+<div class="chk"><input type="checkbox" id="m8"><label for="m8">Select a closed region: <span class="cmd"><span class="p">›</span> hatch last ansi32</span> (ansi31–ansi38) <span class="exp"><b>Expect:</b> standard ANSI hatch renders in viewport + PDF, scales with the object.</span></label></div>
+
+<div class="grp-title">Blocks — delete guard</div>
+<div class="chk"><input type="checkbox" id="m9"><label for="m9">Define a block, insert one instance, try <span class="cmd"><span class="p">›</span> blockdelete &lt;name&gt;</span> <span class="exp"><b>Expect:</b> refused while instances exist. Delete instance, retry → succeeds; undo restores. <code>blocklib</code> lists library.</span></label></div>
+</details>
+</section>
+
+<!-- ============ 3 ANALYSIS ============ -->
+<section id="analysis">
+<details>
+<summary>3 · Analysis &amp; Camera</summary>
+<p class="lead">Sun/environment analyses, camera projections, render modes &amp; colors.</p>
+
+<div class="grp-title">M-enviro — sun / radiation</div>
+<div class="chk"><input type="checkbox" id="a1"><label for="a1">Build a few boxes, then <span class="cmd"><span class="p">›</span> shadowstudy 2024-06-21 09:00 15:00 120</span> <span class="exp"><b>Expect:</b> shadow frames across the time range.</span></label></div>
+<div class="chk"><input type="checkbox" id="a2"><label for="a2"><span class="cmd"><span class="p">›</span> sunhours 2024-06-21 1.5</span> <span class="exp"><b>Expect:</b> a ground grid heatmap of sun hours.</span></label></div>
+<div class="chk"><input type="checkbox" id="a3"><label for="a3"><span class="cmd"><span class="p">›</span> facesunhours last 2024-06-21</span> <span class="exp"><b>Expect:</b> per-face insolation coloring on the selected object.</span></label></div>
+<div class="chk"><input type="checkbox" id="a4"><label for="a4"><span class="cmd"><span class="p">›</span> sunpath 25</span> <span class="exp"><b>Expect:</b> a yearly sun-path dome of radius 25.</span></label></div>
+<div class="chk"><input type="checkbox" id="a5"><label for="a5">Import an EPW then <span class="cmd"><span class="p">›</span> radiation last site.epw</span> <span class="exp"><b>Expect:</b> annual kWh/m²·yr per face; <code>report radiation</code> serves stats.</span></label></div>
+<div class="chk"><input type="checkbox" id="a6"><label for="a6"><span class="cmd"><span class="p">›</span> import /path/weather.epw</span> <span class="exp"><b>Expect:</b> sets document location + reports annual EPW stats (no standalone <code>epw</code> verb).</span></label></div>
+
+<div class="grp-title">Camera projections</div>
+<div class="chk"><input type="checkbox" id="a7"><label for="a7"><span class="cmd"><span class="p">›</span> camera 35mm</span> (try 24/50/85) <span class="exp"><b>Expect:</b> perspective FOV changes via full-frame lens math.</span></label></div>
+<div class="chk"><input type="checkbox" id="a8"><label for="a8"><span class="cmd"><span class="p">›</span> camera 2point</span> <span class="exp"><b>Expect:</b> two-point projection — vertical edges stay vertical.</span></label></div>
+<div class="chk"><input type="checkbox" id="a9"><label for="a9"><span class="cmd"><span class="p">›</span> camera pano</span> (alias <code>360</code>), then <span class="cmd"><span class="p">›</span> camera fisheye 200</span> <span class="exp"><b>Expect:</b> equirect panorama; equidistant fisheye. Note: token is <code>pano</code>, not "panorama".</span></label></div>
+<div class="chk"><input type="checkbox" id="a10"><label for="a10"><span class="cmd"><span class="p">›</span> camera phone iphone-ultrawide</span> <span class="exp"><b>Expect:</b> phone-lens FOV sim. <b>View ▸ Camera</b> radios reflect the live mode.</span></label></div>
+
+<div class="grp-title">Render &amp; colors</div>
+<div class="chk"><input type="checkbox" id="a11"><label for="a11"><span class="cmd"><span class="p">›</span> display pencil</span> <span class="exp"><b>Expect:</b> pencil / sketchy-NPR display with profile edges.</span></label></div>
+<div class="chk"><input type="checkbox" id="a12"><label for="a12"><span class="cmd"><span class="p">›</span> sketchup</span> (alias <code>su</code>) <span class="exp"><b>Expect:</b> SketchUp-style preset (sun shading + profile edges + sky/ground gradient).</span></label></div>
+<div class="chk"><input type="checkbox" id="a13"><label for="a13"><span class="cmd"><span class="p">›</span> color last 1,0.3,0</span> then <span class="cmd"><span class="p">›</span> color last off</span> <span class="exp"><b>Expect:</b> per-object color set, then cleared to by-layer.</span></label></div>
+</details>
+</section>
+
+<!-- ============ 4 RENDER ============ -->
+<section id="render">
+<details>
+<summary>4 · Diffusion Render</summary>
+<p class="lead">Ships with NO backend active — user-configured in <code>render_decks.json</code>.</p>
+<div class="chk"><input type="checkbox" id="r1"><label for="r1"><span class="cmd"><span class="p">›</span> render backends</span> (alias <code>render list</code>) <span class="exp"><b>Expect:</b> lists configured backends (empty on a clean install).</span></label></div>
+<div class="chk"><input type="checkbox" id="r2"><label for="r2">Configure one, then <span class="cmd"><span class="p">›</span> render use comfyui</span> and <span class="cmd"><span class="p">›</span> render test</span> <span class="exp"><b>Expect:</b> reachability probe; on failure "cannot reach X — is it running?".</span></label></div>
+<div class="chk"><input type="checkbox" id="r3"><label for="r3"><span class="cmd"><span class="p">›</span> controlimages /tmp/scene</span> <span class="exp"><b>Expect:</b> depth/edge/mask PNGs written from the current view (<code>_depth.png</code>, <code>_edge.png</code>, <code>_mask.png</code>).</span></label></div>
+<div class="chk"><input type="checkbox" id="r4"><label for="r4"><span class="cmd"><span class="p">›</span> render glass pavilion at dusk, photoreal</span> <span class="exp"><b>Expect:</b> async job; result PNG appears in a floating "AI Render" window.</span></label></div>
+<div class="chk"><input type="checkbox" id="r5"><label for="r5">During a job: <span class="cmd"><span class="p">›</span> render cancel</span> <span class="exp"><b>Expect:</b> job truly aborts (task dropped). Errors always land on the command line.</span></label></div>
+</details>
+</section>
+
+<!-- ============ 5 LANDSCAPE ============ -->
+<section id="land">
+<details>
+<summary>5 · Landscape &amp; Planting</summary>
+<p class="lead">Import a terrain first: <code>terrain /path/survey.csv</code> (or .geojson).</p>
+
+<div class="grp-title">M-landscape — contours, grading, drainage, hardscape</div>
+<div class="chk"><input type="checkbox" id="l1"><label for="l1"><span class="cmd"><span class="p">›</span> contours 0.5 5</span> <span class="exp"><b>Expect:</b> chained polylines on <code>contours</code> / <code>contours-major</code>.</span></label></div>
+<div class="chk"><input type="checkbox" id="l2"><label for="l2"><span class="cmd"><span class="p">›</span> pad 10,10 20 15 3.5 2</span> then <span class="cmd"><span class="p">›</span> cutfill</span> <span class="exp"><b>Expect:</b> flat pad + side slopes to daylight; cut/fill m³ estimate; <code>report cutfill</code> serves it.</span></label></div>
+<div class="chk"><input type="checkbox" id="l3"><label for="l3"><span class="cmd"><span class="p">›</span> flowarrows 100</span> then <span class="cmd"><span class="p">›</span> ponding</span> <span class="exp"><b>Expect:</b> steepest-descent glyphs + local-minima markers (advisory-only wording).</span></label></div>
+<div class="chk"><input type="checkbox" id="l4"><label for="l4">Draw a path curve, then <span class="cmd"><span class="p">›</span> sitepath last 1.5</span> <span class="exp"><b>Expect:</b> ribbon draped on terrain; warns on slope steeper than 1:12.</span></label></div>
+
+<div class="grp-title">Planting + tropical packs</div>
+<div class="chk"><input type="checkbox" id="l5"><label for="l5"><span class="cmd"><span class="p">›</span> plant royal-palm 10,5</span> <span class="exp"><b>Expect:</b> age-scaled trunk+canopy draped on terrain, <code>planting</code> layer; palm renders crown-on-trunk. Out-of-band species prints a climate advisory (not an error).</span></label></div>
+<div class="chk"><input type="checkbox" id="l6"><label for="l6"><span class="cmd"><span class="p">›</span> plantrow tilia 0,0 30,0 6</span> then <span class="cmd"><span class="p">›</span> plantschedule /tmp/planting.csv</span> <span class="exp"><b>Expect:</b> row of trees at spacing; schedule CSV + report.</span></label></div>
+<div class="chk"><input type="checkbox" id="l7"><label for="l7"><span class="cmd"><span class="p">›</span> plantcatalog caribbean</span> (or a Köppen zone like <code>Aw</code>) <span class="exp"><b>Expect:</b> filtered species list (33 total: 9 Caribbean, 6 Cali, 6 Guayaquil + temperate 12).</span></label></div>
+<div class="chk"><input type="checkbox" id="l8"><label for="l8">Set a tropical location, draw a closed region, then <span class="cmd"><span class="p">›</span> miyawaki last 3</span> <span class="exp"><b>Expect:</b> seeded stratified native mini-forest (3–5/m²); reports species-mix %/stem count/area; self-thinning advisory; deterministic on replay.</span></label></div>
+
+<div class="grp-title">2D planting symbols</div>
+<div class="chk"><input type="checkbox" id="l9"><label for="l9"><span class="cmd"><span class="p">›</span> plantsymbols on</span> (alias <code>plansymbols</code>) <span class="exp"><b>Expect:</b> flat top-view glyphs overlaid on plants (round/conifer/palm/shrub/clump); 3D mesh stays for perspective/sun.</span></label></div>
+<div class="chk"><input type="checkbox" id="l10"><label for="l10">Switch to Top view and export SVG / PDF plan. <span class="exp"><b>Expect:</b> symbols in plan exports (Top only), honoring the plant's layer color; meaningless in elevation → not drawn there.</span></label></div>
+</details>
+</section>
+
+<!-- ============ 6 COMPLIANCE ============ -->
+<section id="comply">
+<details>
+<summary>6 · Compliance (advisory only)</summary>
+<div class="callout warn">Every report carries "advisory pre-check, not a code review; verify with a licensed professional / AHJ." Confirm this disclaimer is present.</div>
+
+<div class="grp-title">M-checkengine — engine + demo pack</div>
+<div class="chk"><input type="checkbox" id="c1"><label for="c1"><span class="cmd"><span class="p">›</span> codecheck demo</span> <span class="exp"><b>Expect:</b> severity-colored markers (red/orange/blue) on the <code>compliance</code> layer for the built scene.</span></label></div>
+<div class="chk"><input type="checkbox" id="c2"><label for="c2"><span class="cmd"><span class="p">›</span> report codecheck</span> (and bare <code>report</code>) <span class="exp"><b>Expect:</b> per-rule verdict (pass/fail/warn/info), object ids, measured vs required, checked count.</span></label></div>
+<div class="chk"><input type="checkbox" id="c3"><label for="c3"><span class="cmd"><span class="p">›</span> checkrules list</span>; then Undo the codecheck. <span class="exp"><b>Expect:</b> packs listed; markers removed cleanly by undo; replay stable.</span></label></div>
+
+<div class="grp-title">M-ibc — IBC 2021 + rooms</div>
+<div class="chk"><input type="checkbox" id="c4"><label for="c4">Draw a closed curve, select it: <span class="cmd"><span class="p">›</span> room sel business</span> then <span class="cmd"><span class="p">›</span> rooms</span> <span class="exp"><b>Expect:</b> room tagged with use group + shoelace area; <code>rooms</code> lists it.</span></label></div>
+<div class="chk"><input type="checkbox" id="c5"><label for="c5"><span class="cmd"><span class="p">›</span> codecheck ibc2021</span> <span class="exp"><b>Expect:</b> 11 rules incl. occupant load, exit count, travel distance, tread depth. Messages carry IBC section refs. Travel distance noted as straight-line.</span></label></div>
+
+<div class="grp-title">M-ada — ADA 2010 / A117.1</div>
+<div class="chk"><input type="checkbox" id="c6"><label for="c6">Name a ramp/route/turn/parking, then <span class="cmd"><span class="p">›</span> codecheck ada2010</span> <span class="exp"><b>Expect:</b> 12 rules incl. ramp landings, cross slope, threshold, count-ratio. Name-matched checks disclosed as such.</span></label></div>
+<div class="chk"><input type="checkbox" id="c7"><label for="c7">Author a custom pack JSON, save under <code>~/.config/itsjustcad/checks/</code>, then <span class="cmd"><span class="p">›</span> checkrules load /path/x.checks.json</span> <span class="exp"><b>Expect:</b> loads; malformed JSON / unknown kinds rejected on parse.</span></label></div>
+</details>
+</section>
+
+<!-- ============ 7 INTEROP ============ -->
+<section id="interop">
+<details>
+<summary>7 · Interop</summary>
+<div class="chk"><input type="checkbox" id="i1"><label for="i1"><span class="cmd"><span class="p">›</span> import /path/scan.laz</span> <span class="exp"><b>Expect:</b> LAZ point cloud decompressed + decimated to ≤200k (never materializes the full cloud).</span></label></div>
+<div class="chk"><input type="checkbox" id="i2"><label for="i2"><span class="cmd"><span class="p">›</span> export /path/model.3dm</span> <span class="exp"><b>Expect:</b> spec-conformant openNURBS V5 file (meshes/lines/polylines/NURBS + names/layers).</span></label></div>
+<div class="chk"><input type="checkbox" id="i3"><label for="i3">With a structural model: <span class="cmd"><span class="p">›</span> export /path/model.xlsx</span> (or <code>.saf</code>) <span class="exp"><b>Expect:</b> a genuine SAF 2.2.0 .xlsx workbook (9 sheets, native numeric cells) with the never-analyze disclaimer embedded.</span></label></div>
+<div class="chk"><input type="checkbox" id="i4"><label for="i4">Round-trip via native Import/Export dialogs. <span class="exp"><b>Expect:</b> <code>.saf</code>/<code>.xlsx</code>/<code>.3dm</code> all offered and accepted; no dead filter entries.</span></label></div>
+</details>
+</section>
+
+<!-- ============ 8 PERF ============ -->
+<section id="perf">
+<details>
+<summary>8 · Performance (M-perf step 1, rayon)</summary>
+<p class="lead">Rayon-parallel analysis + import loops, bit-deterministic (replay-safe).</p>
+<div class="chk"><input type="checkbox" id="p1"><label for="p1">Build a dense scene (many towers), then <span class="cmd"><span class="p">›</span> sunhours 2024-06-21</span> <span class="exp"><b>Expect:</b> noticeably faster than before (bench: ~5.5× on 200 towers); result identical to sequential.</span></label></div>
+<div class="chk"><input type="checkbox" id="p2"><label for="p2">Re-run <span class="cmd"><span class="p">›</span> radiation last site.epw</span> and <span class="cmd"><span class="p">›</span> facesunhours last 2024-06-21</span> <span class="exp"><b>Expect:</b> faster (~6.3× / ~4.2×); numbers match a prior run exactly.</span></label></div>
+<div class="chk"><input type="checkbox" id="p3"><label for="p3">Import a large binary STL and a raw LAS. <span class="exp"><b>Expect:</b> faster decode; geometry unchanged. (LAZ/E57 stay sequential by design.)</span></label></div>
+<div class="chk"><input type="checkbox" id="p4"><label for="p4">Undo/redo/reload after an analysis. <span class="exp"><b>Expect:</b> replay reproduces identical results (analysis bins embedded in the op-log).</span></label></div>
+</details>
+</section>
+
+<!-- ============ 9 UI ============ -->
+<section id="ui">
+<details>
+<summary>9 · UI &amp; Dynamic Tabs</summary>
+<p class="lead">M-dyntabs (Blocks/Plugins), M-guitest audits (manual spot-checks).</p>
+
+<div class="grp-title">M-dyntabs — Blocks &amp; Plugins right-dock tabs</div>
+<div class="chk"><input type="checkbox" id="u1"><label for="u1">Open the right dock. <span class="exp"><b>Expect:</b> a <b>Blocks</b> tab (always present — 14 starter param blocks); rows show name, live instance count, geometry count.</span></label></div>
+<div class="chk"><input type="checkbox" id="u2"><label for="u2">In Blocks: click <b>Insert</b> on a row. <span class="exp"><b>Expect:</b> command line prefilled <code>insert &lt;name&gt; </code>; place by typing a position.</span></label></div>
+<div class="chk"><input type="checkbox" id="u3"><label for="u3">Define a plugin (<code>plugin define {…}</code>), open the <b>Plugins</b> tab. <span class="exp"><b>Expect:</b> tab appears with usage/summary/pretty-JSON rows; Run prefills the verb; Reload/Delete work.</span></label></div>
+<div class="chk"><input type="checkbox" id="u4"><label for="u4">Drive tabs from the deck: <span class="cmd"><span class="p">›</span> panel blocks</span> (also chat/sessions/layers/plugins) <span class="exp"><b>Expect:</b> the named tab activates; the directive is transient (relaunch doesn't re-force it).</span></label></div>
+
+<div class="grp-title">M-guitest — usability spot-checks</div>
+<div class="chk"><input type="checkbox" id="u5"><label for="u5">Type a partial verb, then press <b>Tab</b> to accept the autosuggest. <span class="exp"><b>Expect:</b> Tab-accept works (was a fixed dead-key bug).</span></label></div>
+<div class="chk"><input type="checkbox" id="u6"><label for="u6">Check the <b>A+ / A−</b> text-size steppers and other buttons. <span class="exp"><b>Expect:</b> all hit-targets meet the minimum height (A± fix).</span></label></div>
+<div class="chk"><input type="checkbox" id="u7"><label for="u7">Tab-traverse the whole window with the keyboard. <span class="exp"><b>Expect:</b> never dead-ends; cycles back to start.</span></label></div>
+</details>
+</section>
+
+<!-- ============ 10 CRYPTO ============ -->
+<section id="crypto">
+<details>
+<summary>10 · Chat Encryption <span class="tag warn">provisional</span></summary>
+<div class="callout warn">Being finished at review time (<code>chat_crypto.rs</code> uncommitted). Run this section only once the encryption work lands.</div>
+<p class="lead">AES-256-GCM at rest, keyed by an OS-keychain data key; transparent auto-unlock; legacy plaintext upgrades on next save.</p>
+<div class="chk"><input type="checkbox" id="x1"><label for="x1">Have a chat, quit, and inspect <code>~/.config/itsjustcad/chats/&lt;uuid&gt;.json</code>. <span class="exp"><b>Expect:</b> starts with the <code>ICEC</code> magic header — ciphertext, not readable plaintext.</span></label></div>
+<div class="chk"><input type="checkbox" id="x2"><label for="x2">Relaunch, reopen the session. <span class="exp"><b>Expect:</b> transparent auto-unlock — chat reads back, no password prompt.</span></label></div>
+<div class="chk"><input type="checkbox" id="x3"><label for="x3">Take a pre-existing plaintext chat file, open it, send a message, quit. <span class="exp"><b>Expect:</b> legacy plaintext loads, then upgrades to the encrypted <code>ICEC</code> container on save.</span></label></div>
+<div class="chk"><input type="checkbox" id="x4"><label for="x4">On a machine with no keychain (headless/CI/bare Linux). <span class="exp"><b>Expect:</b> plaintext fallback with a one-time warning — never a data-loss or hard fail.</span></label></div>
+</details>
+</section>
+
+<div class="foot">ItsJustCAD — Review 2 · generated 2026-09-03 · verbs verified against <code>crates/commands/src/registry.rs</code> + <code>crates/app/src/app_verbs.rs</code> + assets. Checkbox state is stored locally in your browser.</div>
+</main>
+</div>
+
+<script>
+(function(){
+  var KEY = "ijc-review2-checks";
+  var saved = {};
+  try { saved = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch(e){}
+  var boxes = document.querySelectorAll('input[type=checkbox]');
+  boxes.forEach(function(b){
+    if(saved[b.id]) b.checked = true;
+    b.addEventListener('change', function(){
+      saved[b.id] = b.checked;
+      try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch(e){}
+    });
+  });
+  window.resetChecks = function(){
+    if(!confirm("Clear all checkboxes?")) return;
+    boxes.forEach(function(b){ b.checked = false; });
+    saved = {};
+    try { localStorage.removeItem(KEY); } catch(e){}
+  };
+})();
+</script>
+</body>
+</html>
