@@ -579,6 +579,7 @@ impl Default for Session {
             check_packs: BTreeMap::from([
                 ("demo".to_string(), crate::checkengine::demo_pack()),
                 ("ibc2021".to_string(), crate::checkengine::ibc_pack()),
+                ("ada2010".to_string(), crate::checkengine::ada_pack()),
             ]),
             pending_log: None,
             branches: BTreeMap::new(),
@@ -14876,6 +14877,44 @@ mod tests {
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap(),
             "ibc codecheck must replay bit-identically"
+        );
+    }
+
+    #[test]
+    fn codecheck_ada2010_end_to_end() {
+        // An accessible-route scene run through the embedded ADA pack.
+        let mut s = Session::default();
+        // A ramp centerline named "ramp-1": rises 0.99 m over 12 m (~1:12.1,
+        // just under the 1:12 limit) — running slope PASSES, but there is no
+        // 60 in landing in a >30 in rise, so ramp-landings FAILS.
+        run(&mut s, "polyline 0,0,0 12,0,0.99");
+        run(&mut s, "name last ramp-1");
+        // A narrow door (0.8 m < 0.813 m) → door clear width fails; no
+        // threshold param → door-threshold flags "not modelably detectable".
+        run(&mut s, "insert pdoor 3,3,0 width=0.8");
+        run(&mut s, "name last door-1");
+
+        let out = run(&mut s, "codecheck ada2010");
+        assert!(out.message.contains("advisory"), "{}", out.message);
+        let r = s.doc.compliance_reports.get("ada2010").expect("report stored");
+        let verdict =
+            |id: &str| r.rules.iter().find(|o| o.rule_id == id).unwrap_or_else(|| panic!("{id}"));
+        // Running slope of exactly 1:12 is not > the limit → passes.
+        assert_eq!(verdict("ramp-running-slope").verdict, "pass");
+        // No landing in a >30 in continuous rise → landings fail (error).
+        assert_eq!(verdict("ramp-landings").verdict, "fail");
+        // 0.8 m door leaf < 0.813 m → clear width fails.
+        assert_eq!(verdict("door-clear-width").verdict, "fail");
+        // No 'threshold' param → threshold flagged (honest "not detectable").
+        assert_eq!(verdict("door-threshold").verdict, "warn");
+
+        // Replay stability (embedded rules + marker ids).
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "ada codecheck must replay bit-identically"
         );
     }
 

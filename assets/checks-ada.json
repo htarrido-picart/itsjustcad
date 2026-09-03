@@ -1,0 +1,106 @@
+{
+  "name": "ada2010",
+  "description": "ADA 2010 Standards for Accessible Design / ICC A117.1 geometric pre-check pack. ADVISORY ONLY: a geometric pre-check, not a code review - verify with a licensed professional / AHJ. Thresholds encode common 2010 ADA Standards section values (36 in route, 32 in door, 1:12 ramp, 1:48 cross slope, 1/2 in threshold, 60 in turning space, Table 208.2 parking ratios) as DATA so a later edition or A117.1 swaps in. Several checks are name-matched or param-derived (handrail height, threshold, accessible parking count) and carry honesty notes; reach ranges and door maneuvering clearances are DELIBERATELY OMITTED because the model carries no fixture-height or door-swing geometry - faking them would be dishonest.",
+  "rules": [
+    {
+      "id": "ramp-running-slope",
+      "code_ref": "ADA 405.2",
+      "severity": "error",
+      "target": { "kinds": ["curve"], "name_contains": "ramp" },
+      "check": { "kind": "max_slope", "limit": 0.0833 },
+      "message": "ramp running slope exceeds 1:12 max (ADA 405.2) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "ramp-cross-slope",
+      "code_ref": "ADA 405.3",
+      "severity": "warn",
+      "target": { "kinds": ["mesh"], "name_contains": "ramp" },
+      "check": { "kind": "max_cross_slope", "limit": 0.0208 },
+      "message": "ramp cross slope exceeds 1:48 max (ADA 405.3); measured across the surface's inferred run axis - advisory pre-check, not a code review"
+    },
+    {
+      "id": "ramp-landings",
+      "code_ref": "ADA 405.7",
+      "severity": "error",
+      "target": { "kinds": ["curve"], "name_contains": "ramp" },
+      "check": { "kind": "ramp_landing", "flat_limit": 0.0208, "landing_len": 1.524, "max_rise": 0.762 },
+      "message": "ramp run rises more than 30 in without a 60 in landing (ADA 405.7); landing length is measured along the drawn centerline, width is not checked - advisory pre-check, not a code review"
+    },
+    {
+      "id": "route-clear-width",
+      "code_ref": "ADA 403.5.1",
+      "severity": "warn",
+      "target": { "kinds": ["curve"], "name_contains": "route" },
+      "check": { "kind": "min_clear_width", "min": 0.9144 },
+      "message": "accessible route clear width under 36 in min (ADA 403.5.1; 32 in permitted at isolated points ≤24 in long) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "route-pinch-point",
+      "code_ref": "ADA 403.5.1",
+      "severity": "error",
+      "target": { "kinds": ["curve"], "name_contains": "route" },
+      "check": { "kind": "min_clear_width", "min": 0.8128 },
+      "message": "accessible route pinches below the 32 in absolute minimum at a point (ADA 403.5.1) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "door-clear-width",
+      "code_ref": "ADA 404.2.3",
+      "severity": "error",
+      "target": { "kinds": ["door"] },
+      "check": { "kind": "min_door_width", "min": 0.8128 },
+      "message": "door clear width under 32 in min (ADA 404.2.3) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "door-threshold",
+      "code_ref": "ADA 404.2.5",
+      "severity": "warn",
+      "target": { "kinds": ["door"] },
+      "check": { "kind": "threshold_height", "max": 0.0127 },
+      "message": "door threshold exceeds 1/2 in max (ADA 404.2.5); read from the door block 'threshold' param - a door with no such param is flagged 'not modelably detectable', verify by hand - advisory pre-check, not a code review"
+    },
+    {
+      "id": "turning-space",
+      "code_ref": "ADA 304.3.1",
+      "severity": "warn",
+      "target": { "kinds": ["curve"], "name_contains": "turn" },
+      "check": { "kind": "turning_circle", "diameter": 1.524 },
+      "message": "60 in turning space does not fit clear of obstructions (ADA 304.3.1); a simplified planar disc, no door-swing maneuvering geometry - advisory pre-check, not a code review"
+    },
+    {
+      "id": "clear-floor-space",
+      "code_ref": "ADA 305.3",
+      "severity": "info",
+      "target": { "kinds": ["curve"], "name_contains": "clearance" },
+      "check": { "kind": "min_clear_width", "min": 0.762 },
+      "message": "clear floor space narrower than 30 in (ADA 305.3 requires 30 x 48 in); only the 30 in width is checked here, the 48 in depth is not - advisory pre-check, not a code review"
+    },
+    {
+      "id": "handrail-height",
+      "code_ref": "ADA 505.4",
+      "severity": "info",
+      "target": { "kinds": ["curve"], "name_contains": "handrail" },
+      "check": { "kind": "min_headroom", "min": 0.8636 },
+      "message": "handrail top below 34 in (ADA 505.4 requires 34-38 in); handrails are name-matched curves and only the 34 in lower bound is probed (as clearance above the curve), verify height by hand - advisory pre-check, not a code review"
+    },
+    {
+      "id": "accessible-parking-count",
+      "code_ref": "ADA Table 208.2",
+      "severity": "error",
+      "target": { "kinds": ["block"], "name_contains": "parking" },
+      "check": {
+        "kind": "count_ratio",
+        "thresholds": [[25, 1], [50, 2], [75, 3], [100, 4], [150, 5], [200, 6], [300, 7], [400, 8], [500, 9], [1000000000, 20]],
+        "accessible_name": "accessible"
+      },
+      "message": "too few accessible parking spaces for the total provided (ADA Table 208.2); total = objects named 'parking', accessible = those also named 'accessible' - a name/count heuristic, no stall geometry - advisory pre-check, not a code review"
+    },
+    {
+      "id": "curb-ramp-slope",
+      "code_ref": "ADA 406.1",
+      "severity": "error",
+      "target": { "kinds": ["curve"], "name_contains": "curb" },
+      "check": { "kind": "max_slope", "limit": 0.0833 },
+      "message": "curb ramp running slope exceeds 1:12 max (ADA 406.1) - advisory pre-check, not a code review"
+    }
+  ]
+}

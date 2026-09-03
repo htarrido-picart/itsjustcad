@@ -163,6 +163,47 @@ pub enum CheckKind {
     /// (IBC 1011.5.2). Plan run is the stair's horizontal extent along its long
     /// plan axis; riser count comes from the same clustering as `max_riser`.
     TreadDepth { min: f64 },
+    /// Ramp landings along a ramp centerline curve (ADA 405.7): flags a run
+    /// that rises more than `max_rise` (30 in) without an intervening landing —
+    /// a maximal near-flat stretch (slope ≤ `flat_limit`, default 1:48) at
+    /// least `landing_len` (60 in) long. See [`missing_landings`] for the
+    /// honest limits (reads the drawn centerline; no landing-width geometry).
+    RampLanding {
+        #[serde(default = "default_flat_limit")]
+        flat_limit: f64,
+        landing_len: f64,
+        max_rise: f64,
+    },
+    /// Threshold/step height at a door ≤ `max` (ADA 404.2.5). Read from the
+    /// door block's `threshold` param; a door with no such param is flagged as
+    /// "not modelably detectable" (honest — the model carries no small-step
+    /// geometry), NOT as a pass or a fake measurement. See [`threshold_height`].
+    ThresholdHeight { max: f64 },
+    /// Cross-slope of a walking-surface MESH (ADA 403.3 / 405.3) ≤ `limit`
+    /// (default 1:48). Distinct from `max_slope` (which is the running grade of
+    /// a centerline CURVE); this measures the perpendicular grade of a ramp/
+    /// route surface via up-facing face normals. See [`mesh_cross_slope`].
+    MaxCrossSlope { limit: f64 },
+    /// Accessible count vs total (ADA Table 208.2 parking, etc.): for `total`
+    /// matched objects at least the table's `min_accessible` must ALSO be named
+    /// `accessible_name`. Total = objects matching the rule target; accessible
+    /// = those whose name additionally contains `accessible_name`. `thresholds`
+    /// is ascending `[max_total, min_accessible]` bands (ADA Table 208.2).
+    /// Honest: a pure name/count heuristic — no stall/aisle geometry.
+    CountRatio {
+        /// Ascending `[max_total, min_accessible]` bands (ADA Table 208.2).
+        thresholds: Vec<[f64; 2]>,
+        #[serde(default = "default_accessible_name")]
+        accessible_name: String,
+    },
+}
+
+fn default_flat_limit() -> f64 {
+    1.0 / 48.0
+}
+
+fn default_accessible_name() -> String {
+    "accessible".to_string()
 }
 
 fn default_exit_name() -> String {
@@ -187,6 +228,10 @@ impl CheckKind {
             CheckKind::OccupantLoad { .. } => (None, "occupants"),
             CheckKind::ExitCount { .. } => (None, "exits"),
             CheckKind::TravelDistance { max, .. } => (Some(*max), "m"),
+            CheckKind::RampLanding { max_rise, .. } => (Some(*max_rise), "m rise/run"),
+            CheckKind::ThresholdHeight { max } => (Some(*max), "m"),
+            CheckKind::MaxCrossSlope { limit } => (Some(*limit), "rise/run"),
+            CheckKind::CountRatio { .. } => (None, "count"),
         }
     }
 
@@ -223,6 +268,24 @@ impl CheckKind {
                     }
                 }
             }
+            CheckKind::RampLanding { flat_limit, landing_len, .. } => {
+                if !flat_limit.is_finite() || *flat_limit < 0.0 {
+                    return Err(format!("ramp-landing flat_limit {flat_limit} is negative/non-finite"));
+                }
+                if !landing_len.is_finite() || *landing_len <= 0.0 {
+                    return Err(format!("ramp-landing landing_len {landing_len} is non-positive"));
+                }
+            }
+            CheckKind::CountRatio { thresholds, .. } => {
+                if thresholds.is_empty() {
+                    return Err("count-ratio thresholds table is empty".into());
+                }
+                for t in thresholds {
+                    if !t[0].is_finite() || t[1] < 0.0 {
+                        return Err(format!("bad count-ratio band {t:?}"));
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -241,6 +304,20 @@ fn required_exits(load: f64, thresholds: &[[f64; 2]]) -> usize {
         }
     }
     sorted.last().map(|b| b[1] as usize).unwrap_or(1)
+}
+
+/// Minimum accessible count required for `total` items from ascending
+/// `[max_total, min_accessible]` bands (ADA Table 208.2). The first band whose
+/// `max_total` covers `total` wins; beyond the last band the last band applies.
+fn min_accessible(total: f64, thresholds: &[[f64; 2]]) -> usize {
+    let mut sorted: Vec<[f64; 2]> = thresholds.to_vec();
+    sorted.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    for band in &sorted {
+        if total <= band[0] {
+            return band[1] as usize;
+        }
+    }
+    sorted.last().map(|b| b[1] as usize).unwrap_or(0)
 }
 
 /// One declarative rule. Pure data — see the module docs.
@@ -307,6 +384,17 @@ pub fn demo_pack() -> CheckPack {
 pub fn ibc_pack() -> CheckPack {
     CheckPack::from_json(include_str!("../../../assets/checks-ibc2021.json"))
         .expect("embedded IBC 2021 pack is valid")
+}
+
+/// The embedded ADA 2010 / A117.1 pack (assets/checks-ada.json): ~12 rules
+/// covering accessible ramps (running + cross slope + landings), routes, doors
+/// (clear width + threshold), turning + clear floor space, handrail height, and
+/// accessible parking count. ADVISORY ONLY. Reach ranges and door maneuvering
+/// clearances are DELIBERATELY OMITTED — the model has no fixture-height or
+/// door-swing geometry, so faking them would be dishonest (see PHASES M-ada).
+pub fn ada_pack() -> CheckPack {
+    CheckPack::from_json(include_str!("../../../assets/checks-ada.json"))
+        .expect("embedded ADA 2010 pack is valid")
 }
 
 /// Default on-disk location for user check packs:
@@ -630,6 +718,111 @@ pub fn tread_depth(mesh: &Mesh) -> Option<f64> {
     Some(run / risers.len() as f64)
 }
 
+// ── ADA / A117.1 probes (M-ada) ───────────────────────────────────────────────
+
+/// Ramp landing analysis along a ramp centerline polyline (ADA 405.7).
+/// Walks the samples accumulating rise; a *landing* is a maximal run of
+/// consecutive near-flat segments (running slope ≤ `flat_limit`, default the
+/// 1:48 cross-slope threshold) whose horizontal length ≥ `landing_len`
+/// (60 in). ADA requires a landing at the top and bottom of every ramp run and
+/// between runs so that no single run rises more than `max_rise` (30 in) without
+/// one. Returns the positions (segment midpoints) where the accumulated rise
+/// since the last qualifying landing first exceeds `max_rise` — i.e. a missing
+/// landing. Honest limits: this reads the DRAWN centerline; it cannot see
+/// landing *width* (only length along the path), and complex switchback
+/// geometry that shares samples between runs may under-count. Pure function.
+pub fn missing_landings(
+    samples: &[DVec3],
+    flat_limit: f64,
+    landing_len: f64,
+    max_rise: f64,
+) -> Vec<DVec3> {
+    let mut flags = Vec::new();
+    if samples.len() < 2 {
+        return flags;
+    }
+    // Rise accumulated on the current (non-landing) run since the last landing.
+    let mut run_rise = 0.0f64;
+    // Horizontal length + rise of the current candidate flat stretch.
+    let mut flat_len = 0.0f64;
+    let mut flagged_this_run = false;
+    for w in samples.windows(2) {
+        let run = (w[1] - w[0]).truncate().length();
+        if run < 1e-12 {
+            continue;
+        }
+        let slope = (w[1].z - w[0].z).abs() / run;
+        if slope <= flat_limit {
+            // Extending a flat stretch; once it reaches a full landing length
+            // it resets the run-rise accumulator (a landing was provided).
+            flat_len += run;
+            if flat_len >= landing_len - 1e-9 {
+                run_rise = 0.0;
+                flagged_this_run = false;
+            }
+        } else {
+            // A sloped segment ends any flat stretch and adds to the run rise.
+            flat_len = 0.0;
+            run_rise += (w[1].z - w[0].z).abs();
+            if run_rise > max_rise + 1e-9 && !flagged_this_run {
+                flags.push((w[0] + w[1]) * 0.5);
+                flagged_this_run = true;
+            }
+        }
+    }
+    flags
+}
+
+/// Threshold height at a door/opening (ADA 404.2.5): the vertical step at the
+/// door read from the door block's `threshold` param (meters), else `None`
+/// (not modelably detectable — the engine reports this honestly rather than
+/// inventing a height). Mirrors [`door_width`]'s param-first honesty.
+pub fn threshold_height(params: &BTreeMap<String, String>) -> Option<f64> {
+    params
+        .get("threshold")
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|h| h.is_finite() && *h >= 0.0)
+}
+
+/// Cross-slope of a walking-surface mesh (ADA 403.3 / 405.3): the grade
+/// measured ACROSS the surface's dominant run direction. The run axis is taken
+/// as the mesh's longer horizontal AABB extent; the cross axis is the shorter.
+/// For each up-facing face (normal.z/|n| ≥ 0.7) the cross-slope is the tilt of
+/// its normal projected onto the cross axis. Returns the worst (max) cross
+/// slope over all up-facing faces, or `None` when the mesh has no walking
+/// surface. Honest limit: run/cross axes are inferred from the AABB, so a ramp
+/// drawn on a diagonal or a non-rectangular landing may mis-assign the axes;
+/// this never substitutes for a measured field grade. Pure function.
+pub fn mesh_cross_slope(mesh: &Mesh) -> Option<f64> {
+    let a = mesh.aabb();
+    // Cross axis = the SHORTER horizontal extent (unit vector in XY).
+    let cross = if (a.max.x - a.min.x) >= (a.max.y - a.min.y) {
+        DVec3::new(0.0, 1.0, 0.0)
+    } else {
+        DVec3::new(1.0, 0.0, 0.0)
+    };
+    let pos = mesh.positions();
+    let mut worst: Option<f64> = None;
+    for f in mesh.faces() {
+        let (p0, p1, p2) = (pos[f[0] as usize], pos[f[1] as usize], pos[f[2] as usize]);
+        let n = (p1 - p0).cross(p2 - p0);
+        let len = n.length();
+        if len < 1e-12 {
+            continue;
+        }
+        let nn = n / len;
+        if nn.z.abs() < 0.7 {
+            continue; // not a walking (up-facing) surface
+        }
+        // Grade along the cross axis = |horizontal gradient · cross|. The
+        // gradient of the plane z(x,y) is (-nx/nz, -ny/nz).
+        let grad = DVec3::new(-nn.x / nn.z, -nn.y / nn.z, 0.0);
+        let cross_grade = grad.dot(cross).abs();
+        worst = Some(worst.map_or(cross_grade, |m: f64| m.max(cross_grade)));
+    }
+    worst
+}
+
 // ── Target matching ──────────────────────────────────────────────────────────
 
 /// True when `obj` is one of the query kinds ("curve", "mesh", "block",
@@ -941,6 +1134,77 @@ pub fn evaluate(
                         let c = (a.min + a.max) * 0.5;
                         violations.push((obj.id.short(), DVec3::new(c.x, c.y, a.max.z), tread));
                     }
+                }
+            }
+            CheckKind::RampLanding { flat_limit, landing_len, max_rise } => {
+                for obj in &targets {
+                    let Geometry::Curve(c) = &obj.geometry else { continue };
+                    let samples = resample_polyline(&c.tessellate(0.01), SAMPLE_STEP);
+                    for at in missing_landings(&samples, *flat_limit, *landing_len, *max_rise) {
+                        violations.push((obj.id.short(), at, *max_rise));
+                    }
+                    // Worst measured = the total rise of the run (a coarse proxy
+                    // when passing); use the curve's vertical extent.
+                    if let (Some(lo), Some(hi)) = (
+                        samples.iter().map(|p| p.z).min_by(f64::total_cmp),
+                        samples.iter().map(|p| p.z).max_by(f64::total_cmp),
+                    ) {
+                        worst_max(hi - lo, &mut measured);
+                    }
+                }
+            }
+            CheckKind::ThresholdHeight { max } => {
+                for obj in &targets {
+                    let Geometry::Instance { params, position, .. } = &obj.geometry else {
+                        continue;
+                    };
+                    match threshold_height(params) {
+                        Some(h) => {
+                            worst_max(h, &mut measured);
+                            if h > *max {
+                                violations.push((obj.id.short(), *position, h));
+                            }
+                        }
+                        None => {
+                            // Not modelably detectable: flag honestly (NaN
+                            // measured) rather than pass or fake a height.
+                            violations.push((obj.id.short(), *position, f64::NAN));
+                        }
+                    }
+                }
+            }
+            CheckKind::MaxCrossSlope { limit } => {
+                for obj in &targets {
+                    let Some(mesh) = obj.geometry.mesh() else { continue };
+                    let Some(cross) = mesh_cross_slope(mesh) else { continue };
+                    worst_max(cross, &mut measured);
+                    if cross > *limit {
+                        let a = mesh.aabb();
+                        let c = (a.min + a.max) * 0.5;
+                        violations.push((obj.id.short(), DVec3::new(c.x, c.y, a.max.z), cross));
+                    }
+                }
+            }
+            CheckKind::CountRatio { thresholds, accessible_name } => {
+                let needle = accessible_name.to_lowercase();
+                let total = targets.len();
+                let accessible = targets
+                    .iter()
+                    .filter(|o| {
+                        o.name.as_deref().is_some_and(|n| n.to_lowercase().contains(&needle))
+                    })
+                    .count();
+                let need = min_accessible(total as f64, thresholds);
+                worst_min(accessible as f64, &mut measured);
+                if total > 0 && accessible < need {
+                    // Flag at the centroid of all matched objects.
+                    let mut sum = DVec3::ZERO;
+                    for o in &targets {
+                        let a = o.geometry.aabb();
+                        sum += (a.min + a.max) * 0.5;
+                    }
+                    let at = sum / total as f64;
+                    violations.push((format!("{accessible}/{total} accessible"), at, accessible as f64));
                 }
             }
         }
@@ -1274,6 +1538,110 @@ mod tests {
         // A plain box (no risers) is not a stair.
         let plain = kernel_mesh::make_box(DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0));
         assert_eq!(tread_depth(&plain), None);
+    }
+
+    // ── ADA (M-ada) probes ───────────────────────────────────────────────────
+
+    #[test]
+    fn missing_landings_flags_long_runs_without_a_landing() {
+        // A ramp at 1:12 rising 0.4 m (well under the 0.762 m limit), no flag.
+        let ok = resample_polyline(
+            &[DVec3::ZERO, DVec3::new(4.8, 0.0, 0.4)],
+            0.25,
+        );
+        assert!(missing_landings(&ok, 1.0 / 48.0, 1.524, 0.762).is_empty());
+
+        // A ramp at 1:12 rising 1.0 m in one continuous run (> 0.762 m) with no
+        // landing → flagged once.
+        let steep = resample_polyline(
+            &[DVec3::ZERO, DVec3::new(12.0, 0.0, 1.0)],
+            0.25,
+        );
+        let flags = missing_landings(&steep, 1.0 / 48.0, 1.524, 0.762);
+        assert_eq!(flags.len(), 1, "one missing landing: {flags:?}");
+
+        // Same 1.0 m rise but split by a 2 m flat landing at mid-height → OK.
+        // run 1: 0 → 0.5 m over 6 m; landing: 2 m flat; run 2: 0.5 → 1.0 m.
+        let with_landing = resample_polyline(
+            &[
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(6.0, 0.0, 0.5),
+                DVec3::new(8.0, 0.0, 0.5), // 2 m flat landing
+                DVec3::new(14.0, 0.0, 1.0),
+            ],
+            0.25,
+        );
+        assert!(
+            missing_landings(&with_landing, 1.0 / 48.0, 1.524, 0.762).is_empty(),
+            "landing should clear the run: {:?}",
+            missing_landings(&with_landing, 1.0 / 48.0, 1.524, 0.762)
+        );
+    }
+
+    #[test]
+    fn threshold_height_reads_param_or_none() {
+        let mut params = BTreeMap::new();
+        assert_eq!(threshold_height(&params), None); // not detectable
+        params.insert("threshold".to_string(), "0.012".to_string());
+        assert_eq!(threshold_height(&params), Some(0.012));
+        // Negative / garbage rejected.
+        params.insert("threshold".to_string(), "-1".to_string());
+        assert_eq!(threshold_height(&params), None);
+        params.insert("threshold".to_string(), "tall".to_string());
+        assert_eq!(threshold_height(&params), None);
+    }
+
+    #[test]
+    fn mesh_cross_slope_measures_lateral_tilt() {
+        // A flat ramp surface (a level plate) has ~zero cross slope.
+        let flat = kernel_mesh::make_box(DVec3::ZERO, DVec3::new(4.0, 1.0, 0.05));
+        let c = mesh_cross_slope(&flat).expect("has an up-face");
+        assert!(c < 1e-6, "flat cross slope {c}");
+
+        // Build a plate tilted about the X axis (its LONGER run axis), so the
+        // tilt is a CROSS slope. Two triangles, y from 0..1 rising 0.1 in z.
+        let mesh = Mesh::new(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(4.0, 0.0, 0.0),
+                DVec3::new(4.0, 1.0, 0.1),
+                DVec3::new(0.0, 1.0, 0.1),
+            ],
+            vec![[0, 1, 2], [0, 2, 3]],
+        );
+        let c = mesh_cross_slope(&mesh).expect("has an up-face");
+        // Rise 0.1 over run 1.0 across the short (Y) axis = 1:10.
+        assert!((c - 0.1).abs() < 1e-6, "cross slope {c}");
+    }
+
+    #[test]
+    fn ada_pack_parses_and_is_valid() {
+        let p = ada_pack();
+        assert_eq!(p.name, "ada2010");
+        assert!(p.rules.len() >= 11, "rules: {}", p.rules.len());
+        assert!(p.description.to_lowercase().contains("advisory"));
+        for r in &p.rules {
+            assert!(r.code_ref.starts_with("ADA"), "rule '{}' code_ref '{}'", r.id, r.code_ref);
+            assert!(
+                r.message.contains("advisory pre-check"),
+                "rule '{}' message missing disclaimer",
+                r.id
+            );
+        }
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(CheckPack::from_json(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn min_accessible_thresholds() {
+        // ADA Table 208.2 lower bands.
+        let t = [[25.0, 1.0], [50.0, 2.0], [75.0, 3.0], [100.0, 4.0]];
+        assert_eq!(min_accessible(1.0, &t), 1);
+        assert_eq!(min_accessible(25.0, &t), 1);
+        assert_eq!(min_accessible(26.0, &t), 2);
+        assert_eq!(min_accessible(50.0, &t), 2);
+        assert_eq!(min_accessible(76.0, &t), 4);
+        assert_eq!(min_accessible(500.0, &t), 4); // beyond last band → last
     }
 
     #[test]
