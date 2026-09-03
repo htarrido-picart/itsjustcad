@@ -654,6 +654,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Tools,
         },
         CommandSpec {
+            name: "contours",
+            usage: "contours <interval> [major-every]",
+            summary: "Extract contour polylines FROM the terrain mesh at every multiple of <interval> (marching triangles, chained into polylines). Minor contours go on layer 'contours'; with [major-every] N, every Nth level goes on 'contours-major' instead (index contours). Needs a terrain mesh (run `terrain` first). Example: contours 0.5 5",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "osmfile",
             usage: "osmfile <path.json>",
             summary: "Build OpenStreetMap building context from a saved Overpass API JSON export ('out geom;' query): each building-tagged way footprint is extruded (height tag, else building:levels x 3 m, else 9 m) into a mesh on layer 'context'. lon/lat projected to local meters when a location is set. Example: osmfile /tmp/overpass.json",

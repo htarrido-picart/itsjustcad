@@ -980,6 +980,21 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let [path] = take::<1>("osmfile", "an Overpass .json path", &args)?;
             Ok(Command::OsmFile { path: path.to_string() })
         }
+        "contours" => match args.as_slice() {
+            [interval] => Ok(Command::Contours {
+                interval: number(interval)?,
+                major_every: None,
+                ids: None,
+            }),
+            [interval, major] => Ok(Command::Contours {
+                interval: number(interval)?,
+                major_every: Some(major.parse::<u32>().map_err(|_| {
+                    ParseError::BadNumber((*major).to_string())
+                })?),
+                ids: None,
+            }),
+            _ => wrong("contours", "an interval and optionally a major-every count", &args),
+        },
         "view" => match args.as_slice() {
             ["save", name] => Ok(Command::ViewSave {
                 name: (*name).to_string(),

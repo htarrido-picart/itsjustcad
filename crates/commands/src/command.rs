@@ -908,6 +908,18 @@ pub enum Command {
     OsmFile {
         path: String,
     },
+    /// Extract contour polylines FROM the terrain mesh (marching triangles at
+    /// every multiple of `interval`, chained into polylines). Minor contours
+    /// land on layer "contours", every `major_every`-th level on
+    /// "contours-major". Logged; `ids` are written back on first exec so
+    /// replay recreates identical objects.
+    Contours {
+        interval: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        major_every: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// A raw triangle mesh carried verbatim in the op-log. Used by mesh import
     /// (.obj/.stl/.gltf/.glb) so each imported object is one self-contained
     /// logged op — no external file dependency on replay. Not exposed in the

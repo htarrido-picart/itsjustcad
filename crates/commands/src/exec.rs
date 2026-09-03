@@ -3011,6 +3011,112 @@ fn exec_radiation(
     ))
 }
 
+/// The terrain surface: the most recently created mesh on layer "terrain".
+/// Landscape verbs (`contours`, `pad`, `cutfill`, `flowarrows`, `ponding`,
+/// `sitepath`) all operate on this single surface.
+fn terrain_surface(doc: &Document) -> Result<(ObjectId, &kernel_mesh::Mesh), ExecError> {
+    doc.objects()
+        .filter(|o| o.layer == "terrain")
+        .filter_map(|o| match &o.geometry {
+            Geometry::Mesh(m) => Some((o.id, m)),
+            _ => None,
+        })
+        .last()
+        .ok_or_else(|| {
+            ExecError::Invalid(
+                "no terrain mesh — run `terrain <path.csv|.geojson>` first".into(),
+            )
+        })
+}
+
+/// Contour polylines FROM the terrain mesh: marching triangles at every
+/// multiple of `interval`, chained into polylines. Minor contours on layer
+/// "contours", every `major_every`-th level on "contours-major". Pure
+/// function of the terrain + params, so replay with the written-back ids
+/// recreates identical objects.
+fn exec_contours(
+    doc: &mut Document,
+    interval: f64,
+    major_every: Option<u32>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    if interval <= 0.0 || !interval.is_finite() {
+        return Err(ExecError::Invalid("contours interval must be > 0".into()));
+    }
+    if major_every == Some(0) {
+        return Err(ExecError::Invalid("contours major-every must be ≥ 1".into()));
+    }
+    let (_, mesh) = terrain_surface(doc)?;
+    let lines =
+        crate::landscape::contours(mesh.positions(), mesh.faces(), interval);
+    if lines.is_empty() {
+        return Err(ExecError::Invalid(format!(
+            "no contours: terrain has no elevation band crossing a multiple of {interval}"
+        )));
+    }
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == lines.len() => ids,
+        _ => (0..lines.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    let is_major = |index: i64| -> bool {
+        major_every.is_some_and(|k| index.rem_euclid(k as i64) == 0)
+    };
+    let mut layers_created = Vec::new();
+    // Earthy brown for minor contours, darker + heavier read for majors.
+    for (name, color) in [
+        ("contours", [0.55f32, 0.45, 0.32, 1.0]),
+        ("contours-major", [0.35, 0.25, 0.15, 1.0]),
+    ] {
+        let used = (name == "contours" && lines.iter().any(|c| !is_major(c.index)))
+            || (name == "contours-major" && lines.iter().any(|c| is_major(c.index)));
+        if used && !doc.layers.contains_key(name) {
+            doc.layers.insert(
+                name.to_string(),
+                LayerStyle { color: Some(color), ..LayerStyle::default() },
+            );
+            layers_created.push(name.to_string());
+        }
+    }
+
+    let mut n_major = 0usize;
+    for (line, id) in lines.iter().zip(&new_ids) {
+        let major = is_major(line.index);
+        n_major += usize::from(major);
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: Some(format!("contour {:.3}", line.level)),
+            layer: if major { "contours-major" } else { "contours" }.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(Curve::Polyline {
+                points: line.points.clone(),
+                closed: line.closed,
+            }),
+        });
+    }
+    doc.generation += 1;
+
+    let (zmin, zmax) = lines.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| {
+        (lo.min(c.level), hi.max(c.level))
+    });
+    Ok((
+        Command::Contours { interval, major_every, ids: Some(new_ids.clone()) },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome {
+            message: format!(
+                "contours every {interval} m ({zmin}..{zmax} m): {} minor on 'contours', \
+                 {n_major} major on 'contours-major'",
+                new_ids.len() - n_major
+            ),
+            created: new_ids,
+        },
+    ))
+}
+
 /// Sun-path diagram: the yearly sun-path dome for the document's location as
 /// open polylines on a golden `sunpath` layer — seven date arcs (Dec 21 → Jun
 /// 21; Jul–Nov retrace them), analemma-style hour curves, plus a horizon
@@ -6021,6 +6127,9 @@ fn apply_forward(
         Command::FaceSunHours { targets, ids, year, month, day } => {
             exec_face_sun_hours(doc, targets, ids, year, month, day)
         }
+        Command::Contours { interval, major_every, ids } => {
+            exec_contours(doc, interval, major_every, ids)
+        }
         Command::SunOff => {
             let prev = doc.sun.take();
             doc.generation += 1;
@@ -7454,6 +7563,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Import { .. } => "import",
         Command::Terrain { .. } => "terrain",
         Command::OsmFile { .. } => "osmfile",
+        Command::Contours { .. } => "contours",
         Command::ViewSave { .. } => "view save",
         Command::ViewRestore { .. } => "view",
         Command::ViewList => "view list",
@@ -13156,4 +13266,89 @@ mod tests {
         assert!((((bx - ax).powi(2) + (by - ay).powi(2)).sqrt() - 4.0).abs() < 1e-6, "length 4");
     }
 
+    // ── M-landscape ─────────────────────────────────────────────────────────
+
+    /// Session with a synthetic gridded terrain mesh on layer "terrain":
+    /// (n+1)² vertices over [0,size]², z = f(x,y). Uses a MeshLiteral op like
+    /// the real `terrain` verb, so the whole setup lives in the op-log.
+    fn terrain_session(n: usize, size: f64, f: impl Fn(f64, f64) -> f64) -> Session {
+        let mut s = Session::default();
+        run(&mut s, "layer terrain");
+        let mut positions = Vec::new();
+        for j in 0..=n {
+            for i in 0..=n {
+                let x = size * i as f64 / n as f64;
+                let y = size * j as f64 / n as f64;
+                positions.push(DVec3::new(x, y, f(x, y)));
+            }
+        }
+        let mut faces = Vec::new();
+        let idx = |i: usize, j: usize| (j * (n + 1) + i) as u32;
+        for j in 0..n {
+            for i in 0..n {
+                faces.push([idx(i, j), idx(i + 1, j), idx(i + 1, j + 1)]);
+                faces.push([idx(i, j), idx(i + 1, j + 1), idx(i, j + 1)]);
+            }
+        }
+        s.run(Command::MeshLiteral {
+            id: None,
+            positions,
+            faces,
+            name: Some("terrain".to_string()),
+        })
+        .unwrap();
+        run(&mut s, "layer 0");
+        s
+    }
+
+    #[test]
+    fn contours_needs_a_terrain_mesh() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        let err = s.run(parse("contours 1").unwrap()).unwrap_err();
+        assert!(format!("{err}").contains("no terrain"), "{err}");
+    }
+
+    #[test]
+    fn contours_on_cone_split_minor_major_and_undo() {
+        // Cone peak z=5 at (5,5): closed rings at 1..4 m. major-every 2 →
+        // levels 2 and 4 are major.
+        let mut s = terrain_session(40, 10.0, |x, y| {
+            (5.0 - ((x - 5.0).powi(2) + (y - 5.0).powi(2)).sqrt()).max(0.0)
+        });
+        let before = s.doc.len();
+        let out = run(&mut s, "contours 1 2");
+        assert_eq!(out.created.len(), 4, "{}", out.message);
+        let on_layer = |s: &Session, layer: &str| -> usize {
+            s.doc.objects().filter(|o| o.layer == layer).count()
+        };
+        assert_eq!(on_layer(&s, "contours"), 2, "levels 1 and 3 are minor");
+        assert_eq!(on_layer(&s, "contours-major"), 2, "levels 2 and 4 are major");
+        // Every contour on a cone is a closed ring.
+        for id in &out.created {
+            match &s.doc.get(*id).unwrap().geometry {
+                Geometry::Curve(Curve::Polyline { closed, .. }) => assert!(closed),
+                g => panic!("contour must be a polyline, got {g:?}"),
+            }
+        }
+        // Undo removes the polylines and drops the auto-created layers.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), before);
+        assert!(!s.doc.layers.contains_key("contours"));
+        assert!(!s.doc.layers.contains_key("contours-major"));
+    }
+
+    #[test]
+    fn contours_replay_is_stable() {
+        let mut s = terrain_session(20, 10.0, |x, _| x / 2.0);
+        run(&mut s, "contours 0.5");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "contours log must replay bit-identically (ids embedded)"
+        );
+        assert_eq!(s.doc.len(), replayed.doc.len());
+    }
 }

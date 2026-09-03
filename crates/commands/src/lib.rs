@@ -16,6 +16,7 @@ pub mod gbnf;
 pub mod geo;
 pub mod ifc;
 pub mod io;
+pub mod landscape;
 pub mod las;
 pub mod mesh_export;
 pub mod mesh_import;
