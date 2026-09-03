@@ -99,6 +99,8 @@ pub const UI_VERB_HELP: &str = "\
 These change only the window LAYOUT (panels, docking, viewport split, workspace, theme) — they persist to ui.json and NEVER touch the drawing or the op-log (no replay, no undo). Emit them inside the same ```draft block as everything else. Use them only when the user asks to rearrange the interface, not to draw.
 
   panel show|hide                               show or hide the docked side panel                       e.g. panel hide
+  panel chat|sessions|layers|blocks|plugins     reveal a right-dock tab (opens the panel; Blocks lists   e.g. panel blocks
+                                                block definitions, Plugins the installed macros)
   dock left|right                               move the docked panel to a side                          e.g. dock right
   split 1|2|4                                   set the viewport split (1 / 2 / 4-up)                    e.g. split 4
   workspace <name>                              switch workspace (e.g. model, layout, deck)              e.g. workspace layout
@@ -647,6 +649,7 @@ mod tests {
         assert!(p.contains("## UI/session commands"));
         for line in [
             "panel show|hide",
+            "panel chat|sessions|layers|blocks|plugins",
             "dock left|right",
             "split 1|2|4",
             "workspace <name>",

@@ -53,6 +53,10 @@ impl ViewportSplit {
 pub enum UiAction {
     /// Show or hide the docked side panel.
     PanelVisible { visible: bool },
+    /// Reveal a specific right-dock tab by name (chat | sessions | layers |
+    /// blocks | plugins) — opens the panel and, for the dynamic Blocks/Plugins
+    /// tabs, pins them visible even while empty.
+    PanelTab { name: String },
     /// Move the docked panel to a side.
     DockSide { side: DockSide },
     /// Set the viewport split (1 / 2 / 4).
@@ -70,6 +74,7 @@ impl UiAction {
             UiAction::PanelVisible { visible } => {
                 format!("panel {}", if *visible { "shown" } else { "hidden" })
             }
+            UiAction::PanelTab { name } => format!("panel tab {name}"),
             UiAction::DockSide { side } => format!("dock {side:?}").to_lowercase(),
             UiAction::Split { split } => format!("viewport split {}", split.count()),
             UiAction::Workspace { name } => format!("workspace {name}"),
@@ -81,6 +86,7 @@ impl UiAction {
 /// Parse a UI-plane action from a compact command line. Grammar (one per line):
 ///
 /// - `panel show` / `panel hide`
+/// - `panel chat|sessions|layers|blocks|plugins` (reveal a right-dock tab)
 /// - `dock left` / `dock right`
 /// - `split 1` / `split 2` / `split 4`
 /// - `workspace <name>`
@@ -95,7 +101,12 @@ pub fn parse_ui_action(line: &str) -> Result<UiAction, String> {
         "panel" => match arg {
             Some("show") => Ok(UiAction::PanelVisible { visible: true }),
             Some("hide") => Ok(UiAction::PanelVisible { visible: false }),
-            other => Err(format!("panel expects show|hide, got {other:?}")),
+            Some(tab @ ("chat" | "sessions" | "layers" | "blocks" | "plugins")) => {
+                Ok(UiAction::PanelTab { name: tab.to_string() })
+            }
+            other => Err(format!(
+                "panel expects show|hide|chat|sessions|layers|blocks|plugins, got {other:?}"
+            )),
         },
         "dock" => match arg {
             Some("left") => Ok(UiAction::DockSide { side: DockSide::Left }),
@@ -133,6 +144,14 @@ pub fn apply(value: &mut Value, action: &UiAction) {
     match action {
         UiAction::PanelVisible { visible } => {
             obj.insert("panel_visible".into(), Value::Bool(*visible));
+        }
+        UiAction::PanelTab { name } => {
+            // Revealing a tab implies the panel is visible. `panel_tab` is a
+            // TRANSIENT reveal — the app applies it then strips it from
+            // ui.json before persisting (see the apply loop in `App::ui`), so
+            // a relaunch never re-forces an old tab.
+            obj.insert("panel_visible".into(), Value::Bool(true));
+            obj.insert("panel_tab".into(), Value::String(name.clone()));
         }
         UiAction::DockSide { side } => {
             let s = match side {
@@ -180,6 +199,13 @@ mod tests {
             parse_ui_action("theme dark").unwrap(),
             UiAction::Theme { name: "dark".into() }
         );
+        for tab in ["chat", "sessions", "layers", "blocks", "plugins"] {
+            assert_eq!(
+                parse_ui_action(&format!("panel {tab}")).unwrap(),
+                UiAction::PanelTab { name: tab.into() },
+                "panel {tab} must parse as a tab reveal"
+            );
+        }
     }
 
     #[test]
@@ -189,6 +215,15 @@ mod tests {
         assert!(parse_ui_action("split 3").is_err());
         assert!(parse_ui_action("theme neon").is_err());
         assert!(parse_ui_action("panel").is_err());
+        assert!(parse_ui_action("panel bogus").is_err(), "unknown tab name rejected");
+    }
+
+    #[test]
+    fn panel_tab_apply_reveals_panel_and_records_tab() {
+        let mut v = serde_json::json!({});
+        apply(&mut v, &UiAction::PanelTab { name: "blocks".into() });
+        assert_eq!(v["panel_tab"], serde_json::json!("blocks"));
+        assert_eq!(v["panel_visible"], serde_json::json!(true), "revealing a tab shows the panel");
     }
 
     #[test]
@@ -196,7 +231,15 @@ mod tests {
         // A UI-plane line must NOT parse as a document command: the two tool
         // groups are disjoint. `split 4` / `dock left` / `theme dark` are not
         // substrate verbs.
-        for line in ["panel hide", "dock left", "split 4", "workspace layout", "theme dark"] {
+        for line in [
+            "panel hide",
+            "panel blocks",
+            "panel plugins",
+            "dock left",
+            "split 4",
+            "workspace layout",
+            "theme dark",
+        ] {
             assert!(
                 parse(line).is_err(),
                 "'{line}' must not be a document command"
@@ -272,6 +315,7 @@ mod tests {
         // `parse_ui_action` accepts.
         for line in [
             "panel show|hide",
+            "panel chat|sessions|layers|blocks|plugins",
             "dock left|right",
             "split 1|2|4",
             "workspace <name>",
@@ -281,9 +325,11 @@ mod tests {
         }
 
         // Every advertised example must actually parse — the model is never told
-        // syntax the dispatcher rejects. This exercises all five UiAction verbs.
+        // syntax the dispatcher rejects. This exercises every UiAction verb.
         for example in [
             "panel hide",
+            "panel blocks",
+            "panel plugins",
             "dock right",
             "split 4",
             "workspace layout",

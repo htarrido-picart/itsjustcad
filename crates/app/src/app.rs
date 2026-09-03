@@ -5158,6 +5158,15 @@ impl App {
         if let Some(v) = ui_json["panel_visible"].as_bool() {
             self.panel_visible = v;
         }
+        // Transient tab reveal (`panel blocks` etc.) — see the apply loop in
+        // `ui`, which strips this key before persisting.
+        if let Some(t) = ui_json["panel_tab"].as_str().and_then(panel_tab_by_name) {
+            self.panel_tabs.show(t);
+            self.panel_visible = true;
+            if t == crate::tabstrip::PanelTab::Deck {
+                self.deck_visible = true;
+            }
+        }
         match ui_json["theme"].as_str() {
             Some("dark") => self.forced_dark = Some(true),
             Some("light") => self.forced_dark = Some(false),
@@ -6102,8 +6111,14 @@ impl eframe::App for App {
             for action in &ui_actions {
                 crate::ui_plane::apply(&mut v, action);
             }
-            save_ui_json(&v);
             self.reconcile_ui_plane(&v);
+            // `panel_tab` is a TRANSIENT reveal (deck says "panel blocks", the
+            // tab opens once) — strip it before persisting so a relaunch or a
+            // later unrelated action never re-forces an old tab.
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("panel_tab");
+            }
+            save_ui_json(&v);
         }
 
         // APP-VERB PLANE: run any app-level verbs the deck emitted (camera/view/
