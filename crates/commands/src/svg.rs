@@ -165,7 +165,18 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
             .find(|l| l.name == obj.layer)
             .unwrap_or(&mut orphan);
 
-        let world_segs = collect_segments(&obj.geometry);
+        let mut world_segs = collect_segments(&obj.geometry);
+        // Planting plan: a mesh named `plant:<id>` also emits its 2D top-view
+        // drafting symbol. Only in the Top (plan) projection — a plan glyph is
+        // meaningless in elevation/iso. The 3D mesh feature edges still export;
+        // the symbol overlays them so the drawing reads as a planting plan.
+        if dir == ViewDirection::Top
+            && let (Some(name), Geometry::Mesh(mesh)) = (obj.name.as_deref(), &obj.geometry)
+            && let Some(sym) =
+                crate::landscape::plant_object_symbol(name, mesh.positions())
+        {
+            world_segs.extend(sym);
+        }
         for (a, b) in &world_segs {
             let pa = project(dir, *a);
             let pb = project(dir, *b);
@@ -331,6 +342,28 @@ mod tests {
         let svg = String::from_utf8(bytes).unwrap();
         assert!(svg.contains("id=\"a\""), "layer a group");
         assert!(svg.contains("id=\"b\""), "layer b group");
+    }
+
+    /// A planted tree emits its 2D plan symbol (extra `<line>` elements) in the
+    /// Top-view SVG export, on the 'planting' layer.
+    #[test]
+    fn svg_plant_emits_plan_symbol() {
+        let mut s = Session::default();
+        s.run(parse("plant oak 0,0").unwrap()).unwrap();
+        let (bytes, _) = export_svg(&s.doc);
+        let svg = String::from_utf8(bytes).unwrap();
+        // The planting layer group must exist and carry many line segments —
+        // the 3D feature edges PLUS the round plan symbol (24-gon + 8 branches).
+        assert!(svg.contains("id=\"planting\""), "planting layer group\n{svg}");
+        let planting_group = svg
+            .split("id=\"planting\"")
+            .nth(1)
+            .unwrap()
+            .split("</g>")
+            .next()
+            .unwrap();
+        let lines = planting_group.matches("<line ").count();
+        assert!(lines >= 32, "expected plan-symbol lines, got {lines}");
     }
 
     /// Text annotation renders as Hershey vector strokes (SVG `<line>` elements),

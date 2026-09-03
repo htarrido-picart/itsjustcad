@@ -266,6 +266,17 @@ fn render_view(
             let w = doc.effective_lineweight(obj);
             let mut tmp = Vec::new();
             geometry_segments(&obj.geometry, &mut tmp);
+            // Planting plan: in a Top (plan) view, a mesh named `plant:<id>`
+            // also draws its 2D drafting symbol atop the 3D feature edges. Plan
+            // glyphs are meaningless in elevation/iso, so gate on direction.
+            if view.direction == ViewDirection::Top
+                && let (Some(name), Geometry::Mesh(mesh)) =
+                    (obj.name.as_deref(), &obj.geometry)
+                && let Some(sym) =
+                    crate::landscape::plant_object_symbol(name, mesh.positions())
+            {
+                tmp.extend(sym);
+            }
             for (a, b) in tmp {
                 weighted_segs.push((w, a, b));
             }
@@ -786,6 +797,35 @@ mod tests {
         // Confirm PDF structure is valid.
         assert!(bytes.starts_with(b"%PDF"), "valid PDF header");
         assert!(bytes.ends_with(b"%%EOF\n"), "valid PDF trailer");
+    }
+
+    /// A planted tree draws its plan symbol in a Top view but not in Front:
+    /// the plan glyph is gated to the plan projection.
+    #[test]
+    fn plant_symbol_in_top_view_only() {
+        use crate::{parse, Session};
+
+        let mut top = Session::default();
+        top.run(parse("plant oak 0,0").unwrap()).unwrap();
+        top.run(parse("sheet plan a3").unwrap()).unwrap();
+        top.run(parse("sheetview plan top 200").unwrap()).unwrap();
+        let sheet = top.doc.sheet("plan").unwrap().clone();
+        let (_bytes, drawn_top) = sheet_pdf(&top.doc, &sheet);
+
+        let mut front = Session::default();
+        front.run(parse("plant oak 0,0").unwrap()).unwrap();
+        front.run(parse("sheet plan a3").unwrap()).unwrap();
+        front.run(parse("sheetview plan front 200").unwrap()).unwrap();
+        let sheet_f = front.doc.sheet("plan").unwrap().clone();
+        let (_b2, drawn_front) = sheet_pdf(&front.doc, &sheet_f);
+
+        // Top view adds the round plan symbol (24-gon + 8 branches = 32 segs
+        // before viewport clipping) on top of the shared 3D feature edges, so
+        // it draws substantially more than the front view, which has no symbol.
+        assert!(
+            drawn_top > drawn_front + 20,
+            "top {drawn_top} should exceed front {drawn_front} by the plan symbol"
+        );
     }
 
     /// Model-space LinearDim lines render inside a viewport (segments drawn > 0).
