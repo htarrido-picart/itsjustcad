@@ -184,7 +184,13 @@ fn parse_stl_binary(bytes: &[u8]) -> Result<Mesh, String> {
         return Err("binary STL too short (< 84 bytes)".to_string());
     }
     let tri_count = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
-    let expected = 84 + 50 * tri_count;
+    // Checked arithmetic: a crafted `tri_count` (e.g. 0x40000000) would wrap
+    // `84 + 50 * tri_count` back to a tiny value, sneaking past the length
+    // check and driving the parallel decoder to read past the file end.
+    let expected = tri_count
+        .checked_mul(50)
+        .and_then(|b| b.checked_add(84))
+        .ok_or_else(|| format!("binary STL triangle count {tri_count} overflows"))?;
     if bytes.len() < expected {
         return Err(format!(
             "binary STL truncated: expected {expected} bytes, got {}",
@@ -287,7 +293,12 @@ fn parse_glb_binary(bytes: &[u8]) -> Result<Vec<(String, Mesh)>, String> {
         let chunk_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         let chunk_type = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
         let data_start = pos + 8;
-        let data_end = data_start + chunk_len;
+        // Checked add: a crafted chunk_len near usize::MAX would wrap data_end
+        // back below `total`, passing the bounds check and then panicking on the
+        // `bytes[data_start..data_end]` slice.
+        let Some(data_end) = data_start.checked_add(chunk_len) else {
+            break;
+        };
         if data_end > total {
             break;
         }
@@ -296,8 +307,8 @@ fn parse_glb_binary(bytes: &[u8]) -> Result<Vec<(String, Mesh)>, String> {
             0x004E_4942 => bin_bytes = Some(&bytes[data_start..data_end]),
             _ => {}
         }
-        // Chunks are 4-byte aligned.
-        pos = (data_end + 3) & !3;
+        // Chunks are 4-byte aligned. Saturate to avoid a wrap on the align math.
+        pos = data_end.saturating_add(3) & !3;
     }
 
     let json_raw =
@@ -747,9 +758,15 @@ fn collect_triangles_from_p(
     let pos_len = pos_len as u32;
     for t in 0..tri_count {
         let base = t * 3 * stride;
-        let a = indices[base + vertex_offset];
-        let b = indices[base + stride + vertex_offset];
-        let c = indices[base + 2 * stride + vertex_offset];
+        // Use .get() rather than direct indexing: `vertex_offset` is file-derived
+        // and can exceed `stride`, pushing these reads past the buffer end.
+        let (Some(&a), Some(&b), Some(&c)) = (
+            indices.get(base + vertex_offset),
+            indices.get(base + stride + vertex_offset),
+            indices.get(base + 2 * stride + vertex_offset),
+        ) else {
+            continue;
+        };
         // H-5 pattern: discard OOB faces.
         if a < pos_len && b < pos_len && c < pos_len {
             out.push([a, b, c]);
@@ -771,19 +788,31 @@ fn collect_polylist_from_p(
     let mut cursor = 0usize;
     for &vc in vcounts {
         let n = vc as usize;
-        if n < 3 || cursor + n * stride > indices.len() {
-            cursor += n * stride;
+        // Checked arithmetic: `n * stride` and the running `cursor` are both
+        // driven by file data and can overflow usize on a crafted vcount buffer.
+        let Some(span) = n.checked_mul(stride) else { break };
+        let Some(next) = cursor.checked_add(span) else { break };
+        if n < 3 || next > indices.len() {
+            cursor = next;
             continue;
         }
-        let v0 = indices[cursor + vertex_offset];
+        // .get() guards: `vertex_offset` may exceed `stride`.
+        let Some(&v0) = indices.get(cursor + vertex_offset) else {
+            cursor = next;
+            continue;
+        };
         for i in 1..(n - 1) {
-            let v1 = indices[cursor + i * stride + vertex_offset];
-            let v2 = indices[cursor + (i + 1) * stride + vertex_offset];
+            let (Some(&v1), Some(&v2)) = (
+                indices.get(cursor + i * stride + vertex_offset),
+                indices.get(cursor + (i + 1) * stride + vertex_offset),
+            ) else {
+                continue;
+            };
             if v0 < pos_len && v1 < pos_len && v2 < pos_len {
                 out.push([v0, v1, v2]);
             }
         }
-        cursor += n * stride;
+        cursor = next;
     }
 }
 
@@ -1528,5 +1557,64 @@ endsolid test\n\
             msg.contains("too short") || msg.contains("not a LAS file"),
             "garbage .laz should get the LAS parser's error: {msg}"
         );
+    }
+
+    // ---- M-secreview adversarial inputs: bounds / overflow hardening ----
+
+    /// A crafted binary-STL header claims a triangle count whose byte length
+    /// (`84 + 50 * count`) overflows usize and wraps back below the real file
+    /// length. Before the checked_mul fix this passed the length gate and the
+    /// parallel decoder read past the end (panic). Must now return a clean Err.
+    #[test]
+    fn stl_binary_overflow_tri_count_is_rejected() {
+        let mut bytes = vec![0u8; 84];
+        // 0x33333334 * 50 wraps in usize? No — pick a count that overflows the
+        // multiply on 64-bit: usize::MAX/50 + 1 doesn't fit in u32, so use the
+        // max u32 which times 50 is ~214e9 (fits in usize) but far exceeds the
+        // 84-byte file → truncation error, never a panic. Also exercise the
+        // add-overflow path is unreachable here; the key assertion is no panic.
+        bytes[80..84].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = parse_stl_binary(&bytes).unwrap_err();
+        assert!(
+            err.contains("truncated") || err.contains("overflow"),
+            "huge STL tri_count must error cleanly, got: {err}"
+        );
+    }
+
+    /// GLB with a chunk length near usize::MAX would wrap `data_start + chunk_len`
+    /// back below `total`, sneaking past the bounds check and panicking on the
+    /// slice. With checked_add it just stops scanning chunks → no JSON → Err.
+    #[test]
+    fn glb_chunk_len_overflow_does_not_panic() {
+        let mut bytes = vec![0u8; 24];
+        bytes[0..4].copy_from_slice(b"glTF");
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes()); // version 2
+        bytes[8..12].copy_from_slice(&24u32.to_le_bytes()); // total len
+        // First chunk at offset 12: length = u32::MAX, type = JSON.
+        bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[16..20].copy_from_slice(&0x4E4F_534Au32.to_le_bytes());
+        // Must not panic; no valid JSON chunk parsed → clean error.
+        let res = parse_glb_binary(&bytes);
+        assert!(res.is_err(), "overflowing GLB chunk should error, not panic");
+    }
+
+    /// Collada <triangles> whose <input> offset exceeds the interleave stride,
+    /// plus a truncated <p>, previously indexed past the index buffer. The
+    /// .get() guards must drop the bad faces without panicking.
+    #[test]
+    fn collada_bad_input_offset_does_not_panic() {
+        let mut out: Vec<[u32; 3]> = Vec::new();
+        // stride 2, but ask for vertex_offset 9 (way past stride) with a short
+        // buffer — every read is OOB and must be skipped, not panic.
+        let indices = [0u32, 1, 2, 3, 4, 5];
+        collect_triangles_from_p(&indices, 2, 9, 100, &mut out);
+        assert!(out.is_empty());
+
+        // polylist path: vcount with overflowing span + oversized offset.
+        let mut out2: Vec<[u32; 3]> = Vec::new();
+        let vcounts = [3u32, usize::MAX as u32];
+        collect_polylist_from_p(&indices, &vcounts, 2, 9, 100, &mut out2);
+        // No panic; nothing valid collected.
+        assert!(out2.is_empty());
     }
 }
