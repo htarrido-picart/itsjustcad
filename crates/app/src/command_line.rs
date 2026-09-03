@@ -14,7 +14,9 @@ const MAX_SUGGESTIONS: usize = 8;
 /// Rhino-style command line: single input row + scrollback, up/down history,
 /// plus as-you-type autosuggest popup and usage hints.
 pub struct CommandLine {
-    input: String,
+    /// pub(crate) so app-level journey tests can assert what typing/autosuggest
+    /// left in the input; production code goes through `prefill`/`ui`.
+    pub(crate) input: String,
     history: Vec<String>,
     /// Executed inputs for up-arrow recall.
     recall: Vec<String>,
@@ -564,6 +566,13 @@ impl CommandLine {
                     .id(egui::Id::new("command_line_input"))
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
+                    // While the autosuggest popup is open, Tab must ACCEPT the
+                    // suggestion — without lock_focus egui consumes Tab for
+                    // focus traversal before our handler ever sees it, so the
+                    // Tab-accept branch below was dead (found by the
+                    // journey_autosuggest_accept kittest journey). With the
+                    // popup closed Tab traverses focus as usual.
+                    .lock_focus(show_popup)
                     .hint_text("box 0,0,0 5,5,3"),
             );
             if self.focus_next_frame {

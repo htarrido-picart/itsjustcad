@@ -3721,6 +3721,86 @@ mod side_effect_gate_tests {
         std::mem::forget(rt);
     }
 
+    // ── M-guitest: chat journey + reduce-motion audit (CPU kittest) ──────
+    // These render the pane through kittest's default (CPU) renderer — no GPU,
+    // no snapshot — and assert on the AccessKit tree, so they run in the
+    // normal `cargo test` suite everywhere.
+
+    /// M-deckagent journey: a `QUESTION:` turn renders as a distinct question
+    /// bubble and a `PLAN:` turn as a checklist card — both reachable through
+    /// the accessibility tree (the transcript is not just painted pixels).
+    #[test]
+    fn chat_question_and_plan_render_in_transcript() {
+        use egui_kittest::kittest::Queryable as _;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let colors = crate::theme::roles_from([0.98, 0.98, 0.97, 1.0], [0.20, 0.50, 1.0, 1.0]);
+        let icons = crate::icons::Icons::new();
+        let mut session = Session::default();
+        let mut pane = ready_pane();
+        let mut plan = itsjustcad_deck::Plan::new(vec!["slab".into(), "cores".into()]);
+        plan.mark_step_done();
+        pane.transcript = vec![
+            Entry::User("build a tower".into()),
+            Entry::Question("how tall should the tower be?".into()),
+            Entry::Plan(plan),
+        ];
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(360.0, 700.0))
+            .build_ui(|ui| {
+                pane.ui(ui, &mut session, &handle, &icons, &colors, false, false);
+            });
+        harness.run_steps(4);
+        // Question bubble: the question text plus its "?" badge both render.
+        assert!(
+            harness
+                .query_all_by_label_contains("how tall should the tower be?")
+                .next()
+                .is_some(),
+            "QUESTION turn renders as a question bubble"
+        );
+        // Plan card: header + the checklist body carrying the step names.
+        assert!(
+            harness.query_all_by_label("Plan").next().is_some(),
+            "PLAN turn renders the checklist card header"
+        );
+        // The snapshotted step statuses render as checklist marks.
+        assert!(
+            harness
+                .query_all_by_label_contains("[x] 1. slab")
+                .next()
+                .is_some(),
+            "checklist shows the done mark on step 1"
+        );
+        assert!(
+            harness
+                .query_all_by_label_contains("[ ] 2. cores")
+                .next()
+                .is_some(),
+            "checklist shows the pending mark on step 2"
+        );
+        drop(harness);
+        drop(rt);
+    }
+
+    /// Usability audit: with reduce-motion set the busy indicator is a STATIC
+    /// dot — it must not request continuous repaints the way the spinner does.
+    #[test]
+    fn busy_indicator_honors_reduce_motion() {
+        let mut harness = egui_kittest::Harness::new_ui(|ui| busy_indicator(ui, true));
+        harness.run_steps(2);
+        assert!(
+            !harness.ctx.requested_repaint_last_pass(),
+            "reduce-motion busy indicator must be static (no repaint loop)"
+        );
+        let mut harness = egui_kittest::Harness::new_ui(|ui| busy_indicator(ui, false));
+        harness.run_steps(2);
+        assert!(
+            harness.ctx.requested_repaint_last_pass(),
+            "sanity: the animated spinner does request repaints"
+        );
+    }
+
     // --- Opt-in web search gating at the request-build boundary ---
 
     #[test]

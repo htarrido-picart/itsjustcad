@@ -6502,6 +6502,164 @@ mod tests {
         snapshot_app("dialog_light", false, &seed);
     }
 
+    // ── M-guitest: journey tests ─────────────────────────────────────────
+    // Whole-app flows driven through kittest's AccessKit tree + synthetic
+    // input (typing, key presses) — no snapshots, assertions run on the real
+    // App state after each interaction. Like the previews these need a GPU
+    // adapter (App::new demands wgpu render state), so they are ignored by
+    // default and run explicitly:
+    //
+    //   cargo test -p itsjustcad journey_ -- --ignored --test-threads=1
+
+    /// Build the off-screen app harness, run a few settle frames, then hand it
+    /// to the journey body. Leaks harness + runtime for the same wgpu-teardown
+    /// reason as [`snapshot_app`].
+    #[cfg(test)]
+    fn run_app_journey(f: impl FnOnce(&mut egui_kittest::Harness<'_, App>)) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 900.0))
+            .wgpu()
+            .build_eframe(|cc| App::new(cc, handle.clone()));
+        {
+            let app = harness.state_mut();
+            app.preview_no_viewport = true;
+            app.forced_dark = Some(true);
+            // Journeys must be deterministic regardless of the developer's
+            // persisted ui.json (which can pin dynamic tabs / pick any tab).
+            app.panel_tabs = crate::tabstrip::TabState::default();
+        }
+        harness.run_steps(4);
+        f(&mut harness);
+        std::mem::forget(harness);
+        std::mem::forget(rt);
+    }
+
+    /// Type `line` into the currently-focused widget (the command line is
+    /// focused by default and re-focuses itself after every submit) and press
+    /// Enter. Panics if nothing has focus — that would itself be a usability
+    /// regression (the command line must always reclaim focus).
+    #[cfg(test)]
+    fn submit_command(harness: &mut egui_kittest::Harness<'_, App>, line: &str) {
+        use egui_kittest::kittest::Queryable as _;
+        let input = harness
+            .query_all_by(|n| n.is_focused())
+            .next()
+            .expect("a focused widget (the command line focuses itself)");
+        input.type_text(line);
+        harness.run_steps(2);
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(2);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_box_select_undo() {
+        // Draw a box via the command line → it exists in the doc → select it →
+        // undo → gone. `select` is deliberately NOT logged (view state), so the
+        // first undo reverts the box itself — asserting the op-log invariant.
+        run_app_journey(|h| {
+            submit_command(h, "box 0,0,0 5,5,3");
+            assert_eq!(h.state().session.doc.objects().count(), 1, "box drawn");
+
+            submit_command(h, "select all");
+            assert!(
+                !h.state().session.doc.selection.is_empty(),
+                "select all selected the box"
+            );
+
+            submit_command(h, "undo");
+            assert_eq!(
+                h.state().session.doc.objects().count(),
+                0,
+                "undo (select is unlogged) removed the box"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_layers_add_and_lock() {
+        // Add a layer via the command line → it appears as a row in the Layers
+        // tab (AccessKit query) → lock it → the doc reports it locked.
+        run_app_journey(|h| {
+            use egui_kittest::kittest::Queryable as _;
+            submit_command(h, "layer walls");
+            h.state_mut().panel_tabs.show(crate::tabstrip::PanelTab::Model);
+            h.run_steps(2);
+            assert!(
+                h.query_all_by_label_contains("walls").next().is_some(),
+                "layer 'walls' appears in the Layers table"
+            );
+            assert!(!h.state().session.doc.layer_locked("walls"));
+            submit_command(h, "layerlock walls on");
+            assert!(
+                h.state().session.doc.layer_locked("walls"),
+                "layerlock toggles the doc's lock state"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_autosuggest_accept() {
+        // Type a partial verb → the autosuggest popup lists the completion →
+        // Tab accepts it into the input.
+        run_app_journey(|h| {
+            use egui_kittest::kittest::Queryable as _;
+            let input = h
+                .query_all_by(|n| n.is_focused())
+                .next()
+                .expect("command line focused by default");
+            input.type_text("bo");
+            h.run_steps(2);
+            assert!(
+                h.query_all_by_label_contains("box").next().is_some(),
+                "autosuggest popup offers 'box' for partial 'bo'"
+            );
+            h.key_press(egui::Key::Tab);
+            h.run_steps(2);
+            assert!(
+                h.state().command_line.input.starts_with("box"),
+                "Tab accepted the suggestion into the input (got {:?})",
+                h.state().command_line.input
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_blocks_tab_lists_user_definition() {
+        // The Blocks tab is dynamic (M-dyntabs) — but every new document ships
+        // the STARTER parametric blocks (pdoor, pbed, …), so in practice the
+        // tab is present from the first frame. The journey therefore asserts
+        // (1) the tab is up because definitions exist, and (2) defining a
+        // block from drawn geometry surfaces it as a row in the tab.
+        // (Pure appear/disappear transitions are covered by tabstrip's tests.)
+        run_app_journey(|h| {
+            use egui_kittest::kittest::Queryable as _;
+            assert!(
+                crate::dyntabs::has_block_defs(&h.state().session.doc),
+                "new docs carry the starter parametric blocks"
+            );
+            assert!(
+                h.query_all_by_label_contains("Blocks").next().is_some(),
+                "Blocks tab visible while definitions exist"
+            );
+            submit_command(h, "box 0,0,0 2,2,2");
+            submit_command(h, "block last courtyard_kiosk");
+            h.state_mut()
+                .panel_tabs
+                .show(crate::tabstrip::PanelTab::Blocks);
+            h.run_steps(2);
+            assert!(
+                h.query_all_by_label_contains("courtyard_kiosk").next().is_some(),
+                "user-defined block appears as a Blocks-tab row"
+            );
+        });
+    }
+
     #[test]
     fn discard_choice_clears_pending_and_performs_nav() {
         // The user-reported bug: clicking Discard did nothing. The guard's
