@@ -228,8 +228,84 @@ pub struct PlantSpecies {
     pub growth_m_per_year: f64,
     pub deciduous: bool,
     /// Canopy silhouette: "round" (deciduous shade tree), "cone" (conifer /
-    /// pyramidal evergreen), "column" (fastigiate).
+    /// pyramidal evergreen), "column" (fastigiate), "palm" (bare trunk column
+    /// with a small crown fan atop — for low tropical-sun shadow studies).
     pub form: String,
+    /// Köppen climate codes the species tolerates (e.g. "Af", "Am", "Aw",
+    /// "Cfa", "Cwa", "Cfb", "Dfb"). Empty in untagged legacy catalogs.
+    #[serde(default)]
+    pub climate_zones: Vec<String>,
+    /// Native / naturalized region tags ("caribbean", "valle-del-cauca",
+    /// "guayaquil", "europe", "temperate"…). Empty in legacy catalogs.
+    #[serde(default)]
+    pub native_regions: Vec<String>,
+    /// Miyawaki stratification layer: "canopy", "tree", "subtree" or "shrub".
+    /// `None` when the species is not classified for mini-forest use.
+    #[serde(default)]
+    pub layer: Option<String>,
+}
+
+/// Rough Köppen climate band derived from the absolute latitude of the doc's
+/// georeference. Coarse — a stand-in for a proper climate raster, enough to
+/// advise on species suitability and to gate the Miyawaki generator.
+///
+/// | \|lat\|       | band        | representative zones |
+/// |---------------|-------------|----------------------|
+/// | < 10°         | equatorial  | Af, Am, Aw           |
+/// | 10°–23.5°     | tropical    | Am, Aw               |
+/// | 23.5°–35°     | subtropical | Cfa, Cwa             |
+/// | > 35°         | temperate   | Cfb, Dfb             |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClimateBand {
+    Equatorial,
+    Tropical,
+    Subtropical,
+    Temperate,
+}
+
+impl ClimateBand {
+    /// Derive the band from a latitude in degrees (sign ignored).
+    pub fn from_latitude(lat_deg: f64) -> ClimateBand {
+        let a = lat_deg.abs();
+        if a < 10.0 {
+            ClimateBand::Equatorial
+        } else if a < 23.5 {
+            ClimateBand::Tropical
+        } else if a < 35.0 {
+            ClimateBand::Subtropical
+        } else {
+            ClimateBand::Temperate
+        }
+    }
+
+    /// Köppen codes representative of this band, for the mismatch advisory and
+    /// `plantcatalog zone`. Overlapping on purpose (e.g. Am spans equatorial &
+    /// tropical) so a species tagged for either matches.
+    pub fn zones(self) -> &'static [&'static str] {
+        match self {
+            ClimateBand::Equatorial => &["Af", "Am", "Aw"],
+            ClimateBand::Tropical => &["Am", "Aw"],
+            ClimateBand::Subtropical => &["Cfa", "Cwa", "Csa"],
+            ClimateBand::Temperate => &["Cfb", "Dfb", "Dfc"],
+        }
+    }
+
+    /// Human label used in advisories.
+    pub fn label(self) -> &'static str {
+        match self {
+            ClimateBand::Equatorial => "equatorial tropical",
+            ClimateBand::Tropical => "tropical/monsoon",
+            ClimateBand::Subtropical => "subtropical",
+            ClimateBand::Temperate => "temperate",
+        }
+    }
+
+    /// Does this species tolerate the band? True when any of its climate_zones
+    /// is one of the band's representative codes.
+    pub fn suits(self, sp: &PlantSpecies) -> bool {
+        let zones = self.zones();
+        sp.climate_zones.iter().any(|z| zones.contains(&z.as_str()))
+    }
 }
 
 /// The embedded plant catalog, parsed once. The JSON is a compile-time asset,
@@ -361,6 +437,33 @@ fn push_prism(
     }
 }
 
+/// Append a palm crown atop a bare trunk: a shallow disc of the canopy radius
+/// with a small hemispherical cap — a crown-on-trunk silhouette, NOT a full
+/// ellipsoid. This is what makes a palm's shadow correct at low tropical sun
+/// angles (a thin trunk casting a long thin shadow, the crown a small blob on
+/// top) rather than the fat ovoid a shade tree throws.
+fn push_palm_crown(
+    pos: &mut Vec<DVec3>,
+    faces: &mut Vec<[u32; 3]>,
+    center: DVec3,
+    radius: f64,
+    cap: f64,
+) {
+    const SEG: usize = 8;
+    let b = pos.len() as u32;
+    pos.push(center + DVec3::new(0.0, 0.0, cap)); // crown apex
+    pos.push(center); // hub
+    for i in 0..SEG {
+        let th = std::f64::consts::TAU * i as f64 / SEG as f64;
+        pos.push(center + DVec3::new(radius * th.cos(), radius * th.sin(), 0.0));
+    }
+    for i in 0..SEG as u32 {
+        let (p, q) = (b + 2 + i, b + 2 + (i + 1) % SEG as u32);
+        faces.push([b, p, q]); // upper cone shell (frond fan)
+        faces.push([b + 1, q, p]); // underside
+    }
+}
+
 /// Trunk + canopy mesh for a species at `base` (ground point), scaled by age.
 /// Deterministic; participates in shadow/sun analyses like any scene mesh.
 pub fn plant_mesh(
@@ -372,16 +475,24 @@ pub fn plant_mesh(
     let trunk_frac = match sp.form.as_str() {
         "cone" => 0.15,
         "column" => 0.10,
+        // A palm is nearly all bare trunk — the crown is a thin fan on top.
+        "palm" => 0.85,
         _ => 0.35,
     };
     let trunk_h = trunk_frac * h;
-    let trunk_r = (0.02 * h).clamp(0.05, 0.5);
+    // Palms have slender trunks relative to height; other forms scale as before.
+    let trunk_r = if sp.form == "palm" {
+        (0.012 * h).clamp(0.05, 0.35)
+    } else {
+        (0.02 * h).clamp(0.05, 0.5)
+    };
     let mut pos = Vec::new();
     let mut faces = Vec::new();
     push_prism(&mut pos, &mut faces, base, trunk_r, trunk_h);
     let canopy_base = base + DVec3::new(0.0, 0.0, trunk_h);
     match sp.form.as_str() {
         "cone" => push_cone(&mut pos, &mut faces, canopy_base, canopy_d / 2.0, h - trunk_h),
+        "palm" => push_palm_crown(&mut pos, &mut faces, canopy_base, canopy_d / 2.0, h - trunk_h),
         _ => {
             let rz = (h - trunk_h) / 2.0;
             push_ellipsoid(
@@ -786,18 +897,89 @@ mod tests {
     }
 
     #[test]
-    fn plant_catalog_parses_twelve_real_species() {
+    fn plant_catalog_parses_all_real_species() {
         let cat = plant_catalog();
-        assert_eq!(cat.len(), 12);
+        // 12 legacy temperate + 9 Caribbean + 6 Valle del Cauca + 6 Guayaquil.
+        assert_eq!(cat.len(), 33);
         for sp in cat {
             assert!(sp.mature_height_m > 0.0 && sp.canopy_diameter_m > 0.0);
             assert!(sp.growth_m_per_year > 0.0);
-            assert!(matches!(sp.form.as_str(), "round" | "cone" | "column"), "{}", sp.id);
+            assert!(
+                matches!(sp.form.as_str(), "round" | "cone" | "column" | "palm"),
+                "{}",
+                sp.id
+            );
             assert!(sp.binomial.contains(' '), "binomial has genus + species");
+            // Every tagged species carries climate zones and a Miyawaki layer.
+            assert!(!sp.climate_zones.is_empty(), "{} untagged climate", sp.id);
+            assert!(!sp.native_regions.is_empty(), "{} untagged region", sp.id);
+            assert!(sp.layer.is_some(), "{} missing layer", sp.id);
         }
         // Conifers in the catalog are evergreen.
         assert!(!find_species("picea-abies").unwrap().deciduous);
         assert!(find_species("quercus-robur").unwrap().deciduous);
+    }
+
+    #[test]
+    fn legacy_untagged_catalog_still_loads_via_serde_default() {
+        // A pre-M-plants-tropical catalog entry with no climate/region/layer.
+        let legacy = r#"[{"id":"old-oak","common":"oak","binomial":"Quercus x",
+            "mature_height_m":20.0,"canopy_diameter_m":15.0,
+            "growth_m_per_year":0.5,"deciduous":true,"form":"round"}]"#;
+        let parsed: Vec<PlantSpecies> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].climate_zones.is_empty());
+        assert!(parsed[0].native_regions.is_empty());
+        assert!(parsed[0].layer.is_none());
+    }
+
+    #[test]
+    fn koppen_band_from_latitude() {
+        assert_eq!(ClimateBand::from_latitude(-2.2), ClimateBand::Equatorial); // Guayaquil
+        assert_eq!(ClimateBand::from_latitude(3.4), ClimateBand::Equatorial); // Cali
+        assert_eq!(ClimateBand::from_latitude(18.5), ClimateBand::Tropical); // Santo Domingo
+        assert_eq!(ClimateBand::from_latitude(25.76), ClimateBand::Subtropical); // Miami
+        assert_eq!(ClimateBand::from_latitude(42.36), ClimateBand::Temperate); // Boston
+        // Sign-agnostic.
+        assert_eq!(ClimateBand::from_latitude(-42.0), ClimateBand::Temperate);
+    }
+
+    #[test]
+    fn climate_suitability_matches_zones() {
+        let oak = find_species("quercus-robur").unwrap(); // Cfb/Dfb
+        let palm = find_species("roystonea-regia").unwrap(); // Af/Am/Aw
+        assert!(ClimateBand::Temperate.suits(oak));
+        assert!(!ClimateBand::Equatorial.suits(oak));
+        assert!(ClimateBand::Equatorial.suits(palm));
+        assert!(!ClimateBand::Temperate.suits(palm));
+    }
+
+    #[test]
+    fn palm_shape_is_bare_trunk_with_small_crown_not_ellipsoid() {
+        let palm = find_species("roystonea-regia").unwrap(); // 25 m, palm
+        let oak = find_species("quercus-robur").unwrap(); // 30 m, round
+        let base = DVec3::new(0.0, 0.0, 0.0);
+        let (ppos, _) = plant_mesh(palm, base, None);
+        // The palm's crown sits high on a bare trunk: the lowest canopy vertex
+        // (any vertex above the trunk radius footprint) is near the top.
+        let zmax = ppos.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+        assert!((zmax - 25.0).abs() < 0.5, "palm crown near mature height");
+        // Trunk fraction 0.85 → the widest points (crown, r=3) appear only high
+        // up; below 0.5·h the only geometry is the slender trunk (r<0.4).
+        let low_r = ppos
+            .iter()
+            .filter(|p| p.z < 12.0)
+            .map(|p| (p.x * p.x + p.y * p.y).sqrt())
+            .fold(0.0f64, f64::max);
+        assert!(low_r < 0.5, "palm trunk is slender low down, got {low_r}");
+        // A round tree of the same height carries canopy width well below 12 m.
+        let (opos, _) = plant_mesh(oak, base, None);
+        let oak_low_r = opos
+            .iter()
+            .filter(|p| p.z < 12.0)
+            .map(|p| (p.x * p.x + p.y * p.y).sqrt())
+            .fold(0.0f64, f64::max);
+        assert!(oak_low_r > 5.0, "shade tree is fat low down, got {oak_low_r}");
     }
 
     #[test]

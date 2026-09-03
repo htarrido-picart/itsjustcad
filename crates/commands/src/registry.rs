@@ -686,7 +686,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "plant",
             usage: "plant <species> <x,y[,z]> [age-years]",
-            summary: "Place one plant from the embedded 12-species catalog (ids like quercus-robur, acer-rubrum, betula-pendula, pinus-sylvestris, picea-abies, tilia-cordata; common-name substrings like 'oak' work too): a trunk + canopy mesh named 'plant:<id>' on layer 'planting', draped onto the terrain surface when one exists. [age-years] scales height and canopy along the species growth rate (default mature). Planted canopies occlude sun like any mesh, so shadowstudy/sunhours/radiation account for them. Example: plant oak 10,5 25",
+            summary: "Place one plant from the embedded 33-species catalog: temperate ornamentals (quercus-robur, acer-rubrum, betula-pendula, pinus-sylvestris, tilia-cordata) plus tropical/subtropical packs — Caribbean (royal/coconut palm, ceiba, flamboyan, mango), Valle del Cauca (saman, guadua bamboo, gualanday), Guayaquil (guayacan amarillo, algarrobo, palo santo, ceibo). Common-name substrings like 'oak' or 'palm' work too. Renders a trunk + canopy mesh named 'plant:<id>' on layer 'planting', draped onto the terrain when one exists; palms render as crown-on-trunk for low-sun shadow accuracy. [age-years] scales height and canopy along the species growth rate (default mature). If the doc has a `location`, planting outside the species' climate band prints an advisory. Use `plantcatalog [region|zone]` to browse. Planted canopies occlude sun like any mesh. Example: plant royal-palm 10,5 · plant oak 10,5 25",
             category: Category::Tools,
         },
         CommandSpec {
