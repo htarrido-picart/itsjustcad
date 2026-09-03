@@ -44,6 +44,11 @@ pub enum AppVerb {
     /// Toggle the thin mesh feature edges drawn in Shaded mode by default
     /// (`shadededges [on|off]` / `meshedges`). `None` means bare toggle.
     ShadedEdges(Option<bool>),
+    /// Toggle 2D top-view planting symbols for planted trees
+    /// (`plantsymbols [on|off]` / `plansymbols`). `None` means bare toggle.
+    /// When on, each `plant:<id>` mesh also draws its plan drafting glyph flat
+    /// on the ground (reads as a planting plan in the top view).
+    PlantSymbols(Option<bool>),
     /// SketchUp display preset (`sketchup`): working light + profile edges +
     /// gradient background.
     SketchUp,
@@ -175,6 +180,12 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             None => None,
             _ => return None,
         }),
+        "plantsymbols" | "plansymbols" => AppVerb::PlantSymbols(match words.next() {
+            Some("on" | "true" | "1") => Some(true),
+            Some("off" | "false" | "0") => Some(false),
+            None => None,
+            _ => return None,
+        }),
         "sketchup" | "su" => AppVerb::SketchUp,
         "sketchy" => AppVerb::Sketchy(match words.next() {
             Some("on" | "true" | "1") => Some(true),
@@ -249,6 +260,10 @@ mod tests {
         assert_eq!(classify("shadededges off"), Some(AppVerb::ShadedEdges(Some(false))));
         assert_eq!(classify("meshedges"), Some(AppVerb::ShadedEdges(None)));
         assert_eq!(classify("shadededges garbage"), None);
+        assert_eq!(classify("plantsymbols on"), Some(AppVerb::PlantSymbols(Some(true))));
+        assert_eq!(classify("plantsymbols off"), Some(AppVerb::PlantSymbols(Some(false))));
+        assert_eq!(classify("plansymbols"), Some(AppVerb::PlantSymbols(None)));
+        assert_eq!(classify("plantsymbols garbage"), None);
         assert_eq!(classify("sketchup"), Some(AppVerb::SketchUp));
         assert_eq!(classify("su"), Some(AppVerb::SketchUp));
     }
@@ -348,6 +363,7 @@ mod tests {
         "edgefx",
         "profiles",
         "meshedges",
+        "plantsymbols",
         "gumball",
         "ze",
         "zoomextents",
@@ -377,6 +393,7 @@ mod tests {
         "lightmode",    // alias of `light`
         "profileedges", // alias of `profiles`
         "shadededges",  // alias of `meshedges`
+        "plansymbols",  // alias of `plantsymbols`
         "sketchup",     // preset; advertised as `sketchup`, not a standalone canonical token here
         "su",           // alias of `sketchup`
         "gizmo",        // alias of `gumball`
@@ -403,6 +420,8 @@ mod tests {
             "profiles",
             "shadededges",
             "meshedges",
+            "plantsymbols",
+            "plansymbols",
             "sketchup",
             "su",
             "sketchy",

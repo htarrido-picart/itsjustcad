@@ -283,6 +283,9 @@ pub struct App {
     /// edges" default). ON by default; toggled by `shadededges [on|off]`.
     /// Persisted to `ui.json`. View state, never logged.
     shaded_edges: bool,
+    /// 2D top-view planting symbols overlay for `plant:<id>` meshes. OFF by
+    /// default; toggled by `plantsymbols [on|off]`. View state, never logged.
+    plant_symbols: bool,
     /// Transform gumball/gizmo visibility (Rhino-style persistent toggle).
     /// Default OFF: selecting an object shows only the highlight, no gizmo, and
     /// the gumball is neither drawn nor hit-tested. Toggled with `gumball` / the
@@ -301,6 +304,8 @@ pub struct App {
     uploaded_color_mode: Option<ColorMode>,
     /// Profile-edge flag of the last GPU upload; toggling forces a re-upload.
     uploaded_profile_edges: Option<bool>,
+    /// Plant-symbol flag of the last GPU upload; toggling forces a re-upload.
+    uploaded_plant_symbols: Option<bool>,
     /// Sketchy params of the last GPU upload; changes force a re-upload.
     uploaded_sketchy: Option<itsjustcad_render::SketchyParams>,
     /// Last zoom factor written to ui.json (avoid rewriting every frame).
@@ -696,6 +701,7 @@ impl App {
             light_mode: itsjustcad_render::LightMode::default(),
             profile_edges: false,
             shaded_edges: load_shaded_edges().unwrap_or(true),
+            plant_symbols: false,
             show_gumball: load_gumball_visible().unwrap_or(false),
             sketchy: itsjustcad_render::SketchyParams::default(),
             layout: match preset::preset_for(cad_origin).default_viewports {
@@ -708,6 +714,7 @@ impl App {
             uploaded_theme: None,
             uploaded_color_mode: None,
             uploaded_profile_edges: None,
+            uploaded_plant_symbols: None,
             uploaded_sketchy: None,
             saved_zoom: zoom,
             shot_path: std::env::var("ITSJUSTCAD_SHOT").ok(),
@@ -1125,6 +1132,20 @@ impl App {
                 save_shaded_edges(on);
                 self.command_line
                     .push_line(format!("shaded edges: {}", if on { "on" } else { "off" }));
+            }
+            // Toggle 2D top-view planting symbols. When on, each `plant:<id>`
+            // mesh also draws its plan drafting glyph flat on the ground so the
+            // model reads as a planting plan in the top view. View state, never
+            // logged.
+            Some("plantsymbols" | "plansymbols") => {
+                let on = match words.next() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => !self.plant_symbols, // bare toggle
+                };
+                self.plant_symbols = on;
+                self.command_line
+                    .push_line(format!("plant symbols: {}", if on { "on" } else { "off" }));
             }
             // Toggle the transform gumball/gizmo (Rhino-style persistent
             // toggle). View state, never logged; persisted to ui.json.
@@ -2469,6 +2490,7 @@ impl App {
             || self.uploaded_theme != Some(theme)
             || self.uploaded_color_mode != Some(active_color_mode)
             || self.uploaded_profile_edges != Some(self.profile_edges)
+            || self.uploaded_plant_symbols != Some(self.plant_symbols)
             || self.uploaded_sketchy != Some(self.sketchy);
         // Scene is uploaded once (renderer shared); only the first pane's
         // callback carries the snapshot, the rest just set their camera.
@@ -2477,6 +2499,7 @@ impl App {
             self.uploaded_theme = Some(theme);
             self.uploaded_color_mode = Some(active_color_mode);
             self.uploaded_profile_edges = Some(self.profile_edges);
+            self.uploaded_plant_symbols = Some(self.plant_symbols);
             self.uploaded_sketchy = Some(self.sketchy);
             // Sketchy depth cue: bias by the active pane's eye + scene radius.
             let (sketchy_eye, sketchy_radius) = if self.sketchy.active() {
@@ -2502,6 +2525,12 @@ impl App {
                     sketchy_radius,
                 },
             );
+            // Planting plan overlay: add 2D top-view plant symbols when toggled
+            // on. The 3D canopy meshes stay in `s`; symbols lie flat on the
+            // ground and read as a planting plan in the top view.
+            if self.plant_symbols {
+                scene::append_plant_symbols(&mut s, &self.session.doc);
+            }
             s.underlay = self.decode_underlay();
             s.basemap = self.basemap_data();
             Some(s)

@@ -145,6 +145,10 @@ pub struct HeadlessView {
     /// Thin mesh feature edges in Shaded mode. ON by default (the SketchUp /
     /// Rhino "shaded + edges" look); toggled by `shadededges [on|off]`.
     pub shaded_edges: bool,
+    /// 2D top-view planting symbols for planted trees. OFF by default; toggled
+    /// by `plantsymbols [on|off]`. When on, each `plant:<id>` mesh also draws
+    /// its plan drafting glyph flat on the ground.
+    pub plant_symbols: bool,
 }
 
 impl Default for HeadlessView {
@@ -159,6 +163,7 @@ impl Default for HeadlessView {
             profile_edges: false,
             sketchy: SketchyParams::default(),
             shaded_edges: true,
+            plant_symbols: false,
         }
     }
 }
@@ -219,6 +224,9 @@ pub fn run_script_lines(
             }
             Some(AppVerb::ShadedEdges(on)) => {
                 view.shaded_edges = on.unwrap_or(!view.shaded_edges)
+            }
+            Some(AppVerb::PlantSymbols(on)) => {
+                view.plant_symbols = on.unwrap_or(!view.plant_symbols)
             }
             Some(AppVerb::SketchUp) => {
                 view.light = LightMode::Working;
@@ -511,6 +519,12 @@ pub fn render_headless(
             ..Default::default()
         },
     );
+
+    // Planting plan: overlay 2D top-view plant symbols when toggled on. The 3D
+    // canopy mesh stays; symbols lie flat on the ground and read in plan view.
+    if view.plant_symbols {
+        crate::scene::append_plant_symbols(&mut scene, &session.doc);
+    }
 
     // Attach the transient basemap (satellite/OSM ground image) if one was set
     // by a `basemap` verb earlier in the script. Pixels are already decoded and

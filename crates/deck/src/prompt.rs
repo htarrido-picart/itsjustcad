@@ -50,6 +50,10 @@ Feature edges:
   meshedges on|off                              show/hide the default shaded feature edges (alias:       e.g. meshedges off
                                                 shadededges)
 
+Planting plan:
+  plantsymbols on|off                           2D top-view plan symbols for planted trees (alias:       e.g. plantsymbols on
+                                                plansymbols)
+
 Transform gizmo:
   gumball on|off|toggle                         show/hide the transform gumball (G hotkey = bare toggle) e.g. gumball on
 
