@@ -11,6 +11,7 @@
 
 use glam::DVec3;
 use kernel_mesh::Mesh;
+use rayon::prelude::*;
 
 // ---- public API ----
 
@@ -190,23 +191,33 @@ fn parse_stl_binary(bytes: &[u8]) -> Result<Mesh, String> {
             bytes.len()
         ));
     }
+    // Each 50-byte record decodes independently → parallel decode with an
+    // ordered collect (byte-identical to the sequential reference in tests).
+    let tris: Vec<[DVec3; 3]> = (0..tri_count)
+        .into_par_iter()
+        .map(|i| stl_binary_tri(bytes, i))
+        .collect();
     let mut positions: Vec<DVec3> = Vec::with_capacity(tri_count * 3);
     let mut faces: Vec<[u32; 3]> = Vec::with_capacity(tri_count);
-
-    for i in 0..tri_count {
-        let off = 84 + 50 * i;
-        // Skip normal (12 bytes), read 3 vertices.
+    for tri in tris {
         let base = positions.len() as u32;
-        for j in 0..3 {
-            let p = off + 12 + j * 12;
-            let x = f32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as f64;
-            let y = f32::from_le_bytes(bytes[p + 4..p + 8].try_into().unwrap()) as f64;
-            let z = f32::from_le_bytes(bytes[p + 8..p + 12].try_into().unwrap()) as f64;
-            positions.push(DVec3::new(x, y, z));
-        }
+        positions.extend_from_slice(&tri);
         faces.push([base, base + 1, base + 2]);
     }
     Ok(Mesh::new(positions, faces))
+}
+
+/// Decode the three vertices of binary-STL triangle `i` (the 12-byte normal is
+/// skipped). Caller has verified `bytes` covers `84 + 50 * (i + 1)`.
+fn stl_binary_tri(bytes: &[u8], i: usize) -> [DVec3; 3] {
+    let off = 84 + 50 * i;
+    std::array::from_fn(|j| {
+        let p = off + 12 + j * 12;
+        let x = f32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as f64;
+        let y = f32::from_le_bytes(bytes[p + 4..p + 8].try_into().unwrap()) as f64;
+        let z = f32::from_le_bytes(bytes[p + 8..p + 12].try_into().unwrap()) as f64;
+        DVec3::new(x, y, z)
+    })
 }
 
 fn parse_stl_ascii(bytes: &[u8]) -> Result<Mesh, String> {
@@ -1145,6 +1156,37 @@ f 4 5 6\n\
         let (_, mesh) = &parts[0];
         // A box is 12 triangles; binary STL duplicates each vertex so 36 positions.
         assert_eq!(mesh.faces().len(), 12);
+    }
+
+    /// M-perf determinism: the parallel binary-STL decode is bit-identical to a
+    /// sequential per-triangle decode, and stable across repeated runs.
+    #[test]
+    fn stl_binary_parallel_decode_matches_sequential() {
+        // Synthetic binary STL: 1000 triangles with distinct vertices.
+        let tri_count = 1000usize;
+        let mut bytes = vec![0u8; 84 + 50 * tri_count];
+        bytes[80..84].copy_from_slice(&(tri_count as u32).to_le_bytes());
+        for i in 0..tri_count {
+            let off = 84 + 50 * i;
+            for j in 0..3 {
+                let p = off + 12 + j * 12;
+                let v = i as f32 * 0.37 + j as f32;
+                bytes[p..p + 4].copy_from_slice(&v.to_le_bytes());
+                bytes[p + 4..p + 8].copy_from_slice(&(v * 2.0).to_le_bytes());
+                bytes[p + 8..p + 12].copy_from_slice(&(v * 3.0).to_le_bytes());
+            }
+        }
+        let mesh = parse_stl_binary(&bytes).unwrap();
+        // Sequential reference: the shared per-triangle decoder, in order.
+        let mut seq: Vec<DVec3> = Vec::with_capacity(tri_count * 3);
+        for i in 0..tri_count {
+            seq.extend_from_slice(&stl_binary_tri(&bytes, i));
+        }
+        assert_eq!(mesh.positions(), &seq[..], "parallel decode must match sequential");
+        // Repeat run: identical output.
+        let again = parse_stl_binary(&bytes).unwrap();
+        assert_eq!(mesh.positions(), again.positions());
+        assert_eq!(mesh.faces(), again.faces());
     }
 
     #[test]

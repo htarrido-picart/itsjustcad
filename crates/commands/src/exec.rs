@@ -4,9 +4,10 @@
 use glam::DVec3;
 use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
+use rayon::prelude::*;
 use itsjustcad_doc::{
     format_area, format_length, format_volume, AnalysisReport, AnalysisSample, Annotation,
-    Document, Geometry, Grid, LayerStyle,
+    Document, GeoLocation, Geometry, Grid, LayerStyle,
     LoadGeometry, Material, NamedView, ObjectId, SceneObject, ScheduleRow,
     SheetDim, SheetTable, Story, StructLoad, StructSupport, Underlay, Units,
 };
@@ -2385,6 +2386,207 @@ fn fmt_hhmm(min: u32) -> String {
     format!("{:02}:{:02}", min / 60, min % 60)
 }
 
+// ── M-perf parallel analysis kernels ─────────────────────────────────────────
+//
+// DETERMINISM CONTRACT: every kernel below is parallel over *independent* items
+// with an ordered `collect`, and the per-item math is a single shared function
+// also used by the `_seq` reference — so parallel output is byte-identical to a
+// sequential run (op-log replay invariant). No parallel float reductions:
+// min/avg/max over the collected values stay sequential at the call sites.
+
+/// Count, for one ray origin, the sun directions not occluded by the scene BVH.
+fn lit_slots_one(origin: DVec3, sun_dirs: &[DVec3], bvh: &kernel_mesh::TriBvh) -> usize {
+    sun_dirs.iter().filter(|&&d| !bvh.ray_occluded(origin, d)).count()
+}
+
+/// Unoccluded-sun-slot count per ray origin, parallel over origins.
+fn lit_slot_counts(
+    origins: &[DVec3],
+    sun_dirs: &[DVec3],
+    bvh: &kernel_mesh::TriBvh,
+) -> Vec<usize> {
+    origins.par_iter().map(|&o| lit_slots_one(o, sun_dirs, bvh)).collect()
+}
+
+/// Sequential reference for [`lit_slot_counts`] (determinism oracle).
+#[cfg(test)]
+fn lit_slot_counts_seq(
+    origins: &[DVec3],
+    sun_dirs: &[DVec3],
+    bvh: &kernel_mesh::TriBvh,
+) -> Vec<usize> {
+    origins.iter().map(|&o| lit_slots_one(o, sun_dirs, bvh)).collect()
+}
+
+/// Centroid + unit normal of a triangle, exactly as the analysis loops compute
+/// them (degenerate normals are left unnormalised, matching the old inline code).
+fn tri_centroid_normal(tri: &[DVec3; 3]) -> (DVec3, DVec3) {
+    let centroid = (tri[0] + tri[1] + tri[2]) / 3.0;
+    let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
+    let nlen = normal.length();
+    if nlen > 1e-12 {
+        normal /= nlen;
+    }
+    (centroid, normal)
+}
+
+/// Per-face sun score for `facesunhours`: lit-slot count (sun on the lit side
+/// AND unoccluded), centroid and unit normal.
+fn face_lit_one(
+    tri: &[DVec3; 3],
+    sun_dirs: &[DVec3],
+    bvh: &kernel_mesh::TriBvh,
+) -> (usize, DVec3, DVec3) {
+    let (centroid, normal) = tri_centroid_normal(tri);
+    // Lift the origin off the surface along the normal so the face's own
+    // triangle doesn't self-occlude the ray.
+    let origin = centroid + normal * 1e-3;
+    let lit = sun_dirs
+        .iter()
+        .filter(|&&dir| normal.dot(dir) > 0.0 && !bvh.ray_occluded(origin, dir))
+        .count();
+    (lit, centroid, normal)
+}
+
+/// [`face_lit_one`] over all faces, parallel.
+fn face_lit_slots(
+    faces: &[[DVec3; 3]],
+    sun_dirs: &[DVec3],
+    bvh: &kernel_mesh::TriBvh,
+) -> Vec<(usize, DVec3, DVec3)> {
+    faces.par_iter().map(|tri| face_lit_one(tri, sun_dirs, bvh)).collect()
+}
+
+/// Sequential reference for [`face_lit_slots`] (determinism oracle).
+#[cfg(test)]
+fn face_lit_slots_seq(
+    faces: &[[DVec3; 3]],
+    sun_dirs: &[DVec3],
+    bvh: &kernel_mesh::TriBvh,
+) -> Vec<(usize, DVec3, DVec3)> {
+    faces.iter().map(|tri| face_lit_one(tri, sun_dirs, bvh)).collect()
+}
+
+/// Per-face annual insolation for `radiation`: kWh/m²·yr, centroid, normal.
+/// The 288-bin sum inside `annual_face_irradiation` stays sequential — only
+/// faces run in parallel, so float addition order is unchanged.
+fn face_radiation_one(
+    tri: &[DVec3; 3],
+    bins: &itsjustcad_solar::RadiationBins,
+    year: i32,
+    loc: GeoLocation,
+    bvh: &kernel_mesh::TriBvh,
+) -> (f64, DVec3, DVec3) {
+    let (centroid, normal) = tri_centroid_normal(tri);
+    let origin = centroid + normal * 1e-3;
+    let k = itsjustcad_solar::annual_face_irradiation(
+        bins,
+        year,
+        loc.lat_deg,
+        loc.lon_deg,
+        loc.tz_hours,
+        normal.to_array(),
+        |s| bvh.ray_occluded(origin, DVec3::new(s[0], s[1], s[2])),
+    );
+    (k, centroid, normal)
+}
+
+/// [`face_radiation_one`] over all faces, parallel.
+fn face_radiation_scores(
+    faces: &[[DVec3; 3]],
+    bins: &itsjustcad_solar::RadiationBins,
+    year: i32,
+    loc: GeoLocation,
+    bvh: &kernel_mesh::TriBvh,
+) -> Vec<(f64, DVec3, DVec3)> {
+    faces
+        .par_iter()
+        .map(|tri| face_radiation_one(tri, bins, year, loc, bvh))
+        .collect()
+}
+
+/// Sequential reference for [`face_radiation_scores`] (determinism oracle).
+#[cfg(test)]
+fn face_radiation_scores_seq(
+    faces: &[[DVec3; 3]],
+    bins: &itsjustcad_solar::RadiationBins,
+    year: i32,
+    loc: GeoLocation,
+    bvh: &kernel_mesh::TriBvh,
+) -> Vec<(f64, DVec3, DVec3)> {
+    faces
+        .iter()
+        .map(|tri| face_radiation_one(tri, bins, year, loc, bvh))
+        .collect()
+}
+
+/// One `shadowstudy` time stamp: sun position for local minute `t`; if the sun
+/// is up, the per-object ground-shadow convex hulls (objects in document order,
+/// hulls with < 3 points dropped). `None` when the sun is at/below the horizon.
+#[allow(clippy::too_many_arguments)]
+fn shadow_stamp_one(
+    t: u32,
+    year: i32,
+    month: u32,
+    day: u32,
+    loc: GeoLocation,
+    object_pts: &[Vec<[f64; 3]>],
+) -> Option<Vec<Vec<[f64; 2]>>> {
+    // Interpret the clock time as local; convert to UTC for the SPA.
+    let utc = (t as f64 - loc.tz_hours * 60.0).rem_euclid(1440.0);
+    let (h, mi) = ((utc / 60.0) as u32, (utc % 60.0) as u32);
+    let pos = itsjustcad_solar::solar_position(year, month, day, h, mi, loc.lat_deg, loc.lon_deg);
+    if pos.altitude_deg <= 0.0 {
+        return None;
+    }
+    let dir = itsjustcad_solar::sun_direction(pos.azimuth_deg, pos.altitude_deg);
+    let dir = [dir[0] as f64, dir[1] as f64, dir[2] as f64];
+    let mut hulls = Vec::new();
+    for obj in object_pts {
+        let ground: Vec<[f64; 2]> = obj
+            .iter()
+            .filter_map(|&p| itsjustcad_solar::project_to_ground(p, dir))
+            .map(|g| [g[0], g[1]])
+            .collect();
+        let hull = itsjustcad_solar::convex_hull_xy(ground);
+        if hull.len() >= 3 {
+            hulls.push(hull);
+        }
+    }
+    Some(hulls)
+}
+
+/// [`shadow_stamp_one`] over all stamps, parallel over stamps.
+fn shadow_stamp_hulls(
+    stamps: &[u32],
+    year: i32,
+    month: u32,
+    day: u32,
+    loc: GeoLocation,
+    object_pts: &[Vec<[f64; 3]>],
+) -> Vec<Option<Vec<Vec<[f64; 2]>>>> {
+    stamps
+        .par_iter()
+        .map(|&t| shadow_stamp_one(t, year, month, day, loc, object_pts))
+        .collect()
+}
+
+/// Sequential reference for [`shadow_stamp_hulls`] (determinism oracle).
+#[cfg(test)]
+fn shadow_stamp_hulls_seq(
+    stamps: &[u32],
+    year: i32,
+    month: u32,
+    day: u32,
+    loc: GeoLocation,
+    object_pts: &[Vec<[f64; 3]>],
+) -> Vec<Option<Vec<Vec<[f64; 2]>>>> {
+    stamps
+        .iter()
+        .map(|&t| shadow_stamp_one(t, year, month, day, loc, object_pts))
+        .collect()
+}
+
 /// Compass/vertical facing label for an outward surface normal — the deck LLM
 /// critiques by orientation ("north facade gets no winter sun"), so every kept
 /// analysis sample carries one. `North = +Y, East = +X, Up = +Z` (matches
@@ -2551,42 +2753,28 @@ fn exec_shadow_study(
         ));
     }
 
-    // Build (layer, polygon) for every stamp where the sun is up.
+    // Build (layer, polygon) for every stamp where the sun is up. Stamps are
+    // independent time frames → parallel over stamps (ordered collect + the
+    // sequential flatten below keep polygon order identical to the old loop).
     struct Poly {
         layer: String,
         pts: Vec<DVec3>,
     }
+    // Inclusive stamps from `from_min` to `to_min` at `step_min` spacing.
+    let stamps: Vec<u32> = (from_min..=to_min).step_by(step_min as usize).collect();
+    let per_stamp = shadow_stamp_hulls(&stamps, year, month, day, loc, &object_pts);
     let mut polys: Vec<Poly> = Vec::new();
     let mut stamps_up = 0usize;
-    // Inclusive stamps from `from_min` to `to_min` at `step_min` spacing.
-    let mut t = from_min;
-    while t <= to_min {
-        // Interpret the clock time as local; convert to UTC for the SPA.
-        let utc = (t as f64 - loc.tz_hours * 60.0).rem_euclid(1440.0);
-        let (h, mi) = ((utc / 60.0) as u32, (utc % 60.0) as u32);
-        let pos =
-            itsjustcad_solar::solar_position(year, month, day, h, mi, loc.lat_deg, loc.lon_deg);
-        if pos.altitude_deg > 0.0 {
-            stamps_up += 1;
-            let dir = itsjustcad_solar::sun_direction(pos.azimuth_deg, pos.altitude_deg);
-            let dir = [dir[0] as f64, dir[1] as f64, dir[2] as f64];
-            let layer = format!("shadows-{}", fmt_hhmm(t));
-            for obj in &object_pts {
-                let ground: Vec<[f64; 2]> = obj
-                    .iter()
-                    .filter_map(|&p| itsjustcad_solar::project_to_ground(p, dir))
-                    .map(|g| [g[0], g[1]])
-                    .collect();
-                let hull = itsjustcad_solar::convex_hull_xy(ground);
-                if hull.len() >= 3 {
-                    polys.push(Poly {
-                        layer: layer.clone(),
-                        pts: hull.into_iter().map(|h| DVec3::new(h[0], h[1], 0.0)).collect(),
-                    });
-                }
-            }
+    for (&t, hulls) in stamps.iter().zip(&per_stamp) {
+        let Some(hulls) = hulls else { continue };
+        stamps_up += 1;
+        let layer = format!("shadows-{}", fmt_hhmm(t));
+        for hull in hulls {
+            polys.push(Poly {
+                layer: layer.clone(),
+                pts: hull.iter().map(|h| DVec3::new(h[0], h[1], 0.0)).collect(),
+            });
         }
-        t += step_min;
     }
 
     if polys.is_empty() {
@@ -2744,26 +2932,13 @@ fn exec_radiation(
     // Year for the representative sun positions: fixed so replay is stable
     // (annual sun geometry is effectively year-invariant).
     const RAD_YEAR: i32 = 2026;
+    // Faces are independent → parallel per-face scoring (ordered collect; the
+    // 288-bin sum inside each face stays sequential, so replay is bit-stable).
+    let scored = face_radiation_scores(&faces, &bins, RAD_YEAR, loc, &tri_bvh);
     let mut kwh: Vec<f64> = Vec::with_capacity(faces.len());
     let mut samples: Vec<(f64, DVec3, String)> = Vec::with_capacity(faces.len());
     let mut max_k = 0.0f64;
-    for tri in &faces {
-        let centroid = (tri[0] + tri[1] + tri[2]) / 3.0;
-        let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
-        let nlen = normal.length();
-        if nlen > 1e-12 {
-            normal /= nlen;
-        }
-        let origin = centroid + normal * 1e-3;
-        let k = itsjustcad_solar::annual_face_irradiation(
-            &bins,
-            RAD_YEAR,
-            loc.lat_deg,
-            loc.lon_deg,
-            loc.tz_hours,
-            normal.to_array(),
-            |s| tri_bvh.ray_occluded(origin, DVec3::new(s[0], s[1], s[2])),
-        );
+    for &(k, centroid, normal) in &scored {
         max_k = max_k.max(k);
         samples.push((k, centroid, facing_label(normal).to_string()));
         kwh.push(k);
@@ -3032,26 +3207,27 @@ fn exec_sun_hours(
         )));
     }
 
-    // Ray-cast each cell center toward each sun position; count unoccluded slots.
-    let mut cells: Vec<(f64, f64, f64)> = Vec::with_capacity(nx * ny); // (x, y, hours)
-    let mut max_h = 0.0f64;
-    for iy in 0..ny {
-        for ix in 0..nx {
+    // Ray-cast each cell center toward each sun position; count unoccluded
+    // slots. Cells are independent → parallel over cells (ordered collect keeps
+    // row-major cell order; lit counts are integers, so no float-order hazard).
+    let origins: Vec<DVec3> = (0..nx * ny)
+        .map(|c| {
+            let (ix, iy) = (c % nx, c / nx);
             let x = aabb.min.x + (ix as f64 + 0.5) * spacing;
             let y = aabb.min.y + (iy as f64 + 0.5) * spacing;
             // Lift the origin slightly so a ground-coincident triangle at the
             // sample point doesn't self-occlude.
-            let origin = DVec3::new(x, y, 1e-4);
-            let mut lit = 0usize;
-            for &dir in &sun_dirs {
-                if !tri_bvh.ray_occluded(origin, DVec3::from_array(dir)) {
-                    lit += 1;
-                }
-            }
-            let hours = lit as f64 * 0.5; // 30-min slots → hours
-            max_h = max_h.max(hours);
-            cells.push((x, y, hours));
-        }
+            DVec3::new(x, y, 1e-4)
+        })
+        .collect();
+    let dirs: Vec<DVec3> = sun_dirs.iter().map(|&d| DVec3::from_array(d)).collect();
+    let lit_counts = lit_slot_counts(&origins, &dirs, &tri_bvh);
+    let mut cells: Vec<(f64, f64, f64)> = Vec::with_capacity(nx * ny); // (x, y, hours)
+    let mut max_h = 0.0f64;
+    for (o, &lit) in origins.iter().zip(&lit_counts) {
+        let hours = lit as f64 * 0.5; // 30-min slots → hours
+        max_h = max_h.max(hours);
+        cells.push((o.x, o.y, hours));
     }
 
     // Meshes carry no per-vertex color, so emit one small colored quad per cell,
@@ -3205,29 +3381,13 @@ fn exec_face_sun_hours(
 
     // Score each face: hours of unoccluded sun. A ray is only counted when the
     // sun is on the lit side of the face (dot(normal, sun) > 0); a downward- or
-    // away-facing surface can't see that sun position at all.
+    // away-facing surface can't see that sun position at all. Faces are
+    // independent → parallel per-face scoring (ordered collect, integer counts).
+    let scored = face_lit_slots(&faces, &sun_dirs, &tri_bvh);
     let mut hours: Vec<f64> = Vec::with_capacity(faces.len());
     let mut samples: Vec<(f64, DVec3, String)> = Vec::with_capacity(faces.len());
     let mut max_h = 0.0f64;
-    for tri in &faces {
-        let centroid = (tri[0] + tri[1] + tri[2]) / 3.0;
-        let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
-        let nlen = normal.length();
-        if nlen > 1e-12 {
-            normal /= nlen;
-        }
-        // Lift the origin off the surface along the normal so the face's own
-        // triangle doesn't self-occlude the ray.
-        let origin = centroid + normal * 1e-3;
-        let mut lit = 0usize;
-        for &dir in &sun_dirs {
-            if normal.dot(dir) <= 0.0 {
-                continue; // sun behind the face
-            }
-            if !tri_bvh.ray_occluded(origin, dir) {
-                lit += 1;
-            }
-        }
+    for &(lit, centroid, normal) in &scored {
         let h = lit as f64 * 0.5;
         max_h = max_h.max(h);
         samples.push((h, centroid, facing_label(normal).to_string()));
@@ -7340,6 +7500,147 @@ mod tests {
 
     fn run(s: &mut Session, line: &str) -> ApplyOutcome {
         s.run(parse(line).unwrap()).unwrap()
+    }
+
+    // ── M-perf bench: one big analysis case, ignored by default ─────────────
+
+    /// Build a 200-tower massing scene with a location set (the M-perf bench
+    /// scene). 20×10 grid of 4×4 m boxes of varying heights.
+    fn bench_scene() -> Session {
+        let mut s = Session::default();
+        for i in 0..200 {
+            let x = (i % 20) as f64 * 6.0 - 60.0;
+            let y = (i / 20) as f64 * 6.0 - 30.0;
+            let h = 5.0 + (i % 7) as f64 * 3.0;
+            run(&mut s, &format!("box {x},{y},0 4,4,{h}"));
+        }
+        run(&mut s, "location 40.0 0.0 0");
+        s
+    }
+
+    // ── M-perf determinism: parallel kernels == sequential reference ────────
+
+    /// Every rayon analysis kernel must produce output *bit-identical* to its
+    /// sequential reference, and be stable across repeated runs (op-log replay
+    /// invariant). One shared massing scene exercises all four kernels.
+    #[test]
+    fn mperf_parallel_kernels_match_sequential_bitwise() {
+        // Small massing scene: 12 boxes of varying heights.
+        let mut s = Session::default();
+        for i in 0..12 {
+            let x = (i % 4) as f64 * 6.0 - 9.0;
+            let y = (i / 4) as f64 * 6.0 - 3.0;
+            let h = 4.0 + (i % 5) as f64 * 3.0;
+            run(&mut s, &format!("box {x},{y},0 4,4,{h}"));
+        }
+        let loc = GeoLocation { lat_deg: 40.71, lon_deg: -74.01, tz_hours: -5.0 };
+        let tris: Vec<[DVec3; 3]> = scene_triangles(&s.doc)
+            .into_iter()
+            .map(|t| {
+                [
+                    DVec3::from_array(t[0]),
+                    DVec3::from_array(t[1]),
+                    DVec3::from_array(t[2]),
+                ]
+            })
+            .collect();
+        let bvh = kernel_mesh::TriBvh::build(tris.clone());
+        // Sun directions every 30 min of a solstice day (up only).
+        let mut sun_dirs: Vec<DVec3> = Vec::new();
+        for slot in 0..48 {
+            let utc = (slot as f64 * 30.0 - loc.tz_hours * 60.0).rem_euclid(1440.0);
+            let pos = itsjustcad_solar::solar_position(
+                2024, 6, 21,
+                (utc / 60.0) as u32,
+                (utc % 60.0) as u32,
+                loc.lat_deg, loc.lon_deg,
+            );
+            if pos.altitude_deg > 0.0 {
+                let d = itsjustcad_solar::sun_direction(pos.azimuth_deg, pos.altitude_deg);
+                sun_dirs.push(DVec3::new(d[0] as f64, d[1] as f64, d[2] as f64));
+            }
+        }
+        assert!(!sun_dirs.is_empty());
+
+        // sunhours: ground-grid origins.
+        let origins: Vec<DVec3> = (0..400)
+            .map(|c| {
+                DVec3::new((c % 20) as f64 * 1.5 - 14.0, (c / 20) as f64 * 1.5 - 8.0, 1e-4)
+            })
+            .collect();
+        let par = lit_slot_counts(&origins, &sun_dirs, &bvh);
+        assert_eq!(par, lit_slot_counts_seq(&origins, &sun_dirs, &bvh), "sunhours kernel");
+        assert_eq!(par, lit_slot_counts(&origins, &sun_dirs, &bvh), "sunhours repeat run");
+
+        // facesunhours: per-face lit slots (exact f64 equality on centroid/normal).
+        let par = face_lit_slots(&tris, &sun_dirs, &bvh);
+        assert_eq!(par, face_lit_slots_seq(&tris, &sun_dirs, &bvh), "facesunhours kernel");
+        assert_eq!(par, face_lit_slots(&tris, &sun_dirs, &bvh), "facesunhours repeat run");
+
+        // radiation: per-face annual insolation (exact f64 equality — the
+        // 288-bin sum stays sequential inside each face).
+        let bins: itsjustcad_solar::RadiationBins = (0..288)
+            .map(|i| if (7..17).contains(&(i % 24)) { [500.0, 100.0] } else { [0.0, 0.0] })
+            .collect();
+        let par = face_radiation_scores(&tris, &bins, 2026, loc, &bvh);
+        let seq = face_radiation_scores_seq(&tris, &bins, 2026, loc, &bvh);
+        assert!(
+            par.iter().zip(&seq).all(|(a, b)| {
+                a.0.to_bits() == b.0.to_bits() && a.1 == b.1 && a.2 == b.2
+            }),
+            "radiation kernel must be bit-identical to sequential"
+        );
+        assert_eq!(par, face_radiation_scores(&tris, &bins, 2026, loc, &bvh), "radiation repeat");
+
+        // shadowstudy: per-stamp ground hulls.
+        let object_pts: Vec<Vec<[f64; 3]>> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Mesh(m) => {
+                    Some(m.positions().iter().map(|p| [p.x, p.y, p.z]).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        let stamps: Vec<u32> = (0..=1410).step_by(30).collect();
+        let par = shadow_stamp_hulls(&stamps, 2024, 6, 21, loc, &object_pts);
+        let seq = shadow_stamp_hulls_seq(&stamps, 2024, 6, 21, loc, &object_pts);
+        assert_eq!(par, seq, "shadowstudy kernel");
+        assert_eq!(
+            par,
+            shadow_stamp_hulls(&stamps, 2024, 6, 21, loc, &object_pts),
+            "shadowstudy repeat run"
+        );
+        // Sanity: the solstice day actually has lit and dark stamps.
+        assert!(par.iter().any(Option::is_some) && par.iter().any(Option::is_none));
+    }
+
+    /// Timing evidence for the M-perf rayon work — run manually with
+    /// `cargo test --profile quick -p itsjustcad-commands bench_analysis -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "bench: timing evidence only, run manually with --nocapture"]
+    fn bench_analysis_200_boxes() {
+        let mut s = bench_scene();
+        let t0 = std::time::Instant::now();
+        let out = run(&mut s, "sunhours 2024-06-21 1");
+        eprintln!("bench sunhours:      {:>8.1?}  ({})", t0.elapsed(), out.message);
+
+        let mut s = bench_scene();
+        let t0 = std::time::Instant::now();
+        let out = run(&mut s, "facesunhours all 2024-06-21");
+        eprintln!("bench facesunhours:  {:>8.1?}  ({})", t0.elapsed(), out.message);
+
+        let mut s = bench_scene();
+        let t0 = std::time::Instant::now();
+        let out = run(&mut s, "shadowstudy 2024-06-21 06:00 20:00 30");
+        eprintln!("bench shadowstudy:   {:>8.1?}  ({})", t0.elapsed(), out.message);
+
+        let path = write_synth_epw("bench.epw");
+        let mut s = bench_scene();
+        let t0 = std::time::Instant::now();
+        let out = run(&mut s, &format!("radiation all {}", path.display()));
+        eprintln!("bench radiation:     {:>8.1?}  ({})", t0.elapsed(), out.message);
     }
 
     // ── import size ceiling (decompression-bomb / OOM defense) ──────────────

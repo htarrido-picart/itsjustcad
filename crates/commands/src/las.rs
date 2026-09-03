@@ -14,6 +14,7 @@
 //! decompressed chunk-wise so decimation never materializes the whole cloud.
 
 use glam::DVec3;
+use rayon::prelude::*;
 
 /// Maximum points kept after decimation.
 pub const MAX_POINTS: usize = 200_000;
@@ -142,18 +143,19 @@ pub fn parse(data: &[u8]) -> Result<LasPoints, LasError> {
 
     let stride = (record_count / MAX_POINTS).max(1);
 
-    let cap = record_count.div_ceil(stride);
-    let mut positions = Vec::with_capacity(cap);
-
-    let mut i = 0usize;
-    while i < record_count {
-        let base = i * record_length;
-        if base + 12 > point_data.len() {
-            break;
-        }
-        positions.push(decode_xyz(&point_data[base..base + 12], scale, offset));
-        i += stride;
-    }
+    // Decode every kept (multiple-of-stride) record. Each record decodes
+    // independently → parallel with an ordered collect, byte-identical to the
+    // sequential reference used by the determinism test. `record_count` is
+    // clamped to the available data and `record_length >= 20 > 12`, so every
+    // kept record's 12 XYZ bytes are in bounds by construction.
+    let n_kept = record_count.div_ceil(stride);
+    let positions: Vec<DVec3> = (0..n_kept)
+        .into_par_iter()
+        .map(|k| {
+            let base = k * stride * record_length;
+            decode_xyz(&point_data[base..base + 12], scale, offset)
+        })
+        .collect();
 
     Ok(LasPoints { positions, stride, total_records })
 }
@@ -349,6 +351,38 @@ mod tests {
         assert_eq!(stride, 3);
         let kept = count.div_ceil(stride);
         assert!(kept <= MAX_POINTS + 1); // at most one over due to ceil
+    }
+
+    /// M-perf determinism: the parallel record decode is bit-identical to the
+    /// old sequential stride walk, including when decimation (stride > 1)
+    /// kicks in, and stable across repeated runs.
+    #[test]
+    fn parallel_decode_matches_sequential_with_stride() {
+        // 2×MAX_POINTS + 1 records → stride 2, so both the parallel index math
+        // and the decimation path are exercised. Distinct X per record.
+        let n = (MAX_POINTS * 2 + 1) as u32;
+        let mut data = make_las(n, 0.001, 10.0);
+        for i in 0..n as usize {
+            let base = 227 + i * 20;
+            data[base..base + 4].copy_from_slice(&(i as i32).to_le_bytes());
+        }
+        let pts = parse(&data).unwrap();
+        assert_eq!(pts.stride, 2);
+        assert_eq!(pts.positions.len(), (n as usize).div_ceil(2));
+        // Sequential reference: the pre-rayon stride walk.
+        let scale = DVec3::new(0.001, 0.001, 0.001);
+        let offset = DVec3::new(10.0, 10.0, 10.0);
+        let point_data = &data[227..];
+        let mut seq = Vec::new();
+        let mut i = 0usize;
+        while i < n as usize {
+            let base = i * 20;
+            seq.push(decode_xyz(&point_data[base..base + 12], scale, offset));
+            i += pts.stride;
+        }
+        assert_eq!(pts.positions, seq, "parallel decode must match sequential");
+        // Repeat run: identical output.
+        assert_eq!(pts.positions, parse(&data).unwrap().positions);
     }
 
     #[test]

@@ -34,6 +34,10 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 anyhow = "1"
+# Data-parallel hot loops (MIT OR Apache-2.0 — license-clean). Deterministic
+# use only: ordered `collect` with per-item math identical to sequential —
+# never parallel float reductions (op-log replay invariant).
+rayon = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util"] }
