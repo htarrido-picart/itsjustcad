@@ -436,6 +436,97 @@ pub fn terrain_z_at(positions: &[DVec3], faces: &[[u32; 3]], x: f64, y: f64) -> 
     None
 }
 
+// ─── drainage visualization ──────────────────────────────────────────────────
+
+/// Steepest-descent data for one terrain face.
+#[derive(Debug, Clone, Copy)]
+pub struct FaceFlow {
+    pub centroid: DVec3,
+    /// Unit vector down the face plane (has a negative z on any real slope).
+    pub downhill: DVec3,
+    /// Projected (plan) area of the face — used to pick the biggest faces.
+    pub area_xy: f64,
+    /// Slope as rise-over-run (tan of the slope angle).
+    pub slope: f64,
+}
+
+/// Per-face steepest-descent flow: the gradient direction of each non-
+/// horizontal, non-vertical face. Order follows the face list (deterministic).
+pub fn face_flows(positions: &[DVec3], faces: &[[u32; 3]]) -> Vec<FaceFlow> {
+    let mut out = Vec::new();
+    for f in faces {
+        let (a, b, c) = (
+            positions[f[0] as usize],
+            positions[f[1] as usize],
+            positions[f[2] as usize],
+        );
+        let mut n = (b - a).cross(c - a);
+        if n.z < 0.0 {
+            n = -n;
+        }
+        let horiz2 = n.x * n.x + n.y * n.y;
+        // Vertical face (no plan area) or flat face (no descent) → no arrow.
+        if n.z <= 1e-12 || horiz2 < 1e-18 * n.z * n.z || horiz2 == 0.0 {
+            continue;
+        }
+        // Steepest descent within the plane: d ⟂ n, d·(n.xy) < 0 in plan.
+        let d = DVec3::new(n.x * n.z, n.y * n.z, -horiz2).normalize();
+        out.push(FaceFlow {
+            centroid: (a + b + c) / 3.0,
+            downhill: d,
+            area_xy: 0.5 * ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs(),
+            slope: horiz2.sqrt() / n.z,
+        });
+    }
+    out
+}
+
+/// Arrow glyph polyline (open, 5 points): shaft from the centroid down the
+/// slope, then two barbs. Lies in the face plane; the caller lifts it.
+pub fn arrow_points(centroid: DVec3, downhill: DVec3, len: f64) -> Vec<DVec3> {
+    let tip = centroid + downhill * len;
+    let back = tip - downhill * (0.3 * len);
+    // Lateral: perpendicular to the arrow in plan.
+    let plan = (downhill.x * downhill.x + downhill.y * downhill.y).sqrt().max(1e-12);
+    let lat = DVec3::new(-downhill.y / plan, downhill.x / plan, 0.0) * (0.15 * len);
+    vec![centroid, tip, back + lat, tip, back - lat]
+}
+
+/// Local-minima vertices (sinks): interior vertices strictly lower than every
+/// edge-connected neighbor. Boundary vertices (on an edge used by only one
+/// face) are excluded — water leaves the mesh there. Returned in vertex-index
+/// order (deterministic).
+pub fn find_sinks(positions: &[DVec3], faces: &[[u32; 3]]) -> Vec<usize> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut neighbors: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); positions.len()];
+    let mut edge_uses: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+    for f in faces {
+        for e in 0..3 {
+            let (u, v) = (f[e], f[(e + 1) % 3]);
+            neighbors[u as usize].insert(v);
+            neighbors[v as usize].insert(u);
+            let key = (u.min(v), u.max(v));
+            *edge_uses.entry(key).or_insert(0) += 1;
+        }
+    }
+    let mut boundary = vec![false; positions.len()];
+    for ((u, v), uses) in &edge_uses {
+        if *uses == 1 {
+            boundary[*u as usize] = true;
+            boundary[*v as usize] = true;
+        }
+    }
+    (0..positions.len())
+        .filter(|&i| {
+            !boundary[i]
+                && !neighbors[i].is_empty()
+                && neighbors[i]
+                    .iter()
+                    .all(|&j| positions[i].z < positions[j as usize].z)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,6 +777,54 @@ mod tests {
         assert!((z - (3.3 + 9.4)).abs() < 1e-9);
         assert!(terrain_z_at(&pos, &faces, -1.0, 5.0).is_none());
         assert!(terrain_z_at(&pos, &faces, 5.0, 11.0).is_none());
+    }
+
+    #[test]
+    fn flows_on_sloped_plane_point_downslope() {
+        // z = x/2 → downhill is −x everywhere, slope 0.5, dz < 0.
+        let (pos, faces) = grid_terrain(8, 8.0, |x, _| x / 2.0);
+        let flows = face_flows(&pos, &faces);
+        assert_eq!(flows.len(), faces.len(), "every face slopes");
+        for fl in &flows {
+            assert!(fl.downhill.x < -0.85, "points −x, got {:?}", fl.downhill);
+            assert!(fl.downhill.y.abs() < 1e-9);
+            assert!(fl.downhill.z < 0.0, "descends");
+            assert!((fl.slope - 0.5).abs() < 1e-9);
+            assert!((fl.downhill.length() - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn flat_terrain_has_no_flow_arrows() {
+        let (pos, faces) = grid_terrain(4, 4.0, |_, _| 1.0);
+        assert!(face_flows(&pos, &faces).is_empty());
+    }
+
+    #[test]
+    fn arrow_glyph_is_five_points_at_the_tip() {
+        let c = DVec3::new(1.0, 2.0, 3.0);
+        let d = DVec3::new(-1.0, 0.0, 0.0);
+        let pts = arrow_points(c, d, 2.0);
+        assert_eq!(pts.len(), 5);
+        assert_eq!(pts[0], c);
+        assert_eq!(pts[1], DVec3::new(-1.0, 2.0, 3.0), "tip 2 m downhill");
+        assert_eq!(pts[3], pts[1], "polyline returns to the tip between barbs");
+        assert!((pts[2].y - pts[4].y).abs() > 0.1, "barbs straddle the shaft");
+    }
+
+    #[test]
+    fn bowl_has_one_sink_at_center_slope_has_none() {
+        // Paraboloid bowl centered on the (5,5) grid vertex.
+        let (pos, faces) = grid_terrain(10, 10.0, |x, y| {
+            ((x - 5.0).powi(2) + (y - 5.0).powi(2)) / 10.0
+        });
+        let sinks = find_sinks(&pos, &faces);
+        assert_eq!(sinks.len(), 1, "one sink at the bowl bottom");
+        let p = pos[sinks[0]];
+        assert!((p.x - 5.0).abs() < 1e-9 && (p.y - 5.0).abs() < 1e-9);
+        // A uniform slope drains off the edge — no interior minima.
+        let (pos2, faces2) = grid_terrain(10, 10.0, |x, _| x / 2.0);
+        assert!(find_sinks(&pos2, &faces2).is_empty());
     }
 
     #[test]

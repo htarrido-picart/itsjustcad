@@ -3414,6 +3414,186 @@ fn exec_cutfill(
     ))
 }
 
+/// Steepest-descent arrows on the largest terrain faces: a drainage-direction
+/// picture (visualization, not hydrology engineering). Deterministic: faces
+/// sorted by plan area (centroid tie-break), arrow geometry pure per face.
+fn exec_flow_arrows(
+    doc: &mut Document,
+    n: Option<u32>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    if n == Some(0) {
+        return Err(ExecError::Invalid("flowarrows count must be ≥ 1".into()));
+    }
+    let (_, mesh) = terrain_surface(doc)?;
+    let mut flows = crate::landscape::face_flows(mesh.positions(), mesh.faces());
+    if flows.is_empty() {
+        return Err(ExecError::Invalid(
+            "terrain is flat — no descent direction to draw".into(),
+        ));
+    }
+    // Biggest plan-area faces first; centroid tie-break keeps grids stable.
+    flows.sort_by(|a, b| {
+        b.area_xy
+            .total_cmp(&a.area_xy)
+            .then(a.centroid.y.total_cmp(&b.centroid.y))
+            .then(a.centroid.x.total_cmp(&b.centroid.x))
+    });
+    flows.truncate(n.unwrap_or(200) as usize);
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == flows.len() => ids,
+        _ => (0..flows.len()).map(|_| ObjectId::new()).collect(),
+    };
+    let mut layers_created = Vec::new();
+    if !doc.layers.contains_key(ANALYSIS_LAYER) {
+        doc.layers
+            .insert(ANALYSIS_LAYER.to_string(), LayerStyle::default());
+        layers_created.push(ANALYSIS_LAYER.to_string());
+    }
+    let mut samples = Vec::with_capacity(flows.len());
+    for (fl, id) in flows.iter().zip(&new_ids) {
+        // Arrow sized to its face, floated just above the surface.
+        let len = (0.8 * fl.area_xy.sqrt()).max(0.2);
+        let lift = DVec3::new(0.0, 0.0, 0.05);
+        let pts: Vec<DVec3> = crate::landscape::arrow_points(fl.centroid, fl.downhill, len)
+            .into_iter()
+            .map(|p| p + lift)
+            .collect();
+        samples.push((fl.slope, fl.centroid, "downslope".to_string()));
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: None,
+            layer: ANALYSIS_LAYER.to_string(),
+            color: Some([0.15, 0.45, 0.9]),
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(Curve::Polyline { points: pts, closed: false }),
+        });
+    }
+    let max_slope = flows.iter().map(|f| f.slope).fold(0.0f64, f64::max);
+    doc.analysis_reports.insert(
+        "flowarrows".to_string(),
+        build_analysis_report(
+            "flowarrows",
+            format!(
+                "{} steepest-descent arrow(s) — visualization, not hydrology engineering",
+                new_ids.len()
+            ),
+            "rise/run",
+            samples,
+        ),
+    );
+    doc.generation += 1;
+    Ok((
+        Command::FlowArrows { n, ids: Some(new_ids.clone()) },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome {
+            message: format!(
+                "flowarrows: {} downslope arrow(s) on '{ANALYSIS_LAYER}', steepest slope \
+                 {max_slope:.2} rise/run — a gradient visualization, not hydrology engineering",
+                new_ids.len()
+            ),
+            created: new_ids,
+        },
+    ))
+}
+
+/// Ponding markers: a circle at every interior terrain vertex lower than all
+/// its neighbors (visualization, not hydrology engineering).
+fn exec_ponding(
+    doc: &mut Document,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let (_, mesh) = terrain_surface(doc)?;
+    let positions = mesh.positions().to_vec();
+    let faces = mesh.faces().to_vec();
+    let sinks = crate::landscape::find_sinks(&positions, &faces);
+    // Marker radius scaled to the terrain footprint.
+    let (min, max) = positions.iter().fold(
+        (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)),
+        |(lo, hi), p| (lo.min(*p), hi.max(*p)),
+    );
+    let r = (0.02 * (max - min).truncate().length()).clamp(0.15, 2.0);
+    // Sink depth: how far below its lowest neighbor rim the vertex sits — a
+    // marker tag, not a storage volume.
+    let neighbor_min_z = |i: usize| -> f64 {
+        let mut z = f64::INFINITY;
+        for f in &faces {
+            if f.contains(&(i as u32)) {
+                for &v in f {
+                    if v as usize != i {
+                        z = z.min(positions[v as usize].z);
+                    }
+                }
+            }
+        }
+        z
+    };
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == sinks.len() => ids,
+        _ => (0..sinks.len()).map(|_| ObjectId::new()).collect(),
+    };
+    let mut layers_created = Vec::new();
+    if !sinks.is_empty() && !doc.layers.contains_key(ANALYSIS_LAYER) {
+        doc.layers
+            .insert(ANALYSIS_LAYER.to_string(), LayerStyle::default());
+        layers_created.push(ANALYSIS_LAYER.to_string());
+    }
+    let mut samples = Vec::with_capacity(sinks.len());
+    for (&vi, id) in sinks.iter().zip(&new_ids) {
+        let c = positions[vi];
+        samples.push((neighbor_min_z(vi) - c.z, c, "sink".to_string()));
+        let circle: Vec<DVec3> = (0..12)
+            .map(|k| {
+                let a = k as f64 / 12.0 * std::f64::consts::TAU;
+                c + DVec3::new(r * a.cos(), r * a.sin(), 0.05)
+            })
+            .collect();
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: Some("ponding sink".to_string()),
+            layer: ANALYSIS_LAYER.to_string(),
+            color: Some([0.1, 0.35, 0.85]),
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(Curve::Polyline { points: circle, closed: true }),
+        });
+    }
+    doc.analysis_reports.insert(
+        "ponding".to_string(),
+        build_analysis_report(
+            "ponding",
+            format!(
+                "{} local minimum(s) — visualization, not hydrology engineering",
+                sinks.len()
+            ),
+            "m below rim",
+            samples,
+        ),
+    );
+    doc.generation += 1;
+    let message = if sinks.is_empty() {
+        "ponding: no local minima — terrain drains to its edges (local-minima check only, \
+         not hydrology engineering)"
+            .to_string()
+    } else {
+        format!(
+            "ponding: {} potential sink(s) marked on '{ANALYSIS_LAYER}' — local-minima \
+             visualization, not hydrology engineering",
+            sinks.len()
+        )
+    };
+    Ok((
+        Command::Ponding { ids: Some(new_ids.clone()) },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome { message, created: new_ids },
+    ))
+}
+
 /// Sun-path diagram: the yearly sun-path dome for the document's location as
 /// open polylines on a golden `sunpath` layer — seven date arcs (Dec 21 → Jun
 /// 21; Jul–Nov retrace them), analemma-style hour curves, plus a horizon
@@ -6431,6 +6611,8 @@ fn apply_forward(
             exec_pad(doc, at, width, depth, elev, slope)
         }
         Command::CutFill { original_z } => exec_cutfill(doc, original_z),
+        Command::FlowArrows { n, ids } => exec_flow_arrows(doc, n, ids),
+        Command::Ponding { ids } => exec_ponding(doc, ids),
         Command::SunOff => {
             let prev = doc.sun.take();
             doc.generation += 1;
@@ -7873,6 +8055,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Plant { .. } => "plant",
         Command::PlantRow { .. } => "plantrow",
         Command::PlantSchedule { .. } => "plantschedule",
+        Command::FlowArrows { .. } => "flowarrows",
+        Command::Ponding { .. } => "ponding",
         Command::ViewSave { .. } => "view save",
         Command::ViewRestore { .. } => "view",
         Command::ViewList => "view list",
@@ -13813,6 +13997,76 @@ mod tests {
         run(&mut s, "plant spruce 0,0");
         let after = scene_triangles(&s.doc).len();
         assert!(after > before, "plant mesh must join the occlusion scene");
+    }
+
+    #[test]
+    fn flowarrows_point_downslope_and_carry_advisory() {
+        // z = x/2 → every arrow tip is −x of its start.
+        let mut s = terrain_session(10, 10.0, |x, _| x / 2.0);
+        let out = run(&mut s, "flowarrows 20");
+        assert_eq!(out.created.len(), 20, "{}", out.message);
+        assert!(
+            out.message.contains("not hydrology engineering"),
+            "advisory wording required: {}",
+            out.message
+        );
+        for id in &out.created {
+            let obj = s.doc.get(*id).unwrap();
+            assert_eq!(obj.layer, "analysis");
+            let Geometry::Curve(Curve::Polyline { points, .. }) = &obj.geometry else {
+                panic!("arrow must be a polyline");
+            };
+            assert!(points[1].x < points[0].x, "tip is downslope (−x)");
+        }
+        assert!(s.doc.analysis_reports.contains_key("flowarrows"));
+        // Flat terrain has nothing to draw.
+        let mut flat = terrain_session(4, 4.0, |_, _| 1.0);
+        let err = flat.run(parse("flowarrows").unwrap()).unwrap_err();
+        assert!(format!("{err}").contains("flat"), "{err}");
+    }
+
+    #[test]
+    fn ponding_marks_bowl_center_and_none_on_slope() {
+        let mut s = terrain_session(10, 10.0, |x, y| {
+            ((x - 5.0).powi(2) + (y - 5.0).powi(2)) / 10.0
+        });
+        let out = run(&mut s, "ponding");
+        assert_eq!(out.created.len(), 1, "{}", out.message);
+        assert!(out.message.contains("not hydrology engineering"), "{}", out.message);
+        let obj = s.doc.get(out.created[0]).unwrap();
+        let Geometry::Curve(Curve::Polyline { points, closed }) = &obj.geometry else {
+            panic!("marker must be a polyline circle");
+        };
+        assert!(closed);
+        let cx = points.iter().map(|p| p.x).sum::<f64>() / points.len() as f64;
+        let cy = points.iter().map(|p| p.y).sum::<f64>() / points.len() as f64;
+        assert!((cx - 5.0).abs() < 1e-9 && (cy - 5.0).abs() < 1e-9, "marker at bowl bottom");
+        // A uniform slope drains off the edge: zero markers, still advisory.
+        let mut sl = terrain_session(10, 10.0, |x, _| x / 2.0);
+        let out2 = run(&mut sl, "ponding");
+        assert!(out2.created.is_empty());
+        assert!(out2.message.contains("drains to its edges"), "{}", out2.message);
+    }
+
+    #[test]
+    fn drainage_verbs_replay_and_undo_cleanly() {
+        let mut s = terrain_session(10, 10.0, |x, y| {
+            ((x - 5.0).powi(2) + (y - 5.0).powi(2)) / 10.0
+        });
+        let before = s.doc.len();
+        run(&mut s, "flowarrows 10");
+        run(&mut s, "ponding");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "drainage ops must replay bit-identically (ids embedded)"
+        );
+        run(&mut s, "undo");
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), before, "both overlays removed");
+        assert!(!s.doc.layers.contains_key("analysis"), "auto layer dropped");
     }
 
     #[test]

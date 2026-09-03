@@ -1048,6 +1048,18 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             }
             Ok(Command::PlantSchedule { path: args.join(" ") })
         }
+        "flowarrows" => match args.as_slice() {
+            [] => Ok(Command::FlowArrows { n: None, ids: None }),
+            [n] => Ok(Command::FlowArrows {
+                n: Some(n.parse::<u32>().map_err(|_| ParseError::BadNumber((*n).to_string()))?),
+                ids: None,
+            }),
+            _ => wrong("flowarrows", "optionally an arrow count", &args),
+        },
+        "ponding" => {
+            expect_empty("ponding", &args, &args)?;
+            Ok(Command::Ponding { ids: None })
+        }
         "view" => match args.as_slice() {
             ["save", name] => Ok(Command::ViewSave {
                 name: (*name).to_string(),

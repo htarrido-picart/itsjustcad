@@ -690,6 +690,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "flowarrows",
+            usage: "flowarrows [n]",
+            summary: "Drainage direction visualization: steepest-descent arrow glyphs on the [n] largest terrain faces (default 200) on layer 'analysis', plus an AnalysisReport ('flowarrows') of face slopes. A gradient picture only — visualization, not hydrology engineering. Needs a terrain mesh. Example: flowarrows 100",
+            category: Category::Analyze,
+        },
+        CommandSpec {
+            name: "ponding",
+            usage: "ponding",
+            summary: "Mark potential ponding spots: a circle marker at every interior terrain vertex lower than all its neighbors (local minima where water could collect), on layer 'analysis', plus an AnalysisReport ('ponding') of sink depths. Local-minima detection only — visualization, not hydrology engineering. Example: ponding",
+            category: Category::Analyze,
+        },
+        CommandSpec {
             name: "osmfile",
             usage: "osmfile <path.json>",
             summary: "Build OpenStreetMap building context from a saved Overpass API JSON export ('out geom;' query): each building-tagged way footprint is extruded (height tag, else building:levels x 3 m, else 9 m) into a mesh on layer 'context'. lon/lat projected to local meters when a location is set. Example: osmfile /tmp/overpass.json",

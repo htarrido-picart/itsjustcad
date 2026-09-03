@@ -966,6 +966,22 @@ pub enum Command {
     PlantSchedule {
         path: String,
     },
+    /// Steepest-descent arrows on the largest terrain faces (drainage
+    /// visualization, not hydrology engineering). Arrow glyph polylines on
+    /// layer "analysis"; logged with written-back ids like the sun analyses.
+    FlowArrows {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        n: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
+    /// Local-minima detection on the terrain: a marker circle at each
+    /// interior vertex lower than all its neighbors (potential ponding —
+    /// visualization, not hydrology engineering). Logged with ids.
+    Ponding {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// A raw triangle mesh carried verbatim in the op-log. Used by mesh import
     /// (.obj/.stl/.gltf/.glb) so each imported object is one self-contained
     /// logged op — no external file dependency on replay. Not exposed in the
