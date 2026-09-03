@@ -73,6 +73,18 @@ HIG-grounded design revision, run as sequential batches. All six landed.
   - Keep ordered `collect` so output order == sequential (replay invariant); no rayon inside op-log mutation paths — analysis + import + solver inner loops only.
   - *Step 2 — wgpu compute (only if needed)*: occlusion ray casting as compute shader. Costs buffer plumbing + float-determinism care vs replay (analysis bins in op-log shield replay; keep CPU path as reference + test oracle). Deferred until step-1 profiling shows a real remaining hotspot.
 
+## Planting — tropical/subtropical packs (planned 2026-09-03)
+
+- [ ] **M-plants-tropical** — extend the plant catalog beyond the temperate 12 (M-landscape shipped `assets/plants.json`):
+  - *Schema*: species gain `climate_zones` (Köppen: Af/Am/Aw tropical, Cfa/Cwa subtropical...) + `native_regions` tags; existing 12 tagged temperate. Backward-compatible serde (untagged = temperate).
+  - *Caribbean pack*: royal palm (Roystonea regia), coconut palm, ceiba (kapok), flamboyán (Delonix regia), tabebuia/roble amarillo, sea grape (Coccoloba uvifera), mango, guayacán (Guaiacum), almendro (Terminalia catappa).
+  - *Valle del Cauca / Cali pack*: samán (Samanea saman — the iconic pasture giant, 25m canopy), guadua bamboo (Guadua angustifolia — clumping, structural), chiminango (Pithecellobium dulce), gualanday (Jacaranda caucana), carbonero, cachimbo (Erythrina poeppigiana).
+  - *Guayaquil / coastal Ecuador pack*: guayacán (Handroanthus chrysanthus — the yellow bloom), algarrobo (Prosopis), palo santo (Bursera graveolens), ceibo (Ceiba trichistandra — bottle trunk), neem (naturalized), fernán sánchez (Triplaris cumingiana).
+  - Real mature sizes/canopy/growth rates per species; palms get a dedicated canopy shape (crown-on-trunk column, not ellipsoid) — matters for shadow studies at low tropical sun angles.
+  - *Climate awareness*: `location` verb already georeferences the doc — derive Köppen band from latitude (rough: |lat|<10° tropical, 10–23.5° tropical/monsoon, 23.5–35° subtropical); `plant` warns when species climate mismatches doc location ("Betula in Guayaquil — advisory: outside climate range"); `plantcatalog [region|zone]` lists filtered.
+  - Deciduous flag stays (dry-season deciduous: flamboyán/ceibo drop leaves — affects seasonal shadow transparency when that lands).
+  - Data-driven JSON only — no code per species; packs user-extendable + LLM-authorable like plugins.
+
 ## GUI + usability testing (planned 2026-09-02)
 
 - [x] **M-guitest** — automated GUI tests + automated usability audits (closed 2026-09-03):
