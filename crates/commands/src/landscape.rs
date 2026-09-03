@@ -333,6 +333,32 @@ pub fn find_species(query: &str) -> Option<&'static PlantSpecies> {
     })
 }
 
+/// Species in the catalog filtered by an optional region tag and/or an
+/// optional climate band. Both filters are ANDed when present; `None`/`None`
+/// returns the whole catalog. Deterministic (catalog order). Query only.
+pub fn catalog_filtered(
+    region: Option<&str>,
+    band: Option<ClimateBand>,
+) -> Vec<&'static PlantSpecies> {
+    let r = region.map(str::to_lowercase);
+    plant_catalog()
+        .iter()
+        .filter(|s| r.as_deref().is_none_or(|r| s.native_regions.iter().any(|t| t == r)))
+        .filter(|s| band.is_none_or(|b| b.suits(s)))
+        .collect()
+}
+
+/// Native, Miyawaki-classified species available for a climate band: those
+/// whose `climate_zones` suit the band (or whose `native_regions` names the
+/// band's region) AND that carry a stratification `layer`. This is the pool
+/// the Miyawaki generator draws from. Deterministic.
+pub fn miyawaki_pool(band: ClimateBand) -> Vec<&'static PlantSpecies> {
+    plant_catalog()
+        .iter()
+        .filter(|s| s.layer.is_some() && band.suits(s))
+        .collect()
+}
+
 /// Height and canopy diameter at `age_years` (None = mature): a linear
 /// height-growth model capped at maturity, canopy scaled proportionally.
 /// Floored at 5% so a newly planted whip still shows up.

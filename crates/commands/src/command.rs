@@ -966,6 +966,28 @@ pub enum Command {
     PlantSchedule {
         path: String,
     },
+    /// List catalog species, optionally filtered by a region tag ("caribbean",
+    /// "valle-del-cauca", "guayaquil"…) or a Köppen zone code ("Af", "Cfb"…).
+    /// Query only — prints a table, never touches the scene or the op-log.
+    PlantCatalog {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<String>,
+    },
+    /// Dense native Miyawaki mini-forest inside a closed region: pick native,
+    /// layered species for the doc's derived climate band, stratify across
+    /// canopy/tree/subtree/shrub, and seed-place 3–5 stems/m² (scaled by
+    /// `density`) as saplings, adjacent stems differing in species/layer.
+    /// Expands into one MeshLiteral op per stem on layer "planting"; the
+    /// Miyawaki op itself is not logged (like Plant). Stores an AnalysisReport
+    /// ("miyawaki") for the deck. Seeded from the region + a fixed salt so
+    /// replay is byte-stable.
+    Miyawaki {
+        /// Closed region curve(s) to fill.
+        targets: Selector,
+        /// Stems per m² before the default; defaults to 4.0. Clamped to [1, 8].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        density: Option<f64>,
+    },
     /// Steepest-descent arrows on the largest terrain faces (drainage
     /// visualization, not hydrology engineering). Arrow glyph polylines on
     /// layer "analysis"; logged with written-back ids like the sun analyses.
@@ -1417,6 +1439,8 @@ impl Command {
                 | Command::Plant { .. }
                 | Command::PlantRow { .. }
                 | Command::PlantSchedule { .. }
+                | Command::PlantCatalog { .. }
+                | Command::Miyawaki { .. }
                 | Command::Distance { .. }
                 | Command::Area { .. }
                 | Command::Volume { .. }

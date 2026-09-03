@@ -702,6 +702,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "plantcatalog",
+            usage: "plantcatalog [region|zone]",
+            summary: "List catalog species, optionally filtered by a native-region tag (caribbean, valle-del-cauca, guayaquil, europe, north-america, temperate, subtropical) or a Köppen zone code (Af, Am, Aw, Cfa, Cwa, Cfb, Dfb). Prints id, common + botanical name, mature size, climate zones and Miyawaki layer. Query only — no geometry. Example: plantcatalog caribbean · plantcatalog Aw",
+            category: Category::Analyze,
+        },
+        CommandSpec {
+            name: "miyawaki",
+            usage: "miyawaki <closed-region> [density]",
+            summary: "Grow a dense native Miyawaki mini-forest inside a closed region. Picks only species native/suited to the document's climate band (derived from `location` latitude) that carry a stratification layer, spreads them across canopy/tree/subtree/shrub (10/40/30/20%), and seed-places 3–5 stems/m² (scaled by [density], default 4) as saplings — adjacent stems differ in species and layer, never rows. Emits one 'plant:*' mesh per stem on layer 'planting' and stores an AnalysisReport ('miyawaki', see `report`). Seeded from the region so replay is byte-stable. Warns when too few natives exist for the location; advisory: dense planting self-thins 30–50% over time (intended). Needs a closed region; set `location` first. Example: miyawaki last 3",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "flowarrows",
             usage: "flowarrows [n]",
             summary: "Drainage direction visualization: steepest-descent arrow glyphs on the [n] largest terrain faces (default 200) on layer 'analysis', plus an AnalysisReport ('flowarrows') of face slopes. A gradient picture only — visualization, not hydrology engineering. Needs a terrain mesh. Example: flowarrows 100",

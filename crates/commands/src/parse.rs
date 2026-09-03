@@ -1048,6 +1048,24 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             }
             Ok(Command::PlantSchedule { path: args.join(" ") })
         }
+        "plantcatalog" => match args.as_slice() {
+            [] => Ok(Command::PlantCatalog { filter: None }),
+            [f] => Ok(Command::PlantCatalog { filter: Some((*f).to_string()) }),
+            _ => wrong("plantcatalog", "at most one region tag or Köppen zone code", &args),
+        },
+        "miyawaki" => {
+            // A closed region, then an optional density. Like sitepath, a bare
+            // trailing number after 'last' is the density, not an object count.
+            let (targets, rest) = match args.split_first() {
+                Some((&"last", rest)) => (Selector::Last { n: 1 }, rest),
+                _ => selector(&args, "miyawaki")?,
+            };
+            match rest {
+                [] => Ok(Command::Miyawaki { targets, density: None }),
+                [d] => Ok(Command::Miyawaki { targets, density: Some(number(d)?) }),
+                _ => wrong("miyawaki", "a closed region and optional density", &args),
+            }
+        }
         "flowarrows" => match args.as_slice() {
             [] => Ok(Command::FlowArrows { n: None, ids: None }),
             [n] => Ok(Command::FlowArrows {
