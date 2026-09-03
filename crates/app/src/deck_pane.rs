@@ -30,6 +30,9 @@ enum WarmState {
 }
 
 const MAX_RETRIES: u8 = 2;
+/// Hard bound on total auto-driven rounds (steps + retries + verify) of one
+/// plan-execute run, so a runaway plan can never loop the deck forever.
+const MAX_PLAN_ROUNDS: u32 = 24;
 /// Hard cap on one deck turn. A wedged CLI subprocess is killed (kill_on_drop)
 /// instead of idling for hours; the session revives on the next send.
 const TURN_TIMEOUT_SECS: u64 = 600;
@@ -201,6 +204,11 @@ struct SavedChat {
     session_id: Option<String>,
     messages: Vec<ChatMessage>,
     transcript: Vec<Entry>,
+    /// In-flight plan-execute state, if a plan was interrupted (cancel, quit,
+    /// crash) — revived on load so the plan resumes. `default` keeps old drafts
+    /// loading.
+    #[serde(default)]
+    plan: Option<itsjustcad_deck::Plan>,
 }
 
 /// Borrowed mirror of [`SavedChat`] so saving never clones the transcript.
@@ -209,6 +217,7 @@ struct SavedChatRef<'a> {
     session_id: &'a Option<String>,
     messages: &'a [ChatMessage],
     transcript: &'a [Entry],
+    plan: &'a Option<itsjustcad_deck::Plan>,
 }
 
 /// Per-document live-snapshot path: `~/.config/itsjustcad/chats/<uuid>.draft.json`,
@@ -291,6 +300,7 @@ mod saved_chat_tests {
             session_id: &session_id,
             messages: &messages,
             transcript: &entries,
+            plan: &None,
         })
         .unwrap();
         let back: SavedChat = serde_json::from_str(&json).unwrap();
@@ -349,6 +359,7 @@ mod saved_chat_tests {
             session_id: &None,
             messages: &[],
             transcript: &entries,
+            plan: &Some(plan.clone()),
         })
         .unwrap();
         let back: SavedChat = serde_json::from_str(&json).unwrap();
@@ -356,6 +367,14 @@ mod saved_chat_tests {
             matches!(&back.transcript[0], Entry::Question(q) if q == "how tall should the wall be?")
         );
         assert!(matches!(&back.transcript[1], Entry::Plan(p) if *p == plan));
+        // The live plan state itself persists too (resume-after-interrupt).
+        assert_eq!(back.plan, Some(plan));
+        // Old drafts without the plan field still load (serde default).
+        let old: SavedChat = serde_json::from_str(
+            r#"{"session_id":null,"messages":[],"transcript":[]}"#,
+        )
+        .unwrap();
+        assert!(old.plan.is_none());
     }
 
     #[test]
@@ -391,6 +410,26 @@ fn parse_title_summary(reply: &str) -> Option<(String, String)> {
     let summary = lines.map(strip).collect::<Vec<_>>().join(" ");
     Some((title, summary))
 }
+
+/// The continuation message that drives one plan step: names the step and
+/// pins the contract (only this step's commands). Pure — unit-testable.
+fn step_prompt(plan: &itsjustcad_deck::Plan) -> String {
+    let step = plan
+        .current_step()
+        .map(|s| s.text.as_str())
+        .unwrap_or_default();
+    format!(
+        "Step {} of {}: {}\nEmit ONLY this step's commands in a ```draft block.",
+        plan.current + 1,
+        plan.steps.len(),
+        step
+    )
+}
+
+/// The end-of-plan verification message: read-only checks + a summary.
+const VERIFY_PROMPT: &str = "All plan steps are done. Verify the end state with \
+read-only commands (`bbox all`, `schedule`) if useful, and reply with a one-line \
+summary of what was built.";
 
 /// The filesystem path a side-effecting command targets, if any.
 fn deck_command_path(cmd: &Command) -> Option<&str> {
@@ -706,6 +745,13 @@ pub struct DeckPane {
     /// [`DeckPane::take_app_verbs`] and runs them through the same app-verb-aware
     /// path as the human command line (`App::execute_line`). Never op-logged.
     pending_app_verbs: Vec<String>,
+    /// Plan-execute state: the numbered plan the model announced for a
+    /// prolonged task, driven step-by-step by [`finish_turn`]. Persisted in the
+    /// per-doc draft so a cancelled/interrupted plan resumes. `None` = no plan.
+    plan: Option<itsjustcad_deck::Plan>,
+    /// Auto-driven rounds consumed by the current plan run (steps + retries +
+    /// the verify turn), bounded by [`MAX_PLAN_ROUNDS`].
+    plan_rounds: u32,
 }
 
 impl Default for DeckPane {
@@ -775,6 +821,8 @@ impl Default for DeckPane {
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
+            plan: None,
+            plan_rounds: 0,
         }
     }
 }
@@ -947,6 +995,8 @@ impl DeckPane {
     fn clear_live(&mut self) {
         self.stop_turn();
         self.session_id = None;
+        self.plan = None;
+        self.plan_rounds = 0;
         self.messages.clear();
         self.transcript.clear();
         self.current_response.clear();
@@ -1022,8 +1072,20 @@ impl DeckPane {
         self.session_id = draft.session_id;
         self.messages = draft.messages;
         self.transcript = draft.transcript;
+        self.plan = draft.plan;
+        self.plan_rounds = 0;
         self.loaded_session_id = None;
         self.dirty_since_load = false;
+        // An interrupted plan revives with the draft; the user's next message
+        // continues it (the driver picks the cursor back up).
+        if let Some(p) = &self.plan
+            && !p.is_complete()
+            && !p.has_failed()
+        {
+            self.transcript.push(Entry::Status(
+                "interrupted plan restored — send a message to continue".into(),
+            ));
+        }
         if let Some(sid) = &self.session_id {
             self.transcript.push(Entry::Status(format!(
                 "revived session {}",
@@ -1159,6 +1221,7 @@ impl DeckPane {
             session_id: &self.session_id,
             messages: &self.messages,
             transcript: &self.transcript,
+            plan: &self.plan,
         }
         .save(uuid);
     }
@@ -1542,6 +1605,16 @@ impl DeckPane {
         }
         self.streaming_chat.clear();
         self.transcript.push(Entry::Status("stopped".into()));
+        // A cancel mid-plan PAUSES the plan (state stays persisted); the user's
+        // next message resumes it from the current step.
+        if let Some(p) = &self.plan
+            && !p.is_complete()
+            && !p.has_failed()
+        {
+            self.transcript.push(Entry::Status(
+                "plan paused — send a message to resume".into(),
+            ));
+        }
         self.persist_chat();
     }
 
@@ -1727,6 +1800,12 @@ impl DeckPane {
     }
 
     fn finish_turn(&mut self, session: &Session, handle: &tokio::runtime::Handle) {
+        let had_commands = !self.current_commands.is_empty();
+        // A turn that ends awaiting the USER (clarifying question) must not be
+        // auto-continued by the plan driver below.
+        let mut question_turn = false;
+        // A pure `PLAN:` announcement adopted this turn (no commands ran).
+        let mut announced_plan: Option<itsjustcad_deck::Plan> = None;
         if !self.streaming_chat.trim().is_empty() {
             let chat = std::mem::take(&mut self.streaming_chat);
             // Clarify-before-act: a `QUESTION:` turn (with no commands) renders
@@ -1734,7 +1813,16 @@ impl DeckPane {
             if self.current_commands.is_empty()
                 && let Some(q) = itsjustcad_deck::parse_question(&chat)
             {
+                question_turn = true;
                 self.transcript.push(Entry::Question(q));
+            } else if self.current_commands.is_empty()
+                && self.plan.is_none()
+                && let Some(p) = itsjustcad_deck::parse_plan(&chat)
+            {
+                // Plan-execute: a commands-free PLAN announcement becomes the
+                // live plan, rendered as a checklist (not a prose bubble).
+                self.transcript.push(Entry::Plan(p.clone()));
+                announced_plan = Some(p);
             } else {
                 self.transcript.push(Entry::Deck(chat));
             }
@@ -1762,6 +1850,20 @@ impl DeckPane {
         // never queue the error-driven retry, but clear here regardless to be
         // robust to future changes.
         self.vision_turn = false;
+        // ── Plan-execute driver ─────────────────────────────────────────────
+        // Adopt a fresh plan and drive step 1, or advance/retry the live plan.
+        // Every auto-continuation is bounded: MAX_STEP_ATTEMPTS per step (via
+        // the plan's attempt counter) and MAX_PLAN_ROUNDS per run overall.
+        if let Some(p) = announced_plan {
+            self.plan = Some(p);
+            self.plan_rounds = 0;
+            self.continue_plan(session, handle);
+            return;
+        }
+        if self.plan.is_some() && !question_turn {
+            self.drive_plan(had_commands, session, handle);
+            return;
+        }
         if !self.errors_this_turn.is_empty() && self.retries < MAX_RETRIES {
             self.retries += 1;
             let feedback = format!(
@@ -1780,6 +1882,118 @@ impl DeckPane {
             self.start_turn(session, handle);
         }
         self.persist_chat();
+    }
+
+    /// Advance or retry the live plan after a finished turn. `had_commands`
+    /// tells whether the turn actually executed anything (a chat-only reply
+    /// stalls the driver and waits for the user instead of spinning).
+    fn drive_plan(
+        &mut self,
+        had_commands: bool,
+        session: &Session,
+        handle: &tokio::runtime::Handle,
+    ) {
+        let Some(mut plan) = self.plan.take() else { return };
+        if !self.errors_this_turn.is_empty() {
+            // Bounded self-correction: burn one attempt on the current step and
+            // feed the errors back, or fail the step once the budget is gone.
+            let attempts = plan.note_step_error();
+            if attempts >= itsjustcad_deck::MAX_STEP_ATTEMPTS {
+                plan.mark_step_failed();
+                self.refresh_plan_entry(&plan);
+                self.transcript.push(Entry::Status(format!(
+                    "plan stopped: step {} failed after {attempts} attempts",
+                    plan.current + 1
+                )));
+                // The failed plan stays out of `self.plan` (run over), but its
+                // checklist entry keeps the [!] mark in the transcript.
+                self.persist_chat();
+                return;
+            }
+            self.refresh_plan_entry(&plan);
+            self.transcript.push(Entry::Status(format!(
+                "plan step {}: retry {attempts}/{} — feeding errors back",
+                plan.current + 1,
+                itsjustcad_deck::MAX_STEP_ATTEMPTS,
+            )));
+            self.messages.push(ChatMessage {
+                role: Role::User,
+                content: format!(
+                    "Some commands failed:\n{}\nCurrent scene:\n{}\nFix and re-emit ONLY this step's failed or missing commands in a ```draft block.",
+                    self.errors_this_turn.join("\n"),
+                    crate::scene::digest(&session.doc),
+                ),
+            });
+            self.plan = Some(plan);
+            self.start_plan_round(session, handle);
+            return;
+        }
+        if !had_commands {
+            // A chat-only reply mid-plan: do not auto-continue on prose — wait
+            // for the user so the driver can never ping-pong with a rambler.
+            self.plan = Some(plan);
+            self.persist_chat();
+            return;
+        }
+        // The step's commands all succeeded → advance.
+        plan.mark_step_done();
+        self.refresh_plan_entry(&plan);
+        if plan.is_complete() {
+            self.transcript.push(Entry::Status(format!(
+                "plan complete — {} step(s) done, verifying",
+                plan.steps.len()
+            )));
+            // Plan run over; the verify turn is an ordinary turn.
+            self.messages.push(ChatMessage {
+                role: Role::User,
+                content: VERIFY_PROMPT.to_string(),
+            });
+            self.start_plan_round(session, handle);
+            return;
+        }
+        self.plan = Some(plan);
+        self.continue_plan(session, handle);
+    }
+
+    /// Queue the continuation message for the plan's current step and start the
+    /// next turn (bounded by [`MAX_PLAN_ROUNDS`]).
+    fn continue_plan(&mut self, session: &Session, handle: &tokio::runtime::Handle) {
+        let Some(plan) = self.plan.as_ref() else { return };
+        self.messages.push(ChatMessage {
+            role: Role::User,
+            content: step_prompt(plan),
+        });
+        self.start_plan_round(session, handle);
+    }
+
+    /// Start one auto-driven plan round, enforcing the total-round bound. Each
+    /// step gets a fresh per-turn retry budget.
+    fn start_plan_round(&mut self, session: &Session, handle: &tokio::runtime::Handle) {
+        self.plan_rounds += 1;
+        if self.plan_rounds > MAX_PLAN_ROUNDS {
+            self.transcript.push(Entry::Status(format!(
+                "plan aborted: exceeded {MAX_PLAN_ROUNDS} auto-driven rounds"
+            )));
+            self.plan = None;
+            self.persist_chat();
+            return;
+        }
+        self.retries = 0;
+        self.persist_chat();
+        self.start_turn(session, handle);
+    }
+
+    /// Refresh the newest Plan checklist entry in the transcript to `plan`'s
+    /// current state (statuses, cursor), so the checklist ticks live.
+    fn refresh_plan_entry(&mut self, plan: &itsjustcad_deck::Plan) {
+        if let Some(entry) = self
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|e| matches!(e, Entry::Plan(_)))
+        {
+            *entry = Entry::Plan(plan.clone());
+        }
     }
 
     /// Poll streaming deltas; returns whether the document may have changed.
@@ -2948,6 +3162,217 @@ mod clarify_tests {
 }
 
 #[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use itsjustcad_deck::{DeckKind, StepStatus};
+
+    /// A pane whose active cassette is an unreachable local HTTP endpoint, so
+    /// auto-continued turns fail fast asynchronously instead of spawning a
+    /// `claude` subprocess. The spawned request task is dropped with the rt.
+    fn plan_pane() -> DeckPane {
+        let mut pane = side_effect_gate_tests::blank_pane();
+        pane.decks = DecksFile {
+            decks: vec![itsjustcad_deck::DeckConfig {
+                name: "test-local".into(),
+                kind: DeckKind::OpenaiCompat,
+                base_url: "http://127.0.0.1:1/v1".into(),
+                model: "test".into(),
+                api_key: None,
+                grammar: false,
+                terse: None,
+            }],
+            active: 0,
+            local_only: false,
+        };
+        pane
+    }
+
+    fn two_step_plan() -> itsjustcad_deck::Plan {
+        itsjustcad_deck::Plan::new(vec!["model the slab".into(), "extrude the core".into()])
+    }
+
+    #[test]
+    fn step_prompt_names_step_and_contract() {
+        let mut p = two_step_plan();
+        assert!(step_prompt(&p).contains("Step 1 of 2: model the slab"));
+        assert!(step_prompt(&p).contains("ONLY this step's commands"));
+        p.mark_step_done();
+        assert!(step_prompt(&p).contains("Step 2 of 2: extrude the core"));
+    }
+
+    #[test]
+    fn plan_announcement_becomes_checklist_and_drives_step_one() {
+        // A commands-free PLAN: reply is adopted: checklist entry, live plan,
+        // and an auto-queued "Step 1 of 2" continuation message.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session = Session::default();
+        let mut pane = plan_pane();
+        pane.streaming_chat = "PLAN:\n1. model the slab\n2. extrude the core\n".into();
+        pane.current_response = pane.streaming_chat.clone();
+        pane.finish_turn(&session, rt.handle());
+        assert!(pane.transcript.iter().any(|e| matches!(e, Entry::Plan(_))));
+        let plan = pane.plan.as_ref().expect("plan adopted");
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.current, 0);
+        let last = pane.messages.last().expect("continuation queued");
+        assert!(matches!(last.role, Role::User));
+        assert!(last.content.contains("Step 1 of 2: model the slab"), "{}", last.content);
+        assert!(pane.busy(), "the next turn was started");
+        pane.stop_turn();
+    }
+
+    #[test]
+    fn plan_step_success_advances_and_continues() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session = Session::default();
+        let mut pane = plan_pane();
+        pane.plan = Some(two_step_plan());
+        pane.transcript.push(Entry::Plan(two_step_plan()));
+        pane.current_commands.push(ExecutedCommand {
+            line: "box 0,0,0 10,10,0.3".into(),
+            result: Ok("box abc".into()),
+        });
+        pane.finish_turn(&session, rt.handle());
+        let plan = pane.plan.as_ref().expect("plan still live");
+        assert_eq!(plan.current, 1, "step advanced on success");
+        assert_eq!(plan.steps[0].status, StepStatus::Done);
+        // The checklist entry ticked live.
+        assert!(pane.transcript.iter().any(
+            |e| matches!(e, Entry::Plan(p) if p.steps[0].status == StepStatus::Done)
+        ));
+        // Continuation for step 2 queued + started.
+        assert!(pane.messages.last().unwrap().content.contains("Step 2 of 2"));
+        assert!(pane.busy());
+        pane.stop_turn();
+    }
+
+    #[test]
+    fn plan_completion_triggers_verify_turn() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session = Session::default();
+        let mut pane = plan_pane();
+        let mut p = two_step_plan();
+        p.mark_step_done(); // step 1 already done; this turn finishes step 2
+        pane.plan = Some(p);
+        pane.transcript.push(Entry::Plan(two_step_plan()));
+        pane.current_commands.push(ExecutedCommand {
+            line: "box 4,4,0 2,2,9".into(),
+            result: Ok("box def".into()),
+        });
+        pane.finish_turn(&session, rt.handle());
+        assert!(pane.plan.is_none(), "run is over; verify turn is ordinary");
+        assert!(pane
+            .transcript
+            .iter()
+            .any(|e| matches!(e, Entry::Status(s) if s.contains("plan complete"))));
+        assert!(pane.messages.last().unwrap().content.contains("Verify the end state"));
+        assert!(pane.busy());
+        pane.stop_turn();
+    }
+
+    #[test]
+    fn plan_step_errors_get_bounded_retries_then_fail() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session = Session::default();
+        let mut pane = plan_pane();
+        // Two attempts already burned; this turn's error exhausts the budget.
+        let mut p = two_step_plan();
+        p.note_step_error();
+        p.note_step_error();
+        pane.plan = Some(p);
+        pane.transcript.push(Entry::Plan(two_step_plan()));
+        pane.current_commands.push(ExecutedCommand {
+            line: "bogus 1".into(),
+            result: Err("unknown verb".into()),
+        });
+        pane.errors_this_turn.push("`bogus 1` failed: unknown verb".into());
+        pane.finish_turn(&session, rt.handle());
+        assert!(pane.plan.is_none(), "failed plan run stops");
+        assert!(!pane.busy(), "no further auto-continuation after failure");
+        assert!(pane.transcript.iter().any(
+            |e| matches!(e, Entry::Status(s) if s.contains("failed after 3 attempts"))
+        ));
+        // The checklist keeps the [!] mark.
+        assert!(pane.transcript.iter().any(
+            |e| matches!(e, Entry::Plan(p) if p.steps[0].status == StepStatus::Failed)
+        ));
+    }
+
+    #[test]
+    fn plan_step_error_below_budget_retries_with_feedback() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session = Session::default();
+        let mut pane = plan_pane();
+        pane.plan = Some(two_step_plan());
+        pane.transcript.push(Entry::Plan(two_step_plan()));
+        pane.errors_this_turn.push("`box` failed: bad point".into());
+        pane.current_commands.push(ExecutedCommand {
+            line: "box x".into(),
+            result: Err("bad point".into()),
+        });
+        pane.finish_turn(&session, rt.handle());
+        let plan = pane.plan.as_ref().expect("plan still live");
+        assert_eq!(plan.steps[0].attempts, 1);
+        assert_eq!(plan.current, 0, "cursor stays on the failing step");
+        let last = pane.messages.last().unwrap();
+        assert!(last.content.contains("Some commands failed"), "{}", last.content);
+        assert!(pane.busy(), "retry turn started");
+        pane.stop_turn();
+    }
+
+    #[test]
+    fn cancel_mid_plan_pauses_and_preserves_state() {
+        let mut pane = side_effect_gate_tests::blank_pane();
+        pane.plan = Some(two_step_plan());
+        pane.stop_turn();
+        let plan = pane.plan.as_ref().expect("plan preserved across cancel");
+        assert!(!plan.is_complete());
+        assert!(pane.transcript.iter().any(
+            |e| matches!(e, Entry::Status(s) if s.contains("plan paused"))
+        ));
+    }
+
+    #[test]
+    fn interrupted_plan_resumes_from_persisted_draft() {
+        // Round-trip through SavedChat (what persist_chat writes) and load_draft
+        // (what a relaunch runs): the plan revives with its cursor intact.
+        let mut p = two_step_plan();
+        p.mark_step_done();
+        let json = serde_json::to_string(&SavedChatRef {
+            session_id: &None,
+            messages: &[],
+            transcript: &[],
+            plan: &Some(p.clone()),
+        })
+        .unwrap();
+        let draft: SavedChat = serde_json::from_str(&json).unwrap();
+        let mut pane = side_effect_gate_tests::blank_pane();
+        pane.load_draft(draft);
+        let revived = pane.plan.as_ref().expect("plan revived");
+        assert_eq!(revived.current, 1);
+        assert_eq!(revived.steps[0].status, StepStatus::Done);
+        assert!(pane.transcript.iter().any(
+            |e| matches!(e, Entry::Status(s) if s.contains("interrupted plan restored"))
+        ));
+    }
+
+    #[test]
+    fn question_mid_plan_waits_for_the_user() {
+        // A clarifying question during a plan must NOT auto-continue the plan.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session = Session::default();
+        let mut pane = plan_pane();
+        pane.plan = Some(two_step_plan());
+        pane.streaming_chat = "QUESTION: which core layout?".into();
+        pane.current_response = pane.streaming_chat.clone();
+        pane.finish_turn(&session, rt.handle());
+        assert!(pane.transcript.iter().any(|e| matches!(e, Entry::Question(_))));
+        assert!(!pane.busy(), "plan driver must not run past a question");
+        assert!(pane.plan.is_some(), "plan stays for after the answer");
+    }
+}
+
+#[cfg(test)]
 mod side_effect_gate_tests {
     use super::*;
     use std::path::{Path, PathBuf};
@@ -2996,6 +3421,8 @@ mod side_effect_gate_tests {
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
+            plan: None,
+            plan_rounds: 0,
         }
     }
 
@@ -3290,6 +3717,7 @@ mod side_effect_gate_tests {
             session_id: None,
             messages: vec![ChatMessage { role: Role::User, content: "revive me".into() }],
             transcript: vec![Entry::User("revive me".into())],
+            plan: None,
         };
         pane.load_draft(draft);
         assert_eq!(pane.messages.len(), 1);
@@ -3537,6 +3965,7 @@ mod side_effect_gate_tests {
             session_id: &None,
             messages: &[ChatMessage { role: Role::User, content: "legacy global chat".into() }],
             transcript: &[Entry::User("legacy global chat".into())],
+            plan: &None,
         })
         .unwrap();
         std::fs::write(&global, legacy).unwrap();

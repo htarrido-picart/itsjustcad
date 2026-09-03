@@ -135,6 +135,20 @@ QUESTION: <one short clarifying question>
 The user's next message answers it; then proceed normally. Never mix commands and a QUESTION in the same turn, and ask at most one question per turn, only when genuinely needed.
 ";
 
+/// The "Multi-step plans" section: for prolonged tasks the model first emits
+/// the explicit `PLAN:` message form (`crate::agent::parse_plan`), which the
+/// app renders as a checklist and then drives step by step — each step's
+/// commands run, errors are fed back for a bounded retry, and the run ends
+/// with a verification + summary turn. Injected into the full system prompt.
+pub const PLAN_HELP: &str = "\
+## Multi-step plans (prolonged tasks)
+For a prolonged task with several distinct stages (e.g. model a small building: slab, cores, envelope, roof), FIRST reply with only a plan — numbered steps, nothing else:
+PLAN:
+1. <first step>
+2. <second step>
+Then execute it one step per turn: emit ONLY the current step's commands in a ```draft block, read the results/errors fed back, fix failures, and move on when the step succeeds. After the last step, verify the end state with read-only commands (`bbox all`, `schedule`, `report`) and reply with a one-line summary. Simple one-shot requests need NO plan — just draw.
+";
+
 /// Terse mode's hard per-turn token cap. Fewer tokens = faster local inference;
 /// the style rules below make the model spend them on substance.
 pub const TERSE_MAX_TOKENS: u32 = 512;
@@ -222,6 +236,11 @@ camera fisheye 120
 
 If the request is AMBIGUOUS (missing dimension, unclear target like "make it bigger" with several objects), do NOT guess: output exactly one line, no draft block:
 QUESTION: <one short clarifying question>
+
+For a BIG task with several stages, first output only a numbered plan (then one step per turn as draft blocks):
+PLAN:
+1. <first step>
+2. <second step>
 
 Examples (follow this exact syntax):
 "a 10x10x3 slab with a 4x4 courtyard" ->
@@ -312,6 +331,7 @@ Examples:
 {ui_verbs}
 {enviro}
 {clarify}
+{plan}
 ## Rules
 - Points are x,y,z or x,y (z=0). No spaces inside a point. Units: bare numbers are meters; 250cm and 500mm also work.
 - 'last' refers to the most recently created object; 'last N' to the N most recent. After a command that creates an object, that object is 'last'.
@@ -344,6 +364,7 @@ box 10,0,0 4,4,3
         ui_verbs = UI_VERB_HELP,
         enviro = ENVIRO_CRITIQUE_HELP,
         clarify = CLARIFY_HELP,
+        plan = PLAN_HELP,
         scene = if scene_digest.is_empty() {
             "(empty)"
         } else {
@@ -537,6 +558,23 @@ mod tests {
             crate::agent::parse_question("QUESTION: which object?").as_deref(),
             Some("which object?")
         );
+    }
+
+    #[test]
+    fn both_prompts_advertise_the_plan_message_form() {
+        // The plan-execute harness is only reachable if the prompt teaches the
+        // exact `PLAN:` + numbered-step form the parser and grammar accept.
+        let full = system_prompt("", &PluginRegistry::new());
+        assert!(full.contains(PLAN_HELP), "PLAN_HELP not injected");
+        assert!(full.contains("## Multi-step plans"));
+        assert!(full.contains("PLAN:\n1. <first step>"));
+        // Verification guidance names real read-only registry verbs.
+        assert!(full.contains("`bbox all`, `schedule`, `report`"));
+        let brief = brief_system_prompt("");
+        assert!(brief.contains("PLAN:\n1. <first step>"));
+        // The advertised form round-trips through the parser.
+        let p = crate::agent::parse_plan("PLAN:\n1. slab\n2. cores\n").expect("parses");
+        assert_eq!(p.steps.len(), 2);
     }
 
     #[test]

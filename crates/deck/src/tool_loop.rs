@@ -17,6 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::{Plan, MAX_STEP_ATTEMPTS};
+
 /// A single tool invocation the cassette wants performed this step. `id`
 /// correlates the request with its [`ToolResult`] on the next step; `name` is
 /// the tool (e.g. a CAD verb like `box`, or `web_search`); `input` is the raw
@@ -46,6 +48,15 @@ pub enum StepDecision {
     CallTools(Vec<ToolCall>),
     /// The turn is complete; this is the assistant's final prose answer.
     Final(String),
+    /// The cassette announced a numbered PLAN for a prolonged task (the
+    /// `agent::parse_plan` message form). [`run_plan_loop`] adopts it as the
+    /// plan state; emitted again mid-run it REPLANS the remaining steps.
+    /// [`run_tool_loop`] (plain, plan-less loop) skips it and keeps stepping.
+    Plan(Vec<String>),
+    /// The cassette asked a clarifying question (the `agent::parse_question`
+    /// form) instead of acting. Both loops end the turn immediately — the
+    /// user's answer arrives as the next turn.
+    Question(String),
 }
 
 /// A cassette that can drive the agentic loop one step at a time. Given the
@@ -81,6 +92,8 @@ pub struct LoopOutcome {
     /// True when the loop stopped because it hit `max_steps` rather than a
     /// `Final` decision (a runaway cassette; the partial work still stands).
     pub truncated: bool,
+    /// A clarifying question that ended the turn (`StepDecision::Question`).
+    pub question: Option<String>,
 }
 
 /// Drive `cassette` to completion, dispatching each requested tool through
@@ -106,6 +119,13 @@ pub fn run_tool_loop(
                 outcome.answer = answer;
                 return outcome;
             }
+            StepDecision::Question(q) => {
+                outcome.question = Some(q);
+                return outcome;
+            }
+            // A plan announcement in the plain loop: nothing to execute yet —
+            // keep stepping (a plan-aware caller uses `run_plan_loop`).
+            StepDecision::Plan(_) => {}
             StepDecision::CallTools(calls) => {
                 results = Vec::with_capacity(calls.len());
                 for call in &calls {
@@ -123,7 +143,117 @@ pub fn run_tool_loop(
     // mark the turn truncated and return what we have.
     match cassette.step(&results) {
         StepDecision::Final(answer) => outcome.answer = answer,
-        StepDecision::CallTools(_) => outcome.truncated = true,
+        StepDecision::Question(q) => outcome.question = Some(q),
+        StepDecision::CallTools(_) | StepDecision::Plan(_) => outcome.truncated = true,
+    }
+    outcome
+}
+
+// ── Plan-execute harness ─────────────────────────────────────────────────────
+
+/// The transcript of one plan-execute run. Extends [`LoopOutcome`]'s shape with
+/// the plan state, which the caller persists in the chat session so an
+/// interrupted (cancelled / crashed) plan resumes on the next run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlanOutcome {
+    /// The plan as it stands after this run: step statuses, attempt counts and
+    /// the cursor. `None` when the cassette never announced a plan.
+    pub plan: Option<Plan>,
+    /// Every tool call made this run, in order, and its result.
+    pub calls: Vec<ToolCall>,
+    pub results: Vec<ToolResult>,
+    /// The cassette's final answer (the post-verification summary).
+    pub answer: String,
+    /// A clarifying question that suspended the run awaiting the user.
+    pub question: Option<String>,
+    /// True when the run stopped because `cancelled()` reported a user cancel.
+    /// The plan state is preserved so the run resumes later.
+    pub cancelled: bool,
+    /// True when the round budget ran out before a `Final`.
+    pub truncated: bool,
+}
+
+/// Drive a plan-execute run (Claude-Code/DeepSeek-style): the cassette first
+/// announces a `PLAN` (unless `resume` already carries one from a previous,
+/// interrupted run), then executes it step by step — each round of tool calls
+/// belongs to the CURRENT step, whose outcome advances the cursor:
+///
+/// - every tool in the round succeeded → the step is done, cursor advances;
+/// - any tool errored → one attempt is burned; the errors are fed back so the
+///   cassette can retry, at most [`MAX_STEP_ATTEMPTS`] times per step before
+///   the step is marked failed and the run stops (bounded self-correction);
+/// - a mid-run `Plan` decision replans: the remaining steps are replaced.
+///
+/// The run ends at the cassette's `Final` answer (its post-verification
+/// summary), on a `Question` (awaiting the user), on user cancel (checked
+/// before every round via `cancelled`, preserving plan state for resume), on a
+/// failed step, or after `max_rounds` rounds — whichever comes first.
+pub fn run_plan_loop(
+    cassette: &mut dyn AgentCassette,
+    dispatch: &mut dyn ToolDispatch,
+    resume: Option<Plan>,
+    max_rounds: u32,
+    cancelled: &dyn Fn() -> bool,
+) -> PlanOutcome {
+    let budget = max_rounds.max(1);
+    let mut outcome = PlanOutcome { plan: resume, ..PlanOutcome::default() };
+    let mut results: Vec<ToolResult> = Vec::new();
+
+    for _ in 0..budget {
+        if cancelled() {
+            outcome.cancelled = true;
+            return outcome; // plan state preserved → resumable
+        }
+        match cassette.step(&results) {
+            StepDecision::Final(answer) => {
+                outcome.answer = answer;
+                return outcome;
+            }
+            StepDecision::Question(q) => {
+                outcome.question = Some(q);
+                return outcome;
+            }
+            StepDecision::Plan(texts) => match &mut outcome.plan {
+                // First announcement: adopt the plan.
+                None => outcome.plan = Some(Plan::new(texts)),
+                // Mid-run announcement: REPLAN — completed steps stand, the
+                // remaining ones are replaced by the new tail.
+                Some(plan) => {
+                    plan.steps.truncate(plan.current);
+                    plan.steps.extend(Plan::new(texts).steps);
+                }
+            },
+            StepDecision::CallTools(calls) => {
+                results = Vec::with_capacity(calls.len());
+                let mut any_error = false;
+                for call in &calls {
+                    let result = dispatch.dispatch(call);
+                    any_error |= result.is_error;
+                    outcome.results.push(result.clone());
+                    results.push(result);
+                    outcome.calls.push(call.clone());
+                }
+                if let Some(plan) = &mut outcome.plan {
+                    if any_error {
+                        // Burn one attempt; past the budget the step fails and
+                        // the run stops — bounded, never a spin.
+                        if plan.note_step_error() >= MAX_STEP_ATTEMPTS {
+                            plan.mark_step_failed();
+                            return outcome;
+                        }
+                    } else {
+                        plan.mark_step_done();
+                    }
+                }
+            }
+        }
+    }
+
+    // Round budget exhausted: one last chance to summarize, no more tools.
+    match cassette.step(&results) {
+        StepDecision::Final(answer) => outcome.answer = answer,
+        StepDecision::Question(q) => outcome.question = Some(q),
+        _ => outcome.truncated = true,
     }
     outcome
 }
@@ -293,5 +423,195 @@ mod tests {
         assert!(dispatch.ran.is_empty());
         assert_eq!(outcome.answer, "Hi.");
         assert!(outcome.calls.is_empty());
+    }
+
+    #[test]
+    fn question_ends_the_plain_loop_awaiting_the_user() {
+        let mut cassette = ScriptedCassette::new(vec![StepDecision::Question(
+            "which object?".into(),
+        )]);
+        let mut dispatch = RecordingDispatch { ran: Vec::new(), fail_on: None };
+        let outcome = run_tool_loop(&mut cassette, &mut dispatch, 8);
+        assert_eq!(outcome.question.as_deref(), Some("which object?"));
+        assert!(dispatch.ran.is_empty(), "a question turn runs no tools");
+        assert!(!outcome.truncated);
+    }
+
+    // ── plan-execute harness ────────────────────────────────────────────────
+
+    fn call(id: &str, name: &str, input: &str) -> ToolCall {
+        ToolCall { id: id.into(), name: name.into(), input: input.into() }
+    }
+
+    fn never_cancelled() -> impl Fn() -> bool {
+        || false
+    }
+
+    #[test]
+    fn plan_loop_announces_then_advances_steps_on_success() {
+        // THE core plan test: PLAN(2 steps) → step-1 tools ok → step-2 tools ok
+        // → Final summary. Both steps end Done, the answer is the summary.
+        let mut cassette = ScriptedCassette::new(vec![
+            StepDecision::Plan(vec!["model the slab".into(), "extrude the core".into()]),
+            StepDecision::CallTools(vec![call("a", "box", "0,0,0 10,10,0.3")]),
+            StepDecision::CallTools(vec![call("b", "box", "4,4,0 2,2,9")]),
+            StepDecision::Final("Slab + core drawn; 2 objects verified.".into()),
+        ]);
+        let mut dispatch = RecordingDispatch { ran: Vec::new(), fail_on: None };
+        let outcome =
+            run_plan_loop(&mut cassette, &mut dispatch, None, 16, &never_cancelled());
+        let plan = outcome.plan.expect("plan adopted");
+        assert!(plan.is_complete());
+        assert!(plan.steps.iter().all(|s| s.status == crate::agent::StepStatus::Done));
+        assert_eq!(outcome.answer, "Slab + core drawn; 2 objects verified.");
+        assert_eq!(dispatch.ran.len(), 2);
+        assert!(!outcome.truncated && !outcome.cancelled);
+    }
+
+    #[test]
+    fn plan_loop_bounds_retries_then_fails_the_step() {
+        // Step 1 keeps erroring: the loop feeds errors back MAX_STEP_ATTEMPTS
+        // times, then marks the step Failed and stops — never a spin.
+        let mut script = vec![StepDecision::Plan(vec!["impossible step".into()])];
+        for i in 0..10 {
+            script.push(StepDecision::CallTools(vec![call(
+                &format!("c{i}"),
+                "bogus",
+                "x",
+            )]));
+        }
+        let mut cassette = ScriptedCassette::new(script);
+        let mut dispatch =
+            RecordingDispatch { ran: Vec::new(), fail_on: Some("bogus".into()) };
+        let outcome =
+            run_plan_loop(&mut cassette, &mut dispatch, None, 32, &never_cancelled());
+        let plan = outcome.plan.expect("plan adopted");
+        assert!(plan.has_failed());
+        assert_eq!(plan.steps[0].attempts, MAX_STEP_ATTEMPTS);
+        assert_eq!(
+            dispatch.ran.len(),
+            MAX_STEP_ATTEMPTS as usize,
+            "exactly the retry budget's worth of attempts ran"
+        );
+        // Error results were threaded back for the retries.
+        assert!(cassette.seen_results[2][0].is_error);
+    }
+
+    #[test]
+    fn plan_loop_resumes_from_a_persisted_plan() {
+        // A previous run finished step 1 then was interrupted; the persisted
+        // plan round-trips serde (chat-session persistence) and the resumed run
+        // continues at step 2 WITHOUT the cassette re-announcing a plan.
+        let mut prior = Plan::new(vec!["slab".into(), "core".into()]);
+        prior.mark_step_done();
+        let revived: Plan =
+            serde_json::from_str(&serde_json::to_string(&prior).unwrap()).unwrap();
+        assert_eq!(revived.current, 1);
+
+        let mut cassette = ScriptedCassette::new(vec![
+            StepDecision::CallTools(vec![call("a", "box", "4,4,0 2,2,9")]),
+            StepDecision::Final("Core drawn.".into()),
+        ]);
+        let mut dispatch = RecordingDispatch { ran: Vec::new(), fail_on: None };
+        let outcome = run_plan_loop(
+            &mut cassette,
+            &mut dispatch,
+            Some(revived),
+            16,
+            &never_cancelled(),
+        );
+        let plan = outcome.plan.expect("plan kept");
+        assert!(plan.is_complete(), "resumed run completed the remaining step");
+        assert_eq!(plan.steps[0].status, crate::agent::StepStatus::Done);
+        assert_eq!(plan.steps[1].status, crate::agent::StepStatus::Done);
+        assert_eq!(dispatch.ran.len(), 1, "only the remaining step's tools ran");
+        assert_eq!(outcome.answer, "Core drawn.");
+    }
+
+    #[test]
+    fn plan_loop_user_cancel_preserves_plan_state() {
+        // Cancel flips true after the first round of tools: the loop must stop
+        // BEFORE the next round, flag cancelled, and keep the plan resumable.
+        use std::cell::Cell;
+        let rounds = Cell::new(0u32);
+        let cancelled = || rounds.get() >= 2; // checked per round: plan, tools, ⏹
+        let mut cassette = ScriptedCassette::new(vec![
+            StepDecision::Plan(vec!["slab".into(), "core".into()]),
+            StepDecision::CallTools(vec![call("a", "box", "0,0,0 10,10,0.3")]),
+            StepDecision::CallTools(vec![call("b", "box", "4,4,0 2,2,9")]),
+            StepDecision::Final("never reached".into()),
+        ]);
+        struct CountingDispatch<'a>(RecordingDispatch, &'a Cell<u32>);
+        impl ToolDispatch for CountingDispatch<'_> {
+            fn dispatch(&mut self, c: &ToolCall) -> ToolResult {
+                self.1.set(self.1.get() + 1);
+                self.0.dispatch(c)
+            }
+        }
+        let mut dispatch =
+            CountingDispatch(RecordingDispatch { ran: Vec::new(), fail_on: None }, &rounds);
+        // Round counting via dispatched tools: after the first step's tool the
+        // cancel predicate reports true (rounds>=2 counts plan+tool rounds).
+        rounds.set(1); // the plan-announcement round has "happened"
+        let outcome =
+            run_plan_loop(&mut cassette, &mut dispatch, None, 16, &cancelled);
+        assert!(outcome.cancelled, "user cancel must be honoured mid-plan");
+        assert!(outcome.answer.is_empty());
+        let plan = outcome.plan.expect("plan preserved for resume");
+        assert!(!plan.is_complete(), "unfinished steps remain");
+        assert_eq!(plan.steps[0].status, crate::agent::StepStatus::Done);
+        assert_eq!(plan.steps[1].status, crate::agent::StepStatus::Pending);
+        assert_eq!(dispatch.0.ran.len(), 1, "no tools ran after the cancel");
+    }
+
+    #[test]
+    fn plan_loop_midrun_replan_replaces_remaining_steps() {
+        // After step 1 the cassette replans the tail; done steps stand.
+        let mut cassette = ScriptedCassette::new(vec![
+            StepDecision::Plan(vec!["slab".into(), "wrong step".into()]),
+            StepDecision::CallTools(vec![call("a", "box", "0,0,0 10,10,0.3")]),
+            StepDecision::Plan(vec!["better step".into(), "roof".into()]),
+            StepDecision::CallTools(vec![call("b", "box", "0,0,3 10,10,0.2")]),
+            StepDecision::CallTools(vec![call("c", "box", "0,0,6 10,10,0.2")]),
+            StepDecision::Final("done".into()),
+        ]);
+        let mut dispatch = RecordingDispatch { ran: Vec::new(), fail_on: None };
+        let outcome =
+            run_plan_loop(&mut cassette, &mut dispatch, None, 16, &never_cancelled());
+        let plan = outcome.plan.expect("plan kept");
+        assert_eq!(plan.steps.len(), 3, "1 done + 2 replanned");
+        assert_eq!(plan.steps[0].text, "slab");
+        assert_eq!(plan.steps[1].text, "better step");
+        assert_eq!(plan.steps[2].text, "roof");
+        assert!(plan.is_complete());
+        assert_eq!(outcome.answer, "done");
+    }
+
+    #[test]
+    fn plan_loop_round_budget_bounds_a_runaway_plan() {
+        struct GreedyPlanner(bool);
+        impl AgentCassette for GreedyPlanner {
+            fn step(&mut self, _r: &[ToolResult]) -> StepDecision {
+                if !self.0 {
+                    self.0 = true;
+                    return StepDecision::Plan(vec!["forever".into(); 3]);
+                }
+                StepDecision::CallTools(vec![ToolCall {
+                    id: "x".into(),
+                    name: "box".into(),
+                    input: "0,0,0 1,1,1".into(),
+                }])
+            }
+        }
+        let mut dispatch = RecordingDispatch { ran: Vec::new(), fail_on: None };
+        let outcome = run_plan_loop(
+            &mut GreedyPlanner(false),
+            &mut dispatch,
+            None,
+            4,
+            &never_cancelled(),
+        );
+        assert!(outcome.truncated, "runaway plan must hit the round budget");
+        assert!(dispatch.ran.len() <= 4);
     }
 }

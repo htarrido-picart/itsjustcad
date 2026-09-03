@@ -54,14 +54,19 @@ pub fn verbs() -> Vec<&'static str> {
     v
 }
 
-/// A GBNF grammar (llama.cpp syntax) matching the deck's output shape:
+/// A GBNF grammar (llama.cpp syntax) matching the deck's output shape: ONE of
+/// the three structured message forms per turn —
 ///
 /// ```text
-/// <free prose> ( ```draft\n <command line>+ ``` <free prose> )+
+/// ```draft\n <command line>+ ```     (draw / act)
+/// QUESTION: <one line>               (clarify-before-act: ask, don't guess)
+/// PLAN:\n ( N. <step> \n )+          (plan-execute: announce numbered steps)
 /// ```
 ///
 /// where each command line begins with a real verb followed by a permissive
-/// argument tail. Derived from [`registry`] so the verb set never drifts.
+/// argument tail. Derived from [`registry`] so the verb set never drifts. The
+/// QUESTION/PLAN alternatives mirror the deck's `agent::parse_question` /
+/// `agent::parse_plan` message forms so small local models emit them reliably.
 pub fn command_grammar() -> String {
     let verb_alts = verbs()
         .iter()
@@ -70,20 +75,28 @@ pub fn command_grammar() -> String {
         .join(" | ");
 
     // GBNF notes:
-    // - `root` is the entry rule (required by llama.cpp). It forces a draft block
-    //   IMMEDIATELY — no leading prose. The previous grammar allowed unbounded
-    //   leading `prose`, so a small local model would ramble forever (`<think>…`)
-    //   and never be pushed into the fence. Local turns are commands-only.
+    // - `root` is the entry rule (required by llama.cpp). It forces one of the
+    //   three structured forms IMMEDIATELY — no leading prose. The previous
+    //   grammar allowed unbounded leading `prose`, so a small local model would
+    //   ramble forever (`<think>…`) and never be pushed into a form.
     // - A draft block is the literal fence `` ```draft `` on its own line, one or
     //   more command lines, then a closing `` ``` `` fence.
     // - A command line is a real verb then an argument tail. The tail excludes
     //   `<` and `>` so the model cannot emit placeholder junk like `<centerline>`
     //   (a common small-model failure) — args must be literal coords/selectors.
+    // - A question is exactly one `QUESTION: …` line (the ask-before-guessing
+    //   form); a plan is a `PLAN:` header then numbered `N. …` step lines. Both
+    //   use a permissive one-line tail (newlines still fence the structure).
     format!(
-        r#"root      ::= draft
+        r#"root      ::= draft | question | plan
 draft     ::= "```draft" nl command-line+ "```"
 command-line ::= verb tail nl
 verb      ::= {verb_alts}
+question  ::= "QUESTION: " qtail nl
+plan      ::= "PLAN:" nl plan-step+
+plan-step ::= digit+ ". " qtail nl
+digit     ::= [0-9]
+qtail     ::= [^\n]+
 tail      ::= [^\n<>]*
 nl        ::= "\n"
 "#
@@ -124,6 +137,18 @@ mod tests {
         assert!(g.contains("```draft"), "grammar lacks opening draft fence");
         assert!(g.contains("draft     ::="), "grammar lacks draft rule");
         assert!(g.contains("root      ::="), "grammar lacks root rule");
+    }
+
+    #[test]
+    fn grammar_admits_question_and_plan_message_forms() {
+        // The agent-message forms (clarify-before-act QUESTION, plan-execute
+        // PLAN) are root alternatives so a grammar-constrained local model can
+        // emit them — and their literals match the deck's parsers exactly.
+        let g = command_grammar();
+        assert!(g.contains("root      ::= draft | question | plan"), "{g}");
+        assert!(g.contains("question  ::= \"QUESTION: \""), "question rule missing: {g}");
+        assert!(g.contains("plan      ::= \"PLAN:\" nl plan-step+"), "plan rule missing: {g}");
+        assert!(g.contains("plan-step ::= digit+ \". \""), "plan-step rule missing: {g}");
     }
 
     /// Structural balance check: every rule referenced on a right-hand side is
