@@ -53,9 +53,8 @@ pub struct DeckConfig {
     /// Leave false for cloud endpoints. Other cassettes ignore this flag.
     #[serde(default)]
     pub grammar: bool,
-    /// Terse mode override. `None` = default by cassette locality: ON for local
-    /// OpenAI-compat models (llamafile/ollama — fewer tokens = faster local
-    /// inference), OFF for cloud cassettes (anthropic/claude-code/remote).
+    /// Terse mode override. `None` = default ON for every cassette — local
+    /// models answer faster on fewer tokens, cloud models cost less per turn.
     /// `Some(_)` is the user's explicit choice from the LLM menu toggle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terse: Option<bool>,
@@ -64,11 +63,9 @@ pub struct DeckConfig {
 impl DeckConfig {
     /// Whether terse mode (caveman-style response budget: style rules + a hard
     /// per-turn max-token cap) applies to this cassette. Explicit user override
-    /// wins; otherwise ON exactly for local OpenAI-compat models.
+    /// wins; otherwise ON for all cassettes, local and cloud alike.
     pub fn terse_enabled(&self) -> bool {
-        self.terse.unwrap_or_else(|| {
-            matches!(self.kind, DeckKind::OpenaiCompat) && is_local_url(&self.base_url)
-        })
+        self.terse.unwrap_or(true)
     }
 
     /// Whether this cassette can analyze an attached image. Claude (subscription
@@ -298,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn terse_defaults_on_for_local_models_off_for_cloud() {
+    fn terse_defaults_on_for_all_cassettes() {
         let mk = |kind, base_url: &str| DeckConfig {
             name: "x".into(),
             kind,
@@ -308,17 +305,17 @@ mod tests {
             grammar: false,
             terse: None,
         };
-        // Local OpenAI-compat (llamafile/ollama) → terse ON by default.
+        // ON by default everywhere: local (faster inference) AND cloud (cheaper
+        // turns — user 2026-09-02: "i want caveman for cloud as well").
         assert!(mk(DeckKind::OpenaiCompat, "http://localhost:11434/v1").terse_enabled());
         assert!(mk(DeckKind::OpenaiCompat, "http://127.0.0.1:8080").terse_enabled());
-        // Cloud cassettes → OFF by default (anthropic, claude-code, remote compat).
-        assert!(!mk(DeckKind::Anthropic, "https://api.anthropic.com").terse_enabled());
-        assert!(!mk(DeckKind::ClaudeCode, "").terse_enabled());
-        assert!(!mk(DeckKind::OpenaiCompat, "https://api.moonshot.ai/v1").terse_enabled());
+        assert!(mk(DeckKind::Anthropic, "https://api.anthropic.com").terse_enabled());
+        assert!(mk(DeckKind::ClaudeCode, "").terse_enabled());
+        assert!(mk(DeckKind::OpenaiCompat, "https://api.moonshot.ai/v1").terse_enabled());
         // Explicit override wins in both directions.
         let mut c = mk(DeckKind::Anthropic, "https://api.anthropic.com");
-        c.terse = Some(true);
-        assert!(c.terse_enabled());
+        c.terse = Some(false);
+        assert!(!c.terse_enabled());
         let mut c = mk(DeckKind::OpenaiCompat, "http://localhost:11434/v1");
         c.terse = Some(false);
         assert!(!c.terse_enabled());
