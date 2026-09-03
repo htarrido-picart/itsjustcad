@@ -3117,6 +3117,133 @@ fn exec_contours(
     ))
 }
 
+/// Grade a flat building pad into the terrain mesh (see
+/// [`crate::landscape::grade_pad`]). Deterministic vertex edit of the current
+/// terrain, so the logged op replays bit-identically; the first pad snapshots
+/// the pre-grading heights into `Document::pregrade_terrain` for `cutfill`.
+fn exec_pad(
+    doc: &mut Document,
+    at: DVec3,
+    width: f64,
+    depth: f64,
+    elev: f64,
+    slope: Option<f64>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    if width <= 0.0 || depth <= 0.0 {
+        return Err(ExecError::Invalid("pad width and depth must be > 0".into()));
+    }
+    let slope_h = slope.unwrap_or(2.0);
+    if slope_h <= 0.0 || !slope_h.is_finite() {
+        return Err(ExecError::Invalid(
+            "pad slope must be > 0 (horizontal run per unit rise, e.g. 2 = 2:1)".into(),
+        ));
+    }
+    let (tid, mesh) = terrain_surface(doc)?;
+    let old_geometry = Geometry::Mesh(mesh.clone());
+    let original_z: Vec<f64> = mesh.positions().iter().map(|p| p.z).collect();
+    let mut positions = mesh.positions().to_vec();
+    let faces = mesh.faces().to_vec();
+    let (on_pad, on_slope) = crate::landscape::grade_pad(
+        &mut positions,
+        at.x,
+        at.y,
+        width,
+        depth,
+        elev,
+        slope_h,
+    );
+    // First grading of THIS terrain captures the pre-grading snapshot.
+    match &doc.pregrade_terrain {
+        Some((id, _)) if *id == tid => {}
+        _ => doc.pregrade_terrain = Some((tid, original_z)),
+    }
+    if let Some(obj) = doc.get_mut(tid) {
+        obj.geometry = Geometry::Mesh(kernel_mesh::Mesh::new(positions, faces));
+    }
+    Ok((
+        Command::Pad { at, width, depth, elev, slope },
+        Inverse::SetGeometry(vec![(tid, old_geometry)]),
+        ApplyOutcome {
+            message: format!(
+                "pad {width}x{depth} m @ ({:.1}, {:.1}) elev {elev} m: {on_pad} vertex(es) to \
+                 pad grade, {on_slope} on {slope_h}:1 side slopes — run `cutfill` for earthwork",
+                at.x, at.y
+            ),
+            created: Vec::new(),
+        },
+    ))
+}
+
+/// Cut + fill volumes between the current terrain and the pre-grading
+/// snapshot. The original heights are embedded into the logged op on first
+/// exec (radiation-bins pattern), so replay never depends on transient state.
+fn exec_cutfill(
+    doc: &mut Document,
+    original_z: Option<Vec<f64>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let (tid, mesh) = terrain_surface(doc)?;
+    let n = mesh.positions().len();
+    let orig: Vec<f64> = match original_z {
+        Some(o) if o.len() == n => o,
+        Some(_) => {
+            return Err(ExecError::Invalid(
+                "corrupt cutfill snapshot in op-log (vertex count changed)".into(),
+            ))
+        }
+        None => match &doc.pregrade_terrain {
+            Some((id, z)) if *id == tid && z.len() == n => z.clone(),
+            Some(_) => {
+                return Err(ExecError::Invalid(
+                    "terrain changed since grading — re-run `pad` before `cutfill`".into(),
+                ))
+            }
+            None => {
+                return Err(ExecError::Invalid(
+                    "no grading recorded — run `pad` first, then `cutfill`".into(),
+                ))
+            }
+        },
+    };
+    let (cut, fill) =
+        crate::landscape::cut_fill(mesh.positions(), mesh.faces(), &orig);
+    // Per-vertex Δz samples (only where the grade moved) for the deck report.
+    let samples: Vec<(f64, DVec3, String)> = mesh
+        .positions()
+        .iter()
+        .zip(&orig)
+        .filter(|(p, oz)| (p.z - **oz).abs() > 1e-9)
+        .map(|(p, oz)| {
+            let dz = p.z - oz;
+            (dz, *p, if dz < 0.0 { "cut" } else { "fill" }.to_string())
+        })
+        .collect();
+    let net = fill - cut;
+    doc.analysis_reports.insert(
+        "cutfill".to_string(),
+        build_analysis_report(
+            "cutfill",
+            format!(
+                "cut {cut:.1} m3 / fill {fill:.1} m3 / net {net:+.1} m3 vs pre-grading \
+                 terrain (TIN prism estimate)"
+            ),
+            "m dz",
+            samples,
+        ),
+    );
+    doc.generation += 1;
+    Ok((
+        Command::CutFill { original_z: Some(orig) },
+        Inverse::CreatedOnLayer { created: Vec::new(), layers_created: Vec::new() },
+        ApplyOutcome {
+            message: format!(
+                "cutfill: cut {cut:.1} m3, fill {fill:.1} m3, net {net:+.1} m3 vs pre-grading \
+                 terrain (TIN prism estimate — see `report cutfill`)"
+            ),
+            created: Vec::new(),
+        },
+    ))
+}
+
 /// Sun-path diagram: the yearly sun-path dome for the document's location as
 /// open polylines on a golden `sunpath` layer — seven date arcs (Dec 21 → Jun
 /// 21; Jul–Nov retrace them), analemma-style hour curves, plus a horizon
@@ -6130,6 +6257,10 @@ fn apply_forward(
         Command::Contours { interval, major_every, ids } => {
             exec_contours(doc, interval, major_every, ids)
         }
+        Command::Pad { at, width, depth, elev, slope } => {
+            exec_pad(doc, at, width, depth, elev, slope)
+        }
+        Command::CutFill { original_z } => exec_cutfill(doc, original_z),
         Command::SunOff => {
             let prev = doc.sun.take();
             doc.generation += 1;
@@ -7564,6 +7695,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Terrain { .. } => "terrain",
         Command::OsmFile { .. } => "osmfile",
         Command::Contours { .. } => "contours",
+        Command::Pad { .. } => "pad",
+        Command::CutFill { .. } => "cutfill",
         Command::ViewSave { .. } => "view save",
         Command::ViewRestore { .. } => "view",
         Command::ViewList => "view list",
@@ -13336,6 +13469,92 @@ mod tests {
         assert_eq!(s.doc.len(), before);
         assert!(!s.doc.layers.contains_key("contours"));
         assert!(!s.doc.layers.contains_key("contours-major"));
+    }
+
+    #[test]
+    fn pad_grades_terrain_and_undo_restores_it() {
+        // Sloped plane z = x/2; pad 4×4 at (10,10) elev 3 digs into the grade.
+        let mut s = terrain_session(40, 20.0, |x, _| x / 2.0);
+        let (tid, before) = {
+            let (id, m) = terrain_surface(&s.doc).unwrap();
+            (id, m.positions().to_vec())
+        };
+        run(&mut s, "pad 10,10 4 4 3");
+        {
+            let (_, m) = terrain_surface(&s.doc).unwrap();
+            // Center vertex of the pad sits at the pad elevation now.
+            let center = m
+                .positions()
+                .iter()
+                .find(|p| (p.x - 10.0).abs() < 1e-9 && (p.y - 10.0).abs() < 1e-9)
+                .unwrap();
+            assert!((center.z - 3.0).abs() < 1e-12, "pad center at elev 3");
+        }
+        assert!(s.doc.pregrade_terrain.is_some(), "first pad snapshots pre-grading");
+        run(&mut s, "undo");
+        let (tid2, after) = {
+            let (id, m) = terrain_surface(&s.doc).unwrap();
+            (id, m.positions().to_vec())
+        };
+        assert_eq!(tid, tid2);
+        assert_eq!(before, after, "undo must restore the exact terrain");
+    }
+
+    #[test]
+    fn cutfill_zero_for_pad_at_existing_grade() {
+        // Flat plane at z=2, pad at elev 2 → grading is a no-op → zero volumes.
+        let mut s = terrain_session(20, 20.0, |_, _| 2.0);
+        run(&mut s, "pad 10,10 4 4 2");
+        let out = run(&mut s, "cutfill");
+        assert!(
+            out.message.contains("cut 0.0 m3, fill 0.0 m3"),
+            "{}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn cutfill_matches_analytic_volume_and_reports() {
+        // Flat plane z=0, 4×4 pad sunk to −1 at 2:1 → analytic ≈ 36.2 m³ cut.
+        let mut s = terrain_session(80, 20.0, |_, _| 0.0);
+        run(&mut s, "pad 10,10 4 4 -1 2");
+        let out = run(&mut s, "cutfill");
+        let want = 16.0 + 16.0 + 4.0 * std::f64::consts::PI / 3.0;
+        assert!(out.message.contains("fill 0.0 m3"), "{}", out.message);
+        let cut: f64 = out
+            .message
+            .split("cut ")
+            .nth(1)
+            .and_then(|t| t.split(" m3").next())
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((cut - want).abs() < 0.5, "cut {cut} vs analytic {want}");
+        // Deck critique hook: the structured report is stored.
+        let r = s.doc.analysis_reports.get("cutfill").expect("report stored");
+        assert!(r.context.contains("TIN prism estimate"));
+        assert!(r.count > 0);
+        let rep = run(&mut s, "report cutfill");
+        assert!(rep.message.contains("cutfill"), "{}", rep.message);
+    }
+
+    #[test]
+    fn cutfill_without_grading_errors_and_replay_is_stable() {
+        let mut s = terrain_session(10, 10.0, |_, _| 0.0);
+        let err = s.run(parse("cutfill").unwrap()).unwrap_err();
+        assert!(format!("{err}").contains("pad"), "{err}");
+        // Grade, measure, then replay: original heights are embedded in the
+        // logged cutfill op, so the log round-trips bit-identically.
+        run(&mut s, "pad 5,5 2 2 -0.5");
+        run(&mut s, "cutfill");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "pad + cutfill must replay bit-identically"
+        );
+        assert!(replayed.doc.analysis_reports.contains_key("cutfill"));
     }
 
     #[test]

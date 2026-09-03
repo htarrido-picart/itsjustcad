@@ -140,6 +140,80 @@ pub fn contours(positions: &[DVec3], faces: &[[u32; 3]], interval: f64) -> Vec<C
     out
 }
 
+// ─── grading & earthwork ─────────────────────────────────────────────────────
+
+/// Grade a flat rectangular building pad into terrain vertex heights, with
+/// side slopes to daylight. The pad is axis-aligned, centered at `(cx, cy)`,
+/// `w`×`d`, at elevation `elev`. `slope_h` is the side-slope ratio expressed
+/// as horizontal-run per unit rise (e.g. 2.0 = a 2:1 slope). Outside the pad
+/// the graded surface may rise (cut) or fall (fill) by `dist / slope_h`
+/// relative to `elev`; wherever the existing grade already sits inside that
+/// envelope it is left untouched — that is the daylight line.
+///
+/// Returns `(pad_vertices, slope_vertices)` — how many vertices were set to
+/// the pad elevation and how many were pulled onto a side slope.
+pub fn grade_pad(
+    positions: &mut [DVec3],
+    cx: f64,
+    cy: f64,
+    w: f64,
+    d: f64,
+    elev: f64,
+    slope_h: f64,
+) -> (usize, usize) {
+    let (mut on_pad, mut on_slope) = (0usize, 0usize);
+    for p in positions.iter_mut() {
+        let dx = ((p.x - cx).abs() - w / 2.0).max(0.0);
+        let dy = ((p.y - cy).abs() - d / 2.0).max(0.0);
+        let dist = dx.hypot(dy);
+        if dist == 0.0 {
+            if (p.z - elev).abs() > 1e-12 {
+                on_pad += 1;
+            }
+            p.z = elev;
+        } else {
+            // Envelope the graded surface may occupy at this distance.
+            let rise = dist / slope_h;
+            let clamped = p.z.clamp(elev - rise, elev + rise);
+            if (clamped - p.z).abs() > 1e-12 {
+                p.z = clamped;
+                on_slope += 1;
+            }
+        }
+    }
+    (on_pad, on_slope)
+}
+
+/// Cut and fill volumes (m³) between the current terrain and its pre-grading
+/// vertex heights, over the same triangulation (grading only moves z).
+///
+/// Per triangle the signed prism volume is `area_xy · mean(Δz)` — exact for a
+/// linearly interpolated surface when Δz does not change sign inside the
+/// triangle; mixed-sign triangles are attributed by the sign of their mean
+/// (a TIN prism estimate, second-order small on a reasonably dense mesh).
+/// Returns `(cut, fill)`, both ≥ 0.
+pub fn cut_fill(
+    positions: &[DVec3],
+    faces: &[[u32; 3]],
+    original_z: &[f64],
+) -> (f64, f64) {
+    let (mut cut, mut fill) = (0.0f64, 0.0f64);
+    for f in faces {
+        let [a, b, c] = [f[0] as usize, f[1] as usize, f[2] as usize];
+        let (pa, pb, pc) = (positions[a], positions[b], positions[c]);
+        let area_xy = 0.5
+            * ((pb.x - pa.x) * (pc.y - pa.y) - (pc.x - pa.x) * (pb.y - pa.y)).abs();
+        let dz = (pa.z - original_z[a]) + (pb.z - original_z[b]) + (pc.z - original_z[c]);
+        let vol = area_xy * dz / 3.0;
+        if vol > 0.0 {
+            fill += vol;
+        } else {
+            cut -= vol;
+        }
+    }
+    (cut, fill)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +319,67 @@ mod tests {
         for p in &lines[0].points {
             assert!((p.x - 2.0).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn pad_at_grade_on_flat_plane_changes_nothing() {
+        // Flat plane at z=2, pad at elev 2 → no vertex moves, zero cut/fill.
+        let (mut pos, faces) = grid_terrain(20, 20.0, |_, _| 2.0);
+        let orig: Vec<f64> = pos.iter().map(|p| p.z).collect();
+        let (on_pad, on_slope) = grade_pad(&mut pos, 10.0, 10.0, 4.0, 4.0, 2.0, 2.0);
+        assert_eq!((on_pad, on_slope), (0, 0));
+        let (cut, fill) = cut_fill(&pos, &faces, &orig);
+        assert_eq!((cut, fill), (0.0, 0.0));
+    }
+
+    #[test]
+    fn sunk_pad_in_flat_plane_matches_analytic_cut() {
+        // Flat plane z=0, 4×4 pad sunk to −1 with 2:1 slopes. Analytic cut:
+        //   pad:      4·4·1                       = 16
+        //   edges:    perimeter 16 · ∫₀²(1−t/2)dt = 16·1 = 16
+        //   corners:  4·¼-annulus = 2π·∫₀²(r−r²/2)dr = 2π·(2−4/3) = 4π/3
+        // total ≈ 36.19 m³, fill = 0. 0.25 m grid cells → small TIN error.
+        let (mut pos, faces) = grid_terrain(80, 20.0, |_, _| 0.0);
+        let orig: Vec<f64> = pos.iter().map(|p| p.z).collect();
+        let (on_pad, on_slope) = grade_pad(&mut pos, 10.0, 10.0, 4.0, 4.0, -1.0, 2.0);
+        assert!(on_pad > 0 && on_slope > 0);
+        let (cut, fill) = cut_fill(&pos, &faces, &orig);
+        let want = 16.0 + 16.0 + 4.0 * std::f64::consts::PI / 3.0;
+        assert!((cut - want).abs() < 0.5, "cut {cut} vs analytic {want}");
+        assert_eq!(fill, 0.0);
+    }
+
+    #[test]
+    fn raised_pad_is_pure_fill_and_symmetric() {
+        // Same pad raised +1 on the same flat plane → the mirrored volume as
+        // fill, zero cut.
+        let (mut pos, faces) = grid_terrain(80, 20.0, |_, _| 0.0);
+        let orig: Vec<f64> = pos.iter().map(|p| p.z).collect();
+        grade_pad(&mut pos, 10.0, 10.0, 4.0, 4.0, 1.0, 2.0);
+        let (cut, fill) = cut_fill(&pos, &faces, &orig);
+        let want = 32.0 + 4.0 * std::f64::consts::PI / 3.0;
+        assert!((fill - want).abs() < 0.5, "fill {fill} vs analytic {want}");
+        assert_eq!(cut, 0.0);
+    }
+
+    #[test]
+    fn pad_in_sloped_plane_daylights_and_balances() {
+        // Plane z = x/2 on [0,20]², pad 4×4 at (10,10) elev 5 — exactly the
+        // existing grade at pad center x=10. Pad cut (x>10 side) mirrors pad
+        // fill (x<10 side): ∫ over 4×4 of (x/2−5) splits into ±2·... cut in
+        // pad = fill in pad = 4·∫₁₀¹²(x/2−5)dx = 4·1 = 4 m³ each, plus equal
+        // slope-band volumes by symmetry → cut ≈ fill overall.
+        let (mut pos, faces) = grid_terrain(80, 20.0, |x, _| x / 2.0);
+        let orig: Vec<f64> = pos.iter().map(|p| p.z).collect();
+        grade_pad(&mut pos, 10.0, 10.0, 4.0, 4.0, 5.0, 2.0);
+        // Far corner untouched: envelope daylights before reaching it.
+        assert!((pos[0].z - 0.0).abs() < 1e-12, "corner (0,0) must be untouched");
+        let (cut, fill) = cut_fill(&pos, &faces, &orig);
+        assert!(cut > 4.0 && fill > 4.0, "pad body alone is 4 m³ each way");
+        assert!(
+            (cut - fill).abs() < 0.2,
+            "symmetric grading must balance: cut {cut} vs fill {fill}"
+        );
     }
 
     #[test]

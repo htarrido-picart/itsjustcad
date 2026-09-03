@@ -920,6 +920,27 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Grade a flat building pad into the terrain mesh: an axis-aligned
+    /// `width`×`depth` rectangle centered at `at` (XY), set to elevation
+    /// `elev`, with side slopes to daylight at `slope` horizontal-per-rise
+    /// (default 2.0 = 2:1). Deterministic vertex edit of the terrain mesh;
+    /// the first pad also snapshots the pre-grading heights for `cutfill`.
+    Pad {
+        at: DVec3,
+        width: f64,
+        depth: f64,
+        elev: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slope: Option<f64>,
+    },
+    /// Cut + fill volumes (m³) between the current terrain and the
+    /// pre-grading snapshot captured by the first `pad`. The original heights
+    /// are embedded into the logged op on first exec so replay never depends
+    /// on transient state. Stores an AnalysisReport ("cutfill") for the deck.
+    CutFill {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_z: Option<Vec<f64>>,
+    },
     /// A raw triangle mesh carried verbatim in the op-log. Used by mesh import
     /// (.obj/.stl/.gltf/.glb) so each imported object is one self-contained
     /// logged op — no external file dependency on replay. Not exposed in the

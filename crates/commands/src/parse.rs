@@ -995,6 +995,31 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             }),
             _ => wrong("contours", "an interval and optionally a major-every count", &args),
         },
+        "pad" => match args.as_slice() {
+            [at, w, d, elev] => Ok(Command::Pad {
+                at: point(at)?,
+                width: number(w)?,
+                depth: number(d)?,
+                elev: number(elev)?,
+                slope: None,
+            }),
+            [at, w, d, elev, slope] => Ok(Command::Pad {
+                at: point(at)?,
+                width: number(w)?,
+                depth: number(d)?,
+                elev: number(elev)?,
+                slope: Some(number(slope)?),
+            }),
+            _ => wrong(
+                "pad",
+                "a center x,y, a width, a depth, an elevation and optionally a slope ratio",
+                &args,
+            ),
+        },
+        "cutfill" => {
+            expect_empty("cutfill", &args, &args)?;
+            Ok(Command::CutFill { original_z: None })
+        }
         "view" => match args.as_slice() {
             ["save", name] => Ok(Command::ViewSave {
                 name: (*name).to_string(),

@@ -660,6 +660,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Tools,
         },
         CommandSpec {
+            name: "pad",
+            usage: "pad <x,y> <width> <depth> <elev> [slope]",
+            summary: "Grade a flat building pad into the terrain mesh: an axis-aligned width x depth rectangle centered at x,y set to elevation <elev>, with side slopes to daylight at [slope] horizontal-run per unit rise (default 2 = a 2:1 slope). The first pad snapshots the pre-grading terrain so `cutfill` can report earthwork volumes. Needs a terrain mesh. Example: pad 10,10 20 15 3.5 2",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "cutfill",
+            usage: "cutfill",
+            summary: "Report cut and fill volumes (m3) between the current terrain and the pre-grading snapshot taken by the first `pad` — a TIN prism estimate, stored as an AnalysisReport ('cutfill', see `report`) for critique. Run `pad` first. Example: cutfill",
+            category: Category::Analyze,
+        },
+        CommandSpec {
             name: "osmfile",
             usage: "osmfile <path.json>",
             summary: "Build OpenStreetMap building context from a saved Overpass API JSON export ('out geom;' query): each building-tagged way footprint is extruded (height tag, else building:levels x 3 m, else 9 m) into a mesh on layer 'context'. lon/lat projected to local meters when a location is set. Example: osmfile /tmp/overpass.json",

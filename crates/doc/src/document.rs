@@ -129,6 +129,13 @@ pub struct Document {
     /// reports the later constraint. `serde(default)` keeps old files loading.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraints: Vec<SketchConstraint>,
+    /// Pre-grading terrain snapshot: `(terrain object id, original vertex z)`
+    /// captured by the first `pad` op, so `cutfill` can compare the graded
+    /// surface against the original ground. TRANSIENT: `serde(skip)` — the
+    /// snapshot is rebuilt on op-log replay because `pad` re-executes, and
+    /// `cutfill` embeds the heights into its own logged op for stability.
+    #[serde(skip)]
+    pub pregrade_terrain: Option<(ObjectId, Vec<f64>)>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -161,6 +168,7 @@ impl Default for Document {
             show_lineweights: false,
             analysis_reports: BTreeMap::new(),
             constraints: Vec::new(),
+            pregrade_terrain: None,
             generation: 0,
         }
     }
