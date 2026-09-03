@@ -83,6 +83,7 @@ HIG-grounded design revision, run as sequential batches. All six landed.
   - Real mature sizes/canopy/growth rates per species; palms get a dedicated canopy shape (crown-on-trunk column, not ellipsoid) — matters for shadow studies at low tropical sun angles.
   - *Climate awareness*: `location` verb already georeferences the doc — derive Köppen band from latitude (rough: |lat|<10° tropical, 10–23.5° tropical/monsoon, 23.5–35° subtropical); `plant` warns when species climate mismatches doc location ("Betula in Guayaquil — advisory: outside climate range"); `plantcatalog [region|zone]` lists filtered.
   - Deciduous flag stays (dry-season deciduous: flamboyán/ceibo drop leaves — affects seasonal shadow transparency when that lands).
+  - *Miyawaki method*: `miyawaki <region-sel> [density]` — dense native mini-forest generator: picks ONLY species native to the doc's region/climate from the catalog, stratifies into 4 layers (canopy / tree / sub-tree / shrub — catalog gains a `layer` field), plants 3–5 saplings/m² in seeded-random mixed placement (never rows, neighbors differ — seed from op data so replay is stable), all at sapling age. Report: species mix %, stem count, area. Warns if catalog lacks enough native layered species for the location ("Miyawaki needs natives — N found"). Advisory line: survival thinning is part of the method (~30–50% self-thins; densities are intentional).
   - Data-driven JSON only — no code per species; packs user-extendable + LLM-authorable like plugins.
 
 ## GUI + usability testing (planned 2026-09-02)
