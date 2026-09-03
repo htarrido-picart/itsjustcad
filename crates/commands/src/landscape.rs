@@ -243,6 +243,70 @@ pub struct PlantSpecies {
     /// `None` when the species is not classified for mini-forest use.
     #[serde(default)]
     pub layer: Option<String>,
+    /// Plan (top-view) drafting symbol style, independent of the 3D `form`:
+    /// "round" (circle + radiating branches), "conifer" (spiky star),
+    /// "palm" (radiating frond spokes), "shrub" (small stipple circle) or
+    /// "clump" (cluster of dots — bamboo / guadua). Absent in legacy catalogs;
+    /// [`PlantSpecies::plan_symbol_style`] then derives it from `form`.
+    #[serde(default)]
+    pub plan_symbol: Option<String>,
+}
+
+/// The 2D plan-drawing symbol styles a species can render as, top-down. This is
+/// the standard landscape-drafting glyph vocabulary — deliberately distinct
+/// from the 3D `form` silhouette so a fastigiate column can still read as a
+/// shrub stipple in plan, or a clumping bamboo as a dot cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanSymbol {
+    /// Deciduous shade tree: circle with radiating branch lines.
+    Round,
+    /// Conifer / pyramidal evergreen: spiky star (scalloped points).
+    Conifer,
+    /// Palm: radiating frond spokes from the centre (the iconic palm glyph).
+    Palm,
+    /// Shrub / small column: a small stippled circle (dotted ring).
+    Shrub,
+    /// Clumping bamboo (guadua): a cluster of small dots.
+    Clump,
+}
+
+impl PlanSymbol {
+    /// Parse an explicit `plan_symbol` catalog string; unknown → `None`.
+    pub fn parse(s: &str) -> Option<PlanSymbol> {
+        match s {
+            "round" => Some(PlanSymbol::Round),
+            "conifer" => Some(PlanSymbol::Conifer),
+            "palm" => Some(PlanSymbol::Palm),
+            "shrub" => Some(PlanSymbol::Shrub),
+            "clump" => Some(PlanSymbol::Clump),
+            _ => None,
+        }
+    }
+
+    /// Default symbol for a 3D `form` when a species has no explicit
+    /// `plan_symbol`. Guadua bamboo is the notable case: it is stored as a
+    /// "column" form (a tall pole) but drafts as a "clump" — so catalog authors
+    /// set `plan_symbol` explicitly; the generic "column" falls back to a shrub
+    /// stipple.
+    pub fn from_form(form: &str) -> PlanSymbol {
+        match form {
+            "cone" => PlanSymbol::Conifer,
+            "palm" => PlanSymbol::Palm,
+            "column" => PlanSymbol::Shrub,
+            _ => PlanSymbol::Round,
+        }
+    }
+}
+
+impl PlantSpecies {
+    /// The plan-drawing symbol for this species: the explicit `plan_symbol`
+    /// field when present and valid, otherwise derived from `form`.
+    pub fn plan_symbol_style(&self) -> PlanSymbol {
+        self.plan_symbol
+            .as_deref()
+            .and_then(PlanSymbol::parse)
+            .unwrap_or_else(|| PlanSymbol::from_form(&self.form))
+    }
 }
 
 /// Rough Köppen climate band derived from the absolute latitude of the doc's
@@ -532,6 +596,154 @@ pub fn plant_mesh(
     }
     (pos, faces)
 }
+
+/// 2D plan (top-view) drafting symbol for a plant, as a soup of line segments
+/// lying flat in the horizontal plane at `center` (`center.z` is honored so the
+/// glyph drapes on the ground). `canopy_d` is the mature/aged canopy diameter;
+/// the symbol scales to it. Pure and deterministic — the same species + size
+/// always yields the same segments, so it renders identically in the live top
+/// view, the sketch/pencil NPR path, and the PDF/SVG plan exports.
+///
+/// Segment counts by style (radius `r = canopy_d/2`):
+///   * Round   — a `CIRCLE_SEG`-gon canopy ring + `ROUND_BRANCHES` radial
+///     branch stubs from a small hub (reads as a shade tree).
+///   * Conifer — a spiky star: `CONIFER_POINTS` outer points alternating with
+///     inner notches (`2·CONIFER_POINTS` ring segments).
+///   * Palm    — `PALM_FRONDS` frond spokes radiating from the centre, no ring
+///     (the iconic palm plan glyph).
+///   * Shrub   — a small stippled circle: `STIPPLE_DOTS` short dashes around the
+///     ring (a dotted outline).
+///   * Clump   — a cluster of `CLUMP_DOTS` small dot-crosses scattered on a
+///     deterministic ring inside the canopy (bamboo / guadua).
+///
+/// The color is applied by the caller (the plant's layer color); this function
+/// only owns geometry.
+pub fn plan_symbol_segments(
+    style: PlanSymbol,
+    center: DVec3,
+    canopy_d: f64,
+) -> Vec<(DVec3, DVec3)> {
+    use std::f64::consts::TAU;
+    let r = (canopy_d * 0.5).max(0.0);
+    if r < 1e-9 {
+        return Vec::new();
+    }
+    let z = center.z;
+    let at = |ang: f64, rad: f64| {
+        DVec3::new(center.x + rad * ang.cos(), center.y + rad * ang.sin(), z)
+    };
+    // Ring polygon of `n` sides at radius `rad`.
+    let ring = |n: usize, rad: f64| -> Vec<(DVec3, DVec3)> {
+        (0..n)
+            .map(|i| {
+                let a0 = TAU * i as f64 / n as f64;
+                let a1 = TAU * (i + 1) as f64 / n as f64;
+                (at(a0, rad), at(a1, rad))
+            })
+            .collect()
+    };
+    let mut segs = Vec::new();
+    match style {
+        PlanSymbol::Round => {
+            segs.extend(ring(CIRCLE_SEG, r));
+            // Radial branch stubs from a small central hub outward to ~85% of
+            // the canopy — a stylized branching structure.
+            let hub = r * 0.12;
+            for i in 0..ROUND_BRANCHES {
+                let a = TAU * i as f64 / ROUND_BRANCHES as f64;
+                segs.push((at(a, hub), at(a, r * 0.85)));
+            }
+        }
+        PlanSymbol::Conifer => {
+            // Star: outer points at r, inner notches at 0.62·r.
+            let n = CONIFER_POINTS;
+            let inner = r * 0.62;
+            let mut prev = at(0.0, r);
+            for i in 1..=2 * n {
+                let a = TAU * i as f64 / (2 * n) as f64;
+                let rad = if i % 2 == 0 { r } else { inner };
+                let p = at(a, rad);
+                segs.push((prev, p));
+                prev = p;
+            }
+        }
+        PlanSymbol::Palm => {
+            // Frond spokes radiating from the centre; no enclosing ring.
+            for i in 0..PALM_FRONDS {
+                let a = TAU * i as f64 / PALM_FRONDS as f64;
+                segs.push((DVec3::new(center.x, center.y, z), at(a, r)));
+            }
+        }
+        PlanSymbol::Shrub => {
+            // Dotted / stippled ring: short dashes every other segment.
+            let n = STIPPLE_DOTS;
+            for i in 0..n {
+                if i % 2 == 1 {
+                    continue; // gap → stipple
+                }
+                let a0 = TAU * i as f64 / n as f64;
+                let a1 = TAU * (i as f64 + 0.55) / n as f64;
+                segs.push((at(a0, r), at(a1, r)));
+            }
+        }
+        PlanSymbol::Clump => {
+            // Cluster of small dot-crosses on a deterministic inner ring.
+            let dot = (r * 0.14).max(0.02);
+            for i in 0..CLUMP_DOTS {
+                // Two interleaved radii so the cluster looks scattered, not a
+                // perfect circle, while staying fully deterministic.
+                let a = TAU * i as f64 / CLUMP_DOTS as f64;
+                let rad = if i % 2 == 0 { r * 0.55 } else { r * 0.8 };
+                let c = at(a, rad);
+                segs.push((c - DVec3::new(dot, 0.0, 0.0), c + DVec3::new(dot, 0.0, 0.0)));
+                segs.push((c - DVec3::new(0.0, dot, 0.0), c + DVec3::new(0.0, dot, 0.0)));
+            }
+        }
+    }
+    segs
+}
+
+/// Plan symbol for a planted mesh object, recovered purely from its object
+/// `name` (`"plant:<species-id>"`) and mesh vertex positions. Returns `None`
+/// for any object that is not a recognized plant. This is the single bridge the
+/// live viewport, PDF and SVG plan exporters all call, so the symbol is
+/// identical everywhere.
+///
+/// The center is the XY centroid of the vertices at the trunk-base elevation
+/// (the mesh's minimum z, i.e. ground); the canopy diameter is twice the
+/// maximum horizontal distance from that centroid to any vertex — recovering
+/// the aged/scaled canopy actually planted, not the catalog mature figure.
+pub fn plant_object_symbol(name: &str, positions: &[DVec3]) -> Option<Vec<(DVec3, DVec3)>> {
+    let id = name.strip_prefix("plant:")?;
+    let sp = find_species(id)?;
+    if positions.is_empty() {
+        return None;
+    }
+    let n = positions.len() as f64;
+    let cx = positions.iter().map(|p| p.x).sum::<f64>() / n;
+    let cy = positions.iter().map(|p| p.y).sum::<f64>() / n;
+    let zmin = positions.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+    let canopy_d = 2.0
+        * positions
+            .iter()
+            .map(|p| ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt())
+            .fold(0.0f64, f64::max);
+    let center = DVec3::new(cx, cy, zmin);
+    Some(plan_symbol_segments(sp.plan_symbol_style(), center, canopy_d))
+}
+
+/// Canopy ring resolution for the round plan symbol.
+const CIRCLE_SEG: usize = 24;
+/// Radial branch stubs on the round symbol.
+const ROUND_BRANCHES: usize = 8;
+/// Outer points on the conifer star.
+const CONIFER_POINTS: usize = 8;
+/// Frond spokes on the palm symbol.
+const PALM_FRONDS: usize = 8;
+/// Dash slots around the shrub stipple ring (half are gaps).
+const STIPPLE_DOTS: usize = 16;
+/// Dot-crosses in the clump (bamboo) cluster.
+const CLUMP_DOTS: usize = 7;
 
 /// Planting positions for a row from `a` to `b` at `spacing`: every multiple
 /// of `spacing` along the segment starting at `a` (b included only when the
@@ -1175,6 +1387,129 @@ mod tests {
         let (max_b, steep_b) = path_slope_check(&bad, 1.0 / 12.0);
         assert!((max_b - 0.2).abs() < 1e-12);
         assert_eq!(steep_b, 1, "only the first leg is steep");
+    }
+
+    /// Every vertex of a segment soup lies within `tol` of the expected radius
+    /// band and on the given z-plane. Returns the max radius found.
+    fn seg_extent(segs: &[(DVec3, DVec3)], cx: f64, cy: f64, z: f64) -> f64 {
+        let mut rmax = 0.0f64;
+        for (a, b) in segs {
+            for p in [a, b] {
+                assert!((p.z - z).abs() < 1e-9, "symbol must be planar at z={z}");
+                rmax = rmax.max(((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt());
+            }
+        }
+        rmax
+    }
+
+    #[test]
+    fn plan_symbol_default_from_form_and_explicit_override() {
+        // Guadua is a "column" form but drafts as a clump via explicit field.
+        let guadua = find_species("guadua-angustifolia").unwrap();
+        assert_eq!(guadua.form, "column");
+        assert_eq!(guadua.plan_symbol_style(), PlanSymbol::Clump);
+        // Forms without an explicit symbol derive from the 3D form.
+        let oak = find_species("quercus-robur").unwrap(); // round
+        let pine = find_species("pinus-sylvestris").unwrap(); // cone
+        let palm = find_species("roystonea-regia").unwrap(); // palm
+        let cypress = find_species("cupressus-sempervirens").unwrap(); // column
+        assert_eq!(oak.plan_symbol_style(), PlanSymbol::Round);
+        assert_eq!(pine.plan_symbol_style(), PlanSymbol::Conifer);
+        assert_eq!(palm.plan_symbol_style(), PlanSymbol::Palm);
+        assert_eq!(cypress.plan_symbol_style(), PlanSymbol::Shrub);
+    }
+
+    #[test]
+    fn plan_symbol_geometry_per_style_counts_and_extent() {
+        let c = DVec3::new(10.0, 20.0, 3.0);
+        let d = 8.0; // canopy diameter → radius 4
+        let r = d / 2.0;
+
+        let round = plan_symbol_segments(PlanSymbol::Round, c, d);
+        // 24-gon ring + 8 branch stubs.
+        assert_eq!(round.len(), CIRCLE_SEG + ROUND_BRANCHES);
+        let rr = seg_extent(&round, c.x, c.y, c.z);
+        assert!((rr - r).abs() < 1e-6, "round ring reaches canopy radius");
+
+        let conifer = plan_symbol_segments(PlanSymbol::Conifer, c, d);
+        assert_eq!(conifer.len(), 2 * CONIFER_POINTS, "closed star ring");
+        assert!((seg_extent(&conifer, c.x, c.y, c.z) - r).abs() < 1e-6);
+
+        let palm = plan_symbol_segments(PlanSymbol::Palm, c, d);
+        assert_eq!(palm.len(), PALM_FRONDS, "one segment per frond spoke");
+        // Every frond starts at the exact center.
+        for (a, _) in &palm {
+            assert!((a.x - c.x).abs() < 1e-9 && (a.y - c.y).abs() < 1e-9);
+        }
+        assert!((seg_extent(&palm, c.x, c.y, c.z) - r).abs() < 1e-6);
+
+        let shrub = plan_symbol_segments(PlanSymbol::Shrub, c, d);
+        assert_eq!(shrub.len(), STIPPLE_DOTS / 2, "half the ring slots are gaps");
+        assert!(seg_extent(&shrub, c.x, c.y, c.z) <= r + 1e-9);
+
+        let clump = plan_symbol_segments(PlanSymbol::Clump, c, d);
+        assert_eq!(clump.len(), 2 * CLUMP_DOTS, "two crossing dashes per dot");
+        // The clump stays strictly inside the canopy.
+        assert!(seg_extent(&clump, c.x, c.y, c.z) < r);
+    }
+
+    #[test]
+    fn plan_symbol_scales_linearly_with_canopy() {
+        let c = DVec3::ZERO;
+        let small = plan_symbol_segments(PlanSymbol::Round, c, 4.0);
+        let big = plan_symbol_segments(PlanSymbol::Round, c, 8.0);
+        assert_eq!(small.len(), big.len());
+        let rs = seg_extent(&small, 0.0, 0.0, 0.0);
+        let rb = seg_extent(&big, 0.0, 0.0, 0.0);
+        assert!((rb - 2.0 * rs).abs() < 1e-6, "double diameter → double extent");
+        // Degenerate canopy → no geometry.
+        assert!(plan_symbol_segments(PlanSymbol::Round, c, 0.0).is_empty());
+    }
+
+    #[test]
+    fn plan_symbol_is_deterministic() {
+        let c = DVec3::new(1.0, 2.0, 0.5);
+        for style in [
+            PlanSymbol::Round,
+            PlanSymbol::Conifer,
+            PlanSymbol::Palm,
+            PlanSymbol::Shrub,
+            PlanSymbol::Clump,
+        ] {
+            let a = plan_symbol_segments(style, c, 6.0);
+            let b = plan_symbol_segments(style, c, 6.0);
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn plant_object_symbol_recovers_center_and_canopy_from_mesh() {
+        // A real planted mesh: royal palm (palm symbol) at a known base.
+        let palm = find_species("roystonea-regia").unwrap();
+        let base = DVec3::new(5.0, 7.0, 2.0);
+        let (pos, _) = plant_mesh(palm, base, None);
+        let segs = plant_object_symbol("plant:roystonea-regia", &pos).unwrap();
+        assert_eq!(segs.len(), PALM_FRONDS, "palm plan symbol");
+        // Fronds radiate from the trunk axis at ground elevation.
+        for (a, _) in &segs {
+            assert!((a.x - 5.0).abs() < 1e-6 && (a.y - 7.0).abs() < 1e-6);
+            assert!((a.z - 2.0).abs() < 1e-6, "symbol drapes at ground z");
+        }
+        // Non-plant / unknown names yield nothing.
+        assert!(plant_object_symbol("wall", &pos).is_none());
+        assert!(plant_object_symbol("plant:triffid", &pos).is_none());
+        assert!(plant_object_symbol("plant:roystonea-regia", &[]).is_none());
+    }
+
+    #[test]
+    fn legacy_catalog_without_plan_symbol_derives_from_form() {
+        // A pre-plan-symbol entry: no `plan_symbol` field at all.
+        let legacy = r#"[{"id":"old-fir","common":"fir","binomial":"Abies x",
+            "mature_height_m":20.0,"canopy_diameter_m":6.0,
+            "growth_m_per_year":0.4,"deciduous":false,"form":"cone"}]"#;
+        let parsed: Vec<PlantSpecies> = serde_json::from_str(legacy).unwrap();
+        assert!(parsed[0].plan_symbol.is_none());
+        assert_eq!(parsed[0].plan_symbol_style(), PlanSymbol::Conifer);
     }
 
     #[test]
