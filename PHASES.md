@@ -67,7 +67,7 @@ HIG-grounded design revision, run as sequential batches. All six landed.
 
 ## Performance (planned 2026-09-02)
 
-- [ ] **M-perf** — parallelize hot loops with rayon (MIT/Apache, deterministic, replay-safe), GPU compute only if profiling still hurts after:
+- [~] **M-perf** — STEP 1 SHIPPED 2026-09-03 (d6290ab, 6bd87e3); step 2 (GPU) deferred by design. Parallelize hot loops with rayon (MIT/Apache, deterministic, replay-safe), GPU compute only if profiling still hurts after:
   - [x] *Step 1 — rayon on analysis loops* (closed 2026-09-03): `sunhours` grid ray casts, `facesunhours` + `radiation` per-face scoring, `shadowstudy` time frames, raw-LAS point decode, binary-STL triangle decode — all via shared per-item kernels with ordered `collect` (parallel output bit-identical to the `_seq` references kept for tests; no parallel float reductions). Determinism tests per site (par == seq + repeat-run) plus an `#[ignore]` bench (`bench_analysis_200_boxes`). Bench on a 200-tower scene (12-core Intel, quick profile): sunhours 469→85 ms (5.5×), radiation 369→58 ms (6.3×), facesunhours 68→16 ms (4.2×), shadowstudy 19→14 ms (1.4×).
   - Step-1 deliberate skips: `minsurf`/`force_density` is Gauss–Seidel (reads already-updated neighbours — inherently sequential); `dynamic_relaxation` accumulates link forces by scatter with order-dependent float sums (a parallel gather would reassociate additions and change replayed results); LAZ decompression and the E57 reader are sequential streams; OBJ/glTF/Collada parsers are stateful (index interning/XML) — not worth the fiddle.
   - Keep ordered `collect` so output order == sequential (replay invariant); no rayon inside op-log mutation paths — analysis + import + solver inner loops only.
