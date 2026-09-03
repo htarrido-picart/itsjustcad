@@ -11,6 +11,7 @@ mod deck_pane;
 mod diffusion;
 mod download;
 mod draw_tool;
+mod dyntabs;
 mod filewatch;
 mod gumball;
 mod hardware;

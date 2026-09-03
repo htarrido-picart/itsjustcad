@@ -367,8 +367,18 @@ pub struct App {
     /// Retained for the `critique` verb (reveals the Deck tab); the right panel's
     /// own visibility is governed by `panel_tabs`.
     deck_visible: bool,
-    /// Right docked panel tab state (Chat/Sessions/Layers).
+    /// Right docked panel tab state (Chat/Sessions/Layers + dynamic
+    /// Blocks/Plugins tabs — see `tabstrip::TabState::visible_tabs`).
     panel_tabs: crate::tabstrip::TabState,
+    /// Blocks tab: name of the definition awaiting delete confirmation.
+    pending_block_delete: Option<String>,
+    /// Blocks tab: cached library listing (`blocklib`), refreshed on demand so
+    /// the tab doesn't hit the filesystem every frame. `Err` keeps the message.
+    blocklib_cache: Option<Result<Vec<String>, String>>,
+    /// Plugins tab: name of the plugin awaiting delete confirmation.
+    pending_plugin_delete: Option<String>,
+    /// Plugins tab: open read-only JSON source popup `(plugin name, json)`.
+    plugin_json_view: Option<(String, String)>,
     /// The ONE dock width (points) shared by ALL tabs. Seeded from
     /// [`crate::tabstrip::DOCK_WIDTH`]; a user drag updates it, but switching
     /// tabs never changes it (the panel always renders at this width). This is
@@ -724,6 +734,10 @@ impl App {
             underlay_cache: None,
             deck_visible,
             panel_tabs: crate::tabstrip::TabState::default(),
+            pending_block_delete: None,
+            blocklib_cache: None,
+            pending_plugin_delete: None,
+            plugin_json_view: None,
             dock_width: crate::tabstrip::DOCK_WIDTH,
             dock_left: None,
             panel_visible: true,
@@ -977,15 +991,9 @@ impl App {
             self.panel_tabs.show(crate::tabstrip::PanelTab::Sessions);
         }
         // Dev/screenshot hook: force a specific right-dock tab so each tab can be
-        // shot at the (constant) dock width. chat|sessions|layers.
+        // shot at the (constant) dock width. chat|sessions|layers|blocks|plugins.
         if let Ok(tab) = std::env::var("ITSJUSTCAD_PANEL_TAB") {
-            let t = match tab.to_ascii_lowercase().as_str() {
-                "sessions" => Some(crate::tabstrip::PanelTab::Sessions),
-                "layers" | "model" => Some(crate::tabstrip::PanelTab::Model),
-                "chat" | "deck" => Some(crate::tabstrip::PanelTab::Deck),
-                _ => None,
-            };
-            if let Some(t) = t {
+            if let Some(t) = panel_tab_by_name(&tab) {
                 self.panel_tabs.show(t);
             }
         }
@@ -3976,6 +3984,15 @@ impl App {
             return;
         }
 
+        // DYNAMIC TABS: Blocks appears while the doc has block definitions,
+        // Plugins while macros are installed (or while the user pinned either
+        // open). Reconciled every frame from live state — pure logic in
+        // `tabstrip`, derivations in `dyntabs`.
+        let has_blocks = crate::dyntabs::has_block_defs(&self.session.doc);
+        let has_plugins = !self.session.plugins.is_empty();
+        self.panel_tabs.sync_dynamic(has_blocks, has_plugins);
+        let visible_tabs = self.panel_tabs.visible_tabs(has_blocks, has_plugins);
+
         let collapsed = self.panel_tabs.is_collapsed();
         let theme = if ui.visuals().dark_mode { scene::Theme::Dark } else { scene::Theme::Light };
         let mut panel = egui::Panel::right("right_panel").resizable(!collapsed);
@@ -4047,7 +4064,9 @@ impl App {
                 if close.clicked() {
                     self.panel_visible = false;
                 }
-                if let Some(tab) = crate::tabstrip::strip_ui(ui, &self.icons, self.panel_tabs) {
+                if let Some(tab) =
+                    crate::tabstrip::strip_ui(ui, &self.icons, self.panel_tabs, &visible_tabs)
+                {
                     self.panel_tabs.click(tab);
                     if tab == PanelTab::Deck {
                         self.deck_visible = !self.panel_tabs.is_collapsed();
@@ -4118,6 +4137,8 @@ impl App {
                             self.reduce_motion,
                         );
                     }
+                    PanelTab::Blocks => self.blocks_tab(ui),
+                    PanelTab::Plugins => self.plugins_tab(ui),
                 }
             });
         });
@@ -4139,6 +4160,219 @@ impl App {
     /// Layers tab wrapper: runs the layers UI then commits any pending edits.
     fn layers_tab(&mut self, ui: &mut egui::Ui, theme: scene::Theme) {
         self.layers_panel(ui, theme);
+    }
+
+    /// Blocks tab (dynamic): the document's block definitions as rows —
+    /// name, live instance count, param signature for dynamic blocks — plus
+    /// the on-disk library below. A pure VIEW + verb-trigger surface: Insert
+    /// prefills the `insert` command (placement by typing a position), Load
+    /// fires `blockload`, Delete fires the guarded `blockdelete`. All mutations
+    /// go through the ONE substrate path so op-log/undo/replay hold.
+    fn blocks_tab(&mut self, ui: &mut egui::Ui) {
+        let rows = crate::dyntabs::block_rows(&self.session.doc);
+        let mut run_line: Option<String> = None;
+        let mut prefill: Option<String> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if rows.is_empty() {
+                ui.weak("No block definitions yet.");
+                ui.weak("Capture one with `block <selector> <name>` or load one from the library below.");
+            }
+            for row in &rows {
+                let confirming = self.pending_block_delete.as_deref() == Some(row.name.as_str());
+                ui.horizontal(|ui| {
+                    ui.strong(&row.name);
+                    let count = format!(
+                        "{} instance{}",
+                        row.instances,
+                        if row.instances == 1 { "" } else { "s" }
+                    );
+                    ui.weak(count);
+                });
+                if let Some(sig) = &row.param_signature {
+                    ui.weak(format!("params: {sig}"));
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("Insert")
+                        .on_hover_text("prefill `insert` — type a position, press Enter")
+                        .clicked()
+                    {
+                        prefill = Some(format!("insert {} ", row.name));
+                    }
+                    if confirming {
+                        ui.label(egui::RichText::new("delete definition?").color(ui.visuals().warn_fg_color));
+                        if ui.small_button("Delete").clicked() {
+                            run_line = Some(format!("blockdelete {}", self.pending_block_delete.take().unwrap_or_default()));
+                        }
+                        if ui.small_button("Cancel").clicked() {
+                            self.pending_block_delete = None;
+                        }
+                    } else if row.instances > 0 {
+                        // GUARD surfaced in the UI before the verb even runs:
+                        // a definition with live instances cannot be deleted.
+                        ui.add_enabled(false, egui::Button::new("Delete").small())
+                            .on_disabled_hover_text(format!(
+                                "{} instance{} exist — delete the instances first",
+                                row.instances,
+                                if row.instances == 1 { "" } else { "s" }
+                            ));
+                    } else if ui.small_button("Delete").clicked() {
+                        self.pending_block_delete = Some(row.name.clone());
+                    }
+                });
+                ui.separator();
+            }
+
+            // ---- on-disk block library (blocklib / blockload) ----
+            ui.add_space(crate::theme::Spacing::SM);
+            ui.horizontal(|ui| {
+                ui.strong("Library");
+                if ui
+                    .small_button("↻")
+                    .on_hover_text("re-scan ~/.config/itsjustcad/blocks/")
+                    .clicked()
+                {
+                    self.blocklib_cache = None;
+                }
+            });
+            let lib = self.blocklib_cache.get_or_insert_with(|| {
+                itsjustcad_commands::blocklib::list()
+                    .map(|(names, _dir)| names)
+                    .map_err(|e| e.to_string())
+            });
+            match lib {
+                Ok(names) if names.is_empty() => {
+                    ui.weak("library is empty");
+                }
+                Ok(names) => {
+                    for name in names.clone() {
+                        ui.horizontal(|ui| {
+                            ui.label(&name);
+                            let already = rows.iter().any(|r| r.name == name);
+                            if already {
+                                ui.weak("loaded");
+                            } else if ui
+                                .small_button("Load")
+                                .on_hover_text("`blockload` into this document")
+                                .clicked()
+                            {
+                                run_line = Some(format!("blockload {name}"));
+                            }
+                        });
+                    }
+                }
+                Err(e) => {
+                    ui.weak(format!("library unavailable: {e}"));
+                }
+            }
+        });
+        if let Some(line) = run_line {
+            self.execute_line(line);
+        }
+        if let Some(text) = prefill {
+            self.command_line.prefill(text);
+            self.command_line.focus();
+        }
+    }
+
+    /// Plugins tab (dynamic): installed user/LLM-authored macros as rows —
+    /// name, summary, positional arg signature — with Run (prefills the verb),
+    /// JSON (read-only source popup), per-row Delete (confirm), plus Reload
+    /// and Open-folder header actions. Every mutation routes through the
+    /// existing `plugin …` management verbs on the command line.
+    fn plugins_tab(&mut self, ui: &mut egui::Ui) {
+        let rows = crate::dyntabs::plugin_rows(&self.session.plugins);
+        let mut run_line: Option<String> = None;
+        let mut prefill: Option<String> = None;
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("Reload")
+                .on_hover_text("`plugin reload` — re-scan the plugins folder")
+                .clicked()
+            {
+                run_line = Some("plugin reload".into());
+            }
+            if ui
+                .small_button("Open folder")
+                .on_hover_text("reveal ~/.config/itsjustcad/plugins/ in the file manager")
+                .clicked()
+            {
+                open_plugins_folder(&mut self.command_line);
+            }
+        });
+        ui.add_space(crate::theme::Spacing::SM);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if rows.is_empty() {
+                ui.weak("No plugins installed.");
+                ui.weak("Ask the chat to author one, or `plugin save <name> <n>` to capture recent commands.");
+            }
+            for row in &rows {
+                let confirming = self.pending_plugin_delete.as_deref() == Some(row.name.as_str());
+                ui.strong(&row.usage);
+                if !row.summary.is_empty() {
+                    ui.weak(&row.summary);
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("Run")
+                        .on_hover_text("prefill the command line — add args, press Enter")
+                        .clicked()
+                    {
+                        prefill = Some(format!("{} ", row.name));
+                    }
+                    if ui
+                        .small_button("JSON")
+                        .on_hover_text("view the plugin's JSON source (read-only)")
+                        .clicked()
+                    {
+                        self.plugin_json_view = Some((row.name.clone(), row.json.clone()));
+                    }
+                    if confirming {
+                        ui.label(egui::RichText::new("delete plugin?").color(ui.visuals().warn_fg_color));
+                        if ui.small_button("Delete").clicked() {
+                            run_line = Some(format!("plugin delete {}", self.pending_plugin_delete.take().unwrap_or_default()));
+                        }
+                        if ui.small_button("Cancel").clicked() {
+                            self.pending_plugin_delete = None;
+                        }
+                    } else if ui.small_button("Delete").clicked() {
+                        self.pending_plugin_delete = Some(row.name.clone());
+                    }
+                });
+                ui.separator();
+            }
+        });
+        // Read-only JSON source popup (floating, closable).
+        if let Some((name, json)) = self.plugin_json_view.clone() {
+            let mut open = true;
+            egui::Window::new(format!("Plugin source — {name}"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(360.0)
+                .show(ui.ctx(), |ui| {
+                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                        // Read-only: an immutable text buffer renders selectable
+                        // (copyable) but uneditable monospace text.
+                        let mut src = json.as_str();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut src)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                });
+            if !open {
+                self.plugin_json_view = None;
+            }
+        }
+        if let Some(line) = run_line {
+            self.execute_line(line);
+        }
+        if let Some(text) = prefill {
+            self.command_line.prefill(text);
+            self.command_line.focus();
+        }
     }
 
     /// Top menu bar (Layer 3): registry-driven, grouped per preset
@@ -4929,6 +5163,43 @@ impl App {
             Some("light") => self.forced_dark = Some(false),
             _ => {}
         }
+    }
+}
+
+/// Map a user/deck-facing tab name to a right-dock tab. Accepts the labels the
+/// UI uses plus historic aliases (`model` → Layers, `deck` → Chat). Shared by
+/// the `ITSJUSTCAD_PANEL_TAB` dev hook and the UI-plane `panel <tab>` action.
+pub(crate) fn panel_tab_by_name(name: &str) -> Option<crate::tabstrip::PanelTab> {
+    use crate::tabstrip::PanelTab;
+    match name.to_ascii_lowercase().as_str() {
+        "chat" | "deck" => Some(PanelTab::Deck),
+        "sessions" => Some(PanelTab::Sessions),
+        "layers" | "model" => Some(PanelTab::Model),
+        "blocks" => Some(PanelTab::Blocks),
+        "plugins" => Some(PanelTab::Plugins),
+        _ => None,
+    }
+}
+
+/// Reveal the plugins directory in the OS file manager (Plugins tab "Open
+/// folder"). Best-effort; the outcome lands on the command line either way.
+fn open_plugins_folder(command_line: &mut crate::command_line::CommandLine) {
+    let Some(dir) = itsjustcad_commands::plugin::default_dir() else {
+        command_line.push_line("error: no home directory — cannot locate the plugins folder");
+        return;
+    };
+    // The folder may not exist yet (no plugin ever saved) — create it so the
+    // file manager has something to show.
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "windows")]
+    let cmd = "explorer";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let cmd = "xdg-open";
+    match std::process::Command::new(cmd).arg(&dir).spawn() {
+        Ok(_) => command_line.push_line(format!("opened {}", dir.display())),
+        Err(e) => command_line.push_line(format!("error: could not open {}: {e}", dir.display())),
     }
 }
 
