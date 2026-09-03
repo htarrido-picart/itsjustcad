@@ -40,3 +40,45 @@ pub struct Story {
     pub name: String,
     pub elevation: f64,
 }
+
+/// A tagged floor region (M-ibc): a closed boundary polygon with an occupancy
+/// classification and a pre-computed plan area. Created by the logged `room`
+/// verb from a closed curve selection; occupant-load / exit-count / travel-
+/// distance compliance checks read these (the occupancy string keys the IBC
+/// Table 1004.5 load factor carried as DATA in the check pack, not here).
+///
+/// Purely descriptive: the boundary polygon and area are recorded for the
+/// checks and for annotation; nothing here is analyzed on its own.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Room {
+    /// User label (defaults to `<occupancy>-N` when unnamed).
+    pub name: String,
+    /// IBC use-group family, simplified and lower-cased: "assembly",
+    /// "business", "residential", "mercantile", "educational", "storage",
+    /// "institutional". Keys the pack's occupant-load factor table.
+    pub occupancy: String,
+    /// Plan (XY) area of the boundary polygon, square meters (shoelace).
+    pub area: f64,
+    /// Boundary polygon vertices in world space, meters (not closed — the
+    /// first vertex is not repeated at the end). Used for the centroid and as
+    /// the travel-distance start point.
+    pub boundary: Vec<[f64; 3]>,
+}
+
+impl Room {
+    /// Plan centroid of the boundary polygon (mean of the vertices), meters.
+    /// `[0,0,z]` for an empty boundary.
+    pub fn centroid(&self) -> [f64; 3] {
+        if self.boundary.is_empty() {
+            return [0.0, 0.0, 0.0];
+        }
+        let n = self.boundary.len() as f64;
+        let mut c = [0.0f64; 3];
+        for p in &self.boundary {
+            c[0] += p[0];
+            c[1] += p[1];
+            c[2] += p[2];
+        }
+        [c[0] / n, c[1] / n, c[2] / n]
+    }
+}

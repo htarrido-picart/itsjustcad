@@ -134,9 +134,11 @@ Ground every observation in a report sample (\"the north face at (0.0,10.0,2.0) 
 /// advisory framing: these are geometric pre-checks, never a code review.
 pub const CODECHECK_HELP: &str = "\
 ## Compliance pre-checks (codecheck -> report -> grounded critique)
-Run `codecheck <pack>` (the embedded `demo` pack is always available; `checkrules list` shows more) then `report codecheck` in the same ```draft block to fetch per-rule verdicts: pass/fail/warn/info with measured vs required values, violating object ids, and marker locations (colored circles on the 'compliance' layer). Critique the DESIGN grounded in rule ids and numbers — \"stair ab12cd34 riser 0.21 m > max 0.178 m (stair-riser, cf. IBC 1011.5.2): deepen the run or add a riser\" — and propose concrete fix commands.
-Rule packs are data, not code: a pack is JSON ({\"name\":..,\"rules\":[{\"id\",\"code_ref\",\"severity\":\"error|warn|info\",\"target\":{\"kinds\":[..],\"layer\",\"name_contains\"},\"check\":{\"kind\":\"max_slope|min_door_width|max_riser|min_headroom|min_clear_width|turning_circle|min_count_per_story|guard_drop\",..threshold..},\"message\"}]}). You may AUTHOR a pack for the user: draft the JSON, have them save it, then `checkrules load <path>` and `codecheck <name>`.
-ALWAYS state the disclaimer when presenting results: this is an advisory pre-check, not a code review — verify with a licensed professional / AHJ. Never claim a design \"complies\" with any code.
+Run `codecheck <pack>` (the embedded `demo` and `ibc2021` packs are always available; `checkrules list` shows more) then `report codecheck` in the same ```draft block to fetch per-rule verdicts: pass/fail/warn/info with measured vs required values, violating object ids, and marker locations (colored circles on the 'compliance' layer). Critique the DESIGN grounded in rule ids and numbers — \"stair ab12cd34 riser 0.21 m > max 0.178 m (stair-riser, cf. IBC 1011.5.2): deepen the run or add a riser\" — and propose concrete fix commands.
+The `ibc2021` pack encodes IBC 2021 stair/egress geometry (riser, tread, headroom, stair + corridor width, door clear width, guard drop, habitable ceiling height) plus room-level egress: occupant load, exit count, and travel distance. Its occupant-load factors and exit-count bands are DATA in the pack, not code, so a later edition swaps in cleanly.
+Room-level egress needs tagged regions: `room <closed-curve> <occupancy>` labels a closed curve with an IBC use group (assembly|business|residential|mercantile|educational|storage|institutional) and computes its area; `rooms` lists them. Exits are objects whose name contains \"exit\". So the flow is: draw the boundary → `room sel business` → name an exit door \"exit-1\" → `codecheck ibc2021` → `report codecheck`.
+Rule packs are data, not code: a pack is JSON ({\"name\":..,\"rules\":[{\"id\",\"code_ref\",\"severity\":\"error|warn|info\",\"target\":{\"kinds\":[..],\"layer\",\"name_contains\"},\"check\":{\"kind\":\"max_slope|min_door_width|max_riser|tread_depth|min_headroom|min_clear_width|turning_circle|min_count_per_story|guard_drop|occupant_load|exit_count|travel_distance\",..threshold-or-table..},\"message\"}]}). Occupant-load/exit-count carry tables (factors {occupancy:gross_m2}, thresholds [[max_load,exits],..]) instead of a scalar threshold. You may AUTHOR a pack for the user: draft the JSON, have them save it, then `checkrules load <path>` and `codecheck <name>`.
+ALWAYS state the disclaimer when presenting results: this is an advisory pre-check, not a code review — verify with a licensed professional / AHJ. Guard height and habitable-space checks are name-matched only, and travel distance is straight-line, not the routed path. Never claim a design \"complies\" with any code.
 ";
 
 /// The "Ask before guessing" section: when a request is ambiguous the model
@@ -616,6 +618,10 @@ mod tests {
             "turning_circle",
             "min_count_per_story",
             "guard_drop",
+            "tread_depth",
+            "occupant_load",
+            "exit_count",
+            "travel_distance",
         ] {
             assert!(CODECHECK_HELP.contains(kind), "missing check kind '{kind}'");
         }

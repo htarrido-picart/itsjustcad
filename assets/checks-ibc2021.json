@@ -1,0 +1,118 @@
+{
+  "name": "ibc2021",
+  "description": "IBC 2021 geometric pre-check pack. ADVISORY ONLY: a geometric pre-check, not a code review - verify with a licensed professional / AHJ. Thresholds and tables encode common IBC 2021 values (data-driven so a 2024 edition swaps in), but this pack is NOT the code and never certifies compliance. Occupant-load factors are IBC Table 1004.5 gross/net areas converted to m2; exit-count bands are IBC 1006.3.2; travel distance assumes a sprinklered building.",
+  "rules": [
+    {
+      "id": "stair-riser",
+      "code_ref": "IBC 1011.5.2",
+      "severity": "error",
+      "target": { "kinds": ["stair"] },
+      "check": { "kind": "max_riser", "max": 0.1778 },
+      "message": "stair riser exceeds 7 in (0.178 m) max (IBC 1011.5.2) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "stair-tread",
+      "code_ref": "IBC 1011.5.2",
+      "severity": "error",
+      "target": { "kinds": ["stair"] },
+      "check": { "kind": "tread_depth", "min": 0.2794 },
+      "message": "stair tread depth under 11 in (0.279 m) min (IBC 1011.5.2) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "stair-headroom",
+      "code_ref": "IBC 1011.3",
+      "severity": "warn",
+      "target": { "kinds": ["curve"], "name_contains": "stair" },
+      "check": { "kind": "min_headroom", "min": 2.032 },
+      "message": "stair headroom under 80 in (2.032 m) min (IBC 1011.3) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "stair-width",
+      "code_ref": "IBC 1011.2",
+      "severity": "warn",
+      "target": { "kinds": ["curve"], "name_contains": "stair" },
+      "check": { "kind": "min_clear_width", "min": 1.1176 },
+      "message": "stair clear width under 44 in (1.118 m) min (IBC 1011.2) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "corridor-width",
+      "code_ref": "IBC 1020.2",
+      "severity": "warn",
+      "target": { "kinds": ["curve"], "name_contains": "corridor" },
+      "check": { "kind": "min_clear_width", "min": 1.1176 },
+      "message": "corridor clear width under 44 in (1.118 m) min (IBC 1020.2) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "door-width",
+      "code_ref": "IBC 1010.1.1",
+      "severity": "error",
+      "target": { "kinds": ["door"] },
+      "check": { "kind": "min_door_width", "min": 0.8128 },
+      "message": "door clear width under 32 in (0.813 m) min (IBC 1010.1.1) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "guard-height",
+      "code_ref": "IBC 1015.2-1015.3",
+      "severity": "info",
+      "target": { "kinds": ["slab"] },
+      "check": { "kind": "guard_drop", "drop": 0.762 },
+      "message": "walking surface more than 30 in (0.762 m) above adjacent grade - IBC 1015 requires a 42 in (1.067 m) guard; guard presence/height is name-matched only, verify by hand - advisory pre-check, not a code review"
+    },
+    {
+      "id": "ceiling-height",
+      "code_ref": "IBC 1208.2",
+      "severity": "warn",
+      "target": { "kinds": ["curve"], "name_contains": "habitable" },
+      "check": { "kind": "min_headroom", "min": 2.286 },
+      "message": "habitable-space ceiling height under 90 in (2.286 m) min (IBC 1208.2) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "occupant-load",
+      "code_ref": "IBC Table 1004.5",
+      "severity": "info",
+      "target": {},
+      "check": {
+        "kind": "occupant_load",
+        "factors": {
+          "assembly": 1.393,
+          "business": 13.94,
+          "residential": 18.58,
+          "mercantile": 5.574,
+          "educational": 1.858,
+          "storage": 27.87,
+          "institutional": 22.30
+        }
+      },
+      "message": "computed occupant load per room (area / IBC Table 1004.5 factor); a flag means the room's occupancy has no factor - advisory pre-check, not a code review"
+    },
+    {
+      "id": "exit-count",
+      "code_ref": "IBC 1006.3.2",
+      "severity": "error",
+      "target": {},
+      "check": {
+        "kind": "exit_count",
+        "factors": {
+          "assembly": 1.393,
+          "business": 13.94,
+          "residential": 18.58,
+          "mercantile": 5.574,
+          "educational": 1.858,
+          "storage": 27.87,
+          "institutional": 22.30
+        },
+        "thresholds": [[49, 1], [500, 2], [1000, 3], [1000000000, 4]],
+        "exit_name": "exit"
+      },
+      "message": "room provides fewer exits than IBC 1006.3.2 requires for its occupant load (exits are objects named 'exit' within reach of the room; verify egress by hand) - advisory pre-check, not a code review"
+    },
+    {
+      "id": "travel-distance",
+      "code_ref": "IBC 1017.2",
+      "severity": "warn",
+      "target": {},
+      "check": { "kind": "travel_distance", "max": 76.2, "exit_name": "exit" },
+      "message": "straight-line distance from room centroid to nearest exit exceeds 250 ft (76.2 m), the sprinklered-building limit (IBC 1017.2, Table 1017.2); this is straight-line NOT the routed path - advisory pre-check, not a code review"
+    }
+  ]
+}

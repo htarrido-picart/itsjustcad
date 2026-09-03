@@ -9,7 +9,7 @@ use crate::{
     AnalysisReport, Basemap, BlockGeometry, ComplianceReport, GeoLocation, Grid, LayerStyle,
     Material, NamedView,
     ObjectId,
-    ParamBlockDef, SceneObject, Section, Sheet, SketchConstraint, Story, StructLoad,
+    ParamBlockDef, Room, SceneObject, Section, Sheet, SketchConstraint, Story, StructLoad,
     StructSupport, SunPosition, Underlay, Units,
     DEFAULT_LAYER,
 };
@@ -102,6 +102,11 @@ pub struct Document {
     /// Building stories/levels, in creation order.
     #[serde(default)]
     pub stories: Vec<Story>,
+    /// Tagged floor regions (occupancy + area) created by the `room` verb;
+    /// read by the IBC occupant-load / exit-count / travel-distance checks.
+    /// `serde(default)` keeps pre-room files loading cleanly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rooms: Vec<Room>,
     /// Structural loads (point, line, area) placed on the model. Stored for
     /// exchange/annotation; no analysis is performed here. `serde(default)`
     /// keeps pre-load files loading cleanly.
@@ -170,6 +175,7 @@ impl Default for Document {
             materials: BTreeMap::new(),
             grids: BTreeMap::new(),
             stories: Vec::new(),
+            rooms: Vec::new(),
             loads: Vec::new(),
             supports: Vec::new(),
             show_lineweights: false,
@@ -402,7 +408,7 @@ mod tests {
         // sections/materials/grids/stories keys entirely.
         let mut v = serde_json::to_value(Document::default()).unwrap();
         let obj = v.as_object_mut().unwrap();
-        for key in ["sections", "materials", "grids", "stories", "loads", "supports"] {
+        for key in ["sections", "materials", "grids", "stories", "loads", "supports", "rooms"] {
             obj.remove(key);
         }
         let back: Document = serde_json::from_value(v).unwrap();
@@ -410,6 +416,7 @@ mod tests {
         assert!(back.materials.is_empty());
         assert!(back.grids.is_empty());
         assert!(back.stories.is_empty());
+        assert!(back.rooms.is_empty());
         // Pre-compliance snapshots (no `compliance_reports` key) also load
         // empty — the field is skip-serialized when empty, so a default doc
         // round-trips without it.

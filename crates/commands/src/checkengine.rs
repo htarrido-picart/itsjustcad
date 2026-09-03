@@ -39,7 +39,8 @@ use std::path::{Path, PathBuf};
 
 use glam::DVec3;
 use itsjustcad_doc::{
-    AreaKind, ComplianceReport, Document, FrameKind, Geometry, RuleOutcome, SceneObject, Story,
+    AreaKind, ComplianceReport, Document, FrameKind, Geometry, Room, RuleOutcome, SceneObject,
+    Story,
 };
 use kernel_mesh::{Mesh, TriBvh};
 use serde::{Deserialize, Serialize};
@@ -127,22 +128,119 @@ pub enum CheckKind {
     /// Walking surfaces whose top sits more than `drop` above z=0 get flagged
     /// (typically severity "info": verify guards).
     GuardDrop { drop: f64 },
+    /// Occupant load per tagged room = area ÷ the per-occupancy load factor
+    /// (IBC Table 1004.5, m²/occupant, carried as DATA here — never hard-coded).
+    /// Informational: reports the computed load; the `report` shows the count.
+    /// The rule "passes" as long as every matched room has a factor; a room
+    /// whose occupancy has no factor entry is flagged. `unknown_factor` is the
+    /// fallback (gross m²/occupant) when an occupancy is missing from the table.
+    OccupantLoad {
+        /// occupancy family → gross area (m²) per occupant.
+        factors: BTreeMap<String, f64>,
+    },
+    /// Required number of exits from a room, from its occupant load via the
+    /// pack's `factors` and the exit-count `thresholds` (IBC 1006.3.2: each
+    /// entry is `[max_occupant_load, exits_required]`, ascending). Flags rooms
+    /// that (by the exit objects nearby) appear to provide fewer than required.
+    /// Exits are objects whose name contains `exit_name` (default "exit").
+    ExitCount {
+        factors: BTreeMap<String, f64>,
+        /// Ascending `[max_load, required_exits]` bands (IBC 1006.3.2).
+        thresholds: Vec<[f64; 2]>,
+        #[serde(default = "default_exit_name")]
+        exit_name: String,
+    },
+    /// Straight-line travel distance from each room's centroid to the nearest
+    /// exit-tagged object ≤ `max` (IBC 1017.2; the sprinklered assumption is
+    /// noted in the rule message). Honest limit: straight-line, NOT the routed
+    /// path — see the module docs.
+    TravelDistance {
+        max: f64,
+        #[serde(default = "default_exit_name")]
+        exit_name: String,
+    },
+    /// Stair tread depth = plan run of the stair mesh ÷ its riser count ≥ `min`
+    /// (IBC 1011.5.2). Plan run is the stair's horizontal extent along its long
+    /// plan axis; riser count comes from the same clustering as `max_riser`.
+    TreadDepth { min: f64 },
+}
+
+fn default_exit_name() -> String {
+    "exit".to_string()
 }
 
 impl CheckKind {
-    /// (threshold, unit) for the report's measured-vs-required columns.
-    fn required(&self) -> (f64, &'static str) {
+    /// (threshold, unit) for the report's measured-vs-required columns. For
+    /// table-driven kinds (occupant load, exit count) there is no single scalar
+    /// threshold, so `required` is `None` and only the unit is meaningful.
+    fn required(&self) -> (Option<f64>, &'static str) {
         match self {
-            CheckKind::MaxSlope { limit } => (*limit, "rise/run"),
+            CheckKind::MaxSlope { limit } => (Some(*limit), "rise/run"),
             CheckKind::MinDoorWidth { min }
             | CheckKind::MinHeadroom { min }
-            | CheckKind::MinClearWidth { min } => (*min, "m"),
-            CheckKind::MaxRiser { max } => (*max, "m"),
-            CheckKind::TurningCircle { diameter } => (*diameter, "m"),
-            CheckKind::MinCountPerStory { min } => (*min as f64, "count"),
-            CheckKind::GuardDrop { drop } => (*drop, "m"),
+            | CheckKind::MinClearWidth { min }
+            | CheckKind::TreadDepth { min } => (Some(*min), "m"),
+            CheckKind::MaxRiser { max } => (Some(*max), "m"),
+            CheckKind::TurningCircle { diameter } => (Some(*diameter), "m"),
+            CheckKind::MinCountPerStory { min } => (Some(*min as f64), "count"),
+            CheckKind::GuardDrop { drop } => (Some(*drop), "m"),
+            CheckKind::OccupantLoad { .. } => (None, "occupants"),
+            CheckKind::ExitCount { .. } => (None, "exits"),
+            CheckKind::TravelDistance { max, .. } => (Some(*max), "m"),
         }
     }
+
+    /// Validate the kind's own data (thresholds and, for table-driven kinds,
+    /// the embedded factor/threshold tables). Called by [`CheckPack::from_json`].
+    fn validate(&self) -> Result<(), String> {
+        // Scalar threshold, when present, must be positive + finite.
+        if let (Some(t), _) = self.required()
+            && (!t.is_finite() || t <= 0.0)
+        {
+            return Err(format!("non-positive/non-finite threshold {t}"));
+        }
+        let check_factors = |factors: &BTreeMap<String, f64>| -> Result<(), String> {
+            if factors.is_empty() {
+                return Err("occupant-load factor table is empty".into());
+            }
+            for (occ, f) in factors {
+                if !f.is_finite() || *f <= 0.0 {
+                    return Err(format!("occupancy '{occ}' has a non-positive factor {f}"));
+                }
+            }
+            Ok(())
+        };
+        match self {
+            CheckKind::OccupantLoad { factors } => check_factors(factors)?,
+            CheckKind::ExitCount { factors, thresholds, .. } => {
+                check_factors(factors)?;
+                if thresholds.is_empty() {
+                    return Err("exit-count thresholds table is empty".into());
+                }
+                for t in thresholds {
+                    if !t[0].is_finite() || t[1] < 1.0 {
+                        return Err(format!("bad exit-count band {t:?}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Required exit count for `load` occupants from ascending `[max_load, exits]`
+/// bands (IBC 1006.3.2). The first band whose `max_load` covers `load` wins;
+/// a load beyond the last band takes the last band's exit count.
+fn required_exits(load: f64, thresholds: &[[f64; 2]]) -> usize {
+    let mut sorted: Vec<[f64; 2]> = thresholds.to_vec();
+    sorted.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    for band in &sorted {
+        if load <= band[0] {
+            return band[1] as usize;
+        }
+    }
+    sorted.last().map(|b| b[1] as usize).unwrap_or(1)
 }
 
 /// One declarative rule. Pure data — see the module docs.
@@ -188,13 +286,9 @@ impl CheckPack {
             if !seen.insert(r.id.as_str()) {
                 return Err(format!("pack '{}' has a duplicate rule id '{}'", pack.name, r.id));
             }
-            let (threshold, _) = r.check.required();
-            if !threshold.is_finite() || threshold <= 0.0 {
-                return Err(format!(
-                    "rule '{}' has a non-positive/non-finite threshold {threshold}",
-                    r.id
-                ));
-            }
+            r.check
+                .validate()
+                .map_err(|e| format!("rule '{}': {e}", r.id))?;
         }
         Ok(pack)
     }
@@ -205,6 +299,14 @@ impl CheckPack {
 pub fn demo_pack() -> CheckPack {
     CheckPack::from_json(include_str!("../../../assets/checks-demo.json"))
         .expect("embedded demo pack is valid")
+}
+
+/// The embedded IBC 2021 pack (assets/checks-ibc2021.json): ~12 rules covering
+/// stairs, egress, occupant load, exit count, travel distance, and habitable
+/// ceiling height. ADVISORY ONLY — every message carries the disclaimer.
+pub fn ibc_pack() -> CheckPack {
+    CheckPack::from_json(include_str!("../../../assets/checks-ibc2021.json"))
+        .expect("embedded IBC 2021 pack is valid")
 }
 
 /// Default on-disk location for user check packs:
@@ -432,6 +534,100 @@ pub fn count_per_story(stories: &[Story], bottoms: &[f64]) -> Vec<(String, f64, 
             (s.name.clone(), s.elevation, count)
         })
         .collect()
+}
+
+// ── Room / occupancy probes (M-ibc) ──────────────────────────────────────────
+
+/// Occupant load of a room = area ÷ the per-occupancy factor (m²/occupant),
+/// rounded UP (a fractional occupant still counts — IBC 1004.5). `None` when
+/// the occupancy has no factor in the table.
+pub fn occupant_load(room: &Room, factors: &BTreeMap<String, f64>) -> Option<f64> {
+    let f = *factors.get(&room.occupancy)?;
+    if f <= 0.0 {
+        return None;
+    }
+    Some((room.area / f).ceil())
+}
+
+/// A room's proximity radius for the exit-count check: half its longest
+/// boundary chord (bounding-box diagonal), so exits on the room's edges count.
+fn room_reach(room: &Room) -> f64 {
+    let mut lo = [f64::INFINITY; 2];
+    let mut hi = [f64::NEG_INFINITY; 2];
+    for p in &room.boundary {
+        lo[0] = lo[0].min(p[0]);
+        lo[1] = lo[1].min(p[1]);
+        hi[0] = hi[0].max(p[0]);
+        hi[1] = hi[1].max(p[1]);
+    }
+    if !lo[0].is_finite() {
+        return 0.0;
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt();
+    diag * 0.5
+}
+
+/// World positions of exit-tagged objects: any object whose name contains
+/// `exit_name` (case-insensitive), reported at its AABB center, optionally
+/// restricted to the story `band`.
+fn exit_positions(doc: &Document, exit_name: &str, band: Option<(f64, f64)>) -> Vec<DVec3> {
+    let needle = exit_name.to_lowercase();
+    doc.objects()
+        .filter(|o| o.name.as_deref().is_some_and(|n| n.to_lowercase().contains(&needle)))
+        .filter(|o| match band {
+            Some((lo, hi)) => {
+                let a = o.geometry.aabb();
+                a.max.z >= lo - 1e-9 && a.min.z < hi - 1e-9
+            }
+            None => true,
+        })
+        .map(|o| {
+            let a = o.geometry.aabb();
+            (a.min + a.max) * 0.5
+        })
+        .collect()
+}
+
+/// Rooms matching a rule's target query (only `name_contains` applies to rooms
+/// — they have no layer/kind), restricted to the story `band` by centroid z.
+fn rooms_in_band<'a>(
+    doc: &'a Document,
+    q: &'a TargetQuery,
+    band: Option<(f64, f64)>,
+) -> impl Iterator<Item = &'a Room> + 'a {
+    doc.rooms.iter().filter(move |r| {
+        if let Some(needle) = &q.name_contains {
+            let needle = needle.to_lowercase();
+            if !r.name.to_lowercase().contains(&needle)
+                && !r.occupancy.to_lowercase().contains(&needle)
+            {
+                return false;
+            }
+        }
+        if let Some((lo, hi)) = band {
+            let z = r.centroid()[2];
+            if z < lo - 1e-9 || z >= hi - 1e-9 {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+/// Stair tread depth from a boxy stair mesh: the plan run along the stair's
+/// longer horizontal axis divided by the riser count (`stair_risers`). `None`
+/// when fewer than one riser is found (not a stair-like mesh).
+pub fn tread_depth(mesh: &Mesh) -> Option<f64> {
+    let risers = stair_risers(mesh);
+    if risers.is_empty() {
+        return None;
+    }
+    let a = mesh.aabb();
+    // Plan run is the longer horizontal extent (stairs run along one plan axis).
+    let run = (a.max.x - a.min.x).max(a.max.y - a.min.y);
+    // Treads number one fewer than risers on a straight flight, but boxy meshes
+    // vary; dividing the run by the riser count is the honest, stable estimate.
+    Some(run / risers.len() as f64)
 }
 
 // ── Target matching ──────────────────────────────────────────────────────────
@@ -677,6 +873,76 @@ pub fn evaluate(
                     }
                 }
             }
+            CheckKind::OccupantLoad { factors } => {
+                // Rooms, filtered by the target's story band + name_contains.
+                for room in rooms_in_band(doc, &rule.target, band) {
+                    let load = occupant_load(room, factors);
+                    let c = room.centroid();
+                    let at = DVec3::new(c[0], c[1], c[2]);
+                    match load {
+                        Some(n) => worst_max(n, &mut measured),
+                        None => {
+                            // No factor for this occupancy → flag it.
+                            violations.push((room.name.clone(), at, f64::NAN));
+                        }
+                    }
+                }
+            }
+            CheckKind::ExitCount { factors, thresholds, exit_name } => {
+                let exits = exit_positions(doc, exit_name, band);
+                for room in rooms_in_band(doc, &rule.target, band) {
+                    let Some(load) = occupant_load(room, factors) else { continue };
+                    let need = required_exits(load, thresholds);
+                    // Count exits within a generous radius of the room (its
+                    // longest boundary chord) — honest proximity heuristic.
+                    let c = room.centroid();
+                    let ctr = DVec3::new(c[0], c[1], c[2]);
+                    let reach = room_reach(room);
+                    let have = exits
+                        .iter()
+                        .filter(|e| (**e - ctr).truncate().length() <= reach)
+                        .count();
+                    worst_min(have as f64, &mut measured);
+                    if have < need {
+                        violations.push((room.name.clone(), ctr, have as f64));
+                    }
+                }
+            }
+            CheckKind::TravelDistance { max, exit_name } => {
+                let exits = exit_positions(doc, exit_name, band);
+                for room in rooms_in_band(doc, &rule.target, band) {
+                    let c = room.centroid();
+                    let ctr = DVec3::new(c[0], c[1], c[2]);
+                    let nearest = exits
+                        .iter()
+                        .map(|e| (*e - ctr).length())
+                        .min_by(f64::total_cmp);
+                    match nearest {
+                        Some(d) => {
+                            worst_max(d, &mut measured);
+                            if d > *max {
+                                violations.push((room.name.clone(), ctr, d));
+                            }
+                        }
+                        None => {
+                            // No exits at all → the room can't reach one.
+                            violations.push((room.name.clone(), ctr, f64::INFINITY));
+                        }
+                    }
+                }
+            }
+            CheckKind::TreadDepth { min } => {
+                for obj in &targets {
+                    let Some(mesh) = obj.geometry.mesh() else { continue };
+                    let Some(tread) = tread_depth(mesh) else { continue };
+                    worst_min(tread, &mut measured);
+                    if tread < *min {
+                        let a = mesh.aabb();
+                        let c = (a.min + a.max) * 0.5;
+                        violations.push((obj.id.short(), DVec3::new(c.x, c.y, a.max.z), tread));
+                    }
+                }
+            }
         }
 
         let (required, unit) = rule.check.required();
@@ -691,6 +957,16 @@ pub fn evaluate(
                 objects.push(id.clone());
             }
         }
+        // Room-based checks are evaluated against tagged rooms, not scene
+        // objects, so report the honest count for each.
+        let checked = match &rule.check {
+            CheckKind::OccupantLoad { .. }
+            | CheckKind::ExitCount { .. }
+            | CheckKind::TravelDistance { .. } => {
+                rooms_in_band(doc, &rule.target, band).count()
+            }
+            _ => targets.len(),
+        };
         outcomes.push(RuleOutcome {
             rule_id: rule.id.clone(),
             code_ref: rule.code_ref.clone(),
@@ -700,9 +976,9 @@ pub fn evaluate(
             objects,
             locations: violations.iter().map(|(_, p, _)| [p.x, p.y, p.z]).collect(),
             measured,
-            required: Some(required),
+            required,
             unit: unit.to_string(),
-            checked: targets.len(),
+            checked,
         });
     }
 
@@ -907,6 +1183,126 @@ mod tests {
         // No stories: one document-wide band.
         let counts = count_per_story(&[], &[0.0, 9.0]);
         assert_eq!(counts, vec![("(document)".to_string(), 0.0, 2)]);
+    }
+
+    // ── IBC (M-ibc) probes ───────────────────────────────────────────────────
+
+    fn room(occ: &str, area: f64, boundary: Vec<[f64; 3]>) -> Room {
+        Room { name: format!("{occ}-1"), occupancy: occ.to_string(), area, boundary }
+    }
+
+    /// A tiny named mesh object whose AABB center sits at `at` — used as an
+    /// "exit" marker in the egress tests.
+    fn named_marker(name: &str, at: DVec3) -> SceneObject {
+        use itsjustcad_doc::ObjectId;
+        let mesh = kernel_mesh::make_box(at - DVec3::splat(0.05), DVec3::splat(0.1));
+        SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: Some(name.to_string()),
+            layer: itsjustcad_doc::DEFAULT_LAYER.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Mesh(mesh),
+        }
+    }
+
+    #[test]
+    fn ibc_pack_parses_and_is_valid() {
+        let p = ibc_pack();
+        assert_eq!(p.name, "ibc2021");
+        assert!(p.rules.len() >= 11, "rules: {}", p.rules.len());
+        assert!(p.description.to_lowercase().contains("advisory"));
+        // Every rule carries a real IBC section ref and the disclaimer.
+        for r in &p.rules {
+            assert!(r.code_ref.starts_with("IBC"), "rule '{}' code_ref '{}'", r.id, r.code_ref);
+            assert!(
+                r.message.contains("advisory pre-check"),
+                "rule '{}' message missing disclaimer",
+                r.id
+            );
+        }
+        // Round-trips.
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(CheckPack::from_json(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn occupant_load_100m2_business_is_8() {
+        // IBC Table 1004.5: business gross factor 13.94 m2/occ. 100 / 13.94 =
+        // 7.17 → ceil → 8 occupants.
+        let mut factors = BTreeMap::new();
+        factors.insert("business".to_string(), 13.94);
+        let r = room("business", 100.0, vec![]);
+        assert_eq!(occupant_load(&r, &factors), Some(8.0));
+        // Unknown occupancy → None.
+        let other = room("assembly", 100.0, vec![]);
+        assert_eq!(occupant_load(&other, &factors), None);
+    }
+
+    #[test]
+    fn required_exits_thresholds() {
+        // IBC 1006.3.2 bands: <=49 -> 1, 50-500 -> 2, 501-1000 -> 3, >1000 -> 4.
+        let t = [[49.0, 1.0], [500.0, 2.0], [1000.0, 3.0], [1e9, 4.0]];
+        assert_eq!(required_exits(1.0, &t), 1);
+        assert_eq!(required_exits(49.0, &t), 1);
+        assert_eq!(required_exits(50.0, &t), 2);
+        assert_eq!(required_exits(500.0, &t), 2);
+        assert_eq!(required_exits(501.0, &t), 3);
+        assert_eq!(required_exits(1000.0, &t), 3);
+        assert_eq!(required_exits(1001.0, &t), 4);
+        assert_eq!(required_exits(50000.0, &t), 4);
+    }
+
+    #[test]
+    fn tread_depth_from_synthetic_stair() {
+        // Three treads 0.30 m deep (X) each, tops at z=0.15,0.30,0.45 (risers
+        // 0.15). Plan run along the long X axis = 0.9 m (Y width only 0.5 m);
+        // riser count = 2 → tread = 0.45 m. (The boxy estimate divides the run
+        // by the riser count, an honest approximation.)
+        let mut mesh = kernel_mesh::make_box(DVec3::ZERO, DVec3::new(0.3, 0.5, 0.15));
+        for i in 1..3 {
+            let step = kernel_mesh::make_box(
+                DVec3::new(0.3 * i as f64, 0.0, 0.0),
+                DVec3::new(0.3, 0.5, 0.15 * (i + 1) as f64),
+            );
+            mesh.merge(&step);
+        }
+        let t = tread_depth(&mesh).expect("stair tread");
+        assert!((t - 0.45).abs() < 1e-9, "tread {t}");
+        // A plain box (no risers) is not a stair.
+        let plain = kernel_mesh::make_box(DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0));
+        assert_eq!(tread_depth(&plain), None);
+    }
+
+    #[test]
+    fn travel_distance_and_exit_count_on_known_layout() {
+        // Business room, 200 m2 (load ceil(200/13.94)=15 -> needs 1 exit under
+        // 49). One exit 3 m from the room centroid, well within 76.2 m.
+        let square =
+            || vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 20.0, 0.0], [0.0, 20.0, 0.0]];
+        let mut doc = Document::default();
+        doc.rooms.push(room("business", 200.0, square()));
+        // Exit object named "exit-1" near the room centroid (5,10,0).
+        doc.insert(named_marker("exit-1", DVec3::new(5.0, 8.0, 0.0)));
+
+        let pack = ibc_pack();
+        let (report, _) = evaluate(&doc, "ibc2021", None, &pack.rules, &[]).unwrap();
+        let exitc = report.rules.iter().find(|r| r.rule_id == "exit-count").unwrap();
+        assert_eq!(exitc.verdict, "pass", "exit-count: {exitc:?}");
+        let travel = report.rules.iter().find(|r| r.rule_id == "travel-distance").unwrap();
+        assert_eq!(travel.verdict, "pass", "travel: {travel:?}");
+        let occ = report.rules.iter().find(|r| r.rule_id == "occupant-load").unwrap();
+        assert!((occ.measured.unwrap() - 15.0).abs() < 1e-9, "occ load {occ:?}");
+
+        // Move the exit 200 m away → travel distance fails (> 76.2 m).
+        let mut far = Document::default();
+        far.rooms.push(room("business", 200.0, square()));
+        far.insert(named_marker("exit-far", DVec3::new(5.0, 210.0, 0.0)));
+        let (report, _) = evaluate(&far, "ibc2021", None, &pack.rules, &[]).unwrap();
+        let travel = report.rules.iter().find(|r| r.rule_id == "travel-distance").unwrap();
+        assert_eq!(travel.verdict, "warn", "far travel: {travel:?}");
     }
 
     // ── engine (evaluate) unknown-story error ────────────────────────────────

@@ -888,6 +888,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Structure,
         },
         CommandSpec {
+            name: "room",
+            usage: "room <closed-curve> <occupancy> [name]",
+            summary: "Tag a closed-curve region with an IBC use group (assembly|business|residential|mercantile|educational|storage|institutional) and its computed plan area. Rooms feed the IBC occupant-load / exit-count / travel-distance compliance checks (codecheck ibc2021). Example: room sel business · room #suite assembly Lobby",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "rooms",
+            usage: "rooms",
+            summary: "List the tagged occupancy regions (name, use group, area). Query only. Example: rooms",
+            category: Category::Structure,
+        },
+        CommandSpec {
             name: "beam",
             usage: "beam <a x,y,z> <b x,y,z> <section> [material <m>] [rot <deg>]",
             summary: "Frame member (horizontal): sweep a named section along the line a→b into a solid. Optional material and roll angle (deg). Example: beam 0,0,3 6,0,3 W12 material steel · beam 0,0,3 6,0,3 col rot 90",

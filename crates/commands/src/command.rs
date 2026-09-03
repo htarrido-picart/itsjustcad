@@ -1206,6 +1206,19 @@ pub enum Command {
         name: String,
         elevation: f64,
     },
+    /// Tag a closed-curve selection as an occupancy region (M-ibc). The plan
+    /// area is computed at apply time and the boundary polygon captured, so the
+    /// occupant-load / exit-count / travel-distance checks read a `Room` off
+    /// the document. Logged (undo restores the prior room list); `name` is
+    /// optional (defaults to `<occupancy>-N`).
+    Room {
+        boundary: Selector,
+        occupancy: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// List the tagged occupancy regions (query, never logged).
+    RoomList,
     /// Frame member (beam or column): a line member with a named section swept
     /// along it, rolled by `orientation_deg`. `beam` and `column` are two verbs
     /// mapping to this one command; the `kind` disambiguates. `id` is filled at
@@ -1412,6 +1425,7 @@ impl Command {
                 | Command::EnviroReport { .. }
                 | Command::CheckRulesList
                 | Command::CheckRulesLoad { .. }
+                | Command::RoomList
                 | Command::BlocksList
                 | Command::BlockLibList
                 | Command::ConstraintsList

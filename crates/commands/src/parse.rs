@@ -1508,6 +1508,29 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let [name, elev] = take::<2>("story", "a name and an elevation", &args)?;
             Ok(Command::DefStory { name: name.to_string(), elevation: number(elev)? })
         }
+        "rooms" => {
+            if args.is_empty() {
+                Ok(Command::RoomList)
+            } else {
+                wrong("rooms", "no arguments", &args)
+            }
+        }
+        "room" => {
+            let (boundary, rest) = selector(&args, "room")?;
+            match rest {
+                [occ] => Ok(Command::Room {
+                    boundary,
+                    occupancy: (*occ).to_string(),
+                    name: None,
+                }),
+                [occ, name] => Ok(Command::Room {
+                    boundary,
+                    occupancy: (*occ).to_string(),
+                    name: Some((*name).to_string()),
+                }),
+                _ => wrong("room", "a selector, an occupancy type, and an optional name", &args),
+            }
+        }
         "beam" => parse_frame(FrameKind::Beam, &args),
         "column" => parse_frame(FrameKind::Column, &args),
         "slab" => parse_area(AreaKind::Slab, &args),

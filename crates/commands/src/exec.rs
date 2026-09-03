@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use itsjustcad_doc::{
     format_area, format_length, format_volume, AnalysisReport, AnalysisSample, Annotation,
     Document, GeoLocation, Geometry, Grid, LayerStyle,
-    LoadGeometry, Material, NamedView, ObjectId, SceneObject, ScheduleRow,
+    LoadGeometry, Material, NamedView, ObjectId, Room, SceneObject, ScheduleRow,
     SheetDim, SheetTable, Story, StructLoad, StructSupport, Underlay, Units,
 };
 
@@ -19,6 +19,19 @@ use crate::{BoolKind, Command, CompassDir, MirrorPlane, OptionOp, Selector};
 
 /// Chord tolerance used when tessellating profile curves for extrusion.
 const PROFILE_TOL: f64 = 0.01;
+
+/// Accepted `room` occupancy classifications — the IBC use groups, simplified
+/// to family names. These key the occupant-load factor table carried as DATA
+/// in the compliance pack (never hard-coded thresholds).
+const ROOM_OCCUPANCIES: &[&str] = &[
+    "assembly",
+    "business",
+    "residential",
+    "mercantile",
+    "educational",
+    "storage",
+    "institutional",
+];
 
 /// Pixel aspect ratio (width / height) of a raster file, or `None` if it can't
 /// be read. Only the header is decoded, so this is cheap.
@@ -221,6 +234,9 @@ enum Inverse {
     /// `story`: restore the previous story list (a story replace/append edits
     /// the whole list, so snapshot it).
     StoryList(Vec<Story>),
+    /// `room`: restore the previous room list (a room tag appends to the whole
+    /// list, so snapshot it — mirrors `StoryList`).
+    RoomList(Vec<itsjustcad_doc::Room>),
     /// `load`: remove the load that was appended at the given index.
     RemoveLoad(usize),
     /// `support`: remove the support that was appended at the given index.
@@ -560,10 +576,10 @@ impl Default for Session {
             log: Vec::new(),
             cursor: 0,
             plugins: crate::plugin::PluginRegistry::default(),
-            check_packs: BTreeMap::from([(
-                "demo".to_string(),
-                crate::checkengine::demo_pack(),
-            )]),
+            check_packs: BTreeMap::from([
+                ("demo".to_string(), crate::checkengine::demo_pack()),
+                ("ibc2021".to_string(), crate::checkengine::ibc_pack()),
+            ]),
             pending_log: None,
             branches: BTreeMap::new(),
             current_branch: MAIN_BRANCH.to_string(),
@@ -914,6 +930,10 @@ impl Session {
             }
             Inverse::StoryList(prev) => {
                 self.doc.stories = prev.clone();
+                self.doc.generation += 1;
+            }
+            Inverse::RoomList(prev) => {
+                self.doc.rooms = prev.clone();
                 self.doc.generation += 1;
             }
             Inverse::RemoveLoad(idx) => {
@@ -7823,6 +7843,26 @@ fn apply_forward(
                 ApplyOutcome { created: Vec::new(), message: msg },
             ))
         }
+        Command::RoomList => {
+            let list: Vec<String> = doc
+                .rooms
+                .iter()
+                .map(|r| {
+                    format!("  {} ({}) — {}", r.name, r.occupancy, format_area(doc.units, r.area))
+                })
+                .collect();
+            let msg = if list.is_empty() {
+                "no rooms tagged (room <closed-curve> <occupancy>)".to_string()
+            } else {
+                format!("rooms:\n{}", list.join("\n"))
+            };
+            Ok((
+                Command::RoomList,
+                // Not logged; this Inverse is never stored.
+                Inverse::DeleteCreated(Vec::new()),
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
         Command::BlockLibList => {
             let (names, dir) = crate::blocklib::list()
                 .map_err(|e| ExecError::Invalid(e.to_string()))?;
@@ -7945,6 +7985,64 @@ fn apply_forward(
                     created: Vec::new(),
                     message: format!("story '{name}' at {elevation} m"),
                 },
+            ))
+        }
+        Command::Room { boundary, occupancy, name } => {
+            let occ = occupancy.to_lowercase();
+            if !ROOM_OCCUPANCIES.contains(&occ.as_str()) {
+                return Err(ExecError::Invalid(format!(
+                    "unknown occupancy '{occupancy}' (use one of: {})",
+                    ROOM_OCCUPANCIES.join(", ")
+                )));
+            }
+            let ids = resolve(doc, &boundary)?;
+            // The region boundary is a single closed curve.
+            if ids.len() != 1 {
+                return Err(ExecError::Invalid(format!(
+                    "room needs exactly one closed curve as its boundary ({} selected)",
+                    ids.len()
+                )));
+            }
+            let obj = doc.get(ids[0]).expect("resolved");
+            let pts = match &obj.geometry {
+                Geometry::Curve(c) if c.is_closed() => c.tessellate(PROFILE_TOL),
+                Geometry::Curve(_) => {
+                    return Err(ExecError::Invalid(
+                        "room boundary is an open curve — close it first".into(),
+                    ))
+                }
+                _ => {
+                    return Err(ExecError::Invalid(
+                        "room boundary must be a closed curve".into(),
+                    ))
+                }
+            };
+            if pts.len() < 3 {
+                return Err(ExecError::Invalid(
+                    "room boundary has fewer than 3 vertices".into(),
+                ));
+            }
+            let area = shoelace_area(&pts);
+            let prev = doc.rooms.clone();
+            let label = name.clone().unwrap_or_else(|| {
+                let n = doc.rooms.iter().filter(|r| r.occupancy == occ).count() + 1;
+                format!("{occ}-{n}")
+            });
+            doc.rooms.push(Room {
+                name: label.clone(),
+                occupancy: occ.clone(),
+                area,
+                boundary: pts.iter().map(|p| [p.x, p.y, p.z]).collect(),
+            });
+            doc.generation += 1;
+            let msg = format!(
+                "room '{label}' ({occ}) — {}",
+                format_area(doc.units, area)
+            );
+            Ok((
+                Command::Room { boundary, occupancy: occ, name: Some(label) },
+                Inverse::RoomList(prev),
+                ApplyOutcome { created: Vec::new(), message: msg },
             ))
         }
         Command::FrameMember { id, kind, a, b, section, material, orientation_deg } => {
@@ -8439,6 +8537,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::DefMaterial { .. } => "material",
         Command::DefGrid { .. } => "grid",
         Command::DefStory { .. } => "story",
+        Command::Room { .. } => "room",
+        Command::RoomList => "rooms",
         Command::FrameMember { kind, .. } => kind.label(),
         Command::AreaMember { kind, .. } => kind.label(),
         Command::AddLoad { .. } => "load",
@@ -14688,6 +14788,95 @@ mod tests {
         let cc = parse("codecheck demo").unwrap();
         assert!(!cc.is_side_effecting());
         assert!(cc.is_logged());
+    }
+
+    // ── M-ibc: room tagging + IBC pack ───────────────────────────────────────
+
+    #[test]
+    fn room_tags_closed_curve_with_area_and_undoes() {
+        let mut s = Session::default();
+        // 10×20 m rectangle → 200 m² plan area.
+        run(&mut s, "rect 0,0,0 10 20");
+        let out = run(&mut s, "room last business Office");
+        assert!(out.message.contains("business"), "{}", out.message);
+        assert_eq!(s.doc.rooms.len(), 1);
+        let r = &s.doc.rooms[0];
+        assert_eq!(r.name, "Office");
+        assert_eq!(r.occupancy, "business");
+        assert!((r.area - 200.0).abs() < 1e-6, "area {}", r.area);
+        // Centroid is the rectangle center (5,10,0).
+        let c = r.centroid();
+        assert!((c[0] - 5.0).abs() < 1e-6 && (c[1] - 10.0).abs() < 1e-6, "centroid {c:?}");
+        // `rooms` lists it.
+        assert!(run(&mut s, "rooms").message.contains("Office"));
+        // Undo removes the room, redo restores it.
+        run(&mut s, "undo");
+        assert!(s.doc.rooms.is_empty(), "undo drops the room");
+        run(&mut s, "redo");
+        assert_eq!(s.doc.rooms.len(), 1);
+    }
+
+    #[test]
+    fn room_rejects_open_curve_and_bad_occupancy() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,0,0");
+        let err = s.run(parse("room last business").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("open curve"), "{err}");
+        // Auto-named when no name given, valid occupancy.
+        run(&mut s, "rect 0,0,0 5 5");
+        let out = run(&mut s, "room last storage");
+        assert!(out.message.contains("storage-1"), "{}", out.message);
+        // Unknown occupancy is refused.
+        run(&mut s, "rect 20,0,0 5 5");
+        let err = s.run(parse("room last spaceship").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("unknown occupancy"), "{err}");
+    }
+
+    #[test]
+    fn room_replay_is_stable() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 20");
+        run(&mut s, "room last business");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "room op must replay bit-identically (name written back)"
+        );
+        assert_eq!(replayed.doc.rooms, s.doc.rooms);
+    }
+
+    #[test]
+    fn codecheck_ibc2021_end_to_end() {
+        // A room + egress scene run through the embedded IBC pack.
+        let mut s = Session::default();
+        // Business floor: 10×20 m rectangle (200 m² → load 15 → 1 exit).
+        run(&mut s, "rect 0,0,0 10 20");
+        run(&mut s, "room last business");
+        // A door named "exit-1" near the room centroid.
+        run(&mut s, "insert pdoor 5,8,0 width=0.9");
+        run(&mut s, "name last exit-1");
+        let out = run(&mut s, "codecheck ibc2021");
+        assert!(out.message.contains("advisory"), "{}", out.message);
+        let r = s.doc.compliance_reports.get("ibc2021").expect("report stored");
+        let verdict =
+            |id: &str| r.rules.iter().find(|o| o.rule_id == id).unwrap_or_else(|| panic!("{id}"));
+        // Occupant load computed on the room (info verdict, measured = 15).
+        assert!((verdict("occupant-load").measured.unwrap() - 15.0).abs() < 1e-9);
+        assert_eq!(verdict("occupant-load").checked, 1, "one room checked");
+        // One exit within reach, one required → exit count passes.
+        assert_eq!(verdict("exit-count").verdict, "pass");
+        // Exit is ~3 m from the centroid, well under 76.2 m → travel passes.
+        assert_eq!(verdict("travel-distance").verdict, "pass");
+        // Replay stability (embedded rules + marker ids).
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "ibc codecheck must replay bit-identically"
+        );
     }
 
     #[test]
