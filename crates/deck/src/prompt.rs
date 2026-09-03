@@ -149,6 +149,15 @@ PLAN:
 Then execute it one step per turn: emit ONLY the current step's commands in a ```draft block, read the results/errors fed back, fix failures, and move on when the step succeeds. After the last step, verify the end state with read-only commands (`bbox all`, `schedule`, `report`) and reply with a one-line summary. Simple one-shot requests need NO plan — just draw.
 ";
 
+/// The "Presenting data" section: nudges the model to answer tabular questions
+/// with a markdown pipe table. The chat transcript renders real grids
+/// (M-chatmd), so tables are BOTH nicer to read and cheaper than prose —
+/// which is why terse mode repeats the rule rather than suppressing it.
+pub const TABLE_HELP: &str = "\
+## Presenting data
+When presenting tabular data — object lists, analysis stats, schedules, `report` output — format it as a markdown pipe table (`| col | col |` with a `|---|---|` separator row). The chat renders tables as real grids. Tables are terse: dense information, few tokens.
+";
+
 /// Terse mode's hard per-turn token cap. Fewer tokens = faster local inference;
 /// the style rules below make the model spend them on substance.
 pub const TERSE_MAX_TOKENS: u32 = 512;
@@ -164,6 +173,7 @@ Answer like a laconic senior drafter. Hard rules:
 - No hedging or self-narration (never \"it seems\", \"let me\", \"I will now\").
 - Sentence fragments are fine. Substance is not optional: keep every number, command, warning, and question.
 - Prefer a ```draft block over prose. At most one short line of chat unless the user asked for an explanation.
+- Markdown tables ARE terse: for lists, stats, or schedules, prefer a pipe table over sentences.
 ";
 
 /// Apply terse mode to a built system prompt + token budget: append the style
@@ -332,6 +342,7 @@ Examples:
 {enviro}
 {clarify}
 {plan}
+{tables}
 ## Rules
 - Points are x,y,z or x,y (z=0). No spaces inside a point. Units: bare numbers are meters; 250cm and 500mm also work.
 - 'last' refers to the most recently created object; 'last N' to the N most recent. After a command that creates an object, that object is 'last'.
@@ -365,6 +376,7 @@ box 10,0,0 4,4,3
         enviro = ENVIRO_CRITIQUE_HELP,
         clarify = CLARIFY_HELP,
         plan = PLAN_HELP,
+        tables = TABLE_HELP,
         scene = if scene_digest.is_empty() {
             "(empty)"
         } else {
@@ -394,6 +406,26 @@ mod tests {
             );
         }
         assert!(prompt.contains(SELECTOR_HELP));
+    }
+
+    #[test]
+    fn system_prompt_teaches_markdown_tables() {
+        // M-chatmd: the transcript renders pipe tables as real grids, so the
+        // prompt must nudge the model to USE them for tabular data.
+        let prompt = system_prompt("", &PluginRegistry::new());
+        assert!(prompt.contains(TABLE_HELP), "table nudge missing");
+        assert!(prompt.contains("markdown pipe table"));
+    }
+
+    #[test]
+    fn terse_mode_keeps_the_table_nudge() {
+        // Tables ARE terse — terse mode must not talk the model out of them:
+        // the style rules repeat the preference, and the appended section
+        // never displaces the main TABLE_HELP.
+        let (p, _) = terse_adjusted(system_prompt("", &PluginRegistry::new()), 4096, true);
+        assert!(p.contains(TABLE_HELP));
+        assert!(TERSE_STYLE_HELP.contains("pipe table"));
+        assert!(p.contains("Markdown tables ARE terse"));
     }
 
     #[test]

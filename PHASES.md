@@ -52,6 +52,12 @@ HIG-grounded design revision, run as sequential batches. All six landed.
   - *Plan-execute harness* DONE: `agent::{Plan, PlanStep, parse_plan}` + `tool_loop::run_plan_loop` (Plan/Question step decisions, MAX_STEP_ATTEMPTS per-step retry, mid-run replan, cancel-preserves-state, round budget); streaming path mirrored in deck_pane (checklist Entry::Plan ticks live, step-per-turn auto-continuation, verify turn with bbox/schedule, plan persisted in the per-doc draft → resumes after relaunch, Stop pauses). GBNF root now `draft | question | plan`.
   - NOT done (deliberate cuts): `run_plan_loop` is not yet the live execution path (the streaming deck_pane driver is; the loop is the future FOSS-harness core and is fully mock-tested); no dedicated per-step GBNF "STEP" form (steps are plain draft blocks — the existing fence grammar covers them).
 
+- [x] **M-chatmd** — rich markdown in the deck chat transcript (closed 2026-09-02):
+  - *Rendering* via `egui_commonmark` 0.24 (MIT/Apache, matches workspace egui 0.35): deck bubbles + the streaming bubble render **tables as striped grids** (the headline — pairs with the `report` verb for analysis stats/schedules), plus bold/italic, inline + fenced code, lists, headings, rules. Chosen over a hand-rolled parser because it slots into the existing bubble frames without touching the custom Question/Plan/Status entry styles (base integration 618f561).
+  - *Prompt nudge*: `TABLE_HELP` "## Presenting data" section in the full system prompt (pipe tables for object lists/stats/schedules) + a "tables ARE terse" rule in `TERSE_STYLE_HELP`; brief local prompt untouched (GBNF-constrained draft/question/plan forms — tables come from cloud models and `report`).
+  - *Copy*: right-click "Copy message" on User/Deck/Question/Plan bubbles copies the RAW markdown source (`entry_copy_text`), so pasted tables stay tables.
+  - Tests: prompt-nudge + terse-interaction tests, `entry_copy_text` unit test, `chat_markdown_table` kittest preview snapshots (dark + light).
+
 ## Performance (planned 2026-09-02)
 
 - [ ] **M-perf** — parallelize hot loops with rayon (MIT/Apache, deterministic, replay-safe), GPU compute only if profiling still hurts after:

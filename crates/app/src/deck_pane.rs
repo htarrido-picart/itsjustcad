@@ -175,6 +175,35 @@ fn chat_is_empty(transcript: &[Entry], streaming: &str) -> bool {
     transcript.is_empty() && streaming.trim().is_empty()
 }
 
+/// The RAW text a transcript entry yields when copied — the original markdown
+/// source, not the rendered layout, so a pasted table/emphasis survives as
+/// markdown (M-chatmd). `None` = nothing sensible to copy (the Commands card
+/// has its own detail pane).
+fn entry_copy_text(entry: &Entry) -> Option<String> {
+    match entry {
+        Entry::User(t) | Entry::Deck(t) | Entry::Status(t) => Some(t.clone()),
+        Entry::Question(q) => Some(q.clone()),
+        Entry::Plan(p) => Some(p.checklist()),
+        Entry::Commands(_) => None,
+    }
+}
+
+/// Attach a right-click "Copy message" menu to a transcript bubble. The frame
+/// response only senses hover, so re-interact for clicks first; the menu
+/// copies the RAW markdown (see [`entry_copy_text`]). A `None` raw (the
+/// Commands card) attaches nothing.
+fn attach_copy_menu(response: &egui::Response, raw: Option<String>) {
+    let Some(raw) = raw else { return };
+    response
+        .interact(egui::Sense::click())
+        .context_menu(move |ui| {
+            if ui.button("Copy message").clicked() {
+                ui.ctx().copy_text(raw.clone());
+                ui.close();
+            }
+        });
+}
+
 /// A raised WHITE chip frame with a soft shadow (dark-neutral in dark mode).
 /// Used for the header controls — the "LLM" button and the deck/model selectors
 /// — so they read as raised buttons on the white dock. Wrap a widget in this and
@@ -2944,7 +2973,7 @@ impl DeckPane {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Min),
                                         |ui| {
-                                            egui::Frame::NONE
+                                            let r = egui::Frame::NONE
                                                 .fill(user_bg)
                                                 .corner_radius(bubble_radius)
                                                 .inner_margin(egui::Margin::symmetric(10, 6))
@@ -2962,6 +2991,7 @@ impl DeckPane {
                                                         egui::RichText::new(t).color(user_txt),
                                                     );
                                                 });
+                                            attach_copy_menu(&r.response, entry_copy_text(entry));
                                         },
                                     );
                                 }
@@ -2970,7 +3000,7 @@ impl DeckPane {
                                     ui.with_layout(
                                         egui::Layout::left_to_right(egui::Align::Min),
                                         |ui| {
-                                            egui::Frame::NONE
+                                            let r = egui::Frame::NONE
                                                 .fill(deck_bg)
                                                 .corner_radius(bubble_radius)
                                                 .inner_margin(egui::Margin::symmetric(10, 6))
@@ -2984,6 +3014,9 @@ impl DeckPane {
                                                         t.trim(),
                                                     );
                                                 });
+                                            // Copy yields the RAW markdown, not
+                                            // the rendered layout.
+                                            attach_copy_menu(&r.response, entry_copy_text(entry));
                                         },
                                     );
                                 }
@@ -3008,7 +3041,7 @@ impl DeckPane {
                                     ui.with_layout(
                                         egui::Layout::left_to_right(egui::Align::Min),
                                         |ui| {
-                                            egui::Frame::NONE
+                                            let r = egui::Frame::NONE
                                                 .fill(deck_bg)
                                                 .stroke(egui::Stroke::new(1.5, ACCENT))
                                                 .corner_radius(bubble_radius)
@@ -3024,13 +3057,14 @@ impl DeckPane {
                                                     );
                                                     ui.label(egui::RichText::new(q));
                                                 });
+                                            attach_copy_menu(&r.response, entry_copy_text(entry));
                                         },
                                     );
                                 }
                                 Entry::Plan(plan) => {
                                     // Plan checklist: monospace card so the
                                     // [x]/[ ]/[!] marks align.
-                                    egui::Frame::group(ui.style())
+                                    let r = egui::Frame::group(ui.style())
                                         .inner_margin(egui::Margin::same(
                                             crate::theme::Spacing::S as i8,
                                         ))
@@ -3044,6 +3078,7 @@ impl DeckPane {
                                                     .monospace(),
                                             );
                                         });
+                                    attach_copy_menu(&r.response, entry_copy_text(entry));
                                 }
                             }
                             ui.add_space(crate::theme::Spacing::XS);
@@ -3527,6 +3562,57 @@ mod side_effect_gate_tests {
         };
         snapshot_pane("chat_conversation", build(), true, ());
         snapshot_pane("chat_conversation_light", build(), false, ());
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to (re)generate chat previews"]
+    fn chat_preview_markdown_table() {
+        // M-chatmd headline: a pipe-syntax table (the `report` verb's natural
+        // output shape) renders as a striped grid, plus the rest of the
+        // markdown subset in one transcript.
+        let build = || {
+            let mut p = ready_pane();
+            p.transcript = vec![
+                Entry::User("give me the sun-hours report as a table".into()),
+                Entry::Deck(
+                    "### Sun hours\n\
+                     | Face | Min | Avg | Max |\n\
+                     |------|----:|----:|----:|\n\
+                     | North | 0.5 | 1.2 | 2.0 |\n\
+                     | South | 6.1 | 8.4 | 9.9 |\n\n\
+                     The **north** face is the shade risk — see `report sunhours`.\n\n\
+                     - terrace: south\n\
+                     - storage: north"
+                        .into(),
+                ),
+                Entry::Status("turn done in 1.4s".into()),
+            ];
+            p
+        };
+        snapshot_pane("chat_markdown_table", build(), true, ());
+        snapshot_pane("chat_markdown_table_light", build(), false, ());
+    }
+
+    #[test]
+    fn entry_copy_text_yields_raw_markdown() {
+        // Copying a bubble must give back the ORIGINAL markdown source (so a
+        // pasted table stays a table), never a rendered/flattened form.
+        let md = "| a | b |\n|---|---|\n| 1 | 2 |";
+        assert_eq!(entry_copy_text(&Entry::Deck(md.into())).as_deref(), Some(md));
+        assert_eq!(
+            entry_copy_text(&Entry::User("**hi**".into())).as_deref(),
+            Some("**hi**")
+        );
+        assert_eq!(
+            entry_copy_text(&Entry::Question("how tall?".into())).as_deref(),
+            Some("how tall?")
+        );
+        // The commands card opens its own detail pane instead.
+        assert_eq!(entry_copy_text(&Entry::Commands(Vec::new())), None);
+        // A plan copies as its checklist text.
+        let plan = itsjustcad_deck::parse_plan("PLAN:\n1. slab\n2. cores").unwrap();
+        let copied = entry_copy_text(&Entry::Plan(plan)).unwrap();
+        assert!(copied.contains("slab") && copied.contains("cores"), "{copied}");
     }
 
     #[test]
