@@ -527,6 +527,96 @@ pub fn find_sinks(positions: &[DVec3], faces: &[[u32; 3]]) -> Vec<usize> {
         .collect()
 }
 
+// ─── hardscape (site paths) ──────────────────────────────────────────────────
+
+/// Resample a polyline at (close to) `step` spacing: `ceil(len/step)` equal
+/// arclength intervals including both endpoints (closed curves get the seam
+/// point at both ends). Deterministic.
+pub fn sample_polyline(points: &[DVec3], closed: bool, step: f64) -> Vec<DVec3> {
+    if points.len() < 2 || step <= 0.0 || !step.is_finite() {
+        return points.to_vec();
+    }
+    let mut pts: Vec<DVec3> = points.to_vec();
+    if closed {
+        pts.push(points[0]);
+    }
+    let seg_lens: Vec<f64> = pts.windows(2).map(|w| (w[1] - w[0]).length()).collect();
+    let total: f64 = seg_lens.iter().sum();
+    if total < 1e-12 {
+        return vec![pts[0]];
+    }
+    let n = (total / step).ceil().max(1.0) as usize;
+    let mut out = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let mut target = total * i as f64 / n as f64;
+        let mut p = *pts.last().unwrap();
+        for (k, len) in seg_lens.iter().enumerate() {
+            if target <= *len || k == seg_lens.len() - 1 {
+                let t = if *len > 1e-12 { (target / len).min(1.0) } else { 0.0 };
+                p = pts[k] + (pts[k + 1] - pts[k]) * t;
+                break;
+            }
+            target -= len;
+        }
+        out.push(p);
+    }
+    out
+}
+
+/// Constant-width ribbon along a sampled centerline: ±width/2 offsets
+/// perpendicular (in plan) to the local direction, stitched into a triangle
+/// strip. Returns `(positions, faces)`; positions alternate left/right.
+pub fn ribbon(samples: &[DVec3], width: f64) -> (Vec<DVec3>, Vec<[u32; 3]>) {
+    let n = samples.len();
+    if n < 2 || width <= 0.0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut pos = Vec::with_capacity(2 * n);
+    let mut last_perp = DVec3::new(0.0, 1.0, 0.0);
+    for i in 0..n {
+        // Central difference in plan; falls back to the previous direction on
+        // a degenerate (vertical / duplicate) step.
+        let d = samples[(i + 1).min(n - 1)] - samples[i.saturating_sub(1)];
+        let plan = (d.x * d.x + d.y * d.y).sqrt();
+        let perp = if plan > 1e-12 {
+            DVec3::new(-d.y / plan, d.x / plan, 0.0)
+        } else {
+            last_perp
+        };
+        last_perp = perp;
+        pos.push(samples[i] + perp * (width / 2.0));
+        pos.push(samples[i] - perp * (width / 2.0));
+    }
+    let mut faces = Vec::with_capacity(2 * (n - 1));
+    for i in 0..(n as u32 - 1) {
+        let (l0, r0, l1, r1) = (2 * i, 2 * i + 1, 2 * i + 2, 2 * i + 3);
+        faces.push([l0, r0, r1]);
+        faces.push([l0, r1, l1]);
+    }
+    (pos, faces)
+}
+
+/// Accessible-slope check along a sampled path: `(max_slope, steep_segments)`
+/// where slope is rise-over-run between consecutive samples and segments
+/// steeper than `limit` (e.g. 1/12) are counted. Advisory only.
+pub fn path_slope_check(samples: &[DVec3], limit: f64) -> (f64, usize) {
+    let mut max_slope = 0.0f64;
+    let mut steep = 0usize;
+    for w in samples.windows(2) {
+        let run = (w[1] - w[0]).truncate().length();
+        let rise = (w[1].z - w[0].z).abs();
+        if run < 1e-12 {
+            continue;
+        }
+        let s = rise / run;
+        max_slope = max_slope.max(s);
+        if s > limit {
+            steep += 1;
+        }
+    }
+    (max_slope, steep)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,6 +915,58 @@ mod tests {
         // A uniform slope drains off the edge — no interior minima.
         let (pos2, faces2) = grid_terrain(10, 10.0, |x, _| x / 2.0);
         assert!(find_sinks(&pos2, &faces2).is_empty());
+    }
+
+    #[test]
+    fn sample_polyline_even_spacing_and_endpoints() {
+        let pts = vec![DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0)];
+        let s = sample_polyline(&pts, false, 0.5);
+        assert_eq!(s.len(), 21, "10 m at 0.5 m → 20 intervals + both ends");
+        assert_eq!(s[0], pts[0]);
+        assert_eq!(*s.last().unwrap(), pts[1]);
+        for w in s.windows(2) {
+            assert!(((w[1] - w[0]).length() - 0.5).abs() < 1e-9);
+        }
+        // Closed square: seam included, corners survive resampling arclength.
+        let sq = vec![
+            DVec3::ZERO,
+            DVec3::new(4.0, 0.0, 0.0),
+            DVec3::new(4.0, 4.0, 0.0),
+            DVec3::new(0.0, 4.0, 0.0),
+        ];
+        let s2 = sample_polyline(&sq, true, 1.0);
+        assert_eq!(s2.len(), 17, "16 m perimeter at 1 m");
+        assert_eq!(s2[0], *s2.last().unwrap(), "closed seam");
+    }
+
+    #[test]
+    fn ribbon_width_and_face_count() {
+        let center = vec![
+            DVec3::ZERO,
+            DVec3::new(5.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 1.0),
+        ];
+        let (pos, faces) = ribbon(&center, 2.0);
+        assert_eq!(pos.len(), 6, "left/right pair per sample");
+        assert_eq!(faces.len(), 4, "two triangles per span");
+        // Straight-in-plan centerline → edges at y = ±1.
+        for pair in pos.chunks(2) {
+            assert!((pair[0].y - 1.0).abs() < 1e-9 && (pair[1].y + 1.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn path_slope_check_flags_only_steep_runs() {
+        // 12 m of run rising 1 m → exactly 1:12, NOT flagged (limit is >).
+        let ok = vec![DVec3::ZERO, DVec3::new(12.0, 0.0, 1.0)];
+        let (max_s, steep) = path_slope_check(&ok, 1.0 / 12.0);
+        assert!((max_s - 1.0 / 12.0).abs() < 1e-12);
+        assert_eq!(steep, 0, "exactly at the limit passes");
+        // 5 m rising 1 m → 1:5, flagged.
+        let bad = vec![DVec3::ZERO, DVec3::new(5.0, 0.0, 1.0), DVec3::new(10.0, 0.0, 1.0)];
+        let (max_b, steep_b) = path_slope_check(&bad, 1.0 / 12.0);
+        assert!((max_b - 0.2).abs() < 1e-12);
+        assert_eq!(steep_b, 1, "only the first leg is steep");
     }
 
     #[test]

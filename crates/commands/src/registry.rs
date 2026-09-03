@@ -702,6 +702,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "sitepath",
+            usage: "sitepath <curve-selector> <width>",
+            summary: "Hardscape path: a <width>-wide ribbon mesh following the selected curve (line, polyline, arc, circle...), draped onto the terrain surface, on layer 'hardscape'. Reports the max grade and warns where it exceeds the 1:12 accessible slope — advisory, not a code check. Example: sitepath last 1.5",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "osmfile",
             usage: "osmfile <path.json>",
             summary: "Build OpenStreetMap building context from a saved Overpass API JSON export ('out geom;' query): each building-tagged way footprint is extruded (height tag, else building:levels x 3 m, else 9 m) into a mesh on layer 'context'. lon/lat projected to local meters when a location is set. Example: osmfile /tmp/overpass.json",

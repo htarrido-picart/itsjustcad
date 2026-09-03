@@ -3594,6 +3594,108 @@ fn exec_ponding(
     ))
 }
 
+/// Hardscape path: a constant-width ribbon mesh following the selected curve,
+/// draped onto the terrain (where present), with an accessible-slope advisory
+/// (warns past 1:12). Deterministic function of the scene + params.
+fn exec_site_path(
+    doc: &mut Document,
+    targets: Selector,
+    width: f64,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    if width <= 0.0 || !width.is_finite() {
+        return Err(ExecError::Invalid("sitepath width must be > 0".into()));
+    }
+    let target_ids = resolve(doc, &targets)?;
+    let curve = target_ids
+        .iter()
+        .find_map(|id| match doc.get(*id).map(|o| &o.geometry) {
+            Some(Geometry::Curve(c)) => Some(c.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            ExecError::Invalid(
+                "sitepath needs a selected curve (draw a line/polyline/arc first)".into(),
+            )
+        })?;
+    let centerline = crate::landscape::sample_polyline(
+        &curve.tessellate(PROFILE_TOL),
+        curve.is_closed(),
+        0.5,
+    );
+    if centerline.len() < 2 {
+        return Err(ExecError::Invalid("sitepath curve has no length".into()));
+    }
+    // Drape onto the terrain surface where the path crosses it (2 cm wear
+    // course above grade); off-terrain samples keep the curve's own z.
+    let terrain = terrain_surface(doc).ok().map(|(_, m)| (m.positions().to_vec(), m.faces().to_vec()));
+    let mut draped_n = 0usize;
+    let draped: Vec<DVec3> = centerline
+        .iter()
+        .map(|p| match &terrain {
+            Some((pos, faces)) => {
+                match crate::landscape::terrain_z_at(pos, faces, p.x, p.y) {
+                    Some(z) => {
+                        draped_n += 1;
+                        DVec3::new(p.x, p.y, z + 0.02)
+                    }
+                    None => *p,
+                }
+            }
+            None => *p,
+        })
+        .collect();
+    const ACCESS_LIMIT: f64 = 1.0 / 12.0;
+    let (max_slope, steep) = crate::landscape::path_slope_check(&draped, ACCESS_LIMIT);
+    let (positions, faces) = crate::landscape::ribbon(&draped, width);
+    let length: f64 = draped.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == 1 => ids,
+        _ => vec![ObjectId::new()],
+    };
+    let mut layers_created = Vec::new();
+    if !doc.layers.contains_key("hardscape") {
+        doc.layers.insert(
+            "hardscape".to_string(),
+            LayerStyle { color: Some([0.62, 0.60, 0.56, 1.0]), ..LayerStyle::default() },
+        );
+        layers_created.push("hardscape".to_string());
+    }
+    doc.insert(SceneObject {
+        visible: true,
+        id: new_ids[0],
+        name: Some("sitepath".to_string()),
+        layer: "hardscape".to_string(),
+        color: None,
+        material: None,
+        lineweight_mm: None,
+        geometry: Geometry::Mesh(kernel_mesh::Mesh::new(positions, faces)),
+    });
+    doc.generation += 1;
+
+    let drape_note = if draped_n > 0 { " draped onto terrain" } else { "" };
+    let slope_note = if steep > 0 {
+        format!(
+            "; WARNING: {steep} segment(s) exceed the 1:12 accessible slope \
+             (steepest 1:{:.0}) — advisory, not a code check",
+            1.0 / max_slope
+        )
+    } else {
+        format!("; grade within 1:12 throughout (steepest {max_slope:.3} rise/run) — advisory")
+    };
+    Ok((
+        Command::SitePath { targets, width, ids: Some(new_ids.clone()) },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome {
+            message: format!(
+                "sitepath: {length:.1} m x {width} m ribbon{drape_note} on 'hardscape'{slope_note}"
+            ),
+            created: new_ids,
+        },
+    ))
+}
+
 /// Sun-path diagram: the yearly sun-path dome for the document's location as
 /// open polylines on a golden `sunpath` layer — seven date arcs (Dec 21 → Jun
 /// 21; Jul–Nov retrace them), analemma-style hour curves, plus a horizon
@@ -6613,6 +6715,7 @@ fn apply_forward(
         Command::CutFill { original_z } => exec_cutfill(doc, original_z),
         Command::FlowArrows { n, ids } => exec_flow_arrows(doc, n, ids),
         Command::Ponding { ids } => exec_ponding(doc, ids),
+        Command::SitePath { targets, width, ids } => exec_site_path(doc, targets, width, ids),
         Command::SunOff => {
             let prev = doc.sun.take();
             doc.generation += 1;
@@ -8057,6 +8160,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::PlantSchedule { .. } => "plantschedule",
         Command::FlowArrows { .. } => "flowarrows",
         Command::Ponding { .. } => "ponding",
+        Command::SitePath { .. } => "sitepath",
         Command::ViewSave { .. } => "view save",
         Command::ViewRestore { .. } => "view",
         Command::ViewList => "view list",
@@ -14067,6 +14171,56 @@ mod tests {
         run(&mut s, "undo");
         assert_eq!(s.doc.len(), before, "both overlays removed");
         assert!(!s.doc.layers.contains_key("analysis"), "auto layer dropped");
+    }
+
+    #[test]
+    fn sitepath_on_slope_warns_on_flat_does_not() {
+        // z = x/2 (1:2 grade). A path running up the fall line must warn.
+        let mut s = terrain_session(20, 20.0, |x, _| x / 2.0);
+        run(&mut s, "line 2,10,0 18,10,0");
+        let out = run(&mut s, "sitepath last 1.5");
+        assert!(out.message.contains("WARNING"), "{}", out.message);
+        assert!(out.message.contains("1:12"), "{}", out.message);
+        assert!(out.message.contains("advisory"), "{}", out.message);
+        let obj = s.doc.get(out.created[0]).unwrap();
+        assert_eq!(obj.layer, "hardscape");
+        let Geometry::Mesh(m) = &obj.geometry else { panic!("ribbon must be a mesh") };
+        // Draped: ribbon z follows the terrain (+2 cm), so x=10 sits near 5.
+        let mid = m
+            .positions()
+            .iter()
+            .find(|p| (p.x - 10.0).abs() < 0.3)
+            .expect("sample near x=10");
+        assert!((mid.z - 5.02).abs() < 0.2, "draped onto terrain, got {}", mid.z);
+
+        // A contour-following path (constant elevation) does not warn.
+        run(&mut s, "line 10,2,0 10,18,0");
+        let out2 = run(&mut s, "sitepath last 1.5");
+        assert!(!out2.message.contains("WARNING"), "{}", out2.message);
+        assert!(out2.message.contains("within 1:12"), "{}", out2.message);
+    }
+
+    #[test]
+    fn sitepath_without_curve_errors_and_replays() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2");
+        let err = s.run(parse("sitepath last 1").unwrap()).unwrap_err();
+        assert!(format!("{err}").contains("curve"), "{err}");
+        // Flat ground, no terrain: path still builds and replays stably.
+        run(&mut s, "line 0,5,0 20,5,0");
+        run(&mut s, "sitepath last 2");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "sitepath must replay bit-identically"
+        );
+        // Undo drops the ribbon and the auto-created layer.
+        let n = s.doc.len();
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), n - 1);
+        assert!(!s.doc.layers.contains_key("hardscape"));
     }
 
     #[test]

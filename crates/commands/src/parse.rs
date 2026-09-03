@@ -1060,6 +1060,16 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("ponding", &args, &args)?;
             Ok(Command::Ponding { ids: None })
         }
+        "sitepath" => {
+            // Exactly one path curve, so 'last' never takes a count: a bare
+            // number after it is the width, not an object count (like revolve).
+            let (targets, rest) = match args.split_first() {
+                Some((&"last", rest)) => (Selector::Last { n: 1 }, rest),
+                _ => selector(&args, "sitepath")?,
+            };
+            let [width] = take::<1>("sitepath", "a path width after the selector", rest)?;
+            Ok(Command::SitePath { targets, width: number(width)?, ids: None })
+        }
         "view" => match args.as_slice() {
             ["save", name] => Ok(Command::ViewSave {
                 name: (*name).to_string(),

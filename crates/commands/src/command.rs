@@ -982,6 +982,16 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Hardscape path: a `width`-wide ribbon mesh following the selected
+    /// curve, draped onto the terrain surface, on layer "hardscape". Warns
+    /// where the draped grade exceeds 1:12 (accessible-slope advisory).
+    /// Logged with a written-back id.
+    SitePath {
+        targets: Selector,
+        width: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// A raw triangle mesh carried verbatim in the op-log. Used by mesh import
     /// (.obj/.stl/.gltf/.glb) so each imported object is one self-contained
     /// logged op — no external file dependency on replay. Not exposed in the
