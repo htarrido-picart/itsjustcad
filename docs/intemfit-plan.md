@@ -60,13 +60,27 @@ assumption you'd otherwise make, his answers win.
 - **"No subdivision"** mode (block stays one parcel).
 - **Loose / highly irregular** lots (that's why Irregularity caps at 0.4).
 - **Automatic "reserve N% open space."** He wants *named features placed*, not a blind percentage. Do NOT implement percentage-reservation.
+- **Voronoi** street/lot networks — RESOLVED from the actual form (2026-09-03): Q6 asks "any pattern you'd never use?" and he wrote **"Voronoi"**. It's a rejection, not a request. Do not build it.
+
+### Form verified against the real questionnaire (2026-09-03)
+
+The 4-page `subdivision-visual-picker.pdf` (Manuel's marks) confirms every §1 row
+above. Notable exacts: Q2 circled **all three** sizes (small/medium/large → full
+parameter range, no fixed target); Q7 marked **all six** lot rules incl. flag/panhandle;
+Q10 marked front/side/rear/build-to/buildable-envelope (not "lot lines are enough");
+Q11 marked park/greenway/pond/tree-save (NOT %-reserve, NOT "I place them"). Q9
+("anything wrong about lots") and Q14 ("missing on day one") were left blank.
 
 ### Open questions — resolve with Manuel before Phase 5/6
 
-1. **Voronoi** — written in the "never use" box, but ambiguous (may be a request; he left hexagonal unmarked, which Voronoi resembles). **Ask before building anything Voronoi.** If wanted, it's a new algorithm, not a variant.
-2. **"What's missing on day one"** — left blank. Follow up.
-3. **Lot width mix** — need his product list (e.g. 40/50/60 ft) + proportions, and whether the mix is a hard ratio or soft preference. Algorithm shape depends on it.
-4. **Alley dimensions** — ROW width + whether alleys are required on every block or only some.
+1. **"What's missing on day one"** (Q14) — left blank on the form. Follow up separately.
+2. **Lot width mix** — the form confirms he wants a width *mix* but not the product list.
+   Need his actual products (e.g. 40/50/60 ft) + proportions, and whether the mix is a
+   hard ratio or soft preference. Algorithm shape depends on it. (Not asked on this form.)
+3. **Alley dimensions** — ROW width + whether alleys are required on every block or only
+   some. (Not asked on this form.)
+4. **Flag-lot area accounting** — confirm the pole area is excluded from countable lot
+   area (§7.4).
 
 ---
 
@@ -443,4 +457,5 @@ tool. Get Phase 3 into his hands early and let his reaction reorder everything a
 1. **Confirm `i_overlay` polygon offset** (inward/outward buffer) quality — Phase-1 gate.
 2. **Locate the Python prototype** — the plan references `/prototype/python`; it is not
    yet in this repo. Get it from Manuel/source before Phase 3 (port target).
-3. **Manuel's §1 open questions** (Voronoi, width-mix products, alley dims, day-one).
+3. **Manuel's §1 open questions** (width-mix products, alley dims, day-one, flag-lot
+   area accounting). Voronoi is now resolved — ruled out.
