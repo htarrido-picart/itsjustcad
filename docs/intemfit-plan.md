@@ -73,11 +73,18 @@ capability. These were "ruled out" by Manuel but are **in scope as tool features
   Non-rectilinear like radial/hex. **We can derive it as the dual of our existing
   Bowyer-Watson Delaunay** (`kernel-mesh::triangulate`) — circumcenters of adjacent
   triangles are the Voronoi vertices — so no new geometry dep. Phase 5b with radial/hex.
+- **Blind %-reserve open space** — owner-requested 2026-09-04 as an **opt-in keyword**,
+  NOT the default. `lotopenspace reserve=<pct>` pulls whole blocks out of subdivision
+  until ~pct of the *site* is open, biggest-and-most-central first (CityEngine's model:
+  open space = a block you chose not to subdivide). Default stays feature-placement
+  (`type=park|greenway|pond|treesave`, Manuel's preference); reserve is a separate mode
+  a user asks for by keyword. Reserved blocks are tagged so `lotreport` nets them out
+  (§11). `reserve=0` (default) = off.
 
 ### Explicitly ruled out — do not build
 
-- **"No subdivision"** mode (block stays one parcel) — not requested by anyone.
-- **Automatic "reserve N% open space."** Manuel wants *named features placed*, not a blind percentage. Do NOT implement percentage-reservation.
+- **"No subdivision"** mode (whole site stays one parcel) — not requested by anyone.
+  (Distinct from reserve, which excludes *selected blocks*, not the entire site.)
 
 ### Form verified against the real questionnaire (2026-09-03)
 
@@ -301,6 +308,9 @@ pub struct SubdivisionSettings {
     pub setback_rear: f64,   // 20
     pub build_to_line: f64,  // 0 = disabled
     pub draw_buildable_envelope: bool, // true
+
+    // Open space (Phase 9)
+    pub open_space_reserve_frac: f64,  // 0.0 = off (feature-placement default); >0 = blind %-reserve mode (owner opt-in)
 }
 
 pub struct LotWidthMix {
@@ -444,7 +454,14 @@ Every subdivision algorithm must pass these block shapes:
 - **Phase 7** — skeleton output on the cul-de-sac + curved-street blocks visually matches
   the questionnaire reference diagrams.
 - **Phase 8** — setbacks + buildable envelopes render per lot; frontage at setback line.
-- **Phases 9–12** — as specified; re-scope with Manuel before Phase 10.
+- **Phase 9** — feature placement (`type=park|greenway|pond|treesave`) works; the
+  opt-in `reserve=<pct>` mode excludes whole blocks until ~pct of the site is open,
+  central-and-large first, and tags them as open space. Default (`reserve=0`) unchanged.
+- **Phase 11** — `lotreport` reports yield on **net developable area** (site minus
+  open-space features AND reserved blocks), not gross — a gross number lies once open
+  space exists. Report both gross and net so the ratio is visible. Option comparison
+  diffs two settings runs.
+- **Phases 10, 12** — as specified; re-scope with Manuel before Phase 10.
 
 ---
 
@@ -462,8 +479,8 @@ registry-registered, deck-callable, GBNF-grammared, logged + undoable.
 | `lotsetbacks` | lots | front, side, rear, buildto, envelope |
 | `lotfrontage` | lots | at=setback\|curb (default setback) |
 | `lotmergeslivers` | lots | threshold |
-| `lotopenspace` | region | type=park\|greenway\|pond\|treesave, area |
-| `lotreport` | lots/site | → AnalysisReport (yield: lot count, avg area, frontage) |
+| `lotopenspace` | region | type=park\|greenway\|pond\|treesave, area · OR reserve=<pct> (owner opt-in blind %) |
+| `lotreport` | lots/site | → AnalysisReport (yield: lot count, avg area, frontage, **net-of-open-space**) |
 | `lotsettings` | none | show/set the sticky SubdivisionSettings |
 
 - **Preview**: `preview=yes` draws the result through the viewport overlay as args
