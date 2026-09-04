@@ -121,6 +121,8 @@ pub fn loft_profiles_guided(
             .expect("n >= 3");
         for j in 0..total {
             let offset = g[j] - base[j][attach];
+            // k is used arithmetically (ring distance) as well as to index warped.
+            #[allow(clippy::needless_range_loop)]
             for k in 0..n {
                 let d = {
                     let raw = (k as isize - attach as isize).unsigned_abs();

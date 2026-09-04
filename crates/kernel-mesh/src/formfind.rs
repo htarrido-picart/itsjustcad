@@ -294,6 +294,9 @@ pub fn force_density(net: &mut Network, max_sweeps: usize, tol: f64) -> RelaxRep
     while iters < max_sweeps {
         iters += 1;
         let mut max_step = 0.0f64;
+        // Gauss–Seidel sweep: reads/writes net.positions[i] in place while
+        // indexing four parallel arrays — an iterator rewrite would obscure it.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             if net.fixed[i] {
                 continue;
@@ -320,6 +323,8 @@ pub fn force_density(net: &mut Network, max_sweeps: usize, tol: f64) -> RelaxRep
     }
     // Residual: out-of-balance force under the force-density model.
     let mut max_res = 0.0f64;
+    // Indexes net.{fixed,loads,positions} + adj together; keep the range loop.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         if net.fixed[i] {
             continue;

@@ -130,6 +130,9 @@ pub fn solve_document(doc: &Document) -> Result<SolveReport, ExecError> {
         doc: &Document,
         id: ObjectId,
     ) -> Option<&'a SketchEntity> {
+        // Not an `entry` case: the insert branch also mutably borrows `sk` and
+        // can bail with `return None`, which the entry API can't express cleanly.
+        #[allow(clippy::map_entry)]
         if !entities.contains_key(&id) {
             match doc.get(id).map(|o| &o.geometry) {
                 Some(Geometry::Curve(Curve::Line { a, b })) => {
@@ -536,7 +539,10 @@ fn unsupported_for(
     ))
 }
 
-fn line_endpoints(doc: &Document, id: ObjectId) -> Result<((f64, f64), (f64, f64)), ExecError> {
+/// Planar endpoints of a line: `((ax, ay), (bx, by))`.
+type LineEnds = ((f64, f64), (f64, f64));
+
+fn line_endpoints(doc: &Document, id: ObjectId) -> Result<LineEnds, ExecError> {
     match doc.get(id).map(|o| &o.geometry) {
         Some(Geometry::Curve(Curve::Line { a, b })) => Ok(((a.x, a.y), (b.x, b.y))),
         _ => Err(unsupported(doc, id)),
