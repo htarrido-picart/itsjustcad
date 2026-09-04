@@ -121,3 +121,24 @@ the op-log — the plugin is only a convenience layer over the substrate.
   manifests are written `0600` (owner-only) on Unix.
 * A malformed manifest is skipped with a clear warning — it never crashes the
   app or blocks other plugins from loading.
+
+## Other data-driven, LLM-authorable content
+
+Plugins are one instance of a wider pattern: user-editable JSON data that the
+substrate reads and the deck can author on request, never native code.
+
+* **Compliance check packs** (`*.checks.json`, in
+  `~/.config/itsjustcad/checks/`) are the same idea for `codecheck`: a named list
+  of rules — id, code reference, severity, a target query, a geometric predicate,
+  a threshold, and a message. The embedded `demo`, `ibc2021`, and `ada2010` packs
+  ship built in; drop your own in the directory (or `checkrules load <path>`),
+  then `codecheck <name>`. The deck can draft a pack for you and have you save it.
+  These are advisory pre-checks only — never a code review.
+* **The plant catalog** (`crates/commands/assets/plants.json`) is data too — each species is
+  botanical/common name, mature size, canopy, growth rate, deciduous flag,
+  climate zones, native regions, and plan symbol. New species are data, not code,
+  and packs are user-extendable the same way.
+* **Blocks** (`.block.json` in `~/.config/itsjustcad/blocks/`) capture reusable
+  geometry — including parametric (dynamic) blocks with named params. Manage them
+  with `block` / `insert` / `pblock` / `param` / `blocklib` / `blockload` /
+  `blocksave` / `blockdelete`.

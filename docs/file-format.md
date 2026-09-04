@@ -52,11 +52,24 @@ See the `option` command for switching between branches.
 
 ## What is and is not logged
 
-**Logged** (mutates model state): every geometry and annotation command.
+**Logged** (mutates model state): every geometry and annotation command — including the newer domains: landscape ops (`terrain`, `contours`, `pad`, `plant`, `plantrow`, `miyawaki`, `sitepath`), structural members (`beam`, `column`, `slab`, `wall`, `grid`, `story`, `load`, `support`), `room` tags, `codecheck` runs, and `constrain`.
 
-**Not logged** (I/O or queries): `select`, `print`, `export`, `import`, `distance`, `area`, `volume`, `bbox`, `undo`, `redo`, `amend`, `option`.
+**Not logged** (I/O or queries): `select`, `print`, `export`, `import`, `distance`, `area`, `volume`, `bbox`, `schedule`, `report`, `plantcatalog`, `rooms`, `undo`, `redo`, `amend`, `option`. View / camera / UI verbs (display, lighting, camera, panels, basemap, `plantsymbols`) and privacy/accessibility toggles (`chatencryption`, `reducemotion`) are session/UI state and are never logged either.
 
-`import` is the notable exception: DXF import expands each entity into its equivalent substrate op (`line`, `polyline`, etc.) which *are* logged. The `import` command itself is not logged, so replay never re-reads the source file.
+`import` is the notable exception: DXF import expands each entity into its equivalent substrate op (`line`, `polyline`, etc.) which *are* logged. The `import` command itself is not logged, so replay never re-reads the source file. The same "expand once, replay disk-free" pattern applies to `terrain`, `codecheck`, `cutfill`, and `radiation` — the resolved data (mesh, rule set + marker ids, pre-grading heights, EPW irradiance bins) is embedded in the logged op so replay never needs the original file.
+
+---
+
+## Derived document fields
+
+Beyond the `ops` array, a file carries a few small pieces of derived-but-persisted state, all `#[serde(default)]` for back-compat (older files simply omit them):
+
+- **`rooms`** — tagged occupancy regions (name, IBC use group, area, boundary) for IBC egress checks.
+- **`param_blocks` / block definitions** — dynamic (parametric) blocks and captured block definitions; instances re-derive geometry from the template.
+- **`compliance_reports`** — the per-rule verdicts from `codecheck`, served by `report codecheck`. Each carries the advisory-pre-check disclaimer in its context.
+- **analysis reports** — the compact structured summaries stored by environmental and landscape studies (`sunhours`, `facesunhours`, `radiation`, `shadowstudy`, `cutfill`, `plantschedule`, `flowarrows`, `ponding`, `miyawaki`), served by `report`. Regenerated on replay.
+
+Compliance and analysis reports are summaries for critique, never certified results — the app never claims to analyse or certify.
 
 ---
 
