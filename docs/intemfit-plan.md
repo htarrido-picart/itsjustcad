@@ -479,11 +479,29 @@ Every subdivision algorithm must pass these block shapes:
   no drift; boolean union/intersection/difference pass. 10 sample blocks in
   `samples/blocks/*.json` (§8 cases 1–10; #11/#12/#13 deferred to Phase 5b). 31 unit +
   7 §8 integration tests green; clippy clean.
-- **Phase 2** — `lotsubdivide` runs from command line + deck; settings sticky across
-  save/reload (serde on the doc); preview draws through the viewport overlay and bakes
-  nothing until commit; verb registered (GBNF + palette). Runs headless (no GUI needed).
-- **Phase 3** — recursive OBB passes all §8 assertions on all 10 blocks. **Send a build
-  to Manuel here.**
+- **Phase 2** — ✅ **DONE (2026-09-04).** `lotsubdivide` + `lotsettings` run from the
+  command line + deck (registry-registered → GBNF auto-derives + palette). Settings are
+  sticky across save/reload (`Document::subdivision_settings`, serde-default so
+  pre-intemfit files load; logged so replay reproduces them). The bridge
+  (`commands/src/lot.rs`) converts closed doc curves ↔ `Polygon2d`; `perimeter`/
+  `streetfollowing` return a clear "not yet implemented (Phase 4/7)" error, never a
+  panic. Runs fully headless. **Preview overlay: SKIPPED for this milestone** — the verb
+  bakes on run (acceptable per the plan's "bake-on-run is acceptable"); results bake as a
+  logged op with written-back ids (contours precedent) so undo is one `CreatedOnLayer`
+  inverse and replay is byte-identical. A viewport-overlay preview is a cheap later
+  follow-up (draw the same lot polygons before commit).
+- **Phase 3** — ✅ **DONE (2026-09-04).** Recursive OBB (`method=grid`) in
+  `subdivision/src/subdivision/recursive_obb.rs`: min-area OBB → cut along the short axis
+  pivoted on the long-axis midpoint → recurse while area > `lot_area_min`; terminates when
+  area < min OR any child side < `lot_width_min` (a high `lot_width_min` forcing lots
+  above `lot_area_max` is left correct, not "fixed"). Four modifiers: street-access
+  fallback (orthogonal split; every original block edge counts as frontage in Phase 3 —
+  no street graph yet), snap-to-contour-vertex, edge-alignment (OBB hull-edge reference),
+  seed-before-recurse. **Deterministic for a fixed seed** (splitmix64 seeded from a
+  quantized block hash + `settings.seed`) — replay byte-identical (verified by a Session
+  replay test). All §8 assertions pass on all 10 base blocks (`tests/blocks.rs`): area
+  conserved, no overlaps, every lot has a street edge under `force_street_access=1.0`,
+  widths ≥ `lot_width_min` where guaranteed, determinism. **Send a build to Manuel here.**
 - **Phase 4** — offset subdivision passes; degenerate fallbacks verified.
 - **Phase 5** — all four street patterns generate valid non-overlapping blocks on a real
   parcel; every block edge correctly tagged; alley tier generates when requested.
