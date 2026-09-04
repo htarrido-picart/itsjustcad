@@ -44,7 +44,7 @@ assumption you'd otherwise make, his answers win.
 |---|---|
 | Lot patterns | Grid (recursive), Perimeter (offset), Street-following (skeleton). All three. |
 | Lot sizes | Small through large — parameter range, no fixed target |
-| Irregularity | Uniform to moderate only. **Not** "loose." Cap the parameter at 0.4. |
+| Irregularity | Manuel: uniform to moderate, cap 0.4 (his default). Owner adds a `loose` mode unlocking to 1.0 — see owner-scope note below. |
 | Automation | Tool generates roads AND lots from a raw boundary |
 | Street patterns | Orthogonal grid, diagonal/skewed, organic/free-form, cul-de-sac clusters |
 | Lot rules | Width **mix**, independent **depth**, front-loaded, **alley-loaded**, wider corner lots, flag/panhandle lots |
@@ -53,14 +53,26 @@ assumption you'd otherwise make, his answers win.
 | Open space | Pocket parks, greenway/trail corridor, retention pond, tree-save — tool places them |
 | Buildings | Footprints **yes**; roofs + 3D massing **yes** |
 
+### Owner-requested — IN the tool, beyond Manuel's scope (Hector, 2026-09-04)
+
+Manuel's questionnaire scopes *his* defaults; the product owner wants broader tool
+capability. These were "ruled out" by Manuel but are **in scope as tool features**
+(not necessarily Manuel's defaults — ship them, don't force them on his flow):
+
+- **Radial / circular** street networks — a dedicated polar generator. Note: this
+  **breaks the pure-rectilinear assumption**, so recursive-OBB is no longer the *sole*
+  road core — it stays the core for ortho/skewed/organic blocks, while radial needs its
+  own ring+spoke layout. Block subdivision still runs on whatever blocks it emits.
+- **Hexagonal** street networks — a hex-lattice generator (also non-rectilinear).
+- **Loose / highly irregular** lots — the `irregularity` clamp becomes a *soft default*
+  at 0.4 (Manuel's preference) with a "loose" mode unlocking up to 1.0; loose likely
+  needs the organic subdivider (heavy jitter / non-orthogonal splits), not plain OBB.
+
 ### Explicitly ruled out — do not build
 
-- **Radial / circular** street networks — lets the road generator assume rectilinear logic; recursive-OBB stays a valid core.
-- **Hexagonal** street networks.
-- **"No subdivision"** mode (block stays one parcel).
-- **Loose / highly irregular** lots (that's why Irregularity caps at 0.4).
-- **Automatic "reserve N% open space."** He wants *named features placed*, not a blind percentage. Do NOT implement percentage-reservation.
-- **Voronoi** street/lot networks — RESOLVED from the actual form (2026-09-03): Q6 asks "any pattern you'd never use?" and he wrote **"Voronoi"**. It's a rejection, not a request. Do not build it.
+- **"No subdivision"** mode (block stays one parcel) — not requested by anyone.
+- **Automatic "reserve N% open space."** Manuel wants *named features placed*, not a blind percentage. Do NOT implement percentage-reservation.
+- **Voronoi** street/lot networks — RESOLVED from the actual form (2026-09-03): Q6 asks "any pattern you'd never use?" and Manuel wrote **"Voronoi"**; the owner has not re-requested it. Do not build it unless Hector asks.
 
 ### Form verified against the real questionnaire (2026-09-03)
 
@@ -240,7 +252,7 @@ reference). serde-defaulted so old docs load; stored on the document.
 pub enum SubdivisionMethod { Recursive, Offset, Skeleton }
 pub enum LoadingType       { FrontLoaded, AlleyLoaded, Mixed }
 pub enum CornerAlignment   { StreetWidth, StreetLength }
-pub enum StreetPattern     { Orthogonal, Skewed, Organic, CulDeSac }
+pub enum StreetPattern     { Orthogonal, Skewed, Organic, CulDeSac, Radial, Hexagonal } // Radial/Hexagonal = owner scope (Phase 5b)
 
 pub struct SubdivisionSettings {
     pub method: SubdivisionMethod, // = Recursive
@@ -251,7 +263,8 @@ pub struct SubdivisionSettings {
     pub lot_area_min: f64,         // = 5000
     pub lot_area_max: f64,         // = 9000
     pub lot_width_min: f64,        // = 50
-    pub irregularity: f64,         // CLAMP [0.0, 0.4] — see §1
+    pub irregularity: f64,         // soft default clamp [0.0, 0.4] (Manuel); `loose` unlocks up to 1.0
+    pub loose: bool,               // owner scope: unlock irregularity >0.4, route to organic subdivider
     pub corner_angle_max: f64,     // = 45
     pub corner_width: f64,
 
@@ -325,13 +338,22 @@ area/depth, jittered by `irregularity`. Split the strip with lines orthogonal to
 offset curve. If `subdivide_core`, run recursive OBB on the interior. Fall back to
 recursive OBB when `offset_width ≈ 0` or the offset polygon collapses.
 
-### 7.3 Road network (Phase 5)
-Four generators → a `StreetGraph` of centerlines with widths:
+### 7.3 Road network (Phase 5, + radial/hex in Phase 5b — owner scope)
+Generators → a `StreetGraph` of centerlines with widths. **Four rectilinear (Manuel):**
 - **Orthogonal** — recursive OBB of the *site* to ~2× lot depth; spine roads along splits.
 - **Skewed** — same with a global rotation on split directions.
 - **Organic** — spline spines fitted to the site long axis with controlled sinusoidal
   deviation, then secondary connectors.
 - **Cul-de-sac** — a spine plus perpendicular stubs ending in bulbs, spaced by block depth.
+
+**Two non-rectilinear (owner-requested, Phase 5b — do after the four above work):**
+- **Radial / circular** — a center (or centers) with ring roads at block-depth spacing +
+  radial spokes; blocks are annular-sector polygons. Does NOT use OBB site-splitting;
+  its own polar layout. Feed the sector blocks into offset/skeleton subdivision (not
+  recursive-OBB, which assumes rectilinear).
+- **Hexagonal** — a hex lattice sized to block depth; blocks are the hex cells (or
+  6-way street intersections). Non-rectilinear; same "subdivide the emitted blocks" flow.
+These raise the §8 validation bar: add annular-sector and hex-cell blocks as cases.
 Then offset centerlines by ROW/2 (`i_overlay`), boolean-subtract from the site, tag
 every resulting block edge with its generating street. Snap to existing boundary access
 points. If `AlleyLoaded`, insert a second tier of narrower rear lanes bisecting each
@@ -380,6 +402,8 @@ Every subdivision algorithm must pass these block shapes:
 8. Near-degenerate sliver block
 9. Block where `lot_width_min` forces lots above `lot_area_max`
 10. 15° acute corner (corner-lot clamping)
+11. Annular-sector block (radial generator output — owner scope)
+12. Hex-cell block (hexagonal generator output — owner scope)
 
 **Assertions (all cases):**
 - Σ lot area == block area within tolerance
