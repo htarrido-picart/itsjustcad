@@ -4,6 +4,8 @@ Status as of 2026-09-01. Shipped milestones (M2–M5 core, layers, gumball,
 undo, dims/sheets/PDF, DXF/glTF/OBJ/STL, local-LLM onboarding, per-doc chat
 persistence, native menus, clipboard) are omitted — this tracks what's LEFT.
 
+> Interop note (2026-09-04): DXF **block export** was a gap — `Geometry::Instance` used to export zero entities, so block instances vanished on save while the importer already read `BLOCK`/`INSERT`. Now closed: the exporter emits a `BLOCKS` section + `INSERT` entities and blocks round-trip (parametric instances bake to static blocks). See `docs/interop.md`.
+
 ## Design system (report batches A–F) — COMPLETE ✅
 
 HIG-grounded design revision, run as sequential batches. All six landed.

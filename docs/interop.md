@@ -14,7 +14,7 @@ Format is detected by file extension.
 
 ### DXF (R12 / R2000)
 
-Entities imported: `LINE`, `LWPOLYLINE`, `POLYLINE`, `CIRCLE`, `ARC`, `TEXT`, and `LAYER` table entries. Each entity becomes its own logged substrate op (`line`, `polyline`, `circle`, `arc`, `text`, `layer`). The `import` command itself is not logged — the expanded ops are, so replay needs no access to the original file.
+Entities imported: `LINE`, `LWPOLYLINE`, `POLYLINE`, `CIRCLE`, `ARC`, `TEXT`, `MTEXT`, `DIMENSION`, `HATCH`, `ELLIPSE`, `POINT`, `3DFACE`, `INSERT`, `LAYER` table entries, and `BLOCK` definitions from the `BLOCKS` section. Each entity becomes its own logged substrate op (`line`, `polyline`, `circle`, `arc`, `text`, `layer`, `block`, `insert`). The `import` command itself is not logged — the expanded ops are, so replay needs no access to the original file. Blocks **round-trip**: a `BLOCK` definition and its `INSERT` instances export and re-import with their name, insertion point, uniform scale, and rotation preserved.
 
 ### OBJ / STL / glTF / GLB / Collada
 
@@ -76,7 +76,7 @@ Format is detected by file extension.
 
 ### DXF R12
 
-2D entities (lines, polylines, circles, arcs, text, dimensions, hatches) are written at their XY coordinates. Meshes are exploded to their feature edges as polyline entities. Layer colours and lineweights (DXF code 370) are honoured.
+2D entities (lines, polylines, circles, arcs, text, dimensions, hatches) are written at their XY coordinates. Meshes are exploded to their feature edges as polyline entities. Layer colours and lineweights (DXF code 370) are honoured. Block definitions are written to a `BLOCKS` section (`BLOCK`/`ENDBLK` per definition) and instances export as `INSERT` entities carrying insertion point, uniform scale (41/42/43) and rotation (50) — so blocks **round-trip** through export → import. Parametric (dynamic) blocks have no DXF equivalent, so each parametric instance is **baked** to a static block at its current parameter values (the geometry is preserved; the parametric link is not).
 
 ### STL (binary)
 

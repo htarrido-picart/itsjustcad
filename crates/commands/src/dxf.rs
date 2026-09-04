@@ -8,7 +8,7 @@
 //! meshes export their feature edges as LINE entities.
 
 use glam::DVec3;
-use itsjustcad_doc::{Annotation, Document, Geometry};
+use itsjustcad_doc::{Annotation, BlockGeometry, Document, Geometry};
 
 /// Chord tolerance for tessellating curves R12 cannot represent (meters).
 const EXPORT_TOL: f64 = 0.005;
@@ -94,84 +94,134 @@ fn text(t: &mut Tags, layer: &str, pos: DVec3, height: f64, content: &str) {
     t.tag(1, content);
 }
 
-/// One document object -> zero or more entities. Returns entities written.
-fn entity(t: &mut Tags, layer: &str, geometry: &Geometry, units: itsjustcad_doc::Units) -> usize {
-    match geometry {
-        Geometry::Curve(curve) => match curve {
-            kernel_curve::Curve::Line { a, b } => {
-                line(t, layer, *a, *b);
-                1
+/// A curve -> one entity (LINE/POLYLINE/CIRCLE/ARC; ellipses & NURBS tessellate).
+fn curve_entity(t: &mut Tags, layer: &str, curve: &kernel_curve::Curve) -> usize {
+    match curve {
+        kernel_curve::Curve::Line { a, b } => {
+            line(t, layer, *a, *b);
+            1
+        }
+        kernel_curve::Curve::Polyline { points, closed } => {
+            polyline(t, layer, points, *closed);
+            1
+        }
+        kernel_curve::Curve::Arc { center, radius, start, end } => {
+            if curve.is_closed() {
+                t.tag(0, "CIRCLE");
+                t.tag(8, layer);
+                t.point(*center);
+                t.num(40, *radius);
+            } else {
+                t.tag(0, "ARC");
+                t.tag(8, layer);
+                t.point(*center);
+                t.num(40, *radius);
+                // DXF arcs run CCW from 50 to 51, degrees.
+                t.num(50, start.to_degrees().rem_euclid(360.0));
+                t.num(51, end.to_degrees().rem_euclid(360.0));
             }
-            kernel_curve::Curve::Polyline { points, closed } => {
-                polyline(t, layer, points, *closed);
-                1
-            }
-            kernel_curve::Curve::Arc { center, radius, start, end } => {
-                if curve.is_closed() {
-                    t.tag(0, "CIRCLE");
-                    t.tag(8, layer);
-                    t.point(*center);
-                    t.num(40, *radius);
-                } else {
-                    t.tag(0, "ARC");
-                    t.tag(8, layer);
-                    t.point(*center);
-                    t.num(40, *radius);
-                    // DXF arcs run CCW from 50 to 51, degrees.
-                    t.num(50, start.to_degrees().rem_euclid(360.0));
-                    t.num(51, end.to_degrees().rem_euclid(360.0));
-                }
-                1
-            }
-            // R12 has no ELLIPSE or SPLINE: tessellate to a closed/open polyline.
-            kernel_curve::Curve::Ellipse { .. } | kernel_curve::Curve::Nurbs { .. } => {
-                polyline(t, layer, &curve.tessellate(EXPORT_TOL), curve.is_closed());
-                1
-            }
-        },
-        Geometry::Mesh(mesh)
-        | Geometry::Frame { mesh, .. }
-        | Geometry::Area { mesh, .. } => {
-            let edges = mesh_feature_edges(mesh);
-            let n = edges.len();
-            for (a, b) in edges {
-                line(t, layer, a, b);
+            1
+        }
+        // R12 has no ELLIPSE or SPLINE: tessellate to a closed/open polyline.
+        kernel_curve::Curve::Ellipse { .. } | kernel_curve::Curve::Nurbs { .. } => {
+            polyline(t, layer, &curve.tessellate(EXPORT_TOL), curve.is_closed());
+            1
+        }
+    }
+}
+
+/// A mesh -> its feature edges as LINE entities. Returns the edge count.
+fn mesh_entity(t: &mut Tags, layer: &str, mesh: &kernel_mesh::Mesh) -> usize {
+    let edges = mesh_feature_edges(mesh);
+    let n = edges.len();
+    for (a, b) in edges {
+        line(t, layer, a, b);
+    }
+    n
+}
+
+/// An annotation -> one or more entities.
+fn annotation_entity(
+    t: &mut Tags,
+    layer: &str,
+    a: &Annotation,
+    units: itsjustcad_doc::Units,
+) -> usize {
+    match a {
+        Annotation::LinearDim { a, b, offset } => {
+            // Dimension line offset to the left of a->b, value as TEXT.
+            let dir = (*b - *a).normalize_or_zero();
+            let left = DVec3::new(-dir.y, dir.x, 0.0) * *offset;
+            line(t, layer, *a + left, *b + left);
+            let mid = (*a + *b) / 2.0 + left;
+            text(t, layer, mid, 0.2, &itsjustcad_doc::format_length(units, (*b - *a).length()));
+            2
+        }
+        Annotation::Text { pos, text: s, height } => {
+            // Tessellate via Hershey stroke font to world-space polylines so
+            // the text renders at world scale consistently across all outputs.
+            let strokes = itsjustcad_doc::hershey::text_strokes(s, [pos.x, pos.y], *height);
+            let n = strokes.len();
+            for poly in strokes {
+                let pts: Vec<DVec3> = poly.iter().map(|p| DVec3::new(p[0], p[1], pos.z)).collect();
+                polyline(t, layer, &pts, false);
             }
             n
         }
-        Geometry::Annotation(a) => match a {
-            Annotation::LinearDim { a, b, offset } => {
-                // Dimension line offset to the left of a->b, value as TEXT.
-                let dir = (*b - *a).normalize_or_zero();
-                let left = DVec3::new(-dir.y, dir.x, 0.0) * *offset;
-                line(t, layer, *a + left, *b + left);
-                let mid = (*a + *b) / 2.0 + left;
-                text(t, layer, mid, 0.2, &itsjustcad_doc::format_length(units, (*b - *a).length()));
-                2
-            }
-            Annotation::Text { pos, text: s, height } => {
-                // Tessellate via Hershey stroke font to world-space polylines so
-                // the text renders at world scale consistently across all outputs.
-                let strokes = itsjustcad_doc::hershey::text_strokes(s, [pos.x, pos.y], *height);
-                let n = strokes.len();
-                for poly in strokes {
-                    let pts: Vec<DVec3> = poly
-                        .iter()
-                        .map(|p| DVec3::new(p[0], p[1], pos.z))
-                        .collect();
-                    polyline(t, layer, &pts, false);
-                }
-                n
-            }
-            Annotation::Hatch { boundary, .. } => {
-                // Pattern dropped; the boundary survives as a closed polyline.
-                polyline(t, layer, boundary, true);
-                1
-            }
-        },
-        // Block instances: exported as the boundary box only (block definitions
-        // are resolved by the renderer, not by DXF export — R12 has no XREF).
-        Geometry::Instance { .. } => 0,
+        Annotation::Hatch { boundary, .. } => {
+            // Pattern dropped; the boundary survives as a closed polyline.
+            polyline(t, layer, boundary, true);
+            1
+        }
+    }
+}
+
+/// One block-definition geometry -> entities, written into a BLOCK body. Shares
+/// the exact per-kind writers used for top-level entities so a block's contents
+/// round-trip identically to loose geometry.
+fn block_entity(
+    t: &mut Tags,
+    layer: &str,
+    g: &BlockGeometry,
+    units: itsjustcad_doc::Units,
+) -> usize {
+    match g {
+        BlockGeometry::Curve(c) => curve_entity(t, layer, c),
+        BlockGeometry::Mesh(m) => mesh_entity(t, layer, m),
+        BlockGeometry::Annotation(a) => annotation_entity(t, layer, a, units),
+    }
+}
+
+/// Emit an `INSERT` entity referencing block `name` (already sanitized) with the
+/// instance's insertion point, uniform scale (41/42/43) and rotation (50).
+fn insert(t: &mut Tags, layer: &str, name: &str, position: DVec3, rotation_deg: f64, scale: f64) {
+    t.tag(0, "INSERT");
+    t.tag(8, layer);
+    t.tag(2, name);
+    t.point(position);
+    t.num(41, scale);
+    t.num(42, scale);
+    t.num(43, scale);
+    t.num(50, rotation_deg.rem_euclid(360.0));
+}
+
+/// One document object -> zero or more entities. Returns entities written.
+fn entity(t: &mut Tags, layer: &str, geometry: &Geometry, units: itsjustcad_doc::Units) -> usize {
+    match geometry {
+        Geometry::Curve(curve) => curve_entity(t, layer, curve),
+        Geometry::Mesh(mesh) | Geometry::Frame { mesh, .. } | Geometry::Area { mesh, .. } => {
+            mesh_entity(t, layer, mesh)
+        }
+        Geometry::Annotation(a) => annotation_entity(t, layer, a, units),
+        // Block instances export as an INSERT referencing the sanitized block
+        // name written in the BLOCKS section (R12 supports internal blocks; only
+        // XREFs are unsupported). Parametric instances are baked: their geometry
+        // already lives in `doc.blocks` under `block`, so they export as a plain
+        // static block + INSERT like any other instance.
+        Geometry::Instance { block, position, rotation_deg, scale, .. } => {
+            insert(t, layer, &dxf_layer(block), *position, *rotation_deg, *scale);
+            1
+        }
         // Point clouds are not representable as DXF entities in this exporter.
         Geometry::Points { .. } => 0,
     }
@@ -206,6 +256,29 @@ pub fn document_dxf(doc: &Document) -> (String, usize) {
         t.tag(370, &lw_hundredths.to_string());
     }
     t.tag(0, "ENDTAB");
+    t.tag(0, "ENDSEC");
+
+    // BLOCKS section: one BLOCK/ENDBLK per definition in `doc.blocks`. Parametric
+    // (dynamic) blocks have no DXF equivalent, but each parametric instance keeps
+    // its baked geometry in `doc.blocks` under its per-instance key, so those keys
+    // export as ordinary static blocks here — no special handling needed. Block
+    // bodies are written at the origin (base point 0,0,0); INSERT places them.
+    t.tag(0, "SECTION");
+    t.tag(2, "BLOCKS");
+    for (name, geoms) in &doc.blocks {
+        let bname = dxf_layer(name);
+        t.tag(0, "BLOCK");
+        t.tag(8, "0");
+        t.tag(2, &bname);
+        t.tag(70, "0"); // 0 = a normal (non-anonymous) block
+        t.point(DVec3::ZERO); // base point at origin
+        t.tag(3, &bname); // block name repeated (R12 convention)
+        for g in geoms {
+            block_entity(&mut t, "0", g, doc.units);
+        }
+        t.tag(0, "ENDBLK");
+        t.tag(8, "0");
+    }
     t.tag(0, "ENDSEC");
 
     t.tag(0, "SECTION");
@@ -1342,6 +1415,134 @@ mod tests {
         let parsed = parse_dxf(text).unwrap();
         assert!(parsed.entities.is_empty(), "unknown block insert imports nothing");
         assert_eq!(parsed.skipped, 1);
+    }
+
+    /// Collect the block-instance geometries of a session's document.
+    fn instances_of(
+        doc: &Document,
+    ) -> Vec<(String, DVec3, f64, f64)> {
+        doc.objects()
+            .filter_map(|o| match &o.geometry {
+                G::Instance { block, position, rotation_deg, scale, .. } => {
+                    Some((block.clone(), *position, *rotation_deg, *scale))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Full block round-trip: define a block, place two instances with distinct
+    /// position/rotation/scale, export to DXF, re-import, and assert the block
+    /// definition survives with both instances and their transforms.
+    #[test]
+    fn block_definition_and_instances_round_trip() {
+        let mut s = Session::default();
+        // Define a block "WIDGET" from a circle + a line.
+        run(&mut s, "circle 0,0,0 1.5");
+        run(&mut s, "line -2,0,0 2,0,0");
+        run(&mut s, "block last 2 widget");
+        // Two instances on a non-default layer, distinct transforms.
+        run(&mut s, "layer symbols");
+        run(&mut s, "insert widget 5,5,0 90 2");
+        run(&mut s, "insert widget 8,1,0 0 1");
+
+        let path = std::env::temp_dir().join("itsjustcad_block_roundtrip.dxf");
+        run(&mut s, &format!("export {}", path.display()));
+
+        let mut s2 = Session::default();
+        run(&mut s2, &format!("import {}", path.display()));
+
+        // Block definition survives (keyed by the sanitized/uppercased name the
+        // exporter writes; the importer reads the group-2 name verbatim).
+        assert!(
+            s2.doc.blocks.contains_key("WIDGET"),
+            "block def must round-trip, have: {:?}",
+            s2.doc.blocks.keys().collect::<Vec<_>>()
+        );
+        let def = &s2.doc.blocks["WIDGET"];
+        assert_eq!(def.len(), 2, "widget = circle + line");
+
+        // Both instances survive, on the (lowercased) symbols layer.
+        let mut got = instances_of(&s2.doc);
+        got.sort_by(|a, b| a.1.x.partial_cmp(&b.1.x).unwrap());
+        assert_eq!(got.len(), 2, "two instances survive: {got:?}");
+        assert_eq!(got[0].0, "WIDGET");
+        assert!((got[0].1 - DVec3::new(5.0, 5.0, 0.0)).length() < 1e-9, "pos {:?}", got[0].1);
+        assert!((got[0].2 - 90.0).abs() < 1e-9, "rotation {}", got[0].2);
+        assert!((got[0].3 - 2.0).abs() < 1e-9, "scale {}", got[0].3);
+        assert!((got[1].1 - DVec3::new(8.0, 1.0, 0.0)).length() < 1e-9);
+        assert!((got[1].2 - 0.0).abs() < 1e-9);
+        assert!((got[1].3 - 1.0).abs() < 1e-9);
+        // Instance layer preserved (lowercased on the way back in).
+        for o in s2.doc.objects() {
+            if matches!(o.geometry, G::Instance { .. }) {
+                assert_eq!(o.layer, "symbols", "instance keeps its layer");
+            }
+        }
+    }
+
+    /// Two distinct block definitions round-trip together.
+    #[test]
+    fn multiple_block_definitions_round_trip() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0,0 1");
+        run(&mut s, "block last tree");
+        run(&mut s, "rect 0,0,0 1 2");
+        run(&mut s, "block last door");
+        run(&mut s, "insert tree 0,0,0");
+        run(&mut s, "insert door 5,0,0");
+
+        let path = std::env::temp_dir().join("itsjustcad_two_blocks.dxf");
+        run(&mut s, &format!("export {}", path.display()));
+
+        let mut s2 = Session::default();
+        run(&mut s2, &format!("import {}", path.display()));
+        assert!(s2.doc.blocks.contains_key("TREE"), "TREE def survives");
+        assert!(s2.doc.blocks.contains_key("DOOR"), "DOOR def survives");
+        let names: std::collections::BTreeSet<_> =
+            instances_of(&s2.doc).into_iter().map(|i| i.0).collect();
+        assert!(names.contains("TREE") && names.contains("DOOR"), "both inserts: {names:?}");
+    }
+
+    /// A parametric (dynamic) block instance exports its BAKED geometry as a
+    /// static DXF block + INSERT: DXF has no dynamic-block concept, so the
+    /// instance re-imports as a plain static block instance (params are lost, the
+    /// geometry at the current param values is preserved).
+    #[test]
+    fn parametric_block_instance_bakes_to_static() {
+        let mut s = Session::default();
+        run(&mut s, "pblock pdoor width=0.9 : rect 0,0,0 {width} 0.05");
+        run(&mut s, "insert pdoor 2,0,0 width=1.2");
+
+        let path = std::env::temp_dir().join("itsjustcad_pblock.dxf");
+        run(&mut s, &format!("export {}", path.display()));
+
+        let mut s2 = Session::default();
+        run(&mut s2, &format!("import {}", path.display()));
+
+        // Exactly one instance re-imports, referencing a static baked block whose
+        // geometry (a closed rect polyline) is preserved. It is NOT parametric —
+        // no `source`/`params` survive DXF (documented bake behavior).
+        let inst: Vec<_> = s2
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                G::Instance { block, source, params, position, .. } => {
+                    Some((block.clone(), source.clone(), params.clone(), *position))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inst.len(), 1, "one baked instance re-imports: {inst:?}");
+        assert!(inst[0].1.is_none(), "re-imported instance is static, not parametric");
+        assert!(inst[0].2.is_empty(), "no params survive DXF");
+        assert!((inst[0].3 - DVec3::new(2.0, 0.0, 0.0)).length() < 1e-9);
+        // The baked block definition exists and carries the rect geometry.
+        assert!(
+            s2.doc.blocks.contains_key(&inst[0].0),
+            "baked block def present: have {:?}",
+            s2.doc.blocks.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
