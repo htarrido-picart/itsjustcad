@@ -6,10 +6,11 @@
 //! `commands`. All conversion (doc `Curve` ↔ `Polygon2d`) lives here; the pure
 //! crate never sees a document.
 //!
-//! Phases 2–3 ship two verbs:
+//! Phases 2–4 ship two verbs:
 //! - `lotsubdivide` — subdivide selected closed block curve(s) into lots on the
-//!   `lots` layer. Only `method=grid` (recursive OBB) is implemented; `perimeter`
-//!   / `streetfollowing` return a clear "not yet implemented" error (Phase 4/7).
+//!   `lots` layer. `method=grid` (recursive OBB, Phase 3) and `method=perimeter`
+//!   (offset/perimeter, Phase 4) are implemented; `streetfollowing` returns a
+//!   clear "not yet implemented" error (Phase 7).
 //! - `lotsettings` — show or set the sticky `SubdivisionSettings` on the doc.
 //!
 //! Results bake as a logged op with written-back ids (contours/landscape
@@ -71,14 +72,7 @@ pub fn subdivide_blocks(
     settings: &SubdivisionSettings,
 ) -> Result<LotBake, String> {
     match settings.method {
-        SubdivisionMethod::Recursive => {}
-        SubdivisionMethod::Offset => {
-            return Err(
-                "lotsubdivide method=perimeter is not yet implemented (Phase 4 — offset \
-                 subdivision). Use method=grid."
-                    .into(),
-            );
-        }
+        SubdivisionMethod::Recursive | SubdivisionMethod::Offset => {}
         SubdivisionMethod::Skeleton => {
             return Err(
                 "lotsubdivide method=streetfollowing is not yet implemented (Phase 7 — \
@@ -93,7 +87,11 @@ pub fn subdivide_blocks(
     let mut z_acc = 0.0;
     let mut z_n = 0usize;
     for (block, z) in blocks {
-        for lot in subdivision::subdivide(block, settings) {
+        let lots = match settings.method {
+            SubdivisionMethod::Offset => subdivision::subdivide_offset(block, settings),
+            _ => subdivision::subdivide(block, settings),
+        };
+        for lot in lots {
             if lot.has_street {
                 with_street += 1;
             }
@@ -193,14 +191,39 @@ mod tests {
     }
 
     #[test]
-    fn perimeter_method_errors_cleanly() {
-        let poly = curve_to_polygon(&rect_curve(400.0, 120.0)).unwrap();
+    fn perimeter_method_runs_and_conserves_area() {
+        // Phase 4: method=perimeter now runs (no longer the deferral error).
+        let poly = curve_to_polygon(&rect_curve(400.0, 300.0)).unwrap();
         let s = SubdivisionSettings {
             method: SubdivisionMethod::Offset,
+            offset_width: 30.0,
+            subdivide_core: true,
+            lot_area_min: 4000.0,
+            lot_width_min: 20.0,
+            force_street_access: 0.0,
+            seed: 7,
             ..SubdivisionSettings::default()
         };
-        let err = subdivide_blocks(&[(poly, 0.0)], &s).unwrap_err();
-        assert!(err.contains("Phase 4"));
+        let bake = subdivide_blocks(&[(poly.clone(), 0.0)], &s).unwrap();
+        assert!(bake.polygons.len() > 1, "expected multiple perimeter lots");
+        let sum: f64 = bake.polygons.iter().map(|p| p.area()).sum();
+        assert!((sum - poly.area()).abs() / poly.area() < 1e-3);
+    }
+
+    #[test]
+    fn perimeter_zero_offset_falls_back() {
+        // offset_width ≈ 0 → falls back to recursive OBB, not an error.
+        let poly = curve_to_polygon(&rect_curve(400.0, 300.0)).unwrap();
+        let s = SubdivisionSettings {
+            method: SubdivisionMethod::Offset,
+            offset_width: 0.0,
+            lot_area_min: 4000.0,
+            lot_width_min: 20.0,
+            ..SubdivisionSettings::default()
+        };
+        let bake = subdivide_blocks(&[(poly.clone(), 0.0)], &s).unwrap();
+        let sum: f64 = bake.polygons.iter().map(|p| p.area()).sum();
+        assert!((sum - poly.area()).abs() / poly.area() < 1e-3);
     }
 
     #[test]

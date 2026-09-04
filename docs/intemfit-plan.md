@@ -502,7 +502,26 @@ Every subdivision algorithm must pass these block shapes:
   replay test). All §8 assertions pass on all 10 base blocks (`tests/blocks.rs`): area
   conserved, no overlaps, every lot has a street edge under `force_street_access=1.0`,
   widths ≥ `lot_width_min` where guaranteed, determinism. **Send a build to Manuel here.**
-- **Phase 4** — offset subdivision passes; degenerate fallbacks verified.
+- **Phase 4** — ✅ **DONE (2026-09-04).** Offset / perimeter subdivision
+  (`method=perimeter`) in `subdivision/src/subdivision/offset_sub.rs`: inward-offset
+  the block by `offset_width` via `clip_bridge::offset` (i_overlay) to get the
+  interior **core**; walk the boundary sampling at a spacing derived from
+  `lot_area_min / offset_width` (≥ `lot_width_min`), jittered by `irregularity`
+  (splitmix64 seeded from a quantized block hash + `settings.seed`, salted apart
+  from recursive_obb → replay byte-identical); cut the block with lines **orthogonal
+  to the boundary** at each sample and keep each wedge minus the core as a perimeter
+  lot; if `subdivide_core`, run `recursive_obb` on the core, else keep it as one
+  hollow-ring lot. **Degenerate fallbacks verified** (`tests/offset_blocks.rs`):
+  `offset_width ≈ 0` → falls back to recursive OBB (byte-identical); huge
+  `offset_width` collapsing the interior → clean fallback, no panic; thin rectangle
+  (#1) whose inset self-collapses → fallback; plus a covered-area safety net that
+  falls back rather than emit an under-covered block. All §8 assertions pass on the
+  10 base blocks: Σ lot area == block area within tol, no overlaps, every lot is a
+  real (positive-extent) ring, deterministic for a fixed seed. `subdivide_core`
+  on/off proven to give core lots vs a hollow ring. `lot.rs` wires `method=perimeter`
+  (replaces the deferral) with the same bake path as grid: logged op, written-back
+  ids on the `lots` layer, undo, replay byte-identical (verified by a Session replay
+  test).
 - **Phase 5** — all four street patterns generate valid non-overlapping blocks on a real
   parcel; every block edge correctly tagged; alley tier generates when requested.
 - **Phase 6** — width mix hits requested proportions within 5% on a 500 ft frontage;

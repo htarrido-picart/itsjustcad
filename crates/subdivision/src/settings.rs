@@ -191,16 +191,20 @@ mod tests {
 
     #[test]
     fn irregularity_clamped_tight_by_default() {
-        let mut s = SubdivisionSettings::default();
-        s.irregularity = 0.9;
+        let s = SubdivisionSettings {
+            irregularity: 0.9,
+            ..SubdivisionSettings::default()
+        };
         assert!((s.clamped_irregularity() - 0.4).abs() < 1e-12);
     }
 
     #[test]
     fn loose_raises_the_cap() {
-        let mut s = SubdivisionSettings::default();
-        s.irregularity = 0.9;
-        s.loose = true;
+        let s = SubdivisionSettings {
+            irregularity: 0.9,
+            loose: true,
+            ..SubdivisionSettings::default()
+        };
         assert!((s.clamped_irregularity() - 0.9).abs() < 1e-12);
     }
 

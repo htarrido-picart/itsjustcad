@@ -3791,6 +3791,11 @@ fn exec_lot_subdivide(
     // Build the effective settings: sticky doc settings with per-run overrides.
     let mut settings = doc.subdivision_settings.clone();
     settings.method = method_enum;
+    let method_label = match method_enum {
+        subdivision::SubdivisionMethod::Recursive => "grid",
+        subdivision::SubdivisionMethod::Offset => "perimeter",
+        subdivision::SubdivisionMethod::Skeleton => "streetfollowing",
+    };
     if let Some(a) = area {
         settings.lot_area_min = a;
     }
@@ -3858,7 +3863,7 @@ fn exec_lot_subdivide(
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome {
             message: format!(
-                "lotsubdivide grid: {n} lots on '{}' ({} with street frontage)",
+                "lotsubdivide {method_label}: {n} lots on '{}' ({} with street frontage)",
                 crate::lot::LOTS_LAYER,
                 bake.with_street
             ),
@@ -15645,11 +15650,47 @@ mod tests {
     }
 
     #[test]
-    fn perimeter_method_errors_not_panics() {
+    fn perimeter_method_runs_and_bakes_lots() {
+        // Phase 4: method=perimeter now runs (no longer the deferral error).
         let mut s = Session::default();
-        run(&mut s, "rect 0,0,0 400 120");
-        let err = s.run(parse("lotsubdivide last perimeter").unwrap()).unwrap_err();
-        assert!(format!("{err:?}").contains("Phase 4"));
+        run(&mut s, "rect 0,0,0 400 300");
+        let out = run(&mut s, "lotsubdivide last perimeter area=4000 width=20 seed=7");
+        assert!(out.created.len() > 1, "expected multiple perimeter lots");
+        assert_eq!(lot_count(&s), out.created.len());
+    }
+
+    #[test]
+    fn perimeter_undo_and_replay_byte_identical() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 300");
+        run(&mut s, "lotsubdivide last perimeter area=4000 width=20 irregularity=0.3 seed=7");
+        assert!(lot_count(&s) > 0);
+
+        // Undo removes all baked lots + the layer.
+        let before: Vec<_> = s
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| s.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        run(&mut s, "undo");
+        assert_eq!(lot_count(&s), 0, "undo removes perimeter lots");
+        run(&mut s, "redo");
+
+        // Replay recreates byte-identical lot geometry (deterministic subdivider).
+        let log: Vec<Command> = s.log.iter().map(|a| a.op.clone()).collect();
+        let rebuilt = Session::replay(log).unwrap();
+        let after: Vec<_> = rebuilt
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| rebuilt.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        assert_eq!(before, after, "replay recreated identical perimeter lots");
     }
 
     #[test]

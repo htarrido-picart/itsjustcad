@@ -9,8 +9,9 @@
 //! `subdivision` (leaf) ← `commands` ← `app`).
 //!
 //! Phases shipped: 1 (geometry foundation + `i_overlay` bridge), 3 (recursive
-//! OBB subdivision, `method=grid`). Phase 2 (verb/settings plumbing) lives in the
-//! commands crate but the `SubdivisionSettings` type is defined here.
+//! OBB subdivision, `method=grid`), 4 (offset/perimeter subdivision,
+//! `method=perimeter`). Phase 2 (verb/settings plumbing) lives in the commands
+//! crate but the `SubdivisionSettings` type is defined here.
 
 pub mod geometry;
 pub mod settings;
@@ -22,6 +23,7 @@ pub use geometry::polygon2d::Polygon2d;
 pub use geometry::polyline::PolylineTools;
 pub use geometry::split::{split_by_line, Line2d};
 pub use settings::{SubdivisionMethod, SubdivisionSettings};
+pub use subdivision::offset_sub::subdivide as subdivide_offset;
 pub use subdivision::{subdivide, Lot};
 
 use glam::DVec2;
