@@ -102,6 +102,15 @@ HIG-grounded design revision, run as sequential batches. All six landed.
   - [x] *Headless `--shot` theme*: already honors `ITSJUSTCAD_THEME=dark|light` (headless.rs `resolve_theme` + env round-trip tests) — the "hardcodes dark" gap was closed earlier. Full GUI-chrome capture from `--shot` deliberately NOT added: it would drag the eframe/kittest test harness into the shipping binary; the kittest preview tests already produce full-chrome PNGs in both themes.
   - Snapshot/GPU tests stay `#[ignore]`d (Metal-only) while logic journeys (chat render, reduce-motion, shortcut audit) run everywhere; human usability testing stays manual.
 
+## intemfit — lot subdivision (planned 2026-09-03 — NOT started; plan only)
+
+- [ ] **M-intemfit** — parametric site planning (roads → blocks → lots), CityEngine/TestFit-style, as a native ItsJustCAD Rust feature (target decided 2026-09-03: NOT a Rhino plugin, NOT a JSON macro). Full build plan in **`docs/intemfit-plan.md`** (grounded in Manuel's questionnaire — ask before inventing requirements). Shape:
+  - New pure-Rust `crates/subdivision` (no egui/doc deps): `Polygon2d` + `i_overlay` bridge (offset/boolean — the Clipper2 role; **Phase-1 blocker: confirm i_overlay offset quality + AGPLv3 fit**), `OrientedBox`, recursive-OBB / offset / straight-skeleton subdivision, street generators (orthogonal/skewed/organic/culdesac), lot rules (width-mix packing, depth, corner, flag, front/alley loading, sliver merge), setbacks + buildable envelope, open-space placement, footprints/roofs, yield reporting.
+  - `lot*` verbs in crates/commands (deck-callable, GBNF, logged + replay-stable, seeded-deterministic); results bake to `lots`/`roads`/`blocks` layers; yield via the `report` plane; viewport preview before commit. NO Rhino toolbar/.rui/multi-target — those are dropped.
+  - Phase order: 1 geom foundation → 2 verb+settings+preview → **3 recursive-OBB (first shippable, send to Manuel)** → 4 offset → 5 roads+block-extraction+street-tagging → 6 lot rules → 7 skeleton → 8 setbacks → 9 open space → 10 buildings → 11 yield → 12 polish. Do NOT attempt 10–12 in the first release.
+  - Ruled out (Manuel): radial/circular + hexagonal streets, no-subdivision mode, loose lots (irregularity caps at 0.4), blind %-open-space. Open questions before Phase 5/6: Voronoi (ambiguous), width-mix product list, alley dims, "day one" blank.
+  - Blockers to clear before coding: confirm i_overlay offset; obtain the referenced Python prototype (`/prototype/python`, not yet in repo) to port from; resolve Manuel's open questions.
+
 ## Compliance plugins (engine SHIPPED 2026-09-03; packs still planned)
 
 Shared foundation first, then two rule packs riding it. Advisory only — every
