@@ -331,6 +331,37 @@ pub struct LotWidthMix {
 
 Keep separate internal fields; expose the shared names only in the verb args.
 
+### 6b. Default profile — metric, European / Latin-American (placeholder until Manuel confirms)
+
+**Units are metres / m².** Manuel works in Cali + Guayaquil; defaults follow
+European + LatAm urban form (party-wall `medianería` lots, deep narrow `solares`,
+continuous street-wall / build-to tradition, the Law-of-the-Indies gridiron), NOT US
+suburban feet. **Every number below is a placeholder** sourced from typical Euro/LatAm
+practice — flag it in output and swap when Manuel answers the §1 open questions.
+
+| Setting | Default (m / m² / %) | Rationale |
+|---|---|---|
+| `lot_width_min` | 6 m | European terraced / narrow LatAm frontage |
+| width mix (soft) | 6 / 8 / 10 m at 25 / 50 / 25 % | narrow-row → LatAm-standard blend; soft, not hard ratio |
+| `lot_depth_target` / tol | 25 m / ±5 m | deep LatAm solar; European-dense variant 18 m |
+| `lot_area_min` / target | 120 / 200 m² | row/terraced through standard urban lot |
+| `loading` | FrontLoaded | continuous street facade is the tradition |
+| `alley_width` | 5 m | `callejón` / mews (US would be ~6 m) |
+| `setback_front` | 3 m | suburban; urban cores use `build_to_line = 0` |
+| `setback_side` | **0 m** | party-wall / `medianería` — attached housing is the norm; detached overrides |
+| `setback_rear` | 3 m | patio/courtyard behind |
+| `corner_lot_width_bonus` | +15 % | `esquina` premium (corner lots larger in the grid) |
+| `corner_angle_max` | 45° | as US |
+| `allow_flag_lots` | false | uncommon in the formal grid; pole 3 m + excluded area if enabled |
+| `sliver_area_frac` | 0.5 | as US |
+| road ROW (Phase 5) | 12 m | residential `calle` |
+| block depth (Phase 5) | ~2× lot depth (~50 m); LatAm `cuadra` option ~84–100 m | double-loaded block; the classic 100-vara ≈ 84 m block |
+| `irregularity` | 0.0 (formal grid); cap 0.4 (Manuel); `loose` → 1.0 (owner) | grid regularity by default |
+
+Ship this as a named **`region` profile** (`euro_latam` default; a `us_suburban` profile
+with feet-derived numbers can be added later). The §6 struct defaults should carry the
+metric `euro_latam` values, not the imperial examples shown in the field comments.
+
 ---
 
 ## 7. Algorithm notes (portable — port from Python/Rhino plan)
