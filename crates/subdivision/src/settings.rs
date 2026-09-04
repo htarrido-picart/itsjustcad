@@ -89,6 +89,15 @@ pub struct SubdivisionSettings {
     pub offset_width: f64,
     pub subdivide_core: bool,
 
+    // ── Road network (Phase 5, `lotgeneratesite`) ──
+    /// Which of the road generators to run (four rectilinear in Phase 5;
+    /// radial/hex/Voronoi are Phase 5b owner scope).
+    pub street_pattern: StreetPattern,
+    /// Road right-of-way width (full, curb to curb). 0 = generator default.
+    pub road_width: f64,
+    /// Target block depth used to space roads. 0 = derive from lot depth.
+    pub block_depth: f64,
+
     // ── Skeleton (Phase 7) ──
     pub shallow_lot_frac: f64,
     pub corner_align: CornerAlignment,
@@ -134,6 +143,9 @@ impl Default for SubdivisionSettings {
             corner_width: 0.0,
             offset_width: 120.0,
             subdivide_core: true,
+            street_pattern: StreetPattern::Orthogonal,
+            road_width: 12.0,
+            block_depth: 0.0,
             shallow_lot_frac: 0.0,
             corner_align: CornerAlignment::StreetWidth,
             simplify: 0.0,

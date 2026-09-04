@@ -1067,6 +1067,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             }
         }
         "lotsubdivide" => parse_lotsubdivide(&args),
+        "lotgeneratesite" => parse_lotgeneratesite(&args),
         "lotsettings" => {
             // Each arg is a key=value pair; none = show only.
             let mut sets = Vec::new();
@@ -1746,6 +1747,89 @@ fn parse_lotsubdivide(args: &[&str]) -> Result<Command, ParseError> {
         irregularity,
         seed,
         ids: None,
+    })
+}
+
+/// `lotgeneratesite [selector] <pattern> [roadwidth=<> blockdepth=<> alleys=on|off \
+/// seed=<> preview=on|off]`. `pattern` may be the first bare positional token
+/// (`orthogonal`) or a `pattern=orthogonal` key. A leading selector token is
+/// optional; otherwise the target defaults to the current selection.
+fn parse_lotgeneratesite(args: &[&str]) -> Result<Command, ParseError> {
+    const PATTERNS: &[&str] = &[
+        "orthogonal", "ortho", "grid", "skewed", "skew", "diagonal", "organic", "free",
+        "freeform", "culdesac", "cul-de-sac", "cul", "radial", "hexagonal", "hex", "voronoi",
+    ];
+    let is_kv = |s: &str| s.contains('=');
+    let is_pattern = |s: &str| PATTERNS.contains(&s.to_lowercase().as_str());
+
+    let (targets, rest): (Selector, &[&str]) = match args.split_first() {
+        Some((first, _)) if !is_pattern(first) && !is_kv(first) => {
+            let (sel, rest) = selector(args, "lotgeneratesite")?;
+            (sel, rest)
+        }
+        _ => (Selector::Selected, args),
+    };
+
+    let mut pattern: Option<String> = None;
+    let mut roadwidth = None;
+    let mut blockdepth = None;
+    let mut alleys = None;
+    let mut seed = None;
+
+    let parse_bool = |v: &str| -> Result<bool, ParseError> {
+        match v.to_lowercase().as_str() {
+            "on" | "yes" | "true" | "1" => Ok(true),
+            "off" | "no" | "false" | "0" => Ok(false),
+            _ => Err(ParseError::BadNumber(v.to_string())),
+        }
+    };
+
+    for tok in rest {
+        if let Some((k, v)) = tok.split_once('=') {
+            match k.to_lowercase().as_str() {
+                "pattern" => pattern = Some(v.to_string()),
+                "roadwidth" | "road" | "row" => roadwidth = Some(number(v)?),
+                "blockdepth" | "depth" => blockdepth = Some(number(v)?),
+                "alleys" | "alley" => alleys = Some(parse_bool(v)?),
+                "seed" => {
+                    seed = Some(
+                        v.parse::<u64>()
+                            .map_err(|_| ParseError::BadNumber(v.to_string()))?,
+                    )
+                }
+                // `preview` accepted + ignored: this milestone bakes on run.
+                "preview" => {
+                    let _ = parse_bool(v)?;
+                }
+                _ => {
+                    return wrong(
+                        "lotgeneratesite",
+                        "pattern/roadwidth/blockdepth/alleys/seed params",
+                        args,
+                    )
+                }
+            }
+        } else if is_pattern(tok) && pattern.is_none() {
+            pattern = Some(tok.to_string());
+        } else {
+            return wrong(
+                "lotgeneratesite",
+                "a pattern (orthogonal|skewed|organic|culdesac) and key=value params",
+                args,
+            );
+        }
+    }
+
+    let pattern = pattern.unwrap_or_else(|| "orthogonal".to_string());
+    Ok(Command::LotGenerateSite {
+        targets,
+        pattern,
+        roadwidth,
+        blockdepth,
+        alleys,
+        seed,
+        road_ids: None,
+        block_ids: None,
     })
 }
 

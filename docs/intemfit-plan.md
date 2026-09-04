@@ -522,8 +522,42 @@ Every subdivision algorithm must pass these block shapes:
   (replaces the deferral) with the same bake path as grid: logged op, written-back
   ids on the `lots` layer, undo, replay byte-identical (verified by a Session replay
   test).
-- **Phase 5** — all four street patterns generate valid non-overlapping blocks on a real
-  parcel; every block edge correctly tagged; alley tier generates when requested.
+- **Phase 5** — ✅ **DONE (2026-09-04).** Road-network generation + block
+  extraction + street tagging via `lotgeneratesite`. `crates/subdivision/src/streets/`:
+  `street_graph.rs` (`StreetGraph` = centerlines + widths + hierarchy tier
+  {Spine/Connector/Stub/Alley} + endpoint adjacency) and the FOUR rectilinear
+  generators in `generators/` — **orthogonal** (recursive min-area-OBB split of the
+  site to ~2× block depth, a spine centerline per split), **skewed** (same, split
+  directions globally rotated 22.5°), **organic** (a sinusoidally-deviated spine down
+  the site long axis + perpendicular connectors spaced by block depth), **culdesac**
+  (a long-axis spine + alternating perpendicular stubs ending in turnaround bulb
+  loops). `block_extractor.rs` offsets each centerline by ROW/2 into a ribbon and
+  boolean-subtracts each ribbon from the site (`clip_bridge`), subtracting ribbons
+  one-by-one (not a pre-union) so disjoint ribbons never merge and swallow interior
+  blocks. `blocks/block.rs` + `block_edge.rs`: **every `BlockEdge` carries
+  `{is_street, street_id, street_width, street_length, is_alley}`** (the §5 hard
+  dependency) — an edge is `is_street` when its midpoint sits ½-width from a street
+  centerline AND is not on the untouched site boundary, tagged with that street's
+  id/width/length; original-boundary non-street edges stay `is_street=false`. **Alley
+  tier**: with `loading=AlleyLoaded`, each block is bisected along its long axis into
+  two sub-blocks whose shared edge is tagged `is_alley` (width `alley_width`); without,
+  none. Verb `lotgeneratesite [selector] <pattern> roadwidth= blockdepth= alleys=on|off
+  seed=` (registry-registered → GBNF/deck; parse/dispatch/exec) bakes roads onto a
+  `roads` layer + blocks onto a `blocks` layer as one logged op (road ids then block
+  ids written back; undo `CreatedOnLayer` removes both; **seeded-deterministic →
+  replay byte-identical**). `StreetPattern` + `road_width` + `block_depth` added to
+  `SubdivisionSettings` (serde-default). radial/hex/Voronoi return a clean
+  "Phase 5b" error, never a panic. **Confirmed the tagged block geometry survives
+  into the bake** so a downstream `lotsubdivide` on a generated block honours
+  `force_street_access` (test `generated_block_subdivides_with_street_access`). Tests
+  (all green): `tests/streets.rs` — the 4 generators on a rectangular + L-shaped site
+  (valid graph, non-overlapping blocks, coverage = site − ROW within tol, no gaps),
+  **street-tagging correctness on a known 2×2 orthogonal grid** (each corner block
+  fronts exactly 2 roads with the right id/width; outer edges `is_street=false`),
+  alley tier present iff `AlleyLoaded`, byte-identical for a fixed seed; plus
+  street_graph/block_extractor unit tests + `lotgeneratesite` exec (bake/undo/replay)
+  + `lot.rs` bridge tests. Phase 5b (radial/hex/Voronoi) and Phase 6 (lot rules) pick
+  up from here.
 - **Phase 6** — width mix hits requested proportions within 5% on a 500 ft frontage;
   alley-loaded blocks have correct two-sided depth; no slivers remain.
 - **Phase 7** — skeleton output on the cul-de-sac + curved-street blocks visually matches

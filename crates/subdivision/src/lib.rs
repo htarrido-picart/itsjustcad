@@ -13,16 +13,20 @@
 //! `method=perimeter`). Phase 2 (verb/settings plumbing) lives in the commands
 //! crate but the `SubdivisionSettings` type is defined here.
 
+pub mod blocks;
 pub mod geometry;
 pub mod settings;
+pub mod streets;
 pub mod subdivision;
 
+pub use blocks::{Block, BlockEdge};
 pub use geometry::clip_bridge;
 pub use geometry::oriented_box::{convex_hull, OrientedBox};
 pub use geometry::polygon2d::Polygon2d;
 pub use geometry::polyline::PolylineTools;
 pub use geometry::split::{split_by_line, Line2d};
-pub use settings::{SubdivisionMethod, SubdivisionSettings};
+pub use settings::{LoadingType, StreetPattern, SubdivisionMethod, SubdivisionSettings};
+pub use streets::{extract_blocks, generate_streets, Street, StreetGraph, StreetTier};
 pub use subdivision::offset_sub::subdivide as subdivide_offset;
 pub use subdivision::{subdivide, Lot};
 

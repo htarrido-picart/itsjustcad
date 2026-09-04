@@ -20,13 +20,21 @@
 use glam::{DVec2, DVec3};
 use itsjustcad_doc::{Document, Geometry, LayerStyle, ObjectId, SceneObject};
 use kernel_curve::Curve;
-use subdivision::{Polygon2d, SubdivisionMethod, SubdivisionSettings};
+use subdivision::{
+    Polygon2d, StreetPattern, SubdivisionMethod, SubdivisionSettings,
+};
 
 /// Chord tolerance for tessellating a block boundary curve to a polygon.
 const BLOCK_TOL: f64 = 0.01;
 
 /// The layer baked lots land on.
 pub const LOTS_LAYER: &str = "lots";
+
+/// The layer baked road centerlines land on (`lotgeneratesite`).
+pub const ROADS_LAYER: &str = "roads";
+
+/// The layer baked blocks land on (`lotgeneratesite`).
+pub const BLOCKS_LAYER: &str = "blocks";
 
 /// Convert a closed document `Curve` to a `Polygon2d` (XY projection; z dropped).
 pub fn curve_to_polygon(curve: &Curve) -> Option<Polygon2d> {
@@ -141,6 +149,141 @@ pub fn insert_lots(doc: &mut Document, bake: &LotBake, ids: &[ObjectId]) {
     }
 }
 
+/// A street-pattern string → enum (`lotgeneratesite pattern=`).
+pub fn parse_pattern(s: &str) -> Option<StreetPattern> {
+    match s.to_lowercase().as_str() {
+        "orthogonal" | "ortho" | "grid" => Some(StreetPattern::Orthogonal),
+        "skewed" | "skew" | "diagonal" => Some(StreetPattern::Skewed),
+        "organic" | "free" | "freeform" => Some(StreetPattern::Organic),
+        "culdesac" | "cul-de-sac" | "cul" => Some(StreetPattern::CulDeSac),
+        "radial" | "hexagonal" | "hex" | "voronoi" => None, // Phase 5b — not built
+        _ => None,
+    }
+}
+
+/// The result of generating a site: road centerline polylines + block boundary
+/// polygons, all at elevation `z`, ready to bake.
+#[derive(Debug)]
+pub struct SiteBake {
+    /// Road centerlines as open (or closed, for bulbs) polylines.
+    pub roads: Vec<Vec<DVec2>>,
+    /// Whether each road centerline is a closed loop (cul-de-sac bulb).
+    pub road_closed: Vec<bool>,
+    /// Block boundary polygons.
+    pub blocks: Vec<Polygon2d>,
+    /// How many block edges are street-tagged (frontage) / alley-tagged.
+    pub street_edges: usize,
+    pub alley_edges: usize,
+    pub z: f64,
+}
+
+/// Core Phase-5 bridge: generate roads + blocks for `site` with `settings`.
+/// Deterministic — output depends only on the site + settings (seed). Errors for
+/// the Phase-5b patterns (radial/hex/Voronoi) which are not yet built.
+pub fn generate_site(site: &Polygon2d, z: f64, settings: &SubdivisionSettings) -> Result<SiteBake, String> {
+    match settings.street_pattern {
+        StreetPattern::Orthogonal
+        | StreetPattern::Skewed
+        | StreetPattern::Organic
+        | StreetPattern::CulDeSac => {}
+        StreetPattern::Radial | StreetPattern::Hexagonal | StreetPattern::Voronoi => {
+            return Err(
+                "lotgeneratesite pattern=radial|hexagonal|voronoi is not yet implemented \
+                 (Phase 5b — owner scope). Use pattern=orthogonal|skewed|organic|culdesac."
+                    .into(),
+            );
+        }
+    }
+
+    let graph = subdivision::generate_streets(site, settings);
+    if graph.is_empty() {
+        return Err(
+            "lotgeneratesite produced no roads (site too small for the given blockdepth?)".into(),
+        );
+    }
+    let blocks = subdivision::extract_blocks(site, &graph, settings);
+    if blocks.is_empty() {
+        return Err("lotgeneratesite produced no blocks".into());
+    }
+
+    let mut roads = Vec::new();
+    let mut road_closed = Vec::new();
+    for s in &graph.streets {
+        let closed = s.centerline.len() >= 3
+            && s.centerline.first().unwrap().distance(*s.centerline.last().unwrap()) < 1e-6;
+        roads.push(s.centerline.clone());
+        road_closed.push(closed);
+    }
+    let street_edges = blocks.iter().map(|b| b.street_edge_count()).sum();
+    let alley_edges = blocks.iter().map(|b| b.alley_edge_count()).sum();
+
+    Ok(SiteBake {
+        roads,
+        road_closed,
+        blocks: blocks.into_iter().map(|b| b.polygon).collect(),
+        street_edges,
+        alley_edges,
+        z,
+    })
+}
+
+/// Ensure a layer exists; returns `Some(name)` if newly created.
+fn ensure_layer(doc: &mut Document, name: &str, color: [f32; 4]) -> Option<String> {
+    if doc.layers.contains_key(name) {
+        return None;
+    }
+    doc.layers.insert(
+        name.to_string(),
+        LayerStyle {
+            color: Some(color),
+            ..LayerStyle::default()
+        },
+    );
+    Some(name.to_string())
+}
+
+/// Ensure the `roads` layer exists (a slate grey for centerlines).
+pub fn ensure_roads_layer(doc: &mut Document) -> Option<String> {
+    ensure_layer(doc, ROADS_LAYER, [0.35, 0.38, 0.42, 1.0])
+}
+
+/// Ensure the `blocks` layer exists (a muted olive for block outlines).
+pub fn ensure_blocks_layer(doc: &mut Document) -> Option<String> {
+    ensure_layer(doc, BLOCKS_LAYER, [0.55, 0.58, 0.30, 1.0])
+}
+
+/// Insert baked roads onto the `roads` layer and blocks onto the `blocks` layer
+/// with the given ids (roads first, then blocks — the id order the exec records).
+pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], block_ids: &[ObjectId]) {
+    for ((pts, closed), id) in bake.roads.iter().zip(&bake.road_closed).zip(road_ids) {
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: Some("road".to_string()),
+            layer: ROADS_LAYER.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(Curve::Polyline {
+                points: pts.iter().map(|v| DVec3::new(v.x, v.y, bake.z)).collect(),
+                closed: *closed,
+            }),
+        });
+    }
+    for (poly, id) in bake.blocks.iter().zip(block_ids) {
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: Some("block".to_string()),
+            layer: BLOCKS_LAYER.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +389,81 @@ mod tests {
             Some(SubdivisionMethod::Skeleton)
         );
         assert_eq!(parse_method("bogus"), None);
+    }
+
+    #[test]
+    fn parse_pattern_aliases() {
+        assert_eq!(parse_pattern("orthogonal"), Some(StreetPattern::Orthogonal));
+        assert_eq!(parse_pattern("skew"), Some(StreetPattern::Skewed));
+        assert_eq!(parse_pattern("organic"), Some(StreetPattern::Organic));
+        assert_eq!(parse_pattern("culdesac"), Some(StreetPattern::CulDeSac));
+        // Phase 5b patterns are not accepted by the Phase-5 verb.
+        assert_eq!(parse_pattern("radial"), None);
+        assert_eq!(parse_pattern("bogus"), None);
+    }
+
+    #[test]
+    fn generate_site_produces_roads_and_blocks() {
+        let poly = curve_to_polygon(&rect_curve(400.0, 300.0)).unwrap();
+        let s = SubdivisionSettings {
+            street_pattern: StreetPattern::Orthogonal,
+            road_width: 12.0,
+            block_depth: 60.0,
+            seed: 7,
+            ..SubdivisionSettings::default()
+        };
+        let bake = generate_site(&poly, 0.0, &s).unwrap();
+        assert!(!bake.roads.is_empty(), "expected roads");
+        assert!(!bake.blocks.is_empty(), "expected blocks");
+        // Blocks stay inside the site.
+        let sum: f64 = bake.blocks.iter().map(|p| p.area()).sum();
+        assert!(sum <= poly.area() + 1.0);
+        // Street tags survived into the bake (every block fronts a road).
+        assert!(bake.street_edges > 0, "blocks should carry street tags");
+    }
+
+    #[test]
+    fn generate_site_radial_errors_cleanly() {
+        let poly = curve_to_polygon(&rect_curve(400.0, 300.0)).unwrap();
+        let s = SubdivisionSettings {
+            street_pattern: StreetPattern::Radial,
+            ..SubdivisionSettings::default()
+        };
+        let err = generate_site(&poly, 0.0, &s).unwrap_err();
+        assert!(err.contains("Phase 5b"));
+    }
+
+    #[test]
+    fn generated_block_subdivides_with_street_access() {
+        // A generated block, fed back to recursive-OBB subdivision, must produce
+        // lots that keep street frontage — confirming the tagged block geometry
+        // survives into a downstream lotsubdivide (plan Phase 5 requirement).
+        let poly = curve_to_polygon(&rect_curve(400.0, 300.0)).unwrap();
+        let gs = SubdivisionSettings {
+            street_pattern: StreetPattern::Orthogonal,
+            road_width: 12.0,
+            block_depth: 80.0,
+            seed: 7,
+            ..SubdivisionSettings::default()
+        };
+        let bake = generate_site(&poly, 0.0, &gs).unwrap();
+        // Take the largest generated block and subdivide it.
+        let block = bake
+            .blocks
+            .iter()
+            .max_by(|a, b| a.area().partial_cmp(&b.area()).unwrap())
+            .unwrap()
+            .clone();
+        let ss = SubdivisionSettings {
+            method: SubdivisionMethod::Recursive,
+            lot_area_min: 1500.0,
+            lot_width_min: 15.0,
+            force_street_access: 1.0,
+            ..SubdivisionSettings::default()
+        };
+        let out = subdivide_blocks(&[(block, 0.0)], &ss).unwrap();
+        assert!(out.polygons.len() >= 1);
+        // With force_street_access, every lot keeps a boundary (street) edge.
+        assert_eq!(out.with_street, out.polygons.len(), "all lots must front a street");
     }
 }

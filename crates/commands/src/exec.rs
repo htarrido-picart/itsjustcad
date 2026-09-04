@@ -3945,6 +3945,131 @@ fn exec_lot_settings(
     ))
 }
 
+/// `lotgeneratesite` (M-intemfit Phase 5): generate a road network + blocks from
+/// the selected site boundary curve. Roads bake onto the `roads` layer, blocks
+/// onto the `blocks` layer, as one logged op. Per-run args override the sticky
+/// settings and are baked into the op so replay is self-contained. Deterministic
+/// for a fixed seed → written-back ids make replay recreate byte-identical
+/// roads + blocks.
+#[allow(clippy::too_many_arguments)]
+fn exec_lot_generate_site(
+    doc: &mut Document,
+    targets: Selector,
+    pattern: String,
+    roadwidth: Option<f64>,
+    blockdepth: Option<f64>,
+    alleys: Option<bool>,
+    seed: Option<u64>,
+    road_ids: Option<Vec<ObjectId>>,
+    block_ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let Some(pattern_enum) = crate::lot::parse_pattern(&pattern) else {
+        return Err(ExecError::Invalid(format!(
+            "unknown lotgeneratesite pattern '{pattern}' — use \
+             orthogonal | skewed | organic | culdesac"
+        )));
+    };
+
+    // Effective settings: sticky doc settings + per-run overrides.
+    let mut settings = doc.subdivision_settings.clone();
+    settings.street_pattern = pattern_enum;
+    if let Some(w) = roadwidth {
+        settings.road_width = w;
+    }
+    if let Some(d) = blockdepth {
+        settings.block_depth = d;
+    }
+    if let Some(a) = alleys {
+        settings.loading = if a {
+            subdivision::LoadingType::AlleyLoaded
+        } else {
+            subdivision::LoadingType::FrontLoaded
+        };
+    }
+    if let Some(s) = seed {
+        settings.seed = s;
+    }
+
+    // Gather the (single) closed site boundary from the selection. If several
+    // closed curves are selected, use the largest by area (the site).
+    let sel_ids = resolve(doc, &targets)?;
+    let mut best: Option<(subdivision::Polygon2d, f64)> = None;
+    for id in &sel_ids {
+        if let Some(obj) = doc.get(*id)
+            && let Geometry::Curve(c) = &obj.geometry
+            && c.is_closed()
+            && let Some(poly) = crate::lot::curve_to_polygon(c)
+        {
+            let pts = c.tessellate(PROFILE_TOL);
+            let z = if pts.is_empty() {
+                0.0
+            } else {
+                pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
+            };
+            let a = poly.area();
+            if best.as_ref().map(|(_, _)| a).is_none() || a > best.as_ref().map(|(p, _)| p.area()).unwrap_or(0.0) {
+                best = Some((poly, z));
+            }
+        }
+    }
+    let Some((site, z)) = best else {
+        return Err(ExecError::Invalid(
+            "lotgeneratesite needs a closed site boundary curve (draw or select one first)".into(),
+        ));
+    };
+
+    let bake = crate::lot::generate_site(&site, z, &settings).map_err(ExecError::Invalid)?;
+
+    // Written-back ids: roads first, then blocks. Reuse on replay.
+    let new_road_ids: Vec<ObjectId> = match road_ids {
+        Some(ids) if ids.len() == bake.roads.len() => ids,
+        _ => (0..bake.roads.len()).map(|_| ObjectId::new()).collect(),
+    };
+    let new_block_ids: Vec<ObjectId> = match block_ids {
+        Some(ids) if ids.len() == bake.blocks.len() => ids,
+        _ => (0..bake.blocks.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    let mut layers_created = Vec::new();
+    if let Some(name) = crate::lot::ensure_roads_layer(doc) {
+        layers_created.push(name);
+    }
+    if let Some(name) = crate::lot::ensure_blocks_layer(doc) {
+        layers_created.push(name);
+    }
+    crate::lot::insert_site(doc, &bake, &new_road_ids, &new_block_ids);
+    doc.generation += 1;
+
+    let mut created: Vec<ObjectId> = new_road_ids.clone();
+    created.extend(new_block_ids.clone());
+    let n_roads = new_road_ids.len();
+    let n_blocks = new_block_ids.len();
+    Ok((
+        Command::LotGenerateSite {
+            targets,
+            pattern,
+            roadwidth,
+            blockdepth,
+            alleys,
+            seed,
+            road_ids: Some(new_road_ids),
+            block_ids: Some(new_block_ids),
+        },
+        Inverse::CreatedOnLayer { created: created.clone(), layers_created },
+        ApplyOutcome {
+            message: format!(
+                "lotgeneratesite {pattern_enum:?}: {n_roads} roads on '{}', {n_blocks} blocks on \
+                 '{}' ({} street edges, {} alley edges)",
+                crate::lot::ROADS_LAYER,
+                crate::lot::BLOCKS_LAYER,
+                bake.street_edges,
+                bake.alley_edges,
+            ),
+            created,
+        },
+    ))
+}
+
 /// Contour polylines FROM the terrain mesh: marching triangles at every
 /// multiple of `interval`, chained into polylines. Minor contours on layer
 /// "contours", every `major_every`-th level on "contours-major". Pure
@@ -7463,6 +7588,18 @@ fn apply_forward(
             exec_lot_subdivide(doc, targets, method, area, width, irregularity, seed, ids)
         }
         Command::LotSettings { sets, prev } => exec_lot_settings(doc, sets, prev),
+        Command::LotGenerateSite {
+            targets,
+            pattern,
+            roadwidth,
+            blockdepth,
+            alleys,
+            seed,
+            road_ids,
+            block_ids,
+        } => exec_lot_generate_site(
+            doc, targets, pattern, roadwidth, blockdepth, alleys, seed, road_ids, block_ids,
+        ),
         Command::FlowArrows { n, ids } => exec_flow_arrows(doc, n, ids),
         Command::Ponding { ids } => exec_ponding(doc, ids),
         Command::CodeCheck { pack, story, rules, ids } => {
@@ -9008,6 +9145,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::CutFill { .. } => "cutfill",
         Command::LotSubdivide { .. } => "lotsubdivide",
         Command::LotSettings { .. } => "lotsettings",
+        Command::LotGenerateSite { .. } => "lotgeneratesite",
         Command::Plant { .. } => "plant",
         Command::PlantRow { .. } => "plantrow",
         Command::PlantSchedule { .. } => "plantschedule",
@@ -15691,6 +15829,80 @@ mod tests {
             .map(|o| o.geometry.clone())
             .collect();
         assert_eq!(before, after, "replay recreated identical perimeter lots");
+    }
+
+    // ── M-intemfit: lotgeneratesite (Phase 5) ───────────────────────────────
+
+    fn layer_count(s: &Session, layer: &str) -> usize {
+        s.doc.all_ids()
+            .iter()
+            .filter(|id| s.doc.get(**id).map(|o| o.layer == layer).unwrap_or(false))
+            .count()
+    }
+
+    #[test]
+    fn lotgeneratesite_bakes_roads_and_blocks_layers() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 300");
+        let out = run(
+            &mut s,
+            "lotgeneratesite last orthogonal roadwidth=12 blockdepth=60 seed=7",
+        );
+        assert!(out.created.len() > 2, "expected roads + blocks");
+        assert!(s.doc.layers.contains_key(crate::lot::ROADS_LAYER));
+        assert!(s.doc.layers.contains_key(crate::lot::BLOCKS_LAYER));
+        assert!(layer_count(&s, crate::lot::ROADS_LAYER) > 0, "roads baked");
+        assert!(layer_count(&s, crate::lot::BLOCKS_LAYER) > 0, "blocks baked");
+        assert!(out.message.contains("street edges"), "{}", out.message);
+    }
+
+    #[test]
+    fn lotgeneratesite_undo_removes_both_layers() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 300");
+        run(&mut s, "lotgeneratesite last orthogonal roadwidth=12 blockdepth=60 seed=7");
+        assert!(layer_count(&s, crate::lot::ROADS_LAYER) > 0);
+        assert!(layer_count(&s, crate::lot::BLOCKS_LAYER) > 0);
+        run(&mut s, "undo");
+        assert_eq!(layer_count(&s, crate::lot::ROADS_LAYER), 0, "undo removes roads");
+        assert_eq!(layer_count(&s, crate::lot::BLOCKS_LAYER), 0, "undo removes blocks");
+    }
+
+    #[test]
+    fn lotgeneratesite_replay_is_byte_identical() {
+        // Deterministic generators → replaying the log recreates identical roads
+        // + blocks (ids written back on first exec).
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 300");
+        run(&mut s, "lotgeneratesite last culdesac blockdepth=60 alleys=on seed=7");
+        let geo = |s: &Session| -> Vec<_> {
+            let mut v: Vec<_> = s
+                .doc
+                .all_ids()
+                .iter()
+                .filter_map(|id| s.doc.get(*id))
+                .filter(|o| {
+                    o.layer == crate::lot::ROADS_LAYER || o.layer == crate::lot::BLOCKS_LAYER
+                })
+                .map(|o| (o.layer.clone(), o.geometry.clone()))
+                .collect();
+            v.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            v
+        };
+        let before = geo(&s);
+        let log: Vec<Command> = s.log.iter().map(|a| a.op.clone()).collect();
+        let rebuilt = Session::replay(log).unwrap();
+        assert_eq!(before, geo(&rebuilt), "replay recreated identical roads + blocks");
+    }
+
+    #[test]
+    fn lotgeneratesite_radial_errors_cleanly() {
+        // `radial` parses (it is a known pattern keyword) but is a Phase-5b
+        // generator the Phase-5 exec does not build → a clear error, no panic.
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 300");
+        let err = s.run(parse("lotgeneratesite last radial").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("orthogonal"), "{err}");
     }
 
     #[test]

@@ -1357,6 +1357,33 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prev: Option<String>,
     },
+    /// Generate a road network + blocks from the selected site boundary curve
+    /// (M-intemfit, Phase 5). `pattern` is one of the four rectilinear
+    /// generators (`orthogonal` | `skewed` | `organic` | `culdesac`). Roads bake
+    /// onto the `roads` layer, blocks onto the `blocks` layer. The numeric args
+    /// override the sticky `SubdivisionSettings` for this run: `roadwidth` =
+    /// road ROW width, `blockdepth` = block-depth road spacing; `alleys` inserts
+    /// the rear-lane tier. Deterministic for a fixed seed → replay recreates
+    /// identical roads + blocks, so the baked `ids` are written back on first
+    /// exec (road ids then block ids).
+    LotGenerateSite {
+        targets: Selector,
+        /// `orthogonal` | `skewed` | `organic` | `culdesac`.
+        pattern: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        roadwidth: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blockdepth: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alleys: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<u64>,
+        /// Baked ids: road centerlines first, then block outlines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        road_ids: Option<Vec<ObjectId>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block_ids: Option<Vec<ObjectId>>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild
