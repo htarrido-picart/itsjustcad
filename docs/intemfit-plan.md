@@ -437,10 +437,17 @@ Every subdivision algorithm must pass these block shapes:
 
 ## 9. Phase definitions of done
 
-- **Phase 1** — `i_overlay` round-trips a polygon with no coordinate drift; offset +
-  boolean pass on all 10 blocks; `OrientedBox` returns correct long/short axes for
-  rotated inputs. **`i_overlay` offset support + AGPLv3 compatibility confirmed — if
-  offset is inadequate, resolve here, not later.** Crate builds with no doc/egui deps.
+- **Phase 1** — ✅ **DONE (2026-09-04).** `crates/subdivision` pure-Rust leaf crate
+  (no egui/doc/commands deps): `Polygon2d` (CCW, shoelace, point-in-poly, centroid),
+  `OrientedBox` (min-area rect via rotating calipers on the monotone-chain hull —
+  rotated-rectangle tests recover correct long/short axes), `PolylineTools` (resample,
+  Douglas–Peucker simplify, perpendicular-at-param, arc-length), `split_by_line`
+  (Sutherland–Hodgman half-plane clip — all Phase 3 needs), and `clip_bridge` (the sole
+  `i_overlay` touch-point, int-scale ×1000 = `CLIP_SCALE` defined once). **i_overlay
+  offset support + AGPLv3 compatibility CONFIRMED** (see §12.1). Offset round-trips with
+  no drift; boolean union/intersection/difference pass. 10 sample blocks in
+  `samples/blocks/*.json` (§8 cases 1–10; #11/#12/#13 deferred to Phase 5b). 31 unit +
+  7 §8 integration tests green; clippy clean.
 - **Phase 2** — `lotsubdivide` runs from command line + deck; settings sticky across
   save/reload (serde on the doc); preview draws through the viewport overlay and bakes
   nothing until commit; verb registered (GBNF + palette). Runs headless (no GUI needed).
@@ -505,7 +512,16 @@ tool. Get Phase 3 into his hands early and let his reaction reorder everything a
 
 ## 12. Open blockers to clear before coding
 
-1. **Confirm `i_overlay` polygon offset** (inward/outward buffer) quality — Phase-1 gate.
+1. ✅ **RESOLVED (2026-09-04) — `i_overlay` polygon offset works.** `i_overlay` 8.1.0
+   (crates.io, **MIT OR Apache-2.0 → AGPLv3-clean**, pure Rust, no C/FFI) ships BOTH
+   boolean overlay (`SingleFloatOverlay::overlay` — union/intersection/difference/xor)
+   AND polygon OFFSET via the `OutlineOffset` trait (`OutlineStyle` with independent
+   outer/inner offset + Miter/Round/Bevel joins; `outline_fixed_scale` pins the
+   float→int scale we control). Verified in `clip_bridge.rs` tests: inward offset shrinks
+   area, outward grows it, a deep inset collapses to empty, and boolean ops give the
+   expected areas. **No fallback to `geo` or a vendored Clipper2 needed.** Phase 3
+   (recursive OBB) does not use offset at all — it uses only the half-plane clip — so the
+   bridge is wired + smoke-tested now for Phase 4+ but is not on the Phase-3 critical path.
 2. **Locate the Python prototype** — the plan references `/prototype/python`; it is not
    yet in this repo. Get it from Manuel/source before Phase 3 (port target).
 3. **Manuel's §1 open questions** (width-mix products, alley dims, day-one, flag-lot

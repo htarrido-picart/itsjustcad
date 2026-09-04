@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright © 2026 Hector Tarrido-Picart
+
+//! `subdivision` — pure-Rust 2D site-planning geometry (intemfit / M-intemfit).
+//!
+//! ZERO `egui` / `itsjustcad-doc` / `itsjustcad-commands` deps: plain geometry
+//! in, plain geometry out, unit-tested headless. The commands crate owns the
+//! bridge from document curves to these types (dependency direction:
+//! `subdivision` (leaf) ← `commands` ← `app`).
+//!
+//! Phases shipped: 1 (geometry foundation + `i_overlay` bridge), 3 (recursive
+//! OBB subdivision, `method=grid`). Phase 2 (verb/settings plumbing) lives in the
+//! commands crate but the `SubdivisionSettings` type is defined here.
+
+pub mod geometry;
+pub mod settings;
+pub mod subdivision;
+
+pub use geometry::clip_bridge;
+pub use geometry::oriented_box::{convex_hull, OrientedBox};
+pub use geometry::polygon2d::Polygon2d;
+pub use geometry::polyline::PolylineTools;
+pub use geometry::split::{split_by_line, Line2d};
+pub use settings::{SubdivisionMethod, SubdivisionSettings};
+pub use subdivision::{subdivide, Lot};
+
+use glam::DVec2;
+
+/// A validation block loaded from a `samples/blocks/*.json` file. The JSON is a
+/// simple `{"name": "...", "boundary": [[x,y], ...]}` object.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SampleBlock {
+    pub name: String,
+    pub boundary: Vec<[f64; 2]>,
+}
+
+impl SampleBlock {
+    /// Parse a sample block from a JSON string.
+    pub fn from_json(s: &str) -> Result<SampleBlock, serde_json::Error> {
+        serde_json::from_str(s)
+    }
+
+    /// Convert the boundary into a `Polygon2d` (CCW-normalised).
+    pub fn polygon(&self) -> Option<Polygon2d> {
+        Polygon2d::new(self.boundary.iter().map(|p| DVec2::new(p[0], p[1])).collect())
+    }
+}

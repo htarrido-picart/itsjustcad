@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright © 2026 Hector Tarrido-Picart
+#
+# Pure-Rust 2D subdivision geometry (intemfit / M-intemfit). ZERO egui, doc, or
+# commands deps — plain geometry in, plain geometry out, unit-tested headless.
+[package]
+name = "subdivision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# 2D boolean overlay + polygon OFFSET (OutlineOffset). Pure Rust, MIT OR
+# Apache-2.0 — AGPLv3-compatible. Confirmed on crates.io v8.1.0. Provides the
+# offset/boolean gap Phase 4+ needs; Phase 3 uses only the half-plane clip here.
+i_overlay = "8.1"

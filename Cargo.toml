@@ -5,6 +5,7 @@ members = [
     "crates/kernel-curve",
     "crates/kernel-brep",
     "crates/kernel-occt",
+    "crates/subdivision",
     "crates/constraints",
     "crates/doc",
     "crates/commands",
@@ -61,6 +62,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 kernel-mesh = { path = "crates/kernel-mesh" }
 kernel-curve = { path = "crates/kernel-curve" }
 kernel-occt = { path = "crates/kernel-occt" }
+subdivision = { path = "crates/subdivision" }
 itsjustcad-constraints = { path = "crates/constraints" }
 itsjustcad-doc = { path = "crates/doc" }
 itsjustcad-commands = { path = "crates/commands" }
