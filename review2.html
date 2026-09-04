@@ -113,18 +113,8 @@
 <h2 class="sec">Pending / Known Issues <span class="tag warn">read first</span></h2>
 <p class="lead">Open items, honest limits, and cleanups to schedule before the v0.1 push. None block manual testing.</p>
 
-<div class="grp-title">Clippy — ~13 non-test lints (workspace, <code>--all-targets</code>)</div>
-<p class="lead">Cosmetic/idiomatic only; nothing correctness-affecting. Auto-fixable with <code>cargo clippy --fix</code>.</p>
-<table>
-  <tr><th>Kind</th><th>Where</th></tr>
-  <tr><td>Loop index used to index a slice (<code>needless_range_loop</code>) ×3</td><td><code>kernel-mesh/src/formfind.rs:297,323</code>; <code>edges.rs:393</code></td></tr>
-  <tr><td>Borrowed expr already implements trait (<code>needless_borrow</code>) ×4</td><td><code>app/src/app.rs</code> (2805, ~4773–4774, ~6517–6518, ~6530–6531)</td></tr>
-  <tr><td><code>contains_key</code> then <code>insert</code> on a BTreeMap</td><td><code>kernel-mesh/src/csg.rs:444,467</code></td></tr>
-  <tr><td><code>&amp;mut Vec</code> where <code>&amp;mut [_]</code> would do</td><td><code>kernel-mesh/src/solids.rs:124</code></td></tr>
-  <tr><td>Very complex type — factor into a <code>type</code> alias</td><td><code>commands/src/sketch.rs:133</code></td></tr>
-  <tr><td>Unnecessary <code>copied</code> / <code>clone</code> / <code>let…else</code> / collapsible <code>if</code> / <code>×-1</code></td><td><code>commands/src/sketch.rs:539</code>, <code>app/src/menu.rs:1098</code>, <code>app/src/deck_pane.rs:1140</code></td></tr>
-  <tr><td>Doc list item without indentation ×2</td><td>rustdoc comments (kernel-mesh)</td></tr>
-</table>
+<div class="grp-title">Clippy <span class="tag ok">clean</span> — workspace 0 warnings</div>
+<p class="lead">The 13 lints noted in the first pass are now <b>all cleared</b> (commits <code>ab787f4</code> non-app, <code>7b14eea</code> app-crate). Genuine false-positives (Gauss–Seidel index-mutation loops, <code>contains_key</code>/<code>insert</code> where <code>entry</code> can't hold the second borrow) got scoped <code>#[allow]</code> + reason comments; the rest were real trivial fixes (type alias, let-chain, dropped <code>.copied()</code>, <code>let…else</code>→<code>?</code>, doc-list reword). <code>cargo clippy --workspace</code> now reports zero.</p>
 
 <div class="grp-title">TODO / FIXME / HACK in shipped code</div>
 <p class="lead"><span class="tag ok">clean</span> Zero non-test <code>TODO</code>/<code>FIXME</code>/<code>HACK</code> markers found across <code>crates/*/src</code>.</p>
@@ -139,19 +129,15 @@
   <li><b>M-landscape (partial pieces NOT done):</b> contour labels + sheet/PDF feed, freeform <code>grade</code> regions, retaining-edge detection, <code>plantmass</code>, seasonal deciduous transparency, watershed accumulation, <code>swale</code>, stairs/ramp generators, site sections through terrain.</li>
   <li><b>Plan symbols NOT done:</b> seasonal deciduous stipple density, per-species custom art, symbol in DXF export.</li>
   <li><b>M-deckagent:</b> <code>run_plan_loop</code> is mock-tested but <b>not yet the live execution path</b> (the streaming deck_pane driver is); no dedicated per-step GBNF "STEP" form.</li>
+  <li><b>Code signing (M-sign, deprioritized):</b> the app is unsigned / ad-hoc-signed, so macOS re-prompts for keychain access after each rebuild and Gatekeeper warns on first launch. Chat encryption is therefore <b>default OFF</b> for now; flip back to default-ON once a stable Developer ID signature makes the "Always Allow" grant stick. Ship-gate decision for v0.1.</li>
 </ul>
 
 <div class="grp-title">Phases explicitly marked partial</div>
 <ul><li><span class="tag warn">[~]</span> <b>M-perf</b> — Step 1 shipped; Step 2 (GPU) deferred.</li></ul>
 
-<div class="grp-title">Uncommitted working-tree files</div>
-<table>
-  <tr><th>Path</th><th>Status</th></tr>
-  <tr><td><code>crates/app/src/chat_crypto.rs</code></td><td>Untracked — chat-encryption work in progress (concurrent).</td></tr>
-  <tr><td><code>crates/app/src/chat_store.rs</code>, <code>main.rs</code>, <code>Cargo.toml</code>, <code>Cargo.lock</code>, <code>PHASES.md</code>, <code>crates/app/Cargo.toml</code></td><td>Modified — chat-encryption wiring.</td></tr>
-  <tr><td><code>.claude/</code></td><td>Untracked tooling dir.</td></tr>
-</table>
-<div class="callout warn">Chat encryption (<code>chat_crypto.rs</code>) is still being finished at review time — its test section (§10) is provisional and only applies once that work lands.</div>
+<div class="grp-title">Uncommitted working-tree files <span class="tag ok">resolved</span></div>
+<p class="lead">Chat encryption fully landed (commits <code>7b14eea</code>, <code>44d5e09</code>, <code>eb01b18</code>, <code>538c5f4</code>) — no encryption files remain uncommitted. Only <code>.claude/</code> (tooling dir) stays untracked, never staged.</p>
+<div class="callout ok">Chat encryption landed and is now an <b>opt-in user setting, default OFF</b> — no keychain prompt unless enabled (the app isn't code-signed yet; revisit the default once M-sign lands).</div>
 
 <div class="grp-title">Larger open phases (not part of this push)</div>
 <ul>
@@ -358,17 +344,17 @@
 <!-- ============ 10 CRYPTO ============ -->
 <section id="crypto">
 <details>
-<summary>10 · Chat Encryption <span class="tag warn">provisional</span></summary>
-<div class="callout warn">Being finished at review time (<code>chat_crypto.rs</code> uncommitted). Run this section only once the encryption work lands.</div>
-<p class="lead">AES-256-GCM at rest, keyed by an OS-keychain data key; transparent auto-unlock; legacy plaintext upgrades on next save.</p>
-<div class="chk"><input type="checkbox" id="x1"><label for="x1">Have a chat, quit, and inspect <code>~/.config/itsjustcad/chats/&lt;uuid&gt;.json</code>. <span class="exp"><b>Expect:</b> starts with the <code>ICEC</code> magic header — ciphertext, not readable plaintext.</span></label></div>
-<div class="chk"><input type="checkbox" id="x2"><label for="x2">Relaunch, reopen the session. <span class="exp"><b>Expect:</b> transparent auto-unlock — chat reads back, no password prompt.</span></label></div>
-<div class="chk"><input type="checkbox" id="x3"><label for="x3">Take a pre-existing plaintext chat file, open it, send a message, quit. <span class="exp"><b>Expect:</b> legacy plaintext loads, then upgrades to the encrypted <code>ICEC</code> container on save.</span></label></div>
-<div class="chk"><input type="checkbox" id="x4"><label for="x4">On a machine with no keychain (headless/CI/bare Linux). <span class="exp"><b>Expect:</b> plaintext fallback with a one-time warning — never a data-loss or hard fail.</span></label></div>
+<summary>10 · Chat Encryption <span class="tag ok">shipped · opt-in</span></summary>
+<p class="lead">AES-256-GCM at rest, keyed by an OS-keychain data key; <b>default OFF</b>, toggled with <code>chatencryption on|off</code> (alias <code>encryptchats</code>). Key cached per process → at most one keychain prompt per launch. Self-describing format loads plaintext or encrypted either way, so toggling is lossless.</p>
+<div class="chk"><input type="checkbox" id="x0"><label for="x0">Fresh install, have a chat, quit, inspect <code>~/.config/itsjustcad/chats/&lt;uuid&gt;.json</code>. <span class="exp"><b>Expect:</b> plaintext JSON (default OFF) — <b>no keychain prompt at any point</b>.</span></label></div>
+<div class="chk"><input type="checkbox" id="x1"><label for="x1">Type <code>chatencryption on</code>, send a message, quit, re-inspect the file. <span class="exp"><b>Expect:</b> status line confirms "chat encryption: on"; file now starts with the <code>ICEC</code> magic header — ciphertext. One keychain prompt (grant it).</span></label></div>
+<div class="chk"><input type="checkbox" id="x2"><label for="x2">Relaunch, reopen the session, send several messages. <span class="exp"><b>Expect:</b> reads back fine; at most <b>one</b> keychain prompt for the whole session (key is cached), not one per save.</span></label></div>
+<div class="chk"><input type="checkbox" id="x3"><label for="x3">Type <code>chatencryption off</code>, send a message, quit, re-inspect. <span class="exp"><b>Expect:</b> new save is plaintext JSON again — no data lost switching back.</span></label></div>
+<div class="chk"><input type="checkbox" id="x4"><label for="x4">With encryption on, on a machine/session with no keychain. <span class="exp"><b>Expect:</b> plaintext fallback with a one-time warning — never a data-loss or hard fail.</span></label></div>
 </details>
 </section>
 
-<div class="foot">ItsJustCAD — Review 2 · generated 2026-09-03 · verbs verified against <code>crates/commands/src/registry.rs</code> + <code>crates/app/src/app_verbs.rs</code> + assets. Checkbox state is stored locally in your browser.</div>
+<div class="foot">ItsJustCAD — Review 2 · generated 2026-09-03 · rev. b · post chat-encryption + clippy-clean · verbs verified against <code>crates/commands/src/registry.rs</code> + <code>crates/app/src/app_verbs.rs</code> + assets. Checkbox state is stored locally in your browser.</div>
 </main>
 </div>
 
