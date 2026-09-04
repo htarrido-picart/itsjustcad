@@ -64,6 +64,11 @@ pub enum AppVerb {
     /// Toggle Reduce Motion for animated progress bars (`reducemotion [on|off]`).
     /// `None` means bare toggle.
     ReduceMotion(Option<bool>),
+    /// Toggle at-rest encryption of chat-session files (`chatencryption [on|off]`
+    /// / `encryptchats`). `None` means bare toggle. Persisted to ui.json; a
+    /// disabled setting writes new saves in plaintext (existing encrypted stores
+    /// still load and re-save in the chosen mode).
+    ChatEncryption(Option<bool>),
     /// Persist the document (`save [path]`). Argument is the optional path.
     Save(Option<String>),
     /// Command reference (`help [verb]`).
@@ -206,6 +211,12 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             None => None,
             _ => return None,
         }),
+        "chatencryption" | "encryptchats" => AppVerb::ChatEncryption(match words.next() {
+            Some("on" | "true" | "1") => Some(true),
+            Some("off" | "false" | "0") => Some(false),
+            None => None,
+            _ => return None,
+        }),
         "camera" => AppVerb::Camera(
             words.next().map(str::to_ascii_lowercase),
             words.next().map(str::to_ascii_lowercase),
@@ -299,6 +310,10 @@ mod tests {
         assert_eq!(classify("reducemotion 0"), Some(AppVerb::ReduceMotion(Some(false))));
         assert_eq!(classify("reducemotion"), Some(AppVerb::ReduceMotion(None)));
         assert_eq!(classify("reducemotion garbage"), None);
+        assert_eq!(classify("chatencryption on"), Some(AppVerb::ChatEncryption(Some(true))));
+        assert_eq!(classify("encryptchats off"), Some(AppVerb::ChatEncryption(Some(false))));
+        assert_eq!(classify("chatencryption"), Some(AppVerb::ChatEncryption(None)));
+        assert_eq!(classify("chatencryption garbage"), None);
     }
 
     #[test]
@@ -389,7 +404,9 @@ mod tests {
         "template",     // GUI-only
         "save",         // fs write — refused on deck plane
         "help",         // meta, not a view action
-        "reducemotion", // accessibility toggle, not a drawing/view verb the model reframes with
+        "reducemotion",  // accessibility toggle, not a drawing/view verb the model reframes with
+        "chatencryption", // privacy setting, not a drawing/view verb
+        "encryptchats",   // alias of `chatencryption`
         "lightmode",    // alias of `light`
         "profileedges", // alias of `profiles`
         "shadededges",  // alias of `meshedges`
@@ -429,6 +446,8 @@ mod tests {
             "gumball",
             "gizmo",
             "reducemotion",
+            "chatencryption",
+            "encryptchats",
             "camera",
             "save",
             "help",

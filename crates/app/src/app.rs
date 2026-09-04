@@ -1208,6 +1208,21 @@ impl App {
                 self.command_line
                     .push_line(format!("reduce motion: {}", if on { "on" } else { "off" }));
             }
+            // Toggle at-rest chat encryption. Persisted to ui.json; read by
+            // DocSessions::save on the next chat write. Existing stores still
+            // load regardless (the format is self-describing).
+            Some("chatencryption" | "encryptchats") => {
+                let on = match words.next() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => !load_chat_encryption(), // bare toggle
+                };
+                save_chat_encryption(on);
+                self.command_line.push_line(format!(
+                    "chat encryption: {} (applies to the next chat save)",
+                    if on { "on" } else { "off" }
+                ));
+            }
             Some("viewports" | "vp") => {
                 match words.next() {
                     Some("1") => self.set_layout(ViewportLayout::Single),
@@ -5397,6 +5412,19 @@ fn load_reduce_motion() -> bool {
 fn save_reduce_motion(on: bool) {
     let mut v = load_ui_json();
     v["reduce_motion"] = serde_json::json!(on);
+    save_ui_json(&v);
+}
+
+/// Whether chat-session files are encrypted at rest. Default ON (secure by
+/// default when a keychain is available); users can opt out via
+/// `chatencryption off`. Read by [`crate::chat_store::DocSessions::save`].
+pub(crate) fn load_chat_encryption() -> bool {
+    load_ui_json()["chat_encryption"].as_bool().unwrap_or(true)
+}
+
+fn save_chat_encryption(on: bool) {
+    let mut v = load_ui_json();
+    v["chat_encryption"] = serde_json::json!(on);
     save_ui_json(&v);
 }
 

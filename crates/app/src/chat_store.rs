@@ -281,9 +281,10 @@ impl DocSessions {
         Self::load_with(doc_uuid, &crate::chat_crypto::OsKeyStore)
     }
 
-    /// Persist to the app-local store; see [`Self::save_with`].
+    /// Persist to the app-local store; see [`Self::save_with_opts`]. Encryption
+    /// follows the user's `chat_encryption` preference (default ON).
     pub fn save(&self) {
-        self.save_with(&crate::chat_crypto::OsKeyStore);
+        self.save_with_opts(&crate::chat_crypto::OsKeyStore, crate::app::load_chat_encryption());
     }
 
     /// Load, transparently decrypting an encrypted store or reading a legacy
@@ -298,16 +299,22 @@ impl DocSessions {
             .unwrap_or_else(|| DocSessions::new(doc_uuid.to_string()))
     }
 
-    /// Persist to the app-local store, private (0600), ENCRYPTED at rest when a
-    /// keychain is available (plaintext fallback otherwise, with a one-time
-    /// warning — never a data loss / hard fail). Best-effort. NEVER writes into
-    /// the shared document. `store` is injectable for tests.
-    pub fn save_with<K: crate::chat_crypto::KeyStore>(&self, store: &K) {
+    /// Persist to the app-local store, private (0600). `encrypt` gates at-rest
+    /// encryption: when `false` the store is written as plaintext JSON
+    /// (self-describing, so it still loads); when `true` it is sealed if a
+    /// keychain is available (plaintext fallback with a one-time warning
+    /// otherwise). Best-effort; NEVER writes into the shared document. `store`
+    /// is injectable for tests.
+    pub fn save_with_opts<K: crate::chat_crypto::KeyStore>(&self, store: &K, encrypt: bool) {
         let Some(path) = store_path(&self.doc_uuid) else { return };
         let Some(parent) = path.parent() else { return };
         let _ = std::fs::create_dir_all(parent);
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let blob = crate::chat_crypto::seal_for_write(store, &json);
+            let blob = if encrypt {
+                crate::chat_crypto::seal_for_write(store, &json)
+            } else {
+                json
+            };
             let _ = crate::journal::write_private(&path, &blob);
         }
     }
@@ -539,6 +546,24 @@ mod tests {
             "store must be encrypted at rest with a healthy key"
         );
         let opened = crate::chat_crypto::open(&key, &sealed).unwrap();
+        let back: DocSessions = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(back, docs);
+    }
+
+    #[test]
+    fn opt_out_writes_plaintext_that_still_opens() {
+        // With encryption disabled the serialized bytes are plain JSON (not our
+        // encrypted container), yet `open` still recovers them — so a user who
+        // turns encryption off loses no sessions and can turn it back on later.
+        let docs = doc_with_two_sessions();
+        let key = MemKey([7u8; 32]);
+        let json = serde_json::to_vec_pretty(&docs).unwrap();
+        assert!(
+            !crate::chat_crypto::is_encrypted(&json),
+            "opt-out must leave the store as plaintext JSON"
+        );
+        // The self-describing loader reads plaintext regardless of key.
+        let opened = crate::chat_crypto::open(&key, &json).unwrap();
         let back: DocSessions = serde_json::from_slice(&opened).unwrap();
         assert_eq!(back, docs);
     }
