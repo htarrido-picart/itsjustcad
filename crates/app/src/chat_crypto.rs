@@ -26,6 +26,7 @@
 //! write is fine.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use aes_gcm::{
     aead::{generic_array::GenericArray, Aead, AeadCore, KeyInit, OsRng},
@@ -79,8 +80,24 @@ pub trait KeyStore {
 /// The real OS-keychain-backed store used at runtime.
 pub struct OsKeyStore;
 
+/// Process-wide cache of the resolved data key. The keychain is consulted at
+/// most ONCE per app run: macOS ties a keychain item's access ACL to the exact
+/// signed binary, so an unsigned/ad-hoc build re-prompts on every access — and
+/// `seal_for_write`/`open` run on every chat save/load. Caching collapses that
+/// to a single prompt per launch. `Some(key)` = available; `None` = keychain
+/// unavailable this run (fall back to plaintext without retrying + re-prompting).
+static KEY_CACHE: OnceLock<Option<[u8; KEY_LEN]>> = OnceLock::new();
+
 impl KeyStore for OsKeyStore {
     fn get_or_create_key(&self) -> Result<[u8; KEY_LEN], ()> {
+        (*KEY_CACHE.get_or_init(|| Self::fetch_key().ok())).ok_or(())
+    }
+}
+
+impl OsKeyStore {
+    /// Uncached keychain fetch: read the per-user key, minting + storing one on
+    /// first run. Called at most once via [`KEY_CACHE`].
+    fn fetch_key() -> Result<[u8; KEY_LEN], ()> {
         let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|_| ())?;
         match entry.get_secret() {
             Ok(bytes) if bytes.len() == KEY_LEN => {
