@@ -67,12 +67,17 @@ capability. These were "ruled out" by Manuel but are **in scope as tool features
 - **Loose / highly irregular** lots — the `irregularity` clamp becomes a *soft default*
   at 0.4 (Manuel's preference) with a "loose" mode unlocking up to 1.0; loose likely
   needs the organic subdivider (heavy jitter / non-orthogonal splits), not plain OBB.
+- **Voronoi** street networks — owner-requested 2026-09-04 (Manuel had it on "never use";
+  Hector overrides for tool capability). A Voronoi generator: seed points (jittered grid
+  or Poisson-disk) → Voronoi diagram → cell edges become streets, cells become blocks.
+  Non-rectilinear like radial/hex. **We can derive it as the dual of our existing
+  Bowyer-Watson Delaunay** (`kernel-mesh::triangulate`) — circumcenters of adjacent
+  triangles are the Voronoi vertices — so no new geometry dep. Phase 5b with radial/hex.
 
 ### Explicitly ruled out — do not build
 
 - **"No subdivision"** mode (block stays one parcel) — not requested by anyone.
 - **Automatic "reserve N% open space."** Manuel wants *named features placed*, not a blind percentage. Do NOT implement percentage-reservation.
-- **Voronoi** street/lot networks — RESOLVED from the actual form (2026-09-03): Q6 asks "any pattern you'd never use?" and Manuel wrote **"Voronoi"**; the owner has not re-requested it. Do not build it unless Hector asks.
 
 ### Form verified against the real questionnaire (2026-09-03)
 
@@ -252,7 +257,7 @@ reference). serde-defaulted so old docs load; stored on the document.
 pub enum SubdivisionMethod { Recursive, Offset, Skeleton }
 pub enum LoadingType       { FrontLoaded, AlleyLoaded, Mixed }
 pub enum CornerAlignment   { StreetWidth, StreetLength }
-pub enum StreetPattern     { Orthogonal, Skewed, Organic, CulDeSac, Radial, Hexagonal } // Radial/Hexagonal = owner scope (Phase 5b)
+pub enum StreetPattern     { Orthogonal, Skewed, Organic, CulDeSac, Radial, Hexagonal, Voronoi } // Radial/Hexagonal/Voronoi = owner scope (Phase 5b)
 
 pub struct SubdivisionSettings {
     pub method: SubdivisionMethod, // = Recursive
@@ -353,7 +358,11 @@ Generators → a `StreetGraph` of centerlines with widths. **Four rectilinear (M
   recursive-OBB, which assumes rectilinear).
 - **Hexagonal** — a hex lattice sized to block depth; blocks are the hex cells (or
   6-way street intersections). Non-rectilinear; same "subdivide the emitted blocks" flow.
-These raise the §8 validation bar: add annular-sector and hex-cell blocks as cases.
+- **Voronoi** — seed points (jittered grid / Poisson-disk, seeded from op data for
+  replay), Voronoi diagram via the dual of `kernel-mesh::triangulate` (circumcenters of
+  adjacent Delaunay triangles = Voronoi vertices), clipped to the site; cell edges →
+  streets, cells → blocks. Irregular by nature — pairs naturally with `loose`.
+These raise the §8 validation bar: add annular-sector, hex-cell, and Voronoi-cell blocks.
 Then offset centerlines by ROW/2 (`i_overlay`), boolean-subtract from the site, tag
 every resulting block edge with its generating street. Snap to existing boundary access
 points. If `AlleyLoaded`, insert a second tier of narrower rear lanes bisecting each
@@ -404,6 +413,7 @@ Every subdivision algorithm must pass these block shapes:
 10. 15° acute corner (corner-lot clamping)
 11. Annular-sector block (radial generator output — owner scope)
 12. Hex-cell block (hexagonal generator output — owner scope)
+13. Voronoi-cell block (irregular convex polygon — owner scope)
 
 **Assertions (all cases):**
 - Σ lot area == block area within tolerance
@@ -482,4 +492,5 @@ tool. Get Phase 3 into his hands early and let his reaction reorder everything a
 2. **Locate the Python prototype** — the plan references `/prototype/python`; it is not
    yet in this repo. Get it from Manuel/source before Phase 3 (port target).
 3. **Manuel's §1 open questions** (width-mix products, alley dims, day-one, flag-lot
-   area accounting). Voronoi is now resolved — ruled out.
+   area accounting). Voronoi is now an owner-requested Phase-5b generator (dual of our
+   Delaunay), not ruled out.
