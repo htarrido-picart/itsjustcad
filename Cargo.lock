@@ -5105,6 +5105,7 @@ version = "0.3.0"
 dependencies = [
  "glam 0.30.10",
  "i_overlay",
+ "kernel-mesh",
  "serde",
  "serde_json",
 ]

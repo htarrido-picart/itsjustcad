@@ -558,6 +558,46 @@ Every subdivision algorithm must pass these block shapes:
   street_graph/block_extractor unit tests + `lotgeneratesite` exec (bake/undo/replay)
   + `lot.rs` bridge tests. Phase 5b (radial/hex/Voronoi) and Phase 6 (lot rules) pick
   up from here.
+- **Phase 5b** — ✅ **DONE (2026-09-04).** The three NON-rectilinear street
+  generators (owner scope), each emitting a `StreetGraph` fed into the SAME
+  `block_extractor` + street-tagging path as Phase 5:
+  - **Radial / circular** (`streets/generators/radial.rs`): its own polar layout —
+    a center (site centroid; N centers spread along the long axis for large sites)
+    → concentric ring roads (Connector tier) at block-depth spacing + radial spokes
+    (Spine tier), each clipped to the site boundary into inside runs. Blocks are
+    annular-sector polygons. Does NOT use OBB site-splitting.
+  - **Hexagonal** (`hexagonal.rs`): a pointy-top hex lattice sized so each cell is
+    ≈ one block deep (circumradius = depth/√3), tiled over the padded site bbox;
+    every distinct hex-cell edge (deduped) is one street centerline. Blocks are the
+    hex cells; boundary cells clipped by the extractor boolean.
+  - **Voronoi** (`voronoi.rs`): jittered-grid seeds (splitmix64 seeded from a
+    quantized site hash + `settings.seed`, salted apart → replay-stable) → the
+    Voronoi diagram built as the **dual of `kernel_mesh::triangulate`** (Bowyer-
+    Watson Delaunay; circumcenters of the two triangles sharing a Delaunay edge =
+    a Voronoi edge; hull-edge rays dropped, site clips the rest). `kernel-mesh`
+    added as a subdivision dep — it depends only on glam+serde (no subdivision), so
+    no cycle, and it is a workspace crate so **no new external dependency**. Cell
+    edges → streets, cells → blocks.
+  All three wired into `generate()` dispatch + `lotgeneratesite` (replacing the
+  clean-error stubs in `lot.rs` `parse_pattern`/`generate_site`). Same bake path:
+  roads→`roads` layer, blocks→`blocks` layer, one logged op, undo, seeded-
+  deterministic → byte-identical replay. Street tagging via the shared
+  `block_extractor` so every emitted block still carries `{is_street, street_id,
+  street_width, street_length, is_alley}`; a generated non-rectilinear block feeds
+  `lotsubdivide` and honours `force_street_access`. The extractor gained a
+  block-depth-derived crumb floor (`0.03·block_depth²`) so the many overlapping
+  curved ribbons the polar/hex/Voronoi paths subtract cannot leave sub-cell slivers
+  that pairwise-overlap (rectilinear blocks are ~block_depth², untouched). Sample
+  blocks #11 annular-sector / #12 hex-cell / #13 Voronoi-cell added to
+  `samples/blocks/` and run through the shared §8 subdivision assertions.
+  **Tests:** `tests/streets.rs` grew 6 Phase-5b tests — the three generators on a
+  rectangular + L-shaped site (valid graph, non-overlapping blocks inside the site),
+  street-tagged blocks, byte-identical fixed-seed replay, radial ring/spoke
+  geometry, hexagonal interior-cell size, Voronoi cell-count-tracks-seeds + the
+  **Delaunay-dual correctness on a known square seed set** (dual vertex = center),
+  and downstream `lotsubdivide` honouring force_street_access; plus per-generator
+  unit tests + updated `lot.rs`/`exec.rs` bridge tests. Phase 6 (lot rules: width
+  mix, depth, corner, flag, front/alley loading) picks up here.
 - **Phase 6** — width mix hits requested proportions within 5% on a 500 ft frontage;
   alley-loaded blocks have correct two-sided depth; no slivers remain.
 - **Phase 7** — skeleton output on the cul-de-sac + curved-street blocks visually matches
@@ -628,4 +668,6 @@ tool. Get Phase 3 into his hands early and let his reaction reorder everything a
    yet in this repo. Get it from Manuel/source before Phase 3 (port target).
 3. **Manuel's §1 open questions** (width-mix products, alley dims, day-one, flag-lot
    area accounting). Voronoi is now an owner-requested Phase-5b generator (dual of our
-   Delaunay), not ruled out.
+   Delaunay), not ruled out. ✅ **Phase 5b SHIPPED 2026-09-04** — radial/hexagonal/
+   Voronoi all built; Voronoi reuses `kernel_mesh::triangulate` (no new external dep,
+   no cycle). See §9.

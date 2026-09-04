@@ -156,7 +156,10 @@ pub fn parse_pattern(s: &str) -> Option<StreetPattern> {
         "skewed" | "skew" | "diagonal" => Some(StreetPattern::Skewed),
         "organic" | "free" | "freeform" => Some(StreetPattern::Organic),
         "culdesac" | "cul-de-sac" | "cul" => Some(StreetPattern::CulDeSac),
-        "radial" | "hexagonal" | "hex" | "voronoi" => None, // Phase 5b — not built
+        // Phase 5b — owner scope, non-rectilinear.
+        "radial" | "circular" | "ring" => Some(StreetPattern::Radial),
+        "hexagonal" | "hex" => Some(StreetPattern::Hexagonal),
+        "voronoi" | "voro" => Some(StreetPattern::Voronoi),
         _ => None,
     }
 }
@@ -177,24 +180,11 @@ pub struct SiteBake {
     pub z: f64,
 }
 
-/// Core Phase-5 bridge: generate roads + blocks for `site` with `settings`.
-/// Deterministic — output depends only on the site + settings (seed). Errors for
-/// the Phase-5b patterns (radial/hex/Voronoi) which are not yet built.
+/// Core site-generation bridge: generate roads + blocks for `site` with
+/// `settings`. Deterministic — output depends only on the site + settings (seed).
+/// Handles all seven patterns: the four rectilinear (Phase 5) plus the three
+/// non-rectilinear radial/hexagonal/Voronoi generators (Phase 5b — owner scope).
 pub fn generate_site(site: &Polygon2d, z: f64, settings: &SubdivisionSettings) -> Result<SiteBake, String> {
-    match settings.street_pattern {
-        StreetPattern::Orthogonal
-        | StreetPattern::Skewed
-        | StreetPattern::Organic
-        | StreetPattern::CulDeSac => {}
-        StreetPattern::Radial | StreetPattern::Hexagonal | StreetPattern::Voronoi => {
-            return Err(
-                "lotgeneratesite pattern=radial|hexagonal|voronoi is not yet implemented \
-                 (Phase 5b — owner scope). Use pattern=orthogonal|skewed|organic|culdesac."
-                    .into(),
-            );
-        }
-    }
-
     let graph = subdivision::generate_streets(site, settings);
     if graph.is_empty() {
         return Err(
@@ -397,8 +387,10 @@ mod tests {
         assert_eq!(parse_pattern("skew"), Some(StreetPattern::Skewed));
         assert_eq!(parse_pattern("organic"), Some(StreetPattern::Organic));
         assert_eq!(parse_pattern("culdesac"), Some(StreetPattern::CulDeSac));
-        // Phase 5b patterns are not accepted by the Phase-5 verb.
-        assert_eq!(parse_pattern("radial"), None);
+        // Phase 5b non-rectilinear patterns are now accepted.
+        assert_eq!(parse_pattern("radial"), Some(StreetPattern::Radial));
+        assert_eq!(parse_pattern("hex"), Some(StreetPattern::Hexagonal));
+        assert_eq!(parse_pattern("voronoi"), Some(StreetPattern::Voronoi));
         assert_eq!(parse_pattern("bogus"), None);
     }
 
@@ -423,14 +415,29 @@ mod tests {
     }
 
     #[test]
-    fn generate_site_radial_errors_cleanly() {
+    fn generate_site_nonrectilinear_patterns_produce_output() {
+        // Phase 5b: radial / hexagonal / Voronoi now generate roads + blocks
+        // through the shared extractor rather than erroring.
         let poly = curve_to_polygon(&rect_curve(400.0, 300.0)).unwrap();
-        let s = SubdivisionSettings {
-            street_pattern: StreetPattern::Radial,
-            ..SubdivisionSettings::default()
-        };
-        let err = generate_site(&poly, 0.0, &s).unwrap_err();
-        assert!(err.contains("Phase 5b"));
+        for p in [
+            StreetPattern::Radial,
+            StreetPattern::Hexagonal,
+            StreetPattern::Voronoi,
+        ] {
+            let s = SubdivisionSettings {
+                street_pattern: p,
+                road_width: 10.0,
+                block_depth: 60.0,
+                seed: 7,
+                ..SubdivisionSettings::default()
+            };
+            let bake = generate_site(&poly, 0.0, &s)
+                .unwrap_or_else(|e| panic!("{p:?} errored: {e}"));
+            assert!(!bake.roads.is_empty(), "{p:?}: expected roads");
+            assert!(!bake.blocks.is_empty(), "{p:?}: expected blocks");
+            let sum: f64 = bake.blocks.iter().map(|p| p.area()).sum();
+            assert!(sum <= poly.area() + 1.0, "{p:?}: blocks exceed site");
+        }
     }
 
     #[test]

@@ -105,8 +105,16 @@ pub fn extract(
         pieces = next;
     }
 
-    // Drop slivers (numerical crumbs from the boolean) below a tiny area.
-    let min_keep = (site.area() * 1e-6).max(1e-6);
+    // Drop slivers (numerical crumbs from the boolean) below a small area. Two
+    // floors: a site-relative epsilon, and — when a block depth is known — a
+    // fraction of one cell (block_depth²). Curved generators (radial/hex/Voronoi)
+    // subtract many overlapping ribbons whose endcaps leave sub-metre crumbs that
+    // can pairwise-overlap; a real block is always a meaningful fraction of a
+    // cell, so this floor removes the crumbs without touching genuine blocks
+    // (rectilinear blocks are ~block_depth², far above it).
+    let depth = crate::streets::generators::effective_block_depth(settings);
+    let cell_floor = if depth > 0.0 { depth * depth * 0.03 } else { 0.0 };
+    let min_keep = (site.area() * 1e-6).max(1e-6).max(cell_floor);
     let mut blocks: Vec<Block> = pieces
         .into_iter()
         .filter(|p| p.area() > min_keep)

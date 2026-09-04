@@ -13,16 +13,28 @@
 //! - [`culdesac`] — a spine road with perpendicular stubs ending in bulbs,
 //!   spaced by block depth.
 //!
-//! (Radial / hexagonal / Voronoi are Phase 5b — owner scope — and live nowhere
-//! yet.)
+//! **Three non-rectilinear (owner scope, Phase 5b):**
+//!
+//! - [`radial`] — concentric ring roads at block-depth spacing + radial spokes
+//!   from a center (or centers), clipped to the site; blocks are annular sectors.
+//!   Its own polar layout — does NOT use OBB site-splitting.
+//! - [`hexagonal`] — a hex lattice sized to block depth over the site bbox; hex
+//!   cell edges become streets, hex cells become blocks (boundary cells clipped).
+//! - [`voronoi`] — jittered-grid seeds (seeded from op data for replay) →
+//!   Voronoi diagram as the **dual of `kernel_mesh::triangulate`** (circumcenters
+//!   of adjacent Delaunay triangles are the Voronoi vertices); cell edges →
+//!   streets, cells → blocks. Reuses the existing Delaunay — no new external dep.
 //!
 //! Determinism: each generator seeds a splitmix64 from a quantized hash of the
 //! site + `settings.seed`, so the same input yields a byte-identical graph.
 
 pub mod culdesac;
+pub mod hexagonal;
 pub mod organic;
 pub mod orthogonal;
+pub mod radial;
 pub mod skewed;
+pub mod voronoi;
 
 use crate::geometry::polygon2d::Polygon2d;
 use crate::settings::{StreetPattern, SubdivisionSettings};
@@ -95,17 +107,18 @@ pub(crate) fn effective_road_width(settings: &SubdivisionSettings) -> f64 {
 }
 
 /// Dispatch on `settings.street_pattern` to the matching generator. Phase 5
-/// covers the four rectilinear patterns; the Phase-5b patterns return an empty
-/// graph (the caller reports "not yet implemented").
+/// covers the four rectilinear patterns; Phase 5b adds the three non-rectilinear
+/// generators (radial / hexagonal / Voronoi). All seven produce a `StreetGraph`
+/// fed to the same `block_extractor`.
 pub fn generate(site: &Polygon2d, settings: &SubdivisionSettings) -> StreetGraph {
     match settings.street_pattern {
         StreetPattern::Orthogonal => orthogonal::generate(site, settings),
         StreetPattern::Skewed => skewed::generate(site, settings),
         StreetPattern::Organic => organic::generate(site, settings),
         StreetPattern::CulDeSac => culdesac::generate(site, settings),
-        // Phase 5b — owner scope; not built in this cart.
-        StreetPattern::Radial | StreetPattern::Hexagonal | StreetPattern::Voronoi => {
-            StreetGraph::new()
-        }
+        // Phase 5b — owner scope, non-rectilinear.
+        StreetPattern::Radial => radial::generate(site, settings),
+        StreetPattern::Hexagonal => hexagonal::generate(site, settings),
+        StreetPattern::Voronoi => voronoi::generate(site, settings),
     }
 }

@@ -17,3 +17,8 @@ serde_json.workspace = true
 # Apache-2.0 — AGPLv3-compatible. Confirmed on crates.io v8.1.0. Provides the
 # offset/boolean gap Phase 4+ needs; Phase 3 uses only the half-plane clip here.
 i_overlay = "8.1"
+# Bowyer-Watson Delaunay (`triangulate`) reused for the Voronoi generator
+# (Phase 5b): Voronoi vertices are the circumcenters of adjacent Delaunay
+# triangles. kernel-mesh depends only on glam+serde (no subdivision dep) → no
+# dependency cycle. AGPLv3 (same workspace crate); no new external dep.
+kernel-mesh = { path = "../kernel-mesh" }

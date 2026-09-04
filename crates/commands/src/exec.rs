@@ -15896,13 +15896,33 @@ mod tests {
     }
 
     #[test]
-    fn lotgeneratesite_radial_errors_cleanly() {
-        // `radial` parses (it is a known pattern keyword) but is a Phase-5b
-        // generator the Phase-5 exec does not build → a clear error, no panic.
-        let mut s = Session::default();
-        run(&mut s, "rect 0,0,0 400 300");
-        let err = s.run(parse("lotgeneratesite last radial").unwrap()).unwrap_err();
-        assert!(err.to_string().contains("orthogonal"), "{err}");
+    fn lotgeneratesite_nonrectilinear_patterns_bake() {
+        // Phase 5b: radial / hexagonal / voronoi now generate roads + blocks
+        // (they were clean-error stubs in Phase 5). Each bakes onto the roads +
+        // blocks layers with no panic.
+        for pattern in ["radial", "hexagonal", "voronoi"] {
+            let mut s = Session::default();
+            run(&mut s, "rect 0,0,0 400 300");
+            s.run(parse(&format!("lotgeneratesite last {pattern} blockdepth=60"))
+                .unwrap())
+                .unwrap_or_else(|e| panic!("{pattern} errored: {e}"));
+            let n_roads = s
+                .doc
+                .all_ids()
+                .iter()
+                .filter_map(|id| s.doc.get(*id))
+                .filter(|o| o.layer == crate::lot::ROADS_LAYER)
+                .count();
+            let n_blocks = s
+                .doc
+                .all_ids()
+                .iter()
+                .filter_map(|id| s.doc.get(*id))
+                .filter(|o| o.layer == crate::lot::BLOCKS_LAYER)
+                .count();
+            assert!(n_roads > 0, "{pattern}: no roads baked");
+            assert!(n_blocks > 0, "{pattern}: no blocks baked");
+        }
     }
 
     #[test]
