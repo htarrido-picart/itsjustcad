@@ -5415,11 +5415,13 @@ fn save_reduce_motion(on: bool) {
     save_ui_json(&v);
 }
 
-/// Whether chat-session files are encrypted at rest. Default ON (secure by
-/// default when a keychain is available); users can opt out via
-/// `chatencryption off`. Read by [`crate::chat_store::DocSessions::save`].
+/// Whether chat-session files are encrypted at rest. Default OFF (opt-in): the
+/// app isn't code-signed, so an always-on default would prompt every user for
+/// keychain access on first chat. Users opt in via `chatencryption on`. Revisit
+/// the default once code signing (M-sign) makes the grant stick. Read by
+/// [`crate::chat_store::DocSessions::save`].
 pub(crate) fn load_chat_encryption() -> bool {
-    load_ui_json()["chat_encryption"].as_bool().unwrap_or(true)
+    load_ui_json()["chat_encryption"].as_bool().unwrap_or(false)
 }
 
 fn save_chat_encryption(on: bool) {

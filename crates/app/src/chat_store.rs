@@ -282,7 +282,8 @@ impl DocSessions {
     }
 
     /// Persist to the app-local store; see [`Self::save_with_opts`]. Encryption
-    /// follows the user's `chat_encryption` preference (default ON).
+    /// follows the user's `chat_encryption` preference (default OFF; opt in via
+    /// `chatencryption on`).
     pub fn save(&self) {
         self.save_with_opts(&crate::chat_crypto::OsKeyStore, crate::app::load_chat_encryption());
     }
