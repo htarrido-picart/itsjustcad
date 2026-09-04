@@ -18,6 +18,7 @@ itsjustcad-solar.workspace = true
 kernel-mesh.workspace = true
 kernel-curve.workspace = true
 kernel-occt = { workspace = true }
+subdivision.workspace = true
 glam.workspace = true
 serde.workspace = true
 serde_json.workspace = true

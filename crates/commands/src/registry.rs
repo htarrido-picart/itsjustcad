@@ -684,6 +684,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "lotsubdivide",
+            usage: "lotsubdivide [selector] <method> [area=<> width=<> irregularity=<> seed=<>]",
+            summary: "Subdivide the selected closed block curve(s) into lots on layer 'lots' (M-intemfit site planning). method=grid is recursive minimum-area OBB subdivision (splits along the block's short axis, pivoted on the long-axis midpoint, recursing while lot area > area) — the only method wired now. method=perimeter (Phase 4) and method=streetfollowing (Phase 7) are not yet implemented and return a clear error. area = min lot area (recursion stop), width = min lot side length, irregularity 0..0.4 jitters the split pivot (needs a seed to matter), seed makes the layout deterministic (replay-stable). Every lot keeps a block-boundary (street) edge. Sticky defaults come from `lotsettings`. Example: lotsubdivide last grid area=6500 width=50 · lotsubdivide grid width=40 irregularity=0.2 seed=7",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "lotsettings",
+            usage: "lotsettings [key=value ...]",
+            summary: "Show or set the sticky lot-subdivision settings stored on the document (used by `lotsubdivide` when a run omits an arg). Keys: method (grid|perimeter|streetfollowing), area (min lot area), area_max, width (min lot side), irregularity (0..0.4, or up to 1.0 with loose), loose (on/off), force_street (1.0 = every lot must keep a street edge), seed. No args prints the current settings. Settings are logged so saved files replay them. Example: lotsettings area=6500 width=50 · lotsettings loose=on irregularity=0.7",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "plant",
             usage: "plant <species> <x,y[,z]> [age-years]",
             summary: "Place one plant from the embedded 33-species catalog: temperate ornamentals (quercus-robur, acer-rubrum, betula-pendula, pinus-sylvestris, tilia-cordata) plus tropical/subtropical packs — Caribbean (royal/coconut palm, ceiba, flamboyan, mango), Valle del Cauca (saman, guadua bamboo, gualanday), Guayaquil (guayacan amarillo, algarrobo, palo santo, ceibo). Common-name substrings like 'oak' or 'palm' work too. Renders a trunk + canopy mesh named 'plant:<id>' on layer 'planting', draped onto the terrain when one exists; palms render as crown-on-trunk for low-sun shadow accuracy. [age-years] scales height and canopy along the species growth rate (default mature). If the doc has a `location`, planting outside the species' climate band prints an advisory. Use `plantcatalog [region|zone]` to browse. Planted canopies occlude sun like any mesh. Example: plant royal-palm 10,5 · plant oak 10,5 25",

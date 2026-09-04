@@ -1323,6 +1323,40 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
     },
+    /// Subdivide the selected closed block curve(s) into lots (M-intemfit,
+    /// Phase 3). `method` is `grid` (recursive OBB — the only method wired in
+    /// Phases 1–3), `perimeter` (Phase 4) or `streetfollowing` (Phase 7). The
+    /// numeric args override the sticky `SubdivisionSettings` for this run:
+    /// `area` = lot_area_min, `width` = lot_width_min, `irregularity`, `seed`.
+    /// Deterministic for a fixed seed → replay recreates identical lots, so the
+    /// baked `ids` are written back on first exec (contours precedent).
+    LotSubdivide {
+        targets: Selector,
+        /// `grid` | `perimeter` | `streetfollowing`.
+        method: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        area: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        irregularity: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
+    /// Show or set the sticky `SubdivisionSettings` on the document
+    /// (M-intemfit). With no `sets`, the exec message reports the current
+    /// settings; otherwise each `key=value` updates one field. Logged so saved
+    /// files replay the settings; the inverse restores the prior settings JSON.
+    LotSettings {
+        /// `key=value` pairs to apply; empty = show only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sets: Vec<(String, String)>,
+        /// Prior settings JSON captured on first exec (for undo + replay).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prev: Option<String>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild

@@ -1066,6 +1066,21 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 _ => wrong("miyawaki", "a closed region and optional density", &args),
             }
         }
+        "lotsubdivide" => parse_lotsubdivide(&args),
+        "lotsettings" => {
+            // Each arg is a key=value pair; none = show only.
+            let mut sets = Vec::new();
+            for tok in &args {
+                let Some((k, v)) = tok.split_once('=') else {
+                    return wrong("lotsettings", "key=value params (or no args to show)", &args);
+                };
+                if k.is_empty() || v.is_empty() {
+                    return wrong("lotsettings", "non-empty key=value params", &args);
+                }
+                sets.push((k.to_string(), v.to_string()));
+            }
+            Ok(Command::LotSettings { sets, prev: None })
+        }
         "flowarrows" => match args.as_slice() {
             [] => Ok(Command::FlowArrows { n: None, ids: None }),
             [n] => Ok(Command::FlowArrows {
@@ -1663,6 +1678,77 @@ fn parse_pblock(input: &str) -> Result<Command, ParseError> {
 }
 
 /// `grid <name> x A:0 B:5 ... y 1:0 2:4 ... [levels 0,3,6]`
+/// `lotsubdivide [selector] <method> [area=<> width=<> irregularity=<> seed=<> \
+/// method=<>]`. The method may be the first bare positional token (`grid`) or a
+/// `method=grid` key. Any leading `last`/`all`/`sel`/`name` token is a selector;
+/// otherwise the target defaults to the current selection.
+fn parse_lotsubdivide(args: &[&str]) -> Result<Command, ParseError> {
+    const METHODS: &[&str] = &[
+        "grid",
+        "recursive",
+        "perimeter",
+        "offset",
+        "streetfollowing",
+        "skeleton",
+    ];
+    let is_kv = |s: &str| s.contains('=');
+    let is_method = |s: &str| METHODS.contains(&s.to_lowercase().as_str());
+
+    // Optional leading selector: only if the first token is neither a method
+    // keyword nor a key=value pair.
+    let (targets, rest): (Selector, &[&str]) = match args.split_first() {
+        Some((first, r)) if !is_method(first) && !is_kv(first) => {
+            let (sel, rest) = selector(args, "lotsubdivide")?;
+            let _ = r;
+            (sel, rest)
+        }
+        _ => (Selector::Selected, args),
+    };
+
+    let mut method: Option<String> = None;
+    let mut area = None;
+    let mut width = None;
+    let mut irregularity = None;
+    let mut seed = None;
+
+    for tok in rest {
+        if let Some((k, v)) = tok.split_once('=') {
+            match k.to_lowercase().as_str() {
+                "method" => method = Some(v.to_string()),
+                "area" => area = Some(number(v)?),
+                "width" => width = Some(number(v)?),
+                "irregularity" | "irreg" => irregularity = Some(number(v)?),
+                "seed" => {
+                    seed = Some(
+                        v.parse::<u64>()
+                            .map_err(|_| ParseError::BadNumber(v.to_string()))?,
+                    )
+                }
+                _ => return wrong("lotsubdivide", "area/width/irregularity/seed/method params", args),
+            }
+        } else if is_method(tok) && method.is_none() {
+            method = Some(tok.to_string());
+        } else {
+            return wrong(
+                "lotsubdivide",
+                "a method (grid|perimeter|streetfollowing) and key=value params",
+                args,
+            );
+        }
+    }
+
+    let method = method.unwrap_or_else(|| "grid".to_string());
+    Ok(Command::LotSubdivide {
+        targets,
+        method,
+        area,
+        width,
+        irregularity,
+        seed,
+        ids: None,
+    })
+}
+
 fn parse_grid(args: &[&str]) -> Result<Command, ParseError> {
     let (name, mut rest) = args
         .split_first()

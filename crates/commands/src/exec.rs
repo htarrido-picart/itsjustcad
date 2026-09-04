@@ -247,6 +247,8 @@ enum Inverse {
     /// `constraints delete`: reinsert the removed constraints at their
     /// (0-based) indices, ascending.
     ConstraintsRestore(Vec<(usize, itsjustcad_doc::SketchConstraint)>),
+    /// `lotsettings`: restore the previous subdivision settings (serialized).
+    SubdivisionSettings { prev: String },
 }
 
 /// Owns the document plus its op-log; the single mutation path for both the
@@ -966,6 +968,12 @@ impl Session {
                     self.doc.constraints.insert(idx, c);
                 }
                 self.doc.generation += 1;
+            }
+            Inverse::SubdivisionSettings { prev } => {
+                if let Ok(settings) = serde_json::from_str(prev) {
+                    self.doc.subdivision_settings = settings;
+                    self.doc.generation += 1;
+                }
             }
         }
         Ok(ApplyOutcome {
@@ -3756,6 +3764,180 @@ fn terrain_surface(doc: &Document) -> Result<(ObjectId, &kernel_mesh::Mesh), Exe
                 "no terrain mesh — run `terrain <path.csv|.geojson>` first".into(),
             )
         })
+}
+
+/// `lotsubdivide` (M-intemfit Phase 3): subdivide the selected closed block
+/// curve(s) into lots on the `lots` layer via the pure `subdivision` crate.
+/// Numeric args override the sticky settings for THIS run (they are baked into
+/// the logged op so replay is self-contained). Deterministic for a fixed seed →
+/// the written-back `ids` make replay recreate byte-identical lots.
+#[allow(clippy::too_many_arguments)]
+fn exec_lot_subdivide(
+    doc: &mut Document,
+    targets: Selector,
+    method: String,
+    area: Option<f64>,
+    width: Option<f64>,
+    irregularity: Option<f64>,
+    seed: Option<u64>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let Some(method_enum) = crate::lot::parse_method(&method) else {
+        return Err(ExecError::Invalid(format!(
+            "unknown lotsubdivide method '{method}' — use grid | perimeter | streetfollowing"
+        )));
+    };
+
+    // Build the effective settings: sticky doc settings with per-run overrides.
+    let mut settings = doc.subdivision_settings.clone();
+    settings.method = method_enum;
+    if let Some(a) = area {
+        settings.lot_area_min = a;
+    }
+    if let Some(w) = width {
+        settings.lot_width_min = w;
+    }
+    if let Some(irr) = irregularity {
+        settings.irregularity = irr;
+    }
+    if let Some(s) = seed {
+        settings.seed = s;
+    }
+
+    // Gather closed block polygons from the selection.
+    let sel_ids = resolve(doc, &targets)?;
+    let mut blocks: Vec<(subdivision::Polygon2d, f64)> = Vec::new();
+    for id in &sel_ids {
+        if let Some(obj) = doc.get(*id)
+            && let Geometry::Curve(c) = &obj.geometry
+            && c.is_closed()
+            && let Some(poly) = crate::lot::curve_to_polygon(c)
+        {
+            // Source elevation: mean z of the tessellated boundary.
+            let pts = c.tessellate(PROFILE_TOL);
+            let z = if pts.is_empty() {
+                0.0
+            } else {
+                pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
+            };
+            blocks.push((poly, z));
+        }
+    }
+    if blocks.is_empty() {
+        return Err(ExecError::Invalid(
+            "lotsubdivide needs a closed block curve (draw or select a boundary polyline first)"
+                .into(),
+        ));
+    }
+
+    let bake = crate::lot::subdivide_blocks(&blocks, &settings).map_err(ExecError::Invalid)?;
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == bake.polygons.len() => ids,
+        _ => (0..bake.polygons.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    let mut layers_created = Vec::new();
+    if let Some(name) = crate::lot::ensure_lots_layer(doc) {
+        layers_created.push(name);
+    }
+    crate::lot::insert_lots(doc, &bake, &new_ids);
+    doc.generation += 1;
+
+    let n = new_ids.len();
+    Ok((
+        Command::LotSubdivide {
+            targets,
+            method,
+            area,
+            width,
+            irregularity,
+            seed,
+            ids: Some(new_ids.clone()),
+        },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome {
+            message: format!(
+                "lotsubdivide grid: {n} lots on '{}' ({} with street frontage)",
+                crate::lot::LOTS_LAYER,
+                bake.with_street
+            ),
+            created: new_ids,
+        },
+    ))
+}
+
+/// `lotsettings` (M-intemfit): show or set the sticky `SubdivisionSettings`.
+/// With no `sets`, reports the current settings. Logged; the prior settings JSON
+/// is captured into the op on first exec so replay + undo are self-contained.
+fn exec_lot_settings(
+    doc: &mut Document,
+    sets: Vec<(String, String)>,
+    prev: Option<String>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let prev_json = prev.unwrap_or_else(|| {
+        serde_json::to_string(&doc.subdivision_settings).unwrap_or_default()
+    });
+
+    if sets.is_empty() {
+        let s = &doc.subdivision_settings;
+        let msg = format!(
+            "lot settings: method={:?} area_min={} area_max={} width_min={} irregularity={} \
+             loose={} force_street={} seed={}",
+            s.method,
+            s.lot_area_min,
+            s.lot_area_max,
+            s.lot_width_min,
+            s.irregularity,
+            s.loose,
+            s.force_street_access,
+            s.seed,
+        );
+        return Ok((
+            Command::LotSettings { sets, prev: Some(prev_json.clone()) },
+            Inverse::SubdivisionSettings { prev: prev_json },
+            ApplyOutcome { message: msg, created: Vec::new() },
+        ));
+    }
+
+    let s = &mut doc.subdivision_settings;
+    for (k, v) in &sets {
+        let num = || v.parse::<f64>().map_err(|_| ExecError::Invalid(format!("bad number '{v}'")));
+        match k.to_lowercase().as_str() {
+            "method" => {
+                s.method = crate::lot::parse_method(v).ok_or_else(|| {
+                    ExecError::Invalid(format!("unknown method '{v}'"))
+                })?
+            }
+            "area" | "area_min" | "lot_area_min" => s.lot_area_min = num()?,
+            "area_max" | "lot_area_max" => s.lot_area_max = num()?,
+            "width" | "width_min" | "lot_width_min" => s.lot_width_min = num()?,
+            "irregularity" | "irreg" => s.irregularity = num()?,
+            "loose" => s.loose = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+            "force_street_access" | "force_street" => s.force_street_access = num()?,
+            "seed" => {
+                s.seed = v
+                    .parse::<u64>()
+                    .map_err(|_| ExecError::Invalid(format!("bad seed '{v}'")))?
+            }
+            other => {
+                return Err(ExecError::Invalid(format!(
+                    "unknown lot setting '{other}' (try area/area_max/width/irregularity/loose/\
+                     force_street/method/seed)"
+                )));
+            }
+        }
+    }
+    doc.generation += 1;
+
+    Ok((
+        Command::LotSettings { sets: sets.clone(), prev: Some(prev_json.clone()) },
+        Inverse::SubdivisionSettings { prev: prev_json },
+        ApplyOutcome {
+            message: format!("updated {} lot setting(s)", sets.len()),
+            created: Vec::new(),
+        },
+    ))
 }
 
 /// Contour polylines FROM the terrain mesh: marching triangles at every
@@ -7272,6 +7454,10 @@ fn apply_forward(
             exec_pad(doc, at, width, depth, elev, slope)
         }
         Command::CutFill { original_z } => exec_cutfill(doc, original_z),
+        Command::LotSubdivide { targets, method, area, width, irregularity, seed, ids } => {
+            exec_lot_subdivide(doc, targets, method, area, width, irregularity, seed, ids)
+        }
+        Command::LotSettings { sets, prev } => exec_lot_settings(doc, sets, prev),
         Command::FlowArrows { n, ids } => exec_flow_arrows(doc, n, ids),
         Command::Ponding { ids } => exec_ponding(doc, ids),
         Command::CodeCheck { pack, story, rules, ids } => {
@@ -8815,6 +9001,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Contours { .. } => "contours",
         Command::Pad { .. } => "pad",
         Command::CutFill { .. } => "cutfill",
+        Command::LotSubdivide { .. } => "lotsubdivide",
+        Command::LotSettings { .. } => "lotsettings",
         Command::Plant { .. } => "plant",
         Command::PlantRow { .. } => "plantrow",
         Command::PlantSchedule { .. } => "plantschedule",
@@ -15396,5 +15584,98 @@ mod tests {
         v.as_object_mut().unwrap().remove("compliance_reports");
         let old: Document = serde_json::from_value(v).unwrap();
         assert!(old.compliance_reports.is_empty(), "pre-compliance snapshots load empty");
+    }
+
+    // ── M-intemfit: lotsubdivide / lotsettings (Phase 2/3) ──────────────────
+
+    fn lot_count(s: &Session) -> usize {
+        s.doc.all_ids()
+            .iter()
+            .filter(|id| {
+                s.doc.get(**id).map(|o| o.layer == crate::lot::LOTS_LAYER).unwrap_or(false)
+            })
+            .count()
+    }
+
+    #[test]
+    fn lotsubdivide_grid_bakes_lots_on_layer() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 120");
+        let out = run(&mut s, "lotsubdivide last grid area=6500 width=50");
+        assert!(out.created.len() > 1, "expected multiple lots");
+        assert!(s.doc.layers.contains_key(crate::lot::LOTS_LAYER));
+        assert_eq!(lot_count(&s), out.created.len());
+    }
+
+    #[test]
+    fn lotsubdivide_undo_removes_lots() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 120");
+        run(&mut s, "lotsubdivide last grid area=6500 width=50");
+        assert!(lot_count(&s) > 0);
+        run(&mut s, "undo");
+        assert_eq!(lot_count(&s), 0, "undo removes baked lots + layer");
+    }
+
+    #[test]
+    fn lotsubdivide_replay_is_byte_identical() {
+        // Deterministic subdivider → replaying the log recreates identical lots.
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 120");
+        run(&mut s, "lotsubdivide last grid area=6500 width=50 irregularity=0.3 seed=7");
+        let before: Vec<_> = s
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| s.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        let log: Vec<Command> = s.log.iter().map(|a| a.op.clone()).collect();
+        let rebuilt = Session::replay(log).unwrap();
+        let after: Vec<_> = rebuilt
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| rebuilt.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        assert_eq!(before, after, "replay recreated identical lot geometry");
+    }
+
+    #[test]
+    fn perimeter_method_errors_not_panics() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 120");
+        let err = s.run(parse("lotsubdivide last perimeter").unwrap()).unwrap_err();
+        assert!(format!("{err:?}").contains("Phase 4"));
+    }
+
+    #[test]
+    fn lotsettings_sticks_and_survives_roundtrip() {
+        let mut s = Session::default();
+        run(&mut s, "lotsettings area=6500 width=45 irregularity=0.2");
+        assert_eq!(s.doc.subdivision_settings.lot_area_min, 6500.0);
+        assert_eq!(s.doc.subdivision_settings.lot_width_min, 45.0);
+        // Serde roundtrip (checkpoint sidecar) preserves the settings.
+        let json = serde_json::to_string(&s.doc).unwrap();
+        let back: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subdivision_settings, s.doc.subdivision_settings);
+        // Pre-intemfit snapshots (no field) load with defaults.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("subdivision_settings");
+        let old: Document = serde_json::from_value(v).unwrap();
+        assert_eq!(old.subdivision_settings, subdivision::SubdivisionSettings::default());
+    }
+
+    #[test]
+    fn lotsettings_undo_restores_prior() {
+        let mut s = Session::default();
+        run(&mut s, "lotsettings area=6500");
+        run(&mut s, "lotsettings area=8000");
+        assert_eq!(s.doc.subdivision_settings.lot_area_min, 8000.0);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.subdivision_settings.lot_area_min, 6500.0);
     }
 }

@@ -148,6 +148,11 @@ pub struct Document {
     /// `cutfill` embeds the heights into its own logged op for stability.
     #[serde(skip)]
     pub pregrade_terrain: Option<(ObjectId, Vec<f64>)>,
+    /// Sticky lot-subdivision settings (M-intemfit / `lotsettings`,
+    /// `lotsubdivide`). serde-defaulted so pre-intemfit files load unchanged;
+    /// logged via the settings/subdivide ops so saved files replay identically.
+    #[serde(default)]
+    pub subdivision_settings: subdivision::SubdivisionSettings,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -183,6 +188,7 @@ impl Default for Document {
             compliance_reports: BTreeMap::new(),
             constraints: Vec::new(),
             pregrade_terrain: None,
+            subdivision_settings: subdivision::SubdivisionSettings::default(),
             generation: 0,
         }
     }
