@@ -101,9 +101,30 @@ Number suffixes work anywhere regardless of display units: `500mm`, `2.5m`, `12f
 
 ---
 
+## What ItsJustCAD can do
+
+Beyond modelling and drafting, the same command language covers:
+
+- **Environmental analysis** — solar lighting, shadow studies, sun-hours and
+  per-face insolation heatmaps, annual radiation from EPW weather, sun-path
+  diagrams; every study stores a report the deck can critique.
+- **Landscape & site** — terrain, contours, grading (`pad`/`cutfill`), a
+  33-species planting catalog (`plant`/`plantrow`/`miyawaki`), hardscape paths,
+  and advisory drainage visualisation.
+- **Code-compliance pre-checks** — `codecheck ibc2021` / `ada2010` run geometric
+  pre-checks and report per-rule verdicts. Advisory only: never a code review —
+  verify with a licensed professional / AHJ.
+- **Form-finding** — funicular arches, tensegrity, cable nets, minimal surfaces,
+  and analytic shells (hypar, geodesic, space frame, vaults, grid shells).
+- **Structure + BIM interop** — beams/columns/slabs/walls/loads/supports as
+  geometry + metadata (recorded, never analysed), with IFC and SAF handoff.
+- **AI diffusion render** — turn the current view into a rendered image via a
+  configured diffusion backend (opt-in; ships with none active).
+
 ## Next steps
 
-- [Tutorial: courtyard building](tutorial.md) — a complete walkthrough
+- [Tutorial: courtyard building](tutorial.md) — a complete walkthrough, plus
+  site/planting/sun and code-compliance mini-flows
 - [Command reference](command-reference.md) — every command
 - [Deck (LLM)](deck.md) — the built-in AI drafting partner
-- [Interop](interop.md) — DXF, IFC, glTF, SAF exchange
+- [Interop](interop.md) — DXF, IFC, 3DM, SAF, point-cloud exchange
