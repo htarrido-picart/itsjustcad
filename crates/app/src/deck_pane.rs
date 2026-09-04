@@ -1137,7 +1137,7 @@ impl DeckPane {
     /// labeled instantly; an async LLM pass may refine it later (see
     /// [`spawn_summarize`]). Returns the archived session id (for the summarizer).
     pub fn archive_active(&mut self, mode: ArchiveMode) -> Option<String> {
-        let Some(store) = self.store.as_mut() else { return None };
+        let store = self.store.as_mut()?;
         if self.messages.is_empty() {
             return None;
         }

@@ -999,10 +999,10 @@ impl App {
         }
         // Dev/screenshot hook: force a specific right-dock tab so each tab can be
         // shot at the (constant) dock width. chat|sessions|layers|blocks|plugins.
-        if let Ok(tab) = std::env::var("ITSJUSTCAD_PANEL_TAB") {
-            if let Some(t) = panel_tab_by_name(&tab) {
-                self.panel_tabs.show(t);
-            }
+        if let Ok(tab) = std::env::var("ITSJUSTCAD_PANEL_TAB")
+            && let Some(t) = panel_tab_by_name(&tab)
+        {
+            self.panel_tabs.show(t);
         }
     }
 
@@ -2802,7 +2802,7 @@ impl App {
             let stroke = egui::Stroke::new(1.0, divider);
             let eps = 0.5;
             let painter = ui.painter();
-            for rect in panes.iter().copied() {
+            for &rect in panes.iter() {
                 if rect.left() > full.left() + eps {
                     painter.vline(rect.left(), rect.y_range(), stroke);
                 }
@@ -4767,11 +4767,11 @@ impl App {
         }
     }
 
-    /// Model Setup panel: hardware recommendation, the catalog gated by RAM +
-    /// free disk, an Install button per model with a live progress bar + speed
-    /// + cancel, and the currently-installed model with Re-download / Remove.
-    /// Download completion/failure is handled by [`Self::poll_model_download`]
-    /// (every frame, panel open or not), not here.
+    /// Model Setup panel: hardware recommendation, the catalog gated by RAM and
+    /// free disk, an Install button per model with a live progress bar (speed
+    /// and cancel), and the currently-installed model with Re-download / Remove.
+    /// Download completion/failure is handled by `poll_model_download` (called
+    /// every frame, panel open or not), not here.
     fn model_setup_ui(&mut self, ctx: &egui::Context) {
         if !self.show_model_setup {
             return;

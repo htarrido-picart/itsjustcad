@@ -49,6 +49,13 @@ futures = "0.3"
 async-trait = "0.1"
 rfd = "0.15"
 dirs = "6"
+# Chat-session encryption at rest (MIT OR Apache-2.0 — license-clean, RustCrypto).
+# AES-256-GCM authenticated encryption; `std` pulls `OsRng` for nonce/key gen.
+aes-gcm = { version = "0.10", features = ["std"] }
+# OS keychain for the data key (macOS Keychain / Windows Cred Manager / Linux
+# Secret Service). Apache-2.0 OR MIT. `apple-native`/`windows-native` avoid the
+# heavy dbus path on those OSes; `sync-secret-service` is the Linux backend.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 # internal crates
 kernel-mesh = { path = "crates/kernel-mesh" }

@@ -276,21 +276,39 @@ pub fn store_path(doc_uuid: &str) -> Option<std::path::PathBuf> {
 
 impl DocSessions {
     /// Load this document's sessions from the app-local store, or an empty set.
+    /// Uses the real OS-keychain-backed key store; see [`Self::load_with`].
     pub fn load(doc_uuid: &str) -> Self {
+        Self::load_with(doc_uuid, &crate::chat_crypto::OsKeyStore)
+    }
+
+    /// Persist to the app-local store; see [`Self::save_with`].
+    pub fn save(&self) {
+        self.save_with(&crate::chat_crypto::OsKeyStore);
+    }
+
+    /// Load, transparently decrypting an encrypted store or reading a legacy
+    /// plaintext one (both distinguished by a file marker). Any read/decrypt
+    /// failure yields an empty set rather than losing the caller's day.
+    /// `store` is injectable so tests never touch the real keychain.
+    pub fn load_with<K: crate::chat_crypto::KeyStore>(doc_uuid: &str, store: &K) -> Self {
         store_path(doc_uuid)
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|bytes| crate::chat_crypto::open(store, &bytes).ok())
+            .and_then(|json| serde_json::from_slice(&json).ok())
             .unwrap_or_else(|| DocSessions::new(doc_uuid.to_string()))
     }
 
-    /// Persist to the app-local store, private (0600). Best-effort — a write
-    /// failure is logged, not fatal. NEVER writes into the shared document.
-    pub fn save(&self) {
+    /// Persist to the app-local store, private (0600), ENCRYPTED at rest when a
+    /// keychain is available (plaintext fallback otherwise, with a one-time
+    /// warning — never a data loss / hard fail). Best-effort. NEVER writes into
+    /// the shared document. `store` is injectable for tests.
+    pub fn save_with<K: crate::chat_crypto::KeyStore>(&self, store: &K) {
         let Some(path) = store_path(&self.doc_uuid) else { return };
         let Some(parent) = path.parent() else { return };
         let _ = std::fs::create_dir_all(parent);
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = crate::journal::write_private(&path, json.as_bytes());
+        if let Ok(json) = serde_json::to_vec_pretty(self) {
+            let blob = crate::chat_crypto::seal_for_write(store, &json);
+            let _ = crate::journal::write_private(&path, &blob);
         }
     }
 }
@@ -496,6 +514,33 @@ mod tests {
         assert_eq!(fmt_date(1_609_459_200), "2021-01-01");
         // 2020-02-29 (leap day) 00:00:00 UTC = 1582934400
         assert_eq!(fmt_date(1_582_934_400), "2020-02-29");
+    }
+
+    /// In-memory key store for the encrypt/decrypt round-trip below — never
+    /// touches the OS keychain.
+    struct MemKey([u8; 32]);
+    impl crate::chat_crypto::KeyStore for MemKey {
+        fn get_or_create_key(&self) -> Result<[u8; 32], ()> {
+            Ok(self.0)
+        }
+    }
+
+    #[test]
+    fn encrypted_store_serialize_round_trip() {
+        // Serialize → seal (encrypt) → open (decrypt) → deserialize must recover
+        // an identical DocSessions, mirroring the on-disk save/load path without
+        // hitting the filesystem or the real keychain.
+        let docs = doc_with_two_sessions();
+        let key = MemKey([42u8; 32]);
+        let json = serde_json::to_vec_pretty(&docs).unwrap();
+        let sealed = crate::chat_crypto::seal_for_write(&key, &json);
+        assert!(
+            crate::chat_crypto::is_encrypted(&sealed),
+            "store must be encrypted at rest with a healthy key"
+        );
+        let opened = crate::chat_crypto::open(&key, &sealed).unwrap();
+        let back: DocSessions = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(back, docs);
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod app;
 mod app_verbs;
 mod basemap;
 mod boxsel;
+mod chat_crypto;
 mod chat_store;
 mod command_line;
 mod deck_pane;
