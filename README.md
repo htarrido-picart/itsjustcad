@@ -168,15 +168,25 @@ last *n* commands into a tool the same way.
 *A familiar, Rhino-style interface: menu bar, command line, multi-viewport layout, and a docked panel — it adapts to the CAD you came from.*
 
 ### Model
-Boxes · extrude · revolve / loft / sweep / **sweep2 (two rails)** /
-rail-revolve / variable-radius pipe · booleans (union / difference /
-intersect — in-repo BSP CSG) · curves: lines, polylines, arcs, circles,
-ellipses, polygons, NURBS, interpolated C2 curves, helix · curve editing:
-split / trim / extend / join / fillet / offset / rebuild / draggable control
-points · transforms: move / rotate / scale / mirror / copy / linear + polar
-arrays · **blocks**: capture any selection as a definition, `insert` instances
-anywhere · groups · terrain from survey points (in-repo Delaunay) · LAS point
-clouds
+Boxes · extrude · revolve / loft (with guide curves) / **blend** / sweep /
+**sweep2 (two rails)** / rail-revolve / variable-radius pipe · booleans
+(union / difference / intersect — in-repo BSP CSG) · curves: lines, polylines,
+arcs, circles, ellipses, polygons, NURBS, interpolated C2 curves, helix ·
+curve editing: split / trim / extend / join / fillet / offset / rebuild /
+knot-insert / draggable control points · **2D sketch constraints** (parametric
+solver: coincident, parallel, perpendicular, distance, tangent, … with DOF /
+conflict diagnostics) · transforms: move / rotate / scale / mirror / copy /
+linear + polar arrays · **blocks** incl. **parametric (dynamic) blocks** and an
+on-disk block library · groups · terrain from survey points (in-repo Delaunay) ·
+LAS / LAZ / E57 point clouds
+
+### Form-finding & expressive structures
+Dynamic-relaxation form-finding — funicular / catenary arches (Gaudí),
+tensegrity, Frei-Otto cable nets and **minimal surfaces** (`minsurf`) — plus
+analytic shells: hyperbolic paraboloids, geodesic domes, space frames, Gaussian
+catenary vaults (Dieste), and grid shells. Structural members (beam / column /
+slab / wall / grid / story / loads / supports) as geometry + BIM metadata —
+recorded for interop, **never analysed here**.
 
 ### Draw precisely
 Object snaps (end / mid / center) · typed coordinates mid-tool (`5.2,3`,
@@ -186,19 +196,46 @@ gumball on selection
 
 ### See
 Perspective, true-ortho plan/elevation views · **two-point perspective**
-(verticals stay vertical) · lens presets 15–85 mm + phone-camera sims ·
-1/2/4 viewport layouts · display modes: shaded / wireframe / x-ray / ghosted /
-**pencil** (hidden-line on white paper) · color by layer / object / type /
-random · named views · image underlay for tracing scans
+(verticals stay vertical) · 360° panorama + fisheye · lens presets 15–85 mm +
+phone-camera sims (iPhone / Pixel / Galaxy) · 1/2/4 viewport layouts · display
+modes: shaded / wireframe / x-ray / ghosted / **pencil** (hidden-line on white
+paper) · **sketchy NPR edges** + SketchUp look preset · appearance materials
+(glass / metal / concrete / wood) · georeferenced OSM / satellite basemap ·
+color by layer / object / type / random · named views · image underlay for
+tracing scans · **AI diffusion render** of the current view (opt-in; ComfyUI /
+A1111 / Draw Things / Replicate, ships with no backend active)
 
 ![Plan cut in pencil mode — poché walls around a courtyard, hidden-line white-paper view](docs/shot-plan-pencil.png)
 *`plan 1.5` + `display pencil`: a hidden-line plan cut — poché walls, an open courtyard, a central core.*
 
-### Analyze
+### Analyze the environment
 `sun <lat> <lon> <date> <time>` real solar lighting (NOAA SPA, in-repo) ·
-`shadowstudy` across a day · `sunhours` heatmap with occlusion ray-casting
-(BVH-accelerated) · EPW weather import · measure: distance / area / volume /
-bbox · schedules (quantity takeoffs)
+`shadowstudy` across a day · `sunhours` ground heatmap · `facesunhours` per-face
+insolation · `radiation` annual kWh/m²·yr from EPW weather · `sunpath` yearly
+dome diagram — all occlusion ray-cast (BVH-accelerated, rayon-parallelised) ·
+EPW weather import · measure: distance / area / volume / bbox · schedules
+(quantity takeoffs). Every study stores a structured `report` the deck reads to
+critique the design in numbers.
+
+### Landscape & site
+Terrain from survey points or contours · `contours` extraction · grading —
+`pad` building pads with side slopes + `cutfill` earthwork volumes · planting
+from a **33-species catalog** (temperate ornamentals + Caribbean / Valle del
+Cauca / Guayaquil tropical packs): `plant`, `plantrow`, climate-aware advisories,
+`miyawaki` native mini-forests, `plantschedule` takeoffs, 2D plan symbols ·
+hardscape `sitepath` ribbons draped on terrain · drainage `flowarrows` /
+`ponding` (advisory visualisation, not hydrology engineering) · OSM building
+context.
+
+### Pre-check code compliance (advisory only)
+`codecheck <pack>` runs declarative geometric pre-checks — embedded `ibc2021`
+(egress: risers, treads, corridor/stair/door widths, headroom, occupant load,
+exit count, travel distance) and `ada2010` (ramp slopes + landings, clear
+widths, turning space, thresholds, accessible parking) — then `report codecheck`
+gives per-rule verdicts with measured-vs-required numbers. **This is an advisory
+pre-check, never a code review: it never certifies compliance. Verify with a
+licensed professional / AHJ.** Rule packs are LLM-authorable JSON, so editions
+swap in without code.
 
 ![Sun and shadow study — a massing lit by real solar position with ground shadows cast across the day](docs/shot-sun-shadow.png)
 *`sun` + `shadowstudy`: real solar position (NOAA SPA) casts shadows across the day.*
@@ -217,11 +254,15 @@ PDF export
 
 | Direction | Formats |
 |---|---|
-| Import | DXF · OBJ · STL · glTF/GLB · **IFC** · GeoJSON · OSM (Overpass export) · LAS · EPW |
-| Export | DXF · OBJ · STL · glTF/GLB · **IFC4** · SVG · CSV · PDF |
+| Import | DXF · OBJ · STL · glTF/GLB · Collada · **IFC** · **3DM** (Rhino) · GeoJSON · OSM (Overpass export) · LAS / **LAZ** / **E57** point clouds · EPW · STEP† |
+| Export | DXF · OBJ · STL · glTF/GLB · **IFC4** (incl. structural analysis model) · **3DM** · **SAF `.xlsx`** (structural handoff) · SVG · CSV · PDF · STEP† |
 
-IFC is the Revit bridge — both directions, hand-written, zero dependencies.
-Native save stays the op-log JSON.
+IFC is the Revit bridge — both directions, hand-written, zero dependencies, and
+includes typed structural members + the `IfcStructuralAnalysisModel` graph. SAF
+2.2.0 exports a genuine `.xlsx` workbook for RFEM / SCIA / AxisVM / FEM-Design.
+Both carry a **geometry+topology-only, no-analysis-results** disclaimer — the app
+never claims to analyse. Native save stays the op-log JSON. †STEP needs the
+opt-in `kernel-occt` feature.
 
 ### Automate
 
@@ -242,15 +283,24 @@ The right panel is not a chatbot bolted on — it speaks the command substrate.
 *"Draw a podium, then a tower on top" — the deck emits the same commands you'd type, as cards you can inspect, undo, or amend.*
 
 - **Draws** by emitting commands you can inspect (click the command card),
-  undo, or amend
+  undo, or amend — and can drive the view, camera, and window layout too
 - **Teaches**: ask *"how do I make walls from a centerline?"* — it explains
   `offset → extrude → difference` instead of just doing it
+- **Plans**: for multi-stage work it first lays out a numbered plan, then
+  executes it step by step, retrying failed steps and verifying at the end
+- **Asks before guessing**: on an ambiguous request it asks one clarifying
+  question instead of inventing dimensions
+- **Critiques with numbers**: run an analysis or `codecheck`, then it reads the
+  structured `report` and grounds its critique in sampled values and rule ids
 - **Sees**: press **critique** — it screenshots your viewport and reviews the
   massing like a design critic
+- **Talks terse**: a token-frugal reply style (default on for local models,
+  toggleable) and rich **markdown tables** rendered as real grids in the chat
 - **Knows your selection**: select something, say "make this taller"
 - **Builds tools**: authors persistent plugins on request
 - Failed commands feed back automatically for self-correction; conversations
-  survive restarts; **local-only** toggle keeps everything on your machine
+  survive restarts (optionally **encrypted at rest**, opt-in via
+  `chatencryption on`); **local-only** toggle keeps everything on your machine
 
 Configure cassettes in `~/.config/itsjustcad/decks.json`:
 
