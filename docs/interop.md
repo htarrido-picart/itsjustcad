@@ -16,13 +16,21 @@ Format is detected by file extension.
 
 Entities imported: `LINE`, `LWPOLYLINE`, `POLYLINE`, `CIRCLE`, `ARC`, `TEXT`, and `LAYER` table entries. Each entity becomes its own logged substrate op (`line`, `polyline`, `circle`, `arc`, `text`, `layer`). The `import` command itself is not logged — the expanded ops are, so replay needs no access to the original file.
 
-### OBJ / STL / glTF / GLB
+### OBJ / STL / glTF / GLB / Collada
 
-Triangle meshes are stored verbatim as `MeshLiteral` ops in the op-log, making the file self-contained with no dependency on the source.
+Triangle meshes are stored verbatim as `MeshLiteral` ops in the op-log, making the file self-contained with no dependency on the source. Collada `.dae` is supported alongside the others.
+
+### 3DM (Rhino / openNURBS)
+
+A pure-Rust openNURBS reader: meshes become `MeshLiteral`, and lines / polylines / NURBS curves become curve ops, each on its original Rhino layer with its name preserved. BREPs and trimmed surfaces are skipped. No opt-in download needed.
+
+### STEP / STP (opt-in)
+
+AP242 / AP203 / AP214 exact-BREP solids are read via OCCT, then tessellated to a mesh with the exact volume reported. Requires the opt-in `kernel-occt` feature; default builds report a clear "needs the exact-BREP tier" error.
 
 ### IFC (IFC4 and IFC2x3)
 
-Building elements are tessellated into meshes and placed on the `ifc` layer. Structural metadata (sections, materials, stories) is read where present.
+Building elements are reconstructed as typed Frame / Area members (beams, columns, slabs, walls) with their stories and materials where present; the rest falls back to meshes on the `ifc` layer.
 
 ### EPW — EnergyPlus Weather
 
@@ -32,9 +40,9 @@ Sets the document location (latitude, longitude, time-zone) from the file header
 
 `Polygon` features become closed polylines; `LineString` features become polylines; `Point` features become 0.5 m marker circles. The `properties.name` field sets the object name. Coordinates are projected to local metres when a document location has been set (via `location` or `sun`); otherwise lon/lat are treated as local XY.
 
-### LAS 1.2–1.4 point cloud
+### Point clouds — LAS / LAZ / E57
 
-Formats 0–3 are supported. The cloud is decimated to ≤ 200 000 points and stored as a `PointLiteral` op on layer `pointcloud`. LAZ (compressed LAS) is not supported.
+LAS 1.2–1.4 (formats 0–3) and its compressed form **LAZ** are both supported, as is **E57** (ASTM E2807: Cartesian points plus optional RGB / intensity, all sections merged). Every cloud is decimated to ≤ 200 000 points and stored as a `PointLiteral` op on layer `pointcloud`. LAZ is batch-decompressed so the full cloud is never materialised before decimation.
 
 ### Terrain
 
@@ -92,15 +100,31 @@ A tabular schedule of all objects: name, id, layer, type, area, volume.
 
 ### IFC4
 
-Building elements exported as `IfcBuildingElementProxy` (general meshes), `IfcMember` (beams and columns), `IfcSlab`, and `IfcWall`. Structural sections, materials, stories, and the reference grid are exported where present.
+Typed `IfcBeam` / `IfcColumn` / `IfcSlab` / `IfcWall` with swept-solid bodies, plus the full `IfcStructuralAnalysisModel` graph: `IfcStructuralCurveMember` / `SurfaceMember`, `IfcStructuralPointConnection` with boundary conditions, and `IfcStructuralLoadGroup` with point / linear / planar actions. General meshes fall back to `IfcBuildingElementProxy`. Structural sections, materials, stories, and the reference grid are exported where present. The file header carries a "geometry+topology handoff — no analysis results" note.
 
-### SAF — Structural Analysis Format
+### 3DM (Rhino / openNURBS)
 
 ```
-export /tmp/model.saf
+export /tmp/model.3dm
 ```
 
-A ZIP of CSVs matching the SAF 2.2.0 sheet names, ready to open in RFEM, SCIA Engineer, or FEM-Design. Includes:
+A spec-conformant openNURBS V5 archive: meshes and curves with their names and layers. Rhino 5+ opens it.
+
+### STEP / STP (opt-in)
+
+```
+export /tmp/model.step
+```
+
+AP242 via OCCT — **faceted**, one BREP face per triangle. Requires the opt-in `kernel-occt` feature.
+
+### SAF — Structural Analysis Format (`.saf` / `.xlsx`)
+
+```
+export /tmp/model.xlsx
+```
+
+A genuine SAF 2.2.0 `.xlsx` workbook (hand-rolled OOXML — no new dependencies), ready to open in RFEM, SCIA Engineer, AxisVM, or FEM-Design. Both `.saf` and `.xlsx` extensions are accepted. Nine SAF sheets carry:
 
 - `Nodes` — grid intersection points
 - `1D Members` — beams and columns with section and material references
@@ -108,7 +132,9 @@ A ZIP of CSVs matching the SAF 2.2.0 sheet names, ready to open in RFEM, SCIA En
 - `Cross-sections` — named sections (rect, circle, IWF, pipe)
 - `Materials` — E / density
 - `Storeys` — story levels
-- `Point Supports` and `Point Forces`, `Line Force` load cases
+- `Point Supports`, `Point Forces`, and `Line Force` load cases
+
+**Geometry and topology only — never analysis results.** The disclaimer is embedded in the workbook's document properties; the app is an interop bridge, not an analysis tool.
 
 ### PDF
 
@@ -121,6 +147,22 @@ print ground-floor /tmp/ground-floor.pdf
 ```
 
 Vector output at the exact sheet scale.
+
+---
+
+## Diffusion control images
+
+```
+controlimages /tmp/scene
+```
+
+Writes three CAD-owned control inputs from the **current view** for hand-off to a diffusion / image-editing tool:
+
+- `<prefix>_depth.png` — near-to-far depth gradient
+- `<prefix>_edge.png` — feature-edge linework
+- `<prefix>_mask.png` — a flat semantic colour per layer
+
+The in-app `render <prompt…>` flow captures these automatically and drives the configured diffusion backend (ComfyUI / A1111-Forge / Draw Things / Replicate). Backends are user-configured in `~/.config/itsjustcad/render_decks.json`; the app ships with none active and reaches only the endpoint you configure.
 
 ---
 
