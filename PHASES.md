@@ -151,6 +151,14 @@ Audit found nearly all of M7 had already shipped; the two real gaps (LAZ,
 - [x] STEP AP242 import + faceted export — implemented via OCCT, but **gated behind the opt-in 'kernel-occt' feature** (M-kernel); default builds report a clear "needs the exact-BREP tier" error.
 - DWG / SKP / RVT: bridge via open exchange only (no proprietary readers — license clean).
 
+## Assisted-import bridge (planned 2026-09-04 — NOT started)
+
+- [ ] **M-dwg-bridge** — `import *.dwg` via an auto-invoked, license-clean converter, plus a scoped folder the deck can operate in. Turns the current two-step (user converts DWG→DXF by hand, then imports) into one verb the LLM can also drive — WITHOUT giving the model a shell.
+  - **Bounded DWG import**: `import site.dwg` detects a `dwg2dxf` binary (LibreDWG) the way the app resolves `claude`/`ollama` (PATH + common locations); if absent, a clear "install LibreDWG to import DWG (`brew install libredwg`)" message, never a silent fail. Converts the *specific referenced file only* into a temp dir with fixed args (no model-controlled shell string), then feeds the existing hardened DXF importer → DWG blocks land as real block definitions + instances. **LibreDWG is GPLv3 → detect-and-shell-out to a user-installed binary; do NOT bundle or link it** (same detect-don't-ship stance as the LLM CLIs; keeps the AGPLv3 app clean).
+  - **Scoped deck folder access** (optional, separate): a user-granted `workdir` the deck can list/import within — NOT whole-filesystem, NOT arbitrary shell. Lets the LLM find + import files in one place.
+  - **Security invariant** (ties to [[M-secreview]]): the LLM never gets a general exec/filesystem plane. Every external-tool call is a narrow purpose-built verb with fixed arguments on a user-referenced file — auditable, injection-safe. Imported names still sanitized before reaching the prompt. This is the model for ANY future external-tool integration (SKP via a converter, etc.): a bounded verb, never a shell.
+  - Tests: converter-detection (present/absent), fixed-arg invocation (no shell interpolation), temp-dir cleanup, DWG-origin DXF round-trip (blocks survive), workdir path-traversal guard.
+
 ## Long-term / research (audited 2026-09-02 — most had ALREADY shipped)
 
 - [x] **M-kernel** — DONE as designed: opt-in OCCT tier exists (`kernel-occt` crate behind the `kernel-occt` feature; STEP + exact booleans route through it, default builds report the clear "needs the exact-BREP tier" error). Mesh kernel stays default. No further work planned.
