@@ -10,8 +10,10 @@
 //!
 //! Phases shipped: 1 (geometry foundation + `i_overlay` bridge), 3 (recursive
 //! OBB subdivision, `method=grid`), 4 (offset/perimeter subdivision,
-//! `method=perimeter`). Phase 2 (verb/settings plumbing) lives in the commands
-//! crate but the `SubdivisionSettings` type is defined here.
+//! `method=perimeter`), 5 + 5b (road generation + block extraction + street
+//! tagging), 6 (lot rules — width mix, depth, corner, flag, loading, sliver
+//! merge, on euro_latam placeholder defaults). Phase 2 (verb/settings plumbing)
+//! lives in the commands crate but the `SubdivisionSettings` type is here.
 
 pub mod blocks;
 pub mod geometry;
@@ -25,7 +27,12 @@ pub use geometry::oriented_box::{convex_hull, OrientedBox};
 pub use geometry::polygon2d::Polygon2d;
 pub use geometry::polyline::PolylineTools;
 pub use geometry::split::{split_by_line, Line2d};
-pub use settings::{LoadingType, StreetPattern, SubdivisionMethod, SubdivisionSettings};
+pub use settings::{
+    LoadingType, LotWidthMix, RegionProfile, StreetPattern, SubdivisionMethod, SubdivisionSettings,
+};
+pub use subdivision::lot_rules::{
+    apply_lot_rules, LotRulesReport, WidthMixResult, WidthMixSolver,
+};
 pub use streets::{extract_blocks, generate_streets, Street, StreetGraph, StreetTier};
 pub use subdivision::offset_sub::subdivide as subdivide_offset;
 pub use subdivision::{subdivide, Lot};

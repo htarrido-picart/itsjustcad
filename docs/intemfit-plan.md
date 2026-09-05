@@ -598,8 +598,38 @@ Every subdivision algorithm must pass these block shapes:
   and downstream `lotsubdivide` honouring force_street_access; plus per-generator
   unit tests + updated `lot.rs`/`exec.rs` bridge tests. Phase 6 (lot rules: width
   mix, depth, corner, flag, front/alley loading) picks up here.
-- **Phase 6** — width mix hits requested proportions within 5% on a 500 ft frontage;
-  alley-loaded blocks have correct two-sided depth; no slivers remain.
+- **Phase 6** — ✅ **DONE (2026-09-04, on euro_latam placeholder defaults).** Lot
+  rules in `crates/subdivision/src/subdivision/lot_rules/`, applied as a post-pass /
+  mode on subdivision. **WidthMixSolver** (`width_mix.rs`) — the packing problem:
+  greedy fill weighted by running proportion deficit (pick the product whose count
+  share is furthest below target and still fits; ties → narrower first,
+  deterministic), then a swap pass widening the LAST lot to absorb the remainder at
+  the end (slack concentrated, never smeared). **Hits the requested proportions
+  within 5% on a 500 m frontage** (metric, §9) — verified analytically. **DepthController**
+  (`depth.rs`) — independent depth band (euro_latam 25 m ±5), clamp + in-band, separate
+  from area. **CornerLots** (`corner.rs`) — interior angle < `corner_angle_max` (45°) →
+  widen the corner lot by `corner_lot_width_bonus` (euro_latam +15%), width auto-clamped
+  to available slack (no self-intersection; verified on the 15° acute block #10).
+  **FlagLots** (`flag.rs`) — only if `allow_flag_lots` (euro_latam false); pole width ≥
+  `flag_pole_width_min` (3 m); **pole area excluded from countable lot area** (§7.4 open —
+  implemented as the exclusion; ASSUMPTION to confirm with Manuel, surfaced in the note).
+  **LoadingStrategy** (`loading.rs`) — FrontLoaded (full depth) vs AlleyLoaded (two-
+  frontage street→alley half depth; requires an `is_alley` block edge from Phase 5's
+  alley tier; degrades to front-loaded when absent). **SliverMerger** (`sliver.rs`) —
+  repeatedly merge any lot below `sliver_area_frac × lot_area_min` (0.5) into its
+  largest-shared-edge neighbour until none remain (biggest professional-vs-generated
+  difference). A named **`region` profile** (`euro_latam` default carrying the §6b metric
+  placeholders; `us_suburban` stub) + `LotWidthMix` added to `SubdivisionSettings`
+  (serde-default); `effective_*` accessors return `(value, used_placeholder)` so any run
+  resolving a rule from the profile prints **"using euro_latam defaults (placeholder —
+  confirm with Manuel)"**. Wired into `lotsubdivide` (width-mix is opt-in frontage packing;
+  `apply_lot_rules` = corner + sliver runs on every subdivide) + new `lotsettings` keys
+  (region/loading/widthmix/depth/corner/flag/mergeslivers/…) + a `lotloading [sel]
+  front|alley` verb (sticky, logged, undoable, replay-stable). All Σ-area-conserved,
+  seeded-deterministic (byte-identical replay). Tests: 30 unit + 9 §8/§9 integration
+  (`tests/lot_rules.rs`) + 6 commands exec. **Placeholders IN USE — swap when Manuel
+  answers §1:** width mix 6/8/10 m @ 25/50/25%, depth 25±5, corner +15%, alley 5 m, flag
+  pole 3 m + pole-area exclusion. Phase 7 (skeleton) picks up from here.
 - **Phase 7** — skeleton output on the cul-de-sac + curved-street blocks visually matches
   the questionnaire reference diagrams.
 - **Phase 8** — setbacks + buildable envelopes render per lot; frontage at setback line.
@@ -671,3 +701,13 @@ tool. Get Phase 3 into his hands early and let his reaction reorder everything a
    Delaunay), not ruled out. ✅ **Phase 5b SHIPPED 2026-09-04** — radial/hexagonal/
    Voronoi all built; Voronoi reuses `kernel_mesh::triangulate` (no new external dep,
    no cycle). See §9.
+4. ⚠️ **Phase 6 SHIPPED 2026-09-04 ON PLACEHOLDER DEFAULTS.** The lot rules are built
+   and tested, but they run on the metric **euro_latam** profile (§6b) because the §1
+   open questions are still unanswered. **Still needed from Manuel to finalize the
+   defaults:** (2) his real width-mix product list + whether the mix is a hard ratio
+   or soft preference (currently soft 6/8/10 m @ 25/50/25%); (3) alley ROW width +
+   whether alleys are required on every block or only some (currently 5 m); (4) whether
+   the flag-lot pole area is excluded from countable area (currently EXCLUDED — the
+   assumption implemented). Every euro_latam value is flagged at runtime as
+   "placeholder — confirm with Manuel"; swap the `euro_latam` profile numbers in
+   `settings.rs` once he answers.

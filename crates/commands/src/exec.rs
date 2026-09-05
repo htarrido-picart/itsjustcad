@@ -3862,14 +3862,68 @@ fn exec_lot_subdivide(
         },
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome {
-            message: format!(
-                "lotsubdivide {method_label}: {n} lots on '{}' ({} with street frontage)",
-                crate::lot::LOTS_LAYER,
-                bake.with_street
-            ),
+            message: {
+                let mut msg = format!(
+                    "lotsubdivide {method_label}: {n} lots on '{}' ({} with street frontage)",
+                    crate::lot::LOTS_LAYER,
+                    bake.with_street
+                );
+                if bake.slivers_merged > 0 {
+                    msg.push_str(&format!("; {} sliver(s) merged", bake.slivers_merged));
+                }
+                if bake.corners_widened > 0 {
+                    msg.push_str(&format!("; {} corner lot(s) widened", bake.corners_widened));
+                }
+                if let Some(err) = bake.width_mix_error {
+                    msg.push_str(&format!("; width mix ±{:.1}% of target", err * 100.0));
+                }
+                if let Some(note) = &bake.placeholder_note {
+                    msg.push_str(&format!("; {note}"));
+                }
+                msg
+            },
             created: new_ids,
         },
     ))
+}
+
+/// Parse a width-mix string `6:0.25,8:0.5,10:0.25` → `LotWidthMix` (soft
+/// proportions). Each pair is `width:proportion`; proportions are normalised by
+/// the solver. Errors on malformed input.
+fn parse_width_mix(v: &str) -> Result<subdivision::LotWidthMix, ExecError> {
+    let mut products = Vec::new();
+    for pair in v.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (w, p) = pair
+            .split_once(':')
+            .ok_or_else(|| ExecError::Invalid(format!("bad width-mix pair '{pair}' (want width:proportion)")))?;
+        let width: f64 = w
+            .trim()
+            .parse()
+            .map_err(|_| ExecError::Invalid(format!("bad width '{w}' in width-mix")))?;
+        let prop: f64 = p
+            .trim()
+            .parse()
+            .map_err(|_| ExecError::Invalid(format!("bad proportion '{p}' in width-mix")))?;
+        if width <= 0.0 || prop <= 0.0 {
+            return Err(ExecError::Invalid(format!(
+                "width-mix width + proportion must be positive: '{pair}'"
+            )));
+        }
+        products.push((width, prop));
+    }
+    if products.is_empty() {
+        return Err(ExecError::Invalid(
+            "width-mix needs at least one width:proportion pair (e.g. 6:0.25,8:0.5,10:0.25)".into(),
+        ));
+    }
+    Ok(subdivision::LotWidthMix {
+        products,
+        strict_proportions: false,
+    })
 }
 
 /// `lotsettings` (M-intemfit): show or set the sticky `SubdivisionSettings`.
@@ -3925,10 +3979,66 @@ fn exec_lot_settings(
                     .parse::<u64>()
                     .map_err(|_| ExecError::Invalid(format!("bad seed '{v}'")))?
             }
+            // ── Phase 6 lot rules ──
+            "region" => {
+                s.region = match v.to_lowercase().as_str() {
+                    "euro_latam" | "eurolatam" | "metric" => {
+                        subdivision::RegionProfile::EuroLatam
+                    }
+                    "us_suburban" | "us" | "imperial" => {
+                        subdivision::RegionProfile::UsSuburban
+                    }
+                    _ => {
+                        return Err(ExecError::Invalid(format!(
+                            "unknown region '{v}' (try euro_latam | us_suburban)"
+                        )))
+                    }
+                }
+            }
+            "loading" | "load" => {
+                s.loading = match v.to_lowercase().as_str() {
+                    "front" | "frontloaded" => subdivision::LoadingType::FrontLoaded,
+                    "alley" | "alleyloaded" => subdivision::LoadingType::AlleyLoaded,
+                    "mixed" => subdivision::LoadingType::Mixed,
+                    _ => {
+                        return Err(ExecError::Invalid(format!(
+                            "unknown loading '{v}' (try front | alley)"
+                        )))
+                    }
+                }
+            }
+            "widthmix" | "width_mix" | "mix" => {
+                s.width_mix = if matches!(v.to_lowercase().as_str(), "off" | "none" | "") {
+                    None
+                } else {
+                    Some(parse_width_mix(v)?)
+                }
+            }
+            "depth" | "lot_depth" | "lot_depth_target" => s.lot_depth_target = num()?,
+            "depth_tol" | "lot_depth_tolerance" => s.lot_depth_tolerance = num()?,
+            "corner" | "corner_bonus" | "corner_lot_width_bonus" => {
+                // Accept `15%` or a fraction (0.15).
+                let vv = v.trim_end_matches('%');
+                let n: f64 = vv
+                    .parse()
+                    .map_err(|_| ExecError::Invalid(format!("bad corner bonus '{v}'")))?;
+                s.corner_lot_width_bonus = if v.ends_with('%') { n / 100.0 } else { n };
+            }
+            "corner_angle" | "corner_angle_max" => s.corner_angle_max = num()?,
+            "flag" | "allow_flag_lots" => {
+                s.allow_flag_lots = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
+            }
+            "flag_pole" | "flag_pole_width_min" => s.flag_pole_width_min = num()?,
+            "mergeslivers" | "merge_slivers" | "slivers" => {
+                s.merge_slivers = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
+            }
+            "sliver_frac" | "sliver_area_frac" => s.sliver_area_frac = num()?,
+            "alley_width" | "alleywidth" => s.alley_width = num()?,
             other => {
                 return Err(ExecError::Invalid(format!(
                     "unknown lot setting '{other}' (try area/area_max/width/irregularity/loose/\
-                     force_street/method/seed)"
+                     force_street/method/seed/region/loading/widthmix/depth/corner/flag/\
+                     mergeslivers)"
                 )));
             }
         }
@@ -3940,6 +4050,39 @@ fn exec_lot_settings(
         Inverse::SubdivisionSettings { prev: prev_json },
         ApplyOutcome {
             message: format!("updated {} lot setting(s)", sets.len()),
+            created: Vec::new(),
+        },
+    ))
+}
+
+/// `lotloading [sel] front|alley` (M-intemfit Phase 6): set the sticky loading
+/// mode. A thin convenience over `lotsettings loading=…`; logged so replay + undo
+/// reproduce it. `targets` is advisory (loading is sticky doc state applied on the
+/// next subdivide, not a per-object attribute).
+fn exec_lot_loading(
+    doc: &mut Document,
+    targets: Selector,
+    mode: String,
+    prev: Option<String>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let prev_json =
+        prev.unwrap_or_else(|| serde_json::to_string(&doc.subdivision_settings).unwrap_or_default());
+    let loading = match mode.to_lowercase().as_str() {
+        "front" | "frontloaded" => subdivision::LoadingType::FrontLoaded,
+        "alley" | "alleyloaded" => subdivision::LoadingType::AlleyLoaded,
+        _ => {
+            return Err(ExecError::Invalid(format!(
+                "unknown loading mode '{mode}' — use front | alley"
+            )))
+        }
+    };
+    doc.subdivision_settings.loading = loading;
+    doc.generation += 1;
+    Ok((
+        Command::LotLoading { targets, mode: mode.clone(), prev: Some(prev_json.clone()) },
+        Inverse::SubdivisionSettings { prev: prev_json },
+        ApplyOutcome {
+            message: format!("lot loading set to {mode} (sticky; applies on next lotsubdivide)"),
             created: Vec::new(),
         },
     ))
@@ -7588,6 +7731,7 @@ fn apply_forward(
             exec_lot_subdivide(doc, targets, method, area, width, irregularity, seed, ids)
         }
         Command::LotSettings { sets, prev } => exec_lot_settings(doc, sets, prev),
+        Command::LotLoading { targets, mode, prev } => exec_lot_loading(doc, targets, mode, prev),
         Command::LotGenerateSite {
             targets,
             pattern,
@@ -9145,6 +9289,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::CutFill { .. } => "cutfill",
         Command::LotSubdivide { .. } => "lotsubdivide",
         Command::LotSettings { .. } => "lotsettings",
+        Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",
         Command::Plant { .. } => "plant",
         Command::PlantRow { .. } => "plantrow",
@@ -15923,6 +16068,111 @@ mod tests {
             assert!(n_roads > 0, "{pattern}: no roads baked");
             assert!(n_blocks > 0, "{pattern}: no blocks baked");
         }
+    }
+
+    // ── M-intemfit: lot rules (Phase 6) ──────────────────────────────────────
+
+    #[test]
+    fn lotsettings_accepts_phase6_keys() {
+        let mut s = Session::default();
+        run(
+            &mut s,
+            "lotsettings region=euro_latam loading=alley widthmix=6:0.25,8:0.5,10:0.25 \
+             depth=25 corner=15% flag=on mergeslivers=on",
+        );
+        let st = &s.doc.subdivision_settings;
+        assert_eq!(st.region, subdivision::RegionProfile::EuroLatam);
+        assert_eq!(st.loading, subdivision::LoadingType::AlleyLoaded);
+        assert!(st.width_mix.is_some());
+        assert_eq!(st.lot_depth_target, 25.0);
+        assert!((st.corner_lot_width_bonus - 0.15).abs() < 1e-9);
+        assert!(st.allow_flag_lots);
+        assert!(st.merge_slivers);
+    }
+
+    #[test]
+    fn lotloading_sets_sticky_mode_and_undoes() {
+        let mut s = Session::default();
+        run(&mut s, "lotloading alley");
+        assert_eq!(
+            s.doc.subdivision_settings.loading,
+            subdivision::LoadingType::AlleyLoaded
+        );
+        run(&mut s, "undo");
+        assert_eq!(
+            s.doc.subdivision_settings.loading,
+            subdivision::LoadingType::FrontLoaded,
+            "undo restores prior loading"
+        );
+    }
+
+    #[test]
+    fn lotsubdivide_width_mix_reports_proportion_and_placeholder() {
+        // A 500 m frontage × 50 m block, width-mix from the euro_latam default
+        // (no explicit products → placeholder note fires).
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 500 50");
+        // Metric area so the sliver threshold (0.5×area) does not eat the lots.
+        run(&mut s, "lotsettings region=euro_latam widthmix=6:0.25,8:0.5,10:0.25 area=120");
+        let out = run(&mut s, "lotsubdivide last grid seed=7");
+        assert!(out.created.len() > 10, "expected many width-mix lots, got {}", out.created.len());
+        assert!(out.message.contains("width mix"), "message: {}", out.message);
+    }
+
+    #[test]
+    fn lotsubdivide_placeholder_note_surfaces_on_defaults() {
+        // euro_latam corner bonus is a placeholder → note appears even on a plain
+        // grid run (corner rule resolves from the profile).
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 120");
+        let out = run(&mut s, "lotsubdivide last grid area=6500 width=50");
+        assert!(
+            out.message.contains("placeholder — confirm with Manuel"),
+            "message should surface the euro_latam placeholder note: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn lotsubdivide_merges_slivers_no_placeholder_under_us_profile() {
+        // Under us_suburban there are no placeholder fallbacks; a plain run must
+        // NOT print the placeholder note.
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 120");
+        run(&mut s, "lotsettings region=us_suburban");
+        let out = run(&mut s, "lotsubdivide last grid area=6500 width=50");
+        assert!(
+            !out.message.contains("placeholder"),
+            "us_suburban must not print placeholder note: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn lotsubdivide_width_mix_replay_byte_identical() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 500 50");
+        run(&mut s, "lotsettings widthmix=6:0.25,8:0.5,10:0.25 area=120");
+        run(&mut s, "lotsubdivide last grid seed=7");
+        let before: Vec<_> = s
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| s.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        let log = s.save_log();
+        let replayed = Session::replay(log).unwrap();
+        let after: Vec<_> = replayed
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| replayed.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        assert_eq!(before.len(), after.len(), "lot count must survive replay");
     }
 
     #[test]

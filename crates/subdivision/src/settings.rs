@@ -57,6 +57,31 @@ pub struct LotWidthMix {
     pub strict_proportions: bool,
 }
 
+impl LotWidthMix {
+    /// The euro_latam default width mix (plan §6b): 6 / 8 / 10 m at 25 / 50 /
+    /// 25 %, SOFT (not a hard ratio). **Placeholder** until Manuel confirms his
+    /// real product list — flag it in command output.
+    pub fn euro_latam_default() -> LotWidthMix {
+        LotWidthMix {
+            products: vec![(6.0, 0.25), (8.0, 0.50), (10.0, 0.25)],
+            strict_proportions: false,
+        }
+    }
+}
+
+/// A named default profile (plan §6b). `EuroLatam` carries the metric European /
+/// Latin-American placeholder numbers; `UsSuburban` is a stub for later. **Every
+/// EuroLatam value is a placeholder** pending Manuel's §1 answers — surfaced in
+/// command output whenever a lot-rules run falls back to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RegionProfile {
+    /// European / Latin-American metric urban form (plan §6b) — the default.
+    #[default]
+    EuroLatam,
+    /// US suburban (feet-derived). Reserved; not yet populated.
+    UsSuburban,
+}
+
 /// Upper clamp on `irregularity`: Manuel's soft default is 0.4; `loose` unlocks
 /// to 1.0 (Phase 3: loose ONLY raises the cap — no organic subdivider yet).
 pub const IRREGULARITY_CAP_TIGHT: f64 = 0.4;
@@ -68,6 +93,11 @@ pub struct SubdivisionSettings {
     pub method: SubdivisionMethod,
     /// Deterministic output seed (combined with a block hash at run time).
     pub seed: u64,
+
+    /// Named default profile (plan §6b). Drives the lot-rules (Phase 6)
+    /// placeholder defaults; `EuroLatam` numbers are placeholders until Manuel
+    /// confirms — flagged in output when used.
+    pub region: RegionProfile,
 
     // ── Recursive ──
     /// 1.0 = every child lot must retain a street edge.
@@ -133,6 +163,7 @@ impl Default for SubdivisionSettings {
         Self {
             method: SubdivisionMethod::Recursive,
             seed: 0,
+            region: RegionProfile::EuroLatam,
             force_street_access: 1.0,
             lot_area_min: 5000.0,
             lot_area_max: 9000.0,
@@ -183,6 +214,89 @@ impl SubdivisionSettings {
     /// `irregularity` clamped to `[0, cap]` (cap widened by `loose`).
     pub fn clamped_irregularity(&self) -> f64 {
         self.irregularity.clamp(0.0, self.irregularity_cap())
+    }
+
+    /// A fully-metric **euro_latam** settings object (plan §6b). Every value is a
+    /// placeholder pending Manuel's confirmation. Use this when the user selects
+    /// the metric profile explicitly; the struct `Default` keeps the legacy
+    /// imperial example numbers so pre-Phase-6 tests/files are unchanged.
+    pub fn euro_latam() -> SubdivisionSettings {
+        SubdivisionSettings {
+            region: RegionProfile::EuroLatam,
+            lot_width_min: 6.0,
+            lot_area_min: 120.0,
+            lot_area_max: 200.0,
+            width_mix: Some(LotWidthMix::euro_latam_default()),
+            lot_depth_target: 25.0,
+            lot_depth_tolerance: 5.0,
+            loading: LoadingType::FrontLoaded,
+            alley_width: 5.0,
+            corner_lot_width_bonus: 0.15,
+            corner_angle_max: 45.0,
+            allow_flag_lots: false,
+            flag_pole_width_min: 3.0,
+            merge_slivers: true,
+            sliver_area_frac: 0.5,
+            setback_front: 3.0,
+            setback_side: 0.0,
+            setback_rear: 3.0,
+            road_width: 12.0,
+            ..SubdivisionSettings::default()
+        }
+    }
+
+    // ── Lot-rules (Phase 6) effective values + placeholder tracking ──────────
+    //
+    // Each accessor returns `(value, used_placeholder)`. `used_placeholder` is
+    // true when the value came from the euro_latam profile because the user gave
+    // no explicit override — the signal the command surfaces as
+    // "using euro_latam defaults (placeholder — confirm with Manuel)".
+
+    /// Effective width mix for the lot-rules pass. When `width_mix` is unset and
+    /// the region is EuroLatam, fall back to the placeholder 6/8/10 m mix.
+    pub fn effective_width_mix(&self) -> (Option<LotWidthMix>, bool) {
+        match (&self.width_mix, self.region) {
+            (Some(m), _) => (Some(m.clone()), false),
+            (None, RegionProfile::EuroLatam) => {
+                (Some(LotWidthMix::euro_latam_default()), true)
+            }
+            (None, _) => (None, false),
+        }
+    }
+
+    /// Effective independent depth target (metres). Falls back to the euro_latam
+    /// 25 m placeholder when unset (0) under the EuroLatam profile.
+    pub fn effective_depth_target(&self) -> (f64, bool) {
+        if self.lot_depth_target > 0.0 {
+            (self.lot_depth_target, false)
+        } else if self.region == RegionProfile::EuroLatam {
+            (25.0, true)
+        } else {
+            (0.0, false)
+        }
+    }
+
+    /// Effective depth tolerance (metres). Placeholder ±5 m under EuroLatam.
+    pub fn effective_depth_tolerance(&self) -> f64 {
+        if self.lot_depth_tolerance > 0.0 {
+            self.lot_depth_tolerance
+        } else if self.region == RegionProfile::EuroLatam {
+            5.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Effective corner-lot width bonus (fraction). Placeholder +15 % under
+    /// EuroLatam when unset (0).
+    pub fn effective_corner_bonus(&self) -> (f64, bool) {
+        if self.corner_lot_width_bonus > 0.0 {
+            (self.corner_lot_width_bonus, false)
+        } else if self.region == RegionProfile::EuroLatam {
+            (0.15, true)
+        } else {
+            (0.0, false)
+        }
     }
 }
 

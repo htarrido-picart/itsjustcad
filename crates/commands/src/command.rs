@@ -1384,6 +1384,21 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         block_ids: Option<Vec<ObjectId>>,
     },
+    /// Set the sticky lot loading mode (M-intemfit Phase 6): `front` (front-
+    /// loaded, the euro_latam default) or `alley` (alley-loaded, two-frontage —
+    /// takes effect when the block carries an alley edge). A thin convenience
+    /// over `lotsettings loading=…`; logged so replay reproduces it. `targets` is
+    /// accepted for the plan's `lotloading <sel> …` shape but the mode is sticky
+    /// document state (applied on the next subdivide), so the selection is
+    /// advisory only.
+    LotLoading {
+        targets: Selector,
+        /// `front` | `alley`.
+        mode: String,
+        /// Prior settings JSON captured on first exec (for undo + replay).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prev: Option<String>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild

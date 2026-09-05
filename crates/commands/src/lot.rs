@@ -21,7 +21,7 @@ use glam::{DVec2, DVec3};
 use itsjustcad_doc::{Document, Geometry, LayerStyle, ObjectId, SceneObject};
 use kernel_curve::Curve;
 use subdivision::{
-    Polygon2d, StreetPattern, SubdivisionMethod, SubdivisionSettings,
+    Block, Polygon2d, StreetPattern, SubdivisionMethod, SubdivisionSettings,
 };
 
 /// Chord tolerance for tessellating a block boundary curve to a polygon.
@@ -70,6 +70,13 @@ pub struct LotBake {
     pub polygons: Vec<Polygon2d>,
     pub z: f64,
     pub with_street: usize,
+    /// Lot-rules (Phase 6) summary: total slivers merged + corners widened.
+    pub slivers_merged: usize,
+    pub corners_widened: usize,
+    /// The euro_latam placeholder banner, if any rule fell back to defaults.
+    pub placeholder_note: Option<String>,
+    /// Width-mix proportion error achieved (`None` if width-mix not run).
+    pub width_mix_error: Option<f64>,
 }
 
 /// Core Phase-3 bridge: run recursive-OBB subdivision on `blocks` (already
@@ -90,15 +97,51 @@ pub fn subdivide_blocks(
         }
     }
 
+    // A width mix turns subdivision into frontage packing (Phase 6). It is
+    // opt-in: set via `lotsubdivide widthmix=...` / `lotsettings`, never forced
+    // on a plain `grid` run — so the base recursive/offset behaviour is
+    // unchanged unless the user asks for a mix. (The euro_latam default mix is a
+    // placeholder surfaced only once a mix is actually requested.)
+    let use_width_mix = settings.width_mix.is_some() && settings.method != SubdivisionMethod::Offset;
+
     let mut polygons = Vec::new();
     let mut with_street = 0usize;
+    let mut slivers_merged = 0usize;
+    let mut corners_widened = 0usize;
+    let mut placeholder_note: Option<String> = None;
+    let mut width_mix_error: Option<f64> = None;
     let mut z_acc = 0.0;
     let mut z_n = 0usize;
     for (block, z) in blocks {
-        let lots = match settings.method {
-            SubdivisionMethod::Offset => subdivision::subdivide_offset(block, settings),
-            _ => subdivision::subdivide(block, settings),
+        let tagged = Block::untagged(block.clone());
+        // Base lots: width-mix frontage packing when requested + it applies,
+        // else the recursive/offset subdivider.
+        let base_lots = if use_width_mix {
+            match subdivision::subdivision::lot_rules::subdivide_width_mix(&tagged, settings) {
+                Some((lots, err, _ph)) if !lots.is_empty() => {
+                    width_mix_error = Some(width_mix_error.map_or(err, |e: f64| e.max(err)));
+                    lots
+                }
+                // Frontage too short / no usable street → fall back to the method.
+                _ => match settings.method {
+                    SubdivisionMethod::Offset => subdivision::subdivide_offset(block, settings),
+                    _ => subdivision::subdivide(block, settings),
+                },
+            }
+        } else {
+            match settings.method {
+                SubdivisionMethod::Offset => subdivision::subdivide_offset(block, settings),
+                _ => subdivision::subdivide(block, settings),
+            }
         };
+
+        // Lot-rules post-pass: corner widening + sliver merge (+ placeholder note).
+        let (lots, report) = subdivision::apply_lot_rules(&tagged, base_lots, settings);
+        slivers_merged += report.slivers_merged;
+        corners_widened += report.corners_widened;
+        if placeholder_note.is_none() {
+            placeholder_note = report.placeholder_banner();
+        }
         for lot in lots {
             if lot.has_street {
                 with_street += 1;
@@ -114,7 +157,15 @@ pub fn subdivide_blocks(
             .into());
     }
     let z = if z_n > 0 { z_acc / z_n as f64 } else { 0.0 };
-    Ok(LotBake { polygons, z, with_street })
+    Ok(LotBake {
+        polygons,
+        z,
+        with_street,
+        slivers_merged,
+        corners_widened,
+        placeholder_note,
+        width_mix_error,
+    })
 }
 
 /// Ensure the `lots` layer exists; returns `Some(name)` if it was newly created.

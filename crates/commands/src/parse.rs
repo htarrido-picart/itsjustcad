@@ -1068,6 +1068,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }
         "lotsubdivide" => parse_lotsubdivide(&args),
         "lotgeneratesite" => parse_lotgeneratesite(&args),
+        "lotloading" => parse_lotloading(&args),
         "lotsettings" => {
             // Each arg is a key=value pair; none = show only.
             let mut sets = Vec::new();
@@ -1831,6 +1832,40 @@ fn parse_lotgeneratesite(args: &[&str]) -> Result<Command, ParseError> {
         road_ids: None,
         block_ids: None,
     })
+}
+
+/// `lotloading [selector] front|alley`. Sets the sticky loading mode (M-intemfit
+/// Phase 6). The mode may be the first bare positional token (`alley`) or a
+/// `mode=alley` key; a leading selector is optional.
+fn parse_lotloading(args: &[&str]) -> Result<Command, ParseError> {
+    const MODES: &[&str] = &["front", "frontloaded", "alley", "alleyloaded"];
+    let is_kv = |s: &str| s.contains('=');
+    let is_mode = |s: &str| MODES.contains(&s.to_lowercase().as_str());
+
+    let (targets, rest): (Selector, &[&str]) = match args.split_first() {
+        Some((first, _)) if !is_mode(first) && !is_kv(first) => {
+            let (sel, rest) = selector(args, "lotloading")?;
+            (sel, rest)
+        }
+        _ => (Selector::Selected, args),
+    };
+
+    let mut mode: Option<String> = None;
+    for tok in rest {
+        if let Some((k, v)) = tok.split_once('=') {
+            if k.eq_ignore_ascii_case("mode") || k.eq_ignore_ascii_case("loading") {
+                mode = Some(v.to_string());
+            } else {
+                return wrong("lotloading", "a mode (front|alley)", args);
+            }
+        } else if is_mode(tok) && mode.is_none() {
+            mode = Some(tok.to_string());
+        } else {
+            return wrong("lotloading", "a mode (front|alley)", args);
+        }
+    }
+    let mode = mode.ok_or_else(|| wrong_err("lotloading", "a mode (front|alley)", args))?;
+    Ok(Command::LotLoading { targets, mode, prev: None })
 }
 
 fn parse_grid(args: &[&str]) -> Result<Command, ParseError> {
