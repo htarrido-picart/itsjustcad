@@ -74,7 +74,6 @@ mod tests {
     use crate::blocks::block::Block;
     use crate::blocks::block_edge::BlockEdge;
     use crate::geometry::polygon2d::Polygon2d;
-    use glam::DVec2;
 
     fn block_with_alley(alley: bool) -> Block {
         let poly = Polygon2d::from_pairs([(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)])

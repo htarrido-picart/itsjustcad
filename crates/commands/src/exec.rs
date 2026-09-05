@@ -15976,6 +15976,49 @@ mod tests {
         assert_eq!(before, after, "replay recreated identical perimeter lots");
     }
 
+    #[test]
+    fn streetfollowing_method_runs_and_bakes_lots() {
+        // Phase 7: method=streetfollowing runs (skeleton subdivision) instead of
+        // the deferral error.
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 120");
+        let out = run(&mut s, "lotsubdivide last streetfollowing area=4000 width=30 seed=7");
+        assert!(out.created.len() > 1, "expected multiple skeleton lots");
+        assert_eq!(lot_count(&s), out.created.len());
+    }
+
+    #[test]
+    fn streetfollowing_undo_and_replay_byte_identical() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 120");
+        run(&mut s, "lotsubdivide last streetfollowing area=4000 width=30 seed=7");
+        assert!(lot_count(&s) > 0);
+
+        let before: Vec<_> = s
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| s.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        run(&mut s, "undo");
+        assert_eq!(lot_count(&s), 0, "undo removes skeleton lots");
+        run(&mut s, "redo");
+
+        let log: Vec<Command> = s.log.iter().map(|a| a.op.clone()).collect();
+        let rebuilt = Session::replay(log).unwrap();
+        let after: Vec<_> = rebuilt
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| rebuilt.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        assert_eq!(before, after, "replay recreated identical skeleton lots");
+    }
+
     // ── M-intemfit: lotgeneratesite (Phase 5) ───────────────────────────────
 
     fn layer_count(s: &Session, layer: &str) -> usize {

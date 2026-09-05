@@ -630,8 +630,49 @@ Every subdivision algorithm must pass these block shapes:
   (`tests/lot_rules.rs`) + 6 commands exec. **Placeholders IN USE — swap when Manuel
   answers §1:** width mix 6/8/10 m @ 25/50/25%, depth 25±5, corner +15%, alley 5 m, flag
   pole 3 m + pole-area exclusion. Phase 7 (skeleton) picks up from here.
-- **Phase 7** — skeleton output on the cul-de-sac + curved-street blocks visually matches
-  the questionnaire reference diagrams.
+- **Phase 7** — ✅ **DONE (2026-09-04).** Skeleton / street-following subdivision
+  (`method=streetfollowing`). New `crates/subdivision/src/straight_skeleton/`: a
+  `StraightSkeleton` trait (interface) + `offset_approx.rs` = **OffsetApproxSkeleton**,
+  the Phase-7 approximate straight skeleton. It partitions the block into one
+  **face per contour edge** as the *nearest-edge* region (each face = the block
+  clipped by the perpendicular bisector between that edge's supporting line and
+  every other edge's — exactly the seam an inward offset wavefront carves, i.e.
+  the offset-approximate skeleton per §5, computed in closed form per edge so it
+  is robust and never panics on non-convex/notched blocks; coverage-checked with a
+  centroid-fan fallback). `medial_axis_ridge` (iterated `clip_bridge::offset`
+  insets) gives the ridge the unit tests assert on (square → meets near centre;
+  rectangle → medial ridge). Felkel (`felkel.rs`) stays **Phase 12** — the trait is
+  left so it slots in later. `subdivision/skeleton_sub.rs` (SkeletonSubdivision)
+  runs the §7.5 steps: (1) straight skeleton → faces; (2) group adjacent faces
+  along runs of similar-curvature street edges into bands (curvature turn < 40° →
+  one band, so a curved street reads as one run, not a per-segment fan; uses the
+  block's `is_street` tags, every edge counts as frontage on an untagged block);
+  (3) corner regions assigned by `CornerAlignment` (widest street wins, tie-break
+  on length); (4) slice each band **perpendicular to its street edge(s)** at
+  `lot_width_min` spacing — a closed-loop band (cul-de-sac bulb) is **pie-sliced
+  from the centroid to the perimeter** (perpendicular-to-curve wedges, exact-
+  tiling), an open curved band slices each convex face by the shared global
+  perpendicular cut lines so lot lines line up across faces; (5) merge lots below
+  `lot_area_min`; (6) merge shallow/triangular lots per `shallow_lot_frac`; (7)
+  `simplify` vertex reduction. All merges are **area-conserving** (single-ring
+  unions only — never drop the smaller piece), and a `force_street_access` pass
+  folds any streetless wedge into a street neighbour. **Deterministic** (pure
+  geometry, no RNG) → op-log replay byte-identical. Wired into `lot.rs`
+  (`method=streetfollowing` replaces the deferral; same bake path as grid/perimeter
+  — logged op, written-back ids on the `lots` layer, undo, replay-stable) via a
+  shared `subdivide_by_method` dispatch; width-mix packing no longer overrides the
+  skeleton's own slicing. **Tests (all green):** `straight_skeleton` unit tests
+  (square faces meet near centre + tile to 4 equal faces; rectangle medial ridge;
+  notched block no-panic + covers; triangle tiles); `tests/skeleton_blocks.rs` — the
+  §8 blocks that matter (#1 long-thin, #4 cul-de-sac bulb, #5 curved-street varying
+  radius, #7 one short street edge) asserting Σ lot area == block area within tol,
+  no overlaps, no gaps (>95% sampled coverage), every lot has a street edge under
+  `force_street_access`, **lots roughly perpendicular to the street on the bulb +
+  curved cases** (each lot's inward side aligns with the local street normal within
+  30°, ≥60% of lots — the §9 visual claim as a structural proxy), lot count in a
+  sane range, deterministic byte-identical; plus `lot.rs`/`exec.rs` bridge tests
+  (method runs, bakes, undo + byte-identical replay). Phase 8 (setbacks +
+  buildable envelopes) picks up from here.
 - **Phase 8** — setbacks + buildable envelopes render per lot; frontage at setback line.
 - **Phase 9** — feature placement (`type=park|greenway|pond|treesave`) works; the
   opt-in `reserve=<pct>` mode excludes whole blocks until ~pct of the site is open,

@@ -12,12 +12,15 @@
 //! OBB subdivision, `method=grid`), 4 (offset/perimeter subdivision,
 //! `method=perimeter`), 5 + 5b (road generation + block extraction + street
 //! tagging), 6 (lot rules — width mix, depth, corner, flag, loading, sliver
-//! merge, on euro_latam placeholder defaults). Phase 2 (verb/settings plumbing)
-//! lives in the commands crate but the `SubdivisionSettings` type is here.
+//! merge, on euro_latam placeholder defaults), 7 (skeleton / street-following
+//! subdivision, `method=streetfollowing`, via the approximate straight skeleton
+//! in `straight_skeleton`). Phase 2 (verb/settings plumbing) lives in the
+//! commands crate but the `SubdivisionSettings` type is here.
 
 pub mod blocks;
 pub mod geometry;
 pub mod settings;
+pub mod straight_skeleton;
 pub mod streets;
 pub mod subdivision;
 
@@ -33,8 +36,14 @@ pub use settings::{
 pub use subdivision::lot_rules::{
     apply_lot_rules, LotRulesReport, WidthMixResult, WidthMixSolver,
 };
+pub use straight_skeleton::{
+    offset_approx::OffsetApproxSkeleton, SkeletonFace, StraightSkeleton,
+};
 pub use streets::{extract_blocks, generate_streets, Street, StreetGraph, StreetTier};
 pub use subdivision::offset_sub::subdivide as subdivide_offset;
+pub use subdivision::skeleton_sub::{
+    subdivide as subdivide_skeleton, subdivide_block as subdivide_skeleton_block,
+};
 pub use subdivision::{subdivide, Lot};
 
 use glam::DVec2;

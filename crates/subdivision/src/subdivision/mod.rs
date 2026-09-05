@@ -2,10 +2,13 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 //! Subdivision algorithms. Phase 3 ships `recursive_obb` (`method=grid`); Phase 4
-//! ships `offset_sub` (`method=perimeter`); `skeleton_sub` (Phase 7) lands later.
+//! ships `offset_sub` (`method=perimeter`); Phase 7 ships `skeleton_sub`
+//! (`method=streetfollowing`) — perpendicular-to-curve lot lines around cul-de-sac
+//! bulbs and curved streets, via the approximate straight skeleton.
 
 pub mod lot_rules;
 pub mod offset_sub;
 pub mod recursive_obb;
+pub mod skeleton_sub;
 
 pub use recursive_obb::{subdivide, Lot};

@@ -8,9 +8,10 @@
 //!
 //! Phases 2–4 ship two verbs:
 //! - `lotsubdivide` — subdivide selected closed block curve(s) into lots on the
-//!   `lots` layer. `method=grid` (recursive OBB, Phase 3) and `method=perimeter`
-//!   (offset/perimeter, Phase 4) are implemented; `streetfollowing` returns a
-//!   clear "not yet implemented" error (Phase 7).
+//!   `lots` layer. `method=grid` (recursive OBB, Phase 3), `method=perimeter`
+//!   (offset/perimeter, Phase 4), and `method=streetfollowing` (skeleton /
+//!   street-following, Phase 7 — perpendicular-to-curve lot lines) are all
+//!   implemented.
 //! - `lotsettings` — show or set the sticky `SubdivisionSettings` on the doc.
 //!
 //! Results bake as a logged op with written-back ids (contours/landscape
@@ -79,30 +80,41 @@ pub struct LotBake {
     pub width_mix_error: Option<f64>,
 }
 
-/// Core Phase-3 bridge: run recursive-OBB subdivision on `blocks` (already
-/// tessellated + validated closed) with `settings`. Errors for unimplemented
-/// methods. Deterministic — output depends only on the blocks + settings.
+/// Dispatch one block to the subdivider selected by `settings.method`.
+/// `tagged` carries the block's street tags (Phase 5) for the skeleton method;
+/// for a plain `lotsubdivide` on an arbitrary curve it is `Block::untagged`, so
+/// the skeleton treats every contour edge as frontage (same as grid/perimeter).
+fn subdivide_by_method(
+    block: &Polygon2d,
+    tagged: &Block,
+    settings: &SubdivisionSettings,
+) -> Vec<subdivision::Lot> {
+    match settings.method {
+        SubdivisionMethod::Offset => subdivision::subdivide_offset(block, settings),
+        SubdivisionMethod::Skeleton => subdivision::subdivide_skeleton_block(tagged, settings),
+        SubdivisionMethod::Recursive => subdivision::subdivide(block, settings),
+    }
+}
+
+/// Core bridge: run the subdivider selected by `settings.method`
+/// (grid/perimeter/streetfollowing) on `blocks` (already tessellated + validated
+/// closed) with `settings`. Deterministic — output depends only on the blocks +
+/// settings.
 pub fn subdivide_blocks(
     blocks: &[(Polygon2d, f64)],
     settings: &SubdivisionSettings,
 ) -> Result<LotBake, String> {
-    match settings.method {
-        SubdivisionMethod::Recursive | SubdivisionMethod::Offset => {}
-        SubdivisionMethod::Skeleton => {
-            return Err(
-                "lotsubdivide method=streetfollowing is not yet implemented (Phase 7 — \
-                 skeleton subdivision). Use method=grid."
-                    .into(),
-            );
-        }
-    }
+    // All three methods (grid / perimeter / streetfollowing) are implemented.
 
     // A width mix turns subdivision into frontage packing (Phase 6). It is
     // opt-in: set via `lotsubdivide widthmix=...` / `lotsettings`, never forced
     // on a plain `grid` run — so the base recursive/offset behaviour is
     // unchanged unless the user asks for a mix. (The euro_latam default mix is a
-    // placeholder surfaced only once a mix is actually requested.)
-    let use_width_mix = settings.width_mix.is_some() && settings.method != SubdivisionMethod::Offset;
+    // placeholder surfaced only once a mix is actually requested.) Skeleton
+    // subdivision drives its own perpendicular slicing, so width-mix packing does
+    // not override it either.
+    let use_width_mix = settings.width_mix.is_some()
+        && settings.method == SubdivisionMethod::Recursive;
 
     let mut polygons = Vec::new();
     let mut with_street = 0usize;
@@ -123,16 +135,10 @@ pub fn subdivide_blocks(
                     lots
                 }
                 // Frontage too short / no usable street → fall back to the method.
-                _ => match settings.method {
-                    SubdivisionMethod::Offset => subdivision::subdivide_offset(block, settings),
-                    _ => subdivision::subdivide(block, settings),
-                },
+                _ => subdivide_by_method(block, &tagged, settings),
             }
         } else {
-            match settings.method {
-                SubdivisionMethod::Offset => subdivision::subdivide_offset(block, settings),
-                _ => subdivision::subdivide(block, settings),
-            }
+            subdivide_by_method(block, &tagged, settings)
         };
 
         // Lot-rules post-pass: corner widening + sliver merge (+ placeholder note).
@@ -411,14 +417,28 @@ mod tests {
     }
 
     #[test]
-    fn streetfollowing_method_errors_cleanly() {
+    fn streetfollowing_method_runs_and_conserves_area() {
+        // Phase 7: method=streetfollowing now runs (skeleton subdivision) rather
+        // than returning the deferral error.
         let poly = curve_to_polygon(&rect_curve(400.0, 120.0)).unwrap();
         let s = SubdivisionSettings {
             method: SubdivisionMethod::Skeleton,
+            lot_area_min: 3000.0,
+            lot_width_min: 30.0,
+            merge_slivers: false,
+            corner_lot_width_bonus: 0.0,
+            width_mix: None,
+            region: subdivision::RegionProfile::UsSuburban,
             ..SubdivisionSettings::default()
         };
-        let err = subdivide_blocks(&[(poly, 0.0)], &s).unwrap_err();
-        assert!(err.contains("Phase 7"));
+        let bake = subdivide_blocks(&[(poly.clone(), 0.0)], &s).unwrap();
+        assert!(!bake.polygons.is_empty());
+        let sum: f64 = bake.polygons.iter().map(|p| p.area()).sum();
+        assert!(
+            (sum - poly.area()).abs() / poly.area() < 0.02,
+            "skeleton conserves area: {sum} vs {}",
+            poly.area()
+        );
     }
 
     #[test]
