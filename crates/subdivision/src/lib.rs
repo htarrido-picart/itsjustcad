@@ -22,6 +22,7 @@
 
 pub mod blocks;
 pub mod geometry;
+pub mod indexing;
 pub mod open_space;
 pub mod buildings;
 pub mod reporting;
@@ -36,6 +37,7 @@ pub use buildings::{
     roof as building_roof, BuildingResult, Floor, Footprint, Massing,
 };
 pub use geometry::clip_bridge;
+pub use indexing::ConsistentIndexing;
 pub use geometry::oriented_box::{convex_hull, OrientedBox};
 pub use open_space::{
     greenway, pocket_park, reserve_blocks, retention_pond, tree_save, OpenSpaceFeature,
@@ -46,14 +48,14 @@ pub use reporting::{FrontageStats, YieldComparison, YieldInputs, YieldReport};
 pub use geometry::polyline::PolylineTools;
 pub use geometry::split::{split_by_line, Line2d};
 pub use settings::{
-    FootprintMode, LoadingType, LotWidthMix, RegionProfile, RoofType, StreetPattern,
-    SubdivisionMethod, SubdivisionSettings, Typology,
+    FootprintMode, LoadingType, LotWidthMix, RegionProfile, RoofType, SkeletonImpl,
+    StreetPattern, SubdivisionMethod, SubdivisionSettings, Typology,
 };
 pub use subdivision::lot_rules::{
     apply_lot_rules, LotRulesReport, WidthMixResult, WidthMixSolver,
 };
 pub use straight_skeleton::{
-    offset_approx::OffsetApproxSkeleton, SkeletonFace, StraightSkeleton,
+    felkel::FelkelSkeleton, offset_approx::OffsetApproxSkeleton, SkeletonFace, StraightSkeleton,
 };
 pub use streets::{extract_blocks, generate_streets, Street, StreetGraph, StreetTier};
 pub use subdivision::offset_sub::subdivide as subdivide_offset;

@@ -17,8 +17,10 @@
 //! (`skeleton_sub`) groups these faces by street and slices them perpendicular
 //! to their street edge.
 
+pub mod felkel;
 pub mod offset_approx;
 
+pub use felkel::FelkelSkeleton;
 pub use offset_approx::OffsetApproxSkeleton;
 
 use crate::geometry::polygon2d::Polygon2d;

@@ -4069,12 +4069,22 @@ fn exec_lot_settings(
             "stepback_start" | "stepback_start_floor" => {
                 s.stepback_start_floor = (num()?.max(0.0)) as usize
             }
+            // Skeleton backend (Phase 12) — `skeleton=felkel|offset`. Default
+            // offset (robust). felkel = true straight skeleton (convex-exact,
+            // non-convex fallback to offset).
+            "skeleton" | "skeleton_impl" => {
+                s.skeleton_impl = subdivision::SkeletonImpl::parse(v).ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "unknown skeleton impl '{v}' (try offset | felkel)"
+                    ))
+                })?;
+            }
             other => {
                 return Err(ExecError::Invalid(format!(
                     "unknown lot setting '{other}' (try area/area_max/width/irregularity/loose/\
                      force_street/method/seed/region/loading/widthmix/depth/corner/flag/\
                      mergeslivers/front/side/rear/buildto/typology/footprint/floors/floorheight/\
-                     coverage/roof/pitch/stepback)"
+                     coverage/roof/pitch/stepback/skeleton)"
                 )));
             }
         }
@@ -16524,6 +16534,74 @@ mod tests {
             .map(|o| o.geometry.clone())
             .collect();
         assert_eq!(before, after, "replay recreated identical lot geometry");
+    }
+
+    // ── Phase 12: consistent indexing + felkel skeleton ─────────────────────
+
+    /// Helper: lot names on the lots layer, in a stable (sorted) order.
+    fn lot_names(s: &Session) -> Vec<String> {
+        let mut v: Vec<String> = s
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| s.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .filter_map(|o| o.name.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn lots_carry_stable_spatial_index_in_name() {
+        // Phase 12.1 — baked lots are named `lot #N` with a spatial index, and the
+        // set of indices is exactly 1..=count (a permutation, no gaps/dupes).
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 120");
+        let out = run(&mut s, "lotsubdivide last grid area=6500 width=50");
+        let names = lot_names(&s);
+        assert_eq!(names.len(), out.created.len());
+        assert!(names.iter().all(|n| n.starts_with("lot #")), "named lot #N: {names:?}");
+        let mut nums: Vec<usize> =
+            names.iter().map(|n| n.trim_start_matches("lot #").parse().unwrap()).collect();
+        nums.sort();
+        let expected: Vec<usize> = (1..=out.created.len()).collect();
+        assert_eq!(nums, expected, "indices are a 1..=n permutation");
+    }
+
+    #[test]
+    fn resubdivide_same_site_keeps_indices() {
+        // Phase 12.1 — a re-run on the identical site produces the identical set
+        // of spatial indices (the replay/stability invariant).
+        let mut a = Session::default();
+        run(&mut a, "rect 0,0,0 400 120");
+        run(&mut a, "lotsubdivide last grid area=6500 width=50 seed=3");
+        let names_a = lot_names(&a);
+
+        let mut b = Session::default();
+        run(&mut b, "rect 0,0,0 400 120");
+        run(&mut b, "lotsubdivide last grid area=6500 width=50 seed=3");
+        let names_b = lot_names(&b);
+        assert_eq!(names_a, names_b, "identical site → identical lot indices");
+    }
+
+    #[test]
+    fn skeleton_felkel_setting_bakes_lots() {
+        // Phase 12.2 — `lotsettings skeleton=felkel` then a streetfollowing
+        // subdivide runs the Felkel backend and bakes lots (no panic, non-empty).
+        let mut s = Session::default();
+        run(&mut s, "lotsettings skeleton=felkel");
+        run(&mut s, "rect 0,0,0 400 120");
+        let out = run(&mut s, "lotsubdivide last streetfollowing area=6500 width=40");
+        assert!(out.created.len() > 1, "felkel skeleton baked multiple lots");
+        assert_eq!(lot_count(&s), out.created.len());
+    }
+
+    #[test]
+    fn skeleton_setting_rejects_unknown_impl() {
+        let mut s = Session::default();
+        let r = s.run(parse("lotsettings skeleton=bogus").unwrap());
+        assert!(r.is_err(), "unknown skeleton impl is rejected");
     }
 
     #[test]

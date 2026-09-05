@@ -685,6 +685,10 @@ fn translate_block_geom(g: &mut itsjustcad_doc::BlockGeometry, d: DVec3) {
     }
 }
 
+// Short-lived per-record return value (never stored in bulk), so the size gap
+// between Entity and the unit variants is harmless — boxing would add an
+// allocation per DXF entity for a cosmetic lint.
+#[allow(clippy::large_enum_variant)]
 enum RecordOutcome {
     Entity(String, crate::Command),
     PolyOpened,

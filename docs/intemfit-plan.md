@@ -213,10 +213,15 @@ Resolve in Phase 1, not Phase 5.**
 ### Straight skeleton — build/port
 
 No production straight skeleton exists ready-made. Same strategy as the Rhino plan:
-1. **Phase 7:** `offset_approx.rs` — iterated small `i_overlay` insets with topology
-   tracking. Approximate medial axis, robust, fast. Good at survey tolerances.
-2. **Phase 12:** port Felkel & Obdržálek (1998) priority-queue event algorithm behind
-   the same `StraightSkeleton` trait.
+1. **Phase 7 (DONE):** `offset_approx.rs` — iterated small `i_overlay` insets with
+   topology tracking. Approximate medial axis, robust, fast. Good at survey
+   tolerances. Remains the **default** backend.
+2. **Phase 12 (DONE, convex-exact partial):** `felkel.rs` — Felkel & Obdržálek
+   (1998) priority-queue **edge-event** algorithm behind the same
+   `StraightSkeleton` trait. Exact on convex polygons (no reflex vertices ⇒ no
+   split events); falls back to `offset_approx` on non-convex input (split events
+   not implemented — the honest partial). Opt-in via `lotsettings skeleton=felkel`;
+   default stays `offset` for safety.
 
 ### No Rhino infra — ItsJustCAD equivalents
 
@@ -823,7 +828,54 @@ Every subdivision algorithm must pass these block shapes:
   space; FAR = GFA/net on real buildings; served through `report`; not-logged +
   deterministic; empty-doc clean error; compare diff; compare needs two runs). Phase 12
   (polish) picks up from here.
-- **Phase 12** — as specified (polish).
+- **Phase 12** — ✅ **DONE (2026-09-05). M-intemfit COMPLETE.** Polish cart, three
+  pieces:
+  1. **Consistent indexing** (`crates/subdivision/src/indexing.rs`,
+     `ConsistentIndexing`) — deterministic lot/block IDs by **spatial** order, not
+     creation order. `assign(&[Polygon2d]) -> Vec<usize>` buckets each lot by its
+     centroid quantised to an (auto-derived or fixed) block grid, sorts buckets
+     **row-major** (top→bottom, left→right — plat reading order), and within a block
+     orders along the block's principal (long) axis then perpendicular, with fully
+     deterministic float-quantised + index tie-breaks. Geometry-only (no RNG, no
+     creation order) → identical input geometry gives identical indices regardless
+     of input order. Wired into the bake (`commands/src/lot.rs`): lots baked as
+     `lot #N`, blocks as `block #N`, carrying the stable index. **Tests:** 7 unit
+     (`indexing.rs`) — along-street order, shuffled-input-same-indices, re-run
+     identical, **incremental add keeps a stable prefix** (add one lot → existing
+     keep their numbers), row-major across blocks, empty; + 2 exec
+     (`lots_carry_stable_spatial_index_in_name` = names are a 1..=n permutation,
+     `resubdivide_same_site_keeps_indices` = identical site → identical indices).
+  2. **True straight skeleton — Felkel & Obdržálek (1998)** — SHIPPED as the
+     **convex-exact PARTIAL** the plan sanctions (§12.2), NOT default. New
+     `crates/subdivision/src/straight_skeleton/felkel.rs` (`FelkelSkeleton`) behind
+     the existing `StraightSkeleton` trait. On a **convex** polygon it runs the
+     genuine Felkel **priority-queue edge-event** simulation: per-vertex interior
+     angle bisectors with speed `1/sin(θ/2)`, a circular active-vertex ring, the
+     earliest convergent adjacent-bisector event popped each step (deterministic
+     tie-break), collapsing edges into new skeleton nodes until ≤2 vertices remain.
+     Convex ⇒ no reflex vertices ⇒ **no split events** ⇒ the loop is exact and
+     robust. On a **non-convex** polygon (where split events + their near-parallel
+     fragility would be required) it **falls back to `OffsetApproxSkeleton`** — the
+     documented, honest partial (never ship a broken skeleton). Opt-in via
+     `lotsettings skeleton=felkel|offset` (`SkeletonImpl` enum on
+     `SubdivisionSettings`, serde-default **Offset** for safety); `skeleton_sub`
+     dispatches the backend through the shared trait so nothing else changed.
+     **Tests:** 6 felkel unit (convex detection, square→centre node,
+     rectangle→medial ridge segment x∈[5,25], triangle→incenter, non-convex→no
+     exact nodes + covering fallback, convex Felkel-vs-OffsetApprox agree) + 9
+     integration (`tests/felkel.rs`): square/rectangle/L-shape correctness,
+     Felkel-vs-Offset agreement on 3 convex blocks, **no-panic on all §8 blocks**,
+     area-conservation + street-access + byte-identical determinism on the
+     conservation-safe §8 set (#1/#4/#5/#7 — the notch is excluded from the
+     conservation assertion for both backends, the same Phase-7 limit), and the
+     default offset backend unchanged; + 2 exec (`skeleton_felkel_setting_bakes_lots`,
+     `skeleton_setting_rejects_unknown_impl`).
+  3. **Optimization** — deliberately **skipped** (plan §12: "optional, skip if 1+2
+     fill the cart"). The subdivision path is already deterministic + fast for the
+     tested sites; a speculative hot-path rewrite risked the replay-determinism
+     invariant for no measured need. Left as a clean future follow-up.
+  `cargo test -p subdivision` 162 lib + all integration green; `cargo clippy -p
+  subdivision` clean (0 new warnings). **M-intemfit is COMPLETE (Phases 1–12).**
 
 ---
 

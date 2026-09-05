@@ -34,8 +34,8 @@ use crate::blocks::block_edge::BlockEdge;
 use crate::geometry::polygon2d::Polygon2d;
 use crate::geometry::polyline::PolylineTools;
 use crate::geometry::split::{split_by_line, Line2d};
-use crate::settings::{CornerAlignment, SubdivisionSettings};
-use crate::straight_skeleton::{OffsetApproxSkeleton, SkeletonFace, StraightSkeleton};
+use crate::settings::{CornerAlignment, SkeletonImpl, SubdivisionSettings};
+use crate::straight_skeleton::{FelkelSkeleton, OffsetApproxSkeleton, SkeletonFace, StraightSkeleton};
 use crate::subdivision::lot_rules::sliver;
 use crate::subdivision::recursive_obb::Lot;
 use glam::DVec2;
@@ -50,9 +50,15 @@ pub fn subdivide_block(block: &Block, settings: &SubdivisionSettings) -> Vec<Lot
         return Vec::new();
     }
 
-    // 1. Straight skeleton → one face per contour edge.
-    let sk = OffsetApproxSkeleton::new();
-    let faces = sk.faces(poly);
+    // 1. Straight skeleton → one face per contour edge. The backend is selected
+    // by `settings.skeleton_impl` (§12.2): the robust Phase-7 offset-approximate
+    // skeleton (default) or the true Phase-12 Felkel skeleton (convex-exact,
+    // non-convex fallback). Both implement the same `StraightSkeleton` trait, so
+    // the rest of the subdivider is unchanged.
+    let faces = match settings.skeleton_impl {
+        SkeletonImpl::Felkel => FelkelSkeleton::new().faces(poly),
+        SkeletonImpl::Offset => OffsetApproxSkeleton::new().faces(poly),
+    };
     if faces.is_empty() {
         return Vec::new();
     }

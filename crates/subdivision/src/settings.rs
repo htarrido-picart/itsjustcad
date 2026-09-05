@@ -27,6 +27,34 @@ pub enum LoadingType {
     Mixed,
 }
 
+/// Which straight-skeleton implementation the skeleton subdivider uses
+/// (plan §12.2). `Offset` = the Phase-7 [`crate::straight_skeleton::
+/// OffsetApproxSkeleton`] (robust on any polygon) — the DEFAULT for safety.
+/// `Felkel` = the Phase-12 [`crate::straight_skeleton::FelkelSkeleton`] (a true
+/// straight skeleton, exact on convex polygons via the priority-queue event loop,
+/// falling back to the approximate skeleton on non-convex input). Opt-in via
+/// `lotsettings skeleton=felkel|offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkeletonImpl {
+    /// Offset-approximate skeleton (Phase 7). Robust; the safe default.
+    #[default]
+    Offset,
+    /// True Felkel skeleton (Phase 12), convex-exact + non-convex fallback.
+    Felkel,
+}
+
+impl SkeletonImpl {
+    /// Parse a skeleton-impl keyword. `None` if unknown.
+    pub fn parse(s: &str) -> Option<SkeletonImpl> {
+        match s.to_lowercase().as_str() {
+            "offset" | "approx" | "offsetapprox" => Some(SkeletonImpl::Offset),
+            "felkel" | "true" | "exact" => Some(SkeletonImpl::Felkel),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CornerAlignment {
     #[default]
@@ -220,10 +248,14 @@ pub struct SubdivisionSettings {
     /// Target block depth used to space roads. 0 = derive from lot depth.
     pub block_depth: f64,
 
-    // ── Skeleton (Phase 7) ──
+    // ── Skeleton (Phase 7 / 12) ──
     pub shallow_lot_frac: f64,
     pub corner_align: CornerAlignment,
     pub simplify: f64,
+    /// Which straight-skeleton backend `method=streetfollowing` uses (plan §12.2).
+    /// Default `Offset` (the robust Phase-7 approximate skeleton); `Felkel` opts
+    /// into the true Phase-12 skeleton (convex-exact, non-convex fallback).
+    pub skeleton_impl: SkeletonImpl,
 
     // ── Lot rules (Phase 6) ──
     pub width_mix: Option<LotWidthMix>,
@@ -299,6 +331,7 @@ impl Default for SubdivisionSettings {
             shallow_lot_frac: 0.0,
             corner_align: CornerAlignment::StreetWidth,
             simplify: 0.0,
+            skeleton_impl: SkeletonImpl::Offset,
             width_mix: None,
             lot_depth_target: 0.0,
             lot_depth_tolerance: 0.0,

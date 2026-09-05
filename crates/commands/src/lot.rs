@@ -195,12 +195,20 @@ pub fn ensure_lots_layer(doc: &mut Document) -> Option<String> {
 }
 
 /// Insert baked lot curves onto the `lots` layer with the given ids.
+///
+/// Lot names carry a **stable spatial index** (plan §12.1): each lot is named
+/// `lot #N` where `N` is its deterministic position in spatial (row-major by
+/// block, then along-street) order via [`subdivision::ConsistentIndexing`] — NOT
+/// its creation order. Re-subdividing the same site keeps every lot's number; a
+/// later edit that adds a lot keeps the prefix stable rather than renumbering all.
 pub fn insert_lots(doc: &mut Document, bake: &LotBake, ids: &[ObjectId]) {
-    for (poly, id) in bake.polygons.iter().zip(ids) {
+    let indices = subdivision::ConsistentIndexing::new().assign(&bake.polygons);
+    for (k, (poly, id)) in bake.polygons.iter().zip(ids).enumerate() {
+        let idx = indices.get(k).copied().unwrap_or(k + 1);
         doc.insert(SceneObject {
             visible: true,
             id: *id,
-            name: Some("lot".to_string()),
+            name: Some(format!("lot #{idx}")),
             layer: LOTS_LAYER.to_string(),
             color: None,
             material: None,
@@ -321,11 +329,15 @@ pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], b
             }),
         });
     }
-    for (poly, id) in bake.blocks.iter().zip(block_ids) {
+    // Blocks carry a stable spatial index too (plan §12.1): row-major order over
+    // the block set so a re-generated site keeps each block's number.
+    let block_idx = subdivision::ConsistentIndexing::new().assign(&bake.blocks);
+    for (k, (poly, id)) in bake.blocks.iter().zip(block_ids).enumerate() {
+        let idx = block_idx.get(k).copied().unwrap_or(k + 1);
         doc.insert(SceneObject {
             visible: true,
             id: *id,
-            name: Some("block".to_string()),
+            name: Some(format!("block #{idx}")),
             layer: BLOCKS_LAYER.to_string(),
             color: None,
             material: None,
