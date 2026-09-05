@@ -48,9 +48,10 @@ pub fn keymap(key: Key, mods: Modifiers, ctx: KeyContext<'_>) -> Option<String> 
         Key::C if bare && !ctx.draw_active => "circle",
         Key::P if bare && !ctx.draw_active => "polyline",
         Key::R if bare && !ctx.draw_active => "rect",
-        // Rhino-style Gumball toggle: bare G flips gizmo visibility. Free key
-        // (not a draw verb), works with or without a selection.
-        Key::G if bare && !ctx.draw_active => "gumball",
+        // Gumball toggle: Cmd/Ctrl+G flips gizmo visibility. Uses the command
+        // modifier (NOT bare G) so it never eats the first letter of a typed
+        // command that starts with 'g' (geodesic, grid, group, gaussvault…).
+        Key::G if cmd && !ctx.draw_active => "gumball",
         _ => return None,
     };
     Some(line.to_string())
@@ -177,15 +178,17 @@ mod tests {
     }
 
     #[test]
-    fn g_toggles_gumball_bare_only() {
-        // Bare G flips the gizmo, with or without a selection.
-        assert_eq!(keymap(Key::G, NONE, ctx()).unwrap(), "gumball");
+    fn cmd_g_toggles_gumball_bare_g_types() {
+        // Cmd/Ctrl+G flips the gizmo, with or without a selection.
+        assert_eq!(keymap(Key::G, CMD, ctx()).unwrap(), "gumball");
         let none = KeyContext { has_selection: false, ..ctx() };
-        assert_eq!(keymap(Key::G, NONE, none).unwrap(), "gumball");
-        // Not while a draw tool owns the keyboard, not with modifiers.
+        assert_eq!(keymap(Key::G, CMD, none).unwrap(), "gumball");
+        // Bare G is NOT a hotkey — it must type into the command line so words
+        // starting with 'g' (geodesic, grid…) aren't hijacked.
+        assert_eq!(keymap(Key::G, NONE, ctx()), None);
+        // Not while a draw tool owns the keyboard, not with Shift.
         let drawing = KeyContext { draw_active: true, ..ctx() };
-        assert_eq!(keymap(Key::G, NONE, drawing), None);
-        assert_eq!(keymap(Key::G, CMD, ctx()), None);
+        assert_eq!(keymap(Key::G, CMD, drawing), None);
         assert_eq!(keymap(Key::G, Modifiers::SHIFT, ctx()), None);
     }
 

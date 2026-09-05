@@ -58,7 +58,7 @@ pub enum AppVerb {
     /// Tune the sketchy edge effect (`edgefx jitter=.. extension=.. …`).
     /// Carries the raw `key=value` tokens for the front-end to apply.
     EdgeFx(Vec<String>),
-    /// Toggle the transform gumball/gizmo (`gumball [on|off|toggle]` / G hotkey).
+    /// Toggle the transform gumball/gizmo (`gumball [on|off|toggle]` / Cmd+G hotkey).
     /// `None` means bare toggle.
     Gumball(Option<bool>),
     /// Toggle Reduce Motion for animated progress bars (`reducemotion [on|off]`).

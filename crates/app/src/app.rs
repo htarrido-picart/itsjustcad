@@ -1781,11 +1781,12 @@ impl App {
 
     /// Modeless-hotkey exceptions (Rhino-style) that STILL fire even though the
     /// command line is focused-by-default: Delete/Backspace = delete selection,
-    /// Esc = deselect, G = toggle gumball. They act ONLY on an EMPTY command line
-    /// (so typing a word is never hijacked), with focus on the command input or
-    /// nothing, no modal open, and no draw tool active. Runs BEFORE any widget so
-    /// the matched key/text events can be consumed — otherwise the focused input
-    /// would also eat the letter. Everything NOT in this whitelist types normally.
+    /// Esc = deselect, Cmd+G = toggle gumball. All non-letter or modified, so
+    /// none can hijack the first character of a typed command (bare `g` now
+    /// types — a word like "geodesic" is never eaten; only Cmd+G toggles). They
+    /// act on an EMPTY command line, with focus on the command input or nothing,
+    /// no modal open, and no draw tool active. Runs BEFORE any widget so matched
+    /// key events can be consumed. Everything NOT in this whitelist types normally.
     fn early_hotkeys(&mut self, ctx: &egui::Context) {
         let modal = self.show_palette
             || self.show_about
