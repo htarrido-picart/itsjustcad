@@ -22,20 +22,27 @@
 use std::path::{Path, PathBuf};
 
 /// The directories we probe for the `dwg2dxf` (LibreDWG) binary, in priority
-/// order — the Homebrew targets (Intel + Apple Silicon), the common `/usr/bin`,
-/// and `~/.local/bin`. Mirrors the LLM-CLI resolver's stance: a Finder-launched
-/// `.app` inherits a stripped `PATH`, so absolute probes rescue the lookup.
+/// order. `~/.local/bin` is probed FIRST: a user who builds a newer LibreDWG
+/// from source installs it there (the Homebrew bottles lag, and the 0.13.3 that
+/// Homebrew ships silently drops the ENTITIES section on AutoCAD-2013 AEC/ADT
+/// files — see module docs). A source-built `dwg2dxf` links its own libredwg
+/// dylib by absolute path, so preferring `~/.local/bin` is self-contained and
+/// lets the newer converter win over a stale `/usr/local/bin` copy. After that
+/// we fall back to the Homebrew targets (Intel + Apple Silicon) and `/usr/bin`.
+/// Mirrors the LLM-CLI resolver's stance: a Finder-launched `.app` inherits a
+/// stripped `PATH`, so absolute probes rescue the lookup.
 ///
 /// Pure (modulo `$HOME`) so the search set is unit-testable.
 pub fn dwg2dxf_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/bin"),
-    ];
+    let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         dirs.push(home.join(".local").join("bin"));
     }
+    dirs.extend([
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/bin"),
+    ]);
     dirs
 }
 
@@ -157,11 +164,22 @@ pub fn convert_dwg_to_dxf_with(bin: &Path, input: &str) -> Result<String, String
             ));
         }
         // Even on exit 0 the file may be missing or truncated — read then verify.
-        let dxf = std::fs::read_to_string(&out_dxf).map_err(|_| {
+        //
+        // Read as BYTES, not `read_to_string`: a real AutoCAD DWG carries binary
+        // payloads (preview thumbnails, ACAD proxy/BINARY-chunk group codes) that
+        // LibreDWG faithfully emits into the ASCII DXF, so the file is valid ASCII
+        // DXF *interleaved with* non-UTF-8 bytes. `read_to_string` would reject
+        // the whole 200 MB file on the first stray byte and — worse — that error
+        // was mapped to "conversion incomplete", making a COMPLETE conversion of
+        // a big ADT file look truncated. We decode lossily: the DXF grammar the
+        // importer parses is ASCII group codes, and the only bytes replaced are
+        // inside binary blobs the importer already skips.
+        let bytes = std::fs::read(&out_dxf).map_err(|_| {
             "DWG conversion incomplete (converter too old or unsupported DWG — try a newer \
              LibreDWG/ODA)"
                 .to_string()
         })?;
+        let dxf = String::from_utf8_lossy(&bytes).into_owned();
         validate_dxf_complete(&dxf)?;
         Ok(dxf)
     })();
@@ -231,6 +249,22 @@ mod tests {
         let dirs = dwg2dxf_search_dirs();
         assert!(dirs.contains(&PathBuf::from("/usr/local/bin")), "{dirs:?}");
         assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")), "{dirs:?}");
+    }
+
+    #[test]
+    fn search_dirs_prefer_local_bin_over_system() {
+        // A source-built newer LibreDWG installs into ~/.local/bin; it must win
+        // over a stale /usr/local/bin (Homebrew 0.13.3) copy that mangles ADT
+        // files. So ~/.local/bin must be probed BEFORE the system dirs.
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let dirs = dwg2dxf_search_dirs();
+            let local = home.join(".local").join("bin");
+            let local_idx = dirs.iter().position(|d| *d == local);
+            let usrlocal_idx = dirs.iter().position(|d| *d == PathBuf::from("/usr/local/bin"));
+            assert!(local_idx.is_some(), "{dirs:?}");
+            assert!(usrlocal_idx.is_some(), "{dirs:?}");
+            assert!(local_idx < usrlocal_idx, "~/.local/bin must precede /usr/local/bin: {dirs:?}");
+        }
     }
 
     #[test]
@@ -325,6 +359,34 @@ mod tests {
         fs::write(&input, b"DWG-fake").unwrap();
         let err = convert_dwg_to_dxf_with(&stub, input.to_str().unwrap()).unwrap_err();
         assert!(err.contains("conversion incomplete"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stub that writes a COMPLETE DXF (ENTITIES + EOF) but injects a raw
+    /// non-UTF-8 byte (0xFF) inside a binary group-code value — exactly what a
+    /// real AutoCAD DWG's proxy/thumbnail payload produces. The conversion must
+    /// succeed (lossy decode), NOT be misreported as "conversion incomplete".
+    /// This is the 000-BG.dwg regression: 0.14 produced a full 200 MB DXF that
+    /// `read_to_string` rejected on the first binary byte.
+    #[cfg(unix)]
+    #[test]
+    fn convert_with_stub_emitting_non_utf8_dxf_succeeds() {
+        let dir = tmp("stubbinary");
+        let stub = dir.join("dwg2dxf");
+        // Writes a valid DXF skeleton, then a 0xFF byte, then the EOF marker.
+        fs::write(
+            &stub,
+            b"#!/bin/sh\n{ printf '0\\nSECTION\\n2\\nENTITIES\\n0\\nLINE\\n310\\n'; \
+              printf '\\377\\377'; printf '\\n0\\nENDSEC\\n0\\nEOF\\n'; } > \"$2\"\n",
+        )
+        .unwrap();
+        make_executable(&stub);
+        let input = dir.join("binary.dwg");
+        fs::write(&input, b"DWG-fake").unwrap();
+        let dxf = convert_dwg_to_dxf_with(&stub, input.to_str().unwrap())
+            .expect("non-UTF-8 but complete DXF must convert, not be flagged incomplete");
+        assert!(dxf.contains("ENTITIES"), "{dxf}");
+        assert!(dxf.contains("EOF"), "{dxf}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
