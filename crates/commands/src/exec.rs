@@ -4213,6 +4213,213 @@ fn exec_lot_generate_site(
     ))
 }
 
+/// `lotsetbacks` (M-intemfit Phase 8): compute + bake the buildable envelope per
+/// selected lot curve onto the `setbacks` layer. The envelope is the lot inset by
+/// per-edge setbacks (front from the street edge, rear opposite, side the rest);
+/// `buildto > 0` pins the front to the build-to line. Per-run args override the
+/// sticky settings and are baked into the op so replay is self-contained; the
+/// written-back ids make replay recreate byte-identical envelopes. A collapsed
+/// envelope (setbacks exceed the lot) is reported, never a panic.
+#[allow(clippy::too_many_arguments)]
+fn exec_lot_setbacks(
+    doc: &mut Document,
+    targets: Selector,
+    front: Option<f64>,
+    side: Option<f64>,
+    rear: Option<f64>,
+    buildto: Option<f64>,
+    envelope: Option<bool>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    // Effective settings: sticky doc settings + per-run overrides.
+    let mut settings = doc.subdivision_settings.clone();
+    if let Some(f) = front {
+        settings.setback_front = f;
+    }
+    if let Some(s) = side {
+        settings.setback_side = s;
+    }
+    if let Some(r) = rear {
+        settings.setback_rear = r;
+    }
+    if let Some(b) = buildto {
+        settings.build_to_line = b;
+    }
+    let draw = envelope.unwrap_or(true);
+
+    // Gather closed lot polygons from the selection.
+    let sel_ids = resolve(doc, &targets)?;
+    let mut lots: Vec<(subdivision::Polygon2d, f64)> = Vec::new();
+    for id in &sel_ids {
+        if let Some(obj) = doc.get(*id)
+            && let Geometry::Curve(c) = &obj.geometry
+            && c.is_closed()
+            && let Some(poly) = crate::lot::curve_to_polygon(c)
+        {
+            let pts = c.tessellate(PROFILE_TOL);
+            let z = if pts.is_empty() {
+                0.0
+            } else {
+                pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
+            };
+            lots.push((poly, z));
+        }
+    }
+    if lots.is_empty() {
+        return Err(ExecError::Invalid(
+            "lotsetbacks needs closed lot curve(s) (select lots, or run lotsubdivide first)".into(),
+        ));
+    }
+
+    let bake = crate::lot::compute_setbacks(&lots, &settings).map_err(ExecError::Invalid)?;
+
+    // envelope=off: report only, bake nothing (no logged geometry).
+    if !draw {
+        let mut msg = format!(
+            "lotsetbacks: {} envelope(s) computed (front {} / side {} / rear {}",
+            bake.envelopes.len(),
+            settings.setback_front,
+            settings.setback_side,
+            settings.setback_rear,
+        );
+        if settings.build_to_line > 0.0 {
+            msg.push_str(&format!("; build-to {}", settings.build_to_line));
+        }
+        msg.push(')');
+        if bake.collapsed > 0 {
+            msg.push_str(&format!("; {} collapsed (setbacks exceed lot)", bake.collapsed));
+        }
+        if let Some(note) = &bake.placeholder_note {
+            msg.push_str(&format!("; {note}"));
+        }
+        // Not baked → nothing to undo; report through a no-op logged op with no
+        // created ids (envelope=off with ids=None means replay recomputes only).
+        return Ok((
+            Command::LotSetbacks { targets, front, side, rear, buildto, envelope, ids: Some(Vec::new()) },
+            Inverse::CreatedOnLayer { created: Vec::new(), layers_created: Vec::new() },
+            ApplyOutcome { message: msg, created: Vec::new() },
+        ));
+    }
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == bake.envelopes.len() => ids,
+        _ => (0..bake.envelopes.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    let mut layers_created = Vec::new();
+    if let Some(name) = crate::lot::ensure_setbacks_layer(doc) {
+        layers_created.push(name);
+    }
+    crate::lot::insert_setbacks(doc, &bake, &new_ids);
+    doc.generation += 1;
+
+    let n = new_ids.len();
+    Ok((
+        Command::LotSetbacks {
+            targets,
+            front,
+            side,
+            rear,
+            buildto,
+            envelope,
+            ids: Some(new_ids.clone()),
+        },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome {
+            message: {
+                let mut msg = format!(
+                    "lotsetbacks: {n} buildable envelope(s) on '{}' (front {} / side {} / rear {}",
+                    crate::lot::SETBACKS_LAYER,
+                    settings.setback_front,
+                    settings.setback_side,
+                    settings.setback_rear,
+                );
+                if bake.build_to_used {
+                    msg.push_str(&format!("; front pinned to build-to {}", settings.build_to_line));
+                }
+                msg.push(')');
+                if bake.collapsed > 0 {
+                    msg.push_str(&format!("; {} collapsed (setbacks exceed lot)", bake.collapsed));
+                }
+                if let Some(note) = &bake.placeholder_note {
+                    msg.push_str(&format!("; {note}"));
+                }
+                msg
+            },
+            created: new_ids,
+        },
+    ))
+}
+
+/// `lotfrontage` (M-intemfit Phase 8): report each selected lot's frontage
+/// length, measured along the setback line by DEFAULT (`at=setback`, Manuel's
+/// explicit ask) or the curb (`at=curb`). Read-only query — stored on the
+/// AnalysisReport plane (`lotfrontage`) + rendered so `report` can re-show it and
+/// the deck can critique. Never logged.
+fn exec_lot_frontage(
+    doc: &mut Document,
+    targets: Selector,
+    at: Option<String>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let at_str = at.clone().unwrap_or_else(|| "setback".to_string());
+    let Some(at_enum) = crate::lot::parse_frontage_at(&at_str) else {
+        return Err(ExecError::Invalid(format!(
+            "unknown lotfrontage at='{at_str}' — use setback | curb"
+        )));
+    };
+
+    let settings = doc.subdivision_settings.clone();
+    let sel_ids = resolve(doc, &targets)?;
+    let mut lots: Vec<subdivision::Polygon2d> = Vec::new();
+    let mut zs: Vec<f64> = Vec::new();
+    for id in &sel_ids {
+        if let Some(obj) = doc.get(*id)
+            && let Geometry::Curve(c) = &obj.geometry
+            && c.is_closed()
+            && let Some(poly) = crate::lot::curve_to_polygon(c)
+        {
+            let pts = c.tessellate(PROFILE_TOL);
+            let z = if pts.is_empty() {
+                0.0
+            } else {
+                pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
+            };
+            lots.push(poly);
+            zs.push(z);
+        }
+    }
+    if lots.is_empty() {
+        return Err(ExecError::Invalid(
+            "lotfrontage needs closed lot curve(s) (select lots, or run lotsubdivide first)".into(),
+        ));
+    }
+
+    let measures = crate::lot::measure_frontage(&lots, at_enum, &settings);
+    let at_label = match at_enum {
+        subdivision::FrontageAt::Setback => "setback line",
+        subdivision::FrontageAt::Curb => "curb",
+    };
+    let samples: Vec<(f64, DVec3, String)> = measures
+        .iter()
+        .zip(&zs)
+        .map(|(m, z)| (m.length, DVec3::new(m.at.x, m.at.y, *z), at_label.to_string()))
+        .collect();
+    let context = format!(
+        "measured at the {at_label} (default: setback line — plan §5); {} lot(s)",
+        measures.len()
+    );
+    let report = build_analysis_report("lotfrontage", context, "m", samples);
+    let msg = format_analysis_report(&report);
+    doc.analysis_reports.insert("lotfrontage".to_string(), report);
+    doc.generation += 1;
+
+    Ok((
+        Command::LotFrontage { targets, at },
+        Inverse::Rename(Vec::new()), // not logged; inverse unused
+        ApplyOutcome { message: msg.trim_end().to_string(), created: Vec::new() },
+    ))
+}
+
 /// Contour polylines FROM the terrain mesh: marching triangles at every
 /// multiple of `interval`, chained into polylines. Minor contours on layer
 /// "contours", every `major_every`-th level on "contours-major". Pure
@@ -7744,6 +7951,10 @@ fn apply_forward(
         } => exec_lot_generate_site(
             doc, targets, pattern, roadwidth, blockdepth, alleys, seed, road_ids, block_ids,
         ),
+        Command::LotSetbacks { targets, front, side, rear, buildto, envelope, ids } => {
+            exec_lot_setbacks(doc, targets, front, side, rear, buildto, envelope, ids)
+        }
+        Command::LotFrontage { targets, at } => exec_lot_frontage(doc, targets, at),
         Command::FlowArrows { n, ids } => exec_flow_arrows(doc, n, ids),
         Command::Ponding { ids } => exec_ponding(doc, ids),
         Command::CodeCheck { pack, story, rules, ids } => {
@@ -9291,6 +9502,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LotSettings { .. } => "lotsettings",
         Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",
+        Command::LotSetbacks { .. } => "lotsetbacks",
+        Command::LotFrontage { .. } => "lotfrontage",
         Command::Plant { .. } => "plant",
         Command::PlantRow { .. } => "plantrow",
         Command::PlantSchedule { .. } => "plantschedule",
@@ -16243,5 +16456,141 @@ mod tests {
         assert_eq!(s.doc.subdivision_settings.lot_area_min, 8000.0);
         run(&mut s, "undo");
         assert_eq!(s.doc.subdivision_settings.lot_area_min, 6500.0);
+    }
+
+    // ── M-intemfit: setbacks + buildable envelopes + frontage (Phase 8) ──────
+
+    fn setback_count(s: &Session) -> usize {
+        s.doc
+            .all_ids()
+            .iter()
+            .filter(|id| {
+                s.doc.get(**id).map(|o| o.layer == crate::lot::SETBACKS_LAYER).unwrap_or(false)
+            })
+            .count()
+    }
+
+    #[test]
+    fn lotsetbacks_bakes_envelope_layer() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 30 40");
+        let out = run(&mut s, "lotsetbacks last front=5 side=3 rear=7");
+        assert_eq!(out.created.len(), 1, "one envelope for one lot");
+        assert!(s.doc.layers.contains_key(crate::lot::SETBACKS_LAYER));
+        assert_eq!(setback_count(&s), 1);
+        // Distinct layer from `lots`.
+        assert_ne!(crate::lot::SETBACKS_LAYER, crate::lot::LOTS_LAYER);
+    }
+
+    #[test]
+    fn lotsetbacks_undo_removes_envelopes() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 30 40");
+        run(&mut s, "lotsetbacks last front=5 side=3 rear=7");
+        assert!(setback_count(&s) > 0);
+        run(&mut s, "undo");
+        assert_eq!(setback_count(&s), 0, "undo removes baked envelopes + layer");
+    }
+
+    #[test]
+    fn lotsetbacks_replay_is_byte_identical() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 30 40");
+        run(&mut s, "lotsetbacks last front=5 side=3 rear=7");
+        let before: Vec<_> = s
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| s.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::SETBACKS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        let log: Vec<Command> = s.log.iter().map(|a| a.op.clone()).collect();
+        let rebuilt = Session::replay(log).unwrap();
+        let after: Vec<_> = rebuilt
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| rebuilt.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::SETBACKS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        assert_eq!(before, after, "replay recreated identical envelope geometry");
+    }
+
+    #[test]
+    fn lotsetbacks_euro_latam_placeholder_note_appears() {
+        // Under the euro_latam default profile the setback numbers are §6b
+        // placeholders → the run surfaces the "confirm with Manuel" note.
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 30 40");
+        // Explicit setbacks that leave an envelope, but region stays euro_latam.
+        let out = run(&mut s, "lotsetbacks last front=3 side=0 rear=3");
+        assert!(
+            out.message.contains("placeholder — confirm with Manuel"),
+            "message should carry the euro_latam placeholder note: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn lotsetbacks_collapse_reported_not_panicked() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 6 6");
+        run(&mut s, "lotsettings region=us_suburban");
+        // Setbacks far exceed the lot → all collapse → clean error, no panic.
+        let err = s
+            .run(parse("lotsetbacks last front=8 side=8 rear=8").unwrap())
+            .unwrap_err();
+        assert!(format!("{err}").contains("collapse") || format!("{err}").contains("exceed"));
+    }
+
+    #[test]
+    fn lotsetbacks_envelope_off_reports_without_baking() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 30 40");
+        run(&mut s, "lotsettings region=us_suburban");
+        let out = run(&mut s, "lotsetbacks last front=5 side=3 rear=7 envelope=off");
+        assert_eq!(setback_count(&s), 0, "envelope=off bakes nothing");
+        assert!(out.message.contains("computed"), "message: {}", out.message);
+    }
+
+    #[test]
+    fn lotfrontage_reports_setback_by_default() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 40 20");
+        run(&mut s, "lotsettings region=us_suburban");
+        let out = run(&mut s, "lotfrontage last");
+        // Report goes to the AnalysisReport plane keyed 'lotfrontage'.
+        assert!(s.doc.analysis_reports.contains_key("lotfrontage"));
+        assert!(out.message.contains("setback line"), "message: {}", out.message);
+    }
+
+    #[test]
+    fn lotfrontage_setback_and_curb_differ() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 40 20");
+        // Sticky small setbacks so lotfrontage's setback-line measure stays
+        // inside the lot: front is the 40-wide bottom edge; side=4 insets both
+        // ends → setback frontage (40−8=32) < curb (40).
+        run(&mut s, "lotsettings region=us_suburban");
+        s.doc.subdivision_settings.setback_front = 3.0;
+        s.doc.subdivision_settings.setback_side = 4.0;
+        s.doc.subdivision_settings.setback_rear = 3.0;
+        run(&mut s, "lotfrontage last at=curb");
+        let curb = s.doc.analysis_reports["lotfrontage"].avg;
+        run(&mut s, "lotfrontage last at=setback");
+        let setback = s.doc.analysis_reports["lotfrontage"].avg;
+        assert!(curb > 0.0 && setback > 0.0);
+        assert!(
+            (curb - setback).abs() > 1.0,
+            "curb {curb} and setback {setback} frontage should differ"
+        );
+    }
+
+    #[test]
+    fn lotfrontage_is_not_logged() {
+        assert!(!parse("lotfrontage last").unwrap().is_logged(), "lotfrontage is a query");
+        assert!(parse("lotsetbacks last front=5").unwrap().is_logged(), "lotsetbacks is logged");
     }
 }

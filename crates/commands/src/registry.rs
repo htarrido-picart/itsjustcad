@@ -708,6 +708,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Tools,
         },
         CommandSpec {
+            name: "lotsetbacks",
+            usage: "lotsetbacks [selector] [front=<> side=<> rear=<> buildto=<> envelope=on|off]",
+            summary: "Compute and bake the buildable envelope for the selected lot curve(s) (M-intemfit site planning, Phase 8). The envelope is the lot inset by per-edge setbacks: front from the street-fronting edge (the longest edge when the lot carries no street tag), rear from the opposite edge, side from every remaining edge. The inset is a robust per-edge half-plane clip, so non-convex/notched lots are handled and a lot too small for its setbacks collapses cleanly to nothing (reported, never a panic). front/side/rear are the setback distances (metres); buildto>0 pins the front of the envelope to a build-to line at that distance from the curb (a continuous street wall) instead of the front setback. Envelopes bake as closed curves onto the 'setbacks' layer (kept distinct from 'lots'); envelope=off computes + reports without baking. Missing args fall back to the sticky settings (lotsettings) — under the euro_latam profile the setback numbers (front 3 / side 0 party-wall / rear 3 m) are placeholders and the run notes 'confirm with Manuel'. Deterministic; logged so undo removes the envelopes and replay recreates them byte-identically. Example: lotsetbacks last front=3 side=0 rear=3 · lotsetbacks front=0 buildto=0 envelope=on",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "lotfrontage",
+            usage: "lotfrontage [selector] [at=setback|curb]",
+            summary: "Report the street frontage length of the selected lot(s), measured along the front SETBACK line by default (at=setback — Manuel's explicit ask, plan §5) or along the curb (at=curb, the street edge as drawn). The two differ on cul-de-sac bulbs and curved streets, where the outer curb arc is longer than the inset setback line — the most common reason automated layouts get rejected by reviewers, hence setback is the default. A read-only query (never logged): results go to the report plane as an AnalysisReport keyed 'lotfrontage' (count, min/avg/max, distribution, extreme lots) so `report` can re-show it and the deck can critique. Example: lotfrontage last · lotfrontage at=curb",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "plant",
             usage: "plant <species> <x,y[,z]> [age-years]",
             summary: "Place one plant from the embedded 33-species catalog: temperate ornamentals (quercus-robur, acer-rubrum, betula-pendula, pinus-sylvestris, tilia-cordata) plus tropical/subtropical packs — Caribbean (royal/coconut palm, ceiba, flamboyan, mango), Valle del Cauca (saman, guadua bamboo, gualanday), Guayaquil (guayacan amarillo, algarrobo, palo santo, ceibo). Common-name substrings like 'oak' or 'palm' work too. Renders a trunk + canopy mesh named 'plant:<id>' on layer 'planting', draped onto the terrain when one exists; palms render as crown-on-trunk for low-sun shadow accuracy. [age-years] scales height and canopy along the species growth rate (default mature). If the doc has a `location`, planting outside the species' climate band prints an advisory. Use `plantcatalog [region|zone]` to browse. Planted canopies occlude sun like any mesh. Example: plant royal-palm 10,5 · plant oak 10,5 25",

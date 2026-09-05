@@ -1399,6 +1399,41 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prev: Option<String>,
     },
+    /// Compute + bake the buildable envelope for the selected lot curve(s)
+    /// (M-intemfit Phase 8). The envelope is the lot inset by per-edge setbacks
+    /// (front from the street edge, rear opposite, side the rest); `buildto > 0`
+    /// pins the front to the build-to line. Envelopes bake onto the `setbacks`
+    /// layer (distinct from `lots`). Numeric args override the sticky
+    /// `SubdivisionSettings` for this run and are baked into the op so replay is
+    /// self-contained. Deterministic → written-back `ids` make replay recreate
+    /// byte-identical envelopes.
+    LotSetbacks {
+        targets: Selector,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        front: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        side: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rear: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        buildto: Option<f64>,
+        /// `envelope=off` skips the bake (just report). Default on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        envelope: Option<bool>,
+        /// Baked envelope ids, written back on first exec.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
+    /// Report each selected lot's frontage length, measured along the setback
+    /// line by DEFAULT (`at=setback`, Manuel's explicit ask) or the curb
+    /// (`at=curb`). A read-only query — never logged; results go to the
+    /// AnalysisReport / `report` plane. (M-intemfit Phase 8.)
+    LotFrontage {
+        targets: Selector,
+        /// `setback` (default) | `curb`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild
@@ -1523,6 +1558,7 @@ impl Command {
                 | Command::Bbox { .. }
                 | Command::Schedule { .. }
                 | Command::EnviroReport { .. }
+                | Command::LotFrontage { .. }
                 | Command::CheckRulesList
                 | Command::CheckRulesLoad { .. }
                 | Command::RoomList

@@ -41,6 +41,9 @@ pub use straight_skeleton::{
 };
 pub use streets::{extract_blocks, generate_streets, Street, StreetGraph, StreetTier};
 pub use subdivision::offset_sub::subdivide as subdivide_offset;
+pub use subdivision::setbacks::{
+    buildable_envelope, frontage, EdgeRole, Envelope, FrontageAt,
+};
 pub use subdivision::skeleton_sub::{
     subdivide as subdivide_skeleton, subdivide_block as subdivide_skeleton_block,
 };

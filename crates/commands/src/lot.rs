@@ -31,6 +31,10 @@ const BLOCK_TOL: f64 = 0.01;
 /// The layer baked lots land on.
 pub const LOTS_LAYER: &str = "lots";
 
+/// The layer baked buildable envelopes land on (`lotsetbacks`) — kept distinct
+/// from `lots` so an envelope and its lot are separately selectable / toggleable.
+pub const SETBACKS_LAYER: &str = "setbacks";
+
 /// The layer baked road centerlines land on (`lotgeneratesite`).
 pub const ROADS_LAYER: &str = "roads";
 
@@ -331,6 +335,131 @@ pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], b
     }
 }
 
+// ── Phase 8: setbacks + buildable envelopes + frontage-at-setback ───────────
+
+use subdivision::{FrontageAt, RegionProfile};
+
+/// The result of computing buildable envelopes for a set of lots: the envelope
+/// polygons (only the ones that did not collapse) + counts, ready to bake onto
+/// the `setbacks` layer.
+#[derive(Debug)]
+pub struct SetbackBake {
+    pub envelopes: Vec<Polygon2d>,
+    pub z: f64,
+    /// Lots whose envelope collapsed (setbacks exceeded the lot) — reported.
+    pub collapsed: usize,
+    /// Whether any envelope pinned its front to the build-to line.
+    pub build_to_used: bool,
+    /// euro_latam placeholder banner when the run used profile defaults.
+    pub placeholder_note: Option<String>,
+}
+
+/// Compute the buildable envelope for each lot polygon in `lots` under
+/// `settings`. Deterministic. A lot whose envelope collapses is counted, not
+/// baked (reported to the user). The `setbacks` are read from `settings`
+/// (front/side/rear/build-to), already overridden per-run by the verb.
+pub fn compute_setbacks(
+    lots: &[(Polygon2d, f64)],
+    settings: &SubdivisionSettings,
+) -> Result<SetbackBake, String> {
+    let mut envelopes = Vec::new();
+    let mut collapsed = 0usize;
+    let mut build_to_used = false;
+    let mut z_acc = 0.0;
+    let mut z_n = 0usize;
+    for (poly, z) in lots {
+        // Preserve any street tags the source curve carries by treating the lot
+        // as untagged (a baked lot curve has no tags) — the longest edge is the
+        // front, matching the subdivision "usable without a street graph" spirit.
+        let block = Block::untagged(poly.clone());
+        let env = subdivision::buildable_envelope(&block, settings);
+        build_to_used |= env.build_to_used;
+        match env.polygon {
+            Some(p) => envelopes.push(p),
+            None => collapsed += 1,
+        }
+        z_acc += *z;
+        z_n += 1;
+    }
+    if envelopes.is_empty() {
+        return Err(format!(
+            "every buildable envelope collapsed ({collapsed} lot(s)) — setbacks exceed the lot \
+             size; reduce front/side/rear"
+        ));
+    }
+    // euro_latam placeholder banner: when the profile is EuroLatam the setback
+    // numbers are §6b placeholders (front 3 / side 0 / rear 3) pending Manuel.
+    let placeholder_note = if settings.region == RegionProfile::EuroLatam {
+        Some(
+            "using euro_latam setback defaults (placeholder — confirm with Manuel)".to_string(),
+        )
+    } else {
+        None
+    };
+    let z = if z_n > 0 { z_acc / z_n as f64 } else { 0.0 };
+    Ok(SetbackBake {
+        envelopes,
+        z,
+        collapsed,
+        build_to_used,
+        placeholder_note,
+    })
+}
+
+/// Ensure the `setbacks` layer exists (a muted teal for buildable envelopes).
+pub fn ensure_setbacks_layer(doc: &mut Document) -> Option<String> {
+    ensure_layer(doc, SETBACKS_LAYER, [0.25, 0.60, 0.58, 1.0])
+}
+
+/// Insert baked envelope curves onto the `setbacks` layer with the given ids.
+pub fn insert_setbacks(doc: &mut Document, bake: &SetbackBake, ids: &[ObjectId]) {
+    for (poly, id) in bake.envelopes.iter().zip(ids) {
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: Some("envelope".to_string()),
+            layer: SETBACKS_LAYER.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
+        });
+    }
+}
+
+/// Parse a frontage-measurement location string → [`FrontageAt`]. Default (and
+/// Manuel's explicit ask) is the setback line.
+pub fn parse_frontage_at(s: &str) -> Option<FrontageAt> {
+    match s.to_lowercase().as_str() {
+        "setback" | "setbackline" | "" => Some(FrontageAt::Setback),
+        "curb" | "curbline" | "street" => Some(FrontageAt::Curb),
+        _ => None,
+    }
+}
+
+/// One lot's frontage measurement, ready to fold into an AnalysisReport sample.
+pub struct FrontageMeasure {
+    pub length: f64,
+    /// Front-edge midpoint of the lot (a location the deck can point at).
+    pub at: DVec2,
+}
+
+/// Measure the frontage of each lot polygon under `at` (default: setback line).
+/// Returns one [`FrontageMeasure`] per lot. Deterministic.
+pub fn measure_frontage(
+    lots: &[Polygon2d],
+    at: FrontageAt,
+    settings: &SubdivisionSettings,
+) -> Vec<FrontageMeasure> {
+    lots.iter()
+        .map(|poly| {
+            let block = Block::untagged(poly.clone());
+            let length = subdivision::frontage(&block, at, settings);
+            FrontageMeasure { length, at: poly.centroid() }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +638,54 @@ mod tests {
             let sum: f64 = bake.blocks.iter().map(|p| p.area()).sum();
             assert!(sum <= poly.area() + 1.0, "{p:?}: blocks exceed site");
         }
+    }
+
+    #[test]
+    fn setbacks_envelope_area_and_collapse() {
+        // Untagged square 40×40: the longest-edge tie picks the first (bottom)
+        // edge as front, so front/rear inset vertically (40−5−7=28) and side
+        // insets horizontally (40−2·3=34) → 28×34 = 952.
+        let poly = curve_to_polygon(&rect_curve(40.0, 40.0)).unwrap();
+        let s = SubdivisionSettings {
+            setback_front: 5.0,
+            setback_side: 3.0,
+            setback_rear: 7.0,
+            region: RegionProfile::UsSuburban,
+            ..SubdivisionSettings::default()
+        };
+        let bake = compute_setbacks(&[(poly, 0.0)], &s).unwrap();
+        assert_eq!(bake.envelopes.len(), 1);
+        assert!((bake.envelopes[0].area() - 952.0).abs() < 1.0, "area {}", bake.envelopes[0].area());
+        assert_eq!(bake.collapsed, 0);
+        assert!(bake.placeholder_note.is_none());
+
+        // Tiny lot + huge setbacks → all collapse → error, not a panic.
+        let tiny = curve_to_polygon(&rect_curve(6.0, 6.0)).unwrap();
+        assert!(compute_setbacks(&[(tiny, 0.0)], &s).is_err());
+    }
+
+    #[test]
+    fn frontage_setback_is_default_and_differs_from_curb() {
+        let poly = curve_to_polygon(&rect_curve(40.0, 20.0)).unwrap();
+        let s = SubdivisionSettings {
+            setback_front: 4.0,
+            setback_side: 4.0,
+            setback_rear: 2.0,
+            region: RegionProfile::UsSuburban,
+            ..SubdivisionSettings::default()
+        };
+        let m_setback = measure_frontage(&[poly.clone()], FrontageAt::Setback, &s);
+        let m_curb = measure_frontage(&[poly], FrontageAt::Curb, &s);
+        // Curb (40) vs setback (40 − 2*side = 32): they differ.
+        assert!((m_curb[0].length - 40.0).abs() < 0.5, "curb {}", m_curb[0].length);
+        assert!(
+            (m_curb[0].length - m_setback[0].length).abs() > 1.0,
+            "setback {} should differ from curb {}",
+            m_setback[0].length,
+            m_curb[0].length
+        );
+        assert_eq!(parse_frontage_at("nonsense"), None);
+        assert_eq!(parse_frontage_at(""), Some(FrontageAt::Setback));
     }
 
     #[test]

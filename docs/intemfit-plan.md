@@ -673,7 +673,44 @@ Every subdivision algorithm must pass these block shapes:
   sane range, deterministic byte-identical; plus `lot.rs`/`exec.rs` bridge tests
   (method runs, bakes, undo + byte-identical replay). Phase 8 (setbacks +
   buildable envelopes) picks up from here.
-- **Phase 8** — setbacks + buildable envelopes render per lot; frontage at setback line.
+- **Phase 8** — ✅ **DONE (2026-09-05).** Setbacks + buildable envelopes +
+  frontage-at-setback. `crates/subdivision/src/subdivision/setbacks.rs`:
+  `classify_edges` tags each lot edge **Front** (street-tagged; the longest edge
+  on an untagged lot) / **Rear** (edge whose outward normal is most anti-parallel
+  to the front) / **Side** (the rest). `buildable_envelope` = the lot inset
+  per-edge by front/side/rear via a **per-edge half-plane clip**
+  (`split_by_line`), keeping only the interior side each step — robust on
+  non-convex / notched lots (no naive per-edge-offset self-intersection), and when
+  the setbacks exceed the lot the interior clip empties and it **collapses cleanly
+  to `None`** (reported, never a panic). `build_to_line > 0` pins the front line to
+  the build-to distance instead of `setback_front` (a continuous street wall).
+  side = 0 (euro_latam party-wall / `medianería`) → no side inset, envelope spans
+  the full width. **Frontage measured at the setback line by DEFAULT** (§5,
+  Manuel's explicit ask — not an option): `frontage(at=setback|curb)` — setback =
+  the buildable envelope's front-edge extent (the front setback line inside the
+  lot), curb = the raw street-tagged contour edge(s); the two differ on cul-de-sac
+  bulbs and curved streets where the inset arc is shorter than the outer curb.
+  Verbs (registry-registered → GBNF/deck): `lotsetbacks <sel> [front= side= rear=
+  buildto= envelope=on|off]` computes + bakes the envelope polygon per lot onto a
+  `setbacks` layer (distinct from `lots`) as one logged op with written-back ids;
+  undo removes the envelopes + layer; **replay byte-identical** (deterministic
+  geometry). Per-run args override the sticky settings (`setback_*` /
+  `build_to_line` already in `SubdivisionSettings`); under the euro_latam profile
+  the setback numbers are §6b placeholders and the run prints "using euro_latam
+  setback defaults (placeholder — confirm with Manuel)". `lotfrontage <sel>
+  [at=setback|curb]` reports each lot's frontage via the `AnalysisReport` /
+  `report` plane (keyed `lotfrontage`: count, min/avg/max, distribution, extreme
+  lots) — read-only, never logged. Tests: 7 setbacks unit (rect area ==
+  (w−2·side)(d−front−rear); side=0 spans full width; L / re-entrant-notch envelope
+  inside the lot + valid simple polygon; collapse clean when setbacks exceed;
+  build-to pins the front; frontage setback ≠ curb on a tapering lot; deterministic)
+  + `tests/setbacks.rs` §8-block integration (irregular #3 notch inside, #4 bulb
+  frontage setback ≠ curb, collapse on #8 sliver / #10 acute / #3 notch) +
+  `lot.rs` bridge (envelope area + collapse, frontage default-is-setback) +
+  `exec.rs` (bake/undo/byte-identical replay, euro_latam placeholder note,
+  collapse reported not panicked, envelope=off reports without baking, frontage
+  report + setback ≠ curb + lotfrontage-not-logged). **Phase 9 (open space) picks
+  up from here; Phase 10 (buildings) is the explicit re-scope-with-Manuel gate.**
 - **Phase 9** — feature placement (`type=park|greenway|pond|treesave`) works; the
   opt-in `reserve=<pct>` mode excludes whole blocks until ~pct of the site is open,
   central-and-large first, and tags them as open space. Default (`reserve=0`) unchanged.

@@ -1069,6 +1069,8 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "lotsubdivide" => parse_lotsubdivide(&args),
         "lotgeneratesite" => parse_lotgeneratesite(&args),
         "lotloading" => parse_lotloading(&args),
+        "lotsetbacks" => parse_lotsetbacks(&args),
+        "lotfrontage" => parse_lotfrontage(&args),
         "lotsettings" => {
             // Each arg is a key=value pair; none = show only.
             let mut sets = Vec::new();
@@ -1866,6 +1868,95 @@ fn parse_lotloading(args: &[&str]) -> Result<Command, ParseError> {
     }
     let mode = mode.ok_or_else(|| wrong_err("lotloading", "a mode (front|alley)", args))?;
     Ok(Command::LotLoading { targets, mode, prev: None })
+}
+
+/// `lotsetbacks [selector] [front=<> side=<> rear=<> buildto=<> envelope=on|off]`.
+/// Computes + bakes the buildable envelope per selected lot (M-intemfit Phase 8).
+/// A leading selector is optional; otherwise the target defaults to the current
+/// selection. All params are key=value.
+fn parse_lotsetbacks(args: &[&str]) -> Result<Command, ParseError> {
+    let is_kv = |s: &str| s.contains('=');
+    let (targets, rest): (Selector, &[&str]) = match args.split_first() {
+        Some((first, _)) if !is_kv(first) => {
+            let (sel, rest) = selector(args, "lotsetbacks")?;
+            (sel, rest)
+        }
+        _ => (Selector::Selected, args),
+    };
+
+    let parse_bool = |v: &str| -> Result<bool, ParseError> {
+        match v.to_lowercase().as_str() {
+            "on" | "yes" | "true" | "1" => Ok(true),
+            "off" | "no" | "false" | "0" => Ok(false),
+            _ => Err(ParseError::BadNumber(v.to_string())),
+        }
+    };
+
+    let mut front = None;
+    let mut side = None;
+    let mut rear = None;
+    let mut buildto = None;
+    let mut envelope = None;
+    for tok in rest {
+        let Some((k, v)) = tok.split_once('=') else {
+            return wrong(
+                "lotsetbacks",
+                "front/side/rear/buildto/envelope params",
+                args,
+            );
+        };
+        match k.to_lowercase().as_str() {
+            "front" | "setback_front" => front = Some(number(v)?),
+            "side" | "setback_side" => side = Some(number(v)?),
+            "rear" | "setback_rear" => rear = Some(number(v)?),
+            "buildto" | "build_to" | "build_to_line" | "buildtoline" => buildto = Some(number(v)?),
+            "envelope" | "env" => envelope = Some(parse_bool(v)?),
+            _ => {
+                return wrong(
+                    "lotsetbacks",
+                    "front/side/rear/buildto/envelope params",
+                    args,
+                )
+            }
+        }
+    }
+    Ok(Command::LotSetbacks {
+        targets,
+        front,
+        side,
+        rear,
+        buildto,
+        envelope,
+        ids: None,
+    })
+}
+
+/// `lotfrontage [selector] [at=setback|curb]`. Reports each lot's frontage length
+/// measured along the setback line by default (Manuel's explicit ask) or the
+/// curb (M-intemfit Phase 8). A read-only query.
+fn parse_lotfrontage(args: &[&str]) -> Result<Command, ParseError> {
+    let is_kv = |s: &str| s.contains('=');
+    let (targets, rest): (Selector, &[&str]) = match args.split_first() {
+        Some((first, _)) if !is_kv(first) => {
+            let (sel, rest) = selector(args, "lotfrontage")?;
+            (sel, rest)
+        }
+        _ => (Selector::Selected, args),
+    };
+
+    let mut at = None;
+    for tok in rest {
+        if let Some((k, v)) = tok.split_once('=') {
+            if k.eq_ignore_ascii_case("at") {
+                at = Some(v.to_string());
+            } else {
+                return wrong("lotfrontage", "at=setback|curb", args);
+            }
+        } else {
+            return wrong("lotfrontage", "at=setback|curb", args);
+        }
+    }
+    Ok(Command::LotFrontage { targets, at })
 }
 
 fn parse_grid(args: &[&str]) -> Result<Command, ParseError> {
