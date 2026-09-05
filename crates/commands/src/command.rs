@@ -1434,6 +1434,33 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<String>,
     },
+    /// Place open space (M-intemfit Phase 9). Two modes bake onto the
+    /// `openspace` layer so a later `lotreport` nets them out of gross site
+    /// area:
+    /// - **Feature placement** (default): `feature` is `park` | `greenway` |
+    ///   `pond` | `treesave`; the tool PLACES that amenity at the selected
+    ///   region (or the largest empty block), sized to `area` when given.
+    /// - **Blind %-reserve** (owner opt-in): `reserve > 0` pulls whole blocks
+    ///   out of subdivision until ~pct of the site is open, biggest-and-most-
+    ///   central first, tagged as open space. `feature` is ignored in this
+    ///   mode. Deterministic → written-back `ids` make replay byte-identical.
+    LotOpenSpace {
+        targets: Selector,
+        /// `park` | `greenway` | `pond` | `treesave` (feature-placement mode).
+        /// `None` when `reserve` mode is used.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feature: Option<String>,
+        /// Requested feature area (m²); `None` = default fraction of the region.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        area: Option<f64>,
+        /// Blind %-reserve percentage (0..100). `Some(pct)` selects reserve
+        /// mode; `None`/0 = feature-placement mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reserve: Option<f64>,
+        /// Baked open-space ids, written back on first exec.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild

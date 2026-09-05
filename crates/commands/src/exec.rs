@@ -4420,6 +4420,103 @@ fn exec_lot_frontage(
     ))
 }
 
+/// `lotopenspace` (M-intemfit Phase 9): place an open-space feature
+/// (`type=park|greenway|pond|treesave`) at the selected region / largest empty
+/// block, OR run the blind `reserve=<pct>` mode that pulls whole central blocks
+/// out of subdivision as open space. Both bake onto the `openspace` layer as one
+/// logged op with written-back ids (deterministic → replay byte-identical); undo
+/// removes the geometry + layer. Feature placement is design-intent, not
+/// hydrology/ecology engineering — the run surfaces a no-false-precision note.
+fn exec_lot_openspace(
+    doc: &mut Document,
+    targets: Selector,
+    feature: Option<String>,
+    area: Option<f64>,
+    reserve: Option<f64>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let settings = doc.subdivision_settings.clone();
+
+    // Gather the selected region(s): the largest closed curve is the region
+    // (site for reserve, or the block/region for feature placement). An open
+    // polyline, if one is selected, is a candidate greenway path.
+    let sel_ids = resolve(doc, &targets)?;
+    let mut best_region: Option<(subdivision::Polygon2d, f64)> = None;
+    let mut greenway_path: Option<Vec<glam::DVec2>> = None;
+    for id in &sel_ids {
+        let Some(obj) = doc.get(*id) else { continue };
+        let Geometry::Curve(c) = &obj.geometry else { continue };
+        if c.is_closed() {
+            if let Some(poly) = crate::lot::curve_to_polygon(c) {
+                let pts = c.tessellate(PROFILE_TOL);
+                let z = if pts.is_empty() {
+                    0.0
+                } else {
+                    pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
+                };
+                let a = poly.area();
+                if best_region.as_ref().map(|(p, _)| a > p.area()).unwrap_or(true) {
+                    best_region = Some((poly, z));
+                }
+            }
+        } else {
+            let pts = c.tessellate(PROFILE_TOL);
+            if pts.len() >= 2 {
+                greenway_path = Some(pts.iter().map(|p| glam::DVec2::new(p.x, p.y)).collect());
+            }
+        }
+    }
+
+    let bake = if let Some(pct) = reserve.filter(|p| *p > 0.0) {
+        // Blind %-reserve mode.
+        let Some((site, z)) = best_region else {
+            return Err(ExecError::Invalid(
+                "lotopenspace reserve=<pct> needs a closed site boundary curve (select one first)"
+                    .into(),
+            ));
+        };
+        crate::lot::reserve_open_space(&site, pct, &settings, z).map_err(ExecError::Invalid)?
+    } else {
+        // Feature-placement mode (default).
+        let feat_str = feature.clone().unwrap_or_else(|| "park".to_string());
+        let Some(feat) = crate::lot::parse_open_space_feature(&feat_str) else {
+            return Err(ExecError::Invalid(format!(
+                "unknown lotopenspace type='{feat_str}' — use park | greenway | pond | treesave"
+            )));
+        };
+        let Some((region, z)) = best_region else {
+            return Err(ExecError::Invalid(
+                "lotopenspace needs a closed region curve (select a block/region, or draw one)"
+                    .into(),
+            ));
+        };
+        crate::lot::place_feature(&region, greenway_path.as_deref(), feat, area, z)
+            .map_err(ExecError::Invalid)?
+    };
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == bake.polygons.len() => ids,
+        _ => (0..bake.polygons.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    let mut layers_created = Vec::new();
+    if let Some(name) = crate::lot::ensure_openspace_layer(doc) {
+        layers_created.push(name);
+    }
+    crate::lot::insert_open_space(doc, &bake, &new_ids);
+    doc.generation += 1;
+
+    let mut msg = format!("lotopenspace: {}", bake.summary);
+    if let Some(a) = &bake.advisory {
+        msg.push_str(&format!(" ({a})"));
+    }
+    Ok((
+        Command::LotOpenSpace { targets, feature, area, reserve, ids: Some(new_ids.clone()) },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome { message: msg, created: new_ids },
+    ))
+}
+
 /// Contour polylines FROM the terrain mesh: marching triangles at every
 /// multiple of `interval`, chained into polylines. Minor contours on layer
 /// "contours", every `major_every`-th level on "contours-major". Pure
@@ -7955,6 +8052,9 @@ fn apply_forward(
             exec_lot_setbacks(doc, targets, front, side, rear, buildto, envelope, ids)
         }
         Command::LotFrontage { targets, at } => exec_lot_frontage(doc, targets, at),
+        Command::LotOpenSpace { targets, feature, area, reserve, ids } => {
+            exec_lot_openspace(doc, targets, feature, area, reserve, ids)
+        }
         Command::FlowArrows { n, ids } => exec_flow_arrows(doc, n, ids),
         Command::Ponding { ids } => exec_ponding(doc, ids),
         Command::CodeCheck { pack, story, rules, ids } => {
@@ -9504,6 +9604,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LotGenerateSite { .. } => "lotgeneratesite",
         Command::LotSetbacks { .. } => "lotsetbacks",
         Command::LotFrontage { .. } => "lotfrontage",
+        Command::LotOpenSpace { .. } => "lotopenspace",
         Command::Plant { .. } => "plant",
         Command::PlantRow { .. } => "plantrow",
         Command::PlantSchedule { .. } => "plantschedule",
@@ -16592,5 +16693,146 @@ mod tests {
     fn lotfrontage_is_not_logged() {
         assert!(!parse("lotfrontage last").unwrap().is_logged(), "lotfrontage is a query");
         assert!(parse("lotsetbacks last front=5").unwrap().is_logged(), "lotsetbacks is logged");
+    }
+
+    // ── M-intemfit: lotopenspace (Phase 9) ──────────────────────────────────
+
+    fn openspace_count(s: &Session) -> usize {
+        s.doc
+            .all_ids()
+            .iter()
+            .filter(|id| {
+                s.doc.get(**id).map(|o| o.layer == crate::lot::OPENSPACE_LAYER).unwrap_or(false)
+            })
+            .count()
+    }
+
+    #[test]
+    fn lotopenspace_park_bakes_on_openspace_layer() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 120");
+        let out = run(&mut s, "lotopenspace last type=park area=4000");
+        assert!(s.doc.layers.contains_key(crate::lot::OPENSPACE_LAYER));
+        assert_eq!(openspace_count(&s), 1);
+        assert!(out.message.contains("park"), "message: {}", out.message);
+        // Distinct layer from lots.
+        assert_ne!(crate::lot::OPENSPACE_LAYER, crate::lot::LOTS_LAYER);
+    }
+
+    #[test]
+    fn lotopenspace_each_feature_type_places_a_polygon() {
+        for feat in ["park", "greenway", "pond", "treesave"] {
+            let mut s = Session::default();
+            run(&mut s, "rect 0,0,0 200 120");
+            let out = run(&mut s, &format!("lotopenspace last type={feat}"));
+            assert_eq!(openspace_count(&s), 1, "{feat} should place one polygon");
+            // Every placed feature carries the no-false-precision advisory.
+            assert!(out.message.contains("advisory"), "{feat}: {}", out.message);
+        }
+    }
+
+    #[test]
+    fn lotopenspace_default_is_feature_placement() {
+        // Bare run with a region → park placement (feature mode is the default).
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 120");
+        run(&mut s, "lotopenspace last");
+        assert_eq!(openspace_count(&s), 1);
+    }
+
+    #[test]
+    fn lotopenspace_undo_removes_geometry() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 120");
+        run(&mut s, "lotopenspace last type=pond area=3000");
+        assert!(openspace_count(&s) > 0);
+        run(&mut s, "undo");
+        assert_eq!(openspace_count(&s), 0, "undo removes open-space geometry + layer");
+    }
+
+    #[test]
+    fn lotopenspace_replay_is_byte_identical() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 120");
+        run(&mut s, "lotopenspace last type=park area=4000");
+        let before: Vec<_> = s
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| s.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::OPENSPACE_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        let log: Vec<Command> = s.log.iter().map(|a| a.op.clone()).collect();
+        let rebuilt = Session::replay(log).unwrap();
+        let after: Vec<_> = rebuilt
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| rebuilt.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::OPENSPACE_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        assert_eq!(before, after, "replay recreated identical open-space geometry");
+    }
+
+    #[test]
+    fn lotopenspace_reserve_pulls_central_blocks() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 400");
+        let out = run(&mut s, "lotopenspace last reserve=20");
+        assert!(openspace_count(&s) > 0, "reserve should bake blocks: {}", out.message);
+        assert!(out.message.contains('%'), "reports the achieved fraction: {}", out.message);
+    }
+
+    #[test]
+    fn lotopenspace_reserve_is_deterministic_replay() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 400");
+        run(&mut s, "lotsettings seed=7");
+        run(&mut s, "lotopenspace last reserve=25");
+        let before: Vec<_> = s
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| s.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::OPENSPACE_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        let log: Vec<Command> = s.log.iter().map(|a| a.op.clone()).collect();
+        let rebuilt = Session::replay(log).unwrap();
+        let after: Vec<_> = rebuilt
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| rebuilt.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::OPENSPACE_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        assert!(!before.is_empty(), "reserve baked something");
+        assert_eq!(before, after, "reserve replay byte-identical");
+    }
+
+    #[test]
+    fn lotopenspace_reserve_zero_is_feature_mode() {
+        // reserve=0 → NOT reserve mode; defaults to feature placement (park).
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 120");
+        let cmd = parse("lotopenspace last reserve=0").unwrap();
+        match &cmd {
+            Command::LotOpenSpace { reserve, feature, .. } => {
+                assert!(reserve.is_none(), "reserve=0 is off");
+                assert_eq!(feature.as_deref(), Some("park"), "defaults to feature mode");
+            }
+            _ => panic!("wrong command"),
+        }
+        s.run(cmd).unwrap();
+        assert_eq!(openspace_count(&s), 1, "one park placed, not a reserve");
+    }
+
+    #[test]
+    fn lotopenspace_is_logged() {
+        assert!(parse("lotopenspace last type=park").unwrap().is_logged());
+        assert!(parse("lotopenspace last reserve=20").unwrap().is_logged());
     }
 }

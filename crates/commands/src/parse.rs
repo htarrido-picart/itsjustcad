@@ -1071,6 +1071,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "lotloading" => parse_lotloading(&args),
         "lotsetbacks" => parse_lotsetbacks(&args),
         "lotfrontage" => parse_lotfrontage(&args),
+        "lotopenspace" => parse_lotopenspace(&args),
         "lotsettings" => {
             // Each arg is a key=value pair; none = show only.
             let mut sets = Vec::new();
@@ -1957,6 +1958,59 @@ fn parse_lotfrontage(args: &[&str]) -> Result<Command, ParseError> {
         }
     }
     Ok(Command::LotFrontage { targets, at })
+}
+
+/// `lotopenspace <sel> type=park|greenway|pond|treesave [area=]`
+///  OR `lotopenspace [site-sel] reserve=<pct>` (M-intemfit Phase 9).
+///
+/// Feature-placement mode is the default (Manuel's questionnaire); the blind
+/// %-reserve mode is a separate mode selected by the `reserve=` keyword (owner
+/// opt-in, §1). A leading non-`k=v` token is an optional selector.
+fn parse_lotopenspace(args: &[&str]) -> Result<Command, ParseError> {
+    let is_kv = |s: &str| s.contains('=');
+    let (targets, rest): (Selector, &[&str]) = match args.split_first() {
+        Some((first, _)) if !is_kv(first) => {
+            let (sel, rest) = selector(args, "lotopenspace")?;
+            (sel, rest)
+        }
+        _ => (Selector::Selected, args),
+    };
+
+    let mut feature = None;
+    let mut area = None;
+    let mut reserve = None;
+    for tok in rest {
+        let Some((k, v)) = tok.split_once('=') else {
+            return wrong(
+                "lotopenspace",
+                "type=park|greenway|pond|treesave [area=] · OR reserve=<pct>",
+                args,
+            );
+        };
+        match k.to_lowercase().as_str() {
+            "type" | "feature" | "kind" => feature = Some(v.to_string()),
+            "area" => area = Some(number(v)?),
+            "reserve" | "reservepct" | "reserve_pct" => reserve = Some(number(v)?),
+            _ => {
+                return wrong(
+                    "lotopenspace",
+                    "type=park|greenway|pond|treesave [area=] · OR reserve=<pct>",
+                    args,
+                )
+            }
+        }
+    }
+    // A reserve of 0 (or absent) with no feature → default to a park placement
+    // so a bare `lotopenspace last` is still meaningful, matching "default is
+    // feature placement".
+    let reserve = match reserve {
+        Some(p) if p > 0.0 => Some(p),
+        _ => None,
+    };
+    if reserve.is_none() && feature.is_none() {
+        feature = Some("park".to_string());
+    }
+    Ok(Command::LotOpenSpace { targets, feature, area, reserve, ids: None })
 }
 
 fn parse_grid(args: &[&str]) -> Result<Command, ParseError> {

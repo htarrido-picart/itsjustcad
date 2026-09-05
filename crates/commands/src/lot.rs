@@ -460,6 +460,189 @@ pub fn measure_frontage(
         .collect()
 }
 
+// ── Phase 9: open space — feature placement + blind %-reserve ───────────────
+
+use subdivision::OpenSpaceFeature;
+
+/// The layer baked open-space geometry (parks / greenways / ponds / tree-save /
+/// reserved blocks) lands on. Tagged distinctly so a later `lotreport`
+/// (Phase 11) can net open space out of gross site area.
+pub const OPENSPACE_LAYER: &str = "openspace";
+
+/// The result of an open-space run: the feature/reserved polygons + per-feature
+/// labels, ready to bake onto the `openspace` layer, plus a summary the exec
+/// surfaces (mode, achieved reserve fraction, advisory note).
+#[derive(Debug)]
+pub struct OpenSpaceBake {
+    /// The open-space polygons to bake.
+    pub polygons: Vec<Polygon2d>,
+    /// One object-name label per polygon (e.g. `openspace:park`,
+    /// `openspace:reserve`).
+    pub labels: Vec<String>,
+    pub z: f64,
+    /// Human summary of what was placed / reserved.
+    pub summary: String,
+    /// The no-false-precision advisory (design intent, not engineering).
+    pub advisory: Option<String>,
+}
+
+/// Ensure the `openspace` layer exists (a muted forest green).
+pub fn ensure_openspace_layer(doc: &mut Document) -> Option<String> {
+    ensure_layer(doc, OPENSPACE_LAYER, [0.30, 0.55, 0.32, 1.0])
+}
+
+/// A feature-type keyword → [`OpenSpaceFeature`].
+pub fn parse_open_space_feature(s: &str) -> Option<OpenSpaceFeature> {
+    OpenSpaceFeature::parse(s)
+}
+
+/// Feature-placement mode: place one open-space amenity of `feature` at the
+/// given `region` (a selected closed curve or the largest empty block),
+/// optionally sized to `area`. `path` is the region's tessellated boundary; for
+/// a greenway an explicit open `path` routes the corridor, otherwise the
+/// corridor follows the region's long-axis centerline.
+pub fn place_feature(
+    region: &Polygon2d,
+    path: Option<&[DVec2]>,
+    feature: OpenSpaceFeature,
+    area: Option<f64>,
+    z: f64,
+) -> Result<OpenSpaceBake, String> {
+    let poly = match feature {
+        OpenSpaceFeature::PocketPark => subdivision::pocket_park(region, area),
+        OpenSpaceFeature::RetentionPond => subdivision::retention_pond(region, area),
+        OpenSpaceFeature::TreeSave => subdivision::tree_save(region, area),
+        OpenSpaceFeature::Greenway => {
+            let route: Vec<DVec2> = match path {
+                Some(p) if p.len() >= 2 => p.to_vec(),
+                // Route along the region's long-axis centerline (aabb diagonal
+                // spine through the centroid).
+                _ => long_axis_spine(region),
+            };
+            subdivision::greenway(&route, None, area)
+        }
+    };
+    let Some(poly) = poly else {
+        return Err(format!(
+            "could not place a {} in the selected region (region too small for the requested area?)",
+            feature.label().trim_start_matches("openspace:")
+        ));
+    };
+
+    let advisory = Some(open_space_advisory(feature));
+    let summary = format!(
+        "placed a {} of {:.0} m² on '{}'",
+        feature.label().trim_start_matches("openspace:"),
+        poly.area(),
+        OPENSPACE_LAYER,
+    );
+    Ok(OpenSpaceBake {
+        polygons: vec![poly],
+        labels: vec![feature.label().to_string()],
+        z,
+        summary,
+        advisory,
+    })
+}
+
+/// Blind %-reserve mode: pull whole blocks out of `site` until ~`pct` (0..100)
+/// of the site is open, biggest-and-most-central first. Reserved blocks bake as
+/// open space (tagged `openspace:reserve`) so a later `lotreport` nets them out
+/// and a subsequent `lotsubdivide` on the site's blocks skips them.
+pub fn reserve_open_space(
+    site: &Polygon2d,
+    pct: f64,
+    settings: &SubdivisionSettings,
+    z: f64,
+) -> Result<OpenSpaceBake, String> {
+    let frac = (pct / 100.0).clamp(0.0, 0.9);
+    // The reserve block set comes from the street generator, which needs a
+    // positive block depth + road width. If the sticky settings never set them
+    // (defaults leave block_depth = 0), derive a sensible depth from the site so
+    // a bare `lotopenspace reserve=20` still produces blocks.
+    let mut settings = settings.clone();
+    if settings.block_depth <= 0.0 {
+        let (lo, hi) = site.aabb();
+        let short = (hi.x - lo.x).min(hi.y - lo.y).max(1.0);
+        // ~4 blocks across the short dimension, floored so tiny sites still work.
+        settings.block_depth = (short / 4.0).max(10.0);
+    }
+    if settings.road_width <= 0.0 {
+        settings.road_width = 12.0;
+    }
+    let res = subdivision::reserve_blocks(site, frac, &settings);
+    if res.reserved.is_empty() {
+        return Err(format!(
+            "blind reserve={pct}% reserved no blocks (site too small for the given blockdepth, \
+             or the generator produced no blocks)"
+        ));
+    }
+    let polygons: Vec<Polygon2d> = res.reserved.iter().map(|b| b.polygon.clone()).collect();
+    let labels: Vec<String> = polygons.iter().map(|_| "openspace:reserve".to_string()).collect();
+    let summary = format!(
+        "reserved {} block(s) as open space on '{}' — {:.1}% of the site (requested {:.0}%)",
+        polygons.len(),
+        OPENSPACE_LAYER,
+        res.achieved_frac() * 100.0,
+        pct,
+    );
+    Ok(OpenSpaceBake {
+        polygons,
+        labels,
+        z,
+        summary,
+        advisory: Some(
+            "reserved blocks are excluded from subdivision and tagged so yield nets them out; \
+             this is a planning reservation, not a programmed park"
+                .to_string(),
+        ),
+    })
+}
+
+/// The no-false-precision advisory for a placed feature (plan §9 advisory).
+fn open_space_advisory(feature: OpenSpaceFeature) -> String {
+    match feature {
+        OpenSpaceFeature::RetentionPond =>
+            "advisory: a design-intent basin footprint, NOT a sized detention volume \
+             (no hydrology — storage/outflow/storm event)".to_string(),
+        OpenSpaceFeature::TreeSave =>
+            "advisory: a design-intent preservation boundary, NOT a surveyed canopy or \
+             arborist assessment".to_string(),
+        _ =>
+            "advisory: a design-intent amenity placement, not landscape or civil engineering"
+                .to_string(),
+    }
+}
+
+/// The long-axis spine of a region: from one aabb corner through the centroid to
+/// the opposite corner, clipped to a 3-point centerline. A cheap deterministic
+/// route for a greenway when the user gives no explicit path.
+fn long_axis_spine(region: &Polygon2d) -> Vec<DVec2> {
+    let (lo, hi) = region.aabb();
+    let c = region.centroid();
+    if (hi.x - lo.x) >= (hi.y - lo.y) {
+        vec![DVec2::new(lo.x, c.y), c, DVec2::new(hi.x, c.y)]
+    } else {
+        vec![DVec2::new(c.x, lo.y), c, DVec2::new(c.x, hi.y)]
+    }
+}
+
+/// Insert baked open-space curves onto the `openspace` layer with the given ids.
+pub fn insert_open_space(doc: &mut Document, bake: &OpenSpaceBake, ids: &[ObjectId]) {
+    for ((poly, label), id) in bake.polygons.iter().zip(&bake.labels).zip(ids) {
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: Some(label.clone()),
+            layer: OPENSPACE_LAYER.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

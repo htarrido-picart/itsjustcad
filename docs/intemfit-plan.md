@@ -711,9 +711,39 @@ Every subdivision algorithm must pass these block shapes:
   collapse reported not panicked, envelope=off reports without baking, frontage
   report + setback ≠ curb + lotfrontage-not-logged). **Phase 9 (open space) picks
   up from here; Phase 10 (buildings) is the explicit re-scope-with-Manuel gate.**
-- **Phase 9** — feature placement (`type=park|greenway|pond|treesave`) works; the
-  opt-in `reserve=<pct>` mode excludes whole blocks until ~pct of the site is open,
-  central-and-large first, and tags them as open space. Default (`reserve=0`) unchanged.
+- **Phase 9** — ✅ **DONE (2026-09-05).** Open space — feature placement + blind
+  %-reserve. `crates/subdivision/src/open_space/`: **feature placement** (default,
+  Manuel's questionnaire) — `pocket_park` (a rounded-rectangle green polygon sized to
+  `area` or a region fraction, clipped inside the region so it never crosses a street),
+  `greenway` (a linear buffered trail corridor: the path — a selected open polyline, or
+  the region's long-axis spine — offset by width/2 into a closed simple ribbon; `area`
+  sets width = area/length), `retention_pond` (an exact-area regular n-gon basin
+  footprint, clipped to the region), `tree_save` (the region outline preserved whole, or
+  scaled about its centroid to `area` — keeps the natural shape). All four return valid,
+  non-self-intersecting polygons; a `is_valid_feature` guard rejects degenerate output.
+  **Blind %-reserve** (owner opt-in keyword, §1) — `reserve_blocks` runs the deterministic
+  street generator to get the block set, scores each block `(area/max_area)·centrality`
+  (biggest-AND-most-central), sorts by score with a quantised-centroid tiebreak, and pulls
+  whole blocks until reserved area ≈ pct of the site; returns `reserved` (tagged) +
+  `developable` (disjoint — what a later subdivide runs on). frac clamped to `[0,0.9]`
+  (whole-site is the ruled-out "no subdivision" mode); `reserve=0`/absent = off.
+  **Verb `lotopenspace`** (registry-registered → GBNF/deck): `lotopenspace [sel]
+  type=park|greenway|pond|treesave [area=]` OR `lotopenspace [site-sel] reserve=<pct>`.
+  Both bake onto the `openspace` layer (each object named `openspace:{park|greenway|pond|
+  treesave|reserve}` so Phase 11 `lotreport` can net them out) as one logged op with
+  written-back ids; undo removes the geometry + layer; **deterministic → replay
+  byte-identical** (verified). `SubdivisionSettings.open_space_reserve_frac` already
+  present (serde-default 0, §6b). Reserve derives a sensible `block_depth` from the site
+  when the sticky settings leave it 0, so a bare `lotopenspace reserve=20` works.
+  **Advisory** surfaced on every run: feature placement is design-intent, not
+  hydrology/ecology engineering (a pond is a footprint, not a sized detention volume; a
+  tree-save is a marked polygon, not a survey) — no false-precision claims. Tests (24 in
+  the pure crate + 9 exec): each feature type places a valid polygon at the requested
+  location/area; reserve≈20 % near target with conservation (reserved + developable == all
+  blocks); reserved blocks larger + more central than developable; developable excludes
+  reserved and subdivides; reserve=0 = feature mode; deterministic same-seed; undo removes
+  geometry; replay byte-identical (feature + reserve). **Phase 10 (buildings) is next —
+  re-scope resolved in `docs/intemfit-phase10-scope.md`.**
 - **Phase 11** — `lotreport` reports yield on **net developable area** (site minus
   open-space features AND reserved blocks), not gross — a gross number lies once open
   space exists. Report both gross and net so the ratio is visible. Option comparison

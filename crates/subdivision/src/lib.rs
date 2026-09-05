@@ -14,11 +14,15 @@
 //! tagging), 6 (lot rules — width mix, depth, corner, flag, loading, sliver
 //! merge, on euro_latam placeholder defaults), 7 (skeleton / street-following
 //! subdivision, `method=streetfollowing`, via the approximate straight skeleton
-//! in `straight_skeleton`). Phase 2 (verb/settings plumbing) lives in the
-//! commands crate but the `SubdivisionSettings` type is here.
+//! in `straight_skeleton`), 9 (open space — feature placement in `open_space/`:
+//! pocket park, greenway corridor, retention pond, tree-save; plus blind
+//! %-reserve pulling whole central blocks out as open space). Phase 2 (verb/
+//! settings plumbing) lives in the commands crate but the `SubdivisionSettings`
+//! type is here.
 
 pub mod blocks;
 pub mod geometry;
+pub mod open_space;
 pub mod settings;
 pub mod straight_skeleton;
 pub mod streets;
@@ -27,6 +31,10 @@ pub mod subdivision;
 pub use blocks::{Block, BlockEdge};
 pub use geometry::clip_bridge;
 pub use geometry::oriented_box::{convex_hull, OrientedBox};
+pub use open_space::{
+    greenway, pocket_park, reserve_blocks, retention_pond, tree_save, OpenSpaceFeature,
+    ReservedBlock,
+};
 pub use geometry::polygon2d::Polygon2d;
 pub use geometry::polyline::PolylineTools;
 pub use geometry::split::{split_by_line, Line2d};
