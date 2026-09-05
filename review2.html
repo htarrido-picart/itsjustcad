@@ -79,33 +79,34 @@
 <div class="wrap">
 <nav>
   <div class="brand">ItsJustCAD</div>
-  <div class="date">Review 2 · 2026-09-03</div>
+  <div class="date">Review 2 · rev c · 2026-09-04</div>
   <button class="reset" onclick="resetChecks()">Reset checks</button>
   <h2>Overview</h2>
   <a href="#pending">Pending / Known Issues</a>
   <a href="#howto">How to test</a>
   <h2>Manual test plan</h2>
-  <a href="#deck">1 · Deck &amp; Chat</a>
-  <a href="#model">2 · Drawing &amp; Modeling</a>
-  <a href="#analysis">3 · Analysis &amp; Camera</a>
-  <a href="#render">4 · Render</a>
-  <a href="#land">5 · Landscape &amp; Planting</a>
-  <a href="#comply">6 · Compliance</a>
-  <a href="#interop">7 · Interop</a>
-  <a href="#perf">8 · Performance</a>
-  <a href="#ui">9 · UI &amp; Tabs</a>
-  <a href="#crypto">10 · Chat Encryption</a>
+  <a href="#intemfit">1 · intemfit (Lot Subdivision)</a>
+  <a href="#deck">2 · Deck &amp; Chat</a>
+  <a href="#model">3 · Drawing &amp; Modeling</a>
+  <a href="#analysis">4 · Analysis &amp; Camera</a>
+  <a href="#render">5 · Render</a>
+  <a href="#land">6 · Landscape &amp; Planting</a>
+  <a href="#comply">7 · Compliance</a>
+  <a href="#interop">8 · Interop</a>
+  <a href="#perf">9 · Performance</a>
+  <a href="#ui">10 · UI &amp; Tabs</a>
+  <a href="#crypto">11 · Chat Encryption</a>
 </nav>
 
 <main>
 <header class="top">
-  <h1>ItsJustCAD — Review 2</h1>
-  <p class="sub">Manual test plan &amp; pending-issues audit for the 2026-09-02 → 09-03 work push.</p>
+  <h1>ItsJustCAD — Review 2 <span class="tag info" style="vertical-align:middle">rev c</span></h1>
+  <p class="sub">Manual test plan &amp; pending-issues audit. rev c adds the <b>intemfit</b> lot-subdivision feature (Phases 1–6), the DXF block-export round-trip, and the gumball hotkey fix.</p>
 </header>
 <div class="meta">
   <span><b>Build under test:</b> <code>dist/ItsJustCAD.app</code></span>
-  <span><b>Branch:</b> main (82 commits ahead of origin)</span>
-  <span><b>Date:</b> 2026-09-03</span>
+  <span><b>Branch:</b> main (ahead of origin)</span>
+  <span><b>Date:</b> 2026-09-04 · rev c</span>
 </div>
 
 <!-- ============ PENDING ============ -->
@@ -113,8 +114,8 @@
 <h2 class="sec">Pending / Known Issues <span class="tag warn">read first</span></h2>
 <p class="lead">Open items, honest limits, and cleanups to schedule before the v0.1 push. None block manual testing.</p>
 
-<div class="grp-title">Clippy <span class="tag ok">clean</span> — workspace 0 warnings</div>
-<p class="lead">The 13 lints noted in the first pass are now <b>all cleared</b> (commits <code>ab787f4</code> non-app, <code>7b14eea</code> app-crate). Genuine false-positives (Gauss–Seidel index-mutation loops, <code>contains_key</code>/<code>insert</code> where <code>entry</code> can't hold the second borrow) got scoped <code>#[allow]</code> + reason comments; the rest were real trivial fixes (type alias, let-chain, dropped <code>.copied()</code>, <code>let…else</code>→<code>?</code>, doc-list reword). <code>cargo clippy --workspace</code> now reports zero.</p>
+<div class="grp-title">Clippy <span class="tag ok">clean</span> — 0 as of last check</div>
+<p class="lead">The 13 lints noted in the first pass were cleared earlier (commits <code>ab787f4</code>, <code>7b14eea</code>). Every intemfit phase (1–6) landed with <b>clippy 0</b> per its commit note (`crates/subdivision` + `crates/commands/src/lot.rs`). Genuine false-positives kept scoped <code>#[allow]</code> + reason comments; the rest were real trivial fixes. <b>0 as of last check</b> — re-run <code>cargo clippy --workspace</code> before the v0.1 push to confirm.</p>
 
 <div class="grp-title">TODO / FIXME / HACK in shipped code</div>
 <p class="lead"><span class="tag ok">clean</span> Zero non-test <code>TODO</code>/<code>FIXME</code>/<code>HACK</code> markers found across <code>crates/*/src</code>.</p>
@@ -132,6 +133,22 @@
   <li><b>Code signing (M-sign, deprioritized):</b> the app is unsigned / ad-hoc-signed, so macOS re-prompts for keychain access after each rebuild and Gatekeeper warns on first launch. Chat encryption is therefore <b>default OFF</b> for now; flip back to default-ON once a stable Developer ID signature makes the "Always Allow" grant stick. Ship-gate decision for v0.1.</li>
 </ul>
 
+<div class="grp-title">intemfit (M-intemfit) — remaining phases &amp; open questions</div>
+<p class="lead">Phases 1–6 shipped (see the <a href="#intemfit">intemfit manual-test section</a>). Still open:</p>
+<ul>
+  <li><span class="tag info">[ ]</span> <b>Phase 7</b> — skeleton (street-following) subdivision, <b>in progress next</b>. Until it lands, <code>lotsubdivide method=streetfollowing</code> returns a clean "not yet implemented (Phase 7)" error (never a panic).</li>
+  <li><span class="tag info">[ ]</span> <b>Phase 8</b> setbacks + buildable envelopes · <b>Phase 9</b> open-space feature placement (+ opt-in <code>reserve=&lt;pct&gt;</code>) · <b>Phase 10</b> buildings/roof massing (<b>re-scope-with-Manuel gate</b> — do not start early) · <b>Phase 11</b> yield reporting (net-of-open-space) · <b>Phase 12</b> polish (true straight skeleton, indexing, optimization).</li>
+  <li><span class="tag warn">⚠</span> <b>Manuel's open questions still unanswered</b> — the euro_latam Phase-6 defaults are <b>placeholders</b> until he confirms: (2) real width-mix product list + hard-ratio vs soft-preference (currently soft <code>6/8/10 m @ 25/50/25%</code>); (3) alley ROW width + required on every block or some (currently 5 m); (4) flag-lot pole-area excluded from countable area (currently <b>excluded</b> — the implemented assumption). Every euro_latam value prints "using euro_latam defaults (placeholder — confirm with Manuel)" at runtime.</li>
+</ul>
+
+<div class="grp-title">M-dwg-bridge — real-world DWG test findings (2026-09-04) <span class="tag warn">gaps</span></div>
+<p class="lead">Tested against a 38 MB AutoCAD-2013 ADT <code>000-BG.dwg</code> (commit <code>2db05a2</code>). These are converter/importer coverage gaps, <b>not</b> an export regression — the DXF-block <i>export</i> round-trip (<code>09abdd0</code>) is a verified positive control.</p>
+<ul>
+  <li><b>LibreDWG 0.13.3 too old:</b> cannot convert this Architectural-Desktop DWG — silently drops the whole ENTITIES section (exit 0 but truncated, 4291 hard errors). M-dwg-bridge must require a newer LibreDWG / ODA converter and <b>detect the truncation</b> (missing ENTITIES/EOF) rather than trusting the exit code.</li>
+  <li><b>DXF importer block-content gap</b> (<code>dxf.rs parse_blocks</code>): only commits blocks whose bodies are flat LINE/POLYLINE/TEXT — <b>drops HATCH / SPLINE / nested-INSERT / mesh block bodies</b>, so real architectural blocks lose most geometry even from a valid DXF.</li>
+  <li><b>Ergonomic:</b> the <code>blocks</code> query verb prints nothing in headless — query verbs should echo to stdout under headless so round-trips are scriptable/testable.</li>
+</ul>
+
 <div class="grp-title">Phases explicitly marked partial</div>
 <ul><li><span class="tag warn">[~]</span> <b>M-perf</b> — Step 1 shipped; Step 2 (GPU) deferred.</li></ul>
 
@@ -139,12 +156,16 @@
 <p class="lead">Chat encryption fully landed (commits <code>7b14eea</code>, <code>44d5e09</code>, <code>eb01b18</code>, <code>538c5f4</code>) — no encryption files remain uncommitted. Only <code>.claude/</code> (tooling dir) stays untracked, never staged.</p>
 <div class="callout ok">Chat encryption landed and is now an <b>opt-in user setting, default OFF</b> — no keychain prompt unless enabled (the app isn't code-signed yet; revisit the default once M-sign lands).</div>
 
-<div class="grp-title">Larger open phases (not part of this push)</div>
+<div class="grp-title">Planned phases (from PHASES.md — not yet shipped)</div>
 <ul>
+  <li><span class="tag info">[ ]</span> <b>M-intemfit (Phases 7–12)</b> — skeleton → setbacks → open space → buildings/massing → yield → polish (details above).</li>
+  <li><span class="tag info">[ ]</span> <b>M-dwg-bridge</b> — assisted <code>import *.dwg</code> via a detected license-clean converter (LibreDWG, detect-don't-bundle) + a scoped deck <code>workdir</code>. Blocked on a newer converter + the DXF-block coverage gaps above.</li>
+  <li><span class="tag ok">[x]</span> <b>M-plants-tropical</b> — <b>SHIPPED 2026-09-03</b> (Caribbean / Valle del Cauca / Guayaquil species + Miyawaki mini-forest). Covered in <a href="#land">§6 Landscape</a>.</li>
   <li><span class="tag info">[ ]</span> <b>M-i18n / M-docs</b> — not started (no i18n infra; UI strings hardcoded). Spanish first, tutorials, website.</li>
-  <li><span class="tag info">[ ]</span> <b>Local model finetune</b> — 0.6B too weak; default is 4B Qwen.</li>
-  <li><span class="tag info">[ ]</span> <b>PRE-PUSH PASS</b> — README install section, screenshots, repo URL owner fix, push + tag v0.1.</li>
-  <li><span class="tag info">[ ]</span> <b>M-sign</b> (deprioritized), <b>M-legacyskin/uipolish</b> (largely == design batches A–F).</li>
+  <li><span class="tag info">[ ]</span> <b>M-legacyskin / M-uipolish</b> — onboarding skins (AutoCAD/Rhino/Revit theme + fonts + aliases), app icon, toolbar iconography. Largely == design batches A–F.</li>
+  <li><span class="tag info">[ ]</span> <b>Local model finetune</b> — 0.6B too weak; default is 4B Qwen; free synthetic training data from the command registry.</li>
+  <li><span class="tag info">[ ]</span> <b>PRE-PUSH PASS</b> — README install section, 6 value-prop screenshots, repo URL owner fix, push main + tag v0.1.</li>
+  <li><span class="tag info">[ ]</span> <b>M-sign</b> (deprioritized) — Apple + Windows code-signing certs to kill first-launch warnings; unblocks default-ON chat encryption.</li>
 </ul>
 </section>
 
@@ -159,10 +180,39 @@
 <div class="callout">Every analysis/compliance/advisory output is intentionally worded as advisory — the app never claims to certify or analyze structurally.</div>
 </section>
 
-<!-- ============ 1 DECK ============ -->
-<section id="deck">
+<!-- ============ 1 INTEMFIT ============ -->
+<section id="intemfit">
 <details open>
-<summary>1 · Deck &amp; Chat</summary>
+<summary>1 · intemfit — Lot Subdivision <span class="tag ok">Phases 1–6 shipped</span></summary>
+<p class="lead">Parametric site planning (roads → blocks → lots), CityEngine/TestFit-style, as a native Rust feature. Pure-Rust <code>crates/subdivision</code> + <code>lot*</code> verbs; results bake onto the <code>lots</code>, <code>roads</code> and <code>blocks</code> layers. All verbs are logged, undoable, deck-callable, and <b>replay byte-identical for a fixed seed</b>.</p>
+<div class="callout warn">Phase 6 runs on <b>euro_latam placeholder defaults</b> (metric: party-wall / <i>medianería</i> lots, deep <i>solares</i>). Any run that resolves a rule from the profile prints <b>"using euro_latam defaults (placeholder — confirm with Manuel)"</b>. Confirm that banner appears.</div>
+
+<div class="grp-title">Site generation (<code>lotgeneratesite</code> — Phase 5 + 5b)</div>
+<div class="chk"><input type="checkbox" id="if1"><label for="if1">Draw a large closed site boundary, select it, then <span class="cmd"><span class="p">›</span> lotgeneratesite last orthogonal roadwidth=12 blockdepth=60</span> <span class="exp"><b>Expect:</b> a road grid on the <code>roads</code> layer + block outlines on the <code>blocks</code> layer; every block edge tagged with the street it fronts.</span></label></div>
+<div class="chk"><input type="checkbox" id="if2"><label for="if2">Try the other three rectilinear patterns: <span class="cmd"><span class="p">›</span> lotgeneratesite skewed blockdepth=60</span> · <code>organic</code> · <code>culdesac blockdepth=50</code> <span class="exp"><b>Expect:</b> skewed = grid rotated 22.5°; organic = sinusoidal spine + connectors; culdesac = spine with perpendicular stubs ending in turnaround bulbs.</span></label></div>
+<div class="chk"><input type="checkbox" id="if3"><label for="if3">Non-rectilinear (Phase 5b, owner scope): <span class="cmd"><span class="p">›</span> lotgeneratesite radial</span> · <code>hexagonal</code> (alias <code>hex</code>) · <code>voronoi</code> (alias <code>voro</code>) <span class="exp"><b>Expect:</b> radial = ring roads + spokes / annular-sector blocks; hex = hex-cell blocks; voronoi = irregular cells (seeded). Note: the registry <i>usage</i> string still calls these "not yet built" — that text lags; the generators <b>are</b> wired.</span></label></div>
+<div class="chk"><input type="checkbox" id="if4"><label for="if4"><span class="cmd"><span class="p">›</span> lotgeneratesite culdesac blockdepth=50 alleys=on seed=7</span> <span class="exp"><b>Expect:</b> each block bisected along its long axis, the shared edge tagged as an alley. Re-run with the same seed → byte-identical layout (replay-stable).</span></label></div>
+
+<div class="grp-title">Subdivision methods (<code>lotsubdivide</code> — Phases 3, 4, 7)</div>
+<div class="chk"><input type="checkbox" id="if5"><label for="if5">Draw one closed block curve, select it, then <span class="cmd"><span class="p">›</span> lotsubdivide last grid area=6500 width=50</span> <span class="exp"><b>Expect:</b> recursive-OBB lots on the <code>lots</code> layer; every lot keeps a street (block-boundary) edge; Σ lot area ≈ block area.</span></label></div>
+<div class="chk"><input type="checkbox" id="if6"><label for="if6"><span class="cmd"><span class="p">›</span> lotsubdivide grid width=40 irregularity=0.2 seed=7</span> <span class="exp"><b>Expect:</b> jittered split pivots (irregularity needs a seed to matter); re-run same seed → identical result.</span></label></div>
+<div class="chk"><input type="checkbox" id="if7"><label for="if7"><span class="cmd"><span class="p">›</span> lotsubdivide perimeter area=6500 width=40</span> <span class="exp"><b>Expect:</b> perimeter strip cut into lots orthogonal to the boundary + a gridded (or hollow-ring) core; falls back to grid cleanly if the offset collapses — no panic.</span></label></div>
+<div class="chk"><input type="checkbox" id="if8"><label for="if8">Subdivide a block produced by <code>lotgeneratesite</code>. <span class="exp"><b>Expect:</b> tagged frontage carries through — <code>force_street_access</code> is honoured on the generated block.</span></label></div>
+<div class="chk"><input type="checkbox" id="if9"><label for="if9"><span class="cmd"><span class="p">›</span> lotsubdivide last streetfollowing</span> <span class="exp"><b>Expect:</b> a clear error — "method=streetfollowing is not yet implemented (Phase 7)". Never a panic.</span></label></div>
+
+<div class="grp-title">Lot rules (Phase 6 — euro_latam placeholders)</div>
+<div class="chk"><input type="checkbox" id="if10"><label for="if10"><span class="cmd"><span class="p">›</span> lotsettings widthmix=6:0.25,8:0.5,10:0.25 depth=25 corner=15%</span> then <span class="cmd"><span class="p">›</span> lotsubdivide last grid width=40</span> <span class="exp"><b>Expect:</b> the frontage re-sliced by width-mix packing (hits target proportions within ~5%); acute corner lots widened + clamped. Message reports the mix ±% and the placeholder banner.</span></label></div>
+<div class="chk"><input type="checkbox" id="if11"><label for="if11"><span class="cmd"><span class="p">›</span> lotsettings mergeslivers=on</span> and subdivide a ragged block. <span class="exp"><b>Expect:</b> lots below <code>sliver_frac × area</code> merged into their largest-shared-edge neighbour; no slivers remain.</span></label></div>
+<div class="chk"><input type="checkbox" id="if12"><label for="if12">Generate a site with <code>alleys=on</code>, then <span class="cmd"><span class="p">›</span> lotloading last alley</span> (alias of <code>lotsettings loading=alley</code>) and subdivide. <span class="exp"><b>Expect:</b> two-frontage lots at half the block depth (street → alley); degrades to front-loaded when no alley edge is present. Sticky + logged.</span></label></div>
+<div class="chk"><input type="checkbox" id="if13"><label for="if13"><span class="cmd"><span class="p">›</span> lotsettings region=us_suburban</span> then subdivide. <span class="exp"><b>Expect:</b> the placeholder banner disappears (only euro_latam is flagged as placeholder). Bare <span class="cmd" style="display:inline"><span class="p">›</span> lotsettings</span> prints the current sticky settings.</span></label></div>
+<div class="chk"><input type="checkbox" id="if14"><label for="if14">Undo any <code>lot*</code> op; then save, reload, and replay. <span class="exp"><b>Expect:</b> undo removes the baked roads/blocks/lots (one <code>CreatedOnLayer</code> inverse); reloaded settings replay byte-identical.</span></label></div>
+</details>
+</section>
+
+<!-- ============ 2 DECK ============ -->
+<section id="deck">
+<details>
+<summary>2 · Deck &amp; Chat</summary>
 <p class="lead">Terse mode (default), clarify-before-act, plan-execute, markdown rendering, critique/report hooks.</p>
 
 <div class="grp-title">Terse mode (default ON, all backends incl. cloud)</div>
@@ -188,7 +238,7 @@
 <!-- ============ 2 MODELING ============ -->
 <section id="model">
 <details>
-<summary>2 · Drawing &amp; Modeling</summary>
+<summary>3 · Drawing &amp; Modeling</summary>
 <p class="lead">NURBS, solids, constraints, minimal surfaces, hatches, blocks.</p>
 
 <div class="grp-title">M-nurbs — knot insertion + curvature</div>
@@ -217,7 +267,7 @@
 <!-- ============ 3 ANALYSIS ============ -->
 <section id="analysis">
 <details>
-<summary>3 · Analysis &amp; Camera</summary>
+<summary>4 · Analysis &amp; Camera</summary>
 <p class="lead">Sun/environment analyses, camera projections, render modes &amp; colors.</p>
 
 <div class="grp-title">M-enviro — sun / radiation</div>
@@ -244,7 +294,7 @@
 <!-- ============ 4 RENDER ============ -->
 <section id="render">
 <details>
-<summary>4 · Diffusion Render</summary>
+<summary>5 · Diffusion Render</summary>
 <p class="lead">Ships with NO backend active — user-configured in <code>render_decks.json</code>.</p>
 <div class="chk"><input type="checkbox" id="r1"><label for="r1"><span class="cmd"><span class="p">›</span> render backends</span> (alias <code>render list</code>) <span class="exp"><b>Expect:</b> lists configured backends (empty on a clean install).</span></label></div>
 <div class="chk"><input type="checkbox" id="r2"><label for="r2">Configure one, then <span class="cmd"><span class="p">›</span> render use comfyui</span> and <span class="cmd"><span class="p">›</span> render test</span> <span class="exp"><b>Expect:</b> reachability probe; on failure "cannot reach X — is it running?".</span></label></div>
@@ -257,7 +307,7 @@
 <!-- ============ 5 LANDSCAPE ============ -->
 <section id="land">
 <details>
-<summary>5 · Landscape &amp; Planting</summary>
+<summary>6 · Landscape &amp; Planting</summary>
 <p class="lead">Import a terrain first: <code>terrain /path/survey.csv</code> (or .geojson).</p>
 
 <div class="grp-title">M-landscape — contours, grading, drainage, hardscape</div>
@@ -281,7 +331,7 @@
 <!-- ============ 6 COMPLIANCE ============ -->
 <section id="comply">
 <details>
-<summary>6 · Compliance (advisory only)</summary>
+<summary>7 · Compliance (advisory only)</summary>
 <div class="callout warn">Every report carries "advisory pre-check, not a code review; verify with a licensed professional / AHJ." Confirm this disclaimer is present.</div>
 
 <div class="grp-title">M-checkengine — engine + demo pack</div>
@@ -302,18 +352,21 @@
 <!-- ============ 7 INTEROP ============ -->
 <section id="interop">
 <details>
-<summary>7 · Interop</summary>
+<summary>8 · Interop</summary>
 <div class="chk"><input type="checkbox" id="i1"><label for="i1"><span class="cmd"><span class="p">›</span> import /path/scan.laz</span> <span class="exp"><b>Expect:</b> LAZ point cloud decompressed + decimated to ≤200k (never materializes the full cloud).</span></label></div>
 <div class="chk"><input type="checkbox" id="i2"><label for="i2"><span class="cmd"><span class="p">›</span> export /path/model.3dm</span> <span class="exp"><b>Expect:</b> spec-conformant openNURBS V5 file (meshes/lines/polylines/NURBS + names/layers).</span></label></div>
 <div class="chk"><input type="checkbox" id="i3"><label for="i3">With a structural model: <span class="cmd"><span class="p">›</span> export /path/model.xlsx</span> (or <code>.saf</code>) <span class="exp"><b>Expect:</b> a genuine SAF 2.2.0 .xlsx workbook (9 sheets, native numeric cells) with the never-analyze disclaimer embedded.</span></label></div>
 <div class="chk"><input type="checkbox" id="i4"><label for="i4">Round-trip via native Import/Export dialogs. <span class="exp"><b>Expect:</b> <code>.saf</code>/<code>.xlsx</code>/<code>.3dm</code> all offered and accepted; no dead filter entries.</span></label></div>
+
+<div class="grp-title">DXF block round-trip <span class="tag ok">new · 09abdd0</span></div>
+<div class="chk"><input type="checkbox" id="i5"><label for="i5">Define a block, insert an instance, then <span class="cmd"><span class="p">›</span> export /tmp/blocks.dxf</span> and re-import it. <span class="exp"><b>Expect:</b> blocks survive — exporter emits a BLOCKS section + INSERT entities; instances come back with exact transforms (parametric blocks bake to static). See §7 Pending for the known importer coverage gap on HATCH/SPLINE/nested-INSERT block bodies.</span></label></div>
 </details>
 </section>
 
 <!-- ============ 8 PERF ============ -->
 <section id="perf">
 <details>
-<summary>8 · Performance (M-perf step 1, rayon)</summary>
+<summary>9 · Performance (M-perf step 1, rayon)</summary>
 <p class="lead">Rayon-parallel analysis + import loops, bit-deterministic (replay-safe).</p>
 <div class="chk"><input type="checkbox" id="p1"><label for="p1">Build a dense scene (many towers), then <span class="cmd"><span class="p">›</span> sunhours 2024-06-21</span> <span class="exp"><b>Expect:</b> noticeably faster than before (bench: ~5.5× on 200 towers); result identical to sequential.</span></label></div>
 <div class="chk"><input type="checkbox" id="p2"><label for="p2">Re-run <span class="cmd"><span class="p">›</span> radiation last site.epw</span> and <span class="cmd"><span class="p">›</span> facesunhours last 2024-06-21</span> <span class="exp"><b>Expect:</b> faster (~6.3× / ~4.2×); numbers match a prior run exactly.</span></label></div>
@@ -325,7 +378,7 @@
 <!-- ============ 9 UI ============ -->
 <section id="ui">
 <details>
-<summary>9 · UI &amp; Dynamic Tabs</summary>
+<summary>10 · UI &amp; Dynamic Tabs</summary>
 <p class="lead">M-dyntabs (Blocks/Plugins), M-guitest audits (manual spot-checks).</p>
 
 <div class="grp-title">M-dyntabs — Blocks &amp; Plugins right-dock tabs</div>
@@ -338,13 +391,17 @@
 <div class="chk"><input type="checkbox" id="u5"><label for="u5">Type a partial verb, then press <b>Tab</b> to accept the autosuggest. <span class="exp"><b>Expect:</b> Tab-accept works (was a fixed dead-key bug).</span></label></div>
 <div class="chk"><input type="checkbox" id="u6"><label for="u6">Check the <b>A+ / A−</b> text-size steppers and other buttons. <span class="exp"><b>Expect:</b> all hit-targets meet the minimum height (A± fix).</span></label></div>
 <div class="chk"><input type="checkbox" id="u7"><label for="u7">Tab-traverse the whole window with the keyboard. <span class="exp"><b>Expect:</b> never dead-ends; cycles back to start.</span></label></div>
+
+<div class="grp-title">Gumball hotkey fix <span class="tag ok">new · 155b807</span></div>
+<div class="chk"><input type="checkbox" id="u8"><label for="u8">Click into the command line and type a command starting with <b>g</b>, e.g. <span class="cmd"><span class="p">›</span> geodesic</span> <span class="exp"><b>Expect:</b> the letter <b>g</b> types normally — the gumball is <b>not</b> toggled and the first letter is not eaten (was the old bug).</span></label></div>
+<div class="chk"><input type="checkbox" id="u9"><label for="u9">Select an object and press <b>Cmd/Ctrl+G</b>. <span class="exp"><b>Expect:</b> the gumball toggles on/off. Bare <code>g</code> no longer does this.</span></label></div>
 </details>
 </section>
 
 <!-- ============ 10 CRYPTO ============ -->
 <section id="crypto">
 <details>
-<summary>10 · Chat Encryption <span class="tag ok">shipped · opt-in</span></summary>
+<summary>11 · Chat Encryption <span class="tag ok">shipped · opt-in</span></summary>
 <p class="lead">AES-256-GCM at rest, keyed by an OS-keychain data key; <b>default OFF</b>, toggled with <code>chatencryption on|off</code> (alias <code>encryptchats</code>). Key cached per process → at most one keychain prompt per launch. Self-describing format loads plaintext or encrypted either way, so toggling is lossless.</p>
 <div class="chk"><input type="checkbox" id="x0"><label for="x0">Fresh install, have a chat, quit, inspect <code>~/.config/itsjustcad/chats/&lt;uuid&gt;.json</code>. <span class="exp"><b>Expect:</b> plaintext JSON (default OFF) — <b>no keychain prompt at any point</b>.</span></label></div>
 <div class="chk"><input type="checkbox" id="x1"><label for="x1">Type <code>chatencryption on</code>, send a message, quit, re-inspect the file. <span class="exp"><b>Expect:</b> status line confirms "chat encryption: on"; file now starts with the <code>ICEC</code> magic header — ciphertext. One keychain prompt (grant it).</span></label></div>
@@ -354,7 +411,7 @@
 </details>
 </section>
 
-<div class="foot">ItsJustCAD — Review 2 · generated 2026-09-03 · rev. b · post chat-encryption + clippy-clean · verbs verified against <code>crates/commands/src/registry.rs</code> + <code>crates/app/src/app_verbs.rs</code> + assets. Checkbox state is stored locally in your browser.</div>
+<div class="foot">ItsJustCAD — Review 2 · rev c · 2026-09-04 · adds intemfit (lot subdivision, Phases 1–6) + DXF block round-trip + gumball hotkey fix · verbs verified against <code>crates/commands/src/registry.rs</code> + <code>crates/commands/src/lot.rs</code> + <code>crates/app/src/app_verbs.rs</code> + assets. Checkbox state is stored locally in your browser.</div>
 </main>
 </div>
 
