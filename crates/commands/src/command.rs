@@ -1461,6 +1461,43 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Generate buildings inside each selected lot's buildable envelope
+    /// (M-intemfit Phase 10): a footprint (typology + fill mode), a stepped 3D
+    /// mass (floors × floor height, upper floors stepped back), and a roof
+    /// (flat / gable / hip / shed). Bakes footprint + mass + roof onto the
+    /// `buildings` layer; per-floor areas are stored so Phase 11 can compute
+    /// GFA/FAR. Deterministic → written-back `ids` make replay byte-identical.
+    LotBuilding {
+        targets: Selector,
+        /// `detached` | `row` | `courtyard` | `slab` (typology).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        typology: Option<String>,
+        /// `full` | `coverage` | `inset` | `typology` (footprint fill mode).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        footprint: Option<String>,
+        /// Storey count.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        floors: Option<usize>,
+        /// Storey height (metres).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        floorheight: Option<f64>,
+        /// Lot-coverage fraction for coverage mode (0..1).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        coverage: Option<f64>,
+        /// `flat` | `gable` | `hip` | `shed` | `auto` (roof form).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        roof: Option<String>,
+        /// Roof pitch (degrees).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pitch: Option<f64>,
+        /// Per-floor step-back inset (metres) above the step-back start floor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stepback: Option<f64>,
+        /// Baked building ids (3 per building: footprint, mass, roof), written
+        /// back on first exec.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild

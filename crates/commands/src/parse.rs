@@ -1072,6 +1072,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "lotsetbacks" => parse_lotsetbacks(&args),
         "lotfrontage" => parse_lotfrontage(&args),
         "lotopenspace" => parse_lotopenspace(&args),
+        "lotbuilding" => parse_lotbuilding(&args),
         "lotsettings" => {
             // Each arg is a key=value pair; none = show only.
             let mut sets = Vec::new();
@@ -2011,6 +2012,62 @@ fn parse_lotopenspace(args: &[&str]) -> Result<Command, ParseError> {
         feature = Some("park".to_string());
     }
     Ok(Command::LotOpenSpace { targets, feature, area, reserve, ids: None })
+}
+
+/// `lotbuilding [selector] [typology= footprint= floors= floorheight= coverage=
+/// roof= pitch= stepback=]` (M-intemfit Phase 10). Generates a footprint +
+/// stepped 3D mass + roof inside each selected lot's buildable envelope. A
+/// leading non-`k=v` token is an optional selector; missing params fall back to
+/// the sticky `lotsettings`.
+fn parse_lotbuilding(args: &[&str]) -> Result<Command, ParseError> {
+    let is_kv = |s: &str| s.contains('=');
+    let (targets, rest): (Selector, &[&str]) = match args.split_first() {
+        Some((first, _)) if !is_kv(first) => {
+            let (sel, rest) = selector(args, "lotbuilding")?;
+            (sel, rest)
+        }
+        _ => (Selector::Selected, args),
+    };
+
+    let usage = "typology= footprint= floors= floorheight= coverage= roof= pitch= stepback=";
+    let mut typology = None;
+    let mut footprint = None;
+    let mut floors = None;
+    let mut floorheight = None;
+    let mut coverage = None;
+    let mut roof = None;
+    let mut pitch = None;
+    let mut stepback = None;
+    for tok in rest {
+        let Some((k, v)) = tok.split_once('=') else {
+            return wrong("lotbuilding", usage, args);
+        };
+        match k.to_lowercase().as_str() {
+            "typology" | "type" | "typ" => typology = Some(v.to_string()),
+            "footprint" | "mode" | "fill" => footprint = Some(v.to_string()),
+            "floors" | "storeys" | "stories" | "floor_count" => {
+                floors = Some(number(v)?.max(1.0) as usize)
+            }
+            "floorheight" | "floor_height" | "storeyheight" => floorheight = Some(number(v)?),
+            "coverage" | "coverage_frac" | "cov" => coverage = Some(number(v)?),
+            "roof" | "roof_type" => roof = Some(v.to_string()),
+            "pitch" | "roof_pitch" => pitch = Some(number(v)?),
+            "stepback" | "step_back" | "stepback_depth" => stepback = Some(number(v)?),
+            _ => return wrong("lotbuilding", usage, args),
+        }
+    }
+    Ok(Command::LotBuilding {
+        targets,
+        typology,
+        footprint,
+        floors,
+        floorheight,
+        coverage,
+        roof,
+        pitch,
+        stepback,
+        ids: None,
+    })
 }
 
 fn parse_grid(args: &[&str]) -> Result<Command, ParseError> {

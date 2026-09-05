@@ -69,6 +69,98 @@ impl LotWidthMix {
     }
 }
 
+/// Building typology (plan §7.6, Phase 10) — drives the footprint shape inside
+/// the buildable envelope. All owner-scoped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Typology {
+    /// Free-standing house: a compact mass centred in the envelope. DEFAULT.
+    #[default]
+    Detached,
+    /// Row / terrace: fills the full lot width (party-wall, side = 0, matching
+    /// the euro_latam medianería) with a front/rear margin.
+    Row,
+    /// Courtyard: a ring footprint with an interior void.
+    Courtyard,
+    /// Apartment slab: a single large mass ~= the envelope.
+    Slab,
+}
+
+impl Typology {
+    /// Parse a typology keyword (with aliases). `None` if unknown.
+    pub fn parse(s: &str) -> Option<Typology> {
+        match s.to_lowercase().as_str() {
+            "detached" | "house" | "single" => Some(Typology::Detached),
+            "row" | "terrace" | "townhouse" | "rowhouse" => Some(Typology::Row),
+            "courtyard" | "court" | "perimeter" => Some(Typology::Courtyard),
+            "slab" | "apartment" | "apt" | "block" => Some(Typology::Slab),
+            _ => None,
+        }
+    }
+}
+
+/// Footprint fill mode (plan §7.6, Phase 10) — how much of the buildable
+/// envelope the footprint claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FootprintMode {
+    /// The footprint IS the buildable envelope.
+    FullEnvelope,
+    /// A centred footprint whose area is `coverage_frac × lot_area` (lot-coverage
+    /// %), clamped to the envelope.
+    CoverageRatio,
+    /// The envelope inset by `footprint_inset` on all sides.
+    Inset,
+    /// The typology dictates the shape. DEFAULT.
+    #[default]
+    TypologyDriven,
+}
+
+impl FootprintMode {
+    /// Parse a footprint-mode keyword. `None` if unknown.
+    pub fn parse(s: &str) -> Option<FootprintMode> {
+        match s.to_lowercase().as_str() {
+            "full" | "fullenvelope" | "envelope" => Some(FootprintMode::FullEnvelope),
+            "coverage" | "coverageratio" | "ratio" => Some(FootprintMode::CoverageRatio),
+            "inset" => Some(FootprintMode::Inset),
+            "typology" | "typologydriven" | "auto" => Some(FootprintMode::TypologyDriven),
+            _ => None,
+        }
+    }
+}
+
+/// Roof form (plan §7.6, Phase 10). `PerTypology` picks a sensible default from
+/// the typology (detached/row → gable, courtyard/slab → flat).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoofType {
+    /// Horizontal slab cap.
+    Flat,
+    /// Symmetric two-slope roof with a ridge along the long axis.
+    Gable,
+    /// Four sloped faces to a central ridge.
+    Hip,
+    /// Single mono-pitch plane.
+    Shed,
+    /// Pick per-typology (DEFAULT).
+    #[default]
+    PerTypology,
+}
+
+impl RoofType {
+    /// Parse a roof-type keyword. `None` if unknown.
+    pub fn parse(s: &str) -> Option<RoofType> {
+        match s.to_lowercase().as_str() {
+            "flat" => Some(RoofType::Flat),
+            "gable" | "pitched" => Some(RoofType::Gable),
+            "hip" | "hipped" => Some(RoofType::Hip),
+            "shed" | "mono" | "monopitch" | "skillion" => Some(RoofType::Shed),
+            "auto" | "pertypology" | "typology" | "default" => Some(RoofType::PerTypology),
+            _ => None,
+        }
+    }
+}
+
 /// A named default profile (plan §6b). `EuroLatam` carries the metric European /
 /// Latin-American placeholder numbers; `UsSuburban` is a stub for later. **Every
 /// EuroLatam value is a placeholder** pending Manuel's §1 answers — surfaced in
@@ -156,6 +248,33 @@ pub struct SubdivisionSettings {
     // ── Open space (Phase 9) ──
     /// 0.0 = off (feature-placement default); > 0 = blind %-reserve (owner).
     pub open_space_reserve_frac: f64,
+
+    // ── Buildings (Phase 10) ──
+    /// Building typology (drives the footprint shape). Default `Detached`.
+    pub typology: Typology,
+    /// Footprint fill mode. Default `TypologyDriven`.
+    pub footprint_mode: FootprintMode,
+    /// Lot-coverage fraction for `FootprintMode::CoverageRatio` (0..1).
+    /// **euro_latam placeholder** (0.5) — confirm with Manuel.
+    pub coverage_frac: f64,
+    /// Fixed inset (metres) for `FootprintMode::Inset`.
+    pub footprint_inset: f64,
+    /// Storey height (metres). **euro_latam placeholder** (~3 m) — confirm with
+    /// Manuel. Height = `floor_count × floor_height`.
+    pub floor_height: f64,
+    /// Number of storeys. Default 2.
+    pub floor_count: usize,
+    /// First floor index (0-based) that steps back. Floors at/above this inset
+    /// cumulatively by `stepback_depth`.
+    pub stepback_start_floor: usize,
+    /// Per-floor step-back inset (metres) applied above `stepback_start_floor`.
+    /// 0 = no step-back (a straight prism).
+    pub stepback_depth: f64,
+    /// Roof form. Default `PerTypology`.
+    pub roof_type: RoofType,
+    /// Roof pitch (degrees) for gable / hip / shed. **euro_latam placeholder**
+    /// (30°) — confirm with Manuel.
+    pub roof_pitch: f64,
 }
 
 impl Default for SubdivisionSettings {
@@ -197,6 +316,17 @@ impl Default for SubdivisionSettings {
             build_to_line: 0.0,
             draw_buildable_envelope: true,
             open_space_reserve_frac: 0.0,
+            // Buildings (Phase 10). euro_latam placeholders flagged in-verb.
+            typology: Typology::Detached,
+            footprint_mode: FootprintMode::TypologyDriven,
+            coverage_frac: 0.5,
+            footprint_inset: 2.0,
+            floor_height: 3.0,
+            floor_count: 2,
+            stepback_start_floor: 3,
+            stepback_depth: 0.0,
+            roof_type: RoofType::PerTypology,
+            roof_pitch: 30.0,
         }
     }
 }

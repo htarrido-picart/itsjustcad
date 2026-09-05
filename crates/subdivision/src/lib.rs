@@ -23,12 +23,17 @@
 pub mod blocks;
 pub mod geometry;
 pub mod open_space;
+pub mod buildings;
 pub mod settings;
 pub mod straight_skeleton;
 pub mod streets;
 pub mod subdivision;
 
 pub use blocks::{Block, BlockEdge};
+pub use buildings::{
+    build_on_envelope, default_roof_for, footprint as building_footprint, massing as building_massing,
+    roof as building_roof, BuildingResult, Floor, Footprint, Massing,
+};
 pub use geometry::clip_bridge;
 pub use geometry::oriented_box::{convex_hull, OrientedBox};
 pub use open_space::{
@@ -39,7 +44,8 @@ pub use geometry::polygon2d::Polygon2d;
 pub use geometry::polyline::PolylineTools;
 pub use geometry::split::{split_by_line, Line2d};
 pub use settings::{
-    LoadingType, LotWidthMix, RegionProfile, StreetPattern, SubdivisionMethod, SubdivisionSettings,
+    FootprintMode, LoadingType, LotWidthMix, RegionProfile, RoofType, StreetPattern,
+    SubdivisionMethod, SubdivisionSettings, Typology,
 };
 pub use subdivision::lot_rules::{
     apply_lot_rules, LotRulesReport, WidthMixResult, WidthMixSolver,

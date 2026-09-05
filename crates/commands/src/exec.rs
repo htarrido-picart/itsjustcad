@@ -4034,11 +4034,47 @@ fn exec_lot_settings(
             }
             "sliver_frac" | "sliver_area_frac" => s.sliver_area_frac = num()?,
             "alley_width" | "alleywidth" => s.alley_width = num()?,
+            // Setbacks (Phase 8) — sticky so they replay + feed lotbuilding.
+            "front" | "setback_front" => s.setback_front = num()?,
+            "side" | "setback_side" => s.setback_side = num()?,
+            "rear" | "setback_rear" => s.setback_rear = num()?,
+            "buildto" | "build_to" | "build_to_line" => s.build_to_line = num()?,
+            // Buildings (Phase 10).
+            "typology" | "typ" => {
+                s.typology = subdivision::Typology::parse(v).ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "unknown typology '{v}' (try detached | row | courtyard | slab)"
+                    ))
+                })?;
+            }
+            "footprint" | "footprint_mode" => {
+                s.footprint_mode = subdivision::FootprintMode::parse(v).ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "unknown footprint mode '{v}' (try full | coverage | inset | typology)"
+                    ))
+                })?;
+            }
+            "floors" | "floor_count" => s.floor_count = (num()?.max(1.0)) as usize,
+            "floorheight" | "floor_height" => s.floor_height = num()?,
+            "coverage" | "coverage_frac" => s.coverage_frac = num()?,
+            "roof" | "roof_type" => {
+                s.roof_type = subdivision::RoofType::parse(v).ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "unknown roof type '{v}' (try flat | gable | hip | shed | auto)"
+                    ))
+                })?;
+            }
+            "pitch" | "roof_pitch" => s.roof_pitch = num()?,
+            "stepback" | "stepback_depth" => s.stepback_depth = num()?,
+            "stepback_start" | "stepback_start_floor" => {
+                s.stepback_start_floor = (num()?.max(0.0)) as usize
+            }
             other => {
                 return Err(ExecError::Invalid(format!(
                     "unknown lot setting '{other}' (try area/area_max/width/irregularity/loose/\
                      force_street/method/seed/region/loading/widthmix/depth/corner/flag/\
-                     mergeslivers)"
+                     mergeslivers/front/side/rear/buildto/typology/footprint/floors/floorheight/\
+                     coverage/roof/pitch/stepback)"
                 )));
             }
         }
@@ -4512,6 +4548,147 @@ fn exec_lot_openspace(
     }
     Ok((
         Command::LotOpenSpace { targets, feature, area, reserve, ids: Some(new_ids.clone()) },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome { message: msg, created: new_ids },
+    ))
+}
+
+/// `lotbuilding` (M-intemfit Phase 10): generate a footprint + stepped 3D mass +
+/// roof inside each selected lot's buildable envelope, baking footprint (2D) +
+/// mass (3D mesh) + roof (3D mesh) onto the `buildings` layer. Per-run args
+/// override the sticky settings and are baked into the op so replay is
+/// self-contained; written-back ids make replay byte-identical. Per-floor areas
+/// are stored on the buildings so Phase 11 yield can compute GFA/FAR. A lot with
+/// a collapsed buildable envelope is reported (no building), never a panic.
+#[allow(clippy::too_many_arguments)]
+fn exec_lot_building(
+    doc: &mut Document,
+    targets: Selector,
+    typology: Option<String>,
+    footprint: Option<String>,
+    floors: Option<usize>,
+    floorheight: Option<f64>,
+    coverage: Option<f64>,
+    roof: Option<String>,
+    pitch: Option<f64>,
+    stepback: Option<f64>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    // Effective settings: sticky doc settings + per-run overrides.
+    let mut settings = doc.subdivision_settings.clone();
+    if let Some(t) = &typology {
+        settings.typology = crate::lot::parse_typology(t).ok_or_else(|| {
+            ExecError::Invalid(format!(
+                "unknown lotbuilding typology='{t}' — use detached | row | courtyard | slab"
+            ))
+        })?;
+    }
+    if let Some(f) = &footprint {
+        settings.footprint_mode = crate::lot::parse_footprint_mode(f).ok_or_else(|| {
+            ExecError::Invalid(format!(
+                "unknown lotbuilding footprint='{f}' — use full | coverage | inset | typology"
+            ))
+        })?;
+    }
+    if let Some(r) = &roof {
+        settings.roof_type = crate::lot::parse_roof_type(r).ok_or_else(|| {
+            ExecError::Invalid(format!(
+                "unknown lotbuilding roof='{r}' — use flat | gable | hip | shed | auto"
+            ))
+        })?;
+    }
+    if let Some(n) = floors {
+        settings.floor_count = n.max(1);
+    }
+    if let Some(h) = floorheight {
+        settings.floor_height = h;
+    }
+    if let Some(c) = coverage {
+        settings.coverage_frac = c;
+    }
+    if let Some(p) = pitch {
+        settings.roof_pitch = p;
+    }
+    if let Some(s) = stepback {
+        settings.stepback_depth = s;
+    }
+
+    // Gather closed lot polygons from the selection.
+    let sel_ids = resolve(doc, &targets)?;
+    let mut lots: Vec<(subdivision::Polygon2d, f64)> = Vec::new();
+    for id in &sel_ids {
+        if let Some(obj) = doc.get(*id)
+            && let Geometry::Curve(c) = &obj.geometry
+            && c.is_closed()
+            && let Some(poly) = crate::lot::curve_to_polygon(c)
+        {
+            let pts = c.tessellate(PROFILE_TOL);
+            let z = if pts.is_empty() {
+                0.0
+            } else {
+                pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
+            };
+            lots.push((poly, z));
+        }
+    }
+    if lots.is_empty() {
+        return Err(ExecError::Invalid(
+            "lotbuilding needs closed lot curve(s) (select lots, or run lotsubdivide first)".into(),
+        ));
+    }
+
+    let bake = crate::lot::compute_buildings(&lots, &settings).map_err(ExecError::Invalid)?;
+
+    // 3 objects per building (footprint + mass + roof).
+    let want = bake.buildings.len() * crate::lot::OBJECTS_PER_BUILDING;
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == want => ids,
+        _ => (0..want).map(|_| ObjectId::new()).collect(),
+    };
+
+    let mut layers_created = Vec::new();
+    if let Some(name) = crate::lot::ensure_buildings_layer(doc) {
+        layers_created.push(name);
+    }
+    crate::lot::insert_buildings(doc, &bake, &new_ids);
+    doc.generation += 1;
+
+    let n = bake.buildings.len();
+    let msg = {
+        let mut m = format!(
+            "lotbuilding: {n} building(s) on '{}' ({:?} typology, {:?} roof; {} total floor(s), \
+             GFA {:.0} m²)",
+            crate::lot::BUILDINGS_LAYER,
+            bake.typology,
+            bake.roof_type,
+            bake.total_floors,
+            bake.total_gfa,
+        );
+        if bake.collapsed > 0 {
+            m.push_str(&format!(
+                "; {} lot(s) skipped (buildable envelope collapsed)",
+                bake.collapsed
+            ));
+        }
+        if let Some(note) = &bake.placeholder_note {
+            m.push_str(&format!("; {note}"));
+        }
+        m
+    };
+
+    Ok((
+        Command::LotBuilding {
+            targets,
+            typology,
+            footprint,
+            floors,
+            floorheight,
+            coverage,
+            roof,
+            pitch,
+            stepback,
+            ids: Some(new_ids.clone()),
+        },
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome { message: msg, created: new_ids },
     ))
@@ -8055,6 +8232,21 @@ fn apply_forward(
         Command::LotOpenSpace { targets, feature, area, reserve, ids } => {
             exec_lot_openspace(doc, targets, feature, area, reserve, ids)
         }
+        Command::LotBuilding {
+            targets,
+            typology,
+            footprint,
+            floors,
+            floorheight,
+            coverage,
+            roof,
+            pitch,
+            stepback,
+            ids,
+        } => exec_lot_building(
+            doc, targets, typology, footprint, floors, floorheight, coverage, roof, pitch, stepback,
+            ids,
+        ),
         Command::FlowArrows { n, ids } => exec_flow_arrows(doc, n, ids),
         Command::Ponding { ids } => exec_ponding(doc, ids),
         Command::CodeCheck { pack, story, rules, ids } => {
@@ -9605,6 +9797,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LotSetbacks { .. } => "lotsetbacks",
         Command::LotFrontage { .. } => "lotfrontage",
         Command::LotOpenSpace { .. } => "lotopenspace",
+        Command::LotBuilding { .. } => "lotbuilding",
         Command::Plant { .. } => "plant",
         Command::PlantRow { .. } => "plantrow",
         Command::PlantSchedule { .. } => "plantschedule",
@@ -16834,5 +17027,162 @@ mod tests {
     fn lotopenspace_is_logged() {
         assert!(parse("lotopenspace last type=park").unwrap().is_logged());
         assert!(parse("lotopenspace last reserve=20").unwrap().is_logged());
+    }
+
+    // ── M-intemfit: lotbuilding (Phase 10) ───────────────────────────────────
+
+    fn buildings_count(s: &Session) -> usize {
+        s.doc
+            .all_ids()
+            .iter()
+            .filter(|id| {
+                s.doc.get(**id).map(|o| o.layer == crate::lot::BUILDINGS_LAYER).unwrap_or(false)
+            })
+            .count()
+    }
+
+    fn building_meshes(s: &Session) -> usize {
+        s.doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| s.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::BUILDINGS_LAYER)
+            .filter(|o| matches!(o.geometry, Geometry::Mesh(_)))
+            .count()
+    }
+
+    #[test]
+    fn lotbuilding_bakes_footprint_and_mass() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 30 40");
+        run(&mut s, "lotsettings region=us_suburban front=5 side=3 rear=7");
+        let out = run(&mut s, "lotbuilding last typology=detached floors=3 roof=gable");
+        assert!(s.doc.layers.contains_key(crate::lot::BUILDINGS_LAYER));
+        // 3 objects per building: footprint (curve) + mass (mesh) + roof (mesh).
+        assert_eq!(buildings_count(&s), 3, "footprint + mass + roof");
+        assert_eq!(building_meshes(&s), 2, "mass + roof are meshes");
+        assert!(out.message.contains("GFA"), "message reports GFA: {}", out.message);
+        assert_eq!(out.created.len(), 3);
+    }
+
+    #[test]
+    fn lotbuilding_undo_removes_buildings() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 30 40");
+        run(&mut s, "lotsettings region=us_suburban front=5 side=3 rear=7");
+        run(&mut s, "lotbuilding last floors=2");
+        assert!(buildings_count(&s) > 0);
+        run(&mut s, "undo");
+        assert_eq!(buildings_count(&s), 0, "undo removes baked buildings + layer");
+    }
+
+    #[test]
+    fn lotbuilding_replay_is_byte_identical() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 30 40");
+        run(&mut s, "lotsettings region=us_suburban front=5 side=3 rear=7");
+        run(&mut s, "lotbuilding last typology=slab floors=5 stepback=2 roof=flat");
+        let before: Vec<_> = s
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| s.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::BUILDINGS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        let log: Vec<Command> = s.log.iter().map(|a| a.op.clone()).collect();
+        let rebuilt = Session::replay(log).unwrap();
+        let after: Vec<_> = rebuilt
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| rebuilt.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::BUILDINGS_LAYER)
+            .map(|o| o.geometry.clone())
+            .collect();
+        assert!(!before.is_empty(), "buildings baked something");
+        assert_eq!(before, after, "replay recreated identical building geometry");
+    }
+
+    #[test]
+    fn lotbuilding_is_deterministic_same_run() {
+        // Two identical runs on identical docs produce identical geometry.
+        let build = |()| {
+            let mut s = Session::default();
+            run(&mut s, "rect 0,0,0 25 35");
+            run(&mut s, "lotsettings region=us_suburban front=4 side=3 rear=5");
+            run(&mut s, "lotbuilding last typology=detached floors=3 roof=hip pitch=35");
+            s.doc
+                .all_ids()
+                .iter()
+                .filter_map(|id| s.doc.get(*id).cloned())
+                .filter(|o| o.layer == crate::lot::BUILDINGS_LAYER)
+                .map(|o| o.geometry)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(build(()), build(()), "same inputs → identical buildings");
+    }
+
+    #[test]
+    fn lotbuilding_euro_latam_placeholder_note_appears() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 30 40");
+        // Region stays euro_latam (default) → placeholder note surfaces. Small
+        // setbacks so the envelope survives (side=0 party-wall for a row).
+        run(&mut s, "lotsettings front=3 side=0 rear=3");
+        let out = run(&mut s, "lotbuilding last typology=row floors=3");
+        assert!(
+            out.message.contains("confirm with Manuel"),
+            "message should carry the euro_latam placeholder note: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn lotbuilding_collapsed_envelope_reported_not_panicked() {
+        // Tiny lot with large sticky setbacks → envelope collapses → clean error.
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 6 6");
+        run(&mut s, "lotsettings region=us_suburban");
+        s.doc.subdivision_settings.setback_front = 8.0;
+        s.doc.subdivision_settings.setback_side = 8.0;
+        s.doc.subdivision_settings.setback_rear = 8.0;
+        let err = s.run(parse("lotbuilding last floors=2").unwrap()).unwrap_err();
+        let m = format!("{err}");
+        assert!(m.contains("collapsed") || m.contains("no buildings"), "err: {m}");
+        assert_eq!(buildings_count(&s), 0);
+    }
+
+    #[test]
+    fn lotbuilding_stepback_shrinks_and_lowers_gfa() {
+        // A stepped tower stores per-floor areas; the exec message reflects GFA.
+        // We verify the pure pipeline: stepped GFA < naive floors×ground area.
+        use subdivision::{FootprintMode, SubdivisionSettings, Typology};
+        let env = subdivision::Polygon2d::from_pairs([
+            (0.0, 0.0),
+            (40.0, 0.0),
+            (40.0, 40.0),
+            (0.0, 40.0),
+        ])
+        .unwrap();
+        let st = SubdivisionSettings {
+            typology: Typology::Slab,
+            footprint_mode: FootprintMode::FullEnvelope,
+            floor_count: 5,
+            stepback_start_floor: 1,
+            stepback_depth: 3.0,
+            ..SubdivisionSettings::default()
+        };
+        let b = subdivision::build_on_envelope(&env, &env, 0.0, &st).unwrap();
+        let naive = 5.0 * env.area();
+        assert!(b.gfa < naive, "stepped GFA {} < naive {}", b.gfa, naive);
+        // Per-floor areas are stored (Phase 11 reads these).
+        assert_eq!(b.floors.len(), 5);
+        assert!(b.floors[0].area > b.floors[4].area, "upper floor stepped back");
+    }
+
+    #[test]
+    fn lotbuilding_is_logged() {
+        assert!(parse("lotbuilding last typology=detached").unwrap().is_logged());
     }
 }

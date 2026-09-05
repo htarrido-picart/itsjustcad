@@ -437,6 +437,43 @@ block along its long axis, tagged `is_alley`.
 Produces the perpendicular-to-curve lot lines around cul-de-sac bulbs. ~60% of total
 subdivision effort — why it's late despite being visually important.
 
+### 7.6 Buildings — footprint + stepped massing + roof (Phase 10)
+
+Buildings generate INSIDE the Phase-8 buildable envelope (`setbacks::buildable_envelope`).
+Owner scope resolved 2026-09-05 (all options, no Manuel gate): every footprint mode,
+typology, roof, and stepped massing. `crates/subdivision/src/buildings/`:
+
+1. **Footprint** (`footprint.rs`) — a 2D polygon inside the envelope. Four **fill modes**:
+   `full` (footprint = envelope), `coverage` (a centred rectangle of `coverage_frac × lot_area`,
+   the lot-coverage %), `inset` (envelope inset a fixed margin), `typology` (the typology
+   decides — DEFAULT). Four **typologies** drive the shape: `detached` (compact mass centred
+   in the envelope), `row`/terrace (fills the full lot width — party-wall, matching euro_latam
+   side=0 medianería, with a front/rear margin), `courtyard` (a ring footprint with an interior
+   void/hole), `slab` (a large single apartment mass ≈ envelope).
+2. **Massing** (`massing.rs`) — extrude the footprint floor by floor. Height is **fixed** =
+   `floor_count × floor_height`. Floors at/above `stepback_start_floor` inset cumulatively by
+   `stepback_depth` per floor (stepped / wedding-cake massing). Emits an indexed triangle
+   `Mesh` (side walls + ground slab + top cap + courtyard inner walls) and records **per-floor
+   net areas** so Phase 11 yield computes **GFA = Σ per-floor areas** (net of step-backs and
+   any void) and **FAR = GFA / site area**.
+3. **Roof** (`roof.rs`) — cap the top floor's ring at the mass top: `flat` (slab), `gable`
+   (two-slope ridge along the long axis), `hip` (four faces to a central ridge), `shed`
+   (mono-pitch). `PerTypology` (default) → detached/row = gable, courtyard/slab = flat.
+   `roof_pitch` (degrees) sets the peak rise = half-span × tan(pitch).
+
+**Settings** (SubdivisionSettings, serde-default): `typology`, `footprint_mode`,
+`coverage_frac`, `footprint_inset`, `floor_height`, `floor_count`, `stepback_start_floor`,
+`stepback_depth`, `roof_type`, `roof_pitch`. euro_latam placeholders (floor_height ~3 m,
+coverage 0.5, roof_pitch 30°) flagged "confirm with Manuel" in verb output.
+
+**Verb** `lotbuilding <sel> [typology= footprint= floors= floorheight= coverage= roof= pitch=
+stepback=]` → for each selected lot: compute envelope (reuse setbacks) → footprint → stepped
+mass → roof; bake footprint (2D curve) + mass (3D mesh) + roof (3D mesh) onto the `buildings`
+layer (3 objects/lot). Logged, written-back ids, undo, byte-identical replay, deterministic.
+A collapsed envelope (setbacks exceed the lot) is skipped + reported, never a panic. Setbacks
++ building settings are now also settable stickily via `lotsettings` (front/side/rear/buildto/
+typology/footprint/floors/floorheight/coverage/roof/pitch/stepback) so they replay.
+
 ---
 
 ## 8. Validation cases (Rust unit tests; JSON in `crates/subdivision/samples/blocks`)
@@ -742,13 +779,26 @@ Every subdivision algorithm must pass these block shapes:
   location/area; reserve≈20 % near target with conservation (reserved + developable == all
   blocks); reserved blocks larger + more central than developable; developable excludes
   reserved and subdivides; reserve=0 = feature mode; deterministic same-seed; undo removes
-  geometry; replay byte-identical (feature + reserve). **Phase 10 (buildings) is next —
-  re-scope resolved in `docs/intemfit-phase10-scope.md`.**
+  geometry; replay byte-identical (feature + reserve).
+- **Phase 10** — ✅ **DONE (2026-09-05).** Buildings — footprint + stepped massing + roofs
+  (§7.6; owner scope, re-scope resolved in `docs/intemfit-phase10-scope.md`, now folded
+  into §7.6). `crates/subdivision/src/buildings/` (`footprint.rs`, `massing.rs`, `roof.rs`,
+  `mod.rs` orchestration `build_on_envelope`) + verb `lotbuilding` (exec + parse + registry,
+  deck-callable/GBNF). All 4 fill modes + 4 typologies + 4 roofs + stepped massing with
+  per-floor GFA. Tests: 25 pure (footprint per typology inside envelope, all 4 modes,
+  height == floors×floor_height, step-back shrinks upper floors, GFA == Σ per-floor areas,
+  each roof a valid mesh, full pipeline, determinism, collapse→None) + 8 exec (bakes
+  footprint+mass+roof on `buildings` layer, undo removes, byte-identical replay, deterministic,
+  euro_latam placeholder note, collapsed envelope reported not panicked, GFA stored, is-logged).
+  `lotsettings` extended with sticky setback + building keys so they replay. **Phase 11
+  (yield reporting) picks up: read per-floor areas / built GFA for FAR = GFA / net site.**
 - **Phase 11** — `lotreport` reports yield on **net developable area** (site minus
   open-space features AND reserved blocks), not gross — a gross number lies once open
-  space exists. Report both gross and net so the ratio is visible. Option comparison
-  diffs two settings runs.
-- **Phases 10, 12** — as specified; re-scope with Manuel before Phase 10.
+  space exists. Report both gross and net so the ratio is visible. **Built GFA/FAR** now
+  available: the `buildings` layer's `building:mass` objects carry the extruded floors and
+  `lotbuilding` stored per-floor areas (GFA = Σ floor areas net of step-backs). Option
+  comparison diffs two settings runs.
+- **Phase 12** — as specified (polish).
 
 ---
 
@@ -767,7 +817,8 @@ registry-registered, deck-callable, GBNF-grammared, logged + undoable.
 | `lotfrontage` | lots | at=setback\|curb (default setback) |
 | `lotmergeslivers` | lots | threshold |
 | `lotopenspace` | region | type=park\|greenway\|pond\|treesave, area · OR reserve=<pct> (owner opt-in blind %) |
-| `lotreport` | lots/site | → AnalysisReport (yield: lot count, avg area, frontage, **net-of-open-space**) |
+| `lotbuilding` | lots | typology=detached\|row\|courtyard\|slab, footprint=full\|coverage\|inset\|typology, floors, floorheight, coverage, roof=flat\|gable\|hip\|shed\|auto, pitch, stepback → footprint+mass+roof on `buildings` layer |
+| `lotreport` | lots/site | → AnalysisReport (yield: lot count, avg area, frontage, **net-of-open-space**, **built GFA/FAR**) |
 | `lotsettings` | none | show/set the sticky SubdivisionSettings |
 
 - **Preview**: `preview=yes` draws the result through the viewport overlay as args

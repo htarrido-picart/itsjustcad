@@ -643,6 +643,192 @@ pub fn insert_open_space(doc: &mut Document, bake: &OpenSpaceBake, ids: &[Object
     }
 }
 
+// ── Phase 10: buildings — footprint + stepped massing + roof ────────────────
+
+use kernel_mesh::Mesh;
+use subdivision::{FootprintMode, RoofType, Typology};
+
+/// The layer baked building geometry (footprints + 3D mass + roof) lands on.
+/// Tagged distinctly so a later `lotreport` (Phase 11) can total built GFA/FAR.
+pub const BUILDINGS_LAYER: &str = "buildings";
+
+/// One baked building: its footprint polygon (2D), the stepped mass mesh (3D,
+/// positioned at the lot z), the roof mesh (3D), and per-floor GFA data
+/// (floor count + per-floor areas) so Phase 11 yield can compute GFA / FAR.
+#[derive(Debug)]
+pub struct BuiltBuilding {
+    pub footprint: Polygon2d,
+    pub void: Option<Polygon2d>,
+    pub mass: Mesh,
+    pub roof: Mesh,
+    /// Per-floor net areas (net of step-backs / courtyard void).
+    pub floor_areas: Vec<f64>,
+    pub height: f64,
+    pub gfa: f64,
+    pub z: f64,
+}
+
+/// The result of a `lotbuilding` run over one or more lots.
+#[derive(Debug)]
+pub struct BuildingBake {
+    pub buildings: Vec<BuiltBuilding>,
+    /// Lots whose buildable envelope collapsed (no building) — reported.
+    pub collapsed: usize,
+    /// euro_latam placeholder banner when profile defaults (floor height, roof
+    /// pitch, coverage) were in play.
+    pub placeholder_note: Option<String>,
+    /// Total built GFA across all lots (sum of per-building GFA).
+    pub total_gfa: f64,
+    /// Total achieved floor count across all lots.
+    pub total_floors: usize,
+    /// The resolved roof type used (after PerTypology resolution).
+    pub roof_type: RoofType,
+    /// The typology used.
+    pub typology: Typology,
+}
+
+/// Parse a typology keyword → [`Typology`].
+pub fn parse_typology(s: &str) -> Option<Typology> {
+    Typology::parse(s)
+}
+
+/// Parse a footprint-mode keyword → [`FootprintMode`].
+pub fn parse_footprint_mode(s: &str) -> Option<FootprintMode> {
+    FootprintMode::parse(s)
+}
+
+/// Parse a roof-type keyword → [`RoofType`].
+pub fn parse_roof_type(s: &str) -> Option<RoofType> {
+    RoofType::parse(s)
+}
+
+/// Compute the footprint + stepped mass + roof for each lot polygon under
+/// `settings`. Deterministic. A lot whose buildable envelope collapses is
+/// counted (not built) and reported. `settings` already carries the per-run
+/// building overrides (typology / mode / floors / roof / …).
+pub fn compute_buildings(
+    lots: &[(Polygon2d, f64)],
+    settings: &SubdivisionSettings,
+) -> Result<BuildingBake, String> {
+    let mut buildings = Vec::new();
+    let mut collapsed = 0usize;
+    let mut total_gfa = 0.0;
+    let mut total_floors = 0usize;
+    for (poly, z) in lots {
+        // Buildings generate INSIDE the Phase-8 buildable envelope. A baked lot
+        // curve carries no street tags → longest edge is the front (same spirit
+        // as lotsetbacks).
+        let block = Block::untagged(poly.clone());
+        let env = subdivision::buildable_envelope(&block, settings);
+        let Some(envelope) = env.polygon else {
+            collapsed += 1;
+            continue;
+        };
+        match subdivision::build_on_envelope(&envelope, poly, *z, settings) {
+            Some(b) => {
+                total_gfa += b.gfa;
+                total_floors += b.floors.len();
+                buildings.push(BuiltBuilding {
+                    footprint: b.footprint,
+                    void: b.void,
+                    mass: b.mass,
+                    roof: b.roof,
+                    floor_areas: b.floors.iter().map(|f| f.area).collect(),
+                    height: b.height,
+                    gfa: b.gfa,
+                    z: *z,
+                });
+            }
+            None => collapsed += 1,
+        }
+    }
+    if buildings.is_empty() {
+        return Err(format!(
+            "no buildings generated ({collapsed} lot(s) had a collapsed buildable envelope) — \
+             reduce setbacks or the footprint size"
+        ));
+    }
+    // Resolve PerTypology for reporting.
+    let roof_type = match settings.roof_type {
+        RoofType::PerTypology => subdivision::default_roof_for(settings.typology),
+        rt => rt,
+    };
+    let placeholder_note = if settings.region == RegionProfile::EuroLatam {
+        Some(
+            "using euro_latam building defaults (floor height 3 m / roof pitch 30° / coverage — \
+             placeholder, confirm with Manuel)"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    Ok(BuildingBake {
+        buildings,
+        collapsed,
+        placeholder_note,
+        total_gfa,
+        total_floors,
+        roof_type,
+        typology: settings.typology,
+    })
+}
+
+/// Ensure the `buildings` layer exists (a warm terracotta for built mass).
+pub fn ensure_buildings_layer(doc: &mut Document) -> Option<String> {
+    ensure_layer(doc, BUILDINGS_LAYER, [0.72, 0.45, 0.32, 1.0])
+}
+
+/// The number of baked objects one building produces (footprint curve + mass
+/// mesh + roof mesh = 3). Used to allocate + slice the written-back id list so
+/// replay is byte-identical.
+pub const OBJECTS_PER_BUILDING: usize = 3;
+
+/// Insert baked buildings onto the `buildings` layer. Each building emits, in
+/// order: the footprint curve (2D), the mass mesh (3D), the roof mesh (3D). The
+/// `ids` slice must hold `OBJECTS_PER_BUILDING × buildings.len()` ids in that
+/// order so undo/replay round-trips exactly.
+pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId]) {
+    for (i, b) in bake.buildings.iter().enumerate() {
+        let base = i * OBJECTS_PER_BUILDING;
+        if base + 2 >= ids.len() {
+            break;
+        }
+        // Footprint (2D curve).
+        doc.insert(SceneObject {
+            visible: true,
+            id: ids[base],
+            name: Some("building:footprint".to_string()),
+            layer: BUILDINGS_LAYER.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(polygon_to_curve(&b.footprint, b.z)),
+        });
+        // Mass (3D mesh).
+        doc.insert(SceneObject {
+            visible: true,
+            id: ids[base + 1],
+            name: Some("building:mass".to_string()),
+            layer: BUILDINGS_LAYER.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Mesh(b.mass.clone()),
+        });
+        // Roof (3D mesh).
+        doc.insert(SceneObject {
+            visible: true,
+            id: ids[base + 2],
+            name: Some("building:roof".to_string()),
+            layer: BUILDINGS_LAYER.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Mesh(b.roof.clone()),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
