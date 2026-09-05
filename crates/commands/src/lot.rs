@@ -460,6 +460,136 @@ pub fn measure_frontage(
         .collect()
 }
 
+// ── Phase 11: yield reporting — gather inputs from the document ──────────────
+
+use subdivision::YieldInputs;
+
+/// The set of layers intemfit bakes onto that are NOT the site boundary — used
+/// to pick the gross-site polygon (the largest closed curve NOT on one of these).
+const INTEMFIT_LAYERS: &[&str] =
+    &[LOTS_LAYER, SETBACKS_LAYER, ROADS_LAYER, BLOCKS_LAYER, OPENSPACE_LAYER, BUILDINGS_LAYER];
+
+/// Parse the GFA + footprint area a `lotbuilding` bake stored on a
+/// `building:mass gfa=… fp=…` object name. Returns `(gfa, footprint)`.
+fn parse_mass_name(name: &str) -> Option<(f64, f64)> {
+    let rest = name.strip_prefix("building:mass")?;
+    let mut gfa = None;
+    let mut fp = None;
+    for tok in rest.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("gfa=") {
+            gfa = v.parse::<f64>().ok();
+        } else if let Some(v) = tok.strip_prefix("fp=") {
+            fp = v.parse::<f64>().ok();
+        }
+    }
+    Some((gfa.unwrap_or(0.0), fp.unwrap_or(0.0)))
+}
+
+/// Gather the yield inputs from the current document (M-intemfit Phase 11).
+///
+/// - **Lots**: closed curves on the `lots` layer. If `sel_ids` is non-empty,
+///   only lots inside the selection count (lets a user report a subset).
+/// - **Gross site**: the largest closed curve NOT on an intemfit output layer
+///   (the boundary the user drew). Falls back to (lot + open-space) area when no
+///   such boundary is present, so a bare doc of baked lots still reports.
+/// - **Open space**: `openspace:*` objects on the `openspace` layer — feature
+///   labels (`park`/`greenway`/`pond`/`treesave`) net out as features, `reserve`
+///   nets out as reserved blocks (the §11 distinction is preserved).
+/// - **Built yield**: GFA + footprint parsed off each `building:mass` object
+///   name (persisted by `lotbuilding`).
+/// - **Frontage**: measured at the setback line (§5) for each lot.
+pub fn gather_yield_inputs(
+    doc: &Document,
+    sel_ids: &[ObjectId],
+    settings: &SubdivisionSettings,
+) -> YieldInputs {
+    let in_sel = |id: &ObjectId| sel_ids.is_empty() || sel_ids.contains(id);
+
+    let mut lot_polys: Vec<Polygon2d> = Vec::new();
+    let mut open_space_feature_areas: Vec<f64> = Vec::new();
+    let mut reserved_block_areas: Vec<f64> = Vec::new();
+    let mut building_gfas: Vec<f64> = Vec::new();
+    let mut building_footprints: Vec<f64> = Vec::new();
+    let mut site_candidates: Vec<f64> = Vec::new();
+
+    for obj in doc.objects() {
+        match obj.layer.as_str() {
+            LOTS_LAYER => {
+                if in_sel(&obj.id)
+                    && let Geometry::Curve(c) = &obj.geometry
+                    && c.is_closed()
+                    && let Some(p) = curve_to_polygon(c)
+                {
+                    lot_polys.push(p);
+                }
+            }
+            OPENSPACE_LAYER => {
+                if let Geometry::Curve(c) = &obj.geometry
+                    && c.is_closed()
+                    && let Some(p) = curve_to_polygon(c)
+                {
+                    let is_reserve = obj
+                        .name
+                        .as_deref()
+                        .map(|n| n.contains("reserve"))
+                        .unwrap_or(false);
+                    if is_reserve {
+                        reserved_block_areas.push(p.area());
+                    } else {
+                        open_space_feature_areas.push(p.area());
+                    }
+                }
+            }
+            BUILDINGS_LAYER => {
+                if let Some(name) = &obj.name
+                    && let Some((gfa, fp)) = parse_mass_name(name)
+                {
+                    building_gfas.push(gfa);
+                    if fp > 0.0 {
+                        building_footprints.push(fp);
+                    }
+                }
+            }
+            other => {
+                // A closed curve on a non-intemfit layer is a candidate site
+                // boundary (the user-drawn site).
+                if !INTEMFIT_LAYERS.contains(&other)
+                    && let Geometry::Curve(c) = &obj.geometry
+                    && c.is_closed()
+                    && let Some(p) = curve_to_polygon(c)
+                {
+                    site_candidates.push(p.area());
+                }
+            }
+        }
+    }
+
+    let lot_area_sum: f64 = lot_polys.iter().map(|p| p.area()).sum();
+    let open_space_sum: f64 =
+        open_space_feature_areas.iter().chain(&reserved_block_areas).sum::<f64>();
+    // Gross site: the largest user-drawn boundary when one exists (open space
+    // sits INSIDE it — never add the two, that double-counts). Only when NO
+    // boundary is present do we fall back to lots + open space (so a doc of just
+    // baked lots + open space still nets correctly — net == lots).
+    let boundary = site_candidates.iter().copied().fold(0.0f64, f64::max);
+    let gross_site_area = if boundary > 0.0 { boundary } else { lot_area_sum + open_space_sum };
+
+    let lot_frontages: Vec<f64> = measure_frontage(&lot_polys, subdivision::FrontageAt::Setback, settings)
+        .into_iter()
+        .map(|m| m.length)
+        .collect();
+
+    YieldInputs {
+        lot_areas: lot_polys.iter().map(|p| p.area()).collect(),
+        lot_frontages,
+        gross_site_area,
+        open_space_feature_areas,
+        reserved_block_areas,
+        building_gfas,
+        building_footprints,
+    }
+}
+
 // ── Phase 9: open space — feature placement + blind %-reserve ───────────────
 
 use subdivision::OpenSpaceFeature;
@@ -804,11 +934,17 @@ pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId
             lineweight_mm: None,
             geometry: Geometry::Curve(polygon_to_curve(&b.footprint, b.z)),
         });
-        // Mass (3D mesh).
+        // Mass (3D mesh). The name carries the GFA + footprint area so a later
+        // `lotreport` (Phase 11) can read the built yield straight off the
+        // document — persisted across save/reload, deterministic.
         doc.insert(SceneObject {
             visible: true,
             id: ids[base + 1],
-            name: Some("building:mass".to_string()),
+            name: Some(format!(
+                "building:mass gfa={:.3} fp={:.3}",
+                b.gfa,
+                b.footprint.area()
+            )),
             layer: BUILDINGS_LAYER.to_string(),
             color: None,
             material: None,

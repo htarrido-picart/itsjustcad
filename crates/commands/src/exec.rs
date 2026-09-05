@@ -4456,6 +4456,71 @@ fn exec_lot_frontage(
     ))
 }
 
+/// `lotreport` (M-intemfit Phase 11): build a yield summary from the current
+/// intemfit geometry (lots on the `lots` layer, `openspace:*` features/reserved
+/// blocks, `building:mass` GFA) and store it on the `report` plane keyed
+/// `lotyield`. Reports on the **net developable area** (gross site − open space),
+/// not the gross site — a gross number lies once open space exists — plus built
+/// GFA and **FAR = GFA / net area**. `compare` diffs the two most recent
+/// snapshots (A = previous, B = current). Read-only query — never logged.
+fn exec_lot_report(
+    doc: &mut Document,
+    targets: Selector,
+    compare: Option<String>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    // Compare mode: diff the two stored snapshots. No geometry read.
+    if compare.is_some() {
+        let a = doc.yield_reports.get("lotyield_prev");
+        let b = doc.yield_reports.get("lotyield");
+        let (Some(a), Some(b)) = (a, b) else {
+            return Err(ExecError::Invalid(
+                "lotreport compare needs two yield runs — run `lotreport` twice \
+                 (before and after a change) first"
+                    .into(),
+            ));
+        };
+        let cmp = subdivision::YieldComparison::diff(a, b);
+        let msg = cmp.to_markdown(a, b);
+        return Ok((
+            Command::LotReport { targets, compare },
+            Inverse::Rename(Vec::new()), // never logged
+            ApplyOutcome { message: msg.trim_end().to_string(), created: Vec::new() },
+        ));
+    }
+
+    let settings = doc.subdivision_settings.clone();
+    // An explicit selector reports a subset of lots; the default (Selected /
+    // nothing) reports the whole document.
+    let sel_ids: Vec<ObjectId> = match &targets {
+        Selector::Selected => Vec::new(),
+        _ => resolve(doc, &targets).unwrap_or_default(),
+    };
+    let inputs = crate::lot::gather_yield_inputs(doc, &sel_ids, &settings);
+    let report = subdivision::YieldReport::compute(&inputs);
+
+    if report.is_empty() {
+        return Err(ExecError::Invalid(
+            "nothing to report — no intemfit geometry found (run lotsubdivide / \
+             lotgeneratesite / lotbuilding first, or draw a site boundary)"
+                .into(),
+        ));
+    }
+
+    let msg = report.to_markdown("yield");
+    // Rotate the last snapshot into the compare slot, then store the new one.
+    if let Some(prev) = doc.yield_reports.get("lotyield").cloned() {
+        doc.yield_reports.insert("lotyield_prev".to_string(), prev);
+    }
+    doc.yield_reports.insert("lotyield".to_string(), report);
+    doc.generation += 1;
+
+    Ok((
+        Command::LotReport { targets, compare },
+        Inverse::Rename(Vec::new()), // never logged; inverse unused
+        ApplyOutcome { message: msg.trim_end().to_string(), created: Vec::new() },
+    ))
+}
+
 /// `lotopenspace` (M-intemfit Phase 9): place an open-space feature
 /// (`type=park|greenway|pond|treesave`) at the selected region / largest empty
 /// block, OR run the blind `reserve=<pct>` mode that pulls whole central blocks
@@ -8229,6 +8294,7 @@ fn apply_forward(
             exec_lot_setbacks(doc, targets, front, side, rear, buildto, envelope, ids)
         }
         Command::LotFrontage { targets, at } => exec_lot_frontage(doc, targets, at),
+        Command::LotReport { targets, compare } => exec_lot_report(doc, targets, compare),
         Command::LotOpenSpace { targets, feature, area, reserve, ids } => {
             exec_lot_openspace(doc, targets, feature, area, reserve, ids)
         }
@@ -8663,10 +8729,13 @@ fn apply_forward(
             ))
         }
         Command::EnviroReport { kind } => {
-            if doc.analysis_reports.is_empty() && doc.compliance_reports.is_empty() {
+            if doc.analysis_reports.is_empty()
+                && doc.compliance_reports.is_empty()
+                && doc.yield_reports.is_empty()
+            {
                 return Err(ExecError::Invalid(
                     "no analysis stored — run sunhours, facesunhours, radiation, \
-                     shadowstudy, or codecheck first, then `report`"
+                     shadowstudy, codecheck, or lotreport first, then `report`"
                         .into(),
                 ));
             }
@@ -8683,12 +8752,29 @@ fn apply_forward(
                     msg.push_str(&format_compliance_report(r));
                 }
             }
+            // Yield reports (M-intemfit Phase 11) ride the same plane: bare
+            // `report` includes the latest; `report lotyield` filters to it.
+            // `lotyield_prev` (the compare A-slot) is only shown when asked for
+            // by exact key so bare `report` stays uncluttered.
+            for (k, r) in &doc.yield_reports {
+                let want_this = match kind.as_deref() {
+                    None => k == "lotyield",
+                    Some(w) => w == k || (w == "lotyield" && k == "lotyield"),
+                };
+                if want_this {
+                    if !msg.is_empty() {
+                        msg.push('\n');
+                    }
+                    msg.push_str(&r.to_markdown(k));
+                }
+            }
             if msg.is_empty() {
                 let stored: Vec<String> = doc
                     .analysis_reports
                     .keys()
                     .cloned()
                     .chain(doc.compliance_reports.keys().map(|k| format!("codecheck:{k}")))
+                    .chain(doc.yield_reports.keys().cloned())
                     .collect();
                 return Err(ExecError::Invalid(format!(
                     "no '{}' report stored (stored: {})",
@@ -9796,6 +9882,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LotGenerateSite { .. } => "lotgeneratesite",
         Command::LotSetbacks { .. } => "lotsetbacks",
         Command::LotFrontage { .. } => "lotfrontage",
+        Command::LotReport { .. } => "lotreport",
         Command::LotOpenSpace { .. } => "lotopenspace",
         Command::LotBuilding { .. } => "lotbuilding",
         Command::Plant { .. } => "plant",
@@ -17184,5 +17271,159 @@ mod tests {
     #[test]
     fn lotbuilding_is_logged() {
         assert!(parse("lotbuilding last typology=detached").unwrap().is_logged());
+    }
+
+    // ── M-intemfit: lotreport — yield + net-of-open-space + compare (Phase 11) ─
+
+    /// Build a site rect, subdivide it into lots. Returns the session; the site
+    /// boundary lives on the Default layer, lots on the `lots` layer.
+    fn subdivided_site() -> Session {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 120");
+        run(&mut s, "lotsettings region=us_suburban");
+        run(&mut s, "lotsubdivide last grid area=6500 width=50");
+        s
+    }
+
+    #[test]
+    fn lotreport_yields_lots_and_stores_on_report_plane() {
+        let mut s = subdivided_site();
+        let n = lot_count(&s);
+        assert!(n > 1);
+        let out = run(&mut s, "lotreport");
+        // Stored on the yield-report plane keyed 'lotyield'.
+        let r = s.doc.yield_reports.get("lotyield").expect("lotyield stored");
+        assert_eq!(r.lot_count, n, "report lot count matches baked lots");
+        // Total lot area matches the baked lots within tolerance.
+        let baked: f64 = s
+            .doc
+            .all_ids()
+            .iter()
+            .filter_map(|id| s.doc.get(*id))
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(c) => crate::lot::curve_to_polygon(c).map(|p| p.area()),
+                _ => None,
+            })
+            .sum();
+        assert!((r.total_lot_area - baked).abs() < 1.0, "{} vs {baked}", r.total_lot_area);
+        // Markdown table renders.
+        assert!(out.message.contains("| Metric | Value |"), "msg: {}", out.message);
+        assert!(out.message.contains("Net developable area"));
+    }
+
+    #[test]
+    fn lotreport_net_equals_gross_when_no_open_space() {
+        let s0 = {
+            let mut s = subdivided_site();
+            run(&mut s, "lotreport");
+            s
+        };
+        let r = &s0.doc.yield_reports["lotyield"];
+        assert!(
+            (r.net_developable_area - r.gross_site_area).abs() < 1.0,
+            "net {} should equal gross {} with no open space",
+            r.net_developable_area,
+            r.gross_site_area
+        );
+        assert!(r.open_space_ratio.abs() < 1e-6, "open-space ratio 0 when none");
+    }
+
+    #[test]
+    fn lotreport_nets_out_open_space() {
+        let mut s = subdivided_site();
+        // Place a park on the site (open space layer, feature).
+        run(&mut s, "lotopenspace all type=park area=4000");
+        run(&mut s, "lotreport");
+        let r = &s.doc.yield_reports["lotyield"];
+        assert!(r.open_space_feature_area > 0.0, "park area detected");
+        // net = gross − open space (within tolerance of the placed park area).
+        assert!(
+            (r.gross_site_area - r.net_developable_area - r.open_space_feature_area).abs() < 1.0,
+            "net {} = gross {} − open {} ",
+            r.net_developable_area,
+            r.gross_site_area,
+            r.open_space_feature_area
+        );
+        assert!(r.open_space_ratio > 0.0);
+    }
+
+    #[test]
+    fn lotreport_far_is_gfa_over_net() {
+        let mut s = subdivided_site();
+        run(&mut s, "lotbuilding all typology=row floors=2");
+        run(&mut s, "lotreport");
+        let r = &s.doc.yield_reports["lotyield"];
+        assert!(r.building_count > 0, "buildings detected");
+        assert!(r.total_gfa > 0.0, "GFA totalled");
+        let far = r.far_net.expect("FAR net computed");
+        let expect = r.total_gfa / r.net_developable_area;
+        assert!((far - expect).abs() < 1e-6, "FAR {far} = GFA/net {expect}");
+    }
+
+    #[test]
+    fn lotreport_served_through_report_plane() {
+        let mut s = subdivided_site();
+        run(&mut s, "lotreport");
+        let out = run(&mut s, "report");
+        assert!(out.message.contains("Yield"), "report serves yield: {}", out.message);
+        let out2 = run(&mut s, "report lotyield");
+        assert!(out2.message.contains("Net developable area"));
+    }
+
+    #[test]
+    fn lotreport_is_not_logged_and_deterministic() {
+        assert!(!parse("lotreport").unwrap().is_logged(), "lotreport is a query");
+        assert!(!parse("lotreport compare").unwrap().is_logged());
+        // Deterministic: two runs on the same doc give the same report.
+        let mut s = subdivided_site();
+        run(&mut s, "lotreport");
+        let a = s.doc.yield_reports["lotyield"].clone();
+        run(&mut s, "lotreport");
+        let b = s.doc.yield_reports["lotyield"].clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn lotreport_empty_doc_is_clean_error_not_panic() {
+        let mut s = Session::default();
+        let err = s.run(parse("lotreport").unwrap()).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("nothing to report"),
+            "clean nothing-to-report error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn lotreport_compare_diffs_two_runs() {
+        let mut s = subdivided_site();
+        // Run A: fine lots.
+        run(&mut s, "lotreport");
+        let a_lots = s.doc.yield_reports["lotyield"].lot_count;
+        // Change: place open space, then a coarser re-subdivide would change
+        // counts — simplest known delta: add a park, re-report. Net drops.
+        run(&mut s, "lotopenspace all type=park area=4000");
+        run(&mut s, "lotreport");
+        let b_net = s.doc.yield_reports["lotyield"].net_developable_area;
+        let a_net = s.doc.yield_reports["lotyield_prev"].net_developable_area;
+        assert!(b_net < a_net, "net dropped after adding open space");
+        let out = run(&mut s, "lotreport compare");
+        assert!(out.message.contains("Δ = B − A"), "compare table: {}", out.message);
+        // Δ net area negative.
+        let cmp = subdivision::YieldComparison::diff(
+            &s.doc.yield_reports["lotyield_prev"],
+            &s.doc.yield_reports["lotyield"],
+        );
+        assert!(cmp.delta_net_area < 0.0);
+        let _ = a_lots;
+    }
+
+    #[test]
+    fn lotreport_compare_needs_two_runs() {
+        let mut s = subdivided_site();
+        run(&mut s, "lotreport");
+        // Only one run stored → compare errors cleanly.
+        let err = s.run(parse("lotreport compare").unwrap()).unwrap_err();
+        assert!(format!("{err:?}").contains("two yield runs"), "got {err:?}");
     }
 }

@@ -24,6 +24,7 @@ pub mod blocks;
 pub mod geometry;
 pub mod open_space;
 pub mod buildings;
+pub mod reporting;
 pub mod settings;
 pub mod straight_skeleton;
 pub mod streets;
@@ -41,6 +42,7 @@ pub use open_space::{
     ReservedBlock,
 };
 pub use geometry::polygon2d::Polygon2d;
+pub use reporting::{FrontageStats, YieldComparison, YieldInputs, YieldReport};
 pub use geometry::polyline::PolylineTools;
 pub use geometry::split::{split_by_line, Line2d};
 pub use settings::{

@@ -124,7 +124,7 @@ Each phase has a definition of done (§9). Don't start a phase until the previou
 | 8 | Setbacks + buildable envelopes (`lotsetbacks`) | Cheap once lots are correct |
 | 9 | Open-space feature placement (`lotopenspace`) | Pocket park, greenway, pond, tree-save |
 | 10 | Building footprints + roof massing | Second product; do not start early |
-| 11 | Yield reporting + option comparison (via `report` plane) | Makes it a decision tool |
+| 11 | Yield reporting + option comparison (via `report` plane) | Makes it a decision tool — ✅ DONE |
 | 12 | Consistent indexing, true straight skeleton, optimization | Polish |
 
 **Phase 3 is the first shippable milestone.** Get it to Manuel before starting Phase 5.
@@ -792,12 +792,37 @@ Every subdivision algorithm must pass these block shapes:
   euro_latam placeholder note, collapsed envelope reported not panicked, GFA stored, is-logged).
   `lotsettings` extended with sticky setback + building keys so they replay. **Phase 11
   (yield reporting) picks up: read per-floor areas / built GFA for FAR = GFA / net site.**
-- **Phase 11** — `lotreport` reports yield on **net developable area** (site minus
-  open-space features AND reserved blocks), not gross — a gross number lies once open
-  space exists. Report both gross and net so the ratio is visible. **Built GFA/FAR** now
-  available: the `buildings` layer's `building:mass` objects carry the extruded floors and
-  `lotbuilding` stored per-floor areas (GFA = Σ floor areas net of step-backs). Option
-  comparison diffs two settings runs.
+- **Phase 11** — ✅ **DONE (2026-09-05).** Yield reporting + option comparison.
+  `crates/subdivision/src/reporting.rs`: pure `YieldInputs` → `YieldReport::compute`
+  (geometry-free summary math, unit-tested headless) — lot count + total/avg/min/max
+  lot area, frontage stats (at the setback line, §5), GROSS vs **NET developable
+  area** (net = gross − open-space features − reserved blocks, floored at 0) with the
+  open-space ratio, built **GFA** (Σ per-building GFA), building count, **FAR = GFA /
+  net** (plus FAR gross, and `None` when net is 0 so an FAR is never a division-by-zero
+  lie), and lot-coverage % when footprints exist. `YieldReport::to_markdown` renders a
+  GitHub-flavoured Markdown table (M-chatmd renders it in chat); `YieldComparison::diff`
+  + `to_markdown` render an A/B option-compare table (Δ lot count, Δ net area, Δ GFA,
+  Δ FAR, Δ open-space ratio). Verb **`lotreport [site-sel]`** (registry-registered →
+  GBNF/deck): builds a `YieldReport` from the current document via the bridge
+  `lot::gather_yield_inputs` — lots on the `lots` layer, `openspace:*` objects split
+  into features vs `reserve` on the `openspace` layer, GFA + footprint parsed off each
+  `building:mass gfa=… fp=…` object name (`lotbuilding` now persists both onto the mass
+  object so yield reads it straight off the doc), gross site = the largest closed curve
+  NOT on an intemfit output layer (else lots + open space). Stored on a new
+  `Document::yield_reports` map keyed `lotyield` and served by the existing `report`
+  verb (`report` / `report lotyield`); **read-only, never logged** (like
+  `lotfrontage`/`report`), deterministic. **`lotreport compare`** rotates the prior
+  snapshot into `lotyield_prev` and diffs the two (minimal 2-slot A/B store per §11).
+  Empty / no-intemfit-geometry site → clean "nothing to report", never a panic. Deck
+  prompt gains a `YIELD_CRITIQUE_HELP` section (judge FAR against NET, not gross).
+  **Tests (all green):** 11 pure `reporting` unit tests (lot/area stats; net == gross
+  when no open space + ratio 0; net = gross − open when present; FAR = GFA / net;
+  lot-coverage; frontage present/absent; empty flagged; FAR `None` when net 0;
+  deterministic; 2-run compare deltas; markdown rows) + 9 `lotreport` exec tests (yields
+  match baked lots + total area within tol; net == gross no-open-space; nets out open
+  space; FAR = GFA/net on real buildings; served through `report`; not-logged +
+  deterministic; empty-doc clean error; compare diff; compare needs two runs). Phase 12
+  (polish) picks up from here.
 - **Phase 12** — as specified (polish).
 
 ---

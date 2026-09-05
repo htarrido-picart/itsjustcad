@@ -146,6 +146,20 @@ Rule packs are data, not code: a pack is JSON ({\"name\":..,\"rules\":[{\"id\",\
 ALWAYS state the disclaimer when presenting results: this is an advisory pre-check, not a code review — verify with a licensed professional / AHJ. Guard height, habitable-space, and handrail checks are name-matched only; travel distance is straight-line, not the routed path; ramp cross slope infers the run axis from the mesh AABB; door threshold/reach/maneuvering clearance are param-only or omitted. Never claim a design \"complies\" with any code.
 ";
 
+/// The "Yield critique" section: teaches the intemfit yield workflow
+/// (M-intemfit Phase 11). Like [`ENVIRO_CRITIQUE_HELP`] this is interpretation
+/// guidance — the `lotreport`/`report` verbs are advertised through the
+/// registry — carrying the key honesty rule: judge FAR against NET developable
+/// area, never gross, once open space exists.
+pub const YIELD_CRITIQUE_HELP: &str = "\
+## Site yield critique (lotreport -> report -> decision feedback)
+After generating a layout (lotgeneratesite / lotsubdivide, plus lotopenspace and lotbuilding), emit `lotreport` (then `report` or `report lotyield` in the same ```draft block) for a Markdown yield table: lot count + area stats, frontage at the setback line, GROSS vs NET developable site area (net = gross − open-space features − reserved blocks), open-space ratio, total GFA, and FAR. Critique the numbers, don't just recite them:
+  - Judge density with FAR (net) — GFA over land you can actually build on — NOT FAR gross; once open space exists a gross number overstates achievable density. Call out the gap.
+  - A high open-space ratio with low FAR means the program may not fit — suggest taller/denser typologies (lotbuilding floors=, typology=slab) or less reserve.
+  - Small min lot area or wildly varying lot areas (min vs max) hint at slivers or an over-aggressive subdivide — suggest merge or a coarser area=.
+To compare options: `lotreport`, change a setting (e.g. lotsettings, re-subdivide, add open space), `lotreport` again, then `lotreport compare` for the A/B diff (Δ lot count, Δ GFA, Δ FAR, Δ net area). Ground each observation in a table number and propose a concrete command.
+";
+
 /// The "Ask before guessing" section: when a request is ambiguous the model
 /// must emit ONE `QUESTION:` line (the explicit message form
 /// `crate::agent::parse_question` recognizes) and no commands that turn,
@@ -364,6 +378,7 @@ Examples:
 {ui_verbs}
 {enviro}
 {codecheck}
+{yield_critique}
 {clarify}
 {plan}
 {tables}
@@ -399,6 +414,7 @@ box 10,0,0 4,4,3
         ui_verbs = UI_VERB_HELP,
         enviro = ENVIRO_CRITIQUE_HELP,
         codecheck = CODECHECK_HELP,
+        yield_critique = YIELD_CRITIQUE_HELP,
         clarify = CLARIFY_HELP,
         plan = PLAN_HELP,
         tables = TABLE_HELP,

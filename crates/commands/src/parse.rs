@@ -1071,6 +1071,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "lotloading" => parse_lotloading(&args),
         "lotsetbacks" => parse_lotsetbacks(&args),
         "lotfrontage" => parse_lotfrontage(&args),
+        "lotreport" => parse_lotreport(&args),
         "lotopenspace" => parse_lotopenspace(&args),
         "lotbuilding" => parse_lotbuilding(&args),
         "lotsettings" => {
@@ -1959,6 +1960,30 @@ fn parse_lotfrontage(args: &[&str]) -> Result<Command, ParseError> {
         }
     }
     Ok(Command::LotFrontage { targets, at })
+}
+
+/// `lotreport [site-sel]` builds a yield summary (lot stats, net-of-open-space
+/// site area, built GFA, FAR) and stores it on the `report` plane; `lotreport
+/// compare` diffs the two most recent yield snapshots (M-intemfit Phase 11). A
+/// read-only query. A bare selector reports a subset of lots; `compare` takes no
+/// selector.
+fn parse_lotreport(args: &[&str]) -> Result<Command, ParseError> {
+    // `lotreport compare` → A/B diff (no selector).
+    if let [first] = args
+        && first.eq_ignore_ascii_case("compare")
+    {
+        return Ok(Command::LotReport { targets: Selector::Selected, compare: Some("compare".into()) });
+    }
+    let targets = if args.is_empty() {
+        Selector::Selected
+    } else {
+        let (sel, rest) = selector(args, "lotreport")?;
+        if !rest.is_empty() {
+            return wrong("lotreport", "[selector] · OR compare", args);
+        }
+        sel
+    };
+    Ok(Command::LotReport { targets, compare: None })
 }
 
 /// `lotopenspace <sel> type=park|greenway|pond|treesave [area=]`

@@ -136,6 +136,13 @@ pub struct Document {
     /// `serde(default)` keeps pre-compliance checkpoints loading.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub compliance_reports: BTreeMap<String, ComplianceReport>,
+    /// Structured yield summaries (`lotreport`, M-intemfit Phase 11), keyed by
+    /// slot — `lotyield` = latest run, `lotyield_prev` = the previous run kept
+    /// for `lotreport compare` (A/B option comparison). Served by the read-only
+    /// `report` command alongside the other report planes. Never logged (a query
+    /// only); `serde(default)` keeps pre-Phase-11 checkpoints loading.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub yield_reports: BTreeMap<String, subdivision::YieldReport>,
     /// Sketch constraints created by the logged `constrain` command; solved by
     /// `solveconstraints` (commands crate). Order matters — redundancy blame
     /// reports the later constraint. `serde(default)` keeps old files loading.
@@ -186,6 +193,7 @@ impl Default for Document {
             show_lineweights: false,
             analysis_reports: BTreeMap::new(),
             compliance_reports: BTreeMap::new(),
+            yield_reports: BTreeMap::new(),
             constraints: Vec::new(),
             pregrade_terrain: None,
             subdivision_settings: subdivision::SubdivisionSettings::default(),

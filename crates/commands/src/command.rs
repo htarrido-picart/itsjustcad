@@ -1498,6 +1498,19 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Yield report (M-intemfit Phase 11). Builds a yield summary from the
+    /// current intemfit geometry — lot stats, gross-vs-**net-of-open-space**
+    /// site area, built GFA, and **FAR = GFA / net developable area** — and
+    /// stores it on the AnalysisReport / `report` plane (keyed `lotyield`) so the
+    /// deck can read + critique grounded numbers. Read-only query — never logged.
+    /// `compare` (`lotreport compare`) diffs the two most recent yield snapshots
+    /// (A = previous, B = current) for option comparison.
+    LotReport {
+        targets: Selector,
+        /// `Some("compare")` runs the A/B diff; `None` builds a fresh report.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compare: Option<String>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild
@@ -1623,6 +1636,7 @@ impl Command {
                 | Command::Schedule { .. }
                 | Command::EnviroReport { .. }
                 | Command::LotFrontage { .. }
+                | Command::LotReport { .. }
                 | Command::CheckRulesList
                 | Command::CheckRulesLoad { .. }
                 | Command::RoomList
