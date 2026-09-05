@@ -9,6 +9,7 @@ pub mod blocklib;
 pub mod checkengine;
 mod command;
 pub mod csv;
+pub mod dwg;
 pub mod dxf;
 pub mod e57;
 mod error;
@@ -30,6 +31,7 @@ pub mod rhino3dm;
 pub mod saf;
 pub mod sketch;
 pub mod svg;
+pub mod workdir;
 
 pub use command::{
     BoolKind, Command, CompassDir, ConstrainKind, GridshellSurfaceSpec, MirrorPlane, OptionOp,

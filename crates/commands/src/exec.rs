@@ -1218,8 +1218,24 @@ impl Session {
     /// - `.obj` / `.stl` / `.gltf` / `.glb` → one `MeshLiteral` logged op per
     ///   named object in the file.
     fn import(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        // Workdir name resolution: when a deck workdir is granted and `path`
+        // isn't already an existing file on disk, resolve it as a bare name
+        // inside that scoped folder (path-traversal guarded — '..'/absolute/
+        // separators refused). This lets the deck reference files by name within
+        // its one folder, and turns a traversal attempt into a clear refusal
+        // rather than a stray filesystem read. A human's real, existing path
+        // (absolute or relative) still imports directly. When no workdir is set,
+        // behaviour is unchanged.
+        let path = if !std::path::Path::new(&path).is_file() && crate::workdir::get().is_some() {
+            crate::workdir::resolve_within(&path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(ExecError::Invalid)?
+        } else {
+            path
+        };
         let ext = path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).unwrap_or_default();
         match ext.as_str() {
+            "dwg" => self.import_dwg(path),
             "dxf" => self.import_dxf(path),
             "obj" | "stl" | "gltf" | "glb" | "dae" => self.import_mesh(path),
             "3dm" => self.import_3dm(path),
@@ -1230,7 +1246,7 @@ impl Session {
             "las" | "laz" => self.import_las(path),
             "e57" => self.import_e57(path),
             other => Err(ExecError::Invalid(format!(
-                "unknown import extension '.{other}' (supported: .dxf, .obj, .stl, .gltf, .glb, .dae, .3dm, .step, .stp, .ifc, .epw, .geojson, .las, .laz, .e57)"
+                "unknown import extension '.{other}' (supported: .dwg, .dxf, .obj, .stl, .gltf, .glb, .dae, .3dm, .step, .stp, .ifc, .epw, .geojson, .las, .laz, .e57)"
             ))),
         }
     }
@@ -1266,6 +1282,39 @@ impl Session {
                 "imported exact STEP solid from {path} (volume {:.4}, tessellated to {} triangles) — one MeshLiteral op",
                 exact.volume,
                 exact.mesh.faces().len()
+            ),
+        })
+    }
+
+    /// Assisted DWG import: shell out to a user-installed `dwg2dxf` (LibreDWG)
+    /// binary to convert the ONE referenced file into a temp DXF, then feed the
+    /// existing DXF importer. LibreDWG is GPLv3 — we detect-and-shell-out to a
+    /// user-installed binary, never link or bundle it (keeps the AGPLv3 app
+    /// clean; same stance as the LLM CLIs). The conversion validates the output
+    /// is complete (ENTITIES + EOF) before importing, because LibreDWG can exit
+    /// 0 on a silently-truncated conversion. See [`crate::dwg`].
+    fn import_dwg(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
+        let dxf = crate::dwg::convert_dwg_to_dxf(&path)
+            .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+        let parsed = crate::dxf::parse_dxf(&dxf)
+            .map_err(|e| ExecError::Invalid(format!("'{path}' (converted DXF): {e}")))?;
+        let prev_layer = self.doc.current_layer.clone();
+        let total = parsed.entities.len();
+        let mut created = Vec::new();
+        for (layer, cmd) in parsed.entities {
+            if self.doc.current_layer != layer {
+                self.run(Command::Layer { name: layer })?;
+            }
+            created.extend(self.run(cmd)?.created);
+        }
+        if self.doc.current_layer != prev_layer {
+            self.run(Command::Layer { name: prev_layer })?;
+        }
+        Ok(ApplyOutcome {
+            created,
+            message: format!(
+                "imported {total} entities from {path} (via dwg2dxf, {} skipped) — one logged op each",
+                parsed.skipped
             ),
         })
     }
@@ -9226,6 +9275,43 @@ fn apply_forward(
                 ApplyOutcome { created: Vec::new(), message: msg },
             ))
         }
+        Command::Workdir { path } => {
+            // No arg → show the current grant. With a path → grant that folder.
+            let msg = match path {
+                Some(ref p) => {
+                    let canon = crate::workdir::set(p.as_str())
+                        .map_err(ExecError::Invalid)?;
+                    format!("workdir set to {}", canon.display())
+                }
+                None => match crate::workdir::get() {
+                    Some(dir) => format!("workdir: {}", dir.display()),
+                    None => "no workdir set — grant one with 'workdir <path>'".to_string(),
+                },
+            };
+            Ok((
+                Command::Workdir { path: path.clone() },
+                Inverse::DeleteCreated(Vec::new()),
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::WorkdirFiles => {
+            let msg = match crate::workdir::list_importable() {
+                Ok((dir, names)) if names.is_empty() => {
+                    format!("workdir {} has no importable files", dir.display())
+                }
+                Ok((dir, names)) => format!(
+                    "importable files in {}:\n{}",
+                    dir.display(),
+                    names.iter().map(|n| format!("  {n}")).collect::<Vec<_>>().join("\n")
+                ),
+                Err(e) => e,
+            };
+            Ok((
+                Command::WorkdirFiles,
+                Inverse::DeleteCreated(Vec::new()),
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
         Command::RoomList => {
             let list: Vec<String> = doc
                 .rooms
@@ -9926,6 +10012,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::BlockParamSet { .. } => "param",
         Command::BlockDeleteDef { .. } => "blockdelete",
         Command::BlocksList => "blocks",
+        Command::Workdir { .. } => "workdir",
+        Command::WorkdirFiles => "files",
         Command::BlockLibList => "blocklib",
         Command::BlockLibLoad { .. } => "blockload",
         Command::BlockLibSave { .. } => "blocksave",
@@ -17503,5 +17591,90 @@ mod tests {
         // Only one run stored → compare errors cleanly.
         let err = s.run(parse("lotreport compare").unwrap()).unwrap_err();
         assert!(format!("{err:?}").contains("two yield runs"), "got {err:?}");
+    }
+
+    // ── M-dwg-bridge: assisted DWG import + scoped workdir ─────────────────────
+
+    /// Tests here mutate the process `PATH`/`HOME`, so they serialize on one
+    /// mutex to avoid racing each other (cargo runs tests in parallel threads).
+    static DWG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Full flow, converter-independent: `import_dwg`'s conversion+validation is
+    /// proven deterministically in `crate::dwg` (stubbed `dwg2dxf` emitting valid
+    /// vs truncated DXF), because on a host WITH a real LibreDWG installed the
+    /// well-known-dir resolver would prefer it over a PATH stub. Here we assert
+    /// the exec wiring: a `.dwg` import routes through the DWG path (an absent
+    /// converter on a bare-PATH host surfaces the install hint; a present one
+    /// converts). We only pin that a `.dwg` extension dispatches to `import_dwg`
+    /// and never silently no-ops — the message always names dwg2dxf on success or
+    /// the install/incomplete hint on failure.
+    #[test]
+    fn dwg_extension_dispatches_to_assisted_import() {
+        let dir = std::env::temp_dir().join(format!("ijc_dwgdisp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("plan.dwg");
+        std::fs::write(&input, b"not-a-real-dwg").unwrap();
+        let mut s = Session::default();
+        let res = s.run(Command::Import { path: input.to_string_lossy().into_owned() });
+        // Whatever the host has, the outcome must be a DWG-path message — never a
+        // silent empty import and never a panic.
+        match res {
+            Ok(out) => assert!(out.message.contains("via dwg2dxf"), "{}", out.message),
+            Err(e) => {
+                let m = format!("{e:?}");
+                assert!(
+                    m.contains("install LibreDWG")
+                        || m.contains("conversion incomplete")
+                        || m.contains("dwg2dxf"),
+                    "DWG failure must be a clear DWG-path error, got {m}"
+                );
+            }
+        }
+        assert_eq!(s.doc.len(), 0, "a failed/fake DWG import leaves nothing behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `import <bare-name>` resolves inside the granted workdir; a traversal name
+    /// is refused. Uses an isolated `$HOME` so the persisted grant is hermetic.
+    #[cfg(unix)]
+    #[test]
+    fn import_resolves_bare_name_in_workdir_and_guards_traversal() {
+        let _guard = DWG_ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("ijc_wdhome_{}", std::process::id()));
+        let work = home.join("Drawings");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&work).unwrap();
+        // A tiny valid DXF file in the workdir.
+        std::fs::write(
+            work.join("site.dxf"),
+            "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDSEC\n0\nEOF\n",
+        )
+        .unwrap();
+
+        let prev_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let result = (|| {
+            let mut s = Session::default();
+            // Grant the workdir.
+            s.run(Command::Workdir { path: Some(work.to_string_lossy().into_owned()) })?;
+            // Bare name resolves inside it.
+            let out = s.run(Command::Import { path: "site.dxf".into() })?;
+            assert!(out.message.contains("imported"), "{}", out.message);
+            assert_eq!(s.doc.len(), 1, "bare-name import lands geometry");
+            // Traversal name is refused.
+            let err = s.run(Command::Import { path: "../escape.dxf".into() }).unwrap_err();
+            assert!(format!("{err:?}").contains("path separators")
+                || format!("{err:?}").contains("escapes"), "got {err:?}");
+            Ok::<(), ExecError>(())
+        })();
+
+        match prev_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        result.unwrap();
     }
 }

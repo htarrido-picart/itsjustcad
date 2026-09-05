@@ -299,7 +299,16 @@ pub fn run_script_lines(
                     continue;
                 }
                 let cmd = parse(line).map_err(|e| (line.clone(), e.to_string()))?;
-                session.run(cmd).map_err(|e| (line.clone(), e.to_string()))?;
+                // Read-only QUERY verbs (blocks, files, workdir, bbox, area, …)
+                // carry their answer in the outcome message but produce no
+                // geometry. In headless mode there is no chat pane to show it, so
+                // echo query results to stdout — this makes DWG/DXF round-trips
+                // and workdir listings scriptable/testable (M-dwg-bridge finding).
+                let is_query = !cmd.is_logged();
+                let outcome = session.run(cmd).map_err(|e| (line.clone(), e.to_string()))?;
+                if is_query && !outcome.message.is_empty() {
+                    println!("{}", outcome.message);
+                }
             }
         }
     }

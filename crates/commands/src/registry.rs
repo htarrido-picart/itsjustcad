@@ -655,8 +655,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "import",
-            usage: "import <path.{dxf|obj|stl|gltf|glb|dae|3dm|step|stp|ifc|epw|geojson|las|laz|e57}>",
-            summary: "Import a file by extension: DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT → logged ops), OBJ/STL/glTF/GLB meshes, Rhino .3dm (openNURBS: meshes → MeshLiteral, lines/polylines/NURBS curves → Polyline, on their Rhino layer; breps/surfaces skipped), STEP/STP (AP242/AP203/AP214 exact BREP solids via OCCT — read exactly then tessellated to a MeshLiteral with the exact volume reported; needs the 'kernel-occt' feature), IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0.5m marker circle; properties.name → object name; lon/lat projected to local meters when a location is set, else treated as local xy), LAS 1.2–1.4 or compressed LAZ point cloud (formats 0–3; decimated to ≤200k points; stored on layer 'pointcloud'), or E57 point cloud (ASTM E2807; Cartesian + optional RGB/intensity; all sections merged; decimated to ≤200k; stored on layer 'pointcloud'). Example: import /tmp/site.las · import /tmp/scan.e57",
+            usage: "import <path.{dwg|dxf|obj|stl|gltf|glb|dae|3dm|step|stp|ifc|epw|geojson|las|laz|e57}>",
+            summary: "Import a file by extension. DWG (assisted: auto-invokes a user-installed dwg2dxf/LibreDWG to convert the referenced file to DXF then imports it; needs 'brew install libredwg'; a truncated conversion is rejected with a clear error, never a silent empty import). A bare file NAME (no path) is resolved inside the granted deck workdir (see 'workdir'). DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT, HATCH, SPLINE, nested block INSERTs → logged ops), OBJ/STL/glTF/GLB meshes, Rhino .3dm (openNURBS: meshes → MeshLiteral, lines/polylines/NURBS curves → Polyline, on their Rhino layer; breps/surfaces skipped), STEP/STP (AP242/AP203/AP214 exact BREP solids via OCCT — read exactly then tessellated to a MeshLiteral with the exact volume reported; needs the 'kernel-occt' feature), IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0.5m marker circle; properties.name → object name; lon/lat projected to local meters when a location is set, else treated as local xy), LAS 1.2–1.4 or compressed LAZ point cloud (formats 0–3; decimated to ≤200k points; stored on layer 'pointcloud'), or E57 point cloud (ASTM E2807; Cartesian + optional RGB/intensity; all sections merged; decimated to ≤200k; stored on layer 'pointcloud'). Example: import /tmp/site.las · import /tmp/scan.e57",
             category: Category::File,
         },
         CommandSpec {
@@ -880,6 +880,18 @@ pub fn registry() -> &'static [CommandSpec] {
             usage: "blocks",
             summary: "List all block definitions with their geometry counts (query only). Example: blocks",
             category: Category::Annotate,
+        },
+        CommandSpec {
+            name: "workdir",
+            usage: "workdir [path]",
+            summary: "Show or grant the scoped deck workdir — a single user-chosen folder the deck may list and import files from (NOT the whole filesystem, NOT a shell). No arg prints the current grant; 'workdir <path>' grants that folder (persisted to ~/.config/itsjustcad/workdir.txt). Once granted, 'files' lists importable files and 'import <name>' resolves a bare file name inside it (path-traversal guarded: '..', absolute paths and separators are refused). Example: workdir ~/Drawings · workdir",
+            category: Category::File,
+        },
+        CommandSpec {
+            name: "files",
+            usage: "files",
+            summary: "List the importable files in the granted deck workdir (query only). Import one with 'import <name>'. Errors clearly if no workdir is set (grant one with 'workdir <path>'). Example: files",
+            category: Category::File,
         },
         CommandSpec {
             name: "blocklib",

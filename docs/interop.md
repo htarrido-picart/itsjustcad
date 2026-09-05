@@ -12,9 +12,22 @@ import <path>
 
 Format is detected by file extension.
 
+### DWG (assisted, via LibreDWG)
+
+DWG import is **assisted**: `import site.dwg` auto-detects a user-installed `dwg2dxf` (LibreDWG) binary — probing the well-known install dirs (`/usr/local/bin`, `/opt/homebrew/bin`, `/usr/bin`, `~/.local/bin`) then `PATH`, the same way the app resolves the LLM CLIs — and converts the referenced file to a temporary DXF, which is then fed through the DXF importer above.
+
+- **License-clean.** LibreDWG is GPLv3, so ItsJustCAD **detects and shells out to** a user-installed binary; it does **not** bundle, link, or depend on it. Same detect-don't-ship stance as the LLM CLIs, keeping the AGPLv3 app's distribution clean.
+- **No shell, fixed arguments.** The converter is invoked with a fixed argument vector (`dwg2dxf -o <tmp>.dxf <input>`) against the one referenced file — no shell string, no interpolation, no model-controlled flags. The temp file is cleaned up on every path.
+- **Truncation is caught.** LibreDWG can exit 0 while silently dropping the drawing (older versions cannot read AutoCAD-2013 Architectural-Desktop DWGs). ItsJustCAD does **not** trust the exit code: the converted DXF must contain both an `ENTITIES` section and an `EOF` marker, otherwise the import fails with *"DWG conversion incomplete (converter too old or unsupported DWG — try a newer LibreDWG/ODA)"* — never a silent empty import.
+- **Missing converter** produces a clear *"install LibreDWG to import DWG (`brew install libredwg`)"* message.
+
+Note: the assisted path is only as capable as the installed converter. For complex/ADT DWGs you need a recent LibreDWG or an ODA-based converter.
+
 ### DXF (R12 / R2000)
 
-Entities imported: `LINE`, `LWPOLYLINE`, `POLYLINE`, `CIRCLE`, `ARC`, `TEXT`, `MTEXT`, `DIMENSION`, `HATCH`, `ELLIPSE`, `POINT`, `3DFACE`, `INSERT`, `LAYER` table entries, and `BLOCK` definitions from the `BLOCKS` section. Each entity becomes its own logged substrate op (`line`, `polyline`, `circle`, `arc`, `text`, `layer`, `block`, `insert`). The `import` command itself is not logged — the expanded ops are, so replay needs no access to the original file. Blocks **round-trip**: a `BLOCK` definition and its `INSERT` instances export and re-import with their name, insertion point, uniform scale, and rotation preserved.
+Entities imported: `LINE`, `LWPOLYLINE`, `POLYLINE`, `CIRCLE`, `ARC`, `TEXT`, `MTEXT`, `DIMENSION`, `HATCH`, `SPLINE`, `ELLIPSE`, `POINT`, `3DFACE`, `INSERT`, `LAYER` table entries, and `BLOCK` definitions from the `BLOCKS` section. Each entity becomes its own logged substrate op (`line`, `polyline`, `circle`, `arc`, `text`, `layer`, `block`, `insert`). The `import` command itself is not logged — the expanded ops are, so replay needs no access to the original file. Blocks **round-trip**: a `BLOCK` definition and its `INSERT` instances export and re-import with their name, insertion point, uniform scale, and rotation preserved.
+
+**Block-body coverage** (widened for real architectural DWG/DXF blocks): a block whose body contains a `HATCH` keeps the hatch boundary as a closed polyline; a `SPLINE` is tessellated to a polyline (fit points, or control points when no fit points are present); a **nested** `INSERT` (a block placed inside another block) has the referenced block's geometry **baked in** at the nested insert's position/rotation/uniform-scale (block definitions are flat, so the nested reference is baked rather than kept live; cyclic references are detected and skipped). A block that mixes mappable and unmappable bodies keeps what maps instead of being discarded.
 
 ### OBJ / STL / glTF / GLB / Collada
 
@@ -43,6 +56,17 @@ Sets the document location (latitude, longitude, time-zone) from the file header
 ### Point clouds — LAS / LAZ / E57
 
 LAS 1.2–1.4 (formats 0–3) and its compressed form **LAZ** are both supported, as is **E57** (ASTM E2807: Cartesian points plus optional RGB / intensity, all sections merged). Every cloud is decimated to ≤ 200 000 points and stored as a `PointLiteral` op on layer `pointcloud`. LAZ is batch-decompressed so the full cloud is never materialised before decimation.
+
+### Scoped workdir (deck-driven import)
+
+```
+workdir           # show the granted folder
+workdir <path>    # grant a folder
+files             # list importable files in it
+import <name>     # import a file by bare name inside the workdir
+```
+
+A **workdir** is a single, user-granted folder the deck (LLM) may list and import files from — not the whole filesystem, and never a shell. Grant one with `workdir <path>` (persisted to `~/.config/itsjustcad/workdir.txt`); `files` lists the importable files inside it, and `import <name>` resolves a bare file name against it. Name resolution is **path-traversal guarded**: absolute paths, `..` components, embedded path separators, and symlink escapes out of the folder are all refused. This keeps the deck's file access bounded to one folder a human explicitly chose.
 
 ### Terrain
 

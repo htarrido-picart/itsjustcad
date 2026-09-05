@@ -1500,6 +1500,20 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("blocks", &args, &args)?;
             Ok(Command::BlocksList)
         }
+        // workdir            -> show the granted deck workdir
+        // workdir <path>     -> grant a folder (path may contain spaces)
+        "workdir" => {
+            if args.is_empty() {
+                Ok(Command::Workdir { path: None })
+            } else {
+                Ok(Command::Workdir { path: Some(args.join(" ")) })
+            }
+        }
+        // files              -> list importable files in the workdir
+        "files" => {
+            expect_empty("files", &args, &args)?;
+            Ok(Command::WorkdirFiles)
+        }
         // blockdelete <name>
         "blockdelete" => match args.as_slice() {
             [name] => Ok(Command::BlockDeleteDef { name: (*name).to_string() }),
@@ -4178,6 +4192,33 @@ mod tests {
             parse("import /tmp/model.3dm").unwrap(),
             Command::Import { path: "/tmp/model.3dm".into() },
         );
+    }
+
+    #[test]
+    fn workdir_and_files_parse_and_roundtrip() {
+        // No-arg workdir → show.
+        let cmd = parse("workdir").unwrap();
+        assert_eq!(cmd, Command::Workdir { path: None });
+        assert!(!cmd.is_logged(), "workdir is a query/config verb, never logged");
+        // With a (spaced) path → grant.
+        assert_eq!(
+            parse("workdir /Users/me/My Drawings").unwrap(),
+            Command::Workdir { path: Some("/Users/me/My Drawings".into()) },
+        );
+        // files → list.
+        let files = parse("files").unwrap();
+        assert_eq!(files, Command::WorkdirFiles);
+        assert!(!files.is_logged());
+        assert!(parse("files x").is_err(), "files takes no arguments");
+        // Serde round-trip both directions.
+        for c in [
+            Command::Workdir { path: None },
+            Command::Workdir { path: Some("/tmp/d".into()) },
+            Command::WorkdirFiles,
+        ] {
+            let json = serde_json::to_string(&c).unwrap();
+            assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), c);
+        }
     }
 
     #[test]

@@ -549,18 +549,45 @@ pub fn parse_dxf(text: &str) -> Result<DxfEntities, String> {
     Ok(out)
 }
 
+/// A nested `INSERT` inside a block body, captured during the scan and resolved
+/// in a second pass (the referenced block may be defined later in the file).
+struct NestedInsert {
+    /// Name of the block this INSERT references.
+    block: String,
+    position: DVec3,
+    rotation_deg: f64,
+    scale: f64,
+}
+
+/// A raw (pre-resolution) block definition: its directly-committed geometry plus
+/// any nested INSERTs to be baked once every definition is known.
+struct RawBlock {
+    base: DVec3,
+    geoms: Vec<itsjustcad_doc::BlockGeometry>,
+    nested: Vec<NestedInsert>,
+}
+
 /// Parse the BLOCKS-section records into block definitions. Each `BLOCK`…`ENDBLK`
 /// span is one named definition; its entities become [`BlockGeometry`] translated
 /// so the block base point (group 10 of `BLOCK`) sits at the origin (INSERT's
-/// insertion point then places it). Point clouds, meshes and NESTED inserts inside
-/// a block are dropped (v1) — most real blocks are flat curve/text symbols.
+/// insertion point then places it).
+///
+/// Block-body coverage (M-dwg-bridge — real architectural blocks were coming in
+/// empty): flat LINE/POLYLINE/LWPOLYLINE/CIRCLE/ARC/TEXT/MTEXT/DIMENSION/ELLIPSE
+/// **plus** HATCH (→ boundary polyline), SPLINE (→ tessellated polyline) and
+/// NESTED INSERTs (→ the referenced block's geometry BAKED in at the insert's
+/// transform, since [`BlockGeometry`] is deliberately flat and cannot hold a
+/// nested reference). Point clouds and meshes inside a block are still dropped
+/// (blocks are 2D symbols in practice). A block whose body mixes mappable and
+/// unmappable bodies keeps what maps rather than being discarded wholesale.
 fn parse_blocks(
     records: Vec<(&str, Vec<(i32, &str)>)>,
 ) -> std::collections::BTreeMap<String, Vec<itsjustcad_doc::BlockGeometry>> {
     use itsjustcad_doc::BlockGeometry;
     use kernel_curve::Curve;
-    let mut blocks = std::collections::BTreeMap::new();
-    let mut cur: Option<(String, DVec3, Vec<BlockGeometry>)> = None; // name, base, geoms
+    // Preserve definition order for stable, deterministic baking.
+    let mut raw: Vec<(String, RawBlock)> = Vec::new();
+    let mut cur: Option<(String, RawBlock)> = None;
     let mut open_poly: Option<(String, bool, Vec<DVec3>)> = None;
     for (name, fields) in records {
         match name {
@@ -571,28 +598,25 @@ fn parse_blocks(
                     .map(|(_, v)| v.to_string())
                     .unwrap_or_default();
                 let base = record_point(&fields, 10).unwrap_or(DVec3::ZERO);
-                cur = Some((bname, base, Vec::new()));
+                cur = Some((bname, RawBlock { base, geoms: Vec::new(), nested: Vec::new() }));
                 open_poly = None;
             }
             "ENDBLK" => {
-                // Flush a still-open POLYLINE, then commit the block.
-                if let (Some((_, _, geoms)), Some((_, closed, pts))) =
+                // Flush a still-open POLYLINE, then stash the raw block.
+                if let (Some((_, blk)), Some((_, closed, pts))) =
                     (cur.as_mut(), open_poly.take())
                     && pts.len() >= 2
                 {
-                    geoms.push(BlockGeometry::Curve(Curve::Polyline { points: pts, closed }));
+                    blk.geoms.push(BlockGeometry::Curve(Curve::Polyline { points: pts, closed }));
                 }
-                if let Some((bname, base, mut geoms)) = cur.take() {
-                    for g in geoms.iter_mut() {
-                        translate_block_geom(g, -base);
-                    }
-                    if !bname.is_empty() && !geoms.is_empty() {
-                        blocks.insert(bname, geoms);
-                    }
+                if let Some((bname, blk)) = cur.take()
+                    && !bname.is_empty()
+                {
+                    raw.push((bname, blk));
                 }
             }
             _ => {
-                let Some((_, _, geoms)) = cur.as_mut() else {
+                let Some((_, blk)) = cur.as_mut() else {
                     continue;
                 };
                 // POLYLINE vertex folding, mirroring the ENTITIES path.
@@ -608,7 +632,7 @@ fn parse_blocks(
                             let (closed, pts) = (*closed, std::mem::take(pts));
                             open_poly = None;
                             if pts.len() >= 2 {
-                                geoms.push(BlockGeometry::Curve(Curve::Polyline {
+                                blk.geoms.push(BlockGeometry::Curve(Curve::Polyline {
                                     points: pts,
                                     closed,
                                 }));
@@ -623,16 +647,145 @@ fn parse_blocks(
                     open_poly = Some((String::new(), closed, Vec::new()));
                     continue;
                 }
+                // A NESTED insert: record it for baking in the resolution pass.
+                if name == "INSERT" {
+                    if let Some(bn) = fields.iter().find(|(c, _)| *c == 2).map(|(_, v)| v.to_string())
+                    {
+                        blk.nested.push(NestedInsert {
+                            block: bn,
+                            position: record_point(&fields, 10).unwrap_or(DVec3::ZERO),
+                            rotation_deg: record_num(&fields, 50).unwrap_or(0.0),
+                            scale: record_num(&fields, 41).filter(|s| *s > 0.0).unwrap_or(1.0),
+                        });
+                    }
+                    continue;
+                }
                 let mut dummy = None;
                 if let RecordOutcome::Entity(_, cmd) = record_entity(name, &fields, &mut dummy)
                     && let Some(g) = command_to_block_geometry(&cmd)
                 {
-                    geoms.push(g);
+                    blk.geoms.push(g);
                 }
             }
         }
     }
-    blocks
+    resolve_blocks(raw)
+}
+
+/// Second pass: re-origin each raw block on its base point and BAKE nested
+/// INSERTs by copying the referenced block's (already re-origined) geometry in
+/// at the insert's position/rotation/scale. A depth/visited guard makes cyclic
+/// or self-referential blocks safe (the cycle edge is simply skipped).
+fn resolve_blocks(
+    raw: Vec<(String, RawBlock)>,
+) -> std::collections::BTreeMap<String, Vec<itsjustcad_doc::BlockGeometry>> {
+    use std::collections::BTreeMap;
+    let by_name: BTreeMap<String, &RawBlock> =
+        raw.iter().map(|(n, b)| (n.clone(), b)).collect();
+    let mut out: BTreeMap<String, Vec<itsjustcad_doc::BlockGeometry>> = BTreeMap::new();
+    for (name, _blk) in &raw {
+        let mut visiting = std::collections::BTreeSet::new();
+        let geoms = bake_block(name, &by_name, &mut visiting);
+        if !geoms.is_empty() {
+            out.insert(name.clone(), geoms);
+        }
+    }
+    out
+}
+
+/// Recursively build one block's re-origined geometry, baking nested inserts.
+/// `visiting` holds the ancestry to break cycles.
+fn bake_block(
+    name: &str,
+    by_name: &std::collections::BTreeMap<String, &RawBlock>,
+    visiting: &mut std::collections::BTreeSet<String>,
+) -> Vec<itsjustcad_doc::BlockGeometry> {
+    let Some(blk) = by_name.get(name) else {
+        return Vec::new();
+    };
+    if !visiting.insert(name.to_string()) {
+        return Vec::new(); // cycle — skip this edge
+    }
+    // Direct geometry, re-origined on the base point.
+    let mut geoms = blk.geoms.clone();
+    for g in geoms.iter_mut() {
+        translate_block_geom(g, -blk.base);
+    }
+    // Baked nested inserts: the child's geometry (already re-origined) placed at
+    // the insert transform, then shifted so the PARENT'S base sits at the origin.
+    for ins in &blk.nested {
+        let child = bake_block(&ins.block, by_name, visiting);
+        for mut g in child {
+            transform_block_geom(&mut g, ins.scale, ins.rotation_deg.to_radians(), ins.position);
+            translate_block_geom(&mut g, -blk.base);
+            geoms.push(g);
+        }
+    }
+    visiting.remove(name);
+    geoms
+}
+
+/// Apply a uniform scale, CCW rotation about +Z (radians) and translation to
+/// block geometry, in that order (scale, rotate, then translate) — matching how
+/// an INSERT places a block. Points are transformed about the origin.
+fn transform_block_geom(g: &mut itsjustcad_doc::BlockGeometry, scale: f64, rot: f64, off: DVec3) {
+    let (s, c) = rot.sin_cos();
+    let xf = |p: DVec3| -> DVec3 {
+        let x = p.x * scale;
+        let y = p.y * scale;
+        DVec3::new(x * c - y * s + off.x, x * s + y * c + off.y, p.z * scale + off.z)
+    };
+    map_block_geom_points(g, xf, scale);
+}
+
+/// Apply a point map (and radius scale, for arcs) to every point of a block
+/// geometry in place. `rscale` scales radii/heights that don't come from points.
+fn map_block_geom_points(
+    g: &mut itsjustcad_doc::BlockGeometry,
+    xf: impl Fn(DVec3) -> DVec3,
+    rscale: f64,
+) {
+    use itsjustcad_doc::{Annotation, BlockGeometry};
+    use kernel_curve::Curve;
+    match g {
+        BlockGeometry::Curve(Curve::Line { a, b }) => {
+            *a = xf(*a);
+            *b = xf(*b);
+        }
+        BlockGeometry::Curve(Curve::Polyline { points, .. }) => {
+            for p in points.iter_mut() {
+                *p = xf(*p);
+            }
+        }
+        BlockGeometry::Curve(Curve::Arc { center, radius, .. }) => {
+            *center = xf(*center);
+            *radius *= rscale.abs();
+        }
+        BlockGeometry::Curve(Curve::Ellipse { center, rx, ry, .. }) => {
+            *center = xf(*center);
+            *rx *= rscale.abs();
+            *ry *= rscale.abs();
+        }
+        BlockGeometry::Curve(Curve::Nurbs { control, .. }) => {
+            for p in control.iter_mut() {
+                *p = xf(*p);
+            }
+        }
+        BlockGeometry::Annotation(Annotation::Text { pos, height, .. }) => {
+            *pos = xf(*pos);
+            *height *= rscale.abs();
+        }
+        BlockGeometry::Annotation(Annotation::LinearDim { a, b, .. }) => {
+            *a = xf(*a);
+            *b = xf(*b);
+        }
+        BlockGeometry::Annotation(Annotation::Hatch { boundary, .. }) => {
+            for p in boundary.iter_mut() {
+                *p = xf(*p);
+            }
+        }
+        BlockGeometry::Mesh(_) => {}
+    }
 }
 
 /// Convert a parsed entity command into block geometry (curve/annotation). Point
@@ -835,6 +988,39 @@ fn record_entity(
                 }
                 _ => None,
             }
+        }
+        "SPLINE" => {
+            // A NURBS curve. We have no exact spline primitive, so tessellate to
+            // a polyline: prefer the FIT points (11/21/31 — the on-curve points
+            // the spline interpolates), else fall back to the control points
+            // (10/20/30), which form the spline's control polygon and give a
+            // reasonable coarse approximation. Group 70 bit 1 = closed. This is
+            // the same "unsupported curve → polyline" stance the exporter takes.
+            let flags = record_num(fields, 70).unwrap_or(0.0) as i64;
+            let closed = flags & 1 != 0;
+            let mut fit = Vec::new();
+            let mut ctrl = Vec::new();
+            let mut fx: Option<f64> = None;
+            let mut cx: Option<f64> = None;
+            for (code, value) in fields {
+                match (code, value.parse::<f64>()) {
+                    (11, Ok(v)) => fx = Some(v),
+                    (21, Ok(y)) => {
+                        if let Some(x) = fx.take() {
+                            fit.push(DVec3::new(x, y, 0.0));
+                        }
+                    }
+                    (10, Ok(v)) => cx = Some(v),
+                    (20, Ok(y)) => {
+                        if let Some(x) = cx.take() {
+                            ctrl.push(DVec3::new(x, y, 0.0));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let points = if fit.len() >= 2 { fit } else { ctrl };
+            (points.len() >= 2).then_some(Command::Polyline { id: None, points, closed })
         }
         "HATCH" => {
             // Import the hatch BOUNDARY as a closed polyline (the fill pattern is
@@ -1409,6 +1595,140 @@ mod tests {
         assert_eq!(inserts[0].3, Some(90.0));
         assert_eq!(inserts[0].4, Some(2.0));
         assert_eq!(inserts[1].4, Some(1.0), "default scale 1 when 41 absent");
+    }
+
+    /// M-dwg-bridge: a block whose body is a HATCH now imports with the hatch
+    /// boundary as a closed polyline (was dropped → block came in empty).
+    #[test]
+    fn block_with_hatch_body_imports_boundary() {
+        let text = "0\nSECTION\n2\nBLOCKS\n\
+            0\nBLOCK\n2\nFILLSYM\n10\n0\n20\n0\n30\n0\n\
+            0\nHATCH\n8\n0\n10\n0\n20\n0\n2\nSOLID\n70\n1\n71\n0\n\
+            91\n1\n92\n2\n72\n0\n73\n1\n93\n3\n\
+            10\n0\n20\n0\n10\n4\n20\n0\n10\n2\n20\n3\n\
+            75\n0\n76\n1\n98\n1\n10\n2\n20\n1\n\
+            0\nENDBLK\n0\nENDSEC\n\
+            0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nFILLSYM\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        let def = parsed.entities.iter().find_map(|(_, c)| match c {
+            Command::BlockDefine { name, geometries, .. } if name == "FILLSYM" => {
+                geometries.clone()
+            }
+            _ => None,
+        });
+        let geoms = def.expect("FILLSYM block must be defined, not dropped");
+        assert_eq!(geoms.len(), 1, "hatch boundary → one polyline: {geoms:?}");
+        match &geoms[0] {
+            itsjustcad_doc::BlockGeometry::Curve(kernel_curve::Curve::Polyline { points, closed }) => {
+                assert!(closed);
+                assert_eq!(points.len(), 3, "3 boundary verts, not the seed");
+            }
+            other => panic!("expected closed polyline, got {other:?}"),
+        }
+    }
+
+    /// M-dwg-bridge: a block whose body is a SPLINE now imports as a tessellated
+    /// polyline (from its fit points) instead of being dropped.
+    #[test]
+    fn block_with_spline_body_imports_polyline() {
+        // SPLINE with 3 fit points (11/21) — should read back as a 3-pt polyline.
+        let text = "0\nSECTION\n2\nBLOCKS\n\
+            0\nBLOCK\n2\nCURVY\n10\n0\n20\n0\n30\n0\n\
+            0\nSPLINE\n8\n0\n70\n0\n71\n3\n\
+            11\n0\n21\n0\n11\n2\n21\n3\n11\n5\n21\n0\n\
+            0\nENDBLK\n0\nENDSEC\n\
+            0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nCURVY\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        let geoms = parsed
+            .entities
+            .iter()
+            .find_map(|(_, c)| match c {
+                Command::BlockDefine { name, geometries, .. } if name == "CURVY" => {
+                    geometries.clone()
+                }
+                _ => None,
+            })
+            .expect("CURVY block must be defined");
+        assert_eq!(geoms.len(), 1);
+        match &geoms[0] {
+            itsjustcad_doc::BlockGeometry::Curve(kernel_curve::Curve::Polyline { points, .. }) => {
+                assert_eq!(points.len(), 3, "spline fit points → polyline");
+                assert!((points[1] - DVec3::new(2.0, 3.0, 0.0)).length() < 1e-9);
+            }
+            other => panic!("expected polyline from spline, got {other:?}"),
+        }
+    }
+
+    /// Top-level SPLINE also tessellates to a polyline (from control points when
+    /// no fit points are present).
+    #[test]
+    fn top_level_spline_imports_from_control_points() {
+        let text = "0\nSECTION\n2\nENTITIES\n\
+            0\nSPLINE\n8\nS\n70\n0\n\
+            10\n0\n20\n0\n10\n1\n20\n2\n10\n4\n20\n0\n\
+            0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        assert_eq!(parsed.skipped, 0, "spline with points must not skip");
+        match &parsed.entities[0].1 {
+            Command::Polyline { points, .. } => assert_eq!(points.len(), 3),
+            other => panic!("expected polyline, got {other:?}"),
+        }
+    }
+
+    /// M-dwg-bridge: a block containing a NESTED INSERT of another block bakes
+    /// the referenced block's geometry in at the insert transform (BlockGeometry
+    /// is flat, so we bake rather than keep a live reference).
+    #[test]
+    fn block_with_nested_insert_bakes_child_geometry() {
+        // LEAF = one line 0,0→1,0. TREE contains a nested INSERT of LEAF at
+        // (10,0) with scale 1, rotation 0 → the baked line lands at 10,0→11,0.
+        let text = "0\nSECTION\n2\nBLOCKS\n\
+            0\nBLOCK\n2\nLEAF\n10\n0\n20\n0\n30\n0\n\
+            0\nLINE\n8\n0\n10\n0\n20\n0\n11\n1\n21\n0\n\
+            0\nENDBLK\n\
+            0\nBLOCK\n2\nTREE\n10\n0\n20\n0\n30\n0\n\
+            0\nINSERT\n2\nLEAF\n10\n10\n20\n0\n\
+            0\nENDBLK\n0\nENDSEC\n\
+            0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nTREE\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        let tree = parsed
+            .entities
+            .iter()
+            .find_map(|(_, c)| match c {
+                Command::BlockDefine { name, geometries, .. } if name == "TREE" => {
+                    geometries.clone()
+                }
+                _ => None,
+            })
+            .expect("TREE block must be defined");
+        assert_eq!(tree.len(), 1, "TREE bakes the one nested LEAF line");
+        match &tree[0] {
+            itsjustcad_doc::BlockGeometry::Curve(kernel_curve::Curve::Line { a, b }) => {
+                assert!((*a - DVec3::new(10.0, 0.0, 0.0)).length() < 1e-9, "a {a}");
+                assert!((*b - DVec3::new(11.0, 0.0, 0.0)).length() < 1e-9, "b {b}");
+            }
+            other => panic!("expected baked line, got {other:?}"),
+        }
+    }
+
+    /// A self-referential (cyclic) block must not recurse forever — the cycle
+    /// edge is skipped, the block still imports with its direct geometry.
+    #[test]
+    fn cyclic_nested_block_is_safe() {
+        let text = "0\nSECTION\n2\nBLOCKS\n\
+            0\nBLOCK\n2\nLOOP\n10\n0\n20\n0\n30\n0\n\
+            0\nLINE\n8\n0\n10\n0\n20\n0\n11\n1\n21\n0\n\
+            0\nINSERT\n2\nLOOP\n10\n0\n20\n0\n\
+            0\nENDBLK\n0\nENDSEC\n\
+            0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nLOOP\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n";
+        let parsed = parse_dxf(text).unwrap();
+        let loop_def = parsed.entities.iter().find_map(|(_, c)| match c {
+            Command::BlockDefine { name, geometries, .. } if name == "LOOP" => geometries.clone(),
+            _ => None,
+        });
+        assert!(loop_def.is_some(), "cyclic block still defines (no hang)");
+        // Only the direct line survives; the cyclic nested insert is skipped.
+        assert_eq!(loop_def.unwrap().len(), 1);
     }
 
     #[test]

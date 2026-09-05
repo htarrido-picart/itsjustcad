@@ -1184,6 +1184,16 @@ pub enum Command {
     BlockDeleteDef { name: String },
     /// List block definitions (query; never logged).
     BlocksList,
+    // -- scoped deck workdir (a user-granted import folder) --
+    /// Show the granted workdir (no arg) or grant one (`path` set). A grant is
+    /// persisted to `~/.config/itsjustcad/workdir.txt`. Query/config, never
+    /// logged (it is machine-local grant state, not document geometry).
+    Workdir {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// List importable files inside the granted workdir (query; never logged).
+    WorkdirFiles,
     // -- block content library (.block.json on disk) --
     /// List block names available in ~/.config/itsjustcad/blocks/ (query; never logged).
     BlockLibList,
@@ -1641,6 +1651,8 @@ impl Command {
                 | Command::CheckRulesLoad { .. }
                 | Command::RoomList
                 | Command::BlocksList
+                | Command::Workdir { .. }
+                | Command::WorkdirFiles
                 | Command::BlockLibList
                 | Command::ConstraintsList
                 | Command::Undo
