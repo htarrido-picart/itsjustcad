@@ -15,6 +15,7 @@
 
 use itsjustcad_commands::{Category, registry};
 
+use crate::i18n::t as tr;
 use crate::icons::{Icon, Icons};
 use crate::preset::MenuStyle;
 
@@ -393,13 +394,28 @@ pub struct NativeMenu {
 /// bar). Kept as a standalone fn so it is unit-testable.
 pub fn appearance_native_items() -> Vec<(&'static str, &'static str, MenuAction)> {
     vec![
-        ("theme_light", "Appearance: Light", MenuAction::SetTheme(Some(false))),
-        ("theme_dark", "Appearance: Dark", MenuAction::SetTheme(Some(true))),
-        ("theme_system", "Appearance: System", MenuAction::SetTheme(None)),
-        ("text_bigger", "Text Size: Increase", MenuAction::ZoomStep(true)),
-        ("text_smaller", "Text Size: Decrease", MenuAction::ZoomStep(false)),
-        ("text_reset", "Text Size: Reset", MenuAction::ZoomReset),
+        ("theme_light", tr("menu.theme.light"), MenuAction::SetTheme(Some(false))),
+        ("theme_dark", tr("menu.theme.dark"), MenuAction::SetTheme(Some(true))),
+        ("theme_system", tr("menu.theme.system"), MenuAction::SetTheme(None)),
+        ("text_bigger", tr("menu.theme.text_bigger"), MenuAction::ZoomStep(true)),
+        ("text_smaller", tr("menu.theme.text_smaller"), MenuAction::ZoomStep(false)),
+        ("text_reset", tr("menu.theme.text_reset"), MenuAction::ZoomReset),
     ]
+}
+
+/// Map a top-level menu's canonical English id (`"File"`, `"Edit"`, …) to its
+/// i18n key so the displayed title localizes while ids/tests stay stable.
+fn menu_title_key(id: &str) -> &'static str {
+    match id {
+        "File" => "menu.file",
+        "Edit" => "menu.edit",
+        "View" => "menu.view",
+        "Theme" => "menu.theme",
+        "LLM" => "menu.llm",
+        "Window" => "menu.window",
+        "Help" => "menu.help",
+        _ => "menu.file",
+    }
 }
 
 /// Build one leaf whose accelerator comes from [`action_shortcut`] for `action`.
@@ -434,26 +450,26 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
         let t = "File";
         #[cfg_attr(target_os = "macos", allow(unused_mut))]
         let mut items = vec![
-            wired_leaf(t, "new", "New", MenuAction::NewDocument),
-            wired_leaf(t, "new_session", "New file session", MenuAction::NewSession),
+            wired_leaf(t, "new", tr("menu.file.new"), MenuAction::NewDocument),
+            wired_leaf(t, "new_session", tr("menu.file.new_session"), MenuAction::NewSession),
             NativeItem::Separator,
             NativeItem::Leaf {
                 id: format!("{t}/open"),
-                label: "Open…".into(),
+                label: tr("menu.file.open").into(),
                 shortcut: menu_shortcut("open").map(str::to_string),
                 enabled: true,
                 action: menu_action("open"),
             },
             NativeItem::Leaf {
                 id: format!("{t}/save"),
-                label: "Save".into(),
+                label: tr("menu.file.save").into(),
                 shortcut: menu_shortcut("save").map(str::to_string),
                 enabled: true,
                 action: menu_action("save"),
             },
             NativeItem::Leaf {
                 id: format!("{t}/saveas"),
-                label: "Save As…".into(),
+                label: tr("menu.file.save_as").into(),
                 shortcut: None,
                 enabled: true,
                 // `save ` prefilled so the user supplies a path (Save As).
@@ -462,20 +478,20 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             NativeItem::Separator,
             NativeItem::Leaf {
                 id: format!("{t}/import"),
-                label: "Import…".into(),
+                label: tr("menu.file.import").into(),
                 shortcut: None,
                 enabled: true,
                 action: MenuAction::ImportDialog,
             },
             NativeItem::Leaf {
                 id: format!("{t}/export"),
-                label: "Export…".into(),
+                label: tr("menu.file.export").into(),
                 shortcut: None,
                 enabled: true,
                 action: MenuAction::ExportDialog,
             },
             NativeItem::Separator,
-            wired_leaf(t, "settings", "Settings…", MenuAction::ModelSetup),
+            wired_leaf(t, "settings", tr("menu.file.settings"), MenuAction::ModelSetup),
         ];
         // macOS puts Quit in the app menu automatically; on other platforms we
         // surface it here. AppKit still offers ⌘Q regardless.
@@ -484,7 +500,7 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             items.push(NativeItem::Separator);
             items.push(NativeItem::Predefined(PredefinedKind::Quit));
         }
-        menus.push(NativeMenu { title: t.into(), items });
+        menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
     }
 
     // ── Edit ────────────────────────────────────────────────────────────────
@@ -502,8 +518,8 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             }
         };
         let items = vec![
-            wired_leaf(t, "undo", "Undo", MenuAction::Execute("undo".into())),
-            wired_leaf(t, "redo", "Redo", MenuAction::Execute("redo".into())),
+            wired_leaf(t, "undo", tr("menu.edit.undo"), MenuAction::Execute("undo".into())),
+            wired_leaf(t, "redo", tr("menu.edit.redo"), MenuAction::Execute("redo".into())),
             NativeItem::Separator,
             // Cut = copy-selection then delete-selection (app clipboard verbs).
             // NO ⌘X/⌘C/⌘V accelerators here: on macOS a native muda accelerator
@@ -512,35 +528,35 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             // fires object cut/copy/paste on ⌘X/⌘C/⌘V when NOT typing (it returns
             // None while a text field is focused), so text clipboard works in
             // fields and object clipboard works in the viewport — no conflict.
-            sel_leaf("cut", "Cut", MenuAction::Execute("cut".into()), None),
-            sel_leaf("copy", "Copy", MenuAction::Execute("copyselection".into()), None),
+            sel_leaf("cut", tr("menu.edit.cut"), MenuAction::Execute("cut".into()), None),
+            sel_leaf("copy", tr("menu.edit.copy"), MenuAction::Execute("copyselection".into()), None),
             NativeItem::Leaf {
                 id: format!("{t}/paste"),
-                label: "Paste".into(),
+                label: tr("menu.edit.paste").into(),
                 shortcut: None,
                 enabled: true, // paste doesn't need a selection
                 action: MenuAction::Execute("pasteselection".into()),
             },
-            sel_leaf("delete", "Delete", MenuAction::Execute("delete sel".into()), Some("Delete")),
+            sel_leaf("delete", tr("menu.edit.delete"), MenuAction::Execute("delete sel".into()), Some("Delete")),
             NativeItem::Separator,
             NativeItem::Leaf {
                 id: format!("{t}/selectall"),
-                label: "Select All".into(),
+                label: tr("menu.edit.select_all").into(),
                 shortcut: menu_shortcut("select all").map(str::to_string),
                 enabled: true,
                 action: MenuAction::Execute("select all".into()),
             },
-            sel_leaf("deselect", "Deselect", MenuAction::Execute("selectnone".into()), None),
+            sel_leaf("deselect", tr("menu.edit.deselect"), MenuAction::Execute("selectnone".into()), None),
             NativeItem::Separator,
             NativeItem::Leaf {
                 id: format!("{t}/history"),
-                label: "Edit history…".into(),
+                label: tr("menu.edit.history").into(),
                 shortcut: None,
                 enabled: true,
                 action: MenuAction::EditHistory,
             },
         ];
-        menus.push(NativeMenu { title: t.into(), items });
+        menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
     }
 
     // ── View ─────────────────────────────────────────────────────────────────
@@ -568,52 +584,52 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
         // Panel visibility is a stateful flip, not a fire-and-forget verb.
         let panel_item = NativeItem::Leaf {
             id: format!("{t}/panel"),
-            label: if view.panel_visible { "Hide Panel".into() } else { "Show Panel".into() },
+            label: if view.panel_visible { tr("menu.view.hide_panel").into() } else { tr("menu.view.show_panel").into() },
             shortcut: action_shortcut(&MenuAction::TogglePanel).map(str::to_string),
             enabled: true,
             action: MenuAction::TogglePanel,
         };
         let items = vec![
             // Command palette is the primary discoverability surface.
-            wired_leaf(t, "palette", "Command Palette…", MenuAction::CommandPalette),
+            wired_leaf(t, "palette", tr("menu.view.palette"), MenuAction::CommandPalette),
             NativeItem::Separator,
             // Panel visibility as a stateful "Hide Panel" ⇄ "Show Panel" flip.
             panel_item,
             NativeItem::Separator,
             // Display modes — radio: the active one carries a check.
-            radio("disp_shaded", "Display: Shaded", "display shaded", view.display == Some(DisplayModeTag::Shaded)),
-            radio("disp_wire", "Display: Wireframe", "display wireframe", view.display == Some(DisplayModeTag::Wireframe)),
-            radio("disp_xray", "Display: X-ray", "display xray", view.display == Some(DisplayModeTag::XRay)),
-            radio("disp_pencil", "Display: Pencil", "display pencil", view.display == Some(DisplayModeTag::Pencil)),
+            radio("disp_shaded", tr("menu.view.disp_shaded"), "display shaded", view.display == Some(DisplayModeTag::Shaded)),
+            radio("disp_wire", tr("menu.view.disp_wire"), "display wireframe", view.display == Some(DisplayModeTag::Wireframe)),
+            radio("disp_xray", tr("menu.view.disp_xray"), "display xray", view.display == Some(DisplayModeTag::XRay)),
+            radio("disp_pencil", tr("menu.view.disp_pencil"), "display pencil", view.display == Some(DisplayModeTag::Pencil)),
             NativeItem::Separator,
             // Lighting modes — radio: the active one carries a check.
-            radio("light_working", "Lighting: Working", "lightmode working", view.lighting == Some(LightModeTag::Working)),
-            radio("light_sun", "Lighting: Sun", "lightmode sun", view.lighting == Some(LightModeTag::Sun)),
-            radio("light_present", "Lighting: Presentation", "lightmode presentation", view.lighting == Some(LightModeTag::Presentation)),
+            radio("light_working", tr("menu.view.light_working"), "lightmode working", view.lighting == Some(LightModeTag::Working)),
+            radio("light_sun", tr("menu.view.light_sun"), "lightmode sun", view.lighting == Some(LightModeTag::Sun)),
+            radio("light_present", tr("menu.view.light_present"), "lightmode presentation", view.lighting == Some(LightModeTag::Presentation)),
             NativeItem::Separator,
             // Camera projections — radio: the active one carries a check. Ortho
             // standard views (top/front/…) check nothing; the projection there
             // is implied by the view. Fires the same `camera <mode>` verbs the
             // command line and the deck use.
-            radio("cam_persp", "Camera: Perspective", "camera persp", view.camera == Some(CameraTag::Perspective)),
-            radio("cam_2point", "Camera: Two-Point", "camera 2point", view.camera == Some(CameraTag::TwoPoint)),
-            radio("cam_pano", "Camera: Panorama 360°", "camera pano", view.camera == Some(CameraTag::Panorama)),
-            radio("cam_fisheye", "Camera: Fisheye", "camera fisheye", view.camera == Some(CameraTag::Fisheye)),
+            radio("cam_persp", tr("menu.view.cam_persp"), "camera persp", view.camera == Some(CameraTag::Perspective)),
+            radio("cam_2point", tr("menu.view.cam_2point"), "camera 2point", view.camera == Some(CameraTag::TwoPoint)),
+            radio("cam_pano", tr("menu.view.cam_pano"), "camera pano", view.camera == Some(CameraTag::Panorama)),
+            radio("cam_fisheye", tr("menu.view.cam_fisheye"), "camera fisheye", view.camera == Some(CameraTag::Fisheye)),
             NativeItem::Separator,
             // Viewport layout.
-            ex("vp1", "Viewports: 1", "viewports 1"),
-            ex("vp2", "Viewports: 2", "viewports 2"),
-            ex("vp4", "Viewports: 4", "viewports 4"),
+            ex("vp1", tr("menu.view.vp1"), "viewports 1"),
+            ex("vp2", tr("menu.view.vp2"), "viewports 2"),
+            ex("vp4", tr("menu.view.vp4"), "viewports 4"),
             NativeItem::Separator,
             // Standard views.
-            ex("v_top", "Top", "top"),
-            ex("v_front", "Front", "front"),
-            ex("v_right", "Right", "right"),
-            ex("v_persp", "Perspective", "persp"),
+            ex("v_top", tr("menu.view.top"), "top"),
+            ex("v_front", tr("menu.view.front"), "front"),
+            ex("v_right", tr("menu.view.right"), "right"),
+            ex("v_persp", tr("menu.view.persp"), "persp"),
             NativeItem::Separator,
-            ex("ze", "Zoom Extents", "ze"),
+            ex("ze", tr("menu.view.zoom_extents"), "ze"),
         ];
-        menus.push(NativeMenu { title: t.into(), items });
+        menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
     }
 
     // ── Theme ─────────────────────────────────────────────────────────────────
@@ -631,7 +647,7 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             }
             items.push(wired_leaf(t, id, label, action));
         }
-        menus.push(NativeMenu { title: t.into(), items });
+        menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
     }
 
     // ── LLM ─────────────────────────────────────────────────────────────────────
@@ -642,17 +658,17 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
     {
         let t = "LLM";
         let items = vec![
-            wired_leaf(t, "model_setup", "Model Setup…", MenuAction::ModelSetup),
+            wired_leaf(t, "model_setup", tr("menu.llm.model_setup"), MenuAction::ModelSetup),
             NativeItem::Leaf {
                 id: format!("{t}/reveal_models"),
-                label: "Reveal Models Folder…".into(),
+                label: tr("menu.llm.reveal_models").into(),
                 shortcut: None,
                 enabled: true,
                 action: MenuAction::RevealModelsFolder,
             },
             NativeItem::Leaf {
                 id: format!("{t}/download_default"),
-                label: "Download Default Model".into(),
+                label: tr("menu.llm.download_default").into(),
                 shortcut: None,
                 enabled: true,
                 action: MenuAction::DownloadDefaultModel,
@@ -660,27 +676,27 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             NativeItem::Separator,
             NativeItem::Check {
                 id: format!("{t}/local_only"),
-                label: "Local Only".into(),
+                label: tr("menu.llm.local_only").into(),
                 action: MenuAction::ToggleLocalOnly,
                 checked: false, // synced live by the app
                 enabled: true,
             },
             NativeItem::Check {
                 id: format!("{t}/web_search"),
-                label: "Allow Web Search".into(),
+                label: tr("menu.llm.web_search").into(),
                 action: MenuAction::ToggleWebSearch,
                 checked: false, // synced live by the app
                 enabled: true,
             },
             NativeItem::Check {
                 id: format!("{t}/terse"),
-                label: "Terse Replies".into(),
+                label: tr("menu.llm.terse").into(),
                 action: MenuAction::ToggleTerse,
                 checked: false, // synced live by the app
                 enabled: true,
             },
         ];
-        menus.push(NativeMenu { title: t.into(), items });
+        menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
     }
 
     // ── Window (macOS) ────────────────────────────────────────────────────────
@@ -688,7 +704,7 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
     // Screen. No MenuAction — AppKit implements them.
     #[cfg(target_os = "macos")]
     menus.push(NativeMenu {
-        title: "Window".to_string(),
+        title: tr("menu.window").to_string(),
         items: vec![
             NativeItem::Predefined(PredefinedKind::Minimize),
             NativeItem::Predefined(PredefinedKind::Zoom),
@@ -702,18 +718,18 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
     // ── Help ───────────────────────────────────────────────────────────────────
     // Docs, Command reference, About.
     menus.push(NativeMenu {
-        title: "Help".to_string(),
+        title: tr("menu.help").to_string(),
         items: vec![
             NativeItem::Leaf {
                 id: "Help/docs".into(),
-                label: "Docs".into(),
+                label: tr("menu.help.docs").into(),
                 action: MenuAction::Insert("help ".into()),
                 shortcut: None,
                 enabled: true,
             },
             NativeItem::Leaf {
                 id: "Help/reference".into(),
-                label: "Command reference".into(),
+                label: tr("menu.help.reference").into(),
                 action: MenuAction::Help,
                 shortcut: None,
                 enabled: true,
@@ -721,7 +737,7 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             NativeItem::Separator,
             NativeItem::Leaf {
                 id: "Help/palette".into(),
-                label: "Command Palette…".into(),
+                label: tr("menu.help.palette").into(),
                 action: MenuAction::CommandPalette,
                 shortcut: action_shortcut(&MenuAction::CommandPalette).map(str::to_string),
                 enabled: true,
@@ -729,7 +745,7 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             NativeItem::Separator,
             NativeItem::Leaf {
                 id: "Help/about".into(),
-                label: "About ItsJustCAD".into(),
+                label: tr("menu.help.about").into(),
                 action: MenuAction::About,
                 shortcut: None,
                 enabled: true,
@@ -751,25 +767,27 @@ pub fn verbs_in(cats: &[Category]) -> Vec<&'static str> {
         .collect()
 }
 
-/// A Lucide [`Icon`] for a menu leaf, chosen by its label / id so the in-window
-/// bar keeps a scannable icon column. Falls back to a neutral mark.
-fn leaf_icon(id: &str, label: &str) -> Icon {
-    match label {
-        "New" => return Icon::New,
-        "New file session" => return Icon::NewSession,
-        "Open…" => return Icon::Open,
-        "Save" | "Save As…" => return Icon::Save,
-        "Import…" => return Icon::Import,
-        "Export…" => return Icon::Export,
-        "Settings…" => return Icon::Model,
-        "Undo" => return Icon::Undo,
-        "Redo" => return Icon::Redo,
-        "Edit history…" => return Icon::History,
-        "Command reference" | "Docs" => return Icon::Help,
-        "About ItsJustCAD" => return Icon::About,
+/// A Lucide [`Icon`] for a menu leaf, chosen by its stable `id` so the in-window
+/// bar keeps a scannable icon column regardless of the active UI language (the
+/// label is localized; the id is not). Falls back to a neutral mark.
+fn leaf_icon(id: &str, _label: &str) -> Icon {
+    let suffix = id.rsplit('/').next().unwrap_or("");
+    match suffix {
+        "new" => return Icon::New,
+        "new_session" => return Icon::NewSession,
+        "open" => return Icon::Open,
+        "save" | "saveas" => return Icon::Save,
+        "import" => return Icon::Import,
+        "export" => return Icon::Export,
+        "settings" => return Icon::Model,
+        "undo" => return Icon::Undo,
+        "redo" => return Icon::Redo,
+        "history" => return Icon::History,
+        "reference" | "docs" => return Icon::Help,
+        "about" => return Icon::About,
         _ => {}
     }
-    verb_icon(id.rsplit('/').next().unwrap_or(""))
+    verb_icon(suffix)
 }
 
 /// Draw the minimal menu bar in-window (fallback when no native OS bar). Renders
@@ -990,21 +1008,23 @@ mod tests {
 
     #[test]
     fn menu_bar_top_titles() {
-        // The geometry-free top titles are the documented contract.
+        // The geometry-free top titles are the documented contract. Displayed
+        // titles are localized; assert against the active-locale catalog values
+        // (via `tr`) so the test is language-independent.
         assert_eq!(TOP_TITLES, ["File", "Edit", "View", "Theme", "LLM"]);
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
             let titles: Vec<String> =
                 native_model(style, true, ViewState::default()).iter().map(|m| m.title.clone()).collect();
             let mut expected = vec![
-                "File".to_string(),
-                "Edit".into(),
-                "View".into(),
-                "Theme".into(),
-                "LLM".into(),
+                tr("menu.file").to_string(),
+                tr("menu.edit").into(),
+                tr("menu.view").into(),
+                tr("menu.theme").into(),
+                tr("menu.llm").into(),
             ];
             #[cfg(target_os = "macos")]
-            expected.push("Window".to_string());
-            expected.push("Help".to_string());
+            expected.push(tr("menu.window").to_string());
+            expected.push(tr("menu.help").to_string());
             assert_eq!(titles, expected, "menu titles differ for {style:?}");
         }
     }
@@ -1034,46 +1054,51 @@ mod tests {
     fn file_menu_has_curated_items() {
         let file = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
-            .find(|m| m.title == "File")
+            .find(|m| m.title == tr("menu.file"))
             .unwrap();
         let ls = leaves(&[file]);
         let has = |label: &str| ls.iter().any(|(_, l, _)| l == label);
-        assert!(has("New"));
-        assert!(has("Open\u{2026}"));
-        assert!(has("Save"));
-        assert!(has("Save As\u{2026}"));
-        assert!(has("Import\u{2026}"));
-        assert!(has("Export\u{2026}"));
-        assert!(has("Settings\u{2026}"));
+        assert!(has(tr("menu.file.new")));
+        assert!(has(tr("menu.file.open")));
+        assert!(has(tr("menu.file.save")));
+        assert!(has(tr("menu.file.save_as")));
+        assert!(has(tr("menu.file.import")));
+        assert!(has(tr("menu.file.export")));
+        assert!(has(tr("menu.file.settings")));
         // Import/Export route to native dialogs.
-        assert!(ls.iter().any(|(_, l, a)| l == "Import\u{2026}" && *a == MenuAction::ImportDialog));
-        assert!(ls.iter().any(|(_, l, a)| l == "Export\u{2026}" && *a == MenuAction::ExportDialog));
+        assert!(ls.iter().any(|(_, l, a)| l == tr("menu.file.import") && *a == MenuAction::ImportDialog));
+        assert!(ls.iter().any(|(_, l, a)| l == tr("menu.file.export") && *a == MenuAction::ExportDialog));
         // Save As prefills `save ` for a path.
-        assert!(ls.iter().any(|(_, l, a)| l == "Save As\u{2026}" && *a == MenuAction::Insert("save ".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == tr("menu.file.save_as") && *a == MenuAction::Insert("save ".into())));
     }
 
     #[test]
     fn edit_menu_has_curated_items() {
         let edit = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
-            .find(|m| m.title == "Edit")
+            .find(|m| m.title == tr("menu.edit"))
             .unwrap();
         let ls = leaves(&[edit]);
-        for label in ["Undo", "Redo", "Cut", "Copy", "Paste", "Delete", "Select All", "Deselect", "Edit history\u{2026}"] {
+        for key in [
+            "menu.edit.undo", "menu.edit.redo", "menu.edit.cut", "menu.edit.copy",
+            "menu.edit.paste", "menu.edit.delete", "menu.edit.select_all",
+            "menu.edit.deselect", "menu.edit.history",
+        ] {
+            let label = tr(key);
             assert!(ls.iter().any(|(_, l, _)| l == label), "Edit missing {label}");
         }
-        assert!(ls.iter().any(|(_, l, a)| l == "Undo" && *a == MenuAction::Execute("undo".into())));
-        assert!(ls.iter().any(|(_, l, a)| l == "Copy" && *a == MenuAction::Execute("copyselection".into())));
-        assert!(ls.iter().any(|(_, l, a)| l == "Paste" && *a == MenuAction::Execute("pasteselection".into())));
-        assert!(ls.iter().any(|(_, l, a)| l == "Delete" && *a == MenuAction::Execute("delete sel".into())));
-        assert!(ls.iter().any(|(_, l, a)| l == "Select All" && *a == MenuAction::Execute("select all".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == tr("menu.edit.undo") && *a == MenuAction::Execute("undo".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == tr("menu.edit.copy") && *a == MenuAction::Execute("copyselection".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == tr("menu.edit.paste") && *a == MenuAction::Execute("pasteselection".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == tr("menu.edit.delete") && *a == MenuAction::Execute("delete sel".into())));
+        assert!(ls.iter().any(|(_, l, a)| l == tr("menu.edit.select_all") && *a == MenuAction::Execute("select all".into())));
     }
 
     #[test]
     fn view_menu_has_display_lighting_viewports_views_and_palette() {
         let view = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
-            .find(|m| m.title == "View")
+            .find(|m| m.title == tr("menu.view"))
             .unwrap();
         let ls = leaves(&[view]);
         let by_action = |a: &MenuAction| ls.iter().any(|(_, _, act)| act == a);
@@ -1092,7 +1117,7 @@ mod tests {
     fn llm_menu_has_setup_reveal_download_and_toggles() {
         let llm = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
-            .find(|m| m.title == "LLM")
+            .find(|m| m.title == tr("menu.llm"))
             .expect("LLM menu present at top level");
         // Leaves: Model Setup, Reveal Models Folder, Download Default Model.
         let ls = leaves(&[llm.clone()]);
@@ -1128,7 +1153,7 @@ mod tests {
     fn theme_menu_has_appearance_and_text_size() {
         let theme = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
-            .find(|m| m.title == "Theme")
+            .find(|m| m.title == tr("menu.theme"))
             .expect("Theme menu present at top level");
         let ls = leaves(&[theme]);
         let by_action = |a: &MenuAction| ls.iter().any(|(_, _, act)| act == a);
@@ -1146,13 +1171,13 @@ mod tests {
     fn help_menu_has_docs_reference_palette_about() {
         let help = native_model(MenuStyle::AutoCAD, true, ViewState::default())
             .into_iter()
-            .find(|m| m.title == "Help")
+            .find(|m| m.title == tr("menu.help"))
             .unwrap();
         let ls = leaves(&[help]);
-        assert!(ls.iter().any(|(_, l, _)| l == "Docs"));
-        assert!(ls.iter().any(|(_, l, a)| l == "Command reference" && *a == MenuAction::Help));
+        assert!(ls.iter().any(|(_, l, _)| l == tr("menu.help.docs")));
+        assert!(ls.iter().any(|(_, l, a)| l == tr("menu.help.reference") && *a == MenuAction::Help));
         assert!(ls.iter().any(|(_, _, a)| *a == MenuAction::CommandPalette));
-        assert!(ls.iter().any(|(_, l, a)| l == "About ItsJustCAD" && *a == MenuAction::About));
+        assert!(ls.iter().any(|(_, l, a)| l == tr("menu.help.about") && *a == MenuAction::About));
     }
 
     #[test]
@@ -1244,7 +1269,7 @@ mod tests {
     fn view_check(view: ViewState, id: &str) -> Option<bool> {
         native_model(MenuStyle::Rhino, true, view)
             .into_iter()
-            .find(|m| m.title == "View")?
+            .find(|m| m.title == tr("menu.view"))?
             .items
             .iter()
             .find_map(|it| match it {
@@ -1295,7 +1320,7 @@ mod tests {
         // command line / deck use, so the menu stays a thin stateful skin.
         let view = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
-            .find(|m| m.title == "View")
+            .find(|m| m.title == tr("menu.view"))
             .unwrap();
         let action_of = |id: &str| -> Option<MenuAction> {
             view.items.iter().find_map(|it| match it {
@@ -1317,7 +1342,7 @@ mod tests {
         let panel_of = |view: ViewState| -> (String, Option<String>) {
             native_model(MenuStyle::Rhino, true, view)
                 .into_iter()
-                .find(|m| m.title == "View")
+                .find(|m| m.title == tr("menu.view"))
                 .unwrap()
                 .items
                 .iter()
@@ -1333,10 +1358,10 @@ mod tests {
                 .expect("View/panel present")
         };
         let (shown, sc) = panel_of(ViewState { panel_visible: true, ..Default::default() });
-        assert_eq!(shown, "Hide Panel");
+        assert_eq!(shown, tr("menu.view.hide_panel"));
         assert_eq!(sc, Some("Cmd+\\".to_string()));
         let (hidden, _) = panel_of(ViewState { panel_visible: false, ..Default::default() });
-        assert_eq!(hidden, "Show Panel");
+        assert_eq!(hidden, tr("menu.view.show_panel"));
     }
 
     #[test]
@@ -1354,7 +1379,7 @@ mod tests {
     fn window_menu_present_with_standard_items() {
         let win = native_model(MenuStyle::Rhino, false, ViewState::default())
             .into_iter()
-            .find(|m| m.title == "Window")
+            .find(|m| m.title == tr("menu.window"))
             .expect("Window menu present");
         let kinds: Vec<PredefinedKind> = win
             .items
@@ -1381,10 +1406,10 @@ mod tests {
         assert_eq!(menu_shortcut("line"), None);
         let file = native_model(MenuStyle::Rhino, true, ViewState::default())
             .into_iter()
-            .find(|m| m.title == "File")
+            .find(|m| m.title == tr("menu.file"))
             .unwrap();
         let save = file.items.iter().find_map(|it| match it {
-            NativeItem::Leaf { label, shortcut, .. } if label == "Save" => Some(shortcut.clone()),
+            NativeItem::Leaf { label, shortcut, .. } if *label == tr("menu.file.save") => Some(shortcut.clone()),
             _ => None,
         });
         assert_eq!(save, Some(Some("Cmd+S".to_string())));
