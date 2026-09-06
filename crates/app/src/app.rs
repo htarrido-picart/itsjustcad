@@ -664,6 +664,11 @@ impl App {
         // One-time prefs carry-over from the old product name.
         migrate_legacy_config();
 
+        // Restore the UI language before any string is rendered. Persisted choice
+        // wins; otherwise fall back to English (the default) — a system-locale
+        // guess is intentionally NOT made here to keep first-run deterministic.
+        crate::i18n::set_lang(load_lang());
+
         let rs = cc
             .wgpu_render_state
             .as_ref()
@@ -1254,6 +1259,23 @@ impl App {
                     self.sketchy.depthcue,
                     self.sketchy.endpoints,
                 ));
+            }
+            // Set the UI language (`language en|es` / `lang es`). Applies live
+            // and persists to ui.json. View/session state, never logged.
+            Some("language" | "lang") => {
+                match words.next().and_then(crate::i18n::Lang::from_code) {
+                    Some(lang) => {
+                        save_lang(lang);
+                        self.command_line.push_line(format!(
+                            "language: {} ({})",
+                            lang.native_name(),
+                            lang.code()
+                        ));
+                    }
+                    None => {
+                        self.command_line.push_line("usage: language en|es");
+                    }
+                }
             }
             // Toggle Reduce Motion: disables animated progress bars.
             // View/session state, never logged; persisted to ui.json.
@@ -4955,6 +4977,27 @@ impl App {
                 );
                 ui.separator();
 
+                // Interface language. Applies live and persists to ui.json. A
+                // combo box so the choice is discoverable outside the command
+                // line (`language en|es`).
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(crate::i18n::t("settings.language.label")).strong());
+                    let mut lang = crate::i18n::current_lang();
+                    egui::ComboBox::from_id_salt("settings_language")
+                        .selected_text(lang.native_name())
+                        .show_ui(ui, |ui| {
+                            for l in [crate::i18n::Lang::En, crate::i18n::Lang::Es] {
+                                ui.selectable_value(&mut lang, l, l.native_name());
+                            }
+                        });
+                    if lang != crate::i18n::current_lang() {
+                        save_lang(lang);
+                    }
+                })
+                .response
+                .on_hover_text(crate::i18n::t("settings.language.help"));
+                ui.separator();
+
                 // The one live download (if any), shown at the top.
                 let active_state = self
                     .active_download
@@ -5472,6 +5515,25 @@ fn load_gumball_visible() -> Option<bool> {
 fn save_gumball_visible(visible: bool) {
     let mut v = load_ui_json();
     v["show_gumball"] = serde_json::json!(visible);
+    save_ui_json(&v);
+}
+
+/// Restore the persisted UI language from `ui.json` (`"language": "en"|"es"`).
+/// Defaults to English when the key is absent or unrecognized. UI state, never
+/// part of the op-log.
+fn load_lang() -> crate::i18n::Lang {
+    load_ui_json()["language"]
+        .as_str()
+        .and_then(crate::i18n::Lang::from_code)
+        .unwrap_or(crate::i18n::Lang::En)
+}
+
+/// Persist the UI language choice to `ui.json` and apply it live for subsequent
+/// `t()` lookups.
+fn save_lang(lang: crate::i18n::Lang) {
+    crate::i18n::set_lang(lang);
+    let mut v = load_ui_json();
+    v["language"] = serde_json::json!(lang.code());
     save_ui_json(&v);
 }
 
@@ -6197,7 +6259,7 @@ impl eframe::App for App {
                             ),
                         );
                         ui.add_space(crate::theme::Spacing::M);
-                        if ui.button("Close").clicked() {
+                        if ui.button(crate::i18n::t("about.close")).clicked() {
                             self.show_about = false;
                         }
                     });

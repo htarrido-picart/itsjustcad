@@ -69,6 +69,11 @@ pub enum AppVerb {
     /// disabled setting writes new saves in plaintext (existing encrypted stores
     /// still load and re-save in the chosen mode).
     ChatEncryption(Option<bool>),
+    /// Set the UI language (`language en|es` / `lang es`). Carries the parsed
+    /// [`crate::i18n::Lang`]; persisted to ui.json and applied live. A bare
+    /// `language` with no/unknown argument is rejected by `classify` (returns
+    /// `None`) so the command line reports an error rather than silently no-op.
+    Language(crate::i18n::Lang),
     /// Persist the document (`save [path]`). Argument is the optional path.
     Save(Option<String>),
     /// Command reference (`help [verb]`).
@@ -217,6 +222,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             None => None,
             _ => return None,
         }),
+        "language" | "lang" => AppVerb::Language(crate::i18n::Lang::from_code(words.next()?)?),
         "camera" => AppVerb::Camera(
             words.next().map(str::to_ascii_lowercase),
             words.next().map(str::to_ascii_lowercase),
@@ -255,6 +261,17 @@ mod tests {
             classify("camera fisheye 120"),
             Some(AppVerb::Camera(Some("fisheye".into()), Some("120".into())))
         );
+    }
+
+    #[test]
+    fn classifies_language_verb() {
+        use crate::i18n::Lang;
+        assert_eq!(classify("language en"), Some(AppVerb::Language(Lang::En)));
+        assert_eq!(classify("language es"), Some(AppVerb::Language(Lang::Es)));
+        assert_eq!(classify("lang es-CO"), Some(AppVerb::Language(Lang::Es)));
+        // Bare or unknown argument is not an app verb (falls through → error).
+        assert_eq!(classify("language"), None);
+        assert_eq!(classify("language fr"), None);
     }
 
     #[test]
