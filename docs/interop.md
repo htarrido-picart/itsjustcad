@@ -12,6 +12,8 @@ import <path>
 
 Format is detected by file extension.
 
+**Import warnings.** An import that finishes but drops entities the parser can't map (unsupported types, malformed records), or whose DWG conversion produced LibreDWG soft warnings, completes with a **warning state** rather than a plain success: the GUI shows a ⚠ "Imported with warnings" popup listing the imported/skipped counts and any converter-warning lines, and the headless runner echoes the same summary to stderr (`warning: imported <path> with problems — N imported, M skipped`). A fully clean import shows the green "✔ Imported" success popup. This surfaces the difference between a perfect import and a lossy one — e.g. a big AutoCAD-2013 ADT DWG that LibreDWG converts with thousands of soft AEC/proxy errors — instead of an unconditional success tick.
+
 ### DWG (assisted, via LibreDWG)
 
 DWG import is **assisted**: `import site.dwg` auto-detects a user-installed `dwg2dxf` (LibreDWG) binary — probing the well-known install dirs (`/usr/local/bin`, `/opt/homebrew/bin`, `/usr/bin`, `~/.local/bin`) then `PATH`, the same way the app resolves the LLM CLIs — and converts the referenced file to a temporary DXF, which is then fed through the DXF importer above.
@@ -19,6 +21,7 @@ DWG import is **assisted**: `import site.dwg` auto-detects a user-installed `dwg
 - **License-clean.** LibreDWG is GPLv3, so ItsJustCAD **detects and shells out to** a user-installed binary; it does **not** bundle, link, or depend on it. Same detect-don't-ship stance as the LLM CLIs, keeping the AGPLv3 app's distribution clean.
 - **No shell, fixed arguments.** The converter is invoked with a fixed argument vector (`dwg2dxf -o <tmp>.dxf <input>`) against the one referenced file — no shell string, no interpolation, no model-controlled flags. The temp file is cleaned up on every path.
 - **Truncation is caught.** LibreDWG can exit 0 while silently dropping the drawing (older versions cannot read AutoCAD-2013 Architectural-Desktop DWGs). ItsJustCAD does **not** trust the exit code: the converted DXF must contain both an `ENTITIES` section and an `EOF` marker, otherwise the import fails with *"DWG conversion incomplete (converter too old or unsupported DWG — try a newer LibreDWG/ODA)"* — never a silent empty import.
+- **Soft warnings are surfaced, not swallowed.** LibreDWG can exit 0 with a complete DXF while still logging thousands of soft `ERROR`/`warning` lines for imperfect AEC/proxy geometry (the 000-BG.dwg ADT case: complete output, 2694 warnings). Those do **not** fail the import — the drawing loads — but the converter's warning count is counted and surfaced in the import warning state (⚠ popup / headless stderr), so the user knows the result may be imperfect.
 - **Missing converter** produces a clear *"install LibreDWG to import DWG (`brew install libredwg`)"* message.
 
 Note: the assisted path is only as capable as the installed converter. For complex/ADT DWGs you need a recent LibreDWG or an ODA-based converter.

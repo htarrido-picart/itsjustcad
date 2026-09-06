@@ -112,8 +112,56 @@ fn dxf_has_pair(dxf: &str, code: i32, value: &str) -> bool {
     false
 }
 
+/// A successful conversion plus any SOFT warnings LibreDWG reported on stderr.
+///
+/// LibreDWG exits 0 and produces a COMPLETE DXF (ENTITIES + EOF) while still
+/// logging thousands of `ERROR`/warning lines for AEC proxy classes and other
+/// imperfect geometry (the 000-BG.dwg ADT finding: 2694 errors, valid output).
+/// Those are not hard failures — the drawing imports — but the user must be told
+/// the result may be imperfect. So we return the DXF text alongside a
+/// human-readable warning summary (empty when the converter was silent).
+#[derive(Debug, Clone)]
+pub struct Converted {
+    /// The complete, validated DXF text ready for the importer.
+    pub dxf: String,
+    /// Soft-warning lines to surface (e.g. "LibreDWG reported N warnings…").
+    /// Empty ⇒ a clean conversion with nothing to warn about.
+    pub warnings: Vec<String>,
+}
+
+/// Count the ERROR/warning lines LibreDWG emitted on stderr. Pure so the
+/// stderr-parse rule is unit-testable without spawning a converter.
+///
+/// LibreDWG prefixes real problems with `ERROR` (uppercase) and lesser notes
+/// with `Warning`/`warning`; we count any line mentioning either. Case- and
+/// leading-whitespace-insensitive; blank lines never count.
+pub fn count_libredwg_warnings(stderr: &str) -> usize {
+    stderr
+        .lines()
+        .filter(|line| {
+            let l = line.to_ascii_lowercase();
+            l.contains("error") || l.contains("warning")
+        })
+        .count()
+}
+
+/// Build the soft-warning summary lines for a successful conversion given the
+/// converter's stderr. Pure + tested. Returns an empty vec when the converter
+/// was silent (a clean conversion), else a single count line the popup shows.
+pub fn conversion_warnings(stderr: &str) -> Vec<String> {
+    let n = count_libredwg_warnings(stderr);
+    if n == 0 {
+        Vec::new()
+    } else {
+        vec![format!(
+            "LibreDWG reported {n} warning(s); some entities may be imperfect."
+        )]
+    }
+}
+
 /// Convert `input` (a `.dwg` path) to DXF text via a resolved `dwg2dxf` binary,
-/// validating the result is complete before returning it.
+/// validating the result is complete before returning it, and capturing any
+/// soft warnings the converter logged (see [`Converted`]).
 ///
 /// SECURITY: the argument vector is FIXED — `dwg2dxf -o <tmp>.dxf <input>` — with
 /// no shell, no string interpolation, and no caller-controlled flags. Only the
@@ -123,7 +171,9 @@ fn dxf_has_pair(dxf: &str, code: i32, value: &str) -> bool {
 /// - Absent `dwg2dxf` → clear "install LibreDWG" error.
 /// - Converter exits non-zero → surfaces its stderr.
 /// - Converter exits 0 but the DXF is truncated → the truncation error.
-pub fn convert_dwg_to_dxf(input: &str) -> Result<String, String> {
+/// - Converter exits 0 with a complete DXF but noisy stderr → success WITH
+///   warnings (never a failure).
+pub fn convert_dwg_to_dxf(input: &str) -> Result<Converted, String> {
     let bin = resolve_dwg2dxf().ok_or_else(|| {
         "install LibreDWG to import DWG (brew install libredwg)".to_string()
     })?;
@@ -132,7 +182,7 @@ pub fn convert_dwg_to_dxf(input: &str) -> Result<String, String> {
 
 /// Core conversion against an explicit converter binary — lets a test inject a
 /// stub `dwg2dxf` that writes a known (valid or truncated) DXF.
-pub fn convert_dwg_to_dxf_with(bin: &Path, input: &str) -> Result<String, String> {
+pub fn convert_dwg_to_dxf_with(bin: &Path, input: &str) -> Result<Converted, String> {
     if !Path::new(input).is_file() {
         return Err(format!("cannot read DWG '{input}' (no such file)"));
     }
@@ -163,6 +213,9 @@ pub fn convert_dwg_to_dxf_with(bin: &Path, input: &str) -> Result<String, String
                 stderr.trim()
             ));
         }
+        // Exit 0 — but LibreDWG still logs soft warnings/errors for imperfect
+        // AEC/proxy geometry. Capture them; they do NOT fail the import.
+        let warnings = conversion_warnings(&String::from_utf8_lossy(&output.stderr));
         // Even on exit 0 the file may be missing or truncated — read then verify.
         //
         // Read as BYTES, not `read_to_string`: a real AutoCAD DWG carries binary
@@ -181,7 +234,7 @@ pub fn convert_dwg_to_dxf_with(bin: &Path, input: &str) -> Result<String, String
         })?;
         let dxf = String::from_utf8_lossy(&bytes).into_owned();
         validate_dxf_complete(&dxf)?;
-        Ok(dxf)
+        Ok(Converted { dxf, warnings })
     })();
 
     // Clean up the temp dir on EVERY path (success or error).
@@ -336,10 +389,59 @@ mod tests {
         make_executable(&stub);
         let input = dir.join("model.dwg");
         fs::write(&input, b"DWG-fake").unwrap();
-        let dxf = convert_dwg_to_dxf_with(&stub, input.to_str().unwrap()).unwrap();
-        assert!(dxf.contains("ENTITIES"), "{dxf}");
-        assert!(dxf.contains("LINE"), "{dxf}");
+        let got = convert_dwg_to_dxf_with(&stub, input.to_str().unwrap()).unwrap();
+        assert!(got.dxf.contains("ENTITIES"), "{}", got.dxf);
+        assert!(got.dxf.contains("LINE"), "{}", got.dxf);
+        // A silent converter (no stderr) → no soft warnings.
+        assert!(got.warnings.is_empty(), "{:?}", got.warnings);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stub that writes a COMPLETE DXF but emits LibreDWG-style ERROR lines on
+    /// stderr (the 000-BG.dwg shape: exit 0, valid drawing, noisy stderr). The
+    /// conversion must SUCCEED and carry a populated warning summary — never fail.
+    #[cfg(unix)]
+    #[test]
+    fn convert_with_stub_emitting_stderr_warnings_succeeds_with_warnings() {
+        let dir = tmp("stubwarn");
+        let stub = dir.join("dwg2dxf");
+        fs::write(
+            &stub,
+            b"#!/bin/sh\n\
+              printf 'ERROR: bad AEC proxy\\nERROR: unstable class\\nWarning: skipped\\n' 1>&2\n\
+              printf '0\\nSECTION\\n2\\nENTITIES\\n0\\nLINE\\n8\\n0\\n\
+              10\\n0\\n20\\n0\\n11\\n5\\n21\\n1\\n0\\nENDSEC\\n0\\nEOF\\n' > \"$2\"\n",
+        )
+        .unwrap();
+        make_executable(&stub);
+        let input = dir.join("adt.dwg");
+        fs::write(&input, b"DWG-fake").unwrap();
+        let got = convert_dwg_to_dxf_with(&stub, input.to_str().unwrap())
+            .expect("noisy-but-complete conversion must succeed, not fail");
+        assert!(got.dxf.contains("ENTITIES"), "{}", got.dxf);
+        assert_eq!(got.warnings.len(), 1, "{:?}", got.warnings);
+        assert!(got.warnings[0].contains('3'), "{:?}", got.warnings); // 3 lines
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn counts_error_and_warning_lines() {
+        let stderr = "ERROR: a\nfine line\nWarning: b\nWARNING C\nokay\nerror: d\n";
+        assert_eq!(count_libredwg_warnings(stderr), 4);
+        assert!(count_libredwg_warnings("").eq(&0));
+    }
+
+    #[test]
+    fn conversion_warnings_empty_when_silent() {
+        assert!(conversion_warnings("").is_empty());
+        assert!(conversion_warnings("all good\nnothing here\n").is_empty());
+    }
+
+    #[test]
+    fn conversion_warnings_summarize_count() {
+        let w = conversion_warnings("ERROR: x\nERROR: y\n");
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains('2') && w[0].contains("warning"), "{:?}", w);
     }
 
     /// A stub that writes a TRUNCATED DXF (no ENTITIES, no EOF) but exits 0 —
@@ -383,10 +485,10 @@ mod tests {
         make_executable(&stub);
         let input = dir.join("binary.dwg");
         fs::write(&input, b"DWG-fake").unwrap();
-        let dxf = convert_dwg_to_dxf_with(&stub, input.to_str().unwrap())
+        let got = convert_dwg_to_dxf_with(&stub, input.to_str().unwrap())
             .expect("non-UTF-8 but complete DXF must convert, not be flagged incomplete");
-        assert!(dxf.contains("ENTITIES"), "{dxf}");
-        assert!(dxf.contains("EOF"), "{dxf}");
+        assert!(got.dxf.contains("ENTITIES"), "{}", got.dxf);
+        assert!(got.dxf.contains("EOF"), "{}", got.dxf);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -409,7 +511,7 @@ mod tests {
         // depends on the binary.
         let fixture = std::env::var("ITSJUSTCAD_DWG_FIXTURE")
             .expect("set ITSJUSTCAD_DWG_FIXTURE to a .dwg path");
-        let dxf = convert_dwg_to_dxf_with(&bin, &fixture).unwrap();
-        assert!(dxf.contains("ENTITIES"));
+        let got = convert_dwg_to_dxf_with(&bin, &fixture).unwrap();
+        assert!(got.dxf.contains("ENTITIES"));
     }
 }

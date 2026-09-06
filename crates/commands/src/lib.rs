@@ -38,7 +38,7 @@ pub use command::{
     Selector,
 };
 pub use error::{ExecError, ParseError};
-pub use exec::{ApplyOutcome, Session, MAIN_BRANCH};
+pub use exec::{ApplyOutcome, ImportSummary, Session, MAIN_BRANCH};
 pub use parse::parse;
 pub use plugin::{Plugin, PluginError, PluginParam, PluginRegistry};
 pub use registry::{registry, Category, CommandSpec, SELECTOR_HELP};

@@ -285,6 +285,37 @@ pub struct Session {
     /// off this; it is NOT part of the replayable op-log, so it never affects
     /// geometry, ids, or replay-stability.
     doc_uuid: Option<String>,
+    /// Structured outcome of the most recent `import`, stashed so the UI (and
+    /// headless tests) can render a warning popup when a conversion was noisy or
+    /// entities were skipped. Session-only state like `plugins`/`check_packs`:
+    /// NEVER part of the op-log or file format. Overwritten by each import,
+    /// cleared once the caller takes it via [`Session::take_last_import`].
+    last_import: Option<ImportSummary>,
+}
+
+/// Structured result of an import, beyond the human message. Drives the app's
+/// 3-state completion popup (clean success vs. success-with-warnings) and is
+/// cheap enough to assert on in headless tests. UI-facing + serde-free.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportSummary {
+    /// Source path imported.
+    pub path: String,
+    /// Entities successfully applied to the document.
+    pub entities_imported: usize,
+    /// Entities the parser dropped (unsupported types / malformed records).
+    pub entities_skipped: usize,
+    /// Soft-warning lines (e.g. the LibreDWG converter warning count). Empty ⇒
+    /// nothing to warn about from the converter.
+    pub warnings: Vec<String>,
+}
+
+impl ImportSummary {
+    /// True when the import completed but the user should be shown a warning
+    /// state instead of the plain success tick: some entities were skipped OR
+    /// the converter reported soft warnings. Pure — the popup-state decision.
+    pub fn has_problems(&self) -> bool {
+        self.entities_skipped > 0 || !self.warnings.is_empty()
+    }
 }
 
 /// The implicit branch every session starts on and that divergent work is
@@ -587,11 +618,19 @@ impl Default for Session {
             branches: BTreeMap::new(),
             current_branch: MAIN_BRANCH.to_string(),
             doc_uuid: None,
+            last_import: None,
         }
     }
 }
 
 impl Session {
+    /// Take the structured summary of the most recent import (if any), clearing
+    /// it. The app calls this right after running an `import` to decide whether
+    /// the completion popup shows the clean-success tick or the warning state.
+    pub fn take_last_import(&mut self) -> Option<ImportSummary> {
+        self.last_import.take()
+    }
+
     pub fn run(&mut self, cmd: Command) -> Result<ApplyOutcome, ExecError> {
         match cmd {
             Command::Undo => self.undo(),
@@ -1294,9 +1333,9 @@ impl Session {
     /// is complete (ENTITIES + EOF) before importing, because LibreDWG can exit
     /// 0 on a silently-truncated conversion. See [`crate::dwg`].
     fn import_dwg(&mut self, path: String) -> Result<ApplyOutcome, ExecError> {
-        let dxf = crate::dwg::convert_dwg_to_dxf(&path)
+        let converted = crate::dwg::convert_dwg_to_dxf(&path)
             .map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
-        let parsed = crate::dxf::parse_dxf(&dxf)
+        let parsed = crate::dxf::parse_dxf(&converted.dxf)
             .map_err(|e| ExecError::Invalid(format!("'{path}' (converted DXF): {e}")))?;
         let prev_layer = self.doc.current_layer.clone();
         let total = parsed.entities.len();
@@ -1310,10 +1349,21 @@ impl Session {
         if self.doc.current_layer != prev_layer {
             self.run(Command::Layer { name: prev_layer })?;
         }
+        self.last_import = Some(ImportSummary {
+            path: path.clone(),
+            entities_imported: total,
+            entities_skipped: parsed.skipped,
+            warnings: converted.warnings.clone(),
+        });
+        let warn_note = if converted.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", converted.warnings.join("; "))
+        };
         Ok(ApplyOutcome {
             created,
             message: format!(
-                "imported {total} entities from {path} (via dwg2dxf, {} skipped) — one logged op each",
+                "imported {total} entities from {path} (via dwg2dxf, {} skipped) — one logged op each{warn_note}",
                 parsed.skipped
             ),
         })
@@ -1335,6 +1385,12 @@ impl Session {
         if self.doc.current_layer != prev_layer {
             self.run(Command::Layer { name: prev_layer })?;
         }
+        self.last_import = Some(ImportSummary {
+            path: path.clone(),
+            entities_imported: total,
+            entities_skipped: parsed.skipped,
+            warnings: Vec::new(),
+        });
         Ok(ApplyOutcome {
             created,
             message: format!(
@@ -17632,6 +17688,53 @@ mod tests {
             }
         }
         assert_eq!(s.doc.len(), 0, "a failed/fake DWG import leaves nothing behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A DXF import with unsupported entity types populates the structured
+    /// [`ImportSummary`]: `entities_skipped > 0`, and (no converter involved)
+    /// `warnings` empty. Pins that the app can render the warning state.
+    #[test]
+    fn dxf_import_records_skipped_in_summary() {
+        // SPLINE + INSERT are unsupported → skipped; the LINE imports.
+        let dxf = "0\nSECTION\n2\nENTITIES\n\
+                   0\nLINE\n8\n0\n10\n0\n20\n0\n11\n5\n21\n1\n\
+                   0\nSPLINE\n8\n0\n\
+                   0\nINSERT\n8\n0\n2\nNOPE\n10\n0\n20\n0\n\
+                   0\nENDSEC\n0\nEOF\n";
+        let dir = std::env::temp_dir().join(format!("ijc_dxfsum_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("m.dxf");
+        std::fs::write(&input, dxf).unwrap();
+        let mut s = Session::default();
+        s.run(Command::Import { path: input.to_string_lossy().into_owned() })
+            .unwrap();
+        let sum = s.take_last_import().expect("import must record a summary");
+        assert!(sum.entities_skipped > 0, "{sum:?}");
+        assert!(sum.warnings.is_empty(), "{sum:?}");
+        assert!(sum.has_problems(), "skips alone must flag the warning state");
+        // Taken once → cleared.
+        assert!(s.take_last_import().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_dxf_import_summary_has_no_problems() {
+        let dxf = "0\nSECTION\n2\nENTITIES\n\
+                   0\nLINE\n8\n0\n10\n0\n20\n0\n11\n5\n21\n1\n\
+                   0\nENDSEC\n0\nEOF\n";
+        let dir = std::env::temp_dir().join(format!("ijc_dxfclean_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("m.dxf");
+        std::fs::write(&input, dxf).unwrap();
+        let mut s = Session::default();
+        s.run(Command::Import { path: input.to_string_lossy().into_owned() })
+            .unwrap();
+        let sum = s.take_last_import().unwrap();
+        assert_eq!(sum.entities_skipped, 0, "{sum:?}");
+        assert!(!sum.has_problems(), "clean import → success state");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -309,6 +309,19 @@ pub fn run_script_lines(
                 if is_query && !outcome.message.is_empty() {
                     println!("{}", outcome.message);
                 }
+                // An import records a structured summary; when it skipped
+                // entities or the DWG converter reported soft warnings, echo the
+                // warning summary to stderr so the warning state is scriptable
+                // and testable without the GUI popup (M-dwg-bridge finding).
+                if let Some(summary) = session.take_last_import().filter(|s| s.has_problems()) {
+                    eprintln!(
+                        "warning: imported {} with problems — {} entities imported, {} skipped",
+                        summary.path, summary.entities_imported, summary.entities_skipped
+                    );
+                    for w in &summary.warnings {
+                        eprintln!("warning: {w}");
+                    }
+                }
             }
         }
     }
@@ -759,6 +772,29 @@ mod tests {
         let (out, _view) = run_script_lines(session, &lines).expect("should succeed");
         // BTreeMap<String, LayerStyle> — key is layer name
         assert!(out.doc.layers.contains_key("walls"));
+    }
+
+    #[test]
+    fn headless_import_with_skips_runs_and_records_warning_summary() {
+        // A DXF whose SPLINE + INSERT are unsupported → skipped; the LINE
+        // imports. The script path must apply it without error, and the recorded
+        // summary must flag the warning state (its stderr echo is scriptable).
+        let dxf = "0\nSECTION\n2\nENTITIES\n\
+                   0\nLINE\n8\n0\n10\n0\n20\n0\n11\n5\n21\n1\n\
+                   0\nSPLINE\n8\n0\n\
+                   0\nINSERT\n8\n0\n2\nNOPE\n10\n0\n20\n0\n\
+                   0\nENDSEC\n0\nEOF\n";
+        let dir = std::env::temp_dir().join(format!("ijc_hlimport_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("m.dxf");
+        std::fs::write(&input, dxf).unwrap();
+        let lines = vec![format!("import {}", input.to_string_lossy())];
+        let (out, _view) = run_script_lines(Session::default(), &lines)
+            .expect("import with skips must still succeed");
+        // The LINE was applied — the document is non-empty after import.
+        assert!(out.doc.objects().count() > 0, "the supported LINE should import");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

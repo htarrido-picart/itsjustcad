@@ -435,8 +435,9 @@ pub struct App {
     /// A DXF import running in time-boxed batches (progress modal). `None` when
     /// no import is in flight.
     import_job: Option<ImportJob>,
-    /// Completion message from the last import, shown in a dismissable popup.
-    import_result: Option<String>,
+    /// Structured outcome of the last import, shown in a dismissable popup that
+    /// renders a clean-success tick or a warning state (see [`ImportOutcome`]).
+    import_result: Option<ImportOutcome>,
     /// Bundled catalog of downloadable local models, parsed once.
     catalog: crate::model_catalog::Catalog,
     /// The download in flight from the Model Setup panel, if any. The UI polls
@@ -517,6 +518,65 @@ impl ImportJob {
         } else {
             self.cursor as f32 / self.total as f32
         }
+    }
+}
+
+/// Structured result of a finished import, driving the completion popup. UI-only
+/// (no serde, no op-log): built from the substrate's `ImportSummary` for DWG or
+/// straight from the parser's skip count for the batched DXF path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportOutcome {
+    /// Source path (display form) for the heading.
+    pub path: String,
+    /// Entities successfully applied.
+    pub entities_imported: usize,
+    /// Entities dropped by the parser (unsupported types).
+    pub entities_skipped: usize,
+    /// Soft-warning lines to list (e.g. the LibreDWG converter warning count).
+    pub warnings: Vec<String>,
+}
+
+/// Which face the completion popup shows. Pure decision so the success-vs-warning
+/// choice is unit-tested without an egui context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportPopupState {
+    /// Clean import: everything applied, no skips, no converter warnings.
+    Success,
+    /// Import finished but with skipped entities and/or converter warnings.
+    Warning,
+}
+
+impl ImportOutcome {
+    /// The popup face for this outcome: [`ImportPopupState::Warning`] when any
+    /// entities were skipped OR the converter reported soft warnings, else
+    /// [`ImportPopupState::Success`].
+    pub(crate) fn popup_state(&self) -> ImportPopupState {
+        if self.entities_skipped > 0 || !self.warnings.is_empty() {
+            ImportPopupState::Warning
+        } else {
+            ImportPopupState::Success
+        }
+    }
+
+    /// Warning-state body lines: the counts line plus each converter warning.
+    /// Empty vec in the success state.
+    pub(crate) fn warning_lines(&self) -> Vec<String> {
+        if self.popup_state() == ImportPopupState::Success {
+            return Vec::new();
+        }
+        let mut lines = vec![format!(
+            "{} entities imported, {} skipped",
+            self.entities_imported, self.entities_skipped
+        )];
+        if self.entities_skipped > 0 {
+            lines.push(format!(
+                "{} entit{} of unsupported types were skipped",
+                self.entities_skipped,
+                if self.entities_skipped == 1 { "y" } else { "ies" }
+            ));
+        }
+        lines.extend(self.warnings.iter().cloned());
+        lines
     }
 }
 
@@ -1924,17 +1984,51 @@ impl App {
                     );
                 });
         }
-        // Completion popup — shown until the user dismisses it.
+        // Completion popup — shown until the user dismisses it. Three faces:
+        // clean success (green tick), success-with-warnings (amber ⚠ + counts),
+        // and — handled elsewhere — hard errors, which surface on the command
+        // line, never here.
         let mut dismiss = false;
-        if let Some(msg) = &self.import_result {
-            egui::Window::new("Import complete")
+        if let Some(outcome) = &self.import_result {
+            let title = match outcome.popup_state() {
+                ImportPopupState::Success => "Import complete",
+                ImportPopupState::Warning => "Imported with warnings",
+            };
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.set_min_width(300.0);
-                    ui.label(egui::RichText::new("✔ Successful import").strong());
-                    ui.label(egui::RichText::new(msg).weak());
+                    ui.set_min_width(320.0);
+                    match outcome.popup_state() {
+                        ImportPopupState::Success => {
+                            ui.label(
+                                egui::RichText::new(format!("✔ Imported {}", outcome.path))
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(0x2e, 0xa0, 0x43)),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} entities",
+                                    outcome.entities_imported
+                                ))
+                                .weak(),
+                            );
+                        }
+                        ImportPopupState::Warning => {
+                            let amber = egui::Color32::from_rgb(0xd1, 0x8b, 0x00);
+                            ui.label(
+                                egui::RichText::new("⚠ Imported with warnings")
+                                    .strong()
+                                    .color(amber),
+                            );
+                            ui.label(egui::RichText::new(&outcome.path).weak());
+                            ui.add_space(4.0);
+                            for line in outcome.warning_lines() {
+                                ui.label(egui::RichText::new(line).color(amber));
+                            }
+                        }
+                    }
                     ui.add_space(6.0);
                     if ui.button("OK").clicked() {
                         dismiss = true;
@@ -1956,10 +2050,39 @@ impl App {
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("dxf"));
         if !is_dxf {
-            self.command_line
-                .execute(&mut self.session, &format!("import {}", path.display()));
-            self.zoom_extents_all();
-            self.import_result = Some(format!("Imported {}", path.display()));
+            // Run through the substrate directly (not the string command line) so
+            // we can read back the structured import summary — DWG conversions may
+            // report soft warnings, and any importer tracks skipped entities.
+            let disp = path.display().to_string();
+            match self
+                .session
+                .run(itsjustcad_commands::Command::Import { path: disp.clone() })
+            {
+                Ok(outcome) => {
+                    self.command_line.push_line(outcome.message);
+                    self.zoom_extents_all();
+                    let summary = self.session.take_last_import();
+                    self.import_result = Some(match summary {
+                        Some(s) => ImportOutcome {
+                            path: s.path,
+                            entities_imported: s.entities_imported,
+                            entities_skipped: s.entities_skipped,
+                            warnings: s.warnings,
+                        },
+                        // Non-entity importers (e.g. mesh/terrain) don't record a
+                        // summary — treat as a clean success.
+                        None => ImportOutcome {
+                            path: disp,
+                            entities_imported: 0,
+                            entities_skipped: 0,
+                            warnings: Vec::new(),
+                        },
+                    });
+                }
+                Err(e) => self
+                    .command_line
+                    .push_line(format!("import failed: {} — {e}", disp)),
+            }
             return;
         }
         // Parse up front (fast); the slow part — one logged op per entity — is
@@ -2023,8 +2146,13 @@ impl App {
                 "Imported {} entities from {} ({} skipped).",
                 job.total, job.path, job.skipped
             );
-            self.command_line.push_line(msg.clone());
-            self.import_result = Some(msg);
+            self.command_line.push_line(msg);
+            self.import_result = Some(ImportOutcome {
+                path: job.path.clone(),
+                entities_imported: job.total,
+                entities_skipped: job.skipped,
+                warnings: Vec::new(),
+            });
             self.zoom_extents_all();
             // job dropped — import complete.
         } else {
@@ -6427,6 +6555,59 @@ mod tests {
         // Empty import is treated as complete (avoids a 0/0 progress bar).
         job.total = 0;
         assert_eq!(job.fraction(), 1.0);
+    }
+
+    #[test]
+    fn clean_import_shows_success_state() {
+        let o = ImportOutcome {
+            path: "plan.dxf".into(),
+            entities_imported: 42,
+            entities_skipped: 0,
+            warnings: Vec::new(),
+        };
+        assert_eq!(o.popup_state(), ImportPopupState::Success);
+        assert!(o.warning_lines().is_empty());
+    }
+
+    #[test]
+    fn skipped_entities_force_warning_state() {
+        let o = ImportOutcome {
+            path: "plan.dxf".into(),
+            entities_imported: 40,
+            entities_skipped: 2,
+            warnings: Vec::new(),
+        };
+        assert_eq!(o.popup_state(), ImportPopupState::Warning);
+        let lines = o.warning_lines();
+        assert!(lines.iter().any(|l| l.contains("40 entities imported, 2 skipped")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("unsupported types")), "{lines:?}");
+    }
+
+    #[test]
+    fn converter_warnings_force_warning_state_even_with_no_skips() {
+        let o = ImportOutcome {
+            path: "adt.dwg".into(),
+            entities_imported: 1000,
+            entities_skipped: 0,
+            warnings: vec!["LibreDWG reported 2694 warning(s); some entities may be imperfect.".into()],
+        };
+        assert_eq!(o.popup_state(), ImportPopupState::Warning);
+        let lines = o.warning_lines();
+        assert!(lines.iter().any(|l| l.contains("2694 warning")), "{lines:?}");
+        // No skips → no "unsupported types" line, but the counts line stays.
+        assert!(lines.iter().any(|l| l.contains("1000 entities imported, 0 skipped")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("unsupported types")), "{lines:?}");
+    }
+
+    #[test]
+    fn one_skipped_entity_uses_singular() {
+        let o = ImportOutcome {
+            path: "p.dxf".into(),
+            entities_imported: 3,
+            entities_skipped: 1,
+            warnings: Vec::new(),
+        };
+        assert!(o.warning_lines().iter().any(|l| l.contains("1 entity of")), "{:?}", o.warning_lines());
     }
 
     /// Whole-app-window previews (SwiftUI-#Preview style) rendered off-screen via
