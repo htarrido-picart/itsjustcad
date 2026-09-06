@@ -110,10 +110,8 @@ pub fn t(key: &str) -> &'static str {
     if let Some(v) = lookup(lang, key) {
         return v;
     }
-    if lang != Lang::En {
-        if let Some(v) = lookup(Lang::En, key) {
-            return v;
-        }
+    if lang != Lang::En && let Some(v) = lookup(Lang::En, key) {
+        return v;
     }
     // Unknown key: echo it back (leaked to 'static so the signature stays
     // allocation-free for callers). Interning is fine — unknown keys are a bug
@@ -148,6 +146,12 @@ fn leak_key(key: &str) -> &'static str {
 /// Locale-aware decimal separator: `.` for English, `,` for Spanish (matches
 /// Latin-American / European convention). Thousands grouping is intentionally
 /// omitted (CAD coordinate readouts read cleaner ungrouped).
+///
+/// Part of the i18n public API for number-formatting call sites (status-bar
+/// coordinate readouts, property panels). Kept `#[allow(dead_code)]` until those
+/// surfaces adopt it (the doc-crate `format_length` is the next choke point to
+/// route through here); covered by `number_formatting_is_locale_aware`.
+#[allow(dead_code)]
 pub fn decimal_sep() -> char {
     match current_lang() {
         Lang::En => '.',
@@ -157,6 +161,10 @@ pub fn decimal_sep() -> char {
 
 /// Format a number with `decimals` places using the active locale's decimal
 /// separator. e.g. `fmt_num(3.5, 2)` → `"3.50"` (en) / `"3,50"` (es).
+///
+/// Part of the i18n public API (see [`decimal_sep`]); `#[allow(dead_code)]`
+/// until numeric UI surfaces route through it.
+#[allow(dead_code)]
 pub fn fmt_num(value: f64, decimals: usize) -> String {
     let s = format!("{value:.decimals$}");
     match decimal_sep() {
