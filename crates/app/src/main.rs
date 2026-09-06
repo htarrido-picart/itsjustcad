@@ -17,6 +17,7 @@ mod filewatch;
 mod gumball;
 mod hardware;
 mod headless;
+mod i18n;
 mod icons;
 mod journal;
 mod keymap;
