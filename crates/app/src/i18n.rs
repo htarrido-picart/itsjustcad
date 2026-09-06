@@ -244,6 +244,11 @@ static EN: &[(&str, &str)] = &[
     ("menu.llm.local_only", "Local Only"),
     ("menu.llm.web_search", "Allow Web Search"),
     ("menu.llm.terse", "Terse Replies"),
+    // ── Menu: Window (in-window fallback labels; native bar uses OS items) ──
+    ("menu.window.minimize", "Minimize"),
+    ("menu.window.zoom", "Zoom"),
+    ("menu.window.bring_all_to_front", "Bring All to Front"),
+    ("menu.window.fullscreen", "Toggle Full Screen"),
     // ── Menu: Help ──
     ("menu.help.docs", "Docs"),
     ("menu.help.reference", "Command reference"),
@@ -353,6 +358,11 @@ static ES: &[(&str, &str)] = &[
     ("menu.llm.local_only", "Solo local"),
     ("menu.llm.web_search", "Permitir búsqueda web"),
     ("menu.llm.terse", "Respuestas concisas"),
+    // ── Menú: Ventana ──
+    ("menu.window.minimize", "Minimizar"),
+    ("menu.window.zoom", "Zoom"),
+    ("menu.window.bring_all_to_front", "Traer todo al frente"),
+    ("menu.window.fullscreen", "Pantalla completa"),
     // ── Menú: Ayuda ──
     ("menu.help.docs", "Documentación"),
     ("menu.help.reference", "Referencia de comandos"),

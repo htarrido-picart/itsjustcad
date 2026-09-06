@@ -813,11 +813,11 @@ pub fn ui(
                         }
                         NativeItem::Predefined(kind) => {
                             let label = match kind {
-                                PredefinedKind::Minimize => "Minimize",
-                                PredefinedKind::Zoom => "Zoom",
-                                PredefinedKind::BringAllToFront => "Bring All to Front",
-                                PredefinedKind::Fullscreen => "Toggle Full Screen",
-                                PredefinedKind::Quit => "Quit",
+                                PredefinedKind::Minimize => tr("menu.window.minimize"),
+                                PredefinedKind::Zoom => tr("menu.window.zoom"),
+                                PredefinedKind::BringAllToFront => tr("menu.window.bring_all_to_front"),
+                                PredefinedKind::Fullscreen => tr("menu.window.fullscreen"),
+                                PredefinedKind::Quit => tr("menu.file.quit"),
                             };
                             let _ = ui.button(label);
                         }
