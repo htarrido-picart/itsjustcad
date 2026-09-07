@@ -27,7 +27,7 @@ HIG-grounded design revision, run as sequential batches. All six landed.
 
 - [x] **M-layerspanel** — Rhino-style 7-column layers table + lock/linetype. *(verified shipped)*
 - [x] **M-uilayout** — Rhino docking layout. *(mostly landed; verified)*
-- [ ] **M-legacyskin / M-uipolish** — onboarding-driven skins (AutoCAD/Rhino/Revit theme + fonts + aliases), app icon (all platform sizes), toolbar iconography, ergonomics pass. Largely == design batches A–F.
+- [x] **M-legacyskin / M-uipolish** — onboarding-driven skins (AutoCAD/Rhino/Revit theme + fonts + aliases), app icon, toolbar iconography. *(shipped: skin token-sets + per-skin alias tables + `expand_alias` pre-parse wiring + template-picker choice were already live from batches A–F. This cart added the residual: a live `skin native|autocad|rhino|revit` app-verb (classify + execute_line, staged-apply via `pending_skin`, headless-acknowledged, persisted to ui.json); localized skin names + a language picker in onboarding (i18n keys `skin.*`/`onboard.skin.prompt`, en+es); tests for skin code round-trip, ui.json persistence, alias additivity/non-shadowing.)* App icon: DONE — brand mark (tuxedo-cat) at 16–1024 PNG set + `.icns` in the bundle (`CFBundleIconFile`) + runtime window icon (`main.rs`); generator `examples/gen_icon.rs`. No platform sizes deferred for macOS. Toolbar iconography/ergonomics: covered by batches A–F (Lucide set), not re-touched.
 
 ## Big domain adds
 
