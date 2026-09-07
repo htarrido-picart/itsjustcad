@@ -672,10 +672,21 @@ fn parse_blocks(
     resolve_blocks(raw)
 }
 
+/// Hard caps to keep a crafted (malicious) DXF from exhausting memory or the
+/// stack during nested-block baking:
+/// - `MAX_BLOCK_DEPTH` bounds recursion on a deep *acyclic* nested-block chain
+///   (the cycle guard alone does not — an acyclic chain never repeats a name).
+/// - `MAX_TOTAL_BAKED_GEOMS` bounds a diamond DAG, where a shared child is baked
+///   into every parent, so geometry can grow ~2^depth (exponential blow-up / OOM).
+const MAX_BLOCK_DEPTH: usize = 48;
+const MAX_TOTAL_BAKED_GEOMS: usize = 300_000;
+
 /// Second pass: re-origin each raw block on its base point and BAKE nested
 /// INSERTs by copying the referenced block's (already re-origined) geometry in
-/// at the insert's position/rotation/scale. A depth/visited guard makes cyclic
-/// or self-referential blocks safe (the cycle edge is simply skipped).
+/// at the insert's position/rotation/scale. Three guards keep hostile input safe:
+/// a **visited** set breaks reference *cycles*, a **depth** cap bounds deep
+/// acyclic nesting chains, and a running **geometry budget** bounds diamond DAGs
+/// (exponential fan-out). Past any cap the offending edge is skipped, not baked.
 fn resolve_blocks(
     raw: Vec<(String, RawBlock)>,
 ) -> std::collections::BTreeMap<String, Vec<itsjustcad_doc::BlockGeometry>> {
@@ -683,23 +694,35 @@ fn resolve_blocks(
     let by_name: BTreeMap<String, &RawBlock> =
         raw.iter().map(|(n, b)| (n.clone(), b)).collect();
     let mut out: BTreeMap<String, Vec<itsjustcad_doc::BlockGeometry>> = BTreeMap::new();
+    // Total baked geometry across ALL blocks in this file — the diamond-DAG cap.
+    let mut total_baked: usize = 0;
     for (name, _blk) in &raw {
         let mut visiting = std::collections::BTreeSet::new();
-        let geoms = bake_block(name, &by_name, &mut visiting);
+        let geoms = bake_block(name, &by_name, &mut visiting, 0, &mut total_baked);
         if !geoms.is_empty() {
             out.insert(name.clone(), geoms);
+        }
+        if total_baked >= MAX_TOTAL_BAKED_GEOMS {
+            // Budget exhausted: stop resolving further blocks rather than risk OOM.
+            break;
         }
     }
     out
 }
 
 /// Recursively build one block's re-origined geometry, baking nested inserts.
-/// `visiting` holds the ancestry to break cycles.
+/// `visiting` holds the ancestry to break cycles; `depth` bounds acyclic nesting;
+/// `total_baked` is the shared running geometry budget (diamond-DAG guard).
 fn bake_block(
     name: &str,
     by_name: &std::collections::BTreeMap<String, &RawBlock>,
     visiting: &mut std::collections::BTreeSet<String>,
+    depth: usize,
+    total_baked: &mut usize,
 ) -> Vec<itsjustcad_doc::BlockGeometry> {
+    if depth >= MAX_BLOCK_DEPTH || *total_baked >= MAX_TOTAL_BAKED_GEOMS {
+        return Vec::new(); // depth/budget cap — skip this edge
+    }
     let Some(blk) = by_name.get(name) else {
         return Vec::new();
     };
@@ -711,14 +734,22 @@ fn bake_block(
     for g in geoms.iter_mut() {
         translate_block_geom(g, -blk.base);
     }
+    // Count retained geometry against the budget. Children counted as they are
+    // pushed below (a diamond DAG copies a shared child into each parent, so each
+    // copy is real retained geometry and must count separately).
+    *total_baked = total_baked.saturating_add(geoms.len());
     // Baked nested inserts: the child's geometry (already re-origined) placed at
     // the insert transform, then shifted so the PARENT'S base sits at the origin.
     for ins in &blk.nested {
-        let child = bake_block(&ins.block, by_name, visiting);
+        if *total_baked >= MAX_TOTAL_BAKED_GEOMS {
+            break; // budget exhausted — stop baking further children
+        }
+        let child = bake_block(&ins.block, by_name, visiting, depth + 1, total_baked);
         for mut g in child {
             transform_block_geom(&mut g, ins.scale, ins.rotation_deg.to_radians(), ins.position);
             translate_block_geom(&mut g, -blk.base);
             geoms.push(g);
+            *total_baked = total_baked.saturating_add(1);
         }
     }
     visiting.remove(name);
@@ -1729,6 +1760,77 @@ mod tests {
         assert!(loop_def.is_some(), "cyclic block still defines (no hang)");
         // Only the direct line survives; the cyclic nested insert is skipped.
         assert_eq!(loop_def.unwrap().len(), 1);
+    }
+
+    /// Security: a DEEP acyclic nested-block chain (B0→B1→…→Bn) must not overflow
+    /// the stack — the cycle guard alone would not stop it (no name ever repeats).
+    /// The depth cap bounds recursion; import returns cleanly and bounded.
+    #[test]
+    fn deep_acyclic_nested_chain_is_bounded_no_overflow() {
+        // Build 400 blocks: each B{i} has one line + a nested INSERT of B{i+1};
+        // the last just has a line. 400 > MAX_BLOCK_DEPTH, so the cap must engage.
+        let n = 400usize;
+        let mut s = String::from("0\nSECTION\n2\nBLOCKS\n");
+        for i in 0..n {
+            s.push_str(&format!(
+                "0\nBLOCK\n2\nB{i}\n10\n0\n20\n0\n30\n0\n\
+                 0\nLINE\n8\n0\n10\n0\n20\n0\n11\n1\n21\n0\n"
+            ));
+            if i + 1 < n {
+                s.push_str(&format!("0\nINSERT\n2\nB{}\n10\n1\n20\n0\n", i + 1));
+            }
+            s.push_str("0\nENDBLK\n");
+        }
+        s.push_str(
+            "0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nB0\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n",
+        );
+        // Must not panic / overflow the stack.
+        let parsed = parse_dxf(&s).unwrap();
+        let b0 = parsed.entities.iter().find_map(|(_, c)| match c {
+            Command::BlockDefine { name, geometries, .. } if name == "B0" => geometries.clone(),
+            _ => None,
+        });
+        // B0 imports; its baked geometry is bounded by the depth cap (≤ depth+1
+        // lines), never the full 400.
+        let g = b0.expect("B0 must define");
+        assert!(g.len() <= super::MAX_BLOCK_DEPTH + 1, "unbounded bake: {}", g.len());
+    }
+
+    /// Security: a diamond DAG where a shared child is referenced by every level
+    /// can bake ~2^depth geometry (exponential OOM). The running geometry budget
+    /// must cap the total; import returns cleanly and bounded.
+    #[test]
+    fn diamond_dag_geometry_is_budget_capped_no_oom() {
+        // D{i} contains a line + TWO inserts of D{i+1}; leaf D{depth} is one line.
+        // Uncapped total ≈ 2^depth lines — 30 levels would be ~10^9. The budget
+        // (MAX_TOTAL_BAKED_GEOMS) must clamp it well below that.
+        let depth = 30usize;
+        let mut s = String::from("0\nSECTION\n2\nBLOCKS\n");
+        for i in 0..=depth {
+            s.push_str(&format!(
+                "0\nBLOCK\n2\nD{i}\n10\n0\n20\n0\n30\n0\n\
+                 0\nLINE\n8\n0\n10\n0\n20\n0\n11\n1\n21\n0\n"
+            ));
+            if i < depth {
+                s.push_str(&format!("0\nINSERT\n2\nD{}\n10\n1\n20\n0\n", i + 1));
+                s.push_str(&format!("0\nINSERT\n2\nD{}\n10\n2\n20\n0\n", i + 1));
+            }
+            s.push_str("0\nENDBLK\n");
+        }
+        s.push_str(
+            "0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nD0\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n",
+        );
+        // Must not OOM / hang. Every defined block's baked geometry is bounded.
+        let parsed = parse_dxf(&s).unwrap();
+        for (_, c) in &parsed.entities {
+            if let Command::BlockDefine { geometries: Some(g), .. } = c {
+                assert!(
+                    g.len() <= super::MAX_TOTAL_BAKED_GEOMS,
+                    "block baked {} geoms — budget breached",
+                    g.len()
+                );
+            }
+        }
     }
 
     #[test]
