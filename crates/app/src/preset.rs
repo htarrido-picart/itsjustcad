@@ -23,6 +23,10 @@ pub enum CadOrigin {
 }
 
 impl CadOrigin {
+    /// Plain (unlocalized) English name. The UI now labels skins through the
+    /// i18n catalog via [`Self::label_key`]; this stays as a stable building
+    /// block for logs / tests / non-localized surfaces.
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             CadOrigin::AutoCAD => "AutoCAD",
@@ -30,6 +34,53 @@ impl CadOrigin {
             CadOrigin::Revit => "Revit",
             CadOrigin::None => "ItsJustCAD default",
         }
+    }
+
+    /// The i18n key for this skin's onboarding / settings label. Names go through
+    /// the `t()` catalog so the picker localizes (en + es).
+    pub fn label_key(self) -> &'static str {
+        match self {
+            CadOrigin::AutoCAD => "skin.autocad",
+            CadOrigin::Rhino => "skin.rhino",
+            CadOrigin::Revit => "skin.revit",
+            CadOrigin::None => "skin.native",
+        }
+    }
+
+    /// The short slug persisted to `ui.json` / accepted by the `skin` verb
+    /// (`"native"`, `"autocad"`, `"rhino"`, `"revit"`). Distinct from the serde
+    /// representation only for `None` → `"native"` (friendlier verb word).
+    pub fn code(self) -> &'static str {
+        match self {
+            CadOrigin::AutoCAD => "autocad",
+            CadOrigin::Rhino => "rhino",
+            CadOrigin::Revit => "revit",
+            CadOrigin::None => "native",
+        }
+    }
+
+    /// Parse a verb-supplied / persisted skin name back into a [`CadOrigin`].
+    /// Accepts common synonyms (`native`/`default`/`itsjustcad`/`none` →
+    /// [`CadOrigin::None`], `acad`→AutoCAD). Case-insensitive. Unknown → `None`
+    /// (caller keeps its current skin and reports usage).
+    pub fn from_code(s: &str) -> Option<CadOrigin> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "native" | "default" | "itsjustcad" | "none" => Some(CadOrigin::None),
+            "autocad" | "acad" => Some(CadOrigin::AutoCAD),
+            "rhino" => Some(CadOrigin::Rhino),
+            "revit" => Some(CadOrigin::Revit),
+            _ => None,
+        }
+    }
+
+    /// All skins in onboarding-picker order (Native default first).
+    pub fn all() -> [CadOrigin; 4] {
+        [
+            CadOrigin::None,
+            CadOrigin::AutoCAD,
+            CadOrigin::Rhino,
+            CadOrigin::Revit,
+        ]
     }
 }
 
@@ -549,6 +600,28 @@ mod tests {
         }
     }
 
+    /// Mirror of the exact ui.json read/write the app performs for the skin
+    /// (`save_cad_origin` writes `to_value`; `load_cad_origin` reads the string
+    /// key and `from_value`s it). Kept pure (no fs) so it runs in the unit suite
+    /// while exercising the real serialization path a `skin` verb persists.
+    #[test]
+    fn cad_origin_ui_json_key_round_trip() {
+        for origin in CadOrigin::all() {
+            let mut ui = serde_json::Map::new();
+            // write (as save_cad_origin does)
+            ui.insert(
+                "cad_origin".to_string(),
+                serde_json::to_value(origin).unwrap(),
+            );
+            let doc = serde_json::Value::Object(ui);
+            // read back (as load_cad_origin does)
+            let s = doc["cad_origin"].as_str().expect("string key");
+            let back: CadOrigin =
+                serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap();
+            assert_eq!(back, origin, "ui.json skin round-trip failed for {origin:?}");
+        }
+    }
+
     #[test]
     fn cad_origin_json_values() {
         assert_eq!(serde_json::to_string(&CadOrigin::AutoCAD).unwrap(), r#""autocad""#);
@@ -560,6 +633,83 @@ mod tests {
     #[test]
     fn cad_origin_default_is_none() {
         assert_eq!(CadOrigin::default(), CadOrigin::None);
+    }
+
+    // ── skin verb: code parse/roundtrip ────────────────────────────────────────
+
+    #[test]
+    fn cad_origin_code_roundtrip() {
+        for origin in CadOrigin::all() {
+            assert_eq!(
+                CadOrigin::from_code(origin.code()),
+                Some(origin),
+                "code roundtrip failed for {origin:?}"
+            );
+        }
+        // `all()` is the picker order, Native first.
+        assert_eq!(CadOrigin::all()[0], CadOrigin::None);
+    }
+
+    #[test]
+    fn cad_origin_from_code_synonyms_and_case() {
+        assert_eq!(CadOrigin::from_code("NATIVE"), Some(CadOrigin::None));
+        assert_eq!(CadOrigin::from_code("default"), Some(CadOrigin::None));
+        assert_eq!(CadOrigin::from_code("itsjustcad"), Some(CadOrigin::None));
+        assert_eq!(CadOrigin::from_code("none"), Some(CadOrigin::None));
+        assert_eq!(CadOrigin::from_code("acad"), Some(CadOrigin::AutoCAD));
+        assert_eq!(CadOrigin::from_code(" AutoCAD "), Some(CadOrigin::AutoCAD));
+        // Unknown → None (caller keeps current skin).
+        assert_eq!(CadOrigin::from_code("sketchup"), None);
+        assert_eq!(CadOrigin::from_code(""), None);
+    }
+
+    #[test]
+    fn every_skin_has_a_label_key() {
+        // Each skin maps to a distinct i18n key (asserted present in the catalog
+        // by the i18n completeness test).
+        let mut keys: Vec<&str> = CadOrigin::all().iter().map(|o| o.label_key()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), 4, "skin label keys must be distinct");
+    }
+
+    // ── aliases are ADDITIVE (never shadow a canonical verb) ────────────────────
+
+    /// The canonical substrate + app verbs an alias must never silently shadow.
+    /// If an alias key equals a canonical command name, typing that name would be
+    /// rewritten — breaking the "canonical names always still work" guarantee.
+    const CANONICAL_VERBS: &[&str] = &[
+        "line", "polyline", "circle", "arc", "rect", "point", "box", "sphere",
+        "cylinder", "cone", "move", "copy", "rotate", "scale", "mirror", "array",
+        "offset", "trim", "extend", "fillet", "chamfer", "join", "explode",
+        "delete", "extrude", "revolve", "loft", "sweep", "layer", "group",
+        "block", "hatch", "text", "dimension", "units", "zoom", "pan", "view",
+    ];
+
+    #[test]
+    fn aliases_never_shadow_a_canonical_verb() {
+        for (name, aliases) in [
+            ("autocad", AUTOCAD_ALIASES),
+            ("rhino", RHINO_ALIASES),
+            ("revit", REVIT.aliases),
+        ] {
+            for (alias, _canonical) in aliases {
+                assert!(
+                    !CANONICAL_VERBS.contains(alias),
+                    "{name} alias '{alias}' shadows a canonical verb — aliases must be additive"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_verb_falls_through_when_not_an_alias() {
+        // A full canonical name that is not itself an alias key must NOT expand
+        // (it flows unchanged to the substrate parser).
+        assert_eq!(expand_alias("box 0,0,0 1,1,1", AUTOCAD_ALIASES), None);
+        assert_eq!(expand_alias("extrude", AUTOCAD_ALIASES), None);
+        // And an unknown token in a skin with no aliases (Revit) never expands.
+        assert_eq!(expand_alias("l", REVIT.aliases), None);
     }
 
     // ── layout fields ─────────────────────────────────────────────────────────

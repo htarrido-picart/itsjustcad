@@ -74,6 +74,12 @@ pub enum AppVerb {
     /// `language` with no/unknown argument is rejected by `classify` (returns
     /// `None`) so the command line reports an error rather than silently no-op.
     Language(crate::i18n::Lang),
+    /// Switch the legacy-CAD skin (`skin native|autocad|rhino|revit`). Carries
+    /// the parsed [`crate::preset::CadOrigin`]; persisted to ui.json and applied
+    /// live (palette/accent/fonts + alias table). A bare `skin` with no/unknown
+    /// argument is rejected by `classify` (returns `None`) so the command line
+    /// reports usage rather than silently no-op. Dark/light stays orthogonal.
+    Skin(crate::preset::CadOrigin),
     /// Persist the document (`save [path]`). Argument is the optional path.
     Save(Option<String>),
     /// Command reference (`help [verb]`).
@@ -223,6 +229,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             _ => return None,
         }),
         "language" | "lang" => AppVerb::Language(crate::i18n::Lang::from_code(words.next()?)?),
+        "skin" | "theme_skin" => AppVerb::Skin(crate::preset::CadOrigin::from_code(words.next()?)?),
         "camera" => AppVerb::Camera(
             words.next().map(str::to_ascii_lowercase),
             words.next().map(str::to_ascii_lowercase),
@@ -272,6 +279,21 @@ mod tests {
         // Bare or unknown argument is not an app verb (falls through → error).
         assert_eq!(classify("language"), None);
         assert_eq!(classify("language fr"), None);
+    }
+
+    #[test]
+    fn classifies_skin_verb() {
+        use crate::preset::CadOrigin;
+        assert_eq!(classify("skin native"), Some(AppVerb::Skin(CadOrigin::None)));
+        assert_eq!(classify("skin autocad"), Some(AppVerb::Skin(CadOrigin::AutoCAD)));
+        assert_eq!(classify("skin rhino"), Some(AppVerb::Skin(CadOrigin::Rhino)));
+        assert_eq!(classify("skin revit"), Some(AppVerb::Skin(CadOrigin::Revit)));
+        // Synonyms + case-insensitivity.
+        assert_eq!(classify("skin ACAD"), Some(AppVerb::Skin(CadOrigin::AutoCAD)));
+        assert_eq!(classify("skin default"), Some(AppVerb::Skin(CadOrigin::None)));
+        // Bare or unknown argument falls through → command line reports usage.
+        assert_eq!(classify("skin"), None);
+        assert_eq!(classify("skin sketchup"), None);
     }
 
     #[test]
@@ -431,6 +453,8 @@ mod tests {
         "sketchup",     // preset; advertised as `sketchup`, not a standalone canonical token here
         "su",           // alias of `sketchup`
         "gizmo",        // alias of `gumball`
+        "skin",         // UI skin switch, not a drawing/view verb the model reframes with
+        "theme_skin",   // alias of `skin`
     ];
 
     #[test]
@@ -465,6 +489,8 @@ mod tests {
             "reducemotion",
             "chatencryption",
             "encryptchats",
+            "skin",
+            "theme_skin",
             "camera",
             "save",
             "help",

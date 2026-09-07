@@ -271,6 +271,12 @@ pub fn run_script_lines(
             Some(AppVerb::ChatEncryption(_)) => {
                 // No chat sessions in headless mode — silently accepted.
             }
+            Some(AppVerb::Skin(origin)) => {
+                // No UI chrome to restyle in headless mode; acknowledge the
+                // choice (aliases would apply to a live command line). Not
+                // persisted here.
+                println!("skin {}", origin.code());
+            }
             Some(AppVerb::GuiOnly(name)) => {
                 eprintln!("warning: '{name}' is GUI-only; ignored in headless mode");
             }
