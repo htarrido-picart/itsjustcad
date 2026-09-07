@@ -127,6 +127,15 @@ HIG-grounded design revision, run as sequential batches. All six landed.
   - Owner scope beyond Manuel (Hector, 2026-09-04): radial/circular + hexagonal + **Voronoi** street generators (Phase 5b — non-rectilinear; Voronoi = dual of our Bowyer-Watson Delaunay, no new dep) + a `loose` lot mode (irregularity unlocks past 0.4 to 1.0, routes to the organic subdivider) + opt-in blind %-open-space (`lotopenspace reserve=<pct>`, default off — feature placement stays default; reserved blocks netted out of yield). Still ruled out: whole-site no-subdivision mode. Open questions before Phase 5/6: width-mix product list, alley dims, "day one" blank (Q14), flag-lot area accounting — Phase-6 fallback defaults are metric **European/LatAm** (party-wall/medianería, deep solares, build-to street-wall; `euro_latam` region profile), NOT US suburban feet; every value a flagged placeholder until Manuel confirms.
   - Blockers to clear before coding: confirm i_overlay offset; obtain the referenced Python prototype (`/prototype/python`, not yet in repo) to port from; resolve Manuel's open questions.
 
+## M-paperspace / M-annotation (planned 2026-09-07 — NOT started)
+
+- [ ] **M-paperspace / M-annotation** — a proper scale-independent PAPER-SPACE annotation layer on sheets. Audit finding (2026-09-07): sheets already have per-viewport SCALE (`SheetView.scale`, denominator; `SheetDim` converts paper→model through `view_index` so dimension labels are correct) — that part is done right. BUT the annotation layer is half-built and has a scale-correctness bug:
+  - **Bug**: `Annotation::Text { pos, height }` lives in MODEL space with a model-unit height → the same text renders at different apparent sizes in viewports of different scales (huge at 1:50, tiny at 1:500). Real drafting text belongs in paper space, sized in mm-on-paper, scale-independent. Only dimensions got the paper-space treatment (`SheetDim`); text did not.
+  - **Missing entirely**: leaders, text callouts. No `Annotation::Leader`/`Callout` type exists.
+  - **Correct as-is (leave)**: column grid is a typed model-space datum (`structure::Grid`, reference lines + bubbles) — right place (a datum, shows through viewports, like Revit). Grid bubble also exists as a library block symbol.
+  - **Build**: paper-space annotation entities on `Sheet` (mm coords from lower-left, like `SheetDim`), each optionally anchored to a `SheetView`: **paper text** (mm height, scale-independent), **leaders** (arrow + kink + text), **callouts/tags** (bubble + text, incl. grid-bubble tags referencing a model grid line), maybe paper-space schedules keying. Verbs `sheettext`/`sheetleader`/`sheettag` mirroring `sheetdim`; render in the sheet preview + PDF at true paper size; deck-callable; keep model-space `Annotation` (Text/Hatch/LinearDim) for in-model notes. Don't touch the grid datum.
+  - Tests: paper text renders at the same mm size regardless of the viewport's scale; leader/callout geometry; PDF output at true paper size; replay-stable.
+
 ## Compliance plugins (engine SHIPPED 2026-09-03; packs still planned)
 
 Shared foundation first, then two rule packs riding it. Advisory only — every
