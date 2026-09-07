@@ -123,12 +123,36 @@ impl OsKeyStore {
 /// every save when there is no keychain (headless / CI / bare Linux).
 static WARNED_PLAINTEXT: AtomicBool = AtomicBool::new(false);
 
+/// Set once the writer has actually fallen back to plaintext despite the user
+/// asking for encryption. The UI polls [`take_plaintext_fallback_notice`] to
+/// surface it to the user exactly once (a status line), so "encrypted" chat that
+/// is really plaintext is never silent.
+static PLAINTEXT_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+/// Whether the fallback-to-plaintext notice is pending. Consumes the flag: the
+/// first caller gets `true`, subsequent callers `false` (so the user is told
+/// once, not every frame). Returns `false` when no fallback has occurred.
+pub fn take_plaintext_fallback_notice() -> bool {
+    PLAINTEXT_FALLBACK.swap(false, Ordering::Relaxed)
+}
+
 fn warn_plaintext_once() {
+    // Raise the user-facing notice EVERY time we fall back (the UI de-dupes via
+    // its own consume-once poll), so if the user re-enables encryption later they
+    // are re-told it is still plaintext.
+    PLAINTEXT_FALLBACK.store(true, Ordering::Relaxed);
     if !WARNED_PLAINTEXT.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             "chat encryption unavailable (no OS keychain) — chat sessions stored in plaintext"
         );
     }
+}
+
+/// Probe whether the key store can currently yield a key (i.e. encryption will
+/// actually work). Lets the UI warn the user the moment they turn encryption ON
+/// if the keychain is unavailable, rather than only after the first save.
+pub fn keychain_available<K: KeyStore>(store: &K) -> bool {
+    store.get_or_create_key().is_ok()
 }
 
 /// Whether `blob` is one of our encrypted containers (magic + version match).
@@ -263,6 +287,23 @@ mod tests {
         // And it reads straight back (as plaintext) with any store.
         let opened = open(&store, &sealed).expect("plaintext open");
         assert_eq!(opened, msg);
+    }
+
+    #[test]
+    fn plaintext_fallback_raises_user_notice() {
+        // Falling back to plaintext must raise a user-facing notice so "encrypted"
+        // chat is never silently plaintext. (The flag is process-wide and
+        // consume-once; other tests may share it, so we only assert a fallback
+        // raises it — the consume-once semantics are covered by the swap itself.)
+        let store = AbsentKeyStore;
+        let _ = seal_for_write(&store, br#"{"doc_uuid":"n"}"#);
+        assert!(take_plaintext_fallback_notice(), "fallback must raise a user notice");
+    }
+
+    #[test]
+    fn keychain_available_reflects_store() {
+        assert!(keychain_available(&MemKeyStore::with(1)), "present store => available");
+        assert!(!keychain_available(&AbsentKeyStore), "absent store => unavailable");
     }
 
     #[test]

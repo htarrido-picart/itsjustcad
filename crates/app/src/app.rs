@@ -1334,6 +1334,16 @@ impl App {
                     "chat encryption: {} (applies to the next chat save)",
                     if on { "on" } else { "off" }
                 ));
+                // If the user turned encryption ON but no keychain is available,
+                // tell them NOW that chat will be stored in plaintext — do not let
+                // "encrypted" silently mean plaintext.
+                if on
+                    && !crate::chat_crypto::keychain_available(&crate::chat_crypto::OsKeyStore)
+                {
+                    self.command_line.push_line(
+                        "WARNING: no OS keychain available — chat will be saved in PLAINTEXT, not encrypted",
+                    );
+                }
             }
             Some("viewports" | "vp") => {
                 match words.next() {
@@ -6073,6 +6083,14 @@ impl eframe::App for App {
         // events can be consumed (the command line is focused-by-default, so the
         // input would otherwise eat the letter).
         self.early_hotkeys(&ui.ctx().clone());
+        // If a chat save fell back to plaintext despite the user's `chatencryption
+        // on`, surface it once here (consume-once flag) so "encrypted" chat can
+        // never silently mean plaintext.
+        if crate::chat_crypto::take_plaintext_fallback_notice() {
+            self.command_line.push_line(
+                "WARNING: chat encryption unavailable — the last chat save was written in PLAINTEXT",
+            );
+        }
         // Apply a `skin` verb requested last frame (needs a Context to re-stamp
         // the design tokens; `execute_line` had none). Live skin switch.
         if let Some(origin) = self.pending_skin.take() {
