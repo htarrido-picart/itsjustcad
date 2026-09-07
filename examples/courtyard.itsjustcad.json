@@ -1,0 +1,149 @@
+{
+  "itsjustcad": 1,
+  "ops": [
+    {
+      "cmd": "units",
+      "units": "m"
+    },
+    {
+      "cmd": "layer",
+      "name": "walls"
+    },
+    {
+      "cmd": "rectangle",
+      "id": "d8037f73-0d57-4d19-9064-ef8aec8417f9",
+      "corner": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "width": 20.0,
+      "height": 14.0
+    },
+    {
+      "cmd": "extrude",
+      "id": "6292bab7-6ad2-472b-8a32-4edac9c87ce0",
+      "profile": {
+        "sel": "last",
+        "n": 1
+      },
+      "height": 6.0
+    },
+    {
+      "cmd": "name",
+      "targets": {
+        "sel": "last",
+        "n": 1
+      },
+      "name": "shell"
+    },
+    {
+      "cmd": "rectangle",
+      "id": "ce2fa4c2-c44a-4ec9-a2ce-c64c08209c5e",
+      "corner": [
+        5.0,
+        4.0,
+        0.0
+      ],
+      "width": 10.0,
+      "height": 6.0
+    },
+    {
+      "cmd": "extrude",
+      "id": "3f800f4d-c499-468b-b094-4e3048365b3d",
+      "profile": {
+        "sel": "last",
+        "n": 1
+      },
+      "height": 7.0
+    },
+    {
+      "cmd": "name",
+      "targets": {
+        "sel": "last",
+        "n": 1
+      },
+      "name": "court"
+    },
+    {
+      "cmd": "difference",
+      "id": "a39402f4-1105-4e68-a163-917b0226fd20",
+      "target": {
+        "sel": "named",
+        "name": "shell"
+      },
+      "tools": {
+        "sel": "named",
+        "name": "court"
+      }
+    },
+    {
+      "cmd": "name",
+      "targets": {
+        "sel": "last",
+        "n": 1
+      },
+      "name": "building"
+    },
+    {
+      "cmd": "plan",
+      "ids": [
+        "f615355e-1fe7-4ad8-a0bf-bec5edc8a953",
+        "15bb5007-977c-4265-ad1b-eb5b90166fe9",
+        "f469c122-3c00-457c-980f-7159def35b1d",
+        "96f97ca4-68ba-4315-94ea-c69001a847b2",
+        "299218ff-2bd6-4931-a6a6-a778688bd32d",
+        "a40e718f-c2d0-490c-828a-c63a9071d79c",
+        "7e511af3-66ec-4cfa-9a31-a777f32682e3",
+        "216f2415-f017-4cc4-9b4d-3f85855cc71d",
+        "b12f251f-edfc-48ac-952e-3d9ff777c350",
+        "bb6add9f-a17b-4382-be17-2d7cd9116271",
+        "cee5f750-bd7a-474e-aafa-89d2e8c71e20",
+        "d517b63a-f88a-437a-ac1e-ac8ff692441b",
+        "8865e519-8ded-4086-b9ad-75c2c34bb558"
+      ],
+      "height": 1.5
+    },
+    {
+      "cmd": "dim",
+      "id": "5f4e172f-aff6-4cf7-94ae-e5375f634133",
+      "a": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "b": [
+        20.0,
+        0.0,
+        0.0
+      ],
+      "offset": -2.0
+    },
+    {
+      "cmd": "dim",
+      "id": "6f3254fe-1bd6-4ee8-af60-feabb449500d",
+      "a": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "b": [
+        0.0,
+        14.0,
+        0.0
+      ],
+      "offset": -2.0
+    },
+    {
+      "cmd": "sheet",
+      "name": "plan-01",
+      "paper": "a3"
+    },
+    {
+      "cmd": "sheet_view",
+      "sheet": "plan-01",
+      "direction": "top",
+      "scale": 100.0
+    }
+  ]
+}

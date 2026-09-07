@@ -1,0 +1,75 @@
+{
+  "itsjustcad": 1,
+  "ops": [
+    {
+      "cmd": "units",
+      "units": "m"
+    },
+    {
+      "cmd": "box",
+      "id": "447c6e92-eb09-45ac-ada0-47194c83458f",
+      "corner": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": [
+        40.0,
+        30.0,
+        4.0
+      ]
+    },
+    {
+      "cmd": "name",
+      "targets": {
+        "sel": "last",
+        "n": 1
+      },
+      "name": "podium"
+    },
+    {
+      "cmd": "box",
+      "id": "db894525-86e8-4715-81dc-73196c589c8c",
+      "corner": [
+        6.0,
+        6.0,
+        4.0
+      ],
+      "size": [
+        20.0,
+        14.0,
+        24.0
+      ]
+    },
+    {
+      "cmd": "name",
+      "targets": {
+        "sel": "last",
+        "n": 1
+      },
+      "name": "tower"
+    },
+    {
+      "cmd": "box",
+      "id": "3157c41c-83ea-434f-a52d-ce652864a483",
+      "corner": [
+        10.0,
+        10.0,
+        28.0
+      ],
+      "size": [
+        12.0,
+        8.0,
+        16.0
+      ]
+    },
+    {
+      "cmd": "name",
+      "targets": {
+        "sel": "last",
+        "n": 1
+      },
+      "name": "setback"
+    }
+  ]
+}

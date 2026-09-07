@@ -1,0 +1,17 @@
+# Courtyard building: shell minus a courtyard void, a plan cut, a sheet + PDF.
+# Run:  ItsJustCAD --run examples/scripts/courtyard.script --out courtyard.itsjustcad.json
+units m
+layer walls
+rect 0,0,0 20 14
+extrude last 6
+name last shell
+rect 5,4,0 10 6
+extrude last 7
+name last court
+difference shell court
+name last building
+plan 1.5
+dim 0,0,0 20,0,0 -2
+dim 0,0,0 0,14,0 -2
+sheet plan-01 a3
+sheetview plan-01 top 1:100

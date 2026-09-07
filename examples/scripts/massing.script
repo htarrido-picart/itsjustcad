@@ -1,0 +1,12 @@
+# Podium-and-tower massing — a few boxes, ready to orbit.
+# Run:  ItsJustCAD --run examples/scripts/massing.script --out massing.itsjustcad.json
+units m
+box 0,0,0 40,30,4
+name last podium
+box 6,6,4 20,14,24
+name last tower
+box 10,10,28 12,8,16
+name last setback
+persp
+ze
+display shaded

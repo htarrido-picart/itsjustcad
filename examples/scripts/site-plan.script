@@ -1,0 +1,12 @@
+# Site planning: boundary -> streets/blocks -> lots -> setbacks -> buildings -> yield.
+# Run:  ItsJustCAD --run examples/scripts/site-plan.script --out site-plan.itsjustcad.json
+units m
+rect 0,0,0 240 180
+name last site
+lotgeneratesite last orthogonal roadwidth=12 blockdepth=60 seed=7
+lotsubdivide all grid area=1400 width=18 seed=7
+lotsetbacks all front=4 side=0 rear=4
+lotbuilding all typology=row floors=3 roof=gable pitch=30
+lotreport
+top
+ze
