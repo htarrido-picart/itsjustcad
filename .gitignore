@@ -2,3 +2,6 @@
 dist/
 .claude/
 *.pdf
+
+# internal review docs — never publish
+review*.html
