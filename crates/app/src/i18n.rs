@@ -270,6 +270,12 @@ static EN: &[(&str, &str)] = &[
     ("onboard.language.prompt", "Choose your language"),
     ("settings.language.label", "Language"),
     ("settings.language.help", "Interface language. Applies immediately."),
+    // ── Onboarding / skin (legacy-CAD look + command aliases) ──
+    ("onboard.skin.prompt", "Which CAD are you coming from?"),
+    ("skin.native", "ItsJustCAD default"),
+    ("skin.autocad", "AutoCAD"),
+    ("skin.rhino", "Rhino"),
+    ("skin.revit", "Revit"),
     // ── Panel tabs / headers ──
     ("panel.tab.chat", "Chat"),
     ("panel.tab.layers", "Layers"),
@@ -384,6 +390,12 @@ static ES: &[(&str, &str)] = &[
     ("onboard.language.prompt", "Elige tu idioma"),
     ("settings.language.label", "Idioma"),
     ("settings.language.help", "Idioma de la interfaz. Se aplica de inmediato."),
+    // ── Bienvenida / skin (apariencia CAD heredada + alias de comandos) ──
+    ("onboard.skin.prompt", "¿De qué CAD vienes?"),
+    ("skin.native", "ItsJustCAD (predeterminado)"),
+    ("skin.autocad", "AutoCAD"),
+    ("skin.rhino", "Rhino"),
+    ("skin.revit", "Revit"),
     // ── Pestañas / encabezados del panel ──
     ("panel.tab.chat", "Chat"),
     ("panel.tab.layers", "Capas"),

@@ -423,6 +423,11 @@ pub struct App {
     template_scale: TemplateScale,
     /// Legacy-CAD origin selected in the template picker (persisted to ui.json).
     cad_origin: CadOrigin,
+    /// A skin switch requested by the `skin` verb, applied at the top of the
+    /// next `ui()` frame (where an `egui::Context` is in hand to re-stamp the
+    /// design tokens). `execute_line` has no `Context`, so it stages the change
+    /// here instead of restyling inline.
+    pending_skin: Option<CadOrigin>,
     /// Deck-brain choice in the onboarding modal (persisted to ui.json; local
     /// paths also write a cassette into decks.json).
     deck_brain: DeckBrain,
@@ -831,6 +836,7 @@ impl App {
             template_units: TemplateUnits::Meters,
             template_scale: TemplateScale::Building,
             cad_origin,
+            pending_skin: None,
             // Dev hook: ITSJUSTCAD_BRAIN=download pre-selects the download path so
             // the hardware-recommendation panel is visible in ITSJUSTCAD_SHOT frames.
             deck_brain: match std::env::var("ITSJUSTCAD_BRAIN").ok().as_deref() {
@@ -1274,6 +1280,30 @@ impl App {
                     }
                     None => {
                         self.command_line.push_line("usage: language en|es");
+                    }
+                }
+            }
+            // Switch the legacy-CAD skin (`skin native|autocad|rhino|revit`).
+            // Applies live (palette/accent/fonts + alias table) and persists to
+            // ui.json. Dark/light stays orthogonal. View/session state, never
+            // logged. Reuses the onboarding preset machinery.
+            Some("skin" | "theme_skin") => {
+                match words.next().and_then(CadOrigin::from_code) {
+                    Some(origin) => {
+                        self.cad_origin = origin;
+                        save_cad_origin(origin);
+                        // Restyle needs an egui Context (absent here); stage it
+                        // for the next `ui()` frame.
+                        self.pending_skin = Some(origin);
+                        self.command_line.push_line(format!(
+                            "skin: {} ({})",
+                            preset::preset_for(origin).menu_style_label(),
+                            origin.code()
+                        ));
+                    }
+                    None => {
+                        self.command_line
+                            .push_line("usage: skin native|autocad|rhino|revit");
                     }
                 }
             }
@@ -6025,6 +6055,11 @@ impl eframe::App for App {
         // events can be consumed (the command line is focused-by-default, so the
         // input would otherwise eat the letter).
         self.early_hotkeys(&ui.ctx().clone());
+        // Apply a `skin` verb requested last frame (needs a Context to re-stamp
+        // the design tokens; `execute_line` had none). Live skin switch.
+        if let Some(origin) = self.pending_skin.take() {
+            apply_preset(ui.ctx().clone(), origin);
+        }
         // Attach the true native OS menu bar (muda) on the first interactive
         // frame — no-op in headless/`--shot` (no window) — then drain its click
         // channel each frame and route any pick through the substrate, exactly
@@ -6128,23 +6163,30 @@ impl eframe::App for App {
                     ui.radio_value(&mut self.template_scale, TemplateScale::Building, "Building (~30m)");
                     ui.radio_value(&mut self.template_scale, TemplateScale::Urban, "Urban (~300m)");
                     ui.add_space(8.0);
-                    ui.label("Which CAD are you coming from?");
-                    ui.radio_value(
-                        &mut self.cad_origin, CadOrigin::None,
-                        CadOrigin::None.label(),
-                    );
-                    ui.radio_value(
-                        &mut self.cad_origin, CadOrigin::AutoCAD,
-                        CadOrigin::AutoCAD.label(),
-                    );
-                    ui.radio_value(
-                        &mut self.cad_origin, CadOrigin::Rhino,
-                        CadOrigin::Rhino.label(),
-                    );
-                    ui.radio_value(
-                        &mut self.cad_origin, CadOrigin::Revit,
-                        CadOrigin::Revit.label(),
-                    );
+                    // Language picker — sets the UI locale for the whole app
+                    // (and re-localizes the rest of this dialog live). Persisted
+                    // on Start; also flippable later via Settings / `language`.
+                    ui.label(crate::i18n::t("onboard.language.prompt"));
+                    for l in [crate::i18n::Lang::En, crate::i18n::Lang::Es] {
+                        let mut sel = crate::i18n::current_lang() == l;
+                        if ui.radio(sel, l.native_name()).clicked() {
+                            sel = true;
+                            crate::i18n::set_lang(l);
+                        }
+                        let _ = sel;
+                    }
+                    ui.add_space(8.0);
+                    // Skin picker — the legacy-CAD look + command aliases. Labels
+                    // go through the i18n catalog so they localize with the choice
+                    // above.
+                    ui.label(crate::i18n::t("onboard.skin.prompt"));
+                    for origin in CadOrigin::all() {
+                        ui.radio_value(
+                            &mut self.cad_origin,
+                            origin,
+                            crate::i18n::t(origin.label_key()),
+                        );
+                    }
                     ui.add_space(8.0);
                     ui.separator();
                     ui.label("Deck brain — where should the assistant run?");
@@ -6206,6 +6248,9 @@ impl eframe::App for App {
             if done {
                 self.show_template_picker = false;
                 save_onboarding_done();
+                // Persist the language chosen above (already applied live via
+                // set_lang; this writes it to ui.json so it survives restarts).
+                save_lang(crate::i18n::current_lang());
                 save_cad_origin(self.cad_origin);
                 save_deck_brain(self.deck_brain);
                 apply_deck_brain(self.deck_brain, self.hardware.tier());
