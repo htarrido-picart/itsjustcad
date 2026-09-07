@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ItsJustCAD — a complete architect's CAD in a single binary, with an LLM built in</title>
+<meta name="description" content="ItsJustCAD is a free, open-source (AGPLv3) CAD for architects — modelling, drafting, environmental analysis, site planning, DWG/IFC exchange, and an embedded local-LLM drafting partner. One ~10 MB binary, no subscription, no cloud.">
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --ink:#eef1f5;
+    --muted:#a2a9b5; --line:#2a2f3a; --accent:#6aa9ff; --accent2:#7ee0c0;
+    --warn:#e6b34d; --radius:14px; --max:1080px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  a{color:var(--accent); text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:var(--max); margin:0 auto; padding:0 22px}
+  code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.9em}
+  header.hero{padding:70px 0 40px; text-align:center;
+    background:radial-gradient(1200px 400px at 50% -100px, #1c2230 0%, var(--bg) 70%);}
+  header.hero h1{font-size:44px; letter-spacing:-.02em; margin:0 0 6px}
+  header.hero .tag{font-size:20px; color:var(--accent2); font-weight:600; margin:0 0 18px}
+  header.hero p.lead{max-width:720px; margin:0 auto 26px; font-size:18px; color:var(--muted)}
+  .btns{display:flex; gap:12px; justify-content:center; flex-wrap:wrap}
+  .btn{display:inline-block; padding:12px 22px; border-radius:10px; font-weight:600}
+  .btn.primary{background:var(--accent); color:#0b1220}
+  .btn.primary:hover{text-decoration:none; filter:brightness(1.08)}
+  .btn.ghost{border:1px solid var(--line); color:var(--ink)}
+  .btn.ghost:hover{text-decoration:none; border-color:var(--accent)}
+  .pill{display:inline-block; margin:22px 0 0; padding:5px 12px; border:1px solid var(--line);
+    border-radius:999px; font-size:13px; color:var(--muted)}
+  section{padding:52px 0; border-top:1px solid var(--line)}
+  section h2{font-size:28px; margin:0 0 8px; letter-spacing:-.01em}
+  section .sub{color:var(--muted); margin:0 0 28px; max-width:720px}
+  .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:20px}
+  .card h3{margin:0 0 6px; font-size:17px}
+  .card p{margin:0; color:var(--muted); font-size:14.5px}
+  .shots{display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:18px}
+  figure{margin:0; background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); overflow:hidden}
+  figure img{width:100%; display:block; background:#0b0d11}
+  figcaption{padding:12px 16px; color:var(--muted); font-size:13.5px}
+  pre{background:#0b0d11; border:1px solid var(--line); border-radius:12px; padding:16px 18px;
+    overflow-x:auto; color:#d7dce6; font-size:13.5px; line-height:1.55}
+  pre .c{color:#7f8896}
+  table{width:100%; border-collapse:collapse; margin-top:6px}
+  th,td{text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); font-size:14.5px}
+  th{color:var(--muted); font-weight:600}
+  .note{background:var(--panel2); border:1px solid var(--line); border-left:3px solid var(--warn);
+    border-radius:10px; padding:14px 18px; color:var(--muted); font-size:14.5px}
+  footer{padding:40px 0 60px; border-top:1px solid var(--line); color:var(--muted); font-size:14px}
+  footer a{color:var(--ink)}
+  .two{display:grid; grid-template-columns:1fr 1fr; gap:28px; align-items:start}
+  @media(max-width:720px){.two{grid-template-columns:1fr} header.hero h1{font-size:34px}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <h1>ItsJustCAD</h1>
+    <p class="tag">It's just CAD.</p>
+    <p class="lead">A complete architect's CAD in a single ~10&nbsp;MB binary —
+      modelling, drafting, environmental analysis, and site planning — with an
+      LLM drafting partner built into the app that draws with the same commands
+      you type.</p>
+    <div class="btns">
+      <a class="btn primary" href="https://github.com/htarrido-picart/itsjustcad/releases/latest">Download</a>
+      <a class="btn ghost" href="https://github.com/htarrido-picart/itsjustcad">View on GitHub</a>
+      <a class="btn ghost" href="tutorials/">Read the tutorials</a>
+    </div>
+    <div class="pill">Free &amp; open source · AGPL-3.0 · Linux / macOS / Windows · no subscription, no cloud tether</div>
+  </div>
+</header>
+
+<section id="what">
+  <div class="wrap">
+    <h2>One command substrate, human and machine</h2>
+    <p class="sub">The whole app is a command language. Your typed commands, the
+      mouse tools, and the LLM all flow through one path — a click-drawn rectangle
+      and an LLM-drawn rectangle are the exact same operation. And the file you
+      save is not geometry: it's the ordered <em>op-log</em> of commands that built
+      the model, so you get perfect undo, history editing, and clean git diffs for
+      free.</p>
+    <div class="two">
+      <pre><span class="c"># type these into the command bar</span>
+box 0,0,0 40,30,4       <span class="c"># a podium</span>
+box 6,6,4 20,14,24      <span class="c"># a tower</span>
+plan 1.5                <span class="c"># cut a plan</span>
+sheet plan-01 a3        <span class="c"># a paper sheet</span>
+sheetview plan-01 top 1:100
+print plan-01 plan.pdf  <span class="c"># vector PDF at scale</span></pre>
+      <div>
+        <p>Or tell the deck, in plain language:</p>
+        <pre><span class="c">"make a 40×30 podium with a tower on top,
+ cut a plan, and print an A3 sheet"</span></pre>
+        <p style="color:var(--muted); font-size:14.5px">— it emits those same
+        commands as cards you can inspect, undo, or amend. No second code path.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="screens">
+  <div class="wrap">
+    <h2>See it</h2>
+    <p class="sub">Every image below is real output from the app — massing,
+      drafting, and analysis.</p>
+    <div class="shots">
+      <figure>
+        <img src="screenshots/massing.png" alt="Podium-and-tower massing in a perspective viewport" loading="lazy">
+        <figcaption>Massing in seconds — a few <code>box</code> commands, orbited.</figcaption>
+      </figure>
+      <figure>
+        <img src="screenshots/pencil-section.png" alt="A plan cut rendered in pencil hidden-line mode" loading="lazy">
+        <figcaption><code>plan 1.5</code> + <code>display pencil</code> — a hidden-line plan cut on white paper.</figcaption>
+      </figure>
+      <figure>
+        <img src="screenshots/sun-hours.png" alt="A sun-hours ground heatmap coloured by hours of direct sun" loading="lazy">
+        <figcaption><code>sunhours</code> — an occlusion-accurate heatmap of direct-sun hours, with a report to read.</figcaption>
+      </figure>
+      <figure>
+        <img src="screenshots/site-plan.png" alt="A generated site plan with streets, blocks, lots and row buildings" loading="lazy">
+        <figcaption>Site planning — streets, blocks, lots, setbacks, and buildings from one boundary.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="sub">A working architect's toolkit, not a tech demo.</p>
+    <div class="grid">
+      <div class="card"><h3>Model &amp; draft</h3><p>Boxes, extrude, revolve/loft/sweep, in-repo CSG booleans, NURBS curves, 2D sketch constraints, blocks. Plan/section cuts, elevations, dimensions, hatches, sheets (A4–A0), and vector PDF export.</p></div>
+      <div class="card"><h3>Site planning (intemfit)</h3><p>From one boundary: generate streets and blocks, subdivide into lots, apply setbacks, place buildings, and read a gross-vs-net yield report with GFA, FAR, and coverage.</p></div>
+      <div class="card"><h3>Environmental analysis</h3><p>Real solar position (NOAA SPA), shadow studies, sun-hours and per-face insolation heatmaps, annual radiation from EPW weather, sun-path diagrams — every study stores numbers to design with.</p></div>
+      <div class="card"><h3>Compliance pre-checks</h3><p>Geometric pre-checks against embedded IBC-2021 egress and ADA-2010 packs, with per-rule verdicts. <em>Advisory only — never a code review.</em></p></div>
+      <div class="card"><h3>Landscape &amp; planting</h3><p>Terrain from survey points, contours, grading and earthwork, a 33-species planting catalog (temperate + Caribbean / Latin-American tropical), and advisory drainage.</p></div>
+      <div class="card"><h3>Exchange</h3><p>Import/export DXF, OBJ, STL, glTF, IFC4, 3DM (Rhino), SVG, PDF, and point clouds — plus assisted DWG import and a SAF structural handoff. Hand-written, minimal dependencies.</p></div>
+      <div class="card"><h3>Localized &amp; skinnable</h3><p>English and Spanish ship in-app (switch anytime). The UI skins itself to the CAD you came from — AutoCAD, Rhino, or Revit — with matching colors and command aliases.</p></div>
+      <div class="card"><h3>Embedded local-LLM deck</h3><p>An LLM partner that draws, teaches, plans multi-step work, and critiques designs in numbers — running a local model, a cloud model, or nothing at all. It ships with no backend active.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="download">
+  <div class="wrap">
+    <h2>Download &amp; install</h2>
+    <p class="sub">One file. No installer, no dependencies, no account.
+      <a href="https://github.com/htarrido-picart/itsjustcad/releases/latest">Get the latest release →</a></p>
+    <table>
+      <tr><th>Your OS</th><th>First launch</th></tr>
+      <tr><td><b>macOS</b> (Apple Silicon or Intel)</td><td>Unpack <code>ItsJustCAD.app</code>, then right-click ▸ <b>Open</b> (once).</td></tr>
+      <tr><td><b>Windows</b> (x86-64)</td><td>Unzip, double-click, <b>More info ▸ Run anyway</b> (once).</td></tr>
+      <tr><td><b>Linux</b> (x86-64)</td><td><code>tar xzf …</code>, <code>chmod +x itsjustcad</code>, then run.</td></tr>
+    </table>
+    <p class="note" style="margin-top:18px">The app is not code-signed yet, so your
+      OS shows a one-time "unidentified developer" warning on the very first
+      launch. Use the step above; after that it just opens. It's a single ~10&nbsp;MB
+      program with nothing to install.</p>
+  </div>
+</section>
+
+<section id="license">
+  <div class="wrap">
+    <h2>Free, open, and honest</h2>
+    <p class="sub">The desktop app is free and open source under
+      <b>AGPL-3.0-or-later</b> — use it, fork it, build on it. The file format and
+      command language are documented and stable. A separate paid mobile edition
+      funds the polish, so this isn't a donation-starved side project.</p>
+    <p class="note"><b>Advisory-only disclaimer.</b> ItsJustCAD's compliance
+      pre-checks, structural metadata, site-planning envelopes, and environmental
+      studies are <b>design-stage aids, not professional certification</b>. The app
+      never certifies code compliance and never performs structural analysis.
+      Verify allowable use, zoning, egress, accessibility, and structure with a
+      licensed professional and the authority having jurisdiction.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p><b>ItsJustCAD</b> — © 2026 Hector Tarrido-Picart · AGPL-3.0-or-later ·
+      <a href="https://github.com/htarrido-picart/itsjustcad">GitHub</a> ·
+      <a href="tutorials/">Tutorials</a> ·
+      <a href="command-reference.md">Command reference</a> ·
+      <a href="deck.md">The deck</a> ·
+      <a href="interop.md">Interop</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

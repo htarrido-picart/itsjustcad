@@ -212,8 +212,8 @@ color by layer / object / type / random · named views · image underlay for
 tracing scans · **AI diffusion render** of the current view (opt-in; ComfyUI /
 A1111 / Draw Things / Replicate, ships with no backend active)
 
-![Plan cut in pencil mode — poché walls around a courtyard, hidden-line white-paper view](docs/shot-plan-pencil.png)
-*`plan 1.5` + `display pencil`: a hidden-line plan cut — poché walls, an open courtyard, a central core.*
+![Plan cut in pencil mode — poché walls around a courtyard, hidden-line white-paper view](docs/screenshots/pencil-section.png)
+*`plan 1.5` + `display pencil`: a hidden-line plan cut — poché walls around an open courtyard.*
 
 ### Analyze the environment
 `sun <lat> <lon> <date> <time>` real solar lighting (NOAA SPA, in-repo) ·
@@ -243,6 +243,9 @@ structured yield/coverage takeoff the deck can critique. Envelope and zoning
 parameters are advisory geometry aids — verify allowable use, density, and
 setbacks with the local zoning authority.
 
+![A generated site plan — streets, blocks, lots, setback envelopes, and row buildings](docs/screenshots/site-plan.png)
+*`lotgeneratesite` → `lotsubdivide` → `lotsetbacks` → `lotbuilding`: a full site from one boundary, plus a `lotreport` yield.*
+
 ### Pre-check code compliance (advisory only)
 `codecheck <pack>` runs declarative geometric pre-checks — embedded `ibc2021`
 (egress: risers, treads, corridor/stair/door widths, headroom, occupant load,
@@ -255,6 +258,9 @@ swap in without code.
 
 ![Sun and shadow study — a massing lit by real solar position with ground shadows cast across the day](docs/shot-sun-shadow.png)
 *`sun` + `shadowstudy`: real solar position (NOAA SPA) casts shadows across the day.*
+
+![A sun-hours ground heatmap — cells coloured by hours of direct sun, cool in shadow, warm in full sun](docs/screenshots/sun-hours.png)
+*`sunhours`: an occlusion-accurate heatmap of direct-sun hours; `report sunhours` prints the numbers to design with.*
 
 ### Document
 Plan/section cuts — heavy cut lines + light projected edges · elevation views
@@ -406,12 +412,30 @@ Minimal dependencies by policy: the CSG engine, DXF/PDF/SVG/glTF/IFC
 readers-writers, solar math, Delaunay, and BVH are written in-repo. That
 policy — not just Rust — is why the binary is ~10 MB.
 
-## Docs
+## Documentation
 
-| File | What |
+New here? Start with the **[tutorials](docs/tutorials/)** — four guided,
+step-by-step walkthroughs a working architect can follow top to bottom:
+
+| # | Tutorial | You end with |
+|---|---|---|
+| 1 | [Getting started](docs/tutorials/01-getting-started.md) | Your first massing — orbited, saved, printed to a PDF sheet |
+| 2 | [Site planning with intemfit](docs/tutorials/02-site-planning.md) | A subdivided site with buildings and a yield report |
+| 3 | [Environmental analysis](docs/tutorials/03-environmental-analysis.md) | A sun-hours study read in numbers and critiqued by the deck |
+| 4 | [Working with the deck](docs/tutorials/04-deck.md) | The LLM drawing and analysing in the same commands you type |
+
+There's also a self-contained **[landing page](docs/index.html)** (open it in a
+browser) and **[ready-to-open example documents](examples/)** — a massing, a
+courtyard sheet, and a full intemfit site.
+
+| Reference | What |
 |---|---|
-| [docs/COMMANDS.txt](docs/COMMANDS.txt) | Every command, generated from `--help` |
-| [FORMAT.md](FORMAT.md) | The op-log file format + stability promise |
+| [docs/getting-started.md](docs/getting-started.md) | Install, first model, the command language at a glance |
+| [docs/command-reference.md](docs/command-reference.md) · [docs/COMMANDS.txt](docs/COMMANDS.txt) | Every command with its exact usage |
+| [docs/deck.md](docs/deck.md) | The LLM partner — cassettes, terse mode, plugins, encryption |
+| [docs/interop.md](docs/interop.md) | DXF · IFC · 3DM · SAF · point-cloud exchange |
+| [docs/file-format.md](docs/file-format.md) · [FORMAT.md](FORMAT.md) | The op-log file format + stability promise |
+| [docs/plugins.md](docs/plugins.md) | Runtime-authored command macros |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Tests-required, one-substrate rule, minimal deps |
 | [docs/ui-legacy-research.md](docs/ui-legacy-research.md) | The AutoCAD/Rhino/Revit conventions the skins implement |
 
