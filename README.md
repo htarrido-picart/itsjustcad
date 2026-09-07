@@ -84,6 +84,10 @@ and which CAD you're coming from (**AutoCAD / Rhino / Revit / none**). The UI
 adapts: background colors, font sizes, and command aliases match the software
 your hands already know. `pl`, `o`, `tr`, `co` all work if you chose AutoCAD.
 
+The interface is fully localized — **English and Spanish (Español)** ship
+in-app; switch anytime with the `language en|es` verb or the language setting.
+Missing keys fall back to English, so nothing is ever blank.
+
 A 60-second tour — type into the command line (bottom bar):
 
 ```
@@ -180,6 +184,9 @@ linear + polar arrays · **blocks** incl. **parametric (dynamic) blocks** and an
 on-disk block library · groups · terrain from survey points (in-repo Delaunay) ·
 LAS / LAZ / E57 point clouds
 
+![Podium-and-tower massing in the perspective viewport](docs/shot-massing.png)
+*A few `box` commands: a podium, a stepped base, and a tower — massing in seconds.*
+
 ### Form-finding & expressive structures
 Dynamic-relaxation form-finding — funicular / catenary arches (Gaudí),
 tensegrity, Frei-Otto cable nets and **minimal surfaces** (`minsurf`) — plus
@@ -227,6 +234,15 @@ hardscape `sitepath` ribbons draped on terrain · drainage `flowarrows` /
 `ponding` (advisory visualisation, not hydrology engineering) · OSM building
 context.
 
+### Plan a site
+Parcel-scale site planning: `lotsubdivide` splits a parent lot into buildable
+lots · `lotsetbacks` / `lotfrontage` / `lotopenspace` / `lotloading` apply
+zoning envelope rules · `lotbuilding` places massing within the envelope ·
+`lotgeneratesite` lays out a full site from settings · `lotreport` gives a
+structured yield/coverage takeoff the deck can critique. Envelope and zoning
+parameters are advisory geometry aids — verify allowable use, density, and
+setbacks with the local zoning authority.
+
 ### Pre-check code compliance (advisory only)
 `codecheck <pack>` runs declarative geometric pre-checks — embedded `ibc2021`
 (egress: risers, treads, corridor/stair/door widths, headroom, occupant load,
@@ -254,7 +270,7 @@ PDF export
 
 | Direction | Formats |
 |---|---|
-| Import | DXF · OBJ · STL · glTF/GLB · Collada · **IFC** · **3DM** (Rhino) · GeoJSON · OSM (Overpass export) · LAS / **LAZ** / **E57** point clouds · EPW · STEP† |
+| Import | **DWG** (assisted) · DXF · OBJ · STL · glTF/GLB · Collada · **IFC** · **3DM** (Rhino) · GeoJSON · OSM (Overpass export) · LAS / **LAZ** / **E57** point clouds · EPW · STEP† |
 | Export | DXF · OBJ · STL · glTF/GLB · **IFC4** (incl. structural analysis model) · **3DM** · **SAF `.xlsx`** (structural handoff) · SVG · CSV · PDF · STEP† |
 
 IFC is the Revit bridge — both directions, hand-written, zero dependencies, and
@@ -263,6 +279,12 @@ includes typed structural members + the `IfcStructuralAnalysisModel` graph. SAF
 Both carry a **geometry+topology-only, no-analysis-results** disclaimer — the app
 never claims to analyse. Native save stays the op-log JSON. †STEP needs the
 opt-in `kernel-occt` feature.
+
+**DWG** is an *assisted* bridge: the AutoCAD `.dwg` importer shells out to a
+user-installed `dwg2dxf` (LibreDWG, `brew install libredwg`) to convert to DXF,
+then imports through the hardened DXF path — LibreDWG is GPLv3 and is **never
+linked or bundled**, so the AGPLv3 distribution stays clean. A truncated
+conversion is rejected with a clear error, never a silent empty import.
 
 ### Automate
 

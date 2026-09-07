@@ -1,10 +1,11 @@
 # Security
 
-ItsJustCAD opens files authored by other people (DXF, IFC, OBJ, STL, glTF/GLB,
-Collada, LAS/LAZ, E57, 3DM, GeoJSON, OSM/Overpass, EPW, and its own
+ItsJustCAD opens files authored by other people (DWG, DXF, IFC, OBJ, STL,
+glTF/GLB, Collada, LAS/LAZ, E57, 3DM, GeoJSON, OSM/Overpass, EPW, and its own
 `.itsjustcad.json`), loads user- and LLM-authored JSON (plugins, block
-libraries, check-rule packs, deck configs), and can connect to a local or cloud
-LLM. We treat all of that as a trust boundary.
+libraries, check-rule packs, deck configs), can shell out to a user-installed
+DWG converter, and can connect to a local or cloud LLM. We treat all of that as
+a trust boundary.
 
 ## Supported versions
 
@@ -79,6 +80,12 @@ saved conversation.
   deflate path is trusted for the 3DM zip-bomb vector.
 - **JSON loaders:** path-traversal-validated names; malformed JSON returns a
   clean error (never a panic) via `serde_json`'s depth-limited parser.
+- **DWG converter (`dwg2dxf`/LibreDWG):** the GPLv3 converter is a user-installed
+  external binary, never linked or bundled; it is probed only on known paths and
+  its output is not trusted on exit code — the produced DXF is validated for a
+  complete ENTITIES section and EOF marker before import, so a truncated or
+  broken conversion is rejected with a clear error rather than a silent empty
+  import. The converted DXF then flows through the hardened DXF parser above.
 - **Accepted / low-risk:** the SD control-image loader reads
   `<prefix>_depth.png` from an app-generated prefix in a private runtime dir —
   the fixed suffix and internal-only prefix mean it cannot read an arbitrary
