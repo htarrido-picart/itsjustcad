@@ -131,10 +131,58 @@ fn corner_lots_widened_and_clamped_on_acute_block() {
         assert!(l.polygon.area() > 0.0);
         assert!(l.polygon.len() >= 3);
     }
-    // Widening is bounded (slack-clamped) → total growth stays modest.
+    // Corner widening is a TRUE area transfer: Σ lot area is conserved exactly
+    // (the neighbour gives up precisely what the corner lot gains) — NOT merely
+    // "bounded growth". Assert against the BLOCK area, the invariant used in
+    // blocks.rs / offset_blocks.rs.
+    let block_area = block_poly.area();
     let after_area: f64 = out.iter().map(|l| l.polygon.area()).sum();
-    assert!(after_area >= before_area - 1.0, "area should not shrink");
-    assert!(after_area < before_area * 1.5, "widen unbounded: {before_area} -> {after_area}");
+    assert!(
+        (before_area - block_area).abs() / block_area < 5e-3,
+        "pre-condition: subdivision should already tile the block ({before_area} vs {block_area})"
+    );
+    assert!(
+        (after_area - block_area).abs() / block_area < 5e-3,
+        "corner widening broke area conservation: Σ {after_area} != block {block_area}"
+    );
+    // No pairwise lot overlap after widening.
+    for i in 0..out.len() {
+        for j in (i + 1)..out.len() {
+            let ov = overlap_area(&out[i].polygon, &out[j].polygon);
+            let tol = 0.01 * out[i].polygon.area().min(out[j].polygon.area());
+            assert!(
+                ov <= tol.max(1.0),
+                "lots {i} and {j} overlap by {ov} after corner widening"
+            );
+        }
+    }
+}
+
+/// Overlap area of two lots by sampling (mirrors blocks.rs / offset_blocks.rs):
+/// count interior sample points of `a` that also fall inside `b`, scaled by cell
+/// area. Cheap disjoint test tolerant of shared boundaries.
+fn overlap_area(a: &Polygon2d, b: &Polygon2d) -> f64 {
+    let (lo_a, hi_a) = a.aabb();
+    let (lo_b, hi_b) = b.aabb();
+    let lo = lo_a.max(lo_b);
+    let hi = hi_a.min(hi_b);
+    if lo.x >= hi.x || lo.y >= hi.y {
+        return 0.0;
+    }
+    let n = 40;
+    let dx = (hi.x - lo.x) / n as f64;
+    let dy = (hi.y - lo.y) / n as f64;
+    let cell = dx * dy;
+    let mut acc = 0.0;
+    for i in 0..n {
+        for j in 0..n {
+            let p = DVec2::new(lo.x + (i as f64 + 0.5) * dx, lo.y + (j as f64 + 0.5) * dy);
+            if a.contains(p) && b.contains(p) {
+                acc += cell;
+            }
+        }
+    }
+    acc
 }
 
 // ── Flag lots: only when enabled, pole excluded ───────────────────────────────

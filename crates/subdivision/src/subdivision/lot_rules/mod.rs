@@ -6,7 +6,8 @@
 //!
 //! - [`width_mix`] — the packing solver (frontage → width sequence).
 //! - [`depth`] — an independent depth target, separate from area.
-//! - [`corner`] — widen acute-corner lots, clamped against self-intersection.
+//! - [`corner`] — widen acute-corner lots by a true area transfer from the
+//!   adjacent neighbour (clamped to available room; Σ area conserved).
 //! - [`flag`] — panhandle lots (pole area excluded from countable area).
 //! - [`loading`] — FrontLoaded vs AlleyLoaded (two-frontage depth).
 //! - [`sliver`] — merge sub-threshold lots into their largest-shared-edge
@@ -72,8 +73,10 @@ impl LotRulesReport {
 /// separate entry, [`subdivide_width_mix`]. Returns the transformed lots plus a
 /// report.
 ///
-/// Σ area is conserved (widening moves area between lots via clamped slack;
-/// sliver merge unions, never deletes). Deterministic for a fixed seed.
+/// Σ area is conserved: corner widening is a TRUE transfer — the corner lot gains
+/// exactly what its adjacent neighbour gives up across their shared boundary
+/// (clamped to the room that exists, so it never overruns the block or overlaps);
+/// sliver merge unions, never deletes. Deterministic for a fixed seed.
 pub fn apply_lot_rules(
     block: &Block,
     lots: Vec<Lot>,
@@ -99,40 +102,51 @@ pub fn apply_lot_rules(
         report.placeholder_notes.push("corner bonus +15%".into());
     }
 
-    // ── Corner lots: widen the lot sitting at each acute block corner. ────────
+    // ── Corner lots: widen the lot at each acute block corner by a TRUE area
+    //    transfer from its adjacent (down-frontage) neighbour. The shared boundary
+    //    moves along the frontage so Σ area is conserved and no overlap is created;
+    //    the move is clamped to the room the neighbour can spare, so the corner lot
+    //    can never overrun the block. ────────────────────────────────────────────
     let acute = corner::acute_corners(&block.polygon, settings.corner_angle_max);
     if !acute.is_empty() && corner_bonus > 0.0 {
         let bverts = block.polygon.verts();
         let n = bverts.len();
+        // Keep at least this much of the neighbour's own frontage after the give.
+        let min_keep = (settings.lot_width_min * 0.5).max(1.0);
         for &ci in &acute {
             let cv = bverts[ci];
-            // The frontage direction at the corner: along the incoming block edge.
+            // The frontage direction: along the LONGER of the two block edges
+            // meeting at the corner, oriented away from the corner (into the
+            // block). The corner lot widens along its frontage, taking area from
+            // the next lot down that street edge.
             let prev = bverts[(ci + n - 1) % n];
-            let dir = cv - prev;
+            let next = bverts[(ci + 1) % n];
+            let e_prev = cv - prev; // toward the corner along the incoming edge
+            let e_next = next - cv; // away from the corner along the outgoing edge
+            let dir = if e_next.length() >= e_prev.length() {
+                e_next
+            } else {
+                -e_prev
+            };
             if dir.length_squared() < 1e-12 {
                 continue;
             }
+            let dir = dir.normalize();
             // Find the lot whose centroid is nearest this corner.
-            if let Some((li, _)) = lots
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| {
-                    a.polygon
-                        .centroid()
-                        .distance(cv)
-                        .partial_cmp(&b.polygon.centroid().distance(cv))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
-                // Slack = distance to the next lot's frontage (bounded so we do
-                // not overrun). Use half the lot's own frontage as a safe cap.
-                let slack = corner_lot_slack(&lots[li].polygon, dir);
-                let widened =
-                    corner::widen_corner_lot(&lots[li].polygon, dir, corner_bonus, slack);
-                if widened.area() > lots[li].polygon.area() + 1e-9 {
-                    lots[li].polygon = widened;
-                    report.corners_widened += 1;
-                }
+            let Some(ci_lot) = nearest_lot(&lots, cv) else { continue };
+            // Its neighbour = the lot immediately down-`dir` sharing the corner
+            // lot's hi boundary (the piece the widen would push into).
+            let Some(ni_lot) = neighbour_down_dir(&lots, ci_lot, dir) else { continue };
+            if let Some(t) = corner::transfer_corner_widen(
+                &lots[ci_lot].polygon,
+                &lots[ni_lot].polygon,
+                dir,
+                corner_bonus,
+                min_keep,
+            ) {
+                lots[ci_lot].polygon = t.corner;
+                lots[ni_lot].polygon = t.neighbour;
+                report.corners_widened += 1;
             }
         }
     }
@@ -148,14 +162,70 @@ pub fn apply_lot_rules(
     (lots, report)
 }
 
-/// A conservative frontage slack for corner widening: a fraction of the lot's own
-/// frontage extent along `dir`, so the widen never doubles the lot.
-fn corner_lot_slack(lot: &Polygon2d, dir: DVec2) -> f64 {
-    let d = dir.normalize();
-    let projs: Vec<f64> = lot.verts().iter().map(|v| v.dot(d)).collect();
-    let lo = projs.iter().cloned().fold(f64::INFINITY, f64::min);
-    let hi = projs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    (hi - lo) * 0.5
+/// Index of the lot whose centroid is nearest `p`.
+fn nearest_lot(lots: &[Lot], p: DVec2) -> Option<usize> {
+    lots.iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            a.polygon
+                .centroid()
+                .distance(p)
+                .partial_cmp(&b.polygon.centroid().distance(p))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+}
+
+/// The lot immediately down-`dir` of `corner_idx` that shares its hi boundary: the
+/// piece a widen along `dir` would push into. Chosen as the lot (other than the
+/// corner) whose centroid projection along `dir` is the smallest value still
+/// greater than the corner lot's centroid projection, and that laterally overlaps
+/// the corner lot (so the shared boundary is real). Deterministic (index tie-break).
+fn neighbour_down_dir(lots: &[Lot], corner_idx: usize, dir: DVec2) -> Option<usize> {
+    let corner = &lots[corner_idx].polygon;
+    let c_proj = corner.centroid().dot(dir);
+    // Lateral (⊥ dir) span of the corner lot, to require a real shared boundary.
+    let perp = DVec2::new(-dir.y, dir.x);
+    let (c_plo, c_phi) = {
+        let ps = corner.verts().iter().map(|v| v.dot(perp));
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for p in ps {
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        (lo, hi)
+    };
+    let mut best: Option<(usize, f64)> = None;
+    for (i, l) in lots.iter().enumerate() {
+        if i == corner_idx {
+            continue;
+        }
+        let proj = l.polygon.centroid().dot(dir);
+        if proj <= c_proj {
+            continue;
+        }
+        // Require lateral overlap with the corner lot.
+        let (plo, phi) = {
+            let ps = l.polygon.verts().iter().map(|v| v.dot(perp));
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for p in ps {
+                lo = lo.min(p);
+                hi = hi.max(p);
+            }
+            (lo, hi)
+        };
+        let overlap = phi.min(c_phi) - plo.max(c_plo);
+        if overlap <= 1e-6 {
+            continue;
+        }
+        match best {
+            Some((_, bp)) if proj >= bp => {}
+            _ => best = Some((i, proj)),
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 /// Width-mix frontage subdivision (plan §7.4): slice `block` into lots along its
