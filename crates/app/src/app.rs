@@ -4686,7 +4686,14 @@ impl App {
                 None => Some(CameraTag::Perspective),
             }
         };
-        crate::menu::ViewState { display, lighting, camera, panel_visible: self.panel_visible }
+        crate::menu::ViewState {
+            display,
+            lighting,
+            camera,
+            panel_visible: self.panel_visible,
+            skin: self.cad_origin,
+            lang: crate::i18n::current_lang(),
+        }
     }
 
     /// Toggle the right docked panel from the View menu, mirroring the ⌘\
@@ -4758,6 +4765,17 @@ impl App {
             MenuAction::ToggleWebSearch => self.deck_pane.toggle_web_search(),
             MenuAction::ToggleTerse => self.deck_pane.toggle_terse(),
             MenuAction::TogglePanel => self.toggle_panel(),
+            // Theme ▸ Skin radio: apply live + persist, exactly like the
+            // `skin <name>` verb. Restyle needs a Context, so apply immediately
+            // (we have `ctx`) rather than staging via `pending_skin`.
+            MenuAction::SetSkin(origin) => {
+                self.cad_origin = origin;
+                save_cad_origin(origin);
+                apply_preset(ctx.clone(), origin);
+            }
+            // Theme ▸ Language radio: apply live + persist, exactly like the
+            // `language en|es` verb.
+            MenuAction::SetLanguage(lang) => save_lang(lang),
         }
     }
 

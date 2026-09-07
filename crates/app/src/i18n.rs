@@ -31,9 +31,10 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// The languages the app ships. English is the source catalog; Spanish is the
 /// priority second language (target market: Cali / Guayaquil). Add a variant +
 /// its catalog to grow the set — the completeness test guards coverage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Lang {
     /// English (source of truth; every key defined here).
+    #[default]
     En,
     /// Spanish (español) — architect / CAD terminology.
     Es,

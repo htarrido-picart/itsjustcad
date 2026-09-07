@@ -15,9 +15,10 @@
 
 use itsjustcad_commands::{Category, registry};
 
+use crate::i18n::Lang;
 use crate::i18n::t as tr;
 use crate::icons::{Icon, Icons};
-use crate::preset::MenuStyle;
+use crate::preset::{CadOrigin, MenuStyle};
 
 /// What happens when a menu item is chosen. The rule (documented on each
 /// variant) is: bare draw verbs start the interactive draw tool; verbs that
@@ -84,6 +85,14 @@ pub enum MenuAction {
     /// View menu shows this as a stateful "Hide Panel" ⇄ "Show Panel" flip and
     /// mirrors the ⌘\ hotkey. UI state, not op-log.
     TogglePanel,
+    /// Switch the legacy-CAD skin (palette/fonts/accent + alias table). Radio in
+    /// the Theme menu's Skin group; fires the same apply+persist path the
+    /// `skin <name>` verb uses. UI/session state, not op-log.
+    SetSkin(CadOrigin),
+    /// Switch the UI language. Radio in the Theme menu's Language group; fires the
+    /// same apply+persist path the `language en|es` verb uses. UI/session state,
+    /// not op-log.
+    SetLanguage(Lang),
 }
 
 /// Draw-tool verbs (mirror `draw_tool::try_start`). A menu pick of one of these
@@ -337,6 +346,12 @@ pub struct ViewState {
     /// Whether the right docked panel is currently shown; flips the Panel item's
     /// label between "Hide Panel" and "Show Panel".
     pub panel_visible: bool,
+    /// Active legacy-CAD skin — drives the check on the Theme ▸ Skin radio group.
+    /// Matched against each `SetSkin(origin)` item's origin.
+    pub skin: CadOrigin,
+    /// Active UI language — drives the check on the Theme ▸ Language radio group.
+    /// Matched against each `SetLanguage(lang)` item's lang.
+    pub lang: Lang,
 }
 
 /// The display-mode radio choices the View menu offers, in menu order. A copy of
@@ -401,6 +416,28 @@ pub fn appearance_native_items() -> Vec<(&'static str, &'static str, MenuAction)
         ("text_smaller", tr("menu.theme.text_smaller"), MenuAction::ZoomStep(false)),
         ("text_reset", tr("menu.theme.text_reset"), MenuAction::ZoomReset),
     ]
+}
+
+/// The Theme ▸ Skin radio group: `(id_suffix, CadOrigin)` in picker order
+/// (Native first). Each becomes a `Check` firing `SetSkin(origin)` — the same
+/// apply+persist path the `skin <name>` verb uses. Stable ids (`skin_native` …)
+/// keep tests / native routing language-independent; labels localize via the
+/// skin's `label_key`. Standalone so it is unit-testable and shared by the native
+/// + in-window bars.
+pub fn skin_radio_items() -> [(&'static str, CadOrigin); 4] {
+    [
+        ("skin_native", CadOrigin::None),
+        ("skin_autocad", CadOrigin::AutoCAD),
+        ("skin_rhino", CadOrigin::Rhino),
+        ("skin_revit", CadOrigin::Revit),
+    ]
+}
+
+/// The Theme ▸ Language radio group: `(id_suffix, Lang)`. Each becomes a `Check`
+/// firing `SetLanguage(lang)` — the same apply+persist path the `language en|es`
+/// verb uses. Labels use each language's own `native_name` (English / Español).
+pub fn lang_radio_items() -> [(&'static str, Lang); 2] {
+    [("lang_en", Lang::En), ("lang_es", Lang::Es)]
 }
 
 /// Map a top-level menu's canonical English id (`"File"`, `"Edit"`, …) to its
@@ -646,6 +683,32 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                 items.push(NativeItem::Separator);
             }
             items.push(wired_leaf(t, id, label, action));
+        }
+        // ── Skin radio group (CadOrigin) ─────────────────────────────────────
+        // Native / AutoCAD / Rhino / Revit; the active skin carries the check.
+        // Fires the same apply+persist path the `skin <name>` verb uses.
+        items.push(NativeItem::Separator);
+        for (id, origin) in skin_radio_items() {
+            items.push(NativeItem::Check {
+                id: format!("{t}/{id}"),
+                label: tr(origin.label_key()).into(),
+                action: MenuAction::SetSkin(origin),
+                checked: view.skin == origin,
+                enabled: true,
+            });
+        }
+        // ── Language radio group (Lang) ──────────────────────────────────────
+        // English / Español; the active language carries the check. Fires the
+        // same apply+persist path the `language en|es` verb uses.
+        items.push(NativeItem::Separator);
+        for (id, lang) in lang_radio_items() {
+            items.push(NativeItem::Check {
+                id: format!("{t}/{id}"),
+                label: lang.native_name().to_string(),
+                action: MenuAction::SetLanguage(lang),
+                checked: view.lang == lang,
+                enabled: true,
+            });
         }
         menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
     }
@@ -943,6 +1006,8 @@ pub fn demo_open(
         lighting: Some(LightModeTag::Working),
         camera: Some(CameraTag::Perspective),
         panel_visible: true,
+        skin: CadOrigin::None,
+        lang: Lang::En,
     };
     let Some(menu) = native_model(style, false, view).into_iter().find(|m| m.title == title) else {
         return;
@@ -1165,6 +1230,80 @@ mod tests {
         assert!(by_action(&MenuAction::ZoomStep(true)), "Increase missing");
         assert!(by_action(&MenuAction::ZoomStep(false)), "Decrease missing");
         assert!(by_action(&MenuAction::ZoomReset), "Reset missing");
+    }
+
+    /// Helper: collect the (id, checked, action) of Theme-menu Check items.
+    fn theme_checks(view: ViewState) -> Vec<(String, bool, MenuAction)> {
+        native_model(MenuStyle::Rhino, true, view)
+            .into_iter()
+            .find(|m| m.title == tr("menu.theme"))
+            .expect("Theme menu present")
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                NativeItem::Check { id, checked, action, .. } => {
+                    Some((id.clone(), *checked, action.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn theme_menu_has_skin_group_with_all_four_options() {
+        let checks = theme_checks(ViewState::default());
+        for (id, origin) in skin_radio_items() {
+            let full = format!("Theme/{id}");
+            let found = checks
+                .iter()
+                .find(|(i, _, _)| i == &full)
+                .unwrap_or_else(|| panic!("skin item {full} missing"));
+            assert_eq!(found.2, MenuAction::SetSkin(origin), "{full} wrong action");
+        }
+    }
+
+    #[test]
+    fn theme_menu_skin_radio_checks_active_skin() {
+        // Exactly the active skin carries the check.
+        for (_, active) in skin_radio_items() {
+            let view = ViewState { skin: active, ..Default::default() };
+            for (id, origin) in skin_radio_items() {
+                let full = format!("Theme/{id}");
+                let checked = theme_checks(view)
+                    .into_iter()
+                    .find(|(i, _, _)| i == &full)
+                    .map(|(_, c, _)| c)
+                    .unwrap();
+                assert_eq!(checked, origin == active, "{full} check wrong for active {active:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn theme_menu_has_language_group_with_correct_check() {
+        for (_, active) in lang_radio_items() {
+            let view = ViewState { lang: active, ..Default::default() };
+            let checks = theme_checks(view);
+            for (id, lang) in lang_radio_items() {
+                let full = format!("Theme/{id}");
+                let (_, checked, action) = checks
+                    .iter()
+                    .find(|(i, _, _)| i == &full)
+                    .unwrap_or_else(|| panic!("lang item {full} missing"))
+                    .clone();
+                assert_eq!(action, MenuAction::SetLanguage(lang), "{full} wrong action");
+                assert_eq!(checked, lang == active, "{full} check wrong for active {active:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn skin_and_language_items_route_to_apply_actions() {
+        // Selecting a Theme skin/language item dispatches the apply+persist action
+        // (SetSkin / SetLanguage), the same the app routes through apply_menu_action.
+        let checks = theme_checks(ViewState::default());
+        assert!(checks.iter().any(|(_, _, a)| *a == MenuAction::SetSkin(CadOrigin::Rhino)));
+        assert!(checks.iter().any(|(_, _, a)| *a == MenuAction::SetLanguage(Lang::Es)));
     }
 
     #[test]

@@ -209,6 +209,18 @@ impl NativeMenuBar {
                 it.set_checked(view.camera == Some(tag));
             }
         }
+        // Skin radios (Theme ▸ Skin): exactly the active skin checked.
+        for (id, origin) in crate::menu::skin_radio_items() {
+            if let Some(it) = self.check_items.get(&format!("Theme/{id}")) {
+                it.set_checked(view.skin == origin);
+            }
+        }
+        // Language radios (Theme ▸ Language): exactly the active language checked.
+        for (id, lang) in crate::menu::lang_radio_items() {
+            if let Some(it) = self.check_items.get(&format!("Theme/{id}")) {
+                it.set_checked(view.lang == lang);
+            }
+        }
         // Panel item label flip.
         if let Some(it) = &self.panel_item {
             it.set_text(if view.panel_visible { "Hide Panel" } else { "Show Panel" });
@@ -406,6 +418,42 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Native + in-window parity for the new Theme ▸ Skin / Language radios: the
+    /// model exposes each as a `Check` carrying a stable `Theme/*` id and the
+    /// SetSkin/SetLanguage action, so the muda `routes`/`check_items` maps (built
+    /// from this same model) cover them and the sync path can flip their marks.
+    #[test]
+    fn theme_skin_language_checks_are_present_and_routed() {
+        use crate::i18n::Lang;
+        use crate::menu::{lang_radio_items, skin_radio_items};
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            let mut checks: std::collections::HashMap<String, MenuAction> =
+                std::collections::HashMap::new();
+            for top in native_model(style, true, ViewState::default()) {
+                for item in &top.items {
+                    if let NativeItem::Check { id, action, .. } = item {
+                        checks.insert(id.clone(), action.clone());
+                    }
+                }
+            }
+            for (id, origin) in skin_radio_items() {
+                assert_eq!(
+                    checks.get(&format!("Theme/{id}")),
+                    Some(&MenuAction::SetSkin(origin)),
+                    "skin radio {id} not routed for {style:?}"
+                );
+            }
+            for (id, lang) in lang_radio_items() {
+                assert_eq!(
+                    checks.get(&format!("Theme/{id}")),
+                    Some(&MenuAction::SetLanguage(lang)),
+                    "language radio {id} not routed for {style:?}"
+                );
+            }
+            let _ = Lang::En;
         }
     }
 
