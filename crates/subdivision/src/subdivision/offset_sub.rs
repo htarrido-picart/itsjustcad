@@ -210,13 +210,20 @@ fn cut_into_wedges(
     // Target frontage per perimeter lot: derive from area/depth if available,
     // else from lot_width_min. Depth of the strip is offset_width.
     let depth = settings.offset_width.max(1.0);
+    // Floor the frontage spacing to a sane metre value: a tiny `lot_width_min`
+    // (e.g. 0.0001) would otherwise make `perim / target_width` billions of cuts
+    // (DoS / hang).
+    const MIN_FRONTAGE_M: f64 = 0.5;
     let target_width = if settings.lot_area_min > 0.0 {
         (settings.lot_area_min / depth).max(settings.lot_width_min)
     } else {
         settings.lot_width_min.max(1.0)
-    };
+    }
+    .max(MIN_FRONTAGE_M);
 
-    let n_cuts = (perim / target_width).floor() as i64;
+    // Hard cap on the number of cuts regardless of spacing, as a second guard.
+    const MAX_CUTS: i64 = 100_000;
+    let n_cuts = ((perim / target_width).floor() as i64).min(MAX_CUTS);
     if n_cuts < 2 || perim < 1e-6 {
         // Too short to slice — one wedge = the whole block.
         return vec![block.clone()];

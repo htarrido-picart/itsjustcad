@@ -885,6 +885,12 @@ pub fn sample_polyline(points: &[DVec3], closed: bool, step: f64) -> Vec<DVec3> 
     if points.len() < 2 || step <= 0.0 || !step.is_finite() {
         return points.to_vec();
     }
+    // Floor the step to a sane metre value: a tiny step (e.g. 0.0001) would make
+    // `total/step` millions/billions of samples (DoS / hang / OOM). Also hard-cap
+    // the sample count as a second guard.
+    const MIN_STEP_M: f64 = 0.5;
+    const MAX_SAMPLES: usize = 1_000_000;
+    let step = step.max(MIN_STEP_M);
     let mut pts: Vec<DVec3> = points.to_vec();
     if closed {
         pts.push(points[0]);
@@ -894,7 +900,7 @@ pub fn sample_polyline(points: &[DVec3], closed: bool, step: f64) -> Vec<DVec3> 
     if total < 1e-12 {
         return vec![pts[0]];
     }
-    let n = (total / step).ceil().max(1.0) as usize;
+    let n = ((total / step).ceil().max(1.0) as usize).min(MAX_SAMPLES);
     let mut out = Vec::with_capacity(n + 1);
     for i in 0..=n {
         let mut target = total * i as f64 / n as f64;
@@ -1357,6 +1363,16 @@ mod tests {
         let s2 = sample_polyline(&sq, true, 1.0);
         assert_eq!(s2.len(), 17, "16 m perimeter at 1 m");
         assert_eq!(s2[0], *s2.last().unwrap(), "closed seam");
+    }
+
+    /// Security: a tiny `step` must be floored so it cannot generate a runaway
+    /// sample count (DoS / hang). 10 m with step 0.0001 would be ~100k samples;
+    /// the 0.5 m floor bounds it to ~21.
+    #[test]
+    fn sample_polyline_tiny_step_is_clamped() {
+        let pts = vec![DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0)];
+        let s = sample_polyline(&pts, false, 0.0001);
+        assert_eq!(s.len(), 21, "tiny step clamped to 0.5 m floor, got {}", s.len());
     }
 
     #[test]

@@ -324,6 +324,10 @@ pub fn hatch_ansi(boundary: &[DVec3], code: u8, spacing: f64) -> Vec<[DVec3; 2]>
 pub fn point_in_poly(pts: &[DVec2], p: DVec2) -> bool {
     let mut inside = false;
     let n = pts.len();
+    // Defensive: `j = n - 1` underflows on empty input; no interior below 3 pts.
+    if n < 3 {
+        return false;
+    }
     let mut j = n - 1;
     for i in 0..n {
         let a = pts[i];

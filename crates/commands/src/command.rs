@@ -1689,6 +1689,10 @@ impl Command {
                 | Command::Underlay { .. }
                 | Command::BlockLibLoad { .. }
                 | Command::CheckRulesLoad { .. }
+                // GRANTING a workdir (path set) widens the deck's filesystem
+                // reach and is persisted to disk → confirm-gated. The no-arg query
+                // form (`workdir`) and `files` stay non-gated (pure state reads).
+                | Command::Workdir { path: Some(_) }
         )
     }
 
@@ -1713,6 +1717,7 @@ impl Command {
                 Some(format!("blocksave → library:{name}"))
             }
             Command::CheckRulesLoad { path } => Some(format!("checkrules ← {path}")),
+            Command::Workdir { path: Some(p) } => Some(format!("grant workdir → {p}")),
             _ => None,
         }
     }
@@ -1736,6 +1741,8 @@ mod classify_tests {
             Command::OsmFile { path: "/tmp/o.json".into() },
             Command::PlantSchedule { path: "/tmp/plants.csv".into() },
             Command::Underlay { path: "/tmp/p.png".into(), corner: None, width: None, height: None },
+            // Granting a workdir (path set) is a persisted fs grant → gated.
+            Command::Workdir { path: Some("/tmp/imports".into()) },
         ];
         for c in &cases {
             assert!(c.is_side_effecting(), "{c:?} must be side-effecting");
@@ -1743,6 +1750,16 @@ mod classify_tests {
                 c.side_effect_summary().is_some(),
                 "{c:?} must carry a summary path"
             );
+        }
+    }
+
+    /// The workdir QUERY forms (no-arg `workdir`, and `files`) stay non-gated so
+    /// the deck can read its own grant state without a human confirm.
+    #[test]
+    fn workdir_query_forms_stay_pure() {
+        for c in [Command::Workdir { path: None }, Command::WorkdirFiles] {
+            assert!(!c.is_side_effecting(), "{c:?} must be a pure query");
+            assert!(c.side_effect_summary().is_none(), "{c:?} has no fs path");
         }
     }
 

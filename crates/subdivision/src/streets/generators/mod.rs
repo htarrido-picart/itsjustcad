@@ -82,18 +82,26 @@ pub(crate) fn site_seed(site: &Polygon2d, seed: u64, salt: u64) -> u64 {
     h | 1
 }
 
+/// A sane metre floor for any spacing/depth that becomes a loop denominator or a
+/// lattice cell size. A hostile/typo value like `blockdepth=0.0001` would
+/// otherwise spin up billions of road rows / lattice cells (DoS / hang). No real
+/// urban block depth is below this.
+pub(crate) const MIN_SPACING_M: f64 = 0.5;
+
 /// The effective block depth for road spacing: the verb-supplied value if
 /// positive, else a fallback of ~2× the lot depth target (or a multiple of the
-/// min lot width when no depth target is set). Never returns ≤ 0.
+/// min lot width when no depth target is set). Clamped to [`MIN_SPACING_M`] so a
+/// tiny denominator can never generate an unbounded number of roads.
 pub(crate) fn effective_block_depth(settings: &SubdivisionSettings) -> f64 {
-    if settings.block_depth > 0.0 {
+    let d = if settings.block_depth > 0.0 {
         settings.block_depth
     } else if settings.lot_depth_target > 0.0 {
         settings.lot_depth_target * 2.0
     } else {
         // ~2× lot depth; lacking a depth target, derive from min width.
         (settings.lot_width_min * 2.0).max(20.0)
-    }
+    };
+    d.max(MIN_SPACING_M)
 }
 
 /// The effective road ROW width: the verb-supplied value if positive, else a
@@ -120,5 +128,28 @@ pub fn generate(site: &Polygon2d, settings: &SubdivisionSettings) -> StreetGraph
         StreetPattern::Radial => radial::generate(site, settings),
         StreetPattern::Hexagonal => hexagonal::generate(site, settings),
         StreetPattern::Voronoi => voronoi::generate(site, settings),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Security: a tiny (or zero) block depth must be clamped to the metre floor
+    /// so road-spacing loops can't spin up billions of rows.
+    #[test]
+    fn effective_block_depth_clamps_tiny_value() {
+        let s = SubdivisionSettings {
+            block_depth: 0.0001,
+            ..SubdivisionSettings::default()
+        };
+        assert!(
+            effective_block_depth(&s) >= MIN_SPACING_M,
+            "tiny block depth must clamp to {MIN_SPACING_M} m, got {}",
+            effective_block_depth(&s)
+        );
+        // A realistic value passes through unchanged.
+        let s2 = SubdivisionSettings { block_depth: 60.0, ..SubdivisionSettings::default() };
+        assert!((effective_block_depth(&s2) - 60.0).abs() < 1e-9);
     }
 }

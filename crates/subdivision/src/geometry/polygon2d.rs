@@ -112,6 +112,11 @@ impl Polygon2d {
     /// used for interior tests where the query point is well inside).
     pub fn contains(&self, p: DVec2) -> bool {
         let n = self.verts.len();
+        // Defensive: a ray cast needs a real ring; `j = n - 1` underflows on an
+        // empty vec and there is no interior below 3 vertices.
+        if n < 3 {
+            return false;
+        }
         let mut inside = false;
         let mut j = n - 1;
         for i in 0..n {
