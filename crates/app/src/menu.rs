@@ -93,6 +93,16 @@ pub enum MenuAction {
     /// same apply+persist path the `language en|es` verb uses. UI/session state,
     /// not op-log.
     SetLanguage(Lang),
+    /// Quit the application (⌘Q). Routes through the dirty-doc guard, then closes
+    /// the (single) window — which terminates the app. Present in the File menu on
+    /// every platform so ⌘Q is always reachable from the menu bar; the macOS app
+    /// menu additionally surfaces a native Quit.
+    Quit,
+    /// Close the current window/document (⌘W). This is a single-window app, so
+    /// Close behaves like Quit — it routes through the same dirty-doc guard and
+    /// closes the window. Kept a distinct variant so the accelerator (⌘W) and
+    /// label read as the platform-standard Close.
+    Close,
 }
 
 /// Draw-tool verbs (mirror `draw_tool::try_start`). A menu pick of one of these
@@ -135,6 +145,8 @@ pub fn action_shortcut(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ModelSetup => Some("Cmd+,"),
         MenuAction::CommandPalette => Some("Cmd+K"),
         MenuAction::TogglePanel => Some("Cmd+\\"),
+        MenuAction::Quit => Some("Cmd+Q"),
+        MenuAction::Close => Some("Cmd+W"),
         MenuAction::Execute(v) if v == "undo" => Some("Cmd+Z"),
         MenuAction::Execute(v) if v == "redo" => Some("Cmd+Shift+Z"),
         _ => None,
@@ -320,9 +332,11 @@ pub enum PredefinedKind {
     BringAllToFront,
     /// Enter/Exit Full Screen (⌃⌘F on macOS; label toggles natively).
     Fullscreen,
-    /// Quit the application (⌘Q). On macOS the app menu owns Quit; on other
-    /// platforms it is surfaced at the foot of the File menu.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    /// Quit the application (⌘Q). Retained for the in-window/`predefined` mapping
+    /// and Linux fallback; the macOS app menu now carries a native Quit and the
+    /// File menu carries a routed [`MenuAction::Quit`], so the model no longer
+    /// emits this predefined variant directly.
+    #[allow(dead_code)]
     Quit,
 }
 
@@ -529,14 +543,16 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             },
             NativeItem::Separator,
             wired_leaf(t, "settings", tr("menu.file.settings"), MenuAction::ModelSetup),
+            NativeItem::Separator,
+            // Close (⌘W) closes the current window/document. Single-window app, so
+            // it routes through the same dirty-doc guard as Quit.
+            wired_leaf(t, "close", tr("menu.file.close"), MenuAction::Close),
+            // Quit (⌘Q) is surfaced in the File menu on EVERY platform so it is
+            // always reachable from the menu bar — the earlier `#[cfg(not(macos))]`
+            // gate left macOS with no reachable menu-bar Quit. On macOS the native
+            // app menu additionally carries a predefined Quit (see native_menu).
+            wired_leaf(t, "quit", tr("menu.file.quit"), MenuAction::Quit),
         ];
-        // macOS puts Quit in the app menu automatically; on other platforms we
-        // surface it here. AppKit still offers ⌘Q regardless.
-        #[cfg(not(target_os = "macos"))]
-        {
-            items.push(NativeItem::Separator);
-            items.push(NativeItem::Predefined(PredefinedKind::Quit));
-        }
         menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
     }
 
@@ -843,6 +859,7 @@ fn leaf_icon(id: &str, _label: &str) -> Icon {
         "import" => return Icon::Import,
         "export" => return Icon::Export,
         "settings" => return Icon::Model,
+        "close" | "quit" => return Icon::Close,
         "undo" => return Icon::Undo,
         "redo" => return Icon::Redo,
         "history" => return Icon::History,
@@ -1135,6 +1152,49 @@ mod tests {
         assert!(ls.iter().any(|(_, l, a)| l == tr("menu.file.export") && *a == MenuAction::ExportDialog));
         // Save As prefills `save ` for a path.
         assert!(ls.iter().any(|(_, l, a)| l == tr("menu.file.save_as") && *a == MenuAction::Insert("save ".into())));
+    }
+
+    #[test]
+    fn file_menu_has_reachable_quit_and_close() {
+        // Regression: macOS previously had NO menu-bar Quit (it was cfg'd out,
+        // and the native app menu did not surface one). Quit MUST be in the File
+        // menu on every platform, with ⌘Q; Close MUST be present with ⌘W.
+        let file = native_model(MenuStyle::Rhino, true, ViewState::default())
+            .into_iter()
+            .find(|m| m.title == tr("menu.file"))
+            .unwrap();
+        let quit = file.items.iter().find_map(|it| match it {
+            NativeItem::Leaf { label, action, shortcut, .. }
+                if *action == MenuAction::Quit =>
+            {
+                Some((label.clone(), shortcut.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            quit,
+            Some((tr("menu.file.quit").to_string(), Some("Cmd+Q".to_string()))),
+            "File ▸ Quit must be present with ⌘Q on every platform"
+        );
+        let close = file.items.iter().find_map(|it| match it {
+            NativeItem::Leaf { label, action, shortcut, .. }
+                if *action == MenuAction::Close =>
+            {
+                Some((label.clone(), shortcut.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            close,
+            Some((tr("menu.file.close").to_string(), Some("Cmd+W".to_string()))),
+            "File ▸ Close must be present with ⌘W"
+        );
+    }
+
+    #[test]
+    fn quit_close_shortcuts_present() {
+        assert_eq!(action_shortcut(&MenuAction::Quit), Some("Cmd+Q"));
+        assert_eq!(action_shortcut(&MenuAction::Close), Some("Cmd+W"));
     }
 
     #[test]

@@ -4786,6 +4786,11 @@ impl App {
             // Theme ▸ Language radio: apply live + persist, exactly like the
             // `language en|es` verb.
             MenuAction::SetLanguage(lang) => save_lang(lang),
+            // Quit / Close (⌘Q / ⌘W). Single-window app: both route through the
+            // dirty-doc guard and, if clean (or after Discard), close the window —
+            // which terminates the process. Close is Quit's twin here because
+            // there is exactly one window/document.
+            MenuAction::Quit | MenuAction::Close => self.guarded_nav(ctx, PendingNav::Quit),
         }
     }
 

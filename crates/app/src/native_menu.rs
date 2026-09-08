@@ -276,6 +276,19 @@ fn build_menu(
     // Live handle to the View ▸ Panel item, so its label can flip each frame.
     let mut panel_item: Option<MenuItem> = None;
 
+    // macOS: the FIRST submenu is the bold app-name menu. muda does not create it
+    // for us, so the auto app menu had no Quit — leaving ⌘Q unreachable from the
+    // menu bar. Build a proper app menu with the OS-standard About + Quit (⌘Q).
+    // `PredefinedMenuItem::quit` terminates the app via AppKit directly.
+    #[cfg(target_os = "macos")]
+    {
+        let app_menu = Submenu::new("", true);
+        app_menu.append(&PredefinedMenuItem::about(None, None)).ok()?;
+        app_menu.append(&PredefinedMenuItem::separator()).ok()?;
+        app_menu.append(&PredefinedMenuItem::quit(None)).ok()?;
+        menu.append(&app_menu).ok()?;
+    }
+
     // Selection-dependent items start disabled (built with no selection); the
     // app's per-frame `sync_selection` enables them once something is selected.
     for top in native_model(style, false, ViewState::default()) {

@@ -197,6 +197,7 @@ static EN: &[(&str, &str)] = &[
     ("menu.file.import", "Import…"),
     ("menu.file.export", "Export…"),
     ("menu.file.settings", "Settings…"),
+    ("menu.file.close", "Close"),
     ("menu.file.quit", "Quit"),
     // ── Menu: Edit ──
     ("menu.edit.undo", "Undo"),
@@ -317,6 +318,7 @@ static ES: &[(&str, &str)] = &[
     ("menu.file.import", "Importar…"),
     ("menu.file.export", "Exportar…"),
     ("menu.file.settings", "Ajustes…"),
+    ("menu.file.close", "Cerrar"),
     ("menu.file.quit", "Salir"),
     // ── Menú: Edición ──
     ("menu.edit.undo", "Deshacer"),
