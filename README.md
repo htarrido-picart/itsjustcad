@@ -36,6 +36,18 @@ that draws with the exact same commands you type.
 
 Each link always resolves to the **newest release** — no need to update it per version.
 
+### User Beta Review
+
+Testing the beta? Open **[`docs/beta-review.html`](docs/beta-review.html)** in
+your browser — a comprehensive, tickable manual-test checklist covering every
+v0.4.0 area (modeling, expressive structures, intemfit site planning,
+environmental analysis, compliance pre-check, landscape/planting, DWG import,
+the LLM deck, language/skins, sheets/PDF, interop, render, and the UI). Work
+through it, tick what passes, jot notes on anything that doesn't, then click
+**Export results** to download a JSON of your run and send it back — email
+[htarrido@pm.me](mailto:htarrido@pm.me) or open a GitHub issue. Your ticks and
+notes are saved in the browser as you go.
+
 > The app is not code‑signed yet, so your OS shows a one‑time "unidentified
 > developer" / "Windows protected your PC" warning on the very first launch.
 > Use the step above to open it; after that it just launches. Nothing to

@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ItsJustCAD — Beta User Review (v0.4.0)</title>
+<style>
+  :root{
+    --bg:#f7f7f5; --panel:#ffffff; --ink:#1c1c1e; --muted:#6b6b70;
+    --line:#e2e2df; --accent:#2b6cb0; --accent-soft:#eaf1f8;
+    --warn:#b7791f; --warn-soft:#fdf6e7; --err:#c53030; --err-soft:#fdeaea;
+    --ok:#2f855a; --code-bg:#f0f0ee; --radius:10px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink); background:var(--bg);
+  }
+  .wrap{display:flex; align-items:flex-start; max-width:1180px; margin:0 auto;}
+  nav{
+    position:sticky; top:0; align-self:flex-start; width:250px; flex:none;
+    height:100vh; overflow-y:auto; padding:24px 16px 40px; border-right:1px solid var(--line);
+    background:var(--panel);
+  }
+  nav h2{font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:18px 0 6px;}
+  nav a{display:block; color:var(--ink); text-decoration:none; padding:4px 8px; border-radius:6px; font-size:13.5px;}
+  nav a:hover{background:var(--accent-soft); color:var(--accent);}
+  nav .brand{font-weight:700; font-size:15px; margin-bottom:2px;}
+  nav .date{color:var(--muted); font-size:12px; margin-bottom:12px;}
+  main{flex:1; min-width:0; padding:32px 40px 120px;}
+  header.top{margin-bottom:8px;}
+  header.top h1{font-size:26px; margin:0 0 4px;}
+  header.top .sub{color:var(--muted); margin:0 0 6px;}
+  .meta{display:flex; gap:16px; flex-wrap:wrap; font-size:12.5px; color:var(--muted); margin:10px 0 24px;}
+  .meta b{color:var(--ink);}
+  section{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:6px 22px 18px; margin:0 0 20px;}
+  details{border-top:1px solid var(--line); padding:8px 0;}
+  details:first-of-type{border-top:none;}
+  summary{cursor:pointer; font-weight:600; font-size:16px; padding:6px 0; list-style:none; display:flex; align-items:center; gap:8px;}
+  summary::-webkit-details-marker{display:none;}
+  summary::before{content:"\25B8"; color:var(--muted); transition:transform .15s; font-size:12px;}
+  details[open]>summary::before{transform:rotate(90deg);}
+  h2.sec{font-size:20px; margin:14px 0 2px; padding-top:8px;}
+  .lead{color:var(--muted); font-size:13.5px; margin:2px 0 10px;}
+  ol.steps{list-style:none; counter-reset:step; margin:6px 0 12px; padding:0;}
+  ol.steps li{counter-increment:step; position:relative; padding:6px 6px 6px 34px; border-radius:6px;}
+  ol.steps li::before{
+    content:counter(step); position:absolute; left:4px; top:6px; width:20px; height:20px;
+    background:var(--accent-soft); color:var(--accent); border-radius:50%; font-size:11px; font-weight:700;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .chk{display:flex; gap:9px; align-items:flex-start; padding:5px 6px; border-radius:6px;}
+  .chk:hover{background:#fafafa;}
+  .chk input{margin-top:3px; width:16px; height:16px; flex:none;}
+  .chk label{cursor:pointer;}
+  code{background:var(--code-bg); padding:1.5px 6px; border-radius:5px; font:13px/1.4 "SF Mono",ui-monospace,Menlo,Consolas,monospace;}
+  .cmd{display:block; background:#1c1c1e; color:#e6e6e6; padding:8px 12px; border-radius:7px; margin:5px 0; font:13px/1.5 "SF Mono",ui-monospace,Menlo,Consolas,monospace; overflow-x:auto;}
+  .cmd .p{color:#7fb4e6;}
+  .exp{color:var(--muted); font-size:13px;}
+  .exp b{color:var(--ok); font-weight:600;}
+  .tag{display:inline-block; font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; padding:2px 7px; border-radius:20px; vertical-align:middle;}
+  .tag.err{background:var(--err-soft); color:var(--err);}
+  .tag.warn{background:var(--warn-soft); color:var(--warn);}
+  .tag.ok{background:#e6f4ec; color:var(--ok);}
+  .tag.info{background:var(--accent-soft); color:var(--accent);}
+  .callout{border-left:3px solid var(--accent); background:var(--accent-soft); padding:8px 14px; border-radius:0 7px 7px 0; margin:10px 0; font-size:13.5px;}
+  .callout.warn{border-color:var(--warn); background:var(--warn-soft);}
+  .grp-title{font-weight:600; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; margin:16px 0 4px;}
+  .reset{float:right; font-size:12px; color:var(--accent); cursor:pointer; background:none; border:1px solid var(--line); border-radius:6px; padding:3px 10px;}
+  hr{border:none; border-top:1px solid var(--line); margin:14px 0;}
+  .foot{color:var(--muted); font-size:12px; text-align:center; padding:30px 0 0;}
+  .notes-wrap{margin:10px 0 4px;}
+  .notes-wrap label{display:block; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-bottom:3px;}
+  textarea.notes{width:100%; min-height:52px; resize:vertical; font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; padding:7px 9px; border:1px solid var(--line); border-radius:7px; background:#fcfcfb; color:var(--ink);}
+  .exportbar{position:sticky; bottom:0; z-index:5; display:flex; gap:10px; align-items:center; flex-wrap:wrap; background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:12px 16px; margin:0 0 20px; box-shadow:0 -2px 10px rgba(0,0,0,.04);}
+  .btn{font-size:13.5px; font-weight:600; cursor:pointer; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:7px; padding:8px 16px;}
+  .btn.secondary{background:#fff; color:var(--accent);}
+  .btn:hover{filter:brightness(1.05);}
+  .progress{font-size:13px; color:var(--muted); margin-left:auto;}
+  .progress b{color:var(--ink);}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <div class="brand">ItsJustCAD</div>
+  <div class="date">Beta User Review &middot; v0.4.0</div>
+  <button class="reset" onclick="resetChecks()">Reset checks</button>
+  <h2>Start here</h2>
+  <a href="#howto">How to test</a>
+  <a href="#limits">Honest limits</a>
+  <h2>Checklist</h2>
+  <a href="#model">1 &middot; Drawing &amp; Modeling</a>
+  <a href="#expressive">2 &middot; Expressive Structures</a>
+  <a href="#intemfit">3 &middot; intemfit (Site Planning)</a>
+  <a href="#analysis">4 &middot; Environmental Analysis</a>
+  <a href="#comply">5 &middot; Compliance (pre-check)</a>
+  <a href="#land">6 &middot; Landscape &amp; Planting</a>
+  <a href="#dwg">7 &middot; DWG / DXF Import</a>
+  <a href="#deck">8 &middot; Deck (LLM Chat)</a>
+  <a href="#i18n">9 &middot; Language &amp; Skins</a>
+  <a href="#sheets">10 &middot; Sheets &amp; PDF</a>
+  <a href="#interop">11 &middot; Interop &amp; Export</a>
+  <a href="#render">12 &middot; Diffusion Render</a>
+  <a href="#ui">13 &middot; UI, Menus &amp; Gumball</a>
+  <h2>Finish</h2>
+  <a href="#export">Export results</a>
+</nav>
+
+<main>
+<header class="top">
+  <h1>ItsJustCAD &mdash; Beta User Review <span class="tag info" style="vertical-align:middle">v0.4.0</span></h1>
+  <p class="sub">Work through the checklist, then Export results and send the JSON to the developer.</p>
+</header>
+<div class="meta">
+  <span><b>Build under test:</b> latest v0.4.0 release (the app you downloaded)</span>
+  <span><b>Report to:</b> <a href="mailto:htarrido@pm.me">htarrido@pm.me</a> or a GitHub issue</span>
+</div>
+
+<!-- ============ HOWTO ============ -->
+<section id="howto">
+<h2 class="sec">How to run these tests</h2>
+<ol class="steps">
+  <li>Launch ItsJustCAD. Start each group from a fresh document (&#8984;N / Ctrl+N) unless a step says to build on the previous one.</li>
+  <li>Commands are typed in the <b>command line</b> (bottom, full-width) or the <b>deck Chat</b> &mdash; both accept the same verbs. Selectors: <code>last</code> = most recent object, <code>sel</code> = current selection, <code>name:foo</code> = by name.</li>
+  <li>For each item, verify the <b>expected result</b>, then tick the box. Leave a box <b>unchecked if it failed</b> and write what happened in that section's <b>Notes</b> field.</li>
+  <li>Your ticks + notes are saved in this browser automatically. When done, jump to <a href="#export">Export results</a>, download the JSON, and send it back.</li>
+</ol>
+<div class="callout">Every analysis / compliance / advisory output is intentionally worded as advisory &mdash; the app never claims to certify or analyze structurally. Compliance is a <b>pre-check, not a certification</b>.</div>
+</section>
+
+<!-- ============ HONEST LIMITS ============ -->
+<section id="limits">
+<h2 class="sec">Honest limits <span class="tag warn">read first</span></h2>
+<p class="lead">Known, deliberate limits in v0.4.0. None of these block testing &mdash; they explain results you might otherwise flag as bugs:</p>
+<ul>
+  <li><b>intemfit euro_latam profile is placeholder.</b> Any run that resolves a rule from the <code>euro_latam</code> region prints <b>"using euro_latam defaults (placeholder &mdash; confirm with Manuel)"</b>. That banner is expected, not an error.</li>
+  <li><b>Compliance is name-match + straight-line.</b> Guard/handrail/ceiling checks match by object name (no geometric modeling); travel distance is straight-line room-centroid &rarr; nearest exit, not a routed egress path. Advisory pre-check only &mdash; verify with a licensed professional / AHJ.</li>
+  <li><b>Straight-skeleton (Felkel) is convex-exact only.</b> <code>skeleton=felkel</code> falls back to the offset-approximation on non-convex blocks (never a broken skeleton). The robust <code>skeleton=offset</code> is the default.</li>
+  <li><b>DWG import is only as good as the installed LibreDWG.</b> 0.13.3 is too old for modern AutoCAD-2013+ files &mdash; those fail loudly (truncation detected), never a silent empty import. 0.14+ or an ODA converter is needed for them.</li>
+  <li><b>Diffusion render ships with no backend active.</b> You configure one (e.g. ComfyUI) before rendering.</li>
+  <li><b>App is unsigned.</b> Expect a one-time "unidentified developer" warning on first launch; chat encryption is default OFF for the same reason.</li>
+</ul>
+</section>
+
+<!-- ============ 1 MODELING ============ -->
+<section id="model">
+<details open>
+<summary>1 &middot; Drawing &amp; Modeling</summary>
+<p class="lead">2D drafting, NURBS curves, solids, booleans, constraints, hatches, blocks.</p>
+
+<div class="grp-title">2D drawing &amp; transforms</div>
+<div class="chk"><input type="checkbox" id="m0a"><label for="m0a"><span class="cmd"><span class="p">&#8250;</span> line 0,0,0 10,0,0</span> &middot; <code>rect 0,0,0 4 6</code> &middot; <code>circle 0,0,0 2.5</code> &middot; <code>polygon 0,0,0 3 6</code> <span class="exp"><b>Expect:</b> each primitive draws in the XY plane.</span></label></div>
+<div class="chk"><input type="checkbox" id="m0b"><label for="m0b">Draw a box, then <span class="cmd"><span class="p">&#8250;</span> array last 5,3,1 3,4,0</span> then <span class="cmd"><span class="p">&#8250;</span> polararray last 8</span> <span class="exp"><b>Expect:</b> a 5&times;3 grid of copies; then a full-circle polar array. <code>move</code>/<code>rotate</code>/<code>scale</code>/<code>mirror</code>/<code>copy</code> all work on a selection.</span></label></div>
+<div class="chk"><input type="checkbox" id="m0c"><label for="m0c">Draw two crossing lines, then <span class="cmd"><span class="p">&#8250;</span> fillet last 2 0.5</span>; draw a long line and <span class="cmd"><span class="p">&#8250;</span> offset last 0.2</span> <span class="exp"><b>Expect:</b> a tangent-arc rounded corner; a parallel offset curve (original kept).</span></label></div>
+
+<div class="grp-title">Solids &mdash; extrude, revolve, loft, sweep, pipe</div>
+<div class="chk"><input type="checkbox" id="m0d"><label for="m0d">Draw a closed profile, then <span class="cmd"><span class="p">&#8250;</span> extrude last 3</span> <span class="exp"><b>Expect:</b> a solid extruded upward.</span></label></div>
+<div class="chk"><input type="checkbox" id="m0e"><label for="m0e">Draw a profile beside an axis, then <span class="cmd"><span class="p">&#8250;</span> revolve last</span> <span class="exp"><b>Expect:</b> a revolved solid (full circle about z by default; partial angles cap cleanly).</span></label></div>
+<div class="chk"><input type="checkbox" id="m0f"><label for="m0f">Draw a curve, then <span class="cmd"><span class="p">&#8250;</span> pipe last 2 0.5</span> <span class="exp"><b>Expect:</b> a variable-radius pipe (2 &rarr; 0.5), capped and watertight.</span></label></div>
+
+<div class="grp-title">Booleans &mdash; union / difference / intersect</div>
+<div class="chk"><input type="checkbox" id="m0g"><label for="m0g">Build two overlapping boxes (name them <code>tower</code>, <code>core</code>), then <span class="cmd"><span class="p">&#8250;</span> difference tower core</span> <span class="exp"><b>Expect:</b> the tool box is cut from the target (a hole/courtyard); inputs consumed. <code>union</code> and <code>intersect</code> likewise.</span></label></div>
+
+<div class="grp-title">NURBS &mdash; knot insertion + curvature</div>
+<div class="chk"><input type="checkbox" id="m1"><label for="m1">Draw a curve, then <span class="cmd"><span class="p">&#8250;</span> insertknot last 0.5</span> <span class="exp"><b>Expect:</b> knot inserted, curve shape unchanged (shape-exact).</span></label></div>
+<div class="chk"><input type="checkbox" id="m2"><label for="m2"><span class="cmd"><span class="p">&#8250;</span> curvature last</span> <span class="exp"><b>Expect:</b> curvature comb hairs + tip curve on the <code>analysis</code> layer; reports max &kappa; / min radius.</span></label></div>
+
+<div class="grp-title">Blend + guided loft</div>
+<div class="chk"><input type="checkbox" id="m3"><label for="m3">With two curves named top/bottom: <span class="cmd"><span class="p">&#8250;</span> blend name:top name:bottom 1.5</span> <span class="exp"><b>Expect:</b> Hermite-eased blend sheet; bulge 1 = ruled.</span></label></div>
+<div class="chk"><input type="checkbox" id="m4"><label for="m4"><span class="cmd"><span class="p">&#8250;</span> loft name:rings guides name:rail</span> <span class="exp"><b>Expect:</b> skin bows through the guide curve.</span></label></div>
+
+<div class="grp-title">Sketch constraints</div>
+<div class="chk"><input type="checkbox" id="m5"><label for="m5">Draw two lines, then <span class="cmd"><span class="p">&#8250;</span> constrain perpendicular name:l1 name:l2</span> <span class="exp"><b>Expect:</b> solves immediately; status prints solved / DOF / conflicts.</span></label></div>
+<div class="chk"><input type="checkbox" id="m6"><label for="m6"><span class="cmd"><span class="p">&#8250;</span> constraints list</span> then <span class="cmd"><span class="p">&#8250;</span> solveconstraints</span> <span class="exp"><b>Expect:</b> constraint listed; re-solve stable. Undo reverts.</span></label></div>
+
+<div class="grp-title">ANSI hatches</div>
+<div class="chk"><input type="checkbox" id="m8"><label for="m8">Select a closed region: <span class="cmd"><span class="p">&#8250;</span> hatch last ansi32</span> (ansi31&ndash;ansi38, plus brick/concrete/insulation/earth) <span class="exp"><b>Expect:</b> standard hatch renders in viewport + PDF, scales with the object.</span></label></div>
+
+<div class="grp-title">Blocks &mdash; delete guard</div>
+<div class="chk"><input type="checkbox" id="m9"><label for="m9">Define a block, insert one instance, try <span class="cmd"><span class="p">&#8250;</span> blockdelete &lt;name&gt;</span> <span class="exp"><b>Expect:</b> refused while instances exist. Delete the instance, retry &rarr; succeeds; undo restores. <code>blocklib</code> lists the library.</span></label></div>
+
+<div class="notes-wrap"><label for="note-model">Notes for this section</label><textarea class="notes" id="note-model" data-section="1 · Drawing & Modeling" placeholder="Anything that failed, surprised you, or needs a follow-up..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 2 EXPRESSIVE ============ -->
+<section id="expressive">
+<details>
+<summary>2 &middot; Expressive Structures <span class="tag ok">geodesic / form-finding working</span></summary>
+<p class="lead">Weird-structures pack: geodesic domes, space frames, shells, and physics-based form-finding (dynamic relaxation). These now build correctly.</p>
+
+<div class="chk"><input type="checkbox" id="e1"><label for="e1"><span class="cmd"><span class="p">&#8250;</span> geodesic 3 5 dome</span> (try <code>full</code>) <span class="exp"><b>Expect:</b> a Buckminster-Fuller geodesic dome &mdash; icosahedron subdivided 3&times;, projected to radius 5, struts as edges. <code>full</code> = whole sphere.</span></label></div>
+<div class="chk"><input type="checkbox" id="e2"><label for="e2"><span class="cmd"><span class="p">&#8250;</span> spaceframe 6 4 3 1.5</span> <span class="exp"><b>Expect:</b> a double-layer space frame &mdash; 6&times;4 bays, top + offset bottom chords tied by pyramid diagonals.</span></label></div>
+<div class="chk"><input type="checkbox" id="e3"><label for="e3"><span class="cmd"><span class="p">&#8250;</span> hypar 5 5 5</span> then <span class="cmd"><span class="p">&#8250;</span> gaussvault 6 12 3 undulate</span> <span class="exp"><b>Expect:</b> a Candela hypar saddle shell; a Dieste Gaussian brick vault with sinusoidal double-curvature.</span></label></div>
+<div class="chk"><input type="checkbox" id="e4"><label for="e4"><span class="cmd"><span class="p">&#8250;</span> gridshell hypar 5 5 5</span> (or <code>gridshell vault 6 12 3 undulate</code>) <span class="exp"><b>Expect:</b> a reciprocal lath net draped on the doubly-curved surface.</span></label></div>
+<div class="chk"><input type="checkbox" id="e5"><label for="e5"><span class="cmd"><span class="p">&#8250;</span> funicular -5,0,0 5,0,0 24 1 1.4 invert</span> <span class="exp"><b>Expect:</b> form-finding via dynamic relaxation &mdash; a hung chain, then <code>invert</code> flips it into the pure-compression arch (Gaud&iacute;).</span></label></div>
+<div class="chk"><input type="checkbox" id="e6"><label for="e6"><span class="cmd"><span class="p">&#8250;</span> tensegrity 3 1 2</span> then <span class="cmd"><span class="p">&#8250;</span> cablenet 0,0,0 8,0,0 8,8,3 0,8,3 8 1.5</span> <span class="exp"><b>Expect:</b> a relaxed 3-strut tensegrity T-prism; a taut cable-net minimal surface over four anchors (Frei Otto).</span></label></div>
+<div class="chk"><input type="checkbox" id="e7"><label for="e7">Draw a closed 3D boundary, then <span class="cmd"><span class="p">&#8250;</span> minsurf last</span> (alias <code>soapfilm</code>) <span class="exp"><b>Expect:</b> a soap-film minimal surface spanning the wire; undo/replay stable.</span></label></div>
+
+<div class="notes-wrap"><label for="note-expressive">Notes for this section</label><textarea class="notes" id="note-expressive" data-section="2 · Expressive Structures" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 3 INTEMFIT ============ -->
+<section id="intemfit">
+<details>
+<summary>3 &middot; intemfit &mdash; Site Planning &amp; Lot Subdivision <span class="tag ok">Phases 1&ndash;12 shipped</span></summary>
+<p class="lead">Parametric site planning (roads &rarr; blocks &rarr; lots &rarr; setbacks &rarr; open space &rarr; buildings &rarr; yield), CityEngine/TestFit-style. Results bake onto the <code>roads</code>, <code>blocks</code>, <code>lots</code>, <code>setbacks</code>, <code>openspace</code>, <code>buildings</code> layers. All geometry verbs are undoable and replay byte-identical for a fixed seed.</p>
+<div class="callout warn">The <b>euro_latam</b> profile runs on <b>placeholder defaults</b>. Any run resolving a rule from it prints <b>"using euro_latam defaults (placeholder &mdash; confirm with Manuel)"</b>. Confirm that banner appears where noted.</div>
+
+<div class="grp-title">Site generation (<code>lotgeneratesite</code>)</div>
+<div class="chk"><input type="checkbox" id="if1"><label for="if1">Draw a large closed site boundary, select it, then <span class="cmd"><span class="p">&#8250;</span> lotgeneratesite last orthogonal roadwidth=12 blockdepth=60</span> <span class="exp"><b>Expect:</b> a road grid on <code>roads</code> + block outlines on <code>blocks</code>; every block edge tagged with the street it fronts.</span></label></div>
+<div class="chk"><input type="checkbox" id="if2"><label for="if2">Try the other rectilinear patterns: <code>skewed</code> &middot; <code>organic</code> &middot; <code>culdesac blockdepth=50</code> <span class="exp"><b>Expect:</b> skewed = grid rotated 22.5&deg;; organic = sinusoidal spine + connectors; culdesac = stubs ending in turnaround bulbs.</span></label></div>
+<div class="chk"><input type="checkbox" id="if3"><label for="if3">Non-rectilinear: <code>radial</code> &middot; <code>hexagonal</code> &middot; <span class="cmd"><span class="p">&#8250;</span> lotgeneratesite voronoi blockdepth=70 seed=3</span> <span class="exp"><b>Expect:</b> radial rings + spokes; hex-cell blocks; irregular seeded voronoi cells.</span></label></div>
+<div class="chk"><input type="checkbox" id="if4"><label for="if4"><span class="cmd"><span class="p">&#8250;</span> lotgeneratesite culdesac blockdepth=50 alleys=on seed=7</span>, re-run with the same seed <span class="exp"><b>Expect:</b> a rear-lane alley tier bisects each block; same seed &rarr; byte-identical layout (replay-stable).</span></label></div>
+
+<div class="grp-title">Subdivision (<code>lotsubdivide</code>)</div>
+<div class="chk"><input type="checkbox" id="if5"><label for="if5">Draw one closed block, select it, then <span class="cmd"><span class="p">&#8250;</span> lotsubdivide last grid area=6500 width=50</span> <span class="exp"><b>Expect:</b> recursive OBB lots on <code>lots</code>; every lot keeps a street edge; &Sigma; lot area &asymp; block area.</span></label></div>
+<div class="chk"><input type="checkbox" id="if7"><label for="if7"><span class="cmd"><span class="p">&#8250;</span> lotsubdivide perimeter area=6500 width=40</span> <span class="exp"><b>Expect:</b> perimeter strip + gridded core; falls back to grid cleanly if the inward offset collapses &mdash; no panic.</span></label></div>
+<div class="chk"><input type="checkbox" id="if8"><label for="if8"><span class="cmd"><span class="p">&#8250;</span> lotsubdivide last streetfollowing</span> on a cul-de-sac bulb / curved block <span class="exp"><b>Expect:</b> lots sliced perpendicular to the street; &Sigma; area == block; every lot has a street edge; no panic.</span></label></div>
+<div class="chk"><input type="checkbox" id="if9b"><label for="if9b"><span class="cmd"><span class="p">&#8250;</span> lotsettings skeleton=felkel</span> then subdivide a <b>convex</b> block, and a <b>notched</b> block, with <code>streetfollowing</code> <span class="exp"><b>Expect:</b> convex uses the true Felkel skeleton; the notched block falls back to offset-approx (never broken, never a panic).</span></label></div>
+
+<div class="grp-title">Lot rules (euro_latam placeholders)</div>
+<div class="chk"><input type="checkbox" id="if10"><label for="if10"><span class="cmd"><span class="p">&#8250;</span> lotsettings widthmix=6:0.25,8:0.5,10:0.25 depth=25 corner=15%</span> then subdivide <span class="exp"><b>Expect:</b> frontage re-sliced by width-mix (within ~5%); corner lots widened + area-conserved from the neighbour; placeholder banner printed.</span></label></div>
+<div class="chk"><input type="checkbox" id="if11"><label for="if11"><span class="cmd"><span class="p">&#8250;</span> lotsettings mergeslivers=on</span> and subdivide a ragged block <span class="exp"><b>Expect:</b> lots below <code>sliver_frac &times; area</code> merged into their largest-shared-edge neighbour; no slivers remain.</span></label></div>
+<div class="chk"><input type="checkbox" id="if13"><label for="if13"><span class="cmd"><span class="p">&#8250;</span> lotsettings region=us_suburban</span> then subdivide <span class="exp"><b>Expect:</b> the placeholder banner disappears (only euro_latam is flagged). Bare <code>lotsettings</code> prints current sticky settings.</span></label></div>
+
+<div class="grp-title">Setbacks + frontage</div>
+<div class="chk"><input type="checkbox" id="if15"><label for="if15">Select a lot, then <span class="cmd"><span class="p">&#8250;</span> lotsetbacks last front=3 side=0 rear=3</span> <span class="exp"><b>Expect:</b> a buildable-envelope curve on <code>setbacks</code> (distinct from <code>lots</code>); notched lots handled; euro_latam numbers flagged.</span></label></div>
+<div class="chk"><input type="checkbox" id="if17"><label for="if17"><span class="cmd"><span class="p">&#8250;</span> lotfrontage last</span> then <span class="cmd"><span class="p">&#8250;</span> lotfrontage at=curb</span> on a bulb <span class="exp"><b>Expect:</b> frontage at the setback line by default; <code>at=curb</code> measures the raw street edge (longer on bulbs). Read-only.</span></label></div>
+
+<div class="grp-title">Open space + buildings + yield</div>
+<div class="chk"><input type="checkbox" id="if18"><label for="if18"><span class="cmd"><span class="p">&#8250;</span> lotopenspace last type=park area=800</span> (try <code>greenway</code>/<code>pond</code>/<code>treesave</code>, or <code>reserve=20</code>) <span class="exp"><b>Expect:</b> amenity baked on <code>openspace</code>, clipped inside the region; reserve pulls whole blocks out of subdivision. Advisory wording.</span></label></div>
+<div class="chk"><input type="checkbox" id="if20"><label for="if20">Select subdivided lots, then <span class="cmd"><span class="p">&#8250;</span> lotbuilding last typology=row floors=3 roof=gable pitch=35</span> <span class="exp"><b>Expect:</b> per lot &mdash; <code>building:footprint</code> (2D), <code>building:mass</code> (3D), <code>building:roof</code> (3D). A collapsed envelope is skipped, never a panic.</span></label></div>
+<div class="chk"><input type="checkbox" id="if22"><label for="if22"><span class="cmd"><span class="p">&#8250;</span> lotreport</span> then change a setting and <span class="cmd"><span class="p">&#8250;</span> lotreport compare</span> <span class="exp"><b>Expect:</b> a Markdown table &mdash; lot count, GROSS vs NET area, GFA, FAR = GFA/net; then an A/B diff. Empty site = clean "nothing to report".</span></label></div>
+
+<div class="grp-title">Undo &amp; replay</div>
+<div class="chk"><input type="checkbox" id="if25"><label for="if25">Undo a <code>lot*</code> op; then save, reload, and replay the pipeline <span class="exp"><b>Expect:</b> undo removes baked geometry cleanly; reloaded settings + ops replay byte-identical.</span></label></div>
+
+<div class="notes-wrap"><label for="note-intemfit">Notes for this section</label><textarea class="notes" id="note-intemfit" data-section="3 · intemfit (Site Planning)" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 4 ANALYSIS ============ -->
+<section id="analysis">
+<details>
+<summary>4 &middot; Environmental Analysis &amp; Camera</summary>
+<p class="lead">Sun / shadow / radiation studies, camera projections (incl. phone-lens sims), render modes.</p>
+
+<div class="grp-title">Sun / shadow / radiation</div>
+<div class="chk"><input type="checkbox" id="a0"><label for="a0">Set a site first: <span class="cmd"><span class="p">&#8250;</span> location 40.71 -74.01 -5</span> <span class="exp"><b>Expect:</b> observer location set (needed by the studies below).</span></label></div>
+<div class="chk"><input type="checkbox" id="a1"><label for="a1">Build a few boxes, then <span class="cmd"><span class="p">&#8250;</span> shadowstudy 2024-06-21 09:00 15:00 120</span> <span class="exp"><b>Expect:</b> shadow frames across the time range.</span></label></div>
+<div class="chk"><input type="checkbox" id="a2"><label for="a2"><span class="cmd"><span class="p">&#8250;</span> sunhours 2024-06-21 1.5</span> <span class="exp"><b>Expect:</b> a ground-grid heatmap of sun hours (blue few &rarr; red most).</span></label></div>
+<div class="chk"><input type="checkbox" id="a3"><label for="a3"><span class="cmd"><span class="p">&#8250;</span> facesunhours last 2024-06-21</span> <span class="exp"><b>Expect:</b> per-face insolation coloring on the selected object.</span></label></div>
+<div class="chk"><input type="checkbox" id="a4"><label for="a4"><span class="cmd"><span class="p">&#8250;</span> sunpath 25</span> <span class="exp"><b>Expect:</b> a yearly sun-path dome of radius 25.</span></label></div>
+<div class="chk"><input type="checkbox" id="a5"><label for="a5"><span class="cmd"><span class="p">&#8250;</span> import /path/weather.epw</span> then <span class="cmd"><span class="p">&#8250;</span> radiation last /path/weather.epw</span> <span class="exp"><b>Expect:</b> EPW sets location + prints annual stats; radiation gives kWh/m&sup2;&middot;yr per face. <code>report radiation</code> serves stats.</span></label></div>
+
+<div class="grp-title">Camera projections</div>
+<div class="chk"><input type="checkbox" id="a7"><label for="a7"><span class="cmd"><span class="p">&#8250;</span> camera 35mm</span> (try 24/50/85) <span class="exp"><b>Expect:</b> perspective FOV changes via full-frame lens math.</span></label></div>
+<div class="chk"><input type="checkbox" id="a8"><label for="a8"><span class="cmd"><span class="p">&#8250;</span> camera 2point</span> then <span class="cmd"><span class="p">&#8250;</span> camera pano</span> (alias <code>360</code>) then <span class="cmd"><span class="p">&#8250;</span> camera fisheye 200</span> <span class="exp"><b>Expect:</b> two-point (verticals stay vertical); equirect panorama; equidistant fisheye.</span></label></div>
+<div class="chk"><input type="checkbox" id="a10"><label for="a10"><span class="cmd"><span class="p">&#8250;</span> camera phone iphone-ultrawide</span> <span class="exp"><b>Expect:</b> a phone-lens FOV sim. <b>View &#9656; Camera</b> radios reflect the live mode.</span></label></div>
+
+<div class="grp-title">Render &amp; colors</div>
+<div class="chk"><input type="checkbox" id="a11"><label for="a11"><span class="cmd"><span class="p">&#8250;</span> display pencil</span> then <span class="cmd"><span class="p">&#8250;</span> sketchup</span> (alias <code>su</code>) <span class="exp"><b>Expect:</b> pencil / sketchy-NPR display; then a SketchUp-style preset (sun + profile edges + sky/ground gradient).</span></label></div>
+<div class="chk"><input type="checkbox" id="a13"><label for="a13"><span class="cmd"><span class="p">&#8250;</span> color last 1,0.3,0</span> then <span class="cmd"><span class="p">&#8250;</span> color last off</span> <span class="exp"><b>Expect:</b> per-object color set, then cleared to by-layer.</span></label></div>
+
+<div class="notes-wrap"><label for="note-analysis">Notes for this section</label><textarea class="notes" id="note-analysis" data-section="4 · Environmental Analysis" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 5 COMPLIANCE ============ -->
+<section id="comply">
+<details>
+<summary>5 &middot; Compliance (advisory pre-check only)</summary>
+<div class="callout warn">Every report carries "advisory pre-check, not a code review; verify with a licensed professional / AHJ." Confirm this disclaimer is present.</div>
+
+<div class="chk"><input type="checkbox" id="c1"><label for="c1"><span class="cmd"><span class="p">&#8250;</span> codecheck demo</span> <span class="exp"><b>Expect:</b> severity-colored markers (red/orange/blue) on the <code>compliance</code> layer.</span></label></div>
+<div class="chk"><input type="checkbox" id="c2"><label for="c2"><span class="cmd"><span class="p">&#8250;</span> report codecheck</span> (and bare <code>report</code>) <span class="exp"><b>Expect:</b> per-rule verdict (pass/fail/warn/info), object ids, measured vs required, checked count.</span></label></div>
+<div class="chk"><input type="checkbox" id="c3"><label for="c3"><span class="cmd"><span class="p">&#8250;</span> checkrules list</span>; then Undo the codecheck <span class="exp"><b>Expect:</b> packs listed; markers removed cleanly by undo; replay stable.</span></label></div>
+<div class="chk"><input type="checkbox" id="c7"><label for="c7">Author a custom pack JSON, save under <code>~/.config/itsjustcad/checks/</code>, then <span class="cmd"><span class="p">&#8250;</span> checkrules load /path/x.checks.json</span> <span class="exp"><b>Expect:</b> loads; malformed JSON / unknown kinds rejected on parse. Then <code>codecheck x</code> runs it.</span></label></div>
+
+<div class="notes-wrap"><label for="note-comply">Notes for this section</label><textarea class="notes" id="note-comply" data-section="5 · Compliance" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 6 LANDSCAPE ============ -->
+<section id="land">
+<details>
+<summary>6 &middot; Landscape &amp; Planting</summary>
+<p class="lead">Import a terrain first: <code>terrain /path/survey.csv</code> (or .geojson).</p>
+
+<div class="grp-title">Contours, grading, drainage, hardscape</div>
+<div class="chk"><input type="checkbox" id="l1"><label for="l1"><span class="cmd"><span class="p">&#8250;</span> contours 0.5 5</span> <span class="exp"><b>Expect:</b> chained polylines on <code>contours</code> / <code>contours-major</code>.</span></label></div>
+<div class="chk"><input type="checkbox" id="l2"><label for="l2"><span class="cmd"><span class="p">&#8250;</span> pad 10,10 20 15 3.5 2</span> then <span class="cmd"><span class="p">&#8250;</span> cutfill</span> <span class="exp"><b>Expect:</b> a flat pad + side slopes to daylight; a cut/fill m&sup3; estimate; <code>report cutfill</code> serves it.</span></label></div>
+<div class="chk"><input type="checkbox" id="l3"><label for="l3"><span class="cmd"><span class="p">&#8250;</span> flowarrows 100</span> then <span class="cmd"><span class="p">&#8250;</span> ponding</span> <span class="exp"><b>Expect:</b> steepest-descent glyphs + local-minima markers (advisory-only wording).</span></label></div>
+<div class="chk"><input type="checkbox" id="l4"><label for="l4">Draw a path curve, then <span class="cmd"><span class="p">&#8250;</span> sitepath last 1.5</span> <span class="exp"><b>Expect:</b> a ribbon draped on terrain; warns on slope steeper than 1:12.</span></label></div>
+
+<div class="grp-title">Planting + tropical packs</div>
+<div class="chk"><input type="checkbox" id="l5"><label for="l5"><span class="cmd"><span class="p">&#8250;</span> plant royal-palm 10,5</span> <span class="exp"><b>Expect:</b> an age-scaled trunk + canopy on the <code>planting</code> layer, draped on terrain; palm renders crown-on-trunk. Out-of-band species prints a climate advisory (not an error).</span></label></div>
+<div class="chk"><input type="checkbox" id="l6"><label for="l6"><span class="cmd"><span class="p">&#8250;</span> plantrow tilia 0,0 30,0 6</span> then <span class="cmd"><span class="p">&#8250;</span> plantschedule /tmp/planting.csv</span> <span class="exp"><b>Expect:</b> a row of trees at spacing; a schedule CSV + report.</span></label></div>
+<div class="chk"><input type="checkbox" id="l7"><label for="l7"><span class="cmd"><span class="p">&#8250;</span> plantcatalog caribbean</span> (or a K&ouml;ppen zone like <code>Aw</code>) <span class="exp"><b>Expect:</b> a filtered species list (33 total across temperate + tropical packs).</span></label></div>
+<div class="chk"><input type="checkbox" id="l8"><label for="l8">Set a tropical location, draw a closed region, then <span class="cmd"><span class="p">&#8250;</span> miyawaki last 3</span> <span class="exp"><b>Expect:</b> a seeded stratified native mini-forest; reports species-mix / stem count; self-thinning advisory; deterministic on replay.</span></label></div>
+
+<div class="notes-wrap"><label for="note-land">Notes for this section</label><textarea class="notes" id="note-land" data-section="6 · Landscape & Planting" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 7 DWG ============ -->
+<section id="dwg">
+<details>
+<summary>7 &middot; DWG / DXF Import <span class="tag ok">assisted bridge</span></summary>
+<p class="lead">Assisted <code>import *.dwg</code> via a user-installed converter (LibreDWG &mdash; detect, don't bundle). Plus truncation detection, an import-warning popup, and a scoped deck <code>workdir</code>.</p>
+<div class="callout warn">Needs <code>brew install libredwg</code>. <b>0.14+</b> is required for modern (AutoCAD-2013+) files; <b>0.13.3 fails loudly</b> (truncation detected) rather than importing an empty model.</div>
+
+<div class="chk"><input type="checkbox" id="dw1"><label for="dw1">With <code>dwg2dxf</code> installed, <span class="cmd"><span class="p">&#8250;</span> import /path/site.dwg</span> <span class="exp"><b>Expect:</b> the referenced file is converted to DXF in a temp dir, then imported &mdash; blocks land as real definitions + INSERT instances. Temp dir cleaned up.</span></label></div>
+<div class="chk"><input type="checkbox" id="dw2"><label for="dw2">With <code>dwg2dxf</code> <b>absent</b>, retry <span class="exp"><b>Expect:</b> a clear "install LibreDWG to import DWG (brew install libredwg)" message &mdash; never a silent fail, never a panic.</span></label></div>
+<div class="chk"><input type="checkbox" id="dw3"><label for="dw3">Import a DWG that an old LibreDWG (0.13.3) truncates <span class="exp"><b>Expect:</b> truncation detected &rarr; "DWG conversion incomplete (converter too old...)". The exit code is not trusted.</span></label></div>
+<div class="chk"><input type="checkbox" id="dw4"><label for="dw4">Import a file that drops entities <span class="exp"><b>Expect:</b> an amber &#9888; "Imported with warnings" popup with imported/skipped counts &mdash; not a false green &#10004;. A clean import still shows the green tick.</span></label></div>
+<div class="chk"><input type="checkbox" id="dw6"><label for="dw6"><span class="cmd"><span class="p">&#8250;</span> workdir ~/Drawings</span> (confirm the grant gate), then <span class="cmd"><span class="p">&#8250;</span> files</span> <span class="exp"><b>Expect:</b> one chosen folder granted (not the whole FS, not a shell); <code>files</code> lists importable files. Bare <code>workdir</code> prints the grant.</span></label></div>
+<div class="chk"><input type="checkbox" id="dw7"><label for="dw7">With a workdir granted, <span class="cmd"><span class="p">&#8250;</span> import site.dwg</span> (bare name), then try <code>import ../secret.dwg</code> <span class="exp"><b>Expect:</b> the bare name resolves inside the workdir; path-traversal (<code>..</code>, absolute paths) is refused.</span></label></div>
+<div class="chk"><input type="checkbox" id="dw5"><label for="dw5">Define a block, insert an instance, <span class="cmd"><span class="p">&#8250;</span> export /tmp/blocks.dxf</span> then re-import <span class="exp"><b>Expect:</b> blocks survive &mdash; BLOCKS section + INSERT entities; wider bodies (HATCH/SPLINE/nested INSERT) covered.</span></label></div>
+
+<div class="notes-wrap"><label for="note-dwg">Notes for this section</label><textarea class="notes" id="note-dwg" data-section="7 · DWG / DXF Import" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 8 DECK ============ -->
+<section id="deck">
+<details>
+<summary>8 &middot; Deck &amp; Chat (LLM)</summary>
+<p class="lead">Terse mode (default), clarify-before-act, plan-execute, markdown rendering, critique/report hooks.</p>
+
+<div class="chk"><input type="checkbox" id="d1"><label for="d1">Ask a design question (e.g. <i>"give me a massing idea for a corner lot"</i>) <span class="exp"><b>Expect:</b> a short, terse reply, not a wall of prose.</span></label></div>
+<div class="chk"><input type="checkbox" id="d2"><label for="d2">Open <b>LLM &#9656; Terse Replies</b>, toggle OFF, ask again <span class="exp"><b>Expect:</b> a longer answer; the setting persists across relaunch.</span></label></div>
+<div class="chk"><input type="checkbox" id="d3"><label for="d3">Give an ambiguous instruction (e.g. <i>"add a door"</i> with nothing selected) <span class="exp"><b>Expect:</b> an accent-bordered <b>Question</b> bubble asking one clarifying question; answer it and the turn continues + executes.</span></label></div>
+<div class="chk"><input type="checkbox" id="d5"><label for="d5">Ask for a multi-step task (e.g. <i>"draw a 10&times;10 slab, add 4 columns, put a beam on top"</i>) <span class="exp"><b>Expect:</b> a <b>Plan</b> checklist; items tick <code>[ ]&rarr;[x]</code> live, one step per turn.</span></label></div>
+<div class="chk"><input type="checkbox" id="d6"><label for="d6">Press <b>Stop</b> mid-plan, relaunch, reopen the doc <span class="exp"><b>Expect:</b> Stop pauses cleanly; the plan is persisted in the per-doc draft and resumes.</span></label></div>
+<div class="chk"><input type="checkbox" id="d7"><label for="d7">Ask the deck to <i>"list the layers as a table"</i> <span class="exp"><b>Expect:</b> a striped grid table; bold/italic, code, lists, headings all render.</span></label></div>
+<div class="chk"><input type="checkbox" id="d9"><label for="d9">Run an analysis (e.g. <code>sunhours 2024-06-21</code>) then <span class="cmd"><span class="p">&#8250;</span> report</span> and ask <i>"where should I NOT put a terrace?"</i> <span class="exp"><b>Expect:</b> a structured report, then a critique grounded in sampled locations ("north face at (x,y) gets N h").</span></label></div>
+
+<div class="notes-wrap"><label for="note-deck">Notes for this section</label><textarea class="notes" id="note-deck" data-section="8 · Deck (LLM Chat)" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 9 I18N ============ -->
+<section id="i18n">
+<details>
+<summary>9 &middot; Language &amp; Legacy Skins</summary>
+<p class="lead">English / Espa&ntilde;ol catalog + onboarding-driven legacy skins (AutoCAD / Rhino / Revit palettes, fonts, aliases). Reachable via onboarding, a verb, and the Theme menu.</p>
+
+<div class="chk"><input type="checkbox" id="ln1"><label for="ln1"><span class="cmd"><span class="p">&#8250;</span> language es</span> (alias <code>lang</code>) <span class="exp"><b>Expect:</b> the menu bar + dialogs switch to Spanish (capa, cota, s&oacute;lido, malla, croquis...). Live, no relaunch. <code>lang en</code> switches back.</span></label></div>
+<div class="chk"><input type="checkbox" id="ln2"><label for="ln2">Switch to Espa&ntilde;ol, quit, relaunch <span class="exp"><b>Expect:</b> language persists, applied at startup before the first render. Region variants like <code>es-CO</code> resolve; unknown codes rejected cleanly.</span></label></div>
+<div class="chk"><input type="checkbox" id="sk1"><label for="sk1"><span class="cmd"><span class="p">&#8250;</span> skin autocad</span> (alias <code>acad</code>) &middot; <code>rhino</code> &middot; <code>revit</code> &middot; <code>native</code> <span class="exp"><b>Expect:</b> each applies live &mdash; background, grid colors, fonts + the per-skin alias table. Persisted.</span></label></div>
+<div class="chk"><input type="checkbox" id="sk2"><label for="sk2">Under AutoCAD skin: <span class="cmd"><span class="p">&#8250;</span> L</span> &middot; <code>C</code> &middot; <code>CO last 5,0,0</code> <span class="exp"><b>Expect:</b> aliases fire &mdash; L&rarr;line, C&rarr;circle, CO&rarr;copy. Additive; don't shadow canonical names.</span></label></div>
+<div class="chk"><input type="checkbox" id="mn1"><label for="mn1">Open <b>Theme &#9656; Skin</b> and <b>Theme &#9656; Language</b> <span class="exp"><b>Expect:</b> radio groups with the current one checked; selecting fires the same apply+persist path as the verbs.</span></label></div>
+
+<div class="notes-wrap"><label for="note-i18n">Notes for this section</label><textarea class="notes" id="note-i18n" data-section="9 · Language & Skins" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 10 SHEETS ============ -->
+<section id="sheets">
+<details>
+<summary>10 &middot; Sheets &amp; PDF</summary>
+<p class="lead">Paper sheets, scaled ortho views, plan/section/elevation, vector PDF export.</p>
+
+<div class="chk"><input type="checkbox" id="sh1"><label for="sh1">Build a small massing, then <span class="cmd"><span class="p">&#8250;</span> plan 1.2</span> and <span class="cmd"><span class="p">&#8250;</span> elevation south</span> <span class="exp"><b>Expect:</b> plan cut outlines on <code>sections</code>; south elevation edges on <code>elevations</code>.</span></label></div>
+<div class="chk"><input type="checkbox" id="sh2"><label for="sh2"><span class="cmd"><span class="p">&#8250;</span> sheet plan a1</span> then <span class="cmd"><span class="p">&#8250;</span> sheetview plan top 1:100</span> <span class="exp"><b>Expect:</b> a named A1 sheet; a scaled top view added at 1:100.</span></label></div>
+<div class="chk"><input type="checkbox" id="sh3"><label for="sh3"><span class="cmd"><span class="p">&#8250;</span> print plan /tmp/plan.pdf</span> <span class="exp"><b>Expect:</b> a vector PDF at the views' scales; lineweights honored; opens in any PDF viewer.</span></label></div>
+
+<div class="notes-wrap"><label for="note-sheets">Notes for this section</label><textarea class="notes" id="note-sheets" data-section="10 · Sheets & PDF" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 11 INTEROP ============ -->
+<section id="interop">
+<details>
+<summary>11 &middot; Interop &amp; Export</summary>
+<div class="chk"><input type="checkbox" id="i1"><label for="i1"><span class="cmd"><span class="p">&#8250;</span> import /path/scan.laz</span> (or <code>.e57</code>) <span class="exp"><b>Expect:</b> point cloud decompressed + decimated to &le;200k (never materializes the full cloud); on the <code>pointcloud</code> layer.</span></label></div>
+<div class="chk"><input type="checkbox" id="i2"><label for="i2"><span class="cmd"><span class="p">&#8250;</span> export /path/model.3dm</span> <span class="exp"><b>Expect:</b> a spec-conformant openNURBS V5 file (meshes/lines/polylines/NURBS + names/layers); Rhino 5+ opens it.</span></label></div>
+<div class="chk"><input type="checkbox" id="i3"><label for="i3">With a structural model: <span class="cmd"><span class="p">&#8250;</span> export /path/model.xlsx</span> (or <code>.saf</code> / <code>.ifc</code>) <span class="exp"><b>Expect:</b> a genuine SAF 2.2.0 .xlsx workbook with the never-analyze disclaimer embedded; IFC4 emits typed elements.</span></label></div>
+<div class="chk"><input type="checkbox" id="i4"><label for="i4">Round-trip via the native Import/Export dialogs <span class="exp"><b>Expect:</b> <code>.saf</code>/<code>.xlsx</code>/<code>.3dm</code>/<code>.dxf</code>/<code>.stl</code>/<code>.obj</code> all offered and accepted; no dead filter entries.</span></label></div>
+
+<div class="notes-wrap"><label for="note-interop">Notes for this section</label><textarea class="notes" id="note-interop" data-section="11 · Interop & Export" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 12 RENDER ============ -->
+<section id="render">
+<details>
+<summary>12 &middot; Diffusion Render <span class="tag info">no backend by default</span></summary>
+<p class="lead">Ships with NO backend active &mdash; you configure one in <code>render_decks.json</code> first.</p>
+<div class="chk"><input type="checkbox" id="r1"><label for="r1"><span class="cmd"><span class="p">&#8250;</span> render backends</span> (alias <code>render list</code>) <span class="exp"><b>Expect:</b> lists configured backends (empty on a clean install).</span></label></div>
+<div class="chk"><input type="checkbox" id="r2"><label for="r2">Configure one, then <span class="cmd"><span class="p">&#8250;</span> render use comfyui</span> and <span class="cmd"><span class="p">&#8250;</span> render test</span> <span class="exp"><b>Expect:</b> a reachability probe; on failure "cannot reach X &mdash; is it running?".</span></label></div>
+<div class="chk"><input type="checkbox" id="r3"><label for="r3"><span class="cmd"><span class="p">&#8250;</span> controlimages /tmp/scene</span> <span class="exp"><b>Expect:</b> depth/edge/mask PNGs written from the current view (<code>_depth.png</code>, <code>_edge.png</code>, <code>_mask.png</code>).</span></label></div>
+<div class="chk"><input type="checkbox" id="r4"><label for="r4"><span class="cmd"><span class="p">&#8250;</span> render glass pavilion at dusk, photoreal</span>, then <span class="cmd"><span class="p">&#8250;</span> render cancel</span> mid-job <span class="exp"><b>Expect:</b> an async job &rarr; result PNG in a floating "AI Render" window; cancel truly aborts the task.</span></label></div>
+
+<div class="notes-wrap"><label for="note-render">Notes for this section</label><textarea class="notes" id="note-render" data-section="12 · Diffusion Render" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 13 UI ============ -->
+<section id="ui">
+<details>
+<summary>13 &middot; UI, Menus &amp; Gumball</summary>
+<p class="lead">Right-dock tabs, native menus, window controls, autosuggest, gumball hotkey.</p>
+
+<div class="chk"><input type="checkbox" id="u1"><label for="u1">Open the right dock <span class="exp"><b>Expect:</b> a <b>Blocks</b> tab (14 starter param blocks); rows show name, live instance count, geometry count. <b>Insert</b> prefills <code>insert &lt;name&gt; </code>.</span></label></div>
+<div class="chk"><input type="checkbox" id="u3"><label for="u3">Define a plugin (<code>plugin define {...}</code>), open the <b>Plugins</b> tab <span class="exp"><b>Expect:</b> a tab with usage/summary rows; Run prefills the verb; Reload/Delete work.</span></label></div>
+<div class="chk"><input type="checkbox" id="u5"><label for="u5">Type a partial verb, press <b>Tab</b> to accept the autosuggest <span class="exp"><b>Expect:</b> Tab-accept works (was a fixed dead-key bug); tab-traversing the window never dead-ends.</span></label></div>
+<div class="chk"><input type="checkbox" id="umenu"><label for="umenu">Exercise the native menus &mdash; File / Edit / View / Theme / LLM. Try <b>Close</b> (&#8984;W) then <b>Quit</b> (&#8984;Q) <span class="exp"><b>Expect:</b> menus populated (no empty menus); Close closes the window, Quit exits cleanly (prompts to save unsaved work).</span></label></div>
+<div class="chk"><input type="checkbox" id="u8"><label for="u8">In the command line, type a command starting with <b>g</b>, e.g. <span class="cmd"><span class="p">&#8250;</span> geodesic</span> <span class="exp"><b>Expect:</b> the letter <b>g</b> types normally &mdash; the gumball is not toggled and the first letter is not eaten (old bug).</span></label></div>
+<div class="chk"><input type="checkbox" id="u9"><label for="u9">Select an object and press <b>&#8984;/Ctrl+G</b> <span class="exp"><b>Expect:</b> the gumball toggles on/off. Bare <code>g</code> no longer does this.</span></label></div>
+
+<div class="notes-wrap"><label for="note-ui">Notes for this section</label><textarea class="notes" id="note-ui" data-section="13 · UI, Menus & Gumball" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ EXPORT ============ -->
+<section id="export">
+<h2 class="sec">Export results &amp; send them back</h2>
+<p class="lead">When you're done, add any overall notes below, then <b>Download JSON</b> and email it to <a href="mailto:htarrido@pm.me">htarrido@pm.me</a> (or attach it to a GitHub issue). The JSON records every test id, whether it passed, and your notes.</p>
+<div class="notes-wrap"><label for="note-global">Overall notes (tester name, OS, version, general impressions)</label><textarea class="notes" id="note-global" data-section="_overall" placeholder="e.g. Tester: Jane · macOS 14 Apple Silicon · v0.4.0 · general feedback..." style="min-height:80px"></textarea></div>
+</section>
+
+<div class="exportbar">
+  <button class="btn" onclick="exportResults()">&#8681; Download JSON</button>
+  <button class="btn secondary" onclick="copyResults()">Copy to clipboard</button>
+  <span class="progress" id="progress">0 of 0 tests checked</span>
+</div>
+
+<div class="foot">ItsJustCAD &mdash; Beta User Review &middot; v0.4.0 &middot; advisory checklist; compliance is a pre-check, not a certification. Your checkbox state &amp; notes are stored locally in your browser until you export them.</div>
+</main>
+</div>
+
+<script>
+(function(){
+  var KEY = "ijc-beta-review-checks";
+  var NKEY = "ijc-beta-review-notes";
+  var saved = {}, notes = {};
+  try { saved = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch(e){}
+  try { notes = JSON.parse(localStorage.getItem(NKEY) || "{}"); } catch(e){}
+
+  var boxes = document.querySelectorAll('input[type=checkbox]');
+  var areas = document.querySelectorAll('textarea.notes');
+
+  function updateProgress(){
+    var total = boxes.length, done = 0;
+    boxes.forEach(function(b){ if(b.checked) done++; });
+    var el = document.getElementById('progress');
+    if(el) el.innerHTML = "<b>" + done + "</b> of <b>" + total + "</b> tests checked";
+  }
+
+  boxes.forEach(function(b){
+    if(saved[b.id]) b.checked = true;
+    b.addEventListener('change', function(){
+      saved[b.id] = b.checked;
+      try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch(e){}
+      updateProgress();
+    });
+  });
+  areas.forEach(function(a){
+    if(notes[a.id]) a.value = notes[a.id];
+    a.addEventListener('input', function(){
+      notes[a.id] = a.value;
+      try { localStorage.setItem(NKEY, JSON.stringify(notes)); } catch(e){}
+    });
+  });
+  updateProgress();
+
+  // Map each checkbox to its section (nearest <details><summary> text).
+  function sectionOf(box){
+    var d = box.closest('details');
+    if(d){
+      var s = d.querySelector('summary');
+      if(s){
+        // strip tag text (uppercase pills) — take the leading label
+        var clone = s.cloneNode(true);
+        var tags = clone.querySelectorAll('.tag');
+        tags.forEach(function(t){ t.remove(); });
+        return clone.textContent.trim();
+      }
+    }
+    var sec = box.closest('section');
+    return sec ? (sec.id || "unknown") : "unknown";
+  }
+  // Label text for a checkbox (its expected-result line, trimmed).
+  function labelOf(box){
+    var lab = document.querySelector('label[for="'+box.id+'"]');
+    var t = lab ? lab.textContent.replace(/\s+/g,' ').trim() : "";
+    return t.length > 160 ? t.slice(0,157) + "..." : t;
+  }
+
+  function buildReport(){
+    var tests = [];
+    boxes.forEach(function(b){
+      tests.push({
+        id: b.id,
+        section: sectionOf(b),
+        label: labelOf(b),
+        passed: !!b.checked
+      });
+    });
+    var sectionNotes = {};
+    areas.forEach(function(a){
+      if(a.value && a.value.trim()){
+        var key = a.getAttribute('data-section') || a.id;
+        sectionNotes[key] = a.value.trim();
+      }
+    });
+    var passed = tests.filter(function(t){ return t.passed; }).length;
+    return {
+      app: "ItsJustCAD",
+      review: "Beta User Review",
+      version: "0.4.0",
+      exportedAt: new Date().toISOString(),
+      summary: { total: tests.length, passed: passed, unchecked: tests.length - passed },
+      overallNotes: (notes['note-global'] || "").trim(),
+      sectionNotes: sectionNotes,
+      tests: tests
+    };
+  }
+
+  window.exportResults = function(){
+    var data = JSON.stringify(buildReport(), null, 2);
+    var blob = new Blob([data], {type:"application/json"});
+    var url = URL.createObjectURL(blob);
+    var stamp = new Date().toISOString().slice(0,10);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = "itsjustcad-beta-review-" + stamp + ".json";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+  };
+
+  window.copyResults = function(){
+    var data = JSON.stringify(buildReport(), null, 2);
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(data).then(function(){
+        alert("Results JSON copied to clipboard — paste it into an email or GitHub issue.");
+      }, function(){ fallbackCopy(data); });
+    } else {
+      fallbackCopy(data);
+    }
+  };
+  function fallbackCopy(text){
+    var ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); alert("Results JSON copied to clipboard."); }
+    catch(e){ alert("Could not copy automatically — use Download JSON instead."); }
+    document.body.removeChild(ta);
+  }
+
+  window.resetChecks = function(){
+    if(!confirm("Clear all checkboxes and notes?")) return;
+    boxes.forEach(function(b){ b.checked = false; });
+    areas.forEach(function(a){ a.value = ""; });
+    saved = {}; notes = {};
+    try { localStorage.removeItem(KEY); localStorage.removeItem(NKEY); } catch(e){}
+    updateProgress();
+  };
+})();
+</script>
+</body>
+</html>
