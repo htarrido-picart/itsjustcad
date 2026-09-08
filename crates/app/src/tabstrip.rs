@@ -17,11 +17,15 @@
 ///     it into the Chat tab. Promoted OUT of the Chat pane into its own tab.
 ///   - `Layers` (was "Model"): Layers **and** Properties shown together as
 ///     stacked, independently-collapsible sections (Rhino-style).
-///   - `Blocks` / `Plugins`: DYNAMIC tabs. They appear only while the document
-///     has block definitions / the session has installed plugins, or while the
-///     user has explicitly opened them (see [`TabState::visible_tabs`]). Pure
-///     VIEW + verb-trigger surfaces: every mutation they offer routes through
-///     the normal command substrate, never a second mutation path.
+///   - `Blocks` / `Plugins`: DYNAMIC tabs. `Plugins` appears while the session
+///     has installed plugins (content-driven). `Blocks` is REVEAL-driven: it is
+///     NOT shown merely because block definitions exist — it appears when the
+///     user **double-clicks a block instance in the viewport** or explicitly
+///     opens it (`panel tab blocks` / menu), both of which pin it via
+///     [`TabState::show`]. Either way, a dynamic tab may also be kept open by the
+///     user (see [`TabState::visible_tabs`]). Pure VIEW + verb-trigger surfaces:
+///     every mutation they offer routes through the normal command substrate,
+///     never a second mutation path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelTab {
     Deck,

@@ -35,7 +35,10 @@ pub struct BlockRow {
 
 /// True when the document has at least one user-facing block definition
 /// (plain or parametric). Baked per-instance entries don't count — they are
-/// derived data, not definitions.
+/// derived data, not definitions. Retained as a pure predicate over the
+/// definition set (exercised in tests); the Blocks tab itself is now
+/// reveal-driven and scopes to *instanced* blocks via [`drawing_block_rows`].
+#[allow(dead_code)] // part of the dyntabs derivation API; exercised in tests
 pub fn has_block_defs(doc: &Document) -> bool {
     !doc.param_blocks.is_empty()
         || doc.blocks.keys().any(|k| !k.starts_with(PARAM_BAKE_PREFIX))
@@ -80,6 +83,61 @@ pub fn block_rows(doc: &Document) -> Vec<BlockRow> {
             param_signature,
         })
         .collect()
+}
+
+/// Scope [`block_rows`] to the blocks actually PRESENT on the drawing: only
+/// definitions with at least one live instance in the document. This is what the
+/// redesigned Blocks tab lists — "blocks in this drawing", not every starter or
+/// library definition that merely exists as a def. A def with zero instances is
+/// excluded (the user reaches those through the "+" library search instead).
+pub fn drawing_block_rows(doc: &Document) -> Vec<BlockRow> {
+    block_rows(doc)
+        .into_iter()
+        .filter(|r| r.instances > 0)
+        .collect()
+}
+
+/// Case-insensitive substring filter over block rows by name. An empty (or
+/// whitespace-only) query returns every row unchanged. Drives the search field
+/// at the top of the Blocks tab. Pure, so it is unit-tested standalone.
+pub fn filter_block_rows(rows: &[BlockRow], query: &str) -> Vec<BlockRow> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return rows.to_vec();
+    }
+    rows.iter()
+        .filter(|r| r.name.to_ascii_lowercase().contains(&q))
+        .cloned()
+        .collect()
+}
+
+/// Case-insensitive substring filter over library block names (the `blocklib`
+/// listing: starter symbols + `~/.config/itsjustcad/blocks/*.block.json`). An
+/// empty query returns every name. Drives the "+" library search popup. Pure.
+pub fn filter_library(names: &[String], query: &str) -> Vec<String> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return names.to_vec();
+    }
+    names
+        .iter()
+        .filter(|n| n.to_ascii_lowercase().contains(&q))
+        .cloned()
+        .collect()
+}
+
+/// Pure decision for the viewport double-click trigger: a double-click that hits
+/// an object reveals the Blocks tab **iff** that object is a block instance
+/// (`Geometry::Instance`). Any other geometry (or a miss) leaves the tab alone.
+/// The caller passes the hit object's geometry; `None` means the double-click
+/// hit empty space. Returns the block/definition name to scroll to when it fires.
+pub fn double_click_reveals_blocks(hit: Option<&Geometry>) -> Option<String> {
+    match hit {
+        Some(Geometry::Instance { block, source, .. }) => {
+            Some(source.as_deref().unwrap_or(block.as_str()).to_string())
+        }
+        _ => None,
+    }
 }
 
 /// One row of the Plugins tab: an installed user/LLM-authored macro.
@@ -209,6 +267,132 @@ mod tests {
         assert!(block_rows(&s.doc).iter().any(|r| r.name == "mytemp"));
         run(&mut s, "blockdelete mytemp");
         assert!(!block_rows(&s.doc).iter().any(|r| r.name == "mytemp"));
+    }
+
+    // ---- drawing-scoped rows (blocks PRESENT on the drawing) ----
+
+    #[test]
+    fn drawing_rows_exclude_defs_with_zero_instances() {
+        // A captured definition with no instances is a def but is NOT "on the
+        // drawing": drawing_block_rows drops it. The full block_rows still has it.
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last uninstanced");
+        assert!(block_rows(&s.doc).iter().any(|r| r.name == "uninstanced"));
+        assert!(
+            !drawing_block_rows(&s.doc).iter().any(|r| r.name == "uninstanced"),
+            "a def with 0 instances is not a drawing block"
+        );
+    }
+
+    #[test]
+    fn drawing_rows_include_only_instanced_blocks() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last placed");
+        run(&mut s, "insert placed 5,0,0");
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last shelf"); // never inserted
+        let rows = drawing_block_rows(&s.doc);
+        assert!(rows.iter().any(|r| r.name == "placed" && r.instances == 1));
+        assert!(!rows.iter().any(|r| r.name == "shelf"));
+    }
+
+    #[test]
+    fn drawing_rows_scope_parametric_by_instances() {
+        // Starter pblocks exist as defs but have no instances → excluded until
+        // one is placed.
+        let mut s = Session::default();
+        assert!(drawing_block_rows(&s.doc).is_empty(), "no instances yet");
+        run(&mut s, "pblock mypdoor width=0.9 : rect 0,0,0 {width} 0.05");
+        run(&mut s, "insert mypdoor 0,0,0");
+        let rows = drawing_block_rows(&s.doc);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "mypdoor");
+        assert!(rows[0].param_signature.is_some());
+    }
+
+    // ---- search filter (by name substring, case-insensitive) ----
+
+    #[test]
+    fn filter_matches_case_insensitive_substring() {
+        let rows = vec![
+            BlockRow { name: "DoorSingle".into(), instances: 1, geometries: 0, param_signature: None },
+            BlockRow { name: "window".into(), instances: 2, geometries: 0, param_signature: None },
+            BlockRow { name: "tree".into(), instances: 1, geometries: 0, param_signature: None },
+        ];
+        let hit = filter_block_rows(&rows, "OO"); // matches "DoorSingle"
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].name, "DoorSingle");
+        assert_eq!(filter_block_rows(&rows, "w").len(), 1); // "window"
+        assert_eq!(filter_block_rows(&rows, "zzz").len(), 0);
+    }
+
+    #[test]
+    fn filter_empty_query_returns_all() {
+        let rows = vec![
+            BlockRow { name: "a".into(), instances: 1, geometries: 0, param_signature: None },
+            BlockRow { name: "b".into(), instances: 1, geometries: 0, param_signature: None },
+        ];
+        assert_eq!(filter_block_rows(&rows, "").len(), 2);
+        assert_eq!(filter_block_rows(&rows, "   ").len(), 2);
+    }
+
+    // ---- library search (derives from blocklib names) ----
+
+    #[test]
+    fn library_filter_matches_substring() {
+        let names = vec![
+            "door-single".to_string(),
+            "window-double".to_string(),
+            "tree".to_string(),
+        ];
+        assert_eq!(filter_library(&names, "door"), vec!["door-single".to_string()]);
+        assert_eq!(filter_library(&names, "DOUBLE"), vec!["window-double".to_string()]);
+        assert_eq!(filter_library(&names, ""), names);
+        assert!(filter_library(&names, "nope").is_empty());
+    }
+
+    // ---- double-click → reveal Blocks tab (pure decision) ----
+
+    #[test]
+    fn double_click_on_instance_reveals_blocks() {
+        let inst = Geometry::Instance {
+            block: "door".into(),
+            source: None,
+            position: glam::DVec3::ZERO,
+            scale: 1.0,
+            rotation_deg: 0.0,
+            params: Default::default(),
+        };
+        assert_eq!(double_click_reveals_blocks(Some(&inst)).as_deref(), Some("door"));
+    }
+
+    #[test]
+    fn double_click_on_dynamic_instance_uses_source_name() {
+        let inst = Geometry::Instance {
+            block: "__param/mypdoor/abc".into(),
+            source: Some("mypdoor".into()),
+            position: glam::DVec3::ZERO,
+            scale: 1.0,
+            rotation_deg: 0.0,
+            params: Default::default(),
+        };
+        assert_eq!(
+            double_click_reveals_blocks(Some(&inst)).as_deref(),
+            Some("mypdoor"),
+            "dynamic instance keys off the source definition, not the baked block"
+        );
+    }
+
+    #[test]
+    fn double_click_on_non_instance_does_not_reveal() {
+        let line = Geometry::Curve(kernel_curve::Curve::Line {
+            a: glam::DVec3::ZERO,
+            b: glam::DVec3::X,
+        });
+        assert!(double_click_reveals_blocks(Some(&line)).is_none());
+        assert!(double_click_reveals_blocks(None).is_none(), "miss reveals nothing");
     }
 
     #[test]
