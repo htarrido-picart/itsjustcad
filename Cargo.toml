@@ -11,6 +11,7 @@ members = [
     "crates/commands",
     "crates/deck",
     "crates/render",
+    "crates/raytrace",
     "crates/solar",
     "crates/app",
     "crates/ffi",
@@ -69,6 +70,7 @@ itsjustcad-doc = { path = "crates/doc" }
 itsjustcad-commands = { path = "crates/commands" }
 itsjustcad-deck = { path = "crates/deck" }
 itsjustcad-render = { path = "crates/render" }
+itsjustcad-raytrace = { path = "crates/raytrace" }
 itsjustcad-solar = { path = "crates/solar" }
 
 [profile.release]

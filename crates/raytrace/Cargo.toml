@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright © 2026 Hector Tarrido-Picart
+[package]
+name = "itsjustcad-raytrace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+rayon.workspace = true
+kernel-mesh.workspace = true
+itsjustcad-doc.workspace = true
+itsjustcad-solar.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }

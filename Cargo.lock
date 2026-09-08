@@ -2758,6 +2758,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "itsjustcad-raytrace"
+version = "0.4.0"
+dependencies = [
+ "glam 0.30.10",
+ "image",
+ "itsjustcad-doc",
+ "itsjustcad-solar",
+ "kernel-mesh",
+ "rayon",
+]
+
+[[package]]
 name = "itsjustcad-render"
 version = "0.4.0"
 dependencies = [
