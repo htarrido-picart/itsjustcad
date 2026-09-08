@@ -55,6 +55,45 @@ pub fn circumcenter(a: DVec2, b: DVec2, c: DVec2) -> Option<DVec2> {
     Some(DVec2::new(ux, uy))
 }
 
+/// Liang-Barsky clip of the segment `a`→`b` to the axis-aligned box [lo, hi].
+/// Returns the clipped `(a', b')` (both endpoints on or inside the box), or `None`
+/// if the segment lies entirely outside. Keeps every emitted Voronoi edge local
+/// to the site: circumcenters of thin sliver triangles can land arbitrarily far
+/// away, and left unclipped they would blow up the scene bounds so zoom-extents
+/// frames the diagram to a few pixels (the near-blank render).
+fn clip_segment_to_box(a: DVec2, b: DVec2, lo: DVec2, hi: DVec2) -> Option<(DVec2, DVec2)> {
+    let d = b - a;
+    let mut t0 = 0.0_f64;
+    let mut t1 = 1.0_f64;
+    let checks = [(-d.x, a.x - lo.x), (d.x, hi.x - a.x), (-d.y, a.y - lo.y), (d.y, hi.y - a.y)];
+    for (num_dir, num_dist) in checks {
+        if num_dir.abs() < 1e-18 {
+            // Parallel to this edge and outside its slab → no intersection.
+            if num_dist < 0.0 {
+                return None;
+            }
+        } else {
+            let t = num_dist / num_dir;
+            if num_dir < 0.0 {
+                if t > t1 {
+                    return None;
+                }
+                if t > t0 {
+                    t0 = t;
+                }
+            } else {
+                if t < t0 {
+                    return None;
+                }
+                if t < t1 {
+                    t1 = t;
+                }
+            }
+        }
+    }
+    Some((a + d * t0, a + d * t1))
+}
+
 /// Generate Voronoi seed points as a jittered grid over the site bbox, spaced by
 /// block depth, keeping only seeds inside the site. Deterministic (splitmix64).
 pub fn seed_points(site: &Polygon2d, settings: &SubdivisionSettings) -> Vec<DVec2> {
@@ -126,25 +165,81 @@ pub fn generate(site: &Polygon2d, settings: &SubdivisionSettings) -> StreetGraph
         }
     }
 
+    // Hull-edge rays are clipped to a bbox padded by ~one road width past the
+    // site so the ROW ribbon still fully severs the boundary cell, WITHOUT the
+    // baked road centerline shooting off to infinity (which would blow up the
+    // scene bounds and make zoom-extents frame the whole diagram to a few
+    // pixels). One road-width of overscan is enough for the half-width ribbon to
+    // cross the site edge.
+    let (lo, hi) = site.aabb();
+    let pad = width.max(effective_block_depth(settings) * 0.25);
+    let clip_lo = lo - DVec2::splat(pad);
+    let clip_hi = hi + DVec2::splat(pad);
+    // A fallback ray length used only to seed the parametric ray before clipping.
+    let ray_len = (hi - lo).length() + pad;
+    let site_centroid = site.centroid();
+
     // Deterministic emission: sort the shared Delaunay edges, emit one Voronoi
-    // segment per interior edge (shared by exactly two triangles).
+    // segment per interior edge (shared by two triangles) and one clipped ray per
+    // hull edge (shared by one) so boundary cells close instead of leaking.
     let mut shared: Vec<(&(u32, u32), &Vec<usize>)> = edge_tris.iter().collect();
     shared.sort_by_key(|(k, _)| **k);
 
     let mut seen: std::collections::HashSet<((i64, i64), (i64, i64))> =
         std::collections::HashSet::new();
-    for (_ek, owners) in shared {
-        if owners.len() != 2 {
-            continue; // hull edge → the dual is a ray, dropped (site clips anyway)
-        }
-        let (Some(p), Some(q)) = (ccs[owners[0]], ccs[owners[1]]) else {
-            continue;
-        };
-        if p.distance_squared(q) < 1e-12 {
-            continue;
-        }
-        if seen.insert(edge_key(p, q)) {
-            graph.add(vec![p, q], width, StreetTier::Connector);
+    for (ek, owners) in shared {
+        if owners.len() == 2 {
+            // Interior edge: the dual is the finite segment joining the two
+            // circumcenters.
+            let (Some(p), Some(q)) = (ccs[owners[0]], ccs[owners[1]]) else {
+                continue;
+            };
+            // Clip to the padded bbox so distant circumcenters stay local.
+            let Some((p, q)) = clip_segment_to_box(p, q, clip_lo, clip_hi) else {
+                continue;
+            };
+            if p.distance_squared(q) < 1e-12 {
+                continue;
+            }
+            if seen.insert(edge_key(p, q)) {
+                graph.add(vec![p, q], width, StreetTier::Connector);
+            }
+        } else if owners.len() == 1 {
+            // Hull edge: the dual is an infinite ray from the lone triangle's
+            // circumcenter, perpendicular to the Delaunay hull edge, pointing
+            // OUTWARD (away from the triangle interior). Extend it past the site
+            // so the ROW ribbon carves the boundary cell closed. Dropping these
+            // (the old behaviour) left every perimeter cell open → the sparse,
+            // fragmented render.
+            let Some(p) = ccs[owners[0]] else { continue };
+            let a = seeds[ek.0 as usize];
+            let b = seeds[ek.1 as usize];
+            let mid = (a + b) * 0.5;
+            let edge = b - a;
+            let mut n = DVec2::new(-edge.y, edge.x); // perpendicular to hull edge
+            if n.length_squared() < 1e-18 {
+                continue;
+            }
+            n = n.normalize();
+            // Orient outward: away from the site centroid (the hull opens outward
+            // there). Fall back to the edge-midpoint direction for centred sites.
+            let outward = mid - site_centroid;
+            if outward.dot(n) < 0.0 {
+                n = -n;
+            }
+            // Clip the ray p→(p + n·ray_len) to the padded bbox so the baked
+            // centerline stays local. If the whole ray misses the clip box there
+            // is nothing to draw.
+            let far = p + n * ray_len;
+            let Some((p, q)) = clip_segment_to_box(p, far, clip_lo, clip_hi) else {
+                continue;
+            };
+            if p.distance_squared(q) < 1e-12 {
+                continue;
+            }
+            if seen.insert(edge_key(p, q)) {
+                graph.add(vec![p, q], width, StreetTier::Connector);
+            }
         }
     }
 
@@ -204,6 +299,58 @@ mod tests {
         assert!(seeds.len() >= 3, "need seeds");
         let g = generate(&site, &s);
         assert!(!g.is_empty(), "voronoi produced no edges");
+    }
+
+    #[test]
+    fn hull_rays_close_boundary_cells_into_blocks() {
+        // Regression: previously hull-edge duals were dropped, so perimeter cells
+        // stayed open and the block extractor produced only a handful of loose
+        // fragments (near-blank render). With the clipped rays every cell closes,
+        // so the block count should be on the order of the seed count.
+        let site = rect(400.0, 300.0);
+        let s = SubdivisionSettings {
+            block_depth: 70.0,
+            seed: 3,
+            ..SubdivisionSettings::default()
+        };
+        let seeds = seed_points(&site, &s);
+        let g = generate(&site, &s);
+        let blocks = crate::streets::block_extractor::extract(&site, &g, &s);
+        // Every interior + boundary cell should carve a block: expect at least
+        // half the seed count (some edge seeds merge / clip away).
+        assert!(
+            blocks.len() >= seeds.len() / 2,
+            "expected ~one block per cell: {} blocks for {} seeds",
+            blocks.len(),
+            seeds.len()
+        );
+    }
+
+    #[test]
+    fn baked_roads_stay_local_to_the_site() {
+        // The clipped rays must not shoot off to infinity — every road vertex
+        // stays within one block depth of the site bbox, so zoom-extents frames
+        // the diagram (not a giant empty canvas).
+        let site = rect(400.0, 300.0);
+        let s = SubdivisionSettings {
+            block_depth: 70.0,
+            seed: 3,
+            ..SubdivisionSettings::default()
+        };
+        let (lo, hi) = site.aabb();
+        let margin = s.block_depth;
+        let g = generate(&site, &s);
+        for st in &g.streets {
+            for p in &st.centerline {
+                assert!(
+                    p.x >= lo.x - margin
+                        && p.x <= hi.x + margin
+                        && p.y >= lo.y - margin
+                        && p.y <= hi.y + margin,
+                    "road vertex {p:?} escaped the site bbox by more than one block depth"
+                );
+            }
+        }
     }
 
     #[test]
