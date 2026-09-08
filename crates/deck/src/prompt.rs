@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright © 2026 Hector Tarrido-Picart
 
-use itsjustcad_commands::{registry, PluginRegistry, SELECTOR_HELP};
+use itsjustcad_commands::{registry, Category, PluginRegistry, SELECTOR_HELP};
 
 // INVARIANT — three deck-executable planes, three prompt advertisements, three
 // completeness tests. The deck can drive geometry through THREE disjoint tool
@@ -234,81 +234,211 @@ pub fn terse_adjusted(prompt: String, max_tokens: u32, terse: bool) -> (String, 
 /// `plugins` are user/LLM-authored macros — the LLM must see them so it can
 /// call plugin verbs directly (`<pluginname> args...`) and author new ones via
 /// the `plugin define` command.
-/// A FOCUSED, short system prompt for small LOCAL models (e.g. a 0.6–4B
-/// llamafile). The full [`system_prompt`] lists every registry command (~33 KB)
-/// which overwhelms a tiny model — it rambles and never emits commands. This
-/// brief teaches only the draft convention + the common commands + one worked
-/// example; the GBNF grammar backstops the full verb set at the token level.
-/// Keep it terse: small models stay on-task and burn far fewer tokens.
-pub fn brief_system_prompt(scene_digest: &str) -> String {
-    let digest = if scene_digest.trim().is_empty() {
-        "(the document is empty)"
+/// Order the [`Category`] taxonomy is rendered in the compact catalog. Solid /
+/// Structure / Analyze lead because that is where the deck spends most turns and
+/// where the old brief prompt's omissions (geodesic, hypar, funicular, …) bit.
+const CATEGORY_ORDER: &[Category] = &[
+    Category::Solid,
+    Category::Structure,
+    Category::Analyze,
+    Category::Draw2d,
+    Category::Curve,
+    Category::Boolean,
+    Category::Transform,
+    Category::Annotate,
+    Category::Dimension,
+    Category::View,
+    Category::File,
+    Category::Edit,
+    Category::Tools,
+];
+
+/// Human label for a category header in the compact catalog.
+fn category_label(c: Category) -> &'static str {
+    match c {
+        Category::File => "File",
+        Category::Edit => "Edit",
+        Category::View => "View",
+        Category::Draw2d => "Draw (2D)",
+        Category::Curve => "Curve",
+        Category::Solid => "Solid",
+        Category::Boolean => "Boolean",
+        Category::Transform => "Transform",
+        Category::Annotate => "Annotate",
+        Category::Dimension => "Dimension",
+        Category::Analyze => "Analyze",
+        Category::Structure => "Structure / form-finding",
+        Category::Tools => "Tools",
+    }
+}
+
+/// A one-LINE summary for the compact catalog: the first sentence of the full
+/// registry summary, with the trailing "Example: …" dropped and clamped to a
+/// terse width. The full syntax + examples stay reachable via `help <verb>`.
+fn terse_summary(summary: &str) -> String {
+    // Drop the worked example the full prompt carries — `help` serves it.
+    let head = summary
+        .split("Example:")
+        .next()
+        .unwrap_or(summary)
+        .trim()
+        .trim_end_matches(['.', '·', ' ']);
+    // First sentence only, then clamp width so 160+ verbs stay ~one screen each.
+    // Kept short on purpose: the compact catalog is a menu of NAMES; the full
+    // syntax lives behind `help <verb>`, so a long summary would just be waste.
+    let first = head.split(". ").next().unwrap_or(head).trim();
+    const MAX: usize = 52;
+    if first.chars().count() > MAX {
+        let mut s: String = first.chars().take(MAX - 1).collect();
+        s.push('…');
+        s
     } else {
-        scene_digest
-    };
+        first.to_string()
+    }
+}
+
+/// Render EVERY registry verb as `name — terse summary`, grouped by
+/// [`Category`]. Single source of truth: [`registry`]. This is the command list
+/// the compact catalog embeds; a completeness test asserts every verb NAME
+/// appears here, so a newly-added verb can never silently vanish from the deck's
+/// view (the anti-regression guard the old brief prompt lacked).
+pub fn compact_command_catalog() -> String {
+    let mut out = String::new();
+    for &cat in CATEGORY_ORDER {
+        let mut lines = String::new();
+        for spec in registry().iter().filter(|s| s.category == cat) {
+            lines.push_str(&format!("  {:<16} {}\n", spec.name, terse_summary(spec.summary)));
+        }
+        if !lines.is_empty() {
+            out.push_str(&format!("### {}\n{}", category_label(cat), lines));
+        }
+    }
+    out
+}
+
+/// The UNIFIED, compact system prompt used by EVERY backend — claude-code,
+/// Anthropic, and local models alike. It lists every registry verb as
+/// name + one-line summary grouped by [`Category`] (see
+/// [`compact_command_catalog`]) instead of the full [`system_prompt`]'s ~33 KB
+/// of usage strings + long descriptions + worked examples. Targets ~6–8 KB.
+///
+/// The trade-off: the model sees every command NAME (so it knows geodesic,
+/// hypar, funicular, tensegrity, minsurf, … all exist and never claims "no such
+/// primitive"), and fetches the FULL syntax/args/examples for an unfamiliar
+/// verb on demand with `help <verb>` — whose output threads back through the
+/// turn loop. The GBNF grammar still backstops the full verb set for local
+/// models at the token level.
+pub fn compact_system_prompt(scene_digest: &str, plugins: &PluginRegistry) -> String {
+    let catalog = compact_command_catalog();
+
+    // Plugin macros (if any) as callable verbs, plus the authoring commands.
+    // Same sanitizer the full prompt + digest use, so a forged fence in a
+    // plugin field can never inject instructions.
+    let mut plugin_block = String::new();
+    if !plugins.is_empty() {
+        plugin_block.push_str("\n### Plugins (user macros — call by name)\n");
+        for p in plugins.iter() {
+            let mut usage = crate::digest::sanitize_name(&p.name);
+            for param in &p.params {
+                usage.push(' ');
+                usage.push_str(&crate::digest::sanitize_name(&param.name));
+            }
+            let summary = if p.description.is_empty() {
+                format!("Plugin macro ({} line(s)).", p.body.len())
+            } else {
+                crate::digest::sanitize_name(&p.description)
+            };
+            plugin_block.push_str(&format!("  {usage:<16} {summary}\n"));
+        }
+    }
+    plugin_block.push_str(
+        "\nAuthor a reusable macro with `plugin define {\"name\":\"<n>\",\"params\":[{\"name\":\"h\",\"default\":\"3\"}],\"body\":[\"rect 0,0 {0} {0}\",\"extrude last {h}\"]}` — body lines are templates ({0}/{h} substitute args); invoke later as `<n> arg1 arg2`.\n",
+    );
+
     format!(
-        r#"You are the CAD engine of ItsJustCAD. Output ONLY a ```draft block: one command per line, no prose, no explanation. Units are meters, Z is up, the ground plane is z=0. Selectors count back from newest: `last`, `last 2`, `last 3`, or `all`.
+        r#"You are the drafting companion inside ItsJustCAD, a CAD program for architects. You model by emitting commands — the same commands the human types. Coordinates are meters, Z is up, the ground plane is z=0.
 
-Common commands (args are literal numbers/selectors — never placeholders):
-  box <x,y,z> <sx,sy,sz>        circle <x,y,z> <r>           line <x,y,z> <x,y,z>
-  rect <x,y,z> <w> <h>          polyline <x,y> <x,y> ... [closed]
-  arc <x,y,z> <r> <a0> <a1>     extrude <sel> <height>       revolve <sel>
-  loft <sel>                    difference <target> <tools>  union <sel>   intersect <sel>
-  move <sel> <dx,dy,dz>         copy <sel> <dx,dy,dz>        rotate <sel> <deg> [x|y|z]
-  scale <sel> <factor>          mirror <sel> <xy|yz|xz>      delete <sel>
+## How to draw
+Emit commands inside a ```draft fenced block, ONE command per line. Commands execute live as you stream them. Text outside the block is chat shown to the architect. Keep chat brief.
 
-ALWAYS create every object (box, circle, line, ...) BEFORE you reference it. `last`, `last 2`, `union`, `difference` only act on objects you already emitted this turn — never combine things you have not drawn yet.
-To cut a hole: box the solid, then box a slightly TALLER void, then `difference last 2 last`.
+## Command catalog (name — one-line summary, grouped by category)
+This is the COMPLETE command set: every verb ItsJustCAD supports. You see each command's NAME and a terse summary. Before using a verb whose exact arguments you are unsure of, emit `help <verb>` (e.g. `help geodesic`) in a ```draft block on its OWN — the app replies with that verb's full syntax, arguments, and worked examples, threaded back to you so you can then call it correctly. Never tell the user a capability "doesn't exist" without checking this list first: if it is named here, it exists.
+{catalog}
+{selectors}
+{plugin_block}
 
-You can ALSO change the view/camera/UI (same ```draft block, never geometry). Do NOT refuse these:
-  top|bottom|front|back|left|right|persp   standard view        ze   zoom to fit
-  display shaded|wireframe|xray|ghosted|pencil   viewport style   sketchup   SketchUp look
-  light working|sun|presentation           lighting model
-  camera 2point|persp|pano|fisheye [fov]|<n>mm|phone <lens>   projection/lens (phone: iphone-ultrawide, ...)
-  panel show|hide    dock left|right    split 1|2|4    workspace <name>    theme dark|light
-"make it a pencil sketch from the top" ->
-```draft
-display pencil
-top
-```
-"hide the layers panel and give me 4 viewports" ->
-```draft
-panel hide
-split 4
-```
-"fisheye / iphone ultrawide view" ->
-```draft
-camera fisheye 120
-```
+## You can also change the VIEW and UI, not just geometry
+You are NOT geometry-only. Besides drawing, you can reframe the viewport, orbit to standard views, zoom, switch display/render styles, change lighting, pick a camera lens/projection (including fisheye and phone-camera sims), and rearrange the window (panels, docking, viewport split, workspace, theme). Emit these in the SAME ```draft block, one per line — they run exactly like the human's command line and never touch the drawing or op-log. When the user asks for a look, a view, a camera, or a layout change, DO IT — never reply that you "only emit geometry commands".
 
-If the request is AMBIGUOUS (missing dimension, unclear target like "make it bigger" with several objects), do NOT guess: output exactly one line, no draft block:
-QUESTION: <one short clarifying question>
+{view_verbs}
+{ui_verbs}
+{enviro}
+{codecheck}
+{yield_critique}
+{clarify}
+{plan}
+{tables}
+## Rules
+- Points are x,y,z or x,y (z=0). No spaces inside a point. Units: bare numbers are meters; 250cm and 500mm also work.
+- 'last' refers to the most recently created object; 'last N' to the N most recent. Create every object BEFORE you reference it — `last`, `union`, `difference` only act on objects that already exist.
+- To make a solid: draw a closed profile (rect/circle/polygon/closed polyline), then 'extrude last <height>'. To cut a hole: draw the solid, draw a taller void, then `difference last 2 last`.
+- Name important objects ('name last core') so you can refer to them later.
+- If a command fails you receive the error text; correct it and re-emit only the failed/remaining commands.
+- If unsure of a verb's arguments, `help <verb>` FIRST, read the reply, then use it.
 
-For a BIG task with several stages, first output only a numbered plan (then one step per turn as draft blocks):
-PLAN:
-1. <first step>
-2. <second step>
-
-Examples (follow this exact syntax):
-"a 10x10x3 slab with a 4x4 courtyard" ->
+## Example
+User: make two 4x4x3 towers 10m apart
 ```draft
-box 0,0,0 10,10,3
-box 3,3,-1 4,4,5
-difference last 2 last
-```
-"a 5m circle at the origin and a 2m cube at x=10" ->
-```draft
-circle 0,0,0 5
-box 10,0,0 2,2,2
-```
-"extrude the last curve 3m tall, then move it 4m along x" ->
-```draft
-extrude last 3
-move last 4,0,0
+box 0,0,0 4,4,3
+box 10,0,0 4,4,3
 ```
 
-Current scene: {digest}"#
+## Current scene
+{scene}
+"#,
+        catalog = catalog,
+        selectors = SELECTOR_HELP,
+        plugin_block = plugin_block,
+        view_verbs = VIEW_VERB_HELP,
+        ui_verbs = UI_VERB_HELP,
+        enviro = ENVIRO_CRITIQUE_HELP,
+        codecheck = CODECHECK_HELP,
+        yield_critique = YIELD_CRITIQUE_HELP,
+        clarify = CLARIFY_HELP,
+        plan = PLAN_HELP,
+        tables = TABLE_HELP,
+        scene = if scene_digest.trim().is_empty() {
+            "(empty)"
+        } else {
+            scene_digest
+        },
     )
+}
+
+/// Which system prompt a cassette gets. Pure so the choice is unit-testable
+/// (see the prompt-selection tests). DEFAULT for every backend is
+/// [`PromptChoice::Compact`]; the verbose [`system_prompt`] is an explicit
+/// opt-in fallback (env `ITSJUSTCAD_FULL_PROMPT=1`), NOT the old
+/// empty-url-means-local heuristic that misclassified the claude-code cassette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptChoice {
+    /// Unified compact catalog — every backend, every model.
+    Compact,
+    /// The full ~33 KB registry dump. Opt-in fallback only.
+    Full,
+}
+
+/// Choose the system-prompt flavor for a cassette. `full_opt_in` is the
+/// explicit override (e.g. `std::env::var("ITSJUSTCAD_FULL_PROMPT").is_ok()`).
+/// Crucially this NO LONGER keys on `base_url` — the claude-code cassette has an
+/// empty base_url yet is a strong model, so it (and every other backend) gets
+/// the full-capability compact catalog by default.
+pub fn select_prompt(full_opt_in: bool) -> PromptChoice {
+    if full_opt_in {
+        PromptChoice::Full
+    } else {
+        PromptChoice::Compact
+    }
 }
 
 pub fn system_prompt(scene_digest: &str, plugins: &PluginRegistry) -> String {
@@ -354,6 +484,7 @@ Emit commands inside a ```draft fenced block, ONE command per line. Commands exe
 ## Commands
 {commands}
 {selectors}
+If you are unsure of a verb's exact arguments, emit `help <verb>` (e.g. `help geodesic`) in a ```draft block — the app replies with that verb's full syntax + examples, threaded back to you.
 {plugin_block}
 
 ## You can also change the VIEW and UI, not just geometry
@@ -661,16 +792,16 @@ mod tests {
 
     #[test]
     fn both_prompts_advertise_clarify_before_act() {
-        // The full prompt embeds the whole section; the brief (local) prompt
-        // carries a condensed rule. Both teach the exact `QUESTION:` form the
-        // parser (`agent::parse_question`) recognizes.
-        let full = system_prompt("", &PluginRegistry::new());
-        assert!(full.contains(CLARIFY_HELP), "CLARIFY_HELP not injected");
-        assert!(full.contains("## Ask before guessing"));
-        assert!(full.contains("QUESTION: <one short clarifying question>"));
-        let brief = brief_system_prompt("");
-        assert!(brief.contains("QUESTION: <one short clarifying question>"));
-        assert!(brief.contains("AMBIGUOUS"));
+        // Both the full and the compact prompt embed the clarify section whole,
+        // teaching the exact `QUESTION:` form the parser recognizes.
+        for p in [
+            system_prompt("", &PluginRegistry::new()),
+            compact_system_prompt("", &PluginRegistry::new()),
+        ] {
+            assert!(p.contains(CLARIFY_HELP), "CLARIFY_HELP not injected");
+            assert!(p.contains("## Ask before guessing"));
+            assert!(p.contains("QUESTION: <one short clarifying question>"));
+        }
         // The advertised form round-trips through the parser.
         assert_eq!(
             crate::agent::parse_question("QUESTION: which object?").as_deref(),
@@ -682,17 +813,102 @@ mod tests {
     fn both_prompts_advertise_the_plan_message_form() {
         // The plan-execute harness is only reachable if the prompt teaches the
         // exact `PLAN:` + numbered-step form the parser and grammar accept.
-        let full = system_prompt("", &PluginRegistry::new());
-        assert!(full.contains(PLAN_HELP), "PLAN_HELP not injected");
-        assert!(full.contains("## Multi-step plans"));
-        assert!(full.contains("PLAN:\n1. <first step>"));
-        // Verification guidance names real read-only registry verbs.
-        assert!(full.contains("`bbox all`, `schedule`, `report`"));
-        let brief = brief_system_prompt("");
-        assert!(brief.contains("PLAN:\n1. <first step>"));
+        for p in [
+            system_prompt("", &PluginRegistry::new()),
+            compact_system_prompt("", &PluginRegistry::new()),
+        ] {
+            assert!(p.contains(PLAN_HELP), "PLAN_HELP not injected");
+            assert!(p.contains("## Multi-step plans"));
+            assert!(p.contains("PLAN:\n1. <first step>"));
+            assert!(p.contains("`bbox all`, `schedule`, `report`"));
+        }
         // The advertised form round-trips through the parser.
         let p = crate::agent::parse_plan("PLAN:\n1. slab\n2. cores\n").expect("parses");
         assert_eq!(p.steps.len(), 2);
+    }
+
+    #[test]
+    fn compact_catalog_lists_every_registry_command_name() {
+        // ANTI-REGRESSION GUARD. The old brief prompt hard-coded ~10 verbs, so
+        // the model could not see geodesic/hypar/funicular/… The compact catalog
+        // is derived from `registry()` and MUST name EVERY verb, so a strong
+        // model (claude-code) never again claims a real capability doesn't exist.
+        let prompt = compact_system_prompt("", &PluginRegistry::new());
+        for spec in registry() {
+            assert!(
+                prompt.contains(spec.name),
+                "compact catalog missing verb name '{}'",
+                spec.name
+            );
+        }
+        // The specific verbs the bug report called out are present by name.
+        for verb in [
+            "geodesic",
+            "hypar",
+            "funicular",
+            "tensegrity",
+            "minsurf",
+        ] {
+            assert!(
+                prompt.contains(verb),
+                "compact catalog missing form-finding verb '{verb}'"
+            );
+        }
+        assert!(prompt.contains(SELECTOR_HELP));
+    }
+
+    #[test]
+    fn compact_prompt_is_smaller_than_full_yet_complete() {
+        // The whole point: same coverage (every verb name), far fewer bytes.
+        // "Meaningfully smaller" = at most half the full prompt's bytes. The
+        // saving comes from the COMMAND LIST (names + one-liners, no per-verb
+        // usage strings / long descriptions / worked examples); the shared
+        // workflow sections (view, codecheck, enviro, …) are carried by both.
+        let compact = compact_system_prompt("", &PluginRegistry::new());
+        let full = system_prompt("", &PluginRegistry::new());
+        assert!(
+            compact.len() * 2 < full.len(),
+            "compact ({}) should be well under half of full ({})",
+            compact.len(),
+            full.len()
+        );
+        // The command CATALOG itself is the compact-by-design part: ~7–10 KB for
+        // 160+ verbs vs the full prompt's ~45 KB command table.
+        let catalog = compact_command_catalog();
+        assert!(
+            catalog.len() < 12_000,
+            "compact catalog bloated to {} bytes",
+            catalog.len()
+        );
+    }
+
+    #[test]
+    fn compact_prompt_teaches_help_as_a_tool() {
+        // The model must know to fetch full syntax on demand.
+        let p = compact_system_prompt("", &PluginRegistry::new());
+        assert!(p.contains("help <verb>"), "compact prompt must teach help <verb>");
+    }
+
+    #[test]
+    fn select_prompt_defaults_to_compact_regardless_of_backend() {
+        // THE BUG FIX, pinned. Selection no longer keys on base_url, so the
+        // claude-code cassette (empty base_url, a STRONG model) gets the compact
+        // full-capability catalog, not a stripped brief. Only an explicit opt-in
+        // switches to the verbose full prompt.
+        assert_eq!(select_prompt(false), PromptChoice::Compact);
+        assert_eq!(select_prompt(true), PromptChoice::Full);
+        // Regression witness: an empty base_url is still "local" by the old
+        // heuristic, yet it must NOT change the prompt choice anymore.
+        assert!(crate::is_local_url(""));
+        assert_eq!(select_prompt(false), PromptChoice::Compact);
+    }
+
+    #[test]
+    fn terse_works_on_the_compact_prompt_too() {
+        let (p, cap) =
+            terse_adjusted(compact_system_prompt("(empty)", &PluginRegistry::new()), 4096, true);
+        assert!(p.contains("## Response style (terse mode)"));
+        assert_eq!(cap, TERSE_MAX_TOKENS);
     }
 
     #[test]
@@ -711,13 +927,6 @@ mod tests {
         assert_eq!(p, base);
         assert!(!p.contains("## Response style (terse mode)"));
         assert_eq!(cap, 4096);
-    }
-
-    #[test]
-    fn terse_works_on_the_brief_local_prompt_too() {
-        let (p, cap) = terse_adjusted(brief_system_prompt("(empty)"), 4096, true);
-        assert!(p.contains("## Response style (terse mode)"));
-        assert_eq!(cap, TERSE_MAX_TOKENS);
     }
 
     #[test]
@@ -743,3 +952,5 @@ mod tests {
         }
     }
 }
+
+
