@@ -107,6 +107,80 @@ pub struct SheetDim {
     pub view_index: usize,
 }
 
+/// A paper-space text note placed on a sheet. `pos_mm` is the lower-left of
+/// the text in paper millimeters (from the sheet lower-left); `height_mm` is
+/// the cap height IN MILLIMETERS ON PAPER. Because the size is stated in paper
+/// mm — never model units — the note renders at exactly the same physical size
+/// regardless of any viewport's scale. This is the scale-independence fix that
+/// model-space `Annotation::Text` (model-unit height) does not have.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SheetText {
+    /// Text anchor (lower-left) in paper space (mm).
+    pub pos_mm: [f64; 2],
+    /// The note text.
+    pub text: String,
+    /// Cap height in millimeters ON PAPER (scale-independent).
+    pub height_mm: f64,
+    /// Optional view this note is associated with (does not affect its size;
+    /// kept for grouping / future anchoring). `None` = free-floating on paper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_index: Option<usize>,
+}
+
+/// A paper-space leader: an arrow tip, a kink (knee), then a text label — all
+/// in paper millimeters, so the whole annotation is scale-independent.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SheetLeader {
+    /// Arrow tip (what the leader points at) in paper space (mm).
+    pub tip_mm: [f64; 2],
+    /// The kink/knee where the leader bends toward the text (mm).
+    pub knee_mm: [f64; 2],
+    /// Text anchor (lower-left) in paper space (mm).
+    pub text_pos_mm: [f64; 2],
+    /// The label text.
+    pub text: String,
+    /// Cap height in millimeters ON PAPER (scale-independent).
+    pub height_mm: f64,
+    /// Optional associated view (grouping only). `None` = free-floating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_index: Option<usize>,
+}
+
+/// The bubble/tag outline shape for a `SheetTag`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TagShape {
+    Bubble,
+    Square,
+    Diamond,
+}
+
+impl TagShape {
+    pub fn label(self) -> &'static str {
+        match self {
+            TagShape::Bubble => "bubble",
+            TagShape::Square => "square",
+            TagShape::Diamond => "diamond",
+        }
+    }
+}
+
+/// A paper-space callout/tag: a shaped bubble with a short label centered in
+/// it (grid bubble, detail number, keynote, etc.). Position + size in paper
+/// millimeters → scale-independent.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SheetTag {
+    /// Bubble center in paper space (mm).
+    pub pos_mm: [f64; 2],
+    /// The tag text (e.g. a grid line "A" or a detail number "3").
+    pub text: String,
+    /// Bubble outline shape.
+    pub shape: TagShape,
+    /// Optional associated view (grouping / grid reference). `None` = free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_index: Option<usize>,
+}
+
 /// A named paper layout holding scaled views of the model.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Sheet {
@@ -120,4 +194,13 @@ pub struct Sheet {
     /// Paper-space dimensions added via `sheetdim`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dims: Vec<SheetDim>,
+    /// Paper-space text notes added via `sheettext` (scale-independent).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub texts: Vec<SheetText>,
+    /// Paper-space leaders added via `sheetleader` (scale-independent).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leaders: Vec<SheetLeader>,
+    /// Paper-space callouts/tags added via `sheettag` (scale-independent).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<SheetTag>,
 }

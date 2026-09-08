@@ -25,7 +25,10 @@ pub use object::{
     LineType, MaterialPreset, ObjectId, ObjectMaterial, ParamBlockDef, ParamBlockParam,
     SceneObject, DEFAULT_LAYER,
 };
-pub use sheet::{PaperSize, ScheduleRow, Sheet, SheetDim, SheetTable, SheetView, ViewDirection};
+pub use sheet::{
+    PaperSize, ScheduleRow, Sheet, SheetDim, SheetLeader, SheetTable, SheetTag, SheetText,
+    SheetView, TagShape, ViewDirection,
+};
 pub use structure::{Grid, Material, Room, Section, Story};
 pub use underlay::{Basemap, Underlay};
 pub use units::{
