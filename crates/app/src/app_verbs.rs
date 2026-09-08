@@ -93,6 +93,13 @@ pub enum AppVerb {
     /// drives the configured render cassette. Network reaches ONLY the
     /// user-configured backend in render_decks.json; ships unconfigured.
     Render(Vec<String>),
+    /// Object-snap control (`osnap on|off` toggles the master switch;
+    /// `osnap <kind> on|off` toggles a single kind). `.0` = the target: `None`
+    /// for the master switch, `Some(kind_key)` for a per-kind toggle. `.1` = the
+    /// requested state (`None` = bare toggle). UI/session state, persisted to
+    /// ui.json; never part of the op-log. Driveable from the command line and
+    /// the UI plane so the deck can flip snapping.
+    Osnap(Option<String>, Option<bool>),
     /// Georeferenced satellite/OSM basemap underlay
     /// (`basemap [osm|sat] [span_m] [opacity]` | `basemap off`). View/session
     /// state, opt-in, NEVER logged. Carries the parsed options for the front-end
@@ -230,6 +237,30 @@ pub fn classify(line: &str) -> Option<AppVerb> {
         }),
         "language" | "lang" => AppVerb::Language(crate::i18n::Lang::from_code(words.next()?)?),
         "skin" | "theme_skin" => AppVerb::Skin(crate::preset::CadOrigin::from_code(words.next()?)?),
+        "osnap" | "snap" => {
+            // `osnap on|off` → master switch; `osnap <kind> [on|off]` → per-kind.
+            let first = words.next();
+            match first {
+                None => AppVerb::Osnap(None, None), // bare toggle of the master
+                Some("on" | "true" | "1") => AppVerb::Osnap(None, Some(true)),
+                Some("off" | "false" | "0") => AppVerb::Osnap(None, Some(false)),
+                Some("toggle") => AppVerb::Osnap(None, None),
+                Some(kind) => {
+                    // Must be a recognised snap-kind key (end/mid/cen/int/…);
+                    // reject unknown so the command line reports usage.
+                    if crate::osnap::SnapKind::from_key(kind).is_none() && kind != "grid" {
+                        return None;
+                    }
+                    let state = match words.next() {
+                        Some("on" | "true" | "1") => Some(true),
+                        Some("off" | "false" | "0") => Some(false),
+                        Some("toggle") | None => None,
+                        _ => return None,
+                    };
+                    AppVerb::Osnap(Some(kind.to_ascii_lowercase()), state)
+                }
+            }
+        }
         "camera" => AppVerb::Camera(
             words.next().map(str::to_ascii_lowercase),
             words.next().map(str::to_ascii_lowercase),
@@ -356,6 +387,23 @@ mod tests {
     }
 
     #[test]
+    fn classifies_osnap() {
+        // Master switch.
+        assert_eq!(classify("osnap on"), Some(AppVerb::Osnap(None, Some(true))));
+        assert_eq!(classify("osnap off"), Some(AppVerb::Osnap(None, Some(false))));
+        assert_eq!(classify("osnap"), Some(AppVerb::Osnap(None, None)));
+        assert_eq!(classify("snap toggle"), Some(AppVerb::Osnap(None, None)));
+        // Per-kind.
+        assert_eq!(classify("osnap end on"), Some(AppVerb::Osnap(Some("end".into()), Some(true))));
+        assert_eq!(classify("osnap int off"), Some(AppVerb::Osnap(Some("int".into()), Some(false))));
+        assert_eq!(classify("osnap tan"), Some(AppVerb::Osnap(Some("tan".into()), None)));
+        assert_eq!(classify("osnap grid off"), Some(AppVerb::Osnap(Some("grid".into()), Some(false))));
+        // Unknown kind / bad state falls through → usage error.
+        assert_eq!(classify("osnap bogus on"), None);
+        assert_eq!(classify("osnap end garbage"), None);
+    }
+
+    #[test]
     fn classifies_save_help_gui_only() {
         assert_eq!(classify("save out.json"), Some(AppVerb::Save(Some("out.json".into()))));
         assert_eq!(classify("save"), Some(AppVerb::Save(None)));
@@ -460,6 +508,8 @@ mod tests {
         "gizmo",        // alias of `gumball`
         "skin",         // UI skin switch, not a drawing/view verb the model reframes with
         "theme_skin",   // alias of `skin`
+        "osnap",        // object-snap toggle: interactive-input setting, not a view/draw verb
+        "snap",         // alias of `osnap`
     ];
 
     #[test]
@@ -496,6 +546,8 @@ mod tests {
             "encryptchats",
             "skin",
             "theme_skin",
+            "osnap",
+            "snap",
             "camera",
             "save",
             "help",

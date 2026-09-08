@@ -48,6 +48,10 @@ pub enum MenuAction {
     /// cards, with search + per-card run/JSON/reload/delete. Modeless, like
     /// Model Setup / About. Fired by the top-level Plugins ▸ Plugins… menu item.
     ShowPlugins,
+    /// Open the modeless object-snap popup (checkbox per snap kind + master +
+    /// grid). Fired by the View ▸ Object Snap… menu item; the same popup the
+    /// clickable status-bar osnap chip opens.
+    ShowOsnap,
     /// Open the Edit history / amend panel as a modal (the command line is the
     /// op-log scrollback; this exposes step-jump + amend on demand).
     EditHistory,
@@ -690,6 +694,9 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             ex("v_persp", tr("menu.view.persp"), "persp"),
             NativeItem::Separator,
             ex("ze", tr("menu.view.zoom_extents"), "ze"),
+            NativeItem::Separator,
+            // Object Snap… opens the modeless osnap popup (per-kind toggles).
+            wired_leaf(t, "osnap", tr("menu.view.osnap"), MenuAction::ShowOsnap),
         ];
         menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
     }
@@ -1294,6 +1301,8 @@ mod tests {
         // Appearance + Text Size are NOT in View anymore — they live in Theme.
         assert!(!by_action(&MenuAction::SetTheme(Some(true))), "theme leaked into View");
         assert!(!by_action(&MenuAction::ZoomStep(true)), "text size leaked into View");
+        // Object Snap… opens the osnap popup (same as the status-bar chip).
+        assert!(by_action(&MenuAction::ShowOsnap), "Object Snap… entry missing from View");
     }
 
     #[test]

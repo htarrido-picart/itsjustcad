@@ -364,6 +364,13 @@ pub struct App {
     active_aspect: f32,
     /// Snap kind currently hit by the draw tool, for the status bar.
     status_snap: Option<&'static str>,
+    /// Object-snap settings (per-kind toggles + master + grid). Persisted to
+    /// ui.json; drives candidate generation, the status-bar readout and the
+    /// clickable osnap popup. UI/session state, never part of the op-log.
+    snap_settings: crate::osnap::SnapSettings,
+    /// Whether the modeless osnap popup (checkbox per snap kind) is open. Opened
+    /// by clicking the status-bar osnap chip or the Draft ▸ Object Snap… menu.
+    osnap_popup_open: bool,
     /// Decoded underlay pixels cached by path, so a scene rebuild (any doc
     /// change) does not re-decode the image every time.
     #[allow(clippy::type_complexity)]
@@ -831,6 +838,8 @@ impl App {
             status_cursor: None,
             active_aspect: 16.0 / 9.0,
             status_snap: None,
+            snap_settings: load_snap_settings(),
+            osnap_popup_open: false,
             underlay_cache: None,
             deck_visible,
             panel_tabs: crate::tabstrip::TabState::default(),
@@ -1264,6 +1273,64 @@ impl App {
                 save_gumball_visible(on);
                 self.command_line
                     .push_line(format!("gumball: {}", if on { "on" } else { "off" }));
+            }
+            // Object-snap control: `osnap on|off` flips the master switch,
+            // `osnap <kind> on|off` a single kind (`osnap grid on|off` the grid
+            // fallback). Persisted to ui.json; also opens/refreshes the popup.
+            // UI/session state, never logged.
+            Some("osnap" | "snap") => {
+                let arg1 = words.next();
+                let arg2 = words.next();
+                let parse_state = |tok: Option<&str>| match tok {
+                    Some("on" | "true" | "1") => Some(Some(true)),
+                    Some("off" | "false" | "0") => Some(Some(false)),
+                    Some("toggle") | None => Some(None),
+                    _ => None,
+                };
+                let msg = match arg1 {
+                    // Master switch: `osnap [on|off|toggle]`.
+                    None | Some("on" | "off" | "true" | "false" | "1" | "0" | "toggle") => {
+                        let on = match parse_state(arg1) {
+                            Some(Some(b)) => b,
+                            Some(None) => !self.snap_settings.master,
+                            None => self.snap_settings.master,
+                        };
+                        self.snap_settings.master = on;
+                        Some(format!("object snap: {}", if on { "on" } else { "off" }))
+                    }
+                    Some("grid") => match parse_state(arg2) {
+                        Some(state) => {
+                            let on = state.unwrap_or(!self.snap_settings.grid);
+                            self.snap_settings.grid = on;
+                            Some(format!("grid snap: {}", if on { "on" } else { "off" }))
+                        }
+                        None => None,
+                    },
+                    Some(kind_key) => match crate::osnap::SnapKind::from_key(kind_key) {
+                        Some(kind) => match parse_state(arg2) {
+                            Some(state) => {
+                                let on = state.unwrap_or(!self.snap_settings.is_on(kind));
+                                self.snap_settings.set(kind, on);
+                                Some(format!(
+                                    "osnap {}: {}",
+                                    kind.label(),
+                                    if on { "on" } else { "off" }
+                                ))
+                            }
+                            None => None,
+                        },
+                        None => None,
+                    },
+                };
+                match msg {
+                    Some(m) => {
+                        save_snap_settings(&self.snap_settings);
+                        self.command_line.push_line(m);
+                    }
+                    None => self
+                        .command_line
+                        .push_line("usage: osnap on|off | osnap <end|mid|cen|int|qua|perp|tan|nod|vtx|near|grid> on|off"),
+                }
             }
             // "SketchUp" display preset: Working hemispheric shading + thick
             // profile edges + shaded display. Combines the ergonomics of the
@@ -3967,30 +4034,37 @@ impl App {
         let cursor_px = response
             .hover_pos()
             .or_else(|| response.interact_pointer_pos());
+        let last_point = self.draw_tool.last_point();
+        let snap_settings = self.snap_settings;
         let mut snap_hit = cursor_px.and_then(|pos| {
             // Screen-proximity cull: only objects whose projected AABB (grown by
             // the snap radius) covers the cursor contribute snap points. At 10k
             // objects this trims the candidate list from every vertex in the
             // scene to just the few under the pointer.
-            let cands = crate::osnap::candidates_filtered(&self.session.doc, |bb| {
-                match projected_rect(view_proj, rect, bb.min, bb.max) {
-                    Some(r) => r
-                        .expand(crate::osnap::SNAP_RADIUS_PX)
-                        .contains(pos),
+            let cands = crate::osnap::candidates_filtered(
+                &self.session.doc,
+                &snap_settings,
+                last_point,
+                |bb| match projected_rect(view_proj, rect, bb.min, bb.max) {
+                    Some(r) => r.expand(crate::osnap::SNAP_RADIUS_PX).contains(pos),
                     None => true, // behind camera / partly clipped: keep to be safe
-                }
-            });
+                },
+            );
             crate::osnap::resolve(
                 &cands,
                 pos,
                 crate::osnap::SNAP_RADIUS_PX,
+                &snap_settings,
                 |w| project(view_proj, rect, w),
             )
         });
+        // Grid fallback only when the grid toggle is on; otherwise the raw
+        // ground-plane point is used (osnap-only precision, no rounding).
+        let grid_on = snap_settings.grid;
         let mut cursor_world = snap_hit.map(|(p, _)| p).or_else(|| {
             cursor_px
                 .and_then(|pos| ground_point(view_proj, rect, pos))
-                .map(crate::osnap::grid_snap)
+                .map(|p| if grid_on { crate::osnap::grid_snap(p) } else { p })
         });
         // Shift = ortho lock: 0°/90° from the last picked point overrides
         // osnap (marker off, the constrained point is what a click commits).
@@ -4108,10 +4182,26 @@ impl App {
             ui.separator();
             ui.label(crate::statusbar::format_counts(doc.selection.len(), doc.len()));
             ui.separator();
-            ui.label(crate::statusbar::snap_label(
-                self.draw_tool.active(),
-                self.status_snap,
-            ));
+            // Clickable osnap chip: shows the live readout (which kind is hit /
+            // grid / idle) and, when master snap is off, an OFF marker. Clicking
+            // opens the modeless osnap popup (checkbox per kind). This is the
+            // "click the osnap toolbar → popup" discoverability surface.
+            let label = if self.snap_settings.master {
+                crate::statusbar::snap_label(self.draw_tool.active(), self.status_snap)
+            } else {
+                format!("{}: {}", crate::i18n::t("osnap.label"), crate::i18n::t("osnap.off"))
+            };
+            if ui
+                .add(
+                    egui::Button::new(label)
+                        .frame(false)
+                        .corner_radius(egui::CornerRadius::same(4)),
+                )
+                .on_hover_text(crate::i18n::t("osnap.tooltip"))
+                .clicked()
+            {
+                self.osnap_popup_open = !self.osnap_popup_open;
+            }
             ui.separator();
             ui.label(format!(
                 "view: {}",
@@ -4790,6 +4880,59 @@ impl App {
     /// Every mutation routes through the existing `plugin …` management verbs on
     /// the command line, so replay/undo invariants hold. Reached from the LLM ▸
     /// Plugins… menu item and the `panel plugins` UI verb.
+    /// Modeless object-snap popup: a master "Object Snap" toggle, a Grid toggle,
+    /// and a checkbox per snap kind (End/Int/Mid/Cen/Qua/Perp/Tan/Node/Vtx/Near).
+    /// Every toggle persists to ui.json and takes effect immediately. Anchored
+    /// near the bottom-left status bar (the "click the osnap toolbar → popup"
+    /// discoverability surface the owner asked for).
+    fn osnap_popup(&mut self, ctx: &egui::Context) {
+        use crate::i18n::t;
+        if !self.osnap_popup_open {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        egui::Window::new(t("osnap.popup.title"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(12.0, -36.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                // Master toggle first (Rhino's "Object Snap" master switch).
+                if ui
+                    .checkbox(&mut self.snap_settings.master, t("osnap.master"))
+                    .on_hover_text(t("osnap.master.tooltip"))
+                    .changed()
+                {
+                    changed = true;
+                }
+                // Grid fallback toggle.
+                if ui.checkbox(&mut self.snap_settings.grid, t("osnap.grid")).changed() {
+                    changed = true;
+                }
+                ui.separator();
+                // Per-kind checkboxes. Dimmed when the master switch is off, but
+                // still individually settable so the enabled set is preserved.
+                ui.add_enabled_ui(self.snap_settings.master, |ui| {
+                    for kind in crate::osnap::SnapKind::ALL {
+                        let mut on = self.snap_settings.is_on(kind);
+                        // `checkbox` mutates `on`; only persist when it actually
+                        // flipped, driving the change through the pure `toggle`.
+                        if ui.checkbox(&mut on, osnap_kind_label(kind)).clicked()
+                            && on != self.snap_settings.is_on(kind)
+                        {
+                            self.snap_settings.toggle(kind);
+                            changed = true;
+                        }
+                    }
+                });
+            });
+        if changed {
+            save_snap_settings(&self.snap_settings);
+        }
+        self.osnap_popup_open = open;
+    }
+
     fn plugins_popup(&mut self, ctx: &egui::Context) {
         use crate::i18n::t;
         if !self.show_plugins {
@@ -5091,6 +5234,7 @@ impl App {
             }
             MenuAction::ModelSetup => self.show_model_setup = true,
             MenuAction::ShowPlugins => self.show_plugins = true,
+            MenuAction::ShowOsnap => self.osnap_popup_open = true,
             MenuAction::EditHistory => self.show_history = true,
             MenuAction::ImportDialog => self.import(None),
             MenuAction::ExportDialog => self.export(None),
@@ -5932,6 +6076,36 @@ fn load_gumball_visible() -> Option<bool> {
 fn save_gumball_visible(visible: bool) {
     let mut v = load_ui_json();
     v["show_gumball"] = serde_json::json!(visible);
+    save_ui_json(&v);
+}
+
+/// Localized checkbox label for a snap kind in the osnap popup.
+fn osnap_kind_label(kind: crate::osnap::SnapKind) -> &'static str {
+    use crate::osnap::SnapKind;
+    crate::i18n::t(match kind {
+        SnapKind::End => "osnap.kind.end",
+        SnapKind::Intersection => "osnap.kind.int",
+        SnapKind::Mid => "osnap.kind.mid",
+        SnapKind::Center => "osnap.kind.cen",
+        SnapKind::Quadrant => "osnap.kind.qua",
+        SnapKind::Perpendicular => "osnap.kind.perp",
+        SnapKind::Tangent => "osnap.kind.tan",
+        SnapKind::Node => "osnap.kind.node",
+        SnapKind::Vertex => "osnap.kind.vtx",
+        SnapKind::Nearest => "osnap.kind.near",
+    })
+}
+
+/// Restore the persisted object-snap settings from ui.json (`osnap` object).
+/// Missing/garbage restores the default set (master on; End/Mid/Center/Int on).
+fn load_snap_settings() -> crate::osnap::SnapSettings {
+    crate::osnap::SnapSettings::from_json(&load_ui_json()["osnap"])
+}
+
+/// Persist the object-snap settings to ui.json under the `osnap` key.
+fn save_snap_settings(s: &crate::osnap::SnapSettings) {
+    let mut v = load_ui_json();
+    v["osnap"] = (*s).to_json();
     save_ui_json(&v);
 }
 
@@ -6838,6 +7012,10 @@ impl eframe::App for App {
         // LLM → Plugins… popup window (cards + search). Modeless; renders any
         // time show_plugins is set. Plugins are NOT a right-dock tab.
         self.plugins_popup(ui.ctx());
+
+        // Object-snap popup (checkbox per snap kind + master + grid). Modeless;
+        // opened by the clickable status-bar osnap chip or the Draft menu item.
+        self.osnap_popup(ui.ctx());
 
         // Handle download completion/failure every frame — even with the Model
         // Setup window closed — so a finished download always becomes the

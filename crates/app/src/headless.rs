@@ -271,6 +271,10 @@ pub fn run_script_lines(
             Some(AppVerb::ChatEncryption(_)) => {
                 // No chat sessions in headless mode — silently accepted.
             }
+            Some(AppVerb::Osnap(_, _)) => {
+                // Osnap affects interactive picking only; no interactive input in
+                // headless mode — silently accepted (never touches the op-log).
+            }
             Some(AppVerb::Skin(origin)) => {
                 // No UI chrome to restyle in headless mode; acknowledge the
                 // choice (aliases would apply to a live command line). Not
