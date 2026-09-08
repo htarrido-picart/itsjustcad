@@ -679,6 +679,11 @@ pub struct DeckPane {
     /// Streaming chat text of the in-flight deck turn (display only).
     streaming_chat: String,
     errors_this_turn: Vec<String>,
+    /// `help <verb>` output requested by the model this turn. When non-empty at
+    /// turn end (and no errors preempt it), it is threaded back as a follow-up
+    /// user message so the model can read the verb's full syntax mid-turn — the
+    /// on-demand-help half of the compact-catalog design.
+    help_output_this_turn: Vec<String>,
     /// Commands executed during the in-flight turn.
     current_commands: Vec<ExecutedCommand>,
     retries: u8,
@@ -821,6 +826,7 @@ impl Default for DeckPane {
             current_response: String::new(),
             streaming_chat: String::new(),
             errors_this_turn: Vec::new(),
+            help_output_this_turn: Vec::new(),
             current_commands: Vec::new(),
             retries: 0,
             probe: ProbeState::Unknown,
@@ -1032,6 +1038,7 @@ impl DeckPane {
         self.streaming_chat.clear();
         self.current_commands.clear();
         self.errors_this_turn.clear();
+        self.help_output_this_turn.clear();
         self.input.clear();
         self.attached_image = None;
         self.loaded_session_id = None;
@@ -1557,17 +1564,26 @@ impl DeckPane {
             }
         }
         let deck = make_deck(&config);
-        // Local (small) models get a FOCUSED, short prompt + `/no_think`: the full
-        // registry prompt (~33 KB) drowns a 0.6–4B model — it rambles and never
-        // emits commands. The brief teaches the draft convention + common verbs +
-        // worked examples; the GBNF grammar backstops the full verb set. `/no_think`
-        // suppresses Qwen3's <think> block so the turn is commands, not reasoning.
+        // UNIFIED PROMPT: every backend — claude-code, Anthropic, and local
+        // models alike — gets the COMPACT catalog (every verb name + a one-liner,
+        // grouped by category; ~7 KB) instead of the full ~33 KB registry dump.
+        // The model fetches full syntax on demand with `help <verb>`, whose output
+        // threads back through the turn loop. This replaces the old
+        // `is_local_url`-based brief/full fork: the claude-code cassette has an
+        // EMPTY base_url — `is_local_url("")` is true — so it used to be
+        // misclassified as a weak local model and handed the 10-verb brief,
+        // blinding Sonnet to geodesic/hypar/funicular/… The full prompt is now an
+        // explicit opt-in only (`ITSJUSTCAD_FULL_PROMPT`), never url-gated.
         let digest = crate::scene::digest(&session.doc);
+        // `/no_think` + terse still key on the LOCAL heuristic (fast inference),
+        // but the PROMPT FLAVOR no longer does.
         let local_prompt = itsjustcad_deck::is_local_url(&config.base_url);
-        let prompt = if local_prompt {
-            itsjustcad_deck::brief_system_prompt(&digest)
-        } else {
-            system_prompt(&digest, &session.plugins)
+        let full_opt_in = std::env::var_os("ITSJUSTCAD_FULL_PROMPT").is_some();
+        let prompt = match itsjustcad_deck::select_prompt(full_opt_in) {
+            itsjustcad_deck::PromptChoice::Full => system_prompt(&digest, &session.plugins),
+            itsjustcad_deck::PromptChoice::Compact => {
+                itsjustcad_deck::compact_system_prompt(&digest, &session.plugins)
+            }
         };
         // Terse mode: style rules appended to the system prompt + a hard
         // per-turn max-token cap. Default ON for local cassettes (fewer tokens
@@ -1614,6 +1630,7 @@ impl DeckPane {
         self.current_response.clear();
         self.streaming_chat.clear();
         self.errors_this_turn.clear();
+        self.help_output_this_turn.clear();
         self.current_commands.clear();
         self.turn_task = Some(handle.spawn(async move { deck.stream_chat(req, tx).await }));
         self.turn_started = Some(std::time::Instant::now());
@@ -1716,6 +1733,24 @@ impl DeckPane {
                     if let Some(verb) = crate::app_verbs::classify(&line)
                         && !matches!(verb, crate::app_verbs::AppVerb::GuiOnly(_))
                     {
+                        // ON-DEMAND HELP TOOL: `help <verb>` is not a view/camera
+                        // action — it fetches a verb's full syntax + examples from
+                        // the registry and threads the text BACK to the model so it
+                        // can call an unfamiliar verb correctly. Run it here (read
+                        // only, no op-log, no fs) and stash the reply; the turn
+                        // finisher feeds it back as a follow-up user message. This
+                        // is the counterpart to the compact catalog (names only).
+                        if let crate::app_verbs::AppVerb::Help(v) = &verb {
+                            let body = crate::app::help_lines(v.as_deref()).join("\n");
+                            let label = v.as_deref().unwrap_or("(all commands)");
+                            self.current_commands.push(ExecutedCommand {
+                                line: line.clone(),
+                                result: Ok(format!("help: {label}")),
+                            });
+                            self.help_output_this_turn
+                                .push(format!("help {label}:\n{body}"));
+                            continue;
+                        }
                         // SECURITY: app-verbs bypass the fs side-effect gate
                         // because they carry no `Command`. Almost all are pure
                         // view/camera state — but a `basemap <provider>` fetch
@@ -1902,6 +1937,25 @@ impl DeckPane {
             );
             self.transcript.push(Entry::Status(format!(
                 "retry {}/{MAX_RETRIES}: feeding errors back",
+                self.retries
+            )));
+            self.messages.push(ChatMessage {
+                role: Role::User,
+                content: feedback,
+            });
+            self.start_turn(session, handle);
+        } else if !self.help_output_this_turn.is_empty() && self.retries < MAX_RETRIES {
+            // ON-DEMAND HELP: the model asked for a verb's full syntax with
+            // `help <verb>`. Thread the reply back as a follow-up user turn so it
+            // can now call the verb correctly. Bounded by the same retry budget
+            // as error feedback so a model that only ever emits `help` can't spin.
+            self.retries += 1;
+            let feedback = format!(
+                "Command reference you requested:\n{}\nNow emit the draft commands to carry out the user's request.",
+                self.help_output_this_turn.join("\n\n"),
+            );
+            self.transcript.push(Entry::Status(format!(
+                "help {}/{MAX_RETRIES}: feeding syntax back",
                 self.retries
             )));
             self.messages.push(ChatMessage {
@@ -3427,6 +3481,7 @@ mod side_effect_gate_tests {
             current_response: String::new(),
             streaming_chat: String::new(),
             errors_this_turn: Vec::new(),
+            help_output_this_turn: Vec::new(),
             current_commands: Vec::new(),
             retries: 0,
             probe: ProbeState::Unknown,
@@ -4195,6 +4250,30 @@ mod side_effect_gate_tests {
         );
         assert_eq!(pane.take_app_verbs(), vec!["camera 2point".to_string()]);
         assert!(pane.errors_this_turn.is_empty(), "app verb must not error");
+    }
+
+    #[test]
+    fn deck_help_verb_is_not_an_app_verb_and_captures_syntax_to_thread_back() {
+        // ON-DEMAND HELP TOOL: `help <verb>` is not a view/camera action — it is
+        // run in-app (read-only) and its full syntax + examples are stashed in
+        // `help_output_this_turn` so the turn finisher can thread them back to the
+        // model. It must NOT be queued as an app verb and must NOT error.
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("help geodesic".to_string())],
+            &mut session,
+        );
+        assert!(pane.take_app_verbs().is_empty(), "help is not a view app-verb");
+        assert!(pane.errors_this_turn.is_empty(), "help must not error");
+        assert_eq!(pane.help_output_this_turn.len(), 1, "help output captured");
+        let captured = &pane.help_output_this_turn[0];
+        assert!(captured.contains("geodesic"), "syntax names the verb: {captured}");
+        // The captured text is the registry's real usage/summary for the verb,
+        // i.e. what `help_lines` returns — proving full syntax (not the compact
+        // one-liner) threads back.
+        let expected = crate::app::help_lines(Some("geodesic")).join("\n");
+        assert!(captured.contains(&expected), "captured must carry full help_lines");
     }
 
     #[test]

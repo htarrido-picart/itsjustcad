@@ -432,6 +432,12 @@ mod tests {
         "persp",
         "basemap",
         "render",
+        // `help <verb>` is an ON-DEMAND deck TOOL, not a view verb: the deck
+        // emits it to fetch a verb's full syntax + examples (the compact catalog
+        // gives only names + one-liners), and the output threads back to the
+        // model mid-turn. Advertised (via the compact prompt's help teaching),
+        // so it lives here rather than on the denylist.
+        "help",
     ];
 
     /// Verbs that `classify` owns but the deck must NOT advertise: internal /
@@ -442,7 +448,6 @@ mod tests {
         "critique",     // GUI-only
         "template",     // GUI-only
         "save",         // fs write — refused on deck plane
-        "help",         // meta, not a view action
         "reducemotion",  // accessibility toggle, not a drawing/view verb the model reframes with
         "chatencryption", // privacy setting, not a drawing/view verb
         "encryptchats",   // alias of `chatencryption`
@@ -556,6 +561,7 @@ mod tests {
             "basemap off",
             "render glass pavilion at dusk",
             "render cancel",
+            "help geodesic",
         ] {
             assert!(
                 classify(line).is_some(),
