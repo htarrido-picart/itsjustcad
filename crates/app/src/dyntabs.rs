@@ -11,7 +11,7 @@
 //! untouched. Keeping the derivations pure (no egui) makes them unit-testable
 //! standalone, like `tabstrip`.
 
-use itsjustcad_doc::{Document, Geometry};
+use itsjustcad_doc::{Document, Geometry, Sheet};
 
 /// Prefix of per-instance baked dynamic-block entries in `Document::blocks`.
 /// These are implementation detail (see `exec::param_bake_key`), NOT user
@@ -186,6 +186,134 @@ pub fn filter_plugin_rows(rows: &[PluginRow], query: &str) -> Vec<PluginRow> {
                 || r.summary.to_ascii_lowercase().contains(&q)
         })
         .cloned()
+        .collect()
+}
+
+// ── Sheets tab derivations ───────────────────────────────────────────────────
+//
+// The Sheets tab is a DYNAMIC right-dock tab: it appears when the document has
+// ≥1 sheet (or when explicitly pinned open). Its body is a LIST — one row per
+// sheet — each showing the sheet name, a paper/view descriptor, and a live
+// mini-preview of the sheet's paper + viewport frames. The preview layout is a
+// pure value (`SheetPreview`) so it is unit-testable independent of egui; the
+// actual painting happens in the app from these rects.
+
+/// Paper-space layout constants for the sheet preview. Mirrors the print
+/// pipeline (`itsjustcad_commands::pdf`): a title strip along the bottom, an
+/// even margin, and equal horizontal viewport slices separated by a gutter. Kept
+/// in sync with `pdf.rs`; the `sheet_preview` invariants are asserted in tests.
+const PREVIEW_MARGIN_MM: f64 = 10.0;
+const PREVIEW_TITLE_MM: f64 = 12.0;
+const PREVIEW_GUTTER_MM: f64 = 5.0;
+
+/// An axis-aligned rectangle in paper millimeters, origin at the sheet's
+/// lower-left (same convention as the PDF pipeline). `min` is the lower-left
+/// corner, `max` the upper-right.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RectMm {
+    pub min: [f64; 2],
+    pub max: [f64; 2],
+}
+
+impl RectMm {
+    /// Frame width in mm. Part of the `RectMm` API (used by preview-layout tests
+    /// and any consumer reasoning about frame extents).
+    #[allow(dead_code)]
+    pub fn width(&self) -> f64 {
+        self.max[0] - self.min[0]
+    }
+    /// Frame height in mm. See [`RectMm::width`].
+    #[allow(dead_code)]
+    pub fn height(&self) -> f64 {
+        self.max[1] - self.min[1]
+    }
+}
+
+/// A pure, GUI-independent layout of a sheet for the tab thumbnail: the paper
+/// extents and each viewport's frame rectangle, all in paper millimeters. The
+/// app maps these into an egui painter rect (flipping Y, since egui's origin is
+/// top-left) to draw the mini-preview. Computed by [`sheet_preview`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SheetPreview {
+    /// Full paper size (landscape) in mm: `[width, height]`.
+    pub paper_mm: [f64; 2],
+    /// One frame rectangle per viewport, laid out as equal horizontal slices
+    /// above the title strip — same geometry the PDF renderer uses.
+    pub viewports: Vec<RectMm>,
+}
+
+/// Compute the pure paper-space layout for a sheet's preview thumbnail: the
+/// paper rectangle plus one frame per viewport. The viewports are equal
+/// horizontal slices between the side margins, above the bottom title strip,
+/// mirroring `pdf::sheet_pdf`. Read-only; no egui. A sheet with zero views
+/// yields an empty `viewports` list (the thumbnail still shows the paper).
+pub fn sheet_preview(sheet: &Sheet) -> SheetPreview {
+    let (paper_w, paper_h) = sheet.paper.landscape_mm();
+    let n = sheet.views.len();
+    let mut viewports = Vec::with_capacity(n);
+    if n > 0 {
+        // Bottom title strip reserves MARGIN + TITLE; views fill the rest up to
+        // the top margin. (The schedule table is intentionally ignored in the
+        // thumbnail — it is a coarse "what's on the sheet" hint, not the PDF.)
+        let y0 = PREVIEW_MARGIN_MM + PREVIEW_TITLE_MM;
+        let y1 = paper_h - PREVIEW_MARGIN_MM;
+        let area_w = paper_w - 2.0 * PREVIEW_MARGIN_MM;
+        let view_w = (area_w - PREVIEW_GUTTER_MM * (n as f64 - 1.0)) / n as f64;
+        for i in 0..n {
+            let x0 = PREVIEW_MARGIN_MM + i as f64 * (view_w + PREVIEW_GUTTER_MM);
+            viewports.push(RectMm {
+                min: [x0, y0],
+                max: [x0 + view_w, y1],
+            });
+        }
+    }
+    SheetPreview { paper_mm: [paper_w, paper_h], viewports }
+}
+
+/// A descriptor of a sheet's paper + view mix for the row subtitle, e.g.
+/// `"a3 · 2 views"`. Pure, so the row text is unit-testable.
+fn sheet_descriptor(sheet: &Sheet) -> String {
+    let n = sheet.views.len();
+    format!(
+        "{} · {} view{}",
+        sheet.paper.label(),
+        n,
+        if n == 1 { "" } else { "s" }
+    )
+}
+
+/// One row of the Sheets tab: a sheet on this document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SheetRow {
+    /// The sheet name (unique per document; the `print` verb keys off it).
+    pub name: String,
+    /// Number of viewports on the sheet.
+    pub views: usize,
+    /// Human-readable paper/view descriptor for the row subtitle.
+    pub descriptor: String,
+    /// The pure preview layout the app paints as a thumbnail.
+    pub preview: SheetPreview,
+}
+
+/// True when the document has at least one sheet. Drives the dynamic-tab
+/// appearance (`TabState::visible_tabs(_, has_sheets)`). Pure predicate.
+pub fn has_sheets(doc: &Document) -> bool {
+    !doc.sheets.is_empty()
+}
+
+/// Derive the ordered Sheets-tab rows from the document — one row per sheet, in
+/// document order (the order sheets were created / stored). Read-only; every
+/// action the tab offers routes through the normal `print` verb on the command
+/// line, never a second mutation path.
+pub fn sheet_rows(doc: &Document) -> Vec<SheetRow> {
+    doc.sheets
+        .iter()
+        .map(|s| SheetRow {
+            name: s.name.clone(),
+            views: s.views.len(),
+            descriptor: sheet_descriptor(s),
+            preview: sheet_preview(s),
+        })
         .collect()
 }
 
@@ -478,5 +606,121 @@ mod tests {
         assert_eq!(filter_plugin_rows(&rows, "   ").len(), 2);
         // No match.
         assert!(filter_plugin_rows(&rows, "zzz").is_empty());
+    }
+
+    // ---- Sheets tab derivations ----
+
+    #[test]
+    fn empty_document_has_no_sheets() {
+        let s = Session::default();
+        assert!(!has_sheets(&s.doc));
+        assert!(sheet_rows(&s.doc).is_empty());
+    }
+
+    #[test]
+    fn creating_a_sheet_makes_the_tab_appear() {
+        let mut s = Session::default();
+        run(&mut s, "sheet plan a3");
+        assert!(has_sheets(&s.doc), "a created sheet must reveal the tab");
+        let rows = sheet_rows(&s.doc);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "plan");
+        assert_eq!(rows[0].views, 0);
+    }
+
+    #[test]
+    fn sheet_rows_list_each_sheet_in_order() {
+        let mut s = Session::default();
+        run(&mut s, "sheet plan a3");
+        run(&mut s, "sheet elevations a2");
+        let rows = sheet_rows(&s.doc);
+        let names: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["plan", "elevations"], "document order preserved");
+    }
+
+    #[test]
+    fn sheet_row_descriptor_reports_paper_and_view_count() {
+        let mut s = Session::default();
+        run(&mut s, "sheet plan a3");
+        run(&mut s, "sheetview plan top 100");
+        run(&mut s, "sheetview plan front 100");
+        let rows = sheet_rows(&s.doc);
+        let r = &rows[0];
+        assert_eq!(r.views, 2);
+        assert_eq!(r.descriptor, "a3 · 2 views");
+    }
+
+    #[test]
+    fn sheet_row_descriptor_singular_view() {
+        let mut s = Session::default();
+        run(&mut s, "sheet plan a4");
+        run(&mut s, "sheetview plan top 50");
+        assert_eq!(sheet_rows(&s.doc)[0].descriptor, "a4 · 1 view");
+    }
+
+    // ---- pure preview layout (paper rect + viewport rects) ----
+
+    #[test]
+    fn preview_paper_matches_landscape_size() {
+        let sheet = Sheet {
+            name: "s".into(),
+            paper: itsjustcad_doc::PaperSize::A3,
+            views: vec![],
+            table: None,
+            dims: vec![],
+            texts: vec![],
+            leaders: vec![],
+            tags: vec![],
+        };
+        let p = sheet_preview(&sheet);
+        assert_eq!(p.paper_mm, [420.0, 297.0], "A3 landscape");
+        assert!(p.viewports.is_empty(), "no views → no frames, paper still drawn");
+    }
+
+    #[test]
+    fn preview_lays_out_one_frame_per_view() {
+        let sheet = Sheet {
+            name: "s".into(),
+            paper: itsjustcad_doc::PaperSize::A3,
+            views: vec![
+                itsjustcad_doc::SheetView { direction: itsjustcad_doc::ViewDirection::Top, scale: 100.0 },
+                itsjustcad_doc::SheetView { direction: itsjustcad_doc::ViewDirection::Front, scale: 100.0 },
+                itsjustcad_doc::SheetView { direction: itsjustcad_doc::ViewDirection::Right, scale: 100.0 },
+            ],
+            table: None,
+            dims: vec![],
+            texts: vec![],
+            leaders: vec![],
+            tags: vec![],
+        };
+        let p = sheet_preview(&sheet);
+        assert_eq!(p.viewports.len(), 3, "one frame per viewport");
+        // Frames are equal-width horizontal slices, all inside the paper margins,
+        // and left-to-right in order.
+        let w0 = p.viewports[0].width();
+        for r in &p.viewports {
+            assert!((r.width() - w0).abs() < 1e-9, "equal-width slices");
+            assert!(r.min[0] >= PREVIEW_MARGIN_MM - 1e-9, "inside left margin");
+            assert!(r.max[0] <= p.paper_mm[0] - PREVIEW_MARGIN_MM + 1e-9, "inside right margin");
+            assert!(r.min[1] >= PREVIEW_MARGIN_MM + PREVIEW_TITLE_MM - 1e-9, "above title strip");
+            assert!(r.max[1] <= p.paper_mm[1] - PREVIEW_MARGIN_MM + 1e-9, "below top margin");
+        }
+        assert!(p.viewports[0].min[0] < p.viewports[1].min[0]);
+        assert!(p.viewports[1].min[0] < p.viewports[2].min[0]);
+        // A gutter separates adjacent frames.
+        let gap = p.viewports[1].min[0] - p.viewports[0].max[0];
+        assert!((gap - PREVIEW_GUTTER_MM).abs() < 1e-9, "gutter between frames");
+    }
+
+    #[test]
+    fn preview_matches_derived_row() {
+        // The row carries the same preview `sheet_preview` computes directly.
+        let mut s = Session::default();
+        run(&mut s, "sheet plan a3");
+        run(&mut s, "sheetview plan top 100");
+        let rows = sheet_rows(&s.doc);
+        let direct = sheet_preview(&s.doc.sheets[0]);
+        assert_eq!(rows[0].preview, direct);
+        assert_eq!(rows[0].preview.viewports.len(), 1);
     }
 }

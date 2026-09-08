@@ -302,6 +302,11 @@ static EN: &[(&str, &str)] = &[
     ("blocks.library.load", "Load"),
     ("blocks.library.load_tooltip", "`blockload` into this document"),
     ("blocks.library.unavailable", "library unavailable"),
+    // ── Sheets tab (paper layouts as a list, one row per sheet) ──
+    ("panel.tab.sheets", "Sheets"),
+    ("sheets.empty", "No sheets in this drawing yet."),
+    ("sheets.empty.hint", "Create one with `sheet <name>`, then add views."),
+    ("sheets.row.tooltip", "select this sheet — prefills `print`, add a path and press Enter"),
     // ── Command line / status ──
     ("cmdline.placeholder", "Type a command…"),
     ("status.ready", "Ready"),
@@ -459,6 +464,11 @@ static ES: &[(&str, &str)] = &[
     ("blocks.library.load", "Cargar"),
     ("blocks.library.load_tooltip", "`blockload` en este documento"),
     ("blocks.library.unavailable", "biblioteca no disponible"),
+    // ── Pestaña de láminas (planchas de papel como lista, una fila por lámina) ──
+    ("panel.tab.sheets", "Láminas"),
+    ("sheets.empty", "Aún no hay láminas en este dibujo."),
+    ("sheets.empty.hint", "Crea una con `sheet <nombre>`, luego agrega vistas."),
+    ("sheets.row.tooltip", "seleccionar esta lámina — precarga `print`, añade una ruta y pulsa Enter"),
     // ── Línea de comandos / estado ──
     ("cmdline.placeholder", "Escribe un comando…"),
     ("status.ready", "Listo"),
