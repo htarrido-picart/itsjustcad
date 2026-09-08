@@ -659,8 +659,8 @@ mod tests {
             material: None,
             lineweight_mm: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::LinearDim {
-                a: DVec3::ZERO,
-                b: DVec3::X,
+                a: itsjustcad_doc::DimAnchor::Free(DVec3::ZERO),
+                b: itsjustcad_doc::DimAnchor::Free(DVec3::X),
                 offset: 0.5,
             }),
         });
