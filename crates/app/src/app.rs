@@ -422,6 +422,12 @@ pub struct App {
     reduce_motion: bool,
     /// Whether the Help → About dialog is open.
     show_about: bool,
+    /// Whether the Help → "Check for Updates…" popup is open.
+    show_update: bool,
+    /// The in-flight / finished update check, if the user has run one this
+    /// session. `None` until Help ▸ Check for Updates… is picked. OFFLINE-first:
+    /// the network is only touched when this is started. See [`crate::update`].
+    update_check: Option<crate::update::UpdateCheck>,
     /// Whether the Edit → "Edit history…" modal (op-log / amend panel) is open.
     show_history: bool,
     /// Command palette (⌘K) overlay state: whether it's open, the current fuzzy
@@ -844,6 +850,8 @@ impl App {
             panel_visible: true,
             reduce_motion: load_reduce_motion(),
             show_about: false,
+            show_update: false,
+            update_check: None,
             show_history: false,
             show_palette: false,
             palette_query: String::new(),
@@ -1938,6 +1946,7 @@ impl App {
     fn early_hotkeys(&mut self, ctx: &egui::Context) {
         let modal = self.show_palette
             || self.show_about
+            || self.show_update
             || self.show_history
             || self.show_model_setup
             || self.show_plugins
@@ -5073,6 +5082,13 @@ impl App {
                 }
             }
             MenuAction::About => self.show_about = true,
+            MenuAction::CheckForUpdates => {
+                // OFFLINE-first: touch the network ONLY on this explicit pick.
+                // Kick off a fresh check on the tokio runtime and open the popup;
+                // the popup polls the shared state each frame.
+                self.update_check = Some(crate::update::start(&self.tokio));
+                self.show_update = true;
+            }
             MenuAction::ModelSetup => self.show_model_setup = true,
             MenuAction::ShowPlugins => self.show_plugins = true,
             MenuAction::EditHistory => self.show_history = true,
@@ -6693,6 +6709,115 @@ impl eframe::App for App {
             }
         }
 
+        // Help → "Check for Updates…" popup. Modeless (draggable / X-closable),
+        // like About / Model Setup. Polls the shared UpdateState each frame and
+        // renders the current phase. HONEST UNSIGNED behaviour: a newer release
+        // offers a Download button that opens the release page in the browser and
+        // surfaces the Gatekeeper note — no silent in-place binary swap.
+        if self.show_update {
+            let mut open = true;
+            let state = self
+                .update_check
+                .as_ref()
+                .map(|c| c.state())
+                .unwrap_or_default();
+            let mut recheck = false;
+            let mut download_url: Option<String> = None;
+            egui::Window::new(crate::i18n::t("update.title"))
+                .collapsible(true)
+                .resizable(false)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    let roles = &self.live_roles(ui.visuals().dark_mode);
+                    crate::widgets::dialog_body(ui, roles, 380.0, |ui| {
+                        crate::widgets::dialog_title(ui, roles, crate::i18n::t("update.title"));
+                        ui.add_space(crate::theme::Spacing::S);
+                        use crate::update::UpdateState;
+                        match &state {
+                            UpdateState::Idle | UpdateState::Checking => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.add_space(crate::theme::Spacing::S);
+                                    crate::widgets::dialog_text(
+                                        ui,
+                                        roles,
+                                        crate::i18n::t("update.checking"),
+                                    );
+                                });
+                                // Keep polling while the background task runs.
+                                ui.ctx().request_repaint();
+                            }
+                            UpdateState::UpToDate { latest } => {
+                                crate::widgets::dialog_text(
+                                    ui,
+                                    roles,
+                                    &crate::i18n::t("update.uptodate").replace("{0}", latest),
+                                );
+                            }
+                            UpdateState::Available { release } => {
+                                crate::widgets::dialog_text(
+                                    ui,
+                                    roles,
+                                    crate::i18n::t("update.available_title"),
+                                );
+                                ui.add_space(crate::theme::Spacing::S);
+                                crate::widgets::dialog_text(
+                                    ui,
+                                    roles,
+                                    &crate::i18n::t("update.current")
+                                        .replace("{0}", crate::update::APP_VERSION),
+                                );
+                                crate::widgets::dialog_text(
+                                    ui,
+                                    roles,
+                                    &crate::i18n::t("update.latest").replace("{0}", &release.tag),
+                                );
+                                ui.add_space(crate::theme::Spacing::M);
+                                if ui.button(crate::i18n::t("update.download")).clicked() {
+                                    // Prefer the release page (html_url); it lists
+                                    // every asset and the notes. Falls back to the
+                                    // direct asset url if that's all we have.
+                                    download_url = Some(release.html_url.clone());
+                                }
+                                ui.add_space(crate::theme::Spacing::S);
+                                // HONEST unsigned / Gatekeeper note (M-sign dep).
+                                crate::widgets::dialog_text(
+                                    ui,
+                                    roles,
+                                    crate::i18n::t("update.unsigned_note"),
+                                );
+                            }
+                            UpdateState::Failed { msg } => {
+                                crate::widgets::dialog_text(
+                                    ui,
+                                    roles,
+                                    crate::i18n::t("update.failed"),
+                                );
+                                ui.add_space(crate::theme::Spacing::XS);
+                                crate::widgets::dialog_text(ui, roles, msg);
+                                ui.add_space(crate::theme::Spacing::M);
+                                if ui.button(crate::i18n::t("update.recheck")).clicked() {
+                                    recheck = true;
+                                }
+                            }
+                        }
+                        ui.add_space(crate::theme::Spacing::M);
+                        if ui.button(crate::i18n::t("update.close")).clicked() {
+                            self.show_update = false;
+                        }
+                    });
+                });
+            if let Some(url) = download_url {
+                crate::update::open_url(&url);
+            }
+            if recheck {
+                self.update_check = Some(crate::update::start(&self.tokio));
+            }
+            if !open {
+                self.show_update = false;
+            }
+        }
+
         // Edit → "Edit history…" modal. The command line is the op-log
         // scrollback; this on-demand popover exposes step-jump + amend (the old
         // History tab's body) as a floating window.
@@ -6963,6 +7088,7 @@ impl eframe::App for App {
         // chat input keeps focus because `focused()` is then `Some`).
         let modal_open = self.show_palette
             || self.show_about
+            || self.show_update
             || self.show_history
             || self.show_model_setup
             || self.show_plugins

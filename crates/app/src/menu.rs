@@ -37,6 +37,10 @@ pub enum MenuAction {
     Help,
     /// Show the About dialog.
     About,
+    /// Check GitHub Releases for a newer version and show the update popup.
+    /// OFFLINE-first: reaches api.github.com ONLY on this explicit user pick.
+    /// Fired by the Help ▸ Check for Updates… menu item.
+    CheckForUpdates,
     /// Open the Model Setup panel (download/manage local models). Available any
     /// time from Tools, not just at first run.
     ModelSetup,
@@ -846,6 +850,13 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             },
             NativeItem::Separator,
             NativeItem::Leaf {
+                id: "Help/updates".into(),
+                label: tr("menu.help.updates").into(),
+                action: MenuAction::CheckForUpdates,
+                shortcut: None,
+                enabled: true,
+            },
+            NativeItem::Leaf {
                 id: "Help/about".into(),
                 label: tr("menu.help.about").into(),
                 action: MenuAction::About,
@@ -888,6 +899,7 @@ fn leaf_icon(id: &str, _label: &str) -> Icon {
         "redo" => return Icon::Redo,
         "history" => return Icon::History,
         "reference" | "docs" => return Icon::Help,
+        "updates" => return Icon::About,
         "about" => return Icon::About,
         _ => {}
     }
@@ -1179,6 +1191,25 @@ mod tests {
         assert!(ls.iter().any(|(_, l, a)| l == tr("menu.file.export") && *a == MenuAction::ExportDialog));
         // Save As prefills `save ` for a path.
         assert!(ls.iter().any(|(_, l, a)| l == tr("menu.file.save_as") && *a == MenuAction::Insert("save ".into())));
+    }
+
+    #[test]
+    fn help_menu_has_check_for_updates() {
+        // M-autoupdate: the Help menu must carry a "Check for Updates…" leaf that
+        // dispatches MenuAction::CheckForUpdates (routed by apply_menu_action to
+        // open the update popup + start the check).
+        let help = native_model(MenuStyle::Rhino, true, ViewState::default())
+            .into_iter()
+            .find(|m| m.title == tr("menu.help"))
+            .expect("Help menu present");
+        let ls = leaves(&[help]);
+        assert!(
+            ls.iter()
+                .any(|(id, l, a)| id == "Help/updates"
+                    && l == tr("menu.help.updates")
+                    && *a == MenuAction::CheckForUpdates),
+            "Help ▸ Check for Updates… leaf missing or misrouted"
+        );
     }
 
     #[test]

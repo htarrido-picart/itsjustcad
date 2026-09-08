@@ -38,6 +38,7 @@ mod tabstrip;
 mod text_context_menu;
 mod theme;
 mod ui_plane;
+mod update;
 mod widgets;
 
 fn cli_help_text() -> String {
