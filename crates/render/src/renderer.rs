@@ -191,6 +191,27 @@ impl ColorMode {
     }
 }
 
+/// Default fat-line half-width (world units) for ordinary scene curves. wgpu
+/// draws line primitives as 1-pixel hairlines with no per-draw width control, so
+/// a readable "wire" is tessellated into a thin ribbon at this half-width. Kept
+/// well under [`snapshot::PROFILE_HALF_WIDTH`] (0.02) so profile/silhouette edges
+/// still read as the boldest outline. At normal modelling zoom (viewing a few
+/// metres) this reads as a crisp ~1.75-pixel stroke — clearly thicker than the
+/// old 1-pixel hairline without looking clunky. Scale this one constant to make
+/// every default wire uniformly heavier or lighter.
+const DEFAULT_LINE_HALF_WIDTH: f32 = 0.012;
+
+/// Expand a polyline strip `[p0, p1, p2, …]` into consecutive segment pairs
+/// `[p0,p1, p1,p2, …]` — the pair-soup layout [`build_edge_ribbon`] expects.
+fn strip_to_pairs(strip: &[[f32; 3]]) -> Vec<[f32; 3]> {
+    let mut out = Vec::with_capacity(strip.len().saturating_sub(1) * 2);
+    for w in strip.windows(2) {
+        out.push(w[0]);
+        out.push(w[1]);
+    }
+    out
+}
+
 /// A CPU ribbon mesh (flat f32 buffers) for a fat profile edge.
 struct EdgeRibbon {
     positions: Vec<[f32; 3]>,
@@ -499,6 +520,10 @@ pub struct SceneRenderer {
     /// Profile / silhouette edges tessellated into fat-line ribbon meshes so
     /// they render visibly thicker than the 1-pixel interior edge lines.
     profile_ribbons: Vec<GpuMesh>,
+    /// Default scene curves widened into thin fat-line ribbons (matte, in the
+    /// curve's own colour) so the viewport wire draws thicker than a 1-pixel
+    /// hairline — wgpu cannot set line width per draw call, so we tessellate.
+    line_ribbons: Vec<GpuMesh>,
     point_clouds: Vec<GpuLine>,
     underlay: Option<GpuUnderlay>,
     basemap: Option<GpuUnderlay>,
@@ -881,6 +906,7 @@ impl SceneRenderer {
             lines: Vec::new(),
             edges: Vec::new(),
             profile_ribbons: Vec::new(),
+            line_ribbons: Vec::new(),
             point_clouds: Vec::new(),
             underlay: None,
             basemap: None,
@@ -1085,6 +1111,57 @@ impl SceneRenderer {
             });
         }
 
+        // Default curves → thin colored fat-line ribbons so the wire draws
+        // thicker than a 1-pixel hairline (wgpu has no per-draw line width). The
+        // hairline `self.lines` above still renders as a crisp core; the ribbon
+        // fattens it. Matte material keeps the curve's own colour flat.
+        self.line_ribbons.clear();
+        for (points, color, _lw) in &scene.lines {
+            if points.len() < 2 {
+                continue;
+            }
+            let pairs = strip_to_pairs(points);
+            let ribbon = build_edge_ribbon(&pairs, DEFAULT_LINE_HALF_WIDTH);
+            if ribbon.indices.is_empty() {
+                continue;
+            }
+            let mut vertices = Vec::with_capacity(ribbon.positions.len() * 6);
+            for (p, n) in ribbon.positions.iter().zip(&ribbon.normals) {
+                vertices.extend_from_slice(p);
+                vertices.extend_from_slice(n);
+            }
+            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("line_ribbon_vb"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("line_ribbon_ib"),
+                contents: bytemuck::cast_slice(&ribbon.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let params = ObjectParams { color: *color, material: [1.0, 0.0, 0.0, 0.0] };
+            let object_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("line_ribbon_ubo"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let object_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("line_ribbon_bg"),
+                layout: &self.object_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: object_buf.as_entire_binding(),
+                }],
+            });
+            self.line_ribbons.push(GpuMesh {
+                vertex_buf,
+                index_buf,
+                index_count: ribbon.indices.len() as u32,
+                object_bind_group,
+            });
+        }
+
         self.point_clouds.clear();
         for (points, color) in &scene.points {
             if points.is_empty() {
@@ -1263,6 +1340,21 @@ impl SceneRenderer {
         if !self.profile_ribbons.is_empty() {
             render_pass.set_pipeline(&self.mesh_pipeline);
             for ribbon in &self.profile_ribbons {
+                render_pass.set_bind_group(1, &ribbon.object_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, ribbon.vertex_buf.slice(..));
+                render_pass
+                    .set_index_buffer(ribbon.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..ribbon.index_count, 0, 0..1);
+            }
+        }
+
+        // Default curve ribbons: widen ordinary wires past the 1-pixel hairline.
+        // Drawn with the solid mesh pipeline (matte, curve's own colour) UNDER
+        // the hairline core. Skipped in pencil mode, where the crisp ink hairline
+        // is the intended hidden-line look.
+        if mode != DisplayMode::Pencil && !self.line_ribbons.is_empty() {
+            render_pass.set_pipeline(&self.mesh_pipeline);
+            for ribbon in &self.line_ribbons {
                 render_pass.set_bind_group(1, &ribbon.object_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, ribbon.vertex_buf.slice(..));
                 render_pass
