@@ -57,24 +57,178 @@ pub enum HatchPattern {
     Ansi { code: u8, spacing: f64 },
 }
 
+/// Which well-defined point on a referenced object a dimension anchor picks.
+///
+/// Supported kinds (M-assocdim):
+/// - [`EndpointRef::Start`] / [`EndpointRef::End`]: first / last bound point of
+///   a line or curve (from `Curve::points_bound`). For non-curve geometry these
+///   fall back to the object's AABB min / max corner.
+/// - [`EndpointRef::Vertex`]: the i-th bound point of the referenced geometry
+///   (curve control/bound points, mesh vertices, hatch boundary points…),
+///   clamped into range.
+/// - [`EndpointRef::BboxCorner`]: one of the 8 AABB corners, indexed by the
+///   low/high bit pattern `(x, y, z)` in `corner` (0..=7).
+/// - [`EndpointRef::Center`]: the object's AABB center.
+///
+/// Deferred (not yet a distinct kind): arc/circle quadrant points, edge
+/// midpoints, face centroids, instance insertion point. Callers requesting an
+/// unsupported point should use `Vertex`/`BboxCorner`/`Center`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "ref", rename_all = "snake_case")]
+pub enum EndpointRef {
+    /// First bound point of a line/curve (AABB min corner otherwise).
+    Start,
+    /// Last bound point of a line/curve (AABB max corner otherwise).
+    End,
+    /// The i-th bound point of the geometry, clamped into range.
+    Vertex { index: usize },
+    /// AABB corner selected by the low/high bits of `corner` (0..=7).
+    BboxCorner { corner: u8 },
+    /// AABB center.
+    Center,
+}
+
+impl EndpointRef {
+    /// Canonical token for the dim verb / registry (`start|end|center|cN|vN`).
+    pub fn token(&self) -> String {
+        match self {
+            EndpointRef::Start => "start".into(),
+            EndpointRef::End => "end".into(),
+            EndpointRef::Center => "center".into(),
+            EndpointRef::BboxCorner { corner } => format!("c{corner}"),
+            EndpointRef::Vertex { index } => format!("v{index}"),
+        }
+    }
+
+    /// Parse a token: `start|end|center|s|e`, `cN` (bbox corner 0..=7),
+    /// `vN` (vertex index). Case-insensitive.
+    pub fn parse(s: &str) -> Option<EndpointRef> {
+        let s = s.trim().to_ascii_lowercase();
+        match s.as_str() {
+            "start" | "s" | "a" => return Some(EndpointRef::Start),
+            "end" | "e" | "b" => return Some(EndpointRef::End),
+            "center" | "c" | "mid" => return Some(EndpointRef::Center),
+            _ => {}
+        }
+        if let Some(rest) = s.strip_prefix('c') {
+            let corner: u8 = rest.parse().ok()?;
+            if corner <= 7 {
+                return Some(EndpointRef::BboxCorner { corner });
+            }
+            return None;
+        }
+        if let Some(rest) = s.strip_prefix('v') {
+            let index: usize = rest.parse().ok()?;
+            return Some(EndpointRef::Vertex { index });
+        }
+        None
+    }
+
+    /// Extract the referenced model point from a resolved set of bound points
+    /// and the geometry AABB. `bounds` are the geometry's ordered bound points
+    /// (line/curve endpoints in order, mesh vertices, hatch boundary…).
+    pub fn extract(&self, bounds: &[DVec3], aabb: Aabb) -> DVec3 {
+        match self {
+            EndpointRef::Start => bounds.first().copied().unwrap_or(aabb.min),
+            EndpointRef::End => bounds.last().copied().unwrap_or(aabb.max),
+            EndpointRef::Center => aabb.center(),
+            EndpointRef::Vertex { index } => {
+                if bounds.is_empty() {
+                    aabb.center()
+                } else {
+                    bounds[(*index).min(bounds.len() - 1)]
+                }
+            }
+            EndpointRef::BboxCorner { corner } => {
+                let c = corner & 0b111;
+                DVec3::new(
+                    if c & 1 != 0 { aabb.max.x } else { aabb.min.x },
+                    if c & 2 != 0 { aabb.max.y } else { aabb.min.y },
+                    if c & 4 != 0 { aabb.max.z } else { aabb.min.z },
+                )
+            }
+        }
+    }
+}
+
+/// One end of a linear dimension: either a free model point (ad-hoc dims, the
+/// original behaviour) or an associative reference to a well-defined point on a
+/// referenced object. Reference anchors carry a `last` cached point so a deleted
+/// / missing referent degrades to the last-known position instead of panicking.
+///
+/// Serde: an old-format bare `[x,y,z]` array deserializes as `Free`, so existing
+/// documents (which stored `a`/`b` as plain `DVec3`) load unchanged.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum DimAnchor {
+    /// Associative reference to a point on object `id`.
+    Object {
+        id: ObjectId,
+        which: EndpointRef,
+        /// Last resolved position; the fallback when the object is gone.
+        last: DVec3,
+    },
+    /// A free, unreferenced model point (original ad-hoc dimension).
+    Free(DVec3),
+}
+
+impl DimAnchor {
+    /// The last-known / free model point without consulting the document.
+    pub fn point(&self) -> DVec3 {
+        match self {
+            DimAnchor::Free(p) => *p,
+            DimAnchor::Object { last, .. } => *last,
+        }
+    }
+
+    /// The referenced object id, if this is an associative anchor.
+    pub fn object_id(&self) -> Option<ObjectId> {
+        match self {
+            DimAnchor::Object { id, .. } => Some(*id),
+            DimAnchor::Free(_) => None,
+        }
+    }
+
+    /// Translate a free anchor's stored point. Object anchors are unaffected —
+    /// they follow their referent, and their `last` cache is refreshed on the
+    /// next resolve.
+    pub fn translate(&mut self, d: DVec3) {
+        if let DimAnchor::Free(p) = self {
+            *p += d;
+        }
+    }
+
+    /// Transform a free anchor's stored point. Object anchors are unaffected.
+    pub fn transform(&mut self, m: &glam::DMat4) {
+        if let DimAnchor::Free(p) = self {
+            *p = m.transform_point3(*p);
+        }
+    }
+}
+
 /// Drafting objects: they live in the document like geometry (layers,
 /// selection, undo) but carry measured/typed content instead of shape.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "ann", rename_all = "snake_case")]
 pub enum Annotation {
-    /// Linear dimension between `a` and `b`; the dimension line sits `offset`
-    /// to the left of a→b in the XY plane. The measured value is derived.
-    LinearDim { a: DVec3, b: DVec3, offset: f64 },
+    /// Linear dimension between anchors `a` and `b`; the dimension line sits
+    /// `offset` to the left of a→b in the XY plane. The measured value is
+    /// derived. Each anchor is either a free point or an associative reference
+    /// to a point on another object (see [`DimAnchor`]); associative anchors
+    /// follow their referent when it moves/edits (resolved at display time).
+    LinearDim { a: DimAnchor, b: DimAnchor, offset: f64 },
     Text { pos: DVec3, text: String, height: f64 },
     /// Hatch of a closed boundary polygon (tessellated at creation time).
     Hatch { boundary: Vec<DVec3>, pattern: HatchPattern },
 }
 
 impl Annotation {
-    /// Points that bound the annotation for AABB/picking purposes.
+    /// Points that bound the annotation for AABB/picking purposes. For a
+    /// `LinearDim` these are the anchors' last-known/free points (no document
+    /// available here); resolved points come from `resolve_dim`.
     pub fn points(&self) -> Vec<DVec3> {
         match self {
-            Annotation::LinearDim { a, b, .. } => vec![*a, *b],
+            Annotation::LinearDim { a, b, .. } => vec![a.point(), b.point()],
             Annotation::Text { pos, .. } => vec![*pos],
             Annotation::Hatch { boundary, .. } => boundary.clone(),
         }
@@ -287,8 +441,8 @@ impl Geometry {
             Geometry::Curve(c) => c.translate(d),
             Geometry::Annotation(a) => match a {
                 Annotation::LinearDim { a, b, .. } => {
-                    *a += d;
-                    *b += d;
+                    a.translate(d);
+                    b.translate(d);
                 }
                 Annotation::Text { pos, .. } => *pos += d,
                 Annotation::Hatch { boundary, .. } => {
@@ -335,8 +489,8 @@ impl Geometry {
                 let s = m.transform_vector3(DVec3::X).length();
                 match a {
                     Annotation::LinearDim { a, b, offset } => {
-                        *a = m.transform_point3(*a);
-                        *b = m.transform_point3(*b);
+                        a.transform(m);
+                        b.transform(m);
                         *offset *= s;
                     }
                     Annotation::Text { pos, height, .. } => {
@@ -399,6 +553,23 @@ impl Geometry {
             }
             Geometry::Points { positions } => Aabb::from_points(positions.clone()),
             Geometry::Frame { mesh, .. } | Geometry::Area { mesh, .. } => mesh.aabb(),
+        }
+    }
+
+    /// Ordered well-defined bound points used to resolve a dimension anchor's
+    /// `Start`/`End`/`Vertex` picks. Line/curve endpoints come out in curve
+    /// order; frames/areas expose their spine/boundary corners; meshes expose
+    /// their vertices. Consumers that only want `Center`/`BboxCorner` ignore
+    /// this and use the AABB.
+    pub fn bound_points(&self) -> Vec<DVec3> {
+        match self {
+            Geometry::Curve(c) => c.points_bound(),
+            Geometry::Mesh(m) => m.positions().to_vec(),
+            Geometry::Annotation(a) => a.points(),
+            Geometry::Instance { position, .. } => vec![*position],
+            Geometry::Points { positions } => positions.clone(),
+            Geometry::Frame { a, b, .. } => vec![*a, *b],
+            Geometry::Area { boundary, .. } => boundary.clone(),
         }
     }
 }
@@ -690,6 +861,77 @@ mod tests {
         assert_eq!(c, [0.1, 0.2, 0.3]);
         assert!((r - 0.7).abs() < 1e-6 && (m - 0.4).abs() < 1e-6);
         assert_eq!(custom.base_color(), [0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn endpoint_ref_parse_and_token_round_trip() {
+        for (tok, want) in [
+            ("start", EndpointRef::Start),
+            ("end", EndpointRef::End),
+            ("center", EndpointRef::Center),
+            ("c3", EndpointRef::BboxCorner { corner: 3 }),
+            ("v2", EndpointRef::Vertex { index: 2 }),
+        ] {
+            let parsed = EndpointRef::parse(tok).expect("parses");
+            assert_eq!(parsed, want, "{tok}");
+            assert_eq!(parsed.token(), tok, "token round-trips for {tok}");
+        }
+        // Aliases and case-insensitivity.
+        assert_eq!(EndpointRef::parse("S"), Some(EndpointRef::Start));
+        assert_eq!(EndpointRef::parse("E"), Some(EndpointRef::End));
+        assert_eq!(EndpointRef::parse("mid"), Some(EndpointRef::Center));
+        // Out-of-range bbox corner rejected; garbage rejected.
+        assert_eq!(EndpointRef::parse("c8"), None);
+        assert_eq!(EndpointRef::parse("nope"), None);
+    }
+
+    #[test]
+    fn endpoint_ref_extract_picks_the_right_point() {
+        let bounds = vec![DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0)];
+        let aabb = Aabb::from_points(bounds.clone());
+        assert_eq!(EndpointRef::Start.extract(&bounds, aabb), DVec3::ZERO);
+        assert_eq!(EndpointRef::End.extract(&bounds, aabb), DVec3::new(10.0, 0.0, 0.0));
+        assert_eq!(EndpointRef::Center.extract(&bounds, aabb), aabb.center());
+        // Vertex index clamps into range.
+        assert_eq!(EndpointRef::Vertex { index: 9 }.extract(&bounds, aabb), bounds[1]);
+        // Empty bounds fall back to AABB corners/center.
+        assert_eq!(EndpointRef::Start.extract(&[], aabb), aabb.min);
+        assert_eq!(EndpointRef::End.extract(&[], aabb), aabb.max);
+    }
+
+    #[test]
+    fn dim_anchor_translate_only_moves_free() {
+        let mut free = DimAnchor::Free(DVec3::new(1.0, 2.0, 0.0));
+        free.translate(DVec3::new(0.0, 5.0, 0.0));
+        assert_eq!(free.point(), DVec3::new(1.0, 7.0, 0.0));
+
+        let mut bound = DimAnchor::Object {
+            id: ObjectId::new(),
+            which: EndpointRef::Start,
+            last: DVec3::new(3.0, 3.0, 0.0),
+        };
+        // Object anchors are NOT translated — they follow their referent via
+        // resolution; the `last` cache stays put until the next resolve.
+        bound.translate(DVec3::new(100.0, 100.0, 0.0));
+        assert_eq!(bound.point(), DVec3::new(3.0, 3.0, 0.0));
+        assert!(bound.object_id().is_some());
+    }
+
+    /// Old-format `LinearDim { a: [x,y,z], b: [x,y,z] }` JSON must still load,
+    /// migrating each bare point to a `Free` anchor (serde untagged on DimAnchor).
+    #[test]
+    fn linear_dim_legacy_point_json_migrates_to_free() {
+        let json = r#"{ "ann": "linear_dim",
+            "a": [0.0, 0.0, 0.0], "b": [10.0, 0.0, 0.0], "offset": 0.5 }"#;
+        let ann: Annotation = serde_json::from_str(json).unwrap();
+        match ann {
+            Annotation::LinearDim { a, b, offset } => {
+                assert_eq!(a, DimAnchor::Free(DVec3::ZERO));
+                assert_eq!(b, DimAnchor::Free(DVec3::new(10.0, 0.0, 0.0)));
+                assert_eq!(offset, 0.5);
+            }
+            other => panic!("expected LinearDim, got {other:?}"),
+        }
     }
 
     /// A pre-material SceneObject JSON (no `material` field) must still load,

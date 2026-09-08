@@ -239,6 +239,79 @@ impl Document {
         self.objects.get(&id)
     }
 
+    /// Resolve a dimension anchor to its live model point.
+    ///
+    /// - `Free` anchors return their stored point.
+    /// - `Object` anchors look up the referent's *current* geometry and extract
+    ///   the referenced point, so a moved/edited object drags the dimension with
+    ///   it. If the referent is missing (deleted) the anchor degrades to its
+    ///   cached `last` point — never panics.
+    pub fn resolve_anchor(&self, anchor: &crate::DimAnchor) -> glam::DVec3 {
+        match anchor {
+            crate::DimAnchor::Free(p) => *p,
+            crate::DimAnchor::Object { id, which, last } => match self.get(*id) {
+                Some(obj) => {
+                    let bounds = obj.geometry.bound_points();
+                    which.extract(&bounds, obj.geometry.aabb())
+                }
+                None => *last,
+            },
+        }
+    }
+
+    /// True when `anchor` references an object that no longer exists (orphaned
+    /// associative dim). Free anchors are never orphaned.
+    pub fn anchor_is_orphaned(&self, anchor: &crate::DimAnchor) -> bool {
+        matches!(anchor, crate::DimAnchor::Object { id, .. } if self.get(*id).is_none())
+    }
+
+    /// Resolve both anchors of a `LinearDim`, returning the live `(a, b)` model
+    /// points. This is the single place render/export/measure should call so a
+    /// dimension always follows its referenced geometry.
+    pub fn resolve_dim(
+        &self,
+        a: &crate::DimAnchor,
+        b: &crate::DimAnchor,
+    ) -> (glam::DVec3, glam::DVec3) {
+        (self.resolve_anchor(a), self.resolve_anchor(b))
+    }
+
+    /// Refresh the cached `last` point of every associative dimension anchor to
+    /// its currently-resolved position. Called after edits so a subsequent
+    /// delete of the referent degrades to a sensible (up-to-date) fallback and
+    /// so serialized files carry the live value. Returns the number of
+    /// associative dimension objects whose anchors were refreshed.
+    pub fn refresh_dim_anchors(&mut self) -> usize {
+        // Resolve first (immutable borrow), then write back (mutable borrow).
+        let mut updates: Vec<(ObjectId, glam::DVec3, glam::DVec3)> = Vec::new();
+        for obj in self.objects() {
+            if let crate::Geometry::Annotation(crate::Annotation::LinearDim { a, b, .. }) =
+                &obj.geometry
+                && (a.object_id().is_some() || b.object_id().is_some())
+            {
+                updates.push((obj.id, self.resolve_anchor(a), self.resolve_anchor(b)));
+            }
+        }
+        let n = updates.len();
+        for (id, ra, rb) in updates {
+            if let Some(obj) = self.objects.get_mut(&id)
+                && let crate::Geometry::Annotation(crate::Annotation::LinearDim { a, b, .. }) =
+                    &mut obj.geometry
+            {
+                if let crate::DimAnchor::Object { last, .. } = a {
+                    *last = ra;
+                }
+                if let crate::DimAnchor::Object { last, .. } = b {
+                    *last = rb;
+                }
+            }
+        }
+        if n > 0 {
+            self.generation += 1;
+        }
+        n
+    }
+
     /// Mutable iterator over every object (unordered). Bumps the generation so
     /// callers need not remember to; used by bulk edits like layer rename/delete.
     pub fn objects_mut(&mut self) -> impl Iterator<Item = &mut SceneObject> {
@@ -402,6 +475,114 @@ mod tests {
             lineweight_mm: None,
             geometry: Geometry::Mesh(mesh),
         }
+    }
+
+    fn line_obj(a: DVec3, b: DVec3) -> SceneObject {
+        use kernel_curve::Curve;
+        SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: DEFAULT_LAYER.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(Curve::Line { a, b }),
+        }
+    }
+
+    #[test]
+    fn resolve_object_anchor_follows_referent() {
+        use crate::{DimAnchor, EndpointRef};
+        let mut doc = Document::default();
+        let line = line_obj(DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0));
+        let lid = line.id;
+        doc.insert(line);
+
+        let a = DimAnchor::Object { id: lid, which: EndpointRef::Start, last: DVec3::ZERO };
+        let b = DimAnchor::Object {
+            id: lid,
+            which: EndpointRef::End,
+            last: DVec3::new(10.0, 0.0, 0.0),
+        };
+        // Resolves against the current line endpoints.
+        assert_eq!(doc.resolve_dim(&a, &b), (DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0)));
+
+        // Move the line: the resolved anchors follow it (no anchor mutation).
+        doc.get_mut(lid).unwrap().geometry.translate(DVec3::new(0.0, 4.0, 0.0));
+        assert_eq!(
+            doc.resolve_dim(&a, &b),
+            (DVec3::new(0.0, 4.0, 0.0), DVec3::new(10.0, 4.0, 0.0)),
+            "object anchors track the moved line"
+        );
+    }
+
+    #[test]
+    fn resolve_free_anchor_returns_stored_point() {
+        use crate::DimAnchor;
+        let doc = Document::default();
+        let a = DimAnchor::Free(DVec3::new(1.0, 2.0, 0.0));
+        let b = DimAnchor::Free(DVec3::new(3.0, 4.0, 0.0));
+        assert_eq!(
+            doc.resolve_dim(&a, &b),
+            (DVec3::new(1.0, 2.0, 0.0), DVec3::new(3.0, 4.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn deleted_referent_degrades_to_last_without_panic() {
+        use crate::{DimAnchor, EndpointRef};
+        let doc = Document::default(); // referent never inserted → "deleted"
+        let a = DimAnchor::Object {
+            id: ObjectId::new(),
+            which: EndpointRef::Start,
+            last: DVec3::new(7.0, 7.0, 0.0),
+        };
+        assert!(doc.anchor_is_orphaned(&a));
+        assert_eq!(doc.resolve_anchor(&a), DVec3::new(7.0, 7.0, 0.0), "falls back to last");
+        // Free anchors are never orphaned.
+        assert!(!doc.anchor_is_orphaned(&DimAnchor::Free(DVec3::ZERO)));
+    }
+
+    #[test]
+    fn refresh_dim_anchors_updates_last_cache() {
+        use crate::{Annotation, DimAnchor, EndpointRef};
+        let mut doc = Document::default();
+        let line = line_obj(DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0));
+        let lid = line.id;
+        doc.insert(line);
+
+        let dim = SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: DEFAULT_LAYER.to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Annotation(Annotation::LinearDim {
+                a: DimAnchor::Object { id: lid, which: EndpointRef::Start, last: DVec3::ZERO },
+                b: DimAnchor::Object {
+                    id: lid,
+                    which: EndpointRef::End,
+                    last: DVec3::new(10.0, 0.0, 0.0),
+                },
+                offset: 0.5,
+            }),
+        };
+        let did = dim.id;
+        doc.insert(dim);
+
+        // Move the line, then refresh caches: `last` should track the new points.
+        doc.get_mut(lid).unwrap().geometry.translate(DVec3::new(0.0, 4.0, 0.0));
+        assert_eq!(doc.refresh_dim_anchors(), 1, "one dim object refreshed");
+        let Geometry::Annotation(Annotation::LinearDim { a, b, .. }) =
+            &doc.get(did).unwrap().geometry
+        else {
+            panic!("expected dim");
+        };
+        assert_eq!(a.point(), DVec3::new(0.0, 4.0, 0.0));
+        assert_eq!(b.point(), DVec3::new(10.0, 4.0, 0.0));
     }
 
     #[test]

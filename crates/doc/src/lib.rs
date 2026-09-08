@@ -21,9 +21,9 @@ pub use constraint::{PointRef, SketchConstraint};
 pub use document::Document;
 pub use loads::{LoadGeometry, RestraintKind, StructLoad, StructSupport};
 pub use object::{
-    Annotation, AreaKind, BlockGeometry, FrameKind, Geometry, HatchPattern, LayerStyle,
-    LineType, MaterialPreset, ObjectId, ObjectMaterial, ParamBlockDef, ParamBlockParam,
-    SceneObject, DEFAULT_LAYER,
+    Annotation, AreaKind, BlockGeometry, DimAnchor, EndpointRef, FrameKind, Geometry,
+    HatchPattern, LayerStyle, LineType, MaterialPreset, ObjectId, ObjectMaterial, ParamBlockDef,
+    ParamBlockParam, SceneObject, DEFAULT_LAYER,
 };
 pub use sheet::{
     PaperSize, ScheduleRow, Sheet, SheetDim, SheetLeader, SheetTable, SheetTag, SheetText,
