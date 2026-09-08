@@ -314,6 +314,15 @@ pub fn run_script_lines(
                         .map_err(|e| (line.clone(), e))?;
                     continue;
                 }
+                // `raytrace [out.png] [samples] [size]`: the built-in CPU path
+                // tracer (M-raytrace part 1). Pure-CPU, so it runs headless with
+                // no wgpu device — unlike the diffusion `render` verb.
+                if line == "raytrace" || line.starts_with("raytrace ") {
+                    let args = line.strip_prefix("raytrace").unwrap().trim();
+                    raytrace_headless(&session, &view, args)
+                        .map_err(|e| (line.clone(), e))?;
+                    continue;
+                }
                 let cmd = parse(line).map_err(|e| (line.clone(), e.to_string()))?;
                 // Read-only QUERY verbs (blocks, files, workdir, bbox, area, …)
                 // carry their answer in the outcome message but produce no
@@ -447,6 +456,76 @@ fn build_headless_camera(session: &Session, view: &HeadlessView, aspect: f32) ->
         camera.target.z -= 0.5 * camera.distance * camera.pitch.tan();
     }
     camera
+}
+
+/// `raytrace [out.png] [samples] [size]` — the built-in CPU path tracer.
+///
+/// Renders the current document + view to a PNG with the pure-Rust
+/// [`itsjustcad_raytrace`] core (no wgpu, so it works fully headless and is
+/// end-to-end testable). Framing reuses [`build_headless_camera`] so the shot
+/// matches the raster viewport; a path tracer needs a pinhole, so an ortho
+/// standard view is promoted to perspective for the ray camera.
+///
+/// Defaults: `raytrace.png`, 48 spp, 800px wide (5:3 aspect).
+pub fn raytrace_headless(
+    session: &Session,
+    view: &HeadlessView,
+    args: &str,
+) -> Result<(), String> {
+    use itsjustcad_raytrace::{render, scene_from_doc, Camera, Settings, Sky};
+
+    // Parse positional args: [out.png] [samples] [size]. Numbers are
+    // disambiguated by magnitude — an image width is ≥ 64, sample counts are
+    // typically below that — so `raytrace shot.png 64` reads 64 as spp while
+    // `raytrace shot.png 32 1200` reads 32 spp at 1200px.
+    let mut out = "raytrace.png".to_string();
+    let mut samples: u32 = 48;
+    let mut width: u32 = 800;
+    let mut nums = args.split_whitespace().filter_map(|t| t.parse::<u32>().ok());
+    for tok in args.split_whitespace() {
+        if tok.parse::<u32>().is_err() {
+            out = tok.to_string();
+        }
+    }
+    if let Some(first) = nums.next() {
+        if let Some(second) = nums.next() {
+            samples = first;
+            width = second;
+        } else if first >= 256 {
+            width = first;
+        } else {
+            samples = first;
+        }
+    }
+    let height = (width as f32 * 5.0 / 8.0).round() as u32; // 8:5 frame
+    let aspect = width as f32 / height as f32;
+
+    let cam = build_headless_camera(session, view, aspect);
+    let eye = cam.eye();
+    let target = cam.target;
+    // Z-up world; near-vertical views fall back to +Y like the raster path.
+    let up = if cam.pitch.abs() > 1.55 {
+        glam::Vec3::Y
+    } else {
+        glam::Vec3::Z
+    };
+    let rt_cam = Camera::look_at(
+        glam::DVec3::new(eye.x as f64, eye.y as f64, eye.z as f64),
+        glam::DVec3::new(target.x as f64, target.y as f64, target.z as f64),
+        glam::DVec3::new(up.x as f64, up.y as f64, up.z as f64),
+        cam.fov_y as f64,
+        aspect as f64,
+    );
+
+    let scene = scene_from_doc(&session.doc, Sky::default());
+    let settings = Settings { width, height, samples_per_pixel: samples, ..Default::default() };
+    let image = render(&scene, &rt_cam, &settings);
+    image.save_png(std::path::Path::new(&out))?;
+    println!(
+        "raytraced {out} ({width}x{height}, {samples} spp, {} triangles)",
+        scene.triangle_count()
+    );
+    Ok(())
 }
 
 /// Render the three control images (`<prefix>_depth/edge/mask.png`) from the
@@ -1002,6 +1081,39 @@ mod tests {
         let session = Session::default();
         let lines = vec!["definitely_not_a_verb".to_owned()];
         assert!(run_script_lines(session, &lines).is_err());
+    }
+
+    #[test]
+    fn raytrace_verb_writes_png() {
+        let dir = std::env::temp_dir().join(format!("itsjustcad_rt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("shot.png");
+        let session = Session::default();
+        // Tiny sample/size so the CPU render is quick in CI.
+        let lines = vec![
+            "box 0,0,0 2,2,2".to_owned(),
+            format!("raytrace {} 4 64", out.display()),
+        ];
+        assert!(run_script_lines(session, &lines).is_ok(), "raytrace verb runs headless");
+        assert!(out.exists(), "raytrace verb should have written a PNG");
+        // A real PNG file: non-trivial size, PNG magic bytes.
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.len() > 100, "png not empty");
+        assert_eq!(&bytes[..4], &[0x89, b'P', b'N', b'G'], "PNG magic");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raytrace_verb_empty_scene_still_renders_sky() {
+        // No geometry: the tracer still writes a valid sky-only image.
+        let dir = std::env::temp_dir().join(format!("itsjustcad_rt2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("sky.png");
+        let session = Session::default();
+        let lines = vec![format!("raytrace {} 4 64", out.display())];
+        assert!(run_script_lines(session, &lines).is_ok());
+        assert!(out.exists(), "empty-scene raytrace still writes a PNG");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

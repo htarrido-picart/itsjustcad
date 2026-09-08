@@ -1177,6 +1177,12 @@ impl App {
                         .push_line("usage: controlimages <path-prefix>"),
                 }
             }
+            // Built-in CPU path tracer (M-raytrace). Renders the actual model
+            // (materials/sun/sky/GI) — complementary to the AI diffuse `render`.
+            Some("raytrace") => {
+                let rest: Vec<String> = words.map(str::to_owned).collect();
+                self.raytrace_view(&rest);
+            }
             Some("open") => self.open(words.next().map(Into::into)),
             // Import/Export: WITH a path they run unchanged through the substrate
             // (headless/scripts always pass one). A BARE `import`/`export` typed
@@ -1718,6 +1724,59 @@ impl App {
         itsjustcad_render::render_control_images(
             &device, &queue, &self.session.doc, view_proj, eye, near, far, w, h, prefix,
         )
+    }
+
+    /// `raytrace [out.png] [samples] [size]`: the built-in CPU path tracer.
+    /// Renders the actual model — real materials, sun, sky, shadows, GI — from
+    /// the active viewport camera to a PNG. Pure-CPU (no wgpu), so it shares the
+    /// same core the headless runner uses. Numbers disambiguate by magnitude:
+    /// a value ≥ 256 is the image width, otherwise it is the sample count.
+    fn raytrace_view(&mut self, args: &[String]) {
+        use itsjustcad_raytrace::{render, scene_from_doc, Camera, Settings, Sky};
+
+        let mut out = "raytrace.png".to_string();
+        let mut samples: u32 = 48;
+        let mut width: u32 = 800;
+        let nums: Vec<u32> = args.iter().filter_map(|t| t.parse::<u32>().ok()).collect();
+        for tok in args {
+            if tok.parse::<u32>().is_err() {
+                out = tok.clone();
+            }
+        }
+        match nums.as_slice() {
+            [] => {}
+            [only] if *only >= 256 => width = *only,
+            [only] => samples = *only,
+            [spp, w, ..] => {
+                samples = *spp;
+                width = *w;
+            }
+        }
+        let height = (width as f32 * 5.0 / 8.0).round() as u32;
+        let aspect = width as f32 / height as f32;
+
+        let cam_idx = self.layout.camera_index(self.active_pane);
+        let camera = self.cameras[cam_idx];
+        let eye = camera.eye();
+        let target = camera.target;
+        let up = if camera.pitch.abs() > 1.55 { glam::Vec3::Y } else { glam::Vec3::Z };
+        let rt_cam = Camera::look_at(
+            glam::DVec3::new(eye.x as f64, eye.y as f64, eye.z as f64),
+            glam::DVec3::new(target.x as f64, target.y as f64, target.z as f64),
+            glam::DVec3::new(up.x as f64, up.y as f64, up.z as f64),
+            camera.fov_y as f64,
+            aspect as f64,
+        );
+        let scene = scene_from_doc(&self.session.doc, Sky::default());
+        let settings = Settings { width, height, samples_per_pixel: samples, ..Default::default() };
+        let image = render(&scene, &rt_cam, &settings);
+        match image.save_png(std::path::Path::new(&out)) {
+            Ok(()) => self.command_line.push_line(format!(
+                "raytraced {out} ({width}x{height}, {samples} spp, {} tris)",
+                scene.triangle_count()
+            )),
+            Err(e) => self.command_line.push_line(format!("raytrace failed: {e}")),
+        }
     }
 
     /// The `render` verb: AI-diffuse the current view via the active cassette

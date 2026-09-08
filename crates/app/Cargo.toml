@@ -22,6 +22,7 @@ kernel-curve.workspace = true
 itsjustcad-commands.workspace = true
 itsjustcad-deck.workspace = true
 itsjustcad-render.workspace = true
+itsjustcad-raytrace.workspace = true
 kernel-mesh.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
