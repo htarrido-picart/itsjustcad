@@ -8,8 +8,8 @@
 
 use glam::{DVec2, DVec3};
 use itsjustcad_doc::{
-    Annotation, Document, Geometry, ScheduleRow, Sheet, SheetDim, SheetView,
-    ViewDirection,
+    Annotation, Document, Geometry, ScheduleRow, Sheet, SheetDim, SheetLeader, SheetTag,
+    SheetText, SheetView, ViewDirection,
 };
 
 /// Chord tolerance for tessellating curves at print time (meters).
@@ -184,6 +184,130 @@ fn render_sheet_dim(d: &SheetDim, view_scale: f64, content: &mut String) {
     let model_m = paper_dist_mm * view_scale / 1000.0;
     let label = format!("{:.3}m", model_m);
     emit_dim_text(a_off, b_off, &label, content);
+}
+
+/// Render a paper-space text note at TRUE paper size. `height_mm` is a cap
+/// height in millimeters ON PAPER, so it is emitted directly through `mm()`
+/// (mm→pt) with NO viewport-scale term anywhere — the note is the same
+/// physical size regardless of any `SheetView.scale`. This is the fix for the
+/// model-space `Annotation::Text` bug where identical text rendered huge at
+/// 1:50 and tiny at 1:500.
+fn render_sheet_text(t: &SheetText, content: &mut String) {
+    // PDF font size in points: paper-mm cap height × pt/mm. No scale term.
+    let font_pt = t.height_mm * PT_PER_MM;
+    content.push_str(&format!(
+        "BT /F1 {:.2} Tf {} {} Td ({}) Tj ET\n",
+        font_pt,
+        mm(t.pos_mm[0]),
+        mm(t.pos_mm[1]),
+        escape_pdf_text(&t.text)
+    ));
+}
+
+/// Render a paper-space leader (arrow tip → knee → text) at true paper size.
+fn render_sheet_leader(l: &SheetLeader, content: &mut String) {
+    let tip = DVec2::new(l.tip_mm[0], l.tip_mm[1]);
+    let knee = DVec2::new(l.knee_mm[0], l.knee_mm[1]);
+    let tpos = DVec2::new(l.text_pos_mm[0], l.text_pos_mm[1]);
+
+    // Leader polyline: tip → knee → text anchor.
+    content.push_str(&format!(
+        "0.25 w\n{} {} m {} {} l {} {} l S\n",
+        mm(tip.x),
+        mm(tip.y),
+        mm(knee.x),
+        mm(knee.y),
+        mm(tpos.x),
+        mm(tpos.y),
+    ));
+
+    // Arrowhead at the tip: a small (2 mm) filled triangle along tip→knee.
+    let dir = (knee - tip).normalize_or_zero();
+    let perp = DVec2::new(-dir.y, dir.x);
+    let ah = 2.0_f64; // arrow length mm
+    let aw = 0.7_f64; // arrow half-width mm
+    let base = tip + dir * ah;
+    let p1 = base + perp * aw;
+    let p2 = base - perp * aw;
+    content.push_str(&format!(
+        "{} {} m {} {} l {} {} l f\n",
+        mm(tip.x),
+        mm(tip.y),
+        mm(p1.x),
+        mm(p1.y),
+        mm(p2.x),
+        mm(p2.y),
+    ));
+
+    // Text at true paper size (mm on paper), sitting just above the anchor.
+    let font_pt = l.height_mm * PT_PER_MM;
+    content.push_str(&format!(
+        "BT /F1 {:.2} Tf {} {} Td ({}) Tj ET\n",
+        font_pt,
+        mm(tpos.x + 1.0),
+        mm(tpos.y + 0.5),
+        escape_pdf_text(&l.text)
+    ));
+}
+
+/// Render a paper-space callout/tag (shaped bubble + centered text) at true
+/// paper size. Bubble radius scales with the label length so multi-char tags
+/// (e.g. grid "A", detail "3") stay legible; still purely in paper mm.
+fn render_sheet_tag(t: &SheetTag, content: &mut String) {
+    let c = DVec2::new(t.pos_mm[0], t.pos_mm[1]);
+    // Radius in paper mm: a base plus growth for longer labels.
+    let r = 3.5_f64 + (t.text.chars().count().saturating_sub(1) as f64) * 1.2;
+
+    content.push_str("0.4 w\n");
+    match t.shape {
+        itsjustcad_doc::TagShape::Bubble => {
+            // Circle via 4 Bézier arcs (kappa ≈ 0.5523).
+            let k = 0.5522847498 * r;
+            content.push_str(&format!(
+                "{} {} m \
+                 {} {} {} {} {} {} c \
+                 {} {} {} {} {} {} c \
+                 {} {} {} {} {} {} c \
+                 {} {} {} {} {} {} c S\n",
+                mm(c.x + r), mm(c.y),
+                mm(c.x + r), mm(c.y + k), mm(c.x + k), mm(c.y + r), mm(c.x), mm(c.y + r),
+                mm(c.x - k), mm(c.y + r), mm(c.x - r), mm(c.y + k), mm(c.x - r), mm(c.y),
+                mm(c.x - r), mm(c.y - k), mm(c.x - k), mm(c.y - r), mm(c.x), mm(c.y - r),
+                mm(c.x + k), mm(c.y - r), mm(c.x + r), mm(c.y - k), mm(c.x + r), mm(c.y),
+            ));
+        }
+        itsjustcad_doc::TagShape::Square => {
+            content.push_str(&format!(
+                "{} {} {} {} re S\n",
+                mm(c.x - r),
+                mm(c.y - r),
+                mm(2.0 * r),
+                mm(2.0 * r),
+            ));
+        }
+        itsjustcad_doc::TagShape::Diamond => {
+            content.push_str(&format!(
+                "{} {} m {} {} l {} {} l {} {} l h S\n",
+                mm(c.x), mm(c.y + r),
+                mm(c.x + r), mm(c.y),
+                mm(c.x), mm(c.y - r),
+                mm(c.x - r), mm(c.y),
+            ));
+        }
+    }
+
+    // Centered label at true paper size. Font ~ 60% of radius, clamped.
+    let font_mm = (r * 0.9).clamp(2.0, 5.0);
+    let font_pt = font_mm * PT_PER_MM;
+    // Rough centering: ~0.5 mm per char at this font, half-width left shift.
+    let text_w_mm = t.text.chars().count() as f64 * font_mm * 0.5;
+    content.push_str(&format!(
+        "BT /F1 {:.2} Tf {} {} Td ({}) Tj ET\n",
+        font_pt,
+        mm(c.x - text_w_mm / 2.0),
+        mm(c.y - font_mm / 2.5),
+        escape_pdf_text(&t.text)
+    ));
 }
 
 /// Liang-Barsky clip of a 2D segment to an axis-aligned rect. Returns the
@@ -545,6 +669,18 @@ pub fn sheet_pdf(doc: &Document, sheet: &Sheet) -> (Vec<u8>, usize) {
         render_sheet_dim(d, scale, &mut content);
     }
 
+    // Paper-space annotations (SheetText/SheetLeader/SheetTag): TRUE paper size,
+    // scale-independent — no viewport scale enters their sizing.
+    for t in &sheet.texts {
+        render_sheet_text(t, &mut content);
+    }
+    for l in &sheet.leaders {
+        render_sheet_leader(l, &mut content);
+    }
+    for t in &sheet.tags {
+        render_sheet_tag(t, &mut content);
+    }
+
     (write_pdf(paper_w, paper_h, content.as_bytes()), drawn)
 }
 
@@ -644,6 +780,9 @@ mod tests {
             views: vec![],
             table: None,
             dims: vec![],
+            texts: vec![],
+            leaders: vec![],
+            tags: vec![],
         };
         let (bytes, drawn) = sheet_pdf(&doc, &sheet);
         assert!(bytes.starts_with(b"%PDF"));
@@ -767,6 +906,142 @@ mod tests {
             content.contains("10.000m"),
             "PDF should contain dim label '10.000m'"
         );
+    }
+
+    /// CORE BUG FIX: paper-space text renders at the SAME paper-mm size
+    /// regardless of the sheet view's scale. We place identical `sheettext` on
+    /// two sheets whose only difference is the viewport scale (1:50 vs 1:500)
+    /// and assert the emitted PDF font size (points, = mm-on-paper × pt/mm) is
+    /// byte-identical. Model-space `Annotation::Text` would fail this because
+    /// its size passes through the scale.
+    #[test]
+    fn sheettext_is_invariant_to_viewport_scale() {
+        use crate::{parse, Session};
+
+        let font_op_for_scale = |scale: u32| -> String {
+            let mut s = Session::default();
+            s.run(parse("sheet s1 a3").unwrap()).unwrap();
+            s.run(parse(&format!("sheetview s1 top {scale}")).unwrap()).unwrap();
+            // 5 mm cap height ON PAPER.
+            s.run(parse("sheettext s1 20,180 PLAN 5").unwrap()).unwrap();
+            let sheet = s.doc.sheet("s1").unwrap().clone();
+            let (bytes, _) = sheet_pdf(&s.doc, &sheet);
+            let content = String::from_utf8_lossy(&bytes).into_owned();
+            // Extract the "/F1 <pt> Tf ... (PLAN) Tj" font-size token.
+            let line = content
+                .lines()
+                .find(|l| l.contains("(PLAN)"))
+                .expect("PLAN text must be emitted")
+                .to_string();
+            // token after "/F1"
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let i = toks.iter().position(|t| *t == "/F1").unwrap();
+            toks[i + 1].to_string()
+        };
+
+        let at_50 = font_op_for_scale(50);
+        let at_500 = font_op_for_scale(500);
+        assert_eq!(
+            at_50, at_500,
+            "paper text font size must be identical across viewport scales (1:50 gave {at_50}, 1:500 gave {at_500})"
+        );
+        // And it must equal 5 mm × pt/mm, proving true paper size.
+        let expected = format!("{:.2}", 5.0 * PT_PER_MM);
+        assert_eq!(at_50, expected, "5mm cap height should map to {expected} pt");
+    }
+
+    /// `sheettext`/`sheetleader`/`sheettag` store on the sheet, replay byte-
+    /// stable through JSON, and undo pops the last of each.
+    #[test]
+    fn paper_annotations_roundtrip_and_undo() {
+        use crate::{parse, Session};
+
+        let mut s = Session::default();
+        s.run(parse("sheet plan a3").unwrap()).unwrap();
+        s.run(parse("sheetview plan top 100").unwrap()).unwrap();
+        s.run(parse("sheettext plan 20,180 FLOOR PLAN 5").unwrap()).unwrap();
+        s.run(parse("sheetleader plan 40,40 55,55 60,55 SEE DETAIL 2.5").unwrap()).unwrap();
+        s.run(parse("sheettag plan 30,30 A").unwrap()).unwrap();
+        s.run(parse("sheettag plan 90,90 3 diamond").unwrap()).unwrap();
+
+        let sheet = s.doc.sheet("plan").unwrap();
+        assert_eq!(sheet.texts.len(), 1);
+        assert_eq!(sheet.texts[0].text, "FLOOR PLAN");
+        assert!((sheet.texts[0].height_mm - 5.0).abs() < 1e-9);
+        assert_eq!(sheet.leaders.len(), 1);
+        assert_eq!(sheet.leaders[0].text, "SEE DETAIL");
+        assert!((sheet.leaders[0].tip_mm[0] - 40.0).abs() < 1e-9);
+        assert_eq!(sheet.tags.len(), 2);
+        assert_eq!(sheet.tags[0].text, "A");
+        assert_eq!(sheet.tags[0].shape, itsjustcad_doc::TagShape::Bubble);
+        assert_eq!(sheet.tags[1].shape, itsjustcad_doc::TagShape::Diamond);
+
+        // Round-trip JSON: identical state and byte-stable.
+        let json = crate::io::to_json(&s);
+        let s2 = crate::io::from_json(&json).unwrap();
+        let sheet2 = s2.doc.sheet("plan").unwrap();
+        assert_eq!(sheet2.texts, sheet.texts);
+        assert_eq!(sheet2.leaders, sheet.leaders);
+        assert_eq!(sheet2.tags, sheet.tags);
+        assert_eq!(crate::io::to_json(&s2), json, "replay-stable JSON");
+
+        // Undo pops in reverse order.
+        s.run(parse("undo").unwrap()).unwrap(); // tag 3
+        assert_eq!(s.doc.sheet("plan").unwrap().tags.len(), 1);
+        s.run(parse("undo").unwrap()).unwrap(); // tag A
+        assert_eq!(s.doc.sheet("plan").unwrap().tags.len(), 0);
+        s.run(parse("undo").unwrap()).unwrap(); // leader
+        assert_eq!(s.doc.sheet("plan").unwrap().leaders.len(), 0);
+        s.run(parse("undo").unwrap()).unwrap(); // text
+        assert_eq!(s.doc.sheet("plan").unwrap().texts.len(), 0);
+    }
+
+    /// Leader geometry: the PDF polyline visits tip → knee → text anchor, and
+    /// the tag bubble/text are emitted at true paper mm.
+    #[test]
+    fn leader_and_tag_geometry_in_pdf() {
+        use crate::{parse, Session};
+
+        let mut s = Session::default();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse("sheetview s1 top 100").unwrap()).unwrap();
+        s.run(parse("sheetleader s1 40,40 55,55 60,55 NOTE 2.5").unwrap()).unwrap();
+        s.run(parse("sheettag s1 30,30 A2").unwrap()).unwrap();
+
+        let sheet = s.doc.sheet("s1").unwrap().clone();
+        let (bytes, _) = sheet_pdf(&s.doc, &sheet);
+        let content = String::from_utf8_lossy(&bytes);
+
+        // Leader polyline: "tip m knee l text l S". In pt: tip=(40,40)mm etc.
+        let tip = (mm(40.0), mm(40.0));
+        let knee = (mm(55.0), mm(55.0));
+        let tanc = (mm(60.0), mm(55.0));
+        let poly = format!(
+            "{} {} m {} {} l {} {} l S",
+            tip.0, tip.1, knee.0, knee.1, tanc.0, tanc.1
+        );
+        assert!(content.contains(&poly), "leader polyline tip→knee→text expected: {poly}");
+        assert!(content.contains("(NOTE)"), "leader label emitted");
+        assert!(content.contains("(A2)"), "tag label emitted");
+        // Tag bubble center is at 30,30 mm — the circle start point (c.x+r, c.y).
+        assert!(content.contains(&format!("{} {} m", mm(30.0 + 3.5 + 1.2), mm(30.0))),
+            "bubble arc start at radius-from-center");
+    }
+
+    /// Paper annotations render into the exported PDF (export coverage).
+    #[test]
+    fn paper_annotations_present_in_export() {
+        use crate::{parse, Session};
+
+        let mut s = Session::default();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse("sheetview s1 top 100").unwrap()).unwrap();
+        s.run(parse("sheettext s1 10,10 HELLO 3").unwrap()).unwrap();
+        let sheet = s.doc.sheet("s1").unwrap().clone();
+        let (bytes, _) = sheet_pdf(&s.doc, &sheet);
+        assert!(bytes.starts_with(b"%PDF"));
+        assert!(bytes.ends_with(b"%%EOF\n"));
+        assert!(String::from_utf8_lossy(&bytes).contains("(HELLO)"));
     }
 
     /// Text annotation "HELLO" at 0.01m height renders as Hershey strokes in PDF.
