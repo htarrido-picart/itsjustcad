@@ -380,6 +380,16 @@ pub struct App {
     /// Blocks tab: cached library listing (`blocklib`), refreshed on demand so
     /// the tab doesn't hit the filesystem every frame. `Err` keeps the message.
     blocklib_cache: Option<Result<Vec<String>, String>>,
+    /// Blocks tab: the top search field text (filters the drawing-blocks list by
+    /// name substring, case-insensitive).
+    blocks_search: String,
+    /// Blocks tab: whether the "+" library-search popup is open.
+    blocklib_open: bool,
+    /// Blocks tab: search text inside the "+" library popup.
+    blocklib_search: String,
+    /// Blocks tab: a block name to scroll to / highlight next frame, set when a
+    /// viewport double-click on an instance reveals the tab.
+    blocks_reveal: Option<String>,
     /// Plugins tab: name of the plugin awaiting delete confirmation.
     pending_plugin_delete: Option<String>,
     /// Plugins tab: open read-only JSON source popup `(plugin name, json)`.
@@ -812,6 +822,10 @@ impl App {
             deck_visible,
             panel_tabs: crate::tabstrip::TabState::default(),
             pending_block_delete: None,
+            blocks_search: String::new(),
+            blocklib_open: false,
+            blocklib_search: String::new(),
+            blocks_reveal: None,
             blocklib_cache: None,
             pending_plugin_delete: None,
             plugin_json_view: None,
@@ -2225,16 +2239,15 @@ impl App {
 
     /// Click-select: ray through the clicked pixel vs object AABBs. Unless
     /// `expand` is off (Cmd held), the hit expands to its whole group.
-    fn pick(
-        &mut self,
+    /// The topmost visible object whose AABB the screen ray crosses, if any.
+    /// Shared by single-click pick and the double-click Blocks-tab reveal.
+    fn hit_object(
+        &self,
         view_proj: glam::Mat4,
         rect: egui::Rect,
         pos: egui::Pos2,
-        additive: bool,
-        expand: bool,
-    ) {
+    ) -> Option<itsjustcad_doc::ObjectId> {
         let (origin, dir) = screen_ray(view_proj, rect, pos);
-
         // Build a BVH over visible object AABBs so the ray only tests the boxes
         // it actually crosses rather than every object in the scene.
         let pickable: Vec<(itsjustcad_doc::ObjectId, kernel_mesh::Aabb)> = self
@@ -2254,12 +2267,42 @@ impl App {
                 best = Some((t, id));
             }
         }
+        best.map(|(_, id)| id)
+    }
+
+    /// A viewport double-click: if it lands on a block instance, reveal the
+    /// Blocks tab and scroll to that block. Any other hit (or a miss) is a no-op
+    /// here — normal single-click selection still applies. Pure decision lives in
+    /// [`crate::dyntabs::double_click_reveals_blocks`].
+    fn double_click_viewport(
+        &mut self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+    ) {
+        let Some(id) = self.hit_object(view_proj, rect, pos) else { return };
+        let geom = self.session.doc.objects().find(|o| o.id == id).map(|o| &o.geometry);
+        if let Some(name) = crate::dyntabs::double_click_reveals_blocks(geom) {
+            self.panel_tabs.show(crate::tabstrip::PanelTab::Blocks);
+            self.blocks_reveal = Some(name);
+        }
+    }
+
+    fn pick(
+        &mut self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        additive: bool,
+        expand: bool,
+    ) {
+        let best = self.hit_object(view_proj, rect, pos);
         let doc = &mut self.session.doc;
         if !additive {
             doc.selection.clear();
         }
         let mut note = None;
-        if let Some((_, id)) = best {
+        if let Some(id) = best {
             let ids = if expand {
                 doc.expand_pick(id)
             } else {
@@ -2853,6 +2896,14 @@ impl App {
                     let (additive, bypass_group) =
                         ui.input(|i| (i.modifiers.shift, i.modifiers.command));
                     self.pick(view_proj, rect, pos, additive, !bypass_group);
+                }
+                // Double-click a block INSTANCE → reveal the Blocks tab (and
+                // scroll to that block). Other double-clicks fall through.
+                if !consumed
+                    && response.double_clicked()
+                    && let Some(pos) = response.interact_pointer_pos()
+                {
+                    self.double_click_viewport(view_proj, rect, pos);
                 }
                 // Rhino preset: right-click (no drag) = repeat last command.
                 // We only fire when the click was NOT consumed by a drag and the
@@ -4219,11 +4270,14 @@ impl App {
             return;
         }
 
-        // DYNAMIC TABS: Blocks appears while the doc has block definitions,
-        // Plugins while macros are installed (or while the user pinned either
-        // open). Reconciled every frame from live state — pure logic in
-        // `tabstrip`, derivations in `dyntabs`.
-        let has_blocks = crate::dyntabs::has_block_defs(&self.session.doc);
+        // DYNAMIC TABS: Plugins appears while macros are installed. Blocks is
+        // REVEAL-driven, NOT content-driven — it does not pop up merely because
+        // block definitions exist; it is revealed by a viewport double-click on a
+        // block instance or by an explicit open (both pin it via `show`). So its
+        // content flag is always `false` here; the pin keeps it visible.
+        // Reconciled every frame — pure logic in `tabstrip`, derivations in
+        // `dyntabs`.
+        let has_blocks = false;
         let has_plugins = !self.session.plugins.is_empty();
         self.panel_tabs.sync_dynamic(has_blocks, has_plugins);
         let visible_tabs = self.panel_tabs.visible_tabs(has_blocks, has_plugins);
@@ -4397,24 +4451,115 @@ impl App {
         self.layers_panel(ui, theme);
     }
 
-    /// Blocks tab (dynamic): the document's block definitions as rows —
-    /// name, live instance count, param signature for dynamic blocks — plus
-    /// the on-disk library below. A pure VIEW + verb-trigger surface: Insert
-    /// prefills the `insert` command (placement by typing a position), Load
-    /// fires `blockload`, Delete fires the guarded `blockdelete`. All mutations
-    /// go through the ONE substrate path so op-log/undo/replay hold.
+    /// Blocks tab (dynamic, reveal-driven): the blocks PRESENT on the drawing
+    /// (definitions with ≥1 live instance) as rows — name, instance count, param
+    /// signature for dynamic blocks. A search field at the top filters the list
+    /// by name; a "+" button to its left opens a LIBRARY search (the `blocklib`
+    /// catalog: starter symbols + `~/.config/itsjustcad/blocks/*.block.json`) so
+    /// the user can `blockload` a new block into the document. A pure VIEW +
+    /// verb-trigger surface: Insert prefills the `insert` command, Load fires
+    /// `blockload`, Delete fires the guarded `blockdelete`. All mutations go
+    /// through the ONE substrate path so op-log/undo/replay hold.
     fn blocks_tab(&mut self, ui: &mut egui::Ui) {
-        let rows = crate::dyntabs::block_rows(&self.session.doc);
+        use crate::i18n::t;
+        let all_rows = crate::dyntabs::drawing_block_rows(&self.session.doc);
+        let rows = crate::dyntabs::filter_block_rows(&all_rows, &self.blocks_search);
         let mut run_line: Option<String> = None;
         let mut prefill: Option<String> = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if rows.is_empty() {
-                ui.weak("No block definitions yet.");
-                ui.weak("Capture one with `block <selector> <name>` or load one from the library below.");
+
+        // ---- top bar: "+" library button (LEFT) + search field ----
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("+")
+                .on_hover_text(t("blocks.library.open_tooltip"))
+                .clicked()
+            {
+                self.blocklib_open = !self.blocklib_open;
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.blocks_search)
+                    .hint_text(t("blocks.search.hint"))
+                    .desired_width(f32::INFINITY),
+            );
+        });
+
+        // ---- "+" library search popup (blocklib: browse/load offered blocks) ----
+        if self.blocklib_open {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(t("blocks.library.title"));
+                    if ui
+                        .small_button("↻")
+                        .on_hover_text(t("blocks.library.rescan_tooltip"))
+                        .clicked()
+                    {
+                        self.blocklib_cache = None;
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.blocklib_search)
+                        .hint_text(t("blocks.library.search_hint"))
+                        .desired_width(f32::INFINITY),
+                );
+                let lib = self.blocklib_cache.get_or_insert_with(|| {
+                    itsjustcad_commands::blocklib::list()
+                        .map(|(names, _dir)| names)
+                        .map_err(|e| e.to_string())
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("blocklib_scroll")
+                    .max_height(220.0)
+                    .show(ui, |ui| match lib {
+                        Ok(names) if names.is_empty() => {
+                            ui.weak(t("blocks.library.empty"));
+                        }
+                        Ok(names) => {
+                            let hits =
+                                crate::dyntabs::filter_library(names, &self.blocklib_search);
+                            if hits.is_empty() {
+                                ui.weak(t("blocks.library.no_match"));
+                            }
+                            for name in hits {
+                                ui.horizontal(|ui| {
+                                    ui.label(&name);
+                                    let already = self
+                                        .session
+                                        .doc
+                                        .blocks
+                                        .contains_key(&name)
+                                        || self.session.doc.param_blocks.contains_key(&name);
+                                    if already {
+                                        ui.weak(t("blocks.library.loaded"));
+                                    } else if ui
+                                        .small_button(t("blocks.library.load"))
+                                        .on_hover_text(t("blocks.library.load_tooltip"))
+                                        .clicked()
+                                    {
+                                        run_line = Some(format!("blockload {name}"));
+                                    }
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            ui.weak(format!("{}: {e}", t("blocks.library.unavailable")));
+                        }
+                    });
+            });
+            ui.add_space(crate::theme::Spacing::SM);
+        }
+
+        // ---- drawing-blocks list (scoped to instanced defs, filtered) ----
+        egui::ScrollArea::vertical().id_salt("blocks_scroll").show(ui, |ui| {
+            if all_rows.is_empty() {
+                ui.weak(t("blocks.empty"));
+                ui.weak(t("blocks.empty.hint"));
+            } else if rows.is_empty() {
+                ui.weak(t("blocks.no_match"));
             }
             for row in &rows {
                 let confirming = self.pending_block_delete.as_deref() == Some(row.name.as_str());
-                ui.horizontal(|ui| {
+                // Scroll to the block the double-click revealed, once.
+                let resp = ui.horizontal(|ui| {
                     ui.strong(&row.name);
                     let count = format!(
                         "{} instance{}",
@@ -4422,83 +4567,44 @@ impl App {
                         if row.instances == 1 { "" } else { "s" }
                     );
                     ui.weak(count);
-                });
+                }).response;
+                if self.blocks_reveal.as_deref() == Some(row.name.as_str()) {
+                    resp.scroll_to_me(Some(egui::Align::Center));
+                    self.blocks_reveal = None;
+                }
                 if let Some(sig) = &row.param_signature {
                     ui.weak(format!("params: {sig}"));
                 }
                 ui.horizontal(|ui| {
                     if ui
-                        .small_button("Insert")
-                        .on_hover_text("prefill `insert` — type a position, press Enter")
+                        .small_button(t("blocks.insert"))
+                        .on_hover_text(t("blocks.insert.tooltip"))
                         .clicked()
                     {
                         prefill = Some(format!("insert {} ", row.name));
                     }
                     if confirming {
-                        ui.label(egui::RichText::new("delete definition?").color(ui.visuals().warn_fg_color));
-                        if ui.small_button("Delete").clicked() {
+                        ui.label(egui::RichText::new(t("blocks.delete.confirm")).color(ui.visuals().warn_fg_color));
+                        if ui.small_button(t("btn.delete")).clicked() {
                             run_line = Some(format!("blockdelete {}", self.pending_block_delete.take().unwrap_or_default()));
                         }
-                        if ui.small_button("Cancel").clicked() {
+                        if ui.small_button(t("btn.cancel")).clicked() {
                             self.pending_block_delete = None;
                         }
                     } else if row.instances > 0 {
                         // GUARD surfaced in the UI before the verb even runs:
                         // a definition with live instances cannot be deleted.
-                        ui.add_enabled(false, egui::Button::new("Delete").small())
+                        ui.add_enabled(false, egui::Button::new(t("btn.delete")).small())
                             .on_disabled_hover_text(format!(
                                 "{} instance{} exist — delete the instances first",
                                 row.instances,
                                 if row.instances == 1 { "" } else { "s" }
                             ));
-                    } else if ui.small_button("Delete").clicked() {
+                    } else if ui.small_button(t("btn.delete")).clicked() {
                         self.pending_block_delete = Some(row.name.clone());
                     }
                 });
                 ui.separator();
-            }
-
-            // ---- on-disk block library (blocklib / blockload) ----
-            ui.add_space(crate::theme::Spacing::SM);
-            ui.horizontal(|ui| {
-                ui.strong("Library");
-                if ui
-                    .small_button("↻")
-                    .on_hover_text("re-scan ~/.config/itsjustcad/blocks/")
-                    .clicked()
-                {
-                    self.blocklib_cache = None;
-                }
-            });
-            let lib = self.blocklib_cache.get_or_insert_with(|| {
-                itsjustcad_commands::blocklib::list()
-                    .map(|(names, _dir)| names)
-                    .map_err(|e| e.to_string())
-            });
-            match lib {
-                Ok(names) if names.is_empty() => {
-                    ui.weak("library is empty");
-                }
-                Ok(names) => {
-                    for name in names.clone() {
-                        ui.horizontal(|ui| {
-                            ui.label(&name);
-                            let already = rows.iter().any(|r| r.name == name);
-                            if already {
-                                ui.weak("loaded");
-                            } else if ui
-                                .small_button("Load")
-                                .on_hover_text("`blockload` into this document")
-                                .clicked()
-                            {
-                                run_line = Some(format!("blockload {name}"));
-                            }
-                        });
-                    }
-                }
-                Err(e) => {
-                    ui.weak(format!("library unavailable: {e}"));
-                }
             }
         });
         if let Some(line) = run_line {
@@ -7020,31 +7126,27 @@ mod tests {
     #[test]
     #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
     fn journey_blocks_tab_lists_user_definition() {
-        // The Blocks tab is dynamic (M-dyntabs) — but every new document ships
-        // the STARTER parametric blocks (pdoor, pbed, …), so in practice the
-        // tab is present from the first frame. The journey therefore asserts
-        // (1) the tab is up because definitions exist, and (2) defining a
-        // block from drawn geometry surfaces it as a row in the tab.
-        // (Pure appear/disappear transitions are covered by tabstrip's tests.)
+        // The Blocks tab is dynamic AND reveal-driven (M-dyntabs redesign): it
+        // does NOT pop up just because starter/library definitions exist. The
+        // journey asserts (1) the tab is hidden on a fresh doc, (2) explicitly
+        // opening it works, and (3) a block that is DEFINED AND INSTANCED
+        // surfaces as a drawing-scoped row (a def with no instances would not).
         run_app_journey(|h| {
             use egui_kittest::kittest::Queryable as _;
             assert!(
-                crate::dyntabs::has_block_defs(&h.state().session.doc),
-                "new docs carry the starter parametric blocks"
-            );
-            assert!(
-                h.query_all_by_label_contains("Blocks").next().is_some(),
-                "Blocks tab visible while definitions exist"
+                h.query_all_by_label_contains("Blocks").next().is_none(),
+                "Blocks tab hidden until revealed (defs alone don't show it)"
             );
             submit_command(h, "box 0,0,0 2,2,2");
             submit_command(h, "block last courtyard_kiosk");
+            submit_command(h, "insert courtyard_kiosk 5,0,0");
             h.state_mut()
                 .panel_tabs
                 .show(crate::tabstrip::PanelTab::Blocks);
             h.run_steps(2);
             assert!(
                 h.query_all_by_label_contains("courtyard_kiosk").next().is_some(),
-                "user-defined block appears as a Blocks-tab row"
+                "an instanced block appears as a Blocks-tab row"
             );
         });
     }
