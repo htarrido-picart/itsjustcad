@@ -40,6 +40,10 @@ pub enum MenuAction {
     /// Open the Model Setup panel (download/manage local models). Available any
     /// time from Tools, not just at first run.
     ModelSetup,
+    /// Open the Plugins popup window: installed user/LLM-authored macros as
+    /// cards, with search + per-card run/JSON/reload/delete. Modeless, like
+    /// Model Setup / About. Fired by the LLM ▸ Plugins… menu item.
+    ShowPlugins,
     /// Open the Edit history / amend panel as a modal (the command line is the
     /// op-log scrollback; this exposes step-jump + amend on demand).
     EditHistory,
@@ -753,6 +757,16 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                 action: MenuAction::DownloadDefaultModel,
             },
             NativeItem::Separator,
+            // Plugins… opens the plugins popup window (cards + search), NOT a
+            // right-dock tab. User/LLM-authored macros are managed here.
+            NativeItem::Leaf {
+                id: format!("{t}/plugins"),
+                label: tr("menu.llm.plugins").into(),
+                shortcut: None,
+                enabled: true,
+                action: MenuAction::ShowPlugins,
+            },
+            NativeItem::Separator,
             NativeItem::Check {
                 id: format!("{t}/local_only"),
                 label: tr("menu.llm.local_only").into(),
@@ -859,6 +873,7 @@ fn leaf_icon(id: &str, _label: &str) -> Icon {
         "import" => return Icon::Import,
         "export" => return Icon::Export,
         "settings" => return Icon::Model,
+        "plugins" => return Icon::ToolsCat, // lucide "wrench"
         "close" | "quit" => return Icon::Close,
         "undo" => return Icon::Undo,
         "redo" => return Icon::Redo,
@@ -1250,6 +1265,13 @@ mod tests {
         assert!(by_action(&MenuAction::ModelSetup), "Model Setup missing");
         assert!(by_action(&MenuAction::RevealModelsFolder), "Reveal Models Folder missing");
         assert!(by_action(&MenuAction::DownloadDefaultModel), "Download Default missing");
+        // Plugins… opens the plugins popup window (cards + search), routed via
+        // ShowPlugins — it is NOT a right-dock tab.
+        assert!(by_action(&MenuAction::ShowPlugins), "Plugins… item missing");
+        assert!(
+            ls.iter().any(|(id, _, a)| id == "LLM/plugins" && *a == MenuAction::ShowPlugins),
+            "Plugins… must have the stable id LLM/plugins routing ShowPlugins"
+        );
         // Two checkable toggles with stable ids the app syncs against.
         let checks: Vec<&str> = llm
             .items

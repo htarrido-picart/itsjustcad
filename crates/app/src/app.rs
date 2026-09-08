@@ -390,9 +390,13 @@ pub struct App {
     /// Blocks tab: a block name to scroll to / highlight next frame, set when a
     /// viewport double-click on an instance reveals the tab.
     blocks_reveal: Option<String>,
-    /// Plugins tab: name of the plugin awaiting delete confirmation.
+    /// Plugins popup: whether the Plugins window (cards + search) is open.
+    show_plugins: bool,
+    /// Plugins popup: case-insensitive search filter over the plugin cards.
+    plugins_search: String,
+    /// Plugins popup: name of the plugin awaiting delete confirmation.
     pending_plugin_delete: Option<String>,
-    /// Plugins tab: open read-only JSON source popup `(plugin name, json)`.
+    /// Plugins popup: open read-only JSON source popup `(plugin name, json)`.
     plugin_json_view: Option<(String, String)>,
     /// The ONE dock width (points) shared by ALL tabs. Seeded from
     /// [`crate::tabstrip::DOCK_WIDTH`]; a user drag updates it, but switching
@@ -827,6 +831,8 @@ impl App {
             blocklib_search: String::new(),
             blocks_reveal: None,
             blocklib_cache: None,
+            show_plugins: std::env::var("ITSJUSTCAD_PLUGINS_POPUP").is_ok(),
+            plugins_search: String::new(),
             pending_plugin_delete: None,
             plugin_json_view: None,
             dock_width: crate::tabstrip::DOCK_WIDTH,
@@ -1084,10 +1090,12 @@ impl App {
         }
         // Dev/screenshot hook: force a specific right-dock tab so each tab can be
         // shot at the (constant) dock width. chat|sessions|layers|blocks|plugins.
-        if let Ok(tab) = std::env::var("ITSJUSTCAD_PANEL_TAB")
-            && let Some(t) = panel_tab_by_name(&tab)
-        {
-            self.panel_tabs.show(t);
+        if let Ok(tab) = std::env::var("ITSJUSTCAD_PANEL_TAB") {
+            if tab.eq_ignore_ascii_case("plugins") {
+                self.show_plugins = true;
+            } else if let Some(t) = panel_tab_by_name(&tab) {
+                self.panel_tabs.show(t);
+            }
         }
     }
 
@@ -1928,6 +1936,7 @@ impl App {
             || self.show_about
             || self.show_history
             || self.show_model_setup
+            || self.show_plugins
             || self.show_template_picker
             || self.import_job.is_some()
             || self.import_result.is_some()
@@ -4270,17 +4279,17 @@ impl App {
             return;
         }
 
-        // DYNAMIC TABS: Plugins appears while macros are installed. Blocks is
+        // DYNAMIC TAB: Blocks is the only dynamic right-dock tab. It is
         // REVEAL-driven, NOT content-driven — it does not pop up merely because
         // block definitions exist; it is revealed by a viewport double-click on a
         // block instance or by an explicit open (both pin it via `show`). So its
         // content flag is always `false` here; the pin keeps it visible.
-        // Reconciled every frame — pure logic in `tabstrip`, derivations in
-        // `dyntabs`.
+        // (Plugins are NOT a tab — they live in a popup window; see
+        // `plugins_popup`.) Reconciled every frame — pure logic in `tabstrip`,
+        // derivations in `dyntabs`.
         let has_blocks = false;
-        let has_plugins = !self.session.plugins.is_empty();
-        self.panel_tabs.sync_dynamic(has_blocks, has_plugins);
-        let visible_tabs = self.panel_tabs.visible_tabs(has_blocks, has_plugins);
+        self.panel_tabs.sync_dynamic(has_blocks);
+        let visible_tabs = self.panel_tabs.visible_tabs(has_blocks);
 
         let collapsed = self.panel_tabs.is_collapsed();
         let theme = if ui.visuals().dark_mode { scene::Theme::Dark } else { scene::Theme::Light };
@@ -4427,7 +4436,6 @@ impl App {
                         );
                     }
                     PanelTab::Blocks => self.blocks_tab(ui),
-                    PanelTab::Plugins => self.plugins_tab(ui),
                 }
             });
         });
@@ -4616,82 +4624,151 @@ impl App {
         }
     }
 
-    /// Plugins tab (dynamic): installed user/LLM-authored macros as rows —
-    /// name, summary, positional arg signature — with Run (prefills the verb),
-    /// JSON (read-only source popup), per-row Delete (confirm), plus Reload
-    /// and Open-folder header actions. Every mutation routes through the
-    /// existing `plugin …` management verbs on the command line.
-    fn plugins_tab(&mut self, ui: &mut egui::Ui) {
-        let rows = crate::dyntabs::plugin_rows(&self.session.plugins);
+    /// Plugins popup window (modeless, dismissable — like Model Setup / About):
+    /// installed user/LLM-authored macros shown as CARDS. Each card carries the
+    /// plugin name, its param signature (usage), a summary, and an "Installed"
+    /// indicator, with Run (prefills the verb), JSON (read-only source popup) and
+    /// a confirm-guarded Delete. A search field at the top filters cards by name
+    /// or summary (case-insensitive). Header actions: Reload and Open-folder.
+    /// Every mutation routes through the existing `plugin …` management verbs on
+    /// the command line, so replay/undo invariants hold. Reached from the LLM ▸
+    /// Plugins… menu item and the `panel plugins` UI verb.
+    fn plugins_popup(&mut self, ctx: &egui::Context) {
+        use crate::i18n::t;
+        if !self.show_plugins {
+            return;
+        }
+        let mut open = true;
         let mut run_line: Option<String> = None;
         let mut prefill: Option<String> = None;
-        ui.horizontal(|ui| {
-            if ui
-                .small_button("Reload")
-                .on_hover_text("`plugin reload` — re-scan the plugins folder")
-                .clicked()
-            {
-                run_line = Some("plugin reload".into());
-            }
-            if ui
-                .small_button("Open folder")
-                .on_hover_text("reveal ~/.config/itsjustcad/plugins/ in the file manager")
-                .clicked()
-            {
-                open_plugins_folder(&mut self.command_line);
-            }
-        });
-        ui.add_space(crate::theme::Spacing::SM);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if rows.is_empty() {
-                ui.weak("No plugins installed.");
-                ui.weak("Ask the chat to author one, or `plugin save <name> <n>` to capture recent commands.");
-            }
-            for row in &rows {
-                let confirming = self.pending_plugin_delete.as_deref() == Some(row.name.as_str());
-                ui.strong(&row.usage);
-                if !row.summary.is_empty() {
-                    ui.weak(&row.summary);
-                }
+        egui::Window::new(t("plugins.title"))
+            // Draggable + collapsible + X-closable — never traps input.
+            .collapsible(true)
+            .resizable(true)
+            .default_size([420.0, 460.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                // Header: reload + open-folder actions.
                 ui.horizontal(|ui| {
                     if ui
-                        .small_button("Run")
-                        .on_hover_text("prefill the command line — add args, press Enter")
+                        .button(t("plugins.reload"))
+                        .on_hover_text(t("plugins.reload.tooltip"))
                         .clicked()
                     {
-                        prefill = Some(format!("{} ", row.name));
+                        run_line = Some("plugin reload".into());
                     }
                     if ui
-                        .small_button("JSON")
-                        .on_hover_text("view the plugin's JSON source (read-only)")
+                        .button(t("plugins.open_folder"))
+                        .on_hover_text(t("plugins.open_folder.tooltip"))
                         .clicked()
                     {
-                        self.plugin_json_view = Some((row.name.clone(), row.json.clone()));
-                    }
-                    if confirming {
-                        ui.label(egui::RichText::new("delete plugin?").color(ui.visuals().warn_fg_color));
-                        if ui.small_button("Delete").clicked() {
-                            run_line = Some(format!("plugin delete {}", self.pending_plugin_delete.take().unwrap_or_default()));
-                        }
-                        if ui.small_button("Cancel").clicked() {
-                            self.pending_plugin_delete = None;
-                        }
-                    } else if ui.small_button("Delete").clicked() {
-                        self.pending_plugin_delete = Some(row.name.clone());
+                        open_plugins_folder(&mut self.command_line);
                     }
                 });
+                // Search field: filters cards by name/summary substring.
+                ui.add_space(crate::theme::Spacing::SM);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.plugins_search)
+                        .hint_text(t("plugins.search.hint"))
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(crate::theme::Spacing::SM);
                 ui.separator();
-            }
-        });
+
+                let all = crate::dyntabs::plugin_rows(&self.session.plugins);
+                let rows = crate::dyntabs::filter_plugin_rows(&all, &self.plugins_search);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if all.is_empty() {
+                        ui.weak(t("plugins.empty"));
+                        ui.weak(t("plugins.empty.hint"));
+                        return;
+                    }
+                    if rows.is_empty() {
+                        ui.weak(t("plugins.no_match"));
+                        return;
+                    }
+                    for row in &rows {
+                        let confirming =
+                            self.pending_plugin_delete.as_deref() == Some(row.name.as_str());
+                        // One card per plugin: a framed group so cards read as
+                        // discrete tiles rather than a flat list.
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.strong(&row.usage);
+                                // Installed indicator — right-aligned pill.
+                                if row.installed {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "● {}",
+                                                    t("plugins.installed")
+                                                ))
+                                                .small()
+                                                .color(ui.visuals().weak_text_color()),
+                                            );
+                                        },
+                                    );
+                                }
+                            });
+                            if !row.summary.is_empty() {
+                                ui.weak(&row.summary);
+                            }
+                            ui.add_space(crate::theme::Spacing::XS);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button(t("plugins.run"))
+                                    .on_hover_text(t("plugins.run.tooltip"))
+                                    .clicked()
+                                {
+                                    prefill = Some(format!("{} ", row.name));
+                                }
+                                if ui
+                                    .button(t("plugins.json"))
+                                    .on_hover_text(t("plugins.json.tooltip"))
+                                    .clicked()
+                                {
+                                    self.plugin_json_view =
+                                        Some((row.name.clone(), row.json.clone()));
+                                }
+                                if confirming {
+                                    ui.label(
+                                        egui::RichText::new(t("plugins.delete.confirm"))
+                                            .color(ui.visuals().warn_fg_color),
+                                    );
+                                    if ui.button(t("btn.delete")).clicked() {
+                                        run_line = Some(format!(
+                                            "plugin delete {}",
+                                            self.pending_plugin_delete.take().unwrap_or_default()
+                                        ));
+                                    }
+                                    if ui.button(t("btn.cancel")).clicked() {
+                                        self.pending_plugin_delete = None;
+                                    }
+                                } else if ui.button(t("btn.delete")).clicked() {
+                                    self.pending_plugin_delete = Some(row.name.clone());
+                                }
+                            });
+                        });
+                        ui.add_space(crate::theme::Spacing::SM);
+                    }
+                });
+            });
+        if !open {
+            self.show_plugins = false;
+        }
+
         // Read-only JSON source popup (floating, closable).
         if let Some((name, json)) = self.plugin_json_view.clone() {
-            let mut open = true;
-            egui::Window::new(format!("Plugin source — {name}"))
-                .open(&mut open)
+            let mut src_open = true;
+            egui::Window::new(format!("{} — {name}", t("plugins.source.title")))
+                .open(&mut src_open)
                 .collapsible(false)
                 .resizable(true)
                 .default_width(360.0)
-                .show(ui.ctx(), |ui| {
+                .show(ctx, |ui| {
                     egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
                         // Read-only: an immutable text buffer renders selectable
                         // (copyable) but uneditable monospace text.
@@ -4703,7 +4780,7 @@ impl App {
                         );
                     });
                 });
-            if !open {
+            if !src_open {
                 self.plugin_json_view = None;
             }
         }
@@ -4849,6 +4926,7 @@ impl App {
             }
             MenuAction::About => self.show_about = true,
             MenuAction::ModelSetup => self.show_model_setup = true,
+            MenuAction::ShowPlugins => self.show_plugins = true,
             MenuAction::EditHistory => self.show_history = true,
             MenuAction::ImportDialog => self.import(None),
             MenuAction::ExportDialog => self.export(None),
@@ -5543,6 +5621,10 @@ impl App {
         if let Some(v) = ui_json["panel_visible"].as_bool() {
             self.panel_visible = v;
         }
+        // `panel plugins` opens the Plugins popup window, not a tab.
+        if ui_json["panel_tab"].as_str() == Some("plugins") {
+            self.show_plugins = true;
+        }
         // Transient tab reveal (`panel blocks` etc.) — see the apply loop in
         // `ui`, which strips this key before persisting.
         if let Some(t) = ui_json["panel_tab"].as_str().and_then(panel_tab_by_name) {
@@ -5570,7 +5652,8 @@ pub(crate) fn panel_tab_by_name(name: &str) -> Option<crate::tabstrip::PanelTab>
         "sessions" => Some(PanelTab::Sessions),
         "layers" | "model" => Some(PanelTab::Model),
         "blocks" => Some(PanelTab::Blocks),
-        "plugins" => Some(PanelTab::Plugins),
+        // "plugins" is intentionally NOT a tab — it opens the Plugins popup
+        // window instead (handled by the caller). Returns None here.
         _ => None,
     }
 }
@@ -6478,6 +6561,10 @@ impl eframe::App for App {
             }
         }
 
+        // LLM → Plugins… popup window (cards + search). Modeless; renders any
+        // time show_plugins is set. Plugins are NOT a right-dock tab.
+        self.plugins_popup(ui.ctx());
+
         // Handle download completion/failure every frame — even with the Model
         // Setup window closed — so a finished download always becomes the
         // active deck and a failure is never silent.
@@ -6729,6 +6816,7 @@ impl eframe::App for App {
             || self.show_about
             || self.show_history
             || self.show_model_setup
+            || self.show_plugins
             || self.show_template_picker
             || self.import_job.is_some()
             || self.import_result.is_some()

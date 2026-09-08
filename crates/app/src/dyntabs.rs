@@ -140,7 +140,7 @@ pub fn double_click_reveals_blocks(hit: Option<&Geometry>) -> Option<String> {
     }
 }
 
-/// One row of the Plugins tab: an installed user/LLM-authored macro.
+/// One card in the Plugins popup: a user/LLM-authored macro.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginRow {
     pub name: String,
@@ -149,9 +149,16 @@ pub struct PluginRow {
     pub summary: String,
     /// Pretty-printed JSON source (what `plugin define` took / disk holds).
     pub json: String,
+    /// True when the plugin is present in the registry / on disk (loaded). For
+    /// ItsJustCAD every listed plugin is user/LLM-authored JSON in the plugins
+    /// dir, so this is always `true` today — the field is carried on the card so
+    /// an available-but-not-installed catalog (if one is ever added) can set it
+    /// `false` without reshaping the popup.
+    pub installed: bool,
 }
 
-/// Derive the ordered Plugins-tab rows from the live registry. Read-only.
+/// Derive the ordered Plugins-popup rows from the live registry. Read-only.
+/// Every registry plugin is installed (loaded from disk), so `installed` is set.
 pub fn plugin_rows(reg: &itsjustcad_commands::plugin::PluginRegistry) -> Vec<PluginRow> {
     reg.iter()
         .map(|p| PluginRow {
@@ -159,7 +166,26 @@ pub fn plugin_rows(reg: &itsjustcad_commands::plugin::PluginRegistry) -> Vec<Plu
             usage: p.usage(),
             summary: p.summary(),
             json: serde_json::to_string_pretty(p).unwrap_or_else(|_| "{}".into()),
+            installed: true,
         })
+        .collect()
+}
+
+/// Case-insensitive substring filter over plugin cards by name OR summary. An
+/// empty (or whitespace-only) query returns every row unchanged. Drives the
+/// search field at the top of the Plugins popup. Pure, so it is unit-tested
+/// standalone.
+pub fn filter_plugin_rows(rows: &[PluginRow], query: &str) -> Vec<PluginRow> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return rows.to_vec();
+    }
+    rows.iter()
+        .filter(|r| {
+            r.name.to_ascii_lowercase().contains(&q)
+                || r.summary.to_ascii_lowercase().contains(&q)
+        })
+        .cloned()
         .collect()
 }
 
@@ -415,8 +441,42 @@ mod tests {
         assert_eq!(rows[0].name, "column-grid");
         assert!(rows[0].usage.contains("<nx>"), "usage: {}", rows[0].usage);
         assert!(rows[0].summary.contains("grid of columns"));
+        // A registry plugin is installed (loaded from disk).
+        assert!(rows[0].installed, "a registry plugin must be flagged installed");
         // JSON source round-trips back to the same plugin.
         let back: Plugin = serde_json::from_str(&rows[0].json).unwrap();
         assert_eq!(back.name, "column-grid");
+    }
+
+    #[test]
+    fn plugin_filter_matches_name_or_summary_case_insensitive() {
+        let rows = vec![
+            PluginRow {
+                name: "column-grid".into(),
+                usage: "column-grid <nx>".into(),
+                summary: "Place a grid of columns.".into(),
+                json: "{}".into(),
+                installed: true,
+            },
+            PluginRow {
+                name: "stair".into(),
+                usage: "stair <n>".into(),
+                summary: "A run of treads.".into(),
+                json: "{}".into(),
+                installed: true,
+            },
+        ];
+        // Matches on name.
+        assert_eq!(filter_plugin_rows(&rows, "COLUMN").len(), 1);
+        assert_eq!(filter_plugin_rows(&rows, "column")[0].name, "column-grid");
+        // Matches on summary substring.
+        let by_summary = filter_plugin_rows(&rows, "treads");
+        assert_eq!(by_summary.len(), 1);
+        assert_eq!(by_summary[0].name, "stair");
+        // Empty / whitespace → all rows.
+        assert_eq!(filter_plugin_rows(&rows, "").len(), 2);
+        assert_eq!(filter_plugin_rows(&rows, "   ").len(), 2);
+        // No match.
+        assert!(filter_plugin_rows(&rows, "zzz").is_empty());
     }
 }
