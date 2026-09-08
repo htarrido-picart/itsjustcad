@@ -834,6 +834,24 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Dimension,
         },
         CommandSpec {
+            name: "sheettext",
+            usage: "sheettext <sheet> <x,y> <text...> [height_mm]",
+            summary: "Add a scale-independent paper-space text note to a sheet; position is paper mm from the lower-left, height is the cap height in mm ON PAPER (default 2.5) so the note is the same physical size in every viewport regardless of scale. Example: sheettext plan 20,180 FIRST FLOOR PLAN 5",
+            category: Category::Dimension,
+        },
+        CommandSpec {
+            name: "sheetleader",
+            usage: "sheetleader <sheet> <tipx,y> <kneex,y> <textx,y> <text...> [height_mm]",
+            summary: "Add a paper-space leader (arrow tip → knee → text) to a sheet; all points are paper mm, height is mm on paper (default 2.5). Scale-independent. Example: sheetleader plan 40,40 55,55 60,55 SEE DETAIL 2.5",
+            category: Category::Dimension,
+        },
+        CommandSpec {
+            name: "sheettag",
+            usage: "sheettag <sheet> <x,y> <text> [bubble|square|diamond]",
+            summary: "Add a paper-space callout/tag (shaped bubble + centered text) to a sheet; position is the bubble center in paper mm, shape defaults to bubble. Use for grid bubbles, detail numbers, keynotes. Scale-independent. Example: sheettag plan 30,30 A · sheettag plan 90,90 3 diamond",
+            category: Category::Dimension,
+        },
+        CommandSpec {
             name: "view",
             usage: "view save <name> | view <name> | view list",
             summary: "Named views: save the active viewport camera, restore it later, or list saved views. Example: view save entry then view entry",

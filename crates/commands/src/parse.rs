@@ -4,7 +4,7 @@
 use glam::DVec3;
 use itsjustcad_doc::{
     AreaKind, FrameKind, HatchPattern, LoadGeometry, PaperSize, RestraintKind,
-    Section as StructSection, Units, ViewDirection, METERS_PER_FOOT, METERS_PER_INCH,
+    Section as StructSection, TagShape, Units, ViewDirection, METERS_PER_FOOT, METERS_PER_INCH,
 };
 
 use crate::error::ParseError;
@@ -1193,6 +1193,93 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 _ => wrong(
                     "sheetdim",
                     "a sheet name, two paper points (mm) and an optional offset (mm)",
+                    &args,
+                ),
+            }
+        }
+        "sheettext" => {
+            // sheettext <sheet> <x,y> <text...> [height_mm]
+            let [sheet, pos, rest @ ..] = args.as_slice() else {
+                return wrong(
+                    "sheettext",
+                    "a sheet name, a paper point (mm), and text",
+                    &args,
+                );
+            };
+            // Optional trailing height: only when it leaves at least one word.
+            let (height, words) = match rest.split_last() {
+                Some((last, init)) if !init.is_empty() && number(last).is_ok() => {
+                    (Some(number(last)?), init)
+                }
+                _ => (None, rest),
+            };
+            if words.is_empty() {
+                return wrong(
+                    "sheettext",
+                    "a sheet name, a paper point (mm), and text",
+                    &args,
+                );
+            }
+            Ok(Command::SheetText {
+                sheet: (*sheet).to_string(),
+                pos: paper_point(pos)?,
+                text: words.join(" "),
+                height,
+                view_index: None,
+            })
+        }
+        "sheetleader" => {
+            // sheetleader <sheet> <tipx,y> <kneex,y> <textx,y> <text...> [height_mm]
+            let [sheet, tip, knee, text_pos, rest @ ..] = args.as_slice() else {
+                return wrong(
+                    "sheetleader",
+                    "a sheet name, tip/knee/text paper points (mm), and text",
+                    &args,
+                );
+            };
+            let (height, words) = match rest.split_last() {
+                Some((last, init)) if !init.is_empty() && number(last).is_ok() => {
+                    (Some(number(last)?), init)
+                }
+                _ => (None, rest),
+            };
+            if words.is_empty() {
+                return wrong(
+                    "sheetleader",
+                    "a sheet name, tip/knee/text paper points (mm), and text",
+                    &args,
+                );
+            }
+            Ok(Command::SheetLeader {
+                sheet: (*sheet).to_string(),
+                tip: paper_point(tip)?,
+                knee: paper_point(knee)?,
+                text_pos: paper_point(text_pos)?,
+                text: words.join(" "),
+                height,
+                view_index: None,
+            })
+        }
+        "sheettag" => {
+            // sheettag <sheet> <x,y> <text> [bubble|square|diamond]
+            match args.as_slice() {
+                [sheet, pos, text] => Ok(Command::SheetTag {
+                    sheet: (*sheet).to_string(),
+                    pos: paper_point(pos)?,
+                    text: (*text).to_string(),
+                    shape: None,
+                    view_index: None,
+                }),
+                [sheet, pos, text, shape] => Ok(Command::SheetTag {
+                    sheet: (*sheet).to_string(),
+                    pos: paper_point(pos)?,
+                    text: (*text).to_string(),
+                    shape: Some(tag_shape(shape)?),
+                    view_index: None,
+                }),
+                _ => wrong(
+                    "sheettag",
+                    "a sheet name, a paper point (mm), text, and an optional shape",
                     &args,
                 ),
             }
@@ -2695,6 +2782,15 @@ fn paper_point(s: &str) -> Result<[f64; 2], ParseError> {
     match parts.as_slice() {
         [x, y] => Ok([mm_val(x)?, mm_val(y)?]),
         _ => Err(bad()),
+    }
+}
+
+fn tag_shape(s: &str) -> Result<TagShape, ParseError> {
+    match s.to_ascii_lowercase().as_str() {
+        "bubble" | "circle" | "round" => Ok(TagShape::Bubble),
+        "square" | "box" | "rect" => Ok(TagShape::Square),
+        "diamond" | "rhombus" => Ok(TagShape::Diamond),
+        _ => Err(ParseError::BadTagShape(s.to_string())),
     }
 }
 

@@ -9,7 +9,8 @@ use itsjustcad_doc::{
     format_area, format_length, format_volume, AnalysisReport, AnalysisSample, Annotation,
     Document, GeoLocation, Geometry, Grid, LayerStyle,
     LoadGeometry, Material, NamedView, ObjectId, Room, SceneObject, ScheduleRow,
-    SheetDim, SheetTable, Story, StructLoad, StructSupport, Underlay, Units,
+    SheetDim, SheetLeader, SheetTable, SheetTag, SheetText, Story, StructLoad, StructSupport,
+    TagShape, Underlay, Units,
 };
 
 use std::collections::BTreeMap;
@@ -184,6 +185,12 @@ enum Inverse {
     SheetTableRemoved(String),
     /// `sheetdim`: remove the last dim appended to a sheet.
     PopSheetDim(String),
+    /// `sheettext`: remove the last paper-space text appended to a sheet.
+    PopSheetText(String),
+    /// `sheetleader`: remove the last paper-space leader appended to a sheet.
+    PopSheetLeader(String),
+    /// `sheettag`: remove the last paper-space tag appended to a sheet.
+    PopSheetTag(String),
     /// `block`: remove the block definition this command created/replaced.
     BlockDef {
         name: String,
@@ -882,6 +889,27 @@ impl Session {
                 let sheet = sheet.clone();
                 if let Some(s) = self.doc.sheet_mut(&sheet) {
                     s.dims.pop();
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::PopSheetText(sheet) => {
+                let sheet = sheet.clone();
+                if let Some(s) = self.doc.sheet_mut(&sheet) {
+                    s.texts.pop();
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::PopSheetLeader(sheet) => {
+                let sheet = sheet.clone();
+                if let Some(s) = self.doc.sheet_mut(&sheet) {
+                    s.leaders.pop();
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::PopSheetTag(sheet) => {
+                let sheet = sheet.clone();
+                if let Some(s) = self.doc.sheet_mut(&sheet) {
+                    s.tags.pop();
                 }
                 self.doc.generation += 1;
             }
@@ -8464,6 +8492,9 @@ fn apply_forward(
                 views: Vec::new(),
                 table: None,
                 dims: Vec::new(),
+                texts: Vec::new(),
+                leaders: Vec::new(),
+                tags: Vec::new(),
             });
             doc.generation += 1;
             Ok((
@@ -8969,6 +9000,151 @@ fn apply_forward(
                     created: Vec::new(),
                     message: format!(
                         "dim on '{sheet}' view {vi} @ 1:{scale}: {paper_dist:.1}mm paper = {model_m:.3}m model"
+                    ),
+                },
+            ))
+        }
+        Command::SheetText { sheet, pos, text, height, view_index } => {
+            let height_mm = height.unwrap_or(2.5);
+            if height_mm <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "sheettext height must be positive (mm on paper)".into(),
+                ));
+            }
+            let known: Vec<String> = doc.sheets.iter().map(|s| s.name.clone()).collect();
+            let Some(s) = doc.sheet_mut(&sheet) else {
+                return Err(ExecError::Invalid(format!(
+                    "no sheet '{sheet}' (sheets: {}; create one with: sheet {sheet})",
+                    known.join(", ")
+                )));
+            };
+            if let Some(vi) = view_index
+                && vi >= s.views.len()
+                && !s.views.is_empty()
+            {
+                return Err(ExecError::Invalid(format!(
+                    "view index {vi} is out of range (sheet '{sheet}' has {} views)",
+                    s.views.len()
+                )));
+            }
+            s.texts.push(SheetText {
+                pos_mm: pos,
+                text: text.clone(),
+                height_mm,
+                view_index,
+            });
+            doc.generation += 1;
+            Ok((
+                Command::SheetText {
+                    sheet: sheet.clone(),
+                    pos,
+                    text: text.clone(),
+                    height: Some(height_mm),
+                    view_index,
+                },
+                Inverse::PopSheetText(sheet.clone()),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "text on '{sheet}' at {:.1},{:.1}mm @ {height_mm:.1}mm: \"{text}\"",
+                        pos[0], pos[1]
+                    ),
+                },
+            ))
+        }
+        Command::SheetLeader { sheet, tip, knee, text_pos, text, height, view_index } => {
+            let height_mm = height.unwrap_or(2.5);
+            if height_mm <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "sheetleader height must be positive (mm on paper)".into(),
+                ));
+            }
+            let known: Vec<String> = doc.sheets.iter().map(|s| s.name.clone()).collect();
+            let Some(s) = doc.sheet_mut(&sheet) else {
+                return Err(ExecError::Invalid(format!(
+                    "no sheet '{sheet}' (sheets: {}; create one with: sheet {sheet})",
+                    known.join(", ")
+                )));
+            };
+            if let Some(vi) = view_index
+                && vi >= s.views.len()
+                && !s.views.is_empty()
+            {
+                return Err(ExecError::Invalid(format!(
+                    "view index {vi} is out of range (sheet '{sheet}' has {} views)",
+                    s.views.len()
+                )));
+            }
+            s.leaders.push(SheetLeader {
+                tip_mm: tip,
+                knee_mm: knee,
+                text_pos_mm: text_pos,
+                text: text.clone(),
+                height_mm,
+                view_index,
+            });
+            doc.generation += 1;
+            Ok((
+                Command::SheetLeader {
+                    sheet: sheet.clone(),
+                    tip,
+                    knee,
+                    text_pos,
+                    text: text.clone(),
+                    height: Some(height_mm),
+                    view_index,
+                },
+                Inverse::PopSheetLeader(sheet.clone()),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "leader on '{sheet}': tip {:.1},{:.1} → \"{text}\"",
+                        tip[0], tip[1]
+                    ),
+                },
+            ))
+        }
+        Command::SheetTag { sheet, pos, text, shape, view_index } => {
+            let shape = shape.unwrap_or(TagShape::Bubble);
+            let known: Vec<String> = doc.sheets.iter().map(|s| s.name.clone()).collect();
+            let Some(s) = doc.sheet_mut(&sheet) else {
+                return Err(ExecError::Invalid(format!(
+                    "no sheet '{sheet}' (sheets: {}; create one with: sheet {sheet})",
+                    known.join(", ")
+                )));
+            };
+            if let Some(vi) = view_index
+                && vi >= s.views.len()
+                && !s.views.is_empty()
+            {
+                return Err(ExecError::Invalid(format!(
+                    "view index {vi} is out of range (sheet '{sheet}' has {} views)",
+                    s.views.len()
+                )));
+            }
+            s.tags.push(SheetTag {
+                pos_mm: pos,
+                text: text.clone(),
+                shape,
+                view_index,
+            });
+            doc.generation += 1;
+            Ok((
+                Command::SheetTag {
+                    sheet: sheet.clone(),
+                    pos,
+                    text: text.clone(),
+                    shape: Some(shape),
+                    view_index,
+                },
+                Inverse::PopSheetTag(sheet.clone()),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "{} tag on '{sheet}' at {:.1},{:.1}mm: \"{text}\"",
+                        shape.label(),
+                        pos[0],
+                        pos[1]
                     ),
                 },
             ))
@@ -10060,6 +10236,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::CheckRulesList | Command::CheckRulesLoad { .. } => "checkrules",
         Command::SheetTable { .. } => "sheettable",
         Command::SheetDim { .. } => "sheetdim",
+        Command::SheetText { .. } => "sheettext",
+        Command::SheetLeader { .. } => "sheetleader",
+        Command::SheetTag { .. } => "sheettag",
         Command::MeshLiteral { .. } => "mesh_literal",
         Command::PointLiteral { .. } => "point_literal",
         Command::BlockDefine { .. } => "block",

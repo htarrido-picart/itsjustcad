@@ -1137,6 +1137,43 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         view_index: Option<usize>,
     },
+    /// Add a paper-space text note to a sheet (logged). `pos` is a paper
+    /// coordinate in mm; `height` is the cap height IN MILLIMETERS ON PAPER, so
+    /// the note is scale-independent (unlike model-space `Text`).
+    SheetText {
+        sheet: String,
+        pos: [f64; 2],
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_index: Option<usize>,
+    },
+    /// Add a paper-space leader (arrow tip → knee → text) to a sheet (logged).
+    /// All points are paper coordinates in mm; `height` is the mm-on-paper cap
+    /// height. Scale-independent.
+    SheetLeader {
+        sheet: String,
+        tip: [f64; 2],
+        knee: [f64; 2],
+        text_pos: [f64; 2],
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_index: Option<usize>,
+    },
+    /// Add a paper-space callout/tag (shaped bubble + text) to a sheet (logged).
+    /// `pos` is the bubble center in paper mm. Scale-independent.
+    SheetTag {
+        sheet: String,
+        pos: [f64; 2],
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shape: Option<itsjustcad_doc::TagShape>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_index: Option<usize>,
+    },
     // -- blocks (reusable geometry definitions + instancing) --
     /// Capture the geometry of selected objects as a named block definition.
     /// The source objects remain in the scene; the definition is a snapshot.
