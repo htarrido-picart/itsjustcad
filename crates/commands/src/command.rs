@@ -3,7 +3,7 @@
 
 use glam::DVec3;
 use itsjustcad_doc::{
-    AreaKind, FrameKind, HatchPattern, NamedView, ObjectId, PaperSize,
+    AreaKind, EndpointRef, FrameKind, HatchPattern, NamedView, ObjectId, PaperSize,
     RestraintKind, Section as StructSection, Units, ViewDirection,
 };
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,31 @@ pub enum Selector {
     Last { n: usize },
     All,
     Selected,
+}
+
+/// One end of a `dim` command before exec resolves selectors to object ids.
+///
+/// - `Free(DVec3)` — an ad-hoc model point (the original behaviour).
+/// - `Object { target, which }` — an associative binding: `target` names the
+///   object (by selector) and `which` picks a well-defined point on it; exec
+///   resolves `target` to a single object id and builds a `DimAnchor::Object`.
+///
+/// Serde is `untagged`: a bare `[x,y,z]` array loads as `Free`, so pre-assocdim
+/// command logs (which stored `a`/`b` as plain `DVec3`) still replay.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum DimAnchorSpec {
+    /// Associative binding to a point on the object named by `target`.
+    Object { target: Selector, which: EndpointRef },
+    /// Free model point.
+    Free(DVec3),
+}
+
+impl DimAnchorSpec {
+    /// Convenience constructor for a free point.
+    pub fn free(p: DVec3) -> Self {
+        DimAnchorSpec::Free(p)
+    }
 }
 
 /// Mirror plane: a canonical plane through the origin, or point + normal.
@@ -480,13 +505,16 @@ pub enum Command {
         depth: f64,
     },
     // -- drafting (dimensions, notes, hatches) --
-    /// Linear dimension between two points; the measured value is derived at
-    /// display time, never stored.
+    /// Linear dimension between two anchors; the measured value is derived at
+    /// display time, never stored. Each anchor is a free model point or an
+    /// associative reference to a point on another object (`DimAnchorSpec`,
+    /// resolved to a concrete `DimAnchor` at exec time). Associative anchors
+    /// follow their referent when it moves/edits.
     Dim {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
-        a: DVec3,
-        b: DVec3,
+        a: DimAnchorSpec,
+        b: DimAnchorSpec,
         offset: f64,
     },
     Text {

@@ -3248,6 +3248,10 @@ impl App {
             };
             match ann {
                 Annotation::LinearDim { a, b, offset } => {
+                    // Resolve associative anchors to live model points so the
+                    // dimension follows referenced geometry.
+                    let (a, b) = doc.resolve_dim(a, b);
+                    let (a, b) = (&a, &b);
                     let dir = (*b - *a).normalize_or_zero();
                     let perp = glam::DVec3::new(-dir.y, dir.x, 0.0).normalize_or(glam::DVec3::X);
                     let (a2, b2) = (*a + perp * *offset, *b + perp * *offset);

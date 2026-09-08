@@ -7,7 +7,7 @@ use kernel_mesh::extrude_profile;
 use rayon::prelude::*;
 use itsjustcad_doc::{
     format_area, format_length, format_volume, AnalysisReport, AnalysisSample, Annotation,
-    Document, GeoLocation, Geometry, Grid, LayerStyle,
+    DimAnchor, Document, GeoLocation, Geometry, Grid, LayerStyle,
     LoadGeometry, Material, NamedView, ObjectId, Room, SceneObject, ScheduleRow,
     SheetDim, SheetLeader, SheetTable, SheetTag, SheetText, Story, StructLoad, StructSupport,
     TagShape, Underlay, Units,
@@ -16,7 +16,7 @@ use itsjustcad_doc::{
 use std::collections::BTreeMap;
 
 use crate::error::ExecError;
-use crate::{BoolKind, Command, CompassDir, MirrorPlane, OptionOp, Selector};
+use crate::{BoolKind, Command, CompassDir, DimAnchorSpec, MirrorPlane, OptionOp, Selector};
 
 /// Chord tolerance used when tessellating profile curves for extrusion.
 const PROFILE_TOL: f64 = 0.01;
@@ -6955,7 +6955,34 @@ fn apply_forward(
             ))
         }
         Command::Dim { id, a, b, offset } => {
-            let length = (b - a).length();
+            // Resolve each spec into a concrete `DimAnchor`: a free point stays
+            // free; an object binding resolves its selector to exactly one id and
+            // caches the referent's current point in `last` so the stored dim
+            // carries a live fallback from the start.
+            let resolve_spec = |doc: &Document, spec: &DimAnchorSpec| -> Result<DimAnchor, ExecError> {
+                match spec {
+                    DimAnchorSpec::Free(p) => Ok(DimAnchor::Free(*p)),
+                    DimAnchorSpec::Object { target, which } => {
+                        let ids = resolve(doc, target)?;
+                        if ids.len() != 1 {
+                            return Err(ExecError::Invalid(format!(
+                                "dim anchor must bind exactly one object (got {})",
+                                ids.len()
+                            )));
+                        }
+                        let oid = ids[0];
+                        let obj = doc.get(oid).ok_or_else(|| {
+                            ExecError::Invalid(format!("dim references unknown object {oid}"))
+                        })?;
+                        let last = which.extract(&obj.geometry.bound_points(), obj.geometry.aabb());
+                        Ok(DimAnchor::Object { id: oid, which: *which, last })
+                    }
+                }
+            };
+            let anchor_a = resolve_spec(doc, &a)?;
+            let anchor_b = resolve_spec(doc, &b)?;
+            let (ra, rb) = doc.resolve_dim(&anchor_a, &anchor_b);
+            let length = (rb - ra).length();
             if length < 1e-9 {
                 return Err(ExecError::Invalid(
                     "dimension points must be distinct".into(),
@@ -6970,7 +6997,11 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
-                geometry: Geometry::Annotation(Annotation::LinearDim { a, b, offset }),
+                geometry: Geometry::Annotation(Annotation::LinearDim {
+                    a: anchor_a,
+                    b: anchor_b,
+                    offset,
+                }),
             });
             Ok((
                 Command::Dim { id: Some(id), a, b, offset },
@@ -12616,12 +12647,119 @@ mod tests {
         let Geometry::Annotation(Annotation::LinearDim { a, b, .. }) = &obj.geometry else {
             panic!("expected dim")
         };
-        assert_eq!(*a, DVec3::new(0.0, 5.0, 0.0));
-        assert_eq!(*b, DVec3::new(10.0, 5.0, 0.0));
+        assert_eq!(a.point(), DVec3::new(0.0, 5.0, 0.0));
+        assert_eq!(b.point(), DVec3::new(10.0, 5.0, 0.0));
         run(&mut s, "delete last");
         assert_eq!(s.doc.len(), 0);
         run(&mut s, "undo");
         assert_eq!(s.doc.len(), 1);
+    }
+
+    /// Helper: resolved (a, b) points of the single dim in the doc.
+    fn dim_points(s: &Session) -> (DVec3, DVec3) {
+        let obj = s
+            .doc
+            .objects()
+            .find(|o| matches!(&o.geometry, Geometry::Annotation(Annotation::LinearDim { .. })))
+            .expect("a dim exists");
+        let Geometry::Annotation(Annotation::LinearDim { a, b, .. }) = &obj.geometry else {
+            unreachable!()
+        };
+        s.doc.resolve_dim(a, b)
+    }
+
+    /// M-assocdim core proof: a dim bound to a line's endpoints follows the line
+    /// when it moves — the resolved length/points update, without touching the
+    /// dim itself.
+    #[test]
+    fn associative_dim_follows_moved_object() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "name last wall");
+        // Bind both anchors to the line's start/end via the `@obj.endpoint` form.
+        run(&mut s, "dim @wall.start @wall.end 0.5");
+        assert_eq!(dim_points(&s), (DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0)));
+
+        // Move the LINE by name; the dim (object 2) is untouched but follows.
+        run(&mut s, "move wall 0,5,0");
+        let (a, b) = dim_points(&s);
+        assert_eq!(a, DVec3::new(0.0, 5.0, 0.0), "start follows line");
+        assert_eq!(b, DVec3::new(10.0, 5.0, 0.0), "end follows line");
+        assert!(((b - a).length() - 10.0).abs() < 1e-9, "length preserved");
+    }
+
+    /// A free-point dim is unaffected when an unrelated object moves.
+    #[test]
+    fn free_dim_unaffected_by_other_object_move() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "name last wall");
+        run(&mut s, "dim 0,0,0 10,0,0 0.5"); // free anchors
+        let before = dim_points(&s);
+        run(&mut s, "move wall 0,5,0");
+        assert_eq!(dim_points(&s), before, "free dim stays put");
+    }
+
+    /// Moving the associative dim object itself does not translate its object
+    /// anchors (they follow the referent); it stays bound to the line.
+    #[test]
+    fn moving_associative_dim_does_not_break_binding() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "dim @last.start @last.end 0.5");
+        run(&mut s, "name last thedim");
+        run(&mut s, "move thedim 0,9,0");
+        // Object anchors ignore the translate → still resolve to the line.
+        assert_eq!(dim_points(&s), (DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0)));
+    }
+
+    /// Deleting the referenced object degrades the dim to its last-known points
+    /// (no panic), and the dim survives as an orphan.
+    #[test]
+    fn deleting_referent_degrades_dim_gracefully() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "name last wall");
+        run(&mut s, "dim @wall.start @wall.end 0.5");
+        run(&mut s, "delete wall");
+        assert_eq!(s.doc.len(), 1, "dim remains after referent delete");
+        // Resolves to the cached last points captured at creation — no panic.
+        assert_eq!(dim_points(&s), (DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0)));
+    }
+
+    /// Replay determinism: create dim → move object → reload from the op-log
+    /// yields the same resolved dim.
+    #[test]
+    fn associative_dim_replay_is_deterministic() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "name last wall");
+        run(&mut s, "dim @wall.start @wall.end 0.5");
+        run(&mut s, "move wall 0,5,0");
+        let want = dim_points(&s);
+
+        let json = crate::io::to_json(&s);
+        assert!(json.contains("\"which\""), "object anchor serialized: {json}");
+        let loaded = crate::io::from_json(&json).unwrap();
+        assert_eq!(dim_points(&loaded), want, "replayed dim resolves identically");
+        assert_eq!(crate::io::to_json(&loaded), json, "replay-stable");
+    }
+
+    /// The `dim` verb still parses/creates a free-point dim (backward compat)
+    /// and errors clearly when an object binding matches multiple objects.
+    #[test]
+    fn dim_verb_free_and_multi_object_binding_error() {
+        let mut s = Session::default();
+        run(&mut s, "dim 0,0,0 10,0,0"); // free form, default offset
+        assert_eq!(dim_points(&s), (DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0)));
+
+        // Two lines named the same → `@twins.start` matches 2 objects → error.
+        run(&mut s, "line 0,0,0 1,0,0");
+        run(&mut s, "name last twins");
+        run(&mut s, "line 2,0,0 3,0,0");
+        run(&mut s, "name last twins");
+        let err = s.run(parse("dim @twins.start @twins.end 0.5").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("exactly one"), "{err}");
     }
 
     #[test]

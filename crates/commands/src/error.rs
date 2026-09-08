@@ -37,6 +37,8 @@ pub enum ParseError {
     BadScale(String),
     #[error("'{0}' is not a tag shape; use bubble, square or diamond")]
     BadTagShape(String),
+    #[error("{0}")]
+    BadDimAnchor(String),
 }
 
 fn suggest(s: &Option<String>) -> String {

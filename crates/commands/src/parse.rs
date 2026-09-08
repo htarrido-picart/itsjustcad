@@ -3,13 +3,13 @@
 
 use glam::DVec3;
 use itsjustcad_doc::{
-    AreaKind, FrameKind, HatchPattern, LoadGeometry, PaperSize, RestraintKind,
+    AreaKind, EndpointRef, FrameKind, HatchPattern, LoadGeometry, PaperSize, RestraintKind,
     Section as StructSection, TagShape, Units, ViewDirection, METERS_PER_FOOT, METERS_PER_INCH,
 };
 
 use crate::error::ParseError;
 use crate::registry::registry;
-use crate::{BoolKind, Command, CompassDir, MirrorPlane, OptionOp, Selector};
+use crate::{BoolKind, Command, CompassDir, DimAnchorSpec, MirrorPlane, OptionOp, Selector};
 
 /// Hand-rolled `verb arg arg...` parser. Chosen over a combinator library
 /// because error message quality feeds the LLM retry loop.
@@ -399,15 +399,25 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             })
         }
         "dim" => {
-            let (offset, pts) = match args.as_slice() {
+            // Each anchor is either a free point (`x,y[,z]`) or an associative
+            // binding `@<selector>.<endpoint>` (e.g. `@last.start`, `@wall.end`,
+            // `@a1b2c3d4.c0`, `@last.center`). Offset is an optional trailing
+            // number that must not itself parse as a point.
+            let (offset, ends) = match args.as_slice() {
                 [a, b] => (DEFAULT_DIM_OFFSET, [*a, *b]),
                 [a, b, off] => (number(off)?, [*a, *b]),
-                _ => return wrong("dim", "two points and an optional offset", &args),
+                _ => {
+                    return wrong(
+                        "dim",
+                        "two points/@obj.endpoint anchors and an optional offset",
+                        &args,
+                    )
+                }
             };
             Ok(Command::Dim {
                 id: None,
-                a: point(pts[0])?,
-                b: point(pts[1])?,
+                a: dim_anchor(ends[0])?,
+                b: dim_anchor(ends[1])?,
                 offset,
             })
         }
@@ -2863,6 +2873,23 @@ fn selector_one(s: &str) -> Result<Selector, ParseError> {
     selector(&args, "extrude").map(|(sel, _)| sel)
 }
 
+/// Parse one `dim` anchor: either a free point (`x,y[,z]`) or an associative
+/// binding `@<selector>.<endpoint>` where `<endpoint>` is
+/// `start|end|center|cN|vN` (see [`EndpointRef::parse`]). The selector is a
+/// single-object selector (`last`, a name, or a short id) resolved at exec time.
+fn dim_anchor(tok: &str) -> Result<DimAnchorSpec, ParseError> {
+    if let Some(rest) = tok.strip_prefix('@') {
+        let (sel_str, ep_str) = rest
+            .rsplit_once('.')
+            .ok_or_else(|| ParseError::BadDimAnchor("dim binding needs @<object>.<endpoint>".into()))?;
+        let which = EndpointRef::parse(ep_str)
+            .ok_or_else(|| ParseError::BadDimAnchor(format!("bad dim endpoint '{ep_str}'")))?;
+        let target = selector_one(sel_str)?;
+        return Ok(DimAnchorSpec::Object { target, which });
+    }
+    Ok(DimAnchorSpec::Free(point(tok)?))
+}
+
 fn closest_command(input: &str) -> Option<String> {
     registry()
         .iter()
@@ -4107,8 +4134,8 @@ mod tests {
             parse("dim 0,0 10,0").unwrap(),
             Command::Dim {
                 id: None,
-                a: DVec3::ZERO,
-                b: DVec3::new(10.0, 0.0, 0.0),
+                a: DimAnchorSpec::free(DVec3::ZERO),
+                b: DimAnchorSpec::free(DVec3::new(10.0, 0.0, 0.0)),
                 offset: DEFAULT_DIM_OFFSET,
             }
         );

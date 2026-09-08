@@ -44,7 +44,7 @@ fn project(dir: ViewDirection, p: DVec3) -> DVec2 {
 }
 
 /// World-space line segments worth drawing for one object.
-fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
+fn geometry_segments(doc: &Document, geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
     match geometry {
         Geometry::Curve(curve) => {
             let pts = curve.tessellate(PRINT_TOL);
@@ -65,6 +65,9 @@ fn geometry_segments(geometry: &Geometry, out: &mut Vec<(DVec3, DVec3)>) {
         // LinearDim annotations: render the three dim-line segments (two witness
         // lines + one dim line) so they appear inside viewport projections.
         Geometry::Annotation(Annotation::LinearDim { a, b, offset }) => {
+            // Resolve associative anchors to live model points.
+            let (a, b) = doc.resolve_dim(a, b);
+            let (a, b) = (&a, &b);
             // Perpendicular direction in the XY plane (dim offset is already in
             // model-space meters; positive = left of a→b).
             let dir = (*b - *a).normalize_or_zero();
@@ -389,7 +392,7 @@ fn render_view(
         if obj.visible && doc.layer_visible(&obj.layer) {
             let w = doc.effective_lineweight(obj);
             let mut tmp = Vec::new();
-            geometry_segments(&obj.geometry, &mut tmp);
+            geometry_segments(doc, &obj.geometry, &mut tmp);
             // Planting plan: in a Top (plan) view, a mesh named `plant:<id>`
             // also draws its 2D drafting symbol atop the 3D feature edges. Plan
             // glyphs are meaningless in elevation/iso, so gate on direction.
@@ -472,6 +475,8 @@ fn render_view(
         if let Geometry::Annotation(Annotation::LinearDim { a: da, b: db, offset: dim_off }) =
             &obj.geometry
         {
+            let (da, db) = doc.resolve_dim(da, db);
+            let (da, db) = (&da, &db);
             let dir = (*db - *da).normalize_or_zero();
             let perp = DVec3::new(-dir.y, dir.x, 0.0) * *dim_off;
             // Position label at the midpoint of the dim line.

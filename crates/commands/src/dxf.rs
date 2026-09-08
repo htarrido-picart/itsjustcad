@@ -146,9 +146,18 @@ fn annotation_entity(
     layer: &str,
     a: &Annotation,
     units: itsjustcad_doc::Units,
+    doc: Option<&Document>,
 ) -> usize {
     match a {
         Annotation::LinearDim { a, b, offset } => {
+            // Resolve associative anchors to live points when a document is
+            // available (top-level objects); block-baked dims have no document
+            // and fall back to their last-known/free points.
+            let (a, b) = match doc {
+                Some(d) => d.resolve_dim(a, b),
+                None => (a.point(), b.point()),
+            };
+            let (a, b) = (&a, &b);
             // Dimension line offset to the left of a->b, value as TEXT.
             let dir = (*b - *a).normalize_or_zero();
             let left = DVec3::new(-dir.y, dir.x, 0.0) * *offset;
@@ -188,7 +197,7 @@ fn block_entity(
     match g {
         BlockGeometry::Curve(c) => curve_entity(t, layer, c),
         BlockGeometry::Mesh(m) => mesh_entity(t, layer, m),
-        BlockGeometry::Annotation(a) => annotation_entity(t, layer, a, units),
+        BlockGeometry::Annotation(a) => annotation_entity(t, layer, a, units, None),
     }
 }
 
@@ -206,13 +215,19 @@ fn insert(t: &mut Tags, layer: &str, name: &str, position: DVec3, rotation_deg: 
 }
 
 /// One document object -> zero or more entities. Returns entities written.
-fn entity(t: &mut Tags, layer: &str, geometry: &Geometry, units: itsjustcad_doc::Units) -> usize {
+fn entity(
+    t: &mut Tags,
+    layer: &str,
+    geometry: &Geometry,
+    units: itsjustcad_doc::Units,
+    doc: &Document,
+) -> usize {
     match geometry {
         Geometry::Curve(curve) => curve_entity(t, layer, curve),
         Geometry::Mesh(mesh) | Geometry::Frame { mesh, .. } | Geometry::Area { mesh, .. } => {
             mesh_entity(t, layer, mesh)
         }
-        Geometry::Annotation(a) => annotation_entity(t, layer, a, units),
+        Geometry::Annotation(a) => annotation_entity(t, layer, a, units, Some(doc)),
         // Block instances export as an INSERT referencing the sanitized block
         // name written in the BLOCKS section (R12 supports internal blocks; only
         // XREFs are unsupported). Parametric instances are baked: their geometry
@@ -285,7 +300,7 @@ pub fn document_dxf(doc: &Document) -> (String, usize) {
     t.tag(2, "ENTITIES");
     let mut count = 0usize;
     for obj in doc.objects() {
-        count += entity(&mut t, &dxf_layer(&obj.layer), &obj.geometry, doc.units);
+        count += entity(&mut t, &dxf_layer(&obj.layer), &obj.geometry, doc.units, doc);
     }
     t.tag(0, "ENDSEC");
     t.tag(0, "EOF");
@@ -807,8 +822,13 @@ fn map_block_geom_points(
             *height *= rscale.abs();
         }
         BlockGeometry::Annotation(Annotation::LinearDim { a, b, .. }) => {
-            *a = xf(*a);
-            *b = xf(*b);
+            // Block dims are baked/free; transform their stored points in place.
+            if let itsjustcad_doc::DimAnchor::Free(p) = a {
+                *p = xf(*p);
+            }
+            if let itsjustcad_doc::DimAnchor::Free(p) = b {
+                *p = xf(*p);
+            }
         }
         BlockGeometry::Annotation(Annotation::Hatch { boundary, .. }) => {
             for p in boundary.iter_mut() {
@@ -846,7 +866,24 @@ fn command_to_block_geometry(cmd: &crate::Command) -> Option<itsjustcad_doc::Blo
             BlockGeometry::Annotation(Annotation::Text { pos: *pos, text: text.clone(), height: *height })
         }
         Command::Dim { a, b, offset, .. } => {
-            BlockGeometry::Annotation(Annotation::LinearDim { a: *a, b: *b, offset: *offset })
+            // Block-baked dims are static: fold each anchor spec to its stored
+            // point (free points keep their value; object bindings bake to the
+            // referent's point at bake time — blocks carry no live document).
+            use itsjustcad_doc::DimAnchor;
+            let bake = |spec: &crate::DimAnchorSpec| -> DimAnchor {
+                match spec {
+                    crate::DimAnchorSpec::Free(p) => DimAnchor::Free(*p),
+                    // Object bindings can't resolve here (no document); the
+                    // caller only reaches this for dims created inside a block
+                    // body, where free points are the norm. Degrade to origin.
+                    crate::DimAnchorSpec::Object { .. } => DimAnchor::Free(DVec3::ZERO),
+                }
+            };
+            BlockGeometry::Annotation(Annotation::LinearDim {
+                a: bake(a),
+                b: bake(b),
+                offset: *offset,
+            })
         }
         _ => return None,
     })
@@ -859,8 +896,9 @@ fn translate_block_geom(g: &mut itsjustcad_doc::BlockGeometry, d: DVec3) {
         BlockGeometry::Curve(c) => c.translate(d),
         BlockGeometry::Annotation(Annotation::Text { pos, .. }) => *pos += d,
         BlockGeometry::Annotation(Annotation::LinearDim { a, b, .. }) => {
-            *a += d;
-            *b += d;
+            // Free anchors translate; object bindings follow their referent.
+            a.translate(d);
+            b.translate(d);
         }
         BlockGeometry::Annotation(Annotation::Hatch { boundary, .. }) => {
             boundary.iter_mut().for_each(|p| *p += d);
@@ -985,7 +1023,12 @@ fn record_entity(
                     } else {
                         0.0
                     };
-                    Some(Command::Dim { id: None, a, b, offset })
+                    Some(Command::Dim {
+                        id: None,
+                        a: crate::DimAnchorSpec::free(a),
+                        b: crate::DimAnchorSpec::free(b),
+                        offset,
+                    })
                 }
                 _ => None,
             }
@@ -1483,8 +1526,8 @@ mod tests {
         assert_eq!(parsed.entities.len(), 1, "linear DIMENSION should import");
         match &parsed.entities[0].1 {
             Command::Dim { a, b, offset, .. } => {
-                assert_eq!(*a, DVec3::new(0.0, 0.0, 0.0));
-                assert_eq!(*b, DVec3::new(10.0, 0.0, 0.0));
+                assert_eq!(*a, crate::DimAnchorSpec::free(DVec3::new(0.0, 0.0, 0.0)));
+                assert_eq!(*b, crate::DimAnchorSpec::free(DVec3::new(10.0, 0.0, 0.0)));
                 assert!((offset - 3.0).abs() < 1e-9, "offset {offset}");
             }
             other => panic!("expected Dim, got {other:?}"),

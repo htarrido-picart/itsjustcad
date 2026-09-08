@@ -31,7 +31,7 @@ fn project(dir: ViewDirection, p: DVec3) -> DVec2 {
 }
 
 /// World-space line segments for one geometry object (mirrors pdf.rs `geometry_segments`).
-fn collect_segments(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
+fn collect_segments(doc: &Document, geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
     let mut segs = Vec::new();
     match geometry {
         Geometry::Curve(curve) => {
@@ -49,6 +49,8 @@ fn collect_segments(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
             segs.extend(crate::dxf::mesh_feature_edges(mesh));
         }
         Geometry::Annotation(Annotation::LinearDim { a, b, offset }) => {
+            let (a, b) = doc.resolve_dim(a, b);
+            let (a, b) = (&a, &b);
             let dir = (*b - *a).normalize_or_zero();
             let perp = DVec3::new(-dir.y, dir.x, 0.0) * *offset;
             let a_off = *a + perp;
@@ -165,7 +167,7 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
             .find(|l| l.name == obj.layer)
             .unwrap_or(&mut orphan);
 
-        let mut world_segs = collect_segments(&obj.geometry);
+        let mut world_segs = collect_segments(doc, &obj.geometry);
         // Planting plan: a mesh named `plant:<id>` also emits its 2D top-view
         // drafting symbol. Only in the Top (plan) projection — a plan glyph is
         // meaningless in elevation/iso. The 3D mesh feature edges still export;

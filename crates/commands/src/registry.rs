@@ -248,8 +248,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "dim",
-            usage: "dim <a x,y,z> <b x,y,z> [offset]",
-            summary: "Linear dimension between two points; the measured distance is displayed automatically. Offset (default 0.5) places the dimension line left of a->b. Example: dim 0,0 10,0 0.8",
+            usage: "dim <a> <b> [offset]   where each anchor is `x,y,z` or `@<object>.<endpoint>`",
+            summary: "Linear dimension between two anchors; the measured distance is displayed automatically. Each anchor is a free point (x,y,z) OR an associative binding @<object>.<endpoint> that follows the referenced object when it moves. <object> is a selector (last, a name, or short id); <endpoint> is start|end|center|cN (bbox corner 0-7)|vN (vertex index). Offset (default 0.5) places the dimension line left of a->b. Examples: dim 0,0 10,0 0.8 · dim @wall.start @wall.end · dim @last.center @beam.end 0.5",
             category: Category::Dimension,
         },
         CommandSpec {
