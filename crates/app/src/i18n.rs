@@ -186,6 +186,7 @@ static EN: &[(&str, &str)] = &[
     ("menu.view", "View"),
     ("menu.theme", "Theme"),
     ("menu.llm", "LLM"),
+    ("menu.plugins", "Plugins"),
     ("menu.window", "Window"),
     ("menu.help", "Help"),
     // ── Menu: File ──
@@ -246,7 +247,8 @@ static EN: &[(&str, &str)] = &[
     ("menu.llm.local_only", "Local Only"),
     ("menu.llm.web_search", "Allow Web Search"),
     ("menu.llm.terse", "Terse Replies"),
-    ("menu.llm.plugins", "Plugins…"),
+    // ── Menu: Plugins (top-level) ──
+    ("menu.plugins.manage", "Plugins…"),
     // ── Menu: Window (in-window fallback labels; native bar uses OS items) ──
     ("menu.window.minimize", "Minimize"),
     ("menu.window.zoom", "Zoom"),
@@ -348,6 +350,7 @@ static ES: &[(&str, &str)] = &[
     ("menu.view", "Vista"),
     ("menu.theme", "Tema"),
     ("menu.llm", "IA"),
+    ("menu.plugins", "Complementos"),
     ("menu.window", "Ventana"),
     ("menu.help", "Ayuda"),
     // ── Menú: Archivo ──
@@ -408,7 +411,8 @@ static ES: &[(&str, &str)] = &[
     ("menu.llm.local_only", "Solo local"),
     ("menu.llm.web_search", "Permitir búsqueda web"),
     ("menu.llm.terse", "Respuestas concisas"),
-    ("menu.llm.plugins", "Complementos…"),
+    // ── Menú: Complementos (nivel superior) ──
+    ("menu.plugins.manage", "Complementos…"),
     // ── Menú: Ventana ──
     ("menu.window.minimize", "Minimizar"),
     ("menu.window.zoom", "Zoom"),

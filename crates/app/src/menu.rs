@@ -42,7 +42,7 @@ pub enum MenuAction {
     ModelSetup,
     /// Open the Plugins popup window: installed user/LLM-authored macros as
     /// cards, with search + per-card run/JSON/reload/delete. Modeless, like
-    /// Model Setup / About. Fired by the LLM ▸ Plugins… menu item.
+    /// Model Setup / About. Fired by the top-level Plugins ▸ Plugins… menu item.
     ShowPlugins,
     /// Open the Edit history / amend panel as a modal (the command line is the
     /// op-log scrollback; this exposes step-jump + amend on demand).
@@ -275,7 +275,7 @@ pub fn menu_action(verb: &str) -> MenuAction {
 /// Transform / …) were removed; the registry still drives the palette, deck
 /// prompt, and autosuggest.
 #[allow(dead_code)] // documented contract; referenced by tests
-pub const TOP_TITLES: [&str; 5] = ["File", "Edit", "View", "Theme", "LLM"];
+pub const TOP_TITLES: [&str; 6] = ["File", "Edit", "View", "Theme", "LLM", "Plugins"];
 
 // ── Native menu model (muda) ─────────────────────────────────────────────────
 // The in-window egui menu bar (`ui` below) and the true native OS menu bar
@@ -467,6 +467,7 @@ fn menu_title_key(id: &str) -> &'static str {
         "View" => "menu.view",
         "Theme" => "menu.theme",
         "LLM" => "menu.llm",
+        "Plugins" => "menu.plugins",
         "Window" => "menu.window",
         "Help" => "menu.help",
         _ => "menu.file",
@@ -757,16 +758,6 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                 action: MenuAction::DownloadDefaultModel,
             },
             NativeItem::Separator,
-            // Plugins… opens the plugins popup window (cards + search), NOT a
-            // right-dock tab. User/LLM-authored macros are managed here.
-            NativeItem::Leaf {
-                id: format!("{t}/plugins"),
-                label: tr("menu.llm.plugins").into(),
-                shortcut: None,
-                enabled: true,
-                action: MenuAction::ShowPlugins,
-            },
-            NativeItem::Separator,
             NativeItem::Check {
                 id: format!("{t}/local_only"),
                 label: tr("menu.llm.local_only").into(),
@@ -789,6 +780,24 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                 enabled: true,
             },
         ];
+        menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
+    }
+
+    // ── Plugins ───────────────────────────────────────────────────────────────
+    // A dedicated top-level menu (sibling of File/Edit/View/Theme/LLM). Its one
+    // leaf, Plugins…, opens the plugins popup window (installed user/LLM-authored
+    // macros as cards, with search + per-card run/JSON/reload/delete) via the
+    // existing ShowPlugins action — the same modeless popup Model Setup / About
+    // use. Kept out of LLM so it reads as its own root-level surface.
+    {
+        let t = "Plugins";
+        let items = vec![NativeItem::Leaf {
+            id: format!("{t}/manage"),
+            label: tr("menu.plugins.manage").into(),
+            shortcut: None,
+            enabled: true,
+            action: MenuAction::ShowPlugins,
+        }];
         menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
     }
 
@@ -873,7 +882,7 @@ fn leaf_icon(id: &str, _label: &str) -> Icon {
         "import" => return Icon::Import,
         "export" => return Icon::Export,
         "settings" => return Icon::Model,
-        "plugins" => return Icon::ToolsCat, // lucide "wrench"
+        "manage" => return Icon::ToolsCat, // Plugins… — lucide "wrench"
         "close" | "quit" => return Icon::Close,
         "undo" => return Icon::Undo,
         "redo" => return Icon::Redo,
@@ -1108,7 +1117,7 @@ mod tests {
         // The geometry-free top titles are the documented contract. Displayed
         // titles are localized; assert against the active-locale catalog values
         // (via `tr`) so the test is language-independent.
-        assert_eq!(TOP_TITLES, ["File", "Edit", "View", "Theme", "LLM"]);
+        assert_eq!(TOP_TITLES, ["File", "Edit", "View", "Theme", "LLM", "Plugins"]);
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
             let titles: Vec<String> =
                 native_model(style, true, ViewState::default()).iter().map(|m| m.title.clone()).collect();
@@ -1118,6 +1127,7 @@ mod tests {
                 tr("menu.view").into(),
                 tr("menu.theme").into(),
                 tr("menu.llm").into(),
+                tr("menu.plugins").into(),
             ];
             #[cfg(target_os = "macos")]
             expected.push(tr("menu.window").to_string());
@@ -1130,9 +1140,11 @@ mod tests {
     fn no_geometry_category_menus_present() {
         // The removed category menus (Draw/Curve/Solid/Transform/Modify/Dimension/
         // Analyze/Structure/Tools/Format) must not appear as top-level menus.
+        // NB: "Plugins" is now a LEGITIMATE top-level menu (root-level plugins
+        // popup) — it is intentionally absent from this banned list.
         let banned = [
             "Draw", "Curve", "Solid", "Transform", "Modify", "Dimension", "Annotate",
-            "Analyze", "Structure", "Tools", "Format", "Boolean", "Plugins",
+            "Analyze", "Structure", "Tools", "Format", "Boolean",
         ];
         for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
             for m in native_model(style, true, ViewState::default()) {
@@ -1265,12 +1277,12 @@ mod tests {
         assert!(by_action(&MenuAction::ModelSetup), "Model Setup missing");
         assert!(by_action(&MenuAction::RevealModelsFolder), "Reveal Models Folder missing");
         assert!(by_action(&MenuAction::DownloadDefaultModel), "Download Default missing");
-        // Plugins… opens the plugins popup window (cards + search), routed via
-        // ShowPlugins — it is NOT a right-dock tab.
-        assert!(by_action(&MenuAction::ShowPlugins), "Plugins… item missing");
+        // Plugins… MOVED to its own root-level Plugins menu — it must no longer
+        // appear under LLM (see `plugins_menu_is_top_level_and_routes_show`).
+        assert!(!by_action(&MenuAction::ShowPlugins), "Plugins… must not be in the LLM menu");
         assert!(
-            ls.iter().any(|(id, _, a)| id == "LLM/plugins" && *a == MenuAction::ShowPlugins),
-            "Plugins… must have the stable id LLM/plugins routing ShowPlugins"
+            !ls.iter().any(|(id, _, _)| id == "LLM/plugins"),
+            "stale LLM/plugins leaf must be gone"
         );
         // Two checkable toggles with stable ids the app syncs against.
         let checks: Vec<&str> = llm
@@ -1284,6 +1296,25 @@ mod tests {
         assert!(checks.contains(&"LLM/local_only"), "Local Only toggle missing");
         assert!(checks.contains(&"LLM/web_search"), "Allow Web Search toggle missing");
         assert!(checks.contains(&"LLM/terse"), "Terse Replies toggle missing");
+    }
+
+    #[test]
+    fn plugins_menu_is_top_level_and_routes_show() {
+        // Owner intent: Plugins is its OWN top-level menu (sibling of LLM), with a
+        // single leaf that opens the plugins popup via the existing ShowPlugins.
+        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+            let plugins = native_model(style, true, ViewState::default())
+                .into_iter()
+                .find(|m| m.title == tr("menu.plugins"))
+                .expect("Plugins menu present at top level");
+            let ls = leaves(&[plugins]);
+            assert!(
+                ls.iter().any(|(id, l, a)| id == "Plugins/manage"
+                    && l == tr("menu.plugins.manage")
+                    && *a == MenuAction::ShowPlugins),
+                "Plugins ▸ Plugins… must have id Plugins/manage routing ShowPlugins ({style:?})"
+            );
+        }
     }
 
     #[test]
