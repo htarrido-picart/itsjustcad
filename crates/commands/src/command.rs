@@ -1250,6 +1250,11 @@ pub enum Command {
         target: Selector,
         params: std::collections::BTreeMap<String, String>,
     },
+    /// Flatten selected **parametric** objects to plain static meshes
+    /// (M-parametric `freeze`/`bake`): keeps the derived geometry but drops the
+    /// generator + params, so the object is no longer editable and leaves the
+    /// Parameters tab. Non-parametric objects in the selection are left as-is.
+    Freeze { target: Selector },
     /// Delete a block definition (plain or parametric) by name. Refuses while
     /// instances of it exist in the scene — delete the instances first, so a
     /// definition can never be orphaned out from under live geometry.

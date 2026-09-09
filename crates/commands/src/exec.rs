@@ -9633,6 +9633,43 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Freeze { target } => {
+            let ids = resolve(doc, &target)?;
+            let mut snapshots: Vec<(ObjectId, Geometry)> = Vec::new();
+            let mut frozen = 0usize;
+            for id in &ids {
+                let is_param = matches!(
+                    doc.get(*id).map(|o| &o.geometry),
+                    Some(Geometry::Parametric { .. })
+                );
+                if !is_param {
+                    continue;
+                }
+                let prev = doc.get(*id).expect("resolved").geometry.clone();
+                if let Geometry::Parametric { mesh, .. } = &prev {
+                    let flat = Geometry::Mesh(mesh.clone());
+                    if let Some(o) = doc.get_mut(*id) {
+                        o.geometry = flat;
+                    }
+                    snapshots.push((*id, prev));
+                    frozen += 1;
+                }
+            }
+            if frozen == 0 {
+                return Err(ExecError::Invalid(
+                    "freeze: selection has no parametric objects".into(),
+                ));
+            }
+            doc.generation += 1;
+            Ok((
+                Command::Freeze { target },
+                Inverse::SetGeometry(snapshots),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("freeze: flattened {frozen} parametric object(s)"),
+                },
+            ))
+        }
         Command::BlockDeleteDef { name } => {
             // Guard: refuse while live instances reference this definition. A
             // plain-block instance points `block` at the name; a dynamic-block
@@ -10431,6 +10468,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::BlockParamDefine { .. } => "pblock",
         Command::BlockParamSet { .. } => "param",
         Command::ParamSet { .. } => "paramset",
+        Command::Freeze { .. } => "freeze",
         Command::BlockDeleteDef { .. } => "blockdelete",
         Command::BlocksList => "blocks",
         Command::Workdir { .. } => "workdir",
@@ -15267,6 +15305,38 @@ mod tests {
             }
             g => panic!("expected parametric, got {g:?}"),
         }
+    }
+
+    #[test]
+    fn freeze_flattens_parametric_to_mesh_undo_redo() {
+        let mut s = Session::default();
+        let id = run(&mut s, "geodesic 3 5 dome").created[0];
+        assert!(matches!(
+            &s.doc.get(id).unwrap().geometry,
+            Geometry::Parametric { .. }
+        ));
+        let before = mesh_of(&s, id).positions().len();
+        run(&mut s, "freeze last");
+        // Now a plain mesh, same geometry, not parametric.
+        assert!(matches!(&s.doc.get(id).unwrap().geometry, Geometry::Mesh(_)));
+        assert_eq!(mesh_of(&s, id).positions().len(), before, "geometry preserved");
+        // paramset no longer applies.
+        assert!(s.run(parse("paramset last frequency=5").unwrap()).is_err());
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(matches!(
+            &s.doc.get(id).unwrap().geometry,
+            Geometry::Parametric { .. }
+        ));
+        run(&mut s, "redo");
+        assert!(matches!(&s.doc.get(id).unwrap().geometry, Geometry::Mesh(_)));
+    }
+
+    #[test]
+    fn freeze_errors_when_no_parametric_selected() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        assert!(s.run(parse("freeze last").unwrap()).is_err());
     }
 
     #[test]

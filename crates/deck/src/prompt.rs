@@ -363,6 +363,7 @@ Emit commands inside a ```draft fenced block, ONE command per line. Commands exe
 
 ## Command catalog (name — one-line summary, grouped by category)
 This is the COMPLETE command set: every verb ItsJustCAD supports. You see each command's NAME and a terse summary. Before using a verb whose exact arguments you are unsure of, emit `help <verb>` (e.g. `help geodesic`) in a ```draft block on its OWN — the app replies with that verb's full syntax, arguments, and worked examples, threaded back to you so you can then call it correctly. Never tell the user a capability "doesn't exist" without checking this list first: if it is named here, it exists.
+The form-finding generators (geodesic, spaceframe, hypar, gaussvault, gridshell, funicular, tensegrity, cablenet) build LIVE PARAMETRIC structures: they stay editable after creation via `paramset <sel> key=value` (e.g. `paramset last frequency=4`), shown in the Parameters tab. Use `freeze <sel>` to flatten one to a static mesh.
 {catalog}
 {selectors}
 {plugin_block}

@@ -894,6 +894,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Structure,
         },
         CommandSpec {
+            name: "freeze",
+            usage: "freeze <selector>",
+            summary: "Flatten selected parametric structures to plain static meshes (alias: bake): keeps the geometry but drops the generator + params, so they leave the Parameters tab and are no longer editable. Example: freeze last · freeze sel",
+            category: Category::Structure,
+        },
+        CommandSpec {
             name: "blockdelete",
             usage: "blockdelete <name>",
             summary: "Delete a block definition (plain or parametric). Refuses while instances of it exist — delete the instances first. Example: blockdelete door",

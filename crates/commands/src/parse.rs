@@ -1540,6 +1540,11 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             }
             Ok(Command::ParamSet { target: sel, params })
         }
+        // freeze/bake <selector> — flatten parametric objects to static mesh.
+        "freeze" | "bake" => {
+            let (sel, _rest) = selector(&args, "freeze")?;
+            Ok(Command::Freeze { target: sel })
+        }
         // -- sketch constraints --
         "constrain" => {
             let Some((kind_tok, rest)) = args.split_first() else {
