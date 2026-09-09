@@ -525,6 +525,12 @@ pub struct App {
     /// The download in flight from the Model Setup panel, if any. The UI polls
     /// its [`crate::download::DownloadState`] each frame.
     active_download: Option<ActiveDownload>,
+    /// Whether the Render ▸ Local Renderer Setup panel is open.
+    show_render_setup: bool,
+    /// Bundled catalog of downloadable local Stable Diffusion weights.
+    sd_catalog: crate::sd_catalog::SdCatalog,
+    /// The SD-weights download in flight from the Render Setup panel, if any.
+    active_sd_download: Option<ActiveSdDownload>,
     /// Lucide line-icon texture cache for the chrome (menu bar, tab strip).
     /// Decodes + uploads each icon once, on first draw.
     icons: crate::icons::Icons,
@@ -708,6 +714,17 @@ struct ActiveDownload {
     handle: crate::download::Download,
     /// Set once the terminal state (Done/Failed) has been handled — the Done
     /// cassette persisted, or the failure announced — so it happens only once.
+    persisted: bool,
+}
+
+/// A downloading Stable Diffusion weight file (base model or ControlNet) from
+/// the Render Setup panel. Mirrors [`ActiveDownload`]; the download runs in the
+/// background and the UI polls its state each frame.
+struct ActiveSdDownload {
+    /// The catalog entry id being fetched.
+    entry_id: String,
+    handle: crate::download::Download,
+    /// Once-only terminal-state guard (register the cassette / announce failure).
     persisted: bool,
 }
 
@@ -948,6 +965,9 @@ impl App {
             import_result: None,
             catalog: crate::model_catalog::Catalog::load(),
             active_download: None,
+            show_render_setup: false,
+            sd_catalog: crate::sd_catalog::SdCatalog::load(),
+            active_sd_download: None,
             icons: crate::icons::Icons::new(),
             #[cfg(not(target_os = "linux"))]
             native_menu: None,
@@ -5821,6 +5841,12 @@ impl App {
                 self.show_update = true;
             }
             MenuAction::ModelSetup => self.show_model_setup = true,
+            MenuAction::RenderSetup => self.show_render_setup = true,
+            MenuAction::RevealSdModelsFolder => {
+                if let Some(dir) = crate::sd_catalog::sd_models_dir() {
+                    reveal_folder(&dir);
+                }
+            }
             MenuAction::ShowPlugins => self.show_plugins = true,
             MenuAction::ShowOsnap => self.osnap_popup_open = true,
             MenuAction::ShowRaytrace => self.raytrace_window_open = true,
@@ -6496,6 +6522,267 @@ impl App {
             persisted: false,
         });
     }
+
+    /// Kick off a background download for SD catalog entry `id` into the SD
+    /// weights dir (`~/.config/itsjustcad/sdmodels`). Reuses the same downloader
+    /// as the LLM models (disk gate, resume, progress, cancel, sha verify).
+    fn start_sd_install(&mut self, id: &str) {
+        let Some(entry) = self.sd_catalog.get(id).cloned() else {
+            return;
+        };
+        let Some(dir) = crate::sd_catalog::sd_models_dir() else {
+            tracing::error!("no home dir — cannot resolve SD models directory");
+            return;
+        };
+        let spec = crate::download::DownloadSpec {
+            url: entry.url.clone(),
+            dir,
+            file_name: entry.file_name(),
+            expected_sha256: entry.expected_sha().map(|s| s.to_string()),
+        };
+        let handle = crate::download::start(&self.tokio, spec);
+        self.active_sd_download = Some(ActiveSdDownload {
+            entry_id: entry.id,
+            handle,
+            persisted: false,
+        });
+    }
+
+    /// Per-frame poll of the SD-weights download. On completion of a BASE model
+    /// it auto-registers (and activates) a `LocalSd` render cassette pointing at
+    /// the model + a detected `sd` binary + any already-downloaded depth
+    /// ControlNet, so `render <prompt>` works. A ControlNet download re-points
+    /// the existing cassette. Runs whether the panel is open or not (like
+    /// `poll_model_download`), so a background finish is never dropped.
+    fn poll_sd_download(&mut self) {
+        let outcome = self.active_sd_download.as_mut().and_then(|active| {
+            let out = download_outcome(&active.handle.state(), active.persisted);
+            if out.is_some() {
+                active.persisted = true;
+            }
+            out.map(|o| (active.entry_id.clone(), o))
+        });
+        match outcome {
+            Some((entry_id, DownloadOutcome::Completed)) => {
+                self.register_local_sd_after_download(&entry_id);
+            }
+            Some((entry_id, DownloadOutcome::Failed(msg))) => {
+                let label = self
+                    .sd_catalog
+                    .get(&entry_id)
+                    .map(|m| m.display_name.clone())
+                    .unwrap_or(entry_id);
+                tracing::warn!("SD download failed: {label}: {msg}");
+                self.command_line.push_line(format!(
+                    "SD download of {label} failed: {msg} — reopen Render ▸ Local Renderer Setup to retry (a partial file resumes)."
+                ));
+            }
+            None => {}
+        }
+    }
+
+    /// After an SD file finishes downloading, (re)register the `LocalSd`
+    /// cassette. Pure I/O over `render_decks.json`: builds/updates the cassette
+    /// from whatever base model + depth ControlNet are now on disk plus a
+    /// detected `sd` binary, makes it active, and reports on the command line.
+    fn register_local_sd_after_download(&mut self, entry_id: &str) {
+        let Some(dir) = crate::sd_catalog::sd_models_dir() else { return };
+        // Resolve the on-disk base model + optional ControlNet from the catalog.
+        let model_path = self
+            .sd_catalog
+            .default_model()
+            .map(|m| dir.join(m.file_name()))
+            .filter(|p| p.exists());
+        let Some(model_path) = model_path else {
+            // A ControlNet arrived before any base model — nothing to render with
+            // yet; just note it. The base-model download will register later.
+            let label = self
+                .sd_catalog
+                .get(entry_id)
+                .map(|m| m.display_name.clone())
+                .unwrap_or_else(|| entry_id.to_string());
+            self.command_line
+                .push_line(format!("{label} downloaded — download a base SD model to render."));
+            return;
+        };
+        let control_net = self
+            .sd_catalog
+            .default_controlnet()
+            .map(|c| dir.join(c.file_name()))
+            .filter(|p| p.exists())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let sd_bin = itsjustcad_deck::resolve_sd_binary()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        let mut decks = itsjustcad_deck::RenderDecksFile::load_or_default();
+        let cfg = itsjustcad_deck::RenderConfig::local_sd(
+            LOCAL_SD_CASSETTE_NAME,
+            model_path.to_string_lossy(),
+            control_net,
+            sd_bin.clone(),
+        );
+        match decks.decks.iter().position(|d| d.name == LOCAL_SD_CASSETTE_NAME) {
+            Some(i) => {
+                decks.decks[i] = cfg;
+                decks.active = i;
+            }
+            None => {
+                decks.decks.push(cfg);
+                decks.active = decks.decks.len() - 1;
+            }
+        }
+        decks.save();
+        if sd_bin.is_empty() {
+            self.command_line.push_line(itsjustcad_deck::NO_SD_BINARY_MESSAGE);
+        } else {
+            self.command_line
+                .push_line(crate::i18n::t("render_setup.registered"));
+        }
+    }
+
+    /// Hide the Render Setup panel WITHOUT cancelling any active SD download.
+    fn close_render_setup(&mut self) {
+        self.show_render_setup = false;
+    }
+
+    /// Local Renderer Setup panel: an `sd`-binary status line, the SD model +
+    /// ControlNet catalog gated by RAM and free disk, an Install button per
+    /// entry with a live progress bar (speed + cancel), and the active LocalSd
+    /// renderer. Download completion is handled by `poll_sd_download` (called
+    /// every frame, panel open or not), not here.
+    fn render_setup_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_render_setup {
+            return;
+        }
+        let hw = self.hardware;
+        let catalog = self.sd_catalog.clone();
+        let sd_bin = itsjustcad_deck::resolve_sd_binary();
+        let dir = crate::sd_catalog::sd_models_dir();
+        // Collect intents, act after the closure (avoids borrow clashes).
+        let mut install: Option<String> = None;
+        let mut cancel = false;
+        let mut wants_close = false;
+
+        let active_state = self
+            .active_sd_download
+            .as_ref()
+            .map(|a| (a.entry_id.clone(), a.handle.state()));
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("render_setup_window"),
+            egui::ViewportBuilder::default()
+                .with_title(crate::i18n::t("render_setup.title"))
+                .with_inner_size([520.0, 620.0])
+                .with_min_inner_size([420.0, 320.0])
+                .with_resizable(true),
+            |vctx, _class| {
+                egui::CentralPanel::default().show(vctx, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.label(egui::RichText::new(crate::i18n::t("render_setup.title")).heading());
+                        ui.label(egui::RichText::new(crate::i18n::t("render_setup.intro")).weak());
+                        ui.separator();
+
+                        // `sd` binary status line.
+                        match &sd_bin {
+                            Some(p) => {
+                                ui.label(egui::RichText::new(format!(
+                                    "{} {}",
+                                    crate::i18n::t("render_setup.sd_found"),
+                                    p.display()
+                                )).strong());
+                            }
+                            None => {
+                                ui.label(egui::RichText::new(crate::i18n::t("render_setup.sd_missing")).strong());
+                            }
+                        }
+                        ui.label(egui::RichText::new(hw.recommendation()).weak().small());
+                        ui.separator();
+
+                        // Group: base models, then ControlNets.
+                        for (heading, want_model) in [
+                            (crate::i18n::t("render_setup.models"), true),
+                            (crate::i18n::t("render_setup.controlnets"), false),
+                        ] {
+                            ui.label(egui::RichText::new(heading).strong());
+                            for entry in catalog.models.iter().filter(|e| {
+                                matches!(e.kind, crate::sd_catalog::SdKind::Model) == want_model
+                            }) {
+                                let installed = dir
+                                    .as_ref()
+                                    .map(|d| d.join(entry.file_name()).exists())
+                                    .unwrap_or(false);
+                                ui.horizontal(|ui| {
+                                    ui.label(&entry.display_name);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "({})",
+                                            crate::download::fmt_bytes(entry.size_bytes)
+                                        )).weak(),
+                                    );
+                                });
+                                if entry.is_placeholder() {
+                                    ui.label(
+                                        egui::RichText::new(crate::i18n::t("render_setup.unverified"))
+                                            .weak()
+                                            .small(),
+                                    );
+                                }
+                                // Soft RAM advisory (SD's hard block is disk, not RAM).
+                                if !entry.runnable_at(hw.ram_gb) {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Needs ~{} GB RAM to run comfortably.",
+                                            entry.ram_gb_min
+                                        ))
+                                        .weak()
+                                        .small(),
+                                    );
+                                }
+                                // This entry's live download state, if any.
+                                let this_active = active_state
+                                    .as_ref()
+                                    .filter(|(id, _)| id == &entry.id)
+                                    .map(|(_, s)| s.clone());
+                                if let Some(state) = this_active {
+                                    ui.label(crate::download::progress_caption(&state));
+                                    if state.is_active()
+                                        && ui.button(crate::i18n::t("render_setup.cancel")).clicked()
+                                    {
+                                        cancel = true;
+                                    }
+                                } else if installed {
+                                    ui.label(egui::RichText::new(crate::i18n::t("render_setup.installed")).weak());
+                                } else if let Some(block) = entry.disk_shortfall(hw.free_disk_gb) {
+                                    ui.label(egui::RichText::new(block).weak().small());
+                                } else if active_state.is_none()
+                                    && ui.button(crate::i18n::t("render_setup.install")).clicked()
+                                {
+                                    install = Some(entry.id.clone());
+                                }
+                                ui.separator();
+                            }
+                        }
+                    });
+                });
+                if vctx.input(|i| i.viewport().close_requested()) {
+                    wants_close = true;
+                }
+            },
+        );
+
+        if let Some(id) = install {
+            self.start_sd_install(&id);
+        }
+        if cancel && let Some(active) = &self.active_sd_download {
+            active.handle.cancel();
+        }
+        if wants_close {
+            self.close_render_setup();
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
 }
 
 impl App {
@@ -6873,6 +7160,10 @@ fn deck_brain_into_decks(
 /// at. The actual runtime spawn is the next agent's job; this is the port the
 /// cassette points at so it's ready the moment the server is up.
 const LOCAL_RUNTIME_BASE_URL: &str = "http://localhost:8080/v1";
+
+/// The `render_decks.json` cassette name the Render Setup panel registers for
+/// the downloaded local Stable Diffusion renderer.
+const LOCAL_SD_CASSETTE_NAME: &str = "local-sd";
 
 /// The `decks.json` cassette name for a catalog model id.
 fn cassette_name_for(model_id: &str) -> String {
@@ -7611,9 +7902,14 @@ impl eframe::App for App {
         // Setup window closed — so a finished download always becomes the
         // active deck and a failure is never silent.
         self.poll_model_download();
+        // SD-weights download → auto-register the LocalSd render cassette on
+        // finish, panel open or not (same once-only hand-off guarantee).
+        self.poll_sd_download();
         // Tools → Model Setup panel (also the onboarding "download a local
         // model" entry point). Renders any time show_model_setup is set.
         self.model_setup_ui(ui.ctx());
+        // Render ▸ Local Renderer Setup panel (SD twin of Model Setup).
+        self.render_setup_ui(ui.ctx());
         // Compact corner chip so a download can continue with the panel hidden.
         self.download_progress_chip(ui.ctx());
 
@@ -8863,5 +9159,63 @@ mod tests {
         // variant exists and is distinct.
         let a = crate::menu::MenuAction::ModelSetup;
         assert_ne!(a, crate::menu::MenuAction::About);
+    }
+
+    #[test]
+    fn render_setup_menu_actions_are_distinct() {
+        // The Render menu emits these; apply_menu_action maps them to opening the
+        // panel / revealing the SD models folder.
+        assert_ne!(
+            crate::menu::MenuAction::RenderSetup,
+            crate::menu::MenuAction::ModelSetup
+        );
+        assert_ne!(
+            crate::menu::MenuAction::RevealSdModelsFolder,
+            crate::menu::MenuAction::RevealModelsFolder
+        );
+    }
+
+    #[test]
+    fn native_menu_has_a_render_menu_with_setup_leaf() {
+        // The native menu model must carry a Render menu whose Setup leaf is
+        // wired to RenderSetup — the reachable entry point for local SD render.
+        let menus = crate::menu::native_model(
+            crate::preset::MenuStyle::Rhino,
+            true,
+            crate::menu::ViewState::default(),
+        );
+        let render = menus
+            .iter()
+            .find(|m| m.title == crate::i18n::t("menu.render"))
+            .expect("a Render menu");
+        let has_setup = render.items.iter().any(|it| {
+            matches!(
+                it,
+                crate::menu::NativeItem::Leaf { action, .. }
+                    if *action == crate::menu::MenuAction::RenderSetup
+            )
+        });
+        assert!(has_setup, "Render menu must expose Local Renderer Setup");
+    }
+
+    #[test]
+    fn sd_catalog_loads_and_registers_a_localsd_cassette_shape() {
+        // The SD catalog parses and a LocalSd cassette built from its default
+        // model round-trips through render_decks.json as kind LocalSd.
+        let cat = crate::sd_catalog::SdCatalog::load();
+        let model = cat.default_model().expect("a base SD model");
+        let cfg = itsjustcad_deck::RenderConfig::local_sd(
+            LOCAL_SD_CASSETTE_NAME,
+            format!("/sdmodels/{}", model.file_name()),
+            String::new(),
+            "/opt/homebrew/bin/sd",
+        );
+        let mut decks = itsjustcad_deck::RenderDecksFile::default();
+        decks.decks.push(cfg);
+        decks.active = decks.decks.len() - 1;
+        let json = serde_json::to_string(&decks).unwrap();
+        let back: itsjustcad_deck::RenderDecksFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.active_config().kind, itsjustcad_deck::RenderKind::LocalSd);
+        assert_eq!(back.active_config().name, LOCAL_SD_CASSETTE_NAME);
     }
 }

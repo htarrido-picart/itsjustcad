@@ -72,9 +72,16 @@ pub fn backends_lines(decks: &RenderDecksFile) -> Vec<String> {
                 itsjustcad_deck::RenderKind::Comfy => "comfyui",
                 itsjustcad_deck::RenderKind::Automatic1111 => "a1111-api",
                 itsjustcad_deck::RenderKind::Cloud => "cloud",
+                itsjustcad_deck::RenderKind::LocalSd => "local-sd",
             };
             let ready = if d.is_configured() { "ready" } else { "not configured" };
-            let url = if d.base_url.is_empty() { "-" } else { d.base_url.as_str() };
+            // LocalSd has no URL; show the model file so the row is still useful.
+            let endpoint = if d.kind == itsjustcad_deck::RenderKind::LocalSd {
+                d.model.as_str()
+            } else {
+                d.base_url.as_str()
+            };
+            let url = if endpoint.is_empty() { "-" } else { endpoint };
             format!("{marker} {:<12} {kind:<10} {url:<28} {ready}", d.name)
         })
         .collect()
@@ -348,6 +355,7 @@ mod tests {
             base_url: "http://127.0.0.1:1".into(),
             model: "m".into(),
             api_key: None,
+            ..RenderConfig::none()
         };
         let job = RenderJob::start(rt.handle(), &cfg, RenderRequest::new("x", control, 64, 64));
         job.cancel(); // must not panic; the spawned future is dropped.

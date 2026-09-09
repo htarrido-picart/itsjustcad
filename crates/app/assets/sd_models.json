@@ -1,0 +1,23 @@
+{
+  "_comment": "Curated local Stable Diffusion catalog for ItsJustCAD's Render Setup. The render ENGINE is stable-diffusion.cpp's `sd` CLI (MIT), which the user installs themselves (we NEVER bundle it — same stance as LibreDWG's dwg2dxf). These entries are the WEIGHTS the app downloads on demand into ~/.config/itsjustcad/sdmodels/ and hands to `sd --model`. sha256 is the git-LFS `oid sha256:` from https://huggingface.co/<repo>/raw/main/<file>; size_bytes is the git-LFS `size`. An EMPTY sha256 marks a TODO PLACEHOLDER: the URL shape is real (the leejet/stable-diffusion.cpp GGUF conversions live under HuggingFace) but the exact oid/size were NOT verified from this environment (HF tree listings need auth here), so verification is skipped for that entry and the UI flags it as unverified. To promote a placeholder to verified: GET the /raw/main/<file> pointer, copy its oid + size in, and drop the empty sha. kind=model is the base SD checkpoint; kind=controlnet is an optional depth ControlNet gguf passed via `sd --control-net`.",
+  "models": [
+    {
+      "id": "sd15-q8-gguf",
+      "display_name": "Stable Diffusion 1.5 (Q8, ~1.7 GB)",
+      "kind": "model",
+      "url": "https://huggingface.co/leejet/stable-diffusion.cpp/resolve/main/v1-5-pruned-emaonly-q8_0.gguf",
+      "size_bytes": 1800000000,
+      "sha256": "",
+      "ram_gb_min": 8
+    },
+    {
+      "id": "controlnet-depth-sd15-gguf",
+      "display_name": "Depth ControlNet for SD 1.5 (optional, ~700 MB)",
+      "kind": "controlnet",
+      "url": "https://huggingface.co/leejet/stable-diffusion.cpp/resolve/main/control_depth-fp16-q8_0.gguf",
+      "size_bytes": 730000000,
+      "sha256": "",
+      "ram_gb_min": 8
+    }
+  ]
+}

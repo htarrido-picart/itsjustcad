@@ -285,6 +285,23 @@ static EN: &[(&str, &str)] = &[
     ("menu.llm.local_only", "Local Only"),
     ("menu.llm.web_search", "Allow Web Search"),
     ("menu.llm.terse", "Terse Replies"),
+    // ── Menu: Render (local Stable Diffusion) ──
+    ("menu.render", "Render"),
+    ("menu.render.setup", "Local Renderer Setup…"),
+    ("menu.render.reveal_sdmodels", "Reveal SD Models Folder…"),
+    // ── Render Setup panel ──
+    ("render_setup.title", "Local Renderer Setup"),
+    ("render_setup.intro", "Download a local Stable Diffusion model and render the current view offline. Uses the stable-diffusion.cpp `sd` binary — install it yourself (we never bundle it)."),
+    ("render_setup.sd_found", "Renderer detected: sd at"),
+    ("render_setup.sd_missing", "Renderer NOT found — install stable-diffusion.cpp (the `sd` binary): build from github.com/leejet/stable-diffusion.cpp or `brew install stable-diffusion.cpp`."),
+    ("render_setup.models", "Stable Diffusion models"),
+    ("render_setup.controlnets", "Depth ControlNet (optional — tightens adherence to the CAD geometry)"),
+    ("render_setup.install", "Install"),
+    ("render_setup.cancel", "Cancel"),
+    ("render_setup.installed", "Installed"),
+    ("render_setup.active", "Active renderer"),
+    ("render_setup.unverified", "Unverified (placeholder) — checksum not enforced"),
+    ("render_setup.registered", "Local renderer ready — `render <prompt>` diffuses the current view."),
     // ── Menu: Plugins (top-level) ──
     ("menu.plugins.manage", "Plugins…"),
     // ── Menu: Window (in-window fallback labels; native bar uses OS items) ──
@@ -549,6 +566,23 @@ static ES: &[(&str, &str)] = &[
     ("menu.llm.local_only", "Solo local"),
     ("menu.llm.web_search", "Permitir búsqueda web"),
     ("menu.llm.terse", "Respuestas concisas"),
+    // ── Menú: Render (Stable Diffusion local) ──
+    ("menu.render", "Render"),
+    ("menu.render.setup", "Configuración del renderizador local…"),
+    ("menu.render.reveal_sdmodels", "Mostrar carpeta de modelos SD…"),
+    // ── Panel de configuración del renderizador ──
+    ("render_setup.title", "Configuración del renderizador local"),
+    ("render_setup.intro", "Descarga un modelo de Stable Diffusion local y renderiza la vista actual sin conexión. Usa el binario `sd` de stable-diffusion.cpp; instálalo tú mismo (nunca lo incluimos)."),
+    ("render_setup.sd_found", "Renderizador detectado: sd en"),
+    ("render_setup.sd_missing", "Renderizador NO encontrado: instala stable-diffusion.cpp (el binario `sd`): compílalo desde github.com/leejet/stable-diffusion.cpp o `brew install stable-diffusion.cpp`."),
+    ("render_setup.models", "Modelos de Stable Diffusion"),
+    ("render_setup.controlnets", "ControlNet de profundidad (opcional; ajusta la fidelidad a la geometría CAD)"),
+    ("render_setup.install", "Instalar"),
+    ("render_setup.cancel", "Cancelar"),
+    ("render_setup.installed", "Instalado"),
+    ("render_setup.active", "Renderizador activo"),
+    ("render_setup.unverified", "Sin verificar (marcador) — suma de comprobación no aplicada"),
+    ("render_setup.registered", "Renderizador local listo — `render <prompt>` difunde la vista actual."),
     // ── Menú: Complementos (nivel superior) ──
     ("menu.plugins.manage", "Complementos…"),
     // ── Menú: Ventana ──

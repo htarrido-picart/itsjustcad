@@ -44,6 +44,14 @@ pub enum MenuAction {
     /// Open the Model Setup panel (download/manage local models). Available any
     /// time from Tools, not just at first run.
     ModelSetup,
+    /// Open the Local Renderer Setup panel (download a local Stable Diffusion
+    /// model + detect the `sd` binary, then auto-register the LocalSd render
+    /// cassette). The SD twin of Model Setup; fired by Render ▸ Local Renderer
+    /// Setup…. NEVER bundles stable-diffusion.cpp — the user installs `sd`.
+    RenderSetup,
+    /// Reveal the SD-weights folder (`~/.config/itsjustcad/sdmodels`) in the OS
+    /// file manager. Fired by the Render ▸ Reveal SD Models Folder item.
+    RevealSdModelsFolder,
     /// Open the Plugins popup window: installed user/LLM-authored macros as
     /// cards, with search + per-card run/JSON/reload/delete. Modeless, like
     /// Model Setup / About. Fired by the top-level Plugins ▸ Plugins… menu item.
@@ -480,6 +488,7 @@ fn menu_title_key(id: &str) -> &'static str {
         "View" => "menu.view",
         "Theme" => "menu.theme",
         "LLM" => "menu.llm",
+        "Render" => "menu.render",
         "Plugins" => "menu.plugins",
         "Window" => "menu.window",
         "Help" => "menu.help",
@@ -797,6 +806,27 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                 action: MenuAction::ToggleTerse,
                 checked: false, // synced live by the app
                 enabled: true,
+            },
+        ];
+        menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
+    }
+
+    // ── Render ──────────────────────────────────────────────────────────────────
+    // The local AI-render hub: Local Renderer Setup… downloads a local Stable
+    // Diffusion model and detects the user-installed `sd` (stable-diffusion.cpp)
+    // binary, then auto-registers the LocalSd render cassette so `render <prompt>`
+    // works. Reveal SD Models Folder opens the weights dir. Ships nothing — the
+    // user installs `sd` themselves (we never bundle it).
+    {
+        let t = "Render";
+        let items = vec![
+            wired_leaf(t, "render_setup", tr("menu.render.setup"), MenuAction::RenderSetup),
+            NativeItem::Leaf {
+                id: format!("{t}/reveal_sdmodels"),
+                label: tr("menu.render.reveal_sdmodels").into(),
+                shortcut: None,
+                enabled: true,
+                action: MenuAction::RevealSdModelsFolder,
             },
         ];
         menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
@@ -1154,6 +1184,8 @@ mod tests {
                 tr("menu.view").into(),
                 tr("menu.theme").into(),
                 tr("menu.llm").into(),
+                // Render sits between LLM and Plugins (the local SD-render hub).
+                tr("menu.render").into(),
                 tr("menu.plugins").into(),
             ];
             #[cfg(target_os = "macos")]
