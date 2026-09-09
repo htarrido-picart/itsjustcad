@@ -24,6 +24,8 @@
 //! HTTP servers (std::net, canned responses) — none require a real SD server —
 //! and [`MockRenderDeck`] proves the app-side plumbing with zero I/O.
 
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -154,6 +156,11 @@ pub enum RenderKind {
     Automatic1111,
     /// Cloud diffusion (Replicate / fal.ai / Stability) — scaffold, `env:` key.
     Cloud,
+    /// Local Stable Diffusion via the `stable-diffusion.cpp` `sd` CLI: NO server,
+    /// NO linking — we detect the user-installed `sd` binary and spawn it with a
+    /// FIXED arg vector per render (the same detect-and-shell-out stance as the
+    /// LibreDWG `dwg2dxf` bridge). See [`LocalSdRenderDeck`].
+    LocalSd,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -170,6 +177,25 @@ pub struct RenderConfig {
     /// backends need none; cloud backends read a key at send time only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    // ── LocalSd-only fields (ignored by the HTTP/cloud cassettes) ────────────
+    /// Absolute path to a depth ControlNet `.gguf` for `sd --control-net`.
+    /// Empty ⇒ the model renders from the depth control image via img2img only
+    /// (still works; ControlNet just tightens adherence to the CAD geometry).
+    #[serde(default)]
+    pub control_net: String,
+    /// Absolute path to the resolved `sd` binary. Empty ⇒ resolve it at render
+    /// time via [`resolve_sd_binary`] (the Render Setup panel fills this in when
+    /// it detects one, so the cassette is self-contained across launches).
+    #[serde(default)]
+    pub sd_binary: String,
+    /// Diffusion CFG scale. `0.0`/absent ⇒ a sensible default (see
+    /// [`LocalSdRenderDeck::DEFAULT_CFG_SCALE`]).
+    #[serde(default)]
+    pub cfg_scale: f32,
+    /// Sampling steps. `0`/absent ⇒ a sensible default
+    /// ([`LocalSdRenderDeck::DEFAULT_STEPS`]).
+    #[serde(default)]
+    pub steps: u32,
 }
 
 impl RenderConfig {
@@ -182,6 +208,34 @@ impl RenderConfig {
             base_url: String::new(),
             model: String::new(),
             api_key: None,
+            control_net: String::new(),
+            sd_binary: String::new(),
+            cfg_scale: 0.0,
+            steps: 0,
+        }
+    }
+
+    /// A `LocalSd` cassette pointing at a downloaded SD model `.gguf` and (once
+    /// known) the resolved `sd` binary + a depth ControlNet. This is what the
+    /// Render Setup panel registers after a model download completes. `sd_bin`
+    /// and `control_net` may be empty — the render path resolves the binary and
+    /// treats an empty ControlNet as "img2img only".
+    pub fn local_sd(
+        name: impl Into<String>,
+        model_path: impl Into<String>,
+        control_net: impl Into<String>,
+        sd_binary: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kind: RenderKind::LocalSd,
+            base_url: String::new(),
+            model: model_path.into(),
+            api_key: None,
+            control_net: control_net.into(),
+            sd_binary: sd_binary.into(),
+            cfg_scale: 0.0,
+            steps: 0,
         }
     }
 
@@ -202,15 +256,37 @@ impl RenderConfig {
             RenderKind::None => false,
             RenderKind::Comfy | RenderKind::Automatic1111 => !self.base_url.is_empty(),
             RenderKind::Cloud => self.resolved_key().is_some(),
+            // Ready when a model file is set AND an `sd` binary is resolvable
+            // (either recorded on the cassette or found on the system now).
+            RenderKind::LocalSd => {
+                !self.model.is_empty()
+                    && (self.sd_binary_path().is_some() || resolve_sd_binary().is_some())
+            }
         }
+    }
+
+    /// The recorded `sd` binary path if it still exists on disk, else `None`.
+    /// Callers fall back to [`resolve_sd_binary`] when this is `None`.
+    pub fn sd_binary_path(&self) -> Option<PathBuf> {
+        let p = PathBuf::from(self.sd_binary.trim());
+        (!self.sd_binary.trim().is_empty() && p.is_file()).then_some(p)
     }
 }
 
 /// The unconfigured-backend guidance string. Mirrors the unconfigured LLM
 /// deck's clear message.
 pub const NO_BACKEND_MESSAGE: &str =
-    "no render backend configured — point at a local ComfyUI (http://localhost:8188) \
-     or A1111/Forge (http://localhost:7860), or add a cloud key, in render_decks.json";
+    "no render backend configured — download a local Stable Diffusion model (Render ▸ \
+     Local Renderer Setup…), point at a local ComfyUI (http://localhost:8188) or \
+     A1111/Forge (http://localhost:7860), or add a cloud key, in render_decks.json";
+
+/// Guidance shown when a `LocalSd` cassette is selected but no `sd` binary can
+/// be found. We NEVER bundle stable-diffusion.cpp (its own licence/stance); the
+/// user installs it, exactly like LibreDWG's `dwg2dxf`.
+pub const NO_SD_BINARY_MESSAGE: &str =
+    "install stable-diffusion.cpp (the `sd` binary) to render locally — build it \
+     from source (github.com/leejet/stable-diffusion.cpp) or `brew install \
+     stable-diffusion.cpp`, then re-open Render ▸ Local Renderer Setup…";
 
 /// The persisted render-deck file. Mirrors `DecksFile`: a list of cassettes and
 /// the active index. Ships with ONLY the `None` backend (off by default).
@@ -234,6 +310,7 @@ impl Default for RenderDecksFile {
                     base_url: "http://localhost:8188".into(),
                     model: "sd_xl_base_1.0.safetensors".into(),
                     api_key: None,
+                    ..RenderConfig::none()
                 },
                 RenderConfig {
                     name: "a1111".into(),
@@ -241,6 +318,7 @@ impl Default for RenderDecksFile {
                     base_url: "http://localhost:7860".into(),
                     model: String::new(),
                     api_key: None,
+                    ..RenderConfig::none()
                 },
                 RenderConfig {
                     // Draw Things (macOS) exposes an A1111-compatible HTTP API
@@ -250,6 +328,7 @@ impl Default for RenderDecksFile {
                     base_url: "http://127.0.0.1:7860".into(),
                     model: String::new(),
                     api_key: None,
+                    ..RenderConfig::none()
                 },
                 RenderConfig {
                     name: "cloud".into(),
@@ -257,6 +336,7 @@ impl Default for RenderDecksFile {
                     base_url: "https://api.replicate.com/v1".into(),
                     model: "stability-ai/sdxl".into(),
                     api_key: Some("env:REPLICATE_API_TOKEN".into()),
+                    ..RenderConfig::none()
                 },
             ],
             // Default active = index 0 = the None backend. OFF BY DEFAULT.
@@ -310,6 +390,7 @@ pub fn make_render_deck(config: &RenderConfig) -> Box<dyn RenderDeck> {
         RenderKind::Comfy => Box::new(ComfyRenderDeck::new(config)),
         RenderKind::Automatic1111 => Box::new(Automatic1111RenderDeck::new(config)),
         RenderKind::Cloud => Box::new(CloudRenderDeck::new(config)),
+        RenderKind::LocalSd => Box::new(LocalSdRenderDeck::new(config)),
     }
 }
 
@@ -322,6 +403,8 @@ pub fn probe_url(config: &RenderConfig) -> Option<String> {
         RenderKind::Comfy => Some(format!("{base}/system_stats")),
         RenderKind::Automatic1111 => Some(format!("{base}/sdapi/v1/options")),
         RenderKind::Cloud => Some(format!("{base}/account")),
+        // LocalSd spawns a CLI; there is no endpoint to probe.
+        RenderKind::LocalSd => None,
     }
 }
 
@@ -331,6 +414,10 @@ pub fn probe_url(config: &RenderConfig) -> Option<String> {
 /// the ONLY network call outside [`RenderDeck::render`], and it too only fires
 /// on an explicit user request.
 pub async fn test_connection(config: &RenderConfig) -> Result<String, String> {
+    // LocalSd is checked locally (binary + model present) — no network at all.
+    if config.kind == RenderKind::LocalSd {
+        return local_sd_readiness(config);
+    }
     let Some(url) = probe_url(config) else {
         return Err(NO_BACKEND_MESSAGE.to_string());
     };
@@ -746,6 +833,259 @@ impl RenderDeck for CloudRenderDeck {
     }
 }
 
+// ── LocalSd cassette (detect-and-shell-out to stable-diffusion.cpp `sd`) ──────
+
+/// The directories we probe for the `sd` (stable-diffusion.cpp) binary, in
+/// priority order — the same stripped-`PATH` rescue as the LibreDWG resolver: a
+/// Finder-launched `.app` inherits a minimal `PATH`, so absolute probes find a
+/// Homebrew / `~/.local/bin` / source-built `sd`. Pure (modulo `$HOME`).
+pub fn sd_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".local").join("bin"));
+    }
+    dirs.extend([
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/bin"),
+    ]);
+    dirs
+}
+
+/// Resolve the absolute path to the `sd` CLI, or `None` if it can't be found.
+/// Checks the well-known install dirs first (the fix for a stripped Finder
+/// `PATH`), then falls back to the inherited `PATH`. NEVER bundled — the user
+/// installs stable-diffusion.cpp themselves (same stance as `dwg2dxf`).
+pub fn resolve_sd_binary() -> Option<PathBuf> {
+    resolve_sd_binary_in(&sd_search_dirs(), std::env::var("PATH").ok())
+}
+
+/// Pure core of [`resolve_sd_binary`]: first existing `sd` file across the
+/// candidate dirs then the `PATH`. Injected inputs keep it unit-testable.
+pub fn resolve_sd_binary_in(search_dirs: &[PathBuf], path: Option<String>) -> Option<PathBuf> {
+    for dir in search_dirs {
+        let cand = dir.join("sd");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    if let Some(path) = path {
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join("sd");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// The local-readiness verdict for a `LocalSd` cassette (used by
+/// `test_connection` and by the setup panel). Pure over the config + a resolved
+/// binary; NO network, NO spawn. `Ok` names the binary + model, `Err` is the
+/// precise install/download hint.
+pub fn local_sd_readiness(config: &RenderConfig) -> Result<String, String> {
+    let bin = config
+        .sd_binary_path()
+        .or_else(resolve_sd_binary)
+        .ok_or_else(|| NO_SD_BINARY_MESSAGE.to_string())?;
+    if config.model.trim().is_empty() {
+        return Err(
+            "no local SD model selected — download one in Render ▸ Local Renderer Setup…".into(),
+        );
+    }
+    if !Path::new(config.model.trim()).is_file() {
+        return Err(format!(
+            "SD model file '{}' is missing — re-download it in Render ▸ Local Renderer Setup…",
+            config.model.trim()
+        ));
+    }
+    Ok(format!(
+        "local renderer ready: sd at {} · model {}",
+        bin.display(),
+        config.model.trim()
+    ))
+}
+
+/// Local Stable Diffusion cassette: spawns the user-installed `sd` CLI
+/// (stable-diffusion.cpp) with a FIXED arg vector per render and reads back the
+/// PNG it wrote. NO server, NO shell, NO string interpolation — the argv is an
+/// explicit `Vec<OsString>` (asserted by tests). Temp output is cleaned up on
+/// every path. Async + cancellable: the blocking spawn runs on a blocking
+/// thread the task can drop.
+pub struct LocalSdRenderDeck {
+    name: String,
+    /// Resolved binary path (from the cassette or the system), or `None` when
+    /// absent — `render()` then fails with the install hint (never a panic).
+    binary: Option<PathBuf>,
+    model: String,
+    control_net: String,
+    cfg_scale: f32,
+    steps: u32,
+}
+
+impl LocalSdRenderDeck {
+    /// Default CFG scale when the cassette leaves it at 0.0.
+    pub const DEFAULT_CFG_SCALE: f32 = 7.0;
+    /// Default sampling steps when the cassette leaves it at 0.
+    pub const DEFAULT_STEPS: u32 = 20;
+
+    pub fn new(config: &RenderConfig) -> Self {
+        Self {
+            name: config.name.clone(),
+            binary: config.sd_binary_path().or_else(resolve_sd_binary),
+            model: config.model.trim().to_string(),
+            control_net: config.control_net.trim().to_string(),
+            cfg_scale: if config.cfg_scale > 0.0 {
+                config.cfg_scale
+            } else {
+                Self::DEFAULT_CFG_SCALE
+            },
+            steps: if config.steps > 0 {
+                config.steps
+            } else {
+                Self::DEFAULT_STEPS
+            },
+        }
+    }
+
+    /// The FIXED argument vector for one `sd` invocation. Pure so tests can
+    /// assert the exact argv — there is NO shell and NO caller-controlled flag
+    /// string; the prompt is a single argv element (never concatenated into a
+    /// command line). `control_image` is the depth PNG the CAD captured; `out`
+    /// is the temp PNG `sd` writes. When a ControlNet `.gguf` is set we add
+    /// `--control-net`; otherwise the depth image still rides as
+    /// `--control-image` (img2img-style guidance).
+    pub fn build_args(
+        &self,
+        req: &RenderRequest,
+        control_image: &Path,
+        out: &Path,
+    ) -> Vec<std::ffi::OsString> {
+        use std::ffi::OsString;
+        let mut args: Vec<OsString> = vec![
+            "--mode".into(),
+            "img2img".into(),
+            "--model".into(),
+            OsString::from(&self.model),
+            "--control-image".into(),
+            control_image.into(),
+            "--prompt".into(),
+            OsString::from(&req.prompt),
+            "--cfg-scale".into(),
+            OsString::from(format!("{}", self.cfg_scale)),
+            "--steps".into(),
+            OsString::from(format!("{}", self.steps)),
+            "--strength".into(),
+            OsString::from(format!("{}", req.strength)),
+            "--width".into(),
+            OsString::from(format!("{}", req.width)),
+            "--height".into(),
+            OsString::from(format!("{}", req.height)),
+            "--output".into(),
+            out.into(),
+        ];
+        if !self.control_net.is_empty() {
+            args.push("--control-net".into());
+            args.push(OsString::from(&self.control_net));
+        }
+        if !req.negative_prompt.is_empty() {
+            args.push("--negative-prompt".into());
+            args.push(OsString::from(&req.negative_prompt));
+        }
+        if let Some(seed) = req.seed {
+            args.push("--seed".into());
+            args.push(OsString::from(format!("{seed}")));
+        }
+        args
+    }
+}
+
+#[async_trait]
+impl RenderDeck for LocalSdRenderDeck {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    async fn render(&self, req: RenderRequest) -> Result<RenderedImage, RenderDeckError> {
+        if req.control.is_empty() {
+            return Err(RenderDeckError::NoControlImages);
+        }
+        let bin = self
+            .binary
+            .clone()
+            .ok_or_else(|| RenderDeckError::NoBackend(NO_SD_BINARY_MESSAGE.into()))?;
+        if self.model.is_empty() || !Path::new(&self.model).is_file() {
+            return Err(RenderDeckError::NoBackend(
+                "no local SD model file — download one in Render ▸ Local Renderer Setup…".into(),
+            ));
+        }
+        // Fresh per-invocation temp dir → concurrent renders never collide and
+        // cleanup is one directory removal.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "itsjustcad_sd_{}_{}",
+            std::process::id(),
+            unique_tag()
+        ));
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| RenderDeckError::Other(format!("cannot create SD temp dir: {e}")))?;
+        let ctrl_png = tmp_dir.join("control_depth.png");
+        let out_png = tmp_dir.join("out.png");
+        let name = self.name.clone();
+
+        // Do the filesystem write + blocking spawn on a blocking thread so the
+        // async task stays cancellable (aborting drops this future; the child is
+        // reaped by the OS). All the heavy work returns a Result we map back.
+        let args = self.build_args(&req, &ctrl_png, &out_png);
+        let depth = req.control.depth.clone();
+        let tmp_for_task = tmp_dir.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, RenderDeckError> {
+            std::fs::write(&ctrl_png, &depth)
+                .map_err(|e| RenderDeckError::Other(format!("cannot stage control image: {e}")))?;
+            // FIXED args — no shell, no interpolation.
+            let output = std::process::Command::new(&bin)
+                .args(&args)
+                .output()
+                .map_err(|e| RenderDeckError::Other(format!("failed to run sd: {e}")))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(RenderDeckError::Other(format!(
+                    "sd failed to render: {}",
+                    stderr.trim().chars().take(400).collect::<String>()
+                )));
+            }
+            let png = std::fs::read(&out_png).map_err(|_| {
+                RenderDeckError::Other(
+                    "sd exited 0 but wrote no output image (unsupported model or bad args)".into(),
+                )
+            })?;
+            Ok(png)
+        })
+        .await;
+        // Clean up the temp dir on EVERY path.
+        let _ = std::fs::remove_dir_all(&tmp_for_task);
+        let png = match result {
+            Ok(inner) => inner?,
+            Err(join) => {
+                return Err(RenderDeckError::Other(format!("sd task did not finish: {join}")))
+            }
+        };
+        if png.is_empty() {
+            return Err(RenderDeckError::NoImage);
+        }
+        Ok(RenderedImage { png, backend: name })
+    }
+}
+
+/// A short, process-unique tag for temp paths (nanosecond clock; the enclosing
+/// dir is already pid-namespaced, so this only separates renders in one process).
+fn unique_tag() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
 // ── Mock backend (tests / headless sanity — no I/O) ──────────────────────────
 
 /// A canned cassette that returns a fixed PNG with no network. Proves the whole
@@ -951,6 +1291,7 @@ mod tests {
         let comfy = RenderConfig {
             name: "c".into(), kind: RenderKind::Comfy,
             base_url: "http://localhost:8188".into(), model: "m".into(), api_key: None,
+            ..RenderConfig::none()
         };
         assert!(comfy.is_configured());
         let comfy_no_url = RenderConfig { base_url: String::new(), ..comfy.clone() };
@@ -960,6 +1301,7 @@ mod tests {
             name: "x".into(), kind: RenderKind::Cloud,
             base_url: "https://api.replicate.com/v1".into(), model: "m".into(),
             api_key: Some("literal".into()),
+            ..RenderConfig::none()
         };
         assert!(cloud.is_configured());
         let cloud_no_key = RenderConfig { api_key: None, ..cloud };
@@ -1009,6 +1351,7 @@ mod tests {
             name: "c".into(), kind: RenderKind::Comfy,
             base_url: "http://localhost:8188".into(),
             model: "sd_xl_base_1.0.safetensors".into(), api_key: None,
+            ..RenderConfig::none()
         };
         let deck = ComfyRenderDeck::new(&cfg);
         let req = RenderRequest::new("a stone tower", dummy_control(), 512, 512);
@@ -1025,6 +1368,7 @@ mod tests {
         let cfg = RenderConfig {
             name: "a".into(), kind: RenderKind::Automatic1111,
             base_url: "http://localhost:7860".into(), model: String::new(), api_key: None,
+            ..RenderConfig::none()
         };
         let deck = Automatic1111RenderDeck::new(&cfg);
         let req = RenderRequest::new("dusk", dummy_control(), 768, 512);
@@ -1041,6 +1385,7 @@ mod tests {
             name: "cloud".into(), kind: RenderKind::Cloud,
             base_url: "https://api.replicate.com/v1".into(),
             model: "m".into(), api_key: Some("env:ITSJUSTCAD_UNSET_CLOUD_KEY_ABC".into()),
+            ..RenderConfig::none()
         };
         let deck = make_render_deck(&cfg);
         let req = RenderRequest::new("x", dummy_control(), 512, 512);
@@ -1161,6 +1506,7 @@ mod tests {
             base_url: base.into(),
             model: String::new(),
             api_key: None,
+            ..RenderConfig::none()
         })
     }
 
@@ -1241,6 +1587,7 @@ mod tests {
         let comfy = RenderConfig {
             name: "c".into(), kind: RenderKind::Comfy,
             base_url: "http://localhost:8188/".into(), model: "m".into(), api_key: None,
+            ..RenderConfig::none()
         };
         // Trailing slash is normalised away.
         assert_eq!(probe_url(&comfy).as_deref(), Some("http://localhost:8188/system_stats"));
@@ -1265,6 +1612,7 @@ mod tests {
             name: "cloud".into(), kind: RenderKind::Cloud,
             base_url: "https://api.replicate.com/v1".into(), model: "m".into(),
             api_key: Some("env:ITSJUSTCAD_UNSET_CLOUD_KEY_DEF".into()),
+            ..RenderConfig::none()
         };
         let err = test_connection(&cfg).await.unwrap_err();
         assert!(err.contains("no API key"), "{err}");
@@ -1282,6 +1630,7 @@ mod tests {
         let cfg = RenderConfig {
             name: "a1111".into(), kind: RenderKind::Automatic1111,
             base_url: base, model: String::new(), api_key: None,
+            ..RenderConfig::none()
         };
         let ok = test_connection(&cfg).await.expect("mock reachable");
         assert!(ok.contains("reachable"), "{ok}");
@@ -1304,6 +1653,7 @@ mod tests {
         let cfg = RenderConfig {
             name: "a1111".into(), kind: RenderKind::Automatic1111,
             base_url: base, model: String::new(), api_key: None,
+            ..RenderConfig::none()
         };
         let err = test_connection(&cfg).await.unwrap_err();
         assert!(err.contains("HTTP 404"), "{err}");
@@ -1320,6 +1670,7 @@ mod tests {
         let cfg = RenderConfig {
             name: "cloud".into(), kind: RenderKind::Cloud,
             base_url: base, model: "m".into(), api_key: Some("sekrit-123".into()),
+            ..RenderConfig::none()
         };
         test_connection(&cfg).await.expect("mock cloud probe");
         let log = log.lock().unwrap();
@@ -1357,6 +1708,7 @@ mod tests {
             base_url: base,
             model: "sd_xl_base_1.0.safetensors".into(),
             api_key: None,
+            ..RenderConfig::none()
         });
         let out = deck
             .render(RenderRequest::new("a stone tower", dummy_control(), 512, 512))
@@ -1393,6 +1745,7 @@ mod tests {
             base_url: base,
             model: "m".into(),
             api_key: None,
+            ..RenderConfig::none()
         });
         let err = deck
             .render(RenderRequest::new("x", dummy_control(), 512, 512))
@@ -1433,6 +1786,7 @@ mod tests {
             base_url: base,
             model: "stability-ai/sdxl".into(),
             api_key: Some("test-key-123".into()),
+            ..RenderConfig::none()
         });
         let out = deck
             .render(RenderRequest::new("a glass pavilion", dummy_control(), 512, 512))
@@ -1469,6 +1823,7 @@ mod tests {
             base_url: base,
             model: "m".into(),
             api_key: Some("k".into()),
+            ..RenderConfig::none()
         });
         let err = deck
             .render(RenderRequest::new("x", dummy_control(), 512, 512))
@@ -1508,6 +1863,246 @@ mod tests {
         let dt = f.decks.iter().find(|d| d.name == "drawthings").expect("drawthings preset");
         assert_eq!(dt.kind, RenderKind::Automatic1111);
         assert!(dt.api_key.is_none(), "local — no key");
+    }
+
+    // ── LocalSd: binary resolution ─────────────────────────────────────────
+
+    #[test]
+    fn resolves_sd_from_a_search_dir_under_stripped_path() {
+        let bindir = std::env::temp_dir().join(format!("ijc_sd_resolve_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bindir);
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("sd");
+        std::fs::write(&stub, b"#!/bin/sh\n").unwrap();
+        let stripped = "/usr/bin:/bin".to_string();
+        let got = resolve_sd_binary_in(std::slice::from_ref(&bindir), Some(stripped));
+        assert_eq!(got, Some(stub));
+        std::fs::remove_dir_all(&bindir).unwrap();
+    }
+
+    #[test]
+    fn resolves_sd_from_path_fallback() {
+        let onpath = std::env::temp_dir().join(format!("ijc_sd_path_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&onpath);
+        std::fs::create_dir_all(&onpath).unwrap();
+        let stub = onpath.join("sd");
+        std::fs::write(&stub, b"x").unwrap();
+        let got = resolve_sd_binary_in(
+            &[PathBuf::from("/nonexistent-sd-xyz")],
+            Some(onpath.to_string_lossy().into_owned()),
+        );
+        assert_eq!(got, Some(stub));
+        std::fs::remove_dir_all(&onpath).unwrap();
+    }
+
+    #[test]
+    fn none_when_sd_absent_everywhere() {
+        let got = resolve_sd_binary_in(
+            &[PathBuf::from("/nonexistent-sd-abc")],
+            Some("/also/nope-sd".to_string()),
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn sd_search_dirs_include_homebrew_targets() {
+        let dirs = sd_search_dirs();
+        assert!(dirs.contains(&PathBuf::from("/usr/local/bin")), "{dirs:?}");
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")), "{dirs:?}");
+    }
+
+    // ── LocalSd: fixed-arg command construction (no shell interpolation) ────
+
+    fn local_sd_cfg() -> RenderConfig {
+        RenderConfig::local_sd(
+            "local-sd",
+            "/models/sd15.gguf",
+            "/models/control_depth.gguf",
+            "/opt/homebrew/bin/sd",
+        )
+    }
+
+    #[test]
+    fn localsd_build_args_is_a_fixed_argv_with_prompt_as_one_element() {
+        let deck = LocalSdRenderDeck::new(&local_sd_cfg());
+        let mut req = RenderRequest::new("a glass pavilion at dusk", dummy_control(), 640, 512);
+        req.negative_prompt = "blurry".into();
+        req.seed = Some(42);
+        let ctrl = Path::new("/tmp/ijc/control_depth.png");
+        let out = Path::new("/tmp/ijc/out.png");
+        let args = deck.build_args(&req, ctrl, out);
+        // The prompt is exactly ONE argv element — never concatenated into a
+        // shell string, so spaces/quotes cannot break the invocation.
+        let pos = args.iter().position(|a| a == "--prompt").expect("--prompt present");
+        assert_eq!(args[pos + 1], std::ffi::OsString::from("a glass pavilion at dusk"));
+        // Model + control image + output all ride as their own elements.
+        let model_pos = args.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(args[model_pos + 1], std::ffi::OsString::from("/models/sd15.gguf"));
+        let ctrl_pos = args.iter().position(|a| a == "--control-image").unwrap();
+        assert_eq!(args[ctrl_pos + 1], ctrl.as_os_str());
+        let out_pos = args.iter().position(|a| a == "--output").unwrap();
+        assert_eq!(args[out_pos + 1], out.as_os_str());
+        // ControlNet gguf, negative prompt, and seed are present.
+        let cn_pos = args.iter().position(|a| a == "--control-net").unwrap();
+        assert_eq!(args[cn_pos + 1], std::ffi::OsString::from("/models/control_depth.gguf"));
+        assert!(args.iter().any(|a| a == "--negative-prompt"));
+        let seed_pos = args.iter().position(|a| a == "--seed").unwrap();
+        assert_eq!(args[seed_pos + 1], std::ffi::OsString::from("42"));
+        // No arg is a shell string with the whole command in it.
+        assert!(!args.iter().any(|a| a.to_string_lossy().contains(" -p ")));
+    }
+
+    #[test]
+    fn localsd_build_args_defaults_and_omits_controlnet_when_unset() {
+        let cfg = RenderConfig::local_sd("local-sd", "/models/sd15.gguf", "", "/bin/sd");
+        let deck = LocalSdRenderDeck::new(&cfg);
+        let req = RenderRequest::new("x", dummy_control(), 512, 512);
+        let args = deck.build_args(&req, Path::new("/c.png"), Path::new("/o.png"));
+        // Default cfg-scale/steps applied.
+        let cfg_pos = args.iter().position(|a| a == "--cfg-scale").unwrap();
+        assert_eq!(args[cfg_pos + 1], std::ffi::OsString::from("7"));
+        let steps_pos = args.iter().position(|a| a == "--steps").unwrap();
+        assert_eq!(args[steps_pos + 1], std::ffi::OsString::from("20"));
+        // No ControlNet gguf → no --control-net flag (img2img only).
+        assert!(!args.iter().any(|a| a == "--control-net"));
+    }
+
+    // ── LocalSd: cassette config round-trip in render_decks.json ───────────
+
+    #[test]
+    fn localsd_config_roundtrips_through_render_decks_file() {
+        let mut f = RenderDecksFile::default();
+        f.decks.push(RenderConfig::local_sd(
+            "local-sd15",
+            "/models/sd15.gguf",
+            "/models/cn_depth.gguf",
+            "/opt/homebrew/bin/sd",
+        ));
+        f.active = f.decks.len() - 1;
+        let json = serde_json::to_string(&f).unwrap();
+        let back: RenderDecksFile = serde_json::from_str(&json).unwrap();
+        let cfg = back.active_config();
+        assert_eq!(cfg.kind, RenderKind::LocalSd);
+        assert_eq!(cfg.model, "/models/sd15.gguf");
+        assert_eq!(cfg.control_net, "/models/cn_depth.gguf");
+        assert_eq!(cfg.sd_binary, "/opt/homebrew/bin/sd");
+        // probe_url has no endpoint for LocalSd.
+        assert_eq!(probe_url(&cfg), None);
+    }
+
+    #[test]
+    fn localsd_is_configured_requires_model_and_binary() {
+        // Model set + a real (temp) binary → configured.
+        let bindir = std::env::temp_dir().join(format!("ijc_sd_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bindir);
+        std::fs::create_dir_all(&bindir).unwrap();
+        let sd = bindir.join("sd");
+        std::fs::write(&sd, b"#!/bin/sh\n").unwrap();
+        let cfg = RenderConfig::local_sd("l", "/models/m.gguf", "", sd.to_string_lossy());
+        assert!(cfg.is_configured(), "model + resolvable binary");
+        // No model → not configured.
+        let no_model = RenderConfig::local_sd("l", "", "", sd.to_string_lossy());
+        assert!(!no_model.is_configured());
+        std::fs::remove_dir_all(&bindir).unwrap();
+    }
+
+    // ── LocalSd: readiness verdict (pure, no spawn) ────────────────────────
+
+    #[test]
+    fn local_sd_readiness_missing_binary_gives_install_hint() {
+        let cfg = RenderConfig::local_sd("l", "/models/m.gguf", "", "/nonexistent/sd-xyz");
+        // Force resolution to fail by pointing HOME/PATH-independent: the recorded
+        // path doesn't exist and (on a CI box) neither does a system `sd`. We only
+        // assert the message shape when it errors; if a real `sd` is installed the
+        // model-file check errors instead — both are acceptable install/download
+        // hints, so accept either.
+        let verdict = local_sd_readiness(&cfg);
+        let msg = verdict.unwrap_err();
+        assert!(
+            msg.contains("stable-diffusion.cpp") || msg.contains("model"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn local_sd_readiness_ok_when_binary_and_model_present() {
+        let dir = std::env::temp_dir().join(format!("ijc_sd_ready_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sd = dir.join("sd");
+        std::fs::write(&sd, b"#!/bin/sh\n").unwrap();
+        let model = dir.join("m.gguf");
+        std::fs::write(&model, b"GGUF").unwrap();
+        let cfg = RenderConfig::local_sd(
+            "l",
+            model.to_string_lossy(),
+            "",
+            sd.to_string_lossy(),
+        );
+        let msg = local_sd_readiness(&cfg).expect("ready");
+        assert!(msg.contains("local renderer ready"), "{msg}");
+        assert!(msg.contains("m.gguf"), "{msg}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Spawn the LocalSd deck against a STUB `sd` (a shell script that writes a
+    /// known PNG to its `--output` path) — proves the whole spawn/read pipeline
+    /// with NO real 2 GB model and NO GPU.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn localsd_render_with_stub_sd_returns_the_png() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ijc_sd_stub_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_hex = tiny_png();
+        // The stub scans its args for --output and writes the canned PNG there.
+        let sd = dir.join("sd");
+        std::fs::write(
+            &sd,
+            b"#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then out=\"$2\"; fi\n  shift\ndone\nprintf '\\211PNG\\r\\n\\032\\n' > \"$out\"\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&sd).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&sd, perm).unwrap();
+        let model = dir.join("m.gguf");
+        std::fs::write(&model, b"GGUF").unwrap();
+        let cfg = RenderConfig::local_sd(
+            "local-sd",
+            model.to_string_lossy(),
+            "",
+            sd.to_string_lossy(),
+        );
+        let deck = LocalSdRenderDeck::new(&cfg);
+        let out = deck
+            .render(RenderRequest::new("a tower", dummy_control(), 256, 256))
+            .await
+            .expect("stub sd render");
+        assert_eq!(out.backend, "local-sd");
+        assert!(out.png.starts_with(&[0x89, 0x50, 0x4E, 0x47]), "PNG signature");
+        let _ = png_hex; // silence unused if tiny_png changes
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn localsd_missing_binary_fails_with_install_hint_not_panic() {
+        let cfg = RenderConfig {
+            sd_binary: "/nonexistent/sd-abc".into(),
+            ..RenderConfig::local_sd("l", "/nonexistent/model.gguf", "", "")
+        };
+        let deck = LocalSdRenderDeck::new(&cfg);
+        let err = deck
+            .render(RenderRequest::new("x", dummy_control(), 64, 64))
+            .await
+            .unwrap_err();
+        // Either the binary is missing (install hint) or — if a system `sd`
+        // exists — the model file is missing (download hint). Never a panic.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stable-diffusion.cpp") || msg.contains("model"),
+            "{msg}"
+        );
     }
 
     #[test]

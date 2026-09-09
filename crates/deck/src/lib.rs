@@ -36,11 +36,11 @@ pub use prompt::{
     VIEW_VERB_HELP,
 };
 pub use render_deck::{
-    make_render_deck, probe_url, render_config_path, test_connection, Automatic1111RenderDeck,
-    CloudRenderDeck,
-    ComfyRenderDeck, ControlImages, MockRenderDeck, RenderConfig, RenderDeck, RenderDeckError,
-    RenderDecksFile, RenderKind, RenderRequest, RenderedImage, UnconfiguredRenderDeck,
-    NO_BACKEND_MESSAGE,
+    local_sd_readiness, make_render_deck, probe_url, render_config_path, resolve_sd_binary,
+    resolve_sd_binary_in, sd_search_dirs, test_connection, Automatic1111RenderDeck,
+    CloudRenderDeck, ComfyRenderDeck, ControlImages, LocalSdRenderDeck, MockRenderDeck,
+    RenderConfig, RenderDeck, RenderDeckError, RenderDecksFile, RenderKind, RenderRequest,
+    RenderedImage, UnconfiguredRenderDeck, NO_BACKEND_MESSAGE, NO_SD_BINARY_MESSAGE,
 };
 pub use tool_loop::{
     run_plan_loop, run_tool_loop, AgentCassette, LoopOutcome, PlanOutcome, StepDecision,
