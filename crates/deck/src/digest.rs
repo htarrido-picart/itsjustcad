@@ -127,6 +127,9 @@ pub fn digest(doc: &Document) -> String {
             Geometry::Points { .. } => "pointcloud",
             Geometry::Frame { kind, .. } => kind.label(),
             Geometry::Area { kind, .. } => kind.label(),
+            // Parametric structures report their generator so the LLM knows they
+            // stay editable via `paramset <sel> key=value`.
+            Geometry::Parametric { generator, .. } => generator.token(),
         };
         let name = obj
             .name

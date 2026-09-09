@@ -224,9 +224,10 @@ fn entity(
 ) -> usize {
     match geometry {
         Geometry::Curve(curve) => curve_entity(t, layer, curve),
-        Geometry::Mesh(mesh) | Geometry::Frame { mesh, .. } | Geometry::Area { mesh, .. } => {
-            mesh_entity(t, layer, mesh)
-        }
+        Geometry::Mesh(mesh)
+        | Geometry::Frame { mesh, .. }
+        | Geometry::Area { mesh, .. }
+        | Geometry::Parametric { mesh, .. } => mesh_entity(t, layer, mesh),
         Geometry::Annotation(a) => annotation_entity(t, layer, a, units, Some(doc)),
         // Block instances export as an INSERT referencing the sanitized block
         // name written in the BLOCKS section (R12 supports internal blocks; only

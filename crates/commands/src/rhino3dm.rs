@@ -976,7 +976,8 @@ pub fn export(doc: &itsjustcad_doc::Document) -> (Vec<u8>, String) {
         match &obj.geometry {
             Geometry::Mesh(m)
             | Geometry::Frame { mesh: m, .. }
-            | Geometry::Area { mesh: m, .. } => {
+            | Geometry::Area { mesh: m, .. }
+            | Geometry::Parametric { mesh: m, .. } => {
                 let li = layer_index(&obj.layer, &mut layers);
                 items.push(WriteItem::Mesh {
                     name,

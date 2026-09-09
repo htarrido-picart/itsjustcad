@@ -2498,6 +2498,70 @@ fn mesh_object(doc: &mut Document, id: Option<ObjectId>, mesh: kernel_mesh::Mesh
     id
 }
 
+/// Insert a **live parametric** object (M-parametric): stores the generator +
+/// params and the derived mesh cache. The mesh is re-baked from the same pure
+/// [`itsjustcad_doc::derive_mesh`] on any later `paramset` — the single
+/// re-derive path. Params are sanitized to the schema so the stored map is
+/// always complete and valid (replay-stable).
+fn parametric_object(
+    doc: &mut Document,
+    id: Option<ObjectId>,
+    generator: itsjustcad_doc::GeneratorKind,
+    params: itsjustcad_doc::ParamMap,
+) -> Result<ObjectId, ExecError> {
+    let params = generator.schema().sanitize(&params);
+    let mesh = itsjustcad_doc::derive_mesh(generator, &params)
+        .map_err(|e| ExecError::Invalid(e.to_string()))?;
+    let id = id.unwrap_or_default();
+    doc.insert(SceneObject {
+        visible: true,
+        id,
+        name: None,
+        layer: doc.current_layer.clone(),
+        color: None,
+        material: None,
+        lineweight_mm: None,
+        geometry: Geometry::Parametric { generator, params, mesh },
+    });
+    Ok(id)
+}
+
+/// Parse a `key=value` string token into a typed [`itsjustcad_doc::ParamValue`]
+/// per the field's declared kind. Vec3 accepts `x,y,z`; bool accepts
+/// `true|false|1|0|on|off`; enum accepts any string (schema sanitize snaps
+/// invalid choices back to the default). Returns `None` on a malformed number.
+fn parse_param_value(
+    field: &itsjustcad_doc::ParamField,
+    s: &str,
+) -> Option<itsjustcad_doc::ParamValue> {
+    use itsjustcad_doc::{FieldKind, ParamValue};
+    let s = s.trim();
+    match field.kind {
+        FieldKind::Float => s.parse::<f64>().ok().map(ParamValue::Float),
+        FieldKind::Int => s
+            .parse::<i64>()
+            .ok()
+            .or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
+            .map(ParamValue::Int),
+        FieldKind::Bool => match s.to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" | "yes" => Some(ParamValue::Bool(true)),
+            "false" | "0" | "off" | "no" => Some(ParamValue::Bool(false)),
+            _ => None,
+        },
+        FieldKind::Vec3 => {
+            let parts: Vec<&str> = s.split(',').collect();
+            if parts.len() != 3 {
+                return None;
+            }
+            let x = parts[0].trim().parse::<f64>().ok()?;
+            let y = parts[1].trim().parse::<f64>().ok()?;
+            let z = parts[2].trim().parse::<f64>().ok()?;
+            Some(ParamValue::Vec3([x, y, z]))
+        }
+        FieldKind::Enum => Some(ParamValue::Enum(s.to_string())),
+    }
+}
+
 /// Upper bound on a single grid dimension for procedural surface/lattice
 /// generators. A `256×256` surface is ~66k vertices — far beyond any sane
 /// design resolution, yet small enough that the resulting GPU vertex buffer
@@ -2600,7 +2664,8 @@ fn boolean_inputs(
             match &obj.geometry {
                 Geometry::Mesh(m)
                 | Geometry::Frame { mesh: m, .. }
-                | Geometry::Area { mesh: m, .. } => Ok(m.clone()),
+                | Geometry::Area { mesh: m, .. }
+                | Geometry::Parametric { mesh: m, .. } => Ok(m.clone()),
                 Geometry::Curve(_) => Err(ExecError::Invalid(format!(
                     "'{id}' is a curve; booleans need meshes — extrude it first"
                 ))),
@@ -2792,6 +2857,7 @@ pub(crate) fn build_schedule_rows(doc: &Document, layer: Option<&str>) -> Vec<Sc
                 Geometry::Points { .. } => "pointcloud",
                 Geometry::Frame { kind, .. } => kind.label(),
                 Geometry::Area { kind, .. } => kind.label(),
+                Geometry::Parametric { generator, .. } => generator.token(),
             };
             let area_m2 = match &o.geometry {
                 Geometry::Curve(c) if c.is_closed() => {
@@ -5999,7 +6065,8 @@ fn bake_param_block(
         match &obj.geometry {
             Geometry::Mesh(m)
             | Geometry::Frame { mesh: m, .. }
-            | Geometry::Area { mesh: m, .. } => out.push(BlockGeometry::Mesh(m.clone())),
+            | Geometry::Area { mesh: m, .. }
+            | Geometry::Parametric { mesh: m, .. } => out.push(BlockGeometry::Mesh(m.clone())),
             Geometry::Curve(c) => out.push(BlockGeometry::Curve(c.clone())),
             Geometry::Annotation(a) => out.push(BlockGeometry::Annotation(a.clone())),
             Geometry::Instance { .. } | Geometry::Points { .. } => {}
@@ -6411,11 +6478,15 @@ fn apply_forward(
             if radius <= 0.0 {
                 return Err(ExecError::Invalid("geodesic radius must be positive".into()));
             }
-            let (_, segs) = kernel_mesh::geodesic_network(frequency, radius, !full);
-            // Strut side scales gently with radius so the frame reads at any size.
-            let strut = (radius * 0.02).clamp(0.01, 0.5);
-            let mesh = kernel_mesh::strut_lattice(&segs, strut);
-            let id = mesh_object(doc, id, mesh);
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("frequency".into(), ParamValue::Int(frequency as i64));
+            params.insert("radius".into(), ParamValue::Float(radius));
+            params.insert(
+                "mode".into(),
+                ParamValue::Enum(if full { "full".into() } else { "dome".into() }),
+            );
+            let id = parametric_object(doc, id, GeneratorKind::Geodesic, params)?;
             Ok((
                 Command::Geodesic { id: Some(id), frequency, radius, full },
                 Inverse::DeleteCreated(vec![id]),
@@ -6437,10 +6508,13 @@ fn apply_forward(
                     "space frame bay and depth must be positive".into(),
                 ));
             }
-            let segs = kernel_mesh::spaceframe_struts(nx, ny, bay, depth);
-            let strut = (bay * 0.04).clamp(0.02, 0.3);
-            let mesh = kernel_mesh::strut_lattice(&segs, strut);
-            let id = mesh_object(doc, id, mesh);
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("nx".into(), ParamValue::Int(nx as i64));
+            params.insert("ny".into(), ParamValue::Int(ny as i64));
+            params.insert("bay".into(), ParamValue::Float(bay));
+            params.insert("depth".into(), ParamValue::Float(depth));
+            let id = parametric_object(doc, id, GeneratorKind::SpaceFrame, params)?;
             Ok((
                 Command::SpaceFrame { id: Some(id), nx, ny, bay, depth },
                 Inverse::DeleteCreated(vec![id]),
@@ -6460,8 +6534,14 @@ fn apply_forward(
             }
             let (nu_v, nv_v) =
                 (clamp_grid(nu.unwrap_or(12)), clamp_grid(nv.unwrap_or(12)));
-            let mesh = kernel_mesh::hypar_surface(a, b, c, nu_v, nv_v);
-            let id = mesh_object(doc, id, mesh);
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("a".into(), ParamValue::Float(a));
+            params.insert("b".into(), ParamValue::Float(b));
+            params.insert("c".into(), ParamValue::Float(c));
+            params.insert("nu".into(), ParamValue::Int(nu_v as i64));
+            params.insert("nv".into(), ParamValue::Int(nv_v as i64));
+            let id = parametric_object(doc, id, GeneratorKind::Hypar, params)?;
             Ok((
                 Command::Hypar { id: Some(id), a, b, c, nu, nv },
                 Inverse::DeleteCreated(vec![id]),
@@ -6480,8 +6560,13 @@ fn apply_forward(
                     "gaussvault span, length and rise must be positive".into(),
                 ));
             }
-            let mesh = kernel_mesh::gaussvault_surface(span, length, rise, 24, 24, undulate);
-            let id = mesh_object(doc, id, mesh);
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("span".into(), ParamValue::Float(span));
+            params.insert("length".into(), ParamValue::Float(length));
+            params.insert("rise".into(), ParamValue::Float(rise));
+            params.insert("undulate".into(), ParamValue::Bool(undulate));
+            let id = parametric_object(doc, id, GeneratorKind::GaussVault, params)?;
             Ok((
                 Command::GaussVault { id: Some(id), span, length, rise, undulate },
                 Inverse::DeleteCreated(vec![id]),
@@ -6520,8 +6605,25 @@ fn apply_forward(
                     }
                 }
             }
-            let mesh = kernel_mesh::gridshell(surface.to_kernel(), nu_v, nv_v, 0.06);
-            let id = mesh_object(doc, id, mesh);
+            // Only the hypar-surface gridshell is parametric-editable (the
+            // schema exposes hypar params). The vault variant bakes to a plain
+            // mesh — noted in the M-parametric PHASES entry.
+            let id = match surface {
+                crate::GridshellSurfaceSpec::Hypar { a, b, c } => {
+                    use itsjustcad_doc::{GeneratorKind, ParamValue};
+                    let mut params = itsjustcad_doc::ParamMap::new();
+                    params.insert("a".into(), ParamValue::Float(a));
+                    params.insert("b".into(), ParamValue::Float(b));
+                    params.insert("c".into(), ParamValue::Float(c));
+                    params.insert("nu".into(), ParamValue::Int(nu_v as i64));
+                    params.insert("nv".into(), ParamValue::Int(nv_v as i64));
+                    parametric_object(doc, id, GeneratorKind::Gridshell, params)?
+                }
+                _ => {
+                    let mesh = kernel_mesh::gridshell(surface.to_kernel(), nu_v, nv_v, 0.06);
+                    mesh_object(doc, id, mesh)
+                }
+            };
             Ok((
                 Command::Gridshell { id: Some(id), surface, nu, nv },
                 Inverse::DeleteCreated(vec![id]),
@@ -6553,16 +6655,15 @@ fn apply_forward(
             let seg = segments.unwrap_or(24).clamp(2, MAX_GRID);
             let ld = load.unwrap_or(1.0).max(0.0);
             let sl = slack.unwrap_or(1.4);
-            let mut pts = kernel_mesh::funicular_chain(support_a, support_b, seg, ld, sl);
-            if invert {
-                pts = kernel_mesh::invert_funicular(&pts);
-            }
-            let segsv: Vec<(glam::DVec3, glam::DVec3)> =
-                pts.windows(2).map(|w| (w[0], w[1])).collect();
-            let span = (support_b - support_a).length();
-            let strut = (span * 0.02).clamp(0.02, 0.4);
-            let mesh = kernel_mesh::strut_lattice(&segsv, strut);
-            let id = mesh_object(doc, id, mesh);
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("support_a".into(), ParamValue::Vec3(support_a.to_array()));
+            params.insert("support_b".into(), ParamValue::Vec3(support_b.to_array()));
+            params.insert("segments".into(), ParamValue::Int(seg as i64));
+            params.insert("load".into(), ParamValue::Float(ld));
+            params.insert("slack".into(), ParamValue::Float(sl));
+            params.insert("invert".into(), ParamValue::Bool(invert));
+            let id = parametric_object(doc, id, GeneratorKind::Funicular, params)?;
             Ok((
                 Command::Funicular {
                     id: Some(id),
@@ -6606,12 +6707,13 @@ fn apply_forward(
                     std::f64::consts::PI * (0.5 - 1.0 / struts as f64)
                 }
             };
-            let t = kernel_mesh::tensegrity_prism(struts, r, h, tw);
-            // Thick struts (compression) + thin cables (tension) merged into one.
-            let mut mesh = kernel_mesh::strut_lattice(&t.net.strut_segments(), (r * 0.08).max(0.03));
-            let cables = kernel_mesh::strut_lattice(&t.net.cable_segments(), (r * 0.03).max(0.012));
-            mesh.merge(&cables);
-            let id = mesh_object(doc, id, mesh);
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("struts".into(), ParamValue::Int(struts as i64));
+            params.insert("radius".into(), ParamValue::Float(r));
+            params.insert("height".into(), ParamValue::Float(h));
+            params.insert("twist_deg".into(), ParamValue::Float(tw.to_degrees()));
+            let id = parametric_object(doc, id, GeneratorKind::Tensegrity, params)?;
             Ok((
                 Command::Tensegrity { id: Some(id), struts, radius, height, twist_deg },
                 Inverse::DeleteCreated(vec![id]),
@@ -6627,15 +6729,15 @@ fn apply_forward(
             }
             let nn = clamp_grid(n.unwrap_or(8));
             let sg = finite(sag.unwrap_or(1.5), "cablenet sag")?;
-            let (_, _, segsv) = kernel_mesh::cable_net(corners, nn, sg);
-            if segsv.is_empty() {
-                return Err(ExecError::Invalid("cablenet produced no links".into()));
-            }
-            // Strut side scales with the net span.
-            let span = (corners[1] - corners[0]).length().max(1e-3);
-            let strut = (span * 0.01).clamp(0.01, 0.2);
-            let mesh = kernel_mesh::strut_lattice(&segsv, strut);
-            let id = mesh_object(doc, id, mesh);
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("c0".into(), ParamValue::Vec3(corners[0].to_array()));
+            params.insert("c1".into(), ParamValue::Vec3(corners[1].to_array()));
+            params.insert("c2".into(), ParamValue::Vec3(corners[2].to_array()));
+            params.insert("c3".into(), ParamValue::Vec3(corners[3].to_array()));
+            params.insert("n".into(), ParamValue::Int(nn as i64));
+            params.insert("sag".into(), ParamValue::Float(sg));
+            let id = parametric_object(doc, id, GeneratorKind::Cablenet, params)?;
             Ok((
                 Command::Cablenet { id: Some(id), corners, n, sag },
                 Inverse::DeleteCreated(vec![id]),
@@ -8790,7 +8892,8 @@ fn apply_forward(
                     }
                     Geometry::Mesh(m)
                     | Geometry::Frame { mesh: m, .. }
-                    | Geometry::Area { mesh: m, .. } => mesh_surface_area(m),
+                    | Geometry::Area { mesh: m, .. }
+                    | Geometry::Parametric { mesh: m, .. } => mesh_surface_area(m),
                     Geometry::Annotation(_) => {
                         return Err(ExecError::Invalid(format!(
                             "'{id}' is an annotation — area needs a closed curve or a mesh"
@@ -8828,7 +8931,8 @@ fn apply_forward(
                 match &doc.get(*id).expect("resolved").geometry {
                     Geometry::Mesh(m)
                     | Geometry::Frame { mesh: m, .. }
-                    | Geometry::Area { mesh: m, .. } => total += kernel_mesh::signed_volume(m),
+                    | Geometry::Area { mesh: m, .. }
+                    | Geometry::Parametric { mesh: m, .. } => total += kernel_mesh::signed_volume(m),
                     Geometry::Curve(_) => {
                         return Err(ExecError::Invalid(format!(
                             "'{id}' is a curve; volume needs meshes — extrude it first"
@@ -9271,7 +9375,8 @@ fn apply_forward(
                         Some(match &obj.geometry {
                             Geometry::Mesh(m)
                             | Geometry::Frame { mesh: m, .. }
-                            | Geometry::Area { mesh: m, .. } => BlockGeometry::Mesh(m.clone()),
+                            | Geometry::Area { mesh: m, .. }
+                            | Geometry::Parametric { mesh: m, .. } => BlockGeometry::Mesh(m.clone()),
                             Geometry::Curve(c) => BlockGeometry::Curve(c.clone()),
                             Geometry::Annotation(a) => BlockGeometry::Annotation(a.clone()),
                             // Instances and point clouds within a block are skipped.
@@ -9476,6 +9581,55 @@ fn apply_forward(
                 ApplyOutcome {
                     created: Vec::new(),
                     message: format!("param: '{id}' updated"),
+                },
+            ))
+        }
+        Command::ParamSet { target, params } => {
+            let ids = resolve(doc, &target)?;
+            if ids.len() != 1 {
+                return Err(ExecError::Invalid(format!(
+                    "paramset: selector matched {} objects, expected exactly 1",
+                    ids.len()
+                )));
+            }
+            let id = ids[0];
+            let obj = doc.get(id).expect("resolved");
+            let (generator, cur) = match &obj.geometry {
+                Geometry::Parametric { generator, params, .. } => (*generator, params.clone()),
+                _ => {
+                    return Err(ExecError::Invalid(format!(
+                        "paramset: '{id}' is not a parametric object"
+                    )))
+                }
+            };
+            let schema = generator.schema();
+            let mut new_values = cur.clone();
+            for (k, v) in &params {
+                let Some(field) = schema.field(k) else {
+                    return Err(ExecError::Invalid(format!(
+                        "paramset: {} has no parameter '{k}'",
+                        generator.token()
+                    )));
+                };
+                let pv = parse_param_value(field, v).ok_or_else(|| {
+                    ExecError::Invalid(format!("paramset: bad value '{v}' for '{k}'"))
+                })?;
+                new_values.insert(k.clone(), pv);
+            }
+            let new_values = schema.sanitize(&new_values);
+            let mesh = itsjustcad_doc::derive_mesh(generator, &new_values)
+                .map_err(|e| ExecError::Invalid(e.to_string()))?;
+            let prev_geometry = doc.get(id).expect("resolved").geometry.clone();
+            if let Some(o) = doc.get_mut(id) {
+                o.geometry = Geometry::Parametric { generator, params: new_values, mesh };
+            }
+            doc.generation += 1;
+            Ok((
+                Command::ParamSet { target, params },
+                Inverse::SetGeometry(vec![(id, prev_geometry)]),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("paramset: '{id}' updated"),
                 },
             ))
         }
@@ -10276,6 +10430,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::BlockInsert { .. } => "insert",
         Command::BlockParamDefine { .. } => "pblock",
         Command::BlockParamSet { .. } => "param",
+        Command::ParamSet { .. } => "paramset",
         Command::BlockDeleteDef { .. } => "blockdelete",
         Command::BlocksList => "blocks",
         Command::Workdir { .. } => "workdir",
@@ -15026,7 +15181,7 @@ mod tests {
 
     fn mesh_of(s: &Session, id: ObjectId) -> &kernel_mesh::Mesh {
         match &s.doc.get(id).unwrap().geometry {
-            Geometry::Mesh(m) => m,
+            Geometry::Mesh(m) | Geometry::Parametric { mesh: m, .. } => m,
             g => panic!("expected mesh geometry, got {g:?}"),
         }
     }
@@ -15050,6 +15205,92 @@ mod tests {
         assert!(s.doc.get(id).is_none());
         run(&mut s, "redo");
         assert!(s.doc.get(id).is_some());
+    }
+
+    #[test]
+    fn paramset_geodesic_frequency_changes_mesh_undo_redo_replay() {
+        let mut s = Session::default();
+        let id = run(&mut s, "geodesic 3 5 dome").created[0];
+        let before = mesh_of(&s, id).positions().len();
+        let out = run(&mut s, "paramset last frequency=5");
+        assert!(out.created.is_empty(), "paramset creates nothing");
+        let after = mesh_of(&s, id).positions().len();
+        assert!(after > before, "freq 5 mesh should be larger: {before} -> {after}");
+        // The stored params reflect the change.
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { params, .. } => {
+                assert_eq!(params.get("frequency").unwrap().as_i64(), Some(5));
+            }
+            g => panic!("expected parametric, got {g:?}"),
+        }
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert_eq!(mesh_of(&s, id).positions().len(), before, "undo restores mesh");
+        run(&mut s, "redo");
+        assert_eq!(mesh_of(&s, id).positions().len(), after, "redo re-applies");
+    }
+
+    #[test]
+    fn paramset_rejects_unknown_param_and_non_parametric() {
+        let mut s = Session::default();
+        run(&mut s, "geodesic 3 5 dome");
+        assert!(
+            s.run(parse("paramset last bogus=1").unwrap()).is_err(),
+            "unknown param must error"
+        );
+        // A plain box is not parametric.
+        run(&mut s, "box 0,0,0 1,1,1");
+        assert!(
+            s.run(parse("paramset last radius=2").unwrap()).is_err(),
+            "paramset on non-parametric must error"
+        );
+    }
+
+    #[test]
+    fn paramset_clamps_out_of_range_and_toggles_bool() {
+        let mut s = Session::default();
+        let id = run(&mut s, "gaussvault 6 12 3").created[0];
+        // undulate is a bool param; toggle it on.
+        run(&mut s, "paramset last undulate=true");
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { params, .. } => {
+                assert_eq!(params.get("undulate").unwrap().as_bool(), Some(true));
+            }
+            g => panic!("expected parametric, got {g:?}"),
+        }
+        // frequency over the schema max clamps (geodesic max 6).
+        let g = run(&mut s, "geodesic 3 5 dome").created[0];
+        run(&mut s, "paramset last frequency=999");
+        match &s.doc.get(g).unwrap().geometry {
+            Geometry::Parametric { params, .. } => {
+                assert_eq!(params.get("frequency").unwrap().as_i64(), Some(6));
+            }
+            g => panic!("expected parametric, got {g:?}"),
+        }
+    }
+
+    #[test]
+    fn generators_are_parametric_objects() {
+        // Every generator that maps to the parametric model should create a
+        // Parametric object (not a plain Mesh), so it stays editable.
+        let cases = [
+            "geodesic 3 5 dome",
+            "spaceframe 4 3 3 1.5",
+            "hypar 5 5 5 6 6",
+            "gaussvault 6 12 3",
+            "gridshell hypar 5 5 5 4 4",
+            "funicular -5,0,0 5,0,0 20 1 1.4",
+            "tensegrity 3 1 2",
+            "cablenet 0,0,0 8,0,0 8,8,3 0,8,3 5 1.5",
+        ];
+        for verb in cases {
+            let mut s = Session::default();
+            let id = run(&mut s, verb).created[0];
+            assert!(
+                matches!(&s.doc.get(id).unwrap().geometry, Geometry::Parametric { .. }),
+                "'{verb}' should create a parametric object"
+            );
+        }
     }
 
     #[test]

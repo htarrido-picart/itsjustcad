@@ -888,6 +888,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Annotate,
         },
         CommandSpec {
+            name: "paramset",
+            usage: "paramset <selector> <key=value ...>",
+            summary: "Edit a parameter of a selected built-in parametric structure (geodesic, hypar, gaussvault, gridshell, funicular, tensegrity, cablenet, spaceframe); its mesh re-derives live. These generators stay editable after creation. Example: paramset last frequency=4 · paramset last rise=5",
+            category: Category::Structure,
+        },
+        CommandSpec {
             name: "blockdelete",
             usage: "blockdelete <name>",
             summary: "Delete a block definition (plain or parametric). Refuses while instances of it exist — delete the instances first. Example: blockdelete door",

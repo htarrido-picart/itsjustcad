@@ -383,6 +383,16 @@ pub enum Geometry {
         material: Option<String>,
         mesh: Mesh,
     },
+    /// A **live parametric structure** (M-parametric): the object stores its
+    /// generator kind + typed params, and `mesh` is a derived cache re-baked by
+    /// `param_schema::derive_mesh` whenever a param changes. Same pattern as
+    /// `Frame`/`Area` (source data + derived mesh); re-derive is pure of
+    /// `(generator, params)`, so param edits are deterministic + replay-stable.
+    Parametric {
+        generator: crate::param_schema::GeneratorKind,
+        params: crate::param_schema::ParamMap,
+        mesh: Mesh,
+    },
 }
 
 /// Frame member ergonomic subtype. Both use the same underlying representation;
@@ -460,6 +470,11 @@ impl Geometry {
                 boundary.iter_mut().for_each(|p| *p += d);
                 mesh.transform(glam::DMat4::from_translation(d));
             }
+            // Move only the baked mesh — params are shape, not placement. A move
+            // does not re-derive (it would snap the shape back to the origin).
+            Geometry::Parametric { mesh, .. } => {
+                mesh.transform(glam::DMat4::from_translation(d));
+            }
         }
     }
 
@@ -467,9 +482,10 @@ impl Geometry {
     /// volume, section cuts). `None` for non-solid geometry.
     pub fn mesh(&self) -> Option<&Mesh> {
         match self {
-            Geometry::Mesh(m) | Geometry::Frame { mesh: m, .. } | Geometry::Area { mesh: m, .. } => {
-                Some(m)
-            }
+            Geometry::Mesh(m)
+            | Geometry::Frame { mesh: m, .. }
+            | Geometry::Area { mesh: m, .. }
+            | Geometry::Parametric { mesh: m, .. } => Some(m),
             _ => None,
         }
     }
@@ -536,6 +552,11 @@ impl Geometry {
                 mesh.transform(*m);
                 true
             }
+            // Transform bakes into the mesh cache (params stay canonical shape).
+            Geometry::Parametric { mesh, .. } => {
+                mesh.transform(*m);
+                true
+            }
         }
     }
 
@@ -552,7 +573,9 @@ impl Geometry {
                 Aabb::from_points(vec![*position - DVec3::splat(s), *position + DVec3::splat(s)])
             }
             Geometry::Points { positions } => Aabb::from_points(positions.clone()),
-            Geometry::Frame { mesh, .. } | Geometry::Area { mesh, .. } => mesh.aabb(),
+            Geometry::Frame { mesh, .. }
+            | Geometry::Area { mesh, .. }
+            | Geometry::Parametric { mesh, .. } => mesh.aabb(),
         }
     }
 
@@ -570,6 +593,7 @@ impl Geometry {
             Geometry::Points { positions } => positions.clone(),
             Geometry::Frame { a, b, .. } => vec![*a, *b],
             Geometry::Area { boundary, .. } => boundary.clone(),
+            Geometry::Parametric { mesh, .. } => mesh.positions().to_vec(),
         }
     }
 }

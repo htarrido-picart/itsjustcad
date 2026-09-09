@@ -44,7 +44,8 @@ fn collect(doc: &Document) -> (Vec<MeshPart>, Vec<LinePart>) {
         match &obj.geometry {
             Geometry::Mesh(m)
             | Geometry::Frame { mesh: m, .. }
-            | Geometry::Area { mesh: m, .. } => meshes.push(MeshPart {
+            | Geometry::Area { mesh: m, .. }
+            | Geometry::Parametric { mesh: m, .. } => meshes.push(MeshPart {
                 name,
                 positions: m.positions().to_vec(),
                 faces: m.faces().to_vec(),

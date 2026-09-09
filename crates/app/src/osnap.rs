@@ -247,7 +247,8 @@ pub fn candidates_filtered(
             }
             Geometry::Mesh(m)
             | Geometry::Frame { mesh: m, .. }
-            | Geometry::Area { mesh: m, .. } => {
+            | Geometry::Area { mesh: m, .. }
+            | Geometry::Parametric { mesh: m, .. } => {
                 // Mesh vertices are the natural corners of massing solids and
                 // structural members. Capped so a huge imported mesh does not
                 // flood the candidate list.

@@ -1521,6 +1521,25 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             }
             Ok(Command::BlockParamSet { target: sel, params })
         }
+        // paramset <selector> <key=value ...> — edit a built-in parametric
+        // object (geodesic/hypar/…) and re-derive its mesh.
+        "paramset" => {
+            let (sel, rest) = selector(&args, "paramset")?;
+            if rest.is_empty() {
+                return wrong("paramset", "a selector and one or more key=value params", &args);
+            }
+            let mut params = std::collections::BTreeMap::new();
+            for tok in rest {
+                let Some((k, v)) = tok.split_once('=') else {
+                    return wrong("paramset", "key=value params", &args);
+                };
+                if k.is_empty() {
+                    return wrong("paramset", "a non-empty param name in key=value", &args);
+                }
+                params.insert(k.to_string(), v.to_string());
+            }
+            Ok(Command::ParamSet { target: sel, params })
+        }
         // -- sketch constraints --
         "constrain" => {
             let Some((kind_tok, rest)) = args.split_first() else {

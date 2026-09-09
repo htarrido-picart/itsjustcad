@@ -272,7 +272,8 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
             // exactly like a solid mesh.
             Geometry::Mesh(mesh)
             | Geometry::Frame { mesh, .. }
-            | Geometry::Area { mesh, .. } => {
+            | Geometry::Area { mesh, .. }
+            | Geometry::Parametric { mesh, .. } => {
                 let (color, rm) =
                     resolve_mesh_material(obj, layer_color, theme, selected, mode);
                 scene.meshes.push((mesh.to_render(), color, rm));

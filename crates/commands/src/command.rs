@@ -1243,6 +1243,13 @@ pub enum Command {
         target: Selector,
         params: std::collections::BTreeMap<String, String>,
     },
+    /// Edit one or more params of a built-in **parametric** object (geodesic,
+    /// hypar, …) and re-derive its mesh (M-parametric). `key=value` pairs
+    /// override the object's current params; the schema clamps/validates them.
+    ParamSet {
+        target: Selector,
+        params: std::collections::BTreeMap<String, String>,
+    },
     /// Delete a block definition (plain or parametric) by name. Refuses while
     /// instances of it exist in the scene — delete the instances first, so a
     /// definition can never be orphaned out from under live geometry.

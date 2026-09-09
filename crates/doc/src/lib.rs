@@ -11,6 +11,7 @@ pub mod hatch;
 pub mod hershey;
 pub mod loads;
 mod object;
+pub mod param_schema;
 mod sheet;
 mod structure;
 mod underlay;
@@ -24,6 +25,10 @@ pub use object::{
     Annotation, AreaKind, BlockGeometry, DimAnchor, EndpointRef, FrameKind, Geometry,
     HatchPattern, LayerStyle, LineType, MaterialPreset, ObjectId, ObjectMaterial, ParamBlockDef,
     ParamBlockParam, SceneObject, DEFAULT_LAYER,
+};
+pub use param_schema::{
+    derive_mesh, param_summary, DeriveError, FieldKind, GeneratorKind, ParamField, ParamMap,
+    ParamSchema, ParamValue, Unit, Widget,
 };
 pub use sheet::{
     PaperSize, ScheduleRow, Sheet, SheetDim, SheetLeader, SheetTable, SheetTag, SheetText,
