@@ -307,9 +307,17 @@ mod tests {
         assert_eq!(classify("language en"), Some(AppVerb::Language(Lang::En)));
         assert_eq!(classify("language es"), Some(AppVerb::Language(Lang::Es)));
         assert_eq!(classify("lang es-CO"), Some(AppVerb::Language(Lang::Es)));
+        // Every Romance language parses (M-romance).
+        assert_eq!(classify("language pt"), Some(AppVerb::Language(Lang::Pt)));
+        assert_eq!(classify("language fr"), Some(AppVerb::Language(Lang::Fr)));
+        assert_eq!(classify("language it"), Some(AppVerb::Language(Lang::It)));
+        assert_eq!(classify("language ro"), Some(AppVerb::Language(Lang::Ro)));
+        assert_eq!(classify("language ca"), Some(AppVerb::Language(Lang::Ca)));
+        assert_eq!(classify("language gl"), Some(AppVerb::Language(Lang::Gl)));
+        assert_eq!(classify("lang pt-BR"), Some(AppVerb::Language(Lang::Pt)));
         // Bare or unknown argument is not an app verb (falls through → error).
         assert_eq!(classify("language"), None);
-        assert_eq!(classify("language fr"), None);
+        assert_eq!(classify("language de"), None);
     }
 
     #[test]

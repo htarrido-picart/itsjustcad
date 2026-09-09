@@ -472,11 +472,15 @@ pub fn skin_radio_items() -> [(&'static str, CadOrigin); 4] {
     ]
 }
 
-/// The Theme ▸ Language radio group: `(id_suffix, Lang)`. Each becomes a `Check`
-/// firing `SetLanguage(lang)` — the same apply+persist path the `language en|es`
-/// verb uses. Labels use each language's own `native_name` (English / Español).
-pub fn lang_radio_items() -> [(&'static str, Lang); 2] {
-    [("lang_en", Lang::En), ("lang_es", Lang::Es)]
+/// The Theme ▸ Language radio group: `(id_suffix, Lang)`, one per shipped
+/// language (see [`Lang::ALL`]). Each becomes a `Check` firing
+/// `SetLanguage(lang)` — the same apply+persist path the `language <code>` verb
+/// uses. Labels use each language's own `native_name`.
+pub fn lang_radio_items() -> Vec<(String, Lang)> {
+    Lang::ALL
+        .iter()
+        .map(|l| (format!("lang_{}", l.code()), *l))
+        .collect()
 }
 
 /// Map a top-level menu's canonical English id (`"File"`, `"Edit"`, …) to its

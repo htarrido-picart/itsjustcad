@@ -1460,7 +1460,8 @@ impl App {
                         ));
                     }
                     None => {
-                        self.command_line.push_line("usage: language en|es");
+                        self.command_line
+                            .push_line("usage: language en|es|pt|fr|it|ro|ca|gl");
                     }
                 }
             }
@@ -6156,7 +6157,7 @@ impl App {
                     egui::ComboBox::from_id_salt("settings_language")
                         .selected_text(lang.native_name())
                         .show_ui(ui, |ui| {
-                            for l in [crate::i18n::Lang::En, crate::i18n::Lang::Es] {
+                            for l in crate::i18n::Lang::ALL {
                                 ui.selectable_value(&mut lang, l, l.native_name());
                             }
                         });
@@ -7617,7 +7618,7 @@ impl eframe::App for App {
                     // (and re-localizes the rest of this dialog live). Persisted
                     // on Start; also flippable later via Settings / `language`.
                     ui.label(crate::i18n::t("onboard.language.prompt"));
-                    for l in [crate::i18n::Lang::En, crate::i18n::Lang::Es] {
+                    for l in crate::i18n::Lang::ALL {
                         let mut sel = crate::i18n::current_lang() == l;
                         if ui.radio(sel, l.native_name()).clicked() {
                             sel = true;
