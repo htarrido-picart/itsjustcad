@@ -227,6 +227,39 @@ pub fn terse_adjusted(prompt: String, max_tokens: u32, terse: bool) -> (String, 
     }
 }
 
+/// The reply-language directive, keyed to the active UI language (M-romance).
+///
+/// The deck follows the UI language for its PROSE — a French UI gets French
+/// explanations, questions, plan text, and critique. The command CATALOG and
+/// every command TOKEN stay canonical English: the parser + GBNF grammar only
+/// accept `box`/`geodesic`/`lotsubdivide`, so the model must NOT translate them.
+/// `english_name` is the target language's English name ("French", "Portuguese")
+/// — steering in English is the most reliable across models while the reply
+/// lands in the target language.
+///
+/// Returns `None` for English (no directive needed — English is the default and
+/// the whole prompt is already English), so English prompts stay byte-identical.
+pub fn language_directive(english_name: &str) -> Option<String> {
+    if english_name.eq_ignore_ascii_case("English") {
+        return None;
+    }
+    Some(format!(
+        "\n## Reply language\nRespond in {english_name}: all chat, explanations, questions, plan text, and critique must be in {english_name}. \
+BUT keep every command token exactly as listed in the catalog — command names and their arguments are canonical English and must NEVER be translated \
+(always emit `box`, `geodesic`, `extrude`, `difference`, etc., verbatim). Only your prose is in {english_name}; the commands inside ```draft blocks stay English.\n"
+    ))
+}
+
+/// Append the reply-language directive (if any) to a built system prompt. A
+/// no-op for English. Pure, so the deck's language-follow plumbing is
+/// unit-testable end to end (mirrors [`terse_adjusted`]).
+pub fn with_language(prompt: String, english_name: &str) -> String {
+    match language_directive(english_name) {
+        Some(dir) => format!("{prompt}{dir}"),
+        None => prompt,
+    }
+}
+
 /// Build the system prompt from the command registry (single source of truth)
 /// plus a compact scene digest. Regenerated every turn so the model always
 /// sees current geometry.
@@ -950,6 +983,47 @@ mod tests {
             "theme dark|light",
         ] {
             assert!(p.contains(line), "UI section missing grammar '{line}'");
+        }
+    }
+
+    #[test]
+    fn language_directive_none_for_english() {
+        // English is the default: no directive (prompt stays byte-identical).
+        assert!(language_directive("English").is_none());
+        assert!(language_directive("english").is_none());
+        let base = compact_system_prompt("", &PluginRegistry::new());
+        assert_eq!(with_language(base.clone(), "English"), base);
+    }
+
+    #[test]
+    fn language_directive_present_for_non_english_and_keeps_tokens_canonical() {
+        // A non-English UI adds a "Respond in <lang>" directive naming the target
+        // language, while the command catalog + tokens stay canonical English.
+        for name in ["French", "Portuguese", "Italian", "Romanian", "Catalan", "Galician", "Spanish"] {
+            let dir = language_directive(name).unwrap_or_else(|| panic!("no directive for {name}"));
+            assert!(dir.contains(name), "directive must name the target language {name}");
+            assert!(
+                dir.to_lowercase().contains("respond in"),
+                "directive must steer the reply language"
+            );
+            // The invariant, stated in the directive itself.
+            assert!(
+                dir.contains("NEVER be translated") || dir.contains("canonical English"),
+                "directive must protect command tokens for {name}"
+            );
+
+            // Apply to the real prompt: prose directive present, command catalog
+            // + canonical tokens unchanged (grammar-visible verbs stay English).
+            let full = with_language(compact_system_prompt("", &PluginRegistry::new()), name);
+            assert!(full.contains(name));
+            for token in ["box", "geodesic", "extrude", "difference", "hypar", "funicular"] {
+                assert!(
+                    full.contains(token),
+                    "canonical token '{token}' must survive the {name} directive"
+                );
+            }
+            // The command catalog header stays English (never localized).
+            assert!(full.contains("Command catalog"));
         }
     }
 }

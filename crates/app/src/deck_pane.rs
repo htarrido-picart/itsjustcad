@@ -1585,6 +1585,13 @@ impl DeckPane {
                 itsjustcad_deck::compact_system_prompt(&digest, &session.plugins)
             }
         };
+        // Deck follows the UI language (M-romance): append a "respond in <lang>"
+        // directive keyed to the active locale's English name. The reply lands in
+        // the target language; the command catalog + every command TOKEN stay
+        // canonical English (the parser + GBNF grammar accept English only).
+        // A no-op for English, so English prompts stay byte-identical.
+        let prompt =
+            itsjustcad_deck::with_language(prompt, crate::i18n::current_lang().english_name());
         // Terse mode: style rules appended to the system prompt + a hard
         // per-turn max-token cap. Default ON for local cassettes (fewer tokens
         // = faster inference), OFF for cloud unless the user enabled it.

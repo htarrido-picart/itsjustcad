@@ -31,9 +31,9 @@ pub use digest::digest;
 pub use extract::{Extractor, ExtractEvent};
 pub use probe::{probe, warm_model, ProbeInfo, WarmOutcome};
 pub use prompt::{
-    compact_command_catalog, compact_system_prompt, select_prompt, system_prompt, terse_adjusted,
-    PromptChoice, CLARIFY_HELP, PLAN_HELP, TERSE_MAX_TOKENS, TERSE_STYLE_HELP, UI_VERB_HELP,
-    VIEW_VERB_HELP,
+    compact_command_catalog, compact_system_prompt, language_directive, select_prompt,
+    system_prompt, terse_adjusted, with_language, PromptChoice, CLARIFY_HELP, PLAN_HELP,
+    TERSE_MAX_TOKENS, TERSE_STYLE_HELP, UI_VERB_HELP, VIEW_VERB_HELP,
 };
 pub use render_deck::{
     local_sd_readiness, make_render_deck, probe_url, render_config_path, resolve_sd_binary,
