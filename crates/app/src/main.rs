@@ -31,6 +31,7 @@ mod palette;
 mod point_edit;
 mod precise;
 mod preset;
+mod raytrace_ui;
 mod scene;
 mod statusbar;
 mod suggest;

@@ -52,6 +52,11 @@ pub enum MenuAction {
     /// grid). Fired by the View ▸ Object Snap… menu item; the same popup the
     /// clickable status-bar osnap chip opens.
     ShowOsnap,
+    /// Open the modeless Raytrace render window (the CPU path tracer's
+    /// progressive UI: resolution/samples/bounces/sun/sky/tonemap controls, a
+    /// live-refining preview, cancel + Save PNG). Fired by the View ▸ Raytrace…
+    /// menu item; the `raytrace` verb with no output path opens the same window.
+    ShowRaytrace,
     /// Open the Edit history / amend panel as a modal (the command line is the
     /// op-log scrollback; this exposes step-jump + amend on demand).
     EditHistory,
@@ -697,6 +702,9 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             NativeItem::Separator,
             // Object Snap… opens the modeless osnap popup (per-kind toggles).
             wired_leaf(t, "osnap", tr("menu.view.osnap"), MenuAction::ShowOsnap),
+            NativeItem::Separator,
+            // Raytrace… opens the modeless progressive CPU-path-tracer window.
+            wired_leaf(t, "raytrace", tr("menu.view.raytrace"), MenuAction::ShowRaytrace),
         ];
         menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
     }
@@ -1303,6 +1311,7 @@ mod tests {
         assert!(!by_action(&MenuAction::ZoomStep(true)), "text size leaked into View");
         // Object Snap… opens the osnap popup (same as the status-bar chip).
         assert!(by_action(&MenuAction::ShowOsnap), "Object Snap… entry missing from View");
+        assert!(by_action(&MenuAction::ShowRaytrace), "Raytrace… entry missing from View");
     }
 
     #[test]

@@ -260,6 +260,14 @@ struct RenderResultView {
     backend: String,
 }
 
+/// The live/final raytrace image shown in the Raytrace window: the uploaded
+/// texture plus a copy of the raw RGBA frame (kept so "Save PNG…" can write the
+/// exact accumulated image without re-rendering).
+struct RaytracePreview {
+    texture: egui::TextureHandle,
+    image: itsjustcad_raytrace::Image,
+}
+
 pub struct App {
     session: Session,
     command_line: CommandLine,
@@ -348,6 +356,19 @@ pub struct App {
     /// Last finished diffusion render, shown in the floating "AI Render"
     /// window (closing the window drops it; the PNG stays on disk).
     render_result: Option<RenderResultView>,
+    /// Whether the modeless Raytrace render window is open (View ▸ Raytrace… or
+    /// the `raytrace` verb without an output path). UI state, not op-log.
+    raytrace_window_open: bool,
+    /// The Raytrace window's editable controls (resolution/samples/bounces/…).
+    raytrace_controls: crate::raytrace_ui::RtControls,
+    /// The custom-resolution text field's buffer (parsed on Render).
+    raytrace_custom_res: String,
+    /// The in-flight (or finished) progressive raytrace, polled each frame. Runs
+    /// on a background thread; the UI drains its shared state. See `raytrace_ui`.
+    raytrace_job: Option<crate::raytrace_ui::RaytraceJob>,
+    /// The newest raytrace preview frame uploaded as a texture, with its passes/
+    /// total caption. Refined live as passes accumulate; cleared on new Render.
+    raytrace_preview: Option<RaytracePreview>,
     /// Cmd+C pressed with a selection; Cmd+V then runs `copy sel 1,1,0`.
     clipboard_armed: bool,
     /// In-progress drag-box selection: anchor position of the drag.
@@ -831,6 +852,11 @@ impl App {
             render_job: None,
             render_conn_test: None,
             render_result: None,
+            raytrace_window_open: false,
+            raytrace_controls: crate::raytrace_ui::RtControls::default(),
+            raytrace_custom_res: String::new(),
+            raytrace_job: None,
+            raytrace_preview: None,
             clipboard_armed: false,
             box_drag: None,
             journal,
@@ -1732,15 +1758,15 @@ impl App {
     /// same core the headless runner uses. Numbers disambiguate by magnitude:
     /// a value ≥ 256 is the image width, otherwise it is the sample count.
     fn raytrace_view(&mut self, args: &[String]) {
-        use itsjustcad_raytrace::{render, scene_from_doc, Camera, Settings, Sky};
+        use itsjustcad_raytrace::{render, Settings, Sky};
 
-        let mut out = "raytrace.png".to_string();
+        let mut out: Option<String> = None;
         let mut samples: u32 = 48;
         let mut width: u32 = 800;
         let nums: Vec<u32> = args.iter().filter_map(|t| t.parse::<u32>().ok()).collect();
         for tok in args {
             if tok.parse::<u32>().is_err() {
-                out = tok.clone();
+                out = Some(tok.clone());
             }
         }
         match nums.as_slice() {
@@ -1752,22 +1778,27 @@ impl App {
                 width = *w;
             }
         }
+
+        // No explicit output path → open the interactive progressive window
+        // (live preview + controls + Save PNG) rather than silently writing a
+        // file. Any numeric hints seed the window's controls.
+        let Some(out) = out else {
+            if !nums.is_empty() {
+                self.raytrace_controls.samples_per_pixel = samples;
+                self.raytrace_controls.resolution =
+                    crate::raytrace_ui::Resolution::Custom(width, (width * 5 / 8).max(16));
+            }
+            self.raytrace_window_open = true;
+            self.command_line
+                .push_line("raytrace: opened the render window (View ▸ Raytrace…)");
+            return;
+        };
+
+        // An explicit path keeps the classic one-shot save-to-file behaviour.
         let height = (width as f32 * 5.0 / 8.0).round() as u32;
         let aspect = width as f32 / height as f32;
-
-        let cam_idx = self.layout.camera_index(self.active_pane);
-        let camera = self.cameras[cam_idx];
-        let eye = camera.eye();
-        let target = camera.target;
-        let up = if camera.pitch.abs() > 1.55 { glam::Vec3::Y } else { glam::Vec3::Z };
-        let rt_cam = Camera::look_at(
-            glam::DVec3::new(eye.x as f64, eye.y as f64, eye.z as f64),
-            glam::DVec3::new(target.x as f64, target.y as f64, target.z as f64),
-            glam::DVec3::new(up.x as f64, up.y as f64, up.z as f64),
-            camera.fov_y as f64,
-            aspect as f64,
-        );
-        let scene = scene_from_doc(&self.session.doc, Sky::default());
+        let rt_cam = self.raytrace_camera(aspect as f64);
+        let scene = itsjustcad_raytrace::scene_from_doc(&self.session.doc, Sky::default());
         let settings = Settings { width, height, samples_per_pixel: samples, ..Default::default() };
         let image = render(&scene, &rt_cam, &settings);
         match image.save_png(std::path::Path::new(&out)) {
@@ -1776,6 +1807,309 @@ impl App {
                 scene.triangle_count()
             )),
             Err(e) => self.command_line.push_line(format!("raytrace failed: {e}")),
+        }
+    }
+
+    /// Build a `raytrace::Camera` from the active viewport at the given aspect
+    /// (w/h), matching the viewport's eye/target/up/fov. Shared by the verb, the
+    /// file-save path, and the progressive window.
+    fn raytrace_camera(&self, aspect: f64) -> itsjustcad_raytrace::Camera {
+        let cam_idx = self.layout.camera_index(self.active_pane);
+        let camera = self.cameras[cam_idx];
+        let eye = camera.eye();
+        let target = camera.target;
+        let up = if camera.pitch.abs() > 1.55 { glam::Vec3::Y } else { glam::Vec3::Z };
+        itsjustcad_raytrace::Camera::look_at(
+            glam::DVec3::new(eye.x as f64, eye.y as f64, eye.z as f64),
+            glam::DVec3::new(target.x as f64, target.y as f64, target.z as f64),
+            glam::DVec3::new(up.x as f64, up.y as f64, up.z as f64),
+            camera.fov_y as f64,
+            aspect,
+        )
+    }
+
+    /// Kick off a progressive raytrace on a background thread from the current
+    /// window controls + active viewport. Cancels any in-flight job first, then
+    /// spawns the pass loop; the UI drains its shared state each frame.
+    fn start_raytrace(&mut self) {
+        use itsjustcad_raytrace::{scene_from_doc, Sky, Sun};
+
+        // Cancel + reap any running job before starting a new one.
+        if let Some(job) = self.raytrace_job.take() {
+            job.join();
+        }
+        self.raytrace_preview = None;
+
+        let ctrl = self.raytrace_controls;
+        let settings = ctrl.to_settings();
+        let aspect = settings.width as f64 / settings.height as f64;
+        let cam = self.raytrace_camera(aspect);
+
+        // Sun/sky toggles: an "off" sun removes direct light; an "off" sky drops
+        // ambient to near-black so only the sun (if on) lights the scene.
+        let mut scene = scene_from_doc(&self.session.doc, Sky::default());
+        if !ctrl.sun_on {
+            scene.sun = None;
+        } else if scene.sun.is_none() {
+            scene.sun = Some(Sun::default());
+        }
+        if !ctrl.sky_on {
+            scene.sky = Sky {
+                zenith: glam::DVec3::ZERO,
+                horizon: glam::DVec3::ZERO,
+                ground: glam::DVec3::ZERO,
+            };
+        }
+        let tris = scene.triangle_count();
+
+        let job = crate::raytrace_ui::RaytraceJob::spawn(settings, tris, move |shared, cancel| {
+            let empty = tris == 0;
+            itsjustcad_raytrace::render_progressive(
+                &scene,
+                &cam,
+                &settings,
+                |pr| {
+                    if let Ok(mut s) = shared.lock() {
+                        s.passes_done = pr.passes_done;
+                        s.passes_total = pr.passes_total;
+                        s.latest = Some(pr.image.clone());
+                        if empty {
+                            s.error = Some("rt.empty".into());
+                        }
+                    }
+                },
+                cancel,
+            );
+        });
+        self.command_line.push_line(format!(
+            "raytrace: rendering {}×{} · {} spp · {tris} tris",
+            settings.width, settings.height, settings.samples_per_pixel
+        ));
+        self.raytrace_job = Some(job);
+    }
+
+    /// Drain the newest raytrace pass into a texture and update the caption.
+    /// Non-blocking; requests a repaint while a job is in flight so the preview
+    /// keeps refining even when the user is idle.
+    fn poll_raytrace(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.raytrace_job else { return };
+        let (frame, _done, _total, err, finished) = job.drain();
+        if let Some(img) = frame {
+            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                [img.width as usize, img.height as usize],
+                &img.pixels,
+            );
+            let texture = ctx.load_texture("raytrace_preview", ci, egui::TextureOptions::LINEAR);
+            self.raytrace_preview = Some(RaytracePreview { texture, image: img });
+        }
+        if let Some(key) = err {
+            // Surface an empty-scene note once (guidance, not a blank window).
+            if finished {
+                self.command_line.push_line(crate::i18n::t(&key));
+            }
+        }
+        if !finished {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+    }
+
+    /// The modeless Raytrace render window: controls on the left, the live/final
+    /// preview on the right. Sibling to the diffusion "AI Render" window.
+    fn raytrace_window(&mut self, ctx: &egui::Context) {
+        use crate::i18n::t;
+        use crate::raytrace_ui::{parse_custom_res, progress_line, JobState, Resolution};
+        use itsjustcad_raytrace::ToneMap;
+
+        if !self.raytrace_window_open {
+            return;
+        }
+        let mut open = true;
+        let mut do_render = false;
+        let mut do_stop = false;
+        let mut do_save = false;
+
+        let state = self
+            .raytrace_job
+            .as_ref()
+            .map(|j| j.state())
+            .unwrap_or(JobState::Idle);
+        let running = state == JobState::Running;
+
+        egui::Window::new(t("rt.title"))
+            .collapsible(true)
+            .resizable(true)
+            .default_size([760.0, 520.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    // ── Left: controls ──
+                    ui.vertical(|ui| {
+                        ui.set_width(240.0);
+
+                        ui.label(egui::RichText::new(t("rt.resolution")).strong());
+                        for &p in Resolution::PRESETS {
+                            let sel = self.raytrace_controls.resolution == p;
+                            if ui.selectable_label(sel, p.label()).clicked() {
+                                self.raytrace_controls.resolution = p;
+                            }
+                        }
+                        let is_custom =
+                            matches!(self.raytrace_controls.resolution, Resolution::Custom(..));
+                        let custom_buf = &mut self.raytrace_custom_res;
+                        let mut new_custom: Option<Resolution> = None;
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(is_custom, t("rt.custom")).clicked() {
+                                new_custom = parse_custom_res(custom_buf);
+                            }
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(custom_buf)
+                                    .desired_width(90.0)
+                                    .hint_text("1280x800"),
+                            );
+                            if resp.changed() {
+                                new_custom = parse_custom_res(custom_buf);
+                            }
+                        });
+                        if let Some(r) = new_custom {
+                            self.raytrace_controls.resolution = r;
+                        }
+                        let c = &mut self.raytrace_controls;
+
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(t("rt.samples")).strong());
+                        ui.add(egui::Slider::new(&mut c.samples_per_pixel, 1..=1024).logarithmic(true));
+
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(t("rt.bounces")).strong());
+                        ui.add(egui::Slider::new(&mut c.max_bounces, 0..=16));
+
+                        ui.add_space(6.0);
+                        ui.checkbox(&mut c.sun_on, t("rt.sun"));
+                        ui.checkbox(&mut c.sky_on, t("rt.sky"));
+
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(t("rt.tonemap")).strong());
+                        egui::ComboBox::from_id_salt("rt_tonemap")
+                            .selected_text(match c.tonemap {
+                                ToneMap::Aces => t("rt.tonemap.aces"),
+                                ToneMap::Reinhard => t("rt.tonemap.reinhard"),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut c.tonemap, ToneMap::Aces, t("rt.tonemap.aces"));
+                                ui.selectable_value(
+                                    &mut c.tonemap,
+                                    ToneMap::Reinhard,
+                                    t("rt.tonemap.reinhard"),
+                                );
+                            });
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!running, egui::Button::new(t("rt.render")))
+                                .clicked()
+                            {
+                                do_render = true;
+                            }
+                            if ui
+                                .add_enabled(running, egui::Button::new(t("rt.stop")))
+                                .clicked()
+                            {
+                                do_stop = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.raytrace_preview.is_some(),
+                                    egui::Button::new(t("rt.save")),
+                                )
+                                .clicked()
+                            {
+                                do_save = true;
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(t("rt.hint")).weak().small());
+                    });
+
+                    ui.separator();
+
+                    // ── Right: preview + progress ──
+                    ui.vertical(|ui| {
+                        if let Some(job) = &self.raytrace_job {
+                            let (_f, done, total, _e, _fin) = job.drain();
+                            let line = match state {
+                                JobState::Cancelled => format!("stopped · {done} / {total}"),
+                                _ => progress_line(done, total, job.started.elapsed()),
+                            };
+                            ui.label(egui::RichText::new(format!(
+                                "{line} · {} {}",
+                                job.tri_count,
+                                t("rt.tris")
+                            ))
+                            .weak());
+                        } else {
+                            ui.label(egui::RichText::new(t("rt.hint")).weak().small());
+                        }
+
+                        if let Some(pv) = &self.raytrace_preview {
+                            let size = pv.texture.size_vec2();
+                            let avail = ui.available_size();
+                            let scale = (avail.x / size.x).min(avail.y / size.y).clamp(0.02, 4.0);
+                            ui.add(egui::Image::new(&pv.texture).fit_to_exact_size(size * scale));
+                        } else {
+                            ui.add_space(20.0);
+                            ui.label(egui::RichText::new(t("rt.hint")).weak());
+                        }
+                    });
+                });
+            });
+
+        if do_render {
+            self.start_raytrace();
+        }
+        if do_stop && let Some(job) = &mut self.raytrace_job {
+            job.cancel();
+        }
+        if do_save {
+            self.save_raytrace_png();
+        }
+        if !open {
+            // Closing the window cancels + reaps an in-flight render.
+            if let Some(job) = self.raytrace_job.take() {
+                job.join();
+            }
+            self.raytrace_window_open = false;
+        }
+    }
+
+    /// Save the current accumulated raytrace frame to a PNG via the native save
+    /// dialog (or a timestamped file in the private runtime dir when headless).
+    fn save_raytrace_png(&mut self) {
+        let Some(pv) = &self.raytrace_preview else {
+            self.command_line.push_line("raytrace: nothing to save yet");
+            return;
+        };
+        let path = if self.headless_no_dialog() {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some(private_runtime_dir().join(format!("raytrace_{secs}.png")))
+        } else {
+            rfd::FileDialog::new()
+                .add_filter("PNG", &["png"])
+                .set_file_name("raytrace.png")
+                .save_file()
+        };
+        let Some(path) = path else { return };
+        match pv.image.save_png(&path) {
+            Ok(()) => self.command_line.push_line(format!(
+                "raytrace {}: {}",
+                crate::i18n::t("rt.saved"),
+                path.display()
+            )),
+            Err(e) => self.command_line.push_line(format!("raytrace save failed: {e}")),
         }
     }
 
@@ -5294,6 +5628,7 @@ impl App {
             MenuAction::ModelSetup => self.show_model_setup = true,
             MenuAction::ShowPlugins => self.show_plugins = true,
             MenuAction::ShowOsnap => self.osnap_popup_open = true,
+            MenuAction::ShowRaytrace => self.raytrace_window_open = true,
             MenuAction::EditHistory => self.show_history = true,
             MenuAction::ImportDialog => self.import(None),
             MenuAction::ExportDialog => self.export(None),
@@ -7130,6 +7465,12 @@ impl eframe::App for App {
         // failures surface even while the user is idle.
         self.poll_render(ui.ctx());
         self.render_result_window(ui.ctx());
+
+        // Raytrace: drain the background path-tracer's newest pass into a
+        // texture and draw the modeless render window (controls + live preview
+        // + cancel + save). Runs every frame so the preview refines while idle.
+        self.poll_raytrace(ui.ctx());
+        self.raytrace_window(ui.ctx());
 
         // Multi-session store: key the deck's per-document chats off a stable
         // document uuid (stamped lazily if the file never had one). App-local,
