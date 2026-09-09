@@ -391,8 +391,33 @@ pub enum Geometry {
     Parametric {
         generator: crate::param_schema::GeneratorKind,
         params: crate::param_schema::ParamMap,
+        /// World placement of the derived shape. `params` describe the shape at
+        /// the canonical origin; `placement` carries the move/transform applied
+        /// after creation. A re-derive (`paramset`) rebuilds `mesh` at the origin
+        /// then re-applies `placement`, so editing a param does NOT teleport the
+        /// object back to 0,0,0. `mesh` is the display cache with `placement`
+        /// already baked in.
+        ///
+        /// serde-default is IDENTITY (glam's `DMat4::default()` is the ZERO
+        /// matrix, which would collapse geometry on load), and identity is
+        /// skipped on write to keep files clean and backward-compatible.
+        #[serde(
+            default = "dmat4_identity",
+            skip_serializing_if = "is_dmat4_identity"
+        )]
+        placement: glam::DMat4,
         mesh: Mesh,
     },
+}
+
+/// serde default for `Parametric::placement` — glam's `DMat4::default()` is the
+/// ZERO matrix, so an explicit identity helper is REQUIRED for correctness.
+fn dmat4_identity() -> glam::DMat4 {
+    glam::DMat4::IDENTITY
+}
+
+fn is_dmat4_identity(m: &glam::DMat4) -> bool {
+    *m == glam::DMat4::IDENTITY
 }
 
 /// Frame member ergonomic subtype. Both use the same underlying representation;
@@ -472,8 +497,12 @@ impl Geometry {
             }
             // Move only the baked mesh — params are shape, not placement. A move
             // does not re-derive (it would snap the shape back to the origin).
-            Geometry::Parametric { mesh, .. } => {
-                mesh.transform(glam::DMat4::from_translation(d));
+            // Accumulate the move into `placement` so a later `paramset`
+            // re-derive can re-apply it and keep the object where the user put it.
+            Geometry::Parametric { mesh, placement, .. } => {
+                let t = glam::DMat4::from_translation(d);
+                *placement = t * *placement;
+                mesh.transform(t);
             }
         }
     }
@@ -552,8 +581,11 @@ impl Geometry {
                 mesh.transform(*m);
                 true
             }
-            // Transform bakes into the mesh cache (params stay canonical shape).
-            Geometry::Parametric { mesh, .. } => {
+            // Transform bakes into the mesh cache (params stay canonical shape),
+            // and accumulates into `placement` so a `paramset` re-derive lands
+            // the fresh shape at the same world position.
+            Geometry::Parametric { mesh, placement, .. } => {
+                *placement = *m * *placement;
                 mesh.transform(*m);
                 true
             }

@@ -2531,7 +2531,12 @@ fn parametric_object(
         color: None,
         material: None,
         lineweight_mm: None,
-        geometry: Geometry::Parametric { generator, params, mesh },
+        geometry: Geometry::Parametric {
+            generator,
+            params,
+            placement: glam::DMat4::IDENTITY,
+            mesh,
+        },
     });
     Ok(id)
 }
@@ -9604,8 +9609,10 @@ fn apply_forward(
             }
             let id = ids[0];
             let obj = doc.get(id).expect("resolved");
-            let (generator, cur) = match &obj.geometry {
-                Geometry::Parametric { generator, params, .. } => (*generator, params.clone()),
+            let (generator, cur, placement) = match &obj.geometry {
+                Geometry::Parametric { generator, params, placement, .. } => {
+                    (*generator, params.clone(), *placement)
+                }
                 _ => {
                     return Err(ExecError::Invalid(format!(
                         "paramset: '{id}' is not a parametric object"
@@ -9627,11 +9634,20 @@ fn apply_forward(
                 new_values.insert(k.clone(), pv);
             }
             let new_values = schema.sanitize(&new_values);
-            let mesh = itsjustcad_doc::derive_mesh(generator, &new_values)
+            let mut mesh = itsjustcad_doc::derive_mesh(generator, &new_values)
                 .map_err(|e| ExecError::Invalid(e.to_string()))?;
+            // derive_mesh returns the shape at the canonical origin. Re-apply the
+            // stored placement so a param edit does NOT teleport the object back
+            // to 0,0,0 (Blocker 3).
+            mesh.transform(placement);
             let prev_geometry = doc.get(id).expect("resolved").geometry.clone();
             if let Some(o) = doc.get_mut(id) {
-                o.geometry = Geometry::Parametric { generator, params: new_values, mesh };
+                o.geometry = Geometry::Parametric {
+                    generator,
+                    params: new_values,
+                    placement,
+                    mesh,
+                };
             }
             doc.generation += 1;
             Ok((
@@ -10859,6 +10875,126 @@ mod tests {
             instance_block_key(&s2, id),
             "baked-block key stable across replay"
         );
+    }
+
+    // ── M-parametric replay-stability + placement regressions ───────────────
+
+    /// Blocker 2: a v0.4 file with `geodesic 10 5` (freq 10, historically valid)
+    /// must replay at freq 10, NOT be clamped to the editor-slider max (was 6).
+    /// The verb-created mesh must match a direct `derive_mesh` at freq 10 and be
+    /// strictly larger than the freq-6 mesh.
+    #[test]
+    fn geodesic_freq_beyond_old_slider_max_not_clamped() {
+        use itsjustcad_doc::{GeneratorKind, ParamValue};
+
+        let mut s = Session::default();
+        run(&mut s, "geodesic 10 5");
+        let id = s.doc.all_ids()[0];
+        let verts = match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { params, mesh, .. } => {
+                assert_eq!(
+                    params.get("frequency").unwrap().as_i64(),
+                    Some(10),
+                    "frequency must survive at 10, not clamp to the old slider max"
+                );
+                mesh.positions().len()
+            }
+            g => panic!("expected Parametric, got {g:?}"),
+        };
+
+        // Direct derive at freq 10 must match the verb-created mesh.
+        let mut p10 = GeneratorKind::Geodesic.default_params();
+        p10.insert("frequency".into(), ParamValue::Int(10));
+        p10.insert("radius".into(), ParamValue::Float(5.0));
+        let m10 = itsjustcad_doc::derive_mesh(GeneratorKind::Geodesic, &p10).unwrap();
+        assert_eq!(verts, m10.positions().len(), "verb mesh == direct freq-10 derive");
+
+        // And strictly larger than the freq-6 mesh (proves no clamp to 6).
+        let mut p6 = GeneratorKind::Geodesic.default_params();
+        p6.insert("frequency".into(), ParamValue::Int(6));
+        p6.insert("radius".into(), ParamValue::Float(5.0));
+        let m6 = itsjustcad_doc::derive_mesh(GeneratorKind::Geodesic, &p6).unwrap();
+        assert!(
+            verts > m6.positions().len(),
+            "freq-10 mesh must be larger than freq-6 (not clamped): {verts} vs {}",
+            m6.positions().len()
+        );
+    }
+
+    /// Blocker 2 (grid dim): a hypar with nu=128 (beyond the old slider max 64)
+    /// must replay as 128, not be clamped down.
+    #[test]
+    fn hypar_grid_dim_beyond_old_slider_max_not_clamped() {
+        let mut s = Session::default();
+        run(&mut s, "hypar 5 5 5 128 128");
+        let id = s.doc.all_ids()[0];
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { params, .. } => {
+                assert_eq!(params.get("nu").unwrap().as_i64(), Some(128), "nu not clamped to old max 64");
+                assert_eq!(params.get("nv").unwrap().as_i64(), Some(128), "nv not clamped to old max 64");
+            }
+            g => panic!("expected Parametric, got {g:?}"),
+        }
+    }
+
+    /// Blocker 3: `geodesic 3 5` -> `move` -> `paramset radius=6` must keep the
+    /// object at the moved position, not teleport it back to the origin. Also
+    /// verifies undo/redo and op-log round-trip reproduce identical geometry.
+    #[test]
+    fn paramset_preserves_placement_after_move() {
+        let mut s = Session::default();
+        run(&mut s, "geodesic 3 5");
+        run(&mut s, "move last 10,0,0");
+        run(&mut s, "paramset last radius=6");
+
+        let id = s.doc.all_ids()[0];
+        let center = s.doc.get(id).unwrap().geometry.aabb().center();
+
+        // Reference: the same shape (geodesic 3, radius 6) at the origin. Its AABB
+        // center is not (0,0,0) because a dome is asymmetric in Z; the placement is
+        // proven correct by center == reference_center + (10,0,0).
+        let mut ref_s = Session::default();
+        run(&mut ref_s, "geodesic 3 6");
+        let ref_center = ref_s.doc.get(ref_s.doc.all_ids()[0]).unwrap().geometry.aabb().center();
+        let expected = ref_center + DVec3::new(10.0, 0.0, 0.0);
+        assert!(
+            (center - expected).length() < 1e-6,
+            "paramset after move must keep the +10 X placement: got {center:?}, expected {expected:?}"
+        );
+        assert!(
+            center.x > 5.0,
+            "sanity: object must NOT have snapped back near the origin, got {center:?}"
+        );
+
+        // Placement recorded on the variant, radius applied.
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { params, placement, .. } => {
+                assert_eq!(params.get("radius").unwrap().as_f64(), Some(6.0));
+                assert_eq!(placement.w_axis.truncate(), DVec3::new(10.0, 0.0, 0.0));
+            }
+            g => panic!("expected Parametric, got {g:?}"),
+        }
+
+        // Undo the paramset -> back to radius 5 but still at (10,0,0).
+        s.undo().unwrap();
+        let c_after_undo = s.doc.get(id).unwrap().geometry.aabb().center();
+        assert!(
+            (c_after_undo.x - 10.0).abs() < 1e-6,
+            "undo keeps placement, got {c_after_undo:?}"
+        );
+        // Redo -> radius 6 at (10,0,0) again.
+        s.redo().unwrap();
+        let c_after_redo = s.doc.get(id).unwrap().geometry.aabb().center();
+        assert!((c_after_redo.x - 10.0).abs() < 1e-6, "redo keeps placement");
+        assert_eq!(c_after_redo, center, "redo reproduces identical center");
+
+        // Op-log round-trip: replay must reproduce identical geometry + JSON.
+        let j1 = crate::io::to_json(&s);
+        let s2 = crate::io::from_json(&j1).unwrap();
+        let j2 = crate::io::to_json(&s2);
+        assert_eq!(j1, j2, "op-log JSON byte-stable across replay");
+        let c2 = s2.doc.get(id).unwrap().geometry.aabb().center();
+        assert_eq!(c2, center, "replayed geometry lands at the same position");
     }
 
     #[test]
@@ -15306,12 +15442,14 @@ mod tests {
             }
             g => panic!("expected parametric, got {g:?}"),
         }
-        // frequency over the schema max clamps (geodesic max 6).
+        // frequency over the schema max clamps to the HISTORICAL cap (64), not
+        // the editor-slider comfort range — replay stability requires the clamp
+        // domain to match what the old verbs accepted.
         let g = run(&mut s, "geodesic 3 5 dome").created[0];
         run(&mut s, "paramset last frequency=999");
         match &s.doc.get(g).unwrap().geometry {
             Geometry::Parametric { params, .. } => {
-                assert_eq!(params.get("frequency").unwrap().as_i64(), Some(6));
+                assert_eq!(params.get("frequency").unwrap().as_i64(), Some(64));
             }
             g => panic!("expected parametric, got {g:?}"),
         }

@@ -86,39 +86,49 @@ impl GeneratorKind {
     /// source for the verb parser, the editor UI, and the deck catalog.
     pub fn schema(self) -> ParamSchema {
         match self {
+            // NOTE (replay stability): int `max` values are the HISTORICAL
+            // derive-safe verb caps (geodesic freq 64, grids 256), NOT the
+            // editor-slider comfort range — sanitize() must never narrow a value
+            // an older verb accepted, or an old .ijc file would replay to a
+            // different mesh. Scale floats (radius, a, b, span, ...) do not drive
+            // triangle count, so they carry `max: None` (unbounded clamp) and use
+            // `Widget::Numeric` (a Slider needs a finite range to draw; an
+            // unbounded scale float is a typed numeric). `min` is kept where the
+            // verb required positivity — old values were all above it, so a lower
+            // bound is replay-safe.
             GeneratorKind::Geodesic => ParamSchema {
                 kind: self,
                 fields: vec![
-                    ParamField::int("frequency", "param.geodesic.frequency", 3, 1, 6, 1, Widget::Slider),
-                    ParamField::float("radius", "param.geodesic.radius", 5.0, Some(0.1), Some(50.0), 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::int("frequency", "param.geodesic.frequency", 3, 1, 64, 1, Widget::Slider),
+                    ParamField::float("radius", "param.geodesic.radius", 5.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
                     ParamField::enum_("mode", "param.geodesic.mode", "dome", &["dome", "full"]),
                 ],
             },
             GeneratorKind::SpaceFrame => ParamSchema {
                 kind: self,
                 fields: vec![
-                    ParamField::int("nx", "param.spaceframe.nx", 4, 1, 32, 1, Widget::Slider),
-                    ParamField::int("ny", "param.spaceframe.ny", 3, 1, 32, 1, Widget::Slider),
-                    ParamField::float("bay", "param.spaceframe.bay", 3.0, Some(0.1), Some(20.0), 0.1, Widget::Numeric, Unit::Meter),
-                    ParamField::float("depth", "param.spaceframe.depth", 1.5, Some(0.1), Some(20.0), 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::int("nx", "param.spaceframe.nx", 4, 1, 256, 1, Widget::Slider),
+                    ParamField::int("ny", "param.spaceframe.ny", 3, 1, 256, 1, Widget::Slider),
+                    ParamField::float("bay", "param.spaceframe.bay", 3.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("depth", "param.spaceframe.depth", 1.5, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
                 ],
             },
             GeneratorKind::Hypar => ParamSchema {
                 kind: self,
                 fields: vec![
-                    ParamField::float("a", "param.hypar.a", 5.0, Some(0.1), Some(50.0), 0.1, Widget::Slider, Unit::Meter),
-                    ParamField::float("b", "param.hypar.b", 5.0, Some(0.1), Some(50.0), 0.1, Widget::Slider, Unit::Meter),
-                    ParamField::float("c", "param.hypar.c", 5.0, Some(-50.0), Some(50.0), 0.1, Widget::Slider, Unit::Meter),
-                    ParamField::int("nu", "param.hypar.nu", 12, 2, 64, 1, Widget::Slider),
-                    ParamField::int("nv", "param.hypar.nv", 12, 2, 64, 1, Widget::Slider),
+                    ParamField::float("a", "param.hypar.a", 5.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("b", "param.hypar.b", 5.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("c", "param.hypar.c", 5.0, None, None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::int("nu", "param.hypar.nu", 12, 2, 256, 1, Widget::Slider),
+                    ParamField::int("nv", "param.hypar.nv", 12, 2, 256, 1, Widget::Slider),
                 ],
             },
             GeneratorKind::GaussVault => ParamSchema {
                 kind: self,
                 fields: vec![
-                    ParamField::float("span", "param.gaussvault.span", 6.0, Some(0.1), Some(50.0), 0.1, Widget::Slider, Unit::Meter),
-                    ParamField::float("length", "param.gaussvault.length", 12.0, Some(0.1), Some(100.0), 0.1, Widget::Slider, Unit::Meter),
-                    ParamField::float("rise", "param.gaussvault.rise", 3.0, Some(0.1), Some(30.0), 0.1, Widget::Slider, Unit::Meter),
+                    ParamField::float("span", "param.gaussvault.span", 6.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("length", "param.gaussvault.length", 12.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("rise", "param.gaussvault.rise", 3.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
                     ParamField::bool("undulate", "param.gaussvault.undulate", false),
                 ],
             },
@@ -128,11 +138,11 @@ impl GeneratorKind {
                 // vault variant is reachable from the verb; the parametric editor
                 // exposes the hypar surface params, matching the default.
                 fields: vec![
-                    ParamField::float("a", "param.hypar.a", 5.0, Some(0.1), Some(50.0), 0.1, Widget::Slider, Unit::Meter),
-                    ParamField::float("b", "param.hypar.b", 5.0, Some(0.1), Some(50.0), 0.1, Widget::Slider, Unit::Meter),
-                    ParamField::float("c", "param.hypar.c", 5.0, Some(-50.0), Some(50.0), 0.1, Widget::Slider, Unit::Meter),
-                    ParamField::int("nu", "param.hypar.nu", 8, 2, 48, 1, Widget::Slider),
-                    ParamField::int("nv", "param.hypar.nv", 8, 2, 48, 1, Widget::Slider),
+                    ParamField::float("a", "param.hypar.a", 5.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("b", "param.hypar.b", 5.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("c", "param.hypar.c", 5.0, None, None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::int("nu", "param.hypar.nu", 8, 2, 256, 1, Widget::Slider),
+                    ParamField::int("nv", "param.hypar.nv", 8, 2, 256, 1, Widget::Slider),
                 ],
             },
             GeneratorKind::Funicular => ParamSchema {
@@ -140,19 +150,19 @@ impl GeneratorKind {
                 fields: vec![
                     ParamField::vec3("support_a", "param.funicular.support_a", DVec3::new(-5.0, 0.0, 0.0)),
                     ParamField::vec3("support_b", "param.funicular.support_b", DVec3::new(5.0, 0.0, 0.0)),
-                    ParamField::int("segments", "param.funicular.segments", 24, 2, 128, 1, Widget::Slider),
-                    ParamField::float("load", "param.funicular.load", 1.0, Some(0.0), Some(20.0), 0.1, Widget::Slider, Unit::None),
-                    ParamField::float("slack", "param.funicular.slack", 1.4, Some(1.0), Some(4.0), 0.05, Widget::Slider, Unit::None),
+                    ParamField::int("segments", "param.funicular.segments", 24, 2, 256, 1, Widget::Slider),
+                    ParamField::float("load", "param.funicular.load", 1.0, Some(0.0), None, 0.1, Widget::Numeric, Unit::None),
+                    ParamField::float("slack", "param.funicular.slack", 1.4, Some(1.0), None, 0.05, Widget::Numeric, Unit::None),
                     ParamField::bool("invert", "param.funicular.invert", false),
                 ],
             },
             GeneratorKind::Tensegrity => ParamSchema {
                 kind: self,
                 fields: vec![
-                    ParamField::int("struts", "param.tensegrity.struts", 3, 3, 32, 1, Widget::Slider),
-                    ParamField::float("radius", "param.tensegrity.radius", 1.0, Some(0.1), Some(20.0), 0.1, Widget::Slider, Unit::Meter),
-                    ParamField::float("height", "param.tensegrity.height", 2.0, Some(0.1), Some(20.0), 0.1, Widget::Slider, Unit::Meter),
-                    ParamField::float("twist_deg", "param.tensegrity.twist", 60.0, Some(-180.0), Some(180.0), 1.0, Widget::Slider, Unit::Degree),
+                    ParamField::int("struts", "param.tensegrity.struts", 3, 3, 256, 1, Widget::Slider),
+                    ParamField::float("radius", "param.tensegrity.radius", 1.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("height", "param.tensegrity.height", 2.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("twist_deg", "param.tensegrity.twist", 60.0, None, None, 1.0, Widget::Numeric, Unit::Degree),
                 ],
             },
             GeneratorKind::Cablenet => ParamSchema {
@@ -162,8 +172,8 @@ impl GeneratorKind {
                     ParamField::vec3("c1", "param.cablenet.c1", DVec3::new(8.0, 0.0, 0.0)),
                     ParamField::vec3("c2", "param.cablenet.c2", DVec3::new(8.0, 8.0, 3.0)),
                     ParamField::vec3("c3", "param.cablenet.c3", DVec3::new(0.0, 8.0, 3.0)),
-                    ParamField::int("n", "param.cablenet.n", 8, 2, 48, 1, Widget::Slider),
-                    ParamField::float("sag", "param.cablenet.sag", 1.5, Some(0.0), Some(20.0), 0.1, Widget::Slider, Unit::Meter),
+                    ParamField::int("n", "param.cablenet.n", 8, 2, 256, 1, Widget::Slider),
+                    ParamField::float("sag", "param.cablenet.sag", 1.5, Some(0.0), None, 0.1, Widget::Numeric, Unit::Meter),
                 ],
             },
         }
@@ -666,9 +676,9 @@ mod tests {
     fn sanitize_clamps_and_fills() {
         let s = GeneratorKind::Geodesic.schema();
         let mut p = ParamMap::new();
-        p.insert("frequency".into(), ParamValue::Int(999)); // over max 6
+        p.insert("frequency".into(), ParamValue::Int(999)); // over historical max 64
         let out = s.sanitize(&p);
-        assert_eq!(out.get("frequency").unwrap().as_i64(), Some(6));
+        assert_eq!(out.get("frequency").unwrap().as_i64(), Some(64));
         // radius filled from default
         assert!(out.contains_key("radius"));
         assert!(out.contains_key("mode"));
