@@ -9,7 +9,13 @@ pub const FORMAT_VERSION: u32 = 1;
 
 /// Checkpoint sidecar version. Bumped independently of the op-log format; a
 /// stale or unrecognized checkpoint is simply ignored (full replay).
-pub const CHECKPOINT_VERSION: u32 = 1;
+///
+/// v2 (v0.5.0): M-parametric made the generator verbs (geodesic/hypar/…)
+/// replay into `Geometry::Parametric` instead of `Geometry::Mesh`. A v0.4
+/// checkpoint holds the old Mesh snapshot; opening it against the new replay
+/// path would diverge (and trip `ensure_history`'s debug_assert). Bumping the
+/// version invalidates those stale sidecars → clean full replay.
+pub const CHECKPOINT_VERSION: u32 = 2;
 
 /// File format: the effective forward op-log plus, optionally, design-option
 /// branches. Loading replays `ops` through the same `apply` path used live,
@@ -343,6 +349,34 @@ mod tests {
         }"#;
         let s = from_json(old).unwrap();
         assert!(s.doc.objects().all(|o| o.visible));
+    }
+
+    #[test]
+    fn tampered_file_side_effect_ops_are_skipped_on_load() {
+        // A hand-crafted file whose op-log smuggles in non-logged, side-effecting
+        // ops (export → arbitrary write, import → arbitrary read + dwg2dxf spawn).
+        // The app never writes these to a log, so replay must skip them — opening
+        // a malicious shared document must NOT touch the filesystem.
+        let malicious = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "box",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "size": [2.0, 2.0, 2.0]},
+                {"cmd": "export", "path": "/tmp/itsjustcad-should-never-exist.dxf"},
+                {"cmd": "import", "path": "/etc/passwd"}
+            ]
+        }"#;
+        let s = from_json(malicious).expect("loads, minus the smuggled ops");
+        // The legit box survived; the side-effect ops were dropped.
+        assert_eq!(s.doc.len(), 1);
+        assert!(
+            !std::path::Path::new("/tmp/itsjustcad-should-never-exist.dxf").exists(),
+            "export op must not have run on load"
+        );
+        // Re-saving keeps only the logged op — the tampered ops are gone for good.
+        assert!(!to_json(&s).contains("export"));
+        assert!(!to_json(&s).contains("import"));
     }
 
     #[test]

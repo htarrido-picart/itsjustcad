@@ -1827,6 +1827,10 @@ impl App {
                 width = *w;
             }
         }
+        // Clamp to the window's own bounds so a verb arg can't request an
+        // exabyte buffer / OOM or overflow the `width * 5 / 8` height math.
+        let width = width.clamp(16, 8192);
+        let samples = samples.clamp(1, 4096);
 
         // No explicit output path → open the interactive progressive window
         // (live preview + controls + Save PNG) rather than silently writing a

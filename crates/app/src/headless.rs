@@ -497,6 +497,11 @@ pub fn raytrace_headless(
             samples = first;
         }
     }
+    // Clamp to the same bounds the interactive window enforces, so a verb arg
+    // (`raytrace out.png 48 4000000000`) can't request a multi-exabyte buffer /
+    // OOM or overflow the `width * 5 / 8` height math.
+    let width = width.clamp(16, 8192);
+    let samples = samples.clamp(1, 4096);
     let height = (width as f32 * 5.0 / 8.0).round() as u32; // 8:5 frame
     let aspect = width as f32 / height as f32;
 

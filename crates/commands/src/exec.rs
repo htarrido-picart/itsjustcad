@@ -2424,6 +2424,16 @@ impl Session {
     pub fn replay(log: Vec<Command>) -> Result<Self, ExecError> {
         let mut session = Session::default();
         for cmd in log {
+            // Security: the app only ever appends *logged* ops to the saved log
+            // (`is_logged` == true). A non-logged op in a loaded file therefore
+            // means the file was hand-crafted/tampered — replaying it would run
+            // filesystem/subprocess side effects (`export` → arbitrary write,
+            // `import` → arbitrary read + `dwg2dxf` spawn, etc.) the instant a
+            // victim opens a shared document, bypassing the deck confirm-gate.
+            // Skip these on replay; this exactly mirrors the write-side invariant.
+            if !cmd.is_logged() {
+                continue;
+            }
             session.run(cmd)?;
         }
         Ok(session)

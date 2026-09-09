@@ -190,10 +190,26 @@ pub fn is_newer(current: &str, latest: &str) -> bool {
     parse_semver(latest) > parse_semver(current)
 }
 
+/// A URL is safe to hand to a browser helper only if it is HTTPS and free of
+/// characters that the Windows `cmd /C start` shell would interpret (`&`, `^`,
+/// `|`, `<`, `>`, `"`, `%`, whitespace). The release/asset URLs we open come
+/// from the GitHub API JSON — validated, not trusted — so a tampered response
+/// can't turn a "download" field into a shell command. Legit GitHub URLs pass.
+pub fn is_safe_browser_url(url: &str) -> bool {
+    url.starts_with("https://")
+        && !url
+            .chars()
+            .any(|c| c.is_whitespace() || "&^|<>\"%".contains(c))
+}
+
 /// Open a URL in the user's default browser. Best-effort — a failure to spawn
 /// the helper is silently ignored (nothing to recover). Mirrors the app's
-/// existing `Command::new("open")` reveal helpers, gated per-platform.
+/// existing `Command::new("open")` reveal helpers, gated per-platform. Rejects
+/// any non-HTTPS or shell-unsafe URL (see [`is_safe_browser_url`]).
 pub fn open_url(url: &str) {
+    if !is_safe_browser_url(url) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "windows")]
@@ -214,6 +230,25 @@ mod tests {
         assert!(is_newer("0.4.1", "0.5.0"), "minor bump is newer");
         assert!(is_newer("0.5.0", "1.0.0"), "major bump is newer");
         assert!(is_newer("0.4.0", "1.0.0"), "big jump is newer");
+    }
+
+    #[test]
+    fn browser_url_guard_rejects_unsafe() {
+        // Legit GitHub URLs pass.
+        assert!(is_safe_browser_url(
+            "https://github.com/owner/itsjustcad/releases/tag/v0.5.0"
+        ));
+        assert!(is_safe_browser_url(
+            "https://github.com/owner/itsjustcad/releases/download/v0.5.0/app.zip"
+        ));
+        // Non-HTTPS is refused.
+        assert!(!is_safe_browser_url("http://github.com/x"));
+        assert!(!is_safe_browser_url("file:///etc/passwd"));
+        // Shell-metachar injection (Windows `cmd /C start`) is refused.
+        assert!(!is_safe_browser_url(
+            "https://github.com/x & calc.exe"
+        ));
+        assert!(!is_safe_browser_url("https://github.com/x\"^|<>"));
     }
 
     #[test]
@@ -327,8 +362,10 @@ mod tests {
 
     #[test]
     fn end_to_end_parse_then_compare() {
-        // The exact flow the background task runs, minus the network.
+        // The exact flow the background task runs, minus the network. Uses a
+        // fixed baseline (not APP_VERSION) so a workspace version bump can never
+        // flip this assertion — the sample release tag is v0.4.1.
         let r = parse_latest_release(SAMPLE).unwrap();
-        assert!(is_newer(APP_VERSION, &r.tag), "0.4.0 build < v0.4.1 release");
+        assert!(is_newer("0.4.0", &r.tag), "0.4.0 build < v0.4.1 release");
     }
 }

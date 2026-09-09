@@ -197,11 +197,16 @@ pub fn convert_dwg_to_dxf_with(bin: &Path, input: &str) -> Result<Converted, Str
         .map_err(|e| format!("cannot create temp dir for DWG conversion: {e}"))?;
     let out_dxf = tmp_dir.join("converted.dxf");
 
+    // Absolutize the input path so a filename beginning with '-' can never be
+    // parsed by dwg2dxf as an option (argument injection). We already verified
+    // it is a real file above; canonicalize resolves it to a leading-slash path.
+    let input_abs = std::fs::canonicalize(input).unwrap_or_else(|_| PathBuf::from(input));
+
     // FIXED args — no shell, no interpolation, no model-controlled flags.
     let status = std::process::Command::new(bin)
         .arg("-o")
         .arg(&out_dxf)
-        .arg(input)
+        .arg(&input_abs)
         .output();
 
     let result = (|| {
