@@ -88,6 +88,15 @@ Parametric shells, lattices, and dynamic-relaxation form-finding. These build ge
 
 Examples: `geodesic 3 5 dome` · `hypar 5 5 5` · `funicular -5,0,0 5,0,0 24 1 1.4 invert` · `cablenet 0,0,0 8,0,0 8,8,3 0,8,3 8 1.5` · `polyline 0,0,1 6,0,-1 6,6,1 0,6,-1 closed` then `minsurf last`
 
+### Live parametric editing
+
+Built-in parametric structures (geodesic, hypar, gaussvault, gridshell, funicular, tensegrity, cablenet, spaceframe) **stay editable after creation** — they appear in the **Parameters** tab (right dock) as cards with a schema-driven editor (sliders / numeric fields / dropdowns / toggles). Editing a value re-derives the mesh live.
+
+| Command | Usage |
+|---|---|
+| `paramset` | `paramset <selector> <key=value …>` — edit a parameter of a selected parametric structure; its mesh re-derives immediately. E.g. `paramset last frequency=4` · `paramset last rise=5` |
+| `freeze` | `freeze <selector>` (alias `bake`) — flatten a parametric structure to a plain static mesh: keeps the geometry but drops the generator + params, so it leaves the Parameters tab and is no longer editable |
+
 ---
 
 ## Sketch constraints (`Curve`)
@@ -152,7 +161,7 @@ Inputs are consumed; one result mesh replaces them.
 |---|---|
 | `text` | `text <pos x,y,z> <words…> [height]` |
 | `hatch` | `hatch <selector> [solid \| lines \| crosshatch \| brick \| concrete \| insulation \| earth \| ansi31..ansi38 [spacing]]` — patterns incl. the ANSI standard set (iron/steel/bronze/plastic/fire-brick/marble/lead/aluminum) |
-| `dim` | `dim <a x,y,z> <b x,y,z> [offset]` |
+| `dim` | `dim <a> <b> [offset]` — each anchor is a point `x,y,z` **or** an associative binding `@<object>.<endpoint>` that follows the object when it moves (`<endpoint>` = `start`\|`end`\|`center`\|`cN` bbox-corner 0–7\|`vN` vertex). E.g. `dim @wall.start @wall.end` |
 | `layer` | `layer <name>` — create/switch current layer |
 | `tolayer` | `tolayer <selector> <name>` |
 | `layercolor` | `layercolor <layer> <r,g,b>` |
@@ -303,14 +312,35 @@ Examples: `terrain /tmp/survey.csv` · `contours 0.5 5` · `pad 10,10 20 15 3.5 
 
 ---
 
-## Diffusion render
+## Ray tracer (accurate PBR)
+
+A built-in Rust path tracer that renders the actual model — real materials, sun shadows, and global illumination — with no external backend. Complements the AI diffusion render below (that reimagines the view; the ray tracer renders it faithfully).
+
+| Command | Usage |
+|---|---|
+| `raytrace` | `raytrace [out.png] [samples] [size]` — path-trace the current view to a PNG. Positional and order-tolerant: a filename sets the output, small numbers are samples-per-pixel, large numbers are the image width (e.g. `raytrace shot.png 128 1200`). Runs headless (pure CPU, no GPU device needed). |
+
+In the GUI, **Render ▸ Raytrace…** opens a progressive window: a live preview that refines as samples accumulate, with controls for samples, bounces, resolution, sun, and sky, plus **Stop** and **Save PNG**.
+
+Examples: `raytrace` · `raytrace dusk.png 256` · `raytrace hero.png 128 1600`
+
+---
+
+## Diffusion render (AI)
 
 | Command | Usage |
 |---|---|
 | `controlimages` | `controlimages <path-prefix>` — write depth/edge/mask control PNGs from the current view |
 | `render` | `render <prompt…>` \| `render cancel` — AI-render the current view via the configured diffusion backend |
 
-`render` ships with **no backend active** — configure one (ComfyUI / A1111-Forge / Draw Things / Replicate) in `~/.config/itsjustcad/render_decks.json` via `render backends` / `render use <name>` / `render test`. It captures the control images, runs an async job, and opens the result in an "AI Render" window. See [interop.md](interop.md) for control-image detail.
+`render` reimagines the current view from a text prompt, guided by control images (depth/edge/mask) derived from the model. It ships with **no backend active** — configure one of:
+
+- **A cloud/remote backend** (ComfyUI / A1111-Forge / Draw Things / Replicate) in `~/.config/itsjustcad/render_decks.json` via `render backends` / `render use <name>` / `render test`, or
+- **A fully local, offline backend** via the **Render Setup** panel: download a local Stable Diffusion model and point it at the user-installed `sd` (stable-diffusion.cpp) binary. Once detected, `render <prompt>` runs locally with nothing leaving your machine.
+
+> Local render needs the user-installed `sd` binary plus a downloaded model — not fully one-click yet; the Render Setup panel walks you through both.
+
+It captures the control images, runs an async job, and opens the result in an "AI Render" window. See [interop.md](interop.md) for control-image detail.
 
 ---
 
@@ -354,7 +384,21 @@ chatencryption on|off                                encrypt chat sessions at re
 save [path] · help [verb]                            save document / inline help
 ```
 
-UI/layout verbs (also deck-drivable): `panel show|hide`, `panel chat|sessions|layers|blocks|plugins`, `dock left|right`, `split 1|2|4`, `workspace <name>`, `theme dark|light`.
+### Object snap
+
+Rhino-style precision snapping while drawing. A clickable **osnap chip** in the status bar opens a toggle popup; the same set is under **View ▸ Object Snap…**. The `osnap` verb toggles the master switch or any individual snap.
+
+```
+osnap on|off|toggle                                  master snap switch
+osnap <kind> on|off                                  toggle one snap kind
+   kinds: end · mid · cen (center) · int (intersection) · perp
+          tan (tangent) · qua (quadrant) · near (nearest) · nod (node)
+          vtx (vertex) · grid
+```
+
+Example: `osnap on` · `osnap end on` · `osnap perp off` · `osnap grid on`
+
+UI/layout verbs (also deck-drivable): `panel show|hide`, `panel chat|sessions|layers|blocks|plugins|parameters|sheets`, `dock left|right`, `split 1|2|4`, `workspace <name>`, `theme dark|light`.
 
 ---
 

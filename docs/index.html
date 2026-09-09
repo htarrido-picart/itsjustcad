@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ItsJustCAD — a complete architect's CAD in a single binary, with an LLM built in</title>
-<meta name="description" content="ItsJustCAD is a free, open-source (AGPLv3) CAD for architects — modelling, drafting, environmental analysis, site planning, DWG/IFC exchange, and an embedded local-LLM drafting partner. One ~10 MB binary, no subscription, no cloud.">
+<meta name="description" content="ItsJustCAD is a free, open-source (AGPLv3) CAD for architects — modelling, drafting, a built-in PBR ray tracer, live parametric structures, environmental analysis, site planning, DWG/IFC exchange, multilingual UI, and an embedded local-LLM drafting partner. One ~10 MB binary, no subscription, no cloud.">
 <style>
   :root{
     --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --ink:#eef1f5;
@@ -72,7 +72,7 @@
       <a class="btn ghost" href="https://github.com/htarrido-picart/itsjustcad">View on GitHub</a>
       <a class="btn ghost" href="tutorials/">Read the tutorials</a>
     </div>
-    <div class="pill">Free &amp; open source · AGPL-3.0 · Linux / macOS / Windows · no subscription, no cloud tether</div>
+    <div class="pill">v0.5.0 · Free &amp; open source · AGPL-3.0 · Linux / macOS / Windows · no subscription, no cloud tether</div>
   </div>
 </header>
 
@@ -135,13 +135,15 @@ print plan-01 plan.pdf  <span class="c"># vector PDF at scale</span></pre>
     <h2>What it does</h2>
     <p class="sub">A working architect's toolkit, not a tech demo.</p>
     <div class="grid">
-      <div class="card"><h3>Model &amp; draft</h3><p>Boxes, extrude, revolve/loft/sweep, in-repo CSG booleans, NURBS curves, 2D sketch constraints, blocks. Plan/section cuts, elevations, dimensions, hatches, sheets (A4–A0), and vector PDF export.</p></div>
+      <div class="card"><h3>Model &amp; draft</h3><p>Boxes, extrude, revolve/loft/sweep, in-repo CSG booleans, NURBS curves, 2D sketch constraints, blocks, a full object-snap set. Plan/section cuts, elevations, dimensions (incl. associative <code>dim @wall.start</code>), hatches, sheets (A4–A0), and vector PDF export.</p></div>
+      <div class="card"><h3>Accurate render + AI render</h3><p>A built-in Rust <b>path tracer</b> renders the real model — PBR materials, sun shadows, global illumination — in a live progressive window, no external renderer. Plus an <b>AI diffusion render</b> that reimagines the view from a prompt, cloud or fully local &amp; offline.</p></div>
+      <div class="card"><h3>Live parametric structures</h3><p>Geodesic domes, hypar shells, gaussvaults, funiculars, tensegrity and more stay editable after you draw them — tune them from the <b>Parameters</b> tab (sliders, numbers, dropdowns) or <code>paramset</code>, then freeze to a mesh.</p></div>
       <div class="card"><h3>Site planning (intemfit)</h3><p>From one boundary: generate streets and blocks, subdivide into lots, apply setbacks, place buildings, and read a gross-vs-net yield report with GFA, FAR, and coverage.</p></div>
       <div class="card"><h3>Environmental analysis</h3><p>Real solar position (NOAA SPA), shadow studies, sun-hours and per-face insolation heatmaps, annual radiation from EPW weather, sun-path diagrams — every study stores numbers to design with.</p></div>
       <div class="card"><h3>Compliance pre-checks</h3><p>Geometric pre-checks against embedded IBC-2021 egress and ADA-2010 packs, with per-rule verdicts. <em>Advisory only — never a code review.</em></p></div>
       <div class="card"><h3>Landscape &amp; planting</h3><p>Terrain from survey points, contours, grading and earthwork, a 33-species planting catalog (temperate + Caribbean / Latin-American tropical), and advisory drainage.</p></div>
       <div class="card"><h3>Exchange</h3><p>Import/export DXF, OBJ, STL, glTF, IFC4, 3DM (Rhino), SVG, PDF, and point clouds — plus assisted DWG import and a SAF structural handoff. Hand-written, minimal dependencies.</p></div>
-      <div class="card"><h3>Localized &amp; skinnable</h3><p>English and Spanish ship in-app (switch anytime). The UI skins itself to the CAD you came from — AutoCAD, Rhino, or Revit — with matching colors and command aliases.</p></div>
+      <div class="card"><h3>Multilingual &amp; skinnable</h3><p>Every Romance language ships in-app — English, Spanish, Portuguese, French, Italian, Romanian, Catalan, Galician — and the deck replies in your language. The UI also skins itself to the CAD you came from (AutoCAD, Rhino, Revit) with matching colors and aliases.</p></div>
       <div class="card"><h3>Embedded local-LLM deck</h3><p>An LLM partner that draws, teaches, plans multi-step work, and critiques designs in numbers — running a local model, a cloud model, or nothing at all. It ships with no backend active.</p></div>
     </div>
   </div>

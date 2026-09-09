@@ -10,6 +10,8 @@ top to bottom and end with a real result on screen.
 | 2 | [Site planning with intemfit](02-site-planning.md) | A subdivided site with buildings and a yield report |
 | 3 | [Environmental analysis](03-environmental-analysis.md) | A sun-hours study you can read in numbers and have the deck critique |
 | 4 | [Working with the deck](04-deck.md) | The LLM drawing and analysing with you, in the same commands you type |
+| 5 | [Render a massing with the ray tracer](05-raytrace.md) | A photoreal, physically-based render of your real model — sun shadows and GI, no external tools |
+| 6 | [Edit a parametric structure](06-parametric.md) | A geodesic dome tuned live from the Parameters tab, then frozen — plus a local, offline AI render |
 
 These are the long-form companions to the terse
 [command reference](../command-reference.md), which lists every verb with its

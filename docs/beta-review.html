@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ItsJustCAD — Beta User Review (v0.4.0)</title>
+<title>ItsJustCAD — Beta User Review (v0.5.0)</title>
 <style>
   :root{
     --bg:#f7f7f5; --panel:#ffffff; --ink:#1c1c1e; --muted:#6b6b70;
@@ -85,7 +85,7 @@
 <div class="wrap">
 <nav>
   <div class="brand">ItsJustCAD</div>
-  <div class="date">Beta User Review &middot; v0.4.0</div>
+  <div class="date">Beta User Review &middot; v0.5.0</div>
   <button class="reset" onclick="resetChecks()">Reset checks</button>
   <h2>Start here</h2>
   <a href="#howto">How to test</a>
@@ -110,11 +110,11 @@
 
 <main>
 <header class="top">
-  <h1>ItsJustCAD &mdash; Beta User Review <span class="tag info" style="vertical-align:middle">v0.4.0</span></h1>
+  <h1>ItsJustCAD &mdash; Beta User Review <span class="tag info" style="vertical-align:middle">v0.5.0</span></h1>
   <p class="sub">Work through the checklist, then Export results and send the JSON to the developer.</p>
 </header>
 <div class="meta">
-  <span><b>Build under test:</b> latest v0.4.0 release (the app you downloaded)</span>
+  <span><b>Build under test:</b> latest v0.5.0 release (the app you downloaded)</span>
   <span><b>Report to:</b> <a href="mailto:htarrido@pm.me">htarrido@pm.me</a> or a GitHub issue</span>
 </div>
 
@@ -133,13 +133,13 @@
 <!-- ============ HONEST LIMITS ============ -->
 <section id="limits">
 <h2 class="sec">Honest limits <span class="tag warn">read first</span></h2>
-<p class="lead">Known, deliberate limits in v0.4.0. None of these block testing &mdash; they explain results you might otherwise flag as bugs:</p>
+<p class="lead">Known, deliberate limits in v0.5.0. None of these block testing &mdash; they explain results you might otherwise flag as bugs:</p>
 <ul>
   <li><b>intemfit euro_latam profile is placeholder.</b> Any run that resolves a rule from the <code>euro_latam</code> region prints <b>"using euro_latam defaults (placeholder &mdash; confirm with Manuel)"</b>. That banner is expected, not an error.</li>
   <li><b>Compliance is name-match + straight-line.</b> Guard/handrail/ceiling checks match by object name (no geometric modeling); travel distance is straight-line room-centroid &rarr; nearest exit, not a routed egress path. Advisory pre-check only &mdash; verify with a licensed professional / AHJ.</li>
   <li><b>Straight-skeleton (Felkel) is convex-exact only.</b> <code>skeleton=felkel</code> falls back to the offset-approximation on non-convex blocks (never a broken skeleton). The robust <code>skeleton=offset</code> is the default.</li>
   <li><b>DWG import is only as good as the installed LibreDWG.</b> 0.13.3 is too old for modern AutoCAD-2013+ files &mdash; those fail loudly (truncation detected), never a silent empty import. 0.14+ or an ODA converter is needed for them.</li>
-  <li><b>Diffusion render ships with no backend active.</b> You configure one (e.g. ComfyUI) before rendering.</li>
+  <li><b>The ray tracer needs no setup</b> (it renders the real model in-app), but the <b>AI diffusion render ships with no backend active</b> &mdash; you configure one (e.g. ComfyUI) first. The <b>local, offline</b> diffusion path needs the user-installed <code>sd</code> (stable-diffusion.cpp) binary plus a model download &mdash; not one-click yet.</li>
   <li><b>App is unsigned.</b> Expect a one-time "unidentified developer" warning on first launch; chat encryption is default OFF for the same reason.</li>
 </ul>
 </section>
@@ -181,6 +181,14 @@
 <div class="grp-title">Blocks &mdash; delete guard</div>
 <div class="chk"><input type="checkbox" id="m9"><label for="m9">Define a block, insert one instance, try <span class="cmd"><span class="p">&#8250;</span> blockdelete &lt;name&gt;</span> <span class="exp"><b>Expect:</b> refused while instances exist. Delete the instance, retry &rarr; succeeds; undo restores. <code>blocklib</code> lists the library.</span></label></div>
 
+<div class="grp-title">Object snap (new)</div>
+<div class="chk"><input type="checkbox" id="os1"><label for="os1">Click the <b>osnap chip</b> in the status bar <span class="exp"><b>Expect:</b> a toggle popup for end / mid / center / intersection / perpendicular / tangent / quadrant / nearest / node / vertex; same set under <b>View &middot; Object Snap&hellip;</b>.</span></label></div>
+<div class="chk"><input type="checkbox" id="os2"><label for="os2">Enable a snap and draw near a feature: <span class="cmd"><span class="p">&#8250;</span> osnap end on</span> then start a <code>line</code> near an endpoint <span class="exp"><b>Expect:</b> the cursor snaps to the endpoint with a marker; <code>osnap off</code> disables all; <code>osnap perp off</code> toggles just one.</span></label></div>
+
+<div class="grp-title">Associative dimensions (new)</div>
+<div class="chk"><input type="checkbox" id="ad1"><label for="ad1">Draw a wall/box named <code>wall</code>, then <span class="cmd"><span class="p">&#8250;</span> dim @wall.start @wall.end</span> <span class="exp"><b>Expect:</b> a linear dimension bound to the object's geometry (endpoints <code>start</code>/<code>end</code>/<code>center</code>/<code>cN</code>/<code>vN</code>), showing the measured length.</span></label></div>
+<div class="chk"><input type="checkbox" id="ad2"><label for="ad2">Now <span class="cmd"><span class="p">&#8250;</span> move wall 3,0,0</span> <span class="exp"><b>Expect:</b> the dimension <b>follows</b> the object &mdash; its anchors and text update automatically (a free <code>dim 0,0 10,0</code> stays put).</span></label></div>
+
 <div class="notes-wrap"><label for="note-model">Notes for this section</label><textarea class="notes" id="note-model" data-section="1 · Drawing & Modeling" placeholder="Anything that failed, surprised you, or needs a follow-up..."></textarea></div>
 </details>
 </section>
@@ -199,7 +207,13 @@
 <div class="chk"><input type="checkbox" id="e6"><label for="e6"><span class="cmd"><span class="p">&#8250;</span> tensegrity 3 1 2</span> then <span class="cmd"><span class="p">&#8250;</span> cablenet 0,0,0 8,0,0 8,8,3 0,8,3 8 1.5</span> <span class="exp"><b>Expect:</b> a relaxed 3-strut tensegrity T-prism; a taut cable-net minimal surface over four anchors (Frei Otto).</span></label></div>
 <div class="chk"><input type="checkbox" id="e7"><label for="e7">Draw a closed 3D boundary, then <span class="cmd"><span class="p">&#8250;</span> minsurf last</span> (alias <code>soapfilm</code>) <span class="exp"><b>Expect:</b> a soap-film minimal surface spanning the wire; undo/replay stable.</span></label></div>
 
-<div class="notes-wrap"><label for="note-expressive">Notes for this section</label><textarea class="notes" id="note-expressive" data-section="2 · Expressive Structures" placeholder="Notes..."></textarea></div>
+<div class="grp-title">Live parametric editing (new)</div>
+<div class="chk"><input type="checkbox" id="e8"><label for="e8">After <code>geodesic 3 5 dome</code>, open the right dock &middot; <b>Parameters</b> tab <span class="exp"><b>Expect:</b> the dome appears as a <b>card</b> with a schema-driven editor (sliders / numeric / dropdown / toggle), one control per parameter.</span></label></div>
+<div class="chk"><input type="checkbox" id="e9"><label for="e9">Drag the <b>frequency</b> slider (or edit <b>radius</b>) in the card <span class="exp"><b>Expect:</b> the mesh <b>re-derives live</b> as you change the value &mdash; still fully editable, nothing baked.</span></label></div>
+<div class="chk"><input type="checkbox" id="e10"><label for="e10">From the command line: <span class="cmd"><span class="p">&#8250;</span> paramset last frequency=4</span> <span class="exp"><b>Expect:</b> same effect as the slider &mdash; the structure re-tessellates immediately.</span></label></div>
+<div class="chk"><input type="checkbox" id="e11"><label for="e11"><span class="cmd"><span class="p">&#8250;</span> freeze last</span> (alias <code>bake</code>) <span class="exp"><b>Expect:</b> geometry kept, but the card <b>leaves</b> the Parameters tab &mdash; it's now a plain static mesh, no longer editable.</span></label></div>
+
+<div class="notes-wrap"><label for="note-expressive">Notes for this section</label><textarea class="notes" id="note-expressive" data-section="2 · Expressive & Parametric Structures" placeholder="Notes..."></textarea></div>
 </details>
 </section>
 
@@ -347,10 +361,12 @@
 <!-- ============ 9 I18N ============ -->
 <section id="i18n">
 <details>
-<summary>9 &middot; Language &amp; Legacy Skins</summary>
-<p class="lead">English / Espa&ntilde;ol catalog + onboarding-driven legacy skins (AutoCAD / Rhino / Revit palettes, fonts, aliases). Reachable via onboarding, a verb, and the Theme menu.</p>
+<summary>9 &middot; Language &amp; Legacy Skins <span class="tag ok">all Romance languages</span></summary>
+<p class="lead">Every Romance language ships in-app &mdash; en / es / pt / fr / it / ro / ca / gl &mdash; plus onboarding-driven legacy skins (AutoCAD / Rhino / Revit palettes, fonts, aliases). Reachable via onboarding, a verb, and the Theme menu. Non-English catalogs are seed translations; native-review feedback is very welcome here.</p>
 
 <div class="chk"><input type="checkbox" id="ln1"><label for="ln1"><span class="cmd"><span class="p">&#8250;</span> language es</span> (alias <code>lang</code>) <span class="exp"><b>Expect:</b> the menu bar + dialogs switch to Spanish (capa, cota, s&oacute;lido, malla, croquis...). Live, no relaunch. <code>lang en</code> switches back.</span></label></div>
+<div class="chk"><input type="checkbox" id="ln1b"><label for="ln1b">Try the other Romance languages: <span class="cmd"><span class="p">&#8250;</span> language pt</span> &middot; <code>fr</code> &middot; <code>it</code> &middot; <code>ro</code> &middot; <code>ca</code> &middot; <code>gl</code> <span class="exp"><b>Expect:</b> the UI switches live for each; any missing key falls back to English (never blank). Note any awkward or wrong wording for the native review.</span></label></div>
+<div class="chk"><input type="checkbox" id="ln1c"><label for="ln1c">With a non-English language active, ask the deck something in that language <span class="exp"><b>Expect:</b> the deck <b>replies in the chosen language</b> while the command tokens it emits stay canonical (English verbs).</span></label></div>
 <div class="chk"><input type="checkbox" id="ln2"><label for="ln2">Switch to Espa&ntilde;ol, quit, relaunch <span class="exp"><b>Expect:</b> language persists, applied at startup before the first render. Region variants like <code>es-CO</code> resolve; unknown codes rejected cleanly.</span></label></div>
 <div class="chk"><input type="checkbox" id="sk1"><label for="sk1"><span class="cmd"><span class="p">&#8250;</span> skin autocad</span> (alias <code>acad</code>) &middot; <code>rhino</code> &middot; <code>revit</code> &middot; <code>native</code> <span class="exp"><b>Expect:</b> each applies live &mdash; background, grid colors, fonts + the per-skin alias table. Persisted.</span></label></div>
 <div class="chk"><input type="checkbox" id="sk2"><label for="sk2">Under AutoCAD skin: <span class="cmd"><span class="p">&#8250;</span> L</span> &middot; <code>C</code> &middot; <code>CO last 5,0,0</code> <span class="exp"><b>Expect:</b> aliases fire &mdash; L&rarr;line, C&rarr;circle, CO&rarr;copy. Additive; don't shadow canonical names.</span></label></div>
@@ -390,14 +406,22 @@
 <!-- ============ 12 RENDER ============ -->
 <section id="render">
 <details>
-<summary>12 &middot; Diffusion Render <span class="tag info">no backend by default</span></summary>
-<p class="lead">Ships with NO backend active &mdash; you configure one in <code>render_decks.json</code> first.</p>
+<summary>12 &middot; Render &mdash; Ray Tracer &amp; AI Diffusion <span class="tag info">no diffusion backend by default</span></summary>
+<p class="lead">The ray tracer renders the <b>real model</b> and needs no setup. The AI diffusion render <b>reimagines</b> the view and ships with NO backend active &mdash; you configure one (remote or local) first.</p>
+
+<div class="grp-title">Ray tracer (accurate PBR &mdash; built in, no backend)</div>
+<div class="chk"><input type="checkbox" id="rt1"><label for="rt1">Build a small massing (a box or two), aim a <code>persp</code> view, then open <b>Render &middot; Raytrace&hellip;</b> from the menu <span class="exp"><b>Expect:</b> a progressive window whose preview starts noisy and <b>refines live</b> as samples accumulate; real materials, sun shadows, and GI.</span></label></div>
+<div class="chk"><input type="checkbox" id="rt2"><label for="rt2">Adjust <b>samples / bounces / resolution / sun / sky</b>, then <b>Stop</b> and <b>Save PNG</b> <span class="exp"><b>Expect:</b> controls affect the image; Stop halts refinement; Save writes a PNG.</span></label></div>
+<div class="chk"><input type="checkbox" id="rt3"><label for="rt3">From the command line: <span class="cmd"><span class="p">&#8250;</span> raytrace hero.png 128 1200</span> <span class="exp"><b>Expect:</b> a 1200px-wide, 128-spp PNG written to disk (args are order-tolerant; runs headless too).</span></label></div>
+
+<div class="grp-title">AI diffusion render</div>
 <div class="chk"><input type="checkbox" id="r1"><label for="r1"><span class="cmd"><span class="p">&#8250;</span> render backends</span> (alias <code>render list</code>) <span class="exp"><b>Expect:</b> lists configured backends (empty on a clean install).</span></label></div>
 <div class="chk"><input type="checkbox" id="r2"><label for="r2">Configure one, then <span class="cmd"><span class="p">&#8250;</span> render use comfyui</span> and <span class="cmd"><span class="p">&#8250;</span> render test</span> <span class="exp"><b>Expect:</b> a reachability probe; on failure "cannot reach X &mdash; is it running?".</span></label></div>
+<div class="chk"><input type="checkbox" id="rl1"><label for="rl1"><b>Local, offline:</b> open the <b>Render Setup</b> panel &mdash; download a local SD model from the catalog, then let it detect the user-installed <code>sd</code> (stable-diffusion.cpp) binary <span class="exp"><b>Expect:</b> the model downloads with progress; if <code>sd</code> isn't installed it says so clearly. Once both are present, local render is available offline.</span></label></div>
 <div class="chk"><input type="checkbox" id="r3"><label for="r3"><span class="cmd"><span class="p">&#8250;</span> controlimages /tmp/scene</span> <span class="exp"><b>Expect:</b> depth/edge/mask PNGs written from the current view (<code>_depth.png</code>, <code>_edge.png</code>, <code>_mask.png</code>).</span></label></div>
 <div class="chk"><input type="checkbox" id="r4"><label for="r4"><span class="cmd"><span class="p">&#8250;</span> render glass pavilion at dusk, photoreal</span>, then <span class="cmd"><span class="p">&#8250;</span> render cancel</span> mid-job <span class="exp"><b>Expect:</b> an async job &rarr; result PNG in a floating "AI Render" window; cancel truly aborts the task.</span></label></div>
 
-<div class="notes-wrap"><label for="note-render">Notes for this section</label><textarea class="notes" id="note-render" data-section="12 · Diffusion Render" placeholder="Notes..."></textarea></div>
+<div class="notes-wrap"><label for="note-render">Notes for this section</label><textarea class="notes" id="note-render" data-section="12 · Render (Ray Tracer & AI)" placeholder="Notes..."></textarea></div>
 </details>
 </section>
 
@@ -413,6 +437,9 @@
 <div class="chk"><input type="checkbox" id="umenu"><label for="umenu">Exercise the native menus &mdash; File / Edit / View / Theme / LLM. Try <b>Close</b> (&#8984;W) then <b>Quit</b> (&#8984;Q) <span class="exp"><b>Expect:</b> menus populated (no empty menus); Close closes the window, Quit exits cleanly (prompts to save unsaved work).</span></label></div>
 <div class="chk"><input type="checkbox" id="u8"><label for="u8">In the command line, type a command starting with <b>g</b>, e.g. <span class="cmd"><span class="p">&#8250;</span> geodesic</span> <span class="exp"><b>Expect:</b> the letter <b>g</b> types normally &mdash; the gumball is not toggled and the first letter is not eaten (old bug).</span></label></div>
 <div class="chk"><input type="checkbox" id="u9"><label for="u9">Select an object and press <b>&#8984;/Ctrl+G</b> <span class="exp"><b>Expect:</b> the gumball toggles on/off. Bare <code>g</code> no longer does this.</span></label></div>
+<div class="chk"><input type="checkbox" id="u10"><label for="u10">Open the <b>Blocks</b> tab, use the search box, click the library <b>&#43;</b>, and <b>double-click</b> a block <span class="exp"><b>Expect:</b> search filters the list; &#43; adds from the library; double-click reveals/loads the block into the drawing.</span></label></div>
+<div class="chk"><input type="checkbox" id="u11"><label for="u11">Open <b>Plugins</b> (root-level Plugins menu &rarr; popup) and the <b>Sheets</b> tab <span class="exp"><b>Expect:</b> the Plugins popup shows cards + search + install status; the Sheets tab lists each sheet with a preview thumbnail.</span></label></div>
+<div class="chk"><input type="checkbox" id="u12"><label for="u12"><b>Help &middot; Check for Updates&hellip;</b> <span class="exp"><b>Expect:</b> compares this build against the latest GitHub release &mdash; "You're on the latest (v0.5.0)." when current, or the newer version + a <b>Download</b> button; offline &rarr; "Couldn't check&hellip;" + Check-Again. Never blocks the app.</span></label></div>
 
 <div class="notes-wrap"><label for="note-ui">Notes for this section</label><textarea class="notes" id="note-ui" data-section="13 · UI, Menus & Gumball" placeholder="Notes..."></textarea></div>
 </details>
@@ -422,7 +449,7 @@
 <section id="export">
 <h2 class="sec">Export results &amp; send them back</h2>
 <p class="lead">When you're done, add any overall notes below, then <b>Download JSON</b> and email it to <a href="mailto:htarrido@pm.me">htarrido@pm.me</a> (or attach it to a GitHub issue). The JSON records every test id, whether it passed, and your notes.</p>
-<div class="notes-wrap"><label for="note-global">Overall notes (tester name, OS, version, general impressions)</label><textarea class="notes" id="note-global" data-section="_overall" placeholder="e.g. Tester: Jane · macOS 14 Apple Silicon · v0.4.0 · general feedback..." style="min-height:80px"></textarea></div>
+<div class="notes-wrap"><label for="note-global">Overall notes (tester name, OS, version, general impressions)</label><textarea class="notes" id="note-global" data-section="_overall" placeholder="e.g. Tester: Jane · macOS 14 Apple Silicon · v0.5.0 · general feedback..." style="min-height:80px"></textarea></div>
 </section>
 
 <div class="exportbar">
@@ -431,7 +458,7 @@
   <span class="progress" id="progress">0 of 0 tests checked</span>
 </div>
 
-<div class="foot">ItsJustCAD &mdash; Beta User Review &middot; v0.4.0 &middot; advisory checklist; compliance is a pre-check, not a certification. Your checkbox state &amp; notes are stored locally in your browser until you export them.</div>
+<div class="foot">ItsJustCAD &mdash; Beta User Review &middot; v0.5.0 &middot; advisory checklist; compliance is a pre-check, not a certification. Your checkbox state &amp; notes are stored locally in your browser until you export them.</div>
 </main>
 </div>
 
@@ -514,7 +541,7 @@
     return {
       app: "ItsJustCAD",
       review: "Beta User Review",
-      version: "0.4.0",
+      version: "0.5.0",
       exportedAt: new Date().toISOString(),
       summary: { total: tests.length, passed: passed, unchecked: tests.length - passed },
       overallNotes: (notes['note-global'] || "").trim(),

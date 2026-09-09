@@ -23,6 +23,40 @@ that draws with the exact same commands you type.
 
 ---
 
+## What's new in v0.5.0
+
+- **Accurate ray tracer** — a built-in Rust path tracer renders the *actual*
+  model: real PBR materials, sun shadows, and global illumination, no external
+  renderer. **Render ▸ Raytrace…** opens a progressive live-preview window
+  (samples / bounces / resolution / sun / sky, Stop, Save PNG); `raytrace
+  [out.png] [samples] [size]` runs headless. It complements the AI diffusion
+  render (which *reimagines* the view).
+- **Live parametric structures** — geodesic / hypar / funicular / gaussvault /
+  gridshell / tensegrity / cablenet / space-frame stay editable after creation.
+  A new **Parameters** tab shows each as a card with a schema-driven editor
+  (sliders / numeric / dropdown / toggle) that re-derives the geometry live;
+  `paramset` edits from the command line, `freeze` / `bake` flattens to a static
+  mesh.
+- **Local, offline AI render** — the **Render Setup** panel downloads a local
+  Stable Diffusion model and detects the user-installed `sd`
+  (stable-diffusion.cpp) binary, so `render <prompt>` can run entirely on your
+  machine (needs the `sd` binary + a model download — not one-click yet).
+- **Object snap** — endpoint / midpoint / center / intersection / perpendicular /
+  tangent / quadrant / nearest / node / vertex, with a clickable status-bar
+  osnap chip, a **View ▸ Object Snap…** panel, and an `osnap` verb.
+- **Associative dimensions** — `dim @wall.start @wall.end` binds a dimension to
+  geometry; move the object and the dimension follows.
+- **All Romance languages** — the UI now ships in English, Spanish, Portuguese,
+  French, Italian, Romanian, Catalan, and Galician (seed translations — native
+  review welcome), and the deck replies in the chosen language.
+- **In-app update check** — **Help ▸ Check for Updates…** compares against the
+  latest GitHub release.
+- **UI** — Blocks tab (double-click a block to reveal it, search + library "+"),
+  a Plugins popup and a root-level Plugins menu, a Sheets tab (per-sheet list +
+  preview), reliable Quit / Close menu items, and a **⌘G** gumball toggle.
+
+---
+
 ## Download
 
 **[Download the latest release](https://github.com/htarrido-picart/itsjustcad/releases/latest)** — one file, no installer, nothing else to set up.
@@ -40,9 +74,10 @@ Each link always resolves to the **newest release** — no need to update it per
 
 Testing the beta? Open **[`docs/beta-review.html`](docs/beta-review.html)** in
 your browser — a comprehensive, tickable manual-test checklist covering every
-v0.4.0 area (modeling, expressive structures, intemfit site planning,
-environmental analysis, compliance pre-check, landscape/planting, DWG import,
-the LLM deck, language/skins, sheets/PDF, interop, render, and the UI). Work
+v0.5.0 area (modeling, expressive & live-parametric structures, intemfit site
+planning, environmental analysis, compliance pre-check, landscape/planting, DWG
+import, the LLM deck, language/skins, sheets/PDF, interop, the ray tracer + AI
+render, object snap, associative dimensions, the update check, and the UI). Work
 through it, tick what passes, jot notes on anything that doesn't, then click
 **Export results** to download a JSON of your run and send it back — email
 [htarrido@pm.me](mailto:htarrido@pm.me) or open a GitHub issue. Your ticks and
@@ -96,9 +131,13 @@ and which CAD you're coming from (**AutoCAD / Rhino / Revit / none**). The UI
 adapts: background colors, font sizes, and command aliases match the software
 your hands already know. `pl`, `o`, `tr`, `co` all work if you chose AutoCAD.
 
-The interface is fully localized — **English and Spanish (Español)** ship
-in-app; switch anytime with the `language en|es` verb or the language setting.
-Missing keys fall back to English, so nothing is ever blank.
+The interface is fully localized — **every Romance language** ships in-app:
+English, Spanish (Español), Portuguese (Português), French (Français), Italian
+(Italiano), Romanian (Română), Catalan (Català), and Galician (Galego). Switch
+anytime with the `language <code>` verb or the language setting; the deck
+replies in your chosen language too. Missing keys fall back to English, so
+nothing is ever blank. The non-English catalogs are seed translations — native
+review is welcome.
 
 A 60-second tour — type into the command line (bottom bar):
 
@@ -203,15 +242,21 @@ LAS / LAZ / E57 point clouds
 Dynamic-relaxation form-finding — funicular / catenary arches (Gaudí),
 tensegrity, Frei-Otto cable nets and **minimal surfaces** (`minsurf`) — plus
 analytic shells: hyperbolic paraboloids, geodesic domes, space frames, Gaussian
-catenary vaults (Dieste), and grid shells. Structural members (beam / column /
-slab / wall / grid / story / loads / supports) as geometry + BIM metadata —
-recorded for interop, **never analysed here**.
+catenary vaults (Dieste), and grid shells. These generators stay **live and
+parametric** — each appears as a card in the **Parameters** tab with a
+schema-driven editor (sliders / numeric / dropdown / toggle) that re-derives the
+geometry live; `paramset last frequency=4` does the same from the command line,
+and `freeze` / `bake` flattens to a static mesh when you're done. Structural
+members (beam / column / slab / wall / grid / story / loads / supports) as
+geometry + BIM metadata — recorded for interop, **never analysed here**.
 
 ### Draw precisely
-Object snaps (end / mid / center) · typed coordinates mid-tool (`5.2,3`,
-`@2,3` relative, bare distances) · Shift ortho lock · window/crossing
-drag-select (Rhino convention) · autosuggest with usage hints as you type ·
-gumball on selection
+Full object snap set — endpoint / midpoint / center / intersection /
+perpendicular / tangent / quadrant / nearest / node / vertex — with a clickable
+status-bar osnap chip, a **View ▸ Object Snap…** panel, and per-snap toggles
+(`osnap end on`) · typed coordinates mid-tool (`5.2,3`, `@2,3` relative, bare
+distances) · Shift ortho lock · window/crossing drag-select (Rhino convention) ·
+autosuggest with usage hints as you type · gumball on selection (⌘G to toggle)
 
 ### See
 Perspective, true-ortho plan/elevation views · **two-point perspective**
@@ -221,8 +266,13 @@ modes: shaded / wireframe / x-ray / ghosted / **pencil** (hidden-line on white
 paper) · **sketchy NPR edges** + SketchUp look preset · appearance materials
 (glass / metal / concrete / wood) · georeferenced OSM / satellite basemap ·
 color by layer / object / type / random · named views · image underlay for
-tracing scans · **AI diffusion render** of the current view (opt-in; ComfyUI /
-A1111 / Draw Things / Replicate, ships with no backend active)
+tracing scans · **built-in ray tracer** — a Rust path tracer that renders the
+real model with PBR materials, sun shadows, and global illumination (**Render ▸
+Raytrace…** progressive window + headless `raytrace` verb) · **AI diffusion
+render** of the current view — reimagines the view from a prompt (opt-in;
+ComfyUI / A1111 / Draw Things / Replicate, or a fully **local, offline** Stable
+Diffusion via the Render Setup panel + `sd` binary; ships with no backend
+active)
 
 ![Plan cut in pencil mode — poché walls around a courtyard, hidden-line white-paper view](docs/screenshots/pencil-section.png)
 *`plan 1.5` + `display pencil`: a hidden-line plan cut — poché walls around an open courtyard.*
@@ -276,7 +326,9 @@ swap in without code.
 
 ### Document
 Plan/section cuts — heavy cut lines + light projected edges · elevation views
-· linear dimensions (model + paper space) · text · hatches: solid, lines,
+· linear dimensions (model + paper space), incl. **associative dimensions** that
+bind to geometry — `dim @wall.start @wall.end` follows the object when it moves
+· text · hatches: solid, lines,
 crosshatch, brick, concrete, insulation, earth · sheets (A4–A0) with scaled
 ortho views, schedule tables, and dimensions · per-layer lineweights · vector
 PDF export
@@ -435,6 +487,8 @@ step-by-step walkthroughs a working architect can follow top to bottom:
 | 2 | [Site planning with intemfit](docs/tutorials/02-site-planning.md) | A subdivided site with buildings and a yield report |
 | 3 | [Environmental analysis](docs/tutorials/03-environmental-analysis.md) | A sun-hours study read in numbers and critiqued by the deck |
 | 4 | [Working with the deck](docs/tutorials/04-deck.md) | The LLM drawing and analysing in the same commands you type |
+| 5 | [Render with the ray tracer](docs/tutorials/05-raytrace.md) | A photoreal PBR render of your real model — sun shadows and GI, in-app |
+| 6 | [Edit a parametric structure](docs/tutorials/06-parametric.md) | A live-editable dome tuned from the Parameters tab, then frozen |
 
 There's also a self-contained **[landing page](docs/index.html)** (open it in a
 browser) and **[ready-to-open example documents](examples/)** — a massing, a
