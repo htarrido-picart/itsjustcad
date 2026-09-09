@@ -34,17 +34,20 @@ pub enum PanelTab {
     Model,
     Blocks,
     Sheets,
+    Parameters,
 }
 
 impl PanelTab {
     /// The always-present tabs in display order (Chat first). The dynamic
-    /// `Blocks` and `Sheets` tabs are appended by [`TabState::visible_tabs`].
+    /// `Blocks`, `Sheets` and `Parameters` tabs are appended by
+    /// [`TabState::visible_tabs`].
     pub const FIXED: [PanelTab; 3] = [PanelTab::Deck, PanelTab::Sessions, PanelTab::Model];
 
-    /// True for tabs that come and go with content (`Blocks`, `Sheets`).
+    /// True for tabs that come and go with content (`Blocks`, `Sheets`,
+    /// `Parameters`).
     #[allow(dead_code)] // part of the tab-registry API; exercised in tests
     pub fn is_dynamic(self) -> bool {
-        matches!(self, PanelTab::Blocks | PanelTab::Sheets)
+        matches!(self, PanelTab::Blocks | PanelTab::Sheets | PanelTab::Parameters)
     }
 
     pub fn label(self) -> &'static str {
@@ -54,6 +57,7 @@ impl PanelTab {
             PanelTab::Model => "Layers",
             PanelTab::Blocks => "Blocks",
             PanelTab::Sheets => "Sheets",
+            PanelTab::Parameters => "Parameters",
         }
     }
 
@@ -65,6 +69,7 @@ impl PanelTab {
             PanelTab::Model => crate::icons::Icon::Layers,
             PanelTab::Blocks => crate::icons::Icon::Solid, // lucide "package"
             PanelTab::Sheets => crate::icons::Icon::Print, // lucide "printer"
+            PanelTab::Parameters => crate::icons::Icon::Settings, // lucide "sliders"
         }
     }
 }
@@ -99,6 +104,8 @@ pub struct TabState {
     blocks_pinned: bool,
     /// User explicitly opened the Sheets tab (keeps it visible while empty).
     sheets_pinned: bool,
+    /// User explicitly opened the Parameters tab (keeps it visible while empty).
+    parameters_pinned: bool,
 }
 
 impl Default for TabState {
@@ -109,6 +116,7 @@ impl Default for TabState {
             collapsed: false,
             blocks_pinned: false,
             sheets_pinned: false,
+            parameters_pinned: false,
         }
     }
 }
@@ -124,13 +132,21 @@ impl TabState {
     /// user has pinned it open via [`show`](Self::show), or while it is the
     /// active tab (the active tab may never vanish out from under the user
     /// mid-look).
-    pub fn visible_tabs(self, has_blocks: bool, has_sheets: bool) -> Vec<PanelTab> {
+    pub fn visible_tabs(
+        self,
+        has_blocks: bool,
+        has_sheets: bool,
+        has_parametric: bool,
+    ) -> Vec<PanelTab> {
         let mut tabs: Vec<PanelTab> = PanelTab::FIXED.to_vec();
         if has_blocks || self.blocks_pinned || self.active == PanelTab::Blocks {
             tabs.push(PanelTab::Blocks);
         }
         if has_sheets || self.sheets_pinned || self.active == PanelTab::Sheets {
             tabs.push(PanelTab::Sheets);
+        }
+        if has_parametric || self.parameters_pinned || self.active == PanelTab::Parameters {
+            tabs.push(PanelTab::Parameters);
         }
         tabs
     }
@@ -139,12 +155,15 @@ impl TabState {
     /// empty dynamic tab keeps its pin only while it stays active — once the user
     /// navigates away from an empty Blocks/Sheets tab it un-pins, so the tab
     /// disappears (and reappears automatically when content exists again).
-    pub fn sync_dynamic(&mut self, has_blocks: bool, has_sheets: bool) {
+    pub fn sync_dynamic(&mut self, has_blocks: bool, has_sheets: bool, has_parametric: bool) {
         if !has_blocks && self.active != PanelTab::Blocks {
             self.blocks_pinned = false;
         }
         if !has_sheets && self.active != PanelTab::Sheets {
             self.sheets_pinned = false;
+        }
+        if !has_parametric && self.active != PanelTab::Parameters {
+            self.parameters_pinned = false;
         }
     }
 
@@ -172,6 +191,7 @@ impl TabState {
         match tab {
             PanelTab::Blocks => self.blocks_pinned = true,
             PanelTab::Sheets => self.sheets_pinned = true,
+            PanelTab::Parameters => self.parameters_pinned = true,
             _ => {}
         }
         self.active = tab;
@@ -362,14 +382,14 @@ mod tests {
     #[test]
     fn dynamic_tabs_hidden_without_content() {
         let s = TabState::default();
-        let tabs = s.visible_tabs(false, false);
+        let tabs = s.visible_tabs(false, false, false);
         assert_eq!(tabs, PanelTab::FIXED.to_vec(), "no content → fixed tabs only");
     }
 
     #[test]
     fn blocks_tab_appears_with_block_definitions() {
         let s = TabState::default();
-        let tabs = s.visible_tabs(true, false);
+        let tabs = s.visible_tabs(true, false, false);
         assert_eq!(tabs, vec![
             PanelTab::Deck,
             PanelTab::Sessions,
@@ -383,7 +403,7 @@ mod tests {
         // Plugins moved to a popup window — it must never surface as a tab, no
         // matter the state. `PanelTab` has no `Plugins` variant.
         let s = TabState::default();
-        let labels: Vec<_> = s.visible_tabs(true, false).iter().map(|t| t.label()).collect();
+        let labels: Vec<_> = s.visible_tabs(true, false, false).iter().map(|t| t.label()).collect();
         assert!(!labels.contains(&"Plugins"), "Plugins is a popup, not a tab");
     }
 
@@ -393,19 +413,19 @@ mod tests {
         let mut s = TabState::default();
         s.show(PanelTab::Blocks);
         assert_eq!(s.active(), PanelTab::Blocks);
-        assert!(s.visible_tabs(false, false).contains(&PanelTab::Blocks));
+        assert!(s.visible_tabs(false, false, false).contains(&PanelTab::Blocks));
     }
 
     #[test]
     fn empty_dynamic_tab_disappears_after_navigating_away() {
         let mut s = TabState::default();
         s.show(PanelTab::Blocks); // pinned while empty
-        s.sync_dynamic(false, false);
-        assert!(s.visible_tabs(false, false).contains(&PanelTab::Blocks), "still active");
+        s.sync_dynamic(false, false, false);
+        assert!(s.visible_tabs(false, false, false).contains(&PanelTab::Blocks), "still active");
         s.click(PanelTab::Deck); // navigate away from the EMPTY tab
-        s.sync_dynamic(false, false);
+        s.sync_dynamic(false, false, false);
         assert!(
-            !s.visible_tabs(false, false).contains(&PanelTab::Blocks),
+            !s.visible_tabs(false, false, false).contains(&PanelTab::Blocks),
             "empty + not active + un-pinned → gone"
         );
     }
@@ -415,8 +435,8 @@ mod tests {
         let mut s = TabState::default();
         s.show(PanelTab::Blocks);
         s.click(PanelTab::Model);
-        s.sync_dynamic(true, false); // doc still HAS blocks
-        assert!(s.visible_tabs(true, false).contains(&PanelTab::Blocks));
+        s.sync_dynamic(true, false, false); // doc still HAS blocks
+        assert!(s.visible_tabs(true, false, false).contains(&PanelTab::Blocks));
     }
 
     #[test]
@@ -424,11 +444,11 @@ mod tests {
         let mut s = TabState::default();
         s.show(PanelTab::Blocks);
         s.click(PanelTab::Deck);
-        s.sync_dynamic(false, false); // un-pins: empty + inactive
-        assert!(!s.visible_tabs(false, false).contains(&PanelTab::Blocks));
+        s.sync_dynamic(false, false, false); // un-pins: empty + inactive
+        assert!(!s.visible_tabs(false, false, false).contains(&PanelTab::Blocks));
         // A block definition arrives (e.g. `block last door`): tab is back,
         // no user action needed.
-        assert!(s.visible_tabs(true, false).contains(&PanelTab::Blocks));
+        assert!(s.visible_tabs(true, false, false).contains(&PanelTab::Blocks));
     }
 
     #[test]
@@ -437,8 +457,8 @@ mod tests {
         // under the user even with no content.
         let mut s = TabState::default();
         s.show(PanelTab::Blocks);
-        s.sync_dynamic(false, false);
-        assert!(s.visible_tabs(false, false).contains(&PanelTab::Blocks));
+        s.sync_dynamic(false, false, false);
+        assert!(s.visible_tabs(false, false, false).contains(&PanelTab::Blocks));
         assert_eq!(s.active(), PanelTab::Blocks);
     }
 
@@ -512,7 +532,7 @@ mod tests {
         // A user-dragged width persists identically for every tab.
         let dragged = 412.0;
         let s = TabState::default();
-        for tab in s.visible_tabs(true, false) {
+        for tab in s.visible_tabs(true, false, false) {
             assert_eq!(dock_width(tab, dragged), dragged);
         }
     }
@@ -538,7 +558,7 @@ mod tests {
     fn all_tabs_have_distinct_labels() {
         // Every tab (fixed + dynamic Blocks + Sheets) has a distinct label.
         let labels: Vec<_> = TabState::default()
-            .visible_tabs(true, true)
+            .visible_tabs(true, true, false)
             .iter()
             .map(|t| t.label())
             .collect();
@@ -555,13 +575,13 @@ mod tests {
     #[test]
     fn sheets_tab_hidden_without_sheets() {
         let s = TabState::default();
-        assert!(!s.visible_tabs(false, false).contains(&PanelTab::Sheets));
+        assert!(!s.visible_tabs(false, false, false).contains(&PanelTab::Sheets));
     }
 
     #[test]
     fn sheets_tab_appears_when_doc_has_sheets() {
         let s = TabState::default();
-        let tabs = s.visible_tabs(false, true);
+        let tabs = s.visible_tabs(false, true, false);
         assert_eq!(tabs, vec![
             PanelTab::Deck,
             PanelTab::Sessions,
@@ -574,7 +594,7 @@ mod tests {
     fn blocks_and_sheets_order_blocks_first() {
         // When both dynamic tabs are present, Blocks precedes Sheets.
         let s = TabState::default();
-        let tabs = s.visible_tabs(true, true);
+        let tabs = s.visible_tabs(true, true, false);
         assert_eq!(tabs, vec![
             PanelTab::Deck,
             PanelTab::Sessions,
@@ -590,19 +610,19 @@ mod tests {
         let mut s = TabState::default();
         s.show(PanelTab::Sheets);
         assert_eq!(s.active(), PanelTab::Sheets);
-        assert!(s.visible_tabs(false, false).contains(&PanelTab::Sheets));
+        assert!(s.visible_tabs(false, false, false).contains(&PanelTab::Sheets));
     }
 
     #[test]
     fn empty_sheets_tab_disappears_after_navigating_away() {
         let mut s = TabState::default();
         s.show(PanelTab::Sheets); // pinned while empty
-        s.sync_dynamic(false, false);
-        assert!(s.visible_tabs(false, false).contains(&PanelTab::Sheets), "still active");
+        s.sync_dynamic(false, false, false);
+        assert!(s.visible_tabs(false, false, false).contains(&PanelTab::Sheets), "still active");
         s.click(PanelTab::Deck); // navigate away from the EMPTY tab
-        s.sync_dynamic(false, false);
+        s.sync_dynamic(false, false, false);
         assert!(
-            !s.visible_tabs(false, false).contains(&PanelTab::Sheets),
+            !s.visible_tabs(false, false, false).contains(&PanelTab::Sheets),
             "empty + not active + un-pinned → gone"
         );
     }
@@ -612,10 +632,10 @@ mod tests {
         let mut s = TabState::default();
         s.show(PanelTab::Sheets);
         s.click(PanelTab::Deck);
-        s.sync_dynamic(false, false); // un-pins: empty + inactive
-        assert!(!s.visible_tabs(false, false).contains(&PanelTab::Sheets));
+        s.sync_dynamic(false, false, false); // un-pins: empty + inactive
+        assert!(!s.visible_tabs(false, false, false).contains(&PanelTab::Sheets));
         // A `sheet` verb runs: the tab is back with no user action.
-        assert!(s.visible_tabs(false, true).contains(&PanelTab::Sheets));
+        assert!(s.visible_tabs(false, true, false).contains(&PanelTab::Sheets));
     }
 
     #[test]
@@ -623,8 +643,8 @@ mod tests {
         // Pinning Sheets must not keep Blocks alive and vice-versa.
         let mut s = TabState::default();
         s.show(PanelTab::Sheets);
-        s.sync_dynamic(false, false); // Sheets active → Sheets stays, Blocks gone
-        let tabs = s.visible_tabs(false, false);
+        s.sync_dynamic(false, false, false); // Sheets active → Sheets stays, Blocks gone
+        let tabs = s.visible_tabs(false, false, false);
         assert!(tabs.contains(&PanelTab::Sheets));
         assert!(!tabs.contains(&PanelTab::Blocks));
     }

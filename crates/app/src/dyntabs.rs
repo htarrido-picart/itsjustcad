@@ -11,7 +11,7 @@
 //! untouched. Keeping the derivations pure (no egui) makes them unit-testable
 //! standalone, like `tabstrip`.
 
-use itsjustcad_doc::{Document, Geometry, Sheet};
+use itsjustcad_doc::{Document, Geometry, ObjectId, Sheet};
 
 /// Prefix of per-instance baked dynamic-block entries in `Document::blocks`.
 /// These are implementation detail (see `exec::param_bake_key`), NOT user
@@ -317,6 +317,54 @@ pub fn sheet_rows(doc: &Document) -> Vec<SheetRow> {
         .collect()
 }
 
+// ── Parameters tab (M-parametric) ───────────────────────────────────────────
+
+/// One row of the Parameters tab: a live parametric object in the document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParametricRow {
+    /// The object id (drives selection + `paramset` targeting).
+    pub id: ObjectId,
+    /// Short display id (matches the command-line / digest form).
+    pub short_id: String,
+    /// Optional user-assigned object name.
+    pub name: Option<String>,
+    /// The generator behind the object.
+    pub generator: itsjustcad_doc::GeneratorKind,
+    /// i18n label key for the generator kind (card title).
+    pub generator_label_key: &'static str,
+    /// Compact key-param summary for the card subtitle ("frequency=3, radius=5").
+    pub summary: String,
+    /// This object's current params (the editor reads/writes these).
+    pub params: itsjustcad_doc::ParamMap,
+}
+
+/// True when the document has at least one parametric object. Drives the
+/// dynamic-tab appearance (`TabState::visible_tabs(_, _, has_parametric)`).
+/// Pure predicate.
+pub fn has_parametric(doc: &Document) -> bool {
+    doc.objects().any(|o| matches!(o.geometry, Geometry::Parametric { .. }))
+}
+
+/// Derive the ordered Parameters-tab rows from the document — one row per
+/// parametric object, in document order. Read-only; every edit the tab offers
+/// routes through the normal `paramset` verb, never a second mutation path.
+pub fn parametric_rows(doc: &Document) -> Vec<ParametricRow> {
+    doc.objects()
+        .filter_map(|o| match &o.geometry {
+            Geometry::Parametric { generator, params, .. } => Some(ParametricRow {
+                id: o.id,
+                short_id: o.id.short(),
+                name: o.name.clone(),
+                generator: *generator,
+                generator_label_key: generator.label_key(),
+                summary: itsjustcad_doc::param_summary(*generator, params),
+                params: params.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +663,51 @@ mod tests {
         let s = Session::default();
         assert!(!has_sheets(&s.doc));
         assert!(sheet_rows(&s.doc).is_empty());
+    }
+
+    // ── Parameters tab ──────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_document_has_no_parametric() {
+        let s = Session::default();
+        assert!(!has_parametric(&s.doc));
+        assert!(parametric_rows(&s.doc).is_empty());
+    }
+
+    #[test]
+    fn creating_a_generator_makes_the_parameters_tab_appear() {
+        let mut s = Session::default();
+        run(&mut s, "geodesic 3 5 dome");
+        assert!(has_parametric(&s.doc), "a parametric object must reveal the tab");
+        let rows = parametric_rows(&s.doc);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].generator, itsjustcad_doc::GeneratorKind::Geodesic);
+        assert!(rows[0].summary.contains("frequency"));
+    }
+
+    #[test]
+    fn a_plain_mesh_does_not_reveal_the_parameters_tab() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        assert!(!has_parametric(&s.doc));
+        assert!(parametric_rows(&s.doc).is_empty());
+    }
+
+    #[test]
+    fn parametric_rows_list_each_object_in_order() {
+        let mut s = Session::default();
+        run(&mut s, "geodesic 3 5 dome");
+        run(&mut s, "hypar 5 5 5 6 6");
+        let rows = parametric_rows(&s.doc);
+        let kinds: Vec<_> = rows.iter().map(|r| r.generator).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                itsjustcad_doc::GeneratorKind::Geodesic,
+                itsjustcad_doc::GeneratorKind::Hypar
+            ],
+            "document order preserved"
+        );
     }
 
     #[test]

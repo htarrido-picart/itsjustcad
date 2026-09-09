@@ -28,6 +28,7 @@ mod model_catalog;
 mod native_menu;
 mod osnap;
 mod palette;
+mod param_editor;
 mod point_edit;
 mod precise;
 mod preset;

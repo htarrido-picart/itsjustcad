@@ -268,6 +268,24 @@ struct RaytracePreview {
     image: itsjustcad_raytrace::Image,
 }
 
+/// Debounce window for the Parameters editor: while a slider/drag is active the
+/// re-derive is coalesced so the mesh is not rebuilt every pixel. The pending
+/// edit commits (one `paramset` op) on release, or once this window elapses with
+/// no further change — whichever comes first.
+const PARAM_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(45);
+
+/// A debounced, not-yet-committed Parameters edit. The live params map is what
+/// the editor paints from; the `paramset` op is logged only when the edit
+/// settles (see [`PARAM_DEBOUNCE`]) so undo/redo stays one-op-per-gesture and
+/// heavy generators don't re-derive every frame.
+struct ParamPending {
+    id: itsjustcad_doc::ObjectId,
+    /// The full pending param map (all fields), applied atomically on commit.
+    params: itsjustcad_doc::ParamMap,
+    /// Instant of the last change; a commit fires once now − last ≥ debounce.
+    last_change: std::time::Instant,
+}
+
 pub struct App {
     session: Session,
     command_line: CommandLine,
@@ -421,6 +439,14 @@ pub struct App {
     /// Sheets tab: the name of the currently-selected sheet (the last row the
     /// user clicked), highlighted in the list and used as the `print` target.
     sheet_selected: Option<String>,
+    /// Parameters tab: the id of the parametric object being edited (the last
+    /// card the user clicked). Its schema-driven editor renders below the cards.
+    parametric_selected: Option<itsjustcad_doc::ObjectId>,
+    /// Parameters tab: pending debounced re-derive. Holds the object id, the
+    /// param key/value being dragged, and the instant of the last change; the
+    /// `paramset` op is committed once the slider is released or the debounce
+    /// window elapses (see `PARAM_DEBOUNCE`).
+    param_pending: Option<ParamPending>,
     /// Plugins popup: whether the Plugins window (cards + search) is open.
     show_plugins: bool,
     /// Plugins popup: case-insensitive search filter over the plugin cards.
@@ -875,6 +901,8 @@ impl App {
             blocklib_search: String::new(),
             blocks_reveal: None,
             sheet_selected: None,
+            parametric_selected: None,
+            param_pending: None,
             blocklib_cache: None,
             show_plugins: std::env::var("ITSJUSTCAD_PLUGINS_POPUP").is_ok(),
             plugins_search: String::new(),
@@ -4792,8 +4820,12 @@ impl App {
         // (like Blocks appears when a block is instanced), or when the user pins
         // it open via `panel tab sheets` / a menu. Derived read-only.
         let has_sheets = crate::dyntabs::has_sheets(&self.session.doc);
-        self.panel_tabs.sync_dynamic(has_blocks, has_sheets);
-        let visible_tabs = self.panel_tabs.visible_tabs(has_blocks, has_sheets);
+        // The Parameters tab appears on demand: whenever the document holds ≥1
+        // live parametric object (geodesic/hypar/…), or when pinned open via
+        // `panel tab parameters` / a menu. Content-driven, like Sheets.
+        let has_parametric = crate::dyntabs::has_parametric(&self.session.doc);
+        self.panel_tabs.sync_dynamic(has_blocks, has_sheets, has_parametric);
+        let visible_tabs = self.panel_tabs.visible_tabs(has_blocks, has_sheets, has_parametric);
 
         let collapsed = self.panel_tabs.is_collapsed();
         let theme = if ui.visuals().dark_mode { scene::Theme::Dark } else { scene::Theme::Light };
@@ -4941,6 +4973,7 @@ impl App {
                     }
                     PanelTab::Blocks => self.blocks_tab(ui),
                     PanelTab::Sheets => self.sheets_tab(ui),
+                    PanelTab::Parameters => self.parameters_tab(ui),
                 }
             });
         });
@@ -5262,6 +5295,168 @@ impl App {
         // Title strip along the bottom margin.
         let strip = egui::Rect::from_min_max(map(0.0, 12.0), map(pw, 0.0));
         painter.rect_stroke(strip, 0.0, vp_stroke, egui::StrokeKind::Inside);
+    }
+
+    /// The Parameters tab (M-parametric): a card per live parametric object
+    /// (name, generator kind, key-param summary, a small generator icon), then a
+    /// schema-driven editor for the selected object. All edits route through the
+    /// `paramset` verb (debounced), so op-log/undo/replay invariants hold.
+    fn parameters_tab(&mut self, ui: &mut egui::Ui) {
+        use crate::i18n::t;
+        let rows = crate::dyntabs::parametric_rows(&self.session.doc);
+        // The selection may have been deleted/undone; drop a stale pointer.
+        if let Some(sel) = self.parametric_selected
+            && !rows.iter().any(|r| r.id == sel)
+        {
+            self.parametric_selected = None;
+            self.param_pending = None;
+        }
+
+        egui::ScrollArea::vertical().id_salt("parameters_scroll").show(ui, |ui| {
+            if rows.is_empty() {
+                ui.weak(t("parameters.empty"));
+                ui.weak(t("parameters.empty.hint"));
+                return;
+            }
+            for (i, row) in rows.iter().enumerate() {
+                let bg = if i % 2 == 1 {
+                    ui.visuals().faint_bg_color
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                let selected = self.parametric_selected == Some(row.id);
+                let resp = egui::Frame::NONE
+                    .fill(bg)
+                    .inner_margin(egui::Margin::symmetric(4, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let tint = ui.visuals().text_color();
+                            let img = self.icons.image(
+                                ui.ctx(),
+                                crate::icons::Icon::Settings,
+                                20.0,
+                                tint,
+                            );
+                            ui.add(img);
+                            ui.vertical(|ui| {
+                                // Title: user name if set, else the generator kind.
+                                let title = row
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| t(row.generator_label_key).to_string());
+                                ui.strong(title);
+                                ui.weak(format!("{} · {}", row.short_id, row.summary));
+                            });
+                        });
+                    })
+                    .response
+                    .interact(egui::Sense::click());
+                if selected {
+                    ui.painter().rect_stroke(
+                        resp.rect,
+                        4.0,
+                        egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                if resp.on_hover_text(t("parameters.row.tooltip")).clicked() {
+                    // Select this object for editing AND select it in the scene.
+                    self.parametric_selected = Some(row.id);
+                    self.param_pending = None;
+                    self.session.doc.selection.clear();
+                    self.session.doc.selection.insert(row.id);
+                }
+            }
+
+            // Schema-driven editor for the selected object.
+            if let Some(sel) = self.parametric_selected
+                && let Some(row) = rows.iter().find(|r| r.id == sel)
+            {
+                ui.separator();
+                self.parametric_editor(ui, row);
+            }
+        });
+    }
+
+    /// Render one control per schema field for the selected parametric object
+    /// and commit debounced `paramset` edits. Pure schema → control mapping (see
+    /// `param_editor::field_controls`); this only paints + fires the verb.
+    fn parametric_editor(&mut self, ui: &mut egui::Ui, row: &crate::dyntabs::ParametricRow) {
+        use crate::i18n::t;
+        let schema = row.generator.schema();
+        // The live editing map: the pending map if a drag is in flight for this
+        // object, else the object's current params.
+        let mut values = match &self.param_pending {
+            Some(p) if p.id == row.id => p.params.clone(),
+            _ => row.params.clone(),
+        };
+
+        ui.horizontal(|ui| {
+            ui.strong(t(row.generator_label_key));
+            ui.weak(row.short_id.clone());
+        });
+
+        let mut changed = false;
+        let mut still_active = false;
+        for field in &schema.fields {
+            let (c, a) = crate::param_editor::render_field(ui, field, &mut values);
+            changed |= c;
+            still_active |= a;
+        }
+
+        // Reset-all convenience.
+        ui.add_space(4.0);
+        if ui.button(t("parameters.reset")).clicked() {
+            values = schema.defaults();
+            changed = true;
+            still_active = false;
+        }
+
+        if changed {
+            // Coalesce into the pending edit; commit on release / debounce.
+            self.param_pending = Some(ParamPending {
+                id: row.id,
+                params: schema.sanitize(&values),
+                last_change: std::time::Instant::now(),
+            });
+        }
+        // Commit when the gesture settled: no widget still being dragged AND the
+        // debounce window elapsed since the last change.
+        if let Some(p) = &self.param_pending
+            && p.id == row.id
+            && !still_active
+            && p.last_change.elapsed() >= PARAM_DEBOUNCE
+        {
+            self.commit_paramset(row.id, p.params.clone());
+            self.param_pending = None;
+        } else if self.param_pending.is_some() {
+            // A drag is in flight: keep repainting so the debounce fires.
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Commit a debounced Parameters edit as one `paramset` op through the
+    /// normal command pipeline (logged, undoable, replay-stable). Diffs against
+    /// the object's current params so only changed keys are sent.
+    fn commit_paramset(&mut self, id: itsjustcad_doc::ObjectId, params: itsjustcad_doc::ParamMap) {
+        let cur = match &self.session.doc.get(id).map(|o| &o.geometry) {
+            Some(itsjustcad_doc::Geometry::Parametric { params, .. }) => params.clone(),
+            _ => return,
+        };
+        let mut pairs: std::collections::BTreeMap<String, String> = Default::default();
+        for (k, v) in &params {
+            if cur.get(k) != Some(v) {
+                pairs.insert(k.clone(), crate::param_editor::value_to_token(v));
+            }
+        }
+        if pairs.is_empty() {
+            return;
+        }
+        let cmd = itsjustcad_commands::Command::ParamSet {
+            target: itsjustcad_commands::Selector::Ids { ids: vec![id] },
+            params: pairs,
+        };
+        let _ = self.session.run(cmd);
     }
 
     /// Plugins popup window (modeless, dismissable — like Model Setup / About):
@@ -6355,6 +6550,7 @@ pub(crate) fn panel_tab_by_name(name: &str) -> Option<crate::tabstrip::PanelTab>
         "layers" | "model" => Some(PanelTab::Model),
         "blocks" => Some(PanelTab::Blocks),
         "sheets" | "sheet" => Some(PanelTab::Sheets),
+        "parameters" | "parametric" | "params" => Some(PanelTab::Parameters),
         // "plugins" is intentionally NOT a tab — it opens the Plugins popup
         // window instead (handled by the caller). Returns None here.
         _ => None,
