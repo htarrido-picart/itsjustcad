@@ -1401,11 +1401,38 @@ impl DeckPane {
     }
 
     fn start_probe(&mut self, handle: &tokio::runtime::Handle) {
-        let Some(config) = self.decks.decks.get(self.decks.active).cloned() else {
+        let Some(mut config) = self.decks.decks.get(self.decks.active).cloned() else {
             self.probe = ProbeState::Unavailable("no deck configured".into());
             return;
         };
         self.probed_deck = Some(self.decks.active);
+        // A catalog-installed local cassette is served by a subprocess WE spawn on
+        // demand — it is NOT an external server the user must start. Probing its
+        // URL cold would fail with the generic "is the server running? (ollama
+        // serve)" message, which is misleading for an auto-spawn model. Instead
+        // start (or reuse) the local runtime here and reflect its real state.
+        if is_spawnable_local(&config, &self.catalog) {
+            match self.ensure_local_runtime(&config, handle) {
+                // Server is up — probe the LIVE port so the status shows the real
+                // model/readiness rather than the stale configured base_url.
+                LocalReady::Ready(base_url) => config.base_url = base_url,
+                // Still loading the model (first run reads GBs off disk). Show an
+                // honest "starting" status — NOT an external-server error. Retry
+                // (button) re-probes once it's warm.
+                LocalReady::Pending => {
+                    self.probe = ProbeState::Unavailable(
+                        "starting the local model server… first run loads the model \
+                         (can take ~30 s); press Retry in a moment"
+                            .into(),
+                    );
+                    return;
+                }
+                LocalReady::Failed(msg) => {
+                    self.probe = ProbeState::Unavailable(msg);
+                    return;
+                }
+            }
+        }
         let (tx, rx) = oneshot::channel();
         self.probe = ProbeState::Checking(rx);
         handle.spawn(async move {
