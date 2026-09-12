@@ -161,6 +161,31 @@ pub fn health_url_for_port(port: u16) -> String {
     format!("http://127.0.0.1:{port}/health")
 }
 
+/// Spawn the server child inside the tokio runtime context.
+///
+/// `tokio::process::Command::spawn()` registers the child with the tokio reactor,
+/// so it MUST run inside the runtime — but the caller ([`LocalRuntime::spawn`]) is
+/// invoked synchronously from the UI thread (`ensure_local_runtime` during a deck
+/// turn), which is NOT in the runtime. Without `handle.enter()` the spawn panics
+/// ("there is no reactor running, must be called from the context of a Tokio 1.x
+/// runtime") and aborts the whole app. The guard installs the runtime context for
+/// the current thread for the spawn's duration.
+fn spawn_server_process(
+    handle: &tokio::runtime::Handle,
+    program: &Path,
+    args: &[String],
+) -> Result<tokio::process::Child, String> {
+    let _enter = handle.enter();
+    tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("cannot launch {}: {e}", program.display()))
+}
+
 /// Look up an executable on `PATH` (the real injector for [`build_command`]).
 pub fn which(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -250,14 +275,7 @@ impl LocalRuntime {
         }
         let (program, args) = build_command(plan, port, which)?;
 
-        let child = tokio::process::Command::new(&program)
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("cannot launch {}: {e}", program.display()))?;
+        let child = spawn_server_process(handle, &program, &args)?;
 
         let state = Arc::new(Mutex::new(RuntimeState::Starting));
         let health_url = health_url_for_port(port);
@@ -368,6 +386,28 @@ mod tests {
         .unwrap();
         assert_eq!(prog, PathBuf::from("/models/qwen.llamafile"));
         assert!(!called.get(), "llamafile must not look up PATH");
+    }
+
+    // ── reactor-context regression (crash: SIGABRT on deck turn) ───────────
+
+    #[test]
+    fn spawn_server_process_off_runtime_thread_does_not_panic() {
+        // Reproduces the v0.5.1 crash: `LocalRuntime::spawn` runs synchronously
+        // on the UI thread (via `ensure_local_runtime` during a deck turn), which
+        // is NOT inside the tokio runtime. Before the `handle.enter()` fix, the
+        // `tokio::process::Command::spawn()` panicked "there is no reactor
+        // running, must be called from the context of a Tokio 1.x runtime" and
+        // aborted the app. A harmless real binary stands in for the LLM server.
+        let prog = PathBuf::from("/bin/sleep");
+        if !prog.is_file() {
+            return; // stand-in unavailable on this platform; skip
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        // The test body runs on a plain (non-runtime) thread, exactly like the UI.
+        let mut child = spawn_server_process(&handle, &prog, &["30".to_string()])
+            .expect("spawn must succeed off the runtime thread, not panic on a missing reactor");
+        let _ = child.start_kill();
     }
 
     // ── gguf command shape + PATH gate ─────────────────────────────────────
