@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ItsJustCAD — Beta User Review (v0.5.0)</title>
+<title>ItsJustCAD — Beta User Review (v0.5.2)</title>
 <style>
   :root{
     --bg:#f7f7f5; --panel:#ffffff; --ink:#1c1c1e; --muted:#6b6b70;
@@ -79,13 +79,18 @@
   .btn:hover{filter:brightness(1.05);}
   .progress{font-size:13px; color:var(--muted); margin-left:auto;}
   .progress b{color:var(--ink);}
+  figure.shot{margin:12px 0 14px; padding:0;}
+  figure.shot img{max-width:100%; height:auto; display:block; border:1px solid var(--line); border-radius:8px; background:#fff;}
+  figure.shot figcaption{color:var(--muted); font-size:12.5px; margin-top:6px;}
+  figure.shot figcaption b{color:var(--ok); font-weight:600;}
+  figure.hero{margin:6px 0 22px;}
 </style>
 </head>
 <body>
 <div class="wrap">
 <nav>
   <div class="brand">ItsJustCAD</div>
-  <div class="date">Beta User Review &middot; v0.5.0</div>
+  <div class="date">Beta User Review &middot; v0.5.2</div>
   <button class="reset" onclick="resetChecks()">Reset checks</button>
   <h2>Start here</h2>
   <a href="#howto">How to test</a>
@@ -110,13 +115,18 @@
 
 <main>
 <header class="top">
-  <h1>ItsJustCAD &mdash; Beta User Review <span class="tag info" style="vertical-align:middle">v0.5.0</span></h1>
+  <h1>ItsJustCAD &mdash; Beta User Review <span class="tag info" style="vertical-align:middle">v0.5.2</span></h1>
   <p class="sub">Work through the checklist, then Export results and send the JSON to the developer.</p>
 </header>
 <div class="meta">
-  <span><b>Build under test:</b> latest v0.5.0 release (the app you downloaded)</span>
+  <span><b>Build under test:</b> latest v0.5.2 release (the app you downloaded)</span>
   <span><b>Report to:</b> <a href="mailto:htarrido@pm.me">htarrido@pm.me</a> or a GitHub issue</span>
 </div>
+
+<figure class="shot hero">
+  <img src="shot-ui.png" alt="ItsJustCAD full interface: 3D viewport, command line, status bar and right dock">
+  <figcaption><b>The app at a glance:</b> the 3D viewport, the full-width command line, the status bar (view / snap chips + gumball), and the right dock (Chat / Sessions / Layers plus the contextual Parameters / Sheets / Blocks tabs).</figcaption>
+</figure>
 
 <!-- ============ HOWTO ============ -->
 <section id="howto">
@@ -133,7 +143,7 @@
 <!-- ============ HONEST LIMITS ============ -->
 <section id="limits">
 <h2 class="sec">Honest limits <span class="tag warn">read first</span></h2>
-<p class="lead">Known, deliberate limits in v0.5.0. None of these block testing &mdash; they explain results you might otherwise flag as bugs:</p>
+<p class="lead">Known, deliberate limits in v0.5.2. None of these block testing &mdash; they explain results you might otherwise flag as bugs:</p>
 <ul>
   <li><b>intemfit euro_latam profile is placeholder.</b> Any run that resolves a rule from the <code>euro_latam</code> region prints <b>"using euro_latam defaults (placeholder &mdash; confirm with Manuel)"</b>. That banner is expected, not an error.</li>
   <li><b>Compliance is name-match + straight-line.</b> Guard/handrail/ceiling checks match by object name (no geometric modeling); travel distance is straight-line room-centroid &rarr; nearest exit, not a routed egress path. Advisory pre-check only &mdash; verify with a licensed professional / AHJ.</li>
@@ -149,6 +159,15 @@
 <details open>
 <summary>1 &middot; Drawing &amp; Modeling</summary>
 <p class="lead">2D drafting, NURBS curves, solids, booleans, constraints, hatches, blocks.</p>
+
+<figure class="shot">
+  <img src="shot-viewport.png" alt="Shaded 3D massing — podium base and tower">
+  <figcaption><b>Expected:</b> solids extrude/boolean cleanly into a shaded 3D massing (here a podium base with a tower).</figcaption>
+</figure>
+<figure class="shot">
+  <img src="shot-plan-pencil.png" alt="Plan cut with poché ring around a courtyard, pencil white-paper style">
+  <figcaption><b>Expected:</b> a plan cut with a poché ring around a courtyard, rendered in the white-paper pencil display.</figcaption>
+</figure>
 
 <div class="grp-title">2D drawing &amp; transforms</div>
 <div class="chk"><input type="checkbox" id="m0a"><label for="m0a"><span class="cmd"><span class="p">&#8250;</span> line 0,0,0 10,0,0</span> &middot; <code>rect 0,0,0 4 6</code> &middot; <code>circle 0,0,0 2.5</code> &middot; <code>polygon 0,0,0 3 6</code> <span class="exp"><b>Expect:</b> each primitive draws in the XY plane.</span></label></div>
@@ -199,6 +218,11 @@
 <summary>2 &middot; Expressive Structures <span class="tag ok">geodesic / form-finding working</span></summary>
 <p class="lead">Weird-structures pack: geodesic domes, space frames, shells, and physics-based form-finding (dynamic relaxation). These now build correctly.</p>
 
+<figure class="shot">
+  <img src="shot-massing.png" alt="SketchUp-style massing model">
+  <figcaption><b>Expected:</b> generated forms read as a clean SketchUp-style massing (sun + profile edges + sky/ground gradient).</figcaption>
+</figure>
+
 <div class="chk"><input type="checkbox" id="e1"><label for="e1"><span class="cmd"><span class="p">&#8250;</span> geodesic 3 5 dome</span> (try <code>full</code>) <span class="exp"><b>Expect:</b> a Buckminster-Fuller geodesic dome &mdash; icosahedron subdivided 3&times;, projected to radius 5, struts as edges. <code>full</code> = whole sphere.</span></label></div>
 <div class="chk"><input type="checkbox" id="e2"><label for="e2"><span class="cmd"><span class="p">&#8250;</span> spaceframe 6 4 3 1.5</span> <span class="exp"><b>Expect:</b> a double-layer space frame &mdash; 6&times;4 bays, top + offset bottom chords tied by pyramid diagonals.</span></label></div>
 <div class="chk"><input type="checkbox" id="e3"><label for="e3"><span class="cmd"><span class="p">&#8250;</span> hypar 5 5 5</span> then <span class="cmd"><span class="p">&#8250;</span> gaussvault 6 12 3 undulate</span> <span class="exp"><b>Expect:</b> a Candela hypar saddle shell; a Dieste Gaussian brick vault with sinusoidal double-curvature.</span></label></div>
@@ -223,6 +247,11 @@
 <summary>3 &middot; intemfit &mdash; Site Planning &amp; Lot Subdivision <span class="tag ok">Phases 1&ndash;12 shipped</span></summary>
 <p class="lead">Parametric site planning (roads &rarr; blocks &rarr; lots &rarr; setbacks &rarr; open space &rarr; buildings &rarr; yield), CityEngine/TestFit-style. Results bake onto the <code>roads</code>, <code>blocks</code>, <code>lots</code>, <code>setbacks</code>, <code>openspace</code>, <code>buildings</code> layers. All geometry verbs are undoable and replay byte-identical for a fixed seed.</p>
 <div class="callout warn">The <b>euro_latam</b> profile runs on <b>placeholder defaults</b>. Any run resolving a rule from it prints <b>"using euro_latam defaults (placeholder &mdash; confirm with Manuel)"</b>. Confirm that banner appears where noted.</div>
+
+<figure class="shot">
+  <img src="screenshots/site-plan.png" alt="Irregular site boundary subdivided into blocks and lots, with a road network and detached houses filling the lots, top view">
+  <figcaption><b>Expected:</b> an irregular site boundary subdivided into blocks and lots, with a road network and detached houses filling the lots (top view). This is the end-to-end result of the roads &rarr; blocks &rarr; lots &rarr; buildings pipeline below.</figcaption>
+</figure>
 
 <div class="grp-title">Site generation (<code>lotgeneratesite</code>)</div>
 <div class="chk"><input type="checkbox" id="if1"><label for="if1">Draw a large closed site boundary, select it, then <span class="cmd"><span class="p">&#8250;</span> lotgeneratesite last orthogonal roadwidth=12 blockdepth=60</span> <span class="exp"><b>Expect:</b> a road grid on <code>roads</code> + block outlines on <code>blocks</code>; every block edge tagged with the street it fronts.</span></label></div>
@@ -262,6 +291,15 @@
 <details>
 <summary>4 &middot; Environmental Analysis &amp; Camera</summary>
 <p class="lead">Sun / shadow / radiation studies, camera projections (incl. phone-lens sims), render modes.</p>
+
+<figure class="shot">
+  <img src="shot-sun-shadow.png" alt="Massing lit by the real sun, casting ground shadow lines">
+  <figcaption><b>Expected:</b> the massing lit by the real sun for the set date/time, casting accurate ground shadow lines.</figcaption>
+</figure>
+<figure class="shot">
+  <img src="screenshots/sun-hours.png" alt="Top-down site with a sun-hours ground grid">
+  <figcaption><b>Expected:</b> a top-down sun-hours ground grid over the site (few hours &rarr; many hours).</figcaption>
+</figure>
 
 <div class="grp-title">Sun / shadow / radiation</div>
 <div class="chk"><input type="checkbox" id="a0"><label for="a0">Set a site first: <span class="cmd"><span class="p">&#8250;</span> location 40.71 -74.01 -5</span> <span class="exp"><b>Expect:</b> observer location set (needed by the studies below).</span></label></div>
@@ -382,6 +420,11 @@
 <summary>10 &middot; Sheets &amp; PDF</summary>
 <p class="lead">Paper sheets, scaled ortho views, plan/section/elevation, vector PDF export.</p>
 
+<figure class="shot">
+  <img src="shot-elevation.png" alt="Three-storey facade outline with a window grid, white-paper elevation">
+  <figcaption><b>Expected:</b> a three-storey facade outline with a window grid — a clean white-paper elevation ready to place on a sheet / print to PDF.</figcaption>
+</figure>
+
 <div class="chk"><input type="checkbox" id="sh1"><label for="sh1">Build a small massing, then <span class="cmd"><span class="p">&#8250;</span> plan 1.2</span> and <span class="cmd"><span class="p">&#8250;</span> elevation south</span> <span class="exp"><b>Expect:</b> plan cut outlines on <code>sections</code>; south elevation edges on <code>elevations</code>.</span></label></div>
 <div class="chk"><input type="checkbox" id="sh2"><label for="sh2"><span class="cmd"><span class="p">&#8250;</span> sheet plan a1</span> then <span class="cmd"><span class="p">&#8250;</span> sheetview plan top 1:100</span> <span class="exp"><b>Expect:</b> a named A1 sheet; a scaled top view added at 1:100.</span></label></div>
 <div class="chk"><input type="checkbox" id="sh3"><label for="sh3"><span class="cmd"><span class="p">&#8250;</span> print plan /tmp/plan.pdf</span> <span class="exp"><b>Expect:</b> a vector PDF at the views' scales; lineweights honored; opens in any PDF viewer.</span></label></div>
@@ -409,6 +452,11 @@
 <summary>12 &middot; Render &mdash; Ray Tracer &amp; AI Diffusion <span class="tag info">no diffusion backend by default</span></summary>
 <p class="lead">The ray tracer renders the <b>real model</b> and needs no setup. The AI diffusion render <b>reimagines</b> the view and ships with NO backend active &mdash; you configure one (remote or local) first.</p>
 
+<figure class="shot">
+  <img src="shot-raytrace.png" alt="Path-traced massing with soft global illumination and sky ambient light">
+  <figcaption><b>Expected:</b> a path-traced render of the real model — soft global illumination and sky ambient, refining live as samples accumulate.</figcaption>
+</figure>
+
 <div class="grp-title">Ray tracer (accurate PBR &mdash; built in, no backend)</div>
 <div class="chk"><input type="checkbox" id="rt1"><label for="rt1">Build a small massing (a box or two), aim a <code>persp</code> view, then open <b>Render &middot; Raytrace&hellip;</b> from the menu <span class="exp"><b>Expect:</b> a progressive window whose preview starts noisy and <b>refines live</b> as samples accumulate; real materials, sun shadows, and GI.</span></label></div>
 <div class="chk"><input type="checkbox" id="rt2"><label for="rt2">Adjust <b>samples / bounces / resolution / sun / sky</b>, then <b>Stop</b> and <b>Save PNG</b> <span class="exp"><b>Expect:</b> controls affect the image; Stop halts refinement; Save writes a PNG.</span></label></div>
@@ -431,6 +479,11 @@
 <summary>13 &middot; UI, Menus &amp; Gumball</summary>
 <p class="lead">Right-dock tabs, native menus, window controls, autosuggest, gumball hotkey.</p>
 
+<figure class="shot">
+  <img src="shot-ui.png" alt="Full ItsJustCAD interface with viewport, command line, status bar and right dock">
+  <figcaption><b>Expected:</b> the full interface — viewport + full-width command line + status bar (view / snap chips + gumball) + right dock (Chat / Sessions / Layers plus the contextual Parameters / Sheets / Blocks tabs).</figcaption>
+</figure>
+
 <div class="chk"><input type="checkbox" id="u1"><label for="u1">Open the right dock <span class="exp"><b>Expect:</b> a <b>Blocks</b> tab (14 starter param blocks); rows show name, live instance count, geometry count. <b>Insert</b> prefills <code>insert &lt;name&gt; </code>.</span></label></div>
 <div class="chk"><input type="checkbox" id="u3"><label for="u3">Define a plugin (<code>plugin define {...}</code>), open the <b>Plugins</b> tab <span class="exp"><b>Expect:</b> a tab with usage/summary rows; Run prefills the verb; Reload/Delete work.</span></label></div>
 <div class="chk"><input type="checkbox" id="u5"><label for="u5">Type a partial verb, press <b>Tab</b> to accept the autosuggest <span class="exp"><b>Expect:</b> Tab-accept works (was a fixed dead-key bug); tab-traversing the window never dead-ends.</span></label></div>
@@ -439,7 +492,7 @@
 <div class="chk"><input type="checkbox" id="u9"><label for="u9">Select an object and press <b>&#8984;/Ctrl+G</b> <span class="exp"><b>Expect:</b> the gumball toggles on/off. Bare <code>g</code> no longer does this.</span></label></div>
 <div class="chk"><input type="checkbox" id="u10"><label for="u10">Open the <b>Blocks</b> tab, use the search box, click the library <b>&#43;</b>, and <b>double-click</b> a block <span class="exp"><b>Expect:</b> search filters the list; &#43; adds from the library; double-click reveals/loads the block into the drawing.</span></label></div>
 <div class="chk"><input type="checkbox" id="u11"><label for="u11">Open <b>Plugins</b> (root-level Plugins menu &rarr; popup) and the <b>Sheets</b> tab <span class="exp"><b>Expect:</b> the Plugins popup shows cards + search + install status; the Sheets tab lists each sheet with a preview thumbnail.</span></label></div>
-<div class="chk"><input type="checkbox" id="u12"><label for="u12"><b>Help &middot; Check for Updates&hellip;</b> <span class="exp"><b>Expect:</b> compares this build against the latest GitHub release &mdash; "You're on the latest (v0.5.0)." when current, or the newer version + a <b>Download</b> button; offline &rarr; "Couldn't check&hellip;" + Check-Again. Never blocks the app.</span></label></div>
+<div class="chk"><input type="checkbox" id="u12"><label for="u12"><b>Help &middot; Check for Updates&hellip;</b> <span class="exp"><b>Expect:</b> compares this build against the latest GitHub release &mdash; "You're on the latest (v0.5.2)." when current, or the newer version + a <b>Download</b> button; offline &rarr; "Couldn't check&hellip;" + Check-Again. Never blocks the app.</span></label></div>
 
 <div class="notes-wrap"><label for="note-ui">Notes for this section</label><textarea class="notes" id="note-ui" data-section="13 · UI, Menus & Gumball" placeholder="Notes..."></textarea></div>
 </details>
@@ -449,7 +502,7 @@
 <section id="export">
 <h2 class="sec">Export results &amp; send them back</h2>
 <p class="lead">When you're done, add any overall notes below, then <b>Download JSON</b> and email it to <a href="mailto:htarrido@pm.me">htarrido@pm.me</a> (or attach it to a GitHub issue). The JSON records every test id, whether it passed, and your notes.</p>
-<div class="notes-wrap"><label for="note-global">Overall notes (tester name, OS, version, general impressions)</label><textarea class="notes" id="note-global" data-section="_overall" placeholder="e.g. Tester: Jane · macOS 14 Apple Silicon · v0.5.0 · general feedback..." style="min-height:80px"></textarea></div>
+<div class="notes-wrap"><label for="note-global">Overall notes (tester name, OS, version, general impressions)</label><textarea class="notes" id="note-global" data-section="_overall" placeholder="e.g. Tester: Jane · macOS 14 Apple Silicon · v0.5.2 · general feedback..." style="min-height:80px"></textarea></div>
 </section>
 
 <div class="exportbar">
@@ -458,7 +511,7 @@
   <span class="progress" id="progress">0 of 0 tests checked</span>
 </div>
 
-<div class="foot">ItsJustCAD &mdash; Beta User Review &middot; v0.5.0 &middot; advisory checklist; compliance is a pre-check, not a certification. Your checkbox state &amp; notes are stored locally in your browser until you export them.</div>
+<div class="foot">ItsJustCAD &mdash; Beta User Review &middot; v0.5.2 &middot; advisory checklist; compliance is a pre-check, not a certification. Your checkbox state &amp; notes are stored locally in your browser until you export them.</div>
 </main>
 </div>
 
@@ -541,7 +594,7 @@
     return {
       app: "ItsJustCAD",
       review: "Beta User Review",
-      version: "0.5.0",
+      version: "0.5.2",
       exportedAt: new Date().toISOString(),
       summary: { total: tests.length, passed: passed, unchecked: tests.length - passed },
       overallNotes: (notes['note-global'] || "").trim(),
