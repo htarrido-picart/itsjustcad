@@ -34,14 +34,17 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      # Ubuntu: mesa software renderer (no GPU in GitHub Actions)
+      # Ubuntu: mesa software renderer (no GPU in GitHub Actions) + libdbus
+      # (the keyring/secret-service crate used for OS-keychain chat encryption
+      # links libdbus-sys, which needs libdbus-1-dev + pkg-config on Linux).
       - name: Install Mesa (Ubuntu)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
             libvulkan1 mesa-vulkan-drivers libegl1-mesa-dev \
-            libx11-xcb-dev libxcb-xfixes0-dev
+            libx11-xcb-dev libxcb-xfixes0-dev \
+            libdbus-1-dev pkg-config
 
       - name: Build workspace
         run: cargo build --workspace

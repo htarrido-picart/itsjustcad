@@ -68,7 +68,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libvulkan1 mesa-vulkan-drivers libegl1-mesa-dev \
             libx11-xcb-dev libxcb-xfixes0-dev \
-            libwayland-dev libxkbcommon-dev
+            libwayland-dev libxkbcommon-dev \
+            libdbus-1-dev pkg-config
 
       # ── Build ──────────────────────────────────────────────────────────
       - name: Build release binary
