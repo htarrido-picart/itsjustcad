@@ -63,12 +63,32 @@ that draws with the exact same commands you type.
 
 | Your OS | Download | First launch |
 |---|---|---|
-| **macOS** (Apple Silicon) | [`ItsJustCAD.app`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-macos-aarch64-app.tar.gz) | Unpack, then right‑click the app → **Open** (once) |
-| **macOS** (Intel) | [`ItsJustCAD.app`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-macos-x86_64-app.tar.gz) | Unpack, then right‑click the app → **Open** (once) |
+| **macOS** (Apple Silicon) | [`ItsJustCAD.app`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-macos-aarch64-app.tar.gz) | Unpack, then see **[Opening on macOS](#opening-on-macos-unsigned-app)** (once) |
+| **macOS** (Intel) | [`ItsJustCAD.app`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-macos-x86_64-app.tar.gz) | Unpack, then see **[Opening on macOS](#opening-on-macos-unsigned-app)** (once) |
 | **Windows** (x86‑64) | [`itsjustcad.exe`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-windows-x86_64.zip) | Unzip → double‑click → **More info → Run anyway** (once) |
 | **Linux** (x86‑64) | [`itsjustcad`](https://github.com/htarrido-picart/itsjustcad/releases/latest/download/itsjustcad-linux-x86_64.tar.gz) | `tar xzf`, `chmod +x itsjustcad`, then run |
 
 Each link always resolves to the **newest release** — no need to update it per version.
+
+### Opening on macOS (unsigned app)
+
+The app isn't code‑signed/notarized yet, so macOS quarantines it on download. On
+**macOS 15 (Sequoia)** the first‑launch dialog only offers *Done / Move to Trash*
+— the old "right‑click → Open" trick no longer works. Use one of these (once):
+
+**System Settings (no terminal)**
+1. Unpack, double‑click **ItsJustCAD** → the "Not Opened" dialog appears → click **Done**.
+2. Open  → **System Settings ▸ Privacy & Security**.
+3. Scroll down to *"ItsJustCAD was blocked to protect your Mac."* → click **Open Anyway** → authenticate → **Open Anyway** again.
+
+**Terminal (one line, most reliable)**
+```sh
+xattr -dr com.apple.quarantine /path/to/ItsJustCAD.app   # e.g. ~/Downloads/ItsJustCAD.app
+```
+Then double‑click. This strips the quarantine flag so Gatekeeper stops blocking it.
+
+After the first successful open it launches normally. (Signing + notarization,
+which removes this entirely, is planned.)
 
 ### User Beta Review
 
@@ -83,9 +103,9 @@ through it, tick what passes, jot notes on anything that doesn't, then click
 [htarrido@pm.me](mailto:htarrido@pm.me) or open a GitHub issue. Your ticks and
 notes are saved in the browser as you go.
 
-> The app is not code‑signed yet, so your OS shows a one‑time "unidentified
-> developer" / "Windows protected your PC" warning on the very first launch.
-> Use the step above to open it; after that it just launches. Nothing to
+> The app is not code‑signed yet, so your OS shows a one‑time warning on first
+> launch: macOS — see **[Opening on macOS](#opening-on-macos-unsigned-app)**;
+> Windows — **More info → Run anyway**. After that it just launches. Nothing to
 > install, no dependencies — it's a single ~10 MB program.
 
 ---

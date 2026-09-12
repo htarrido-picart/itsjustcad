@@ -187,4 +187,19 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
+          append_body: true
+          body: |
+            ---
+            ### Opening on macOS (unsigned app)
+            The app isn't code‑signed/notarized yet, so macOS quarantines it on download. On **macOS 15 (Sequoia)** the first‑launch dialog only offers *Done / Move to Trash* — the old "right‑click → Open" no longer works. Do this once:
+
+            **System Settings:** double‑click the app → **Done** → **System Settings ▸ Privacy & Security** → scroll to *"ItsJustCAD was blocked…"* → **Open Anyway** → authenticate → **Open Anyway**.
+
+            **Terminal (one line):**
+            ```sh
+            xattr -dr com.apple.quarantine /path/to/ItsJustCAD.app
+            ```
+            Then double‑click. After the first open it launches normally.
+
+            **Windows:** SmartScreen → **More info → Run anyway** (once).
           files: artifacts/**/*
