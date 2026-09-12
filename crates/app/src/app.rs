@@ -7498,6 +7498,11 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // `frame` feeds the native menu bar, which is only attached off-Linux
+        // (muda/gtk unavailable there); mark it used on Linux so `-D warnings`
+        // clippy stays green without masking other unused vars.
+        #[cfg(target_os = "linux")]
+        let _ = &frame;
         // Modeless-hotkey exceptions run BEFORE any widget so their key/text
         // events can be consumed (the command line is focused-by-default, so the
         // input would otherwise eat the letter).

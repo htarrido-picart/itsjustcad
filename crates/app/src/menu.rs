@@ -183,6 +183,8 @@ pub fn action_shortcut(action: &MenuAction) -> Option<&'static str> {
 /// capability: the user sees Move/Rotate/… exist but greyed until they pick
 /// something. Curated to the modify/transform/boolean verbs that consume a
 /// selection; drawing and file/view verbs stay always-enabled.
+// Consumed only by the native (muda) menu path, which is not built on Linux.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn needs_selection(verb: &str) -> bool {
     matches!(
         verb,
@@ -328,7 +330,9 @@ pub enum NativeItem {
     /// A native predefined item (macOS Minimize / Zoom / Bring All to Front, etc).
     /// Carried in the model so tests can see the Window menu; the muda layer maps
     /// each kind to a [`muda::PredefinedMenuItem`]. Has no [`MenuAction`] — the OS
-    /// handles it.
+    /// handles it. Constructed only on the native (muda) menu platforms; the
+    /// Linux build uses the in-window bar and never emits it.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Predefined(PredefinedKind),
     /// A checkable menu entry (rendered with a checkmark). `checked`/`enabled` in
     /// the model are INITIAL values; the app syncs the live state onto the native
@@ -346,8 +350,10 @@ pub enum NativeItem {
 }
 
 /// A macOS-standard predefined menu item the OS implements directly (no
-/// [`MenuAction`]). Used for the Window menu.
+/// [`MenuAction`]). Used for the Window menu. Only referenced by the native
+/// (muda) menu path, which is not built on Linux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub enum PredefinedKind {
     /// Minimize the window (⌘M).
     Minimize,
@@ -530,8 +536,7 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
     // New, Open…, Save, Save As…, Import…, Export…, Settings (⌘,), Quit.
     {
         let t = "File";
-        #[cfg_attr(target_os = "macos", allow(unused_mut))]
-        let mut items = vec![
+        let items = vec![
             wired_leaf(t, "new", tr("menu.file.new"), MenuAction::NewDocument),
             wired_leaf(t, "new_session", tr("menu.file.new_session"), MenuAction::NewSession),
             NativeItem::Separator,
