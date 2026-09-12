@@ -1587,22 +1587,26 @@ mod tests {
 
     #[test]
     fn selection_edit_items_disabled_when_empty() {
-        let sel_labels = ["Cut", "Copy", "Delete", "Deselect"];
+        // Match by canonical id, NOT the translated label: labels come from `tr()`
+        // (the global UI language, which sibling tests may switch on another
+        // thread), while ids are stable English tokens — so this stays green
+        // regardless of the active locale.
+        let sel_ids = ["Edit/cut", "Edit/copy", "Edit/delete", "Edit/deselect"];
         let empty = native_model(MenuStyle::Rhino, false, ViewState::default());
         let filled = native_model(MenuStyle::Rhino, true, ViewState::default());
-        let enabled_of = |menus: &[NativeMenu], label: &str| -> Option<bool> {
+        let enabled_of = |menus: &[NativeMenu], id: &str| -> Option<bool> {
             menus.iter().flat_map(|m| &m.items).find_map(|it| match it {
-                NativeItem::Leaf { label: l, enabled, .. } if l == label => Some(*enabled),
+                NativeItem::Leaf { id: i, enabled, .. } if i == id => Some(*enabled),
                 _ => None,
             })
         };
-        for l in sel_labels {
-            assert_eq!(enabled_of(&empty, l), Some(false), "{l} should be disabled when empty");
-            assert_eq!(enabled_of(&filled, l), Some(true), "{l} should be enabled with a selection");
+        for id in sel_ids {
+            assert_eq!(enabled_of(&empty, id), Some(false), "{id} should be disabled when empty");
+            assert_eq!(enabled_of(&filled, id), Some(true), "{id} should be enabled with a selection");
         }
         // Paste and Select All stay enabled regardless.
-        assert_eq!(enabled_of(&empty, "Paste"), Some(true));
-        assert_eq!(enabled_of(&empty, "Select All"), Some(true));
+        assert_eq!(enabled_of(&empty, "Edit/paste"), Some(true));
+        assert_eq!(enabled_of(&empty, "Edit/selectall"), Some(true));
     }
 
     // ── Stateful View menu (radios + Panel flip) ─────────────────────────────
