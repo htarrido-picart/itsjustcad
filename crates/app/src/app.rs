@@ -387,6 +387,11 @@ pub struct App {
     /// The newest raytrace preview frame uploaded as a texture, with its passes/
     /// total caption. Refined live as passes accumulate; cleared on new Render.
     raytrace_preview: Option<RaytracePreview>,
+    /// When the `raytrace <out.png>` verb is given an explicit path, the render
+    /// runs on the same background job (off the UI thread) and this holds the
+    /// destination. `poll_raytrace` writes the PNG here once the job finishes,
+    /// then clears it. `None` means the current job is an interactive preview.
+    raytrace_save_path: Option<std::path::PathBuf>,
     /// Cmd+C pressed with a selection; Cmd+V then runs `copy sel 1,1,0`.
     clipboard_armed: bool,
     /// In-progress drag-box selection: anchor position of the drag.
@@ -900,6 +905,7 @@ impl App {
             raytrace_custom_res: String::new(),
             raytrace_job: None,
             raytrace_preview: None,
+            raytrace_save_path: None,
             clipboard_armed: false,
             box_drag: None,
             journal,
@@ -1807,7 +1813,7 @@ impl App {
     /// same core the headless runner uses. Numbers disambiguate by magnitude:
     /// a value ≥ 256 is the image width, otherwise it is the sample count.
     fn raytrace_view(&mut self, args: &[String]) {
-        use itsjustcad_raytrace::{render, Settings, Sky};
+        use itsjustcad_raytrace::{Settings, Sky};
 
         let mut out: Option<String> = None;
         let mut samples: u32 = 48;
@@ -1847,20 +1853,42 @@ impl App {
             return;
         };
 
-        // An explicit path keeps the classic one-shot save-to-file behaviour.
+        // An explicit path: render on the SAME background job as the window
+        // (off the UI thread) so a 1920px/64spp render can't freeze the app.
+        // `poll_raytrace` writes the PNG once the job reports `finished`.
         let height = (width as f32 * 5.0 / 8.0).round() as u32;
         let aspect = width as f32 / height as f32;
-        let rt_cam = self.raytrace_camera(aspect as f64);
+        let cam = self.raytrace_camera(aspect as f64);
         let scene = itsjustcad_raytrace::scene_from_doc(&self.session.doc, Sky::default());
         let settings = Settings { width, height, samples_per_pixel: samples, ..Default::default() };
-        let image = render(&scene, &rt_cam, &settings);
-        match image.save_png(std::path::Path::new(&out)) {
-            Ok(()) => self.command_line.push_line(format!(
-                "raytraced {out} ({width}x{height}, {samples} spp, {} tris)",
-                scene.triangle_count()
-            )),
-            Err(e) => self.command_line.push_line(format!("raytrace failed: {e}")),
+        let tris = scene.triangle_count();
+
+        // Cancel + reap any in-flight job (preview or one-shot) before starting.
+        if let Some(job) = self.raytrace_job.take() {
+            job.join();
         }
+        self.raytrace_preview = None;
+
+        let job = crate::raytrace_ui::RaytraceJob::spawn(settings, tris, move |shared, cancel| {
+            itsjustcad_raytrace::render_progressive(
+                &scene,
+                &cam,
+                &settings,
+                |pr| {
+                    if let Ok(mut s) = shared.lock() {
+                        s.passes_done = pr.passes_done;
+                        s.passes_total = pr.passes_total;
+                        s.latest = Some(pr.image.clone());
+                    }
+                },
+                cancel,
+            );
+        });
+        self.raytrace_job = Some(job);
+        self.raytrace_save_path = Some(std::path::PathBuf::from(&out));
+        self.command_line.push_line(format!(
+            "raytrace: rendering {out} in the background… ({width}x{height}, {samples} spp, {tris} tris)"
+        ));
     }
 
     /// Build a `raytrace::Camera` from the active viewport at the given aspect
@@ -1892,6 +1920,8 @@ impl App {
             job.join();
         }
         self.raytrace_preview = None;
+        // An interactive render supersedes any pending one-shot save.
+        self.raytrace_save_path = None;
 
         let ctrl = self.raytrace_controls;
         let settings = ctrl.to_settings();
@@ -1960,6 +1990,29 @@ impl App {
             if finished {
                 self.command_line.push_line(crate::i18n::t(&key));
             }
+        }
+        // One-shot `raytrace <path>` verb: the render ran on the background job;
+        // write the finished image to the requested path, then clear the job so
+        // it doesn't linger as a phantom preview.
+        if finished && self.raytrace_save_path.is_some() {
+            let path = self.raytrace_save_path.take().expect("checked is_some");
+            match &self.raytrace_preview {
+                Some(pv) => match pv.image.save_png(&path) {
+                    Ok(()) => self
+                        .command_line
+                        .push_line(format!("raytrace: saved {}", path.display())),
+                    Err(e) => self
+                        .command_line
+                        .push_line(format!("raytrace failed: {e}")),
+                },
+                None => self
+                    .command_line
+                    .push_line("raytrace failed: no frame produced"),
+            }
+            if let Some(job) = self.raytrace_job.take() {
+                job.join();
+            }
+            self.raytrace_preview = None;
         }
         if !finished {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
