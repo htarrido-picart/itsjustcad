@@ -2631,6 +2631,10 @@ fn apply_about_center(
             tessellated += 1;
         }
     }
+    // Shared by rotate/scale/mirror: after the transform applies, refresh every
+    // associative dim's cached `last` so it tracks the moved referent. Pure
+    // function of current doc state at a fixed point => replay-stable.
+    doc.refresh_dim_anchors();
     (Inverse::SetGeometry(snapshots), tessellated)
 }
 
@@ -7415,6 +7419,10 @@ fn apply_forward(
             for id in &ids {
                 doc.get_mut(*id).expect("resolved").geometry.translate(delta);
             }
+            // Track moved referents so associative dims carry the post-move
+            // position as their `last` fallback. Deterministic at this fixed
+            // point => live-apply and op-log replay stay byte-identical.
+            doc.refresh_dim_anchors();
             Ok((
                 Command::Move { targets, delta },
                 Inverse::MoveBack { ids: ids.clone(), delta },
@@ -7941,6 +7949,11 @@ fn apply_forward(
         }
         Command::Delete { targets } => {
             let ids = resolve(doc, &targets)?;
+            // Capture each associative dim's last live referent position before
+            // any object vanishes, so a surviving dim degrades to an up-to-date
+            // fallback rather than the stale creation-time point. Pure function
+            // of current doc state at a fixed point => replay-stable.
+            doc.refresh_dim_anchors();
             let mut removed = Vec::new();
             for id in &ids {
                 if let Some(pair) = doc.remove(*id) {
@@ -11947,6 +11960,65 @@ mod tests {
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap()
         );
+    }
+
+    /// Regression (code-review should-fix): an associative dim's cached `last`
+    /// fallback must track its referent through a MOVE and survive the
+    /// referent's DELETE with the moved position — not the stale creation-time
+    /// point. The move/delete command handlers wire `refresh_dim_anchors` in
+    /// deterministically. Also asserts op-log JSON round-trips byte-stable with
+    /// associative dims present.
+    #[test]
+    fn associative_dim_last_tracks_move_then_delete() {
+        use itsjustcad_doc::{Annotation, Geometry};
+
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "name last beam");
+        // Associative dim bound to the named line's endpoints.
+        run(&mut s, "dim @beam.start @beam.end -2");
+        let did = s.doc.last_ids(1)[0];
+
+        // Sanity: the freshly-created dim caches the creation-time endpoints.
+        let anchors = |s: &Session| {
+            let Geometry::Annotation(Annotation::LinearDim { a, b, .. }) =
+                &s.doc.get(did).unwrap().geometry
+            else {
+                panic!("expected dim");
+            };
+            (a.point(), b.point())
+        };
+        assert_eq!(anchors(&s), (DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0)));
+
+        // Move the referent by a known delta; the Move handler must refresh the
+        // cached `last` so the fallback tracks the moved line.
+        run(&mut s, "move beam 0,4,0");
+        assert_eq!(
+            anchors(&s),
+            (DVec3::new(0.0, 4.0, 0.0), DVec3::new(10.0, 4.0, 0.0)),
+            "cached `last` follows the moved referent"
+        );
+
+        // Delete the referent: the Delete handler refreshes BEFORE removal, so
+        // the now-orphaned dim degrades to the MOVED position, not the original.
+        run(&mut s, "delete beam");
+        let Geometry::Annotation(Annotation::LinearDim { a, b, .. }) =
+            &s.doc.get(did).unwrap().geometry
+        else {
+            panic!("expected dim");
+        };
+        assert!(s.doc.anchor_is_orphaned(a), "referent gone → orphaned");
+        assert_eq!(
+            s.doc.resolve_dim(a, b),
+            (DVec3::new(0.0, 4.0, 0.0), DVec3::new(10.0, 4.0, 0.0)),
+            "orphaned dim degrades to the MOVED position, not creation-time"
+        );
+
+        // Op-log round-trip is byte-stable with associative dims present.
+        let j1 = crate::io::to_json(&s);
+        let s2 = crate::io::from_json(&j1).unwrap();
+        let j2 = crate::io::to_json(&s2);
+        assert_eq!(j1, j2, "associative-dim op-log JSON round-trips byte-stable");
     }
 
     #[test]
