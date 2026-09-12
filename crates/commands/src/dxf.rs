@@ -409,7 +409,7 @@ pub fn parse_dxf(text: &str) -> Result<DxfEntities, String> {
 
     // Block definitions, keyed by name. INSERT entities are instanced against
     // these; a BlockDefine op is emitted (before any insert) for each.
-    let blocks = parse_blocks(blk_records);
+    let blocks = parse_blocks(blk_records).map_err(|e| e.to_string())?;
 
     // Fold records into commands; VERTEX/SEQEND attach to the open POLYLINE.
     let mut out = DxfEntities { entities: Vec::new(), skipped: 0 };
@@ -598,7 +598,8 @@ struct RawBlock {
 /// unmappable bodies keeps what maps rather than being discarded wholesale.
 fn parse_blocks(
     records: Vec<(&str, Vec<(i32, &str)>)>,
-) -> std::collections::BTreeMap<String, Vec<itsjustcad_doc::BlockGeometry>> {
+) -> Result<std::collections::BTreeMap<String, Vec<itsjustcad_doc::BlockGeometry>>, crate::ExecError>
+{
     use itsjustcad_doc::BlockGeometry;
     use kernel_curve::Curve;
     // Preserve definition order for stable, deterministic baking.
@@ -678,14 +679,14 @@ fn parse_blocks(
                 }
                 let mut dummy = None;
                 if let RecordOutcome::Entity(_, cmd) = record_entity(name, &fields, &mut dummy)
-                    && let Some(g) = command_to_block_geometry(&cmd)
+                    && let Some(g) = command_to_block_geometry(&cmd)?
                 {
                     blk.geoms.push(g);
                 }
             }
         }
     }
-    resolve_blocks(raw)
+    Ok(resolve_blocks(raw))
 }
 
 /// Hard caps to keep a crafted (malicious) DXF from exhausting memory or the
@@ -840,13 +841,21 @@ fn map_block_geom_points(
     }
 }
 
-/// Convert a parsed entity command into block geometry (curve/annotation). Point
-/// clouds and meshes return `None` — dropped from block definitions.
-fn command_to_block_geometry(cmd: &crate::Command) -> Option<itsjustcad_doc::BlockGeometry> {
+/// Convert a parsed entity command into block geometry (curve/annotation).
+///
+/// Returns `Ok(None)` for commands with no block representation (point clouds,
+/// meshes) — those are silently dropped from block definitions. Returns `Err`
+/// for a command that *should* be a block body but cannot be baked losslessly:
+/// an associative (object-bound) dimension carries a live binding that a static
+/// block definition has no document to resolve, so it is rejected rather than
+/// silently fabricating a bogus origin point.
+fn command_to_block_geometry(
+    cmd: &crate::Command,
+) -> Result<Option<itsjustcad_doc::BlockGeometry>, crate::ExecError> {
     use crate::Command;
     use itsjustcad_doc::{Annotation, BlockGeometry};
     use kernel_curve::Curve;
-    Some(match cmd {
+    Ok(Some(match cmd {
         Command::Line { a, b, .. } => BlockGeometry::Curve(Curve::Line { a: *a, b: *b }),
         Command::Polyline { points, closed, .. } => {
             BlockGeometry::Curve(Curve::Polyline { points: points.clone(), closed: *closed })
@@ -867,27 +876,29 @@ fn command_to_block_geometry(cmd: &crate::Command) -> Option<itsjustcad_doc::Blo
             BlockGeometry::Annotation(Annotation::Text { pos: *pos, text: text.clone(), height: *height })
         }
         Command::Dim { a, b, offset, .. } => {
-            // Block-baked dims are static: fold each anchor spec to its stored
-            // point (free points keep their value; object bindings bake to the
-            // referent's point at bake time — blocks carry no live document).
+            // Block-baked dims are static: a block definition carries no live
+            // document, so only *free-point* anchors can be baked losslessly.
+            // An object-bound (associative) anchor has no point to fold to here
+            // — reject it rather than fabricate a meaningless origin point.
             use itsjustcad_doc::DimAnchor;
-            let bake = |spec: &crate::DimAnchorSpec| -> DimAnchor {
+            let bake = |spec: &crate::DimAnchorSpec| -> Result<DimAnchor, crate::ExecError> {
                 match spec {
-                    crate::DimAnchorSpec::Free(p) => DimAnchor::Free(*p),
-                    // Object bindings can't resolve here (no document); the
-                    // caller only reaches this for dims created inside a block
-                    // body, where free points are the norm. Degrade to origin.
-                    crate::DimAnchorSpec::Object { .. } => DimAnchor::Free(DVec3::ZERO),
+                    crate::DimAnchorSpec::Free(p) => Ok(DimAnchor::Free(*p)),
+                    crate::DimAnchorSpec::Object { .. } => Err(crate::ExecError::Invalid(
+                        "associative dimensions cannot be baked into a block — \
+                         use free points (dim x,y,z ...)"
+                            .into(),
+                    )),
                 }
             };
             BlockGeometry::Annotation(Annotation::LinearDim {
-                a: bake(a),
-                b: bake(b),
+                a: bake(a)?,
+                b: bake(b)?,
                 offset: *offset,
             })
         }
-        _ => return None,
-    })
+        _ => return Ok(None),
+    }))
 }
 
 /// Shift block geometry by `d` (used to re-origin a block on its base point).
@@ -2126,5 +2137,51 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("not a DXF"), "{err}");
         assert_eq!(s.doc.len(), 0, "failed import leaves nothing behind");
+    }
+
+    /// A free-point dim bakes into block geometry (unchanged behaviour): the
+    /// stored points survive verbatim as `DimAnchor::Free`.
+    #[test]
+    fn block_bakes_free_point_dim() {
+        use itsjustcad_doc::{Annotation, BlockGeometry, DimAnchor};
+        let cmd = Command::Dim {
+            id: None,
+            a: crate::DimAnchorSpec::free(DVec3::new(1.0, 2.0, 0.0)),
+            b: crate::DimAnchorSpec::free(DVec3::new(4.0, 2.0, 0.0)),
+            offset: 0.5,
+        };
+        let g = command_to_block_geometry(&cmd).expect("free-point dim bakes");
+        match g {
+            Some(BlockGeometry::Annotation(Annotation::LinearDim { a, b, offset })) => {
+                assert_eq!(a, DimAnchor::Free(DVec3::new(1.0, 2.0, 0.0)));
+                assert_eq!(b, DimAnchor::Free(DVec3::new(4.0, 2.0, 0.0)));
+                assert_eq!(offset, 0.5);
+            }
+            other => panic!("expected a baked LinearDim, got {other:?}"),
+        }
+    }
+
+    /// An associative (object-bound) dim CANNOT be baked into a static block —
+    /// the binding has no live document to resolve against, so baking it would
+    /// have to fabricate a bogus point. It must surface a clean error instead.
+    #[test]
+    fn block_rejects_object_bound_dim() {
+        use itsjustcad_doc::EndpointRef;
+        let cmd = Command::Dim {
+            id: None,
+            a: crate::DimAnchorSpec::Object {
+                target: crate::Selector::Named { name: "wall".into() },
+                which: EndpointRef::Start,
+            },
+            b: crate::DimAnchorSpec::free(DVec3::new(4.0, 2.0, 0.0)),
+            offset: 0.5,
+        };
+        let err = command_to_block_geometry(&cmd)
+            .expect_err("object-bound dim must not bake into a block");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("associative dimensions cannot be baked into a block"),
+            "unexpected error message: {msg}"
+        );
     }
 }
