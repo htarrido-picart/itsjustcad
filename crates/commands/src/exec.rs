@@ -2442,7 +2442,13 @@ impl Session {
 
 fn resolve(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
     let raw: Vec<ObjectId> = match sel {
-        Selector::Ids { ids } => ids.clone(),
+        // Validate ids against the document: the parser never emits `Ids`, but a
+        // hand-edited/corrupted/malicious `.ijc` op-log can, and ~48 downstream
+        // sites do `doc.get(id).expect("resolved")`. Dropping unknown ids here
+        // turns a load-time abort into a clean EmptySelection error (or a
+        // partial op over the ids that DO exist). Named/Last/All/Selected already
+        // only ever yield live ids.
+        Selector::Ids { ids } => ids.iter().copied().filter(|id| doc.get(*id).is_some()).collect(),
         Selector::Named { name } => doc.find_named(name),
         Selector::Last { n } => doc.last_ids(*n),
         Selector::All => doc.all_ids(),
@@ -11933,6 +11939,28 @@ mod tests {
         let json1 = crate::io::to_json(&s);
         let json2 = crate::io::to_json(&crate::io::from_json(&json1).unwrap());
         assert_eq!(json1, json2);
+    }
+
+    #[test]
+    fn ids_selector_with_unknown_id_errors_not_panics() {
+        use itsjustcad_doc::ObjectId;
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 5,5,3");
+        // The parser never emits `Selector::Ids`; only a hand-edited/corrupted
+        // `.ijc` op-log can. An id not in the document must be dropped in
+        // resolve() → a clean EmptySelection error, NOT a downstream
+        // `doc.get(id).expect("resolved")` panic that aborts the whole app on
+        // file open.
+        let bogus = Selector::Ids { ids: vec![ObjectId::new()] };
+        assert!(
+            s.run(Command::Delete { targets: bogus }).is_err(),
+            "unknown id must error gracefully, not panic"
+        );
+        // A mix of unknown + real ids proceeds over the ids that DO exist.
+        let real = s.doc.all_ids()[0];
+        let mixed = Selector::Ids { ids: vec![ObjectId::new(), real, ObjectId::new()] };
+        assert!(s.run(Command::Delete { targets: mixed }).is_ok());
+        assert_eq!(s.doc.len(), 0, "the valid id in the mix was deleted");
     }
 
     #[test]
