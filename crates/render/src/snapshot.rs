@@ -392,12 +392,14 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                     let rot = rotation_deg.to_radians();
                     let (sin_r, cos_r) = rot.sin_cos();
                     let transform = |p: DVec3| -> DVec3 {
-                        // Scale, rotate about Z, then translate.
+                        // Scale, rotate about Z, then translate. `ps` is already
+                        // uniformly scaled by `s` on all axes, so Z only needs the
+                        // instance origin added (no second *s).
                         let ps = p * s;
                         DVec3::new(
                             ps.x * cos_r - ps.y * sin_r + position.x,
                             ps.x * sin_r + ps.y * cos_r + position.y,
-                            ps.z * s + position.z,
+                            ps.z + position.z,
                         )
                     };
                     let color = resolve_color(obj, layer_color, theme, selected, mode, false);

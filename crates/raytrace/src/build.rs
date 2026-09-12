@@ -90,11 +90,13 @@ pub fn scene_from_doc(doc: &Document, sky: Sky) -> Scene {
                 let rot = rotation_deg.to_radians();
                 let (sin_r, cos_r) = rot.sin_cos();
                 let transform = |p: DVec3| -> DVec3 {
+                    // `ps` is already uniformly scaled by `s` on all axes, so Z
+                    // only needs the instance origin added (no second *s).
                     let ps = p * s;
                     DVec3::new(
                         ps.x * cos_r - ps.y * sin_r + position.x,
                         ps.x * sin_r + ps.y * cos_r + position.y,
-                        ps.z * s + position.z,
+                        ps.z + position.z,
                     )
                 };
                 let mat = b.add_material(material_for(obj, layer_color));
@@ -170,5 +172,68 @@ mod tests {
         let doc = Document::default();
         let sun = sun_from_doc(&doc);
         assert!(sun.dir.length() > 0.99);
+    }
+
+    /// A scaled block instance must scale local Z exactly once (uniform scale),
+    /// then translate by the instance origin — regression guard for the
+    /// double-Z-scale bug (`ps.z * s` instead of `ps.z`), which turned world Z
+    /// into `z*s²`. Verified through the real `scene_from_doc` transform via the
+    /// resulting scene's Z bounds.
+    #[test]
+    fn scaled_block_instance_scales_z_once() {
+        use itsjustcad_doc::BlockGeometry;
+
+        // Block-local triangle spanning z in [0, 1] with non-zero area.
+        let tri = kernel_mesh::Mesh::new(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(0.0, 1.0, 1.0),
+            ],
+            vec![[0, 1, 2]],
+        );
+
+        let mut doc = Document::default();
+        doc.blocks
+            .insert("blk".to_string(), vec![BlockGeometry::Mesh(tri)]);
+
+        let scale = 2.0;
+        let origin = DVec3::new(3.0, 4.0, 1000.0);
+        doc.insert(SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: "default".to_string(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Instance {
+                block: "blk".to_string(),
+                position: origin,
+                rotation_deg: 0.0,
+                scale,
+                source: None,
+                params: Default::default(),
+            },
+        });
+
+        let scene = scene_from_doc(&doc, Sky::default());
+        let bounds = scene.bounds.expect("instance produced geometry");
+
+        // Local z=1 → world z = 1*scale + origin.z = 1002 (NOT 1*scale² = 1004).
+        let expected_max_z = 1.0 * scale + origin.z;
+        let expected_min_z = 0.0 * scale + origin.z;
+        assert!(
+            (bounds.max.z - expected_max_z).abs() < 1e-9,
+            "max z double-scaled: got {}, want {}",
+            bounds.max.z,
+            expected_max_z
+        );
+        assert!(
+            (bounds.min.z - expected_min_z).abs() < 1e-9,
+            "min z off: got {}, want {}",
+            bounds.min.z,
+            expected_min_z
+        );
     }
 }
