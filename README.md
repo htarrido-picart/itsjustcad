@@ -219,8 +219,8 @@ last *n* commands into a tool the same way.
 
 ## Feature tour
 
-![The ItsJustCAD interface — menu bar, command line, four-viewport layout, and a right dock with Layers, Properties, History, and Deck tabs](docs/shot-ui.png)
-*A familiar, Rhino-style interface: menu bar, command line, multi-viewport layout, and a docked panel — it adapts to the CAD you came from.*
+![The ItsJustCAD interface — perspective viewport, command line, a status bar with view/snap chips and gumball, and the right dock (Chat, Sessions, Layers, plus contextual Parameters/Sheets/Blocks tabs)](docs/shot-ui.png)
+*A familiar, Rhino-style interface: command line, viewport with view/snap chips, and a docked panel (Chat, Sessions, Layers, and contextual Parameters/Sheets/Blocks) — it adapts to the CAD you came from.*
 
 ### Model
 Boxes · extrude · revolve / loft (with guide curves) / **blend** / sweep /
