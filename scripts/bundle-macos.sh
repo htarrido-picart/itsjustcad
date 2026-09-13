@@ -56,7 +56,7 @@ mkdir -p "$MACOS" "$RESOURCES"
 
 # Info.plist
 BUNDLE_ID="com.itsjustcad.app"
-VERSION="0.5.2"
+VERSION="0.5.3"
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
