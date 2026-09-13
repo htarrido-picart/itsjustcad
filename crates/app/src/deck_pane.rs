@@ -1405,7 +1405,7 @@ impl DeckPane {
     }
 
     fn start_probe(&mut self, handle: &tokio::runtime::Handle) {
-        let Some(mut config) = self.decks.decks.get(self.decks.active).cloned() else {
+        let Some(config) = self.decks.decks.get(self.decks.active).cloned() else {
             self.probe = ProbeState::Unavailable("no deck configured".into());
             return;
         };
@@ -1417,9 +1417,19 @@ impl DeckPane {
         // start (or reuse) the local runtime here and reflect its real state.
         if is_spawnable_local(&config, &self.catalog) {
             match self.ensure_local_runtime(&config, handle) {
-                // Server is up — probe the LIVE port so the status shows the real
-                // model/readiness rather than the stale configured base_url.
-                LocalReady::Ready(base_url) => config.base_url = base_url,
+                // The server is health-checked up and serving THIS model. Mark
+                // ready DIRECTLY — do NOT run the generic probe(), whose strict
+                // /v1/models name-match rejects us: the llamafile server
+                // advertises the model under its own name (e.g. "Qwen3-4B"), not
+                // our catalog id, so the probe would report "model not found" and
+                // leave the deck unusable even though the server is up.
+                LocalReady::Ready(_base_url) => {
+                    self.probe = ProbeState::Ready(ProbeInfo {
+                        detail: "local model ready".into(),
+                        models: vec![config.model.clone()],
+                    });
+                    return;
+                }
                 // Still loading the model (first run reads GBs off disk). Show an
                 // honest "starting" status — NOT an external-server error. Retry
                 // (button) re-probes once it's warm.
@@ -2671,18 +2681,21 @@ impl DeckPane {
             {
                 new_session_clicked = true;
             }
-            // Local model server status (only when one is starting/failed/ready).
+            // Local model server status — shown ONLY while starting or failed. On
+            // Ready the green status dot already conveys readiness, so the extra
+            // "local model ready" text is redundant (and confused users when it
+            // sat next to a stale "starting…"); hide it.
             if let Some(rt) = &self.local_runtime {
-                let state = rt.state();
-                let color = match state {
-                    crate::local_runtime::RuntimeState::Failed { .. } => ERR_COLOR,
-                    crate::local_runtime::RuntimeState::Ready { .. } => OK_COLOR,
-                    crate::local_runtime::RuntimeState::Starting => ACCENT,
-                };
-                if matches!(state, crate::local_runtime::RuntimeState::Starting) {
-                    busy_indicator(ui, reduce_motion);
+                match rt.state() {
+                    crate::local_runtime::RuntimeState::Starting => {
+                        busy_indicator(ui, reduce_motion);
+                        ui.colored_label(ACCENT, "starting local model…");
+                    }
+                    crate::local_runtime::RuntimeState::Failed { .. } => {
+                        ui.colored_label(ERR_COLOR, rt.state().caption());
+                    }
+                    crate::local_runtime::RuntimeState::Ready { .. } => {}
                 }
-                ui.colored_label(color, state.caption());
             }
             // No critique button: `critique` is a command-line/chat verb, not a
             // toolbar affordance (the app still honours `critique_requested`).
