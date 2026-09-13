@@ -14,6 +14,10 @@ use tokio::sync::oneshot;
 enum ProbeState {
     Unknown,
     Checking(oneshot::Receiver<Result<ProbeInfo, String>>),
+    /// A catalog local model whose server WE spawn is still coming up (process
+    /// launched, model loading off disk). Shown amber with a spinner and
+    /// auto-advances to Ready/Unavailable — NOT an error, and no manual Retry.
+    Starting(String),
     Ready(ProbeInfo),
     Unavailable(String),
 }
@@ -1420,9 +1424,9 @@ impl DeckPane {
                 // honest "starting" status — NOT an external-server error. Retry
                 // (button) re-probes once it's warm.
                 LocalReady::Pending => {
-                    self.probe = ProbeState::Unavailable(
+                    self.probe = ProbeState::Starting(
                         "starting the local model server… first run loads the model \
-                         (can take ~30 s); press Retry in a moment"
+                         (~30 s)"
                             .into(),
                     );
                     return;
@@ -1441,9 +1445,11 @@ impl DeckPane {
     }
 
     fn poll_probe(&mut self, handle: &tokio::runtime::Handle) {
-        // Re-probe when the cassette changed or nothing has been probed yet.
+        // Re-probe when the cassette changed, nothing has been probed yet, or a
+        // spawnable local server is still starting (re-check advances it to
+        // Ready/Unavailable once the runtime health-check flips).
         if self.probed_deck != Some(self.decks.active)
-            || matches!(self.probe, ProbeState::Unknown)
+            || matches!(self.probe, ProbeState::Unknown | ProbeState::Starting(_))
         {
             self.start_probe(handle);
         }
@@ -2228,7 +2234,7 @@ impl DeckPane {
         if self.busy()
             || self.deferred_local_turn
             || self.summarize.is_some()
-            || matches!(self.probe, ProbeState::Checking(_))
+            || matches!(self.probe, ProbeState::Checking(_) | ProbeState::Starting(_))
             || matches!(self.warm, WarmState::Warming { .. })
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -2494,7 +2500,7 @@ impl DeckPane {
         self.poll_probe(handle);
         self.poll_warm(handle);
         if self.busy()
-            || matches!(self.probe, ProbeState::Checking(_))
+            || matches!(self.probe, ProbeState::Checking(_) | ProbeState::Starting(_))
             || matches!(self.warm, WarmState::Warming { .. })
         {
             ui.ctx()
@@ -2546,6 +2552,7 @@ impl DeckPane {
                     }
                 },
                 ProbeState::Unavailable(reason) => (ERR_COLOR, reason.clone(), true),
+                ProbeState::Starting(msg) => (STATUS_ORANGE, msg.clone(), false),
                 ProbeState::Checking(_) => {
                     (STATUS_ORANGE, "checking deck…".to_string(), false)
                 }
