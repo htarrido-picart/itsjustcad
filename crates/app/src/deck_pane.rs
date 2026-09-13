@@ -2562,6 +2562,9 @@ impl DeckPane {
             };
         let status_modal_id = egui::Id::new("deck_status_modal");
 
+        // Set inside the header closure by the "+" button; applied after it to
+        // avoid a &mut self borrow inside the &self-capturing closure.
+        let mut new_session_clicked = false;
         ui.horizontal(|ui| {
             // Theme + text-size AND the LLM controls (local only / web search /
             // download default) moved to the top-level LLM menu (see `menu.rs`).
@@ -2659,6 +2662,15 @@ impl DeckPane {
                     ui.ctx().data_mut(|d| d.insert_temp(status_modal_id, true));
                 }
             }
+            // "+" — start a fresh chat session on the SAME document (archives the
+            // current conversation; the file/op-log is untouched). Distinct from
+            // File ▸ New Session, which starts a new *file*.
+            if icons
+                .icon_button(ui, crate::icons::Icon::NewSession, "new chat session (same file)")
+                .clicked()
+            {
+                new_session_clicked = true;
+            }
             // Local model server status (only when one is starting/failed/ready).
             if let Some(rt) = &self.local_runtime {
                 let state = rt.state();
@@ -2678,6 +2690,12 @@ impl DeckPane {
             // supersedes it; a stray destructive control in the header invited
             // accidental transcript loss.
         });
+        // Apply the "+" click outside the closure (needs &mut self). Archives the
+        // current chat via the guarded flow and clears the live pane; the document
+        // stays loaded.
+        if new_session_clicked {
+            self.new_session();
+        }
         // Status detail now lives in a modal opened by the dot (above). Render it
         // when the dot has been clicked; a `retry` button appears for a dead deck.
         {
