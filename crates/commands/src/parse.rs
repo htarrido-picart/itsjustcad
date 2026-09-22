@@ -630,6 +630,24 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             }
             Ok(Command::CurveBool { ids: None, op, targets })
         }
+        "autodim" | "autodimension" => {
+            // autodim <selector> [offset <d>]
+            // Batch-dimension a selection: one linear dim per polyline segment,
+            // or two extent dims (width/height) for other geometry.
+            let (targets, tail) = selector(&args, "autodim")?;
+            let offset = match tail {
+                [] => DEFAULT_DIM_OFFSET,
+                ["offset", d] => number(d)?,
+                _ => {
+                    return wrong(
+                        "autodim",
+                        "a selector and an optional `offset <d>`",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::AutoDim { ids: None, targets, offset })
+        }
         "union" => {
             let (sel, rest) = selector(&args, "union")?;
             expect_empty("union", rest, &args)?;
@@ -5245,6 +5263,32 @@ mod tests {
             let back: Command = serde_json::from_str(&json).unwrap();
             assert_eq!(cmd, back, "{line}");
         }
+    }
+
+    #[test]
+    fn parse_autodim() {
+        // Bare selector -> default offset.
+        assert_eq!(
+            parse("autodim last").unwrap(),
+            Command::AutoDim {
+                ids: None,
+                targets: Selector::Last { n: 1 },
+                offset: DEFAULT_DIM_OFFSET,
+            }
+        );
+        // Explicit `offset <d>` overrides; alias verb accepted.
+        assert_eq!(
+            parse("autodimension all offset 0.8").unwrap(),
+            Command::AutoDim { ids: None, targets: Selector::All, offset: 0.8 }
+        );
+        // Offset accepts unit-suffixed lengths like the rest of the CLI.
+        assert!(matches!(
+            parse("autodim last offset 80cm").unwrap(),
+            Command::AutoDim { offset, .. } if offset == 0.8
+        ));
+        // Missing selector / stray trailing tokens are rejected.
+        assert!(parse("autodim").is_err());
+        assert!(parse("autodim last 0.8").is_err());
     }
 
     #[test]

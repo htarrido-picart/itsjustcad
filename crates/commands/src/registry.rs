@@ -313,6 +313,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Boolean,
         },
         CommandSpec {
+            name: "autodim",
+            usage: "autodim <selector> [offset <d>]",
+            summary: "DraftSight AutoDimension: batch-dimension a selection in one command. Each line/polyline gets one linear dimension per straight segment; any other geometry gets two overall extent dims (width along X, height along Y) from its bounding box. offset (default 0.5) sets the dimension-line offset. Alias: autodimension. Examples: autodim last · autodim all offset 0.8",
+            category: Category::Dimension,
+        },
+        CommandSpec {
             name: "union",
             usage: "union <selector>",
             summary: "Merge 2+ meshes into one solid; inputs are consumed. Example: union last 2",

@@ -691,6 +691,18 @@ pub enum Command {
         op: BoolKind,
         targets: Selector,
     },
+    /// Batch dimensioning (DraftSight AutoDimension): place many linear
+    /// dimensions on a selection in one command. Each selected object yields a
+    /// set of dim spans — a line/polyline gives one dim per straight segment;
+    /// any other geometry gives two overall extent dims (width along X, height
+    /// along Y) from its AABB. Every span becomes a `LinearDim` annotation at a
+    /// consistent `offset`. `ids` caches the created ids for replay-stable undo.
+    AutoDim {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        targets: Selector,
+        offset: f64,
+    },
     // -- edit --
     Move {
         targets: Selector,

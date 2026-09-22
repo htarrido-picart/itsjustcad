@@ -2643,6 +2643,67 @@ fn resolve(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
     Ok(ids)
 }
 
+/// Dimensionable spans of one object for `autodim`: the ordered list of
+/// `(a, b)` world-point pairs that each become a linear dimension.
+///
+/// - A straight-segmented curve (line/polyline) yields one span per segment,
+///   in curve order (closed polylines add the closing segment). Degenerate
+///   segments (shorter than `DIM_MIN_SEG`) are skipped.
+/// - Any other geometry yields two overall extent spans from its AABB: width
+///   along X (at `min.y`) and height along Y (at `min.x`), each at the box's
+///   `min.z`. A zero-length extent is skipped.
+///
+/// Deterministic: order follows curve/point order (or the fixed width-then-
+/// height sequence), so op-log replay is byte-identical.
+fn autodim_spans(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
+    /// Segments shorter than this (meters) are skipped as degenerate.
+    const DIM_MIN_SEG: f64 = 1e-6;
+
+    // A polyline/line dimensions per-segment; everything else uses extents.
+    let seg_points: Option<(Vec<DVec3>, bool)> = match geometry {
+        Geometry::Curve(Curve::Line { a, b }) => Some((vec![*a, *b], false)),
+        Geometry::Curve(Curve::Polyline { points, closed }) => {
+            Some((points.clone(), *closed))
+        }
+        _ => None,
+    };
+
+    if let Some((points, closed)) = seg_points {
+        let mut spans = Vec::new();
+        for w in points.windows(2) {
+            if (w[1] - w[0]).length() >= DIM_MIN_SEG {
+                spans.push((w[0], w[1]));
+            }
+        }
+        // Closing segment for a closed polyline (last -> first).
+        if closed && points.len() >= 3 {
+            let (first, last) = (points[0], points[points.len() - 1]);
+            if (first - last).length() >= DIM_MIN_SEG {
+                spans.push((last, first));
+            }
+        }
+        return spans;
+    }
+
+    // Extent dims from the AABB: width (X) then height (Y).
+    let bb = geometry.aabb();
+    let z = bb.min.z;
+    let mut spans = Vec::new();
+    if (bb.max.x - bb.min.x) >= DIM_MIN_SEG {
+        spans.push((
+            DVec3::new(bb.min.x, bb.min.y, z),
+            DVec3::new(bb.max.x, bb.min.y, z),
+        ));
+    }
+    if (bb.max.y - bb.min.y) >= DIM_MIN_SEG {
+        spans.push((
+            DVec3::new(bb.min.x, bb.min.y, z),
+            DVec3::new(bb.min.x, bb.max.y, z),
+        ));
+    }
+    spans
+}
+
 fn insert_curve(
     doc: &mut Document,
     id: Option<ObjectId>,
@@ -9154,6 +9215,52 @@ fn apply_forward(
                 },
             ))
         }
+        Command::AutoDim { ids, targets, offset } => {
+            // Batch-dimension the selection. Walk objects in selection order and
+            // collect every dim span (per-segment for curves, extents otherwise)
+            // so the emitted dims are deterministic — required for op-log replay.
+            let sel_ids = resolve(doc, &targets)?;
+            let mut spans: Vec<(DVec3, DVec3)> = Vec::new();
+            for oid in sel_ids {
+                let Some(obj) = doc.get(oid) else { continue };
+                spans.extend(autodim_spans(&obj.geometry));
+            }
+            if spans.is_empty() {
+                return Err(ExecError::Invalid(
+                    "autodim: nothing dimensionable in selection".into(),
+                ));
+            }
+            // Reuse the caller's ids on replay (stable undo); else fresh ids.
+            let new_ids: Vec<ObjectId> = match ids {
+                Some(ids) if ids.len() == spans.len() => ids,
+                _ => spans.iter().map(|_| ObjectId::new()).collect(),
+            };
+            for ((a, b), did) in spans.iter().zip(&new_ids) {
+                doc.insert(SceneObject {
+                    visible: true,
+                    id: *did,
+                    name: None,
+                    layer: doc.current_layer.clone(),
+                    color: None,
+                    material: None,
+                    lineweight_mm: None,
+                    geometry: Geometry::Annotation(Annotation::LinearDim {
+                        a: DimAnchor::Free(*a),
+                        b: DimAnchor::Free(*b),
+                        offset,
+                    }),
+                });
+            }
+            let n = new_ids.len();
+            Ok((
+                Command::AutoDim { ids: Some(new_ids.clone()), targets, offset },
+                Inverse::DeleteCreated(new_ids.clone()),
+                ApplyOutcome {
+                    created: new_ids,
+                    message: format!("autodim: placed {n} dimension(s)"),
+                },
+            ))
+        }
         Command::Union { id, targets } => {
             let ids = resolve(doc, &targets)?;
             if ids.len() < 2 {
@@ -13307,6 +13414,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::HatchPat { .. } => "hatchpat",
         Command::Boundary { .. } => "boundary",
         Command::CurveBool { .. } => "curvebool",
+        Command::AutoDim { .. } => "autodim",
         Command::Union { .. } => "union",
         Command::Difference { .. } => "difference",
         Command::Intersect { .. } => "intersect",
@@ -16572,6 +16680,92 @@ mod tests {
         run(&mut s2, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
         let err = s2.run(parse("curvebool union all").unwrap()).unwrap_err();
         assert!(err.to_string().contains("2+ closed curves"), "{err}");
+    }
+
+    /// Pure helper: a closed 4-point rectangle yields exactly 4 segment spans
+    /// (including the closing edge), matching the polyline edges; a mesh yields
+    /// 2 extent spans (width then height) from its AABB.
+    #[test]
+    fn autodim_spans_segments_and_extents() {
+        // Closed unit-ish rectangle 3 wide x 2 tall at origin.
+        let rect = Geometry::Curve(Curve::Polyline {
+            points: vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(3.0, 0.0, 0.0),
+                DVec3::new(3.0, 2.0, 0.0),
+                DVec3::new(0.0, 2.0, 0.0),
+            ],
+            closed: true,
+        });
+        let spans = autodim_spans(&rect);
+        assert_eq!(spans.len(), 4, "4 edges incl. closing segment");
+        // First span is the bottom edge; last is the closing edge (top-left back
+        // to origin).
+        assert_eq!(spans[0], (DVec3::new(0.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)));
+        assert_eq!(spans[3], (DVec3::new(0.0, 2.0, 0.0), DVec3::new(0.0, 0.0, 0.0)));
+
+        // An open polyline has no closing segment.
+        let open = Geometry::Curve(Curve::Polyline {
+            points: vec![DVec3::ZERO, DVec3::new(3.0, 0.0, 0.0), DVec3::new(3.0, 2.0, 0.0)],
+            closed: false,
+        });
+        assert_eq!(autodim_spans(&open).len(), 2);
+
+        // A mesh (box) dimensions its extents: width (X) then height (Y).
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,3,2");
+        let mesh = &s.doc.objects().next().unwrap().geometry;
+        let spans = autodim_spans(mesh);
+        assert_eq!(spans.len(), 2, "two extent dims");
+        // width span runs along X; height span along Y.
+        assert!((spans[0].1.x - spans[0].0.x).abs() > 1e-6 && (spans[0].1.y - spans[0].0.y).abs() < 1e-9);
+        assert!((spans[1].1.y - spans[1].0.y).abs() > 1e-6 && (spans[1].1.x - spans[1].0.x).abs() < 1e-9);
+    }
+
+    /// `autodim` over a closed rectangle places one linear dim per edge (4),
+    /// each with matching endpoints; undo removes them all in one step.
+    #[test]
+    fn autodim_rectangle_places_four_dims_and_undo() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 3,0,0 3,2,0 0,2,0 closed");
+        assert_eq!(s.doc.len(), 1);
+
+        let out = run(&mut s, "autodim last offset 0.8");
+        assert!(out.message.contains("placed 4 dimension"), "{}", out.message);
+        assert_eq!(out.created.len(), 4);
+        // 1 polyline + 4 dims.
+        assert_eq!(s.doc.len(), 5);
+
+        // Collect the placed dims and confirm one matches the bottom edge, with
+        // the requested offset carried through.
+        let dims: Vec<(DVec3, DVec3, f64)> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Annotation(Annotation::LinearDim { a, b, offset }) => {
+                    Some((a.point(), b.point(), *offset))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dims.len(), 4);
+        assert!(
+            dims.iter().any(|(a, b, off)| *a == DVec3::new(0.0, 0.0, 0.0)
+                && *b == DVec3::new(3.0, 0.0, 0.0)
+                && *off == 0.8),
+            "a dim should span the bottom edge at offset 0.8: {dims:?}"
+        );
+
+        // Undo removes all four dims in one op, leaving just the polyline.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+
+        // Nothing dimensionable (a text annotation is a single point, so both
+        // extents are degenerate) → clear error.
+        let mut s2 = Session::default();
+        run(&mut s2, "text 5,5 hi");
+        let err = s2.run(parse("autodim last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("nothing dimensionable"), "{err}");
     }
 
     #[test]
