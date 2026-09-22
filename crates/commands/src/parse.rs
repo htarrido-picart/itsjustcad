@@ -1983,6 +1983,12 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("ncopy", rest, &args)?;
             Ok(Command::Ncopy { target: sel, index, id: None })
         }
+        // xclip <instance-selector> <min x,y> <max x,y>  -> set a clip rect
+        // xclip <instance-selector> off                  -> clear the clip
+        // The clip form takes exactly two trailing point tokens (rect corners);
+        // the `off` form takes the single trailing keyword. Everything before the
+        // trailing arg(s) is the selector.
+        "xclip" => parse_xclip(&args),
         // workdir            -> show the granted deck workdir
         // workdir <path>     -> grant a folder (path may contain spaces)
         "workdir" => {
@@ -2246,6 +2252,42 @@ fn parse_xref(args: &[&str]) -> Result<Command, ParseError> {
             args,
         ),
     }
+}
+
+/// `xclip <instance-selector> <min x,y> <max x,y>` — set the clip rect.
+/// `xclip <instance-selector> off`                 — clear the clip.
+///
+/// The trailing arg(s) are split off the END: a single `off` keyword clears,
+/// otherwise the last two tokens are the rect corners (parsed as points; only
+/// their XY is used). Whatever precedes them is the selector.
+fn parse_xclip(args: &[&str]) -> Result<Command, ParseError> {
+    use glam::DVec2;
+    // `off` form: last token is the keyword.
+    if let Some((&"off", head)) = args.split_last() {
+        let (sel, rest) = selector(head, "xclip")?;
+        expect_empty("xclip", rest, args)?;
+        return Ok(Command::Xclip { target: sel, rect: None });
+    }
+    // rect form: last two tokens are the min/max corners.
+    if args.len() >= 3 {
+        let max_tok = args[args.len() - 1];
+        let min_tok = args[args.len() - 2];
+        let head = &args[..args.len() - 2];
+        let min = point(min_tok)?;
+        let max = point(max_tok)?;
+        let (sel, rest) = selector(head, "xclip")?;
+        expect_empty("xclip", rest, args)?;
+        let rect = itsjustcad_doc::ClipRect::new(
+            DVec2::new(min.x, min.y),
+            DVec2::new(max.x, max.y),
+        );
+        return Ok(Command::Xclip { target: sel, rect: Some(rect) });
+    }
+    wrong(
+        "xclip",
+        "'<instance-selector> <min x,y> <max x,y>' or '<instance-selector> off'",
+        args,
+    )
 }
 
 /// `pblock <name> [pname=default ...] : templ line 1 ; templ line 2 ; ...`
@@ -5955,5 +5997,47 @@ mod tests {
         assert!(parse("ncopy").is_err());
         assert!(parse("ncopy last").is_err());
         assert!(parse("ncopy last x").is_err());
+    }
+
+    #[test]
+    fn xclip_parses_and_roundtrips() {
+        use glam::DVec2;
+        // Set form: two corners → normalized ClipRect.
+        let cmd = parse("xclip last 10,10 0,0").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Xclip {
+                target: Selector::Last { n: 1 },
+                rect: Some(itsjustcad_doc::ClipRect::new(
+                    DVec2::new(10.0, 10.0),
+                    DVec2::new(0.0, 0.0),
+                )),
+            }
+        );
+        // Corners are normalized (min <= max) regardless of input order.
+        if let Command::Xclip { rect: Some(r), .. } = &cmd {
+            assert_eq!(r.min, DVec2::new(0.0, 0.0));
+            assert_eq!(r.max, DVec2::new(10.0, 10.0));
+        } else {
+            panic!("expected a clip rect");
+        }
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+
+        // Off form clears the clip.
+        let off = parse("xclip last off").unwrap();
+        assert_eq!(
+            off,
+            Command::Xclip { target: Selector::Last { n: 1 }, rect: None }
+        );
+        let json = serde_json::to_string(&off).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(off, back);
+
+        // Needs a selector plus either two corners or `off`.
+        assert!(parse("xclip").is_err());
+        assert!(parse("xclip last").is_err());
+        assert!(parse("xclip last 0,0").is_err());
     }
 }

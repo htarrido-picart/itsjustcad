@@ -214,6 +214,7 @@ mod tests {
                 scale,
                 source: None,
                 params: Default::default(),
+                clip: None,
             },
         });
 

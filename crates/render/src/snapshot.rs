@@ -421,7 +421,7 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
             }
             Geometry::Annotation(_) => {}
             // Block instances: resolved to constituent geometry at render time.
-            Geometry::Instance { block, position, rotation_deg, scale, .. } => {
+            Geometry::Instance { block, position, rotation_deg, scale, clip, .. } => {
                 if let Some(defs) = doc.blocks.get(block) {
                     let s = *scale;
                     let rot = rotation_deg.to_radians();
@@ -437,14 +437,39 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                             ps.z + position.z,
                         )
                     };
+                    // XCLIP boundary (world XY), if any. Segment-level cull: a
+                    // mesh face survives if ALL its (world-XY) vertices are inside
+                    // the rect; a polyline segment survives if BOTH endpoints are
+                    // inside. Simple and correct for fully-inside/outside geometry;
+                    // it does NOT split partially-crossing faces/segments at the
+                    // border (an all-or-nothing cull per primitive — good enough
+                    // MVP; a future pass could Cohen–Sutherland-clip the border).
+                    let clip = clip.as_ref();
                     let color = resolve_color(obj, layer_color, theme, selected, mode, false);
                     for def_geo in defs {
                         match def_geo {
                             itsjustcad_doc::BlockGeometry::Mesh(m) => {
-                                // Transform positions and build a new mesh.
+                                // Transform positions and build a new mesh, culling
+                                // faces outside the clip rect (all vertices must be
+                                // inside for the face to survive).
                                 let new_pos: Vec<DVec3> =
                                     m.positions().iter().map(|&p| transform(p)).collect();
-                                let new_mesh = kernel_mesh::Mesh::new(new_pos, m.faces().to_vec());
+                                let faces: Vec<[u32; 3]> = match clip {
+                                    Some(rect) => m
+                                        .faces()
+                                        .iter()
+                                        .filter(|f| {
+                                            f.iter()
+                                                .all(|&vi| rect.contains_xy(new_pos[vi as usize]))
+                                        })
+                                        .copied()
+                                        .collect(),
+                                    None => m.faces().to_vec(),
+                                };
+                                if faces.is_empty() {
+                                    continue;
+                                }
+                                let new_mesh = kernel_mesh::Mesh::new(new_pos, faces);
                                 let mesh_color = resolve_color(obj, layer_color, theme, selected, mode, true);
                                 scene.meshes.push((new_mesh.to_render(), mesh_color, DEFAULT_ROUGH_METAL));
                                 let segments: Vec<[f32; 3]> = kernel_mesh::feature_edges(&new_mesh)
@@ -459,20 +484,42 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                                 scene.edges.push((segments, color, lw_mm));
                             }
                             itsjustcad_doc::BlockGeometry::Curve(c) => {
-                                let mut pts: Vec<[f32; 3]> = c
-                                    .tessellate(DISPLAY_TOL)
-                                    .iter()
-                                    .map(|&p| {
-                                        let tp = transform(p);
-                                        [tp.x as f32, tp.y as f32, tp.z as f32]
-                                    })
-                                    .collect();
+                                let mut world: Vec<DVec3> =
+                                    c.tessellate(DISPLAY_TOL).iter().map(|&p| transform(p)).collect();
                                 if c.is_closed()
-                                    && let Some(first) = pts.first().copied()
+                                    && let Some(first) = world.first().copied()
                                 {
-                                    pts.push(first);
+                                    world.push(first);
                                 }
-                                scene.lines.push((pts, color, lw_mm));
+                                // With a clip rect, emit only the maximal runs of
+                                // consecutive vertices that are all inside (each
+                                // kept segment has both endpoints inside).
+                                match clip {
+                                    Some(rect) => {
+                                        let mut run: Vec<[f32; 3]> = Vec::new();
+                                        for p in &world {
+                                            if rect.contains_xy(*p) {
+                                                run.push([p.x as f32, p.y as f32, p.z as f32]);
+                                            } else {
+                                                if run.len() >= 2 {
+                                                    scene.lines.push((std::mem::take(&mut run), color, lw_mm));
+                                                } else {
+                                                    run.clear();
+                                                }
+                                            }
+                                        }
+                                        if run.len() >= 2 {
+                                            scene.lines.push((run, color, lw_mm));
+                                        }
+                                    }
+                                    None => {
+                                        let pts: Vec<[f32; 3]> = world
+                                            .iter()
+                                            .map(|p| [p.x as f32, p.y as f32, p.z as f32])
+                                            .collect();
+                                        scene.lines.push((pts, color, lw_mm));
+                                    }
+                                }
                             }
                             itsjustcad_doc::BlockGeometry::Annotation(_) => {
                                 // Annotations in block definitions are not rendered in
@@ -857,10 +904,69 @@ mod tests {
                 scale: 1.0,
                 source: None,
                 params: Default::default(),
+                clip: None,
             },
         });
         let scene = snapshot(&doc, Theme::Dark);
         assert_eq!(scene.meshes.len(), 1, "instance resolves to its block mesh");
+    }
+
+    #[test]
+    fn instance_clip_culls_faces_outside_the_rect() {
+        // Triangle (0,0)-(1,0)-(0,1) placed at (5,0,0) → world verts
+        // (5,0),(6,0),(5,1).
+        let mesh = kernel_mesh::Mesh::new(
+            vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+            vec![[0, 1, 2]],
+        );
+        let mut doc = Document::default();
+        doc.blocks
+            .insert("tri".to_string(), vec![itsjustcad_doc::BlockGeometry::Mesh(mesh)]);
+        let id = ObjectId::new();
+        doc.insert(SceneObject {
+            visible: true,
+            id,
+            name: None,
+            layer: "default".into(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Instance {
+                block: "tri".to_string(),
+                position: DVec3::new(5.0, 0.0, 0.0),
+                rotation_deg: 0.0,
+                scale: 1.0,
+                source: None,
+                params: Default::default(),
+                clip: None,
+            },
+        });
+
+        let set_clip = |doc: &mut Document, rect: Option<itsjustcad_doc::ClipRect>| {
+            if let Geometry::Instance { clip, .. } = &mut doc.get_mut(id).unwrap().geometry {
+                *clip = rect;
+            }
+        };
+
+        // A rect covering the whole triangle keeps the face.
+        set_clip(
+            &mut doc,
+            Some(itsjustcad_doc::ClipRect::new(
+                glam::DVec2::new(4.0, -1.0),
+                glam::DVec2::new(7.0, 2.0),
+            )),
+        );
+        assert_eq!(snapshot(&doc, Theme::Dark).meshes.len(), 1, "inside-rect face kept");
+
+        // A rect off to the side excludes all vertices → face culled, no mesh.
+        set_clip(
+            &mut doc,
+            Some(itsjustcad_doc::ClipRect::new(
+                glam::DVec2::new(-10.0, -10.0),
+                glam::DVec2::new(-1.0, -1.0),
+            )),
+        );
+        assert_eq!(snapshot(&doc, Theme::Dark).meshes.len(), 0, "outside-rect face culled");
     }
 
     // -- color mode tests --

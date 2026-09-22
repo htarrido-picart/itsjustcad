@@ -25,8 +25,8 @@ pub use cplane::CPlane;
 pub use document::Document;
 pub use loads::{LoadGeometry, RestraintKind, StructLoad, StructSupport};
 pub use object::{
-    angle_degrees, angular_arc_points, Annotation, AreaKind, BlockGeometry, DimAnchor, EndpointRef,
-    FieldExpr, FrameKind, Geometry,
+    angle_degrees, angular_arc_points, Annotation, AreaKind, BlockGeometry, ClipRect, DimAnchor,
+    EndpointRef, FieldExpr, FrameKind, Geometry,
     HatchPattern, LayerStyle, LineType, MaterialPreset, ObjectId, ObjectMaterial, ParamBlockDef,
     ParamBlockParam, SceneObject, DEFAULT_LAYER,
 };

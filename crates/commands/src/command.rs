@@ -1603,6 +1603,15 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
     },
+    /// XCLIP: clip a block/xref instance to a rectangular boundary (world XY) so
+    /// only the geometry inside the rect renders. `rect` `Some` sets the clip;
+    /// `None` clears it (`xclip <sel> off`). Mutates the instance geometry, so
+    /// it is logged and undone via a geometry snapshot.
+    Xclip {
+        target: Selector,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rect: Option<itsjustcad_doc::ClipRect>,
+    },
     // -- scoped deck workdir (a user-granted import folder) --
     /// Show the granted workdir (no arg) or grant one (`path` set). A grant is
     /// persisted to `~/.config/itsjustcad/workdir.txt`. Query/config, never

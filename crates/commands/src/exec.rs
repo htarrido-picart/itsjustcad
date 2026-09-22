@@ -11899,6 +11899,7 @@ fn apply_forward(
                         scale: sc,
                         source: Some(name.clone()),
                         params: values.clone(),
+                        clip: None,
                     },
                 });
                 return Ok((
@@ -11932,6 +11933,7 @@ fn apply_forward(
                     scale: sc,
                     source: None,
                     params: Default::default(),
+                    clip: None,
                 },
             });
             Ok((
@@ -11983,15 +11985,16 @@ fn apply_forward(
             }
             let id = ids[0];
             let obj = doc.get(id).expect("resolved");
-            let (source, cur_params, position, rot, sc) = match &obj.geometry {
+            let (source, cur_params, position, rot, sc, clip) = match &obj.geometry {
                 Geometry::Instance {
                     source: Some(src),
                     params: cur,
                     position,
                     rotation_deg,
                     scale,
+                    clip,
                     ..
-                } => (src.clone(), cur.clone(), *position, *rotation_deg, *scale),
+                } => (src.clone(), cur.clone(), *position, *rotation_deg, *scale, *clip),
                 _ => {
                     return Err(ExecError::Invalid(format!(
                         "param: '{id}' is not a dynamic-block instance"
@@ -12029,6 +12032,7 @@ fn apply_forward(
                     scale: sc,
                     source: Some(source.clone()),
                     params: new_values.clone(),
+                    clip,
                 };
             }
             doc.generation += 1;
@@ -12232,6 +12236,7 @@ fn apply_forward(
                     scale: sc,
                     source: None,
                     params: Default::default(),
+                    clip: None,
                 },
             });
             doc.generation += 1;
@@ -12400,6 +12405,52 @@ fn apply_forward(
                     created: vec![new_id],
                     message: format!("ncopy: sub-object {index} of '{block}' -> {new_id}"),
                 },
+            ))
+        }
+        // xclip: set (or clear, with `rect: None`) the XCLIP boundary on the
+        // selected block/xref instance(s). Mutates the instance geometry field,
+        // so undo restores the prior geometry snapshot.
+        Command::Xclip { target, rect } => {
+            let ids = resolve(doc, &target)?;
+            // Snapshot only the instances we actually touch (for undo) and mutate
+            // their `clip` field in place.
+            let mut snapshots: Vec<(ObjectId, Geometry)> = Vec::new();
+            let mut touched = 0usize;
+            for id in &ids {
+                let is_instance = matches!(
+                    doc.get(*id).map(|o| &o.geometry),
+                    Some(Geometry::Instance { .. })
+                );
+                if !is_instance {
+                    continue;
+                }
+                let prev = doc.get(*id).expect("resolved").geometry.clone();
+                if let Some(o) = doc.get_mut(*id) {
+                    if let Geometry::Instance { clip, .. } = &mut o.geometry {
+                        *clip = rect;
+                    }
+                }
+                snapshots.push((*id, prev));
+                touched += 1;
+            }
+            if touched == 0 {
+                return Err(ExecError::Invalid(
+                    "xclip: selection has no block/xref instances".into(),
+                ));
+            }
+            doc.generation += 1;
+            let message = if rect.is_some() {
+                format!("xclip: clipped {touched} instance{}", if touched == 1 { "" } else { "s" })
+            } else {
+                format!(
+                    "xclip: cleared clip on {touched} instance{}",
+                    if touched == 1 { "" } else { "s" }
+                )
+            };
+            Ok((
+                Command::Xclip { target, rect },
+                Inverse::SetGeometry(snapshots),
+                ApplyOutcome { created: Vec::new(), message },
             ))
         }
         Command::Workdir { path } => {
@@ -13324,6 +13375,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::XrefReload { .. } => "xref",
         Command::XrefDetach { .. } => "xref",
         Command::Ncopy { .. } => "ncopy",
+        Command::Xclip { .. } => "xclip",
         Command::Workdir { .. } => "workdir",
         Command::WorkdirFiles => "files",
         Command::BlockLibList => "blocklib",
@@ -18475,6 +18527,52 @@ mod tests {
         s.run(Command::Undo).unwrap();
         assert_eq!(s.doc.len(), n_before, "undo removes the ncopy object");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xclip_sets_and_clears_clip_with_undo() {
+        use itsjustcad_doc::ClipRect;
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last widget");
+        run(&mut s, "insert widget 0,0,0");
+        let id = s.doc.objects().last().unwrap().id;
+
+        // Fresh instance is unclipped.
+        let clip_of = |s: &Session, id: ObjectId| match &s.doc.get(id).unwrap().geometry {
+            Geometry::Instance { clip, .. } => *clip,
+            g => panic!("expected Instance, got {g:?}"),
+        };
+        assert_eq!(clip_of(&s, id), None, "new instance has no clip");
+
+        // xclip <sel> <min> <max> → clip set to the (normalized) rect.
+        run(&mut s, "xclip last 5,5 0,0");
+        let want = ClipRect::new(glam::DVec2::new(5.0, 5.0), glam::DVec2::new(0.0, 0.0));
+        assert_eq!(clip_of(&s, id), Some(want), "clip stored");
+
+        // Undo restores the prior (unclipped) geometry snapshot.
+        s.run(Command::Undo).unwrap();
+        assert_eq!(clip_of(&s, id), None, "undo clears the clip");
+
+        // Redo re-applies, then `xclip off` clears it again.
+        s.run(Command::Redo).unwrap();
+        assert_eq!(clip_of(&s, id), Some(want), "redo re-clips");
+        run(&mut s, "xclip last off");
+        assert_eq!(clip_of(&s, id), None, "xclip off clears the clip");
+    }
+
+    #[test]
+    fn xclip_rejects_non_instance_selection() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        // The box is not an instance → error.
+        let err = s
+            .run(crate::parse::parse("xclip last 0,0 1,1").unwrap())
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("no block/xref instances"),
+            "expected non-instance error, got: {err}"
+        );
     }
 
     #[test]

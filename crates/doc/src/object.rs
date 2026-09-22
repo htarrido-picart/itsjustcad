@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright © 2026 Hector Tarrido-Picart
 
-use glam::DVec3;
+use glam::{DVec2, DVec3};
 use kernel_curve::Curve;
 use kernel_mesh::{Aabb, Mesh};
 use serde::{Deserialize, Serialize};
@@ -424,6 +424,32 @@ impl BlockGeometry {
     }
 }
 
+/// A world-XY rectangular clip boundary for a block/xref instance (AutoCAD
+/// XCLIP). Only the instance's expanded geometry that falls inside `[min, max]`
+/// is shown; everything outside is culled at render time. Axis-aligned; the
+/// MVP does not support rotated or polygonal boundaries.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClipRect {
+    pub min: DVec2,
+    pub max: DVec2,
+}
+
+impl ClipRect {
+    /// Build a rect from two opposite corners, normalizing so `min <= max` on
+    /// each axis (callers may pass corners in any order).
+    pub fn new(a: DVec2, b: DVec2) -> Self {
+        ClipRect {
+            min: DVec2::new(a.x.min(b.x), a.y.min(b.y)),
+            max: DVec2::new(a.x.max(b.x), a.y.max(b.y)),
+        }
+    }
+
+    /// Is the world point (XY only) inside the rect (inclusive of the border)?
+    pub fn contains_xy(&self, p: DVec3) -> bool {
+        p.x >= self.min.x && p.x <= self.max.x && p.y >= self.min.y && p.y <= self.max.y
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "geo", rename_all = "snake_case")]
 pub enum Geometry {
@@ -450,6 +476,11 @@ pub enum Geometry {
         /// This instance's param values (empty for plain blocks).
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         params: std::collections::BTreeMap<String, String>,
+        /// Optional XCLIP boundary (world XY). When `Some`, expanded geometry
+        /// outside the rect is culled at render time. `None` = unclipped (the
+        /// default; old files load unchanged).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clip: Option<ClipRect>,
     },
     /// Decimated point cloud from a LAS import. Positions are world-space
     /// after applying LAS scale factors and offsets.
@@ -970,6 +1001,21 @@ pub struct SceneObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_rect_normalizes_and_contains() {
+        // Corners passed in any order normalize to min <= max.
+        let r = ClipRect::new(DVec2::new(10.0, 4.0), DVec2::new(2.0, 8.0));
+        assert_eq!(r.min, DVec2::new(2.0, 4.0));
+        assert_eq!(r.max, DVec2::new(10.0, 8.0));
+        // Inside (inclusive of the border), Z is ignored.
+        assert!(r.contains_xy(DVec3::new(5.0, 6.0, 99.0)));
+        assert!(r.contains_xy(DVec3::new(2.0, 4.0, 0.0))); // corner
+        assert!(r.contains_xy(DVec3::new(10.0, 8.0, 0.0))); // corner
+        // Outside on either axis.
+        assert!(!r.contains_xy(DVec3::new(1.9, 6.0, 0.0)));
+        assert!(!r.contains_xy(DVec3::new(5.0, 8.1, 0.0)));
+    }
 
     #[test]
     fn param_block_expand_substitutes_and_resolves() {

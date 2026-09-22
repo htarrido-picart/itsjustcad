@@ -1074,6 +1074,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Annotate,
         },
         CommandSpec {
+            name: "xclip",
+            usage: "xclip <instance-selector> <min x,y> <max x,y> | xclip <instance-selector> off",
+            summary: "Clip a block/xref instance to a rectangular boundary (world XY) so only the geometry inside the rect renders (AutoCAD XCLIP). Give two opposite corners to set the clip; 'off' clears it. Corners may be in any order. Undoable. Example: xclip last 0,0 10,10 · xclip last off",
+            category: Category::Annotate,
+        },
+        CommandSpec {
             name: "workdir",
             usage: "workdir [path]",
             summary: "Show or grant the scoped deck workdir — a single user-chosen folder the deck may list and import files from (NOT the whole filesystem, NOT a shell). No arg prints the current grant; 'workdir <path>' grants that folder (persisted to ~/.config/itsjustcad/workdir.txt). Once granted, 'files' lists importable files and 'import <name>' resolves a bare file name inside it (path-traversal guarded: '..', absolute paths and separators are refused). Example: workdir ~/Drawings · workdir",
