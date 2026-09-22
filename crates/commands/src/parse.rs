@@ -557,10 +557,25 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                         spacing: number(spacing)?,
                     }
                 }
+                // `pattern <name> [scale]`: a custom pattern imported via
+                // `hatchpat`. Resolved against `doc.hatch_patterns` at exec time;
+                // `lines` is filled there (empty here is a placeholder). Any bare
+                // unrecognised token also routes here so a stray name gives a
+                // clear "no such pattern" error rather than a parse rejection.
+                ["pattern", name] => HatchPattern::Custom {
+                    name: (*name).to_string(),
+                    lines: Vec::new(),
+                    scale: 1.0,
+                },
+                ["pattern", name, scale] => HatchPattern::Custom {
+                    name: (*name).to_string(),
+                    lines: Vec::new(),
+                    scale: number(scale)?,
+                },
                 _ => {
                     return wrong(
                         "hatch",
-                        "an optional pattern: solid, lines [a s], crosshatch [a s], brick [s], concrete [s], insulation [s], earth [s], ansi31..ansi38 [s]",
+                        "an optional pattern: solid, lines [a s], crosshatch [a s], brick [s], concrete [s], insulation [s], earth [s], ansi31..ansi38 [s], pattern <name> [scale]",
                         &args,
                     )
                 }
@@ -1174,6 +1189,10 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 &args,
             ),
         },
+        "hatchpat" => {
+            let [path] = take::<1>("hatchpat", "a .pat file path", &args)?;
+            Ok(Command::HatchPat { path: (*path).to_string() })
+        }
         "underlayopacity" => {
             let [o] = take::<1>("underlayopacity", "an opacity 0..1", &args)?;
             let opacity = number(o)? as f32;

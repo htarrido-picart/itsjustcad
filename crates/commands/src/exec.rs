@@ -165,6 +165,9 @@ enum Inverse {
     Units { prev: Units },
     /// `underlay`/`underlayopacity`/`underlayoff`: restore the previous underlay.
     Underlay { prev: Option<Underlay> },
+    /// `hatchpat`: restore the whole pattern registry (imports may overwrite
+    /// same-named patterns, so we snapshot and restore the map wholesale).
+    HatchPatterns { prev: std::collections::BTreeMap<String, itsjustcad_doc::HatchPatternDef> },
     /// `sun`/`sunoff`: restore the previous solar position.
     Sun { prev: Option<itsjustcad_doc::SunPosition> },
     /// `location` (also set as a side effect of `sun`): restore the previous
@@ -914,6 +917,10 @@ impl Session {
             }
             Inverse::Underlay { prev } => {
                 self.doc.underlay = prev.clone();
+                self.doc.generation += 1;
+            }
+            Inverse::HatchPatterns { prev } => {
+                self.doc.hatch_patterns = prev.clone();
                 self.doc.generation += 1;
             }
             Inverse::Sun { prev } => {
@@ -8950,6 +8957,27 @@ fn apply_forward(
                     "hatch boundary is not closed (close it or use 'polyline ... closed')".into(),
                 ));
             }
+            // Resolve a custom pattern reference (`hatch … pattern <name>`)
+            // against the imported registry, copying its line families into the
+            // hatch so the created object is self-contained (no doc lookup at
+            // render/export time). Done before we build the object below.
+            let pattern = if let itsjustcad_doc::HatchPattern::Custom { name, scale, .. } = &pattern {
+                let def = doc.hatch_patterns.get(name).ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "no imported hatch pattern '{name}' (import one with 'hatchpat <file.pat>')"
+                    ))
+                })?;
+                if *scale <= 0.0 {
+                    return Err(ExecError::Invalid("hatch pattern scale must be positive".into()));
+                }
+                itsjustcad_doc::HatchPattern::Custom {
+                    name: name.clone(),
+                    lines: def.lines.clone(),
+                    scale: *scale,
+                }
+            } else {
+                pattern
+            };
             let pattern_spacing = match &pattern {
                 itsjustcad_doc::HatchPattern::Lines { spacing, .. }
                 | itsjustcad_doc::HatchPattern::Crosshatch { spacing, .. }
@@ -8958,6 +8986,9 @@ fn apply_forward(
                 | itsjustcad_doc::HatchPattern::Insulation { spacing }
                 | itsjustcad_doc::HatchPattern::Earth { spacing }
                 | itsjustcad_doc::HatchPattern::Ansi { spacing, .. } => Some(*spacing),
+                // Custom families carry their own per-family spacing; validated
+                // in `hatch_pat`, so nothing to gate here.
+                itsjustcad_doc::HatchPattern::Custom { .. } => None,
                 itsjustcad_doc::HatchPattern::Solid => None,
             };
             if let itsjustcad_doc::HatchPattern::Ansi { code, .. } = &pattern
@@ -10745,6 +10776,27 @@ fn apply_forward(
                 // Not logged; this Inverse is never stored.
                 Inverse::DeleteCreated(Vec::new()),
                 ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::HatchPat { path } => {
+            let text = read_import_string(&path)?;
+            let pats = crate::pat::parse_pat(&text).map_err(ExecError::Invalid)?;
+            if pats.is_empty() {
+                return Err(ExecError::Invalid(format!("no hatch patterns found in {path}")));
+            }
+            let prev = doc.hatch_patterns.clone();
+            let n = pats.len();
+            for (name, def) in pats {
+                doc.hatch_patterns.insert(name, def);
+            }
+            doc.generation += 1;
+            Ok((
+                Command::HatchPat { path: path.clone() },
+                Inverse::HatchPatterns { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("imported {n} hatch pattern(s) from {path}"),
+                },
             ))
         }
         Command::Underlay { path, corner, width, height } => {
@@ -13252,6 +13304,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Text { .. } => "text",
         Command::Field { .. } => "field",
         Command::Hatch { .. } => "hatch",
+        Command::HatchPat { .. } => "hatchpat",
         Command::Boundary { .. } => "boundary",
         Command::CurveBool { .. } => "curvebool",
         Command::Union { .. } => "union",
@@ -23185,5 +23238,84 @@ mod tests {
         assert!(c.abs_diff_eq(DVec3::new(1.0, 2.0, 3.0), 1e-9), "world coords preserved: {c}");
         // The active CPlane is restored afterward.
         assert!(s.doc.cplane.origin.abs_diff_eq(DVec3::new(0.0, 0.0, 100.0), 1e-12));
+    }
+
+    // ── custom .pat hatch patterns (hatchpat + hatch … pattern) ─────────────
+
+    /// Write a two-pattern .pat to a temp file for the import tests. `tag`
+    /// keeps parallel tests from sharing (and deleting) each other's dir.
+    fn write_sample_pat(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ijc_pat_{}_{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.pat");
+        std::fs::write(
+            &path,
+            "; sample\n*GRAVEL, gravel fill\n45, 0,0, 0,0.5\n135, 0,0, 0,0.5\n*DASHED, dashed\n0, 0,0, 0,0.4, 0.2,-0.2\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn hatchpat_imports_patterns_into_registry() {
+        let mut s = Session::default();
+        let path = write_sample_pat("import");
+        let out = run(&mut s, &format!("hatchpat {}", path.to_str().unwrap()));
+        assert!(out.message.contains("imported 2 hatch pattern(s)"), "msg: {}", out.message);
+        assert!(s.doc.hatch_patterns.contains_key("GRAVEL"));
+        assert!(s.doc.hatch_patterns.contains_key("DASHED"));
+        // The GRAVEL def carries its two crossing families and the description.
+        let g = &s.doc.hatch_patterns["GRAVEL"];
+        assert_eq!(g.description, "gravel fill");
+        assert_eq!(g.lines.len(), 2);
+        assert_eq!(g.lines[0].angle_deg, 45.0);
+        assert_eq!(g.lines[0].delta.y, 0.5, "perpendicular spacing");
+        assert_eq!(s.doc.hatch_patterns["DASHED"].lines[0].dashes, vec![0.2, -0.2]);
+
+        // Undo restores the empty registry.
+        run(&mut s, "undo");
+        assert!(s.doc.hatch_patterns.is_empty(), "undo clears imported patterns");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn hatch_with_imported_pattern_bakes_families_and_renders() {
+        use itsjustcad_doc::{Annotation, Geometry, HatchPattern};
+        let mut s = Session::default();
+        let path = write_sample_pat("render");
+        run(&mut s, &format!("hatchpat {}", path.to_str().unwrap()));
+        // A closed square boundary to hatch.
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+        let poly = s.doc.objects().next().unwrap().id;
+        let out = run(&mut s, &format!("hatch {poly} pattern GRAVEL 2"));
+        assert!(out.message.contains("hatched"), "msg: {}", out.message);
+
+        // The created hatch is self-contained: it carries the copied families
+        // and scale, not just the name.
+        let hatch_id = *out.created.first().unwrap();
+        let Geometry::Annotation(Annotation::Hatch { pattern, boundary }) =
+            &s.doc.get(hatch_id).unwrap().geometry
+        else {
+            panic!("expected a hatch");
+        };
+        let HatchPattern::Custom { name, lines, scale } = pattern else {
+            panic!("expected a custom pattern, got {pattern:?}");
+        };
+        assert_eq!(name, "GRAVEL");
+        assert_eq!(*scale, 2.0);
+        assert_eq!(lines.len(), 2, "both families copied from the registry");
+        // The family generator produces clipped line geometry inside the box.
+        let segs = itsjustcad_doc::hatch::hatch_pat(boundary, lines, *scale);
+        assert!(!segs.is_empty(), "custom pattern must render some hatch lines");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn hatch_unknown_pattern_name_is_clean_error() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 1,0,0 1,1,0 0,1,0 closed");
+        let err = s.run(parse("hatch last pattern NOPE").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no imported hatch pattern 'NOPE'"), "{err}");
     }
 }

@@ -55,6 +55,44 @@ pub enum HatchPattern {
     /// ANSI standard material hatch, codes 31–38 (iron, steel, bronze,
     /// plastic, fire brick, marble, lead, aluminum). See `hatch::hatch_ansi`.
     Ansi { code: u8, spacing: f64 },
+    /// A custom pattern imported from an AutoCAD `.pat` file (`hatchpat`).
+    /// Self-contained: it carries its own line families so the render/PDF/DXF
+    /// paths need no doc lookup (the boundary is already baked in at creation
+    /// time; so is the pattern). `name` is kept for display/round-trip, `scale`
+    /// multiplies every family's spacing/dash length (kept separate so `scale`
+    /// on the hatch object stays lossless). See `hatch::hatch_pat`.
+    Custom {
+        name: String,
+        lines: Vec<PatLine>,
+        scale: f64,
+    },
+}
+
+/// One line-family definition from an AutoCAD `.pat` pattern: an infinite set
+/// of parallel dashed lines. `angle_deg` is the family direction; `origin` is a
+/// point the first line passes through; `delta.x` shifts successive lines along
+/// the line direction, `delta.y` is the perpendicular spacing between lines.
+/// `dashes` is the dash/gap pen pattern (positive = pen-down, negative =
+/// pen-up); empty = a solid line. Mirrors the `angle, x, y, dx, dy [, d1 …]`
+/// grammar. See `crate::hatch::hatch_pat`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PatLine {
+    pub angle_deg: f64,
+    pub origin: glam::DVec2,
+    pub delta: glam::DVec2,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dashes: Vec<f64>,
+}
+
+/// A named hatch pattern imported from a `.pat` file, held in the document's
+/// registry (`Document::hatch_patterns`). Just a bag of line families plus the
+/// header description; a `hatch … pattern <name>` reference copies the families
+/// into a self-contained `HatchPattern::Custom`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct HatchPatternDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    pub lines: Vec<PatLine>,
 }
 
 /// Which well-defined point on a referenced object a dimension anchor picks.
@@ -700,6 +738,9 @@ impl Geometry {
                             | HatchPattern::Insulation { spacing }
                             | HatchPattern::Earth { spacing }
                             | HatchPattern::Ansi { spacing, .. } => *spacing *= s,
+                            // Custom patterns carry a scale factor instead of a
+                            // single spacing (their families each have their own).
+                            HatchPattern::Custom { scale, .. } => *scale *= s,
                             HatchPattern::Solid => {}
                         }
                     }

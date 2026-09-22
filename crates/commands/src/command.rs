@@ -663,6 +663,11 @@ pub enum Command {
         target: Selector,
         pattern: HatchPattern,
     },
+    /// Import all hatch patterns from an AutoCAD `.pat` file into the document's
+    /// pattern registry (`doc.hatch_patterns`), for later use as
+    /// `hatch <sel> pattern <name>`. A resource-load op like `underlay`: logged
+    /// and undoable.
+    HatchPat { path: String },
     /// AutoCAD BOUNDARY: given a seed point inside a region enclosed by existing
     /// curves, trace the smallest closed loop surrounding it and create a closed
     /// boundary polyline (which can then be hatched / extruded). `from` limits
@@ -2194,6 +2199,8 @@ impl Command {
                 // dataextract only touches the fs when writing a .csv
                 | Command::DataExtract { path: Some(_), .. }
                 | Command::Underlay { .. }
+                // hatchpat reads an external .pat file from disk
+                | Command::HatchPat { .. }
                 | Command::BlockLibLoad { .. }
                 | Command::CheckRulesLoad { .. }
                 // GRANTING a workdir (path set) widens the deck's filesystem
@@ -2224,6 +2231,7 @@ impl Command {
             Command::PlantSchedule { path } => Some(format!("plantschedule → {path}")),
             Command::DataExtract { path: Some(p), .. } => Some(format!("dataextract → {p}")),
             Command::Underlay { path, .. } => Some(format!("underlay ← {path}")),
+            Command::HatchPat { path } => Some(format!("hatchpat ← {path}")),
             Command::BlockLibLoad { name, .. } => {
                 Some(format!("blockload ← library:{name}"))
             }

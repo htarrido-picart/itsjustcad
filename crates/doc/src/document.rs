@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_mesh::Aabb;
 
 use crate::{
-    AnalysisReport, Basemap, BlockGeometry, ComplianceReport, GeoLocation, Grid, LayerStyle,
-    Material, NamedView,
+    AnalysisReport, Basemap, BlockGeometry, ComplianceReport, GeoLocation, Grid, HatchPatternDef,
+    LayerStyle, Material, NamedView,
     ObjectId,
     CPlane,
     ParamBlockDef, PlotStyleTable, ResolvedPen, Room, SceneObject, Section, Sheet, SheetSet, SketchConstraint, Story, StructLoad,
@@ -197,6 +197,13 @@ pub struct Document {
     /// cleared by `plotstyle none`. `serde(default)` keeps old files loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_plot_style: Option<String>,
+    /// Custom hatch patterns imported from AutoCAD `.pat` files via `hatchpat`
+    /// (name → line families). A `hatch … pattern <name>` reference copies the
+    /// families into the created hatch (self-contained), so this registry is a
+    /// convenience library, not a live dependency of existing hatches.
+    /// `serde(default)` keeps pre-hatchpat files loading cleanly.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hatch_patterns: BTreeMap<String, HatchPatternDef>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -240,6 +247,7 @@ impl Default for Document {
             named_cplanes: BTreeMap::new(),
             plot_styles: BTreeMap::new(),
             active_plot_style: None,
+            hatch_patterns: BTreeMap::new(),
             generation: 0,
         }
     }

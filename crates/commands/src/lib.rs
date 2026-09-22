@@ -24,6 +24,7 @@ pub mod lot;
 pub mod mesh_export;
 pub mod mesh_import;
 mod parse;
+pub mod pat;
 pub mod pdf;
 pub mod plugin;
 pub mod raster;

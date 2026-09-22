@@ -27,8 +27,8 @@ pub use loads::{LoadGeometry, RestraintKind, StructLoad, StructSupport};
 pub use object::{
     angle_degrees, angular_arc_points, Annotation, AreaKind, BlockGeometry, ClipRect, DimAnchor,
     EndpointRef, FieldExpr, FrameKind, Geometry,
-    HatchPattern, LayerStyle, LineType, MaterialPreset, ObjectId, ObjectMaterial, ParamBlockDef,
-    ParamBlockParam, SceneObject, DEFAULT_LAYER,
+    HatchPattern, HatchPatternDef, LayerStyle, LineType, MaterialPreset, ObjectId, ObjectMaterial,
+    ParamBlockDef, ParamBlockParam, PatLine, SceneObject, DEFAULT_LAYER,
 };
 pub use param_schema::{
     derive_mesh, param_summary, DeriveError, FieldKind, GeneratorKind, ParamField, ParamMap,

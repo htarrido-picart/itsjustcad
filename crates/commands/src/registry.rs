@@ -290,8 +290,14 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "hatch",
-            usage: "hatch <selector> [solid | lines [angle spacing] | crosshatch [angle spacing] | brick [spacing] | concrete [spacing] | insulation [spacing] | earth [spacing] | ansi31..ansi38 [spacing]]",
-            summary: "Hatch the region of a closed curve. Patterns: solid (fill), lines (parallel, default 45° 0.25m), crosshatch (two perpendicular sets), brick (running bond, horizontal courses), concrete (dash-dot scatter), insulation (batt zigzag), earth (45° short dashes), ANSI standard set ansi31-ansi38 (31 iron, 32 steel, 33 bronze/brass, 34 plastic/rubber, 35 fire brick, 36 marble/glass, 37 lead/zinc, 38 aluminum; default spacing 0.2m). Example: hatch last · hatch last brick 0.2 · hatch last ansi32",
+            usage: "hatch <selector> [solid | lines [angle spacing] | crosshatch [angle spacing] | brick [spacing] | concrete [spacing] | insulation [spacing] | earth [spacing] | ansi31..ansi38 [spacing] | pattern <name> [scale]]",
+            summary: "Hatch the region of a closed curve. Patterns: solid (fill), lines (parallel, default 45° 0.25m), crosshatch (two perpendicular sets), brick (running bond, horizontal courses), concrete (dash-dot scatter), insulation (batt zigzag), earth (45° short dashes), ANSI standard set ansi31-ansi38 (31 iron, 32 steel, 33 bronze/brass, 34 plastic/rubber, 35 fire brick, 36 marble/glass, 37 lead/zinc, 38 aluminum; default spacing 0.2m), or `pattern <name> [scale]` to use a custom pattern imported with `hatchpat`. Example: hatch last · hatch last brick 0.2 · hatch last ansi32 · hatch last pattern gravel 2",
+            category: Category::Annotate,
+        },
+        CommandSpec {
+            name: "hatchpat",
+            usage: "hatchpat <path.pat>",
+            summary: "Import all line-based hatch patterns from an AutoCAD .pat file (e.g. USGS geologic pattern libraries) into the drawing, then use them as fills with `hatch <sel> pattern <name>`. Reports how many patterns were imported. Rendering approximates per-family origin phase and multi-length dash cadence (reads faithfully; not pixel-exact). Example: hatchpat /tmp/geology.pat",
             category: Category::Annotate,
         },
         CommandSpec {

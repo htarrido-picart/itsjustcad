@@ -365,6 +365,14 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                     HatchPattern::Ansi { code, spacing } => {
                         push_hatch_segs(&mut scene.lines, hatch_ansi(boundary, *code, *spacing), color, lw_mm);
                     }
+                    HatchPattern::Custom { lines, scale, .. } => {
+                        push_hatch_segs(
+                            &mut scene.lines,
+                            itsjustcad_doc::hatch::hatch_pat(boundary, lines, *scale),
+                            color,
+                            lw_mm,
+                        );
+                    }
                 }
             }
             // A field renders exactly like text — its `text` is the resolved
