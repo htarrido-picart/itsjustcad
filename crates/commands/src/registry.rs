@@ -259,9 +259,21 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Annotate,
         },
         CommandSpec {
+            name: "field",
+            usage: "field <pos x,y,z> <expr> [height]   where expr is: area <sel> | length <sel> | count <sel> | layer | units",
+            summary: "FIELD text: text at a point bound to a live value that auto-updates after edits (mirrors associative dims). expr := area <sel> (closed-curve/mesh area) | length <sel> (curve length) | count <sel> (number of matched objects) | layer (current layer) | units (unit symbol). <sel> is a single-object selector (last, a name, or a short id). Trailing number = height (default 0.2). Examples: field 5,3 area last · field 0,0 count all · field 2,2 length wall 0.3",
+            category: Category::Annotate,
+        },
+        CommandSpec {
             name: "hatch",
             usage: "hatch <selector> [solid | lines [angle spacing] | crosshatch [angle spacing] | brick [spacing] | concrete [spacing] | insulation [spacing] | earth [spacing] | ansi31..ansi38 [spacing]]",
             summary: "Hatch the region of a closed curve. Patterns: solid (fill), lines (parallel, default 45° 0.25m), crosshatch (two perpendicular sets), brick (running bond, horizontal courses), concrete (dash-dot scatter), insulation (batt zigzag), earth (45° short dashes), ANSI standard set ansi31-ansi38 (31 iron, 32 steel, 33 bronze/brass, 34 plastic/rubber, 35 fire brick, 36 marble/glass, 37 lead/zinc, 38 aluminum; default spacing 0.2m). Example: hatch last · hatch last brick 0.2 · hatch last ansi32",
+            category: Category::Annotate,
+        },
+        CommandSpec {
+            name: "boundary",
+            usage: "boundary <seed x,y,z> [from <selector>]",
+            summary: "AutoCAD BOUNDARY: pick a point inside a region enclosed by existing curves and create a closed boundary polyline (then hatch/extrude it). Traces the smallest loop around the seed in the XY plane. `from <selector>` limits the candidate curves; otherwise all curves are used. Example: boundary 5,3 · boundary 5,3 from all",
             category: Category::Annotate,
         },
         CommandSpec {
@@ -325,6 +337,48 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Transform,
         },
         CommandSpec {
+            name: "align",
+            usage: "align <selector> <src1> <tgt1> <src2> <tgt2> [scale on|off]",
+            summary: "Orient/align objects (AutoCAD ALIGN / Rhino Orient): move the selection so source reference points match targets. src1→tgt1 sets the translation; the rotation swings the src1→src2 direction onto the tgt1→tgt2 direction (planar, about Z, from the XY headings). 'scale on' also scales uniformly by |tgt2−tgt1|/|src2−src1|; default off. Alias: orient. Example: align last 0,0,0 5,5,0 1,0,0 5,6,0 · align last 0,0,0 0,0,0 1,0,0 2,0,0 scale on",
+            category: Category::Transform,
+        },
+        CommandSpec {
+            name: "tozero",
+            usage: "tozero <selector>",
+            summary: "Move objects so their combined bounding-box minimum sits at the world origin (0,0,0). Alias: toorigin. Example: tozero all",
+            category: Category::Transform,
+        },
+        CommandSpec {
+            name: "flatten",
+            usage: "flatten <selector>",
+            summary: "Project every vertex onto the XY ground plane (set Z=0). Example: flatten last",
+            category: Category::Transform,
+        },
+        CommandSpec {
+            name: "stretch",
+            usage: "stretch <selector> <min x,y,z> <max x,y,z> <delta x,y,z>",
+            summary: "Move only the vertices inside a box by a delta (vertices outside stay put), stretching lines/polylines/point clouds. A tall z-range acts like a 2D crossing window. Curves/points supported; meshes/solids skipped. Example: stretch all 0,0,-10 5,5,10 1,0,0",
+            category: Category::Transform,
+        },
+        CommandSpec {
+            name: "selsimilar",
+            usage: "selsimilar <selector> [layer|color|type]",
+            summary: "Select every object sharing a property (default layer) with the current selection. Alias: selsim. Example: selsimilar last color",
+            category: Category::Edit,
+        },
+        CommandSpec {
+            name: "dimradius",
+            usage: "dimradius <selector>",
+            summary: "Radial dimension for a circle or arc: from its center to a point on the rim. Alias: dimrad. Example: dimradius last",
+            category: Category::Dimension,
+        },
+        CommandSpec {
+            name: "dimdiameter",
+            usage: "dimdiameter <selector>",
+            summary: "Diameter dimension for a circle or arc: across the full width through its center. Alias: dimdia. Example: dimdiameter last",
+            category: Category::Dimension,
+        },
+        CommandSpec {
             name: "split",
             usage: "split <selector> <point x,y>",
             summary: "Split a curve in two at the nearest point on it to the given point; the original is replaced by the pieces. Example: split last 5,0",
@@ -334,6 +388,12 @@ pub fn registry() -> &'static [CommandSpec] {
             name: "trim",
             usage: "trim <target selector> <cutter selector> <keep point x,y>",
             summary: "Cut a curve where it crosses the cutter curve(s) and keep only the piece nearest the keep point; the rest is removed. Example: trim wall slab 1,1",
+            category: Category::Curve,
+        },
+        CommandSpec {
+            name: "powertrim",
+            usage: "powertrim <target selector> <pick point x,y>",
+            summary: "Trim a curve against ALL other curves at once: split it at every crossing and delete only the segment you pick, keeping the rest (no cutter picking). Example: powertrim wall 5,0",
             category: Category::Curve,
         },
         CommandSpec {
@@ -400,6 +460,12 @@ pub fn registry() -> &'static [CommandSpec] {
             name: "polararray",
             usage: "polararray <selector> <count> [center x,y,z] [total angle deg]",
             summary: "Circular array of copies about the z axis (default: full circle about the targets' bounding-box center; count includes the original). Example: polararray last 8 · polararray col 6 0,0,0 180",
+            category: Category::Transform,
+        },
+        CommandSpec {
+            name: "arraycurve",
+            usage: "arraycurve <selector> <path-selector> <count> [align on|off]",
+            summary: "Distribute copies of the selected object(s) evenly by arc length along a single path curve (endpoints included). With 'align on' (default) each copy rotates so its +X follows the curve tangent; 'align off' translates only. The originals stay put. Example: box 0,0,0 1,1,1 then name last widget then arc 0,0,0 5 0 90 then arraycurve widget last 5",
             category: Category::Transform,
         },
         CommandSpec {
@@ -540,6 +606,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Annotate,
         },
         CommandSpec {
+            name: "cplane",
+            usage: "cplane [world | origin <x,y,z> normal <x,y,z> | 3point <o> <px> <py> | save <name> | <name>]",
+            summary: "Construction plane (CPlane/UCS): the frame typed coordinates are measured against. `cplane` reports it; `cplane world` resets to world XY; `cplane origin 0,0,10 normal 0,0,1` lifts the drawing plane to elevation 10; `cplane 3point <origin> <on-X> <in-XY>` builds a frame from three points; `cplane save top` / `cplane top` store & recall. CPlane-aware verbs: line, polyline (any plane); rect, circle, box (translated/upright planes). Logged geometry always stores WORLD coords, so the CPlane never affects replay. Example: cplane origin 0,0,10 normal 0,0,1",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "underlay",
             usage: "underlay <path.png> [corner x,y] [width]",
             summary: "Place a raster image (PNG) flat on the ground plane to trace over; corner is the lower-left in meters (default 0,0), width in meters (default 10, height follows the image aspect). Example: underlay /tmp/site.png 0,0 20",
@@ -549,6 +621,30 @@ pub fn registry() -> &'static [CommandSpec] {
             name: "underlayopacity",
             usage: "underlayopacity <0..1>",
             summary: "Set the underlay's blend opacity. Example: underlayopacity 0.4",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "underlaymove",
+            usage: "underlaymove <dx,dy>",
+            summary: "Shift the placed underlay image by dx,dy meters (moves its lower-left corner). Example: underlaymove 2,-3",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "underlayscale",
+            usage: "underlayscale <factor>",
+            summary: "Scale the placed underlay's world size about its centre, aspect preserved (>1 grows, <1 shrinks). Example: underlayscale 1.5",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "underlayrotate",
+            usage: "underlayrotate <deg>",
+            summary: "Rotate the placed underlay about its centre to an absolute angle in degrees (CCW). Example: underlayrotate 30",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "underlayplace",
+            usage: "underlayplace <x,y> <width_m> [rot_deg]",
+            summary: "Reposition + resize the placed underlay in one shot (calibration): set its lower-left corner, width in meters (height follows aspect), and optional rotation. Example: underlayplace 0,0 20 15",
             category: Category::Tools,
         },
         CommandSpec {
@@ -636,9 +732,21 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Dimension,
         },
         CommandSpec {
+            name: "plotstyle",
+            usage: "plotstyle <new <name>|set <name> <layer-or-r,g,b> color <r,g,b> [weight <mm>] [screen <pct>]|list [<name>]|apply <name>|none|delete <name>>",
+            summary: "Plot styles / pen tables (AutoCAD CTB/STB): a named, saved mapping from a SOURCE KEY (a layer name, or an object color token 'r,g,b') to how objects PLOT — pen color, lineweight, screening — applied only at print/export, never changing the model. 'new <name>' creates a table; 'set <name> <key> color <r,g,b> [weight <mm>] [screen <pct>]' adds/replaces a mapping (screening 0..100% lightens the pen toward white); 'apply <name>' makes a table the active print pen (looked up per object by layer then color, unmapped objects plot as today); 'none' clears it; 'list [<name>]' shows tables/entries; 'delete <name>' removes one. new/set/apply/none/delete are logged (undoable); list is a query. Example: plotstyle new mono · plotstyle set mono walls color 0,0,0 weight 0.5 · plotstyle apply mono · print plan /tmp/plan.pdf",
+            category: Category::File,
+        },
+        CommandSpec {
             name: "print",
             usage: "print <sheet> <path.pdf>",
             summary: "Export a sheet as a vector PDF at its views' scales. Example: print plan /tmp/plan.pdf",
+            category: Category::File,
+        },
+        CommandSpec {
+            name: "sheetset",
+            usage: "sheetset <new <name>|add <sheet>|remove <sheet>|order <sheet> <index>|list|publish [<path.pdf>]>",
+            summary: "Manage a sheet set — a named, ordered index over existing sheets (AutoCAD Sheet Set Manager). A set only references sheets by name; it never copies their content. Sheet numbers are positional (1-based = order in the set). Sub-commands act on the ACTIVE set (the most recently created): 'new <name>' creates and activates a set; 'add <sheet>' appends an existing sheet; 'remove <sheet>' drops one; 'order <sheet> <index>' moves a sheet to a 1-based slot (renumbering the rest); 'list' shows every set with numbered sheets; 'publish [<path>]' batch-renders every sheet in the active set to a single multi-page PDF (defaults to <setname>.pdf), reusing the print path. new/add/remove/order are logged (undoable); list/publish are query/I-O. Example: sheetset new plans · sheetset add a-101 · sheetset add a-102 · sheetset order a-102 1 · sheetset publish /tmp/plans.pdf",
             category: Category::File,
         },
         CommandSpec {
@@ -822,6 +930,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "dataextract",
+            usage: "dataextract [by count|instance] [to <path.csv>]",
+            summary: "Extract block-instance data (AutoCAD DATAEXTRACTION / BOM): tabulate block instances grouped by definition, with a count and every distinct param/attribute value they carry. `by count` (default) gives one aggregated row per block definition (a param cell shows the shared value, or '(varies)'); `by instance` gives one row per placement. Prints a table, or writes a .csv with `to <path>`. Query only. Aliases: dataextraction, bom. Example: dataextract · dataextract by instance to /tmp/bom.csv",
+            category: Category::Analyze,
+        },
+        CommandSpec {
             name: "sheettable",
             usage: "sheettable <sheet> [layer]",
             summary: "Place a schedule table on a sheet; the table is rendered as a text grid in the PDF at print time. Example: sheettable plan · sheettable plan walls",
@@ -912,6 +1026,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Annotate,
         },
         CommandSpec {
+            name: "xref",
+            usage: "xref attach <path> [at x,y,z] [scale s] [rot deg] | xref list | xref reload <name> | xref detach <name>",
+            summary: "External reference: link another drawing file into this document as a reloadable referenced instance (an xref is a block whose contents came from another file). 'attach' imports the file's geometry into a block named from the path stem and places one instance under the transform; 'list' shows attached xrefs; 'reload' re-reads the file and rebuilds the definition (placements kept); 'detach' removes the instances + definition. Example: xref attach site.dxf at 0,0,0 · xref reload site · xref detach site",
+            category: Category::File,
+        },
+        CommandSpec {
+            name: "ncopy",
+            usage: "ncopy <instance-selector> <index>",
+            summary: "Copy ONE nested object out of an xref/block instance into this document as a real, independent object, transformed by the instance's placement; the source instance stays intact (AutoCAD NCOPY). <index> is the 0-based sub-object of the block definition. Example: ncopy last 0",
+            category: Category::Annotate,
+        },
+        CommandSpec {
             name: "workdir",
             usage: "workdir [path]",
             summary: "Show or grant the scoped deck workdir — a single user-chosen folder the deck may list and import files from (NOT the whole filesystem, NOT a shell). No arg prints the current grant; 'workdir <path>' grants that folder (persisted to ~/.config/itsjustcad/workdir.txt). Once granted, 'files' lists importable files and 'import <name>' resolves a bare file name inside it (path-traversal guarded: '..', absolute paths and separators are refused). Example: workdir ~/Drawings · workdir",
@@ -991,8 +1117,20 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "story",
-            usage: "story <name> <elevation>",
-            summary: "Define a building story/level by name and elevation (meters); stored sorted by elevation. Example: story L1 0 · story L2 3.5",
+            usage: "story <name> <elevation> [height <h>]",
+            summary: "Define a building story/level by name and base elevation (meters), with an optional floor-to-floor height used by 'fromlayer … level'. Stored sorted by elevation. 'level' is an alias. Example: story L1 0 height 3.5 · level L2 3.5 height 3",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "levels",
+            usage: "levels",
+            summary: "List the defined building stories/levels (name, elevation, height). Query only. Example: levels",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "fromlayer",
+            usage: "fromlayer <layer> wall thick <t> [height <h> | level <name>]",
+            summary: "Drawings→BIM: turn the 2D curves on a layer into typed BIM walls, one per curve, extruded vertically from the level base to base+height and 't' meters thick. The walls export as IFCWALL. Give an explicit 'height <h>' (base at Z=0) or a named 'level <name>' whose elevation is the base and whose height is the rise. Example: fromlayer WALLS wall thick 0.2 height 3 · fromlayer A-WALL wall thick 0.15 level L1",
             category: Category::Structure,
         },
         CommandSpec {

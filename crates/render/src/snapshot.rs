@@ -367,7 +367,10 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                     }
                 }
             }
-            Geometry::Annotation(Annotation::Text { pos, text, height }) => {
+            // A field renders exactly like text — its `text` is the resolved
+            // field value (kept current by the field-refresh pass).
+            Geometry::Annotation(Annotation::Text { pos, text, height })
+            | Geometry::Annotation(Annotation::Field { pos, text, height, .. }) => {
                 let color = resolve_color(obj, layer_color, theme, selected, mode, false);
                 let strokes = itsjustcad_doc::hershey::text_strokes(
                     text,

@@ -117,6 +117,7 @@ pub fn digest(doc: &Document) -> String {
             Geometry::Annotation(a) => match a {
                 itsjustcad_doc::Annotation::LinearDim { .. } => "dim",
                 itsjustcad_doc::Annotation::Text { .. } => "text",
+                itsjustcad_doc::Annotation::Field { .. } => "field",
                 itsjustcad_doc::Annotation::Hatch { .. } => "hatch",
             },
             Geometry::Instance { block, .. } => {

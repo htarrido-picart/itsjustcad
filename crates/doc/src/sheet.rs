@@ -204,3 +204,18 @@ pub struct Sheet {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<SheetTag>,
 }
+
+/// A named, ordered collection of existing sheets — the AutoCAD Sheet Set
+/// Manager / InDesign document analogue. A set is a lightweight *index*: it
+/// stores only sheet names, never a copy of their content, so the referenced
+/// `Sheet`s remain the single source of truth. Sheet numbers are positional
+/// (1-based) — the number of a sheet is `its index in `sheets` + 1`, so
+/// reordering renumbers automatically and nothing needs to be stored.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SheetSet {
+    pub name: String,
+    /// Sheet names in publication order. These reference `Document::sheets` by
+    /// name; a name may linger here after its sheet is deleted (readers filter).
+    #[serde(default)]
+    pub sheets: Vec<String>,
+}

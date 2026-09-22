@@ -166,7 +166,9 @@ fn annotation_entity(
             text(t, layer, mid, 0.2, &itsjustcad_doc::format_length(units, (*b - *a).length()));
             2
         }
-        Annotation::Text { pos, text: s, height } => {
+        // A field exports like text — `text` is the resolved field value.
+        Annotation::Text { pos, text: s, height }
+        | Annotation::Field { pos, text: s, height, .. } => {
             // Tessellate via Hershey stroke font to world-space polylines so
             // the text renders at world scale consistently across all outputs.
             let strokes = itsjustcad_doc::hershey::text_strokes(s, [pos.x, pos.y], *height);
@@ -819,7 +821,8 @@ fn map_block_geom_points(
                 *p = xf(*p);
             }
         }
-        BlockGeometry::Annotation(Annotation::Text { pos, height, .. }) => {
+        BlockGeometry::Annotation(Annotation::Text { pos, height, .. })
+        | BlockGeometry::Annotation(Annotation::Field { pos, height, .. }) => {
             *pos = xf(*pos);
             *height *= rscale.abs();
         }
@@ -906,7 +909,8 @@ fn translate_block_geom(g: &mut itsjustcad_doc::BlockGeometry, d: DVec3) {
     use itsjustcad_doc::{Annotation, BlockGeometry};
     match g {
         BlockGeometry::Curve(c) => c.translate(d),
-        BlockGeometry::Annotation(Annotation::Text { pos, .. }) => *pos += d,
+        BlockGeometry::Annotation(Annotation::Text { pos, .. })
+        | BlockGeometry::Annotation(Annotation::Field { pos, .. }) => *pos += d,
         BlockGeometry::Annotation(Annotation::LinearDim { a, b, .. }) => {
             // Free anchors translate; object bindings follow their referent.
             a.translate(d);

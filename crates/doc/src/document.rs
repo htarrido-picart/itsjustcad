@@ -9,10 +9,13 @@ use crate::{
     AnalysisReport, Basemap, BlockGeometry, ComplianceReport, GeoLocation, Grid, LayerStyle,
     Material, NamedView,
     ObjectId,
-    ParamBlockDef, Room, SceneObject, Section, Sheet, SketchConstraint, Story, StructLoad,
+    CPlane,
+    ParamBlockDef, PlotStyleTable, ResolvedPen, Room, SceneObject, Section, Sheet, SheetSet, SketchConstraint, Story, StructLoad,
     StructSupport, SunPosition, Underlay, Units,
     DEFAULT_LAYER,
 };
+
+use glam::DVec3;
 
 /// Seed the layer table for a brand-new document: "Default" plus
 /// "Layer 01".."Layer 05" (6 layers total). `order` keeps "Default" first,
@@ -49,6 +52,10 @@ pub struct Document {
     pub current_layer: String,
     /// Paper layouts, in creation order. Mutators bump `generation` (exec does).
     pub sheets: Vec<Sheet>,
+    /// Named sheet sets (AutoCAD Sheet Set Manager): ordered indexes over
+    /// `sheets`, for batch publish. Each set references sheets by name and never
+    /// copies their content. Mutators bump `generation` (exec does).
+    pub sheet_sets: Vec<SheetSet>,
     /// Display unit for lengths (geometry always stores meters). Set via the
     /// logged `units` command, so saved files carry their unit through replay.
     pub units: Units,
@@ -69,6 +76,13 @@ pub struct Document {
     /// loading cleanly.
     #[serde(default)]
     pub param_blocks: BTreeMap<String, ParamBlockDef>,
+    /// External references (xrefs): block name → the source file path it was
+    /// imported from. An xref is a plain block definition (its geometry lives in
+    /// `blocks` under this name) whose contents came from another drawing; the
+    /// path is kept so `xref reload` can re-read the file and rebuild the def.
+    /// `serde(default)` keeps pre-xref files loading cleanly.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub xrefs: BTreeMap<String, String>,
     /// Mailbox: a `view <name>` restore waiting for the UI to drive the active
     /// viewport camera. The app takes it each frame; never persisted.
     #[serde(skip)]
@@ -160,6 +174,29 @@ pub struct Document {
     /// logged via the settings/subdivide ops so saved files replay identically.
     #[serde(default)]
     pub subdivision_settings: subdivision::SubdivisionSettings,
+    /// Active construction plane (CPlane / UCS). Typed coordinates are resolved
+    /// against this before geometry is built. TRANSIENT: `#[serde(skip)]` keeps
+    /// it out of the op-log and save file, and replay always starts from the
+    /// world (identity) CPlane. This is what makes CPlanes replay-stable — logged
+    /// ops carry WORLD coords (resolved at entry time via `cplane_to_world`), so
+    /// replay reproduces identical geometry regardless of any later CPlane change.
+    /// Set by the (non-logged) `cplane` verb. `serde(default)` gives world.
+    #[serde(skip)]
+    pub cplane: CPlane,
+    /// Named construction planes saved via `cplane save <name>`, recalled via
+    /// `cplane <name>`. TRANSIENT for the same reason as `cplane`.
+    #[serde(skip)]
+    pub named_cplanes: BTreeMap<String, CPlane>,
+    /// Named plot-style tables (AutoCAD CTB/STB pen tables): print-time pen
+    /// overrides that never touch the model. Mutated by the `plotstyle` verbs;
+    /// `serde(default)` keeps pre-plotstyle files loading cleanly.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plot_styles: BTreeMap<String, PlotStyleTable>,
+    /// Name of the active plot style consulted by print/export, or `None` for
+    /// no override (draw as the model dictates). Set by `plotstyle apply` /
+    /// cleared by `plotstyle none`. `serde(default)` keeps old files loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_plot_style: Option<String>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
 }
@@ -173,11 +210,13 @@ impl Default for Document {
             layers: seed_default_layers(),
             current_layer: DEFAULT_LAYER.to_string(),
             sheets: Vec::new(),
+            sheet_sets: Vec::new(),
             units: Units::default(),
             named_views: BTreeMap::new(),
             groups: BTreeMap::new(),
             blocks: BTreeMap::new(),
             param_blocks: BTreeMap::new(),
+            xrefs: BTreeMap::new(),
             pending_view: None,
             underlay: None,
             basemap: None,
@@ -197,6 +236,10 @@ impl Default for Document {
             constraints: Vec::new(),
             pregrade_terrain: None,
             subdivision_settings: subdivision::SubdivisionSettings::default(),
+            cplane: CPlane::world(),
+            named_cplanes: BTreeMap::new(),
+            plot_styles: BTreeMap::new(),
+            active_plot_style: None,
             generation: 0,
         }
     }
@@ -226,6 +269,50 @@ impl Document {
             return w;
         }
         self.layers.get(&obj.layer).map(|s| s.lineweight_mm).unwrap_or(0.18)
+    }
+
+    /// Effective plot color for an object WITHOUT any plot style: per-object
+    /// color beats layer color; falls back to `default` (the caller's theme /
+    /// export default, e.g. black for PDF). This is the *base* color the plot
+    /// style then overrides.
+    pub fn effective_color(&self, obj: &SceneObject, default: [f32; 3]) -> [f32; 3] {
+        if let Some(c) = obj.color {
+            return c;
+        }
+        self.layers
+            .get(&obj.layer)
+            .and_then(|s| s.color)
+            .map(|c| [c[0], c[1], c[2]]) // layer color is RGBA; drop alpha
+            .unwrap_or(default)
+    }
+
+    /// Resolve the pen (color + lineweight) an object should PLOT with, applying
+    /// the active plot style (if any). `default_color` is the export's fallback
+    /// pen color (e.g. black for PDF). When no plot style is active, or the
+    /// object's layer/color is unmapped, returns the object's base pen — so
+    /// unmapped objects plot exactly as today. The model is never modified.
+    pub fn plot_pen(&self, obj: &SceneObject, default_color: [f32; 3]) -> ResolvedPen {
+        let base = ResolvedPen {
+            color: self.effective_color(obj, default_color),
+            weight_mm: self.effective_lineweight(obj),
+        };
+        match self.active_plot_style.as_ref().and_then(|n| self.plot_styles.get(n)) {
+            Some(table) => table.resolve_pen(&obj.layer, base),
+            None => base,
+        }
+    }
+
+    /// Resolve a CPlane-space point (as typed by the user) to WORLD coordinates
+    /// via the active construction plane. World XY (the default) is a no-op.
+    ///
+    /// Callers building logged geometry ops MUST route typed points through this
+    /// so the op stores world coords (replay-stability invariant). See `CPlane`.
+    pub fn cplane_to_world(&self, p: DVec3) -> DVec3 {
+        if self.cplane.is_world() {
+            p
+        } else {
+            self.cplane.to_world(p)
+        }
     }
 
     pub fn objects(&self) -> impl Iterator<Item = &SceneObject> {
@@ -415,6 +502,14 @@ impl Document {
 
     pub fn sheet_mut(&mut self, name: &str) -> Option<&mut Sheet> {
         self.sheets.iter_mut().find(|s| s.name == name)
+    }
+
+    pub fn sheet_set(&self, name: &str) -> Option<&SheetSet> {
+        self.sheet_sets.iter().find(|s| s.name == name)
+    }
+
+    pub fn sheet_set_mut(&mut self, name: &str) -> Option<&mut SheetSet> {
+        self.sheet_sets.iter_mut().find(|s| s.name == name)
     }
 
     pub fn scene_aabb(&self) -> Option<Aabb> {

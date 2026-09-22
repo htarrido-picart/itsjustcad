@@ -206,6 +206,42 @@ impl DimAnchor {
     }
 }
 
+/// A FIELD expression: the live source a [`Annotation::Field`] binds to. This
+/// is the AutoCAD FIELD idea in miniature — text whose content is derived from
+/// a document/geometry property rather than typed. The `Selector`-backed
+/// variants store the raw selector token (`"last"`, a name, or a short id) as a
+/// string because the concrete `Selector` type lives in the commands crate; the
+/// field-eval pass re-parses it. Serde-tagged so new sources can be added
+/// without breaking old op-logs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "field", rename_all = "snake_case")]
+pub enum FieldExpr {
+    /// Total area of the matched closed curve(s)/mesh(es).
+    Area { selector: String },
+    /// Total curve length of the matched curve(s).
+    Length { selector: String },
+    /// Number of matched objects.
+    Count { selector: String },
+    /// The document's current layer name.
+    Layer,
+    /// The document's display units symbol (e.g. `m`, `ft`).
+    Units,
+}
+
+impl FieldExpr {
+    /// Canonical source text (round-trips through the `field` parser). Used in
+    /// creation messages and to keep serialized op-logs human-readable.
+    pub fn source(&self) -> String {
+        match self {
+            FieldExpr::Area { selector } => format!("area {selector}"),
+            FieldExpr::Length { selector } => format!("length {selector}"),
+            FieldExpr::Count { selector } => format!("count {selector}"),
+            FieldExpr::Layer => "layer".to_string(),
+            FieldExpr::Units => "units".to_string(),
+        }
+    }
+}
+
 /// Drafting objects: they live in the document like geometry (layers,
 /// selection, undo) but carry measured/typed content instead of shape.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -218,6 +254,11 @@ pub enum Annotation {
     /// follow their referent when it moves/edits (resolved at display time).
     LinearDim { a: DimAnchor, b: DimAnchor, offset: f64 },
     Text { pos: DVec3, text: String, height: f64 },
+    /// A FIELD: like `Text`, but `text` is the *resolved* string of `expr` and
+    /// is recomputed by the field-refresh pass after mutating ops (mirroring
+    /// associative dimensions). `text` is stored so render/export and op-log
+    /// replay are byte-identical without a document in hand.
+    Field { pos: DVec3, expr: FieldExpr, text: String, height: f64 },
     /// Hatch of a closed boundary polygon (tessellated at creation time).
     Hatch { boundary: Vec<DVec3>, pattern: HatchPattern },
 }
@@ -230,6 +271,7 @@ impl Annotation {
         match self {
             Annotation::LinearDim { a, b, .. } => vec![a.point(), b.point()],
             Annotation::Text { pos, .. } => vec![*pos],
+            Annotation::Field { pos, .. } => vec![*pos],
             Annotation::Hatch { boundary, .. } => boundary.clone(),
         }
     }
@@ -480,6 +522,7 @@ impl Geometry {
                     b.translate(d);
                 }
                 Annotation::Text { pos, .. } => *pos += d,
+                Annotation::Field { pos, .. } => *pos += d,
                 Annotation::Hatch { boundary, .. } => {
                     boundary.iter_mut().for_each(|p| *p += d)
                 }
@@ -539,6 +582,10 @@ impl Geometry {
                         *offset *= s;
                     }
                     Annotation::Text { pos, height, .. } => {
+                        *pos = m.transform_point3(*pos);
+                        *height *= s;
+                    }
+                    Annotation::Field { pos, height, .. } => {
                         *pos = m.transform_point3(*pos);
                         *height *= s;
                     }

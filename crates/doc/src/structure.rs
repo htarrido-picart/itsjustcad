@@ -34,11 +34,22 @@ pub struct Grid {
     pub levels: Vec<f64>,
 }
 
-/// A building story / level: a name and its elevation in meters.
+/// A building story / level: a name, its base elevation in meters, and its
+/// floor-to-floor `height`. The height defaults to 0.0 (unset) so files written
+/// before the field existed load unchanged; a level used for BIM extrusion
+/// (`fromlayer … level <name>`) is expected to carry a positive height.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Story {
     pub name: String,
     pub elevation: f64,
+    /// Floor-to-floor height, meters. 0.0 means "unset" (older files / a bare
+    /// elevation-only level line).
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub height: f64,
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    v.abs() < 1e-12
 }
 
 /// A tagged floor region (M-ibc): a closed boundary polygon with an occupancy

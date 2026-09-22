@@ -3,10 +3,16 @@
 
 use glam::DVec3;
 use itsjustcad_doc::{
-    AreaKind, EndpointRef, FrameKind, HatchPattern, NamedView, ObjectId, PaperSize,
+    AreaKind, EndpointRef, FieldExpr, FrameKind, HatchPattern, NamedView, ObjectId, PaperSize,
     RestraintKind, Section as StructSection, Units, ViewDirection,
 };
 use serde::{Deserialize, Serialize};
+
+/// Serde default for boolean fields that default to `true` (e.g. `arraycurve`
+/// tangent alignment): a missing field in an older log replays as `true`.
+pub(crate) fn default_true() -> bool {
+    true
+}
 
 /// Object selector. `Last(n)` ("last", "last 3") is the workhorse for both the
 /// command line and the LLM.
@@ -53,6 +59,26 @@ pub enum MirrorPlane {
     Yz,
     Xz,
     PointNormal { point: DVec3, normal: DVec3 },
+}
+
+/// Which property `selsimilar` matches on across the document.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SimilarBy {
+    #[default]
+    Layer,
+    Color,
+    Type,
+}
+
+impl std::fmt::Display for SimilarBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SimilarBy::Layer => "layer",
+            SimilarBy::Color => "color",
+            SimilarBy::Type => "type",
+        })
+    }
 }
 
 /// Compass direction naming an elevation view. `North` names the elevation you
@@ -128,6 +154,55 @@ impl GridshellSurfaceSpec {
             }
         }
     }
+}
+
+/// A construction-plane (CPlane / UCS) sub-operation. Carries WORLD-space
+/// definition points (parse-time literals), so it is self-contained; applying
+/// it only changes the active input frame, never any geometry.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum CPlaneOp {
+    /// Reset to the world XY plane.
+    World,
+    /// Report the active plane (query; produces a message only).
+    Report,
+    /// Set by an origin and a normal; the in-plane axes are chosen
+    /// deterministically to form an orthonormal basis.
+    OriginNormal { origin: DVec3, normal: DVec3 },
+    /// Set by three points: origin, a point on +X, and a point in the +XY
+    /// half-plane (fixes the Y side). A robust basis (Gram–Schmidt) is built.
+    ThreePoint { origin: DVec3, on_x: DVec3, on_xy: DVec3 },
+    /// Save the active plane under a name.
+    Save { name: String },
+    /// Recall a previously saved named plane.
+    Recall { name: String },
+}
+
+/// A `plotstyle` sub-operation (see `Command::PlotStyle`). All variants but
+/// `List` mutate doc state and are logged/undoable; `List` is a read-only query.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum PlotStyleOp {
+    /// List all tables, or the entries of one named table. Read-only query.
+    List { name: Option<String> },
+    /// Create a named (empty) plot-style table.
+    New { name: String },
+    /// Add or replace a mapping entry in a table: SOURCE KEY (a layer name or a
+    /// color token `r,g,b`) → plot color + optional lineweight + optional
+    /// screening percentage.
+    Set {
+        name: String,
+        key: String,
+        color: [f32; 3],
+        weight_mm: Option<f64>,
+        screen: Option<f64>,
+    },
+    /// Make a table the active plot style used by print/export.
+    Apply { name: String },
+    /// Clear the active plot style (draw as the model dictates).
+    None,
+    /// Delete a named table (and deactivate it if it was active).
+    Delete { name: String },
 }
 
 /// The shared command language. `id`/`ids` fields are `None` when typed or
@@ -524,12 +599,36 @@ pub enum Command {
         text: String,
         height: f64,
     },
+    /// A FIELD: text at a point whose content is derived from a live document
+    /// property (`expr`) rather than typed. Re-evaluated by the field-refresh
+    /// pass after mutating ops, so e.g. a field showing an object's area tracks
+    /// the object. The evaluated string is stored on the annotation so op-log
+    /// replay is byte-identical (same discipline as associative dimensions).
+    Field {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        pos: DVec3,
+        expr: FieldExpr,
+        height: f64,
+    },
     /// Hatch the region bounded by a closed curve.
     Hatch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
         target: Selector,
         pattern: HatchPattern,
+    },
+    /// AutoCAD BOUNDARY: given a seed point inside a region enclosed by existing
+    /// curves, trace the smallest closed loop surrounding it and create a closed
+    /// boundary polyline (which can then be hatched / extruded). `from` limits
+    /// the candidate boundary curves; without it, every curve in the doc is used.
+    Boundary {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        seed: DVec3,
+        /// Candidate boundary curves; `None` means "all curve objects".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<Selector>,
     },
     // -- edit --
     Move {
@@ -551,6 +650,61 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         center: Option<DVec3>,
     },
+    /// Orient/align (AutoCAD ALIGN / Rhino Orient): rigidly move the selection so
+    /// a source reference frame matches a target one. `src1`→`tgt1` fixes the
+    /// translation; the rotation swings the src1→src2 direction onto the
+    /// tgt1→tgt2 direction. The rotation is planar (about Z through `tgt1`),
+    /// built from the XY headings of the two direction vectors — a 2D-in-plane
+    /// align, not a full 3D two-vector fit. With `scale` on, a uniform scale
+    /// |tgt2−tgt1|/|src2−src1| about `tgt1` is folded in. All four points are
+    /// resolved world coords, so op-log replay is byte-stable.
+    Align {
+        targets: Selector,
+        src1: DVec3,
+        tgt1: DVec3,
+        src2: DVec3,
+        tgt2: DVec3,
+        scale: bool,
+    },
+    /// Translate the selection so its combined bounding-box minimum sits at the
+    /// world origin. Pure translation (fully invertible).
+    ToOrigin {
+        targets: Selector,
+    },
+    /// Project every vertex of the selection onto the XY ground plane (set Z=0).
+    /// Not invertible by a delta, so undo restores a geometry snapshot.
+    Flatten {
+        targets: Selector,
+    },
+    /// Stretch: the command-substrate half of AutoCAD's STRETCH. For each object
+    /// in the selection, every mutable vertex whose position falls inside the
+    /// [`min`, `max`] AABB (inclusive) is shifted by `delta`; vertices outside
+    /// the box stay put, so lines/polylines/shapes stretch rather than move
+    /// whole. A tall `min.z`/`max.z` range makes it behave like a 2D crossing
+    /// window. Not a pure translation, so undo restores a geometry snapshot.
+    Stretch {
+        targets: Selector,
+        min: DVec3,
+        max: DVec3,
+        delta: DVec3,
+    },
+    /// Select every object sharing a property (layer, color, or geometry kind)
+    /// with the current selection. A selection change, never op-logged.
+    SelSimilar {
+        targets: Selector,
+        #[serde(default)]
+        by: SimilarBy,
+    },
+    /// Radial dimension for a circle/arc: from its center to a point on the rim.
+    /// Modeled as a `LinearDim` between those two points, reusing the existing
+    /// dimension machinery (no new annotation type). `diameter` doubles it.
+    DimRadius {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        target: Selector,
+        #[serde(default)]
+        diameter: bool,
+    },
     Mirror {
         targets: Selector,
         plane: MirrorPlane,
@@ -571,6 +725,16 @@ pub enum Command {
         target: Selector,
         cutter: Selector,
         keep: DVec3,
+    },
+    /// PowerTrim a curve against *every* other curve in the document at once
+    /// (DraftSight/AutoCAD PowerTrim): split the target at all its intersections
+    /// with the other curves and drop the single segment containing (or nearest)
+    /// `pick`, keeping the rest as one or more replacement curves.
+    PowerTrim {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        target: Selector,
+        pick: DVec3,
     },
     /// Extend both open ends of curves tangentially by `distance`.
     Extend {
@@ -623,6 +787,19 @@ pub enum Command {
         center: Option<DVec3>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         total_angle_deg: Option<f64>,
+    },
+    /// Copies of `targets` distributed evenly by arc length along a single
+    /// path curve (`path`), endpoints inclusive. With `align` on (default) each
+    /// copy is rotated so the source's +X points along the curve tangent at its
+    /// station; with `align` off copies are translated only.
+    ArrayCurve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        targets: Selector,
+        path: Selector,
+        count: u32,
+        #[serde(default = "crate::command::default_true")]
+        align: bool,
     },
     Delete {
         targets: Selector,
@@ -691,6 +868,10 @@ pub enum Command {
         layer: String,
         linetype: itsjustcad_doc::LineType,
     },
+    /// Plot styles (CTB/STB pen tables): print-time pen overrides that never
+    /// touch the model. The single verb carries a sub-op (`new`/`set`/`apply`/
+    /// `none`/`delete`). `list` is a separate read-only query, not logged.
+    PlotStyle(PlotStyleOp),
     Hide {
         layer: String,
     },
@@ -747,6 +928,12 @@ pub enum Command {
     /// unit; geometry always stores meters regardless.
     Units {
         units: Units,
+    },
+    /// Set / report the active construction plane (CPlane / UCS). NOT logged:
+    /// the CPlane resolves typed input to WORLD at entry time and geometry ops
+    /// carry world coords, so replay is unaffected by the CPlane. See `CPlaneOp`.
+    CPlane {
+        op: CPlaneOp,
     },
     /// Set the document solar position (azimuth + altitude from NOAA SPA).
     /// Logged so saved files replay with identical lighting. `None` reverts to
@@ -882,6 +1069,31 @@ pub enum Command {
     UnderlayOpacity {
         opacity: f32,
     },
+    /// Shift the placed underlay's origin by `dx,dy` meters (its lower-left
+    /// corner, so the whole image translates).
+    UnderlayMove {
+        dx: f64,
+        dy: f64,
+    },
+    /// Scale the placed underlay's world size by `factor` about its centre
+    /// (aspect preserved: width and height both scale).
+    UnderlayScale {
+        factor: f64,
+    },
+    /// Rotate the placed underlay `deg` degrees CCW about its centre. The angle
+    /// is absolute (sets `rotation_deg`), not incremental.
+    UnderlayRotate {
+        deg: f64,
+    },
+    /// Reposition + resize the placed underlay in one shot (calibration): move
+    /// its lower-left corner to `corner`, set its world `width` (height follows
+    /// the current aspect), and optionally set rotation.
+    UnderlayPlace {
+        corner: DVec3,
+        width: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rot_deg: Option<f64>,
+    },
     /// Remove the underlay.
     UnderlayOff,
     // -- sheets / layouts --
@@ -901,6 +1113,10 @@ pub enum Command {
         sheet: String,
         path: String,
     },
+    /// Sheet-set (AutoCAD Sheet Set Manager) operations: a named, ordered index
+    /// over existing sheets for batch publish. See [`SheetSetOp`]. The mutating
+    /// variants are logged; `List`/`Publish` are query / I/O.
+    SheetSet(SheetSetOp),
     /// Export the whole document as DXF R12, SVG, CSV, or 3D mesh format.
     /// Not logged: export is I/O, not model state.
     Export {
@@ -1106,6 +1322,21 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         layer: Option<String>,
     },
+    /// Extract block-instance data (AutoCAD DATAEXTRACTION / BOM). Enumerates
+    /// block instances grouped by definition, tabulating counts and each
+    /// distinct param (`{name}`) value carried by the instances. Printed to the
+    /// command line as a table, or written to `path` (`.csv`) when given. Query
+    /// only; never logged. The `.csv` form is a filesystem write (side-effecting).
+    DataExtract {
+        /// `false` → one row per block definition (aggregated count, default).
+        /// `true` → one row per instance (detailed, with each param value).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        by_instance: bool,
+        /// Optional output path; `Some` writes a `.csv` spreadsheet, `None`
+        /// prints to the command line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
     /// Print the stored structured summaries of environmental analyses
     /// (`Document::analysis_reports`): stats, distribution bins, and extreme
     /// sample locations. This is the deck LLM's critique hook — the analysis
@@ -1261,6 +1492,53 @@ pub enum Command {
     BlockDeleteDef { name: String },
     /// List block definitions (query; never logged).
     BlocksList,
+    // -- external references (xrefs): another drawing linked as a block --
+    /// Attach an external file as an xref: import its geometry into a block
+    /// definition named from the path stem, place one instance under the given
+    /// transform, and record the source path in `Document::xrefs`. An xref IS a
+    /// plain block whose contents came from another drawing. `geometries` is
+    /// `None` when typed; exec imports the file and writes it back so the saved
+    /// op-log replays without the external file. `name` is likewise filled at
+    /// exec (the path stem) for a stable replay.
+    XrefAttach {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<DVec3>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scale: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rotation_deg: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        geometries: Option<Vec<itsjustcad_doc::BlockGeometry>>,
+    },
+    /// List attached xrefs (name, path, live instance count). Query; not logged.
+    XrefList,
+    /// Re-import an xref's source file and rebuild its block definition in place;
+    /// existing instance placements are kept (they reference the def by name).
+    /// `geometries` filled at exec for replay stability, like `XrefAttach`.
+    XrefReload {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        geometries: Option<Vec<itsjustcad_doc::BlockGeometry>>,
+    },
+    /// Detach an xref: delete all its instances and its block definition, and
+    /// drop it from `Document::xrefs`.
+    XrefDetach { name: String },
+    /// NCOPY: copy ONE nested object out of an xref (or any block) instance into
+    /// the host document as a real, independent object, transformed by the
+    /// instance's placement. The source instance is left intact. `target`
+    /// selects the instance; `index` picks which sub-object of the block
+    /// definition to bake out (0-based).
+    Ncopy {
+        target: Selector,
+        index: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+    },
     // -- scoped deck workdir (a user-granted import folder) --
     /// Show the granted workdir (no arg) or grant one (`path` set). A grant is
     /// persisted to `~/.config/itsjustcad/workdir.txt`. Query/config, never
@@ -1310,11 +1588,18 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         levels: Vec<f64>,
     },
-    /// Define (or replace) a building story/level by name and elevation.
+    /// Define (or replace) a building story/level by name and elevation, with an
+    /// optional floor-to-floor `height` used by `fromlayer … level <name>` to
+    /// extrude BIM elements to storey height. `height` is `None`/`0.0` for a
+    /// bare elevation-only level line (older files load unchanged).
     DefStory {
         name: String,
         elevation: f64,
+        #[serde(default, skip_serializing_if = "is_zero_opt")]
+        height: Option<f64>,
     },
+    /// List the defined building stories/levels (query, never logged).
+    StoryList,
     /// Tag a closed-curve selection as an occupancy region (M-ibc). The plan
     /// area is computed at apply time and the boundary polygon captured, so the
     /// occupant-load / exit-count / travel-distance checks read a `Room` off
@@ -1355,6 +1640,31 @@ pub enum Command {
         thickness: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         material: Option<String>,
+    },
+    /// Drawings→BIM: consume the 2D curve objects on a layer and emit typed BIM
+    /// elements extruded to storey height. Each open/closed curve on `layer`
+    /// becomes one `wall` (the only element kind for now) built as a vertical
+    /// panel from the level base to base+height, `thick` metres thick. This is
+    /// the middle step between "import DXF" and "export IFC": the created walls
+    /// are `Geometry::Area { kind: Wall }`, so the existing IFC path exports
+    /// them as `IFCWALL`. `height` gives an explicit floor-to-floor height (base
+    /// at Z=0); `level` instead names a story whose elevation is the base and
+    /// whose height is the rise. Exactly one of `height`/`level` is required.
+    FromLayer {
+        layer: String,
+        /// BIM element kind to build. Only `AreaKind::Wall` is supported today.
+        element: AreaKind,
+        thickness: f64,
+        /// Explicit floor-to-floor height (metres), base at Z=0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<f64>,
+        /// Name of a defined story: its elevation is the base, its height the rise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        level: Option<String>,
+        /// Object ids created on apply, written back for replay stability so
+        /// undo removes the exact same set.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        created: Vec<ObjectId>,
     },
     // -- structural loads & supports (data + light viz; no analysis) --
     /// Add a structural load to the document. Three geometry kinds: `point`
@@ -1692,6 +2002,30 @@ pub enum OptionOp {
     Delete { name: String },
 }
 
+/// The `sheetset` sub-commands — a named, ordered collection of existing sheets
+/// (the AutoCAD Sheet Set Manager analogue). A set only *references* sheets by
+/// name; it never copies their content. Sheet numbers are positional (1-based,
+/// = order in the set), so `Order` renumbers implicitly. See
+/// [`crate::exec::apply_forward`] for the New/Add/Remove/Order semantics and
+/// [`crate::exec::Session`] batch publish.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SheetSetOp {
+    /// Create an empty named set and make it the active (target) set.
+    New { name: String },
+    /// Append an existing sheet to the active set (preserving order).
+    Add { sheet: String },
+    /// Remove a sheet from the active set.
+    Remove { sheet: String },
+    /// Move `sheet` to 1-based position `index` within the active set.
+    Order { sheet: String, index: usize },
+    /// List all sets and their ordered, numbered sheets (query — not logged).
+    List,
+    /// Batch-render every sheet in the active set to one multi-page PDF at
+    /// `path` (defaults to `<setname>.pdf`). I/O — not logged.
+    Publish { path: Option<String> },
+}
+
 fn is_zero_opt(v: &Option<f64>) -> bool {
     v.is_none_or(|x| x.abs() < 1e-12)
 }
@@ -1703,9 +2037,14 @@ impl Command {
             self,
             Command::Select { .. }
                 | Command::SelectNone
+                | Command::SelSimilar { .. }
                 | Command::ViewRestore { .. }
                 | Command::ViewList
                 | Command::Print { .. }
+                // Sheet-set queries/publish are read/I-O; the mutating sheetset
+                // ops (new/add/remove/order) fall through to logged.
+                | Command::SheetSet(SheetSetOp::List)
+                | Command::SheetSet(SheetSetOp::Publish { .. })
                 | Command::Export { .. }
                 | Command::ControlImages { .. }
                 | Command::Import { .. }
@@ -1721,13 +2060,16 @@ impl Command {
                 | Command::Volume { .. }
                 | Command::Bbox { .. }
                 | Command::Schedule { .. }
+                | Command::DataExtract { .. }
                 | Command::EnviroReport { .. }
                 | Command::LotFrontage { .. }
                 | Command::LotReport { .. }
                 | Command::CheckRulesList
                 | Command::CheckRulesLoad { .. }
                 | Command::RoomList
+                | Command::StoryList
                 | Command::BlocksList
+                | Command::XrefList
                 | Command::Workdir { .. }
                 | Command::WorkdirFiles
                 | Command::BlockLibList
@@ -1736,6 +2078,13 @@ impl Command {
                 | Command::Redo
                 | Command::Amend { .. }
                 | Command::Option(..)
+                // The CPlane is transient input state, resolved into world coords
+                // on typed geometry ops. Keeping it out of the op-log is what
+                // makes CPlanes replay-stable (logged ops already carry world).
+                | Command::CPlane { .. }
+                // plotstyle list is a read-only query; the mutating sub-ops
+                // (new/set/apply/none/delete) fall through to logged.
+                | Command::PlotStyle(PlotStyleOp::List { .. })
         )
     }
 
@@ -1757,12 +2106,19 @@ impl Command {
             Command::Export { .. }
                 | Command::ControlImages { .. }
                 | Command::Print { .. }
+                // sheetset publish writes a PDF to disk
+                | Command::SheetSet(SheetSetOp::Publish { .. })
                 | Command::BlockLibSave { .. }
                 // fs reads (can be probed to exfiltrate / DoS)
                 | Command::Import { .. }
+                // xref attach/reload read an external drawing file
+                | Command::XrefAttach { .. }
+                | Command::XrefReload { .. }
                 | Command::Terrain { .. }
                 | Command::OsmFile { .. }
                 | Command::PlantSchedule { .. }
+                // dataextract only touches the fs when writing a .csv
+                | Command::DataExtract { path: Some(_), .. }
                 | Command::Underlay { .. }
                 | Command::BlockLibLoad { .. }
                 | Command::CheckRulesLoad { .. }
@@ -1782,10 +2138,17 @@ impl Command {
                 Some(format!("control images → {prefix}_[depth|edge|mask].png"))
             }
             Command::Print { path, sheet } => Some(format!("print sheet '{sheet}' → {path}")),
+            Command::SheetSet(SheetSetOp::Publish { path }) => Some(format!(
+                "publish sheet set → {}",
+                path.as_deref().unwrap_or("<set>.pdf")
+            )),
             Command::Import { path } => Some(format!("import ← {path}")),
+            Command::XrefAttach { path, .. } => Some(format!("xref attach ← {path}")),
+            Command::XrefReload { name, .. } => Some(format!("xref reload ← {name}")),
             Command::Terrain { path } => Some(format!("terrain ← {path}")),
             Command::OsmFile { path } => Some(format!("osm ← {path}")),
             Command::PlantSchedule { path } => Some(format!("plantschedule → {path}")),
+            Command::DataExtract { path: Some(p), .. } => Some(format!("dataextract → {p}")),
             Command::Underlay { path, .. } => Some(format!("underlay ← {path}")),
             Command::BlockLibLoad { name, .. } => {
                 Some(format!("blockload ← library:{name}"))

@@ -103,10 +103,14 @@ pub fn resolve_runtime(
 /// The program + args to spawn for a plan on `port`, plus the PATH-resolved
 /// llama.cpp server binary for the gguf case.
 ///
-/// - llamafile: `(<file>, ["--server", "--port", p, "--nobrowser"])` — the file
-///   itself is the executable (the caller `chmod +x`es it first).
+/// - llamafile: `(<file>, ["--server", "--port", p, "--nobrowser", "-ngl", "999"])`
+///   — the file itself is the executable (the caller `chmod +x`es it first).
 /// - gguf: `(<llama-server|server>, ["-m", <file>, "--host", "127.0.0.1",
-///   "--port", p])` — requires a llama.cpp server on PATH, else an error.
+///   "--port", p, "-ngl", "999"])` — requires a llama.cpp server on PATH, else an
+///   error.
+///
+/// Both pass `-ngl 999` to offload all layers to the GPU; runtimes with no usable
+/// GPU fall back to CPU, so it is safe to pass unconditionally.
 ///
 /// Pure so both command shapes are unit-testable without spawning anything.
 /// `find_on_path` is injected so the gguf lookup can be tested deterministically.
@@ -124,6 +128,12 @@ pub fn build_command(
                 "--port".into(),
                 port,
                 "--nobrowser".into(),
+                // Offload every layer to the GPU. On Metal (Apple Silicon) this is
+                // the difference between usable and unusably slow; on machines with
+                // no usable GPU llamafile silently falls back to CPU, so passing it
+                // unconditionally is safe.
+                "-ngl".into(),
+                "999".into(),
             ],
         )),
         Runtime::Gguf => {
@@ -145,6 +155,9 @@ pub fn build_command(
                     "127.0.0.1".into(),
                     "--port".into(),
                     port,
+                    // Full GPU offload; falls back to CPU where unsupported.
+                    "-ngl".into(),
+                    "999".into(),
                 ],
             ))
         }
@@ -373,6 +386,10 @@ mod tests {
         // Port is passed through as the value after --port.
         let p = args.iter().position(|a| a == "--port").unwrap();
         assert_eq!(args[p + 1], "8123");
+        // Full GPU offload is requested so Metal-capable machines are not stuck
+        // on CPU inference.
+        let g = args.iter().position(|a| a == "-ngl").expect("-ngl present");
+        assert_eq!(args[g + 1], "999");
     }
 
     #[test]
@@ -425,6 +442,8 @@ mod tests {
         assert!(args.iter().any(|a| a == "127.0.0.1"));
         let p = args.iter().position(|a| a == "--port").unwrap();
         assert_eq!(args[p + 1], "8080");
+        let g = args.iter().position(|a| a == "-ngl").expect("-ngl present");
+        assert_eq!(args[g + 1], "999");
     }
 
     #[test]

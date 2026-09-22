@@ -3,13 +3,19 @@
 
 use glam::DVec3;
 use itsjustcad_doc::{
-    AreaKind, EndpointRef, FrameKind, HatchPattern, LoadGeometry, PaperSize, RestraintKind,
-    Section as StructSection, TagShape, Units, ViewDirection, METERS_PER_FOOT, METERS_PER_INCH,
+    AreaKind, EndpointRef, FieldExpr, FrameKind, HatchPattern, LoadGeometry, PaperSize,
+    RestraintKind, Section as StructSection, TagShape, Units, ViewDirection, METERS_PER_FOOT,
+    METERS_PER_INCH,
 };
 
 use crate::error::ParseError;
 use crate::registry::registry;
-use crate::{BoolKind, Command, CompassDir, DimAnchorSpec, MirrorPlane, OptionOp, Selector};
+use crate::{
+    BoolKind, CPlaneOp, Command, CompassDir, DimAnchorSpec, MirrorPlane, OptionOp, PlotStyleOp,
+    SheetSetOp,
+    Selector,
+    SimilarBy,
+};
 
 /// Hand-rolled `verb arg arg...` parser. Chosen over a combinator library
 /// because error message quality feeds the LLM retry loop.
@@ -442,6 +448,28 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 height,
             })
         }
+        "field" => {
+            // field <pos x,y,z> <expr...> [height]
+            //   expr := area <sel> | length <sel> | count <sel> | layer | units
+            // A trailing numeric word is the text height (only when it leaves a
+            // complete expr in front of it) — mirrors `text`.
+            let (&pos, rest) = args
+                .split_first()
+                .ok_or_else(|| wrong_err("field", "a position and an expression", &args))?;
+            let (height, expr_words) = match rest.split_last() {
+                Some((last, init)) if !init.is_empty() && number(last).is_ok() => {
+                    (number(last)?, init)
+                }
+                _ => (DEFAULT_TEXT_HEIGHT, rest),
+            };
+            let expr = field_expr(expr_words)?;
+            Ok(Command::Field {
+                id: None,
+                pos: point(pos)?,
+                expr,
+                height,
+            })
+        }
         "hatch" => {
             let (sel, rest) = selector(&args, "hatch")?;
             let pattern = match rest {
@@ -486,6 +514,27 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 }
             };
             Ok(Command::Hatch { id: None, target: sel, pattern })
+        }
+        "boundary" => {
+            // boundary <seed x,y,z> [from <selector>]
+            let (&seed, rest) = args
+                .split_first()
+                .ok_or_else(|| wrong_err("boundary", "a seed point", &args))?;
+            let seed = point(seed)?;
+            let from = match rest {
+                [] => None,
+                ["from", sel_rest @ ..] => {
+                    let (sel, tail) = selector(sel_rest, "boundary")?;
+                    if !tail.is_empty() {
+                        return wrong("boundary", "a seed point and optional 'from <selector>'", &args);
+                    }
+                    Some(sel)
+                }
+                _ => {
+                    return wrong("boundary", "a seed point and optional 'from <selector>'", &args)
+                }
+            };
+            Ok(Command::Boundary { id: None, seed, from })
         }
         "union" => {
             let (sel, rest) = selector(&args, "union")?;
@@ -645,6 +694,31 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 total_angle_deg,
             })
         }),
+        "arraycurve" | "patharray" => {
+            // <selector> <path-selector> <count> [align on|off]
+            let (targets, rest) = selector(&args, "arraycurve")?;
+            let (path, rest) = selector(rest, "arraycurve")?;
+            let (&count, rest) = rest.split_first().ok_or_else(|| {
+                wrong_err("arraycurve", "a copy count after the path selector", &args)
+            })?;
+            let count = count
+                .parse::<u32>()
+                .map_err(|_| ParseError::BadNumber(count.to_string()))?;
+            // Optional trailing `align on|off` (alignment defaults on).
+            let align = match rest {
+                [] => true,
+                ["align", "on"] | ["on"] => true,
+                ["align", "off"] | ["off"] => false,
+                _ => {
+                    return Err(wrong_err(
+                        "arraycurve",
+                        "optionally 'align on' or 'align off'",
+                        &args,
+                    ))
+                }
+            };
+            Ok(Command::ArrayCurve { ids: None, targets, path, count, align })
+        }
         "rotate" => with_last_backtrack(&args, "rotate", |sel, rest, args| {
             let (&angle, rest) = rest
                 .split_first()
@@ -671,6 +745,86 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let center = about(rest, "scale", args)?;
             Ok(Command::Scale { targets: sel, factors, center })
         }),
+        "align" | "orient" => {
+            // <selector> <src1> <tgt1> <src2> <tgt2> [scale on|off]
+            let (sel, rest) = selector(&args, "align")?;
+            let (points, scale_rest) = rest.split_at(rest.len().min(4));
+            let [src1, tgt1, src2, tgt2] = take::<4>(
+                "align",
+                "four points: src1 tgt1 src2 tgt2 after the selector",
+                points,
+            )?;
+            let scale = match scale_rest {
+                [] => false,
+                ["scale", "on"] | ["on"] => true,
+                ["scale", "off"] | ["off"] => false,
+                _ => {
+                    return Err(wrong_err(
+                        "align",
+                        "optionally 'scale on' or 'scale off'",
+                        &args,
+                    ))
+                }
+            };
+            Ok(Command::Align {
+                targets: sel,
+                src1: point(src1)?,
+                tgt1: point(tgt1)?,
+                src2: point(src2)?,
+                tgt2: point(tgt2)?,
+                scale,
+            })
+        }
+        "tozero" | "toorigin" => {
+            let (sel, rest) = selector(&args, "tozero")?;
+            expect_empty("tozero", rest, &args)?;
+            Ok(Command::ToOrigin { targets: sel })
+        }
+        "flatten" => {
+            let (sel, rest) = selector(&args, "flatten")?;
+            expect_empty("flatten", rest, &args)?;
+            Ok(Command::Flatten { targets: sel })
+        }
+        "stretch" => {
+            let (sel, rest) = selector(&args, "stretch")?;
+            let [min, max, delta] = take::<3>(
+                "stretch",
+                "a box min x,y,z, a box max x,y,z, and a delta x,y,z",
+                rest,
+            )?;
+            Ok(Command::Stretch {
+                targets: sel,
+                min: point(min)?,
+                max: point(max)?,
+                delta: point(delta)?,
+            })
+        }
+        "selsimilar" | "selsim" => with_last_backtrack(&args, "selsimilar", |sel, rest, args| {
+            let by = match rest {
+                [] => SimilarBy::Layer,
+                ["layer"] => SimilarBy::Layer,
+                ["color"] => SimilarBy::Color,
+                ["type"] => SimilarBy::Type,
+                _ => {
+                    return Err(wrong_err(
+                        "selsimilar",
+                        "an optional property: layer, color, or type",
+                        args,
+                    ))
+                }
+            };
+            Ok(Command::SelSimilar { targets: sel, by })
+        }),
+        "dimradius" | "dimrad" => {
+            let (sel, rest) = selector(&args, "dimradius")?;
+            expect_empty("dimradius", rest, &args)?;
+            Ok(Command::DimRadius { id: None, target: sel, diameter: false })
+        }
+        "dimdiameter" | "dimdia" => {
+            let (sel, rest) = selector(&args, "dimdiameter")?;
+            expect_empty("dimdiameter", rest, &args)?;
+            Ok(Command::DimRadius { id: None, target: sel, diameter: true })
+        }
         "offset" => with_last_backtrack(&args, "offset", |sel, rest, args| {
             let [dist] = take::<1>("offset", "a distance after the selector", rest)
                 .map_err(|_| wrong_err("offset", "a distance after the selector", args))?;
@@ -692,6 +846,12 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             let [keep] = take::<1>("trim", "a keep point after the two selectors", rest)
                 .map_err(|_| wrong_err("trim", "a keep point after the two selectors", &args))?;
             Ok(Command::Trim { id: None, target, cutter, keep: point(keep)? })
+        }
+        "powertrim" => {
+            let (target, rest) = selector(&args, "powertrim")?;
+            let [pick] = take::<1>("powertrim", "a pick point after the selector", rest)
+                .map_err(|_| wrong_err("powertrim", "a pick point after the selector", &args))?;
+            Ok(Command::PowerTrim { ids: None, target, pick: point(pick)? })
         }
         "extend" => with_last_backtrack(&args, "extend", |sel, rest, args| {
             let [dist] = take::<1>("extend", "a distance after the selector", rest)
@@ -897,6 +1057,8 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 .ok_or_else(|| wrong_err("units", "one of m, cm, mm, ft, in, ftin", &args))?;
             Ok(Command::Units { units })
         }
+        "cplane" | "ucs" => parse_cplane(&args),
+        "plotstyle" => parse_plotstyle(&args),
         "underlay" => match args.as_slice() {
             [path] => Ok(Command::Underlay {
                 path: (*path).to_string(),
@@ -930,6 +1092,40 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             }
             Ok(Command::UnderlayOpacity { opacity })
         }
+        "underlaymove" => {
+            let [d] = take::<1>("underlaymove", "an offset dx,dy", &args)?;
+            let p = point(d)?;
+            Ok(Command::UnderlayMove { dx: p.x, dy: p.y })
+        }
+        "underlayscale" => {
+            let [f] = take::<1>("underlayscale", "a positive scale factor", &args)?;
+            let factor = number(f)?;
+            if factor <= 0.0 {
+                return wrong("underlayscale", "a positive scale factor", &args);
+            }
+            Ok(Command::UnderlayScale { factor })
+        }
+        "underlayrotate" => {
+            let [d] = take::<1>("underlayrotate", "an angle in degrees", &args)?;
+            Ok(Command::UnderlayRotate { deg: number(d)? })
+        }
+        "underlayplace" => match args.as_slice() {
+            [corner, width] => Ok(Command::UnderlayPlace {
+                corner: point(corner)?,
+                width: number(width)?,
+                rot_deg: None,
+            }),
+            [corner, width, rot] => Ok(Command::UnderlayPlace {
+                corner: point(corner)?,
+                width: number(width)?,
+                rot_deg: Some(number(rot)?),
+            }),
+            _ => wrong(
+                "underlayplace",
+                "a corner x,y a width in meters and an optional rotation in degrees",
+                &args,
+            ),
+        },
         "underlayoff" => {
             expect_empty("underlayoff", &args, &args)?;
             Ok(Command::UnderlayOff)
@@ -958,6 +1154,30 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 path: path.to_string(),
             })
         }
+        "sheetset" => match args.as_slice() {
+            ["new", name] => Ok(Command::SheetSet(SheetSetOp::New { name: (*name).to_string() })),
+            ["add", sheet] => Ok(Command::SheetSet(SheetSetOp::Add { sheet: (*sheet).to_string() })),
+            ["remove", sheet] | ["rm", sheet] => {
+                Ok(Command::SheetSet(SheetSetOp::Remove { sheet: (*sheet).to_string() }))
+            }
+            ["order", sheet, index] => Ok(Command::SheetSet(SheetSetOp::Order {
+                sheet: (*sheet).to_string(),
+                index: index
+                    .parse::<usize>()
+                    .map_err(|_| ParseError::BadNumber((*index).to_string()))?,
+            })),
+            ["list"] => Ok(Command::SheetSet(SheetSetOp::List)),
+            ["publish"] => Ok(Command::SheetSet(SheetSetOp::Publish { path: None })),
+            ["publish", path] => {
+                Ok(Command::SheetSet(SheetSetOp::Publish { path: Some((*path).to_string()) }))
+            }
+            _ => wrong(
+                "sheetset",
+                "'new <name>', 'add <sheet>', 'remove <sheet>', 'order <sheet> <index>', \
+                 'list', or 'publish [<path.pdf>]'",
+                &args,
+            ),
+        },
         "export" => {
             let [path] = take::<1>("export", "an output path (.dxf/.stl/.obj/.gltf/.glb/.svg/.csv)", &args)?;
             Ok(Command::Export { path: path.to_string() })
@@ -1174,6 +1394,39 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 _ => return wrong("schedule", "an optional layer name", &args),
             };
             Ok(Command::Schedule { layer })
+        }
+        "dataextract" | "dataextraction" | "bom" => {
+            // Optional `by count|instance` mode and an optional `to <path>`
+            // output target, in any order. Defaults: aggregated-count table,
+            // printed to the command line.
+            let mut by_instance = false;
+            let mut path: Option<String> = None;
+            let mut i = 0;
+            while i < args.len() {
+                match args[i] {
+                    "by" => {
+                        let Some(mode) = args.get(i + 1) else {
+                            return wrong("dataextract", "'by count' or 'by instance'", &args);
+                        };
+                        by_instance = match *mode {
+                            "instance" => true,
+                            "count" => false,
+                            _ => return wrong("dataextract", "'by count' or 'by instance'", &args),
+                        };
+                        i += 2;
+                    }
+                    "to" => {
+                        // Everything after `to` is the path (may contain spaces).
+                        if i + 1 >= args.len() {
+                            return wrong("dataextract", "an output path after 'to'", &args);
+                        }
+                        path = Some(args[i + 1..].join(" "));
+                        break;
+                    }
+                    _ => return wrong("dataextract", "'by count|instance' and/or 'to <path.csv>'", &args),
+                }
+            }
+            Ok(Command::DataExtract { by_instance, path })
         }
         "sheettable" => {
             let (sheet, layer) = match args.as_slice() {
@@ -1621,6 +1874,25 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("blocks", &args, &args)?;
             Ok(Command::BlocksList)
         }
+        // -- external references (xrefs) --
+        // xref attach <path> [at x,y,z] [scale s] [rot deg]
+        // xref list | xref reload <name> | xref detach <name>
+        "xref" => parse_xref(&args),
+        // ncopy <xref-instance-selector> <index>
+        // The trailing token is the sub-object index; everything before it is the
+        // selector. Splitting the index off the END avoids the `last N` count
+        // ambiguity (a bare `last` selects one instance; the number is the index).
+        "ncopy" => {
+            let (idx, head) = args.split_last().ok_or_else(|| {
+                wrong_err("ncopy", "a selector and a sub-object index", &args)
+            })?;
+            let index = idx.parse::<usize>().map_err(|_| {
+                wrong_err("ncopy", "a non-negative integer sub-object index", &args)
+            })?;
+            let (sel, rest) = selector(head, "ncopy")?;
+            expect_empty("ncopy", rest, &args)?;
+            Ok(Command::Ncopy { target: sel, index, id: None })
+        }
         // workdir            -> show the granted deck workdir
         // workdir <path>     -> grant a folder (path may contain spaces)
         "workdir" => {
@@ -1680,9 +1952,33 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }
         "grid" => parse_grid(&args),
         "story" | "level" => {
-            let [name, elev] = take::<2>("story", "a name and an elevation", &args)?;
-            Ok(Command::DefStory { name: name.to_string(), elevation: number(elev)? })
+            // `story|level <name> <elevation> [height <h>]`. Height is optional;
+            // it gives the level a floor-to-floor rise for `fromlayer … level`.
+            let (name, elev, height) = match &args[..] {
+                [name, elev] => (*name, *elev, None),
+                [name, elev, "height" | "h", h] => (*name, *elev, Some(number(h)?)),
+                _ => {
+                    return wrong(
+                        "story",
+                        "a name, an elevation and an optional 'height <h>'",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::DefStory {
+                name: name.to_string(),
+                elevation: number(elev)?,
+                height,
+            })
         }
+        "levels" | "stories" => {
+            if args.is_empty() {
+                Ok(Command::StoryList)
+            } else {
+                wrong("levels", "no arguments", &args)
+            }
+        }
+        "fromlayer" => parse_fromlayer(&args),
         "rooms" => {
             if args.is_empty() {
                 Ok(Command::RoomList)
@@ -1770,6 +2066,94 @@ fn parse_section(args: &[&str]) -> Result<Command, ParseError> {
         }
     };
     Ok(Command::DefSection { name: (*name).to_string(), section })
+}
+
+/// `xref` subcommands:
+///   `xref attach <path> [at x,y,z] [scale s] [rot deg]`
+///   `xref list`
+///   `xref reload <name>`
+///   `xref detach <name>`
+///
+/// `attach` parses the trailing `at`/`scale`/`rot` keyword modifiers off the end
+/// and joins the remaining leading tokens as the path, so paths with spaces
+/// survive (same spirit as `import`). Keyword order is free.
+fn parse_xref(args: &[&str]) -> Result<Command, ParseError> {
+    match args.split_first() {
+        Some((&"list", rest)) => {
+            expect_empty("xref", rest, args)?;
+            Ok(Command::XrefList)
+        }
+        Some((&"reload", rest)) => {
+            let name = rest.join(" ");
+            if name.is_empty() {
+                return wrong("xref", "'reload <name>'", args);
+            }
+            Ok(Command::XrefReload { name, geometries: None })
+        }
+        Some((&"detach", rest)) => {
+            let name = rest.join(" ");
+            if name.is_empty() {
+                return wrong("xref", "'detach <name>'", args);
+            }
+            Ok(Command::XrefDetach { name })
+        }
+        Some((&"attach", rest)) => {
+            // Pull the `at x,y,z` / `scale s` / `rot deg` keyword modifiers off
+            // the tail; whatever remains is the (possibly spaced) path.
+            let mut at = None;
+            let mut scale = None;
+            let mut rotation_deg = None;
+            let mut path_toks: Vec<&str> = Vec::new();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "at" => {
+                        let v = rest.get(i + 1).ok_or_else(|| {
+                            wrong_err("xref", "a point after 'at' (x,y,z)", args)
+                        })?;
+                        at = Some(point(v)?);
+                        i += 2;
+                    }
+                    "scale" => {
+                        let v = rest.get(i + 1).ok_or_else(|| {
+                            wrong_err("xref", "a number after 'scale'", args)
+                        })?;
+                        scale = Some(number(v)?);
+                        i += 2;
+                    }
+                    "rot" | "rotation" => {
+                        let v = rest.get(i + 1).ok_or_else(|| {
+                            wrong_err("xref", "a number after 'rot'", args)
+                        })?;
+                        rotation_deg = Some(number(v)?);
+                        i += 2;
+                    }
+                    tok => {
+                        path_toks.push(tok);
+                        i += 1;
+                    }
+                }
+            }
+            let path = path_toks.join(" ");
+            if path.is_empty() {
+                return wrong("xref", "'attach <path> [at x,y,z] [scale s] [rot deg]'", args);
+            }
+            Ok(Command::XrefAttach {
+                path,
+                at,
+                scale,
+                rotation_deg,
+                id: None,
+                name: None,
+                geometries: None,
+            })
+        }
+        _ => wrong(
+            "xref",
+            "'attach <path> [at x,y,z] [scale s] [rot deg]', 'list', 'reload <name>' or 'detach <name>'",
+            args,
+        ),
+    }
 }
 
 /// `pblock <name> [pname=default ...] : templ line 1 ; templ line 2 ; ...`
@@ -2353,6 +2737,83 @@ fn parse_area(kind: AreaKind, args: &[&str]) -> Result<Command, ParseError> {
     Ok(Command::AreaMember { id: None, kind, boundary, thickness, material })
 }
 
+/// `fromlayer <layer> wall thick <t> [height <h> | level <name>]`
+///
+/// Consume the curves on `<layer>` and build BIM elements. Only `wall` is
+/// supported today; the wall rises from the level base to base+height, `t`
+/// metres thick. Exactly one of `height`/`level` must be given.
+fn parse_fromlayer(args: &[&str]) -> Result<Command, ParseError> {
+    let [layer, element] = match args {
+        [l, e, ..] => [*l, *e],
+        _ => {
+            return wrong(
+                "fromlayer",
+                "a layer, an element kind (wall), then 'thick <t>' and 'height <h>' or 'level <name>'",
+                args,
+            )
+        }
+    };
+    let element = match element {
+        "wall" => AreaKind::Wall,
+        "slab" | "column" => {
+            return Err(wrong_err(
+                "fromlayer",
+                "element 'wall' (slab/column not yet supported)",
+                args,
+            ))
+        }
+        _ => {
+            return Err(wrong_err(
+                "fromlayer",
+                "a known element kind: 'wall'",
+                args,
+            ))
+        }
+    };
+    // Parse the trailing keyword options: thick <t>, and height <h> | level <n>.
+    let mut rest = &args[2..];
+    let mut thickness: Option<f64> = None;
+    let mut height: Option<f64> = None;
+    let mut level: Option<String> = None;
+    while let [kw, val, tail @ ..] = rest {
+        match *kw {
+            "thick" | "thickness" => thickness = Some(number(val)?),
+            "height" | "h" => height = Some(number(val)?),
+            "level" | "story" => level = Some((*val).to_string()),
+            _ => {
+                return Err(wrong_err(
+                    "fromlayer",
+                    "options 'thick <t>', 'height <h>' or 'level <name>'",
+                    args,
+                ))
+            }
+        }
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        return wrong("fromlayer", "each option as a keyword and a value", args);
+    }
+    let Some(thickness) = thickness else {
+        return wrong("fromlayer", "a wall thickness via 'thick <t>'", args);
+    };
+    match (height, &level) {
+        (Some(_), Some(_)) => {
+            wrong("fromlayer", "either 'height <h>' or 'level <name>', not both", args)
+        }
+        (None, None) => {
+            wrong("fromlayer", "a 'height <h>' or a 'level <name>'", args)
+        }
+        _ => Ok(Command::FromLayer {
+            layer: layer.to_string(),
+            element,
+            thickness,
+            height,
+            level,
+            created: Vec::new(),
+        }),
+    }
+}
+
 fn take<'a, const N: usize>(
     command: &'static str,
     expected: &'static str,
@@ -2648,6 +3109,119 @@ pub fn number(s: &str) -> Result<f64, ParseError> {
 }
 
 /// `x,y` (z=0) or `x,y,z`, each component with optional units.
+/// Parse the `cplane` (alias `ucs`) verb into a [`CPlaneOp`]. Forms:
+///   cplane                              → report the active plane
+///   cplane world                        → reset to world XY
+///   cplane origin <x,y,z> normal <x,y,z>→ origin + normal
+///   cplane 3point <o> <px> <py>         → origin, point-on-X, point-in-XY
+///   cplane save <name>                  → save active plane
+///   cplane <name>                       → recall a saved plane
+///
+/// Definition points are parsed as plain WORLD literals (a CPlane is defined in
+/// world space); they are NOT themselves re-projected through the active plane.
+fn parse_cplane(args: &[&str]) -> Result<Command, ParseError> {
+    let op = match args {
+        [] => CPlaneOp::Report,
+        ["world"] | ["reset"] | ["off"] => CPlaneOp::World,
+        ["origin", o, "normal", n] => CPlaneOp::OriginNormal {
+            origin: point(o)?,
+            normal: point(n)?,
+        },
+        ["3point", o, px, py] | ["3pt", o, px, py] => CPlaneOp::ThreePoint {
+            origin: point(o)?,
+            on_x: point(px)?,
+            on_xy: point(py)?,
+        },
+        ["save", name] => CPlaneOp::Save { name: (*name).to_string() },
+        [name] => CPlaneOp::Recall { name: (*name).to_string() },
+        _ => {
+            return wrong(
+                "cplane",
+                "world | origin <x,y,z> normal <x,y,z> | 3point <o> <px> <py> | save <name> | <name>",
+                args,
+            )
+        }
+    };
+    Ok(Command::CPlane { op })
+}
+
+/// Parse the `plotstyle` verb (plot styles / CTB-STB pen tables). Forms:
+///   plotstyle new <name>
+///   plotstyle set <name> <key> color <r,g,b> [weight <w>] [screen <pct>]
+///   plotstyle list [<name>]
+///   plotstyle apply <name>
+///   plotstyle none
+///   plotstyle delete <name>
+///
+/// `<key>` is a layer name (may contain spaces, so it is a single joined token
+/// — callers quote or use a name without spaces; a bare `set` glues the words
+/// up to `color`) or a color token `r,g,b`. Plot properties never touch the
+/// model; they apply only at print/export.
+fn parse_plotstyle(args: &[&str]) -> Result<Command, ParseError> {
+    let usage = "new <name> | set <name> <key> color <r,g,b> [weight <w>] [screen <pct>] | list [<name>] | apply <name> | none | delete <name>";
+    let op = match args {
+        ["new", name] => PlotStyleOp::New { name: (*name).to_string() },
+        ["list"] => PlotStyleOp::List { name: None },
+        ["list", name] => PlotStyleOp::List { name: Some((*name).to_string()) },
+        ["apply", name] => PlotStyleOp::Apply { name: (*name).to_string() },
+        ["none"] => PlotStyleOp::None,
+        ["delete", name] => PlotStyleOp::Delete { name: (*name).to_string() },
+        // set <name> <key> color <r,g,b> [weight <w>] [screen <pct>]
+        ["set", name, key, rest @ ..] => {
+            let mut color: Option<[f32; 3]> = None;
+            let mut weight_mm: Option<f64> = None;
+            let mut screen: Option<f64> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "color" => {
+                        let v = rest.get(i + 1).ok_or_else(|| {
+                            wrong_err("plotstyle", "color <r,g,b>", args)
+                        })?;
+                        color = Some(color3(v)?);
+                        i += 2;
+                    }
+                    "weight" => {
+                        let v = rest.get(i + 1).ok_or_else(|| {
+                            wrong_err("plotstyle", "weight <mm>", args)
+                        })?;
+                        let w = number(v)?;
+                        if w <= 0.0 {
+                            return wrong("plotstyle", "a positive lineweight in mm", args);
+                        }
+                        weight_mm = Some(w);
+                        i += 2;
+                    }
+                    "screen" => {
+                        let v = rest.get(i + 1).ok_or_else(|| {
+                            wrong_err("plotstyle", "screen <pct 0..100>", args)
+                        })?;
+                        let s = number(v)?;
+                        if !(0.0..=100.0).contains(&s) {
+                            return wrong("plotstyle", "a screening percentage 0..100", args);
+                        }
+                        screen = Some(s);
+                        i += 2;
+                    }
+                    _ => return wrong("plotstyle", usage, args),
+                }
+            }
+            let Some(color) = color else {
+                return wrong("plotstyle", "set … color <r,g,b>", args);
+            };
+            PlotStyleOp::Set {
+                name: (*name).to_string(),
+                key: (*key).to_string(),
+                color,
+                weight_mm,
+                screen,
+            }
+        }
+        _ => return wrong("plotstyle", usage, args),
+    };
+    Ok(Command::PlotStyle(op))
+}
+
 pub fn point(s: &str) -> Result<DVec3, ParseError> {
     let parts: Vec<&str> = s.split(',').collect();
     let bad = || ParseError::BadPoint(s.to_string());
@@ -2892,7 +3466,7 @@ fn selector<'a>(
     }
 }
 
-fn selector_one(s: &str) -> Result<Selector, ParseError> {
+pub(crate) fn selector_one(s: &str) -> Result<Selector, ParseError> {
     let args = [s];
     selector(&args, "extrude").map(|(sel, _)| sel)
 }
@@ -2912,6 +3486,35 @@ fn dim_anchor(tok: &str) -> Result<DimAnchorSpec, ParseError> {
         return Ok(DimAnchorSpec::Object { target, which });
     }
     Ok(DimAnchorSpec::Free(point(tok)?))
+}
+
+/// Parse a `field` expression from its words (the tokens after the position and
+/// before any trailing height). The selector-backed sources store the raw
+/// selector token verbatim so the field-refresh pass can re-resolve it against
+/// the live document; we still validate it here so a bad selector fails at parse
+/// time, not silently at eval.
+fn field_expr(words: &[&str]) -> Result<FieldExpr, ParseError> {
+    match words {
+        ["area", sel] => {
+            selector_one(sel)?;
+            Ok(FieldExpr::Area { selector: (*sel).to_string() })
+        }
+        ["length", sel] => {
+            selector_one(sel)?;
+            Ok(FieldExpr::Length { selector: (*sel).to_string() })
+        }
+        ["count", sel] => {
+            selector_one(sel)?;
+            Ok(FieldExpr::Count { selector: (*sel).to_string() })
+        }
+        ["layer"] => Ok(FieldExpr::Layer),
+        ["units"] => Ok(FieldExpr::Units),
+        _ => Err(wrong_err(
+            "field",
+            "an expression: area <sel> | length <sel> | count <sel> | layer | units",
+            words,
+        )),
+    }
 }
 
 fn closest_command(input: &str) -> Option<String> {
@@ -3501,6 +4104,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_cplane_all_forms() {
+        assert_eq!(parse("cplane").unwrap(), Command::CPlane { op: CPlaneOp::Report });
+        assert_eq!(parse("cplane world").unwrap(), Command::CPlane { op: CPlaneOp::World });
+        // `ucs` alias resolves to the same command.
+        assert_eq!(parse("ucs world").unwrap(), Command::CPlane { op: CPlaneOp::World });
+        assert_eq!(
+            parse("cplane origin 0,0,10 normal 0,0,1").unwrap(),
+            Command::CPlane {
+                op: CPlaneOp::OriginNormal {
+                    origin: DVec3::new(0.0, 0.0, 10.0),
+                    normal: DVec3::new(0.0, 0.0, 1.0),
+                }
+            }
+        );
+        assert_eq!(
+            parse("cplane 3point 0,0,0 1,0,0 0,1,0").unwrap(),
+            Command::CPlane {
+                op: CPlaneOp::ThreePoint {
+                    origin: DVec3::ZERO,
+                    on_x: DVec3::new(1.0, 0.0, 0.0),
+                    on_xy: DVec3::new(0.0, 1.0, 0.0),
+                }
+            }
+        );
+        assert_eq!(
+            parse("cplane save top").unwrap(),
+            Command::CPlane { op: CPlaneOp::Save { name: "top".into() } }
+        );
+        assert_eq!(
+            parse("cplane top").unwrap(),
+            Command::CPlane { op: CPlaneOp::Recall { name: "top".into() } }
+        );
+        // Malformed forms are rejected with a usage hint.
+        assert!(parse("cplane origin 0,0,0").is_err());
+        assert!(parse("cplane 3point 0,0,0 1,0,0").is_err());
+    }
+
+    #[test]
     fn parse_underlay_opacity_and_off() {
         assert_eq!(
             parse("underlayopacity 0.4").unwrap(),
@@ -3512,8 +4153,60 @@ mod tests {
     }
 
     #[test]
+    fn parse_underlay_transforms() {
+        assert_eq!(
+            parse("underlaymove 2,-3").unwrap(),
+            Command::UnderlayMove { dx: 2.0, dy: -3.0 }
+        );
+        assert_eq!(
+            parse("underlayscale 1.5").unwrap(),
+            Command::UnderlayScale { factor: 1.5 }
+        );
+        assert!(parse("underlayscale 0").unwrap_err().to_string().contains("positive"));
+        assert!(parse("underlayscale -2").is_err());
+        assert_eq!(
+            parse("underlayrotate 30").unwrap(),
+            Command::UnderlayRotate { deg: 30.0 }
+        );
+        assert_eq!(
+            parse("underlayrotate -45").unwrap(),
+            Command::UnderlayRotate { deg: -45.0 }
+        );
+        assert_eq!(
+            parse("underlayplace 0,0 20").unwrap(),
+            Command::UnderlayPlace { corner: DVec3::new(0.0, 0.0, 0.0), width: 20.0, rot_deg: None }
+        );
+        assert_eq!(
+            parse("underlayplace 1,2 20 15").unwrap(),
+            Command::UnderlayPlace {
+                corner: DVec3::new(1.0, 2.0, 0.0),
+                width: 20.0,
+                rot_deg: Some(15.0)
+            }
+        );
+        assert!(parse("underlaymove").is_err());
+        assert!(parse("underlayrotate").is_err());
+        assert!(parse("underlayplace 0,0").is_err());
+        // all logged so files carry the transforms through replay
+        assert!(parse("underlaymove 1,1").unwrap().is_logged());
+        assert!(parse("underlayscale 2").unwrap().is_logged());
+        assert!(parse("underlayrotate 10").unwrap().is_logged());
+        assert!(parse("underlayplace 0,0 5").unwrap().is_logged());
+    }
+
+    #[test]
     fn underlay_json_roundtrip() {
-        for line in ["underlay a.png", "underlay a.png 1,2 5", "underlayopacity 0.3", "underlayoff"] {
+        for line in [
+            "underlay a.png",
+            "underlay a.png 1,2 5",
+            "underlayopacity 0.3",
+            "underlaymove 2,3",
+            "underlayscale 1.5",
+            "underlayrotate 45",
+            "underlayplace 0,0 20",
+            "underlayplace 1,2 20 15",
+            "underlayoff",
+        ] {
             let cmd = parse(line).unwrap();
             let json = serde_json::to_string(&cmd).unwrap();
             let back: Command = serde_json::from_str(&json).unwrap();
@@ -3641,6 +4334,107 @@ mod tests {
     }
 
     #[test]
+    fn parse_align() {
+        // Core 4-point form, scale defaults off; round-trips through JSON.
+        let cmd = parse("align last 0,0,0 5,5,0 1,0,0 5,6,0").unwrap();
+        match &cmd {
+            Command::Align { targets, src1, tgt1, src2, tgt2, scale } => {
+                assert!(matches!(targets, Selector::Last { n: 1 }));
+                assert_eq!(*src1, DVec3::new(0.0, 0.0, 0.0));
+                assert_eq!(*tgt1, DVec3::new(5.0, 5.0, 0.0));
+                assert_eq!(*src2, DVec3::new(1.0, 0.0, 0.0));
+                assert_eq!(*tgt2, DVec3::new(5.0, 6.0, 0.0));
+                assert!(!scale);
+            }
+            other => panic!("expected Align, got {other:?}"),
+        }
+        let back: Command = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+        assert_eq!(cmd, back);
+
+        // `orient` alias + explicit `scale on`.
+        assert!(matches!(
+            parse("orient all 0,0,0 0,0,0 1,0,0 2,0,0 scale on").unwrap(),
+            Command::Align { targets: Selector::All, scale: true, .. }
+        ));
+        // bare `on`/`off` shorthand also accepted.
+        assert!(matches!(
+            parse("align last 0,0,0 0,0,0 1,0,0 2,0,0 on").unwrap(),
+            Command::Align { scale: true, .. }
+        ));
+
+        // Too few points / garbage trailer are errors.
+        assert!(parse("align last 0,0,0 5,5,0 1,0,0").is_err());
+        assert!(parse("align last 0,0,0 5,5,0 1,0,0 5,6,0 wat").is_err());
+    }
+
+    #[test]
+    fn parse_new_edit_verbs() {
+        // tozero / toorigin: selector only, round-trips through JSON.
+        for line in ["tozero all", "toorigin last 2"] {
+            let cmd = parse(line).unwrap();
+            assert!(matches!(cmd, Command::ToOrigin { .. }), "{line}");
+            let back: Command =
+                serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+            assert_eq!(cmd, back, "{line}");
+        }
+        assert!(parse("tozero all extra").is_err());
+
+        // flatten
+        assert!(matches!(parse("flatten last").unwrap(), Command::Flatten { .. }));
+        assert!(parse("flatten").is_err());
+
+        // stretch: selector + box min + box max + delta
+        match parse("stretch all 0,0,-10 5,5,10 1,2,0").unwrap() {
+            Command::Stretch { targets, min, max, delta } => {
+                assert!(matches!(targets, Selector::All));
+                assert_eq!(min, DVec3::new(0.0, 0.0, -10.0));
+                assert_eq!(max, DVec3::new(5.0, 5.0, 10.0));
+                assert_eq!(delta, DVec3::new(1.0, 2.0, 0.0));
+            }
+            other => panic!("expected Stretch, got {other:?}"),
+        }
+        // Missing operands / selector are errors.
+        assert!(parse("stretch all 0,0,0 5,5,5").is_err());
+        assert!(parse("stretch").is_err());
+
+        // selsimilar: default layer, plus explicit properties + alias
+        assert!(matches!(
+            parse("selsimilar last").unwrap(),
+            Command::SelSimilar { by: SimilarBy::Layer, .. }
+        ));
+        assert!(matches!(
+            parse("selsim last color").unwrap(),
+            Command::SelSimilar { by: SimilarBy::Color, .. }
+        ));
+        assert!(matches!(
+            parse("selsimilar all type").unwrap(),
+            Command::SelSimilar { by: SimilarBy::Type, .. }
+        ));
+        assert!(parse("selsimilar last bogus").is_err());
+
+        // dimradius / dimdiameter (+ aliases), round-trip
+        assert!(matches!(
+            parse("dimradius last").unwrap(),
+            Command::DimRadius { diameter: false, .. }
+        ));
+        assert!(matches!(
+            parse("dimrad last").unwrap(),
+            Command::DimRadius { diameter: false, .. }
+        ));
+        assert!(matches!(
+            parse("dimdiameter last").unwrap(),
+            Command::DimRadius { diameter: true, .. }
+        ));
+        assert!(matches!(
+            parse("dimdia last").unwrap(),
+            Command::DimRadius { diameter: true, .. }
+        ));
+        let cmd = parse("dimradius last").unwrap();
+        let back: Command = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
     fn parse_array_commands() {
         assert_eq!(
             parse("array last 5,3,1 3,4,0").unwrap(),
@@ -3706,6 +4500,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_arraycurve() {
+        // Two selectors then a count; alignment defaults on.
+        assert_eq!(
+            parse("arraycurve widget path 5").unwrap(),
+            Command::ArrayCurve {
+                ids: None,
+                targets: Selector::Named { name: "widget".into() },
+                path: Selector::Named { name: "path".into() },
+                count: 5,
+                align: true,
+            }
+        );
+        // Alias + explicit `align off`.
+        assert!(matches!(
+            parse("patharray widget path 3 align off").unwrap(),
+            Command::ArrayCurve { count: 3, align: false, .. }
+        ));
+        // Bare `on`/`off` also accepted.
+        assert!(matches!(
+            parse("arraycurve widget path 3 off").unwrap(),
+            Command::ArrayCurve { align: false, .. }
+        ));
+        // Missing count → clear error.
+        assert!(parse("arraycurve widget path").unwrap_err().to_string().contains("count"));
+        // Trailing junk → error.
+        assert!(parse("arraycurve widget path 5 sideways").is_err());
+    }
+
+    #[test]
     fn array_command_json_roundtrip() {
         for line in [
             "array last 5,3,1 3,4,0",
@@ -3756,6 +4579,12 @@ mod tests {
                 keep,
             } if keep == DVec3::new(1.0, 1.0, 0.0)
         ));
+        assert!(matches!(
+            parse("powertrim wall 5,0").unwrap(),
+            Command::PowerTrim { ids: None, target: Selector::Named { .. }, pick }
+                if pick == DVec3::new(5.0, 0.0, 0.0)
+        ));
+        assert!(parse("powertrim wall").unwrap_err().to_string().contains("pick point"));
         // extend: backtrack makes "last 2" read as last + distance 2
         assert!(matches!(
             parse("extend last 2").unwrap(),
@@ -3798,6 +4627,7 @@ mod tests {
         for line in [
             "split last 5,0",
             "trim wall slab 1,1",
+            "powertrim wall 5,0",
             "extend last 0.5",
             "join last 3",
             "fillet last 2 0.5",
@@ -4135,6 +4965,78 @@ mod tests {
     }
 
     #[test]
+    fn plotstyle_parse_all_forms() {
+        assert_eq!(
+            parse("plotstyle new mono").unwrap(),
+            Command::PlotStyle(PlotStyleOp::New { name: "mono".into() })
+        );
+        assert_eq!(
+            parse("plotstyle list").unwrap(),
+            Command::PlotStyle(PlotStyleOp::List { name: None })
+        );
+        assert_eq!(
+            parse("plotstyle list mono").unwrap(),
+            Command::PlotStyle(PlotStyleOp::List { name: Some("mono".into()) })
+        );
+        assert_eq!(
+            parse("plotstyle apply mono").unwrap(),
+            Command::PlotStyle(PlotStyleOp::Apply { name: "mono".into() })
+        );
+        assert_eq!(
+            parse("plotstyle none").unwrap(),
+            Command::PlotStyle(PlotStyleOp::None)
+        );
+        assert_eq!(
+            parse("plotstyle delete mono").unwrap(),
+            Command::PlotStyle(PlotStyleOp::Delete { name: "mono".into() })
+        );
+        // set with all optional props
+        assert_eq!(
+            parse("plotstyle set mono walls color 255,0,0 weight 0.5 screen 50").unwrap(),
+            Command::PlotStyle(PlotStyleOp::Set {
+                name: "mono".into(),
+                key: "walls".into(),
+                color: [1.0, 0.0, 0.0],
+                weight_mm: Some(0.5),
+                screen: Some(50.0),
+            })
+        );
+        // set with only color
+        assert_eq!(
+            parse("plotstyle set mono walls color 0,0,0").unwrap(),
+            Command::PlotStyle(PlotStyleOp::Set {
+                name: "mono".into(),
+                key: "walls".into(),
+                color: [0.0, 0.0, 0.0],
+                weight_mm: None,
+                screen: None,
+            })
+        );
+        // errors
+        assert!(parse("plotstyle set mono walls weight 0.5").is_err(), "color required");
+        assert!(parse("plotstyle set mono walls color 0,0,0 screen 150").is_err(), "screen range");
+        assert!(parse("plotstyle set mono walls color 0,0,0 weight -1").is_err(), "weight sign");
+        assert!(parse("plotstyle bogus").is_err());
+    }
+
+    #[test]
+    fn plotstyle_json_roundtrip() {
+        for line in [
+            "plotstyle new mono",
+            "plotstyle set mono walls color 0,0,0 weight 0.5 screen 50",
+            "plotstyle apply mono",
+            "plotstyle none",
+            "plotstyle list mono",
+            "plotstyle delete mono",
+        ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "roundtrip failed for `{line}`");
+        }
+    }
+
+    #[test]
     fn layer_command_json_roundtrip() {
         for line in [
             "layer walls",
@@ -4196,6 +5098,42 @@ mod tests {
         ));
         assert!(parse("text 0,0").is_err());
 
+        // field: expr sources round-trip, optional trailing height
+        assert_eq!(
+            parse("field 5,3 area last").unwrap(),
+            Command::Field {
+                id: None,
+                pos: DVec3::new(5.0, 3.0, 0.0),
+                expr: FieldExpr::Area { selector: "last".into() },
+                height: DEFAULT_TEXT_HEIGHT,
+            }
+        );
+        assert_eq!(
+            parse("field 0,0 length wall 0.3").unwrap(),
+            Command::Field {
+                id: None,
+                pos: DVec3::ZERO,
+                expr: FieldExpr::Length { selector: "wall".into() },
+                height: 0.3,
+            }
+        );
+        assert!(matches!(
+            parse("field 0,0 count all").unwrap(),
+            Command::Field { expr: FieldExpr::Count { ref selector }, .. } if selector == "all"
+        ));
+        assert!(matches!(
+            parse("field 0,0 layer").unwrap(),
+            Command::Field { expr: FieldExpr::Layer, .. }
+        ));
+        assert!(matches!(
+            parse("field 0,0 units").unwrap(),
+            Command::Field { expr: FieldExpr::Units, .. }
+        ));
+        // bad/empty expressions fail at parse time
+        assert!(parse("field 0,0").is_err());
+        assert!(parse("field 0,0 bogus last").is_err());
+        assert!(parse("field 0,0 area").is_err());
+
         // hatch: default solid, explicit patterns
         use itsjustcad_doc::HatchPattern;
         assert!(matches!(
@@ -4231,6 +5169,25 @@ mod tests {
         assert!(parse("hatch last ansi30").is_err()); // outside the standard set
         assert!(parse("hatch last ansi39").is_err());
         assert!(parse("hatch last dots").is_err());
+
+        // boundary: seed point, optional `from <selector>`.
+        assert!(matches!(
+            parse("boundary 5,3").unwrap(),
+            Command::Boundary { seed, from: None, .. }
+                if seed == DVec3::new(5.0, 3.0, 0.0)
+        ));
+        assert!(matches!(
+            parse("boundary 1,2,3 from all").unwrap(),
+            Command::Boundary { seed, from: Some(Selector::All), .. }
+                if seed == DVec3::new(1.0, 2.0, 3.0)
+        ));
+        assert!(matches!(
+            parse("boundary 0,0 from walls").unwrap(),
+            Command::Boundary { from: Some(Selector::Named { .. }), .. }
+        ));
+        assert!(parse("boundary").is_err());
+        assert!(parse("boundary 5,3 from").is_err());
+        assert!(parse("boundary 5,3 all").is_err()); // missing the `from` keyword
     }
 
     #[test]
@@ -4286,6 +5243,47 @@ mod tests {
         assert!(parse("sheetview plan top 1:0").unwrap_err().to_string().contains("1:100"));
         assert!(parse("sheet").unwrap_err().to_string().contains("name"));
         assert!(parse("print plan").unwrap_err().to_string().contains("path"));
+    }
+
+    #[test]
+    fn parse_sheetset_commands() {
+        assert_eq!(
+            parse("sheetset new plans").unwrap(),
+            Command::SheetSet(SheetSetOp::New { name: "plans".into() })
+        );
+        assert_eq!(
+            parse("sheetset add a-101").unwrap(),
+            Command::SheetSet(SheetSetOp::Add { sheet: "a-101".into() })
+        );
+        assert_eq!(
+            parse("sheetset remove a-101").unwrap(),
+            Command::SheetSet(SheetSetOp::Remove { sheet: "a-101".into() })
+        );
+        // `rm` alias
+        assert_eq!(
+            parse("sheetset rm a-101").unwrap(),
+            Command::SheetSet(SheetSetOp::Remove { sheet: "a-101".into() })
+        );
+        assert_eq!(
+            parse("sheetset order a-102 1").unwrap(),
+            Command::SheetSet(SheetSetOp::Order { sheet: "a-102".into(), index: 1 })
+        );
+        assert_eq!(
+            parse("sheetset list").unwrap(),
+            Command::SheetSet(SheetSetOp::List)
+        );
+        assert_eq!(
+            parse("sheetset publish").unwrap(),
+            Command::SheetSet(SheetSetOp::Publish { path: None })
+        );
+        assert_eq!(
+            parse("sheetset publish /tmp/set.pdf").unwrap(),
+            Command::SheetSet(SheetSetOp::Publish { path: Some("/tmp/set.pdf".into()) })
+        );
+        // errors
+        assert!(parse("sheetset order a 0").is_ok()); // 0 parses (exec rejects it)
+        assert!(parse("sheetset order a x").unwrap_err().to_string().contains("number"));
+        assert!(parse("sheetset bogus").unwrap_err().to_string().contains("new"));
     }
 
     #[test]
@@ -4509,12 +5507,62 @@ mod tests {
     fn story_parses() {
         assert!(matches!(
             parse("story L1 3.5").unwrap(),
-            Command::DefStory { .. }
+            Command::DefStory { height: None, .. }
         ));
         assert!(matches!(
             parse("level L1 3.5").unwrap(),
-            Command::DefStory { .. }
+            Command::DefStory { height: None, .. }
         ));
+        // Optional floor-to-floor height.
+        let Command::DefStory { name, elevation, height } =
+            parse("level L1 0 height 3.5").unwrap()
+        else {
+            panic!("expected DefStory");
+        };
+        assert_eq!(name, "L1");
+        assert_eq!(elevation, 0.0);
+        assert_eq!(height, Some(3.5));
+    }
+
+    #[test]
+    fn levels_list_parses() {
+        assert!(matches!(parse("levels").unwrap(), Command::StoryList));
+        assert!(matches!(parse("stories").unwrap(), Command::StoryList));
+        assert!(parse("levels extra").is_err());
+    }
+
+    #[test]
+    fn fromlayer_parses_height_and_level() {
+        let Command::FromLayer { layer, element, thickness, height, level, .. } =
+            parse("fromlayer WALLS wall thick 0.2 height 3").unwrap()
+        else {
+            panic!("expected FromLayer");
+        };
+        assert_eq!(layer, "WALLS");
+        assert_eq!(element, AreaKind::Wall);
+        assert_eq!(thickness, 0.2);
+        assert_eq!(height, Some(3.0));
+        assert_eq!(level, None);
+
+        let Command::FromLayer { level, height, .. } =
+            parse("fromlayer A-WALL wall thick 0.15 level L1").unwrap()
+        else {
+            panic!("expected FromLayer");
+        };
+        assert_eq!(level.as_deref(), Some("L1"));
+        assert_eq!(height, None);
+    }
+
+    #[test]
+    fn fromlayer_rejects_bad_forms() {
+        // Missing thickness.
+        assert!(parse("fromlayer WALLS wall height 3").is_err());
+        // Neither height nor level.
+        assert!(parse("fromlayer WALLS wall thick 0.2").is_err());
+        // Both height and level.
+        assert!(parse("fromlayer WALLS wall thick 0.2 height 3 level L1").is_err());
+        // Unsupported element.
+        assert!(parse("fromlayer WALLS door thick 0.2 height 3").is_err());
     }
 
     #[test]
@@ -4642,5 +5690,78 @@ mod tests {
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, back);
         assert!(parse("controlimages").unwrap_err().to_string().contains("prefix"));
+    }
+
+    #[test]
+    fn xref_subcommands_parse_and_roundtrip() {
+        // attach with all modifiers (free keyword order).
+        let cmd = parse("xref attach /tmp/site.dxf at 1,2,3 scale 2 rot 90").unwrap();
+        assert_eq!(
+            cmd,
+            Command::XrefAttach {
+                path: "/tmp/site.dxf".into(),
+                at: Some(DVec3::new(1.0, 2.0, 3.0)),
+                scale: Some(2.0),
+                rotation_deg: Some(90.0),
+                id: None,
+                name: None,
+                geometries: None,
+            }
+        );
+        // bare attach (no modifiers).
+        assert_eq!(
+            parse("xref attach /tmp/a.dxf").unwrap(),
+            Command::XrefAttach {
+                path: "/tmp/a.dxf".into(),
+                at: None,
+                scale: None,
+                rotation_deg: None,
+                id: None,
+                name: None,
+                geometries: None,
+            }
+        );
+        assert_eq!(parse("xref list").unwrap(), Command::XrefList);
+        assert_eq!(
+            parse("xref reload site").unwrap(),
+            Command::XrefReload { name: "site".into(), geometries: None }
+        );
+        assert_eq!(
+            parse("xref detach site").unwrap(),
+            Command::XrefDetach { name: "site".into() }
+        );
+        // Every subcommand JSON round-trips.
+        for line in [
+            "xref attach /tmp/site.dxf at 1,2,3 scale 2 rot 90",
+            "xref list",
+            "xref reload site",
+            "xref detach site",
+        ] {
+            let cmd = parse(line).unwrap();
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, back, "roundtrip failed for: {line}");
+        }
+        // Errors: missing path / name / unknown subcommand.
+        assert!(parse("xref attach").is_err());
+        assert!(parse("xref reload").is_err());
+        assert!(parse("xref detach").is_err());
+        assert!(parse("xref bogus").is_err());
+    }
+
+    #[test]
+    fn ncopy_parses_and_roundtrips() {
+        let cmd = parse("ncopy last 2").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Ncopy { target: Selector::Last { n: 1 }, index: 2, id: None }
+        );
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+        // Needs a selector AND an index.
+        assert!(parse("ncopy").is_err());
+        assert!(parse("ncopy last").is_err());
+        assert!(parse("ncopy last x").is_err());
     }
 }

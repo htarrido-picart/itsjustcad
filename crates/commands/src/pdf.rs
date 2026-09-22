@@ -116,7 +116,9 @@ fn geometry_segments(doc: &Document, geometry: &Geometry, out: &mut Vec<(DVec3, 
         // Text annotations: tessellate via Hershey stroke font into world-space
         // segments. This makes them appear in viewports at world scale and in
         // PDF/SVG/DXF exports consistently (same path as geometry).
-        Geometry::Annotation(Annotation::Text { pos, text, height }) => {
+        // Fields share the text path — `text` is the resolved field value.
+        Geometry::Annotation(Annotation::Text { pos, text, height })
+        | Geometry::Annotation(Annotation::Field { pos, text, height, .. }) => {
             let strokes = itsjustcad_doc::hershey::text_strokes(text, [pos.x, pos.y], *height);
             for poly in strokes {
                 for pair in poly.windows(2) {
@@ -386,12 +388,16 @@ fn render_view(
         view.scale
     ));
 
-    // Collect (lineweight_mm, world-segment) pairs.
-    // Per-object lineweight beats layer lineweight (mirror the color override pattern).
-    let mut weighted_segs: Vec<(f64, DVec3, DVec3)> = Vec::new();
+    // Collect (lineweight_mm, plot_color, world-segment) tuples.
+    // Per-object lineweight beats layer lineweight (mirror the color override
+    // pattern). The plot pen (color + weight) is resolved through the active
+    // plot style, if any: `doc.plot_pen` returns the base pen (default black)
+    // for unmapped objects, so the drawing is unchanged without a plot style.
+    let mut weighted_segs: Vec<(f64, [f32; 3], DVec3, DVec3)> = Vec::new();
     for obj in doc.objects() {
         if obj.visible && doc.layer_visible(&obj.layer) {
-            let w = doc.effective_lineweight(obj);
+            let pen = doc.plot_pen(obj, [0.0, 0.0, 0.0]);
+            let w = pen.weight_mm;
             let mut tmp = Vec::new();
             geometry_segments(doc, &obj.geometry, &mut tmp);
             // Planting plan: in a Top (plan) view, a mesh named `plant:<id>`
@@ -406,7 +412,7 @@ fn render_view(
                 tmp.extend(sym);
             }
             for (a, b) in tmp {
-                weighted_segs.push((w, a, b));
+                weighted_segs.push((w, pen.color, a, b));
             }
         }
     }
@@ -416,7 +422,7 @@ fn render_view(
 
     // Compute bounds for centering (weight-independent).
     let (mut lo, mut hi) = (DVec2::MAX, DVec2::MIN);
-    for &(_, a, b) in &weighted_segs {
+    for &(_, _, a, b) in &weighted_segs {
         let pa = {
             let p = project(view.direction, a);
             DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
@@ -432,13 +438,20 @@ fn render_view(
     let pad = 1.0;
     let (cmin, cmax) = (rmin + DVec2::splat(pad), rmax - DVec2::splat(pad));
 
-    // Sort by lineweight so we can batch `w` operators.
-    weighted_segs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort by (lineweight, color) so we can batch `w` and `RG` operators.
+    weighted_segs.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
 
     let mut drawn = 0usize;
-    // Use a sentinel that guarantees the first segment always emits a `w` op.
+    // Use sentinels that guarantee the first segment always emits `w`/`RG` ops.
     let mut cur_w = -1.0_f64;
-    for (w, wa, wb) in weighted_segs {
+    let mut cur_c = [-1.0_f32; 3];
+    for (w, color, wa, wb) in weighted_segs {
         let pa = {
             let p = project(view.direction, wa);
             DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
@@ -456,6 +469,19 @@ fn render_view(
             if (w - cur_w).abs() > 1e-6 {
                 content.push_str(&format!("{:.4} w\n", w * PT_PER_MM));
                 cur_w = w;
+            }
+            // Emit an `RG` (stroke color) operator only on color change. Black
+            // (the default pen) still emits `0 0 0 RG`, harmless for legacy
+            // drawings; plot styles override the color here.
+            if (color[0] - cur_c[0]).abs() > 1e-6
+                || (color[1] - cur_c[1]).abs() > 1e-6
+                || (color[2] - cur_c[2]).abs() > 1e-6
+            {
+                content.push_str(&format!(
+                    "{:.4} {:.4} {:.4} RG\n",
+                    color[0], color[1], color[2]
+                ));
+                cur_c = color;
             }
             content.push_str(&format!(
                 "{} {} m {} {} l S\n",
@@ -625,6 +651,16 @@ fn render_table(rows: &[ScheduleRow], y_start_mm: f64, content: &mut String) -> 
 /// of geometry lines drawn across all viewports.
 pub fn sheet_pdf(doc: &Document, sheet: &Sheet) -> (Vec<u8>, usize) {
     let (paper_w, paper_h) = sheet.paper.landscape_mm();
+    let (content, drawn) = sheet_content(doc, sheet);
+    (write_pdf(paper_w, paper_h, content.as_bytes()), drawn)
+}
+
+/// Build the PDF content-stream operators for a single sheet (frame, title,
+/// viewports, annotations) plus a count of drawn model lines. Shared by
+/// [`sheet_pdf`] (one page) and [`sheets_pdf`] (multi-page publish) so the two
+/// render byte-identically per sheet.
+fn sheet_content(doc: &Document, sheet: &Sheet) -> (String, usize) {
+    let (paper_w, paper_h) = sheet.paper.landscape_mm();
     let mut content = String::new();
     let mut drawn = 0usize;
 
@@ -687,7 +723,24 @@ pub fn sheet_pdf(doc: &Document, sheet: &Sheet) -> (Vec<u8>, usize) {
         render_sheet_tag(t, &mut content);
     }
 
-    (write_pdf(paper_w, paper_h, content.as_bytes()), drawn)
+    (content, drawn)
+}
+
+/// Batch-publish several sheets into one multi-page PDF (AutoCAD Sheet Set
+/// Manager "Publish"). Each sheet keeps its own MediaBox (paper size), so a set
+/// may mix A3 and A1 pages. Returns the bytes and the total drawn model lines.
+/// Sheets are rendered in the order given — the caller passes them already in
+/// the set's publication (numbering) order.
+pub fn sheets_pdf(doc: &Document, sheets: &[&Sheet]) -> (Vec<u8>, usize) {
+    let mut pages: Vec<(f64, f64, String)> = Vec::with_capacity(sheets.len());
+    let mut drawn_total = 0usize;
+    for s in sheets {
+        let (paper_w, paper_h) = s.paper.landscape_mm();
+        let (content, drawn) = sheet_content(doc, s);
+        drawn_total += drawn;
+        pages.push((paper_w, paper_h, content));
+    }
+    (write_pdf_pages(&pages), drawn_total)
 }
 
 /// Minimal single-page PDF: catalog, page tree, page, content stream, and a
@@ -712,6 +765,52 @@ fn write_pdf(paper_w_mm: f64, paper_h_mm: f64, content: &[u8]) -> Vec<u8> {
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
     ];
 
+    assemble_pdf(&objects)
+}
+
+/// Multi-page PDF writer: one `/Page` per `(paper_w_mm, paper_h_mm, content)`,
+/// each with its own MediaBox, all sharing a single Helvetica font. Object
+/// layout: 1 Catalog, 2 Pages, then per page a Page object + a Contents stream,
+/// and finally the shared Font. Cross-reference offsets are exact, matching the
+/// single-page [`write_pdf`].
+fn write_pdf_pages(pages: &[(f64, f64, String)]) -> Vec<u8> {
+    let n = pages.len();
+    // Object numbering: 1=Catalog, 2=Pages, then for page i (0-based):
+    //   page obj  = 3 + 2*i
+    //   content   = 4 + 2*i
+    // font obj = 3 + 2*n (last).
+    let font_obj = 3 + 2 * n;
+
+    let mut objects: Vec<Vec<u8>> = Vec::with_capacity(2 + 2 * n + 1);
+    objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+    let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 3 + 2 * i)).collect();
+    objects.push(
+        format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), n).into_bytes(),
+    );
+    for (i, (w, h, content)) in pages.iter().enumerate() {
+        let content_obj = 4 + 2 * i;
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] \
+                 /Contents {content_obj} 0 R /Resources << /Font << /F1 {font_obj} 0 R >> >> >>",
+                mm(*w),
+                mm(*h)
+            )
+            .into_bytes(),
+        );
+        let mut s = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        s.extend_from_slice(content.as_bytes());
+        s.extend_from_slice(b"\nendstream");
+        objects.push(s);
+    }
+    objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
+
+    assemble_pdf(&objects)
+}
+
+/// Serialize numbered PDF objects (1-based) into a `%PDF-1.4` body with an exact
+/// xref table and trailer. Shared by the single- and multi-page writers.
+fn assemble_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
     let mut out = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::with_capacity(objects.len());
     for (i, body) in objects.iter().enumerate() {

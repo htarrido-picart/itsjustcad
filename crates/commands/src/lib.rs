@@ -34,8 +34,8 @@ pub mod svg;
 pub mod workdir;
 
 pub use command::{
-    BoolKind, Command, CompassDir, ConstrainKind, DimAnchorSpec, GridshellSurfaceSpec, MirrorPlane,
-    OptionOp, Selector,
+    BoolKind, CPlaneOp, Command, CompassDir, ConstrainKind, DimAnchorSpec, GridshellSurfaceSpec,
+    MirrorPlane, OptionOp, PlotStyleOp, Selector, SheetSetOp, SimilarBy,
 };
 pub use error::{ExecError, ParseError};
 pub use exec::{ApplyOutcome, ImportSummary, Session, MAIN_BRANCH};
