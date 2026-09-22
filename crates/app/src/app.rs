@@ -4773,16 +4773,23 @@ impl App {
             ui.ctx().memory_mut(|m| m.surrender_focus(id));
         }
 
-        let (esc, enter, shift) = ui.input(|i| {
+        let (esc, enter, shift, close_key) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Enter),
                 i.modifiers.shift,
+                i.key_pressed(egui::Key::C),
             )
         });
         if esc {
             self.draw_tool.cancel();
             self.command_line.push_line("drawing cancelled");
+            return;
+        }
+        // `C` closes an open polyline into a loop (Rhino's Close). Letters never
+        // feed the numeric buffer, so intercepting the key here is safe.
+        if close_key && let Some(cmd) = self.draw_tool.on_close() {
+            self.execute_line(cmd);
             return;
         }
         // Typed characters feed the numeric buffer; Backspace edits it
@@ -4907,6 +4914,21 @@ impl App {
                 ) {
                     painter.line_segment([a, b], stroke);
                 }
+            }
+        }
+        // Close-target hint: a ring on the polyline's first point once a loop is
+        // possible, so "click start / press C to close" is a visible affordance
+        // (Rhino highlights the same). Fills solid when the cursor is within the
+        // 0.5-unit snap-close radius, matching draw_tool's CLOSE_SNAP.
+        if let Some(start) = self.draw_tool.close_target()
+            && let Some(screen) = project(view_proj, rect, start)
+        {
+            let near = cursor_world.is_some_and(|c| start.distance(c) < 0.5);
+            let color = egui::Color32::from_rgb(90, 220, 120);
+            if near {
+                painter.circle_filled(screen, 5.0, color);
+            } else {
+                painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.5, color));
             }
         }
         // Osnap marker: square on the snapped point + kind label (Rhino look).

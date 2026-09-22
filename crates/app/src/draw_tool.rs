@@ -22,6 +22,12 @@ pub struct DrawTool {
     input: String,
 }
 
+/// World-space radius around the polyline's first point that snap-closes the
+/// loop on click. Rhino's close is forgiving; keep it generous and paired with
+/// the on-screen highlight ([`DrawTool::close_target`]) so the affordance is
+/// visible, not guessed.
+const CLOSE_SNAP: f64 = 0.5;
+
 /// Millimeter rounding for emitted command strings — points arrive already
 /// resolved (osnap hit or grid snap), this only strips float noise.
 fn num(v: f64) -> f64 {
@@ -97,7 +103,7 @@ impl DrawTool {
             (Verb::Circle, _) => "circle: pick a point on the circle".into(),
             (Verb::Polyline, 0) => "polyline: pick first point (Esc cancels)".into(),
             (Verb::Polyline, n) => format!(
-                "polyline: pick next point ({n} so far — Enter finishes, click near start closes)"
+                "polyline: pick next point ({n} so far — Enter finishes, C or click start closes)"
             ),
         };
         Some(if self.input.is_empty() {
@@ -155,7 +161,7 @@ impl DrawTool {
             }
             Verb::Polyline => {
                 // Clicking near the first point closes the loop.
-                if points.len() >= 3 && points[0].distance(world) < 0.3 {
+                if points.len() >= 3 && points[0].distance(world) < CLOSE_SNAP {
                     let pts: Vec<String> = points.iter().map(|p| fmt(*p)).collect();
                     return Some(format!("polyline {} closed", pts.join(" ")));
                 }
@@ -176,6 +182,29 @@ impl DrawTool {
             return Some(format!("polyline {}", pts.join(" ")));
         }
         None
+    }
+
+    /// `C` closes an open polyline into a loop (Rhino's Close). Needs ≥3 points;
+    /// a no-op otherwise so the keypress falls through harmlessly.
+    pub fn on_close(&mut self) -> Option<String> {
+        if let Some((Verb::Polyline, points)) = &self.state
+            && points.len() >= 3
+        {
+            let pts: Vec<String> = points.iter().map(|p| fmt(*p)).collect();
+            self.state = None;
+            return Some(format!("polyline {} closed", pts.join(" ")));
+        }
+        None
+    }
+
+    /// The polyline's first point once closing is possible (≥3 picked), so the
+    /// canvas can highlight the snap-close target. `None` when not a polyline or
+    /// too few points to close.
+    pub fn close_target(&self) -> Option<DVec3> {
+        match &self.state {
+            Some((Verb::Polyline, points)) if points.len() >= 3 => points.first().copied(),
+            _ => None,
+        }
     }
 
     /// Ghost geometry to overlay: polylines in world space, given the current
@@ -267,6 +296,30 @@ mod tests {
         }
         let cmd = t.on_click(DVec3::new(0.05, 0.05, 0.0)).unwrap();
         assert_eq!(cmd, "polyline 0,0 5,0 5,5 closed");
+    }
+
+    #[test]
+    fn polyline_c_key_closes_loop() {
+        let mut t = DrawTool::default();
+        t.try_start("polyline");
+        assert!(t.close_target().is_none(), "no close target before 3 points");
+        for p in [(0.0, 0.0), (5.0, 0.0), (5.0, 5.0)] {
+            t.on_click(DVec3::new(p.0, p.1, 0.0));
+        }
+        // Close target is the first point; C emits the closed polyline.
+        assert_eq!(t.close_target(), Some(DVec3::new(0.0, 0.0, 0.0)));
+        assert_eq!(t.on_close().unwrap(), "polyline 0,0 5,0 5,5 closed");
+        assert!(!t.active(), "closing finishes the tool");
+    }
+
+    #[test]
+    fn polyline_c_key_is_noop_under_three_points() {
+        let mut t = DrawTool::default();
+        t.try_start("polyline");
+        t.on_click(DVec3::new(0.0, 0.0, 0.0));
+        t.on_click(DVec3::new(3.0, 0.0, 0.0));
+        assert!(t.on_close().is_none(), "need ≥3 points to close");
+        assert!(t.active(), "a no-op close leaves the tool running");
     }
 
     #[test]

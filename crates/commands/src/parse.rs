@@ -274,8 +274,9 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             Ok(Command::LinePerp { id: None, from, curve })
         }
         "polyline" | "pline" => {
+            // Accept Rhino's `close` as well as `closed` for the trailing keyword.
             let (closed, pts) = match args.split_last() {
-                Some((&"closed", rest)) => (true, rest),
+                Some((&"closed", rest)) | Some((&"close", rest)) => (true, rest),
                 _ => (false, &args[..]),
             };
             if pts.len() < 2 {
@@ -367,7 +368,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }
         "interpcurve" | "interp" => {
             let (closed, pts) = match args.split_last() {
-                Some((&"closed", rest)) => (true, rest),
+                Some((&"closed", rest)) | Some((&"close", rest)) => (true, rest),
                 _ => (false, &args[..]),
             };
             if pts.len() < 3 {
@@ -4281,6 +4282,13 @@ mod tests {
     #[test]
     fn parse_polyline_closed() {
         let cmd = parse("polyline 0,0 5,0 5,5 closed").unwrap();
+        assert!(matches!(cmd, Command::Polyline { closed: true, ref points, .. } if points.len() == 3));
+    }
+
+    #[test]
+    fn parse_polyline_close_is_rhino_alias_for_closed() {
+        // Rhino uses `Close`; we accept it as well as our native `closed`.
+        let cmd = parse("polyline 0,0 5,0 5,5 close").unwrap();
         assert!(matches!(cmd, Command::Polyline { closed: true, ref points, .. } if points.len() == 3));
     }
 
