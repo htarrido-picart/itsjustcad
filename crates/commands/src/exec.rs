@@ -2804,17 +2804,18 @@ fn signed_area(poly: &[[f64; 2]]) -> f64 {
     s * 0.5
 }
 
-/// Build a planar arrangement from `segs`, extract every bounded face, and
-/// return the vertex ring of the smallest-area face that contains `seed`.
+/// Build a planar arrangement from `segs` and return the vertex ring of every
+/// bounded (interior) face, each oriented CCW (positive signed area).
 ///
 /// Method: snap-merge near-coincident endpoints (within `tol`), split each
 /// segment at points where other segments cross it, then walk the resulting
 /// half-edge graph (turning clockwise-most at each vertex) to enumerate faces.
-/// The seed's enclosing region is the minimal-area face whose polygon contains
-/// it. This solidly handles axis-aligned / simple polygons formed by a set of
-/// lines or already-closed loops; it degrades to "no region" when curves leave
-/// gaps wider than `tol`. Pure and unit-tested.
-fn boundary_loop(segs: &[Seg2], seed: [f64; 2], tol: f64) -> Option<Vec<[f64; 2]>> {
+/// The single unbounded outer face comes out CW and is dropped. This solidly
+/// handles axis-aligned / simple polygons formed by a set of lines or
+/// already-closed loops; it degrades to "no faces" when curves leave gaps wider
+/// than `tol`. Shared by `boundary` (smallest containing face) and `curvebool`
+/// (face classification by coverage). Pure and unit-tested.
+fn arrangement_faces(segs: &[Seg2], tol: f64) -> Vec<Vec<[f64; 2]>> {
     // --- 1. Snap-merge vertices into a shared point pool. ---
     let mut verts: Vec<[f64; 2]> = Vec::new();
     let vid = |verts: &mut Vec<[f64; 2]>, p: [f64; 2]| -> usize {
@@ -2866,7 +2867,7 @@ fn boundary_loop(segs: &[Seg2], seed: [f64; 2], tol: f64) -> Option<Vec<[f64; 2]
         }
     }
     if edges.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     // --- 3. Half-edge graph: two directed half-edges per undirected edge. ---
@@ -2924,7 +2925,7 @@ fn boundary_loop(segs: &[Seg2], seed: [f64; 2], tol: f64) -> Option<Vec<[f64; 2]
 
     // --- 4. Trace faces. ---
     let mut visited = vec![false; he_from.len()];
-    let mut best_face: Option<(f64, Vec<[f64; 2]>)> = None;
+    let mut faces: Vec<Vec<[f64; 2]>> = Vec::new();
     for start in 0..he_from.len() {
         if visited[start] {
             continue;
@@ -2955,17 +2956,196 @@ fn boundary_loop(segs: &[Seg2], seed: [f64; 2], tol: f64) -> Option<Vec<[f64; 2]
         if area <= tol * tol {
             continue;
         }
-        if point_in_polygon_2d(&poly, seed) {
-            let take = match &best_face {
-                None => true,
-                Some((a, _)) => area < *a,
-            };
-            if take {
-                best_face = Some((area, poly));
-            }
+        faces.push(poly);
+    }
+    faces
+}
+
+/// Trace the smallest bounded face of the arrangement that contains `seed`.
+/// Thin wrapper over `arrangement_faces` used by the `boundary` verb.
+fn boundary_loop(segs: &[Seg2], seed: [f64; 2], tol: f64) -> Option<Vec<[f64; 2]>> {
+    arrangement_faces(segs, tol)
+        .into_iter()
+        .filter(|poly| point_in_polygon_2d(poly, seed))
+        .map(|poly| (signed_area(&poly), poly))
+        .min_by(|a, b| a.0.partial_cmp(&b.0).expect("finite areas"))
+        .map(|(_, poly)| poly)
+}
+
+// ------------------------------------------------------------ curve boolean
+//
+// `curvebool` combines closed planar curves into new closed region curve(s) via
+// union / intersection / difference. It reuses the `arrangement_faces` planar
+// arrangement + the `intersections`/`point_in_polygon_2d` math: every input
+// closed curve is tessellated to a polygon, all edges are dropped into one
+// arrangement, and each resulting bounded face is classified by how many of the
+// input polygons contain its interior point ("coverage"). Faces are kept per op
+// and their rings emitted as closed polylines.
+//
+// Planar assumption: identical to `boundary` — all input curves are treated as
+// coplanar in XY; Z is ignored while tracing and re-applied from the seed (first
+// input) curve. Non-planar input, curves that fold in Z, and self-intersecting
+// inputs are not handled (documented limit). Union/intersection are symmetric;
+// difference is "first curve minus the rest", in selection order.
+
+/// Which region(s) to keep from the classified arrangement faces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CurveBoolOp {
+    Union,
+    Intersect,
+    Difference,
+}
+
+/// An interior point of a simple polygon (average of the first non-degenerate
+/// triangle's centroid, nudged onto the interior). Falls back to the vertex
+/// centroid. Used to classify a face against the input polygons.
+fn polygon_interior_point(poly: &[[f64; 2]]) -> [f64; 2] {
+    // Try triangle centroids off vertex 0 until one lands strictly inside; this
+    // is robust for convex and simple concave faces alike.
+    let n = poly.len();
+    for i in 1..n.saturating_sub(1) {
+        let c = [
+            (poly[0][0] + poly[i][0] + poly[i + 1][0]) / 3.0,
+            (poly[0][1] + poly[i][1] + poly[i + 1][1]) / 3.0,
+        ];
+        if point_in_polygon_2d(poly, c) {
+            return c;
         }
     }
-    best_face.map(|(_, poly)| poly)
+    // Fallback: vertex centroid (fine for convex faces).
+    let mut c = [0.0, 0.0];
+    for p in poly {
+        c[0] += p[0];
+        c[1] += p[1];
+    }
+    [c[0] / n as f64, c[1] / n as f64]
+}
+
+/// Pure 2D polygon boolean: combine `inputs` (each a closed simple ring) under
+/// `op` and return the retained region ring(s), each oriented CCW.
+///
+/// Builds one planar arrangement from every input edge, then keeps a face when
+/// its coverage (number of inputs whose interior contains the face) matches the
+/// op: union → coverage ≥ 1; intersection → coverage == number of inputs;
+/// difference → inside the first input only (coverage includes input 0 and no
+/// other). Requires ≥ 2 inputs. Pure and unit-tested.
+fn polygon_boolean(inputs: &[Vec<[f64; 2]>], op: CurveBoolOp, tol: f64) -> Vec<Vec<[f64; 2]>> {
+    if inputs.len() < 2 {
+        return Vec::new();
+    }
+    let mut segs: Vec<Seg2> = Vec::new();
+    for poly in inputs {
+        let n = poly.len();
+        if n < 3 {
+            continue;
+        }
+        for k in 0..n {
+            segs.push(Seg2 { a: poly[k], b: poly[(k + 1) % n] });
+        }
+    }
+    let faces = arrangement_faces(&segs, tol);
+    let n_inputs = inputs.len();
+    let kept: Vec<Vec<[f64; 2]>> = faces
+        .into_iter()
+        .filter(|face| {
+            let p = polygon_interior_point(face);
+            // Coverage: how many inputs contain this face's interior point, and
+            // whether the first input contains it (for difference).
+            let mut coverage = 0usize;
+            let mut in_first = false;
+            for (i, poly) in inputs.iter().enumerate() {
+                if point_in_polygon_2d(poly, p) {
+                    coverage += 1;
+                    if i == 0 {
+                        in_first = true;
+                    }
+                }
+            }
+            match op {
+                CurveBoolOp::Union => coverage >= 1,
+                CurveBoolOp::Intersect => coverage == n_inputs,
+                CurveBoolOp::Difference => in_first && coverage == 1,
+            }
+        })
+        .collect();
+    // The kept faces tile the retained region, but adjacent faces share internal
+    // edges we want to dissolve so the result is the region's outer boundary
+    // (one ring per connected component), like Rhino. Merge by cancelling
+    // shared edges: a directed edge on a CCW face boundary appears once; the
+    // internal edge between two kept faces appears in both directions and
+    // cancels, leaving only perimeter edges, which we re-loop into rings.
+    merge_faces(&kept, tol)
+}
+
+/// Dissolve the shared internal edges of a set of CCW faces and re-loop the
+/// surviving perimeter edges into closed rings (one per connected component).
+/// Directed edges that appear in both directions (shared between two kept faces)
+/// cancel; the rest are chained head-to-tail. Pure and unit-tested.
+fn merge_faces(faces: &[Vec<[f64; 2]>], tol: f64) -> Vec<Vec<[f64; 2]>> {
+    // Snap-merge vertices into a shared pool so shared edges compare equal.
+    let mut verts: Vec<[f64; 2]> = Vec::new();
+    let mut vid = |p: [f64; 2]| -> usize {
+        for (i, q) in verts.iter().enumerate() {
+            let dx = q[0] - p[0];
+            let dy = q[1] - p[1];
+            if dx * dx + dy * dy <= tol * tol {
+                return i;
+            }
+        }
+        verts.push(p);
+        verts.len() - 1
+    };
+    // Count directed edges; an internal edge appears once forward (u→v) on one
+    // face and once reversed (v→u) on the neighbour. Net them out.
+    let mut count: std::collections::HashMap<(usize, usize), i32> = std::collections::HashMap::new();
+    for face in faces {
+        let n = face.len();
+        for k in 0..n {
+            let u = vid(face[k]);
+            let v = vid(face[(k + 1) % n]);
+            if u == v {
+                continue;
+            }
+            *count.entry((u, v)).or_insert(0) += 1;
+            *count.entry((v, u)).or_insert(0) -= 1;
+        }
+    }
+    // Surviving directed edges: net count > 0 (perimeter, kept once).
+    let mut adj: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (&(u, v), &c) in &count {
+        for _ in 0..c.max(0) {
+            adj.entry(u).or_default().push(v);
+        }
+    }
+    // Chain surviving edges head-to-tail into rings.
+    let mut rings: Vec<Vec<[f64; 2]>> = Vec::new();
+    loop {
+        // Pick any vertex that still has an outgoing edge.
+        let Some((&start, _)) = adj.iter().find(|(_, outs)| !outs.is_empty()) else {
+            break;
+        };
+        let mut ring: Vec<usize> = vec![start];
+        let mut cur = start;
+        loop {
+            let Some(outs) = adj.get_mut(&cur) else { break };
+            if outs.is_empty() {
+                break;
+            }
+            let nxt = outs.pop().expect("non-empty");
+            if nxt == start {
+                break;
+            }
+            ring.push(nxt);
+            cur = nxt;
+            if ring.len() > verts.len() + 1 {
+                break; // safety: malformed graph
+            }
+        }
+        if ring.len() >= 3 {
+            rings.push(ring.iter().map(|&i| verts[i]).collect());
+        }
+    }
+    rings
 }
 
 /// If segment `o` crosses segment `s` at an interior/endpoint point, return the
@@ -8828,6 +9008,81 @@ fn apply_forward(
                 },
             ))
         }
+        Command::CurveBool { ids, op, targets } => {
+            // Gather the CLOSED curves in selection order (selection order is
+            // what makes `difference` = first minus the rest, well-defined).
+            let sel_ids = resolve(doc, &targets)?;
+            let mut inputs: Vec<Vec<[f64; 2]>> = Vec::new();
+            let mut consumed_ids: Vec<ObjectId> = Vec::new();
+            let mut seed_z = 0.0;
+            for cid in sel_ids {
+                let Some(obj) = doc.get(cid) else { continue };
+                let Geometry::Curve(c) = &obj.geometry else { continue };
+                if !c.is_closed() {
+                    continue;
+                }
+                let pts = c.tessellate(PROFILE_TOL);
+                if pts.len() < 3 {
+                    continue;
+                }
+                if consumed_ids.is_empty() {
+                    seed_z = pts[0].z; // carry Z from the first input (planar)
+                }
+                inputs.push(pts.iter().map(|p| [p.x, p.y]).collect());
+                consumed_ids.push(cid);
+            }
+            if inputs.len() < 2 {
+                return Err(ExecError::Invalid(
+                    "curvebool needs 2+ closed curves (selector matched fewer)".into(),
+                ));
+            }
+            let bop = match op {
+                BoolKind::Union => CurveBoolOp::Union,
+                BoolKind::Intersection => CurveBoolOp::Intersect,
+                BoolKind::Difference => CurveBoolOp::Difference,
+            };
+            let rings = polygon_boolean(&inputs, bop, BOUNDARY_TOL);
+            if rings.is_empty() {
+                return Err(ExecError::Invalid(format!(
+                    "curvebool {op}: empty result (curves may not overlap as required)"
+                )));
+            }
+            // Emit each retained region ring as a closed polyline object, lifted
+            // back to the seed Z plane. Inputs are consumed and replaced.
+            let new_ids: Vec<ObjectId> = match ids {
+                Some(ids) if ids.len() == rings.len() => ids,
+                _ => rings.iter().map(|_| ObjectId::new()).collect(),
+            };
+            let mut consumed: Vec<(SceneObject, usize)> = Vec::new();
+            for cid in &consumed_ids {
+                if let Some((obj, index)) = doc.remove(*cid) {
+                    consumed.push((obj, index));
+                }
+            }
+            for (ring, rid) in rings.iter().zip(&new_ids) {
+                let points: Vec<DVec3> =
+                    ring.iter().map(|p| DVec3::new(p[0], p[1], seed_z)).collect();
+                doc.insert(SceneObject {
+                    visible: true,
+                    id: *rid,
+                    name: None,
+                    layer: doc.current_layer.clone(),
+                    color: None,
+                    material: None,
+                    lineweight_mm: None,
+                    geometry: Geometry::Curve(Curve::Polyline { points, closed: true }),
+                });
+            }
+            let n = new_ids.len();
+            Ok((
+                Command::CurveBool { ids: Some(new_ids.clone()), op, targets },
+                Inverse::Replace { created: new_ids.clone(), consumed },
+                ApplyOutcome {
+                    created: new_ids,
+                    message: format!("curvebool {op}: created {n} region(s)"),
+                },
+            ))
+        }
         Command::Union { id, targets } => {
             let ids = resolve(doc, &targets)?;
             if ids.len() < 2 {
@@ -12891,6 +13146,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Field { .. } => "field",
         Command::Hatch { .. } => "hatch",
         Command::Boundary { .. } => "boundary",
+        Command::CurveBool { .. } => "curvebool",
         Command::Union { .. } => "union",
         Command::Difference { .. } => "difference",
         Command::Intersect { .. } => "intersect",
@@ -16045,6 +16301,116 @@ mod tests {
         // A seed outside any loop → clear error.
         let err = s.run(parse("boundary 100,100").unwrap()).unwrap_err();
         assert!(err.to_string().contains("no closed region around seed"), "{err}");
+    }
+
+    // Two axis-aligned squares overlapping in a 2x2 corner: A=[0,4]², B=[2,6]².
+    fn two_overlapping_squares() -> (Vec<[f64; 2]>, Vec<[f64; 2]>) {
+        let a = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]];
+        let b = vec![[2.0, 2.0], [6.0, 2.0], [6.0, 6.0], [2.0, 6.0]];
+        (a, b)
+    }
+
+    #[test]
+    fn polygon_boolean_union_intersect_difference() {
+        let (a, b) = two_overlapping_squares();
+        let inputs = vec![a, b];
+
+        // Union: one region, outer boundary, area = 16 + 16 - 4 = 28.
+        let u = polygon_boolean(&inputs, CurveBoolOp::Union, BOUNDARY_TOL);
+        assert_eq!(u.len(), 1, "union is one connected region");
+        let ua: f64 = signed_area(&u[0]).abs();
+        assert!((ua - 28.0).abs() < 1e-6, "union area 28, got {ua}");
+        // A point in A-only and one in B-only are both inside the union.
+        assert!(point_in_polygon_2d(&u[0], [1.0, 1.0]));
+        assert!(point_in_polygon_2d(&u[0], [5.0, 5.0]));
+
+        // Intersection: the 2x2 overlap rectangle, area 4.
+        let i = polygon_boolean(&inputs, CurveBoolOp::Intersect, BOUNDARY_TOL);
+        assert_eq!(i.len(), 1);
+        let ia: f64 = signed_area(&i[0]).abs();
+        assert!((ia - 4.0).abs() < 1e-6, "overlap area 4, got {ia}");
+        assert!(point_in_polygon_2d(&i[0], [3.0, 3.0]));
+        assert!(!point_in_polygon_2d(&i[0], [1.0, 1.0]));
+
+        // Difference A - B: L-shape, area 16 - 4 = 12; overlap removed.
+        let d = polygon_boolean(&inputs, CurveBoolOp::Difference, BOUNDARY_TOL);
+        let da: f64 = d.iter().map(|r| signed_area(r).abs()).sum();
+        assert!((da - 12.0).abs() < 1e-6, "difference area 12, got {da}");
+        // A point in the removed overlap is outside every difference ring.
+        assert!(!d.iter().any(|r| point_in_polygon_2d(r, [3.0, 3.0])));
+        // A point in A-only survives.
+        assert!(d.iter().any(|r| point_in_polygon_2d(r, [1.0, 1.0])));
+
+        // Fewer than 2 inputs → empty.
+        assert!(polygon_boolean(&inputs[..1], CurveBoolOp::Union, BOUNDARY_TOL).is_empty());
+    }
+
+    #[test]
+    fn merge_faces_dissolves_shared_edge() {
+        // Two unit squares sharing the x=1 edge merge into one 2x1 rectangle.
+        let left = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let right = vec![[1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0]];
+        let merged = merge_faces(&[left, right], BOUNDARY_TOL);
+        assert_eq!(merged.len(), 1, "shared edge dissolved into one ring");
+        let area = signed_area(&merged[0]).abs();
+        assert!((area - 2.0).abs() < 1e-6, "merged area 2, got {area}");
+    }
+
+    #[test]
+    fn curvebool_verb_union_intersect_difference_and_undo() {
+        let mut s = Session::default();
+        // Two overlapping closed squares A=[0,4]², B=[2,6]².
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+        run(&mut s, "polyline 2,2,0 6,2,0 6,6,0 2,6,0 closed");
+        assert_eq!(s.doc.len(), 2);
+
+        // Union consumes both inputs and leaves one region of area 28.
+        let out = run(&mut s, "curvebool union last 2");
+        assert!(out.message.contains("created 1 region"), "{}", out.message);
+        assert_eq!(s.doc.len(), 1, "inputs consumed, one region left");
+        let region = s.doc.objects().last().unwrap();
+        let Geometry::Curve(Curve::Polyline { points, closed }) = &region.geometry else {
+            panic!("expected closed polyline, got {:?}", region.geometry);
+        };
+        assert!(*closed);
+        let ring: Vec<[f64; 2]> = points.iter().map(|p| [p.x, p.y]).collect();
+        assert!((signed_area(&ring).abs() - 28.0).abs() < 1e-6);
+
+        // Undo restores both inputs.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2, "undo restores the two input curves");
+
+        // Intersection → the 2x2 overlap, area 4.
+        let out = run(&mut s, "curvebool intersect last 2");
+        assert!(out.message.contains("created 1 region"), "{}", out.message);
+        let region = s.doc.objects().last().unwrap();
+        let Geometry::Curve(Curve::Polyline { points, .. }) = &region.geometry else {
+            panic!("expected polyline");
+        };
+        let ring: Vec<[f64; 2]> = points.iter().map(|p| [p.x, p.y]).collect();
+        assert!((signed_area(&ring).abs() - 4.0).abs() < 1e-6);
+        run(&mut s, "undo");
+
+        // Difference A - B → area 12; a point in the overlap is excluded.
+        run(&mut s, "curvebool difference last 2");
+        let total: f64 = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => {
+                    let r: Vec<[f64; 2]> = points.iter().map(|p| [p.x, p.y]).collect();
+                    Some(signed_area(&r).abs())
+                }
+                _ => None,
+            })
+            .sum();
+        assert!((total - 12.0).abs() < 1e-6, "difference area 12, got {total}");
+
+        // Fewer than 2 closed curves → clear error.
+        let mut s2 = Session::default();
+        run(&mut s2, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+        let err = s2.run(parse("curvebool union all").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("2+ closed curves"), "{err}");
     }
 
     #[test]

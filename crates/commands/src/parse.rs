@@ -565,6 +565,33 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             };
             Ok(Command::Boundary { id: None, seed, from })
         }
+        "curvebool" | "cboolean" | "region" => {
+            // curvebool <union|intersect|difference> <selector>
+            let (&op_tok, rest) = args.split_first().ok_or_else(|| {
+                wrong_err("curvebool", "an op (union|intersect|difference) and a selector", &args)
+            })?;
+            let op = match op_tok.to_lowercase().as_str() {
+                "union" | "or" => BoolKind::Union,
+                "intersect" | "intersection" | "and" => BoolKind::Intersection,
+                "difference" | "diff" | "sub" | "subtract" => BoolKind::Difference,
+                _ => {
+                    return wrong(
+                        "curvebool",
+                        "an op (union|intersect|difference) and a selector",
+                        &args,
+                    )
+                }
+            };
+            let (targets, tail) = selector(rest, "curvebool")?;
+            if !tail.is_empty() {
+                return wrong(
+                    "curvebool",
+                    "an op (union|intersect|difference) and a selector",
+                    &args,
+                );
+            }
+            Ok(Command::CurveBool { ids: None, op, targets })
+        }
         "union" => {
             let (sel, rest) = selector(&args, "union")?;
             expect_empty("union", rest, &args)?;
@@ -5268,6 +5295,49 @@ mod tests {
         assert!(parse("boundary").is_err());
         assert!(parse("boundary 5,3 from").is_err());
         assert!(parse("boundary 5,3 all").is_err()); // missing the `from` keyword
+    }
+
+    #[test]
+    fn curvebool_parses_all_three_ops_and_aliases() {
+        // The three canonical ops round-trip to the right BoolKind.
+        assert!(matches!(
+            parse("curvebool union last 2").unwrap(),
+            Command::CurveBool { op: BoolKind::Union, ids: None, .. }
+        ));
+        assert!(matches!(
+            parse("curvebool intersect all").unwrap(),
+            Command::CurveBool { op: BoolKind::Intersection, .. }
+        ));
+        assert!(matches!(
+            parse("curvebool difference last 2").unwrap(),
+            Command::CurveBool { op: BoolKind::Difference, .. }
+        ));
+        // Op aliases or/and/sub.
+        assert!(matches!(
+            parse("curvebool or last 2").unwrap(),
+            Command::CurveBool { op: BoolKind::Union, .. }
+        ));
+        assert!(matches!(
+            parse("curvebool and last 2").unwrap(),
+            Command::CurveBool { op: BoolKind::Intersection, .. }
+        ));
+        assert!(matches!(
+            parse("curvebool sub last 2").unwrap(),
+            Command::CurveBool { op: BoolKind::Difference, .. }
+        ));
+        // Verb aliases cboolean/region.
+        assert!(matches!(
+            parse("cboolean union all").unwrap(),
+            Command::CurveBool { op: BoolKind::Union, .. }
+        ));
+        assert!(matches!(
+            parse("region intersect all").unwrap(),
+            Command::CurveBool { op: BoolKind::Intersection, .. }
+        ));
+        // Errors: no op, bad op, missing selector.
+        assert!(parse("curvebool").is_err());
+        assert!(parse("curvebool frobnicate last 2").is_err());
+        assert!(parse("curvebool union").is_err());
     }
 
     #[test]

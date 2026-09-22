@@ -663,6 +663,17 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<Selector>,
     },
+    /// 2D curve boolean (Rhino CurveBoolean / region union-intersect-difference):
+    /// combine 2+ closed planar curves in `targets` into new closed region
+    /// curve(s) via `op`. Works in XY (planar assumption; Z carried from the first
+    /// input). Difference is "first curve minus the rest" in selection order. The
+    /// input curves are consumed and replaced by the result (undoable).
+    CurveBool {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        op: BoolKind,
+        targets: Selector,
+    },
     // -- edit --
     Move {
         targets: Selector,

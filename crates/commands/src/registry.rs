@@ -295,6 +295,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Annotate,
         },
         CommandSpec {
+            name: "curvebool",
+            usage: "curvebool <union|intersect|difference> <selector>",
+            summary: "Rhino CurveBoolean: combine 2+ closed planar curves into new closed region curve(s). union merges the outer boundary of the combined area; intersect keeps the overlap; difference is the first selected curve minus the rest (selection order). Works in the XY plane (planar assumption; Z carried from the first input). Inputs are consumed and replaced by the result (undoable). Op aliases: or/and/sub. Verb aliases: cboolean/region. Example: curvebool union last 2 · curvebool intersect all · curvebool difference last 2",
+            category: Category::Boolean,
+        },
+        CommandSpec {
             name: "union",
             usage: "union <selector>",
             summary: "Merge 2+ meshes into one solid; inputs are consumed. Example: union last 2",
