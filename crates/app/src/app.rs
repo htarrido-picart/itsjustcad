@@ -3303,6 +3303,8 @@ impl App {
             rfd::FileDialog::new()
                 .add_filter("DXF", &["dxf"])
                 .add_filter("SVG", &["svg"])
+                .add_filter("Adobe Illustrator (SVG-content)", &["ai"])
+                .add_filter("JPEG image", &["jpg", "jpeg"])
                 .add_filter("CSV", &["csv"])
                 .add_filter("glTF / GLB", &["gltf", "glb"])
                 .add_filter("OBJ", &["obj"])

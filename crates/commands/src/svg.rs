@@ -122,6 +122,17 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// Format an optional RGBA colour as CSS `rgb(R,G,B)`. `None` → black.
+/// Layer stroke colour as 8-bit RGB (same default as `css_color`: black).
+/// Shared with the raster exporter so JPG and SVG paint identical colours.
+pub fn rgb_color(c: Option<[f32; 4]>) -> [u8; 3] {
+    let [r, g, b, _] = c.unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    [
+        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
+}
+
 fn css_color(c: Option<[f32; 4]>) -> String {
     let [r, g, b, _] = c.unwrap_or([0.0, 0.0, 0.0, 1.0]);
     format!(
@@ -142,19 +153,33 @@ fn svg_num(v: f64) -> String {
 
 /// Build SVG bytes for the current document view.
 /// Returns the SVG bytes and a summary string for the command echo.
-pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
+/// One layer's worth of projected 2D segments, ready to render to SVG or a
+/// raster. Each segment carries its effective lineweight in mm (per-object beats
+/// layer).
+pub struct LayerData {
+    pub name: String,
+    pub style: LayerStyle,
+    /// (projected_a, projected_b, effective_lineweight_mm)
+    pub segs: Vec<(DVec2, DVec2, f64)>,
+}
+
+/// The whole document projected to 2D for export: layers (in draw order, with
+/// the orphan bucket last) plus the padded scene bounds `(vx, vy, vw, vh)` and
+/// the raw segment total. Shared by the SVG writer and the JPG rasterizer so
+/// both see the identical drawing.
+pub struct ProjectedScene {
+    pub layers: Vec<LayerData>,
+    pub bounds: (f64, f64, f64, f64),
+    pub total_segs: usize,
+}
+
+/// Project the document to 2D once. `export_svg` (vector) and `export_jpg`
+/// (raster) both build on this so the two exports never drift apart.
+pub fn project_scene(doc: &Document) -> ProjectedScene {
     let dir = DEFAULT_DIR; // always top-down for now (no live camera in export path)
 
-    // Collect all projected 2D segments per layer.
-    // Each segment carries its effective lineweight in mm (per-object beats layer).
     // Text annotations are tessellated by collect_segments via the Hershey
     // stroke font and flow through as regular line segments.
-    struct LayerData {
-        name: String,
-        style: LayerStyle,
-        /// (projected_a, projected_b, effective_lineweight_mm)
-        segs: Vec<(DVec2, DVec2, f64)>,
-    }
 
     // Gather layers in document layer order (alphabetical + default first).
     let fallback = LayerStyle::default();
@@ -234,6 +259,20 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
     let vw = (max_x - min_x) + 2.0 * pad;
     let vh = (max_y - min_y) + 2.0 * pad;
 
+    // Fold the orphan bucket in as the last layer so callers see a single list.
+    layers.push(orphan);
+    ProjectedScene {
+        layers,
+        bounds: (vx, vy, vw, vh),
+        total_segs,
+    }
+}
+
+pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
+    let scene = project_scene(doc);
+    let (vx, vy, vw, vh) = scene.bounds;
+    let total_segs = scene.total_segs;
+
     // SVG user-units = meters; lineweight stays in mm so divide by 1000 to
     // convert to meter-scale user-units.
     let mut svg = String::new();
@@ -254,8 +293,7 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
     let mut layer_count = 0usize;
     let mut path_count = 0usize;
 
-    let all_layers = layers.iter().chain(std::iter::once(&orphan));
-    for layer in all_layers {
+    for layer in &scene.layers {
         if layer.segs.is_empty() {
             continue;
         }

@@ -26,6 +26,7 @@ pub mod mesh_import;
 mod parse;
 pub mod pdf;
 pub mod plugin;
+pub mod raster;
 mod registry;
 pub mod rhino3dm;
 pub mod saf;

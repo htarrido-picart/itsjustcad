@@ -11138,6 +11138,21 @@ fn apply_forward(
                     let (b, count) = crate::svg::export_svg(doc);
                     (b, format!("SVG, {count}"))
                 }
+                // Adobe Illustrator: modern Illustrator opens SVG-content `.ai`
+                // files directly, so the pragmatic MVP writes the exact same
+                // vector content the SVG writer produces. A true native
+                // .ai/PostScript writer is a follow-up.
+                "ai" => {
+                    let (b, count) = crate::svg::export_svg(doc);
+                    (b, format!("AI (SVG-content), {count}"))
+                }
+                // Raster: no GPU in this crate, so we rasterize the same 2D
+                // projection the SVG writer uses onto a CPU buffer and encode
+                // JPEG. Flat top-down plan, not a shaded 3D screenshot.
+                "jpg" | "jpeg" => {
+                    let (b, detail) = crate::raster::export_jpg(doc).map_err(ExecError::Invalid)?;
+                    (b, detail)
+                }
                 "csv" => {
                     let (b, count) = crate::csv::export_csv(doc);
                     (b, format!("CSV, {count}"))
@@ -17086,6 +17101,44 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("cannot write"), "{err}");
         assert_eq!(s.doc.len(), 3);
+    }
+
+    #[test]
+    fn export_ai_writes_svg_content_and_jpg_writes_jpeg() {
+        let dir = std::env::temp_dir().join("mydrafter-ai-jpg-test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "circle 5,3,0 1.5");
+
+        // .ai routes through the SVG writer: the file IS SVG content that
+        // Illustrator opens. Assert non-empty + the SVG signature.
+        let ai = dir.join("model.ai");
+        let _ = std::fs::remove_file(&ai);
+        let out = run(&mut s, &format!("export {}", ai.display()));
+        assert!(out.message.contains("exported AI"), "{}", out.message);
+        let ai_text = std::fs::read_to_string(&ai).unwrap();
+        assert!(!ai_text.is_empty(), "AI file non-empty");
+        assert!(ai_text.contains("<svg"), "AI file carries SVG content:\n{ai_text}");
+
+        // .jpg rasterizes the same projection: assert JPEG magic bytes FF D8 FF.
+        let jpg = dir.join("model.jpg");
+        let _ = std::fs::remove_file(&jpg);
+        let out = run(&mut s, &format!("export {}", jpg.display()));
+        assert!(out.message.contains("exported JPG"), "{}", out.message);
+        let bytes = std::fs::read(&jpg).unwrap();
+        assert_eq!(&bytes[0..3], &[0xFF, 0xD8, 0xFF], "JPEG magic bytes");
+
+        // .jpeg alias works too.
+        let jpeg = dir.join("model.jpeg");
+        let _ = std::fs::remove_file(&jpeg);
+        run(&mut s, &format!("export {}", jpeg.display()));
+        let bytes = std::fs::read(&jpeg).unwrap();
+        assert_eq!(&bytes[0..3], &[0xFF, 0xD8, 0xFF]);
+
+        // export stays side-effecting, never op-logged.
+        assert!(s.save_log().iter().all(|c| !matches!(c, Command::Export { .. })));
     }
 
     #[test]
