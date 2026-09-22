@@ -12,7 +12,12 @@ enum Verb {
     Polyline,
     Rect,
     Circle,
+    Polygon,
 }
+
+/// Default polygon side count; overridable by typing an integer before the
+/// center click.
+const POLYGON_DEFAULT_SIDES: usize = 6;
 
 #[derive(Default)]
 pub struct DrawTool {
@@ -20,6 +25,9 @@ pub struct DrawTool {
     /// Typed numeric buffer for precise input ("5.2,3", "@2,3", "5"); shown
     /// in the prompt overlay, resolved by the app layer on Enter.
     input: String,
+    /// Live side count for the polygon tool; set from the typed buffer before
+    /// the center is picked (see `sync_polygon_sides`).
+    sides: usize,
 }
 
 /// World-space radius around the polyline's first point that snap-closes the
@@ -54,11 +62,25 @@ impl DrawTool {
             "polyline" | "pline" => Verb::Polyline,
             "rect" | "rectangle" => Verb::Rect,
             "circle" => Verb::Circle,
+            "polygon" => Verb::Polygon,
             _ => return false,
         };
+        if verb == Verb::Polygon {
+            self.sides = POLYGON_DEFAULT_SIDES;
+        }
         self.state = Some((verb, Vec::new()));
         self.input.clear();
         true
+    }
+
+    /// Before the polygon's center is picked, a typed integer sets the side
+    /// count (clamped ≥3) and clears the buffer, so "8 <click center>" draws an
+    /// octagon. No-op for a non-integer buffer.
+    fn sync_polygon_sides(&mut self) {
+        if let Ok(n) = self.input.trim().parse::<usize>() {
+            self.sides = n.max(3);
+            self.input.clear();
+        }
     }
 
     pub fn cancel(&mut self) {
@@ -101,6 +123,11 @@ impl DrawTool {
             (Verb::Rect, _) => "rect: pick opposite corner".into(),
             (Verb::Circle, 0) => "circle: pick center (Esc cancels)".into(),
             (Verb::Circle, _) => "circle: pick a point on the circle".into(),
+            (Verb::Polygon, 0) => format!(
+                "polygon: {} sides — pick center (type N for sides, Esc cancels)",
+                self.sides
+            ),
+            (Verb::Polygon, _) => "polygon: pick a point on the circumradius".into(),
             (Verb::Polyline, 0) => "polyline: pick first point (Esc cancels)".into(),
             (Verb::Polyline, n) => format!(
                 "polyline: pick next point ({n} so far — Enter finishes, C or click start closes)"
@@ -157,6 +184,22 @@ impl DrawTool {
                         return None;
                     }
                     Some(format!("circle {} {r}", fmt(points[0])))
+                }
+            }
+            Verb::Polygon => {
+                if points.is_empty() {
+                    // A number typed before the center sets the side count.
+                    self.sync_polygon_sides();
+                    points.push(world);
+                    self.state = Some((verb, points));
+                    None
+                } else {
+                    let r = num(points[0].distance(world));
+                    if r < 1e-9 {
+                        self.state = Some((verb, points));
+                        return None;
+                    }
+                    Some(format!("polygon {} {r} {}", fmt(points[0]), self.sides))
                 }
             }
             Verb::Polyline => {
@@ -249,6 +292,27 @@ impl DrawTool {
                 }
                 _ => Vec::new(),
             },
+            Verb::Polygon => match (points.first(), cursor) {
+                (Some(&c), Some(edge)) => {
+                    let r = c.distance(edge);
+                    if r < 1e-9 {
+                        return Vec::new();
+                    }
+                    // The circumradius vertex sits under the cursor; step by the
+                    // side count and close the loop by repeating the first point.
+                    let n = self.sides.max(3);
+                    let a0 = (edge.y - c.y).atan2(edge.x - c.x);
+                    let mut strip: Vec<DVec3> = (0..n)
+                        .map(|i| {
+                            let t = a0 + std::f64::consts::TAU * (i as f64) / (n as f64);
+                            c + DVec3::new(r * t.cos(), r * t.sin(), 0.0)
+                        })
+                        .collect();
+                    strip.push(strip[0]);
+                    vec![strip]
+                }
+                _ => Vec::new(),
+            },
         }
     }
 }
@@ -296,6 +360,51 @@ mod tests {
         }
         let cmd = t.on_click(DVec3::new(0.05, 0.05, 0.0)).unwrap();
         assert_eq!(cmd, "polyline 0,0 5,0 5,5 closed");
+    }
+
+    #[test]
+    fn polygon_two_clicks_emits_verb() {
+        let mut t = DrawTool::default();
+        assert!(t.try_start("polygon"));
+        assert!(t.on_click(DVec3::new(0.0, 0.0, 0.0)).is_none());
+        let cmd = t.on_click(DVec3::new(5.0, 0.0, 0.0)).unwrap();
+        assert_eq!(cmd, "polygon 0,0 5 6"); // default 6 sides
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn polygon_sides_override_and_clamp() {
+        let mut t = DrawTool::default();
+        t.try_start("polygon");
+        // Type "8" before the center → octagon.
+        for c in "8".chars() {
+            assert!(t.push_input(c));
+        }
+        t.on_click(DVec3::new(0.0, 0.0, 0.0));
+        assert!(t.on_click(DVec3::new(5.0, 0.0, 0.0)).unwrap().ends_with(" 8"));
+        // A count below 3 clamps up to 3.
+        t.try_start("polygon");
+        t.push_input('2');
+        t.on_click(DVec3::new(0.0, 0.0, 0.0));
+        assert!(t.on_click(DVec3::new(5.0, 0.0, 0.0)).unwrap().ends_with(" 3"));
+    }
+
+    #[test]
+    fn polygon_preview_closes_with_sides_plus_one() {
+        let mut t = DrawTool::default();
+        t.try_start("polygon"); // 6 sides
+        t.on_click(DVec3::new(0.0, 0.0, 0.0));
+        let ghost = t.preview(Some(DVec3::new(5.0, 0.0, 0.0)));
+        assert_eq!(ghost.len(), 1);
+        let ring = &ghost[0];
+        assert_eq!(ring.len(), 7); // 6 vertices + closing repeat
+        assert_eq!(ring.first(), ring.last());
+    }
+
+    #[test]
+    fn polygon_with_args_not_consumed() {
+        let mut t = DrawTool::default();
+        assert!(!t.try_start("polygon 0,0 5 6"));
     }
 
     #[test]
