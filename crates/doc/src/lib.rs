@@ -25,7 +25,8 @@ pub use cplane::CPlane;
 pub use document::Document;
 pub use loads::{LoadGeometry, RestraintKind, StructLoad, StructSupport};
 pub use object::{
-    Annotation, AreaKind, BlockGeometry, DimAnchor, EndpointRef, FieldExpr, FrameKind, Geometry,
+    angle_degrees, angular_arc_points, Annotation, AreaKind, BlockGeometry, DimAnchor, EndpointRef,
+    FieldExpr, FrameKind, Geometry,
     HatchPattern, LayerStyle, LineType, MaterialPreset, ObjectId, ObjectMaterial, ParamBlockDef,
     ParamBlockParam, SceneObject, DEFAULT_LAYER,
 };
@@ -41,7 +42,8 @@ pub use sheet::{
 pub use structure::{Grid, Material, Room, Section, Story};
 pub use underlay::{Basemap, Underlay};
 pub use units::{
-    format_area, format_length, format_volume, Units, METERS_PER_FOOT, METERS_PER_INCH,
+    format_angle, format_area, format_length, format_volume, Units, METERS_PER_FOOT,
+    METERS_PER_INCH,
 };
 pub use view::{NamedView, PanoView};
 

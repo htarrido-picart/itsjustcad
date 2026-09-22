@@ -8827,6 +8827,46 @@ fn apply_forward(
                 },
             ))
         }
+        Command::DimAngular { id, vertex, p1, p2, radius } => {
+            // The measured angle is derived (never stored). Reject a degenerate
+            // definition (either leg zero-length) up front so the annotation
+            // always has a meaningful angle to display.
+            if radius <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "angular dimension radius must be positive".into(),
+                ));
+            }
+            let angle = itsjustcad_doc::angle_degrees(vertex, p1, p2);
+            if (p1 - vertex).length() < 1e-9 || (p2 - vertex).length() < 1e-9 {
+                return Err(ExecError::Invalid(
+                    "angular dimension legs must be nonzero (points distinct from the vertex)".into(),
+                ));
+            }
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Annotation(Annotation::AngularDim {
+                    vertex,
+                    p1,
+                    p2,
+                    radius,
+                }),
+            });
+            Ok((
+                Command::DimAngular { id: Some(id), vertex, p1, p2, radius },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("dimangular {id} ({})", itsjustcad_doc::format_angle(angle)),
+                },
+            ))
+        }
         Command::Text { id, pos, text, height } => {
             if height <= 0.0 {
                 return Err(ExecError::Invalid("text height must be positive".into()));
@@ -13142,6 +13182,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::CurvatureGraph { .. } => "curvature",
         Command::Rebuild { .. } => "rebuild",
         Command::Dim { .. } => "dim",
+        Command::DimAngular { .. } => "dimangular",
         Command::Text { .. } => "text",
         Command::Field { .. } => "field",
         Command::Hatch { .. } => "hatch",
@@ -16424,6 +16465,40 @@ mod tests {
         };
         assert_eq!(a.point(), DVec3::new(0.0, 5.0, 0.0));
         assert_eq!(b.point(), DVec3::new(10.0, 5.0, 0.0));
+        run(&mut s, "delete last");
+        assert_eq!(s.doc.len(), 0);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+    }
+
+    /// dimangular over a 90° corner stores the three points and reports ≈90° in
+    /// its creation message; the stored angle (derived) matches. Undo removes it.
+    #[test]
+    fn dimangular_creates_90_degree_corner() {
+        let mut s = Session::default();
+        // Legs along +X and +Y from the origin → a right angle.
+        let out = run(&mut s, "dimangular 0,0,0 1,0,0 0,1,0");
+        assert_eq!(s.doc.len(), 1);
+        let obj = s.doc.objects().next().unwrap();
+        let Geometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) =
+            &obj.geometry
+        else {
+            panic!("expected angular dim, got {:?}", obj.geometry)
+        };
+        assert_eq!(*vertex, DVec3::ZERO);
+        assert_eq!(*p1, DVec3::new(1.0, 0.0, 0.0));
+        assert_eq!(*p2, DVec3::new(0.0, 1.0, 0.0));
+        assert_eq!(*radius, 1.0);
+        let angle = itsjustcad_doc::angle_degrees(*vertex, *p1, *p2);
+        assert!((angle - 90.0).abs() < 1e-9, "angle {angle}");
+        assert!(out.message.contains("90.0°"), "message: {}", out.message);
+
+        // A zero-length leg is rejected up front.
+        assert!(matches!(
+            s.run(parse("dimangular 0,0,0 0,0,0 0,1,0").unwrap()),
+            Err(ExecError::Invalid(_))
+        ));
+
         run(&mut s, "delete last");
         assert_eq!(s.doc.len(), 0);
         run(&mut s, "undo");

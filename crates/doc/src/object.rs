@@ -253,6 +253,12 @@ pub enum Annotation {
     /// to a point on another object (see [`DimAnchor`]); associative anchors
     /// follow their referent when it moves/edits (resolved at display time).
     LinearDim { a: DimAnchor, b: DimAnchor, offset: f64 },
+    /// Angular dimension: the angle p1–vertex–p2, labelled in degrees with an
+    /// arc of `radius` (model units) swept between the two legs. Points are
+    /// free model points (no associative binding yet); the measured value is
+    /// derived at display time via [`angle_degrees`]. serde-tagged (`ann`), so
+    /// this variant is additive and old op-logs/files load unchanged.
+    AngularDim { vertex: DVec3, p1: DVec3, p2: DVec3, radius: f64 },
     Text { pos: DVec3, text: String, height: f64 },
     /// A FIELD: like `Text`, but `text` is the *resolved* string of `expr` and
     /// is recomputed by the field-refresh pass after mutating ops (mirroring
@@ -270,11 +276,59 @@ impl Annotation {
     pub fn points(&self) -> Vec<DVec3> {
         match self {
             Annotation::LinearDim { a, b, .. } => vec![a.point(), b.point()],
+            Annotation::AngularDim { vertex, p1, p2, .. } => vec![*vertex, *p1, *p2],
             Annotation::Text { pos, .. } => vec![*pos],
             Annotation::Field { pos, .. } => vec![*pos],
             Annotation::Hatch { boundary, .. } => boundary.clone(),
         }
     }
+}
+
+/// The angle p1–`vertex`–p2 in degrees, in `[0, 180]`. This is the value an
+/// [`Annotation::AngularDim`] displays. Computed from the two leg vectors
+/// (`p1 - vertex`, `p2 - vertex`) via their dot product; the result is
+/// clamped so floating-point noise cannot push `acos` past its domain.
+///
+/// A degenerate leg (either point coincident with the vertex) has no defined
+/// angle — this returns `0.0` rather than a `NaN`, so callers get a stable,
+/// harmless label instead of propagating garbage.
+pub fn angle_degrees(vertex: DVec3, p1: DVec3, p2: DVec3) -> f64 {
+    let v1 = p1 - vertex;
+    let v2 = p2 - vertex;
+    let (l1, l2) = (v1.length(), v2.length());
+    if l1 < 1e-12 || l2 < 1e-12 {
+        return 0.0;
+    }
+    let cos = (v1.dot(v2) / (l1 * l2)).clamp(-1.0, 1.0);
+    cos.acos().to_degrees()
+}
+
+/// Tessellate the arc of an angular dimension: points sweeping from the `p1`
+/// leg to the `p2` leg at `radius` around `vertex`, in the plane of the two
+/// legs (falls back to the XY plane when the legs are colinear). Shared by the
+/// renderer and the DXF/PDF/SVG exporters so the arc looks identical
+/// everywhere. A degenerate leg yields a single `vertex` point.
+pub fn angular_arc_points(vertex: DVec3, p1: DVec3, p2: DVec3, radius: f64) -> Vec<DVec3> {
+    let d1 = (p1 - vertex).normalize_or_zero();
+    let d2 = (p2 - vertex).normalize_or_zero();
+    if d1.length_squared() < 0.5 || d2.length_squared() < 0.5 {
+        return vec![vertex];
+    }
+    let sweep = angle_degrees(vertex, p1, p2).to_radians();
+    // Rotation axis = plane normal of the two legs; colinear legs → XY plane.
+    let mut axis = d1.cross(d2);
+    if axis.length_squared() < 1e-18 {
+        axis = DVec3::Z;
+    }
+    let axis = axis.normalize();
+    const SEGMENTS: usize = 24;
+    (0..=SEGMENTS)
+        .map(|i| {
+            let t = sweep * (i as f64 / SEGMENTS as f64);
+            let rot = glam::DQuat::from_axis_angle(axis, t);
+            vertex + rot.mul_vec3(d1) * radius
+        })
+        .collect()
 }
 
 /// A geometry snapshot stored in a block definition. The same enum as
@@ -521,6 +575,11 @@ impl Geometry {
                     a.translate(d);
                     b.translate(d);
                 }
+                Annotation::AngularDim { vertex, p1, p2, .. } => {
+                    *vertex += d;
+                    *p1 += d;
+                    *p2 += d;
+                }
                 Annotation::Text { pos, .. } => *pos += d,
                 Annotation::Field { pos, .. } => *pos += d,
                 Annotation::Hatch { boundary, .. } => {
@@ -580,6 +639,16 @@ impl Geometry {
                         a.transform(m);
                         b.transform(m);
                         *offset *= s;
+                    }
+                    Annotation::AngularDim { vertex, p1, p2, radius } => {
+                        // Points transform exactly; the arc radius (a scalar
+                        // size) follows the X-axis scale so uniform scales stay
+                        // proportional. The measured angle is derived, so it is
+                        // preserved by any rigid/uniform transform automatically.
+                        *vertex = m.transform_point3(*vertex);
+                        *p1 = m.transform_point3(*p1);
+                        *p2 = m.transform_point3(*p2);
+                        *radius *= s;
                     }
                     Annotation::Text { pos, height, .. } => {
                         *pos = m.transform_point3(*pos);
@@ -1035,6 +1104,39 @@ mod tests {
             }
             other => panic!("expected LinearDim, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn angle_degrees_known_cases() {
+        let o = DVec3::ZERO;
+        // 90°: +X vs +Y.
+        assert!((angle_degrees(o, DVec3::X, DVec3::Y) - 90.0).abs() < 1e-9);
+        // 45°: +X vs (1,1,0).
+        assert!((angle_degrees(o, DVec3::X, DVec3::new(1.0, 1.0, 0.0)) - 45.0).abs() < 1e-9);
+        // 180°: opposite rays.
+        assert!((angle_degrees(o, DVec3::X, DVec3::NEG_X) - 180.0).abs() < 1e-9);
+        // Scale-invariant: leg length does not change the angle.
+        assert!((angle_degrees(o, DVec3::X * 5.0, DVec3::Y * 0.1) - 90.0).abs() < 1e-9);
+        // Degenerate zero-length leg → 0.0, never NaN.
+        let deg = angle_degrees(o, o, DVec3::Y);
+        assert_eq!(deg, 0.0);
+        assert!(!deg.is_nan());
+    }
+
+    /// A new `AngularDim` annotation JSON round-trips, and old files without the
+    /// variant are unaffected (serde tag `ann` is additive).
+    #[test]
+    fn angular_dim_json_roundtrips() {
+        let ann = Annotation::AngularDim {
+            vertex: DVec3::ZERO,
+            p1: DVec3::X,
+            p2: DVec3::Y,
+            radius: 1.5,
+        };
+        let json = serde_json::to_string(&ann).unwrap();
+        assert!(json.contains("\"ann\":\"angular_dim\""), "{json}");
+        let back: Annotation = serde_json::from_str(&json).unwrap();
+        assert_eq!(ann, back);
     }
 
     /// A pre-material SceneObject JSON (no `material` field) must still load,

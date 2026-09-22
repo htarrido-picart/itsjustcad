@@ -625,6 +625,18 @@ pub enum Command {
         b: DimAnchorSpec,
         offset: f64,
     },
+    /// Angular dimension: the angle p1–`vertex`–p2, drawn as an arc of `radius`
+    /// between the two legs and labelled in degrees. Points are free model
+    /// points (no associative binding yet). The measured angle is derived at
+    /// display time, never stored.
+    DimAngular {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        vertex: DVec3,
+        p1: DVec3,
+        p2: DVec3,
+        radius: f64,
+    },
     Text {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,

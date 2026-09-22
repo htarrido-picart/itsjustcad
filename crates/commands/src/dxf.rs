@@ -166,6 +166,22 @@ fn annotation_entity(
             text(t, layer, mid, 0.2, &itsjustcad_doc::format_length(units, (*b - *a).length()));
             2
         }
+        Annotation::AngularDim { vertex, p1, p2, radius } => {
+            // Two legs, an arc between them, and the degree label as TEXT.
+            line(t, layer, *vertex, *vertex + (*p1 - *vertex).normalize_or_zero() * *radius);
+            line(t, layer, *vertex, *vertex + (*p2 - *vertex).normalize_or_zero() * *radius);
+            let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
+            polyline(t, layer, &arc, false);
+            let label_at = arc.get(arc.len() / 2).copied().unwrap_or(*vertex);
+            text(
+                t,
+                layer,
+                label_at,
+                0.2,
+                &itsjustcad_doc::format_angle(itsjustcad_doc::angle_degrees(*vertex, *p1, *p2)),
+            );
+            3
+        }
         // A field exports like text — `text` is the resolved field value.
         Annotation::Text { pos, text: s, height }
         | Annotation::Field { pos, text: s, height, .. } => {
@@ -835,6 +851,12 @@ fn map_block_geom_points(
                 *p = xf(*p);
             }
         }
+        BlockGeometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) => {
+            *vertex = xf(*vertex);
+            *p1 = xf(*p1);
+            *p2 = xf(*p2);
+            *radius *= rscale.abs();
+        }
         BlockGeometry::Annotation(Annotation::Hatch { boundary, .. }) => {
             for p in boundary.iter_mut() {
                 *p = xf(*p);
@@ -915,6 +937,11 @@ fn translate_block_geom(g: &mut itsjustcad_doc::BlockGeometry, d: DVec3) {
             // Free anchors translate; object bindings follow their referent.
             a.translate(d);
             b.translate(d);
+        }
+        BlockGeometry::Annotation(Annotation::AngularDim { vertex, p1, p2, .. }) => {
+            *vertex += d;
+            *p1 += d;
+            *p2 += d;
         }
         BlockGeometry::Annotation(Annotation::Hatch { boundary, .. }) => {
             boundary.iter_mut().for_each(|p| *p += d);

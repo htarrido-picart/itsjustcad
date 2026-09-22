@@ -271,6 +271,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Dimension,
         },
         CommandSpec {
+            name: "dimangular",
+            usage: "dimangular <vertex x,y,z> <p1 x,y,z> <p2 x,y,z> [radius]",
+            summary: "Angular dimension: measures the angle p1-vertex-p2 and labels it in degrees, drawing an arc of the given radius (default 1.0) between the two legs. Points are free model points. Example: dimangular 0,0 1,0 0,1  (a 90° corner)",
+            category: Category::Dimension,
+        },
+        CommandSpec {
             name: "text",
             usage: "text <pos x,y,z> <words...> [height]",
             summary: "Text annotation at a point; trailing number = text height in meters (default 0.2). Example: text 5,3 living room 0.3",

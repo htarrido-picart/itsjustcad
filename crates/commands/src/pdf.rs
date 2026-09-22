@@ -84,6 +84,18 @@ fn geometry_segments(doc: &Document, geometry: &Geometry, out: &mut Vec<(DVec3, 
             // Dim line.
             out.push((a_off, b_off));
         }
+        // AngularDim: two legs (out to the arc radius) plus the tessellated arc
+        // between them. The degree label is emitted in the second pass.
+        Geometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) => {
+            let l1 = *vertex + (*p1 - *vertex).normalize_or_zero() * *radius;
+            let l2 = *vertex + (*p2 - *vertex).normalize_or_zero() * *radius;
+            out.push((*vertex, l1));
+            out.push((*vertex, l2));
+            let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
+            for pair in arc.windows(2) {
+                out.push((pair[0], pair[1]));
+            }
+        }
         Geometry::Annotation(Annotation::Hatch { boundary, pattern }) => {
             use itsjustcad_doc::{
                 hatch::{hatch_ansi, hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
@@ -521,6 +533,32 @@ fn render_view(
             {
                 let dist_m = (*db - *da).length();
                 let label = format!("{:.3}m", dist_m);
+                content.push_str(&format!(
+                    "BT /F1 7 Tf {} {} Td ({}) Tj ET\n",
+                    mm(text_pos.x),
+                    mm(text_pos.y),
+                    escape_pdf_text(&label)
+                ));
+            }
+        }
+        // Angular dimension labels: the degree value at the arc midpoint.
+        if let Geometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) =
+            &obj.geometry
+        {
+            let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
+            let mid_world = arc.get(arc.len() / 2).copied().unwrap_or(*vertex);
+            let projected = project(view.direction, mid_world);
+            let paper_pos = DVec2::new(
+                world_to_paper_mm(projected.x, view.scale),
+                world_to_paper_mm(projected.y, view.scale),
+            );
+            let text_pos = paper_pos + offset;
+            if text_pos.x > cmin.x && text_pos.x < cmax.x
+                && text_pos.y > cmin.y && text_pos.y < cmax.y
+            {
+                let label = itsjustcad_doc::format_angle(
+                    itsjustcad_doc::angle_degrees(*vertex, *p1, *p2),
+                );
                 content.push_str(&format!(
                     "BT /F1 7 Tf {} {} Td ({}) Tj ET\n",
                     mm(text_pos.x),

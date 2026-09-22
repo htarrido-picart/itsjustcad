@@ -63,6 +63,30 @@ fn collect_segments(doc: &Document, geometry: &Geometry) -> Vec<(DVec3, DVec3)> 
             segs.push((gb, b_off));
             segs.push((a_off, b_off));
         }
+        // AngularDim: two legs + the tessellated arc, plus the degree label
+        // rendered as world-space Hershey strokes (so SVG carries the value).
+        Geometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) => {
+            let l1 = *vertex + (*p1 - *vertex).normalize_or_zero() * *radius;
+            let l2 = *vertex + (*p2 - *vertex).normalize_or_zero() * *radius;
+            segs.push((*vertex, l1));
+            segs.push((*vertex, l2));
+            let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
+            for pair in arc.windows(2) {
+                segs.push((pair[0], pair[1]));
+            }
+            let mid = arc.get(arc.len() / 2).copied().unwrap_or(*vertex);
+            let label = itsjustcad_doc::format_angle(
+                itsjustcad_doc::angle_degrees(*vertex, *p1, *p2),
+            );
+            let height = (*radius * 0.15).max(0.05);
+            for poly in itsjustcad_doc::hershey::text_strokes(&label, [mid.x, mid.y], height) {
+                for pair in poly.windows(2) {
+                    let a = DVec3::new(pair[0][0], pair[0][1], mid.z);
+                    let b = DVec3::new(pair[1][0], pair[1][1], mid.z);
+                    segs.push((a, b));
+                }
+            }
+        }
         // Text annotations: tessellate via Hershey stroke font so they render
         // as world-space geometry (identical appearance across viewport/SVG/PDF/DXF).
         Geometry::Annotation(Annotation::Text { pos, text, height }) => {

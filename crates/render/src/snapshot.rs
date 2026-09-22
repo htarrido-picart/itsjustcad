@@ -387,6 +387,38 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                     }
                 }
             }
+            // AngularDim: two legs + the arc between them as scene lines, plus
+            // the degree label as Hershey strokes. Drawn as scene geometry (not
+            // an egui overlay) so it appears at world scale in every view; the
+            // app still draws its own crisp overlay label on top.
+            Geometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) => {
+                let color = resolve_color(obj, layer_color, theme, selected, mode, false);
+                let l1 = *vertex + (*p1 - *vertex).normalize_or_zero() * *radius;
+                let l2 = *vertex + (*p2 - *vertex).normalize_or_zero() * *radius;
+                let leg = |a: DVec3, b: DVec3| -> Vec<[f32; 3]> {
+                    vec![[a.x as f32, a.y as f32, a.z as f32], [b.x as f32, b.y as f32, b.z as f32]]
+                };
+                scene.lines.push((leg(*vertex, l1), color, lw_mm));
+                scene.lines.push((leg(*vertex, l2), color, lw_mm));
+                let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
+                if arc.len() >= 2 {
+                    let pts: Vec<[f32; 3]> =
+                        arc.iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]).collect();
+                    scene.lines.push((pts, color, lw_mm));
+                }
+                let mid = arc.get(arc.len() / 2).copied().unwrap_or(*vertex);
+                let label = itsjustcad_doc::format_angle(
+                    itsjustcad_doc::angle_degrees(*vertex, *p1, *p2),
+                );
+                let height = (*radius * 0.15).max(0.05);
+                for poly in itsjustcad_doc::hershey::text_strokes(&label, [mid.x, mid.y], height) {
+                    let pts: Vec<[f32; 3]> =
+                        poly.iter().map(|p| [p[0] as f32, p[1] as f32, mid.z as f32]).collect();
+                    if pts.len() >= 2 {
+                        scene.lines.push((pts, color, lw_mm));
+                    }
+                }
+            }
             Geometry::Annotation(_) => {}
             // Block instances: resolved to constituent geometry at render time.
             Geometry::Instance { block, position, rotation_deg, scale, .. } => {

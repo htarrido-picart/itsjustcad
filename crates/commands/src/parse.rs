@@ -456,6 +456,29 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 offset,
             })
         }
+        "dimangular" => {
+            // dimangular <vertex> <p1> <p2> [radius]
+            // Measures the angle p1–vertex–p2; the trailing number is the arc
+            // radius (default `DEFAULT_DIM_ANGULAR_RADIUS`).
+            let (radius, pts) = match args.as_slice() {
+                [v, p1, p2] => (DEFAULT_DIM_ANGULAR_RADIUS, [*v, *p1, *p2]),
+                [v, p1, p2, r] => (number(r)?, [*v, *p1, *p2]),
+                _ => {
+                    return wrong(
+                        "dimangular",
+                        "a vertex and two points, and an optional radius",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::DimAngular {
+                id: None,
+                vertex: point(pts[0])?,
+                p1: point(pts[1])?,
+                p2: point(pts[2])?,
+                radius,
+            })
+        }
         "text" => {
             let (&pos, rest) = args
                 .split_first()
@@ -2098,6 +2121,8 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
 
 /// Default dimension-line offset (meters) when the user omits it.
 const DEFAULT_DIM_OFFSET: f64 = 0.5;
+/// Default arc radius for an angular dimension (model units).
+const DEFAULT_DIM_ANGULAR_RADIUS: f64 = 1.0;
 /// Default annotation text height (meters).
 const DEFAULT_TEXT_HEIGHT: f64 = 0.2;
 
@@ -5181,6 +5206,23 @@ mod tests {
             Command::Dim { offset, .. } if offset == 0.8
         ));
         assert!(parse("dim 0,0").is_err());
+
+        // dimangular: vertex + two points, optional radius (default 1.0).
+        assert_eq!(
+            parse("dimangular 0,0 1,0 0,1").unwrap(),
+            Command::DimAngular {
+                id: None,
+                vertex: DVec3::ZERO,
+                p1: DVec3::new(1.0, 0.0, 0.0),
+                p2: DVec3::new(0.0, 1.0, 0.0),
+                radius: DEFAULT_DIM_ANGULAR_RADIUS,
+            }
+        );
+        assert!(matches!(
+            parse("dimangular 0,0 1,0 0,1 2.5").unwrap(),
+            Command::DimAngular { radius, .. } if radius == 2.5
+        ));
+        assert!(parse("dimangular 0,0 1,0").is_err());
 
         // text: words join, optional trailing height
         assert_eq!(

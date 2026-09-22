@@ -116,6 +116,7 @@ pub fn digest(doc: &Document) -> String {
             Geometry::Curve(_) => "curve",
             Geometry::Annotation(a) => match a {
                 itsjustcad_doc::Annotation::LinearDim { .. } => "dim",
+                itsjustcad_doc::Annotation::AngularDim { .. } => "angledim",
                 itsjustcad_doc::Annotation::Text { .. } => "text",
                 itsjustcad_doc::Annotation::Field { .. } => "field",
                 itsjustcad_doc::Annotation::Hatch { .. } => "hatch",
