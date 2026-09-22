@@ -2660,6 +2660,90 @@ fn insert_curve(
     (id, outcome)
 }
 
+/// True when two geometries are duplicates: same kind and same defining points
+/// within `tol` (order-sensitive), ignoring id/layer/color. Used by `seldup`.
+///
+/// Curves compare their control/definition points (`points_bound`) so an Arc
+/// vs a Line never matches even if their bound boxes coincide; meshes compare
+/// vertex positions + face indices; other kinds compare their bound points.
+/// A conservative equality: false negatives (a missed duplicate) are safer than
+/// false positives (flagging distinct objects as dupes).
+fn geometry_dup_eq(a: &Geometry, b: &Geometry, tol: f64) -> bool {
+    // Different kinds are never duplicates.
+    if std::mem::discriminant(a) != std::mem::discriminant(b) {
+        return false;
+    }
+    let pts_eq = |pa: &[DVec3], pb: &[DVec3]| -> bool {
+        pa.len() == pb.len() && pa.iter().zip(pb).all(|(p, q)| p.distance(*q) <= tol)
+    };
+    match (a, b) {
+        (Geometry::Curve(ca), Geometry::Curve(cb)) => {
+            // Guard the sub-kind too (Line vs Arc vs Polyline …).
+            std::mem::discriminant(ca) == std::mem::discriminant(cb)
+                && pts_eq(&ca.points_bound(), &cb.points_bound())
+        }
+        (Geometry::Mesh(ma), Geometry::Mesh(mb)) => {
+            ma.faces() == mb.faces() && pts_eq(ma.positions(), mb.positions())
+        }
+        _ => pts_eq(&a.bound_points(), &b.bound_points()),
+    }
+}
+
+/// Center of a circle of `radius` tangent to two lines (TTR, line–line case).
+///
+/// Each line is offset by `±radius` (four parallel candidates); a tangent
+/// circle's center lies on one offset of each line, so it sits at an offset
+/// intersection. We intersect the two lines' *left* offsets as infinite lines
+/// (the sign only picks which of the four bisector cells the center falls in);
+/// then, to choose the stable, intuitive solution, we shift the raw corner
+/// intersection along the two inward bisector directions so the returned center
+/// is exactly `radius` from both lines and nearest the midpoint of the lines'
+/// mutual closest points. Returns `None` when the lines are parallel.
+fn circletan_line_line(
+    la: (DVec3, DVec3),
+    lb: (DVec3, DVec3),
+    radius: f64,
+) -> Option<DVec3> {
+    let d1 = (la.1 - la.0).truncate();
+    let d2 = (lb.1 - lb.0).truncate();
+    let denom = d1.perp_dot(d2);
+    if denom.abs() < 1e-12 {
+        return None; // parallel: no unique tangent circle
+    }
+    // Infinite-line intersection (the corner both lines' supports meet at).
+    let w = (lb.0 - la.0).truncate();
+    let t1 = w.perp_dot(d2) / denom;
+    let z = la.0.z;
+    let corner = (la.0.truncate() + d1 * t1).extend(z);
+    // Unit line directions and their left-normals (perpendicular offset dir).
+    let u1 = d1.normalize();
+    let u2 = d2.normalize();
+    let n1 = glam::DVec2::new(-u1.y, u1.x);
+    let n2 = glam::DVec2::new(-u2.y, u2.x);
+    // Aim the center toward the midpoint of the two lines' closest approach so
+    // the chosen quadrant is the intuitive one; the offset signs are picked to
+    // step toward that side.
+    let mid = ((la.0 + la.1 + lb.0 + lb.1) * 0.25).truncate();
+    let to_mid = mid - corner.truncate();
+    let s1 = if n1.dot(to_mid) >= 0.0 { 1.0 } else { -1.0 };
+    let s2 = if n2.dot(to_mid) >= 0.0 { 1.0 } else { -1.0 };
+    // The center sits on line1's offset (corner + s1*n1*r along its support) and
+    // line2's offset; solving both gives corner + r*(bisector) where the
+    // bisector is scaled so the perpendicular distance to each line is exactly r.
+    // Directly: move `radius` off each line along its inward normal, then meet.
+    // p·n1 = corner·n1 + s1*r  and  p·n2 = corner·n2 + s2*r.
+    let b1 = corner.truncate().dot(n1) + s1 * radius;
+    let b2 = corner.truncate().dot(n2) + s2 * radius;
+    // Solve [n1; n2] p = [b1; b2].
+    let det = n1.x * n2.y - n1.y * n2.x;
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let px = (b1 * n2.y - b2 * n1.y) / det;
+    let py = (n1.x * b2 - n2.x * b1) / det;
+    Some(DVec3::new(px, py, z))
+}
+
 // ------------------------------------------------------------- boundary trace
 //
 // `boundary` (AutoCAD BOUNDARY / pick-point-in-region) works entirely in the 2D
@@ -8166,6 +8250,40 @@ fn apply_forward(
                 outcome,
             ))
         }
+        Command::LineTan { id, from, curve } => {
+            // Foot on the curve nearest `from` is the tangent point; the line
+            // runs from `from` to it (it then lies along the curve's tangent).
+            let (_cid, c) = one_curve(doc, &curve, "linetan")?;
+            let foot = kernel_curve::closest_point(c, from, PROFILE_TOL);
+            if foot.distance(from) < 1e-9 {
+                return Err(ExecError::Invalid(
+                    "linetan: the from-point lies on the curve (degenerate line)".into(),
+                ));
+            }
+            let (id, outcome) = insert_curve(doc, id, Curve::Line { a: from, b: foot }, "linetan");
+            Ok((
+                Command::LineTan { id: Some(id), from, curve },
+                Inverse::DeleteCreated(vec![id]),
+                outcome,
+            ))
+        }
+        Command::LinePerp { id, from, curve } => {
+            // The foot of perpendicular is the closest point on the curve; the
+            // segment `from`→foot meets the curve perpendicularly.
+            let (_cid, c) = one_curve(doc, &curve, "lineperp")?;
+            let foot = kernel_curve::closest_point(c, from, PROFILE_TOL);
+            if foot.distance(from) < 1e-9 {
+                return Err(ExecError::Invalid(
+                    "lineperp: the from-point lies on the curve (degenerate line)".into(),
+                ));
+            }
+            let (id, outcome) = insert_curve(doc, id, Curve::Line { a: from, b: foot }, "lineperp");
+            Ok((
+                Command::LinePerp { id: Some(id), from, curve },
+                Inverse::DeleteCreated(vec![id]),
+                outcome,
+            ))
+        }
         Command::Polyline { id, points, closed } => {
             if closed && points.len() < 3 {
                 return Err(ExecError::Invalid(
@@ -8209,6 +8327,39 @@ fn apply_forward(
             let (id, outcome) = insert_curve(doc, id, curve, "circle");
             Ok((
                 Command::Circle { id: Some(id), center, radius },
+                Inverse::DeleteCreated(vec![id]),
+                outcome,
+            ))
+        }
+        Command::CircleTan { id, a, b, radius } => {
+            if radius <= 0.0 {
+                return Err(ExecError::Invalid("circletan radius must be positive".into()));
+            }
+            // Resolve the two curve selectors to exactly one line each (the solid
+            // supported case is LINE–LINE TTR).
+            let line_of = |sel: &Selector| -> Result<(DVec3, DVec3), ExecError> {
+                let (_cid, c) = one_curve(doc, sel, "circletan")?;
+                match c {
+                    Curve::Line { a, b } => Ok((*a, *b)),
+                    _ => Err(ExecError::Invalid(
+                        "circletan supports the line–line case for now; \
+                         a selected curve is not a line"
+                            .into(),
+                    )),
+                }
+            };
+            let la = line_of(&a)?;
+            let lb = line_of(&b)?;
+            let center = circletan_line_line(la, lb, radius).ok_or_else(|| {
+                ExecError::Invalid(format!(
+                    "circletan: no circle of radius {radius} is tangent to both lines \
+                     (they are parallel)"
+                ))
+            })?;
+            let curve = Curve::Arc { center, radius, start: 0.0, end: std::f64::consts::TAU };
+            let (id, outcome) = insert_curve(doc, id, curve, "circletan");
+            Ok((
+                Command::CircleTan { id: Some(id), a, b, radius },
                 Inverse::DeleteCreated(vec![id]),
                 outcome,
             ))
@@ -9056,6 +9207,7 @@ fn apply_forward(
             let mut want_layers: Vec<String> = Vec::new();
             let mut want_colors: Vec<Option<[f32; 3]>> = Vec::new();
             let mut want_kinds: Vec<u8> = Vec::new();
+            let mut want_weights: Vec<f64> = Vec::new();
             for id in &seeds {
                 let obj = doc.get(*id).expect("resolved");
                 match by {
@@ -9075,6 +9227,12 @@ fn apply_forward(
                             want_kinds.push(k);
                         }
                     }
+                    SimilarBy::Weight => {
+                        let w = doc.effective_lineweight(obj);
+                        if !want_weights.iter().any(|&x| (x - w).abs() < 1e-9) {
+                            want_weights.push(w);
+                        }
+                    }
                 }
             }
             let matched: Vec<ObjectId> = doc
@@ -9083,6 +9241,10 @@ fn apply_forward(
                     SimilarBy::Layer => want_layers.contains(&o.layer),
                     SimilarBy::Color => want_colors.contains(&o.color),
                     SimilarBy::Type => want_kinds.contains(&key(&o.geometry)),
+                    SimilarBy::Weight => {
+                        let w = doc.effective_lineweight(o);
+                        want_weights.iter().any(|&x| (x - w).abs() < 1e-9)
+                    }
                 })
                 .map(|o| o.id)
                 .collect();
@@ -9094,6 +9256,38 @@ fn apply_forward(
                 ApplyOutcome {
                     created: Vec::new(),
                     message: format!("selected {n} similar object(s) by {by}"),
+                },
+            ))
+        }
+        Command::SelDup { targets } => {
+            // Scan the candidate set (a selector, or the whole doc) and flag every
+            // object that is a geometric duplicate of an earlier one (same kind +
+            // same points within tolerance, ignoring id/layer). Selection-only,
+            // never op-logged — a precursor to purge. Mirrors `selsimilar`.
+            let candidates: Vec<ObjectId> = match &targets {
+                Some(sel) => resolve(doc, sel)?,
+                None => doc.objects().map(|o| o.id).collect(),
+            };
+            // Compare each object against the earlier ones; the second (and later)
+            // copy of an identical geometry is the flagged "duplicate".
+            let mut seen: Vec<(ObjectId, &Geometry)> = Vec::new();
+            let mut dups: Vec<ObjectId> = Vec::new();
+            for id in &candidates {
+                let g = &doc.get(*id).expect("candidate").geometry;
+                if seen.iter().any(|(_, prev)| geometry_dup_eq(prev, g, PROFILE_TOL)) {
+                    dups.push(*id);
+                } else {
+                    seen.push((*id, g));
+                }
+            }
+            doc.selection = dups.iter().copied().collect();
+            let n = dups.len();
+            Ok((
+                Command::SelDup { targets },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("selected {n} duplicate object(s)"),
                 },
             ))
         }
@@ -12676,9 +12870,12 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Cablenet { .. } => "cablenet",
         Command::MinSurf { .. } => "minsurf",
         Command::Line { .. } => "line",
+        Command::LineTan { .. } => "linetan",
+        Command::LinePerp { .. } => "lineperp",
         Command::Polyline { .. } => "polyline",
         Command::Rectangle { .. } => "rect",
         Command::Circle { .. } => "circle",
+        Command::CircleTan { .. } => "circletan",
         Command::Arc { .. } => "arc",
         Command::Ellipse { .. } => "ellipse",
         Command::Polygon { .. } => "polygon",
@@ -12709,6 +12906,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Flatten { .. } => "flatten",
         Command::Stretch { .. } => "stretch",
         Command::SelSimilar { .. } => "selsimilar",
+        Command::SelDup { .. } => "seldup",
         Command::DimRadius { diameter, .. } => {
             if *diameter { "dimdiameter" } else { "dimradius" }
         }
@@ -22173,6 +22371,102 @@ mod tests {
         let out = run(&mut s, "selsimilar sel type");
         assert!(s.doc.selection.contains(&c), "{}", out.message);
         assert!(!s.doc.selection.contains(&a), "meshes excluded from curve match");
+    }
+
+    #[test]
+    fn selsimilar_by_weight_selects_same_lineweight() {
+        let mut s = Session::default();
+        // Three lines; give a + b the same override weight, c a different one.
+        let a = run(&mut s, "line 0,0 1,0").created[0];
+        let b = run(&mut s, "line 0,1 1,1").created[0];
+        let c = run(&mut s, "line 0,2 1,2").created[0];
+        // Set per-object lineweight overrides directly (a + b share 0.5).
+        s.doc.get_mut(a).unwrap().lineweight_mm = Some(0.5);
+        s.doc.get_mut(b).unwrap().lineweight_mm = Some(0.5);
+        s.doc.get_mut(c).unwrap().lineweight_mm = Some(0.9);
+
+        s.doc.selection = std::iter::once(a).collect();
+        let out = run(&mut s, "selsimilar sel weight");
+        assert!(out.message.contains("2 similar"), "{}", out.message);
+        assert!(s.doc.selection.contains(&a) && s.doc.selection.contains(&b));
+        assert!(!s.doc.selection.contains(&c), "different weight excluded");
+    }
+
+    #[test]
+    fn seldup_flags_duplicate_polylines() {
+        let mut s = Session::default();
+        // Two identical polylines + one different → exactly one duplicate flagged.
+        let _p1 = run(&mut s, "polyline 0,0 1,0 1,1").created[0];
+        let p2 = run(&mut s, "polyline 0,0 1,0 1,1").created[0];
+        let unique = run(&mut s, "polyline 0,0 2,0 2,2").created[0];
+        let out = run(&mut s, "seldup");
+        assert!(out.message.contains("1 duplicate"), "{}", out.message);
+        assert!(s.doc.selection.contains(&p2), "the second copy is the duplicate");
+        assert!(!s.doc.selection.contains(&unique), "distinct polyline not flagged");
+    }
+
+    #[test]
+    fn lineperp_endpoint_is_foot_of_perpendicular() {
+        let mut s = Session::default();
+        // Horizontal line along X; perpendicular from (5,3,0) lands at (5,0,0).
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "lineperp 5,3,0 last");
+        let Curve::Line { a, b } = curve_of_last(&s) else { panic!("expected a line") };
+        assert!(a.distance(DVec3::new(5.0, 3.0, 0.0)) < 1e-9, "starts at from");
+        assert!(b.distance(DVec3::new(5.0, 0.0, 0.0)) < 1e-9, "foot at (5,0,0)");
+    }
+
+    #[test]
+    fn linetan_endpoint_is_tangent_point_on_circle() {
+        let mut s = Session::default();
+        // Unit circle at origin; nearest point to (5,0,0) is (1,0,0).
+        run(&mut s, "circle 0,0,0 1");
+        run(&mut s, "linetan 5,0,0 last");
+        let Curve::Line { a, b } = curve_of_last(&s) else { panic!("expected a line") };
+        assert!(a.distance(DVec3::new(5.0, 0.0, 0.0)) < 1e-9, "starts at from");
+        assert!(b.distance(DVec3::new(1.0, 0.0, 0.0)) < 1e-9, "tangent point on rim");
+    }
+
+    #[test]
+    fn circletan_line_line_center_is_equidistant() {
+        let mut s = Session::default();
+        // Two perpendicular lines through the origin (the X and Y axes). A circle
+        // of radius 2 tangent to both sits at (2,2) — 2 from each axis.
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "name last la");
+        run(&mut s, "line 0,0,0 0,10,0");
+        run(&mut s, "name last lb");
+        let out = run(&mut s, "circletan la lb 2");
+        assert!(out.message.contains("circletan"), "{}", out.message);
+        let Curve::Arc { center, radius, .. } = curve_of_last(&s) else {
+            panic!("expected a circle (arc)")
+        };
+        assert!((radius - 2.0).abs() < 1e-9);
+        // Distance from center to each line (the axes) must equal the radius.
+        assert!((center.x.abs() - 2.0).abs() < 1e-9, "2 from the Y axis");
+        assert!((center.y.abs() - 2.0).abs() < 1e-9, "2 from the X axis");
+
+        // Undo removes the created circle.
+        let before = s.doc.len();
+        s.undo().unwrap();
+        assert_eq!(s.doc.len(), before - 1, "circletan undo removes the circle");
+
+        // Parallel lines have no tangent circle → graceful error.
+        run(&mut s, "line 0,5,0 10,5,0");
+        run(&mut s, "name last lc");
+        assert!(s.run(parse("circletan la lc 2").unwrap()).is_err());
+    }
+
+    #[test]
+    fn circletan_line_line_helper_center_math() {
+        // Pure helper: axes at origin, radius 3 → center 3 from each line.
+        let la = (DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0));
+        let lb = (DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.0, 1.0, 0.0));
+        let c = circletan_line_line(la, lb, 3.0).expect("non-parallel");
+        assert!((c.x.abs() - 3.0).abs() < 1e-9 && (c.y.abs() - 3.0).abs() < 1e-9);
+        // Parallel lines → None.
+        let lp = (DVec3::new(0.0, 5.0, 0.0), DVec3::new(1.0, 5.0, 0.0));
+        assert!(circletan_line_line(la, lp, 2.0).is_none());
     }
 
     #[test]

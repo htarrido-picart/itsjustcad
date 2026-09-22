@@ -256,6 +256,23 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 b: point(b)?,
             })
         }
+        "linetan" => {
+            // "linetan <from> <curve selector>": the from-point, then a curve.
+            let from = point(args.first().copied().ok_or_else(|| {
+                wrong_err("linetan", "a from point then a curve selector", &args)
+            })?)?;
+            let (curve, rest) = selector(&args[1..], "linetan")?;
+            expect_empty("linetan", rest, &args)?;
+            Ok(Command::LineTan { id: None, from, curve })
+        }
+        "lineperp" => {
+            let from = point(args.first().copied().ok_or_else(|| {
+                wrong_err("lineperp", "a from point then a curve selector", &args)
+            })?)?;
+            let (curve, rest) = selector(&args[1..], "lineperp")?;
+            expect_empty("lineperp", rest, &args)?;
+            Ok(Command::LinePerp { id: None, from, curve })
+        }
         "polyline" | "pline" => {
             let (closed, pts) = match args.split_last() {
                 Some((&"closed", rest)) => (true, rest),
@@ -286,6 +303,17 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 center: point(center)?,
                 radius: number(r)?,
             })
+        }
+        "circletan" | "circlettr" => {
+            // "circletan <curveA> <curveB> <radius>" (TTR). Two selectors then a
+            // radius; the trailing token is the radius.
+            let (a, rest) = selector(&args, "circletan")?;
+            let (b, rest) = selector(rest, "circletan")?;
+            let [r] = take::<1>("circletan", "a radius after the two curve selectors", rest)
+                .map_err(|_| {
+                    wrong_err("circletan", "two curve selectors then a radius", &args)
+                })?;
+            Ok(Command::CircleTan { id: None, a, b, radius: number(r)? })
         }
         "arc" => {
             let [center, r, s, e] =
@@ -805,16 +833,27 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 ["layer"] => SimilarBy::Layer,
                 ["color"] => SimilarBy::Color,
                 ["type"] => SimilarBy::Type,
+                ["weight"] => SimilarBy::Weight,
                 _ => {
                     return Err(wrong_err(
                         "selsimilar",
-                        "an optional property: layer, color, or type",
+                        "an optional property: layer, color, type, or weight",
                         args,
                     ))
                 }
             };
             Ok(Command::SelSimilar { targets: sel, by })
         }),
+        "seldup" | "selduplicate" => {
+            // Optional selector; without one the whole document is scanned.
+            if args.is_empty() {
+                Ok(Command::SelDup { targets: None })
+            } else {
+                let (sel, rest) = selector(&args, "seldup")?;
+                expect_empty("seldup", rest, &args)?;
+                Ok(Command::SelDup { targets: Some(sel) })
+            }
+        }
         "dimradius" | "dimrad" => {
             let (sel, rest) = selector(&args, "dimradius")?;
             expect_empty("dimradius", rest, &args)?;
@@ -4410,7 +4449,40 @@ mod tests {
             parse("selsimilar all type").unwrap(),
             Command::SelSimilar { by: SimilarBy::Type, .. }
         ));
+        assert!(matches!(
+            parse("selsimilar last weight").unwrap(),
+            Command::SelSimilar { by: SimilarBy::Weight, .. }
+        ));
         assert!(parse("selsimilar last bogus").is_err());
+
+        // seldup: optional selector; bare form scans the whole document.
+        assert!(matches!(parse("seldup").unwrap(), Command::SelDup { targets: None }));
+        assert!(matches!(
+            parse("selduplicate last").unwrap(),
+            Command::SelDup { targets: Some(_) }
+        ));
+
+        // linetan / lineperp: a from-point then a curve selector.
+        assert!(matches!(
+            parse("linetan 5,5,0 last").unwrap(),
+            Command::LineTan { from, .. } if from == DVec3::new(5.0, 5.0, 0.0)
+        ));
+        assert!(matches!(
+            parse("lineperp 5,5,0 last").unwrap(),
+            Command::LinePerp { from, .. } if from == DVec3::new(5.0, 5.0, 0.0)
+        ));
+        assert!(parse("linetan 5,5,0").is_err(), "needs a curve selector");
+
+        // circletan / circlettr: two selectors then a radius.
+        assert!(matches!(
+            parse("circletan la lb 2").unwrap(),
+            Command::CircleTan { radius, .. } if (radius - 2.0).abs() < 1e-9
+        ));
+        assert!(matches!(
+            parse("circlettr la lb 1.5").unwrap(),
+            Command::CircleTan { .. }
+        ));
+        assert!(parse("circletan la lb").is_err(), "needs a radius");
 
         // dimradius / dimdiameter (+ aliases), round-trip
         assert!(matches!(

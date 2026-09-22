@@ -69,6 +69,8 @@ pub enum SimilarBy {
     Layer,
     Color,
     Type,
+    /// Effective print lineweight (per-object override, else the layer weight).
+    Weight,
 }
 
 impl std::fmt::Display for SimilarBy {
@@ -77,6 +79,7 @@ impl std::fmt::Display for SimilarBy {
             SimilarBy::Layer => "layer",
             SimilarBy::Color => "color",
             SimilarBy::Type => "type",
+            SimilarBy::Weight => "weight",
         })
     }
 }
@@ -422,6 +425,24 @@ pub enum Command {
         a: DVec3,
         b: DVec3,
     },
+    /// Line from `from` TANGENT to a curve: the line runs from `from` to the
+    /// curve's closest point (the tangent point) and lies along the curve's
+    /// tangent there. Creates a `Curve::Line` object.
+    LineTan {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        from: DVec3,
+        curve: Selector,
+    },
+    /// Line from `from` PERPENDICULAR to a curve: the line runs from `from` to
+    /// the curve's closest point, so the segment meets the curve at its foot of
+    /// perpendicular. Creates a `Curve::Line` object.
+    LinePerp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        from: DVec3,
+        curve: Selector,
+    },
     Polyline {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
@@ -439,6 +460,18 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
         center: DVec3,
+        radius: f64,
+    },
+    /// Circle of the given `radius` tangent to two curves (TTR: tangent-tangent-
+    /// radius). Currently the LINE–LINE case is solid: both lines are offset by
+    /// `radius` and the offsets intersected to give a center equidistant
+    /// (= `radius`) from both lines. The stable candidate nearest the midpoint of
+    /// the two lines' closest points is chosen. Creates a `Curve::Circle`.
+    CircleTan {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        a: Selector,
+        b: Selector,
         radius: f64,
     },
     Arc {
@@ -694,6 +727,14 @@ pub enum Command {
         targets: Selector,
         #[serde(default)]
         by: SimilarBy,
+    },
+    /// Select every object that is a geometric duplicate of another object (same
+    /// geometry kind + same points within a small tolerance, ignoring id/layer).
+    /// A selection change, never op-logged — a precursor to purge. Without a
+    /// selector the whole document is scanned; with one, only the selection.
+    SelDup {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        targets: Option<Selector>,
     },
     /// Radial dimension for a circle/arc: from its center to a point on the rim.
     /// Modeled as a `LinearDim` between those two points, reusing the existing
@@ -2038,6 +2079,7 @@ impl Command {
             Command::Select { .. }
                 | Command::SelectNone
                 | Command::SelSimilar { .. }
+                | Command::SelDup { .. }
                 | Command::ViewRestore { .. }
                 | Command::ViewList
                 | Command::Print { .. }

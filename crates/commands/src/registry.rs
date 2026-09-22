@@ -169,6 +169,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Draw2d,
         },
         CommandSpec {
+            name: "linetan",
+            usage: "linetan <from x,y,z> <curve selector>",
+            summary: "Line from a point TANGENT to a curve: it runs from the point to the curve's nearest (tangent) point, lying along the curve's tangent there. Example: line 0,0,0 10,0,0 then linetan 5,5,0 last",
+            category: Category::Draw2d,
+        },
+        CommandSpec {
+            name: "lineperp",
+            usage: "lineperp <from x,y,z> <curve selector>",
+            summary: "Line from a point PERPENDICULAR to a curve: it runs from the point to the closest point on the curve (the foot of perpendicular). Example: line 0,0,0 10,0,0 then lineperp 5,5,0 last",
+            category: Category::Draw2d,
+        },
+        CommandSpec {
             name: "polyline",
             usage: "polyline <p1> <p2> ... [closed]",
             summary: "Polyline through points; append 'closed' to close it. Example: polyline 0,0 5,0 5,5 closed",
@@ -184,6 +196,12 @@ pub fn registry() -> &'static [CommandSpec] {
             name: "circle",
             usage: "circle <center x,y,z> <radius>",
             summary: "Circle in the XY plane. Example: circle 0,0,0 2.5",
+            category: Category::Draw2d,
+        },
+        CommandSpec {
+            name: "circletan",
+            usage: "circletan <curveA selector> <curveB selector> <radius>",
+            summary: "Circle of a given radius tangent to two curves (TTR: tangent-tangent-radius). Supports the line–line case: both lines are offset by the radius and intersected to place the center equidistant from both. Alias: circlettr. Example: line 0,0,0 10,0,0 then name last la then line 0,0,0 0,10,0 then name last lb then circletan la lb 2",
             category: Category::Draw2d,
         },
         CommandSpec {
@@ -362,8 +380,14 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "selsimilar",
-            usage: "selsimilar <selector> [layer|color|type]",
-            summary: "Select every object sharing a property (default layer) with the current selection. Alias: selsim. Example: selsimilar last color",
+            usage: "selsimilar <selector> [layer|color|type|weight]",
+            summary: "Select every object sharing a property (default layer) with the current selection: layer, color, type (geometry kind), or weight (effective lineweight). Alias: selsim. Example: selsimilar last color",
+            category: Category::Edit,
+        },
+        CommandSpec {
+            name: "seldup",
+            usage: "seldup [<selector>]",
+            summary: "Select objects that are geometric duplicates of another object (same kind + same points within tolerance, ignoring id/layer) — a precursor to purge. With no selector the whole document is scanned. Alias: selduplicate. Example: seldup",
             category: Category::Edit,
         },
         CommandSpec {
