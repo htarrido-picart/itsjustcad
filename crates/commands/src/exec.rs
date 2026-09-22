@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use crate::error::ExecError;
 use crate::{
     BoolKind, CPlaneOp, Command, CompassDir, DimAnchorSpec, MirrorPlane, OptionOp, PlotStyleOp,
-    Selector, SheetSetOp, SimilarBy,
+    RegionMode, Selector, SheetSetOp, SimilarBy,
 };
 
 /// Chord tolerance used when tessellating profile curves for extrusion.
@@ -2726,6 +2726,44 @@ fn insert_curve(
         message: format!("{what} {id}"),
     };
     (id, outcome)
+}
+
+/// A normalized (min ≤ max) axis-aligned rectangle in world XY, the region a
+/// two-point `selregion` selection tests against. Built from two arbitrary
+/// corner points; the Z components of the corners are discarded (planar test).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rect2 {
+    pub min: glam::DVec2,
+    pub max: glam::DVec2,
+}
+
+impl Rect2 {
+    /// Build from two arbitrary corners (any order), normalizing so min ≤ max.
+    pub fn from_corners(a: DVec3, b: DVec3) -> Self {
+        Rect2 {
+            min: glam::DVec2::new(a.x.min(b.x), a.y.min(b.y)),
+            max: glam::DVec2::new(a.x.max(b.x), a.y.max(b.y)),
+        }
+    }
+}
+
+/// True when the object's XY footprint (aabb projected to XY) lies entirely
+/// inside `rect` — AutoCAD/Rhino *window* selection. The aabb Z extent is
+/// ignored, so the rectangle acts as a full-depth window.
+pub fn rect_contains_aabb(rect: Rect2, aabb: kernel_mesh::Aabb) -> bool {
+    aabb.min.x >= rect.min.x
+        && aabb.min.y >= rect.min.y
+        && aabb.max.x <= rect.max.x
+        && aabb.max.y <= rect.max.y
+}
+
+/// True when the object's XY footprint (aabb projected to XY) touches or
+/// overlaps `rect` — AutoCAD/Rhino *crossing* selection. Edge contact counts.
+pub fn rect_intersects_aabb(rect: Rect2, aabb: kernel_mesh::Aabb) -> bool {
+    aabb.min.x <= rect.max.x
+        && aabb.max.x >= rect.min.x
+        && aabb.min.y <= rect.max.y
+        && aabb.max.y >= rect.min.y
 }
 
 /// True when two geometries are duplicates: same kind and same defining points
@@ -9724,6 +9762,35 @@ fn apply_forward(
                 },
             ))
         }
+        Command::SelRegion { min, max, mode } => {
+            // Two-point AutoCAD/Rhino region select. Normalize the corners into a
+            // world-XY rectangle, then keep objects by their aabb footprint:
+            // window = fully inside, crossing = touching/overlapping. Planar in
+            // XY (aabb Z ignored). Selection-only, never op-logged; mirrors
+            // `selsimilar`/`seldup`. An empty rect / no match is not an error.
+            let rect = Rect2::from_corners(min, max);
+            let matched: Vec<ObjectId> = doc
+                .objects()
+                .filter(|o| {
+                    let bb = o.geometry.aabb();
+                    match mode {
+                        RegionMode::Window => rect_contains_aabb(rect, bb),
+                        RegionMode::Crossing => rect_intersects_aabb(rect, bb),
+                    }
+                })
+                .map(|o| o.id)
+                .collect();
+            doc.selection = matched.iter().copied().collect();
+            let n = matched.len();
+            Ok((
+                Command::SelRegion { min, max, mode },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("selected {n} object(s) ({mode})"),
+                },
+            ))
+        }
         Command::DimRadius { id, target, diameter } => {
             // Read the picked circle/arc's center + radius, then build a LinearDim
             // between the center and a rim point. `diameter` uses the far rim point
@@ -13431,6 +13498,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Stretch { .. } => "stretch",
         Command::SelSimilar { .. } => "selsimilar",
         Command::SelDup { .. } => "seldup",
+        Command::SelRegion { .. } => "selregion",
         Command::DimRadius { diameter, .. } => {
             if *diameter { "dimdiameter" } else { "dimradius" }
         }
@@ -23245,6 +23313,78 @@ mod tests {
     }
 
     #[test]
+    fn selregion_window_and_crossing_pick_the_right_objects() {
+        let mut s = Session::default();
+        // Rect is 0,0..10,10. Place three unit boxes:
+        //   inside   — fully within the rect (2..3),
+        //   straddle — crosses the right edge (9..11),
+        //   outside  — entirely beyond the rect (20..21).
+        let inside = run(&mut s, "box 2,2,0 1,1,1").created[0];
+        let straddle = run(&mut s, "box 9,2,0 2,1,1").created[0];
+        let outside = run(&mut s, "box 20,20,0 1,1,1").created[0];
+
+        // window: only the fully-inside box.
+        let out = run(&mut s, "selregion 0,0 10,10 window");
+        assert!(out.message.contains("selected 1 object(s) (window)"), "{}", out.message);
+        assert!(s.doc.selection.contains(&inside));
+        assert!(!s.doc.selection.contains(&straddle), "straddling box excluded from window");
+        assert!(!s.doc.selection.contains(&outside));
+
+        // crossing: inside + straddling, not the far-away box.
+        let out = run(&mut s, "selregion 0,0 10,10 crossing");
+        assert!(out.message.contains("selected 2 object(s) (crossing)"), "{}", out.message);
+        assert!(s.doc.selection.contains(&inside) && s.doc.selection.contains(&straddle));
+        assert!(!s.doc.selection.contains(&outside));
+
+        // Corners may be given in any order (normalized) → same result.
+        let out = run(&mut s, "selregion 10,10 0,0 window");
+        assert!(out.message.contains("selected 1"), "{}", out.message);
+
+        // Empty region far from everything → clean "selected 0", not an error.
+        let out = run(&mut s, "selwindow 100,100 101,101");
+        assert!(out.message.contains("selected 0 object(s) (window)"), "{}", out.message);
+        assert!(s.doc.selection.is_empty());
+
+        // selregion is a selection change, never op-logged.
+        assert!(!Command::SelRegion {
+            min: DVec3::ZERO,
+            max: DVec3::new(1.0, 1.0, 0.0),
+            mode: RegionMode::Window,
+        }
+        .is_logged());
+    }
+
+    #[test]
+    fn rect_aabb_helpers_are_correct() {
+        use kernel_mesh::Aabb;
+        let rect = Rect2::from_corners(DVec3::new(0.0, 0.0, 0.0), DVec3::new(10.0, 10.0, 0.0));
+
+        // Fully inside → contained and intersecting.
+        let inside = Aabb::from_points([DVec3::new(2.0, 2.0, -5.0), DVec3::new(3.0, 3.0, 5.0)]);
+        assert!(rect_contains_aabb(rect, inside));
+        assert!(rect_intersects_aabb(rect, inside));
+
+        // Straddling the edge → not contained, but intersecting.
+        let straddle = Aabb::from_points([DVec3::new(9.0, 2.0, 0.0), DVec3::new(11.0, 3.0, 0.0)]);
+        assert!(!rect_contains_aabb(rect, straddle));
+        assert!(rect_intersects_aabb(rect, straddle));
+
+        // Fully outside → neither.
+        let outside = Aabb::from_points([DVec3::new(20.0, 20.0, 0.0), DVec3::new(21.0, 21.0, 0.0)]);
+        assert!(!rect_contains_aabb(rect, outside));
+        assert!(!rect_intersects_aabb(rect, outside));
+
+        // Edge contact counts as crossing (touching the min corner).
+        let touch = Aabb::from_points([DVec3::new(-1.0, -1.0, 0.0), DVec3::new(0.0, 0.0, 0.0)]);
+        assert!(rect_intersects_aabb(rect, touch));
+        assert!(!rect_contains_aabb(rect, touch));
+
+        // Z extent is ignored (planar test): a tall box still contained in XY.
+        let tall = Aabb::from_points([DVec3::new(4.0, 4.0, -999.0), DVec3::new(5.0, 5.0, 999.0)]);
+        assert!(rect_contains_aabb(rect, tall));
+    }
+
+    #[test]
     fn lineperp_endpoint_is_foot_of_perpendicular() {
         let mut s = Session::default();
         // Horizontal line along X; perpendicular from (5,3,0) lands at (5,0,0).
@@ -23478,10 +23618,11 @@ mod tests {
         let mut s = Session::default();
         let path = write_sample_pat("render");
         run(&mut s, &format!("hatchpat {}", path.to_str().unwrap()));
-        // A closed square boundary to hatch.
+        // A closed square boundary to hatch. Use the `last` selector rather than
+        // formatting the object id — the short-id form is order-sensitive across
+        // the full test binary, whereas `last` always names the polyline.
         run(&mut s, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
-        let poly = s.doc.objects().next().unwrap().id;
-        let out = run(&mut s, &format!("hatch {poly} pattern GRAVEL 2"));
+        let out = run(&mut s, "hatch last pattern GRAVEL 2");
         assert!(out.message.contains("hatched"), "msg: {}", out.message);
 
         // The created hatch is self-contained: it carries the copied families

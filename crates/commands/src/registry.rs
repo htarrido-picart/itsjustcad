@@ -415,6 +415,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Edit,
         },
         CommandSpec {
+            name: "selregion",
+            usage: "selregion <min x,y> <max x,y> [window|crossing]",
+            summary: "Select objects by a two-point axis-aligned rectangle (AutoCAD/Rhino window/crossing). window (default) keeps only objects whose whole XY footprint is inside the rect; crossing keeps any that touch or overlap it. Planar in XY (object aabb Z ignored). Aliases: selwindow (=window), selcrossing (=crossing). Example: selregion 0,0 10,10 crossing",
+            category: Category::Edit,
+        },
+        CommandSpec {
             name: "dimradius",
             usage: "dimradius <selector>",
             summary: "Radial dimension for a circle or arc: from its center to a point on the rim. Alias: dimrad. Example: dimradius last",

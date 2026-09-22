@@ -84,6 +84,28 @@ impl std::fmt::Display for SimilarBy {
     }
 }
 
+/// How a two-point region selects objects (AutoCAD/Rhino window vs crossing).
+/// The test is planar in world XY: an object's aabb is projected to XY and its
+/// Z extent ignored, so the rectangle behaves as a full-depth window.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionMode {
+    /// Only objects whose entire XY footprint lies inside the rectangle.
+    #[default]
+    Window,
+    /// Objects whose XY footprint touches or overlaps the rectangle.
+    Crossing,
+}
+
+impl std::fmt::Display for RegionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RegionMode::Window => "window",
+            RegionMode::Crossing => "crossing",
+        })
+    }
+}
+
 /// Compass direction naming an elevation view. `North` names the elevation you
 /// see standing to the north looking south (i.e. the building's north face).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -775,6 +797,17 @@ pub enum Command {
     SelDup {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         targets: Option<Selector>,
+    },
+    /// Select objects by a two-point axis-aligned rectangle (AutoCAD/Rhino
+    /// window/crossing selection). `window` keeps only objects fully inside the
+    /// rect; `crossing` keeps any that touch or overlap it. Planar in world XY —
+    /// the object's aabb Z extent is ignored. A selection change, never
+    /// op-logged; mirrors `selsimilar`/`seldup`.
+    SelRegion {
+        min: DVec3,
+        max: DVec3,
+        #[serde(default)]
+        mode: RegionMode,
     },
     /// Radial dimension for a circle/arc: from its center to a point on the rim.
     /// Modeled as a `LinearDim` between those two points, reusing the existing
@@ -2129,6 +2162,7 @@ impl Command {
                 | Command::SelectNone
                 | Command::SelSimilar { .. }
                 | Command::SelDup { .. }
+                | Command::SelRegion { .. }
                 | Command::ViewRestore { .. }
                 | Command::ViewList
                 | Command::Print { .. }

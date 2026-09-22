@@ -37,7 +37,7 @@ pub mod workdir;
 
 pub use command::{
     BoolKind, CPlaneOp, Command, CompassDir, ConstrainKind, DimAnchorSpec, GridshellSurfaceSpec,
-    MirrorPlane, OptionOp, PlotStyleOp, Selector, SheetSetOp, SimilarBy,
+    MirrorPlane, OptionOp, PlotStyleOp, RegionMode, Selector, SheetSetOp, SimilarBy,
 };
 pub use error::{ExecError, ParseError};
 pub use exec::{ApplyOutcome, ImportSummary, Session, MAIN_BRANCH};

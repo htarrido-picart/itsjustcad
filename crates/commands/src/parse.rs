@@ -15,6 +15,7 @@ use crate::{
     SheetSetOp,
     Selector,
     SimilarBy,
+    RegionMode,
 };
 
 /// Hand-rolled `verb arg arg...` parser. Chosen over a combinator library
@@ -937,6 +938,30 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 expect_empty("seldup", rest, &args)?;
                 Ok(Command::SelDup { targets: Some(sel) })
             }
+        }
+        "selregion" | "selwindow" | "selcrossing" => {
+            // Two corner points + an optional window|crossing mode. The verb sets
+            // the default mode: `selwindow`/`selcrossing` fix it, `selregion`
+            // defaults to window and accepts an explicit trailing mode word.
+            let (default_mode, expects_mode) = match verb.as_str() {
+                "selwindow" => (RegionMode::Window, false),
+                "selcrossing" => (RegionMode::Crossing, false),
+                _ => (RegionMode::Window, true),
+            };
+            let expected = "two corner points x,y and an optional mode (window|crossing)";
+            let (min, max, mode) = match args.as_slice() {
+                [min, max] => (*min, *max, default_mode),
+                [min, max, m] if expects_mode => {
+                    let mode = match *m {
+                        "window" => RegionMode::Window,
+                        "crossing" => RegionMode::Crossing,
+                        _ => return wrong("selregion", expected, &args),
+                    };
+                    (*min, *max, mode)
+                }
+                _ => return wrong("selregion", expected, &args),
+            };
+            Ok(Command::SelRegion { min: point(min)?, max: point(max)?, mode })
         }
         "dimradius" | "dimrad" => {
             let (sel, rest) = selector(&args, "dimradius")?;
@@ -4600,6 +4625,33 @@ mod tests {
             parse("selduplicate last").unwrap(),
             Command::SelDup { targets: Some(_) }
         ));
+
+        // selregion: two corners, default window; explicit mode; verb aliases.
+        assert!(matches!(
+            parse("selregion 0,0 10,10").unwrap(),
+            Command::SelRegion { mode: RegionMode::Window, min, max }
+                if min == DVec3::new(0.0, 0.0, 0.0) && max == DVec3::new(10.0, 10.0, 0.0)
+        ));
+        assert!(matches!(
+            parse("selregion 0,0 10,10 window").unwrap(),
+            Command::SelRegion { mode: RegionMode::Window, .. }
+        ));
+        assert!(matches!(
+            parse("selregion 0,0 10,10 crossing").unwrap(),
+            Command::SelRegion { mode: RegionMode::Crossing, .. }
+        ));
+        assert!(matches!(
+            parse("selwindow 0,0 10,10").unwrap(),
+            Command::SelRegion { mode: RegionMode::Window, .. }
+        ));
+        assert!(matches!(
+            parse("selcrossing 0,0 10,10").unwrap(),
+            Command::SelRegion { mode: RegionMode::Crossing, .. }
+        ));
+        assert!(parse("selregion 0,0 10,10 bogus").is_err());
+        assert!(parse("selregion 0,0").is_err(), "needs two corners");
+        // fixed-mode verbs reject a trailing mode word.
+        assert!(parse("selwindow 0,0 10,10 crossing").is_err());
 
         // linetan / lineperp: a from-point then a curve selector.
         assert!(matches!(
