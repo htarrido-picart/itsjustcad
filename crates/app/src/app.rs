@@ -8997,8 +8997,14 @@ mod tests {
         rect.min + egui::vec2(rect.width() * fx, rect.height() * fy)
     }
 
-    /// Inject a full primary-button click (press → release) at a screen pos,
-    /// settling frames around each event so the app's `Response` sees a click.
+    /// Inject a full primary-button click at a screen pos. We press, nudge the
+    /// pointer a SUB-threshold fraction of a pixel, then release — a
+    /// press→move→release sequence. egui still reports this as a `clicked()`
+    /// (the move is well under the ~6px drag threshold, so it is NOT a drag),
+    /// but the interior move keeps the pointer "live" so the click registers
+    /// reliably on virtualized CI runners, where a bare press→release in place
+    /// is sometimes dropped. A plain in-place click is flaky there; the
+    /// box-select DRAG path (press-move-release) always worked — this mirrors it.
     #[cfg(test)]
     fn click_at(harness: &mut egui_kittest::Harness<'_, App>, pos: egui::Pos2) {
         let m = egui::Modifiers::default();
@@ -9010,8 +9016,12 @@ mod tests {
             modifiers: m,
         });
         harness.run_steps(1);
+        // Sub-threshold nudge (<< 6px drag threshold → still a click).
+        let nudged = pos + egui::vec2(0.5, 0.5);
+        harness.input_mut().events.push(egui::Event::PointerMoved(nudged));
+        harness.run_steps(1);
         harness.input_mut().events.push(egui::Event::PointerButton {
-            pos,
+            pos: nudged,
             button: egui::PointerButton::Primary,
             pressed: false,
             modifiers: m,
