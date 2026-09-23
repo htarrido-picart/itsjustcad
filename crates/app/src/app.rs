@@ -8938,6 +8938,28 @@ mod tests {
         harness.run_steps(2);
     }
 
+    /// Switch the active viewport to a **top orthographic** view framed on the
+    /// scene, then settle a frame so `last_active_viewport` re-captures the new
+    /// `view_proj`/`rect`.
+    ///
+    /// Why every click journey does this first: the default view is a 3/4
+    /// perspective, so `world_to_screen` is a foreshortened, size-dependent map —
+    /// under CI's window geometry the projected click points drift onto different
+    /// pixels (or off-pane), and the draw-tool / box-select gestures miss. `top`
+    /// makes world→screen a stable axis-aligned *affine* map (no perspective
+    /// divide, no camera tilt): X→screen-x, Y→screen-y, uniform scale. `ze`
+    /// centres the scene so the projected points sit in the middle of the pane
+    /// regardless of pane size — which is exactly what makes the tests
+    /// size-independent.
+    #[cfg(test)]
+    fn top_ortho_view(harness: &mut egui_kittest::Harness<'_, App>) {
+        submit_command(harness, "top");
+        submit_command(harness, "ze");
+        // `submit_command` already settles frames, but paint one more so the
+        // freshly-framed camera's view_proj is the one captured for projection.
+        harness.run_steps(2);
+    }
+
     /// The active pane's screen rect + `view_proj` from the last viewport frame.
     /// Panics if no viewport has painted yet (the journey must `run_steps` at
     /// least once — `run_app_journey` already settles 4 frames before the body).
@@ -9061,6 +9083,10 @@ mod tests {
         // command substrate as typed geometry. We drive the world→screen mapping
         // from the app's own captured view_proj so the clicks invert exactly.
         run_app_journey(|h| {
+            // Deterministic, size-independent projection: click points are placed
+            // via `world_to_screen`, which is only stable under a top-ortho view.
+            top_ortho_view(h);
+
             submit_command(h, "polygon");
             assert!(h.state().draw_tool.active(), "bare `polygon` armed the tool");
             assert!(
@@ -9111,6 +9137,10 @@ mod tests {
         // loop shut. Asserts a CLOSED polyline lands in the doc (not three open
         // segments) — the C-key handler routing through the command substrate.
         run_app_journey(|h| {
+            // Top-ortho first so the pick points project deterministically
+            // (size-independent) rather than through the default perspective.
+            top_ortho_view(h);
+
             submit_command(h, "polyline");
             assert!(h.state().draw_tool.active(), "bare `polyline` armed the tool");
 
@@ -9165,6 +9195,13 @@ mod tests {
                 .map(|o| (o.id, o.geometry.aabb()))
                 .collect();
             assert_eq!(ids.len(), 2, "two boxes drawn");
+
+            // Frame both boxes under a top-ortho view so their projected rects
+            // are stable axis-aligned quads that sit comfortably inside the pane
+            // at any window size (the default perspective foreshortens them and,
+            // under CI geometry, pushes the drag corners off-pane so the gesture
+            // is dropped). Recompute the live view_proj/rect *after* the switch.
+            top_ortho_view(h);
 
             // Projected screen rect of the FIRST box (near the origin); grow the
             // drag a little past it so a window drag fully encloses it, and make
