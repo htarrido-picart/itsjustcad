@@ -5227,30 +5227,61 @@ impl App {
     /// to just the strip; a chevron also toggles it. The Chat tab keeps its
     /// resize behavior (the whole panel is resizable) and background streaming
     /// (tick runs every frame in `ui`, independent of visibility).
+    /// The command line's surface fill: white in light mode, dark-neutral in
+    /// dark mode, so it reads as one clean surface with the deck dock (not a grey
+    /// strip). Same role the full-width command line used before it moved into the
+    /// right column.
+    fn command_line_fill(&self, ui: &egui::Ui) -> egui::Color32 {
+        let accent = preset::preset_for(self.cad_origin).tokens().colors.primary;
+        crate::theme::to_color32(
+            crate::theme::roles_for_mode(ui.visuals().dark_mode, accent).surface,
+        )
+    }
+
+    /// Width of the right column when the deck is hidden — the deck's stored width,
+    /// clamped to the same [floor, half-window] bounds the visible deck uses, so
+    /// hiding/showing the deck never jumps the command line's left edge.
+    fn command_column_width(&self, ui: &egui::Ui) -> f32 {
+        let max_w = (ui.ctx().viewport_rect().width() * 0.5).max(crate::tabstrip::DOCK_MIN);
+        self.dock_width.clamp(crate::tabstrip::DOCK_MIN, max_w)
+    }
+
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         use crate::tabstrip::PanelTab;
         if !self.panel_visible {
-            // Dock hidden → no left edge to clamp the viewport against.
-            self.dock_left = None;
-            // Collapsed to nothing: a small ▸ handle at the top-right edge, at the
-            // SAME height the collapse button had (stored while the panel was
-            // visible) so the button doesn't jump vertically on toggle.
-            let vr = ui.ctx().viewport_rect();
-            let y = ui
-                .ctx()
-                .data(|d| d.get_temp::<f32>(egui::Id::new("panel_toggle_y")))
-                .unwrap_or(vr.top() + 52.0);
-            egui::Area::new(egui::Id::new("panel_show_btn"))
-                .fixed_pos(egui::pos2(vr.right() - 28.0, y))
-                .show(ui.ctx(), |ui| {
-                    if self
-                        .icons
-                        .icon_button(ui, crate::icons::Icon::PanelOpen, "show panel (Cmd+\\)")
-                        .clicked()
-                    {
-                        self.panel_visible = true;
-                    }
+            // Deck hidden — but the command line still lives in the right column
+            // (it must ALWAYS be visible: op-log + input for every mode). Draw a
+            // deck-width right column holding ONLY the command line, with a small ▸
+            // handle to reveal the deck again. This keeps the command line's screen
+            // position stable whether the deck is shown or hidden.
+            let width = self.command_column_width(ui);
+            let cmd_fill = self.command_line_fill(ui);
+            let panel_resp = egui::Panel::right("right_panel")
+                .resizable(false)
+                .exact_size(width)
+                .frame(
+                    egui::Frame::side_top_panel(ui.style())
+                        .fill(cmd_fill)
+                        .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::S as i8, 4)),
+                )
+                .show(ui, |ui| {
+                    // ▸ reveal handle at the top of the column, at the SAME height
+                    // the collapse button had so it doesn't jump on toggle.
+                    ui.horizontal(|ui| {
+                        if self
+                            .icons
+                            .icon_button(ui, crate::icons::Icon::PanelOpen, "show panel (Cmd+\\)")
+                            .clicked()
+                        {
+                            self.panel_visible = true;
+                        }
+                    });
+                    ui.separator();
+                    self.command_line_body(ui);
                 });
+            // The viewport still clamps to the right column's left edge so the 3D
+            // never paints under the command line.
+            self.dock_left = Some(panel_resp.response.rect.left());
             return;
         }
 
@@ -5354,19 +5385,41 @@ impl App {
                     }
                 }
             });
+
+            // COMMAND LINE — under the deck, in the right column. Rendered as a
+            // NON-resizable inner bottom region of this (resizable) right panel.
+            // The c2cfcff keystroke bug was a *resizable* bottom panel nested in
+            // the resizable right panel: the two resize handles fought each other
+            // frame-to-frame, destabilizing layout and dropping keystrokes. A
+            // fixed-height bottom region has a deterministic rect every frame no
+            // matter how the deck is width-dragged, so the TextEdit (stable id)
+            // keeps identical focus/keystroke handling. It sits BELOW the tab strip
+            // so it is present whether the deck body is collapsed or expanded.
+            let cmd_fill = self.command_line_fill(ui);
+            // ~5 lines of history (≈16pt/line) + the input row reserve. Fixed —
+            // not resizable, to avoid the nested-resizable instability.
+            let cmd_h = (5.0f32 * 16.0 + 44.0).min(ui.available_height() * 0.6).max(90.0);
+            egui::Panel::bottom("command_line")
+                .resizable(false)
+                .exact_size(cmd_h)
+                .frame(
+                    egui::Frame::side_top_panel(ui.style())
+                        .fill(cmd_fill)
+                        .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::S as i8, 4)),
+                )
+                .show(ui, |ui| self.command_line_body(ui));
+
             if self.panel_tabs.is_collapsed() {
                 return;
             }
             // Breathing room below the tab strip so each tab's top content (deck
             // selectors, search field, Layers header) doesn't hug the tabs.
             ui.add_space(crate::theme::Spacing::SM);
-            // The command line USED to be docked at the bottom of this right panel.
-            // It now lives as a top-level, full-width bottom panel at the very
-            // bottom of the window (see `command_line_panel` in `ui()`), which
-            // fixes the flicker/dropped-keystroke bug caused by a bottom panel
-            // nested inside the resizable right panel. The tab body now fills the
-            // full right panel. Transparent frame so the WHITE dock fill shows
-            // through for every tab (no grey card inside a white dock).
+            // The command line lives directly under this deck body (the fixed,
+            // non-resizable inner bottom panel declared above the collapse check).
+            // The deck tab body fills the space between the tab strip and it.
+            // Transparent frame so the WHITE dock fill shows through for every tab
+            // (no grey card inside a white dock).
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| {
@@ -8501,52 +8554,32 @@ impl eframe::App for App {
 
         // ── Fixed docked slots (Layer 2) ─────────────────────────────────
         // Panel order matters: the first-declared bottom panel is OUTERMOST, i.e.
-        // lowest on screen. We build the menu bar at the very top, then the
-        // command line as a full-width panel at the VERY bottom of the window,
-        // the status bar directly above it, then the right tab panel, and finally
-        // the central viewport frame with its bottom tab bar.
+        // lowest on screen. We build the menu bar at the very top, then the right
+        // column (deck on top + command line under it — see `right_panel`), the
+        // full-width status bar at the bottom of the LEFT column, and finally the
+        // central viewport frame with its bottom tab bar.
+        //
+        // The command line no longer spans the whole window: it now lives inside
+        // the RIGHT column, directly beneath the deck (the user's request). It is
+        // rendered by `right_panel` as a NON-resizable inner bottom region of the
+        // right `Panel::right` — a fixed-height sibling, not a resizable nested
+        // panel. That distinction is what keeps the c2cfcff keystroke bug away:
+        // the old bug was a *resizable* bottom panel fighting the resizable right
+        // panel's width drag frame-to-frame, which destabilized layout and dropped
+        // keystrokes. A fixed-height inner region has a deterministic rect every
+        // frame regardless of the deck's width, and the TextEdit keeps its stable
+        // explicit id, so focus/keystroke handling is identical to before.
 
         // 1. Menu bar (Layer 3) — always the topmost strip.
         self.menu_bar(ui);
 
-        // 2. Command line — top-level, FULL WIDTH, at the very bottom of the
-        // window (declared first among bottom panels so it is the lowest). Always
-        // visible: it is the op-log scrollback + input for every mode. Moving it
-        // out of the nested right panel fixes the input flicker/dropped-keystroke
-        // bug (an unstable bottom panel inside a resizable right panel).
-        // Resizable so the user can drag the top edge to grow the op-log
-        // scrollback. Default height shows ~5 history lines plus the input row;
-        // the history block reserves that space even when scrollback is sparse.
-        // Resizable: drag the top edge to grow the op-log scrollback up to 60%
-        // of the window (the history fills the extra height — see
-        // `history_h_for`). Floor keeps ~5 lines + input visible.
-        let cmd_max = (ui.ctx().viewport_rect().height() * 0.6).max(150.0);
-        // White background (dark-neutral in dark mode) so the command line reads
-        // as a clean surface like the chat dock — not a grey strip.
-        let cmd_accent = preset::preset_for(self.cad_origin).tokens().colors.primary;
-        let cmd_fill = crate::theme::to_color32(
-            crate::theme::roles_for_mode(ui.visuals().dark_mode, cmd_accent).surface,
-        );
-        egui::Panel::bottom("command_line")
-            .resizable(true)
-            // ~5 lines of history (≈16pt/line) + the input row reserve.
-            .default_size(5.0 * 16.0 + 44.0)
-            .min_size(90.0)
-            .max_size(cmd_max)
-            .frame(
-                egui::Frame::side_top_panel(ui.style())
-                    .fill(cmd_fill)
-                    .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::S as i8, 4)),
-            )
-            .show(ui, |ui| self.command_line_body(ui));
-
-        // 3. Status bar — directly above the command line.
-        // Right dock is declared BEFORE the statusbar so it spans the full height
-        // down to the command line — its bottom edge TOUCHES the command line
-        // instead of stopping at a full-width statusbar. The statusbar (declared
-        // after) then only spans the remaining VIEWPORT width, not under the dock.
+        // 2. Right column: deck (fills, top) + command line (fixed, bottom).
+        // Declared before the status bar so the right column spans the full window
+        // height; the status bar (declared after) then only spans the remaining
+        // LEFT/viewport width, not under the right column.
         self.right_panel(ui);
 
+        // 3. Status bar — full-width bottom of the LEFT column.
         egui::Panel::bottom("statusbar")
             .resizable(false)
             .show(ui, |ui| self.status_bar(ui));
