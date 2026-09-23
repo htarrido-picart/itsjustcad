@@ -63,9 +63,30 @@ fn collect_segments(doc: &Document, geometry: &Geometry) -> Vec<(DVec3, DVec3)> 
             segs.push((gb, b_off));
             segs.push((a_off, b_off));
         }
+        // AngularDim: two legs + the tessellated arc, plus the degree label
+        // rendered as world-space Hershey strokes (so SVG carries the value).
+        Geometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) => {
+            // Leg+arc geometry from the shared helper; the label is placed below.
+            segs.extend(itsjustcad_doc::angular_dim_segments(*vertex, *p1, *p2, *radius));
+            let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
+            let mid = arc.get(arc.len() / 2).copied().unwrap_or(*vertex);
+            let label = itsjustcad_doc::format_angle(
+                itsjustcad_doc::angle_degrees(*vertex, *p1, *p2),
+            );
+            let height = (*radius * 0.15).max(0.05);
+            for poly in itsjustcad_doc::hershey::text_strokes(&label, [mid.x, mid.y], height) {
+                for pair in poly.windows(2) {
+                    let a = DVec3::new(pair[0][0], pair[0][1], mid.z);
+                    let b = DVec3::new(pair[1][0], pair[1][1], mid.z);
+                    segs.push((a, b));
+                }
+            }
+        }
         // Text annotations: tessellate via Hershey stroke font so they render
         // as world-space geometry (identical appearance across viewport/SVG/PDF/DXF).
-        Geometry::Annotation(Annotation::Text { pos, text, height }) => {
+        // Fields share the text path — `text` is the resolved field value (mirrors pdf.rs).
+        Geometry::Annotation(Annotation::Text { pos, text, height })
+        | Geometry::Annotation(Annotation::Field { pos, text, height, .. }) => {
             let strokes = itsjustcad_doc::hershey::text_strokes(text, [pos.x, pos.y], *height);
             for poly in strokes {
                 for pair in poly.windows(2) {
@@ -75,7 +96,36 @@ fn collect_segments(doc: &Document, geometry: &Geometry) -> Vec<(DVec3, DVec3)> 
                 }
             }
         }
-        Geometry::Annotation(_) => {}
+        // Hatch: generate fill lines via the same generators pdf.rs uses.
+        Geometry::Annotation(Annotation::Hatch { boundary, pattern }) => {
+            use itsjustcad_doc::{
+                hatch::{hatch_ansi, hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines, hatch_pat},
+                HatchPattern,
+            };
+            let hatch_segs: Vec<[DVec3; 2]> = match pattern {
+                HatchPattern::Solid => {
+                    let n = boundary.len();
+                    (0..n).map(|i| [boundary[i], boundary[(i + 1) % n]]).collect()
+                }
+                HatchPattern::Lines { angle_deg, spacing } => {
+                    hatch_lines(boundary, *angle_deg, *spacing)
+                }
+                HatchPattern::Crosshatch { angle_deg, spacing } => {
+                    let mut s = hatch_lines(boundary, *angle_deg, *spacing);
+                    s.extend(hatch_lines(boundary, *angle_deg + 90.0, *spacing));
+                    s
+                }
+                HatchPattern::Brick { spacing } => hatch_brick(boundary, *spacing),
+                HatchPattern::Concrete { spacing } => hatch_concrete(boundary, *spacing),
+                HatchPattern::Insulation { spacing } => hatch_insulation(boundary, *spacing),
+                HatchPattern::Earth { spacing } => hatch_earth(boundary, *spacing),
+                HatchPattern::Ansi { code, spacing } => hatch_ansi(boundary, *code, *spacing),
+                HatchPattern::Custom { lines, scale, .. } => hatch_pat(boundary, lines, *scale),
+            };
+            for [a, b] in hatch_segs {
+                segs.push((a, b));
+            }
+        }
         // Block instances are not directly renderable in SVG export.
         Geometry::Instance { .. } => {}
         // Point clouds are not rendered in SVG export.
@@ -98,6 +148,17 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// Format an optional RGBA colour as CSS `rgb(R,G,B)`. `None` → black.
+/// Layer stroke colour as 8-bit RGB (same default as `css_color`: black).
+/// Shared with the raster exporter so JPG and SVG paint identical colours.
+pub fn rgb_color(c: Option<[f32; 4]>) -> [u8; 3] {
+    let [r, g, b, _] = c.unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    [
+        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
+}
+
 fn css_color(c: Option<[f32; 4]>) -> String {
     let [r, g, b, _] = c.unwrap_or([0.0, 0.0, 0.0, 1.0]);
     format!(
@@ -118,19 +179,33 @@ fn svg_num(v: f64) -> String {
 
 /// Build SVG bytes for the current document view.
 /// Returns the SVG bytes and a summary string for the command echo.
-pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
+/// One layer's worth of projected 2D segments, ready to render to SVG or a
+/// raster. Each segment carries its effective lineweight in mm (per-object beats
+/// layer).
+pub struct LayerData {
+    pub name: String,
+    pub style: LayerStyle,
+    /// (projected_a, projected_b, effective_lineweight_mm)
+    pub segs: Vec<(DVec2, DVec2, f64)>,
+}
+
+/// The whole document projected to 2D for export: layers (in draw order, with
+/// the orphan bucket last) plus the padded scene bounds `(vx, vy, vw, vh)` and
+/// the raw segment total. Shared by the SVG writer and the JPG rasterizer so
+/// both see the identical drawing.
+pub struct ProjectedScene {
+    pub layers: Vec<LayerData>,
+    pub bounds: (f64, f64, f64, f64),
+    pub total_segs: usize,
+}
+
+/// Project the document to 2D once. `export_svg` (vector) and `export_jpg`
+/// (raster) both build on this so the two exports never drift apart.
+pub fn project_scene(doc: &Document) -> ProjectedScene {
     let dir = DEFAULT_DIR; // always top-down for now (no live camera in export path)
 
-    // Collect all projected 2D segments per layer.
-    // Each segment carries its effective lineweight in mm (per-object beats layer).
     // Text annotations are tessellated by collect_segments via the Hershey
     // stroke font and flow through as regular line segments.
-    struct LayerData {
-        name: String,
-        style: LayerStyle,
-        /// (projected_a, projected_b, effective_lineweight_mm)
-        segs: Vec<(DVec2, DVec2, f64)>,
-    }
 
     // Gather layers in document layer order (alphabetical + default first).
     let fallback = LayerStyle::default();
@@ -210,6 +285,20 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
     let vw = (max_x - min_x) + 2.0 * pad;
     let vh = (max_y - min_y) + 2.0 * pad;
 
+    // Fold the orphan bucket in as the last layer so callers see a single list.
+    layers.push(orphan);
+    ProjectedScene {
+        layers,
+        bounds: (vx, vy, vw, vh),
+        total_segs,
+    }
+}
+
+pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
+    let scene = project_scene(doc);
+    let (vx, vy, vw, vh) = scene.bounds;
+    let total_segs = scene.total_segs;
+
     // SVG user-units = meters; lineweight stays in mm so divide by 1000 to
     // convert to meter-scale user-units.
     let mut svg = String::new();
@@ -230,8 +319,7 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
     let mut layer_count = 0usize;
     let mut path_count = 0usize;
 
-    let all_layers = layers.iter().chain(std::iter::once(&orphan));
-    for layer in all_layers {
+    for layer in &scene.layers {
         if layer.segs.is_empty() {
             continue;
         }
@@ -298,6 +386,31 @@ mod tests {
         assert!(svg.matches("<g ").count() >= 2, "at least 2 <g> groups\n{svg}");
         // box has feature edges, line has 1 segment.
         assert!(svg.contains("<line "), "should contain <line> elements");
+    }
+
+    #[test]
+    fn svg_renders_field_and_hatch_segments() {
+        // Regression: SVG export used to swallow Annotation::Field and Hatch
+        // (catch-all `Annotation(_) => {}`). Both must now emit stroke segments.
+        let mut s = Session::default();
+        // A closed square to hatch, plus a hatch and a field over it.
+        s.run(parse("polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed").unwrap()).unwrap();
+        s.run(parse("hatch last lines").unwrap()).unwrap();
+        s.run(parse("field 1,1,0 layer 0.5").unwrap()).unwrap();
+
+        let (bytes, _) = export_svg(&s.doc);
+        let svg = String::from_utf8(bytes).unwrap();
+
+        // Hatch fill lines + field text strokes both surface as <line> elements.
+        let line_count = svg.matches("<line ").count();
+        assert!(line_count > 4, "expected hatch + field strokes, got {line_count}\n{svg}");
+
+        // Isolate: a doc with only a field still produces strokes (text present).
+        let mut s2 = Session::default();
+        s2.run(parse("field 0,0,0 layer 1.0").unwrap()).unwrap();
+        let (b2, _) = export_svg(&s2.doc);
+        let svg2 = String::from_utf8(b2).unwrap();
+        assert!(svg2.contains("<line "), "field text strokes present\n{svg2}");
     }
 
     #[test]

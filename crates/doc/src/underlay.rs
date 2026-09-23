@@ -23,20 +23,47 @@ pub struct Underlay {
     pub height: f64,
     /// Blend opacity, 0 (invisible) .. 1 (opaque).
     pub opacity: f32,
+    /// Counter-clockwise rotation about the quad's centre, in degrees. Serde
+    /// defaults to 0 so old save files (no rotation) load unrotated.
+    #[serde(default)]
+    pub rotation_deg: f64,
 }
 
 impl Underlay {
-    /// The four corners of the quad in CCW order starting at the lower-left,
-    /// all at z = 0. Handy for rendering and placement tests.
+    /// The four corners of the quad in CCW order starting at the (pre-rotation)
+    /// lower-left, all at z = 0, with `rotation_deg` applied about the centre.
+    /// Handy for rendering and placement tests. When `rotation_deg` is 0 this
+    /// is exactly the axis-aligned corner/width/height rectangle.
     pub fn quad_corners(&self) -> [DVec2; 4] {
-        let DVec2 { x, y } = self.corner;
-        [
-            DVec2::new(x, y),
-            DVec2::new(x + self.width, y),
-            DVec2::new(x + self.width, y + self.height),
-            DVec2::new(x, y + self.height),
-        ]
+        underlay_quad_corners(self.corner, self.width, self.height, self.rotation_deg)
     }
+
+    /// Centre of the quad (unaffected by rotation, which is about the centre).
+    pub fn center(&self) -> DVec2 {
+        DVec2::new(self.corner.x + self.width * 0.5, self.corner.y + self.height * 0.5)
+    }
+}
+
+/// Pure corner computation for a placed underlay: the axis-aligned rectangle
+/// `corner .. corner + (width, height)` rotated `rotation_deg` degrees CCW about
+/// its centre. Returned CCW from the (pre-rotation) lower-left, all at z = 0.
+/// Split out so the geometry is unit-testable without an `Underlay` value.
+pub fn underlay_quad_corners(corner: DVec2, width: f64, height: f64, rotation_deg: f64) -> [DVec2; 4] {
+    let base = [
+        DVec2::new(corner.x, corner.y),
+        DVec2::new(corner.x + width, corner.y),
+        DVec2::new(corner.x + width, corner.y + height),
+        DVec2::new(corner.x, corner.y + height),
+    ];
+    if rotation_deg == 0.0 {
+        return base;
+    }
+    let center = DVec2::new(corner.x + width * 0.5, corner.y + height * 0.5);
+    let (s, c) = rotation_deg.to_radians().sin_cos();
+    base.map(|p| {
+        let d = p - center;
+        center + DVec2::new(d.x * c - d.y * s, d.x * s + d.y * c)
+    })
 }
 
 /// A georeferenced satellite/OSM ground image placed under the model at the
@@ -110,6 +137,7 @@ mod tests {
             width: 10.0,
             height: 5.0,
             opacity: 0.5,
+            rotation_deg: 0.0,
         };
         assert_eq!(
             u.quad_corners(),
@@ -130,9 +158,41 @@ mod tests {
             width: 8.0,
             height: 6.0,
             opacity: 0.75,
+            rotation_deg: 30.0,
         };
         let json = serde_json::to_string(&u).unwrap();
         let back: Underlay = serde_json::from_str(&json).unwrap();
         assert_eq!(u, back);
+    }
+
+    #[test]
+    fn old_json_without_rotation_defaults_to_zero() {
+        // Back-compat: files saved before rotation existed carry no field.
+        let json = r#"{"path":"a.png","corner":[1.0,2.0],"width":10.0,"height":5.0,"opacity":1.0}"#;
+        let u: Underlay = serde_json::from_str(json).unwrap();
+        assert_eq!(u.rotation_deg, 0.0);
+    }
+
+    #[test]
+    fn rotation_90_maps_corners_about_center() {
+        // A 10x5 rect at origin; centre is (5, 2.5). Rotating 90° CCW sends the
+        // lower-left corner (0,0) to (7.5, -2.5).
+        let corners = underlay_quad_corners(DVec2::new(0.0, 0.0), 10.0, 5.0, 90.0);
+        let eps = 1e-9;
+        assert!((corners[0].x - 7.5).abs() < eps, "{:?}", corners[0]);
+        assert!((corners[0].y - (-2.5)).abs() < eps, "{:?}", corners[0]);
+        // Centre is preserved: the mean of the corners stays at (5, 2.5).
+        let cx = corners.iter().map(|p| p.x).sum::<f64>() / 4.0;
+        let cy = corners.iter().map(|p| p.y).sum::<f64>() / 4.0;
+        assert!((cx - 5.0).abs() < eps && (cy - 2.5).abs() < eps);
+    }
+
+    #[test]
+    fn rotation_360_is_identity() {
+        let a = underlay_quad_corners(DVec2::new(1.0, 2.0), 10.0, 5.0, 0.0);
+        let b = underlay_quad_corners(DVec2::new(1.0, 2.0), 10.0, 5.0, 360.0);
+        for (p, q) in a.iter().zip(b.iter()) {
+            assert!((p.x - q.x).abs() < 1e-9 && (p.y - q.y).abs() < 1e-9);
+        }
     }
 }

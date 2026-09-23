@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ItsJustCAD — Beta User Review (v0.5.2)</title>
+<title>ItsJustCAD — Beta User Review (v0.5.4)</title>
 <style>
   :root{
     --bg:#f7f7f5; --panel:#ffffff; --ink:#1c1c1e; --muted:#6b6b70;
@@ -90,7 +90,7 @@
 <div class="wrap">
 <nav>
   <div class="brand">ItsJustCAD</div>
-  <div class="date">Beta User Review &middot; v0.5.2</div>
+  <div class="date">Beta User Review &middot; v0.5.4</div>
   <button class="reset" onclick="resetChecks()">Reset checks</button>
   <h2>Start here</h2>
   <a href="#howto">How to test</a>
@@ -109,17 +109,18 @@
   <a href="#interop">11 &middot; Interop &amp; Export</a>
   <a href="#render">12 &middot; Diffusion Render</a>
   <a href="#ui">13 &middot; UI, Menus &amp; Gumball</a>
+  <a href="#cadparity">14 &middot; CAD Parity &amp; Drafting</a>
   <h2>Finish</h2>
   <a href="#export">Export results</a>
 </nav>
 
 <main>
 <header class="top">
-  <h1>ItsJustCAD &mdash; Beta User Review <span class="tag info" style="vertical-align:middle">v0.5.2</span></h1>
+  <h1>ItsJustCAD &mdash; Beta User Review <span class="tag info" style="vertical-align:middle">v0.5.4</span></h1>
   <p class="sub">Work through the checklist, then Export results and send the JSON to the developer.</p>
 </header>
 <div class="meta">
-  <span><b>Build under test:</b> latest v0.5.2 release (the app you downloaded)</span>
+  <span><b>Build under test:</b> latest v0.5.4 release (the app you downloaded)</span>
   <span><b>Report to:</b> <a href="mailto:htarrido@pm.me">htarrido@pm.me</a> or a GitHub issue</span>
 </div>
 
@@ -143,7 +144,7 @@
 <!-- ============ HONEST LIMITS ============ -->
 <section id="limits">
 <h2 class="sec">Honest limits <span class="tag warn">read first</span></h2>
-<p class="lead">Known, deliberate limits in v0.5.2. None of these block testing &mdash; they explain results you might otherwise flag as bugs:</p>
+<p class="lead">Known, deliberate limits in v0.5.4. None of these block testing &mdash; they explain results you might otherwise flag as bugs:</p>
 <ul>
   <li><b>intemfit euro_latam profile is placeholder.</b> Any run that resolves a rule from the <code>euro_latam</code> region prints <b>"using euro_latam defaults (placeholder &mdash; confirm with Manuel)"</b>. That banner is expected, not an error.</li>
   <li><b>Compliance is name-match + straight-line.</b> Guard/handrail/ceiling checks match by object name (no geometric modeling); travel distance is straight-line room-centroid &rarr; nearest exit, not a routed egress path. Advisory pre-check only &mdash; verify with a licensed professional / AHJ.</li>
@@ -492,9 +493,40 @@
 <div class="chk"><input type="checkbox" id="u9"><label for="u9">Select an object and press <b>&#8984;/Ctrl+G</b> <span class="exp"><b>Expect:</b> the gumball toggles on/off. Bare <code>g</code> no longer does this.</span></label></div>
 <div class="chk"><input type="checkbox" id="u10"><label for="u10">Open the <b>Blocks</b> tab, use the search box, click the library <b>&#43;</b>, and <b>double-click</b> a block <span class="exp"><b>Expect:</b> search filters the list; &#43; adds from the library; double-click reveals/loads the block into the drawing.</span></label></div>
 <div class="chk"><input type="checkbox" id="u11"><label for="u11">Open <b>Plugins</b> (root-level Plugins menu &rarr; popup) and the <b>Sheets</b> tab <span class="exp"><b>Expect:</b> the Plugins popup shows cards + search + install status; the Sheets tab lists each sheet with a preview thumbnail.</span></label></div>
-<div class="chk"><input type="checkbox" id="u12"><label for="u12"><b>Help &middot; Check for Updates&hellip;</b> <span class="exp"><b>Expect:</b> compares this build against the latest GitHub release &mdash; "You're on the latest (v0.5.2)." when current, or the newer version + a <b>Download</b> button; offline &rarr; "Couldn't check&hellip;" + Check-Again. Never blocks the app.</span></label></div>
+<div class="chk"><input type="checkbox" id="u12"><label for="u12"><b>Help &middot; Check for Updates&hellip;</b> <span class="exp"><b>Expect:</b> compares this build against the latest GitHub release &mdash; "You're on the latest (v0.5.4)." when current, or the newer version + a <b>Download</b> button; offline &rarr; "Couldn't check&hellip;" + Check-Again. Never blocks the app.</span></label></div>
 
 <div class="notes-wrap"><label for="note-ui">Notes for this section</label><textarea class="notes" id="note-ui" data-section="13 · UI, Menus & Gumball" placeholder="Notes..."></textarea></div>
+</details>
+</section>
+
+<!-- ============ 14 CAD PARITY ============ -->
+<section id="cadparity">
+<details>
+<summary>14 &middot; CAD Parity &amp; Drafting <span class="tag ok">new</span></summary>
+<p class="lead">AutoCAD/Rhino-parity drafting verbs from the CAD-parity batch. Type each in the command line (or deck Chat). Selectors: <code>last</code>, <code>sel</code>, <code>all</code>, <code>name:foo</code>.</p>
+
+<div class="chk"><input type="checkbox" id="cp1"><label for="cp1"><b>Move to origin:</b> draw anything, <span class="cmd"><span class="p">&#8250;</span> move last 10,20,0</span> then <span class="cmd"><span class="p">&#8250;</span> tozero last</span> <span class="exp"><b>Expect:</b> the object's bounding-box min snaps to 0,0,0. Undo restores.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp2"><label for="cp2"><b>Flatten Z:</b> make geometry with varied Z, <span class="cmd"><span class="p">&#8250;</span> flatten last</span> <span class="exp"><b>Expect:</b> all vertices drop to Z=0.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp3"><label for="cp3"><b>Select similar / duplicates:</b> <span class="cmd"><span class="p">&#8250;</span> selsimilar sel layer</span> (also <code>color</code>/<code>type</code>/<code>weight</code>); copy an object in place, <span class="cmd"><span class="p">&#8250;</span> seldup</span> <span class="exp"><b>Expect:</b> matching objects selected; <code>seldup</code> selects the duplicate copies.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp4"><label for="cp4"><b>Box select (mouse):</b> drag a box in empty space left&rarr;right, then right&rarr;left <span class="exp"><b>Expect:</b> L&rarr;R = solid window (fully-inside only); R&rarr;L = dashed crossing (touch counts); Shift adds. Also <span class="cmd"><span class="p">&#8250;</span> selregion 0,0 10,10 crossing</span>.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp5"><label for="cp5"><b>Stretch:</b> draw a polyline, <span class="cmd"><span class="p">&#8250;</span> stretch last 0,0,-10 5,5,10 1,0,0</span> <span class="exp"><b>Expect:</b> only vertices inside the box move by the delta; the rest stay. Undo restores.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp6"><label for="cp6"><b>Trim &amp; boolean:</b> cross three lines, <span class="cmd"><span class="p">&#8250;</span> powertrim last 2.5,0</span>; draw two overlapping closed polylines, <span class="cmd"><span class="p">&#8250;</span> curvebool union sel</span> (also <code>intersect</code>/<code>difference</code>) <span class="exp"><b>Expect:</b> powertrim drops the picked segment against all curves; curvebool merges/intersects/subtracts the regions.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp7"><label for="cp7"><b>Boundary:</b> draw 4 lines forming a closed square, <span class="cmd"><span class="p">&#8250;</span> boundary 2,2</span> <span class="exp"><b>Expect:</b> a closed polyline traced around the point (ready to hatch/extrude).</span></label></div>
+<div class="chk"><input type="checkbox" id="cp8"><label for="cp8"><b>Align &amp; array-along-curve:</b> <span class="cmd"><span class="p">&#8250;</span> align last 0,0 5,5 1,0 6,5</span>; draw a path curve + an object, <span class="cmd"><span class="p">&#8250;</span> arraycurve name:obj name:path 6</span> <span class="exp"><b>Expect:</b> align moves+rotates to match the point pairs; arraycurve spaces 6 copies along the path, aligned to the tangent.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp9"><label for="cp9"><b>Polygon &amp; circle-by-tangents:</b> type <span class="cmd"><span class="p">&#8250;</span> polygon</span> (bare) &rarr; type <code>8</code> &rarr; click center &rarr; click radius; two lines then <span class="cmd"><span class="p">&#8250;</span> circletan name:a name:b 2</span> <span class="exp"><b>Expect:</b> interactive octagon with live ghost; circletan draws a circle tangent to both lines.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp10"><label for="cp10"><b>Polyline close:</b> type <span class="cmd"><span class="p">&#8250;</span> polyline</span>, pick 3+ points, then press <b>C</b> (or click the highlighted start ring) <span class="exp"><b>Expect:</b> the loop closes; a green ring marks the start once closing is possible. <code>polyline &hellip; close</code> also works typed.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp11"><label for="cp11"><b>Dimensions:</b> <span class="cmd"><span class="p">&#8250;</span> dimradius name:circ</span>, <span class="cmd"><span class="p">&#8250;</span> dimdiameter name:circ</span>, <span class="cmd"><span class="p">&#8250;</span> dimangular 0,0 3,0 0,3</span>, and <span class="cmd"><span class="p">&#8250;</span> autodim last</span> on a rectangle <span class="exp"><b>Expect:</b> radial/diameter/angular dims render; autodim places one dim per rectangle edge.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp12"><label for="cp12"><b>Field (live text):</b> draw a closed polyline, <span class="cmd"><span class="p">&#8250;</span> field 6,6 area last</span>, then move/scale the polyline <span class="exp"><b>Expect:</b> the field text shows the area and updates after the edit.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp13"><label for="cp13"><b>Drawings&rarr;BIM:</b> import/draw curves on a layer, <span class="cmd"><span class="p">&#8250;</span> level L1 0 3</span> then <span class="cmd"><span class="p">&#8250;</span> fromlayer walls wall thick 0.2 level L1</span>, <span class="cmd"><span class="p">&#8250;</span> export /tmp/m.ifc</span> <span class="exp"><b>Expect:</b> each curve becomes a wall extruded to the level height; the IFC contains IFCWALL entities.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp14"><label for="cp14"><b>Coordinate systems (CPlane):</b> <span class="cmd"><span class="p">&#8250;</span> cplane origin 0,0,10 normal 0,0,1</span>, draw a <code>line</code>/<code>polyline</code>, <span class="cmd"><span class="p">&#8250;</span> cplane world</span> <span class="exp"><b>Expect:</b> typed points land on the raised plane (Z=10); <code>cplane world</code> resets. Saved files reopen identically.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp15"><label for="cp15"><b>Editable Properties:</b> select an object, open the <b>Properties</b> panel, change layer / colour / name / position <span class="exp"><b>Expect:</b> edits apply through undoable commands; multi-select shows &ldquo;&mdash;&rdquo; for mixed values.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp16"><label for="cp16"><b>Xref &amp; ncopy &amp; xclip:</b> <span class="cmd"><span class="p">&#8250;</span> xref attach /path/other.dxf at 0,0,0</span>, <span class="cmd"><span class="p">&#8250;</span> ncopy last 0</span>, <span class="cmd"><span class="p">&#8250;</span> xclip last 0,0 5,5</span> <span class="exp"><b>Expect:</b> the file loads as one referenced instance; ncopy pulls one nested object out; xclip clips the instance to the rectangle. <code>xref reload/detach</code> work.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp17"><label for="cp17"><b>Sheet sets &amp; plot styles:</b> make 2 sheets, <span class="cmd"><span class="p">&#8250;</span> sheetset new SET</span>, add both, <span class="cmd"><span class="p">&#8250;</span> sheetset publish /tmp/set.pdf</span>; <span class="cmd"><span class="p">&#8250;</span> plotstyle new mono</span>, map a layer, <span class="cmd"><span class="p">&#8250;</span> plotstyle apply mono</span> then export a PDF <span class="exp"><b>Expect:</b> one multi-page PDF for the set; the plot style overrides pen colour/weight at print time only.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp18"><label for="cp18"><b>Data extraction:</b> insert a few block instances, <span class="cmd"><span class="p">&#8250;</span> dataextract by count to /tmp/bom.csv</span> <span class="exp"><b>Expect:</b> a CSV (opens in Excel) with a row per block definition + counts and attribute columns.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp19"><label for="cp19"><b>Place image (dynamic) &amp; .pat hatch:</b> <span class="cmd"><span class="p">&#8250;</span> underlay /path/plan.png 0,0 20</span> then <code>underlaymove</code>/<code>underlayscale</code>/<code>underlayrotate</code>; <span class="cmd"><span class="p">&#8250;</span> hatchpat /path/usgs.pat</span> then <span class="cmd"><span class="p">&#8250;</span> hatch last pattern GRAVEL 2</span> <span class="exp"><b>Expect:</b> the reference image moves/scales/rotates; imported .pat patterns render as hatch fills.</span></label></div>
+<div class="chk"><input type="checkbox" id="cp20"><label for="cp20"><b>Import drop &amp; new exports:</b> drag a <code>.dxf</code>/<code>.dwg</code> onto the window; <span class="cmd"><span class="p">&#8250;</span> export /tmp/plan.jpg</span> and <span class="cmd"><span class="p">&#8250;</span> export /tmp/plan.ai</span> <span class="exp"><b>Expect:</b> drag-drop imports (File&nbsp;&#9656;&nbsp;Import also lists DWG + &ldquo;All supported&rdquo;); JPG writes a raster, .ai opens in Illustrator (SVG-content).</span></label></div>
+
+<div class="notes-wrap"><label for="note-cadparity">Notes for this section</label><textarea class="notes" id="note-cadparity" data-section="14 · CAD Parity &amp; Drafting" placeholder="Notes..."></textarea></div>
 </details>
 </section>
 
@@ -502,7 +534,7 @@
 <section id="export">
 <h2 class="sec">Export results &amp; send them back</h2>
 <p class="lead">When you're done, add any overall notes below, then <b>Download JSON</b> and email it to <a href="mailto:htarrido@pm.me">htarrido@pm.me</a> (or attach it to a GitHub issue). The JSON records every test id, whether it passed, and your notes.</p>
-<div class="notes-wrap"><label for="note-global">Overall notes (tester name, OS, version, general impressions)</label><textarea class="notes" id="note-global" data-section="_overall" placeholder="e.g. Tester: Jane · macOS 14 Apple Silicon · v0.5.2 · general feedback..." style="min-height:80px"></textarea></div>
+<div class="notes-wrap"><label for="note-global">Overall notes (tester name, OS, version, general impressions)</label><textarea class="notes" id="note-global" data-section="_overall" placeholder="e.g. Tester: Jane · macOS 14 Apple Silicon · v0.5.4 · general feedback..." style="min-height:80px"></textarea></div>
 </section>
 
 <div class="exportbar">
@@ -511,7 +543,7 @@
   <span class="progress" id="progress">0 of 0 tests checked</span>
 </div>
 
-<div class="foot">ItsJustCAD &mdash; Beta User Review &middot; v0.5.2 &middot; advisory checklist; compliance is a pre-check, not a certification. Your checkbox state &amp; notes are stored locally in your browser until you export them.</div>
+<div class="foot">ItsJustCAD &mdash; Beta User Review &middot; v0.5.4 &middot; advisory checklist; compliance is a pre-check, not a certification. Your checkbox state &amp; notes are stored locally in your browser until you export them.</div>
 </main>
 </div>
 

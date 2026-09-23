@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright © 2026 Hector Tarrido-Picart
 
-use glam::DVec3;
+use glam::{DVec2, DVec3};
 use kernel_curve::Curve;
 use kernel_mesh::{Aabb, Mesh};
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,44 @@ pub enum HatchPattern {
     /// ANSI standard material hatch, codes 31–38 (iron, steel, bronze,
     /// plastic, fire brick, marble, lead, aluminum). See `hatch::hatch_ansi`.
     Ansi { code: u8, spacing: f64 },
+    /// A custom pattern imported from an AutoCAD `.pat` file (`hatchpat`).
+    /// Self-contained: it carries its own line families so the render/PDF/DXF
+    /// paths need no doc lookup (the boundary is already baked in at creation
+    /// time; so is the pattern). `name` is kept for display/round-trip, `scale`
+    /// multiplies every family's spacing/dash length (kept separate so `scale`
+    /// on the hatch object stays lossless). See `hatch::hatch_pat`.
+    Custom {
+        name: String,
+        lines: Vec<PatLine>,
+        scale: f64,
+    },
+}
+
+/// One line-family definition from an AutoCAD `.pat` pattern: an infinite set
+/// of parallel dashed lines. `angle_deg` is the family direction; `origin` is a
+/// point the first line passes through; `delta.x` shifts successive lines along
+/// the line direction, `delta.y` is the perpendicular spacing between lines.
+/// `dashes` is the dash/gap pen pattern (positive = pen-down, negative =
+/// pen-up); empty = a solid line. Mirrors the `angle, x, y, dx, dy [, d1 …]`
+/// grammar. See `crate::hatch::hatch_pat`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PatLine {
+    pub angle_deg: f64,
+    pub origin: glam::DVec2,
+    pub delta: glam::DVec2,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dashes: Vec<f64>,
+}
+
+/// A named hatch pattern imported from a `.pat` file, held in the document's
+/// registry (`Document::hatch_patterns`). Just a bag of line families plus the
+/// header description; a `hatch … pattern <name>` reference copies the families
+/// into a self-contained `HatchPattern::Custom`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct HatchPatternDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    pub lines: Vec<PatLine>,
 }
 
 /// Which well-defined point on a referenced object a dimension anchor picks.
@@ -206,6 +244,42 @@ impl DimAnchor {
     }
 }
 
+/// A FIELD expression: the live source a [`Annotation::Field`] binds to. This
+/// is the AutoCAD FIELD idea in miniature — text whose content is derived from
+/// a document/geometry property rather than typed. The `Selector`-backed
+/// variants store the raw selector token (`"last"`, a name, or a short id) as a
+/// string because the concrete `Selector` type lives in the commands crate; the
+/// field-eval pass re-parses it. Serde-tagged so new sources can be added
+/// without breaking old op-logs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "field", rename_all = "snake_case")]
+pub enum FieldExpr {
+    /// Total area of the matched closed curve(s)/mesh(es).
+    Area { selector: String },
+    /// Total curve length of the matched curve(s).
+    Length { selector: String },
+    /// Number of matched objects.
+    Count { selector: String },
+    /// The document's current layer name.
+    Layer,
+    /// The document's display units symbol (e.g. `m`, `ft`).
+    Units,
+}
+
+impl FieldExpr {
+    /// Canonical source text (round-trips through the `field` parser). Used in
+    /// creation messages and to keep serialized op-logs human-readable.
+    pub fn source(&self) -> String {
+        match self {
+            FieldExpr::Area { selector } => format!("area {selector}"),
+            FieldExpr::Length { selector } => format!("length {selector}"),
+            FieldExpr::Count { selector } => format!("count {selector}"),
+            FieldExpr::Layer => "layer".to_string(),
+            FieldExpr::Units => "units".to_string(),
+        }
+    }
+}
+
 /// Drafting objects: they live in the document like geometry (layers,
 /// selection, undo) but carry measured/typed content instead of shape.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -217,7 +291,18 @@ pub enum Annotation {
     /// to a point on another object (see [`DimAnchor`]); associative anchors
     /// follow their referent when it moves/edits (resolved at display time).
     LinearDim { a: DimAnchor, b: DimAnchor, offset: f64 },
+    /// Angular dimension: the angle p1–vertex–p2, labelled in degrees with an
+    /// arc of `radius` (model units) swept between the two legs. Points are
+    /// free model points (no associative binding yet); the measured value is
+    /// derived at display time via [`angle_degrees`]. serde-tagged (`ann`), so
+    /// this variant is additive and old op-logs/files load unchanged.
+    AngularDim { vertex: DVec3, p1: DVec3, p2: DVec3, radius: f64 },
     Text { pos: DVec3, text: String, height: f64 },
+    /// A FIELD: like `Text`, but `text` is the *resolved* string of `expr` and
+    /// is recomputed by the field-refresh pass after mutating ops (mirroring
+    /// associative dimensions). `text` is stored so render/export and op-log
+    /// replay are byte-identical without a document in hand.
+    Field { pos: DVec3, expr: FieldExpr, text: String, height: f64 },
     /// Hatch of a closed boundary polygon (tessellated at creation time).
     Hatch { boundary: Vec<DVec3>, pattern: HatchPattern },
 }
@@ -229,10 +314,80 @@ impl Annotation {
     pub fn points(&self) -> Vec<DVec3> {
         match self {
             Annotation::LinearDim { a, b, .. } => vec![a.point(), b.point()],
+            Annotation::AngularDim { vertex, p1, p2, .. } => vec![*vertex, *p1, *p2],
             Annotation::Text { pos, .. } => vec![*pos],
+            Annotation::Field { pos, .. } => vec![*pos],
             Annotation::Hatch { boundary, .. } => boundary.clone(),
         }
     }
+}
+
+/// The angle p1–`vertex`–p2 in degrees, in `[0, 180]`. This is the value an
+/// [`Annotation::AngularDim`] displays. Computed from the two leg vectors
+/// (`p1 - vertex`, `p2 - vertex`) via their dot product; the result is
+/// clamped so floating-point noise cannot push `acos` past its domain.
+///
+/// A degenerate leg (either point coincident with the vertex) has no defined
+/// angle — this returns `0.0` rather than a `NaN`, so callers get a stable,
+/// harmless label instead of propagating garbage.
+pub fn angle_degrees(vertex: DVec3, p1: DVec3, p2: DVec3) -> f64 {
+    let v1 = p1 - vertex;
+    let v2 = p2 - vertex;
+    let (l1, l2) = (v1.length(), v2.length());
+    if l1 < 1e-12 || l2 < 1e-12 {
+        return 0.0;
+    }
+    let cos = (v1.dot(v2) / (l1 * l2)).clamp(-1.0, 1.0);
+    cos.acos().to_degrees()
+}
+
+/// Tessellate the arc of an angular dimension: points sweeping from the `p1`
+/// leg to the `p2` leg at `radius` around `vertex`, in the plane of the two
+/// legs (falls back to the XY plane when the legs are colinear). Shared by the
+/// renderer and the DXF/PDF/SVG exporters so the arc looks identical
+/// everywhere. A degenerate leg yields a single `vertex` point.
+pub fn angular_arc_points(vertex: DVec3, p1: DVec3, p2: DVec3, radius: f64) -> Vec<DVec3> {
+    let d1 = (p1 - vertex).normalize_or_zero();
+    let d2 = (p2 - vertex).normalize_or_zero();
+    if d1.length_squared() < 0.5 || d2.length_squared() < 0.5 {
+        return vec![vertex];
+    }
+    let sweep = angle_degrees(vertex, p1, p2).to_radians();
+    // Rotation axis = plane normal of the two legs; colinear legs → XY plane.
+    let mut axis = d1.cross(d2);
+    if axis.length_squared() < 1e-18 {
+        axis = DVec3::Z;
+    }
+    let axis = axis.normalize();
+    const SEGMENTS: usize = 24;
+    (0..=SEGMENTS)
+        .map(|i| {
+            let t = sweep * (i as f64 / SEGMENTS as f64);
+            let rot = glam::DQuat::from_axis_angle(axis, t);
+            vertex + rot.mul_vec3(d1) * radius
+        })
+        .collect()
+}
+
+/// Geometry scaffold of an angular dimension: the two legs (from `vertex` out
+/// to `radius` along each leg direction) plus the tessellated arc between them,
+/// as `(start, end)` segment pairs. Shared by every exporter/renderer so the
+/// leg+arc geometry is defined once (each site still places its own degree
+/// label). The label value comes from [`angle_degrees`] + [`format_angle`].
+pub fn angular_dim_segments(
+    vertex: DVec3,
+    p1: DVec3,
+    p2: DVec3,
+    radius: f64,
+) -> Vec<(DVec3, DVec3)> {
+    let l1 = vertex + (p1 - vertex).normalize_or_zero() * radius;
+    let l2 = vertex + (p2 - vertex).normalize_or_zero() * radius;
+    let mut segs = vec![(vertex, l1), (vertex, l2)];
+    let arc = angular_arc_points(vertex, p1, p2, radius);
+    for pair in arc.windows(2) {
+        segs.push((pair[0], pair[1]));
+    }
+    segs
 }
 
 /// A geometry snapshot stored in a block definition. The same enum as
@@ -328,6 +483,122 @@ impl BlockGeometry {
     }
 }
 
+/// A world-XY rectangular clip boundary for a block/xref instance (AutoCAD
+/// XCLIP). Only the instance's expanded geometry that falls inside `[min, max]`
+/// is shown; everything outside is culled at render time. Axis-aligned; the
+/// MVP does not support rotated or polygonal boundaries.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClipRect {
+    pub min: DVec2,
+    pub max: DVec2,
+}
+
+impl ClipRect {
+    /// Build a rect from two opposite corners, normalizing so `min <= max` on
+    /// each axis (callers may pass corners in any order).
+    pub fn new(a: DVec2, b: DVec2) -> Self {
+        ClipRect {
+            min: DVec2::new(a.x.min(b.x), a.y.min(b.y)),
+            max: DVec2::new(a.x.max(b.x), a.y.max(b.y)),
+        }
+    }
+
+    /// Is the world point (XY only) inside the rect (inclusive of the border)?
+    pub fn contains_xy(&self, p: DVec3) -> bool {
+        p.x >= self.min.x && p.x <= self.max.x && p.y >= self.min.y && p.y <= self.max.y
+    }
+
+    /// The rect's 4 corners in world XY (CCW from min), for overlap tests.
+    fn corners(&self) -> [DVec2; 4] {
+        [
+            DVec2::new(self.min.x, self.min.y),
+            DVec2::new(self.max.x, self.min.y),
+            DVec2::new(self.max.x, self.max.y),
+            DVec2::new(self.min.x, self.max.y),
+        ]
+    }
+
+    /// Should the XCLIP cull KEEP the mesh face `(a,b,c)` (world XY projection)?
+    /// True if any triangle vertex is inside the rect OR any rect corner is
+    /// inside the triangle — so a face whose interior covers a clip window
+    /// smaller than itself survives (else the view/export would go blank). This
+    /// is the SINGLE source of truth for the viewport (snapshot.rs), DXF export
+    /// (dxf.rs) and the raytracer (build.rs): all three call this, keeping the
+    /// clip identical everywhere. Approximate — no border split (no
+    /// Sutherland–Hodgman); the face is kept whole or dropped whole.
+    ///
+    /// A DEGENERATE (near-zero-area) triangle — e.g. an edge-on/vertical face
+    /// that projects to a zero-area segment in XY — is kept ONLY if a vertex is
+    /// actually inside the rect. The corner-in-triangle test is skipped for such
+    /// faces (a zero-area barycentric test spuriously reports "inside" for any
+    /// point), so an edge-on face outside the rect no longer leaks through.
+    pub fn keeps_face(&self, a: DVec3, b: DVec3, c: DVec3) -> bool {
+        if self.contains_xy(a) || self.contains_xy(b) || self.contains_xy(c) {
+            return true;
+        }
+        let (a2, b2, c2) = (a.truncate(), b.truncate(), c.truncate());
+        // Signed area × 2; a degenerate projected triangle has ~0 area and its
+        // barycentric point-in-triangle test is meaningless, so skip it.
+        let area2 = (b2.x - a2.x) * (c2.y - a2.y) - (b2.y - a2.y) * (c2.x - a2.x);
+        if area2.abs() < 1e-12 {
+            return false;
+        }
+        self.corners().iter().any(|&p| point_in_triangle_2d(p, a2, b2, c2))
+    }
+
+    /// Should the XCLIP cull KEEP the segment `a→b` (world XY)? True if both
+    /// endpoints are inside the rect OR the segment crosses the rect (an
+    /// endpoint inside, or it intersects any of the 4 rect edges). Kept as a
+    /// per-primitive keep (no border split): the segment is drawn whole or
+    /// dropped whole, matching `keeps_face`. Shared by all three cull sites.
+    pub fn keeps_segment(&self, a: DVec3, b: DVec3) -> bool {
+        if self.contains_xy(a) || self.contains_xy(b) {
+            return true;
+        }
+        let (a2, b2) = (a.truncate(), b.truncate());
+        let c = self.corners();
+        // Segment crosses the rect boundary if it intersects any rect edge.
+        (0..4).any(|i| segments_intersect(a2, b2, c[i], c[(i + 1) % 4]))
+    }
+}
+
+/// Point-in-triangle via barycentric sign test (inclusive of edges). 2D only.
+/// Caller must guard against degenerate (zero-area) triangles: for those all
+/// three cross products are zero and this returns `true` for ANY point.
+fn point_in_triangle_2d(p: DVec2, a: DVec2, b: DVec2, c: DVec2) -> bool {
+    let d = |u: DVec2, v: DVec2, w: DVec2| (v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x);
+    let d1 = d(a, b, p);
+    let d2 = d(b, c, p);
+    let d3 = d(c, a, p);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    // Inside if all cross products share a sign (allowing zero on an edge).
+    !(has_neg && has_pos)
+}
+
+/// Do the 2D segments `p1→p2` and `p3→p4` intersect (proper or touching)?
+/// Standard orientation test with collinear-overlap handling.
+fn segments_intersect(p1: DVec2, p2: DVec2, p3: DVec2, p4: DVec2) -> bool {
+    let orient = |a: DVec2, b: DVec2, c: DVec2| (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    let on_seg = |a: DVec2, b: DVec2, c: DVec2| {
+        // c is collinear with a,b — is it within the a,b bounding box?
+        c.x >= a.x.min(b.x) && c.x <= a.x.max(b.x) && c.y >= a.y.min(b.y) && c.y <= a.y.max(b.y)
+    };
+    let d1 = orient(p3, p4, p1);
+    let d2 = orient(p3, p4, p2);
+    let d3 = orient(p1, p2, p3);
+    let d4 = orient(p1, p2, p4);
+    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+    {
+        return true;
+    }
+    (d1 == 0.0 && on_seg(p3, p4, p1))
+        || (d2 == 0.0 && on_seg(p3, p4, p2))
+        || (d3 == 0.0 && on_seg(p1, p2, p3))
+        || (d4 == 0.0 && on_seg(p1, p2, p4))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "geo", rename_all = "snake_case")]
 pub enum Geometry {
@@ -354,6 +625,11 @@ pub enum Geometry {
         /// This instance's param values (empty for plain blocks).
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         params: std::collections::BTreeMap<String, String>,
+        /// Optional XCLIP boundary (world XY). When `Some`, expanded geometry
+        /// outside the rect is culled at render time. `None` = unclipped (the
+        /// default; old files load unchanged).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clip: Option<ClipRect>,
     },
     /// Decimated point cloud from a LAS import. Positions are world-space
     /// after applying LAS scale factors and offsets.
@@ -479,7 +755,13 @@ impl Geometry {
                     a.translate(d);
                     b.translate(d);
                 }
+                Annotation::AngularDim { vertex, p1, p2, .. } => {
+                    *vertex += d;
+                    *p1 += d;
+                    *p2 += d;
+                }
                 Annotation::Text { pos, .. } => *pos += d,
+                Annotation::Field { pos, .. } => *pos += d,
                 Annotation::Hatch { boundary, .. } => {
                     boundary.iter_mut().for_each(|p| *p += d)
                 }
@@ -538,7 +820,21 @@ impl Geometry {
                         b.transform(m);
                         *offset *= s;
                     }
+                    Annotation::AngularDim { vertex, p1, p2, radius } => {
+                        // Points transform exactly; the arc radius (a scalar
+                        // size) follows the X-axis scale so uniform scales stay
+                        // proportional. The measured angle is derived, so it is
+                        // preserved by any rigid/uniform transform automatically.
+                        *vertex = m.transform_point3(*vertex);
+                        *p1 = m.transform_point3(*p1);
+                        *p2 = m.transform_point3(*p2);
+                        *radius *= s;
+                    }
                     Annotation::Text { pos, height, .. } => {
+                        *pos = m.transform_point3(*pos);
+                        *height *= s;
+                    }
+                    Annotation::Field { pos, height, .. } => {
                         *pos = m.transform_point3(*pos);
                         *height *= s;
                     }
@@ -553,6 +849,9 @@ impl Geometry {
                             | HatchPattern::Insulation { spacing }
                             | HatchPattern::Earth { spacing }
                             | HatchPattern::Ansi { spacing, .. } => *spacing *= s,
+                            // Custom patterns carry a scale factor instead of a
+                            // single spacing (their families each have their own).
+                            HatchPattern::Custom { scale, .. } => *scale *= s,
                             HatchPattern::Solid => {}
                         }
                     }
@@ -856,6 +1155,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clip_rect_normalizes_and_contains() {
+        // Corners passed in any order normalize to min <= max.
+        let r = ClipRect::new(DVec2::new(10.0, 4.0), DVec2::new(2.0, 8.0));
+        assert_eq!(r.min, DVec2::new(2.0, 4.0));
+        assert_eq!(r.max, DVec2::new(10.0, 8.0));
+        // Inside (inclusive of the border), Z is ignored.
+        assert!(r.contains_xy(DVec3::new(5.0, 6.0, 99.0)));
+        assert!(r.contains_xy(DVec3::new(2.0, 4.0, 0.0))); // corner
+        assert!(r.contains_xy(DVec3::new(10.0, 8.0, 0.0))); // corner
+        // Outside on either axis.
+        assert!(!r.contains_xy(DVec3::new(1.9, 6.0, 0.0)));
+        assert!(!r.contains_xy(DVec3::new(5.0, 8.1, 0.0)));
+    }
+
+    #[test]
+    fn clip_keeps_face_big_face_containing_small_clip() {
+        // A big triangle whose interior covers a small clip window (all verts
+        // outside) must be kept: no vertex inside, but rect corners are inside.
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(2.0, 2.0));
+        let a = DVec3::new(-10.0, -10.0, 0.0);
+        let b = DVec3::new(10.0, -10.0, 0.0);
+        let c = DVec3::new(0.0, 10.0, 0.0);
+        assert!(!rect.contains_xy(a) && !rect.contains_xy(b) && !rect.contains_xy(c));
+        assert!(rect.keeps_face(a, b, c), "big face containing the clip is kept");
+    }
+
+    #[test]
+    fn clip_keeps_face_degenerate_outside_dropped() {
+        // An edge-on/vertical face projects to a zero-XY-area triangle. Fully
+        // outside the rect → must NOT be kept (the degeneracy guard blocks the
+        // spurious corner-in-triangle pass).
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(2.0, 2.0));
+        // All three points share the same XY (a vertical edge seen edge-on),
+        // located outside the rect: zero projected area.
+        let a = DVec3::new(5.0, 5.0, 0.0);
+        let b = DVec3::new(5.0, 5.0, 3.0);
+        let c = DVec3::new(5.0, 5.0, 6.0);
+        assert!(!rect.keeps_face(a, b, c), "degenerate face outside the clip is dropped");
+    }
+
+    #[test]
+    fn clip_keeps_face_degenerate_vertex_inside_kept() {
+        // A degenerate (zero-area) face is still kept if a vertex is inside.
+        let rect = ClipRect::new(DVec2::new(0.0, 0.0), DVec2::new(10.0, 10.0));
+        let a = DVec3::new(5.0, 5.0, 0.0);
+        let b = DVec3::new(5.0, 5.0, 3.0);
+        let c = DVec3::new(5.0, 5.0, 6.0);
+        assert!(rect.keeps_face(a, b, c), "degenerate face with a vertex inside is kept");
+    }
+
+    #[test]
+    fn clip_keeps_face_fully_outside_dropped() {
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(2.0, 2.0));
+        let a = DVec3::new(10.0, 10.0, 0.0);
+        let b = DVec3::new(12.0, 10.0, 0.0);
+        let c = DVec3::new(11.0, 12.0, 0.0);
+        assert!(!rect.keeps_face(a, b, c), "disjoint face is dropped");
+    }
+
+    #[test]
+    fn clip_keeps_segment_straddling_kept() {
+        // Both endpoints outside, but the segment crosses the rect.
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(3.0, 3.0));
+        let a = DVec3::new(0.0, 2.0, 0.0);
+        let b = DVec3::new(4.0, 2.0, 0.0);
+        assert!(!rect.contains_xy(a) && !rect.contains_xy(b));
+        assert!(rect.keeps_segment(a, b), "straddling segment is kept");
+    }
+
+    #[test]
+    fn clip_keeps_segment_outside_dropped() {
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(3.0, 3.0));
+        let a = DVec3::new(10.0, 10.0, 0.0);
+        let b = DVec3::new(12.0, 12.0, 0.0);
+        assert!(!rect.keeps_segment(a, b), "fully-outside segment is dropped");
+    }
+
+    #[test]
+    fn clip_keeps_segment_endpoint_inside_kept() {
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(3.0, 3.0));
+        let a = DVec3::new(2.0, 2.0, 0.0); // inside
+        let b = DVec3::new(10.0, 10.0, 0.0); // outside
+        assert!(rect.keeps_segment(a, b), "segment with an inside endpoint is kept");
+    }
+
+    #[test]
+    fn angular_dim_segments_returns_two_legs_and_arc() {
+        // A 90° corner: vertex at origin, legs along +X and +Y, radius 1.
+        let vertex = DVec3::ZERO;
+        let p1 = DVec3::new(2.0, 0.0, 0.0);
+        let p2 = DVec3::new(0.0, 2.0, 0.0);
+        let segs = angular_dim_segments(vertex, p1, p2, 1.0);
+        // The first two segments are the legs, both starting at the vertex and
+        // reaching out to radius 1 along each leg direction.
+        assert!(segs.len() > 2, "legs + arc segments");
+        assert!(segs[0].0.abs_diff_eq(vertex, 1e-12));
+        assert!(segs[0].1.abs_diff_eq(DVec3::new(1.0, 0.0, 0.0), 1e-12));
+        assert!(segs[1].0.abs_diff_eq(vertex, 1e-12));
+        assert!(segs[1].1.abs_diff_eq(DVec3::new(0.0, 1.0, 0.0), 1e-12));
+        // The remaining segments trace the arc: chained head-to-tail from the p1
+        // leg tip to the p2 leg tip, all at radius 1 from the vertex.
+        let arc = &segs[2..];
+        assert!(!arc.is_empty(), "arc segments present");
+        assert!(arc[0].0.abs_diff_eq(DVec3::new(1.0, 0.0, 0.0), 1e-9), "arc starts at p1 leg tip");
+        for &(a, _) in arc {
+            assert!(((a - vertex).length() - 1.0).abs() < 1e-9, "arc point at radius 1");
+        }
+        assert!(
+            arc.last().unwrap().1.abs_diff_eq(DVec3::new(0.0, 1.0, 0.0), 1e-9),
+            "arc ends at p2 leg tip"
+        );
+    }
+
+    #[test]
     fn param_block_expand_substitutes_and_resolves() {
         let def = ParamBlockDef {
             params: vec![
@@ -988,6 +1401,39 @@ mod tests {
             }
             other => panic!("expected LinearDim, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn angle_degrees_known_cases() {
+        let o = DVec3::ZERO;
+        // 90°: +X vs +Y.
+        assert!((angle_degrees(o, DVec3::X, DVec3::Y) - 90.0).abs() < 1e-9);
+        // 45°: +X vs (1,1,0).
+        assert!((angle_degrees(o, DVec3::X, DVec3::new(1.0, 1.0, 0.0)) - 45.0).abs() < 1e-9);
+        // 180°: opposite rays.
+        assert!((angle_degrees(o, DVec3::X, DVec3::NEG_X) - 180.0).abs() < 1e-9);
+        // Scale-invariant: leg length does not change the angle.
+        assert!((angle_degrees(o, DVec3::X * 5.0, DVec3::Y * 0.1) - 90.0).abs() < 1e-9);
+        // Degenerate zero-length leg → 0.0, never NaN.
+        let deg = angle_degrees(o, o, DVec3::Y);
+        assert_eq!(deg, 0.0);
+        assert!(!deg.is_nan());
+    }
+
+    /// A new `AngularDim` annotation JSON round-trips, and old files without the
+    /// variant are unaffected (serde tag `ann` is additive).
+    #[test]
+    fn angular_dim_json_roundtrips() {
+        let ann = Annotation::AngularDim {
+            vertex: DVec3::ZERO,
+            p1: DVec3::X,
+            p2: DVec3::Y,
+            radius: 1.5,
+        };
+        let json = serde_json::to_string(&ann).unwrap();
+        assert!(json.contains("\"ann\":\"angular_dim\""), "{json}");
+        let back: Annotation = serde_json::from_str(&json).unwrap();
+        assert_eq!(ann, back);
     }
 
     /// A pre-material SceneObject JSON (no `material` field) must still load,

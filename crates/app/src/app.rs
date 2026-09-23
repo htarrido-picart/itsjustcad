@@ -286,6 +286,43 @@ struct ParamPending {
     last_change: std::time::Instant,
 }
 
+/// A not-yet-committed Properties-panel position edit. The three text buffers
+/// are what the fields paint from; the `move` op is logged only when the edit
+/// settles (Enter / focus-loss) so undo/redo stays one-op-per-gesture. `origin`
+/// is the selection's AABB-min at the time the buffers were seeded, so the
+/// commit computes a delta against the value the user actually saw.
+struct PendingPos {
+    /// X/Y/Z as edited text (raw so partial input like "-" isn't clobbered).
+    fields: [String; 3],
+    /// AABB-min the buffers were seeded from; the delta baseline.
+    origin: glam::DVec3,
+}
+
+/// Pure "mixed value" detector for a multi-selection property: `Some(v)` when
+/// every selected object shares value `v`, `None` when they differ (paint "—")
+/// or the selection is empty. Factored out of the paint code so it is testable.
+fn shared_value<T: PartialEq + Clone>(mut values: impl Iterator<Item = T>) -> Option<T> {
+    let first = values.next()?;
+    if values.all(|v| v == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// Pure delta computation for the Properties-panel position edit: the vector
+/// that, added to the selection, moves its `origin` to the typed `target`.
+/// Returns `None` when the delta is negligible (no op should be logged) so a
+/// re-commit of an unchanged field is a no-op. Factored out for unit testing.
+fn move_delta(origin: glam::DVec3, target: glam::DVec3) -> Option<glam::DVec3> {
+    let delta = target - origin;
+    if delta.length() <= 1e-9 {
+        None
+    } else {
+        Some(delta)
+    }
+}
+
 pub struct App {
     session: Session,
     command_line: CommandLine,
@@ -360,6 +397,17 @@ pub struct App {
     /// Default color for layers created via the Layers-panel ＋ button, set in
     /// the ⚙ settings menu. `None` uses the theme default (no `layercolor`).
     new_layer_default_color: Option<[f32; 3]>,
+    /// Per-object color being edited in the Properties panel; the `color`
+    /// command is issued once, when the mouse is released (one op per gesture,
+    /// mirroring `pending_layer_color`). Applies to the whole current selection.
+    pending_object_color: Option<[f32; 3]>,
+    /// Name being typed in the Properties panel `name` field. Held while the
+    /// text field has focus; committed to a `name` op on Enter / focus-loss.
+    pending_object_name: Option<String>,
+    /// Position being typed in the Properties panel X/Y/Z fields. Held as three
+    /// edit buffers plus the AABB-min snapshot they were seeded from, so the
+    /// commit can compute a `move` delta against the live selection origin.
+    pending_object_pos: Option<PendingPos>,
     /// Last executed command line; Enter/Space on the canvas repeats it.
     last_line: Option<String>,
     /// A `critique` request awaiting its viewport screenshot. Holds the
@@ -895,6 +943,9 @@ impl App {
             pending_layer_color: None,
             selected_layer: None,
             new_layer_default_color: None,
+            pending_object_color: None,
+            pending_object_name: None,
+            pending_object_pos: None,
             last_line: None,
             pending_critique: None,
             render_job: None,
@@ -2704,6 +2755,56 @@ impl App {
         }
     }
 
+    /// File extensions the importer accepts (drag-drop + open dialog share this).
+    /// Lower-case, no dot; matching is case-insensitive.
+    const IMPORTABLE_EXTS: &'static [&'static str] = &[
+        "dxf", "dwg", "ifc", "obj", "stl", "gltf", "glb", "dae", "las", "laz", "e57", "3dm",
+    ];
+
+    /// True if `path` has an extension this app can import.
+    fn is_importable(path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| {
+                let e = e.to_ascii_lowercase();
+                Self::IMPORTABLE_EXTS.contains(&e.as_str())
+            })
+    }
+
+    /// Handle OS drag-and-drop: import the first supported file dropped this
+    /// frame. Imports are serial (DXF runs as a batched job that owns
+    /// `import_job`), so a drop while one is in flight is refused rather than
+    /// clobbering the running job; extra files in a single multi-drop are noted.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        let paths: Vec<std::path::PathBuf> = dropped
+            .into_iter()
+            .filter_map(|f| f.path)
+            .filter(|p| Self::is_importable(p))
+            .collect();
+        let Some(first) = paths.first().cloned() else {
+            self.command_line
+                .push_line("drop ignored: not an importable file (dxf/dwg/ifc/obj/stl/…)");
+            return;
+        };
+        if self.import_job.is_some() {
+            self.command_line
+                .push_line("import busy — drop the file again once the current import finishes");
+            return;
+        }
+        if paths.len() > 1 {
+            self.command_line.push_line(format!(
+                "importing {} — {} more dropped file(s) ignored (drop one at a time)",
+                first.display(),
+                paths.len() - 1
+            ));
+        }
+        self.begin_import(first);
+    }
+
     /// Begin importing `path`. DXF files (potentially tens of thousands of
     /// entities) are applied in time-boxed batches with a progress modal (see
     /// [`Self::step_import`]) so the UI never freezes; other formats run
@@ -3166,7 +3267,15 @@ impl App {
                 return None;
             }
             rfd::FileDialog::new()
+                .add_filter(
+                    "All supported",
+                    &[
+                        "dxf", "dwg", "ifc", "obj", "stl", "gltf", "glb", "dae", "las", "laz",
+                        "e57", "3dm",
+                    ],
+                )
                 .add_filter("DXF", &["dxf"])
+                .add_filter("DWG (assisted)", &["dwg"])
                 .add_filter("IFC", &["ifc"])
                 .add_filter("OBJ", &["obj"])
                 .add_filter("STL", &["stl"])
@@ -3194,6 +3303,8 @@ impl App {
             rfd::FileDialog::new()
                 .add_filter("DXF", &["dxf"])
                 .add_filter("SVG", &["svg"])
+                .add_filter("Adobe Illustrator (SVG-content)", &["ai"])
+                .add_filter("JPEG image", &["jpg", "jpeg"])
                 .add_filter("CSV", &["csv"])
                 .add_filter("glTF / GLB", &["gltf", "glb"])
                 .add_filter("OBJ", &["obj"])
@@ -3861,7 +3972,51 @@ impl App {
                         );
                     }
                 }
+                Annotation::AngularDim { vertex, p1, p2, radius } => {
+                    // Two legs out to the arc radius + the arc between them, from
+                    // the shared geometry helper; the degree label at the arc
+                    // midpoint is placed below. Free model points.
+                    for (w0, w1) in
+                        itsjustcad_doc::angular_dim_segments(*vertex, *p1, *p2, *radius)
+                    {
+                        if let (Some(p), Some(q)) =
+                            (project(view_proj, rect, w0), project(view_proj, rect, w1))
+                        {
+                            painter.line_segment([p, q], stroke);
+                        }
+                    }
+                    // Arc points (again) only for the label midpoint.
+                    let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
+                    // Degree label at the arc midpoint (derived value).
+                    let mid = arc.get(arc.len() / 2).copied().unwrap_or(*vertex);
+                    if let Some(p) = project(view_proj, rect, mid) {
+                        let label = itsjustcad_doc::format_angle(
+                            itsjustcad_doc::angle_degrees(*vertex, *p1, *p2),
+                        );
+                        let size = px_height(mid, 0.2);
+                        painter.text(
+                            p,
+                            egui::Align2::CENTER_BOTTOM,
+                            label,
+                            egui::FontId::proportional(size),
+                            color,
+                        );
+                    }
+                }
                 Annotation::Text { pos, text, height } => {
+                    if let Some(p) = project(view_proj, rect, *pos) {
+                        painter.text(
+                            p,
+                            egui::Align2::LEFT_BOTTOM,
+                            text,
+                            egui::FontId::proportional(px_height(*pos, *height)),
+                            color,
+                        );
+                    }
+                }
+                // A field renders like text; its live value lives in `text`,
+                // recomputed by the doc's field-refresh hook.
+                Annotation::Field { pos, text, height, .. } => {
                     if let Some(p) = project(view_proj, rect, *pos) {
                         painter.text(
                             p,
@@ -4156,52 +4311,219 @@ impl App {
 
     /// Properties tab body: read-out of the active selection (count, layer,
     /// combined bounding box). Query-only; no ops issued.
+    /// Editable Properties panel for the current selection. Every field routes
+    /// its mutation through an EXISTING verb via `execute_line`, so the edit is
+    /// op-logged, undoable and replay-stable — the panel never touches `doc`.
+    /// Compact labeled rows (Manuel: AutoCAD's is too big, Rhino's is simple).
+    /// Multi-selection shows a shared value, or "—" / a mixed hint when the
+    /// selected objects disagree; a commit then applies to the whole selection.
     fn properties_panel(&mut self, ui: &mut egui::Ui) {
         // Title comes from the enclosing CollapsingHeader in the Model workspace.
+        let theme = if ui.visuals().dark_mode {
+            scene::Theme::Dark
+        } else {
+            scene::Theme::Light
+        };
         let doc = &self.session.doc;
         let sel = &doc.selection;
         if sel.is_empty() {
             ui.weak("No selection.");
             ui.add_space(4.0);
             ui.weak("Click an object in a viewport, or use `select all`.");
+            // Drop any stale pending edits from a previous selection.
+            self.pending_object_name = None;
+            self.pending_object_pos = None;
+            self.pending_object_color = None;
             return;
         }
-        ui.label(format!("{} object(s) selected", sel.len()));
-        // Layers spanned by the selection.
-        let mut layers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+
+        // Snapshot everything read from `doc` up front so the borrow ends before
+        // we mutate `self` (pending buffers) or call `execute_line`.
+        let count = sel.len();
+        let units = doc.units;
+        // Aggregate over the selection: layers spanned, shared name/color, AABB.
         let mut aabb: Option<kernel_mesh::Aabb> = None;
+        let mut names: Vec<Option<String>> = Vec::new();
+        let mut colors: Vec<Option<[f32; 3]>> = Vec::new();
+        let mut sel_layers: Vec<String> = Vec::new();
         for obj in doc.objects().filter(|o| sel.contains(&o.id)) {
-            layers.insert(obj.layer.as_str());
+            sel_layers.push(obj.layer.clone());
+            names.push(obj.name.clone());
+            colors.push(obj.color);
             let bb = obj.geometry.aabb();
             aabb = Some(match aabb {
                 Some(a) => a.union(bb),
                 None => bb,
             });
         }
-        // Middle-truncate each layer name (preserve head+tail) so a long name
-        // never blows out the narrow Properties column.
-        let shown = layers
-            .into_iter()
-            .map(|n| middle_truncate(n, 18))
-            .collect::<Vec<_>>()
-            .join(", ");
-        ui.label(format!("layer(s): {shown}"));
-        if let Some(bb) = aabb {
-            let s = bb.size();
-            ui.separator();
-            ui.label("bounding box:");
-            ui.monospace(format!(
-                "  size  {}",
-                crate::statusbar::format_cursor(doc.units, Some(s))
-            ));
-            ui.monospace(format!(
-                "  min   {}",
-                crate::statusbar::format_cursor(doc.units, Some(bb.min))
-            ));
-            ui.monospace(format!(
-                "  max   {}",
-                crate::statusbar::format_cursor(doc.units, Some(bb.max))
-            ));
+        // Shared-value detection (None ⇒ mixed / paint a placeholder).
+        let shared_layer = shared_value(sel_layers.iter().cloned());
+        let shared_name = shared_value(names.into_iter());
+        let shared_color = shared_value(colors.into_iter());
+        // Existing layers for the dropdown, alphabetical (BTreeMap order).
+        let all_layers: Vec<String> = doc.layers.keys().cloned().collect();
+        // Fallback swatch when nothing overrides the color (layer/theme default).
+        let fallback = theme.mesh();
+        // Lines to run after the borrow on `doc` is released, in field order.
+        let mut lines: Vec<String> = Vec::new();
+
+        ui.label(format!("{count} object(s) selected"));
+        ui.add_space(2.0);
+
+        egui::Grid::new("properties_editor")
+            .num_columns(2)
+            .spacing(egui::vec2(6.0, 6.0))
+            .show(ui, |ui| {
+                // -- Layer (dropdown → `tolayer <sel> <name>`) --
+                ui.label("Layer");
+                let sel_text = match &shared_layer {
+                    Some(l) => middle_truncate(l, 18),
+                    None => "—".to_string(),
+                };
+                egui::ComboBox::from_id_salt("prop_layer")
+                    .selected_text(sel_text)
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        for name in &all_layers {
+                            let picked = shared_layer.as_deref() == Some(name.as_str());
+                            if ui.selectable_label(picked, middle_truncate(name, 18)).clicked()
+                                && !picked
+                            {
+                                lines.push(format!("tolayer sel {name}"));
+                            }
+                        }
+                    });
+                ui.end_row();
+
+                // -- Name (text field → `name <sel> <name>`) --
+                // Only render when the whole selection shares a name (or is a
+                // single object); mixed names show a disabled placeholder to
+                // avoid clobbering distinct names with one value.
+                ui.label("Name");
+                if count == 1 || shared_name.is_some() {
+                    // Seed the edit buffer from the shared value once; keep it
+                    // while focused so typing isn't overwritten each frame.
+                    let seed = shared_name.clone().flatten().unwrap_or_default();
+                    let buf = self
+                        .pending_object_name
+                        .get_or_insert_with(|| seed.clone());
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(buf)
+                            .desired_width(140.0)
+                            .hint_text("(unnamed)"),
+                    );
+                    // Commit on focus-loss (Enter blurs the field too): one
+                    // `name` op per edit, only when it changed vs the seed.
+                    if resp.lost_focus() {
+                        if let Some(new) = self.pending_object_name.take() {
+                            let new = new.trim();
+                            if new != seed && !new.is_empty() {
+                                lines.push(format!("name sel {new}"));
+                            }
+                        }
+                    } else if !resp.has_focus() {
+                        // Not being edited: keep the buffer synced to the live
+                        // value so a selection change reseeds it next frame.
+                        self.pending_object_name = None;
+                    }
+                } else {
+                    ui.weak("— (mixed)");
+                }
+                ui.end_row();
+
+                // -- Color (picker → `color <sel> r,g,b`) --
+                ui.label("Color");
+                let mut rgb = self
+                    .pending_object_color
+                    .or_else(|| shared_color.flatten())
+                    .unwrap_or([fallback[0], fallback[1], fallback[2]]);
+                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                    self.pending_object_color = Some(rgb);
+                }
+                if shared_color.is_none() && self.pending_object_color.is_none() {
+                    ui.weak("(mixed/none)");
+                } else {
+                    ui.label("");
+                }
+                ui.end_row();
+
+                // -- Position (X/Y/Z of the selection AABB-min → `move` delta) --
+                if let Some(bb) = aabb {
+                    let origin = bb.min;
+                    ui.label("Position");
+                    ui.vertical(|ui| {
+                        // Reseed the buffers when the selection moved out from
+                        // under a stale edit (origin drifted while unfocused).
+                        if let Some(p) = &self.pending_object_pos
+                            && move_delta(p.origin, origin).is_some()
+                        {
+                            self.pending_object_pos = None;
+                        }
+                        // Seed the three buffers from the live AABB-min once; the
+                        // stored `origin` is the delta baseline for the commit.
+                        let pend = self.pending_object_pos.get_or_insert_with(|| PendingPos {
+                            fields: [
+                                format!("{:.4}", origin.x),
+                                format!("{:.4}", origin.y),
+                                format!("{:.4}", origin.z),
+                            ],
+                            origin,
+                        });
+                        let mut commit = false;
+                        for (i, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.weak(*axis);
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut pend.fields[i])
+                                        .desired_width(100.0),
+                                );
+                                if resp.lost_focus()
+                                    && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
+                                {
+                                    commit = true;
+                                }
+                            });
+                        }
+                        if commit
+                            && let Some(p) = self.pending_object_pos.take()
+                        {
+                                // Parse each field, falling back to the origin
+                                // component when a field is left blank/invalid.
+                                let parse = |s: &str, d: f64| s.trim().parse::<f64>().unwrap_or(d);
+                                let target = glam::DVec3::new(
+                                    parse(&p.fields[0], p.origin.x),
+                                    parse(&p.fields[1], p.origin.y),
+                                    parse(&p.fields[2], p.origin.z),
+                                );
+                                if let Some(d) = move_delta(p.origin, target) {
+                                    lines.push(format!(
+                                        "move sel {:.6},{:.6},{:.6}",
+                                        d.x, d.y, d.z
+                                    ));
+                                }
+                        }
+                    });
+                    ui.end_row();
+
+                    // Read-only size for reference (compact).
+                    let s = bb.size();
+                    ui.label("Size");
+                    ui.monospace(crate::statusbar::format_cursor(units, Some(s)));
+                    ui.end_row();
+                }
+            });
+
+        // Commit the color edit once the mouse is released — one logged `color`
+        // op per gesture instead of one per drag frame (mirrors layer color).
+        if let Some(c) = self.pending_object_color
+            && !ui.input(|i| i.pointer.any_down())
+        {
+            lines.push(format!("color sel {:.3},{:.3},{:.3}", c[0], c[1], c[2]));
+            self.pending_object_color = None;
+        }
+
+        for line in lines {
+            self.execute_line(line);
         }
     }
 
@@ -4484,16 +4806,23 @@ impl App {
             ui.ctx().memory_mut(|m| m.surrender_focus(id));
         }
 
-        let (esc, enter, shift) = ui.input(|i| {
+        let (esc, enter, shift, close_key) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Enter),
                 i.modifiers.shift,
+                i.key_pressed(egui::Key::C),
             )
         });
         if esc {
             self.draw_tool.cancel();
             self.command_line.push_line("drawing cancelled");
+            return;
+        }
+        // `C` closes an open polyline into a loop (Rhino's Close). Letters never
+        // feed the numeric buffer, so intercepting the key here is safe.
+        if close_key && let Some(cmd) = self.draw_tool.on_close() {
+            self.execute_line(cmd);
             return;
         }
         // Typed characters feed the numeric buffer; Backspace edits it
@@ -4618,6 +4947,21 @@ impl App {
                 ) {
                     painter.line_segment([a, b], stroke);
                 }
+            }
+        }
+        // Close-target hint: a ring on the polyline's first point once a loop is
+        // possible, so "click start / press C to close" is a visible affordance
+        // (Rhino highlights the same). Fills solid when the cursor is within the
+        // 0.5-unit snap-close radius, matching draw_tool's CLOSE_SNAP.
+        if let Some(start) = self.draw_tool.close_target()
+            && let Some(screen) = project(view_proj, rect, start)
+        {
+            let near = cursor_world.is_some_and(|c| start.distance(c) < 0.5);
+            let color = egui::Color32::from_rgb(90, 220, 120);
+            if near {
+                painter.circle_filled(screen, 5.0, color);
+            } else {
+                painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.5, color));
             }
         }
         // Osnap marker: square on the snapped point + kind label (Rhino look).
@@ -7560,6 +7904,10 @@ impl eframe::App for App {
         // events can be consumed (the command line is focused-by-default, so the
         // input would otherwise eat the letter).
         self.early_hotkeys(&ui.ctx().clone());
+        // OS drag-and-drop: dropping model files onto the window imports them
+        // (the literal "drop in a DWG" ask). Dispatch by extension via the same
+        // `begin_import` the File → Import… dialog uses.
+        self.handle_dropped_files(&ui.ctx().clone());
         // If a chat save fell back to plaintext despite the user's `chatencryption
         // on`, surface it once here (consume-once flag) so "encrypted" chat can
         // never silently mean plaintext.
@@ -8286,6 +8634,36 @@ fn pano_from_view(v: itsjustcad_doc::PanoView) -> itsjustcad_render::PanoProject
 mod tests {
     use super::*;
     use itsjustcad_commands::registry;
+
+    #[test]
+    fn shared_value_detects_agreement_and_mixed() {
+        // Empty selection → no shared value.
+        assert_eq!(shared_value(std::iter::empty::<i32>()), None);
+        // All agree → the shared value.
+        assert_eq!(shared_value([7, 7, 7].into_iter()), Some(7));
+        // Any disagreement → None (paint "—").
+        assert_eq!(shared_value([7, 7, 8].into_iter()), None);
+        // Works over Option<T> (per-object color/name overrides).
+        assert_eq!(
+            shared_value([Some("a"), Some("a")].into_iter()),
+            Some(Some("a"))
+        );
+        assert_eq!(shared_value([Some("a"), None].into_iter()), None);
+    }
+
+    #[test]
+    fn move_delta_is_target_minus_origin_and_ignores_noise() {
+        let o = glam::DVec3::new(1.0, 2.0, 3.0);
+        // Real move → the delta from origin to target.
+        assert_eq!(
+            move_delta(o, glam::DVec3::new(4.0, 2.0, 3.0)),
+            Some(glam::DVec3::new(3.0, 0.0, 0.0))
+        );
+        // No move (identical) → None, so no `move` op is logged.
+        assert_eq!(move_delta(o, o), None);
+        // Sub-epsilon jitter → None (undo/replay stays one-op-per-real-edit).
+        assert_eq!(move_delta(o, o + glam::DVec3::splat(1e-12)), None);
+    }
 
     #[test]
     fn import_job_fraction_tracks_progress() {
@@ -9280,5 +9658,21 @@ mod tests {
         let back: itsjustcad_deck::RenderDecksFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back.active_config().kind, itsjustcad_deck::RenderKind::LocalSd);
         assert_eq!(back.active_config().name, LOCAL_SD_CASSETTE_NAME);
+    }
+
+    #[test]
+    fn importable_extension_gate_matches_dialog_formats() {
+        use std::path::Path;
+        // Every format the open dialog offers is accepted, case-insensitively.
+        for ok in [
+            "plan.dxf", "old.DWG", "model.ifc", "m.obj", "p.STL", "s.gltf", "s.glb", "c.dae",
+            "cloud.las", "cloud.laz", "scan.e57", "r.3dm",
+        ] {
+            assert!(App::is_importable(Path::new(ok)), "{ok} should import");
+        }
+        // Unrelated files are refused (drop is a no-op, not a crash).
+        for bad in ["notes.txt", "image.png", "noext", "archive.zip"] {
+            assert!(!App::is_importable(Path::new(bad)), "{bad} must not import");
+        }
     }
 }

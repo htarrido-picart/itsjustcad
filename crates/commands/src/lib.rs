@@ -24,8 +24,10 @@ pub mod lot;
 pub mod mesh_export;
 pub mod mesh_import;
 mod parse;
+pub mod pat;
 pub mod pdf;
 pub mod plugin;
+pub mod raster;
 mod registry;
 pub mod rhino3dm;
 pub mod saf;
@@ -34,8 +36,8 @@ pub mod svg;
 pub mod workdir;
 
 pub use command::{
-    BoolKind, Command, CompassDir, ConstrainKind, DimAnchorSpec, GridshellSurfaceSpec, MirrorPlane,
-    OptionOp, Selector,
+    BoolKind, CPlaneOp, Command, CompassDir, ConstrainKind, DimAnchorSpec, GridshellSurfaceSpec,
+    MirrorPlane, OptionOp, PlotStyleOp, RegionMode, Selector, SheetSetOp, SimilarBy,
 };
 pub use error::{ExecError, ParseError};
 pub use exec::{ApplyOutcome, ImportSummary, Session, MAIN_BRANCH};

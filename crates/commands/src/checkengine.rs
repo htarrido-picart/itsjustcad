@@ -1438,8 +1438,8 @@ mod tests {
     #[test]
     fn count_per_story_bands() {
         let stories = vec![
-            Story { name: "L1".into(), elevation: 0.0 },
-            Story { name: "L2".into(), elevation: 3.0 },
+            Story { name: "L1".into(), elevation: 0.0, height: 0.0 },
+            Story { name: "L2".into(), elevation: 3.0, height: 0.0 },
         ];
         // Bottoms: two on L1, one on L2.
         let counts = count_per_story(&stories, &[0.0, 1.0, 3.5]);

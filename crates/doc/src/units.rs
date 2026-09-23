@@ -72,6 +72,13 @@ pub fn format_length(units: Units, meters: f64) -> String {
     }
 }
 
+/// Format an angle in degrees for a dimension label (e.g. `45.0°`). Unlike
+/// lengths, angles are unit-independent; one decimal place matches drafting
+/// convention without over-precision.
+pub fn format_angle(degrees: f64) -> String {
+    format!("{degrees:.1}°")
+}
+
 /// Format an area stored in square meters for display in the document's unit.
 pub fn format_area(units: Units, sq_meters: f64) -> String {
     let (per_m, label) = units.per_meter();

@@ -6,12 +6,14 @@
 //! about how it is mutated.
 
 mod constraint;
+mod cplane;
 mod document;
 pub mod hatch;
 pub mod hershey;
 pub mod loads;
 mod object;
 pub mod param_schema;
+mod plotstyle;
 mod sheet;
 mod structure;
 mod underlay;
@@ -19,25 +21,30 @@ mod units;
 mod view;
 
 pub use constraint::{PointRef, SketchConstraint};
+pub use cplane::CPlane;
 pub use document::Document;
 pub use loads::{LoadGeometry, RestraintKind, StructLoad, StructSupport};
 pub use object::{
-    Annotation, AreaKind, BlockGeometry, DimAnchor, EndpointRef, FrameKind, Geometry,
-    HatchPattern, LayerStyle, LineType, MaterialPreset, ObjectId, ObjectMaterial, ParamBlockDef,
-    ParamBlockParam, SceneObject, DEFAULT_LAYER,
+    angle_degrees, angular_arc_points, angular_dim_segments, Annotation, AreaKind, BlockGeometry,
+    ClipRect, DimAnchor,
+    EndpointRef, FieldExpr, FrameKind, Geometry,
+    HatchPattern, HatchPatternDef, LayerStyle, LineType, MaterialPreset, ObjectId, ObjectMaterial,
+    ParamBlockDef, ParamBlockParam, PatLine, SceneObject, DEFAULT_LAYER,
 };
 pub use param_schema::{
     derive_mesh, param_summary, DeriveError, FieldKind, GeneratorKind, ParamField, ParamMap,
     ParamSchema, ParamValue, Unit, Widget,
 };
+pub use plotstyle::{PlotStyleEntry, PlotStyleTable, ResolvedPen};
 pub use sheet::{
-    PaperSize, ScheduleRow, Sheet, SheetDim, SheetLeader, SheetTable, SheetTag, SheetText,
-    SheetView, TagShape, ViewDirection,
+    PaperSize, ScheduleRow, Sheet, SheetDim, SheetLeader, SheetSet, SheetTable, SheetTag,
+    SheetText, SheetView, TagShape, ViewDirection,
 };
 pub use structure::{Grid, Material, Room, Section, Story};
 pub use underlay::{Basemap, Underlay};
 pub use units::{
-    format_area, format_length, format_volume, Units, METERS_PER_FOOT, METERS_PER_INCH,
+    format_angle, format_area, format_length, format_volume, Units, METERS_PER_FOOT,
+    METERS_PER_INCH,
 };
 pub use view::{NamedView, PanoView};
 

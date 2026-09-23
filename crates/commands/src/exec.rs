@@ -7,7 +7,7 @@ use kernel_mesh::extrude_profile;
 use rayon::prelude::*;
 use itsjustcad_doc::{
     format_area, format_length, format_volume, AnalysisReport, AnalysisSample, Annotation,
-    DimAnchor, Document, GeoLocation, Geometry, Grid, LayerStyle,
+    DimAnchor, Document, FieldExpr, GeoLocation, Geometry, Grid, LayerStyle,
     LoadGeometry, Material, NamedView, ObjectId, Room, SceneObject, ScheduleRow,
     SheetDim, SheetLeader, SheetTable, SheetTag, SheetText, Story, StructLoad, StructSupport,
     TagShape, Underlay, Units,
@@ -16,10 +16,18 @@ use itsjustcad_doc::{
 use std::collections::BTreeMap;
 
 use crate::error::ExecError;
-use crate::{BoolKind, Command, CompassDir, DimAnchorSpec, MirrorPlane, OptionOp, Selector};
+use crate::{
+    BoolKind, CPlaneOp, Command, CompassDir, DimAnchorSpec, MirrorPlane, OptionOp, PlotStyleOp,
+    RegionMode, Selector, SheetSetOp, SimilarBy,
+};
 
 /// Chord tolerance used when tessellating profile curves for extrusion.
 const PROFILE_TOL: f64 = 0.01;
+
+/// Snap/merge tolerance for the `boundary` planar arrangement. Endpoints (and
+/// segment-crossing points) closer than this are treated as one vertex, so gaps
+/// larger than this between candidate curves break the enclosing loop.
+const BOUNDARY_TOL: f64 = 1e-4;
 
 /// Accepted `room` occupancy classifications — the IBC use groups, simplified
 /// to family names. These key the occupant-load factor table carried as DATA
@@ -157,6 +165,9 @@ enum Inverse {
     Units { prev: Units },
     /// `underlay`/`underlayopacity`/`underlayoff`: restore the previous underlay.
     Underlay { prev: Option<Underlay> },
+    /// `hatchpat`: restore the whole pattern registry (imports may overwrite
+    /// same-named patterns, so we snapshot and restore the map wholesale).
+    HatchPatterns { prev: std::collections::BTreeMap<String, itsjustcad_doc::HatchPatternDef> },
     /// `sun`/`sunoff`: restore the previous solar position.
     Sun { prev: Option<itsjustcad_doc::SunPosition> },
     /// `location` (also set as a side effect of `sun`): restore the previous
@@ -191,6 +202,10 @@ enum Inverse {
     PopSheetLeader(String),
     /// `sheettag`: remove the last paper-space tag appended to a sheet.
     PopSheetTag(String),
+    /// `sheetset new/add/remove/order`: restore the whole sheet-set table. The
+    /// ops are small and diverse (create/append/reorder), so a snapshot-restore
+    /// is simpler and safer than a per-op inverse.
+    SheetSetsRestore(Vec<itsjustcad_doc::SheetSet>),
     /// `block`: remove the block definition this command created/replaced.
     BlockDef {
         name: String,
@@ -214,6 +229,23 @@ enum Inverse {
     CreatedAndBake {
         created: Vec<ObjectId>,
         block_key: String,
+    },
+    /// `xref attach`: undo removes the created instance, restores the block
+    /// definition this attach created/replaced (None = it was new), and restores
+    /// the previous `xrefs` path binding (None = it was new).
+    XrefAttached {
+        created: Vec<ObjectId>,
+        name: String,
+        prev_block: Option<Vec<itsjustcad_doc::BlockGeometry>>,
+        prev_path: Option<String>,
+    },
+    /// `xref detach`: undo restores the detached instances (with their creation
+    /// indices), the block definition and the `xrefs` path binding.
+    XrefDetached {
+        name: String,
+        path: String,
+        def: Vec<itsjustcad_doc::BlockGeometry>,
+        instances: Vec<(SceneObject, usize)>,
     },
     /// `param` (edit an instance's dynamic-block param): restore the instance's
     /// prior geometry (its params map) and its prior baked geometry.
@@ -256,6 +288,11 @@ enum Inverse {
     ConstraintsRestore(Vec<(usize, itsjustcad_doc::SketchConstraint)>),
     /// `lotsettings`: restore the previous subdivision settings (serialized).
     SubdivisionSettings { prev: String },
+    /// `plotstyle new/set/apply/none/delete`: restore the whole plot-style
+    /// table map + active-name pointer (serialized). The sub-ops are small and
+    /// diverse, so a snapshot-restore is simpler than a per-op inverse (mirrors
+    /// `SheetSetsRestore`).
+    PlotStyles { prev: String },
 }
 
 /// Owns the document plus its op-log; the single mutation path for both the
@@ -664,6 +701,32 @@ impl Session {
             }
             Command::CheckRulesList => Ok(self.checkrules_list()),
             Command::CheckRulesLoad { path } => self.checkrules_load(path),
+            // xref attach/reload READ an external file: resolve its geometry on a
+            // scratch session, then re-enter the generic logged path with
+            // `geometries` (and `name`/`id`) filled — so the op-log carries the
+            // baked block def and replays without the external file (the CutFill
+            // `original_z` / CodeCheck `rules` precedent).
+            Command::XrefAttach { path, at, scale, rotation_deg, id, name: None, geometries: None } => {
+                let (name, geometries) = self.xref_import(&path)?;
+                self.run(Command::XrefAttach {
+                    path,
+                    at,
+                    scale,
+                    rotation_deg,
+                    id,
+                    name: Some(name),
+                    geometries: Some(geometries),
+                })
+            }
+            Command::XrefReload { name, geometries: None } => {
+                let path = self.doc.xrefs.get(&name).cloned().ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "no xref named '{name}' (use 'xref list' to see attached xrefs)"
+                    ))
+                })?;
+                let (_stem, geometries) = self.xref_import(&path)?;
+                self.run(Command::XrefReload { name, geometries: Some(geometries) })
+            }
             cmd => {
                 let logged = cmd.is_logged();
                 // A new logged edit truncates the redo tail, so the undo history
@@ -671,6 +734,13 @@ impl Session {
                 if logged {
                     self.ensure_history()?;
                 }
+                // Resolve typed CPlane-space points to WORLD before the op is
+                // built and logged, so the log carries world coords (replay
+                // stability). No-op when the CPlane is world XY. Redo replays the
+                // already-world logged op via `apply_forward` (not `run`), and
+                // full replay starts from a fresh world CPlane, so neither
+                // double-transforms.
+                let cmd = cplane_resolve(&self.doc, cmd)?;
                 let (op, inverse, outcome) = apply_forward(&mut self.doc, cmd)?;
                 if logged {
                     self.log.truncate(self.cursor);
@@ -680,6 +750,17 @@ impl Session {
                 Ok(outcome)
             }
         }
+    }
+
+    /// Run a command whose points are ALREADY world-space (importers, generated
+    /// geometry) with the CPlane transform suppressed, then restore the active
+    /// plane. Prevents a user-set CPlane from re-projecting import coordinates.
+    fn run_world(&mut self, cmd: Command) -> Result<ApplyOutcome, ExecError> {
+        let saved = self.doc.cplane;
+        self.doc.cplane = itsjustcad_doc::CPlane::world();
+        let out = self.run(cmd);
+        self.doc.cplane = saved;
+        out
     }
 
     fn undo(&mut self) -> Result<ApplyOutcome, ExecError> {
@@ -838,6 +919,10 @@ impl Session {
                 self.doc.underlay = prev.clone();
                 self.doc.generation += 1;
             }
+            Inverse::HatchPatterns { prev } => {
+                self.doc.hatch_patterns = prev.clone();
+                self.doc.generation += 1;
+            }
             Inverse::Sun { prev } => {
                 self.doc.sun = *prev;
                 self.doc.generation += 1;
@@ -913,6 +998,10 @@ impl Session {
                 }
                 self.doc.generation += 1;
             }
+            Inverse::SheetSetsRestore(prev) => {
+                self.doc.sheet_sets = prev.clone();
+                self.doc.generation += 1;
+            }
             Inverse::BlockDef { name, prev } => {
                 match prev {
                     Some(defs) => {
@@ -949,6 +1038,36 @@ impl Session {
                     self.doc.remove(id);
                 }
                 self.doc.blocks.remove(block_key);
+                self.doc.generation += 1;
+            }
+            Inverse::XrefAttached { created, name, prev_block, prev_path } => {
+                for id in created.clone() {
+                    self.doc.remove(id);
+                }
+                match prev_block {
+                    Some(defs) => {
+                        self.doc.blocks.insert(name.clone(), defs.clone());
+                    }
+                    None => {
+                        self.doc.blocks.remove(name);
+                    }
+                }
+                match prev_path {
+                    Some(p) => {
+                        self.doc.xrefs.insert(name.clone(), p.clone());
+                    }
+                    None => {
+                        self.doc.xrefs.remove(name);
+                    }
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::XrefDetached { name, path, def, instances } => {
+                self.doc.blocks.insert(name.clone(), def.clone());
+                self.doc.xrefs.insert(name.clone(), path.clone());
+                for (obj, index) in instances.iter().rev() {
+                    self.doc.restore(obj.clone(), *index);
+                }
                 self.doc.generation += 1;
             }
             Inverse::ParamBlockSet { id, prev_geometry, block_key, prev_bake } => {
@@ -1039,6 +1158,17 @@ impl Session {
             Inverse::SubdivisionSettings { prev } => {
                 if let Ok(settings) = serde_json::from_str(prev) {
                     self.doc.subdivision_settings = settings;
+                    self.doc.generation += 1;
+                }
+            }
+            Inverse::PlotStyles { prev } => {
+                if let Ok((tables, active)) = serde_json::from_str::<(
+                    std::collections::BTreeMap<String, itsjustcad_doc::PlotStyleTable>,
+                    Option<String>,
+                )>(prev)
+                {
+                    self.doc.plot_styles = tables;
+                    self.doc.active_plot_style = active;
                     self.doc.generation += 1;
                 }
             }
@@ -1318,6 +1448,45 @@ impl Session {
         }
     }
 
+    /// Import a file into an ISOLATED scratch session and harvest its geometry as
+    /// a flat `Vec<BlockGeometry>` — the packing an xref block definition needs.
+    /// Reuses the whole `import` pipeline (every supported format) but keeps the
+    /// live document and op-log untouched, exactly as `bake_param_block` runs a
+    /// parametric template on a throwaway session. Returns the path stem (used as
+    /// the xref/block name) plus the harvested geometry. Instances/points in the
+    /// imported file are skipped (block defs are flat), mirroring `BlockDefine`.
+    fn xref_import(
+        &self,
+        path: &str,
+    ) -> Result<(String, Vec<itsjustcad_doc::BlockGeometry>), ExecError> {
+        use itsjustcad_doc::BlockGeometry;
+        let stem = std::path::Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ExecError::Invalid(format!("xref: cannot derive a name from '{path}'")))?;
+        let mut scratch = Session::default();
+        scratch.import(path.to_string())?;
+        let mut out = Vec::new();
+        for obj in scratch.doc.objects() {
+            match &obj.geometry {
+                Geometry::Mesh(m)
+                | Geometry::Frame { mesh: m, .. }
+                | Geometry::Area { mesh: m, .. }
+                | Geometry::Parametric { mesh: m, .. } => out.push(BlockGeometry::Mesh(m.clone())),
+                Geometry::Curve(c) => out.push(BlockGeometry::Curve(c.clone())),
+                Geometry::Annotation(a) => out.push(BlockGeometry::Annotation(a.clone())),
+                Geometry::Instance { .. } | Geometry::Points { .. } => {}
+            }
+        }
+        if out.is_empty() {
+            return Err(ExecError::Invalid(format!(
+                "xref: '{path}' produced no attachable geometry"
+            )));
+        }
+        Ok((stem, out))
+    }
+
     /// STEP AP242 (also AP203/214) import through the exact-BREP tier (OCCT).
     ///
     /// STEP carries exact analytic BREP solids; OCCT reads them exactly and we
@@ -1372,7 +1541,10 @@ impl Session {
             if self.doc.current_layer != layer {
                 self.run(Command::Layer { name: layer })?;
             }
-            created.extend(self.run(cmd)?.created);
+            // Entity coords are file/world coords — bypass the active CPlane
+            // (like `import_3dm`), else a non-world CPlane re-projects them.
+            // Layer switches above stay on `run` (no coords to transform).
+            created.extend(self.run_world(cmd)?.created);
         }
         if self.doc.current_layer != prev_layer {
             self.run(Command::Layer { name: prev_layer })?;
@@ -1408,7 +1580,10 @@ impl Session {
             if self.doc.current_layer != layer {
                 self.run(Command::Layer { name: layer })?;
             }
-            created.extend(self.run(cmd)?.created);
+            // Entity coords are file/world coords — bypass the active CPlane
+            // (like `import_3dm`), else a non-world CPlane re-projects them.
+            // Layer switches above stay on `run` (no coords to transform).
+            created.extend(self.run_world(cmd)?.created);
         }
         if self.doc.current_layer != prev_layer {
             self.run(Command::Layer { name: prev_layer })?;
@@ -1493,7 +1668,7 @@ impl Session {
                 }
                 crate::rhino3dm::Imported::Polyline { points, closed } => {
                     curves += 1;
-                    self.run(Command::Polyline { id: None, points, closed })?
+                    self.run_world(Command::Polyline { id: None, points, closed })?
                 }
             };
             created.extend(out.created);
@@ -1548,6 +1723,7 @@ impl Session {
             self.run(Command::DefStory {
                 name: story.name.clone(),
                 elevation: story.elevation,
+                height: None,
             })?;
         }
 
@@ -1730,7 +1906,7 @@ impl Session {
         if self.doc.current_layer != "pointcloud" {
             self.run(Command::Layer { name: "pointcloud".to_string() })?;
         }
-        let out = self.run(Command::PointLiteral { id: None, positions: pts.positions })?;
+        let out = self.run_world(Command::PointLiteral { id: None, positions: pts.positions })?;
         Ok(ApplyOutcome {
             created: out.created,
             message: format!(
@@ -1755,7 +1931,7 @@ impl Session {
         if self.doc.current_layer != "pointcloud" {
             self.run(Command::Layer { name: "pointcloud".to_string() })?;
         }
-        let out = self.run(Command::PointLiteral { id: None, positions: pts.positions })?;
+        let out = self.run_world(Command::PointLiteral { id: None, positions: pts.positions })?;
 
         let color_note = if pts.colors.is_empty() {
             String::new()
@@ -2473,6 +2649,67 @@ fn resolve(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
     Ok(ids)
 }
 
+/// Dimensionable spans of one object for `autodim`: the ordered list of
+/// `(a, b)` world-point pairs that each become a linear dimension.
+///
+/// - A straight-segmented curve (line/polyline) yields one span per segment,
+///   in curve order (closed polylines add the closing segment). Degenerate
+///   segments (shorter than `DIM_MIN_SEG`) are skipped.
+/// - Any other geometry yields two overall extent spans from its AABB: width
+///   along X (at `min.y`) and height along Y (at `min.x`), each at the box's
+///   `min.z`. A zero-length extent is skipped.
+///
+/// Deterministic: order follows curve/point order (or the fixed width-then-
+/// height sequence), so op-log replay is byte-identical.
+fn autodim_spans(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
+    /// Segments shorter than this (meters) are skipped as degenerate.
+    const DIM_MIN_SEG: f64 = 1e-6;
+
+    // A polyline/line dimensions per-segment; everything else uses extents.
+    let seg_points: Option<(Vec<DVec3>, bool)> = match geometry {
+        Geometry::Curve(Curve::Line { a, b }) => Some((vec![*a, *b], false)),
+        Geometry::Curve(Curve::Polyline { points, closed }) => {
+            Some((points.clone(), *closed))
+        }
+        _ => None,
+    };
+
+    if let Some((points, closed)) = seg_points {
+        let mut spans = Vec::new();
+        for w in points.windows(2) {
+            if (w[1] - w[0]).length() >= DIM_MIN_SEG {
+                spans.push((w[0], w[1]));
+            }
+        }
+        // Closing segment for a closed polyline (last -> first).
+        if closed && points.len() >= 3 {
+            let (first, last) = (points[0], points[points.len() - 1]);
+            if (first - last).length() >= DIM_MIN_SEG {
+                spans.push((last, first));
+            }
+        }
+        return spans;
+    }
+
+    // Extent dims from the AABB: width (X) then height (Y).
+    let bb = geometry.aabb();
+    let z = bb.min.z;
+    let mut spans = Vec::new();
+    if (bb.max.x - bb.min.x) >= DIM_MIN_SEG {
+        spans.push((
+            DVec3::new(bb.min.x, bb.min.y, z),
+            DVec3::new(bb.max.x, bb.min.y, z),
+        ));
+    }
+    if (bb.max.y - bb.min.y) >= DIM_MIN_SEG {
+        spans.push((
+            DVec3::new(bb.min.x, bb.min.y, z),
+            DVec3::new(bb.min.x, bb.max.y, z),
+        ));
+    }
+    spans
+}
+
 fn insert_curve(
     doc: &mut Document,
     id: Option<ObjectId>,
@@ -2495,6 +2732,553 @@ fn insert_curve(
         message: format!("{what} {id}"),
     };
     (id, outcome)
+}
+
+/// A normalized (min ≤ max) axis-aligned rectangle in world XY, the region a
+/// two-point `selregion` selection tests against. Built from two arbitrary
+/// corner points; the Z components of the corners are discarded (planar test).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rect2 {
+    pub min: glam::DVec2,
+    pub max: glam::DVec2,
+}
+
+impl Rect2 {
+    /// Build from two arbitrary corners (any order), normalizing so min ≤ max.
+    pub fn from_corners(a: DVec3, b: DVec3) -> Self {
+        Rect2 {
+            min: glam::DVec2::new(a.x.min(b.x), a.y.min(b.y)),
+            max: glam::DVec2::new(a.x.max(b.x), a.y.max(b.y)),
+        }
+    }
+}
+
+/// True when the object's XY footprint (aabb projected to XY) lies entirely
+/// inside `rect` — AutoCAD/Rhino *window* selection. The aabb Z extent is
+/// ignored, so the rectangle acts as a full-depth window.
+pub fn rect_contains_aabb(rect: Rect2, aabb: kernel_mesh::Aabb) -> bool {
+    aabb.min.x >= rect.min.x
+        && aabb.min.y >= rect.min.y
+        && aabb.max.x <= rect.max.x
+        && aabb.max.y <= rect.max.y
+}
+
+/// True when the object's XY footprint (aabb projected to XY) touches or
+/// overlaps `rect` — AutoCAD/Rhino *crossing* selection. Edge contact counts.
+pub fn rect_intersects_aabb(rect: Rect2, aabb: kernel_mesh::Aabb) -> bool {
+    aabb.min.x <= rect.max.x
+        && aabb.max.x >= rect.min.x
+        && aabb.min.y <= rect.max.y
+        && aabb.max.y >= rect.min.y
+}
+
+/// True when two geometries are duplicates: same kind and same defining points
+/// within `tol` (order-sensitive), ignoring id/layer/color. Used by `seldup`.
+///
+/// Curves compare their control/definition points (`points_bound`) so an Arc
+/// vs a Line never matches even if their bound boxes coincide; meshes compare
+/// vertex positions + face indices; other kinds compare their bound points.
+/// A conservative equality: false negatives (a missed duplicate) are safer than
+/// false positives (flagging distinct objects as dupes).
+fn geometry_dup_eq(a: &Geometry, b: &Geometry, tol: f64) -> bool {
+    // Different kinds are never duplicates.
+    if std::mem::discriminant(a) != std::mem::discriminant(b) {
+        return false;
+    }
+    let pts_eq = |pa: &[DVec3], pb: &[DVec3]| -> bool {
+        pa.len() == pb.len() && pa.iter().zip(pb).all(|(p, q)| p.distance(*q) <= tol)
+    };
+    match (a, b) {
+        (Geometry::Curve(ca), Geometry::Curve(cb)) => {
+            // Guard the sub-kind too (Line vs Arc vs Polyline …).
+            std::mem::discriminant(ca) == std::mem::discriminant(cb)
+                && pts_eq(&ca.points_bound(), &cb.points_bound())
+        }
+        (Geometry::Mesh(ma), Geometry::Mesh(mb)) => {
+            ma.faces() == mb.faces() && pts_eq(ma.positions(), mb.positions())
+        }
+        _ => pts_eq(&a.bound_points(), &b.bound_points()),
+    }
+}
+
+/// Center of a circle of `radius` tangent to two lines (TTR, line–line case).
+///
+/// Each line is offset by `±radius` (four parallel candidates); a tangent
+/// circle's center lies on one offset of each line, so it sits at an offset
+/// intersection. We intersect the two lines' *left* offsets as infinite lines
+/// (the sign only picks which of the four bisector cells the center falls in);
+/// then, to choose the stable, intuitive solution, we shift the raw corner
+/// intersection along the two inward bisector directions so the returned center
+/// is exactly `radius` from both lines and nearest the midpoint of the lines'
+/// mutual closest points. Returns `None` when the lines are parallel.
+fn circletan_line_line(
+    la: (DVec3, DVec3),
+    lb: (DVec3, DVec3),
+    radius: f64,
+) -> Option<DVec3> {
+    let d1 = (la.1 - la.0).truncate();
+    let d2 = (lb.1 - lb.0).truncate();
+    let denom = d1.perp_dot(d2);
+    if denom.abs() < 1e-12 {
+        return None; // parallel: no unique tangent circle
+    }
+    // Infinite-line intersection (the corner both lines' supports meet at).
+    let w = (lb.0 - la.0).truncate();
+    let t1 = w.perp_dot(d2) / denom;
+    let z = la.0.z;
+    let corner = (la.0.truncate() + d1 * t1).extend(z);
+    // Unit line directions and their left-normals (perpendicular offset dir).
+    let u1 = d1.normalize();
+    let u2 = d2.normalize();
+    let n1 = glam::DVec2::new(-u1.y, u1.x);
+    let n2 = glam::DVec2::new(-u2.y, u2.x);
+    // Aim the center toward the midpoint of the two lines' closest approach so
+    // the chosen quadrant is the intuitive one; the offset signs are picked to
+    // step toward that side.
+    let mid = ((la.0 + la.1 + lb.0 + lb.1) * 0.25).truncate();
+    let to_mid = mid - corner.truncate();
+    let s1 = if n1.dot(to_mid) >= 0.0 { 1.0 } else { -1.0 };
+    let s2 = if n2.dot(to_mid) >= 0.0 { 1.0 } else { -1.0 };
+    // The center sits on line1's offset (corner + s1*n1*r along its support) and
+    // line2's offset; solving both gives corner + r*(bisector) where the
+    // bisector is scaled so the perpendicular distance to each line is exactly r.
+    // Directly: move `radius` off each line along its inward normal, then meet.
+    // p·n1 = corner·n1 + s1*r  and  p·n2 = corner·n2 + s2*r.
+    let b1 = corner.truncate().dot(n1) + s1 * radius;
+    let b2 = corner.truncate().dot(n2) + s2 * radius;
+    // Solve [n1; n2] p = [b1; b2].
+    let det = n1.x * n2.y - n1.y * n2.x;
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let px = (b1 * n2.y - b2 * n1.y) / det;
+    let py = (n1.x * b2 - n2.x * b1) / det;
+    Some(DVec3::new(px, py, z))
+}
+
+// ------------------------------------------------------------- boundary trace
+//
+// `boundary` (AutoCAD BOUNDARY / pick-point-in-region) works entirely in the 2D
+// XY plane: every candidate curve is tessellated to line segments and projected
+// to XY, then a planar arrangement is built and the smallest face that contains
+// the seed is returned as a closed polygon.
+//
+// Planar assumption: all boundary curves are treated as if coplanar in XY at the
+// seed's Z. Z is ignored while tracing and re-applied (from the seed) to the
+// resulting loop. Non-planar input, self-intersections that fold in Z, and gaps
+// between curves larger than `BOUNDARY_TOL` are NOT handled (documented limits).
+
+/// A 2D line segment used to build the boundary arrangement.
+#[derive(Clone, Copy)]
+struct Seg2 {
+    a: [f64; 2],
+    b: [f64; 2],
+}
+
+/// Point-in-polygon test (ray casting / even-odd rule) for a closed ring given
+/// as an ordered 2D vertex list. Pure and unit-tested. Behaviour for points
+/// exactly on an edge is undefined; callers seed with an interior point.
+fn point_in_polygon_2d(poly: &[[f64; 2]], p: [f64; 2]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let (px, py) = (p[0], p[1]);
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = (poly[i][0], poly[i][1]);
+        let (xj, yj) = (poly[j][0], poly[j][1]);
+        let crosses = (yi > py) != (yj > py);
+        if crosses {
+            let x_int = xj + (py - yj) / (yi - yj) * (xi - xj);
+            if px < x_int {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Signed area of a ring (positive = CCW).
+fn signed_area(poly: &[[f64; 2]]) -> f64 {
+    let n = poly.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut s = 0.0;
+    let mut j = n - 1;
+    for i in 0..n {
+        s += (poly[j][0] + poly[i][0]) * (poly[i][1] - poly[j][1]);
+        j = i;
+    }
+    s * 0.5
+}
+
+/// Build a planar arrangement from `segs` and return the vertex ring of every
+/// bounded (interior) face, each oriented CCW (positive signed area).
+///
+/// Method: snap-merge near-coincident endpoints (within `tol`), split each
+/// segment at points where other segments cross it, then walk the resulting
+/// half-edge graph (turning clockwise-most at each vertex) to enumerate faces.
+/// The single unbounded outer face comes out CW and is dropped. This solidly
+/// handles axis-aligned / simple polygons formed by a set of lines or
+/// already-closed loops; it degrades to "no faces" when curves leave gaps wider
+/// than `tol`. Shared by `boundary` (smallest containing face) and `curvebool`
+/// (face classification by coverage). Pure and unit-tested.
+fn arrangement_faces(segs: &[Seg2], tol: f64) -> Vec<Vec<[f64; 2]>> {
+    // --- 1. Snap-merge vertices into a shared point pool. ---
+    let mut verts: Vec<[f64; 2]> = Vec::new();
+    let vid = |verts: &mut Vec<[f64; 2]>, p: [f64; 2]| -> usize {
+        for (i, q) in verts.iter().enumerate() {
+            let dx = q[0] - p[0];
+            let dy = q[1] - p[1];
+            if dx * dx + dy * dy <= tol * tol {
+                return i;
+            }
+        }
+        verts.push(p);
+        verts.len() - 1
+    };
+
+    // --- 2. Split each segment at all crossing points with other segments. ---
+    // Collect, per segment, the parameter values t in [0,1] where another
+    // segment intersects it, then emit sub-segments between consecutive splits.
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for (i, s) in segs.iter().enumerate() {
+        let mut ts: Vec<f64> = vec![0.0, 1.0];
+        for (j, o) in segs.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            if let Some(t) = seg_seg_param(s, o, tol) {
+                ts.push(t);
+            }
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ts.dedup_by(|a, b| (*a - *b).abs() <= 1e-9);
+        for w in ts.windows(2) {
+            let (t0, t1) = (w[0], w[1]);
+            if t1 - t0 <= 1e-9 {
+                continue;
+            }
+            let p0 = [
+                s.a[0] + (s.b[0] - s.a[0]) * t0,
+                s.a[1] + (s.b[1] - s.a[1]) * t0,
+            ];
+            let p1 = [
+                s.a[0] + (s.b[0] - s.a[0]) * t1,
+                s.a[1] + (s.b[1] - s.a[1]) * t1,
+            ];
+            let u = vid(&mut verts, p0);
+            let v = vid(&mut verts, p1);
+            if u != v {
+                edges.push((u, v));
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Vec::new();
+    }
+
+    // --- 3. Half-edge graph: two directed half-edges per undirected edge. ---
+    // Dedup undirected edges first so parallel duplicates don't spawn faces.
+    edges.sort();
+    edges.dedup();
+    // adjacency: for each vertex, the directed half-edges leaving it, sorted CCW.
+    let mut out: Vec<Vec<usize>> = vec![Vec::new(); verts.len()];
+    // half-edge h: from he_from[h] to he_to[h]; twin is h^1.
+    let mut he_from: Vec<usize> = Vec::new();
+    let mut he_to: Vec<usize> = Vec::new();
+    for &(u, v) in &edges {
+        let h = he_from.len();
+        he_from.push(u);
+        he_to.push(v);
+        he_from.push(v);
+        he_to.push(u);
+        out[u].push(h);
+        out[v].push(h + 1);
+    }
+    let angle = |h: usize| -> f64 {
+        let a = verts[he_from[h]];
+        let b = verts[he_to[h]];
+        (b[1] - a[1]).atan2(b[0] - a[0])
+    };
+    for lst in out.iter_mut() {
+        lst.sort_by(|&x, &y| angle(x).partial_cmp(&angle(y)).unwrap());
+    }
+
+    // For a half-edge arriving at vertex v, the "next" half-edge that keeps the
+    // face on the left (clockwise-most turn) is the outgoing edge whose angle is
+    // just before the reversed-incoming angle in CCW order.
+    let next = |h: usize| -> usize {
+        let v = he_to[h];
+        let incoming_rev = angle(h ^ 1); // direction v -> u
+        let lst = &out[v];
+        // find edge with largest angle strictly less than incoming_rev, else max.
+        let mut best: Option<usize> = None;
+        let mut best_ang = f64::NEG_INFINITY;
+        let mut max_edge = lst[0];
+        let mut max_ang = f64::NEG_INFINITY;
+        for &e in lst {
+            let a = angle(e);
+            if a > max_ang {
+                max_ang = a;
+                max_edge = e;
+            }
+            if a < incoming_rev - 1e-12 && a > best_ang {
+                best_ang = a;
+                best = Some(e);
+            }
+        }
+        best.unwrap_or(max_edge)
+    };
+
+    // --- 4. Trace faces. ---
+    let mut visited = vec![false; he_from.len()];
+    let mut faces: Vec<Vec<[f64; 2]>> = Vec::new();
+    for start in 0..he_from.len() {
+        if visited[start] {
+            continue;
+        }
+        let mut ring: Vec<usize> = Vec::new();
+        let mut h = start;
+        loop {
+            if visited[h] {
+                break;
+            }
+            visited[h] = true;
+            ring.push(h);
+            h = next(h);
+            if h == start {
+                break;
+            }
+            if ring.len() > he_from.len() + 1 {
+                break; // safety: malformed graph
+            }
+        }
+        if ring.len() < 3 {
+            continue;
+        }
+        let poly: Vec<[f64; 2]> = ring.iter().map(|&e| verts[he_from[e]]).collect();
+        let area = signed_area(&poly);
+        // Bounded interior faces are traced CCW (positive area); the single outer
+        // face comes out CW (negative). Keep only bounded faces.
+        if area <= tol * tol {
+            continue;
+        }
+        faces.push(poly);
+    }
+    faces
+}
+
+/// Trace the smallest bounded face of the arrangement that contains `seed`.
+/// Thin wrapper over `arrangement_faces` used by the `boundary` verb.
+fn boundary_loop(segs: &[Seg2], seed: [f64; 2], tol: f64) -> Option<Vec<[f64; 2]>> {
+    arrangement_faces(segs, tol)
+        .into_iter()
+        .filter(|poly| point_in_polygon_2d(poly, seed))
+        .map(|poly| (signed_area(&poly), poly))
+        .min_by(|a, b| a.0.partial_cmp(&b.0).expect("finite areas"))
+        .map(|(_, poly)| poly)
+}
+
+// ------------------------------------------------------------ curve boolean
+//
+// `curvebool` combines closed planar curves into new closed region curve(s) via
+// union / intersection / difference. It reuses the `arrangement_faces` planar
+// arrangement + the `intersections`/`point_in_polygon_2d` math: every input
+// closed curve is tessellated to a polygon, all edges are dropped into one
+// arrangement, and each resulting bounded face is classified by how many of the
+// input polygons contain its interior point ("coverage"). Faces are kept per op
+// and their rings emitted as closed polylines.
+//
+// Planar assumption: identical to `boundary` — all input curves are treated as
+// coplanar in XY; Z is ignored while tracing and re-applied from the seed (first
+// input) curve. Non-planar input, curves that fold in Z, and self-intersecting
+// inputs are not handled (documented limit). Union/intersection are symmetric;
+// difference is "first curve minus the rest", in selection order.
+
+/// Which region(s) to keep from the classified arrangement faces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CurveBoolOp {
+    Union,
+    Intersect,
+    Difference,
+}
+
+/// An interior point of a simple polygon (average of the first non-degenerate
+/// triangle's centroid, nudged onto the interior). Falls back to the vertex
+/// centroid. Used to classify a face against the input polygons.
+fn polygon_interior_point(poly: &[[f64; 2]]) -> [f64; 2] {
+    // Try triangle centroids off vertex 0 until one lands strictly inside; this
+    // is robust for convex and simple concave faces alike.
+    let n = poly.len();
+    for i in 1..n.saturating_sub(1) {
+        let c = [
+            (poly[0][0] + poly[i][0] + poly[i + 1][0]) / 3.0,
+            (poly[0][1] + poly[i][1] + poly[i + 1][1]) / 3.0,
+        ];
+        if point_in_polygon_2d(poly, c) {
+            return c;
+        }
+    }
+    // Fallback: vertex centroid (fine for convex faces).
+    let mut c = [0.0, 0.0];
+    for p in poly {
+        c[0] += p[0];
+        c[1] += p[1];
+    }
+    [c[0] / n as f64, c[1] / n as f64]
+}
+
+/// Pure 2D polygon boolean: combine `inputs` (each a closed simple ring) under
+/// `op` and return the retained region ring(s), each oriented CCW.
+///
+/// Builds one planar arrangement from every input edge, then keeps a face when
+/// its coverage (number of inputs whose interior contains the face) matches the
+/// op: union → coverage ≥ 1; intersection → coverage == number of inputs;
+/// difference → inside the first input only (coverage includes input 0 and no
+/// other). Requires ≥ 2 inputs. Pure and unit-tested.
+fn polygon_boolean(inputs: &[Vec<[f64; 2]>], op: CurveBoolOp, tol: f64) -> Vec<Vec<[f64; 2]>> {
+    if inputs.len() < 2 {
+        return Vec::new();
+    }
+    let mut segs: Vec<Seg2> = Vec::new();
+    for poly in inputs {
+        let n = poly.len();
+        if n < 3 {
+            continue;
+        }
+        for k in 0..n {
+            segs.push(Seg2 { a: poly[k], b: poly[(k + 1) % n] });
+        }
+    }
+    let faces = arrangement_faces(&segs, tol);
+    let n_inputs = inputs.len();
+    let kept: Vec<Vec<[f64; 2]>> = faces
+        .into_iter()
+        .filter(|face| {
+            let p = polygon_interior_point(face);
+            // Coverage: how many inputs contain this face's interior point, and
+            // whether the first input contains it (for difference).
+            let mut coverage = 0usize;
+            let mut in_first = false;
+            for (i, poly) in inputs.iter().enumerate() {
+                if point_in_polygon_2d(poly, p) {
+                    coverage += 1;
+                    if i == 0 {
+                        in_first = true;
+                    }
+                }
+            }
+            match op {
+                CurveBoolOp::Union => coverage >= 1,
+                CurveBoolOp::Intersect => coverage == n_inputs,
+                CurveBoolOp::Difference => in_first && coverage == 1,
+            }
+        })
+        .collect();
+    // The kept faces tile the retained region, but adjacent faces share internal
+    // edges we want to dissolve so the result is the region's outer boundary
+    // (one ring per connected component), like Rhino. Merge by cancelling
+    // shared edges: a directed edge on a CCW face boundary appears once; the
+    // internal edge between two kept faces appears in both directions and
+    // cancels, leaving only perimeter edges, which we re-loop into rings.
+    merge_faces(&kept, tol)
+}
+
+/// Dissolve the shared internal edges of a set of CCW faces and re-loop the
+/// surviving perimeter edges into closed rings (one per connected component).
+/// Directed edges that appear in both directions (shared between two kept faces)
+/// cancel; the rest are chained head-to-tail. Pure and unit-tested.
+fn merge_faces(faces: &[Vec<[f64; 2]>], tol: f64) -> Vec<Vec<[f64; 2]>> {
+    // Snap-merge vertices into a shared pool so shared edges compare equal.
+    let mut verts: Vec<[f64; 2]> = Vec::new();
+    let mut vid = |p: [f64; 2]| -> usize {
+        for (i, q) in verts.iter().enumerate() {
+            let dx = q[0] - p[0];
+            let dy = q[1] - p[1];
+            if dx * dx + dy * dy <= tol * tol {
+                return i;
+            }
+        }
+        verts.push(p);
+        verts.len() - 1
+    };
+    // Count directed edges; an internal edge appears once forward (u→v) on one
+    // face and once reversed (v→u) on the neighbour. Net them out.
+    // BTreeMap (not HashMap): iteration order over these maps determines ring
+    // trace order, and HashMap iteration is process-random → non-deterministic
+    // rings → op-log replay diverges. Keys are Ord, so BTree gives a stable order.
+    let mut count: std::collections::BTreeMap<(usize, usize), i32> = std::collections::BTreeMap::new();
+    for face in faces {
+        let n = face.len();
+        for k in 0..n {
+            let u = vid(face[k]);
+            let v = vid(face[(k + 1) % n]);
+            if u == v {
+                continue;
+            }
+            *count.entry((u, v)).or_insert(0) += 1;
+            *count.entry((v, u)).or_insert(0) -= 1;
+        }
+    }
+    // Surviving directed edges: net count > 0 (perimeter, kept once).
+    let mut adj: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    for (&(u, v), &c) in &count {
+        for _ in 0..c.max(0) {
+            adj.entry(u).or_default().push(v);
+        }
+    }
+    // Chain surviving edges head-to-tail into rings.
+    let mut rings: Vec<Vec<[f64; 2]>> = Vec::new();
+    // Pick any vertex that still has an outgoing edge, tracing a ring from it.
+    while let Some((&start, _)) = adj.iter().find(|(_, outs)| !outs.is_empty()) {
+        let mut ring: Vec<usize> = vec![start];
+        let mut cur = start;
+        while let Some(outs) = adj.get_mut(&cur) {
+            if outs.is_empty() {
+                break;
+            }
+            let nxt = outs.pop().expect("non-empty");
+            if nxt == start {
+                break;
+            }
+            ring.push(nxt);
+            cur = nxt;
+            if ring.len() > verts.len() + 1 {
+                break; // safety: malformed graph
+            }
+        }
+        if ring.len() >= 3 {
+            rings.push(ring.iter().map(|&i| verts[i]).collect());
+        }
+    }
+    rings
+}
+
+/// If segment `o` crosses segment `s` at an interior/endpoint point, return the
+/// parameter `t` along `s` (0 at `s.a`, 1 at `s.b`). Used to split `s` for the
+/// arrangement. Returns `None` for parallel/non-touching pairs.
+fn seg_seg_param(s: &Seg2, o: &Seg2, tol: f64) -> Option<f64> {
+    let (x1, y1) = (s.a[0], s.a[1]);
+    let (x2, y2) = (s.b[0], s.b[1]);
+    let (x3, y3) = (o.a[0], o.a[1]);
+    let (x4, y4) = (o.b[0], o.b[1]);
+    let denom = (x2 - x1) * (y4 - y3) - (y2 - y1) * (x4 - x3);
+    if denom.abs() < 1e-12 {
+        return None; // parallel or degenerate
+    }
+    let t = ((x3 - x1) * (y4 - y3) - (y3 - y1) * (x4 - x3)) / denom;
+    let u = ((x3 - x1) * (y2 - y1) - (y3 - y1) * (x2 - x1)) / denom;
+    let eps = tol; // permit touching at endpoints
+    if (-eps..=1.0 + eps).contains(&t) && (-eps..=1.0 + eps).contains(&u) {
+        Some(t.clamp(0.0, 1.0))
+    } else {
+        None
+    }
 }
 
 /// Insert a plain mesh object on the current layer, returning its id. Used by
@@ -2638,10 +3422,58 @@ fn apply_about_center(
         }
     }
     // Shared by rotate/scale/mirror: after the transform applies, refresh every
-    // associative dim's cached `last` so it tracks the moved referent. Pure
-    // function of current doc state at a fixed point => replay-stable.
+    // associative dim's cached `last` so it tracks the moved referent, and every
+    // FIELD's text so e.g. an area field tracks the scaled object. Pure function
+    // of current doc state at a fixed point => replay-stable.
     doc.refresh_dim_anchors();
+    refresh_fields(doc);
     (Inverse::SetGeometry(snapshots), tessellated)
+}
+
+/// Build the align/orient transform: the world-space [`glam::DMat4`] that maps
+/// `src1`→`tgt1` and swings the src1→src2 direction onto the tgt1→tgt2
+/// direction. Composed as `translate(tgt1) · [scale] · rotZ(Δθ) · translate(-src1)`
+/// so the pivot for rotation/scale is `src1` before it lands on `tgt1`.
+///
+/// The rotation is **planar**: only the XY headings of the two direction
+/// vectors are used (Δθ = atan2 of tgt-dir − atan2 of src-dir), rotating about
+/// Z. This is the MVP scope — it correctly aligns anything laid out in (or
+/// parallel to) the XY plane (the common CAD drafting case), but does not do a
+/// full 3D two-vector fit (which would also tilt out of plane). Z components of
+/// the reference vectors are ignored for the angle; the translation still uses
+/// full 3D points.
+///
+/// With `scale` on, a uniform factor |tgt2−tgt1| / |src2−src1| (full 3D
+/// lengths) is folded in about the same pivot. Returns `None` only when a
+/// reference vector is zero-length (src1==src2 or tgt1==tgt2), which leaves the
+/// heading — and, when scaling, the factor — undefined.
+fn align_transform(
+    src1: DVec3,
+    tgt1: DVec3,
+    src2: DVec3,
+    tgt2: DVec3,
+    scale: bool,
+) -> Option<glam::DMat4> {
+    let src_dir = src2 - src1;
+    let tgt_dir = tgt2 - tgt1;
+    if src_dir.length() < 1e-12 || tgt_dir.length() < 1e-12 {
+        return None;
+    }
+    // Planar heading difference about Z (2D atan2 on the XY projection).
+    let d_theta = tgt_dir.y.atan2(tgt_dir.x) - src_dir.y.atan2(src_dir.x);
+    let rot = glam::DMat4::from_rotation_z(d_theta);
+    let scale_m = if scale {
+        let f = tgt_dir.length() / src_dir.length();
+        glam::DMat4::from_scale(DVec3::splat(f))
+    } else {
+        glam::DMat4::IDENTITY
+    };
+    Some(
+        glam::DMat4::from_translation(tgt1)
+            * scale_m
+            * rot
+            * glam::DMat4::from_translation(-src1),
+    )
 }
 
 /// "…, 2 curve(s) tessellated to polylines" suffix when a transform degraded
@@ -2813,6 +3645,116 @@ fn shoelace_area(points: &[DVec3]) -> f64 {
     sum.abs() / 2.0
 }
 
+/// Total tessellated length of a curve (open or closed) in meters.
+fn curve_total_length(curve: &Curve) -> f64 {
+    let pts = curve.tessellate(PROFILE_TOL);
+    if pts.len() < 2 {
+        return 0.0;
+    }
+    let mut len: f64 = pts.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+    if curve.is_closed() {
+        len += (pts[0] - pts[pts.len() - 1]).length();
+    }
+    len
+}
+
+/// Evaluate a FIELD expression against the live document, returning the string
+/// to display. This is the single source of truth for both creation and the
+/// [`refresh_fields`] re-eval pass, so a field's text is deterministic given the
+/// document — which is what keeps op-log replay byte-identical. Selector-backed
+/// sources re-parse their stored selector token and reuse the same measurement
+/// paths as the `area`/`length`/`count` commands (no re-implemented geometry).
+pub(crate) fn eval_field_expr(doc: &Document, expr: &FieldExpr) -> Result<String, ExecError> {
+    match expr {
+        FieldExpr::Area { selector } => {
+            let sel = crate::parse::selector_one(selector)
+                .map_err(|e| ExecError::Invalid(e.to_string()))?;
+            let ids = resolve(doc, &sel)?;
+            let mut total = 0.0;
+            for id in &ids {
+                total += match &doc.get(*id).expect("resolved").geometry {
+                    Geometry::Curve(c) if c.is_closed() => shoelace_area(&c.tessellate(PROFILE_TOL)),
+                    Geometry::Curve(_) => {
+                        return Err(ExecError::Invalid(format!(
+                            "field area: '{id}' is an open curve — needs a closed curve or a mesh"
+                        )))
+                    }
+                    Geometry::Mesh(m)
+                    | Geometry::Frame { mesh: m, .. }
+                    | Geometry::Area { mesh: m, .. }
+                    | Geometry::Parametric { mesh: m, .. } => mesh_surface_area(m),
+                    _ => {
+                        return Err(ExecError::Invalid(format!(
+                            "field area: '{id}' has no area (needs a closed curve or a mesh)"
+                        )))
+                    }
+                };
+            }
+            Ok(format_area(doc.units, total))
+        }
+        FieldExpr::Length { selector } => {
+            let sel = crate::parse::selector_one(selector)
+                .map_err(|e| ExecError::Invalid(e.to_string()))?;
+            let ids = resolve(doc, &sel)?;
+            let mut total = 0.0;
+            for id in &ids {
+                match &doc.get(*id).expect("resolved").geometry {
+                    Geometry::Curve(c) => total += curve_total_length(c),
+                    _ => {
+                        return Err(ExecError::Invalid(format!(
+                            "field length: '{id}' is not a curve"
+                        )))
+                    }
+                }
+            }
+            Ok(format_length(doc.units, total))
+        }
+        FieldExpr::Count { selector } => {
+            let sel = crate::parse::selector_one(selector)
+                .map_err(|e| ExecError::Invalid(e.to_string()))?;
+            let ids = resolve(doc, &sel)?;
+            Ok(ids.len().to_string())
+        }
+        FieldExpr::Layer => Ok(doc.current_layer.clone()),
+        FieldExpr::Units => Ok(doc.units.label().to_string()),
+    }
+}
+
+/// Re-evaluate every FIELD annotation's text against the current document,
+/// writing the resolved string back onto the annotation. Mirrors
+/// [`Document::refresh_dim_anchors`]: called after mutating ops so a field
+/// tracks its referenced geometry, and evaluated at the stored expression so
+/// live-apply and op-log replay stay byte-identical. A field whose expression
+/// no longer resolves (referent deleted, curve opened) keeps its last-good text
+/// rather than erroring the whole edit. Returns the number of fields updated.
+///
+/// Trade-off: this is wired into the mutating ops that already refresh dims
+/// (move/rotate/scale/mirror/movezero/flatten/stretch/delete), not into pure
+/// object *creation*. A `count all` field therefore updates when objects are
+/// deleted/moved but not the instant a new object is drawn; a subsequent edit
+/// (or an explicit re-run) reconciles it. Keeping refresh on the existing hook
+/// avoids touching every create path and keeps replay deterministic.
+pub fn refresh_fields(doc: &mut Document) -> usize {
+    let mut updates: Vec<(ObjectId, String)> = Vec::new();
+    for obj in doc.objects() {
+        if let Geometry::Annotation(Annotation::Field { expr, text, .. }) = &obj.geometry
+            && let Ok(new_text) = eval_field_expr(doc, expr)
+            && &new_text != text
+        {
+            updates.push((obj.id, new_text));
+        }
+    }
+    let n = updates.len();
+    for (id, new_text) in updates {
+        if let Some(obj) = doc.get_mut(id)
+            && let Geometry::Annotation(Annotation::Field { text, .. }) = &mut obj.geometry
+        {
+            *text = new_text;
+        }
+    }
+    n
+}
+
 /// Even-odd ray-cast point-in-polygon test in the XY plane. `poly` is a closed
 /// loop that does NOT repeat its first vertex (tessellate() guarantees this).
 fn point_in_polygon(poly: &[DVec3], x: f64, y: f64) -> bool {
@@ -2833,6 +3775,57 @@ fn point_in_polygon(poly: &[DVec3], x: f64, y: f64) -> bool {
         j = i;
     }
     inside
+}
+
+/// Pure inclusive point-in-AABB test used by `stretch`. A point is inside when
+/// every coordinate lies within `[min, max]` on that axis (min/max normalised so
+/// the caller may pass the box corners in either order). A large Z span makes the
+/// box behave like a 2D crossing window in the XY plane.
+fn point_in_box(p: DVec3, min: DVec3, max: DVec3) -> bool {
+    let lo = min.min(max);
+    let hi = min.max(max);
+    p.x >= lo.x && p.x <= hi.x
+        && p.y >= lo.y && p.y <= hi.y
+        && p.z >= lo.z && p.z <= hi.z
+}
+
+/// Shift the mutable vertices of `geom` that fall inside the `[min, max]` box by
+/// `delta`, leaving vertices outside untouched. Returns the number of vertices
+/// moved (0 means nothing changed). Curves (line/polyline/nurbs) and point
+/// clouds expose per-vertex positions and are stretched directly; arc/ellipse
+/// only carry a center, so it is moved as a unit when it falls in the box.
+/// Meshes and other derived-solid geometry (Mesh/Frame/Area/Parametric/Instance)
+/// have no per-vertex mutation path here and are skipped (0 moved).
+fn stretch_geometry(geom: &mut Geometry, min: DVec3, max: DVec3, delta: DVec3) -> usize {
+    let mut moved = 0usize;
+    let mut shift = |p: &mut DVec3| {
+        if point_in_box(*p, min, max) {
+            *p += delta;
+            moved += 1;
+        }
+    };
+    match geom {
+        Geometry::Curve(c) => match c {
+            Curve::Line { a, b } => {
+                shift(a);
+                shift(b);
+            }
+            Curve::Polyline { points, .. } | Curve::Nurbs { control: points, .. } => {
+                points.iter_mut().for_each(&mut shift)
+            }
+            // Arc/Ellipse have no discrete vertices — move the center as a unit.
+            Curve::Arc { center, .. } | Curve::Ellipse { center, .. } => shift(center),
+        },
+        Geometry::Points { positions } => positions.iter_mut().for_each(&mut shift),
+        // Derived-solid / instance geometry has no per-vertex mutation path.
+        Geometry::Mesh(_)
+        | Geometry::Annotation(_)
+        | Geometry::Instance { .. }
+        | Geometry::Frame { .. }
+        | Geometry::Area { .. }
+        | Geometry::Parametric { .. } => {}
+    }
+    moved
 }
 
 /// Deterministic SplitMix64 PRNG — a tiny, portable, byte-stable generator for
@@ -2866,6 +3859,172 @@ fn mesh_surface_area(mesh: &kernel_mesh::Mesh) -> f64 {
             (b - a).cross(c - a).length() / 2.0
         })
         .sum()
+}
+
+/// A block-instance data-extraction (DATAEXTRACTION / BOM) table: dynamic
+/// columns (the union of every param/attribute name any instance carries) plus
+/// the rows. Rows are `count` mode (one per definition) or `instance` mode
+/// (one per placement). Cells are already stringified for either sink (CLI
+/// table or CSV). The first fixed column is the block/definition name and, in
+/// count mode, a `Count`; instance mode carries per-instance ids instead.
+pub(crate) struct DataExtractTable {
+    /// Fixed leading headers (["Block", "Count"] or ["Block", "Instance"]).
+    pub fixed: Vec<String>,
+    /// Distinct param/attribute names, sorted — one column each after `fixed`.
+    pub params: Vec<String>,
+    /// One row of cells; length == fixed.len() + params.len().
+    pub rows: Vec<Vec<String>>,
+    /// Distinct block definition count and total instance count (for the
+    /// summary message), independent of the chosen mode.
+    pub block_types: usize,
+    pub instances: usize,
+}
+
+/// The definition a block instance belongs to: its parametric `source` when it
+/// is a dynamic-block placement, otherwise the plain `block` name.
+fn instance_def_name<'a>(block: &'a str, source: &'a Option<String>) -> &'a str {
+    source.as_deref().unwrap_or(block)
+}
+
+/// Collect all block instances in the document, grouped by definition, into a
+/// data-extraction table. `by_instance` selects the row granularity.
+pub(crate) fn build_dataextract_table(doc: &Document, by_instance: bool) -> DataExtractTable {
+    // Gather (def name, params) per instance in creation order.
+    let mut placements: Vec<(String, std::collections::BTreeMap<String, String>)> = Vec::new();
+    // Distinct param names across every instance → dynamic columns.
+    let mut param_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Distinct definitions (for the block-type count), even ones with no params.
+    let mut defs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for obj in doc.objects() {
+        if let Geometry::Instance { block, source, params, .. } = &obj.geometry {
+            let def = instance_def_name(block, source).to_string();
+            for k in params.keys() {
+                param_names.insert(k.clone());
+            }
+            defs.insert(def.clone());
+            placements.push((def, params.clone()));
+        }
+    }
+    let params: Vec<String> = param_names.into_iter().collect();
+    let block_types = defs.len();
+    let instances = placements.len();
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    if by_instance {
+        // One row per placement, param cells filled where present ("" otherwise).
+        for (def, p) in &placements {
+            let mut row = vec![def.clone(), String::new()]; // instance # filled below
+            for name in &params {
+                row.push(p.get(name).cloned().unwrap_or_default());
+            }
+            rows.push(row);
+        }
+        // Number the instances 1..N within each definition, in creation order.
+        let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for row in &mut rows {
+            let n = seen.entry(row[0].clone()).or_insert(0);
+            *n += 1;
+            row[1] = n.to_string();
+        }
+    } else {
+        // One aggregated row per definition. Count instances; a param cell holds
+        // the shared value if every instance agrees, else "(varies)", else "".
+        let mut order: Vec<String> = Vec::new();
+        let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        // def -> param -> observed distinct values.
+        let mut vals: std::collections::BTreeMap<String, std::collections::BTreeMap<String, std::collections::BTreeSet<String>>> =
+            std::collections::BTreeMap::new();
+        for (def, p) in &placements {
+            if !counts.contains_key(def) {
+                order.push(def.clone());
+            }
+            *counts.entry(def.clone()).or_insert(0) += 1;
+            let per = vals.entry(def.clone()).or_default();
+            for name in &params {
+                if let Some(v) = p.get(name) {
+                    per.entry(name.clone()).or_default().insert(v.clone());
+                }
+            }
+        }
+        for def in &order {
+            let mut row = vec![def.clone(), counts[def].to_string()];
+            let per = vals.get(def);
+            for name in &params {
+                let cell = match per.and_then(|m| m.get(name)) {
+                    None => String::new(),
+                    Some(set) if set.len() == 1 => set.iter().next().cloned().unwrap(),
+                    Some(_) => "(varies)".to_string(),
+                };
+                row.push(cell);
+            }
+            rows.push(row);
+        }
+    }
+
+    let fixed = vec![
+        "Block".to_string(),
+        if by_instance { "Instance".to_string() } else { "Count".to_string() },
+    ];
+    DataExtractTable { fixed, params, rows, block_types, instances }
+}
+
+/// Render a data-extraction table as an ASCII grid for the command line (mirrors
+/// `format_schedule_table`'s box style, but with dynamic columns).
+pub(crate) fn format_dataextract_table(t: &DataExtractTable) -> String {
+    let hdrs: Vec<String> = t.fixed.iter().chain(t.params.iter()).cloned().collect();
+    let ncol = hdrs.len();
+    let mut widths: Vec<usize> = hdrs.iter().map(|h| h.len()).collect();
+    for row in &t.rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+    let sep: String = widths.iter().map(|w| "-".repeat(w + 2)).collect::<Vec<_>>().join("+");
+    let sep = format!("+{}+", sep);
+    let fmt_row = |cols: &[String]| -> String {
+        let inner: String = (0..ncol)
+            .map(|i| {
+                let c = cols.get(i).map(String::as_str).unwrap_or("");
+                format!(" {:<w$} ", c, w = widths[i])
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        format!("|{inner}|")
+    };
+    let mut out = String::new();
+    out.push_str(&sep);
+    out.push('\n');
+    out.push_str(&fmt_row(&hdrs));
+    out.push('\n');
+    out.push_str(&sep);
+    out.push('\n');
+    for row in &t.rows {
+        out.push_str(&fmt_row(row));
+        out.push('\n');
+    }
+    out.push_str(&sep);
+    out
+}
+
+/// Render a data-extraction table as CSV (header row + one row per table row).
+/// Cells containing a comma, quote, or newline are quoted per RFC 4180.
+pub(crate) fn dataextract_csv(t: &DataExtractTable) -> String {
+    fn esc(s: &str) -> String {
+        if s.contains([',', '"', '\n']) {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    }
+    let hdrs: Vec<String> = t.fixed.iter().chain(t.params.iter()).cloned().collect();
+    let mut out = String::new();
+    out.push_str(&hdrs.iter().map(|c| esc(c)).collect::<Vec<_>>().join(","));
+    out.push('\n');
+    for row in &t.rows {
+        out.push_str(&row.iter().map(|c| esc(c)).collect::<Vec<_>>().join(","));
+        out.push('\n');
+    }
+    out
 }
 
 /// Build schedule rows for objects on the given layer (all layers if `None`).
@@ -5490,6 +6649,179 @@ fn exec_site_path(
     ))
 }
 
+/// Station parameters for `arraycurve`: `count` values in `[0, 1]` spaced
+/// evenly. On an OPEN path endpoints are inclusive (like AutoCAD "Divide"):
+/// `count == 1` → single copy at the start; `count >= 2` → both ends included.
+/// On a CLOSED path t=0 and t=1 are the SAME point, so the endpoints-inclusive
+/// scheme would place two overlapping copies there; instead stations span
+/// `[0, 1)` (step `1/count`) so `count` copies are evenly spaced with no overlap.
+/// Pure function of `count`/`closed`, so it is unit-tested directly.
+fn curve_station_ts(count: u32, closed: bool) -> Vec<f64> {
+    if count <= 1 {
+        return vec![0.0];
+    }
+    if closed {
+        // count stations over [0,1): 0, 1/count, ..., (count-1)/count.
+        let n = f64::from(count);
+        return (0..count).map(|i| f64::from(i) / n).collect();
+    }
+    let last = f64::from(count - 1);
+    (0..count).map(|i| f64::from(i) / last).collect()
+}
+
+/// Point and unit tangent at fractional arc-length `t` (0..=1) along a dense
+/// on-curve polyline `pts` (from `Curve::tessellate`). Works for every curve
+/// type because tessellation samples the true curve. The tangent is the local
+/// segment direction; a degenerate (zero-length) path yields `DVec3::X`.
+fn polyline_point_tangent(pts: &[DVec3], t: f64) -> (DVec3, DVec3) {
+    debug_assert!(pts.len() >= 2);
+    // Cumulative arc length along the polyline.
+    let mut cum = Vec::with_capacity(pts.len());
+    cum.push(0.0);
+    for w in pts.windows(2) {
+        cum.push(cum.last().unwrap() + (w[1] - w[0]).length());
+    }
+    let total = *cum.last().unwrap();
+    if total <= f64::EPSILON {
+        return (pts[0], DVec3::X);
+    }
+    let target = t.clamp(0.0, 1.0) * total;
+    // Find the segment containing `target`.
+    for i in 0..pts.len() - 1 {
+        let (s0, s1) = (cum[i], cum[i + 1]);
+        if target <= s1 || i == pts.len() - 2 {
+            let seg = pts[i + 1] - pts[i];
+            let seg_len = seg.length();
+            let frac = if seg_len > f64::EPSILON { (target - s0) / seg_len } else { 0.0 };
+            let point = pts[i] + seg * frac;
+            let tangent = if seg_len > f64::EPSILON { seg / seg_len } else { DVec3::X };
+            return (point, tangent);
+        }
+    }
+    (pts[0], DVec3::X)
+}
+
+/// Rotation that carries the source's local +X onto `tangent`, kept continuous
+/// by preferring the world-up reference. Returns identity when `tangent` is
+/// (nearly) +X. Rotates about the axis that takes +X → tangent by the angle
+/// between them; for the near-antiparallel case it flips about world Z (keeps
+/// planar paths sane).
+fn tangent_rotation(tangent: DVec3) -> glam::DQuat {
+    let from = DVec3::X;
+    let to = tangent.normalize_or_zero();
+    if to.length_squared() < 0.5 {
+        return glam::DQuat::IDENTITY;
+    }
+    let dot = from.dot(to).clamp(-1.0, 1.0);
+    if dot > 1.0 - 1e-9 {
+        return glam::DQuat::IDENTITY;
+    }
+    if dot < -1.0 + 1e-9 {
+        // Antiparallel: 180° about world Z (paths are usually planar in XY).
+        return glam::DQuat::from_axis_angle(DVec3::Z, std::f64::consts::PI);
+    }
+    let axis = from.cross(to).normalize_or_zero();
+    let axis = if axis.length_squared() < 0.5 { DVec3::Z } else { axis };
+    glam::DQuat::from_axis_angle(axis, dot.acos())
+}
+
+/// `arraycurve`: distribute copies of `targets` evenly by arc length along a
+/// single `path` curve. Originals stay put; each station gets one new copy per
+/// source object. With `align` on, copies rotate so their +X follows the curve
+/// tangent. Op-logged with minted ids reused on replay; undo deletes the copies.
+fn exec_array_curve(
+    doc: &mut Document,
+    ids: Option<Vec<ObjectId>>,
+    targets: Selector,
+    path: Selector,
+    count: u32,
+    align: bool,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    if count < 1 {
+        return Err(ExecError::Invalid(
+            "arraycurve count must be at least 1".into(),
+        ));
+    }
+    // The path must resolve to exactly one curve object.
+    let path_ids = resolve(doc, &path)?;
+    let curves: Vec<_> = path_ids
+        .iter()
+        .filter(|id| matches!(doc.get(**id).map(|o| &o.geometry), Some(Geometry::Curve(_))))
+        .collect();
+    if curves.len() != 1 {
+        return Err(ExecError::Invalid(
+            "arraycurve needs a single curve as the path (draw a line/polyline/arc/circle first)"
+                .into(),
+        ));
+    }
+    let curve = match &doc.get(*curves[0]).expect("resolved").geometry {
+        Geometry::Curve(c) => c.clone(),
+        _ => unreachable!("filtered to curves"),
+    };
+    let pts = curve.tessellate(PROFILE_TOL);
+    if pts.len() < 2 {
+        return Err(ExecError::Invalid("arraycurve path has no length".into()));
+    }
+
+    let src = resolve(doc, &targets)?;
+    if src.is_empty() {
+        return Err(ExecError::Invalid("arraycurve: nothing selected to array".into()));
+    }
+    // Only the curve's own closed flag decides closed-vs-open stationing. A
+    // closed path skips the duplicate t=0/t=1 station; an OPEN path keeps its
+    // endpoint copy — even when its ends happen to be near-coincident (an
+    // intentionally-open near-closed path must NOT drop its endpoint).
+    let closed = curve.is_closed();
+    let ts = curve_station_ts(count, closed);
+    let total_new = src.len() * ts.len();
+    // Reuse logged ids on replay; mint new ones live.
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ref v) if v.len() == total_new => v.clone(),
+        _ => (0..total_new).map(|_| ObjectId::new()).collect(),
+    };
+
+    let mut tessellated = 0usize;
+    let mut idx = 0;
+    for src_id in &src {
+        let base = doc.get(*src_id).expect("resolved").clone();
+        // Reference point that lands on each station: the source's AABB center.
+        let anchor = base.geometry.aabb().center();
+        for &t in &ts {
+            let (station, tangent) = polyline_point_tangent(&pts, t);
+            let m = if align {
+                // Rotate about the anchor, then translate anchor → station.
+                let rot = glam::DMat4::from_quat(tangent_rotation(tangent));
+                glam::DMat4::from_translation(station)
+                    * rot
+                    * glam::DMat4::from_translation(-anchor)
+            } else {
+                glam::DMat4::from_translation(station - anchor)
+            };
+            let mut obj = base.clone();
+            obj.id = new_ids[idx];
+            idx += 1;
+            if !obj.geometry.transform(&m, PROFILE_TOL) {
+                tessellated += 1;
+            }
+            doc.insert(obj);
+        }
+    }
+    doc.generation += 1;
+
+    let align_note = if align { " (aligned to tangent)" } else { "" };
+    Ok((
+        Command::ArrayCurve { ids: Some(new_ids.clone()), targets, path, count, align },
+        Inverse::DeleteCreated(new_ids.clone()),
+        ApplyOutcome {
+            message: format!(
+                "arrayed {total_new} copy(ies) along path{align_note}{}",
+                tessellation_note(tessellated)
+            ),
+            created: new_ids,
+        },
+    ))
+}
+
 /// Sun-path diagram: the yearly sun-path dome for the document's location as
 /// open polylines on a golden `sunpath` layer — seven date arcs (Dec 21 → Jun
 /// 21; Jul–Nov retrace them), analemma-style hour curves, plus a horizon
@@ -6036,6 +7368,142 @@ fn layer_style_mut<'a>(
     Ok(doc.layers.get_mut(layer).expect("checked above"))
 }
 
+/// Serialize the plot-style state (tables + active pointer) for an undo snapshot.
+fn snapshot_plot_styles(doc: &Document) -> String {
+    serde_json::to_string(&(&doc.plot_styles, &doc.active_plot_style)).unwrap_or_default()
+}
+
+/// Apply a `plotstyle` sub-op. All sub-ops but `List` mutate `plot_styles` /
+/// `active_plot_style` and snapshot-restore on undo (mirrors `sheetset`). `List`
+/// is a read-only query (never logged; its inverse is inert).
+fn apply_plotstyle(
+    doc: &mut Document,
+    op: PlotStyleOp,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    // Query: not logged, so the returned inverse is never stored.
+    if let PlotStyleOp::List { name } = &op {
+        let msg = match name {
+            Some(n) => {
+                let table = doc.plot_styles.get(n).ok_or_else(|| {
+                    ExecError::Invalid(format!("no plot style '{n}'"))
+                })?;
+                if table.entries.is_empty() {
+                    format!("plot style '{n}': (no entries)")
+                } else {
+                    let mut lines = vec![format!("plot style '{n}':")];
+                    for (key, e) in &table.entries {
+                        let mut parts = Vec::new();
+                        if let Some(c) = e.color {
+                            parts.push(format!(
+                                "color {:.2},{:.2},{:.2}",
+                                c[0], c[1], c[2]
+                            ));
+                        }
+                        if let Some(w) = e.weight_mm {
+                            parts.push(format!("weight {w:.3}mm"));
+                        }
+                        if let Some(s) = e.screen {
+                            parts.push(format!("screen {s:.0}%"));
+                        }
+                        lines.push(format!("  {key} → {}", parts.join(", ")));
+                    }
+                    lines.join("\n")
+                }
+            }
+            None => {
+                if doc.plot_styles.is_empty() {
+                    "no plot styles".to_string()
+                } else {
+                    let active = doc.active_plot_style.as_deref();
+                    let mut lines = vec!["plot styles:".to_string()];
+                    for (n, t) in &doc.plot_styles {
+                        let mark = if active == Some(n.as_str()) { " (active)" } else { "" };
+                        lines.push(format!(
+                            "  {n}{mark} — {} entr{}",
+                            t.entries.len(),
+                            if t.entries.len() == 1 { "y" } else { "ies" }
+                        ));
+                    }
+                    lines.join("\n")
+                }
+            }
+        };
+        return Ok((
+            Command::PlotStyle(PlotStyleOp::List { name: name.clone() }),
+            Inverse::DeleteCreated(Vec::new()),
+            ApplyOutcome { created: Vec::new(), message: msg },
+        ));
+    }
+
+    let prev = snapshot_plot_styles(doc);
+    let (logged, message) = match op {
+        PlotStyleOp::New { name } => {
+            doc.plot_styles.entry(name.clone()).or_default();
+            (
+                Command::PlotStyle(PlotStyleOp::New { name: name.clone() }),
+                format!("created plot style '{name}'"),
+            )
+        }
+        PlotStyleOp::Set { name, key, color, weight_mm, screen } => {
+            let table = doc.plot_styles.get_mut(&name).ok_or_else(|| {
+                ExecError::Invalid(format!(
+                    "no plot style '{name}' (create one with: plotstyle new {name})"
+                ))
+            })?;
+            table.entries.insert(
+                key.clone(),
+                itsjustcad_doc::PlotStyleEntry { color: Some(color), weight_mm, screen },
+            );
+            (
+                Command::PlotStyle(PlotStyleOp::Set {
+                    name: name.clone(),
+                    key: key.clone(),
+                    color,
+                    weight_mm,
+                    screen,
+                }),
+                format!("plot style '{name}': mapped '{key}'"),
+            )
+        }
+        PlotStyleOp::Apply { name } => {
+            if !doc.plot_styles.contains_key(&name) {
+                return Err(ExecError::Invalid(format!("no plot style '{name}'")));
+            }
+            doc.active_plot_style = Some(name.clone());
+            (
+                Command::PlotStyle(PlotStyleOp::Apply { name: name.clone() }),
+                format!("active plot style set to '{name}'"),
+            )
+        }
+        PlotStyleOp::None => {
+            doc.active_plot_style = None;
+            (
+                Command::PlotStyle(PlotStyleOp::None),
+                "cleared active plot style".to_string(),
+            )
+        }
+        PlotStyleOp::Delete { name } => {
+            if doc.plot_styles.remove(&name).is_none() {
+                return Err(ExecError::Invalid(format!("no plot style '{name}'")));
+            }
+            if doc.active_plot_style.as_deref() == Some(name.as_str()) {
+                doc.active_plot_style = None;
+            }
+            (
+                Command::PlotStyle(PlotStyleOp::Delete { name: name.clone() }),
+                format!("deleted plot style '{name}'"),
+            )
+        }
+        PlotStyleOp::List { .. } => unreachable!("handled above"),
+    };
+    doc.generation += 1;
+    Ok((
+        logged,
+        Inverse::PlotStyles { prev },
+        ApplyOutcome { created: Vec::new(), message },
+    ))
+}
+
 /// Resolve a selector to exactly one curve object.
 fn one_curve<'a>(
     doc: &'a Document,
@@ -6050,6 +7518,22 @@ fn one_curve<'a>(
         )));
     }
     curve_of(doc, ids[0], verb).map(|c| (ids[0], c))
+}
+
+/// Index of the piece a PowerTrim pick removes: the segment whose closest point
+/// to `pick` is nearest. Pure so it can be unit-tested in isolation. `pieces`
+/// must be non-empty (the caller guarantees `pieces.len() >= 2`).
+fn powertrim_drop_index(pieces: &[Curve], pick: DVec3) -> usize {
+    pieces
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let da = kernel_curve::closest_point(a, pick, PROFILE_TOL).distance(pick);
+            let db = kernel_curve::closest_point(b, pick, PROFILE_TOL).distance(pick);
+            da.partial_cmp(&db).expect("finite distances")
+        })
+        .map(|(i, _)| i)
+        .expect("pieces is non-empty")
 }
 
 fn curve_of<'a>(doc: &'a Document, id: ObjectId, verb: &str) -> Result<&'a Curve, ExecError> {
@@ -6105,7 +7589,314 @@ fn bake_param_block(
     Ok(out)
 }
 
+/// One-line human summary of a construction plane for the command feedback.
+fn describe_cplane(c: &itsjustcad_doc::CPlane) -> String {
+    if c.is_world() {
+        return "cplane: world XY".to_string();
+    }
+    let o = c.origin;
+    let n = c.normal;
+    format!(
+        "cplane: origin ({:.3}, {:.3}, {:.3}) normal ({:.3}, {:.3}, {:.3})",
+        o.x, o.y, o.z, n.x, n.y, n.z
+    )
+}
+
+/// Rewrite a typed geometry command's CPlane-space point arguments into WORLD
+/// coordinates via the active plane, so the op that gets logged carries world
+/// coords (replay-stability invariant). World XY (the default) is a no-op.
+///
+/// CPlane-aware verbs:
+///
+/// - Fully aware (every defining vertex transformed, correct for ANY plane):
+///   `line`, `polyline`, `point` (PointLiteral).
+/// - Anchor-aware (the single defining point is transformed; the geometry still
+///   extends along world axes, so this is exact for a translated or +Z-normal
+///   plane and an accepted MVP limitation for a tilted/rotated plane): `rect`,
+///   `circle`, `box`.
+///
+/// All other verbs are world-only for now (see report / follow-ups).
+fn cplane_resolve(doc: &Document, cmd: Command) -> Result<Command, ExecError> {
+    if doc.cplane.is_world() {
+        return Ok(cmd);
+    }
+    let tw = |p: DVec3| doc.cplane_to_world(p);
+    // rect/box/circle only transform their anchor — their extents stay
+    // world-axis-aligned. That's exact for a translation-only (e.g. +Z-offset)
+    // plane, but silently mis-orients on a ROTATED plane. Guard rather than emit
+    // wrong geometry; polyline is the plane-aware alternative.
+    let rotated = doc.cplane.is_rotated();
+    let guard = || {
+        ExecError::Invalid(
+            "rect/box/circle need a world-aligned CPlane (rotation unsupported) — use polyline on this plane".into(),
+        )
+    };
+    Ok(match cmd {
+        Command::Line { id, a, b } => Command::Line { id, a: tw(a), b: tw(b) },
+        Command::Polyline { id, points, closed } => Command::Polyline {
+            id,
+            points: points.into_iter().map(tw).collect(),
+            closed,
+        },
+        Command::PointLiteral { id, positions } => Command::PointLiteral {
+            id,
+            positions: positions.into_iter().map(tw).collect(),
+        },
+        Command::Rectangle { id, corner, width, height } => {
+            if rotated {
+                return Err(guard());
+            }
+            Command::Rectangle { id, corner: tw(corner), width, height }
+        }
+        Command::Circle { id, center, radius } => {
+            if rotated {
+                return Err(guard());
+            }
+            Command::Circle { id, center: tw(center), radius }
+        }
+        Command::Box { id, corner, size } => {
+            if rotated {
+                return Err(guard());
+            }
+            Command::Box { id, corner: tw(corner), size }
+        }
+        other => other,
+    })
+}
+
 /// Apply a (non-undo) command. Returns the op with ids filled for the log.
+/// Execute a `sheetset` sub-command. The mutating ops (New/Add/Remove/Order)
+/// snapshot the whole sheet-set table into an [`Inverse::SheetSetsRestore`] and
+/// mutate the *active* set — the last set in `doc.sheet_sets`, i.e. the most
+/// recently `new`'d one. That "last set is active" rule is deterministic under
+/// op-log replay (New always appends), so it needs no transient state.
+///
+/// Sheet numbering is POSITIONAL and 1-based: a sheet's number is its index in
+/// the set + 1, so reordering renumbers implicitly and nothing is stored.
+/// `List` and `Publish` are query / I-O (not logged); they return an unused
+/// inverse like `Print` does.
+fn sheetset_apply(
+    doc: &mut Document,
+    op: SheetSetOp,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    // Snapshot for the mutating ops' inverse.
+    let snapshot = doc.sheet_sets.clone();
+    let unused_inverse = || Inverse::Rename(Vec::new());
+
+    match op {
+        SheetSetOp::New { name } => {
+            if doc.sheet_set(&name).is_some() {
+                return Err(ExecError::Invalid(format!(
+                    "sheet set '{name}' already exists"
+                )));
+            }
+            doc.sheet_sets.push(itsjustcad_doc::SheetSet {
+                name: name.clone(),
+                sheets: Vec::new(),
+            });
+            doc.generation += 1;
+            Ok((
+                Command::SheetSet(SheetSetOp::New { name: name.clone() }),
+                Inverse::SheetSetsRestore(snapshot),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("sheet set '{name}' created (active)"),
+                },
+            ))
+        }
+        SheetSetOp::Add { sheet } => {
+            // Reference an EXISTING sheet by name; never copy its content.
+            if doc.sheet(&sheet).is_none() {
+                let known: Vec<String> = doc.sheets.iter().map(|s| s.name.clone()).collect();
+                return Err(ExecError::Invalid(format!(
+                    "no sheet '{sheet}' (sheets: {}; create one with: sheet {sheet})",
+                    known.join(", ")
+                )));
+            }
+            let Some(set) = doc.sheet_sets.last_mut() else {
+                return Err(ExecError::Invalid(
+                    "no active sheet set (create one with: sheetset new <name>)".into(),
+                ));
+            };
+            if set.sheets.iter().any(|s| s == &sheet) {
+                return Err(ExecError::Invalid(format!(
+                    "sheet '{sheet}' is already in set '{}'",
+                    set.name
+                )));
+            }
+            set.sheets.push(sheet.clone());
+            let (setname, num) = (set.name.clone(), set.sheets.len());
+            doc.generation += 1;
+            Ok((
+                Command::SheetSet(SheetSetOp::Add { sheet: sheet.clone() }),
+                Inverse::SheetSetsRestore(snapshot),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("added '{sheet}' to set '{setname}' as #{num}"),
+                },
+            ))
+        }
+        SheetSetOp::Remove { sheet } => {
+            let Some(set) = doc.sheet_sets.last_mut() else {
+                return Err(ExecError::Invalid(
+                    "no active sheet set (create one with: sheetset new <name>)".into(),
+                ));
+            };
+            let before = set.sheets.len();
+            set.sheets.retain(|s| s != &sheet);
+            if set.sheets.len() == before {
+                return Err(ExecError::Invalid(format!(
+                    "sheet '{sheet}' is not in set '{}'",
+                    set.name
+                )));
+            }
+            let setname = set.name.clone();
+            doc.generation += 1;
+            Ok((
+                Command::SheetSet(SheetSetOp::Remove { sheet: sheet.clone() }),
+                Inverse::SheetSetsRestore(snapshot),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("removed '{sheet}' from set '{setname}'"),
+                },
+            ))
+        }
+        SheetSetOp::Order { sheet, index } => {
+            if index == 0 {
+                return Err(ExecError::Invalid(
+                    "sheetset order index is 1-based (first position is 1)".into(),
+                ));
+            }
+            let Some(set) = doc.sheet_sets.last_mut() else {
+                return Err(ExecError::Invalid(
+                    "no active sheet set (create one with: sheetset new <name>)".into(),
+                ));
+            };
+            let Some(from) = set.sheets.iter().position(|s| s == &sheet) else {
+                return Err(ExecError::Invalid(format!(
+                    "sheet '{sheet}' is not in set '{}'",
+                    set.name
+                )));
+            };
+            // Clamp the 1-based target to the last valid slot.
+            let to = (index - 1).min(set.sheets.len().saturating_sub(1));
+            let name = set.sheets.remove(from);
+            set.sheets.insert(to, name);
+            let setname = set.name.clone();
+            doc.generation += 1;
+            Ok((
+                Command::SheetSet(SheetSetOp::Order { sheet: sheet.clone(), index }),
+                Inverse::SheetSetsRestore(snapshot),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("moved '{sheet}' to #{} in set '{setname}'", to + 1),
+                },
+            ))
+        }
+        SheetSetOp::List => {
+            let mut msg = String::new();
+            if doc.sheet_sets.is_empty() {
+                msg.push_str("no sheet sets (create one with: sheetset new <name>)");
+            } else {
+                let active = doc.sheet_sets.len() - 1;
+                for (i, set) in doc.sheet_sets.iter().enumerate() {
+                    let marker = if i == active { " (active)" } else { "" };
+                    msg.push_str(&format!(
+                        "{}{} — {} sheet(s)\n",
+                        set.name,
+                        marker,
+                        set.sheets.len()
+                    ));
+                    for (n, s) in set.sheets.iter().enumerate() {
+                        let exists = if doc.sheets.iter().any(|d| &d.name == s) {
+                            ""
+                        } else {
+                            " (missing)"
+                        };
+                        msg.push_str(&format!("  {}. {}{}\n", n + 1, s, exists));
+                    }
+                }
+                msg.pop(); // trailing newline
+            }
+            Ok((
+                Command::SheetSet(SheetSetOp::List),
+                unused_inverse(),
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        SheetSetOp::Publish { path } => {
+            let Some(set) = doc.sheet_sets.last() else {
+                return Err(ExecError::Invalid(
+                    "no active sheet set (create one with: sheetset new <name>)".into(),
+                ));
+            };
+            if set.sheets.is_empty() {
+                return Err(ExecError::Invalid(format!(
+                    "sheet set '{}' is empty (add sheets with: sheetset add <sheet>)",
+                    set.name
+                )));
+            }
+            // Resolve each name to its live Sheet, in the set's (numbering) order.
+            // A referenced sheet with no views can't render, so surface it.
+            let mut resolved: Vec<&itsjustcad_doc::Sheet> = Vec::with_capacity(set.sheets.len());
+            for name in &set.sheets {
+                let Some(s) = doc.sheet(name) else {
+                    return Err(ExecError::Invalid(format!(
+                        "set '{}' references missing sheet '{name}'",
+                        set.name
+                    )));
+                };
+                if s.views.is_empty() {
+                    return Err(ExecError::Invalid(format!(
+                        "sheet '{name}' has no views (add one with: sheetview {name} top 1:100)"
+                    )));
+                }
+                resolved.push(s);
+            }
+            // Default output path is derived from the set NAME, which is a
+            // deserialized document field (untrusted: a malicious .ijc could set
+            // `name` to `../../etc/x` or an absolute path). Reduce it to a bare
+            // filename so publish can never write outside the CWD via a
+            // document-controlled path. An explicit user-typed `path` is honored
+            // as-is (that's a deliberate local action).
+            let out_path = match path.clone() {
+                Some(p) => p,
+                None => {
+                    let stem = std::path::Path::new(&set.name)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .filter(|s| !s.is_empty() && *s != "..");
+                    match stem {
+                        Some(s) => format!("{s}.pdf"),
+                        None => {
+                            return Err(ExecError::Invalid(
+                                "sheet set name is not a valid filename — publish with an \
+                                 explicit path: sheetset publish <file.pdf>"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            };
+            let (bytes, drawn) = crate::pdf::sheets_pdf(doc, &resolved);
+            let (pages, size) = (resolved.len(), bytes.len());
+            std::fs::write(&out_path, bytes)
+                .map_err(|e| ExecError::Invalid(format!("cannot write '{out_path}': {e}")))?;
+            let setname = set.name.clone();
+            Ok((
+                Command::SheetSet(SheetSetOp::Publish { path }),
+                unused_inverse(),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "published set '{setname}' -> {out_path} ({pages} pages, {drawn} lines, {size} bytes)"
+                    ),
+                },
+            ))
+        }
+    }
+}
+
 fn apply_forward(
     doc: &mut Document,
     cmd: Command,
@@ -6809,6 +8600,40 @@ fn apply_forward(
                 outcome,
             ))
         }
+        Command::LineTan { id, from, curve } => {
+            // Foot on the curve nearest `from` is the tangent point; the line
+            // runs from `from` to it (it then lies along the curve's tangent).
+            let (_cid, c) = one_curve(doc, &curve, "linetan")?;
+            let foot = kernel_curve::closest_point(c, from, PROFILE_TOL);
+            if foot.distance(from) < 1e-9 {
+                return Err(ExecError::Invalid(
+                    "linetan: the from-point lies on the curve (degenerate line)".into(),
+                ));
+            }
+            let (id, outcome) = insert_curve(doc, id, Curve::Line { a: from, b: foot }, "linetan");
+            Ok((
+                Command::LineTan { id: Some(id), from, curve },
+                Inverse::DeleteCreated(vec![id]),
+                outcome,
+            ))
+        }
+        Command::LinePerp { id, from, curve } => {
+            // The foot of perpendicular is the closest point on the curve; the
+            // segment `from`→foot meets the curve perpendicularly.
+            let (_cid, c) = one_curve(doc, &curve, "lineperp")?;
+            let foot = kernel_curve::closest_point(c, from, PROFILE_TOL);
+            if foot.distance(from) < 1e-9 {
+                return Err(ExecError::Invalid(
+                    "lineperp: the from-point lies on the curve (degenerate line)".into(),
+                ));
+            }
+            let (id, outcome) = insert_curve(doc, id, Curve::Line { a: from, b: foot }, "lineperp");
+            Ok((
+                Command::LinePerp { id: Some(id), from, curve },
+                Inverse::DeleteCreated(vec![id]),
+                outcome,
+            ))
+        }
         Command::Polyline { id, points, closed } => {
             if closed && points.len() < 3 {
                 return Err(ExecError::Invalid(
@@ -6852,6 +8677,39 @@ fn apply_forward(
             let (id, outcome) = insert_curve(doc, id, curve, "circle");
             Ok((
                 Command::Circle { id: Some(id), center, radius },
+                Inverse::DeleteCreated(vec![id]),
+                outcome,
+            ))
+        }
+        Command::CircleTan { id, a, b, radius } => {
+            if radius <= 0.0 {
+                return Err(ExecError::Invalid("circletan radius must be positive".into()));
+            }
+            // Resolve the two curve selectors to exactly one line each (the solid
+            // supported case is LINE–LINE TTR).
+            let line_of = |sel: &Selector| -> Result<(DVec3, DVec3), ExecError> {
+                let (_cid, c) = one_curve(doc, sel, "circletan")?;
+                match c {
+                    Curve::Line { a, b } => Ok((*a, *b)),
+                    _ => Err(ExecError::Invalid(
+                        "circletan supports the line–line case for now; \
+                         a selected curve is not a line"
+                            .into(),
+                    )),
+                }
+            };
+            let la = line_of(&a)?;
+            let lb = line_of(&b)?;
+            let center = circletan_line_line(la, lb, radius).ok_or_else(|| {
+                ExecError::Invalid(format!(
+                    "circletan: no circle of radius {radius} is tangent to both lines \
+                     (they are parallel)"
+                ))
+            })?;
+            let curve = Curve::Arc { center, radius, start: 0.0, end: std::f64::consts::TAU };
+            let (id, outcome) = insert_curve(doc, id, curve, "circletan");
+            Ok((
+                Command::CircleTan { id: Some(id), a, b, radius },
                 Inverse::DeleteCreated(vec![id]),
                 outcome,
             ))
@@ -7139,6 +8997,46 @@ fn apply_forward(
                 },
             ))
         }
+        Command::DimAngular { id, vertex, p1, p2, radius } => {
+            // The measured angle is derived (never stored). Reject a degenerate
+            // definition (either leg zero-length) up front so the annotation
+            // always has a meaningful angle to display.
+            if radius <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "angular dimension radius must be positive".into(),
+                ));
+            }
+            let angle = itsjustcad_doc::angle_degrees(vertex, p1, p2);
+            if (p1 - vertex).length() < 1e-9 || (p2 - vertex).length() < 1e-9 {
+                return Err(ExecError::Invalid(
+                    "angular dimension legs must be nonzero (points distinct from the vertex)".into(),
+                ));
+            }
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Annotation(Annotation::AngularDim {
+                    vertex,
+                    p1,
+                    p2,
+                    radius,
+                }),
+            });
+            Ok((
+                Command::DimAngular { id: Some(id), vertex, p1, p2, radius },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("dimangular {id} ({})", itsjustcad_doc::format_angle(angle)),
+                },
+            ))
+        }
         Command::Text { id, pos, text, height } => {
             if height <= 0.0 {
                 return Err(ExecError::Invalid("text height must be positive".into()));
@@ -7170,6 +9068,39 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Field { id, pos, expr, height } => {
+            if height <= 0.0 {
+                return Err(ExecError::Invalid("field height must be positive".into()));
+            }
+            // Evaluate once at the fixed creation point and store the resolved
+            // string on the annotation. Deterministic => live-apply and op-log
+            // replay produce byte-identical text (same discipline as dims).
+            let text = eval_field_expr(doc, &expr)?;
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Annotation(Annotation::Field {
+                    pos,
+                    expr: expr.clone(),
+                    text: text.clone(),
+                    height,
+                }),
+            });
+            Ok((
+                Command::Field { id: Some(id), pos, expr: expr.clone(), height },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("field: created ({} = {})", expr.source(), text),
+                },
+            ))
+        }
         Command::Hatch { id, target, pattern } => {
             let ids = resolve(doc, &target)?;
             if ids.len() != 1 {
@@ -7189,6 +9120,27 @@ fn apply_forward(
                     "hatch boundary is not closed (close it or use 'polyline ... closed')".into(),
                 ));
             }
+            // Resolve a custom pattern reference (`hatch … pattern <name>`)
+            // against the imported registry, copying its line families into the
+            // hatch so the created object is self-contained (no doc lookup at
+            // render/export time). Done before we build the object below.
+            let pattern = if let itsjustcad_doc::HatchPattern::Custom { name, scale, .. } = &pattern {
+                let def = doc.hatch_patterns.get(name).ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "no imported hatch pattern '{name}' (import one with 'hatchpat <file.pat>')"
+                    ))
+                })?;
+                if *scale <= 0.0 {
+                    return Err(ExecError::Invalid("hatch pattern scale must be positive".into()));
+                }
+                itsjustcad_doc::HatchPattern::Custom {
+                    name: name.clone(),
+                    lines: def.lines.clone(),
+                    scale: *scale,
+                }
+            } else {
+                pattern
+            };
             let pattern_spacing = match &pattern {
                 itsjustcad_doc::HatchPattern::Lines { spacing, .. }
                 | itsjustcad_doc::HatchPattern::Crosshatch { spacing, .. }
@@ -7197,6 +9149,9 @@ fn apply_forward(
                 | itsjustcad_doc::HatchPattern::Insulation { spacing }
                 | itsjustcad_doc::HatchPattern::Earth { spacing }
                 | itsjustcad_doc::HatchPattern::Ansi { spacing, .. } => Some(*spacing),
+                // Custom families carry their own per-family spacing; validated
+                // in `hatch_pat`, so nothing to gate here.
+                itsjustcad_doc::HatchPattern::Custom { .. } => None,
                 itsjustcad_doc::HatchPattern::Solid => None,
             };
             if let itsjustcad_doc::HatchPattern::Ansi { code, .. } = &pattern
@@ -7232,6 +9187,179 @@ fn apply_forward(
                 ApplyOutcome {
                     created: vec![id],
                     message: format!("hatched {} -> {id}", ids[0]),
+                },
+            ))
+        }
+        Command::Boundary { id, seed, from } => {
+            // Collect candidate boundary curves: an explicit `from <selector>`,
+            // else every curve object in the doc.
+            let candidate_ids = match &from {
+                Some(sel) => resolve(doc, sel)?,
+                None => doc.all_ids(),
+            };
+            let mut segs: Vec<Seg2> = Vec::new();
+            for cid in candidate_ids {
+                let Some(obj) = doc.get(cid) else { continue };
+                let Geometry::Curve(c) = &obj.geometry else { continue };
+                // Tessellate every candidate to a polyline of line segments and
+                // work in 2D XY (see `boundary_loop` for the planar assumption).
+                let pts = c.tessellate(PROFILE_TOL);
+                let closed = c.is_closed();
+                let n = pts.len();
+                if n < 2 {
+                    continue;
+                }
+                let last = if closed { n } else { n - 1 };
+                for k in 0..last {
+                    let a = pts[k];
+                    let b = pts[(k + 1) % n];
+                    segs.push(Seg2 {
+                        a: [a.x, a.y],
+                        b: [b.x, b.y],
+                    });
+                }
+            }
+            let seed2 = [seed.x, seed.y];
+            let loop_xy = boundary_loop(&segs, seed2, BOUNDARY_TOL).ok_or_else(|| {
+                ExecError::Invalid("boundary: no closed region around seed".into())
+            })?;
+            // Lift the 2D loop back to the seed's Z plane.
+            let points: Vec<DVec3> =
+                loop_xy.iter().map(|p| DVec3::new(p[0], p[1], seed.z)).collect();
+            let n = points.len();
+            let curve = Curve::Polyline { points, closed: true };
+            let id = id.unwrap_or_default();
+            let id = {
+                let (id, _) = insert_curve(doc, Some(id), curve, "boundary");
+                id
+            };
+            Ok((
+                Command::Boundary { id: Some(id), seed, from },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("boundary: created loop with {n} vertices"),
+                },
+            ))
+        }
+        Command::CurveBool { ids, op, targets } => {
+            // Gather the CLOSED curves in selection order (selection order is
+            // what makes `difference` = first minus the rest, well-defined).
+            let sel_ids = resolve(doc, &targets)?;
+            let mut inputs: Vec<Vec<[f64; 2]>> = Vec::new();
+            let mut consumed_ids: Vec<ObjectId> = Vec::new();
+            let mut seed_z = 0.0;
+            for cid in sel_ids {
+                let Some(obj) = doc.get(cid) else { continue };
+                let Geometry::Curve(c) = &obj.geometry else { continue };
+                if !c.is_closed() {
+                    continue;
+                }
+                let pts = c.tessellate(PROFILE_TOL);
+                if pts.len() < 3 {
+                    continue;
+                }
+                if consumed_ids.is_empty() {
+                    seed_z = pts[0].z; // carry Z from the first input (planar)
+                }
+                inputs.push(pts.iter().map(|p| [p.x, p.y]).collect());
+                consumed_ids.push(cid);
+            }
+            if inputs.len() < 2 {
+                return Err(ExecError::Invalid(
+                    "curvebool needs 2+ closed curves (selector matched fewer)".into(),
+                ));
+            }
+            let bop = match op {
+                BoolKind::Union => CurveBoolOp::Union,
+                BoolKind::Intersection => CurveBoolOp::Intersect,
+                BoolKind::Difference => CurveBoolOp::Difference,
+            };
+            let rings = polygon_boolean(&inputs, bop, BOUNDARY_TOL);
+            if rings.is_empty() {
+                return Err(ExecError::Invalid(format!(
+                    "curvebool {op}: empty result (curves may not overlap as required)"
+                )));
+            }
+            // Emit each retained region ring as a closed polyline object, lifted
+            // back to the seed Z plane. Inputs are consumed and replaced.
+            let new_ids: Vec<ObjectId> = match ids {
+                Some(ids) if ids.len() == rings.len() => ids,
+                _ => rings.iter().map(|_| ObjectId::new()).collect(),
+            };
+            let mut consumed: Vec<(SceneObject, usize)> = Vec::new();
+            for cid in &consumed_ids {
+                if let Some((obj, index)) = doc.remove(*cid) {
+                    consumed.push((obj, index));
+                }
+            }
+            for (ring, rid) in rings.iter().zip(&new_ids) {
+                let points: Vec<DVec3> =
+                    ring.iter().map(|p| DVec3::new(p[0], p[1], seed_z)).collect();
+                doc.insert(SceneObject {
+                    visible: true,
+                    id: *rid,
+                    name: None,
+                    layer: doc.current_layer.clone(),
+                    color: None,
+                    material: None,
+                    lineweight_mm: None,
+                    geometry: Geometry::Curve(Curve::Polyline { points, closed: true }),
+                });
+            }
+            let n = new_ids.len();
+            Ok((
+                Command::CurveBool { ids: Some(new_ids.clone()), op, targets },
+                Inverse::Replace { created: new_ids.clone(), consumed },
+                ApplyOutcome {
+                    created: new_ids,
+                    message: format!("curvebool {op}: created {n} region(s)"),
+                },
+            ))
+        }
+        Command::AutoDim { ids, targets, offset } => {
+            // Batch-dimension the selection. Walk objects in selection order and
+            // collect every dim span (per-segment for curves, extents otherwise)
+            // so the emitted dims are deterministic — required for op-log replay.
+            let sel_ids = resolve(doc, &targets)?;
+            let mut spans: Vec<(DVec3, DVec3)> = Vec::new();
+            for oid in sel_ids {
+                let Some(obj) = doc.get(oid) else { continue };
+                spans.extend(autodim_spans(&obj.geometry));
+            }
+            if spans.is_empty() {
+                return Err(ExecError::Invalid(
+                    "autodim: nothing dimensionable in selection".into(),
+                ));
+            }
+            // Reuse the caller's ids on replay (stable undo); else fresh ids.
+            let new_ids: Vec<ObjectId> = match ids {
+                Some(ids) if ids.len() == spans.len() => ids,
+                _ => spans.iter().map(|_| ObjectId::new()).collect(),
+            };
+            for ((a, b), did) in spans.iter().zip(&new_ids) {
+                doc.insert(SceneObject {
+                    visible: true,
+                    id: *did,
+                    name: None,
+                    layer: doc.current_layer.clone(),
+                    color: None,
+                    material: None,
+                    lineweight_mm: None,
+                    geometry: Geometry::Annotation(Annotation::LinearDim {
+                        a: DimAnchor::Free(*a),
+                        b: DimAnchor::Free(*b),
+                        offset,
+                    }),
+                });
+            }
+            let n = new_ids.len();
+            Ok((
+                Command::AutoDim { ids: Some(new_ids.clone()), targets, offset },
+                Inverse::DeleteCreated(new_ids.clone()),
+                ApplyOutcome {
+                    created: new_ids,
+                    message: format!("autodim: placed {n} dimension(s)"),
                 },
             ))
         }
@@ -7429,6 +9557,7 @@ fn apply_forward(
             // position as their `last` fallback. Deterministic at this fixed
             // point => live-apply and op-log replay stay byte-identical.
             doc.refresh_dim_anchors();
+            refresh_fields(doc);
             Ok((
                 Command::Move { targets, delta },
                 Inverse::MoveBack { ids: ids.clone(), delta },
@@ -7478,6 +9607,318 @@ fn apply_forward(
                         ids.len(),
                         tessellation_note(tessellated)
                     ),
+                },
+            ))
+        }
+        Command::Align { targets, src1, tgt1, src2, tgt2, scale } => {
+            let m = align_transform(src1, tgt1, src2, tgt2, scale).ok_or_else(|| {
+                ExecError::Invalid(
+                    "align: reference vectors must be non-zero (src1≠src2 and tgt1≠tgt2)".into(),
+                )
+            })?;
+            let ids = resolve(doc, &targets)?;
+            if ids.is_empty() {
+                return Err(ExecError::Invalid("align: nothing selected".into()));
+            }
+            // The pivot is already baked into `m`, so apply it about the origin
+            // (center ZERO collapses the wrapper translations to identity).
+            let (inverse, tessellated) = apply_about_center(doc, &ids, Some(DVec3::ZERO), m);
+            Ok((
+                Command::Align { targets, src1, tgt1, src2, tgt2, scale },
+                inverse,
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "aligned {} object(s){}",
+                        ids.len(),
+                        tessellation_note(tessellated)
+                    ),
+                },
+            ))
+        }
+        Command::ToOrigin { targets } => {
+            let ids = resolve(doc, &targets)?;
+            if ids.is_empty() {
+                return Err(ExecError::Invalid("tozero: nothing selected".into()));
+            }
+            // Combined AABB of the whole selection, then translate so its min
+            // corner lands at the world origin. Pure translation → invertible.
+            let mut bb = doc.get(ids[0]).expect("resolved").geometry.aabb();
+            for id in &ids[1..] {
+                bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+            }
+            let delta = -bb.min;
+            for id in &ids {
+                doc.get_mut(*id).expect("resolved").geometry.translate(delta);
+            }
+            doc.refresh_dim_anchors();
+            refresh_fields(doc);
+            Ok((
+                Command::ToOrigin { targets },
+                Inverse::MoveBack { ids: ids.clone(), delta },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("moved {} object(s) to origin", ids.len()),
+                },
+            ))
+        }
+        Command::Flatten { targets } => {
+            let ids = resolve(doc, &targets)?;
+            if ids.is_empty() {
+                return Err(ExecError::Invalid("flatten: nothing selected".into()));
+            }
+            // Snapshot BEFORE mutating: flatten is not a pure translation, so undo
+            // must restore whole geometry (some curves re-tessellate on transform).
+            let mut snapshots = Vec::with_capacity(ids.len());
+            let flat = glam::DMat4::from_scale(glam::DVec3::new(1.0, 1.0, 0.0));
+            for id in &ids {
+                let obj = doc.get_mut(*id).expect("resolved");
+                snapshots.push((*id, obj.geometry.clone()));
+                obj.geometry.transform(&flat, PROFILE_TOL);
+            }
+            doc.refresh_dim_anchors();
+            refresh_fields(doc);
+            Ok((
+                Command::Flatten { targets },
+                Inverse::SetGeometry(snapshots),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("flattened {} object(s) to Z=0", ids.len()),
+                },
+            ))
+        }
+        Command::Stretch { targets, min, max, delta } => {
+            let ids = resolve(doc, &targets)?;
+            // Snapshot BEFORE mutating, and only for objects that actually
+            // change: stretch is not a pure translation (partial vertex moves),
+            // so undo restores whole geometry per touched object.
+            let mut snapshots = Vec::new();
+            let mut vertices_moved = 0usize;
+            for id in &ids {
+                let obj = doc.get_mut(*id).expect("resolved");
+                let before = obj.geometry.clone();
+                let moved = stretch_geometry(&mut obj.geometry, min, max, delta);
+                if moved > 0 {
+                    vertices_moved += moved;
+                    snapshots.push((*id, before));
+                }
+            }
+            // Dims may anchor to moved points; refresh so associative anchors
+            // carry the post-stretch position as their `last` fallback. Fields
+            // bound to stretched geometry re-evaluate too.
+            doc.refresh_dim_anchors();
+            refresh_fields(doc);
+            let message = if snapshots.is_empty() {
+                "stretch: no vertices in box, nothing moved".to_string()
+            } else {
+                format!(
+                    "stretched {} object(s) ({vertices_moved} vertices moved)",
+                    snapshots.len()
+                )
+            };
+            Ok((
+                Command::Stretch { targets, min, max, delta },
+                Inverse::SetGeometry(snapshots),
+                ApplyOutcome { created: Vec::new(), message },
+            ))
+        }
+        Command::SelSimilar { targets, by } => {
+            let seeds = resolve(doc, &targets)?;
+            if seeds.is_empty() {
+                return Err(ExecError::Invalid("selsimilar: nothing selected".into()));
+            }
+            // Gather the distinct property values of the seeds, then scan the whole
+            // document and select every object that matches one of them. Mirrors
+            // `select`: sets `doc.selection` and is never op-logged.
+            let key = |g: &Geometry| -> u8 {
+                match g {
+                    Geometry::Mesh(_) => 0,
+                    Geometry::Curve(_) => 1,
+                    Geometry::Annotation(_) => 2,
+                    Geometry::Instance { .. } => 3,
+                    Geometry::Points { .. } => 4,
+                    Geometry::Frame { .. } => 5,
+                    Geometry::Area { .. } => 6,
+                    Geometry::Parametric { .. } => 7,
+                }
+            };
+            let mut want_layers: Vec<String> = Vec::new();
+            let mut want_colors: Vec<Option<[f32; 3]>> = Vec::new();
+            let mut want_kinds: Vec<u8> = Vec::new();
+            let mut want_weights: Vec<f64> = Vec::new();
+            for id in &seeds {
+                let obj = doc.get(*id).expect("resolved");
+                match by {
+                    SimilarBy::Layer => {
+                        if !want_layers.contains(&obj.layer) {
+                            want_layers.push(obj.layer.clone());
+                        }
+                    }
+                    SimilarBy::Color => {
+                        if !want_colors.contains(&obj.color) {
+                            want_colors.push(obj.color);
+                        }
+                    }
+                    SimilarBy::Type => {
+                        let k = key(&obj.geometry);
+                        if !want_kinds.contains(&k) {
+                            want_kinds.push(k);
+                        }
+                    }
+                    SimilarBy::Weight => {
+                        let w = doc.effective_lineweight(obj);
+                        if !want_weights.iter().any(|&x| (x - w).abs() < 1e-9) {
+                            want_weights.push(w);
+                        }
+                    }
+                }
+            }
+            let matched: Vec<ObjectId> = doc
+                .objects()
+                .filter(|o| match by {
+                    SimilarBy::Layer => want_layers.contains(&o.layer),
+                    SimilarBy::Color => want_colors.contains(&o.color),
+                    SimilarBy::Type => want_kinds.contains(&key(&o.geometry)),
+                    SimilarBy::Weight => {
+                        let w = doc.effective_lineweight(o);
+                        want_weights.iter().any(|&x| (x - w).abs() < 1e-9)
+                    }
+                })
+                .map(|o| o.id)
+                .collect();
+            doc.selection = matched.iter().copied().collect();
+            let n = matched.len();
+            Ok((
+                Command::SelSimilar { targets, by },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("selected {n} similar object(s) by {by}"),
+                },
+            ))
+        }
+        Command::SelDup { targets } => {
+            // Scan the candidate set (a selector, or the whole doc) and flag every
+            // object that is a geometric duplicate of an earlier one (same kind +
+            // same points within tolerance, ignoring id/layer). Selection-only,
+            // never op-logged — a precursor to purge. Mirrors `selsimilar`.
+            let candidates: Vec<ObjectId> = match &targets {
+                Some(sel) => resolve(doc, sel)?,
+                None => doc.objects().map(|o| o.id).collect(),
+            };
+            // Compare each object against the earlier ones; the second (and later)
+            // copy of an identical geometry is the flagged "duplicate".
+            let mut seen: Vec<(ObjectId, &Geometry)> = Vec::new();
+            let mut dups: Vec<ObjectId> = Vec::new();
+            for id in &candidates {
+                let g = &doc.get(*id).expect("candidate").geometry;
+                if seen.iter().any(|(_, prev)| geometry_dup_eq(prev, g, PROFILE_TOL)) {
+                    dups.push(*id);
+                } else {
+                    seen.push((*id, g));
+                }
+            }
+            doc.selection = dups.iter().copied().collect();
+            let n = dups.len();
+            Ok((
+                Command::SelDup { targets },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("selected {n} duplicate object(s)"),
+                },
+            ))
+        }
+        Command::SelRegion { min, max, mode } => {
+            // Two-point AutoCAD/Rhino region select. Normalize the corners into a
+            // world-XY rectangle, then keep objects by their aabb footprint:
+            // window = fully inside, crossing = touching/overlapping. Planar in
+            // XY (aabb Z ignored). Selection-only, never op-logged; mirrors
+            // `selsimilar`/`seldup`. An empty rect / no match is not an error.
+            let rect = Rect2::from_corners(min, max);
+            let matched: Vec<ObjectId> = doc
+                .objects()
+                .filter(|o| {
+                    let bb = o.geometry.aabb();
+                    match mode {
+                        RegionMode::Window => rect_contains_aabb(rect, bb),
+                        RegionMode::Crossing => rect_intersects_aabb(rect, bb),
+                    }
+                })
+                .map(|o| o.id)
+                .collect();
+            doc.selection = matched.iter().copied().collect();
+            let n = matched.len();
+            Ok((
+                Command::SelRegion { min, max, mode },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("selected {n} object(s) ({mode})"),
+                },
+            ))
+        }
+        Command::DimRadius { id, target, diameter } => {
+            // Read the picked circle/arc's center + radius, then build a LinearDim
+            // between the center and a rim point. `diameter` uses the far rim point
+            // so the measured length is 2·r. Reuses the existing dim annotation.
+            let (_tid, curve) = one_curve(doc, &target, "dimradius")?;
+            let (center, radius, start) = match curve {
+                Curve::Arc { center, radius, start, .. } => (*center, *radius, *start),
+                _ => {
+                    return Err(ExecError::Invalid(
+                        "dimradius works on a circle or arc".into(),
+                    ))
+                }
+            };
+            if radius <= 0.0 {
+                return Err(ExecError::Invalid("dimradius: radius must be positive".into()));
+            }
+            // The rim point is built in world XY (center + [r·cos, r·sin, 0]).
+            // That is only correct for an XY-planar arc under a world CPlane; a
+            // non-world CPlane would silently emit a mis-placed dimension. Guard
+            // rather than draw a wrong dim (dimensions on tilted planes are a
+            // later kernel job once arcs carry an explicit plane).
+            if !doc.cplane.is_world() {
+                return Err(ExecError::Invalid(
+                    "dimradius/dimdiameter need a world CPlane (tilted-plane dims unsupported) — reset with: cplane world".into(),
+                ));
+            }
+            // Rim point at the arc's start angle (on-curve for a partial arc).
+            let rim = center + DVec3::new(radius * start.cos(), radius * start.sin(), 0.0);
+            let (a, b) = if diameter {
+                // Opposite rim point → full diameter across the center.
+                let far = center - DVec3::new(radius * start.cos(), radius * start.sin(), 0.0);
+                (far, rim)
+            } else {
+                (center, rim)
+            };
+            let anchor_a = DimAnchor::Free(a);
+            let anchor_b = DimAnchor::Free(b);
+            let length = (b - a).length();
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Annotation(Annotation::LinearDim {
+                    a: anchor_a,
+                    b: anchor_b,
+                    // Matches parse.rs DEFAULT_DIM_OFFSET (0.5).
+                    offset: 0.5,
+                }),
+            });
+            let label = if diameter { "diameter" } else { "radius" };
+            Ok((
+                Command::DimRadius { id: Some(id), target, diameter },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("{label} dim {id} ({})", format_length(doc.units, length)),
                 },
             ))
         }
@@ -7624,6 +10065,85 @@ fn apply_forward(
                     message: format!(
                         "trimmed {tid} -> {id} (kept 1 of {count} pieces)"
                     ),
+                },
+            ))
+        }
+        Command::PowerTrim { ids, target, pick } => {
+            // Resolve exactly one target curve; every *other* curve in the doc
+            // is an implicit cutter (this is the whole point of PowerTrim — no
+            // one-by-one cutter picking).
+            let target_ids = resolve(doc, &target)?;
+            let [tid] = target_ids[..] else {
+                return Err(ExecError::Invalid(format!(
+                    "powertrim target selector matched {} objects, expected exactly 1",
+                    target_ids.len()
+                )));
+            };
+            let curve = curve_of(doc, tid, "powertrim")?;
+            // Intersect against all other curves in the document.
+            let mut cuts = Vec::new();
+            for oid in doc.all_ids() {
+                if oid == tid {
+                    continue;
+                }
+                if let Geometry::Curve(other) = &doc.get(oid).expect("all_ids").geometry {
+                    cuts.extend(kernel_curve::intersections(curve, other, PROFILE_TOL));
+                }
+            }
+            if cuts.is_empty() {
+                return Err(ExecError::Invalid(
+                    "the target does not cross any other curve — nothing to powertrim".into(),
+                ));
+            }
+            let pieces = kernel_curve::split_at_points(curve, &cuts, kernel_curve::JOIN_TOL)
+                .ok_or_else(|| {
+                    ExecError::Invalid(
+                        "cannot powertrim this curve: closed curves need 2+ intersections, \
+                         and NURBS/ellipse trimming is not supported yet"
+                            .into(),
+                    )
+                })?;
+            if pieces.len() < 2 {
+                return Err(ExecError::Invalid(
+                    "the crossings only touch the curve's ends — nothing to powertrim".into(),
+                ));
+            }
+            // Drop the picked segment; keep the rest.
+            let count = pieces.len();
+            let drop = powertrim_drop_index(&pieces, pick);
+            let survivors: Vec<Curve> = pieces
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| *i != drop)
+                .map(|(_, c)| c)
+                .collect();
+            let new_ids: Vec<ObjectId> = match ids {
+                Some(ids) if ids.len() == survivors.len() => ids,
+                _ => survivors.iter().map(|_| ObjectId::new()).collect(),
+            };
+            let (obj, index) = doc.remove(tid).expect("resolved");
+            for (piece, pid) in survivors.iter().zip(&new_ids) {
+                doc.insert(SceneObject {
+                    visible: true,
+                    id: *pid,
+                    name: obj.name.clone(),
+                    layer: obj.layer.clone(),
+                    color: None,
+                    material: None,
+                    lineweight_mm: None,
+                    geometry: Geometry::Curve(piece.clone()),
+                });
+            }
+            let remaining = new_ids.len();
+            Ok((
+                Command::PowerTrim { ids: Some(new_ids.clone()), target, pick },
+                Inverse::Replace { created: new_ids.clone(), consumed: vec![(obj, index)] },
+                ApplyOutcome {
+                    message: format!(
+                        "powertrim: removed 1 segment, {remaining} remaining \
+                         ({tid} split into {count})"
+                    ),
+                    created: new_ids,
                 },
             ))
         }
@@ -7953,6 +10473,9 @@ fn apply_forward(
                 },
             ))
         }
+        Command::ArrayCurve { ids, targets, path, count, align } => {
+            exec_array_curve(doc, ids, targets, path, count, align)
+        }
         Command::Delete { targets } => {
             let ids = resolve(doc, &targets)?;
             // Capture each associative dim's last live referent position before
@@ -7966,6 +10489,10 @@ fn apply_forward(
                     removed.push(pair);
                 }
             }
+            // Re-evaluate fields AFTER removal so a count/area field reflects the
+            // deletion. Fields whose referent just vanished keep their last-good
+            // text (eval failure is ignored by refresh_fields).
+            refresh_fields(doc);
             Ok((
                 Command::Delete { targets },
                 Inverse::Restore(removed),
@@ -8238,6 +10765,7 @@ fn apply_forward(
                 },
             ))
         }
+        Command::PlotStyle(op) => apply_plotstyle(doc, op),
         Command::Hide { layer } => {
             let style = layer_style_mut(doc, &layer)?;
             let prev = style.clone();
@@ -8451,6 +10979,77 @@ fn apply_forward(
                 },
             ))
         }
+        Command::CPlane { op } => {
+            use itsjustcad_doc::CPlane;
+            let msg = match &op {
+                CPlaneOp::Report => describe_cplane(&doc.cplane),
+                CPlaneOp::World => {
+                    doc.cplane = CPlane::world();
+                    doc.generation += 1;
+                    "cplane: world XY".to_string()
+                }
+                CPlaneOp::OriginNormal { origin, normal } => {
+                    let plane = CPlane::from_origin_normal(*origin, *normal).ok_or_else(|| {
+                        ExecError::Invalid("cplane normal cannot be zero".into())
+                    })?;
+                    doc.cplane = plane;
+                    doc.generation += 1;
+                    describe_cplane(&doc.cplane)
+                }
+                CPlaneOp::ThreePoint { origin, on_x, on_xy } => {
+                    let plane =
+                        CPlane::from_three_points(*origin, *on_x, *on_xy).ok_or_else(|| {
+                            ExecError::Invalid(
+                                "cplane 3point needs non-collinear points".into(),
+                            )
+                        })?;
+                    doc.cplane = plane;
+                    doc.generation += 1;
+                    describe_cplane(&doc.cplane)
+                }
+                CPlaneOp::Save { name } => {
+                    doc.named_cplanes.insert(name.clone(), doc.cplane);
+                    format!("cplane saved as '{name}'")
+                }
+                CPlaneOp::Recall { name } => {
+                    let plane = doc
+                        .named_cplanes
+                        .get(name)
+                        .copied()
+                        .ok_or_else(|| ExecError::Invalid(format!("no cplane named '{name}'")))?;
+                    doc.cplane = plane;
+                    doc.generation += 1;
+                    format!("cplane '{name}': {}", describe_cplane(&doc.cplane))
+                }
+            };
+            Ok((
+                Command::CPlane { op },
+                // Not logged; this Inverse is never stored.
+                Inverse::DeleteCreated(Vec::new()),
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::HatchPat { path } => {
+            let text = read_import_string(&path)?;
+            let pats = crate::pat::parse_pat(&text).map_err(ExecError::Invalid)?;
+            if pats.is_empty() {
+                return Err(ExecError::Invalid(format!("no hatch patterns found in {path}")));
+            }
+            let prev = doc.hatch_patterns.clone();
+            let n = pats.len();
+            for (name, def) in pats {
+                doc.hatch_patterns.insert(name, def);
+            }
+            doc.generation += 1;
+            Ok((
+                Command::HatchPat { path: path.clone() },
+                Inverse::HatchPatterns { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("imported {n} hatch pattern(s) from {path}"),
+                },
+            ))
+        }
         Command::Underlay { path, corner, width, height } => {
             let prev = doc.underlay.clone();
             let corner = corner.unwrap_or(DVec3::ZERO);
@@ -8469,15 +11068,17 @@ fn apply_forward(
                     _ => (width, " (image unreadable, assumed square)"),
                 },
             };
-            // Keep the previous opacity when swapping the image; new underlays
-            // start fully opaque.
+            // Keep the previous opacity/rotation when swapping the image; new
+            // underlays start fully opaque and unrotated.
             let opacity = prev.as_ref().map_or(1.0, |u| u.opacity);
+            let rotation_deg = prev.as_ref().map_or(0.0, |u| u.rotation_deg);
             doc.underlay = Some(Underlay {
                 path: path.clone(),
                 corner: corner.truncate(),
                 width,
                 height,
                 opacity,
+                rotation_deg,
             });
             doc.generation += 1;
             Ok((
@@ -8511,6 +11112,106 @@ fn apply_forward(
                     created: Vec::new(),
                     message: format!("underlay opacity {opacity:.2}"),
                 },
+            ))
+        }
+        Command::UnderlayMove { dx, dy } => {
+            let prev = doc.underlay.clone();
+            let Some(u) = doc.underlay.as_mut() else {
+                return Err(ExecError::Invalid(
+                    "no underlay to move (place one with: underlay <path>)".into(),
+                ));
+            };
+            u.corner.x += dx;
+            u.corner.y += dy;
+            doc.generation += 1;
+            Ok((
+                Command::UnderlayMove { dx, dy },
+                Inverse::Underlay { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("underlay moved by {dx:.2},{dy:.2} m"),
+                },
+            ))
+        }
+        Command::UnderlayScale { factor } => {
+            let prev = doc.underlay.clone();
+            if factor <= 0.0 {
+                return Err(ExecError::Invalid("underlay scale must be positive".into()));
+            }
+            let Some(u) = doc.underlay.as_mut() else {
+                return Err(ExecError::Invalid(
+                    "no underlay to scale (place one with: underlay <path>)".into(),
+                ));
+            };
+            // Scale about the centre so the image grows/shrinks in place rather
+            // than sliding off its lower-left anchor.
+            let center = u.center();
+            u.width *= factor;
+            u.height *= factor;
+            u.corner.x = center.x - u.width * 0.5;
+            u.corner.y = center.y - u.height * 0.5;
+            doc.generation += 1;
+            Ok((
+                Command::UnderlayScale { factor },
+                Inverse::Underlay { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("underlay scaled x{factor:.3} → {:.2} x {:.2} m", u.width, u.height),
+                },
+            ))
+        }
+        Command::UnderlayRotate { deg } => {
+            let prev = doc.underlay.clone();
+            let Some(u) = doc.underlay.as_mut() else {
+                return Err(ExecError::Invalid(
+                    "no underlay to rotate (place one with: underlay <path>)".into(),
+                ));
+            };
+            u.rotation_deg = deg;
+            doc.generation += 1;
+            Ok((
+                Command::UnderlayRotate { deg },
+                Inverse::Underlay { prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("underlay rotated to {deg:.1}°"),
+                },
+            ))
+        }
+        Command::UnderlayPlace { corner, width, rot_deg } => {
+            let prev = doc.underlay.clone();
+            if width <= 0.0 {
+                return Err(ExecError::Invalid("underlay width must be positive".into()));
+            }
+            let Some(u) = doc.underlay.as_mut() else {
+                return Err(ExecError::Invalid(
+                    "no underlay to place (create one with: underlay <path>)".into(),
+                ));
+            };
+            // Keep the image aspect: derive the new height from the current
+            // width/height ratio (or square if height is degenerate).
+            let aspect = if u.width > 0.0 { u.height / u.width } else { 1.0 };
+            u.corner = corner.truncate();
+            u.width = width;
+            u.height = width * aspect;
+            if let Some(r) = rot_deg {
+                u.rotation_deg = r;
+            }
+            doc.generation += 1;
+            let msg = match rot_deg {
+                Some(r) => format!(
+                    "underlay placed at {:.2},{:.2}, {:.2} x {:.2} m, {r:.1}°",
+                    u.corner.x, u.corner.y, u.width, u.height
+                ),
+                None => format!(
+                    "underlay placed at {:.2},{:.2}, {:.2} x {:.2} m",
+                    u.corner.x, u.corner.y, u.width, u.height
+                ),
+            };
+            Ok((
+                Command::UnderlayPlace { corner, width, rot_deg },
+                Inverse::Underlay { prev },
+                ApplyOutcome { created: Vec::new(), message: msg },
             ))
         }
         Command::UnderlayOff => {
@@ -8728,6 +11429,7 @@ fn apply_forward(
                 },
             ))
         }
+        Command::SheetSet(op) => sheetset_apply(doc, op),
         Command::Export { path } => {
             let ext = path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).unwrap_or_default();
             let (bytes, detail): (Vec<u8>, String) = match ext.as_str() {
@@ -8738,6 +11440,21 @@ fn apply_forward(
                 "svg" => {
                     let (b, count) = crate::svg::export_svg(doc);
                     (b, format!("SVG, {count}"))
+                }
+                // Adobe Illustrator: modern Illustrator opens SVG-content `.ai`
+                // files directly, so the pragmatic MVP writes the exact same
+                // vector content the SVG writer produces. A true native
+                // .ai/PostScript writer is a follow-up.
+                "ai" => {
+                    let (b, count) = crate::svg::export_svg(doc);
+                    (b, format!("AI (SVG-content), {count}"))
+                }
+                // Raster: no GPU in this crate, so we rasterize the same 2D
+                // projection the SVG writer uses onto a CPU buffer and encode
+                // JPEG. Flat top-down plan, not a shaded 3D screenshot.
+                "jpg" | "jpeg" => {
+                    let (b, detail) = crate::raster::export_jpg(doc).map_err(ExecError::Invalid)?;
+                    (b, detail)
                 }
                 "csv" => {
                     let (b, count) = crate::csv::export_csv(doc);
@@ -9039,6 +11756,30 @@ fn apply_forward(
             };
             Ok((
                 Command::Schedule { layer },
+                Inverse::Rename(Vec::new()), // never logged; inverse unused
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::DataExtract { by_instance, path } => {
+            let table = build_dataextract_table(doc, by_instance);
+            let summary = format!(
+                "extracted {} block type(s), {} instance(s)",
+                table.block_types, table.instances
+            );
+            let msg = if let Some(p) = &path {
+                // Write a CSV spreadsheet (the existing lightweight sink; a real
+                // .xlsx writer exists only for SAF — see the report note).
+                std::fs::write(p, dataextract_csv(&table)).map_err(|e| {
+                    ExecError::Invalid(format!("cannot write data extract '{p}': {e}"))
+                })?;
+                format!("{summary} → {p}")
+            } else if table.instances == 0 {
+                "no block instances to extract".to_string()
+            } else {
+                format!("{}\n{summary}", format_dataextract_table(&table))
+            };
+            Ok((
+                Command::DataExtract { by_instance, path },
                 Inverse::Rename(Vec::new()), // never logged; inverse unused
                 ApplyOutcome { created: Vec::new(), message: msg },
             ))
@@ -9476,6 +12217,7 @@ fn apply_forward(
                         scale: sc,
                         source: Some(name.clone()),
                         params: values.clone(),
+                        clip: None,
                     },
                 });
                 return Ok((
@@ -9509,6 +12251,7 @@ fn apply_forward(
                     scale: sc,
                     source: None,
                     params: Default::default(),
+                    clip: None,
                 },
             });
             Ok((
@@ -9560,15 +12303,16 @@ fn apply_forward(
             }
             let id = ids[0];
             let obj = doc.get(id).expect("resolved");
-            let (source, cur_params, position, rot, sc) = match &obj.geometry {
+            let (source, cur_params, position, rot, sc, clip) = match &obj.geometry {
                 Geometry::Instance {
                     source: Some(src),
                     params: cur,
                     position,
                     rotation_deg,
                     scale,
+                    clip,
                     ..
-                } => (src.clone(), cur.clone(), *position, *rotation_deg, *scale),
+                } => (src.clone(), cur.clone(), *position, *rotation_deg, *scale, *clip),
                 _ => {
                     return Err(ExecError::Invalid(format!(
                         "param: '{id}' is not a dynamic-block instance"
@@ -9606,6 +12350,7 @@ fn apply_forward(
                     scale: sc,
                     source: Some(source.clone()),
                     params: new_values.clone(),
+                    clip,
                 };
             }
             doc.generation += 1;
@@ -9774,6 +12519,258 @@ fn apply_forward(
                 ApplyOutcome { created: Vec::new(), message: msg },
             ))
         }
+        // xref attach: the file has ALREADY been imported into `geometries` on a
+        // scratch session (see `Session::run`); this arm just packs the def, the
+        // instance and the path binding, and records a self-contained op.
+        Command::XrefAttach { path, at, scale, rotation_deg, id, name, geometries } => {
+            let name = name.ok_or_else(|| {
+                ExecError::Invalid("xref attach: name not resolved (internal)".into())
+            })?;
+            let defs = geometries.ok_or_else(|| {
+                ExecError::Invalid("xref attach: geometry not resolved (internal)".into())
+            })?;
+            let id = id.unwrap_or_default();
+            let pos = at.unwrap_or(DVec3::ZERO);
+            let rot = rotation_deg.unwrap_or(0.0);
+            let sc = scale.unwrap_or(1.0);
+            if sc <= 0.0 {
+                return Err(ExecError::Invalid("xref attach scale must be positive".into()));
+            }
+            let ngeo = defs.len();
+            let prev_block = doc.blocks.insert(name.clone(), defs.clone());
+            let prev_path = doc.xrefs.insert(name.clone(), path.clone());
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Instance {
+                    block: name.clone(),
+                    position: pos,
+                    rotation_deg: rot,
+                    scale: sc,
+                    source: None,
+                    params: Default::default(),
+                    clip: None,
+                },
+            });
+            doc.generation += 1;
+            Ok((
+                Command::XrefAttach {
+                    path,
+                    at: Some(pos),
+                    scale: Some(sc),
+                    rotation_deg: Some(rot),
+                    id: Some(id),
+                    name: Some(name.clone()),
+                    geometries: Some(defs),
+                },
+                Inverse::XrefAttached { created: vec![id], name: name.clone(), prev_block, prev_path },
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("xref '{name}' attached ({ngeo} geometr{}) -> {id} at {pos}", if ngeo == 1 { "y" } else { "ies" }),
+                },
+            ))
+        }
+        // xref reload: the file has ALREADY been re-imported into `geometries`;
+        // rebuild the block def IN PLACE. Instances reference it by name, so
+        // their placements are untouched.
+        Command::XrefReload { name, geometries } => {
+            if !doc.xrefs.contains_key(&name) {
+                return Err(ExecError::Invalid(format!(
+                    "no xref named '{name}' (use 'xref list' to see attached xrefs)"
+                )));
+            }
+            let defs = geometries.ok_or_else(|| {
+                ExecError::Invalid("xref reload: geometry not resolved (internal)".into())
+            })?;
+            let ngeo = defs.len();
+            let prev = doc.blocks.insert(name.clone(), defs.clone());
+            doc.generation += 1;
+            Ok((
+                Command::XrefReload { name: name.clone(), geometries: Some(defs) },
+                Inverse::BlockDef { name: name.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("xref '{name}' reloaded ({ngeo} geometr{})", if ngeo == 1 { "y" } else { "ies" }),
+                },
+            ))
+        }
+        Command::XrefDetach { name } => {
+            let path = doc.xrefs.get(&name).cloned().ok_or_else(|| {
+                ExecError::Invalid(format!(
+                    "no xref named '{name}' (use 'xref list' to see attached xrefs)"
+                ))
+            })?;
+            // Collect the instance objects referencing this xref (plain block:
+            // `block == name`), remove them (capturing creation indices for undo).
+            let ids: Vec<ObjectId> = doc
+                .objects()
+                .filter(|o| matches!(&o.geometry, Geometry::Instance { block, source: None, .. } if *block == name))
+                .map(|o| o.id)
+                .collect();
+            let mut instances = Vec::new();
+            for id in ids {
+                if let Some(pair) = doc.remove(id) {
+                    instances.push(pair);
+                }
+            }
+            let def = doc.blocks.remove(&name).unwrap_or_default();
+            doc.xrefs.remove(&name);
+            doc.generation += 1;
+            let n = instances.len();
+            Ok((
+                Command::XrefDetach { name: name.clone() },
+                Inverse::XrefDetached { name: name.clone(), path, def, instances },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("xref '{name}' detached ({n} instance{} removed)", if n == 1 { "" } else { "s" }),
+                },
+            ))
+        }
+        Command::XrefList => {
+            // Count live instances per xref name (plain block instances).
+            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            for o in doc.objects() {
+                if let Geometry::Instance { block, source: None, .. } = &o.geometry
+                    && doc.xrefs.contains_key(block)
+                {
+                    *counts.entry(block.clone()).or_default() += 1;
+                }
+            }
+            let list: Vec<String> = doc
+                .xrefs
+                .iter()
+                .map(|(name, path)| {
+                    let n = counts.get(name).copied().unwrap_or(0);
+                    format!("  {name} ← {path} ({n} instance{})", if n == 1 { "" } else { "s" })
+                })
+                .collect();
+            let msg = if list.is_empty() {
+                "no xrefs attached".to_string()
+            } else {
+                format!("xrefs:\n{}", list.join("\n"))
+            };
+            Ok((
+                Command::XrefList,
+                // XrefList is not logged; this Inverse is never stored.
+                Inverse::DeleteCreated(Vec::new()),
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        // ncopy: bake ONE sub-object of a block/xref instance into an independent
+        // host object under the instance's placement. The instance is untouched.
+        Command::Ncopy { target, index, id } => {
+            let ids = resolve(doc, &target)?;
+            if ids.len() != 1 {
+                return Err(ExecError::Invalid(format!(
+                    "ncopy: selector matched {} objects, expected exactly 1 instance",
+                    ids.len()
+                )));
+            }
+            let obj = doc.get(ids[0]).expect("resolved");
+            let (block, position, rotation_deg, scale) = match &obj.geometry {
+                Geometry::Instance { block, position, rotation_deg, scale, .. } => {
+                    (block.clone(), *position, *rotation_deg, *scale)
+                }
+                _ => {
+                    return Err(ExecError::Invalid(
+                        "ncopy: target is not a block/xref instance".into(),
+                    ))
+                }
+            };
+            let defs = doc.blocks.get(&block).ok_or_else(|| {
+                ExecError::Invalid(format!("ncopy: block definition '{block}' not found"))
+            })?;
+            let sub = defs.get(index).ok_or_else(|| {
+                ExecError::Invalid(format!(
+                    "ncopy: sub-object index {index} out of range (block '{block}' has {} geometr{})",
+                    defs.len(),
+                    if defs.len() == 1 { "y" } else { "ies" }
+                ))
+            })?;
+            // Bake the sub-object to world space under the instance transform:
+            // scale, then rotate about Z, then translate (matches the render
+            // resolution in `render::snapshot`).
+            let mut geometry: Geometry = match sub {
+                itsjustcad_doc::BlockGeometry::Mesh(m) => Geometry::Mesh(m.clone()),
+                itsjustcad_doc::BlockGeometry::Curve(c) => Geometry::Curve(c.clone()),
+                itsjustcad_doc::BlockGeometry::Annotation(a) => Geometry::Annotation(a.clone()),
+            };
+            let m = glam::DMat4::from_translation(position)
+                * glam::DMat4::from_rotation_z(rotation_deg.to_radians())
+                * glam::DMat4::from_scale(DVec3::splat(scale));
+            geometry.transform(&m, BOUNDARY_TOL);
+            let new_id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id: new_id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry,
+            });
+            doc.generation += 1;
+            Ok((
+                Command::Ncopy { target, index, id: Some(new_id) },
+                Inverse::DeleteCreated(vec![new_id]),
+                ApplyOutcome {
+                    created: vec![new_id],
+                    message: format!("ncopy: sub-object {index} of '{block}' -> {new_id}"),
+                },
+            ))
+        }
+        // xclip: set (or clear, with `rect: None`) the XCLIP boundary on the
+        // selected block/xref instance(s). Mutates the instance geometry field,
+        // so undo restores the prior geometry snapshot.
+        Command::Xclip { target, rect } => {
+            let ids = resolve(doc, &target)?;
+            // Snapshot only the instances we actually touch (for undo) and mutate
+            // their `clip` field in place.
+            let mut snapshots: Vec<(ObjectId, Geometry)> = Vec::new();
+            let mut touched = 0usize;
+            for id in &ids {
+                let is_instance = matches!(
+                    doc.get(*id).map(|o| &o.geometry),
+                    Some(Geometry::Instance { .. })
+                );
+                if !is_instance {
+                    continue;
+                }
+                let prev = doc.get(*id).expect("resolved").geometry.clone();
+                if let Some(o) = doc.get_mut(*id)
+                    && let Geometry::Instance { clip, .. } = &mut o.geometry
+                {
+                    *clip = rect;
+                }
+                snapshots.push((*id, prev));
+                touched += 1;
+            }
+            if touched == 0 {
+                return Err(ExecError::Invalid(
+                    "xclip: selection has no block/xref instances".into(),
+                ));
+            }
+            doc.generation += 1;
+            let message = if rect.is_some() {
+                format!("xclip: clipped {touched} instance{}", if touched == 1 { "" } else { "s" })
+            } else {
+                format!(
+                    "xclip: cleared clip on {touched} instance{}",
+                    if touched == 1 { "" } else { "s" }
+                )
+            };
+            Ok((
+                Command::Xclip { target, rect },
+                Inverse::SetGeometry(snapshots),
+                ApplyOutcome { created: Vec::new(), message },
+            ))
+        }
         Command::Workdir { path } => {
             // No arg → show the current grant. With a path → grant that folder.
             let msg = match path {
@@ -9935,24 +12932,53 @@ fn apply_forward(
                 ApplyOutcome { created: Vec::new(), message: msg },
             ))
         }
-        Command::DefStory { name, elevation } => {
+        Command::DefStory { name, elevation, height } => {
             let prev = doc.stories.clone();
+            let h = height.unwrap_or(0.0);
             // Replace by name if it already exists, else append; keep sorted by
             // elevation so level lists read bottom-to-top.
             if let Some(s) = doc.stories.iter_mut().find(|s| s.name == name) {
                 s.elevation = elevation;
+                s.height = h;
             } else {
-                doc.stories.push(Story { name: name.clone(), elevation });
+                doc.stories.push(Story { name: name.clone(), elevation, height: h });
             }
             doc.stories.sort_by(|a, b| a.elevation.total_cmp(&b.elevation));
             doc.generation += 1;
+            let msg = if h > 0.0 {
+                format!("story '{name}' at {elevation} m (h={h} m)")
+            } else {
+                format!("story '{name}' at {elevation} m")
+            };
             Ok((
-                Command::DefStory { name: name.clone(), elevation },
+                Command::DefStory { name: name.clone(), elevation, height },
                 Inverse::StoryList(prev),
-                ApplyOutcome {
-                    created: Vec::new(),
-                    message: format!("story '{name}' at {elevation} m"),
-                },
+                ApplyOutcome { created: Vec::new(), message: msg },
+            ))
+        }
+        Command::StoryList => {
+            let msg = if doc.stories.is_empty() {
+                "no stories defined (define one with 'level <name> <elevation> [height <h>]')"
+                    .to_string()
+            } else {
+                let lines: Vec<String> = doc
+                    .stories
+                    .iter()
+                    .map(|s| {
+                        if s.height > 0.0 {
+                            format!("{} @ {} m (h={} m)", s.name, s.elevation, s.height)
+                        } else {
+                            format!("{} @ {} m", s.name, s.elevation)
+                        }
+                    })
+                    .collect();
+                format!("{} level(s): {}", doc.stories.len(), lines.join(", "))
+            };
+            Ok((
+                Command::StoryList,
+                // Not logged; this Inverse is never stored.
+                Inverse::DeleteCreated(Vec::new()),
+                ApplyOutcome { created: Vec::new(), message: msg },
             ))
         }
         Command::Room { boundary, occupancy, name } => {
@@ -10125,6 +13151,126 @@ fn apply_forward(
                 ApplyOutcome {
                     created: vec![id],
                     message: format!("{} {id} (t={thickness} m)", kind.label()),
+                },
+            ))
+        }
+        Command::FromLayer { layer, element, thickness, height, level, created } => {
+            use itsjustcad_doc::AreaKind;
+            // Only walls are built today; parse rejects anything else, but guard
+            // here too so a hand-crafted op-log can't smuggle in an unsupported
+            // element kind.
+            if element != AreaKind::Wall {
+                return Err(ExecError::Invalid(
+                    "fromlayer only builds walls for now".into(),
+                ));
+            }
+            if thickness <= 0.0 {
+                return Err(ExecError::Invalid("wall thickness must be positive".into()));
+            }
+            // Resolve the base elevation + rise, from an explicit height or a
+            // named level. Exactly one is present (enforced at parse time).
+            let (base_z, rise) = match (height, &level) {
+                (Some(h), None) => (0.0, h),
+                (None, Some(name)) => {
+                    let story = doc.stories.iter().find(|s| &s.name == name).ok_or_else(|| {
+                        ExecError::Invalid(format!(
+                            "no level named '{name}' (define one with 'level {name} <elevation> height <h>')"
+                        ))
+                    })?;
+                    if story.height <= 0.0 {
+                        return Err(ExecError::Invalid(format!(
+                            "level '{name}' has no height (redefine with 'level {name} {} height <h>')",
+                            story.elevation
+                        )));
+                    }
+                    (story.elevation, story.height)
+                }
+                _ => {
+                    return Err(ExecError::Invalid(
+                        "fromlayer needs exactly one of 'height' or 'level'".into(),
+                    ))
+                }
+            };
+            if rise <= 0.0 {
+                return Err(ExecError::Invalid("wall height must be positive".into()));
+            }
+            // Collect the run of points for every curve object on the layer. A
+            // Line contributes its two endpoints; a Polyline its point list;
+            // Arc/Ellipse/Nurbs are tessellated. Non-curve objects are ignored.
+            let mut runs: Vec<Vec<DVec3>> = Vec::new();
+            for obj in doc.objects() {
+                if obj.layer != layer {
+                    continue;
+                }
+                if let Geometry::Curve(curve) = &obj.geometry {
+                    let pts: Vec<DVec3> = match curve {
+                        Curve::Line { a, b } => vec![*a, *b],
+                        Curve::Polyline { points, .. } => points.clone(),
+                        other => other.tessellate(PROFILE_TOL),
+                    };
+                    if pts.len() >= 2 {
+                        runs.push(pts);
+                    }
+                }
+            }
+            if runs.is_empty() {
+                return Err(ExecError::Invalid(format!(
+                    "no curve geometry on layer '{layer}' to build walls from"
+                )));
+            }
+            // One wall per curve run. The wall is a vertical panel: its boundary
+            // is the run projected onto the base plane, then swept from base_z to
+            // base_z+rise. We store it as `Geometry::Area { kind: Wall }` so the
+            // IFC exporter emits an IFCWALL (it keys purely on this AreaKind).
+            let mut created_ids: Vec<ObjectId> = Vec::new();
+            // On replay the ids were captured; hand them out in order.
+            let mut replay = created.iter().copied();
+            for run in &runs {
+                // Vertical boundary loop: bottom run forward, top run back. Put
+                // every bottom point at base_z, top point at base_z+rise.
+                let bottom: Vec<DVec3> =
+                    run.iter().map(|p| DVec3::new(p.x, p.y, base_z)).collect();
+                let mut boundary: Vec<DVec3> = bottom.clone();
+                boundary.extend(
+                    bottom.iter().rev().map(|p| DVec3::new(p.x, p.y, base_z + rise)),
+                );
+                // Thickness direction: horizontal normal of the wall run.
+                let dir = wall_normal(&bottom);
+                let mesh = kernel_mesh::area_member(&boundary, dir, thickness);
+                let id = replay.next().unwrap_or_default();
+                doc.insert(SceneObject {
+                    visible: true,
+                    id,
+                    name: None,
+                    layer: layer.clone(),
+                    color: None,
+                    material: None,
+                    lineweight_mm: None,
+                    geometry: Geometry::Area {
+                        kind: AreaKind::Wall,
+                        boundary,
+                        thickness,
+                        dir,
+                        material: None,
+                        mesh,
+                    },
+                });
+                created_ids.push(id);
+            }
+            let n = created_ids.len();
+            Ok((
+                Command::FromLayer {
+                    layer: layer.clone(),
+                    element,
+                    thickness,
+                    height,
+                    level,
+                    created: created_ids.clone(),
+                },
+                Inverse::DeleteCreated(created_ids.clone()),
+                ApplyOutcome {
+                    created: created_ids,
+                    message: format!("built {n} wall(s) from layer '{layer}'"),
                 },
             ))
         }
@@ -10388,9 +13534,12 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Cablenet { .. } => "cablenet",
         Command::MinSurf { .. } => "minsurf",
         Command::Line { .. } => "line",
+        Command::LineTan { .. } => "linetan",
+        Command::LinePerp { .. } => "lineperp",
         Command::Polyline { .. } => "polyline",
         Command::Rectangle { .. } => "rect",
         Command::Circle { .. } => "circle",
+        Command::CircleTan { .. } => "circletan",
         Command::Arc { .. } => "arc",
         Command::Ellipse { .. } => "ellipse",
         Command::Polygon { .. } => "polygon",
@@ -10402,8 +13551,14 @@ fn describe(cmd: &Command) -> &'static str {
         Command::CurvatureGraph { .. } => "curvature",
         Command::Rebuild { .. } => "rebuild",
         Command::Dim { .. } => "dim",
+        Command::DimAngular { .. } => "dimangular",
         Command::Text { .. } => "text",
+        Command::Field { .. } => "field",
         Command::Hatch { .. } => "hatch",
+        Command::HatchPat { .. } => "hatchpat",
+        Command::Boundary { .. } => "boundary",
+        Command::CurveBool { .. } => "curvebool",
+        Command::AutoDim { .. } => "autodim",
         Command::Union { .. } => "union",
         Command::Difference { .. } => "difference",
         Command::Intersect { .. } => "intersect",
@@ -10414,9 +13569,20 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Move { .. } => "move",
         Command::Rotate { .. } => "rotate",
         Command::Scale { .. } => "scale",
+        Command::Align { .. } => "align",
+        Command::ToOrigin { .. } => "tozero",
+        Command::Flatten { .. } => "flatten",
+        Command::Stretch { .. } => "stretch",
+        Command::SelSimilar { .. } => "selsimilar",
+        Command::SelDup { .. } => "seldup",
+        Command::SelRegion { .. } => "selregion",
+        Command::DimRadius { diameter, .. } => {
+            if *diameter { "dimdiameter" } else { "dimradius" }
+        }
         Command::Mirror { .. } => "mirror",
         Command::Split { .. } => "split",
         Command::Trim { .. } => "trim",
+        Command::PowerTrim { .. } => "powertrim",
         Command::Extend { .. } => "extend",
         Command::Join { .. } => "join",
         Command::Fillet { .. } => "fillet",
@@ -10424,6 +13590,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Copy { .. } => "copy",
         Command::Array { .. } => "array",
         Command::PolarArray { .. } => "polararray",
+        Command::ArrayCurve { .. } => "arraycurve",
         Command::Delete { .. } => "delete",
         Command::Name { .. } => "name",
         Command::Group { .. } => "group",
@@ -10437,6 +13604,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LayerOrder { .. } => "layerorder",
         Command::LayerLock { .. } => "layerlock",
         Command::LayerLinetype { .. } => "layerlinetype",
+        Command::PlotStyle(..) => "plotstyle",
         Command::Hide { .. } => "hide",
         Command::Show { .. } => "show",
         Command::HideObj { .. } => "hideobj",
@@ -10449,8 +13617,13 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Material2 { .. } => "material2",
         Command::Material2Off { .. } => "material2off",
         Command::Units { .. } => "units",
+        Command::CPlane { .. } => "cplane",
         Command::Underlay { .. } => "underlay",
         Command::UnderlayOpacity { .. } => "underlayopacity",
+        Command::UnderlayMove { .. } => "underlaymove",
+        Command::UnderlayScale { .. } => "underlayscale",
+        Command::UnderlayRotate { .. } => "underlayrotate",
+        Command::UnderlayPlace { .. } => "underlayplace",
         Command::UnderlayOff => "underlayoff",
         Command::Sun { .. } => "sun",
         Command::SunOff => "sunoff",
@@ -10463,6 +13636,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
         Command::Print { .. } => "print",
+        Command::SheetSet(..) => "sheetset",
         Command::Export { .. } => "export",
         Command::ControlImages { .. } => "controlimages",
         Command::Import { .. } => "import",
@@ -10498,6 +13672,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Volume { .. } => "volume",
         Command::Bbox { .. } => "bbox",
         Command::Schedule { .. } => "schedule",
+        Command::DataExtract { .. } => "dataextract",
         Command::EnviroReport { .. } => "report",
         Command::CodeCheck { .. } => "codecheck",
         Command::CheckRulesList | Command::CheckRulesLoad { .. } => "checkrules",
@@ -10516,6 +13691,12 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Freeze { .. } => "freeze",
         Command::BlockDeleteDef { .. } => "blockdelete",
         Command::BlocksList => "blocks",
+        Command::XrefAttach { .. } => "xref",
+        Command::XrefList => "xref",
+        Command::XrefReload { .. } => "xref",
+        Command::XrefDetach { .. } => "xref",
+        Command::Ncopy { .. } => "ncopy",
+        Command::Xclip { .. } => "xclip",
         Command::Workdir { .. } => "workdir",
         Command::WorkdirFiles => "files",
         Command::BlockLibList => "blocklib",
@@ -10525,6 +13706,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::DefMaterial { .. } => "material",
         Command::DefGrid { .. } => "grid",
         Command::DefStory { .. } => "story",
+        Command::StoryList => "levels",
+        Command::FromLayer { .. } => "fromlayer",
         Command::Room { .. } => "room",
         Command::RoomList => "rooms",
         Command::FrameMember { kind, .. } => kind.label(),
@@ -10545,6 +13728,184 @@ mod tests {
 
     fn run(s: &mut Session, line: &str) -> ApplyOutcome {
         s.run(parse(line).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn point_in_box_is_inclusive_and_order_agnostic() {
+        let min = DVec3::new(0.0, 0.0, -10.0);
+        let max = DVec3::new(5.0, 5.0, 10.0);
+        // Interior + inclusive faces/corners.
+        assert!(point_in_box(DVec3::new(2.0, 2.0, 0.0), min, max));
+        assert!(point_in_box(min, min, max), "min corner is inside");
+        assert!(point_in_box(max, min, max), "max corner is inside");
+        assert!(point_in_box(DVec3::new(5.0, 0.0, 10.0), min, max), "boundary inside");
+        // Outside on any single axis.
+        assert!(!point_in_box(DVec3::new(6.0, 2.0, 0.0), min, max));
+        assert!(!point_in_box(DVec3::new(2.0, -0.1, 0.0), min, max));
+        assert!(!point_in_box(DVec3::new(2.0, 2.0, 11.0), min, max));
+        // Corners passed in reversed order still define the same box.
+        assert!(point_in_box(DVec3::new(2.0, 2.0, 0.0), max, min));
+    }
+
+    /// Stretch moves only the polyline vertices inside the box; vertices outside
+    /// are untouched, and undo restores the pre-stretch geometry exactly.
+    #[test]
+    fn stretch_moves_only_inside_vertices_and_undo_restores() {
+        let mut s = Session::default();
+        // A 4-point open polyline: two vertices inside a small box at the origin,
+        // two well outside it.
+        run(&mut s, "polyline 0,0,0 1,1,0 10,10,0 20,20,0");
+        let id = s.doc.objects().next().expect("one object").id;
+        let before = s.doc.get(id).expect("object").geometry.clone();
+
+        // Box covers [0,2] in XY (a tall z-range for a 2D crossing window);
+        // delta shifts inside vertices by +5 in X.
+        let out = run(&mut s, "stretch all 0,0,-100 2,2,100 5,0,0");
+        assert!(out.message.contains("2 vertices moved"), "message: {}", out.message);
+
+        let after = match &s.doc.get(id).expect("object").geometry {
+            Geometry::Curve(Curve::Polyline { points, .. }) => points.clone(),
+            other => panic!("expected polyline, got {other:?}"),
+        };
+        // Inside vertices moved by +5 X; outside vertices unchanged.
+        assert_eq!(after[0], DVec3::new(5.0, 0.0, 0.0));
+        assert_eq!(after[1], DVec3::new(6.0, 1.0, 0.0));
+        assert_eq!(after[2], DVec3::new(10.0, 10.0, 0.0));
+        assert_eq!(after[3], DVec3::new(20.0, 20.0, 0.0));
+
+        // Undo restores the original geometry byte-for-byte.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.get(id).expect("object").geometry, before);
+    }
+
+    /// No vertex in the box → a clear no-op message, no snapshot, and undo is a
+    /// separate concern (nothing to restore for this op).
+    #[test]
+    fn stretch_empty_box_is_a_noop() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 1,1,0 2,2,0");
+        let id = s.doc.objects().next().expect("one object").id;
+        let before = s.doc.get(id).expect("object").geometry.clone();
+
+        let out = run(&mut s, "stretch all 100,100,0 200,200,0 5,0,0");
+        assert!(out.message.contains("no vertices in box"), "message: {}", out.message);
+        // Geometry untouched.
+        assert_eq!(s.doc.get(id).expect("object").geometry, before);
+    }
+
+    /// Pure transform builder: src1→tgt1 with a 90° planar swing (src dir +X,
+    /// tgt dir +Y) maps src1 to tgt1 and rotates the direction as expected.
+    #[test]
+    fn align_transform_maps_points_and_rotates_90() {
+        let src1 = DVec3::new(0.0, 0.0, 0.0);
+        let tgt1 = DVec3::new(10.0, 20.0, 0.0);
+        let src2 = DVec3::new(1.0, 0.0, 0.0); // src dir +X
+        let tgt2 = DVec3::new(10.0, 21.0, 0.0); // tgt dir +Y (90° CCW)
+        let m = align_transform(src1, tgt1, src2, tgt2, false).expect("non-degenerate");
+        // src1 lands on tgt1.
+        let p1 = m.transform_point3(src1);
+        assert!((p1 - tgt1).length() < 1e-9, "src1→tgt1: {p1}");
+        // src2 maps onto tgt2 (rigid, no scale, dir aligned).
+        let p2 = m.transform_point3(src2);
+        assert!((p2 - tgt2).length() < 1e-9, "src2→tgt2: {p2}");
+    }
+
+    /// Degenerate reference vectors (src1==src2 or tgt1==tgt2) → None.
+    #[test]
+    fn align_transform_zero_length_ref_is_none() {
+        let p = DVec3::ZERO;
+        assert!(align_transform(p, DVec3::X, p, DVec3::new(0.0, 1.0, 0.0), false).is_none());
+        assert!(align_transform(p, DVec3::X, DVec3::Y, DVec3::X, false).is_none());
+    }
+
+    /// Full exec: a box at the origin aligned with a +90° swing lands its AABB
+    /// center at the expected spot; undo restores geometry.
+    #[test]
+    fn align_translates_and_rotates_object() {
+        let mut s = Session::default();
+        // 2×2×2 box, min corner at origin → AABB center (1,1,1).
+        run(&mut s, "box 0,0,0 2,2,2");
+        let id = s.doc.objects().next().expect("one object").id;
+        let before = s.doc.get(id).expect("object").geometry.clone();
+
+        // src1 origin → tgt1 (10,20,0); src dir +X → tgt dir +Y (90° CCW about
+        // tgt1). The center (1,1,1) about pivot src1=origin rotates to (-1,1,1)
+        // then translates by tgt1 → (9,21,1).
+        let out = run(&mut s, "align all 0,0,0 10,20,0 1,0,0 10,21,0");
+        assert!(out.message.contains("aligned 1 object"), "message: {}", out.message);
+
+        let center = s.doc.get(id).expect("object").geometry.aabb().center();
+        let expected = DVec3::new(9.0, 21.0, 1.0);
+        assert!((center - expected).length() < 1e-6, "center {center}, expected {expected}");
+
+        run(&mut s, "undo");
+        assert_eq!(s.doc.get(id).expect("object").geometry, before);
+    }
+
+    /// `scale on`: a target vector twice the source length doubles the object.
+    #[test]
+    fn align_scale_on_doubles_size() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2"); // 2×2×2
+        let id = s.doc.objects().next().expect("one object").id;
+        let size_before = s.doc.get(id).expect("object").geometry.aabb().size();
+
+        // Same origin/heading, tgt dir (2 long) is 2× the src dir (1 long).
+        run(&mut s, "align all 0,0,0 0,0,0 1,0,0 2,0,0 scale on");
+        let size_after = s.doc.get(id).expect("object").geometry.aabb().size();
+        assert!(
+            (size_after - size_before * 2.0).length() < 1e-6,
+            "size {size_after}, expected {}",
+            size_before * 2.0
+        );
+    }
+
+    /// Degenerate reference vectors surface as a clear exec error.
+    #[test]
+    fn align_zero_length_ref_errors() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2");
+        let err = s
+            .run(parse("align all 0,0,0 5,5,0 0,0,0 6,6,0").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("non-zero"), "{err}");
+    }
+
+    /// align on an empty selection is rejected (mirrors tozero/flatten/stretch)
+    /// and logs no op. `resolve` guards the empty-`all` case, and the added
+    /// `ids.is_empty()` check guards any Ok(empty) resolution (e.g. a corrupted
+    /// `Ids` op-log that filters down to nothing) — either way: error, no op.
+    #[test]
+    fn align_empty_selection_errors_and_logs_nothing() {
+        let mut s = Session::default();
+        let before = s.history().0.len();
+        // Empty doc → `all` resolves to nothing. Distinct (non-zero) reference
+        // vecs so the failure is the selection, not the vector check.
+        let err = s
+            .run(parse("align all 0,0,0 5,5,0 1,1,0 6,6,0").unwrap())
+            .unwrap_err();
+        assert!(matches!(err, ExecError::EmptySelection(_)), "empty selection rejected: {err}");
+        assert_eq!(s.history().0.len(), before, "no op logged on empty align");
+
+        // Directly exercise the verb's own `ids.is_empty()` guard via an `Ids`
+        // op that filters to nothing (stale id in an otherwise non-empty doc).
+        run(&mut s, "box 0,0,0 1,1,1");
+        let before = s.history().0.len();
+        let err = s
+            .run(Command::Align {
+                targets: Selector::Ids { ids: vec![ObjectId::new()] },
+                src1: DVec3::ZERO,
+                tgt1: DVec3::new(5.0, 5.0, 0.0),
+                src2: DVec3::new(1.0, 1.0, 0.0),
+                tgt2: DVec3::new(6.0, 6.0, 0.0),
+                scale: false,
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("nothing selected") || matches!(err, ExecError::EmptySelection(_)),
+            "align guards an empty resolution: {err}"
+        );
+        assert_eq!(s.history().0.len(), before, "no op logged on empty align");
     }
 
     // ── M-perf bench: one big analysis case, ignored by default ─────────────
@@ -11482,6 +14843,164 @@ mod tests {
         // count < 2 refuses
         let err = s.run(parse("polararray last 1").unwrap()).unwrap_err();
         assert!(err.to_string().contains("at least 2"), "{err}");
+    }
+
+    #[test]
+    fn curve_station_ts_spacing() {
+        assert_eq!(curve_station_ts(1, false), vec![0.0]);
+        assert_eq!(curve_station_ts(2, false), vec![0.0, 1.0]);
+        assert_eq!(curve_station_ts(3, false), vec![0.0, 0.5, 1.0]);
+        let ts = curve_station_ts(5, false);
+        assert_eq!(ts.len(), 5);
+        assert!((ts[0] - 0.0).abs() < 1e-12 && (ts[4] - 1.0).abs() < 1e-12);
+        // evenly spaced
+        for w in ts.windows(2) {
+            assert!(((w[1] - w[0]) - 0.25).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn curve_station_ts_closed_excludes_endpoint() {
+        // Closed path: count stations over [0,1), never t=1 (which == t=0).
+        let ts = curve_station_ts(4, true);
+        assert_eq!(ts, vec![0.0, 0.25, 0.5, 0.75]);
+        assert!(!ts.iter().any(|&t| (t - 1.0).abs() < 1e-12), "no duplicate endpoint");
+    }
+
+    #[test]
+    fn array_curve_even_spacing_translate() {
+        let mut s = Session::default();
+        // Source unit box centered at origin, and a straight 10 m path in +X.
+        run(&mut s, "box -0.5,-0.5,0 1,1,1");
+        run(&mut s, "name last widget");
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "name last path");
+        // 3 copies, no alignment: evenly spaced stations at x = 0, 5, 10.
+        let out = run(&mut s, "arraycurve widget path 3 align off");
+        assert_eq!(out.created.len(), 3);
+        // Copies center on the path (z = 0); the source's aabb center is the
+        // reference point moved to each station.
+        for want_x in [0.0, 5.0, 10.0] {
+            let want = DVec3::new(want_x, 0.0, 0.0);
+            assert!(
+                s.doc
+                    .objects()
+                    .any(|o| (o.geometry.aabb().center() - want).length() < 1e-9),
+                "missing copy at x={want_x}"
+            );
+        }
+        // Original + 3 copies.
+        assert_eq!(s.doc.len(), 5);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2); // just source box + path curve
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 5);
+    }
+
+    #[test]
+    fn array_curve_open_near_closed_keeps_endpoint() {
+        // An OPEN polyline whose ends are ~5 mm apart (well within PROFILE_TOL,
+        // 1 cm) must still be treated as OPEN: stations include both endpoints
+        // (t=0 and t=1), so 3 copies land on the start, mid, and near-end — the
+        // endpoint copy is NOT dropped as it would be for a closed path.
+        let mut s = Session::default();
+        run(&mut s, "box -0.5,-0.5,0 1,1,1");
+        run(&mut s, "name last widget");
+        // Open path: start (0,0,0) and end (0,0.005,0) are 5 mm apart — near, but
+        // the polyline is left open (no `closed`/loop back).
+        run(&mut s, "polyline 0,0,0 10,0,0 10,10,0 0,0.005,0");
+        run(&mut s, "name last path");
+        let out = run(&mut s, "arraycurve widget path 3 align off");
+        // Open stationing → count copies (no endpoint merge): 3 copies made.
+        assert_eq!(out.created.len(), 3, "open path keeps the endpoint copy");
+        // The last station (t=1) lands at the path END (~0,0.005,0), NOT looped
+        // back to the start — confirming open (not closed) stationing.
+        let last_at_end = s.doc.objects().any(|o| {
+            let c = o.geometry.aabb().center();
+            (c - DVec3::new(0.0, 0.005, 0.0)).length() < 1e-2
+        });
+        assert!(last_at_end, "final copy sits at the open path's endpoint");
+
+        // Contrast: a genuinely CLOSED path of the same shape drops the
+        // duplicate endpoint (3 stations over [0,1), none at t=1).
+        let mut sc = Session::default();
+        run(&mut sc, "box -0.5,-0.5,0 1,1,1");
+        run(&mut sc, "name last widget");
+        run(&mut sc, "polyline 0,0,0 10,0,0 10,10,0 closed");
+        run(&mut sc, "name last path");
+        let outc = run(&mut sc, "arraycurve widget path 3 align off");
+        assert_eq!(outc.created.len(), 3, "closed path still makes `count` copies");
+        // For the closed path, the last station is at t=0.667 (not the closing
+        // point), so no copy coincides with the loop's start/close at (0,0,0)
+        // other than the t=0 one — i.e. stations are [0, 1/3, 2/3).
+    }
+
+    #[test]
+    fn array_curve_aligns_to_tangent() {
+        let mut s = Session::default();
+        // Asymmetric source: x-extent 1, y-extent 3 (aabb reveals rotation).
+        run(&mut s, "box -0.5,-1.5,0 1,3,1");
+        run(&mut s, "name last widget");
+        // L-shaped path: run east then turn north.
+        run(&mut s, "polyline 0,0 10,0 10,10");
+        run(&mut s, "name last path");
+        // With alignment on, copies on the +Y leg rotate 90° about Z, so their
+        // aabb x-extent grows to ~3 and y-extent shrinks to ~1 — orientation
+        // differs from the source box.
+        run(&mut s, "arraycurve widget path 5 align on");
+        let rotated = s.doc.objects().any(|o| {
+            let s = o.geometry.aabb().size();
+            s.x > 2.5 && s.y < 1.5
+        });
+        assert!(rotated, "expected at least one copy rotated to the +Y tangent");
+        // And with alignment off, no copy should be rotated that way.
+        let mut s2 = Session::default();
+        run(&mut s2, "box -0.5,-1.5,0 1,3,1");
+        run(&mut s2, "name last widget");
+        run(&mut s2, "polyline 0,0 10,0 10,10");
+        run(&mut s2, "name last path");
+        run(&mut s2, "arraycurve widget path 5 align off");
+        let any_rotated = s2.doc.objects().any(|o| {
+            let s = o.geometry.aabb().size();
+            s.x > 2.5 && s.y < 1.5
+        });
+        assert!(!any_rotated, "align off must not rotate copies");
+    }
+
+    #[test]
+    fn array_curve_closed_path_no_duplicate_copy() {
+        // On a CLOSED path, t=0 and t=1 coincide; stations must span [0,1) so
+        // `count` copies are distinct with no overlap at the seam.
+        let mut s = Session::default();
+        // Small source box at the origin.
+        run(&mut s, "box -0.1,-0.1,0 0.2,0.2,0.2");
+        run(&mut s, "name last widget");
+        // Closed square path.
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+        run(&mut s, "name last loop");
+        run(&mut s, "arraycurve widget loop 4 align off");
+
+        // Copy centers (all mesh objects except the source at the origin).
+        let mut centers: Vec<DVec3> = s
+            .doc
+            .objects()
+            .filter(|o| matches!(&o.geometry, Geometry::Mesh(_)))
+            .map(|o| o.geometry.aabb().center())
+            .collect();
+        // 1 source + 4 copies = 5 mesh objects.
+        assert_eq!(centers.len(), 5, "source + 4 copies, got {}", centers.len());
+        // No two placements coincide (a duplicate endpoint would overlap two).
+        centers.sort_by(|a, b| {
+            a.x.partial_cmp(&b.x).unwrap().then(a.y.partial_cmp(&b.y).unwrap())
+        });
+        for w in centers.windows(2) {
+            assert!(
+                (w[0] - w[1]).length() > 1e-6,
+                "no two placements coincide: {} vs {}",
+                w[0],
+                w[1]
+            );
+        }
     }
 
     #[test]
@@ -12450,6 +15969,70 @@ mod tests {
     }
 
     #[test]
+    fn powertrim_drop_index_is_pure() {
+        let seg = |x0: f64, x1: f64| Curve::Line {
+            a: DVec3::new(x0, 0.0, 0.0),
+            b: DVec3::new(x1, 0.0, 0.0),
+        };
+        let pieces = [seg(0.0, 3.0), seg(3.0, 7.0), seg(7.0, 10.0)];
+        // pick sits inside the middle segment
+        assert_eq!(powertrim_drop_index(&pieces, DVec3::new(5.0, 0.0, 0.0)), 1);
+        assert_eq!(powertrim_drop_index(&pieces, DVec3::new(1.0, 0.0, 0.0)), 0);
+        assert_eq!(powertrim_drop_index(&pieces, DVec3::new(9.0, 0.0, 0.0)), 2);
+    }
+
+    #[test]
+    fn powertrim_removes_picked_segment_against_all_curves() {
+        let mut s = Session::default();
+        // Horizontal line crossed by two vertical cutters at x=3 and x=7.
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last wall");
+        run(&mut s, "line 3,-1 3,1");
+        run(&mut s, "line 7,-1 7,1");
+        // Pick on the middle segment (x in 3..7); no cutter selector given.
+        let out = run(&mut s, "powertrim wall 5,0");
+        assert!(out.message.contains("removed 1 segment, 2 remaining"), "{}", out.message);
+        // 2 cutters + 2 surviving outer segments = 4 objects.
+        assert_eq!(s.doc.len(), 4);
+
+        // The two survivors are the outer segments; the middle is gone.
+        let mut spans: Vec<(f64, f64)> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Line { a, b }) if (a.y).abs() < 1e-9 && (b.y).abs() < 1e-9 => {
+                    Some((a.x.min(b.x), a.x.max(b.x)))
+                }
+                _ => None,
+            })
+            .collect();
+        spans.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap());
+        assert_eq!(spans.len(), 2);
+        assert!((spans[0].0 - 0.0).abs() < 1e-9 && (spans[0].1 - 3.0).abs() < 1e-9, "{spans:?}");
+        assert!((spans[1].0 - 7.0).abs() < 1e-9 && (spans[1].1 - 10.0).abs() < 1e-9, "{spans:?}");
+        // survivors inherit the target's name
+        assert_eq!(s.doc.find_named("wall").len(), 2);
+
+        // Undo restores the original single full-length line.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 3);
+        let walls = s.doc.find_named("wall");
+        assert_eq!(walls.len(), 1);
+        let Geometry::Curve(Curve::Line { a, b }) = &s.doc.get(walls[0]).unwrap().geometry else {
+            panic!()
+        };
+        assert!(a.distance(DVec3::ZERO) < 1e-9);
+        assert!(b.distance(DVec3::new(10.0, 0.0, 0.0)) < 1e-9, "undo restores full line");
+
+        // No crossings → error, doc untouched.
+        let n = s.doc.len();
+        run(&mut s, "line 100,0 110,0");
+        let err = s.run(parse("powertrim last 105,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("nothing to powertrim"), "{err}");
+        assert_eq!(s.doc.len(), n + 1);
+    }
+
+    #[test]
     fn extend_open_curves_and_undo() {
         let mut s = Session::default();
         run(&mut s, "line 0,0 10,0");
@@ -12825,6 +16408,101 @@ mod tests {
     }
 
     #[test]
+    fn plotstyle_pen_lookup_overrides_mapped_layer_only() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0,0 1,0,0"); // on Default
+        run(&mut s, "line 0,0,0 0,1,0"); // on Default
+        run(&mut s, "layer walls"); // creates 'walls', makes it current
+        run(&mut s, "layer default"); // switch current back to the default layer
+        run(&mut s, "tolayer last walls"); // move the 2nd line to walls
+        run(&mut s, "plotstyle new mono");
+        run(&mut s, "plotstyle set mono walls color 1,0,0 weight 0.5");
+        run(&mut s, "plotstyle apply mono");
+
+        // Pull the two objects back out.
+        let walls_obj = s
+            .doc
+            .objects()
+            .find(|o| o.layer == "walls")
+            .expect("walls object")
+            .clone();
+        let default_obj = s
+            .doc
+            .objects()
+            .find(|o| o.layer == itsjustcad_doc::DEFAULT_LAYER)
+            .expect("default object")
+            .clone();
+
+        // Object on the mapped layer gets the overridden pen.
+        let wall_pen = s.doc.plot_pen(&walls_obj, [0.0, 0.0, 0.0]);
+        assert_eq!(wall_pen.color, [1.0, 0.0, 0.0]);
+        assert_eq!(wall_pen.weight_mm, 0.5);
+
+        // Unmapped object keeps its base pen (default black + default weight).
+        let def_pen = s.doc.plot_pen(&default_obj, [0.0, 0.0, 0.0]);
+        assert_eq!(def_pen.color, [0.0, 0.0, 0.0]);
+        assert_eq!(def_pen.weight_mm, s.doc.effective_lineweight(&default_obj));
+
+        // With no active style, even the walls object plots as base.
+        run(&mut s, "plotstyle none");
+        let wall_pen_none = s.doc.plot_pen(&walls_obj, [0.0, 0.0, 0.0]);
+        assert_eq!(wall_pen_none.color, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn plotstyle_undo_restores_table_mutations() {
+        let mut s = Session::default();
+        run(&mut s, "plotstyle new mono");
+        assert!(s.doc.plot_styles.contains_key("mono"));
+        run(&mut s, "plotstyle set mono walls color 1,0,0");
+        assert!(s.doc.plot_styles["mono"].entries.contains_key("walls"));
+        run(&mut s, "plotstyle apply mono");
+        assert_eq!(s.doc.active_plot_style.as_deref(), Some("mono"));
+
+        // Undo apply → active cleared, table intact.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.active_plot_style, None);
+        assert!(s.doc.plot_styles["mono"].entries.contains_key("walls"));
+        // Undo set → entry gone, table still exists.
+        run(&mut s, "undo");
+        assert!(s.doc.plot_styles["mono"].entries.is_empty());
+        // Undo new → table gone.
+        run(&mut s, "undo");
+        assert!(!s.doc.plot_styles.contains_key("mono"));
+        // Redo new → table back.
+        run(&mut s, "redo");
+        assert!(s.doc.plot_styles.contains_key("mono"));
+    }
+
+    #[test]
+    fn plotstyle_list_is_query_not_logged() {
+        assert!(!parse("plotstyle list").unwrap().is_logged());
+        assert!(parse("plotstyle new mono").unwrap().is_logged());
+        assert!(parse("plotstyle apply mono").unwrap().is_logged());
+        let mut s = Session::default();
+        run(&mut s, "plotstyle new mono");
+        let out = run(&mut s, "plotstyle list");
+        assert!(out.message.contains("mono"), "{}", out.message);
+    }
+
+    #[test]
+    fn plotstyle_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "plotstyle new mono");
+        run(&mut s, "plotstyle set mono walls color 1,0,0 weight 0.5 screen 50");
+        run(&mut s, "plotstyle apply mono");
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(replayed.doc.active_plot_style.as_deref(), Some("mono"));
+        assert!(replayed.doc.plot_styles["mono"].entries.contains_key("walls"));
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "replay-stable log"
+        );
+    }
+
+    #[test]
     fn sections_layer_default_lineweight_is_heavier() {
         let mut s = Session::default();
         run(&mut s, "box 0,0,0 4,4,3");
@@ -13078,6 +16756,348 @@ mod tests {
     }
 
     #[test]
+    fn point_in_polygon_2d_even_odd() {
+        let square = [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]];
+        assert!(point_in_polygon_2d(&square, [2.0, 2.0]));
+        assert!(!point_in_polygon_2d(&square, [5.0, 2.0]));
+        assert!(!point_in_polygon_2d(&square, [-1.0, 2.0]));
+        // Degenerate rings are never "inside".
+        assert!(!point_in_polygon_2d(&[[0.0, 0.0], [1.0, 0.0]], [0.5, 0.0]));
+    }
+
+    #[test]
+    fn boundary_loop_traces_square_from_four_lines() {
+        // Four separate line segments forming a closed square; seed at center.
+        let segs = vec![
+            Seg2 { a: [0.0, 0.0], b: [4.0, 0.0] },
+            Seg2 { a: [4.0, 0.0], b: [4.0, 4.0] },
+            Seg2 { a: [4.0, 4.0], b: [0.0, 4.0] },
+            Seg2 { a: [0.0, 4.0], b: [0.0, 0.0] },
+        ];
+        let loop_xy = boundary_loop(&segs, [2.0, 2.0], BOUNDARY_TOL).expect("enclosed");
+        assert_eq!(loop_xy.len(), 4, "square has 4 corners");
+        // Every corner of the square must appear in the traced loop.
+        for corner in [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]] {
+            assert!(
+                loop_xy.iter().any(|p| (p[0] - corner[0]).abs() < 1e-6
+                    && (p[1] - corner[1]).abs() < 1e-6),
+                "corner {corner:?} missing from {loop_xy:?}"
+            );
+        }
+        // A seed outside the square encloses no bounded face.
+        assert!(boundary_loop(&segs, [10.0, 10.0], BOUNDARY_TOL).is_none());
+    }
+
+    #[test]
+    fn boundary_loop_picks_smallest_containing_face() {
+        // Two nested squares (crossing walls); seed inside the inner one must
+        // return the inner (smaller) loop, not the outer.
+        let mut segs = Vec::new();
+        for (lo, hi) in [(0.0_f64, 8.0_f64), (2.0, 6.0)] {
+            segs.push(Seg2 { a: [lo, lo], b: [hi, lo] });
+            segs.push(Seg2 { a: [hi, lo], b: [hi, hi] });
+            segs.push(Seg2 { a: [hi, hi], b: [lo, hi] });
+            segs.push(Seg2 { a: [lo, hi], b: [lo, lo] });
+        }
+        let loop_xy = boundary_loop(&segs, [4.0, 4.0], BOUNDARY_TOL).expect("enclosed");
+        let area = signed_area(&loop_xy).abs();
+        assert!((area - 16.0).abs() < 1e-6, "inner square area 4x4=16, got {area}");
+    }
+
+    #[test]
+    fn boundary_verb_creates_closed_polyline_and_undo() {
+        let mut s = Session::default();
+        // Four lines forming a 10x6 rectangle.
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "line 10,0,0 10,6,0");
+        run(&mut s, "line 10,6,0 0,6,0");
+        run(&mut s, "line 0,6,0 0,0,0");
+        let out = run(&mut s, "boundary 5,3");
+        assert!(out.message.contains("created loop with 4 vertices"), "{}", out.message);
+        assert_eq!(s.doc.len(), 5); // 4 lines + 1 boundary polyline
+        let obj = s.doc.objects().last().unwrap();
+        let Geometry::Curve(Curve::Polyline { points, closed }) = &obj.geometry else {
+            panic!("expected closed polyline, got {:?}", obj.geometry);
+        };
+        assert!(*closed, "boundary polyline must be closed");
+        assert_eq!(points.len(), 4);
+        for corner in [[0.0, 0.0], [10.0, 0.0], [10.0, 6.0], [0.0, 6.0]] {
+            assert!(
+                points.iter().any(|p| (p.x - corner[0]).abs() < 1e-6
+                    && (p.y - corner[1]).abs() < 1e-6),
+                "corner {corner:?} missing"
+            );
+        }
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 4); // boundary removed
+
+        // A seed outside any loop → clear error.
+        let err = s.run(parse("boundary 100,100").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no closed region around seed"), "{err}");
+    }
+
+    // Two axis-aligned squares overlapping in a 2x2 corner: A=[0,4]², B=[2,6]².
+    fn two_overlapping_squares() -> (Vec<[f64; 2]>, Vec<[f64; 2]>) {
+        let a = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]];
+        let b = vec![[2.0, 2.0], [6.0, 2.0], [6.0, 6.0], [2.0, 6.0]];
+        (a, b)
+    }
+
+    #[test]
+    fn polygon_boolean_union_intersect_difference() {
+        let (a, b) = two_overlapping_squares();
+        let inputs = vec![a, b];
+
+        // Union: one region, outer boundary, area = 16 + 16 - 4 = 28.
+        let u = polygon_boolean(&inputs, CurveBoolOp::Union, BOUNDARY_TOL);
+        assert_eq!(u.len(), 1, "union is one connected region");
+        let ua: f64 = signed_area(&u[0]).abs();
+        assert!((ua - 28.0).abs() < 1e-6, "union area 28, got {ua}");
+        // A point in A-only and one in B-only are both inside the union.
+        assert!(point_in_polygon_2d(&u[0], [1.0, 1.0]));
+        assert!(point_in_polygon_2d(&u[0], [5.0, 5.0]));
+
+        // Intersection: the 2x2 overlap rectangle, area 4.
+        let i = polygon_boolean(&inputs, CurveBoolOp::Intersect, BOUNDARY_TOL);
+        assert_eq!(i.len(), 1);
+        let ia: f64 = signed_area(&i[0]).abs();
+        assert!((ia - 4.0).abs() < 1e-6, "overlap area 4, got {ia}");
+        assert!(point_in_polygon_2d(&i[0], [3.0, 3.0]));
+        assert!(!point_in_polygon_2d(&i[0], [1.0, 1.0]));
+
+        // Difference A - B: L-shape, area 16 - 4 = 12; overlap removed.
+        let d = polygon_boolean(&inputs, CurveBoolOp::Difference, BOUNDARY_TOL);
+        let da: f64 = d.iter().map(|r| signed_area(r).abs()).sum();
+        assert!((da - 12.0).abs() < 1e-6, "difference area 12, got {da}");
+        // A point in the removed overlap is outside every difference ring.
+        assert!(!d.iter().any(|r| point_in_polygon_2d(r, [3.0, 3.0])));
+        // A point in A-only survives.
+        assert!(d.iter().any(|r| point_in_polygon_2d(r, [1.0, 1.0])));
+
+        // Fewer than 2 inputs → empty.
+        assert!(polygon_boolean(&inputs[..1], CurveBoolOp::Union, BOUNDARY_TOL).is_empty());
+    }
+
+    #[test]
+    fn merge_faces_dissolves_shared_edge() {
+        // Two unit squares sharing the x=1 edge merge into one 2x1 rectangle.
+        let left = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let right = vec![[1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0]];
+        let merged = merge_faces(&[left, right], BOUNDARY_TOL);
+        assert_eq!(merged.len(), 1, "shared edge dissolved into one ring");
+        let area = signed_area(&merged[0]).abs();
+        assert!((area - 2.0).abs() < 1e-6, "merged area 2, got {area}");
+    }
+
+    #[test]
+    fn curvebool_multi_ring_is_deterministic_and_replay_stable() {
+        // A union that yields ≥2 disjoint rings: two separated square pairs.
+        // merge_faces must emit rings in a stable order (BTreeMap, not HashMap)
+        // so the logged op replays byte-identically across fresh sessions.
+        let build = || {
+            let mut s = Session::default();
+            // Group A: two overlapping squares near the origin.
+            run(&mut s, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+            run(&mut s, "polyline 2,2,0 6,2,0 6,6,0 2,6,0 closed");
+            // Group B: two overlapping squares far away (disjoint from A).
+            run(&mut s, "polyline 20,0,0 24,0,0 24,4,0 20,4,0 closed");
+            run(&mut s, "polyline 22,2,0 26,2,0 26,6,0 22,6,0 closed");
+            run(&mut s, "curvebool union all");
+            // Collect every region's vertex sequence in doc order.
+            s.doc
+                .objects()
+                .filter_map(|o| match &o.geometry {
+                    Geometry::Curve(Curve::Polyline { points, .. }) => {
+                        Some(points.iter().map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = build();
+        let b = build();
+        assert!(a.len() >= 2, "expected ≥2 rings, got {}", a.len());
+        assert_eq!(a, b, "ring vertex sequences must be byte-identical across runs");
+
+        // Op-log replay reproduces identical geometry.
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+        run(&mut s, "polyline 2,2,0 6,2,0 6,6,0 2,6,0 closed");
+        run(&mut s, "polyline 20,0,0 24,0,0 24,4,0 20,4,0 closed");
+        run(&mut s, "polyline 22,2,0 26,2,0 26,6,0 22,6,0 closed");
+        run(&mut s, "curvebool union all");
+        let before: Vec<Vec<[f64; 3]>> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => {
+                    Some(points.iter().map(|p| [p.x, p.y, p.z]).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        let log = s.log.iter().map(|a| a.op.clone()).collect::<Vec<_>>();
+        let mut replay = Session::default();
+        for cmd in log {
+            replay.run(cmd).unwrap();
+        }
+        let after: Vec<Vec<[f64; 3]>> = replay
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => {
+                    Some(points.iter().map(|p| [p.x, p.y, p.z]).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(before, after, "op-log replay reproduces identical rings");
+    }
+
+    #[test]
+    fn curvebool_verb_union_intersect_difference_and_undo() {
+        let mut s = Session::default();
+        // Two overlapping closed squares A=[0,4]², B=[2,6]².
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+        run(&mut s, "polyline 2,2,0 6,2,0 6,6,0 2,6,0 closed");
+        assert_eq!(s.doc.len(), 2);
+
+        // Union consumes both inputs and leaves one region of area 28.
+        let out = run(&mut s, "curvebool union last 2");
+        assert!(out.message.contains("created 1 region"), "{}", out.message);
+        assert_eq!(s.doc.len(), 1, "inputs consumed, one region left");
+        let region = s.doc.objects().last().unwrap();
+        let Geometry::Curve(Curve::Polyline { points, closed }) = &region.geometry else {
+            panic!("expected closed polyline, got {:?}", region.geometry);
+        };
+        assert!(*closed);
+        let ring: Vec<[f64; 2]> = points.iter().map(|p| [p.x, p.y]).collect();
+        assert!((signed_area(&ring).abs() - 28.0).abs() < 1e-6);
+
+        // Undo restores both inputs.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2, "undo restores the two input curves");
+
+        // Intersection → the 2x2 overlap, area 4.
+        let out = run(&mut s, "curvebool intersect last 2");
+        assert!(out.message.contains("created 1 region"), "{}", out.message);
+        let region = s.doc.objects().last().unwrap();
+        let Geometry::Curve(Curve::Polyline { points, .. }) = &region.geometry else {
+            panic!("expected polyline");
+        };
+        let ring: Vec<[f64; 2]> = points.iter().map(|p| [p.x, p.y]).collect();
+        assert!((signed_area(&ring).abs() - 4.0).abs() < 1e-6);
+        run(&mut s, "undo");
+
+        // Difference A - B → area 12; a point in the overlap is excluded.
+        run(&mut s, "curvebool difference last 2");
+        let total: f64 = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => {
+                    let r: Vec<[f64; 2]> = points.iter().map(|p| [p.x, p.y]).collect();
+                    Some(signed_area(&r).abs())
+                }
+                _ => None,
+            })
+            .sum();
+        assert!((total - 12.0).abs() < 1e-6, "difference area 12, got {total}");
+
+        // Fewer than 2 closed curves → clear error.
+        let mut s2 = Session::default();
+        run(&mut s2, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+        let err = s2.run(parse("curvebool union all").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("2+ closed curves"), "{err}");
+    }
+
+    /// Pure helper: a closed 4-point rectangle yields exactly 4 segment spans
+    /// (including the closing edge), matching the polyline edges; a mesh yields
+    /// 2 extent spans (width then height) from its AABB.
+    #[test]
+    fn autodim_spans_segments_and_extents() {
+        // Closed unit-ish rectangle 3 wide x 2 tall at origin.
+        let rect = Geometry::Curve(Curve::Polyline {
+            points: vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(3.0, 0.0, 0.0),
+                DVec3::new(3.0, 2.0, 0.0),
+                DVec3::new(0.0, 2.0, 0.0),
+            ],
+            closed: true,
+        });
+        let spans = autodim_spans(&rect);
+        assert_eq!(spans.len(), 4, "4 edges incl. closing segment");
+        // First span is the bottom edge; last is the closing edge (top-left back
+        // to origin).
+        assert_eq!(spans[0], (DVec3::new(0.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)));
+        assert_eq!(spans[3], (DVec3::new(0.0, 2.0, 0.0), DVec3::new(0.0, 0.0, 0.0)));
+
+        // An open polyline has no closing segment.
+        let open = Geometry::Curve(Curve::Polyline {
+            points: vec![DVec3::ZERO, DVec3::new(3.0, 0.0, 0.0), DVec3::new(3.0, 2.0, 0.0)],
+            closed: false,
+        });
+        assert_eq!(autodim_spans(&open).len(), 2);
+
+        // A mesh (box) dimensions its extents: width (X) then height (Y).
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,3,2");
+        let mesh = &s.doc.objects().next().unwrap().geometry;
+        let spans = autodim_spans(mesh);
+        assert_eq!(spans.len(), 2, "two extent dims");
+        // width span runs along X; height span along Y.
+        assert!((spans[0].1.x - spans[0].0.x).abs() > 1e-6 && (spans[0].1.y - spans[0].0.y).abs() < 1e-9);
+        assert!((spans[1].1.y - spans[1].0.y).abs() > 1e-6 && (spans[1].1.x - spans[1].0.x).abs() < 1e-9);
+    }
+
+    /// `autodim` over a closed rectangle places one linear dim per edge (4),
+    /// each with matching endpoints; undo removes them all in one step.
+    #[test]
+    fn autodim_rectangle_places_four_dims_and_undo() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 3,0,0 3,2,0 0,2,0 closed");
+        assert_eq!(s.doc.len(), 1);
+
+        let out = run(&mut s, "autodim last offset 0.8");
+        assert!(out.message.contains("placed 4 dimension"), "{}", out.message);
+        assert_eq!(out.created.len(), 4);
+        // 1 polyline + 4 dims.
+        assert_eq!(s.doc.len(), 5);
+
+        // Collect the placed dims and confirm one matches the bottom edge, with
+        // the requested offset carried through.
+        let dims: Vec<(DVec3, DVec3, f64)> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Annotation(Annotation::LinearDim { a, b, offset }) => {
+                    Some((a.point(), b.point(), *offset))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dims.len(), 4);
+        assert!(
+            dims.iter().any(|(a, b, off)| *a == DVec3::new(0.0, 0.0, 0.0)
+                && *b == DVec3::new(3.0, 0.0, 0.0)
+                && *off == 0.8),
+            "a dim should span the bottom edge at offset 0.8: {dims:?}"
+        );
+
+        // Undo removes all four dims in one op, leaving just the polyline.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+
+        // Nothing dimensionable (a text annotation is a single point, so both
+        // extents are degenerate) → clear error.
+        let mut s2 = Session::default();
+        run(&mut s2, "text 5,5 hi");
+        let err = s2.run(parse("autodim last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("nothing dimensionable"), "{err}");
+    }
+
+    #[test]
     fn annotations_move_and_delete() {
         let mut s = Session::default();
         run(&mut s, "dim 0,0 10,0 0.5");
@@ -13088,6 +17108,40 @@ mod tests {
         };
         assert_eq!(a.point(), DVec3::new(0.0, 5.0, 0.0));
         assert_eq!(b.point(), DVec3::new(10.0, 5.0, 0.0));
+        run(&mut s, "delete last");
+        assert_eq!(s.doc.len(), 0);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+    }
+
+    /// dimangular over a 90° corner stores the three points and reports ≈90° in
+    /// its creation message; the stored angle (derived) matches. Undo removes it.
+    #[test]
+    fn dimangular_creates_90_degree_corner() {
+        let mut s = Session::default();
+        // Legs along +X and +Y from the origin → a right angle.
+        let out = run(&mut s, "dimangular 0,0,0 1,0,0 0,1,0");
+        assert_eq!(s.doc.len(), 1);
+        let obj = s.doc.objects().next().unwrap();
+        let Geometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) =
+            &obj.geometry
+        else {
+            panic!("expected angular dim, got {:?}", obj.geometry)
+        };
+        assert_eq!(*vertex, DVec3::ZERO);
+        assert_eq!(*p1, DVec3::new(1.0, 0.0, 0.0));
+        assert_eq!(*p2, DVec3::new(0.0, 1.0, 0.0));
+        assert_eq!(*radius, 1.0);
+        let angle = itsjustcad_doc::angle_degrees(*vertex, *p1, *p2);
+        assert!((angle - 90.0).abs() < 1e-9, "angle {angle}");
+        assert!(out.message.contains("90.0°"), "message: {}", out.message);
+
+        // A zero-length leg is rejected up front.
+        assert!(matches!(
+            s.run(parse("dimangular 0,0,0 0,0,0 0,1,0").unwrap()),
+            Err(ExecError::Invalid(_))
+        ));
+
         run(&mut s, "delete last");
         assert_eq!(s.doc.len(), 0);
         run(&mut s, "undo");
@@ -13199,6 +17253,109 @@ mod tests {
         run(&mut s, "name last twins");
         let err = s.run(parse("dim @twins.start @twins.end 0.5").unwrap()).unwrap_err();
         assert!(err.to_string().contains("exactly one"), "{err}");
+    }
+
+    /// Last field annotation's stored (resolved) text.
+    fn last_field_text(s: &Session) -> String {
+        s.doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Annotation(Annotation::Field { text, .. }) => Some(text.clone()),
+                _ => None,
+            })
+            .last()
+            .expect("a field exists")
+    }
+
+    #[test]
+    fn field_area_shows_and_tracks_geometry() {
+        let mut s = Session::default();
+        // 10x6 closed rect: area = 60.
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "name last plate");
+        let out = run(&mut s, "field 12,0 area plate");
+        assert!(out.message.contains("area plate = 60.00 m²"), "{}", out.message);
+        assert_eq!(last_field_text(&s), "60.00 m²");
+
+        // Scale the referenced object x2 in-plane => area x4 = 240; the refresh
+        // hook (piggybacked on the scale transform) rewrites the field text.
+        run(&mut s, "scale plate 2 about 0,0,0");
+        assert_eq!(last_field_text(&s), "240.00 m²", "field tracks scaled area");
+    }
+
+    #[test]
+    fn field_count_updates_on_delete() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0,0 1");
+        run(&mut s, "name last c1");
+        run(&mut s, "circle 3,0,0 1");
+        run(&mut s, "name last c2");
+        run(&mut s, "circle 6,0,0 1");
+        run(&mut s, "name last c3");
+        run(&mut s, "field 9,9 count all");
+        // Evaluated at creation, BEFORE the field itself is inserted: 3 circles.
+        assert_eq!(last_field_text(&s), "3");
+        // Delete is a mutating op wired to the refresh hook, so the count field
+        // re-evaluates against the live doc: 1 remaining circle + the field = 2.
+        // (Bare object creation does NOT refresh — see module trade-off.)
+        run(&mut s, "delete c2");
+        run(&mut s, "delete c3");
+        assert_eq!(last_field_text(&s), "2", "count shrinks after delete");
+    }
+
+    #[test]
+    fn field_layer_units_doc_values() {
+        let mut s = Session::default();
+        run(&mut s, "field 0,0 units");
+        assert_eq!(last_field_text(&s), "m");
+        run(&mut s, "field 0,1 layer");
+        assert_eq!(last_field_text(&s), "default"); // DEFAULT_LAYER
+    }
+
+    #[test]
+    fn field_bad_expr_and_empty_match_error() {
+        let mut s = Session::default();
+        // area of an open curve: clear error.
+        run(&mut s, "line 0,0 10,0");
+        let err = s.run(parse("field 0,0 area last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("open curve"), "{err}");
+        // empty match: no object named 'ghost'.
+        let err = s.run(parse("field 0,0 area ghost").unwrap()).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("ghost"), "{err}");
+    }
+
+    #[test]
+    fn eval_field_expr_is_pure() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 4 5"); // area 20
+        run(&mut s, "name last p");
+        let a = eval_field_expr(&s.doc, &FieldExpr::Area { selector: "p".into() }).unwrap();
+        assert_eq!(a, "20.00 m²");
+        let c = eval_field_expr(&s.doc, &FieldExpr::Count { selector: "all".into() }).unwrap();
+        assert_eq!(c, "1");
+    }
+
+    #[test]
+    fn field_replay_is_deterministic() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "name last plate");
+        run(&mut s, "field 12,0 area plate");
+        run(&mut s, "scale plate 2 about 0,0,0");
+        let want = last_field_text(&s);
+        assert_eq!(want, "240.00 m²");
+
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(last_field_text(&replayed), want, "replayed field text identical");
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b, "replayed doc identical");
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap(),
+            "op-log byte-identical after replay"
+        );
     }
 
     #[test]
@@ -13363,6 +17520,157 @@ mod tests {
         assert!(err.to_string().contains("no sheet"), "{err}");
     }
 
+    /// Build a couple of sheets, gather them into a set, and assert the set
+    /// lists them in order with 1-based numbers; then reorder, remove, and undo.
+    #[test]
+    fn sheetset_add_order_remove_and_undo() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "sheet a-101 a3");
+        run(&mut s, "sheetview a-101 top 1:100");
+        run(&mut s, "sheet a-102 a3");
+        run(&mut s, "sheetview a-102 top 1:100");
+
+        run(&mut s, "sheetset new plans");
+        run(&mut s, "sheetset add a-101");
+        let out = run(&mut s, "sheetset add a-102");
+        assert!(out.message.contains("#2"), "{}", out.message);
+
+        // The set references both sheets, in add order, numbered 1..N.
+        let set = s.doc.sheet_set("plans").unwrap();
+        assert_eq!(set.sheets, vec!["a-101".to_string(), "a-102".to_string()]);
+
+        // The set is an INDEX, not a container: it stores names only, and the
+        // referenced sheets are untouched (still 2 live sheets).
+        assert_eq!(s.doc.sheets.len(), 2);
+
+        // list shows them in order with numbers.
+        let out = run(&mut s, "sheetset list");
+        assert!(out.message.contains("1. a-101"), "{}", out.message);
+        assert!(out.message.contains("2. a-102"), "{}", out.message);
+
+        // Reorder: move a-102 to position 1.
+        run(&mut s, "sheetset order a-102 1");
+        assert_eq!(
+            s.doc.sheet_set("plans").unwrap().sheets,
+            vec!["a-102".to_string(), "a-101".to_string()]
+        );
+
+        // Remove a-101.
+        run(&mut s, "sheetset remove a-101");
+        assert_eq!(
+            s.doc.sheet_set("plans").unwrap().sheets,
+            vec!["a-102".to_string()]
+        );
+
+        // Undo restores the remove, then the reorder, then the second add.
+        run(&mut s, "undo"); // undo remove
+        assert_eq!(s.doc.sheet_set("plans").unwrap().sheets.len(), 2);
+        run(&mut s, "undo"); // undo order
+        assert_eq!(
+            s.doc.sheet_set("plans").unwrap().sheets,
+            vec!["a-101".to_string(), "a-102".to_string()]
+        );
+        run(&mut s, "undo"); // undo second add
+        assert_eq!(
+            s.doc.sheet_set("plans").unwrap().sheets,
+            vec!["a-101".to_string()]
+        );
+
+        // Errors: adding a missing sheet, no active set.
+        let err = s.run(parse("sheetset add ghost").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no sheet 'ghost'"), "{err}");
+    }
+
+    /// The mutating sheetset ops are logged and replay byte-identically.
+    #[test]
+    fn sheetset_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "sheet a-101 a3");
+        run(&mut s, "sheet a-102 a3");
+        run(&mut s, "sheetset new plans");
+        run(&mut s, "sheetset add a-101");
+        run(&mut s, "sheetset add a-102");
+        run(&mut s, "sheetset order a-102 1");
+
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        assert_eq!(s.doc.sheet_sets, replayed.doc.sheet_sets);
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
+    }
+
+    /// `sheetset publish` batch-renders every sheet to a single multi-page PDF,
+    /// reusing the print path; it is not logged (I-O).
+    #[test]
+    fn sheetset_publish_writes_multipage_pdf() {
+        let dir = std::env::temp_dir().join("mydrafter-sheetset-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plans.pdf");
+        let _ = std::fs::remove_file(&path);
+
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "extrude last 3");
+        run(&mut s, "sheet a-101 a3");
+        run(&mut s, "sheetview a-101 top 1:100");
+        run(&mut s, "sheet a-102 a4");
+        run(&mut s, "sheetview a-102 persp 1:100");
+        run(&mut s, "sheetset new plans");
+        run(&mut s, "sheetset add a-101");
+        run(&mut s, "sheetset add a-102");
+
+        let out = run(&mut s, &format!("sheetset publish {}", path.display()));
+        assert!(out.message.contains("2 pages"), "{}", out.message);
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"%PDF"), "PDF header present");
+        // One /Type /Page object per sheet.
+        let pages = bytes.windows(b"/Type /Page ".len())
+            .filter(|w| *w == b"/Type /Page ")
+            .count();
+        assert_eq!(pages, 2, "two page objects in the PDF");
+
+        // publish is not logged: replay must not rewrite PDFs.
+        assert!(s.save_log().iter().all(|c| !matches!(
+            c,
+            Command::SheetSet(SheetSetOp::Publish { .. })
+        )));
+
+        // Empty-set and no-views errors are clean.
+        run(&mut s, "sheetset new empty");
+        let err = s
+            .run(parse(&format!("sheetset publish {}", path.display())).unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sheetset_publish_default_path_cannot_traverse() {
+        // Security: the no-arg publish path is derived from the set NAME, a
+        // deserialized (untrusted) document field. A traversal-only name must be
+        // rejected rather than writing outside the CWD.
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "sheet a-101 a3");
+        run(&mut s, "sheetview a-101 top 1:100");
+        // Forge a malicious set name directly (mirrors a hand-crafted .ijc).
+        s.doc.sheet_sets.push(itsjustcad_doc::SheetSet {
+            name: "..".into(),
+            sheets: vec!["a-101".into()],
+        });
+        let err = s
+            .run(parse("sheetset publish").unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("valid filename"),
+            "traversal-only set name must be rejected on no-arg publish: {err}"
+        );
+    }
+
     #[test]
     fn export_writes_dxf_and_is_not_logged() {
         let dir = std::env::temp_dir().join("mydrafter-dxf-test");
@@ -13392,6 +17700,78 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("cannot write"), "{err}");
         assert_eq!(s.doc.len(), 3);
+    }
+
+    #[test]
+    fn import_dxf_uses_file_coords_under_non_world_cplane() {
+        // A DXF LINE lives at file coords Z=0. Importing under a non-world CPlane
+        // (Z-offset) must NOT re-project it up to Z=10 — importers use run_world.
+        let dir = std::env::temp_dir().join("mydrafter-dxf-import-cplane");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("line.dxf");
+        // Minimal R12 DXF: one LINE from (1,2,0) to (3,4,0) on layer 0.
+        let dxf = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n1.0\n20\n2.0\n30\n0.0\n11\n3.0\n21\n4.0\n31\n0.0\n0\nENDSEC\n0\nEOF\n";
+        std::fs::write(&path, dxf).unwrap();
+
+        let mut s = Session::default();
+        // Active CPlane offset +10 in Z (world-aligned axes, translation only).
+        run(&mut s, "cplane origin 0,0,10 normal 0,0,1");
+        assert!(!s.doc.cplane.is_world());
+        let out = run(&mut s, &format!("import {}", path.display()));
+        assert!(out.message.contains("imported"), "{}", out.message);
+
+        // The created line must be at the FILE Z (0), not shifted to the plane (10).
+        let line = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Line { a, b }) => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("imported line present");
+        assert!((line.0.z).abs() < 1e-9, "line.a at file Z=0, got {}", line.0.z);
+        assert!((line.1.z).abs() < 1e-9, "line.b at file Z=0, got {}", line.1.z);
+        assert!((line.0 - DVec3::new(1.0, 2.0, 0.0)).length() < 1e-9);
+        assert!((line.1 - DVec3::new(3.0, 4.0, 0.0)).length() < 1e-9);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn export_ai_writes_svg_content_and_jpg_writes_jpeg() {
+        let dir = std::env::temp_dir().join("mydrafter-ai-jpg-test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "circle 5,3,0 1.5");
+
+        // .ai routes through the SVG writer: the file IS SVG content that
+        // Illustrator opens. Assert non-empty + the SVG signature.
+        let ai = dir.join("model.ai");
+        let _ = std::fs::remove_file(&ai);
+        let out = run(&mut s, &format!("export {}", ai.display()));
+        assert!(out.message.contains("exported AI"), "{}", out.message);
+        let ai_text = std::fs::read_to_string(&ai).unwrap();
+        assert!(!ai_text.is_empty(), "AI file non-empty");
+        assert!(ai_text.contains("<svg"), "AI file carries SVG content:\n{ai_text}");
+
+        // .jpg rasterizes the same projection: assert JPEG magic bytes FF D8 FF.
+        let jpg = dir.join("model.jpg");
+        let _ = std::fs::remove_file(&jpg);
+        let out = run(&mut s, &format!("export {}", jpg.display()));
+        assert!(out.message.contains("exported JPG"), "{}", out.message);
+        let bytes = std::fs::read(&jpg).unwrap();
+        assert_eq!(&bytes[0..3], &[0xFF, 0xD8, 0xFF], "JPEG magic bytes");
+
+        // .jpeg alias works too.
+        let jpeg = dir.join("model.jpeg");
+        let _ = std::fs::remove_file(&jpeg);
+        run(&mut s, &format!("export {}", jpeg.display()));
+        let bytes = std::fs::read(&jpeg).unwrap();
+        assert_eq!(&bytes[0..3], &[0xFF, 0xD8, 0xFF]);
+
+        // export stays side-effecting, never op-logged.
+        assert!(s.save_log().iter().all(|c| !matches!(c, Command::Export { .. })));
     }
 
     #[test]
@@ -13680,6 +18060,88 @@ mod tests {
         let mut s = Session::default();
         assert!(s.run(parse("underlayopacity 0.5").unwrap()).is_err());
         assert!(s.run(parse("underlayoff").unwrap()).is_err());
+    }
+
+    #[test]
+    fn underlay_transforms_without_underlay_error() {
+        let mut s = Session::default();
+        for line in ["underlaymove 1,1", "underlayscale 2", "underlayrotate 30", "underlayplace 0,0 5"] {
+            assert!(s.run(parse(line).unwrap()).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn underlay_move_shifts_origin() {
+        let png = temp_png(200, 100, "mv");
+        let mut s = Session::default();
+        run(&mut s, &format!("underlay {} 1,2 10", png.display()));
+        let (w0, h0) = { let u = s.doc.underlay.as_ref().unwrap(); (u.width, u.height) };
+        run(&mut s, "underlaymove 3,-4");
+        let u = s.doc.underlay.as_ref().unwrap();
+        assert_eq!((u.corner.x, u.corner.y), (4.0, -2.0));
+        assert_eq!((u.width, u.height), (w0, h0), "size unchanged by move");
+        // undo restores origin
+        run(&mut s, "undo");
+        let u = s.doc.underlay.as_ref().unwrap();
+        assert_eq!((u.corner.x, u.corner.y), (1.0, 2.0));
+    }
+
+    #[test]
+    fn underlay_scale_grows_about_center() {
+        let png = temp_png(200, 100, "sc"); // aspect 2:1 -> 10 x 5
+        let mut s = Session::default();
+        run(&mut s, &format!("underlay {} 0,0 10", png.display()));
+        let center_before = s.doc.underlay.as_ref().unwrap().center();
+        run(&mut s, "underlayscale 2");
+        let u = s.doc.underlay.as_ref().unwrap();
+        assert_eq!((u.width, u.height), (20.0, 10.0), "aspect preserved, doubled");
+        // centre held fixed
+        let c = u.center();
+        assert!((c.x - center_before.x).abs() < 1e-9 && (c.y - center_before.y).abs() < 1e-9);
+        // corner moved out to keep centre
+        assert_eq!((u.corner.x, u.corner.y), (-5.0, -2.5));
+    }
+
+    #[test]
+    fn underlay_rotate_sets_absolute_angle_and_rotates_corners() {
+        let png = temp_png(200, 100, "rot"); // 10 x 5 at origin
+        let mut s = Session::default();
+        run(&mut s, &format!("underlay {} 0,0 10", png.display()));
+        run(&mut s, "underlayrotate 90");
+        let u = s.doc.underlay.as_ref().unwrap();
+        assert_eq!(u.rotation_deg, 90.0);
+        // rotation is absolute, not incremental
+        run(&mut s, "underlayrotate 45");
+        assert_eq!(s.doc.underlay.as_ref().unwrap().rotation_deg, 45.0);
+        // corners reflect the rotation: a 45° tilt yields four distinct x's and
+        // four distinct y's (an axis-aligned rect has only two of each).
+        let c = s.doc.underlay.as_ref().unwrap().quad_corners();
+        let distinct = |vals: [f64; 4]| {
+            let mut n = 0;
+            for i in 0..4 {
+                if !(0..i).any(|j| (vals[i] - vals[j]).abs() < 1e-6) {
+                    n += 1;
+                }
+            }
+            n
+        };
+        assert_eq!(distinct([c[0].x, c[1].x, c[2].x, c[3].x]), 4, "rotated: {c:?}");
+        assert_eq!(distinct([c[0].y, c[1].y, c[2].y, c[3].y]), 4, "rotated: {c:?}");
+    }
+
+    #[test]
+    fn underlay_place_repositions_resizes_keeps_aspect() {
+        let png = temp_png(200, 100, "pl"); // aspect 2:1
+        let mut s = Session::default();
+        run(&mut s, &format!("underlay {} 0,0 10", png.display()));
+        run(&mut s, "underlayplace 5,6 40 15");
+        let u = s.doc.underlay.as_ref().unwrap();
+        assert_eq!((u.corner.x, u.corner.y), (5.0, 6.0));
+        assert_eq!((u.width, u.height), (40.0, 20.0), "aspect 2:1 preserved");
+        assert_eq!(u.rotation_deg, 15.0);
+        // without a rotation arg, rotation is left as-is
+        run(&mut s, "underlayplace 0,0 10");
+        assert_eq!(s.doc.underlay.as_ref().unwrap().rotation_deg, 15.0);
     }
 
     #[test]
@@ -14671,6 +19133,190 @@ mod tests {
         let log_before = s.save_log().len();
         run(&mut s, "blocks");
         assert_eq!(s.save_log().len(), log_before, "blocks list must not be logged");
+    }
+
+    /// Write a tiny two-entity DXF (two LINEs on layer 0) to a temp dir and
+    /// return its path plus the dir (caller cleans up). Reuses the minimal-DXF
+    /// idiom the import tests use.
+    fn temp_xref_dxf(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ijc_xref_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two LINEs: (0,0)->(1,0) and (0,0)->(0,1).
+        let dxf = "0\nSECTION\n2\nENTITIES\n\
+                   0\nLINE\n8\n0\n10\n0\n20\n0\n11\n1\n21\n0\n\
+                   0\nLINE\n8\n0\n10\n0\n20\n0\n11\n0\n21\n1\n\
+                   0\nENDSEC\n0\nEOF\n";
+        let path = dir.join("site.dxf");
+        std::fs::write(&path, dxf).unwrap();
+        (path, dir)
+    }
+
+    #[test]
+    fn xref_attach_creates_block_def_and_instance() {
+        let (path, dir) = temp_xref_dxf("attach");
+        let mut s = Session::default();
+        run(&mut s, &format!("xref attach {} at 0,0,0", path.display()));
+        // Block def named from the path stem, holding both lines.
+        assert!(s.doc.blocks.contains_key("site"), "xref block def stored");
+        assert_eq!(s.doc.blocks.get("site").unwrap().len(), 2, "two geometries");
+        // Registry records the source path.
+        assert_eq!(s.doc.xrefs.get("site").map(String::as_str), Some(path.to_string_lossy().as_ref()));
+        // One instance placed, referencing the def by name.
+        let inst = s.doc.objects().last().unwrap();
+        assert!(matches!(&inst.geometry, Geometry::Instance { block, source: None, .. } if block == "site"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xref_attach_undo_restores() {
+        let (path, dir) = temp_xref_dxf("undo");
+        let mut s = Session::default();
+        let n0 = s.doc.len();
+        run(&mut s, &format!("xref attach {}", path.display()));
+        assert!(s.doc.blocks.contains_key("site"));
+        assert_eq!(s.doc.len(), n0 + 1);
+        s.run(Command::Undo).unwrap();
+        assert!(!s.doc.blocks.contains_key("site"), "undo removes def");
+        assert!(!s.doc.xrefs.contains_key("site"), "undo removes registry entry");
+        assert_eq!(s.doc.len(), n0, "undo removes instance");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ncopy_bakes_one_nested_object_and_leaves_xref_intact() {
+        let (path, dir) = temp_xref_dxf("ncopy");
+        let mut s = Session::default();
+        // Attach at an offset with scale so the world geometry is transformed.
+        run(&mut s, &format!("xref attach {} at 10,0,0 scale 2", path.display()));
+        let inst_id = s.doc.objects().last().unwrap().id;
+        let n_before = s.doc.len();
+        // NCOPY sub-object 0 (the first line, endpoints (0,0)->(1,0)).
+        run(&mut s, "ncopy last 0");
+        assert_eq!(s.doc.len(), n_before + 1, "one new host object");
+        let new_obj = s.doc.objects().last().unwrap();
+        // Independent object: a real Curve, not an Instance.
+        let curve = match &new_obj.geometry {
+            Geometry::Curve(c) => c,
+            g => panic!("expected an independent Curve, got {g:?}"),
+        };
+        // World geometry: (0,0)->(1,0) scaled ×2 then translated by (10,0,0)
+        // → (10,0,0)->(12,0,0).
+        let pts = curve.points_bound();
+        let aabb = kernel_mesh::Aabb::from_points(pts);
+        assert!((aabb.min.x - 10.0).abs() < 1e-6, "min x {} != 10", aabb.min.x);
+        assert!((aabb.max.x - 12.0).abs() < 1e-6, "max x {} != 12", aabb.max.x);
+        // The source xref instance and its definition are untouched.
+        assert!(s.doc.get(inst_id).is_some(), "xref instance intact");
+        assert_eq!(s.doc.blocks.get("site").unwrap().len(), 2, "xref def intact");
+        // Undo removes ONLY the copied object.
+        s.run(Command::Undo).unwrap();
+        assert_eq!(s.doc.len(), n_before, "undo removes the ncopy object");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xclip_sets_and_clears_clip_with_undo() {
+        use itsjustcad_doc::ClipRect;
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "block last widget");
+        run(&mut s, "insert widget 0,0,0");
+        let id = s.doc.objects().last().unwrap().id;
+
+        // Fresh instance is unclipped.
+        let clip_of = |s: &Session, id: ObjectId| match &s.doc.get(id).unwrap().geometry {
+            Geometry::Instance { clip, .. } => *clip,
+            g => panic!("expected Instance, got {g:?}"),
+        };
+        assert_eq!(clip_of(&s, id), None, "new instance has no clip");
+
+        // xclip <sel> <min> <max> → clip set to the (normalized) rect.
+        run(&mut s, "xclip last 5,5 0,0");
+        let want = ClipRect::new(glam::DVec2::new(5.0, 5.0), glam::DVec2::new(0.0, 0.0));
+        assert_eq!(clip_of(&s, id), Some(want), "clip stored");
+
+        // Undo restores the prior (unclipped) geometry snapshot.
+        s.run(Command::Undo).unwrap();
+        assert_eq!(clip_of(&s, id), None, "undo clears the clip");
+
+        // Redo re-applies, then `xclip off` clears it again.
+        s.run(Command::Redo).unwrap();
+        assert_eq!(clip_of(&s, id), Some(want), "redo re-clips");
+        run(&mut s, "xclip last off");
+        assert_eq!(clip_of(&s, id), None, "xclip off clears the clip");
+    }
+
+    #[test]
+    fn xclip_rejects_non_instance_selection() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        // The box is not an instance → error.
+        let err = s
+            .run(crate::parse::parse("xclip last 0,0 1,1").unwrap())
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("no block/xref instances"),
+            "expected non-instance error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn xref_detach_removes_instances_and_def_and_undo_restores() {
+        let (path, dir) = temp_xref_dxf("detach");
+        let mut s = Session::default();
+        run(&mut s, &format!("xref attach {}", path.display()));
+        run(&mut s, &format!("xref attach {}", path.display())); // second instance, same def
+        let n = s.doc.len();
+        assert_eq!(n, 2, "two instances");
+        run(&mut s, "xref detach site");
+        assert!(!s.doc.blocks.contains_key("site"), "def removed");
+        assert!(!s.doc.xrefs.contains_key("site"), "registry entry removed");
+        assert_eq!(s.doc.len(), 0, "both instances removed");
+        // Undo restores everything.
+        s.run(Command::Undo).unwrap();
+        assert!(s.doc.blocks.contains_key("site"), "undo restores def");
+        assert!(s.doc.xrefs.contains_key("site"), "undo restores registry entry");
+        assert_eq!(s.doc.len(), n, "undo restores instances");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xref_reload_rebuilds_def_keeping_placement() {
+        let (path, dir) = temp_xref_dxf("reload");
+        let mut s = Session::default();
+        run(&mut s, &format!("xref attach {} at 4,0,0", path.display()));
+        let inst_id = s.doc.objects().last().unwrap().id;
+        // Rewrite the file with a DIFFERENT, single-entity content.
+        std::fs::write(
+            &path,
+            "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDSEC\n0\nEOF\n",
+        )
+        .unwrap();
+        run(&mut s, "xref reload site");
+        // Def rebuilt from the new file (now one geometry).
+        assert_eq!(s.doc.blocks.get("site").unwrap().len(), 1, "def rebuilt");
+        // Instance placement kept (same id, same position).
+        match &s.doc.get(inst_id).unwrap().geometry {
+            Geometry::Instance { block, position, .. } => {
+                assert_eq!(block, "site");
+                assert!((position.x - 4.0).abs() < 1e-9, "placement kept");
+            }
+            g => panic!("expected instance, got {g:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xref_list_is_not_logged() {
+        let (path, dir) = temp_xref_dxf("list");
+        let mut s = Session::default();
+        run(&mut s, &format!("xref attach {}", path.display()));
+        let log_before = s.save_log().len();
+        let out = run(&mut s, "xref list");
+        assert!(out.message.contains("site"), "list shows the xref: {}", out.message);
+        assert_eq!(s.save_log().len(), log_before, "xref list must not be logged");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -15914,6 +20560,129 @@ mod tests {
         assert_eq!(s.doc.len(), 1);
     }
 
+    // -----------------------------------------------------------------------
+    // Drawings→BIM: levels + fromlayer
+    // -----------------------------------------------------------------------
+
+    /// Count objects whose geometry is a Wall area member.
+    fn wall_count(s: &Session) -> usize {
+        s.doc
+            .objects()
+            .filter(|o| {
+                matches!(
+                    o.geometry,
+                    Geometry::Area { kind: itsjustcad_doc::AreaKind::Wall, .. }
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn story_carries_optional_height() {
+        let mut s = Session::default();
+        run(&mut s, "level L1 0 height 3.5");
+        assert_eq!(s.doc.stories.len(), 1);
+        assert_eq!(s.doc.stories[0].name, "L1");
+        assert_eq!(s.doc.stories[0].elevation, 0.0);
+        assert_eq!(s.doc.stories[0].height, 3.5);
+        // Redefining by name replaces both elevation and height.
+        run(&mut s, "level L1 1 height 4");
+        assert_eq!(s.doc.stories.len(), 1);
+        assert_eq!(s.doc.stories[0].elevation, 1.0);
+        assert_eq!(s.doc.stories[0].height, 4.0);
+        // levels query does not log.
+        let out = run(&mut s, "levels");
+        assert!(out.created.is_empty());
+        assert!(out.message.contains("L1"));
+    }
+
+    #[test]
+    fn fromlayer_builds_walls_with_explicit_height() {
+        let mut s = Session::default();
+        // Two footprint lines on a WALLS layer.
+        run(&mut s, "layer WALLS");
+        run(&mut s, "line 0,0,0 6,0,0");
+        run(&mut s, "line 6,0,0 6,4,0");
+        run(&mut s, "layer 0");
+
+        let out = run(&mut s, "fromlayer WALLS wall thick 0.2 height 3");
+        assert_eq!(out.created.len(), 2, "one wall per curve");
+        assert!(out.message.contains("built 2 wall(s) from layer 'WALLS'"));
+        assert_eq!(wall_count(&s), 2);
+
+        // The wall rises from Z=0 to Z=3.
+        let w = s.doc.get(out.created[0]).unwrap();
+        let Geometry::Area { kind, boundary, thickness, .. } = &w.geometry else {
+            panic!("expected Area geometry");
+        };
+        assert_eq!(*kind, itsjustcad_doc::AreaKind::Wall);
+        assert_eq!(*thickness, 0.2);
+        let zmax = boundary.iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        let zmin = boundary.iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        assert!((zmin - 0.0).abs() < 1e-9);
+        assert!((zmax - 3.0).abs() < 1e-9);
+
+        assert_replay_stable(&s);
+
+        // Undo removes exactly the created walls.
+        run(&mut s, "undo");
+        assert_eq!(wall_count(&s), 0);
+        run(&mut s, "redo");
+        assert_eq!(wall_count(&s), 2);
+    }
+
+    #[test]
+    fn fromlayer_uses_named_level_base_and_height() {
+        let mut s = Session::default();
+        run(&mut s, "level L2 3 height 3");
+        run(&mut s, "layer A-WALL");
+        run(&mut s, "line 0,0,0 5,0,0");
+        run(&mut s, "layer 0");
+
+        let out = run(&mut s, "fromlayer A-WALL wall thick 0.15 level L2");
+        assert_eq!(out.created.len(), 1);
+        let w = s.doc.get(out.created[0]).unwrap();
+        let Geometry::Area { boundary, .. } = &w.geometry else {
+            panic!("expected Area geometry");
+        };
+        // Base at the level elevation (3), top at base + height (6).
+        let zmin = boundary.iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        let zmax = boundary.iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        assert!((zmin - 3.0).abs() < 1e-9);
+        assert!((zmax - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fromlayer_errors_clearly() {
+        let mut s = Session::default();
+        // Empty / non-existent layer.
+        let err = s
+            .run(parse("fromlayer NOPE wall thick 0.2 height 3").unwrap())
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("no curve geometry on layer 'NOPE'"));
+        // Missing level definition.
+        run(&mut s, "layer WALLS");
+        run(&mut s, "line 0,0,0 1,0,0");
+        run(&mut s, "layer 0");
+        let err = s
+            .run(parse("fromlayer WALLS wall thick 0.2 level GHOST").unwrap())
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("no level named 'GHOST'"));
+    }
+
+    #[test]
+    fn fromlayer_walls_export_as_ifcwall() {
+        let mut s = Session::default();
+        run(&mut s, "layer WALLS");
+        run(&mut s, "line 0,0,0 6,0,0");
+        run(&mut s, "layer 0");
+        run(&mut s, "fromlayer WALLS wall thick 0.2 height 3");
+        let (bytes, _detail) =
+            crate::ifc::export(&s.doc, "/tmp/fromlayer_wall.ifc").unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("IFCWALL"), "wall must export as IFCWALL");
+    }
+
     #[test]
     fn frame_member_id_written_back_for_replay() {
         // The logged op must carry the concrete id so replay reproduces it.
@@ -16854,6 +21623,122 @@ mod tests {
         assert!(csv.contains("betula-pendula,Betula pendula,silver birch,3,20,9,yes"), "{csv}");
         let r = s.doc.analysis_reports.get("plantschedule").expect("report stored");
         assert_eq!(r.count, 2, "one sample per species");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dataextract_parse_round_trips_modes_and_path() {
+        // Bare verb: count mode, no path.
+        assert_eq!(
+            parse("dataextract").unwrap(),
+            Command::DataExtract { by_instance: false, path: None }
+        );
+        // Aliases resolve to the same command.
+        assert_eq!(
+            parse("bom").unwrap(),
+            Command::DataExtract { by_instance: false, path: None }
+        );
+        assert_eq!(
+            parse("dataextraction by instance").unwrap(),
+            Command::DataExtract { by_instance: true, path: None }
+        );
+        // Mode + output path in either order.
+        assert_eq!(
+            parse("dataextract by instance to /tmp/bom.csv").unwrap(),
+            Command::DataExtract { by_instance: true, path: Some("/tmp/bom.csv".into()) }
+        );
+        assert_eq!(
+            parse("dataextract to /tmp/bom.csv").unwrap(),
+            Command::DataExtract { by_instance: false, path: Some("/tmp/bom.csv".into()) }
+        );
+        // Bogus mode is rejected.
+        assert!(parse("dataextract by wibble").is_err());
+    }
+
+    #[test]
+    fn dataextract_empty_document_is_a_clear_message_not_an_error() {
+        let mut s = Session::default();
+        let out = run(&mut s, "dataextract");
+        assert!(out.message.contains("no block instances"), "{}", out.message);
+    }
+
+    /// Insert plain and dynamic block instances, extract in count mode, and
+    /// assert the table has the right rows/counts/param columns.
+    #[test]
+    fn dataextract_count_mode_tabulates_blocks_and_params() {
+        let mut s = Session::default();
+        // A plain block "widget" (no params), placed twice.
+        run(&mut s, "circle 0,0,0 1.5");
+        run(&mut s, "block last widget");
+        run(&mut s, "insert widget 5,0,0");
+        run(&mut s, "insert widget 8,0,0");
+        // A dynamic block "pdoor" carrying a `width` param, placed twice with
+        // different values (→ a param column with "(varies)").
+        run(&mut s, "pblock pdoor width=0.9 : rect 0,0,0 {width} 0.05");
+        run(&mut s, "insert pdoor 2,0,0 width=1.2");
+        run(&mut s, "insert pdoor 4,0,0 width=1.5");
+
+        let t = build_dataextract_table(&s.doc, false);
+        assert_eq!(t.block_types, 2, "widget + pdoor");
+        assert_eq!(t.instances, 4);
+        assert_eq!(t.fixed, vec!["Block", "Count"]);
+        assert_eq!(t.params, vec!["width"], "one distinct param name");
+        // widget row: count 2, empty width cell.
+        let widget = t.rows.iter().find(|r| r[0] == "widget").expect("widget row");
+        assert_eq!(widget[1], "2");
+        assert_eq!(widget[2], "", "widget carries no width");
+        // pdoor row: count 2, differing widths → "(varies)".
+        let pdoor = t.rows.iter().find(|r| r[0] == "pdoor").expect("pdoor row");
+        assert_eq!(pdoor[1], "2");
+        assert_eq!(pdoor[2], "(varies)");
+
+        // Shared param value collapses to that value (no "(varies)").
+        let mut s2 = Session::default();
+        run(&mut s2, "pblock pw width=0.9 : rect 0,0,0 {width} 0.05");
+        run(&mut s2, "insert pw 0,0,0 width=2");
+        run(&mut s2, "insert pw 3,0,0 width=2");
+        let t2 = build_dataextract_table(&s2.doc, false);
+        let row = t2.rows.iter().find(|r| r[0] == "pw").unwrap();
+        assert_eq!(row[2], "2", "all instances agree on width");
+
+        // CLI message carries the summary.
+        let out = run(&mut s, "dataextract");
+        assert!(
+            out.message.contains("extracted 2 block type(s), 4 instance(s)"),
+            "{}",
+            out.message
+        );
+    }
+
+    /// Instance mode yields one row per placement, numbered within a definition.
+    #[test]
+    fn dataextract_instance_mode_rows_and_csv_export() {
+        let mut s = Session::default();
+        run(&mut s, "pblock pdoor width=0.9 : rect 0,0,0 {width} 0.05");
+        run(&mut s, "insert pdoor 0,0,0 width=1.2");
+        run(&mut s, "insert pdoor 2,0,0 width=1.5");
+
+        let t = build_dataextract_table(&s.doc, true);
+        assert_eq!(t.fixed, vec!["Block", "Instance"]);
+        assert_eq!(t.rows.len(), 2, "one row per placement");
+        assert_eq!(t.rows[0], vec!["pdoor", "1", "1.2"]);
+        assert_eq!(t.rows[1], vec!["pdoor", "2", "1.5"]);
+
+        // CSV export writes a header + one data row per instance.
+        let dir = std::env::temp_dir().join("ijc_dataextract_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bom.csv");
+        let out = run(&mut s, &format!("dataextract by instance to {}", path.display()));
+        assert!(out.message.contains("→"), "{}", out.message);
+        assert!(
+            out.message.contains("extracted 1 block type(s), 2 instance(s)"),
+            "{}",
+            out.message
+        );
+        let csv = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(csv.lines().next().unwrap(), "Block,Instance,width");
+        assert!(csv.contains("pdoor,1,1.2"), "{csv}");
+        assert!(csv.contains("pdoor,2,1.5"), "{csv}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -18655,5 +23540,496 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&home);
         result.unwrap();
+    }
+
+    // ── new CAD verbs: tozero / flatten / selsimilar / dimradius ────────────
+
+    #[test]
+    fn tozero_moves_bbox_min_to_origin_and_undoes() {
+        let mut s = Session::default();
+        let id = run(&mut s, "box 10,20,5 4,4,4").created[0];
+        let before = s.doc.get(id).unwrap().geometry.aabb();
+        assert!(before.min.distance(DVec3::new(10.0, 20.0, 5.0)) < 1e-9);
+        run(&mut s, "tozero last");
+        let after = s.doc.get(id).unwrap().geometry.aabb();
+        assert!(after.min.length() < 1e-9, "bbox min at origin, got {}", after.min);
+        // Undo restores the original position exactly.
+        s.undo().unwrap();
+        let restored = s.doc.get(id).unwrap().geometry.aabb();
+        assert!(restored.min.distance(before.min) < 1e-9, "tozero undo restores position");
+    }
+
+    #[test]
+    fn flatten_zeroes_z_and_undoes() {
+        let mut s = Session::default();
+        let id = run(&mut s, "box 0,0,3 2,2,5").created[0];
+        let before = s.doc.get(id).unwrap().geometry.aabb();
+        assert!(before.max.z > 1.0, "box has height before flatten");
+        run(&mut s, "flatten last");
+        let after = s.doc.get(id).unwrap().geometry.aabb();
+        assert!(after.min.z.abs() < 1e-9 && after.max.z.abs() < 1e-9, "z collapsed to 0");
+        // Undo restores the original geometry (snapshot).
+        s.undo().unwrap();
+        let restored = s.doc.get(id).unwrap().geometry.aabb();
+        assert!(restored.max.distance(before.max) < 1e-9, "flatten undo restores geometry");
+    }
+
+    #[test]
+    fn selsimilar_selects_by_layer_and_type() {
+        let mut s = Session::default();
+        // Two objects on layer 'walls', one on the default layer.
+        run(&mut s, "layer walls");
+        let a = run(&mut s, "box 0,0,0 1,1,1").created[0];
+        let b = run(&mut s, "box 5,0,0 1,1,1").created[0];
+        run(&mut s, "layer 0");
+        let c = run(&mut s, "circle 0,0 1").created[0];
+
+        // Seed the selection with `a`, then match its layer → a + b, not c.
+        s.doc.selection = std::iter::once(a).collect();
+        let out = run(&mut s, "selsimilar sel layer");
+        assert!(out.message.contains("2 similar"), "{}", out.message);
+        assert!(s.doc.selection.contains(&a) && s.doc.selection.contains(&b));
+        assert!(!s.doc.selection.contains(&c), "different layer excluded");
+
+        // By type: seed the circle (curve), matches only curves → c alone.
+        s.doc.selection = std::iter::once(c).collect();
+        let out = run(&mut s, "selsimilar sel type");
+        assert!(s.doc.selection.contains(&c), "{}", out.message);
+        assert!(!s.doc.selection.contains(&a), "meshes excluded from curve match");
+    }
+
+    #[test]
+    fn selsimilar_by_weight_selects_same_lineweight() {
+        let mut s = Session::default();
+        // Three lines; give a + b the same override weight, c a different one.
+        let a = run(&mut s, "line 0,0 1,0").created[0];
+        let b = run(&mut s, "line 0,1 1,1").created[0];
+        let c = run(&mut s, "line 0,2 1,2").created[0];
+        // Set per-object lineweight overrides directly (a + b share 0.5).
+        s.doc.get_mut(a).unwrap().lineweight_mm = Some(0.5);
+        s.doc.get_mut(b).unwrap().lineweight_mm = Some(0.5);
+        s.doc.get_mut(c).unwrap().lineweight_mm = Some(0.9);
+
+        s.doc.selection = std::iter::once(a).collect();
+        let out = run(&mut s, "selsimilar sel weight");
+        assert!(out.message.contains("2 similar"), "{}", out.message);
+        assert!(s.doc.selection.contains(&a) && s.doc.selection.contains(&b));
+        assert!(!s.doc.selection.contains(&c), "different weight excluded");
+    }
+
+    #[test]
+    fn seldup_flags_duplicate_polylines() {
+        let mut s = Session::default();
+        // Two identical polylines + one different → exactly one duplicate flagged.
+        let _p1 = run(&mut s, "polyline 0,0 1,0 1,1").created[0];
+        let p2 = run(&mut s, "polyline 0,0 1,0 1,1").created[0];
+        let unique = run(&mut s, "polyline 0,0 2,0 2,2").created[0];
+        let out = run(&mut s, "seldup");
+        assert!(out.message.contains("1 duplicate"), "{}", out.message);
+        assert!(s.doc.selection.contains(&p2), "the second copy is the duplicate");
+        assert!(!s.doc.selection.contains(&unique), "distinct polyline not flagged");
+    }
+
+    #[test]
+    fn selregion_window_and_crossing_pick_the_right_objects() {
+        let mut s = Session::default();
+        // Rect is 0,0..10,10. Place three unit boxes:
+        //   inside   — fully within the rect (2..3),
+        //   straddle — crosses the right edge (9..11),
+        //   outside  — entirely beyond the rect (20..21).
+        let inside = run(&mut s, "box 2,2,0 1,1,1").created[0];
+        let straddle = run(&mut s, "box 9,2,0 2,1,1").created[0];
+        let outside = run(&mut s, "box 20,20,0 1,1,1").created[0];
+
+        // window: only the fully-inside box.
+        let out = run(&mut s, "selregion 0,0 10,10 window");
+        assert!(out.message.contains("selected 1 object(s) (window)"), "{}", out.message);
+        assert!(s.doc.selection.contains(&inside));
+        assert!(!s.doc.selection.contains(&straddle), "straddling box excluded from window");
+        assert!(!s.doc.selection.contains(&outside));
+
+        // crossing: inside + straddling, not the far-away box.
+        let out = run(&mut s, "selregion 0,0 10,10 crossing");
+        assert!(out.message.contains("selected 2 object(s) (crossing)"), "{}", out.message);
+        assert!(s.doc.selection.contains(&inside) && s.doc.selection.contains(&straddle));
+        assert!(!s.doc.selection.contains(&outside));
+
+        // Corners may be given in any order (normalized) → same result.
+        let out = run(&mut s, "selregion 10,10 0,0 window");
+        assert!(out.message.contains("selected 1"), "{}", out.message);
+
+        // Empty region far from everything → clean "selected 0", not an error.
+        let out = run(&mut s, "selwindow 100,100 101,101");
+        assert!(out.message.contains("selected 0 object(s) (window)"), "{}", out.message);
+        assert!(s.doc.selection.is_empty());
+
+        // selregion is a selection change, never op-logged.
+        assert!(!Command::SelRegion {
+            min: DVec3::ZERO,
+            max: DVec3::new(1.0, 1.0, 0.0),
+            mode: RegionMode::Window,
+        }
+        .is_logged());
+    }
+
+    #[test]
+    fn rect_aabb_helpers_are_correct() {
+        use kernel_mesh::Aabb;
+        let rect = Rect2::from_corners(DVec3::new(0.0, 0.0, 0.0), DVec3::new(10.0, 10.0, 0.0));
+
+        // Fully inside → contained and intersecting.
+        let inside = Aabb::from_points([DVec3::new(2.0, 2.0, -5.0), DVec3::new(3.0, 3.0, 5.0)]);
+        assert!(rect_contains_aabb(rect, inside));
+        assert!(rect_intersects_aabb(rect, inside));
+
+        // Straddling the edge → not contained, but intersecting.
+        let straddle = Aabb::from_points([DVec3::new(9.0, 2.0, 0.0), DVec3::new(11.0, 3.0, 0.0)]);
+        assert!(!rect_contains_aabb(rect, straddle));
+        assert!(rect_intersects_aabb(rect, straddle));
+
+        // Fully outside → neither.
+        let outside = Aabb::from_points([DVec3::new(20.0, 20.0, 0.0), DVec3::new(21.0, 21.0, 0.0)]);
+        assert!(!rect_contains_aabb(rect, outside));
+        assert!(!rect_intersects_aabb(rect, outside));
+
+        // Edge contact counts as crossing (touching the min corner).
+        let touch = Aabb::from_points([DVec3::new(-1.0, -1.0, 0.0), DVec3::new(0.0, 0.0, 0.0)]);
+        assert!(rect_intersects_aabb(rect, touch));
+        assert!(!rect_contains_aabb(rect, touch));
+
+        // Z extent is ignored (planar test): a tall box still contained in XY.
+        let tall = Aabb::from_points([DVec3::new(4.0, 4.0, -999.0), DVec3::new(5.0, 5.0, 999.0)]);
+        assert!(rect_contains_aabb(rect, tall));
+    }
+
+    #[test]
+    fn lineperp_endpoint_is_foot_of_perpendicular() {
+        let mut s = Session::default();
+        // Horizontal line along X; perpendicular from (5,3,0) lands at (5,0,0).
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "lineperp 5,3,0 last");
+        let Curve::Line { a, b } = curve_of_last(&s) else { panic!("expected a line") };
+        assert!(a.distance(DVec3::new(5.0, 3.0, 0.0)) < 1e-9, "starts at from");
+        assert!(b.distance(DVec3::new(5.0, 0.0, 0.0)) < 1e-9, "foot at (5,0,0)");
+    }
+
+    #[test]
+    fn linetan_endpoint_is_tangent_point_on_circle() {
+        let mut s = Session::default();
+        // Unit circle at origin; nearest point to (5,0,0) is (1,0,0).
+        run(&mut s, "circle 0,0,0 1");
+        run(&mut s, "linetan 5,0,0 last");
+        let Curve::Line { a, b } = curve_of_last(&s) else { panic!("expected a line") };
+        assert!(a.distance(DVec3::new(5.0, 0.0, 0.0)) < 1e-9, "starts at from");
+        assert!(b.distance(DVec3::new(1.0, 0.0, 0.0)) < 1e-9, "tangent point on rim");
+    }
+
+    #[test]
+    fn circletan_line_line_center_is_equidistant() {
+        let mut s = Session::default();
+        // Two perpendicular lines through the origin (the X and Y axes). A circle
+        // of radius 2 tangent to both sits at (2,2) — 2 from each axis.
+        run(&mut s, "line 0,0,0 10,0,0");
+        run(&mut s, "name last la");
+        run(&mut s, "line 0,0,0 0,10,0");
+        run(&mut s, "name last lb");
+        let out = run(&mut s, "circletan la lb 2");
+        assert!(out.message.contains("circletan"), "{}", out.message);
+        let Curve::Arc { center, radius, .. } = curve_of_last(&s) else {
+            panic!("expected a circle (arc)")
+        };
+        assert!((radius - 2.0).abs() < 1e-9);
+        // Distance from center to each line (the axes) must equal the radius.
+        assert!((center.x.abs() - 2.0).abs() < 1e-9, "2 from the Y axis");
+        assert!((center.y.abs() - 2.0).abs() < 1e-9, "2 from the X axis");
+
+        // Undo removes the created circle.
+        let before = s.doc.len();
+        s.undo().unwrap();
+        assert_eq!(s.doc.len(), before - 1, "circletan undo removes the circle");
+
+        // Parallel lines have no tangent circle → graceful error.
+        run(&mut s, "line 0,5,0 10,5,0");
+        run(&mut s, "name last lc");
+        assert!(s.run(parse("circletan la lc 2").unwrap()).is_err());
+    }
+
+    #[test]
+    fn circletan_line_line_helper_center_math() {
+        // Pure helper: axes at origin, radius 3 → center 3 from each line.
+        let la = (DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0));
+        let lb = (DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.0, 1.0, 0.0));
+        let c = circletan_line_line(la, lb, 3.0).expect("non-parallel");
+        assert!((c.x.abs() - 3.0).abs() < 1e-9 && (c.y.abs() - 3.0).abs() < 1e-9);
+        // Parallel lines → None.
+        let lp = (DVec3::new(0.0, 5.0, 0.0), DVec3::new(1.0, 5.0, 0.0));
+        assert!(circletan_line_line(la, lp, 2.0).is_none());
+    }
+
+    #[test]
+    fn dimradius_and_diameter_create_dims_and_undo() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0 2");
+        let before = s.doc.len();
+        let out = run(&mut s, "dimradius last");
+        assert!(out.message.contains("radius dim"), "{}", out.message);
+        assert_eq!(s.doc.len(), before + 1, "one dim created");
+        // The measured length equals the radius (center → rim).
+        assert!(out.message.contains('2'), "radius ≈ 2 in {}", out.message);
+        s.undo().unwrap();
+        assert_eq!(s.doc.len(), before, "dimradius undo removes the dim");
+
+        // Diameter measures 2·r across the center.
+        let out = run(&mut s, "dimdiameter last");
+        assert!(out.message.contains("diameter dim"), "{}", out.message);
+        assert!(out.message.contains('4'), "diameter ≈ 4 in {}", out.message);
+        s.undo().unwrap();
+        assert_eq!(s.doc.len(), before, "dimdiameter undo removes the dim");
+
+        // Non-circle target is rejected.
+        run(&mut s, "line 0,0 5,0");
+        assert!(s.run(parse("dimradius last").unwrap()).is_err());
+    }
+
+    #[test]
+    fn dimradius_guards_non_world_cplane() {
+        // dimradius builds the rim point in world XY; on a non-world CPlane it
+        // would emit a mis-placed dim, so it must guard instead.
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0 2");
+        // Works on a world CPlane.
+        run(&mut s, "dimradius last");
+        s.undo().unwrap();
+        // A non-world CPlane (Z-offset is enough — the arc math ignores it) errors.
+        run(&mut s, "cplane origin 0,0,5 normal 0,0,1");
+        let err = s.run(parse("dimradius last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("world CPlane"), "guarded: {err}");
+        let err = s.run(parse("dimdiameter last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("world CPlane"), "guarded: {err}");
+    }
+
+    // ── CPlane / UCS ────────────────────────────────────────────────────────
+
+    /// AABB center of the most-recently-created object.
+    fn last_center(s: &Session) -> DVec3 {
+        let id = *s.doc.all_ids().last().expect("an object exists");
+        s.doc.get(id).expect("live object").geometry.aabb().center()
+    }
+
+    /// A point typed in CPlane space lands at the correct WORLD location: a
+    /// plane lifted to z=10 turns a typed (1,2,0) into world (1,2,10). Uses the
+    /// `PointLiteral` op directly (no command-line verb creates one) so the
+    /// single-point case is exercised the same way the app's picker will.
+    #[test]
+    fn cplane_point_lands_in_world() {
+        let mut s = Session::default();
+        run(&mut s, "cplane origin 0,0,10 normal 0,0,1");
+        s.run(Command::PointLiteral { id: None, positions: vec![DVec3::new(1.0, 2.0, 0.0)] })
+            .unwrap();
+        let c = last_center(&s);
+        assert!(c.abs_diff_eq(DVec3::new(1.0, 2.0, 10.0), 1e-9), "point at {c}");
+
+        // A line's endpoints are both lifted (every vertex transformed).
+        run(&mut s, "line 0,0,0 3,0,0");
+        let c = last_center(&s);
+        assert!(c.abs_diff_eq(DVec3::new(1.5, 0.0, 10.0), 1e-9), "line mid at {c}");
+    }
+
+    /// The op that gets LOGGED carries WORLD coords, so later changing (or
+    /// resetting) the CPlane and replaying reproduces byte-identical geometry.
+    #[test]
+    fn cplane_logged_op_is_world_and_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "cplane origin 0,0,10 normal 0,0,1");
+        s.run(Command::PointLiteral { id: None, positions: vec![DVec3::new(1.0, 2.0, 0.0)] })
+            .unwrap();
+
+        // The single logged op is the point; assert it stores world coords, not
+        // the typed CPlane-space (1,2,0).
+        let logged: Vec<Command> = s.log.iter().map(|a| a.op.clone()).collect();
+        assert_eq!(logged.len(), 1, "only the point is logged (cplane is not)");
+        match &logged[0] {
+            Command::PointLiteral { positions, .. } => {
+                assert_eq!(positions.len(), 1);
+                assert!(
+                    positions[0].abs_diff_eq(DVec3::new(1.0, 2.0, 10.0), 1e-12),
+                    "logged op must carry world coords, got {}",
+                    positions[0]
+                );
+            }
+            other => panic!("expected PointLiteral, got {other:?}"),
+        }
+
+        let before = last_center(&s);
+
+        // Change the CPlane on the live session, THEN replay the log from
+        // scratch (replay starts at the world CPlane and never sees the cplane
+        // op). Geometry must be identical.
+        run(&mut s, "cplane origin 99,99,99 normal 1,0,0");
+        let rebuilt = Session::replay(logged).unwrap();
+        let after = last_center(&rebuilt);
+        assert!(after.abs_diff_eq(before, 1e-12), "replay drifted: {before} vs {after}");
+    }
+
+    /// `cplane world` / save / recall round-trip through the live session.
+    #[test]
+    fn cplane_world_save_recall() {
+        let mut s = Session::default();
+        run(&mut s, "cplane origin 0,0,5 normal 0,0,1");
+        run(&mut s, "cplane save deck");
+        run(&mut s, "cplane world");
+        assert!(s.doc.cplane.is_world(), "reset to world");
+        run(&mut s, "cplane deck");
+        assert!(
+            s.doc.cplane.origin.abs_diff_eq(DVec3::new(0.0, 0.0, 5.0), 1e-12),
+            "recalled saved plane"
+        );
+        // Recalling an unknown name errors.
+        assert!(s.run(parse("cplane nope").unwrap()).is_err());
+        // The report form never errors and mentions the plane.
+        let out = run(&mut s, "cplane");
+        assert!(out.message.contains("cplane"), "{}", out.message);
+    }
+
+    /// rect/box/circle only transform their anchor, so they mis-orient on a
+    /// ROTATED CPlane. They must error there; a pure Z-offset (translation-only)
+    /// plane is allowed and lands the geometry at the offset.
+    #[test]
+    fn rect_box_circle_guard_rotated_cplane() {
+        // Rotated plane: X axis along world Y (normal 1,0,0 → x_axis ≠ world X).
+        let mut s = Session::default();
+        run(&mut s, "cplane origin 0,0,0 normal 1,0,0");
+        assert!(s.doc.cplane.is_rotated(), "this plane's basis is rotated");
+        for verb in ["rect 0,0,0 2 2", "circle 0,0,0 1", "box 0,0,0 1,1,1"] {
+            let err = s.run(parse(verb).unwrap()).unwrap_err();
+            assert!(
+                err.to_string().contains("world-aligned CPlane"),
+                "{verb} must guard on a rotated plane, got: {err}"
+            );
+        }
+        assert_eq!(s.doc.len(), 0, "no geometry created on the rotated plane");
+
+        // Axis-FLIPPED plane: normal (0,0,-1) gives y_axis = -Y (anti-parallel,
+        // wrong sign) — rect would mirror, so it must hit the same guard.
+        let mut sf = Session::default();
+        run(&mut sf, "cplane origin 0,0,0 normal 0,0,-1");
+        assert!(sf.doc.cplane.is_rotated(), "axis-flipped plane is rotated");
+        let err = sf.run(parse("rect 0,0,0 2 2").unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("world-aligned CPlane"),
+            "flipped plane must guard rect, got: {err}"
+        );
+        assert_eq!(sf.doc.len(), 0, "no geometry created on the flipped plane");
+
+        // Pure Z-offset plane (world-aligned axes): rect/circle/box succeed and
+        // land at Z=10.
+        let mut s2 = Session::default();
+        run(&mut s2, "cplane origin 0,0,10 normal 0,0,1");
+        assert!(!s2.doc.cplane.is_rotated(), "Z-offset plane is not rotated");
+        run(&mut s2, "rect 0,0,0 2 2");
+        run(&mut s2, "circle 0,0,0 1");
+        run(&mut s2, "box 0,0,0 1,1,1");
+        assert_eq!(s2.doc.len(), 3, "all three created on the offset plane");
+        let bb = s2.doc.scene_aabb().unwrap();
+        // Everything sits at (or above) Z=10 from the plane offset.
+        assert!(bb.min.z >= 10.0 - 1e-9, "geometry landed at the Z offset, min.z={}", bb.min.z);
+    }
+
+    /// Importers pass world coords; a user CPlane must NOT re-project them.
+    /// `run_world` suppresses the transform for internally-generated geometry.
+    #[test]
+    fn cplane_does_not_reproject_world_run() {
+        let mut s = Session::default();
+        run(&mut s, "cplane origin 0,0,100 normal 0,0,1");
+        // Emulate an importer emitting already-world geometry.
+        s.run_world(Command::PointLiteral {
+            id: None,
+            positions: vec![DVec3::new(1.0, 2.0, 3.0)],
+        })
+        .unwrap();
+        let c = last_center(&s);
+        assert!(c.abs_diff_eq(DVec3::new(1.0, 2.0, 3.0), 1e-9), "world coords preserved: {c}");
+        // The active CPlane is restored afterward.
+        assert!(s.doc.cplane.origin.abs_diff_eq(DVec3::new(0.0, 0.0, 100.0), 1e-12));
+    }
+
+    // ── custom .pat hatch patterns (hatchpat + hatch … pattern) ─────────────
+
+    /// Write a two-pattern .pat to a temp file for the import tests. `tag`
+    /// keeps parallel tests from sharing (and deleting) each other's dir.
+    fn write_sample_pat(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ijc_pat_{}_{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.pat");
+        std::fs::write(
+            &path,
+            "; sample\n*GRAVEL, gravel fill\n45, 0,0, 0,0.5\n135, 0,0, 0,0.5\n*DASHED, dashed\n0, 0,0, 0,0.4, 0.2,-0.2\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn hatchpat_imports_patterns_into_registry() {
+        let mut s = Session::default();
+        let path = write_sample_pat("import");
+        let out = run(&mut s, &format!("hatchpat {}", path.to_str().unwrap()));
+        assert!(out.message.contains("imported 2 hatch pattern(s)"), "msg: {}", out.message);
+        assert!(s.doc.hatch_patterns.contains_key("GRAVEL"));
+        assert!(s.doc.hatch_patterns.contains_key("DASHED"));
+        // The GRAVEL def carries its two crossing families and the description.
+        let g = &s.doc.hatch_patterns["GRAVEL"];
+        assert_eq!(g.description, "gravel fill");
+        assert_eq!(g.lines.len(), 2);
+        assert_eq!(g.lines[0].angle_deg, 45.0);
+        assert_eq!(g.lines[0].delta.y, 0.5, "perpendicular spacing");
+        assert_eq!(s.doc.hatch_patterns["DASHED"].lines[0].dashes, vec![0.2, -0.2]);
+
+        // Undo restores the empty registry.
+        run(&mut s, "undo");
+        assert!(s.doc.hatch_patterns.is_empty(), "undo clears imported patterns");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn hatch_with_imported_pattern_bakes_families_and_renders() {
+        use itsjustcad_doc::{Annotation, Geometry, HatchPattern};
+        let mut s = Session::default();
+        let path = write_sample_pat("render");
+        run(&mut s, &format!("hatchpat {}", path.to_str().unwrap()));
+        // A closed square boundary to hatch. Use the `last` selector rather than
+        // formatting the object id — the short-id form is order-sensitive across
+        // the full test binary, whereas `last` always names the polyline.
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+        let out = run(&mut s, "hatch last pattern GRAVEL 2");
+        assert!(out.message.contains("hatched"), "msg: {}", out.message);
+
+        // The created hatch is self-contained: it carries the copied families
+        // and scale, not just the name.
+        let hatch_id = *out.created.first().unwrap();
+        let Geometry::Annotation(Annotation::Hatch { pattern, boundary }) =
+            &s.doc.get(hatch_id).unwrap().geometry
+        else {
+            panic!("expected a hatch");
+        };
+        let HatchPattern::Custom { name, lines, scale } = pattern else {
+            panic!("expected a custom pattern, got {pattern:?}");
+        };
+        assert_eq!(name, "GRAVEL");
+        assert_eq!(*scale, 2.0);
+        assert_eq!(lines.len(), 2, "both families copied from the registry");
+        // The family generator produces clipped line geometry inside the box.
+        let segs = itsjustcad_doc::hatch::hatch_pat(boundary, lines, *scale);
+        assert!(!segs.is_empty(), "custom pattern must render some hatch lines");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn hatch_unknown_pattern_name_is_clean_error() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 1,0,0 1,1,0 0,1,0 closed");
+        let err = s.run(parse("hatch last pattern NOPE").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no imported hatch pattern 'NOPE'"), "{err}");
     }
 }

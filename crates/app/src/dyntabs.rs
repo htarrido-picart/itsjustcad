@@ -566,6 +566,7 @@ mod tests {
             scale: 1.0,
             rotation_deg: 0.0,
             params: Default::default(),
+            clip: None,
         };
         assert_eq!(double_click_reveals_blocks(Some(&inst)).as_deref(), Some("door"));
     }
@@ -579,6 +580,7 @@ mod tests {
             scale: 1.0,
             rotation_deg: 0.0,
             params: Default::default(),
+            clip: None,
         };
         assert_eq!(
             double_click_reveals_blocks(Some(&inst)).as_deref(),

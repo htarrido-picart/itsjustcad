@@ -320,6 +320,61 @@ pub fn hatch_ansi(boundary: &[DVec3], code: u8, spacing: f64) -> Vec<[DVec3; 2]>
     }
 }
 
+/// Render a custom `.pat` pattern: one dashed line-family per `PatLine`,
+/// clipped to `boundary`, scaled by `scale`. Reuses the same angle+spacing+dash
+/// primitive as the ANSI/built-in patterns — a PAT family *is* a phase-offset
+/// dashed line set.
+///
+/// Rendering fidelity (documented limit): a PAT family's `delta.y` sets the
+/// perpendicular spacing between rails; `delta.x` (the along-line stagger) and
+/// the (origin.x, origin.y) offset are approximated by a single perpendicular
+/// phase derived from the origin, and the dash pen-pattern is drawn as a plain
+/// dash/gap cycle (pen-up runs are gaps, pen-down runs are marks; dot dashes of
+/// length 0 are skipped). This reads faithfully for the common geologic/USGS
+/// line patterns; exact per-family origin phase and multi-length dash cadence
+/// are not reproduced pixel-for-pixel.
+pub fn hatch_pat(
+    boundary: &[DVec3],
+    lines: &[crate::object::PatLine],
+    scale: f64,
+) -> Vec<[DVec3; 2]> {
+    if boundary.len() < 3 {
+        return Vec::new();
+    }
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let mut out = Vec::new();
+    for fam in lines {
+        // Perpendicular spacing between rails; a non-positive delta.y means a
+        // single line through the origin, which we cannot tile — skip it.
+        let spacing = fam.delta.y.abs() * scale;
+        if spacing <= 1e-9 {
+            continue;
+        }
+        // Phase = how far the family's origin sits off the rail grid, measured
+        // perpendicular to the line direction. Rotate origin into pattern space
+        // (same basis as `hatch_lines`) and take its y.
+        let (sin, cos) = fam.angle_deg.to_radians().sin_cos();
+        let phase = (-fam.origin.x * sin + fam.origin.y * cos) * scale;
+        let segs = hatch_lines_phase(boundary, fam.angle_deg, spacing, phase);
+        // Dash pen-pattern: sum of |d| is the period; the first pen-down run is
+        // the visible dash. A more faithful multi-length cadence is a
+        // documented non-goal (see fn docs).
+        if fam.dashes.is_empty() {
+            out.extend(segs);
+        } else {
+            let dash = fam.dashes.iter().find(|d| **d > 0.0).copied().unwrap_or(0.0) * scale;
+            let period: f64 = fam.dashes.iter().map(|d| d.abs()).sum::<f64>() * scale;
+            let gap = (period - dash).max(0.0);
+            if dash > 1e-9 {
+                out.extend(dash_segments(segs, dash, gap));
+            } else {
+                out.extend(segs);
+            }
+        }
+    }
+    out
+}
+
 /// Even-odd point-in-polygon test (XY plane).
 pub fn point_in_poly(pts: &[DVec2], p: DVec2) -> bool {
     let mut inside = false;

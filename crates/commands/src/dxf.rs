@@ -166,7 +166,29 @@ fn annotation_entity(
             text(t, layer, mid, 0.2, &itsjustcad_doc::format_length(units, (*b - *a).length()));
             2
         }
-        Annotation::Text { pos, text: s, height } => {
+        Annotation::AngularDim { vertex, p1, p2, radius } => {
+            // Two legs (as LINE) + arc (as POLYLINE) + the degree label as TEXT.
+            // Leg endpoints come from the shared helper (its first two segments
+            // are the legs); the arc stays a single POLYLINE entity for DXF.
+            let scaffold = itsjustcad_doc::angular_dim_segments(*vertex, *p1, *p2, *radius);
+            for &(a, b) in scaffold.iter().take(2) {
+                line(t, layer, a, b);
+            }
+            let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
+            polyline(t, layer, &arc, false);
+            let label_at = arc.get(arc.len() / 2).copied().unwrap_or(*vertex);
+            text(
+                t,
+                layer,
+                label_at,
+                0.2,
+                &itsjustcad_doc::format_angle(itsjustcad_doc::angle_degrees(*vertex, *p1, *p2)),
+            );
+            3
+        }
+        // A field exports like text — `text` is the resolved field value.
+        Annotation::Text { pos, text: s, height }
+        | Annotation::Field { pos, text: s, height, .. } => {
             // Tessellate via Hershey stroke font to world-space polylines so
             // the text renders at world scale consistently across all outputs.
             let strokes = itsjustcad_doc::hershey::text_strokes(s, [pos.x, pos.y], *height);
@@ -234,13 +256,89 @@ fn entity(
         // XREFs are unsupported). Parametric instances are baked: their geometry
         // already lives in `doc.blocks` under `block`, so they export as a plain
         // static block + INSERT like any other instance.
-        Geometry::Instance { block, position, rotation_deg, scale, .. } => {
-            insert(t, layer, &dxf_layer(block), *position, *rotation_deg, *scale);
-            1
+        Geometry::Instance { block, position, rotation_deg, scale, clip, .. } => {
+            // Without an XCLIP boundary, export as a plain INSERT (compact, and
+            // receivers keep the block reference). With a clip rect, an INSERT
+            // can't be culled by the receiver, so expand the block geometry to
+            // world coords and emit only the in-rect primitives — same
+            // all-or-nothing per-primitive cull the viewport (snapshot.rs) uses:
+            // a segment survives if both endpoints are inside the rect; a face if
+            // all its verts are inside. No border splitting (approximate MVP).
+            match clip {
+                None => {
+                    insert(t, layer, &dxf_layer(block), *position, *rotation_deg, *scale);
+                    1
+                }
+                Some(rect) => clipped_instance_entities(
+                    t, layer, block, *position, *rotation_deg, *scale, rect, doc,
+                ),
+            }
         }
         // Point clouds are not representable as DXF entities in this exporter.
         Geometry::Points { .. } => 0,
     }
+}
+
+/// Expand a clipped block instance to world-space LINE entities, culling
+/// primitives outside `rect`. Returns the number of entities written. Uses the
+/// shared `ClipRect::keeps_face` / `keeps_segment` — the SAME cull the viewport
+/// (snapshot.rs) and raytracer (build.rs) use, so export matches the display: a
+/// mesh feature-edge is kept if its face overlaps the rect; a curve segment if
+/// both endpoints are inside or it crosses the rect. No border splitting — an
+/// out-of-rect primitive is dropped whole (approximate).
+#[allow(clippy::too_many_arguments)]
+fn clipped_instance_entities(
+    t: &mut Tags,
+    layer: &str,
+    block: &str,
+    position: DVec3,
+    rotation_deg: f64,
+    scale: f64,
+    rect: &itsjustcad_doc::ClipRect,
+    doc: &Document,
+) -> usize {
+    let Some(defs) = doc.blocks.get(block) else { return 0 };
+    let rot = rotation_deg.to_radians();
+    let (sin_r, cos_r) = rot.sin_cos();
+    let transform = |p: DVec3| -> DVec3 {
+        let ps = p * scale;
+        DVec3::new(
+            ps.x * cos_r - ps.y * sin_r + position.x,
+            ps.x * sin_r + ps.y * cos_r + position.y,
+            ps.z + position.z,
+        )
+    };
+    let mut count = 0usize;
+    for def in defs {
+        match def {
+            BlockGeometry::Mesh(m) => {
+                // feature_edges returns endpoints in the def frame; transform to world.
+                for (ea, eb) in mesh_feature_edges(m) {
+                    let (a, b) = (transform(ea), transform(eb));
+                    if rect.keeps_segment(a, b) {
+                        line(t, layer, a, b);
+                        count += 1;
+                    }
+                }
+            }
+            BlockGeometry::Curve(c) => {
+                let mut pts: Vec<DVec3> = c.tessellate(EXPORT_TOL).iter().map(|&p| transform(p)).collect();
+                if c.is_closed() && let Some(first) = pts.first().copied() {
+                    pts.push(first);
+                }
+                for pair in pts.windows(2) {
+                    if rect.keeps_segment(pair[0], pair[1]) {
+                        line(t, layer, pair[0], pair[1]);
+                        count += 1;
+                    }
+                }
+            }
+            BlockGeometry::Annotation(_) => {
+                // Annotations in clipped block defs are not exported (matches viewport).
+            }
+        }
+    }
+    count
 }
 
 /// Build the complete DXF text for a document. Returns the file text and the
@@ -819,7 +917,8 @@ fn map_block_geom_points(
                 *p = xf(*p);
             }
         }
-        BlockGeometry::Annotation(Annotation::Text { pos, height, .. }) => {
+        BlockGeometry::Annotation(Annotation::Text { pos, height, .. })
+        | BlockGeometry::Annotation(Annotation::Field { pos, height, .. }) => {
             *pos = xf(*pos);
             *height *= rscale.abs();
         }
@@ -831,6 +930,12 @@ fn map_block_geom_points(
             if let itsjustcad_doc::DimAnchor::Free(p) = b {
                 *p = xf(*p);
             }
+        }
+        BlockGeometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) => {
+            *vertex = xf(*vertex);
+            *p1 = xf(*p1);
+            *p2 = xf(*p2);
+            *radius *= rscale.abs();
         }
         BlockGeometry::Annotation(Annotation::Hatch { boundary, .. }) => {
             for p in boundary.iter_mut() {
@@ -906,11 +1011,17 @@ fn translate_block_geom(g: &mut itsjustcad_doc::BlockGeometry, d: DVec3) {
     use itsjustcad_doc::{Annotation, BlockGeometry};
     match g {
         BlockGeometry::Curve(c) => c.translate(d),
-        BlockGeometry::Annotation(Annotation::Text { pos, .. }) => *pos += d,
+        BlockGeometry::Annotation(Annotation::Text { pos, .. })
+        | BlockGeometry::Annotation(Annotation::Field { pos, .. }) => *pos += d,
         BlockGeometry::Annotation(Annotation::LinearDim { a, b, .. }) => {
             // Free anchors translate; object bindings follow their referent.
             a.translate(d);
             b.translate(d);
+        }
+        BlockGeometry::Annotation(Annotation::AngularDim { vertex, p1, p2, .. }) => {
+            *vertex += d;
+            *p1 += d;
+            *p2 += d;
         }
         BlockGeometry::Annotation(Annotation::Hatch { boundary, .. }) => {
             boundary.iter_mut().for_each(|p| *p += d);
@@ -2183,5 +2294,58 @@ mod tests {
             msg.contains("associative dimensions cannot be baked into a block"),
             "unexpected error message: {msg}"
         );
+    }
+
+    #[test]
+    fn dxf_export_honors_instance_clip() {
+        use itsjustcad_doc::{ClipRect, ObjectId, SceneObject};
+        // A block with two line segments: one inside the clip rect, one outside.
+        let inside = kernel_curve::Curve::Line { a: DVec3::new(0.5, 0.5, 0.0), b: DVec3::new(0.9, 0.9, 0.0) };
+        let outside = kernel_curve::Curve::Line { a: DVec3::new(5.0, 5.0, 0.0), b: DVec3::new(6.0, 6.0, 0.0) };
+        let mut doc = Document::default();
+        doc.blocks.insert(
+            "seg".to_string(),
+            vec![BlockGeometry::Curve(inside), BlockGeometry::Curve(outside)],
+        );
+        let make = |clip: Option<ClipRect>| {
+            let mut d = doc.clone();
+            d.insert(SceneObject {
+                visible: true,
+                id: ObjectId::new(),
+                name: None,
+                layer: "0".into(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Instance {
+                    block: "seg".into(),
+                    position: DVec3::ZERO,
+                    rotation_deg: 0.0,
+                    scale: 1.0,
+                    source: None,
+                    params: Default::default(),
+                    clip,
+                },
+            });
+            d
+        };
+
+        // Without a clip: exported as a single INSERT (1 entity).
+        let (_txt, n_noclip) = document_dxf(&make(None));
+
+        // With a clip rect around [0,1]²: the inside segment survives, the
+        // outside one is culled. Exported as expanded LINE entities, so the
+        // count reflects only the in-rect segment.
+        let rect = ClipRect::new(glam::DVec2::ZERO, glam::DVec2::new(1.0, 1.0));
+        let (txt, n_clip) = document_dxf(&make(Some(rect)));
+        // Only ENTITIES-section entities count (the BLOCKS section still carries
+        // the full block body). scan_entities already scopes to ENTITIES.
+        let lines = scan_entities(&txt).into_iter().filter(|e| e == "LINE").count();
+        assert_eq!(lines, 1, "only the in-rect segment is exported as an entity\n{txt}");
+        // The clipped instance expands to LINE entities (not an INSERT).
+        assert!(!scan_entities(&txt).iter().any(|e| e == "INSERT"), "clipped → no INSERT");
+        assert!(n_clip >= 1);
+        // The unclipped export references the block via a single INSERT.
+        assert!(n_noclip >= 1);
     }
 }
