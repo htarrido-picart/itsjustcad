@@ -105,11 +105,20 @@ jobs:
       # bin. --test-threads=1 because the kittest harnesses aren't parallel-safe
       # (shared wgpu adapter + on-disk snapshot files). No UPDATE_SNAPSHOTS.
       #
+      # The two draw-tool journeys need egui to fire `response.clicked()` for a
+      # synthetic viewport click. That is reliable on real dev machines but NOT
+      # on GitHub's virtualized macOS runner — egui_kittest single-clicks don't
+      # register there (a press-move-release DRAG, e.g. box-select, does; see
+      # journey_box_select_drag which passes). Not an app bug — a test-harness
+      # limitation on virtualized GPUs. They stay #[ignore]d local-only tests;
+      # run `--ignored` on a dev machine to exercise them.
       - name: Run journey + snapshot UI tests (ignored, GPU)
         run: |
           cargo test -p itsjustcad --bin itsjustcad -- \
             --ignored --test-threads=1 \
-            journey_ app_preview_ chat_preview_
+            journey_ app_preview_ chat_preview_ \
+            --skip journey_polygon_draw_tool \
+            --skip journey_polyline_close_c_key
 
       # egui_kittest writes <name>.diff.png / <name>.new.png next to the golden
       # on a mismatch (gitignored). Surface them for human inspection.
