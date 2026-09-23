@@ -507,6 +507,96 @@ impl ClipRect {
     pub fn contains_xy(&self, p: DVec3) -> bool {
         p.x >= self.min.x && p.x <= self.max.x && p.y >= self.min.y && p.y <= self.max.y
     }
+
+    /// The rect's 4 corners in world XY (CCW from min), for overlap tests.
+    fn corners(&self) -> [DVec2; 4] {
+        [
+            DVec2::new(self.min.x, self.min.y),
+            DVec2::new(self.max.x, self.min.y),
+            DVec2::new(self.max.x, self.max.y),
+            DVec2::new(self.min.x, self.max.y),
+        ]
+    }
+
+    /// Should the XCLIP cull KEEP the mesh face `(a,b,c)` (world XY projection)?
+    /// True if any triangle vertex is inside the rect OR any rect corner is
+    /// inside the triangle — so a face whose interior covers a clip window
+    /// smaller than itself survives (else the view/export would go blank). This
+    /// is the SINGLE source of truth for the viewport (snapshot.rs), DXF export
+    /// (dxf.rs) and the raytracer (build.rs): all three call this, keeping the
+    /// clip identical everywhere. Approximate — no border split (no
+    /// Sutherland–Hodgman); the face is kept whole or dropped whole.
+    ///
+    /// A DEGENERATE (near-zero-area) triangle — e.g. an edge-on/vertical face
+    /// that projects to a zero-area segment in XY — is kept ONLY if a vertex is
+    /// actually inside the rect. The corner-in-triangle test is skipped for such
+    /// faces (a zero-area barycentric test spuriously reports "inside" for any
+    /// point), so an edge-on face outside the rect no longer leaks through.
+    pub fn keeps_face(&self, a: DVec3, b: DVec3, c: DVec3) -> bool {
+        if self.contains_xy(a) || self.contains_xy(b) || self.contains_xy(c) {
+            return true;
+        }
+        let (a2, b2, c2) = (a.truncate(), b.truncate(), c.truncate());
+        // Signed area × 2; a degenerate projected triangle has ~0 area and its
+        // barycentric point-in-triangle test is meaningless, so skip it.
+        let area2 = (b2.x - a2.x) * (c2.y - a2.y) - (b2.y - a2.y) * (c2.x - a2.x);
+        if area2.abs() < 1e-12 {
+            return false;
+        }
+        self.corners().iter().any(|&p| point_in_triangle_2d(p, a2, b2, c2))
+    }
+
+    /// Should the XCLIP cull KEEP the segment `a→b` (world XY)? True if both
+    /// endpoints are inside the rect OR the segment crosses the rect (an
+    /// endpoint inside, or it intersects any of the 4 rect edges). Kept as a
+    /// per-primitive keep (no border split): the segment is drawn whole or
+    /// dropped whole, matching `keeps_face`. Shared by all three cull sites.
+    pub fn keeps_segment(&self, a: DVec3, b: DVec3) -> bool {
+        if self.contains_xy(a) || self.contains_xy(b) {
+            return true;
+        }
+        let (a2, b2) = (a.truncate(), b.truncate());
+        let c = self.corners();
+        // Segment crosses the rect boundary if it intersects any rect edge.
+        (0..4).any(|i| segments_intersect(a2, b2, c[i], c[(i + 1) % 4]))
+    }
+}
+
+/// Point-in-triangle via barycentric sign test (inclusive of edges). 2D only.
+/// Caller must guard against degenerate (zero-area) triangles: for those all
+/// three cross products are zero and this returns `true` for ANY point.
+fn point_in_triangle_2d(p: DVec2, a: DVec2, b: DVec2, c: DVec2) -> bool {
+    let d = |u: DVec2, v: DVec2, w: DVec2| (v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x);
+    let d1 = d(a, b, p);
+    let d2 = d(b, c, p);
+    let d3 = d(c, a, p);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    // Inside if all cross products share a sign (allowing zero on an edge).
+    !(has_neg && has_pos)
+}
+
+/// Do the 2D segments `p1→p2` and `p3→p4` intersect (proper or touching)?
+/// Standard orientation test with collinear-overlap handling.
+fn segments_intersect(p1: DVec2, p2: DVec2, p3: DVec2, p4: DVec2) -> bool {
+    let orient = |a: DVec2, b: DVec2, c: DVec2| (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    let on_seg = |a: DVec2, b: DVec2, c: DVec2| {
+        // c is collinear with a,b — is it within the a,b bounding box?
+        c.x >= a.x.min(b.x) && c.x <= a.x.max(b.x) && c.y >= a.y.min(b.y) && c.y <= a.y.max(b.y)
+    };
+    let d1 = orient(p3, p4, p1);
+    let d2 = orient(p3, p4, p2);
+    let d3 = orient(p1, p2, p3);
+    let d4 = orient(p1, p2, p4);
+    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+    {
+        return true;
+    }
+    (d1 == 0.0 && on_seg(p3, p4, p1))
+        || (d2 == 0.0 && on_seg(p3, p4, p2))
+        || (d3 == 0.0 && on_seg(p1, p2, p3))
+        || (d4 == 0.0 && on_seg(p1, p2, p4))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1077,6 +1167,77 @@ mod tests {
         // Outside on either axis.
         assert!(!r.contains_xy(DVec3::new(1.9, 6.0, 0.0)));
         assert!(!r.contains_xy(DVec3::new(5.0, 8.1, 0.0)));
+    }
+
+    #[test]
+    fn clip_keeps_face_big_face_containing_small_clip() {
+        // A big triangle whose interior covers a small clip window (all verts
+        // outside) must be kept: no vertex inside, but rect corners are inside.
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(2.0, 2.0));
+        let a = DVec3::new(-10.0, -10.0, 0.0);
+        let b = DVec3::new(10.0, -10.0, 0.0);
+        let c = DVec3::new(0.0, 10.0, 0.0);
+        assert!(!rect.contains_xy(a) && !rect.contains_xy(b) && !rect.contains_xy(c));
+        assert!(rect.keeps_face(a, b, c), "big face containing the clip is kept");
+    }
+
+    #[test]
+    fn clip_keeps_face_degenerate_outside_dropped() {
+        // An edge-on/vertical face projects to a zero-XY-area triangle. Fully
+        // outside the rect → must NOT be kept (the degeneracy guard blocks the
+        // spurious corner-in-triangle pass).
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(2.0, 2.0));
+        // All three points share the same XY (a vertical edge seen edge-on),
+        // located outside the rect: zero projected area.
+        let a = DVec3::new(5.0, 5.0, 0.0);
+        let b = DVec3::new(5.0, 5.0, 3.0);
+        let c = DVec3::new(5.0, 5.0, 6.0);
+        assert!(!rect.keeps_face(a, b, c), "degenerate face outside the clip is dropped");
+    }
+
+    #[test]
+    fn clip_keeps_face_degenerate_vertex_inside_kept() {
+        // A degenerate (zero-area) face is still kept if a vertex is inside.
+        let rect = ClipRect::new(DVec2::new(0.0, 0.0), DVec2::new(10.0, 10.0));
+        let a = DVec3::new(5.0, 5.0, 0.0);
+        let b = DVec3::new(5.0, 5.0, 3.0);
+        let c = DVec3::new(5.0, 5.0, 6.0);
+        assert!(rect.keeps_face(a, b, c), "degenerate face with a vertex inside is kept");
+    }
+
+    #[test]
+    fn clip_keeps_face_fully_outside_dropped() {
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(2.0, 2.0));
+        let a = DVec3::new(10.0, 10.0, 0.0);
+        let b = DVec3::new(12.0, 10.0, 0.0);
+        let c = DVec3::new(11.0, 12.0, 0.0);
+        assert!(!rect.keeps_face(a, b, c), "disjoint face is dropped");
+    }
+
+    #[test]
+    fn clip_keeps_segment_straddling_kept() {
+        // Both endpoints outside, but the segment crosses the rect.
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(3.0, 3.0));
+        let a = DVec3::new(0.0, 2.0, 0.0);
+        let b = DVec3::new(4.0, 2.0, 0.0);
+        assert!(!rect.contains_xy(a) && !rect.contains_xy(b));
+        assert!(rect.keeps_segment(a, b), "straddling segment is kept");
+    }
+
+    #[test]
+    fn clip_keeps_segment_outside_dropped() {
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(3.0, 3.0));
+        let a = DVec3::new(10.0, 10.0, 0.0);
+        let b = DVec3::new(12.0, 12.0, 0.0);
+        assert!(!rect.keeps_segment(a, b), "fully-outside segment is dropped");
+    }
+
+    #[test]
+    fn clip_keeps_segment_endpoint_inside_kept() {
+        let rect = ClipRect::new(DVec2::new(1.0, 1.0), DVec2::new(3.0, 3.0));
+        let a = DVec3::new(2.0, 2.0, 0.0); // inside
+        let b = DVec3::new(10.0, 10.0, 0.0); // outside
+        assert!(rect.keeps_segment(a, b), "segment with an inside endpoint is kept");
     }
 
     #[test]

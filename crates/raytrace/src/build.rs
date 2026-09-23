@@ -99,9 +99,10 @@ pub fn scene_from_doc(doc: &Document, sky: Sky) -> Scene {
                         ps.z + position.z,
                     )
                 };
-                // XCLIP boundary (world XY): a face survives only if all its
-                // world verts are inside the rect (same all-or-nothing cull the
-                // viewport/DXF export use; no border splitting).
+                // XCLIP boundary (world XY): a face survives if it overlaps the
+                // rect, via the shared `ClipRect::keeps_face` — the SAME cull the
+                // viewport (snapshot.rs) and DXF export (dxf.rs) use, so all three
+                // stay identical. All-or-nothing per face; no border splitting.
                 let clip = clip.as_ref();
                 let mat = b.add_material(material_for(obj, layer_color));
                 for def in defs {
@@ -114,7 +115,11 @@ pub fn scene_from_doc(doc: &Document, sky: Sky) -> Scene {
                                     .faces()
                                     .iter()
                                     .filter(|f| {
-                                        f.iter().all(|&vi| rect.contains_xy(positions[vi as usize]))
+                                        rect.keeps_face(
+                                            positions[f[0] as usize],
+                                            positions[f[1] as usize],
+                                            positions[f[2] as usize],
+                                        )
                                     })
                                     .copied()
                                     .collect();

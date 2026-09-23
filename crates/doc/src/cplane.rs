@@ -55,16 +55,20 @@ impl CPlane {
             && self.normal.abs_diff_eq(DVec3::Z, EPS)
     }
 
-    /// True if the basis is rotated relative to world — i.e. `x_axis` is not
-    /// (anti)parallel to world +X or `y_axis` is not (anti)parallel to world +Y.
-    /// A pure translation / +Z-offset plane (world-aligned axes, any origin) is
-    /// NOT rotated. Verbs whose extents stay world-axis-aligned (rect/box/circle)
-    /// are only correct on a non-rotated plane; they use this as a guard.
+    /// True if the basis is rotated OR flipped relative to world — i.e. `x_axis`
+    /// is not exactly world +X or `y_axis` is not exactly world +Y (correct
+    /// SIGN, not just parallel). A flipped/anti-parallel basis (e.g. normal
+    /// (0,0,-1), or a 180° spin about Z giving y_axis = -Y) counts as rotated,
+    /// because verbs whose extents stay world-axis-aligned (rect/box/circle)
+    /// would MIRROR on such a plane. A pure translation / +Z-offset plane
+    /// (axes exactly world, any origin) is NOT rotated. Those verbs use this as
+    /// a guard.
     pub fn is_rotated(&self) -> bool {
         const EPS: f64 = 1e-9;
-        // |dot| ~ 1 means (anti)parallel to the world axis.
-        let x_aligned = self.x_axis.normalize_or_zero().dot(DVec3::X).abs() > 1.0 - EPS;
-        let y_aligned = self.y_axis.normalize_or_zero().dot(DVec3::Y).abs() > 1.0 - EPS;
+        // Require the correct sign (dot ≈ +1), not merely (anti)parallel: a
+        // flipped axis (dot ≈ -1) is rotated.
+        let x_aligned = self.x_axis.normalize_or_zero().dot(DVec3::X) > 1.0 - EPS;
+        let y_aligned = self.y_axis.normalize_or_zero().dot(DVec3::Y) > 1.0 - EPS;
         !(x_aligned && y_aligned)
     }
 
@@ -175,6 +179,31 @@ mod tests {
         let p = DVec3::new(4.0, -5.0, 6.0);
         let back = c.to_cplane(c.to_world(p));
         assert!(back.abs_diff_eq(p, 1e-10), "got {back}");
+    }
+
+    #[test]
+    fn is_rotated_detects_axis_flip() {
+        // A plane whose normal is (0,0,-1) has a flipped basis (y_axis = -Y):
+        // (anti)parallel to world but WRONG sign → must read as rotated, else
+        // rect/box/circle would mirror.
+        let flipped =
+            CPlane::from_origin_normal(DVec3::ZERO, DVec3::new(0.0, 0.0, -1.0)).unwrap();
+        assert!(flipped.is_rotated(), "axis-flipped plane is rotated: {flipped:?}");
+
+        // A pure +Z-offset world plane (axes exactly world, origin lifted) is
+        // NOT rotated.
+        let offset =
+            CPlane::from_origin_normal(DVec3::new(0.0, 0.0, 10.0), DVec3::Z).unwrap();
+        assert!(!offset.is_rotated(), "Z-offset world plane is not rotated");
+
+        // A 180° spin about Z (x_axis = -X, y_axis = -Y) is also rotated.
+        let spun = CPlane {
+            origin: DVec3::ZERO,
+            x_axis: -DVec3::X,
+            y_axis: -DVec3::Y,
+            normal: DVec3::Z,
+        };
+        assert!(spun.is_rotated(), "180°-about-Z plane is rotated");
     }
 
     #[test]

@@ -160,38 +160,6 @@ fn push_hatch_segs(lines: &mut Vec<SceneLine>, segs: Vec<[DVec3; 2]>, color: [f3
     }
 }
 
-/// Does triangle `(a,b,c)` (world XY) overlap the clip `rect`? Approximate,
-/// cheap test used by the XCLIP mesh cull: true if any triangle vertex is inside
-/// the rect OR any of the rect's 4 corners is inside the triangle. This keeps a
-/// face whose interior covers the rect even when all its verts are outside (a
-/// clip window smaller than the triangle) — without full polygon clipping, so
-/// the face is drawn whole (no border split, documented approximation).
-fn face_overlaps_rect(rect: &itsjustcad_doc::ClipRect, a: DVec3, b: DVec3, c: DVec3) -> bool {
-    if rect.contains_xy(a) || rect.contains_xy(b) || rect.contains_xy(c) {
-        return true;
-    }
-    let (a2, b2, c2) = (a.truncate(), b.truncate(), c.truncate());
-    let corners = [
-        DVec2::new(rect.min.x, rect.min.y),
-        DVec2::new(rect.max.x, rect.min.y),
-        DVec2::new(rect.max.x, rect.max.y),
-        DVec2::new(rect.min.x, rect.max.y),
-    ];
-    corners.iter().any(|&p| point_in_triangle_2d(p, a2, b2, c2))
-}
-
-/// Point-in-triangle via barycentric sign test (inclusive of edges). 2D only.
-fn point_in_triangle_2d(p: DVec2, a: DVec2, b: DVec2, c: DVec2) -> bool {
-    let d = |u: DVec2, v: DVec2, w: DVec2| (v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x);
-    let d1 = d(a, b, p);
-    let d2 = d(b, c, p);
-    let d3 = d(c, a, p);
-    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-    // Inside if all cross products share a sign (allowing zero on an edge).
-    !(has_neg && has_pos)
-}
-
 /// Resolve the display color for an object given the active color mode.
 /// Selection always wins over everything; otherwise the mode determines priority.
 fn resolve_color(
@@ -479,37 +447,37 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                             ps.z + position.z,
                         )
                     };
-                    // XCLIP boundary (world XY), if any. Segment-level cull: a
-                    // mesh face survives if ALL its (world-XY) vertices are inside
-                    // the rect; a polyline segment survives if BOTH endpoints are
-                    // inside. Simple and correct for fully-inside/outside geometry;
-                    // it does NOT split partially-crossing faces/segments at the
-                    // border (an all-or-nothing cull per primitive — good enough
-                    // MVP; a future pass could Cohen–Sutherland-clip the border).
+                    // XCLIP boundary (world XY), if any. Per-primitive cull via
+                    // the shared `ClipRect::keeps_face` / `keeps_segment` — the
+                    // SAME methods the DXF export (dxf.rs) and raytracer
+                    // (build.rs) use, so viewport/export/raytrace stay identical.
+                    // A face survives if it overlaps the rect; a segment if both
+                    // endpoints are inside or it crosses the rect. All-or-nothing
+                    // per primitive — no border split (a future pass could
+                    // Cohen–Sutherland-clip the border).
                     let clip = clip.as_ref();
                     let color = resolve_color(obj, layer_color, theme, selected, mode, false);
                     for def_geo in defs {
                         match def_geo {
                             itsjustcad_doc::BlockGeometry::Mesh(m) => {
                                 // Transform positions and build a new mesh, culling
-                                // faces outside the clip rect (all vertices must be
-                                // inside for the face to survive).
+                                // faces outside the clip rect via the shared
+                                // `ClipRect::keeps_face` (identical to the DXF
+                                // export and raytracer cull).
                                 let new_pos: Vec<DVec3> =
                                     m.positions().iter().map(|&p| transform(p)).collect();
                                 let faces: Vec<[u32; 3]> = match clip {
-                                    // Keep a face if it OVERLAPS the rect (not
-                                    // just fully-inside): any face vertex inside
-                                    // the rect, OR any rect corner inside the
-                                    // triangle. This shows the interior region
-                                    // when the clip window is smaller than a
-                                    // triangle (else the face is culled whole and
-                                    // the view goes blank). Still approximate — no
-                                    // border split (no Sutherland–Hodgman clip).
+                                    // Keep a face if it OVERLAPS the rect (any
+                                    // vertex inside, or a rect corner inside the
+                                    // triangle) — so a clip window smaller than a
+                                    // face still shows its interior (else the view
+                                    // goes blank). Degenerate faces guarded inside
+                                    // `keeps_face`. Approximate — no border split.
                                     Some(rect) => m
                                         .faces()
                                         .iter()
                                         .filter(|f| {
-                                            face_overlaps_rect(rect, new_pos[f[0] as usize], new_pos[f[1] as usize], new_pos[f[2] as usize])
+                                            rect.keeps_face(new_pos[f[0] as usize], new_pos[f[1] as usize], new_pos[f[2] as usize])
                                         })
                                         .copied()
                                         .collect(),
@@ -540,25 +508,24 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                                 {
                                     world.push(first);
                                 }
-                                // With a clip rect, emit only the maximal runs of
-                                // consecutive vertices that are all inside (each
-                                // kept segment has both endpoints inside).
+                                // With a clip rect, keep each tessellated segment
+                                // that the shared `ClipRect::keeps_segment` accepts
+                                // (both endpoints inside OR the segment crosses the
+                                // rect) — identical to the DXF export cull. Kept
+                                // whole per segment; no border split.
                                 match clip {
                                     Some(rect) => {
-                                        let mut run: Vec<[f32; 3]> = Vec::new();
-                                        for p in &world {
-                                            if rect.contains_xy(*p) {
-                                                run.push([p.x as f32, p.y as f32, p.z as f32]);
-                                            } else {
-                                                if run.len() >= 2 {
-                                                    scene.lines.push((std::mem::take(&mut run), color, lw_mm));
-                                                } else {
-                                                    run.clear();
-                                                }
+                                        for pair in world.windows(2) {
+                                            if rect.keeps_segment(pair[0], pair[1]) {
+                                                scene.lines.push((
+                                                    vec![
+                                                        [pair[0].x as f32, pair[0].y as f32, pair[0].z as f32],
+                                                        [pair[1].x as f32, pair[1].y as f32, pair[1].z as f32],
+                                                    ],
+                                                    color,
+                                                    lw_mm,
+                                                ));
                                             }
-                                        }
-                                        if run.len() >= 2 {
-                                            scene.lines.push((run, color, lw_mm));
                                         }
                                     }
                                     None => {
@@ -1022,6 +989,7 @@ mod tests {
     fn face_overlaps_rect_keeps_face_containing_the_clip() {
         // Fix 8: a clip window smaller than a triangle (all triangle verts
         // OUTSIDE the rect) must still be kept — otherwise the view goes blank.
+        // Now delegated to the shared `ClipRect::keeps_face`.
         let a = DVec3::new(-10.0, -10.0, 0.0);
         let b = DVec3::new(10.0, -10.0, 0.0);
         let c = DVec3::new(0.0, 10.0, 0.0);
@@ -1031,14 +999,14 @@ mod tests {
             glam::DVec2::new(0.5, 0.5),
         );
         assert!(!rect.contains_xy(a) && !rect.contains_xy(b) && !rect.contains_xy(c));
-        assert!(face_overlaps_rect(&rect, a, b, c), "face containing the clip is kept");
+        assert!(rect.keeps_face(a, b, c), "face containing the clip is kept");
 
         // A rect fully outside the triangle is not kept.
         let far = itsjustcad_doc::ClipRect::new(
             glam::DVec2::new(100.0, 100.0),
             glam::DVec2::new(101.0, 101.0),
         );
-        assert!(!face_overlaps_rect(&far, a, b, c), "disjoint rect culls the face");
+        assert!(!far.keeps_face(a, b, c), "disjoint rect culls the face");
     }
 
     #[test]

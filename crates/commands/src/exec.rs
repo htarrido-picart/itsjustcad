@@ -6771,14 +6771,11 @@ fn exec_array_curve(
     if src.is_empty() {
         return Err(ExecError::Invalid("arraycurve: nothing selected to array".into()));
     }
-    // A closed path's first and last tessellated points coincide; detect either
-    // via the curve's own flag or the point coincidence so stations skip the
-    // duplicate endpoint (no overlapping copies at t=0 / t=1).
-    let closed = curve.is_closed()
-        || pts
-            .first()
-            .zip(pts.last())
-            .is_some_and(|(a, b)| (*a - *b).length() <= PROFILE_TOL);
+    // Only the curve's own closed flag decides closed-vs-open stationing. A
+    // closed path skips the duplicate t=0/t=1 station; an OPEN path keeps its
+    // endpoint copy — even when its ends happen to be near-coincident (an
+    // intentionally-open near-closed path must NOT drop its endpoint).
+    let closed = curve.is_closed();
     let ts = curve_station_ts(count, closed);
     let total_new = src.len() * ts.len();
     // Reuse logged ids on replay; mint new ones live.
@@ -14900,6 +14897,44 @@ mod tests {
         assert_eq!(s.doc.len(), 2); // just source box + path curve
         run(&mut s, "redo");
         assert_eq!(s.doc.len(), 5);
+    }
+
+    #[test]
+    fn array_curve_open_near_closed_keeps_endpoint() {
+        // An OPEN polyline whose ends are ~5 mm apart (well within PROFILE_TOL,
+        // 1 cm) must still be treated as OPEN: stations include both endpoints
+        // (t=0 and t=1), so 3 copies land on the start, mid, and near-end — the
+        // endpoint copy is NOT dropped as it would be for a closed path.
+        let mut s = Session::default();
+        run(&mut s, "box -0.5,-0.5,0 1,1,1");
+        run(&mut s, "name last widget");
+        // Open path: start (0,0,0) and end (0,0.005,0) are 5 mm apart — near, but
+        // the polyline is left open (no `closed`/loop back).
+        run(&mut s, "polyline 0,0,0 10,0,0 10,10,0 0,0.005,0");
+        run(&mut s, "name last path");
+        let out = run(&mut s, "arraycurve widget path 3 align off");
+        // Open stationing → count copies (no endpoint merge): 3 copies made.
+        assert_eq!(out.created.len(), 3, "open path keeps the endpoint copy");
+        // The last station (t=1) lands at the path END (~0,0.005,0), NOT looped
+        // back to the start — confirming open (not closed) stationing.
+        let last_at_end = s.doc.objects().any(|o| {
+            let c = o.geometry.aabb().center();
+            (c - DVec3::new(0.0, 0.005, 0.0)).length() < 1e-2
+        });
+        assert!(last_at_end, "final copy sits at the open path's endpoint");
+
+        // Contrast: a genuinely CLOSED path of the same shape drops the
+        // duplicate endpoint (3 stations over [0,1), none at t=1).
+        let mut sc = Session::default();
+        run(&mut sc, "box -0.5,-0.5,0 1,1,1");
+        run(&mut sc, "name last widget");
+        run(&mut sc, "polyline 0,0,0 10,0,0 10,10,0 closed");
+        run(&mut sc, "name last path");
+        let outc = run(&mut sc, "arraycurve widget path 3 align off");
+        assert_eq!(outc.created.len(), 3, "closed path still makes `count` copies");
+        // For the closed path, the last station is at t=0.667 (not the closing
+        // point), so no copy coincides with the loop's start/close at (0,0,0)
+        // other than the t=0 one — i.e. stations are [0, 1/3, 2/3).
     }
 
     #[test]
@@ -23875,6 +23910,18 @@ mod tests {
             );
         }
         assert_eq!(s.doc.len(), 0, "no geometry created on the rotated plane");
+
+        // Axis-FLIPPED plane: normal (0,0,-1) gives y_axis = -Y (anti-parallel,
+        // wrong sign) — rect would mirror, so it must hit the same guard.
+        let mut sf = Session::default();
+        run(&mut sf, "cplane origin 0,0,0 normal 0,0,-1");
+        assert!(sf.doc.cplane.is_rotated(), "axis-flipped plane is rotated");
+        let err = sf.run(parse("rect 0,0,0 2 2").unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("world-aligned CPlane"),
+            "flipped plane must guard rect, got: {err}"
+        );
+        assert_eq!(sf.doc.len(), 0, "no geometry created on the flipped plane");
 
         // Pure Z-offset plane (world-aligned axes): rect/circle/box succeed and
         // land at Z=10.

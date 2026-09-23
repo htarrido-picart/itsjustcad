@@ -280,11 +280,12 @@ fn entity(
 }
 
 /// Expand a clipped block instance to world-space LINE entities, culling
-/// primitives outside `rect`. Returns the number of entities written. Mirrors
-/// the viewport cull (snapshot.rs): a mesh face is kept only if all its verts
-/// are inside the rect; a curve segment only if both endpoints are inside. No
-/// border splitting — an out-of-rect primitive is dropped whole (approximate,
-/// matches the display).
+/// primitives outside `rect`. Returns the number of entities written. Uses the
+/// shared `ClipRect::keeps_face` / `keeps_segment` — the SAME cull the viewport
+/// (snapshot.rs) and raytracer (build.rs) use, so export matches the display: a
+/// mesh feature-edge is kept if its face overlaps the rect; a curve segment if
+/// both endpoints are inside or it crosses the rect. No border splitting — an
+/// out-of-rect primitive is dropped whole (approximate).
 #[allow(clippy::too_many_arguments)]
 fn clipped_instance_entities(
     t: &mut Tags,
@@ -314,7 +315,7 @@ fn clipped_instance_entities(
                 // feature_edges returns endpoints in the def frame; transform to world.
                 for (ea, eb) in mesh_feature_edges(m) {
                     let (a, b) = (transform(ea), transform(eb));
-                    if rect.contains_xy(a) && rect.contains_xy(b) {
+                    if rect.keeps_segment(a, b) {
                         line(t, layer, a, b);
                         count += 1;
                     }
@@ -326,7 +327,7 @@ fn clipped_instance_entities(
                     pts.push(first);
                 }
                 for pair in pts.windows(2) {
-                    if rect.contains_xy(pair[0]) && rect.contains_xy(pair[1]) {
+                    if rect.keeps_segment(pair[0], pair[1]) {
                         line(t, layer, pair[0], pair[1]);
                         count += 1;
                     }
