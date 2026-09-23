@@ -5027,10 +5027,11 @@ impl App {
         ui.horizontal(|ui| {
             // Fixed-width slot for the x/y/z readout so growing coordinate values
             // never widen it and shift the rest of the status bar. The text is
-            // left-aligned within a constant 260px region (overflow clips rather
-            // than pushing the toolbar).
+            // left-aligned within a constant 300px region (fits the fixed-width
+            // padded "x … y … z …" readout; overflow clips rather than pushing
+            // the toolbar).
             ui.allocate_ui_with_layout(
-                egui::vec2(260.0, ui.available_height()),
+                egui::vec2(300.0, ui.available_height()),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.add(

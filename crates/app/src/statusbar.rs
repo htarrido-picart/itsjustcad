@@ -7,18 +7,25 @@
 
 use itsjustcad_doc::{format_length, Units};
 
+/// Fixed column width for each coordinate value. Values are right-aligned to
+/// this width (in a monospace font) so a growing/shrinking `x` value never
+/// shifts the `y`/`z` fields — each axis label stays put regardless of value.
+/// 9 fits the widest common readouts ("-2000 mm", "-12.50 m").
+const COORD_W: usize = 9;
+
 /// Cursor position on the ground plane, each axis in document units.
-/// No cursor over a viewport reads as an em-dash placeholder.
+/// No cursor over a viewport reads as an em-dash placeholder. Each value is
+/// padded to [`COORD_W`] so the x/y/z fields are alignment-stable.
 pub fn format_cursor(units: Units, world: Option<glam::DVec3>) -> String {
-    match world {
-        Some(p) => format!(
-            "x {}  y {}  z {}",
+    let (vx, vy, vz) = match world {
+        Some(p) => (
             format_length(units, p.x),
             format_length(units, p.y),
-            format_length(units, p.z)
+            format_length(units, p.z),
         ),
-        None => "x —  y —  z —".to_string(),
-    }
+        None => ("—".to_string(), "—".to_string(), "—".to_string()),
+    };
+    format!("x {vx:>COORD_W$}  y {vy:>COORD_W$}  z {vz:>COORD_W$}")
 }
 
 /// Selection vs total object count, e.g. "2 sel / 10 obj".
@@ -73,22 +80,38 @@ mod tests {
 
     #[test]
     fn cursor_formats_in_document_units() {
+        // Collapse the fixed-width padding (runs of spaces → one) to recover the
+        // underlying readout in document units.
+        let norm = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
         let p = glam::DVec3::new(1.5, -2.0, 0.0);
-        assert_eq!(
-            format_cursor(Units::M, Some(p)),
-            "x 1.50 m  y -2.00 m  z 0.00 m"
-        );
-        assert_eq!(
-            format_cursor(Units::Mm, Some(p)),
-            "x 1500 mm  y -2000 mm  z 0 mm"
-        );
+        assert_eq!(norm(format_cursor(Units::M, Some(p))), "x 1.50 m y -2.00 m z 0.00 m");
+        assert_eq!(norm(format_cursor(Units::Mm, Some(p))), "x 1500 mm y -2000 mm z 0 mm");
         let ft = glam::DVec3::new(12.5 * METERS_PER_FOOT, 0.0, 0.0);
-        assert_eq!(format_cursor(Units::Ft, Some(ft)), "x 12.50'  y 0.00'  z 0.00'");
+        assert_eq!(norm(format_cursor(Units::Ft, Some(ft))), "x 12.50' y 0.00' z 0.00'");
+    }
+
+    #[test]
+    fn cursor_fields_are_alignment_stable() {
+        // The whole point: a wider x value must NOT shift where y/z start. With
+        // each value padded to COORD_W chars, the TOTAL char count is constant
+        // regardless of the values (and of the em-dash placeholder), so the
+        // fields line up column-for-column in the monospace status bar.
+        let len = |w| format_cursor(Units::M, w).chars().count();
+        let small = len(Some(glam::DVec3::new(1.0, 1.0, 1.0)));
+        // Realistic wide readout (each value ≤ COORD_W chars, e.g. "-99.50 m").
+        let big = len(Some(glam::DVec3::new(-99.5, 42.0, -7.0)));
+        let none = len(None);
+        assert_eq!(small, big, "char width shifts when x widens");
+        assert_eq!(small, none, "char width shifts for the placeholder");
     }
 
     #[test]
     fn cursor_placeholder_without_position() {
-        assert_eq!(format_cursor(Units::M, None), "x —  y —  z —");
+        // Placeholder is padded to the same widths as real values (stable layout).
+        let s = format_cursor(Units::M, None);
+        assert!(s.starts_with("x "), "{s}");
+        assert!(s.contains(" y ") && s.contains(" z "), "{s}");
+        assert!(s.contains('—'), "{s}");
     }
 
     #[test]
