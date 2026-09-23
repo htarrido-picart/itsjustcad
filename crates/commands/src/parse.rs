@@ -1078,11 +1078,11 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }
         "tolayer" => {
             let (sel, rest) = selector(&args, "tolayer")?;
-            let [layer] = take::<1>("tolayer", "a layer name after the selector", rest)?;
-            Ok(Command::ToLayer {
-                targets: sel,
-                layer: layer.to_string(),
-            })
+            // Layer names may contain spaces (e.g. "Layer 02"), matching what
+            // the `layer` verb accepts — join the rest rather than taking a
+            // single token, so `tolayer sel Layer 02` works (incl. from the GUI).
+            let layer = layer_name_all("tolayer", rest)?;
+            Ok(Command::ToLayer { targets: sel, layer })
         }
         "layercolor" => {
             let (layer, c) =
@@ -5159,6 +5159,12 @@ mod tests {
         assert!(matches!(
             parse("tolayer slab structure").unwrap(),
             Command::ToLayer { targets: Selector::Named { .. }, ref layer } if layer == "structure"
+        ));
+        // Layer names may contain spaces (the GUI's default "Layer 02"): the
+        // rest after the selector is joined, mirroring the `layer` verb.
+        assert!(matches!(
+            parse("tolayer last Layer 02").unwrap(),
+            Command::ToLayer { targets: Selector::Last { n: 1 }, ref layer } if layer == "Layer 02"
         ));
         assert_eq!(
             parse("layercolor walls 0.8,0.2,0.1").unwrap(),
