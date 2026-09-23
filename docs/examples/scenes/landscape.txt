@@ -1,0 +1,11 @@
+location 10.5 -66.9 -4
+rect 0,0,0 44 28
+plantrow roystonea-regia 2,2 42,2 6
+plantrow roystonea-regia 2,26 42,26 6
+plant mangifera-indica 10,10 12
+plant mangifera-indica 22,10 12
+plant mangifera-indica 34,10 12
+plant mangifera-indica 10,18 12
+plant mangifera-indica 22,18 12
+plant mangifera-indica 34,18 12
+plant delonix-regia 22,14 10

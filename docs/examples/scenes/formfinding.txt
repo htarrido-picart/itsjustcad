@@ -1,0 +1,12 @@
+geodesic 3 5 dome
+hypar 5 5 6
+move last 16,0,0
+gridshell vault 8 10 3
+move last 30,0,0
+funicular -4,0,5 4,0,5 24 1 1.4 invert
+move last 6,16,0
+tensegrity 3 3 6 40
+move last 18,16,0
+polyline 0,0,0 6,0,2 6,6,0 0,6,2 closed
+minsurf last 16
+move last 26,14,0

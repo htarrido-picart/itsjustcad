@@ -1,0 +1,9 @@
+box 0,0,0 0.4,0.4,3
+box -0.6,-0.6,3 1.6,1.6,1.2
+block last 2 tree
+delete last 2
+insert tree 4,4,0
+array last 4,3,1 8,7,0
+xref attach /tmp/pavilion.dxf at 4,26,0
+xref attach /tmp/pavilion.dxf at 20,26,0
+xclip last 20,26 24,30

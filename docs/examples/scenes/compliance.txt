@@ -1,0 +1,13 @@
+box 0,0,0 20,14,0.3
+layer walls
+box 0,0,0.3 20,0.25,3.2
+box 0,13.75,0.3 20,0.25,3.2
+box 0,0,0.3 0.25,14,3.2
+box 19.75,0,0.3 0.25,14,3.2
+layer route
+polyline 2,7,0 8,7,1.2
+name last ramp
+polyline 8,7,0 18,7,0
+name last corridor
+codecheck demo
+report codecheck

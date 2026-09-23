@@ -246,75 +246,12 @@ last *n* commands into a tool the same way.
 ![The ItsJustCAD interface — perspective viewport, command line, a status bar with view/snap chips and gumball, and the right dock (Chat, Sessions, Layers, plus contextual Parameters/Sheets/Blocks tabs)](docs/shot-ui.png)
 *A familiar, Rhino-style interface: command line, viewport with view/snap chips, and a docked panel (Chat, Sessions, Layers, and contextual Parameters/Sheets/Blocks) — it adapts to the CAD you came from.*
 
-### Visual examples
-
-A few verbs, a few numbers — here's what they draw. Every thumbnail below is
-rendered by [`docs/examples/render-examples.sh`](docs/examples/render-examples.sh)
-from a tiny, deterministic command script through the same headless
-`--run … --shot` path used by CI; re-run it on any GPU machine to regenerate them.
-
-**Drawing & curves**
-
-<table>
-  <tr>
-    <td align="center"><img src="docs/examples/img/polyline-arc.png" width="180"><br><code>polyline</code> + <code>arc</code></td>
-    <td align="center"><img src="docs/examples/img/polygon.png" width="180"><br><code>polygon</code></td>
-    <td align="center"><img src="docs/examples/img/circle-tangent.png" width="180"><br><code>circletan</code> (TTR)</td>
-  </tr>
-</table>
-
-**Sweeps & surfaces**
-
-<table>
-  <tr>
-    <td align="center"><img src="docs/examples/img/sweep1.png" width="180"><br><code>sweep</code> (one rail)</td>
-    <td align="center"><img src="docs/examples/img/sweep2.png" width="180"><br><code>sweep2</code> (two rails)</td>
-    <td align="center"><img src="docs/examples/img/loft.png" width="180"><br><code>loft</code></td>
-    <td align="center"><img src="docs/examples/img/revolve.png" width="180"><br><code>revolve</code></td>
-  </tr>
-</table>
-
-**Form-finding & expressive structures**
-
-<table>
-  <tr>
-    <td align="center"><img src="docs/examples/img/geodesic-dome.png" width="180"><br><code>geodesic</code> dome</td>
-    <td align="center"><img src="docs/examples/img/hypar.png" width="180"><br><code>hypar</code> shell</td>
-    <td align="center"><img src="docs/examples/img/gridshell.png" width="180"><br><code>gridshell</code></td>
-  </tr>
-  <tr>
-    <td align="center"><img src="docs/examples/img/funicular.png" width="180"><br><code>funicular</code> (inverted)</td>
-    <td align="center"><img src="docs/examples/img/tensegrity.png" width="180"><br><code>tensegrity</code></td>
-    <td align="center"><img src="docs/examples/img/minsurf.png" width="180"><br><code>minsurf</code> (soap film)</td>
-  </tr>
-</table>
-
-**Parametric structures** — live, re-derived from parameters (Parameters tab / `paramset`)
-
-<table>
-  <tr>
-    <td align="center"><img src="docs/examples/img/spaceframe.png" width="180"><br><code>spaceframe</code> 6×4</td>
-    <td align="center"><img src="docs/examples/img/gaussvault.png" width="180"><br><code>gaussvault</code> (undulate)</td>
-  </tr>
-</table>
-
-**Drawings → BIM & massing**
-
-<table>
-  <tr>
-    <td align="center"><img src="docs/examples/img/fromlayer-walls.png" width="180"><br><code>fromlayer … wall</code></td>
-    <td align="center"><img src="docs/examples/img/massing.png" width="180"><br><code>box</code> massing</td>
-  </tr>
-</table>
-
-**Hatches**
-
-<table>
-  <tr>
-    <td align="center"><img src="docs/examples/img/hatch-brick.png" width="180"><br><code>hatch … brick</code></td>
-    <td align="center"><img src="docs/examples/img/hatch-concrete.png" width="180"><br><code>hatch … concrete</code></td>
-  </tr>
-</table>
+Every showcase image below is rendered by
+[`docs/examples/render-examples.sh`](docs/examples/render-examples.sh) from a
+tiny, deterministic command script in
+[`docs/examples/scenes/`](docs/examples/scenes) through the same headless
+`--run … --shot` path used by CI — paste the script into the command line to get
+the same model, or re-run the script on any GPU machine to regenerate the images.
 
 ### Model
 Boxes · extrude · revolve / loft (with guide curves) / **blend** / sweep /
@@ -343,6 +280,29 @@ geometry live; `paramset last frequency=4` does the same from the command line,
 and `freeze` / `bake` flattens to a static mesh when you're done. Structural
 members (beam / column / slab / wall / grid / story / loads / supports) as
 geometry + BIM metadata — recorded for interop, **never analysed here**.
+
+```
+geodesic 3 5 dome
+hypar 5 5 6
+move last 16,0,0
+gridshell vault 8 10 3
+move last 30,0,0
+funicular -4,0,5 4,0,5 24 1 1.4 invert
+move last 6,16,0
+tensegrity 3 3 6 40
+move last 18,16,0
+polyline 0,0,0 6,0,2 6,6,0 0,6,2 closed
+minsurf last 16
+move last 26,14,0
+```
+
+<img src="docs/examples/img/formfinding.png" width="560">
+
+*Six generators in one scene — a geodesic dome, a `hypar` saddle, a `gridshell`
+vault, an inverted `funicular` arch, a `tensegrity` mast, and a `minsurf` soap
+film across a warped quad. Each stays live in the **Parameters** tab (or via
+`paramset`) until you `freeze` it. `funicular`/`tensegrity`/`minsurf` are
+strut/line nets, so they read as wireframe rather than solid shells.*
 
 ### Draw precisely
 Full object snap set — endpoint / midpoint / center / intersection /
@@ -383,6 +343,23 @@ ComfyUI / A1111 / Draw Things / Replicate, or a fully **local, offline** Stable
 Diffusion via the Render Setup panel + `sd` binary; ships with no backend
 active)
 
+The same model, two ways — a shaded perspective and the hidden-line **pencil**
+display mode (append a view/display to any script; these are view state, never
+logged):
+
+```
+persp
+display shaded
+```
+
+<img src="docs/examples/img/see_shaded.png" width="420"> <img src="docs/examples/img/see_pencil.png" width="420">
+
+*Left: `display shaded` perspective. Right: `display pencil` — hidden-line linework
+on white paper, straight from the model. Other verbs in this family: `camera
+2point` (verticals stay vertical), `camera 24` / `camera phone iphone-ultrawide`
+(lens presets), `top` / `front` (true-ortho views), and `display wireframe` /
+`xray` / `ghosted`.*
+
 ![Plan cut in pencil mode — poché walls around a courtyard, hidden-line white-paper view](docs/screenshots/pencil-section.png)
 *`plan 1.5` + `display pencil`: a hidden-line plan cut — poché walls around an open courtyard.*
 
@@ -395,6 +372,23 @@ EPW weather import · measure: distance / area / volume / bbox · schedules
 (quantity takeoffs). Every study stores a structured `report` the deck reads to
 critique the design in numbers.
 
+```
+box 0,0,0 8,8,10
+box 14,2,0 6,6,6
+box 2,14,0 6,6,7
+location 40.71 -74.01 -5
+sun 40.71 -74.01 2024-06-21 15:00
+sunhours 2024-06-21 1.5
+```
+
+<img src="docs/examples/img/env.png" width="560">
+
+*`sunhours` samples a ground grid and ray-casts toward the sun every 30 min of
+the date (occlusion-tested against the massing), colouring an overlay blue (few
+hours, in shadow) to red (full sun). `report sunhours` prints the numbers to
+design with. Swap in `shadowstudy 2024-06-21 09:00 15:00 120` for time-stamped
+cast-shadow polygons instead of the heatmap.*
+
 ### Landscape & site
 Terrain from survey points or contours · `contours` extraction · grading —
 `pad` building pads with side slopes + `cutfill` earthwork volumes · planting
@@ -404,6 +398,28 @@ Cauca / Guayaquil tropical packs): `plant`, `plantrow`, climate-aware advisories
 hardscape `sitepath` ribbons draped on terrain · drainage `flowarrows` /
 `ponding` (advisory visualisation, not hydrology engineering) · OSM building
 context.
+
+```
+location 10.5 -66.9 -4
+rect 0,0,0 44 28
+plantrow roystonea-regia 2,2 42,2 6
+plantrow roystonea-regia 2,26 42,26 6
+plant mangifera-indica 10,10 12
+plant mangifera-indica 22,10 12
+plant mangifera-indica 34,10 12
+plant mangifera-indica 10,18 12
+plant mangifera-indica 22,18 12
+plant mangifera-indica 34,18 12
+plant delonix-regia 22,14 10
+```
+
+<img src="docs/examples/img/landscape.png" width="560">
+
+*A tropical courtyard: two rows of royal palms (`plantrow roystonea-regia`)
+framing a grid of 12-year-old mango trees with a flamboyán (`delonix-regia`)
+specimen at the centre — all from the embedded 33-species catalog, drawn as
+canopy meshes that occlude sun like any other geometry. `plantschedule` exports a
+takeoff; with a `location` set, off-climate species print an advisory.*
 
 ### Plan a site
 Parcel-scale site planning: `lotsubdivide` splits a parent lot into buildable
@@ -426,6 +442,38 @@ gives per-rule verdicts with measured-vs-required numbers. **This is an advisory
 pre-check, never a code review: it never certifies compliance. Verify with a
 licensed professional / AHJ.** Rule packs are LLM-authorable JSON, so editions
 swap in without code.
+
+```
+box 0,0,0 20,14,0.3
+layer walls
+box 0,0,0.3 20,0.25,3.2
+box 0,13.75,0.3 20,0.25,3.2
+box 0,0,0.3 0.25,14,3.2
+box 19.75,0,0.3 0.25,14,3.2
+layer route
+polyline 2,7,0 8,7,1.2
+name last ramp
+polyline 8,7,0 18,7,0
+name last corridor
+codecheck demo
+report codecheck
+```
+
+<img src="docs/examples/img/compliance.png" width="480">
+
+The verdict is textual — `report codecheck` grounds the pass/fail in measured vs
+required numbers (the deliberately-steep ramp above trips the 1:12 rule), and
+failures also drop coloured markers on the `compliance` layer:
+
+```
+codecheck demo: 6 rule(s) — advisory pre-check, not a code review — verify with a licensed professional / AHJ
+  ramp-slope    [cf. ADA 405.2]     FAIL — measured 0.200 vs required 0.083 rise/run (1 checked); ramp/path segment steeper than 1:12
+  door-width    [cf. ADA 404.2.3]   PASS (0 checked)
+  stair-riser   [cf. IBC 1011.5.2]  PASS (0 checked)
+  headroom      [cf. IBC 1011.3]    PASS (1 checked)
+  corridor-width [cf. ADA 403.5.1]  PASS (1 checked)
+  guard-check   [cf. IBC 1015.2]    PASS — measured 0.300 vs required 0.762 m (1 checked)
+```
 
 ![Sun and shadow study — a massing lit by real solar position with ground shadows cast across the day](docs/shot-sun-shadow.png)
 *`sun` + `shadowstudy`: real solar position (NOAA SPA) casts shadows across the day.*
@@ -451,6 +499,49 @@ sheets → one multi-page PDF via `publish`) · **plot styles / pen tables**
 (`plotstyle`: named layer/color → pen color + weight + screening, applied only
 at print) · per-layer lineweights · vector PDF export
 
+A believable multi-storey building — a plinth, three floor slabs and a roof, a
+service core, and a real curtain-wall facade built by `array`-ing mullions and
+glazing panels across both long elevations:
+
+```
+layer plinth
+layercolor plinth 0.45,0.45,0.48
+box 0,0,0 24,14,0.6
+layer slabs
+layercolor slabs 0.82,0.80,0.76
+box 0,0,3.2 24,14,0.35
+box 0,0,6.6 24,14,0.35
+box 0,0,10.0 24,14,0.35
+layer roof
+layercolor roof 0.5,0.5,0.52
+box -0.4,-0.4,13.4 24.8,14.8,0.6
+layer core
+layercolor core 0.6,0.58,0.55
+box 9,5,0.6 6,5,12.8
+layer glazing
+layercolor glazing 0.35,0.5,0.62
+box 0.3,0.02,0.9 1.7,0.25,2.0
+array last 12,1,4 2.0,0,3.4
+box 0.3,13.73,0.9 1.7,0.25,2.0
+array last 12,1,4 2.0,0,3.4
+layer mullion
+layercolor mullion 0.3,0.3,0.32
+box 0,0,0.6 0.16,0.3,12.8
+array last 13,1,1 2.0,0,0
+box 0,13.7,0.6 0.16,0.3,12.8
+array last 13,1,1 2.0,0,0
+```
+
+<img src="docs/examples/img/facade_persp.png" width="620">
+
+*A 24 × 14 m, four-storey building framed in perspective (`persp`). Each `array`
+lays a course of glazing panels or mullions in one command — a 12-bay × 4-storey
+curtain wall per face — with the floor slabs, roof, plinth and core on their own
+coloured layers. Type `front` to read it as a clean curtain-wall elevation
+instead:*
+
+<img src="docs/examples/img/facade_elev.png" width="560">
+
 ### Drawings → BIM
 `fromlayer <layer> wall thick <t>` turns the 2D curves on a layer into typed BIM
 walls (exported as `IFCWALL`), extruded from a level base by an explicit height
@@ -464,6 +555,36 @@ elevation (with an optional floor-to-floor height `fromlayer` reads), and
 block/xref instance as an independent object · `xclip` clips a block/xref
 instance to a rectangular boundary · `dataextract` (alias `bom`) tabulates block
 instances by definition or per-instance, to a table or CSV.
+
+Define a `tree` block from two boxes, `array` a grove of instances, then
+`xref attach` an external drawing twice and `xclip` one of the references to a
+rectangle (the script exports the referenced `pavilion.dxf` first so it resolves
+anywhere):
+
+```
+box 0,0,0 6,6,0.3
+box 0,0,0.3 6,0.3,3
+box 0,5.7,0.3 6,0.3,3
+export /tmp/pavilion.dxf
+delete all
+box 0,0,0 0.4,0.4,3
+box -0.6,-0.6,3 1.6,1.6,1.2
+block last 2 tree
+delete last 2
+insert tree 4,4,0
+array last 4,3,1 8,7,0
+xref attach /tmp/pavilion.dxf at 4,26,0
+xref attach /tmp/pavilion.dxf at 20,26,0
+xclip last 20,26 24,30
+```
+
+<img src="docs/examples/img/blocks.png" width="560">
+
+*A 4 × 3 `array` of `tree` block instances in front, and two `xref`-attached
+pavilions behind — the right one `xclip`'d to a rectangle so only the geometry
+inside the boundary renders. Editing the block definition (or `xref reload`-ing
+the source file) updates every instance at once. The rendered scene omits the
+`export`/`delete all` setup lines above, which only stage the reference file.*
 
 ![Elevation drawing — a three-storey facade outline with floor lines and a grid of windows](docs/shot-elevation.png)
 *`elevation south`: a clean projected facade — the drafting output, straight from the model.*

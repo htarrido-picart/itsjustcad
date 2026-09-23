@@ -1,0 +1,26 @@
+layer plinth
+layercolor plinth 0.45,0.45,0.48
+box 0,0,0 24,14,0.6
+layer slabs
+layercolor slabs 0.82,0.80,0.76
+box 0,0,3.2 24,14,0.35
+box 0,0,6.6 24,14,0.35
+box 0,0,10.0 24,14,0.35
+layer roof
+layercolor roof 0.5,0.5,0.52
+box -0.4,-0.4,13.4 24.8,14.8,0.6
+layer core
+layercolor core 0.6,0.58,0.55
+box 9,5,0.6 6,5,12.8
+layer glazing
+layercolor glazing 0.35,0.5,0.62
+box 0.3,0.02,0.9 1.7,0.25,2.0
+array last 12,1,4 2.0,0,3.4
+box 0.3,13.73,0.9 1.7,0.25,2.0
+array last 12,1,4 2.0,0,3.4
+layer mullion
+layercolor mullion 0.3,0.3,0.32
+box 0,0,0.6 0.16,0.3,12.8
+array last 13,1,1 2.0,0,0
+box 0,13.7,0.6 0.16,0.3,12.8
+array last 13,1,1 2.0,0,0

@@ -2,23 +2,33 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright © 2026 Hector Tarrido-Picart
 #
-# render-examples.sh — regenerate the small thumbnail images used in the README
-# "Visual examples" section.
+# render-examples.sh — regenerate the inline showcase images used in the README.
 #
-# For each showcase example this writes a tiny, deterministic command script,
-# renders it offscreen to a PNG via the headless `--run … --shot` path, then
-# downscales it to a SMALL thumbnail (default 360 px wide) in docs/examples/img/.
+# Each showcase is a small, deterministic command script in
+# docs/examples/scenes/*.txt. This script frames each one (ze + a view, and an
+# optional display mode) and renders it offscreen to a PNG via the headless
+# `--run … --shot` path — the exact path CI and the agents use — then downscales
+# the committed PNG to a sane width (default 640 px) in docs/examples/img/.
+#
+# The seven scenes map one-to-one to the README's showcased sections:
+#   formfinding  → Form-finding & expressive structures
+#   see_*        → See (camera / display modes)
+#   env          → Analyze the environment (sun + shadow study)
+#   landscape    → Landscape & site (planting)
+#   compliance   → Pre-check code compliance
+#   facade_*     → Document (the flagship curtain-wall building)
+#   blocks       → Blocks & external references
 #
 # ── Requires a GPU adapter ──────────────────────────────────────────────────
 # The headless renderer needs a real wgpu adapter (Metal / Vulkan / D3D12).
-# On a headless CI box or a sandbox with no GPU, `render_headless` fails with
-# "no wgpu adapter" and NO images are produced — that is expected. Run this on a
-# machine with a GPU (any normal desktop/laptop) to (re)generate the thumbnails.
+# On a headless CI box or a sandbox with no GPU, render fails with "no wgpu
+# adapter" and NO images are produced — that is expected. Run this on a machine
+# with a GPU (any normal desktop/laptop) to (re)generate them.
 #
 # ── Usage ───────────────────────────────────────────────────────────────────
 #   docs/examples/render-examples.sh                # build (quick) + render all
-#   IJC_BIN=/path/to/itsjustcad docs/examples/render-examples.sh   # use a prebuilt binary
-#   IJC_THUMB=320 docs/examples/render-examples.sh  # different thumbnail width
+#   IJC_BIN=/path/to/itsjustcad docs/examples/render-examples.sh   # prebuilt binary
+#   IJC_THUMB=720 docs/examples/render-examples.sh  # different committed width
 #
 # Downscaling uses ImageMagick (`magick`/`convert`) if present, else macOS
 # `sips`. If neither exists the full-size 1280×800 PNG is kept as-is.
@@ -26,10 +36,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCENES="$ROOT/docs/examples/scenes"
 IMG_DIR="$ROOT/docs/examples/img"
 TMP_DIR="$(mktemp -d)"
-THUMB_W="${IJC_THUMB:-360}"          # thumbnail width in px
-RENDER_SIZE="${IJC_RENDER_SIZE:-720x720}"  # offscreen window hint (render is fixed 1280x800)
+THUMB_W="${IJC_THUMB:-640}"                 # committed image width in px
+RENDER_SIZE="${IJC_RENDER_SIZE:-1100x850}"  # offscreen window hint
 
 mkdir -p "$IMG_DIR"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -62,13 +73,12 @@ downscale() { # <src.png> <dst.png>
   fi
 }
 
-# ── One example: name + view + heredoc script on stdin ──────────────────────
-# render <name> <view: persp|top|front|…> [display mode]
+# ── Render one scene: <out-name> <scene-file> <view> [display] ──────────────
 render() {
-  local name="$1" view="${2:-persp}" display="${3:-}"
+  local name="$1" scene="$2" view="${3:-persp}" display="${4:-}"
   local script="$TMP_DIR/$name.txt" raw="$TMP_DIR/$name.png" out="$IMG_DIR/$name.png"
-  cat > "$script"
-  { echo "ze"; echo "$view"; [ -n "$display" ] && echo "display $display"; } >> "$script"
+  cp "$scene" "$script"
+  { echo "ze"; echo "$view"; echo "ze"; [ -n "$display" ] && echo "display $display"; } >> "$script"
   if ITSJUSTCAD_WINDOW_SIZE="$RENDER_SIZE" ITSJUSTCAD_THEME=dark \
        "$BIN" --run "$script" --headless --shot "$raw" >/dev/null 2>"$TMP_DIR/$name.err"; then
     downscale "$raw" "$out"
@@ -80,117 +90,50 @@ render() {
 }
 
 FAILED=0
-echo "rendering examples → $IMG_DIR (thumbnail width ${THUMB_W}px)"
+echo "rendering showcase images → $IMG_DIR (committed width ${THUMB_W}px)"
 
-# ── Drawing / curves ────────────────────────────────────────────────────────
-render polyline-arc top <<'EOF'
-polyline 0,0,0 6,0,0 6,4,0 2,4,0
-arc 2,4,0 2 0 180
+# The blocks scene attaches an xref; build its source drawing first so the
+# reference resolves deterministically on any machine.
+PAVILION="$TMP_DIR/pavilion.dxf"
+cat > "$TMP_DIR/mkpavilion.txt" <<EOF
+box 0,0,0 6,6,0.3
+box 0,0,0.3 6,0.3,3
+box 0,5.7,0.3 6,0.3,3
+export $PAVILION
 EOF
+"$BIN" --run "$TMP_DIR/mkpavilion.txt" --headless >/dev/null 2>&1 || true
 
-render polygon top <<'EOF'
-polygon 0,0,0 4 6
-EOF
+# The committed blocks scene references /tmp/pavilion.dxf; point it at ours.
+BLOCKS_SCENE="$TMP_DIR/blocks_scene.txt"
+sed "s#/tmp/pavilion.dxf#$PAVILION#g" "$SCENES/blocks.txt" > "$BLOCKS_SCENE"
 
-render circle-tangent top <<'EOF'
-line 0,0,0 10,0,0
-name last a
-line 0,0,0 0,10,0
-name last b
-circletan a b 2
-EOF
+# ── Form-finding & expressive structures ────────────────────────────────────
+render formfinding "$SCENES/formfinding.txt" persp
 
-# ── Sweeps / surfaces ───────────────────────────────────────────────────────
-render sweep1 <<'EOF'
-polyline 0,0,0 5,0,0 5,5,0 10,5,3
-name last rail
-circle 0,0,0 0.5
-sweep last rail
-EOF
+# ── See (camera / display modes): same building, two ways ───────────────────
+render see_shaded "$SCENES/facade.txt" persp
+render see_pencil "$SCENES/facade.txt" persp pencil
 
-render sweep2 <<'EOF'
-polyline 0,0,0 4,0,2 8,0,0
-name last raila
-polyline 0,6,0 4,6,3 8,6,0
-name last railb
-circle 0,0,0 0.5
-sweep2 last raila railb
-EOF
+# ── Analyze the environment (sun + shadow study) ────────────────────────────
+render env "$SCENES/env.txt" persp
 
-render loft <<'EOF'
-circle 0,0,0 3
-circle 0,0,6 1.5
-loft all
-EOF
+# ── Landscape & site (planting) ─────────────────────────────────────────────
+render landscape "$SCENES/landscape.txt" persp
 
-render revolve <<'EOF'
-polyline 1,0,0 3,0,1 2,0,4 1,0,6 0.6,0,6 0.6,0,0 closed
-revolve last
-EOF
+# ── Pre-check code compliance ───────────────────────────────────────────────
+render compliance "$SCENES/compliance.txt" persp
 
-# ── Form-finding / expressive ───────────────────────────────────────────────
-render geodesic-dome <<'EOF'
-geodesic 3 5 dome
-EOF
+# ── Document (the flagship curtain-wall building) ───────────────────────────
+render facade_persp "$SCENES/facade.txt" persp
+render facade_elev  "$SCENES/facade.txt" front
 
-render hypar <<'EOF'
-hypar 5 5 6
-EOF
-
-render gridshell <<'EOF'
-gridshell vault 8 12 3
-EOF
-
-render funicular <<'EOF'
-funicular 0,0,6 12,0,6 24 1 0.4 invert
-EOF
-
-render tensegrity <<'EOF'
-tensegrity 3 3 5 30
-EOF
-
-render minsurf <<'EOF'
-polyline 0,0,0 6,0,2 6,6,0 0,6,2 closed
-minsurf last 16
-EOF
-
-# ── Parametric (M-parametric) ───────────────────────────────────────────────
-render spaceframe <<'EOF'
-spaceframe 6 4 2 1.5
-EOF
-
-render gaussvault <<'EOF'
-gaussvault 8 14 3 undulate
-EOF
-
-# ── Drawings → BIM ──────────────────────────────────────────────────────────
-render fromlayer-walls <<'EOF'
-layer walls
-polyline 0,0,0 10,0,0 10,8,0 0,8,0 closed
-fromlayer walls wall thick 0.3 height 3
-EOF
-
-render massing <<'EOF'
-box 0,0,0 16,12,2
-box 2,2,2 12,8,3
-box 5,4,5 6,4,8
-EOF
-
-# ── Hatch ───────────────────────────────────────────────────────────────────
-render hatch-brick top <<'EOF'
-rect 0,0,0 8 5
-hatch last brick
-EOF
-
-render hatch-concrete top <<'EOF'
-rect 0,0,0 8 5
-hatch last concrete
-EOF
+# ── Blocks & external references ────────────────────────────────────────────
+render blocks "$BLOCKS_SCENE" persp
 
 echo
 if [ "$FAILED" -eq 0 ]; then
-  echo "done — all examples rendered."
+  echo "done — all showcase images rendered."
 else
-  echo "done — some examples failed (see above). If every one failed with"
+  echo "done — some images failed (see above). If every one failed with"
   echo "'no wgpu adapter', this machine has no GPU; run on a GPU machine."
 fi
