@@ -8985,6 +8985,18 @@ mod tests {
         project(view_proj, rect, world).expect("world point projects in front of camera")
     }
 
+    /// A screen position at fractional `(fx, fy)` inside the active pane rect.
+    /// Camera-independent — unlike `world_to_screen`, it does not depend on how
+    /// `zoom_extents` framed the scene, so draw-tool clicks land on-pane even
+    /// with an EMPTY document (where `ze` has nothing to frame and the zoom
+    /// differs per machine). Use when the test only needs distinct in-pane
+    /// clicks, not a specific world location.
+    #[cfg(test)]
+    fn pane_point(harness: &egui_kittest::Harness<'_, App>, fx: f32, fy: f32) -> egui::Pos2 {
+        let (rect, _) = active_viewport(harness);
+        rect.min + egui::vec2(rect.width() * fx, rect.height() * fy)
+    }
+
     /// Inject a full primary-button click (press → release) at a screen pos,
     /// settling frames around each event so the app's `Response` sees a click.
     #[cfg(test)]
@@ -9100,10 +9112,11 @@ mod tests {
             h.key_press(egui::Key::Num5);
             h.run_steps(2);
 
-            // Center at world origin, edge 3m out along +X — both on the ground
-            // plane so `ground_point` recovers them from the injected clicks.
-            let center = world_to_screen(h, glam::DVec3::new(0.0, 0.0, 0.0));
-            let edge = world_to_screen(h, glam::DVec3::new(3.0, 0.0, 0.0));
+            // Center + a radius point as pane-fraction screen coords (not world
+            // projection): the doc is empty here, so `ze` framing is undefined
+            // across machines — any two distinct in-pane clicks make a polygon.
+            let center = pane_point(h, 0.5, 0.5);
+            let edge = pane_point(h, 0.66, 0.5);
             click_at(h, center);
             assert!(
                 h.state().draw_tool.active(),
@@ -9144,12 +9157,10 @@ mod tests {
             submit_command(h, "polyline");
             assert!(h.state().draw_tool.active(), "bare `polyline` armed the tool");
 
-            for w in [
-                glam::DVec3::new(0.0, 0.0, 0.0),
-                glam::DVec3::new(4.0, 0.0, 0.0),
-                glam::DVec3::new(4.0, 4.0, 0.0),
-            ] {
-                let p = world_to_screen(h, w);
+            // Three distinct in-pane picks as pane-fraction screen coords (the
+            // doc is empty so world projection would depend on per-machine `ze`).
+            for (fx, fy) in [(0.4, 0.6), (0.6, 0.6), (0.6, 0.4)] {
+                let p = pane_point(h, fx, fy);
                 click_at(h, p);
             }
             assert!(
