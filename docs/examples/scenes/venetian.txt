@@ -1,0 +1,34 @@
+layer stone
+layercolor stone 0.86,0.82,0.74
+box 0,0,0 20,1.2,0.6
+box -0.4,-0.1,0.6 20.8,1.3,0.25
+box 0,0,0.85 20,0.8,10.35
+box -0.5,-0.15,11.2 21,1.35,0.9
+box -0.6,-0.2,12.1 21.2,1.4,0.35
+layer opening
+layercolor opening 0.60,0.53,0.42
+box 0.9,0,0.85 2.2,0.85,3.0
+array last 5,1,1 3.6,0,0
+box 1.2,0,4.8 1.6,0.85,2.4
+array last 5,1,1 3.6,0,0
+box 1.2,0,7.9 1.6,0.85,2.2
+array last 5,1,1 3.6,0,0
+layer glazing
+layercolor glazing 0.28,0.40,0.50
+box 1.1,0.3,1.05 1.8,0.15,1.95
+array last 5,1,1 3.6,0,0
+box 1.35,0.3,5.0 1.3,0.15,1.9
+array last 5,1,1 3.6,0,0
+box 1.35,0.3,8.1 1.3,0.15,1.7
+array last 5,1,1 3.6,0,0
+layer trim
+layercolor trim 0.74,0.68,0.55
+arc 2.0,0,3.85 1.1 0 180
+rotate last 90 x about 2.0,0,3.85
+array last 5,1,1 3.6,0,0
+arc 2.0,0,7.2 0.8 0 180
+rotate last 90 x about 2.0,0,7.2
+array last 5,1,1 3.6,0,0
+arc 2.0,0,10.1 0.8 0 180
+rotate last 90 x about 2.0,0,10.1
+array last 5,1,1 3.6,0,0

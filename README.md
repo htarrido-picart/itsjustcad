@@ -304,6 +304,30 @@ film across a warped quad. Each stays live in the **Parameters** tab (or via
 `paramset`) until you `freeze` it. `funicular`/`tensegrity`/`minsurf` are
 strut/line nets, so they read as wireframe rather than solid shells.*
 
+#### Gaussian vaults (Dieste)
+
+The `gaussvault` generator is the app's take on Eladio Dieste's *cerámica
+armada* — the undulating, double-curvature thin-brick shell he pioneered. One
+verb gives the whole family:
+
+```
+gaussvault 12 20 4 undulate
+gaussvault 9 20 3.2 straight
+move last 20,0,0
+funicular -5,0,6 5,0,6 24 1 2.4 invert
+move last 36,6,0
+```
+
+<img src="docs/examples/img/dieste.png" width="560">
+
+*The hero (left) is `gaussvault … undulate` — the wavy Gaussian shell whose
+crest rises and falls along its length, the signature Dieste form that lets a
+few centimetres of brick span wide bays. Beside it, `… straight` shows the plain
+single-curvature vault, and an inverted `funicular` catenary completes the
+form-found masonry family. The vault is a surface mesh, so a `brick` hatch (which
+needs a **closed 2-D boundary curve**) can't lie on it — the shell renders on its
+own; use `hatch` on a flat section cut if you want the brick coursing drawn.*
+
 ### Draw precisely
 Full object snap set — endpoint / midpoint / center / intersection /
 perpendicular / tangent / quadrant / nearest / node / vertex — with a clickable
@@ -541,6 +565,63 @@ coloured layers. Type `front` to read it as a clean curtain-wall elevation
 instead:*
 
 <img src="docs/examples/img/facade_elev.png" width="560">
+
+#### Venetian palazzo facade (round-arched bays)
+
+The same `box` + `array` moves that build a curtain wall also assemble a
+traditional facade. This is a five-bay, three-storey Venetian palazzo — a plinth
+and base course, a ground arcade of tall round arches, two upper floors of
+arched windows, and a string-course cornice. Each round arch head is an `arc`
+stood upright with `rotate … 90 x` (the app's `arc` is drawn in the XY plane, so
+it's rotated into the vertical elevation plane), then `array`-ed across the five
+bays; the stone, glazing, opening and trim reads live on their own layers:
+
+```
+layer stone
+layercolor stone 0.86,0.82,0.74
+box 0,0,0 20,1.2,0.6
+box -0.4,-0.1,0.6 20.8,1.3,0.25
+box 0,0,0.85 20,0.8,10.35
+box -0.5,-0.15,11.2 21,1.35,0.9
+box -0.6,-0.2,12.1 21.2,1.4,0.35
+layer opening
+layercolor opening 0.60,0.53,0.42
+box 0.9,0,0.85 2.2,0.85,3.0
+array last 5,1,1 3.6,0,0
+box 1.2,0,4.8 1.6,0.85,2.4
+array last 5,1,1 3.6,0,0
+box 1.2,0,7.9 1.6,0.85,2.2
+array last 5,1,1 3.6,0,0
+layer glazing
+layercolor glazing 0.28,0.40,0.50
+box 1.1,0.3,1.05 1.8,0.15,1.95
+array last 5,1,1 3.6,0,0
+box 1.35,0.3,5.0 1.3,0.15,1.9
+array last 5,1,1 3.6,0,0
+box 1.35,0.3,8.1 1.3,0.15,1.7
+array last 5,1,1 3.6,0,0
+layer trim
+layercolor trim 0.74,0.68,0.55
+arc 2.0,0,3.85 1.1 0 180
+rotate last 90 x about 2.0,0,3.85
+array last 5,1,1 3.6,0,0
+arc 2.0,0,7.2 0.8 0 180
+rotate last 90 x about 2.0,0,7.2
+array last 5,1,1 3.6,0,0
+arc 2.0,0,10.1 0.8 0 180
+rotate last 90 x about 2.0,0,10.1
+array last 5,1,1 3.6,0,0
+```
+
+<img src="docs/examples/img/venetian_elev.png" width="560">
+
+*A front elevation (`front`), the natural way to read a facade. There's no
+dedicated arch or tracery generator — the whole thing is honest primitives:
+`box` for the plinth, wall, piers and cornice; `arc` + `rotate` for each round
+arch head; and `array` to repeat every element across the five bays and stack the
+floors. In perspective it's a real 3-D slab with a projecting plinth and cornice:*
+
+<img src="docs/examples/img/venetian_persp.png" width="500">
 
 ### Drawings → BIM
 `fromlayer <layer> wall thick <t>` turns the 2D curves on a layer into typed BIM

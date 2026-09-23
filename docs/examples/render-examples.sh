@@ -12,11 +12,13 @@
 #
 # The seven scenes map one-to-one to the README's showcased sections:
 #   formfinding  → Form-finding & expressive structures
+#   dieste       → Form-finding (Dieste Gaussian masonry vaults)
 #   see_*        → See (camera / display modes)
 #   env          → Analyze the environment (sun + shadow study)
 #   landscape    → Landscape & site (planting)
 #   compliance   → Pre-check code compliance
 #   facade_*     → Document (the flagship curtain-wall building)
+#   venetian_*   → Document (a Venetian palazzo facade from primitives)
 #   blocks       → Blocks & external references
 #
 # ── Requires a GPU adapter ──────────────────────────────────────────────────
@@ -109,6 +111,7 @@ sed "s#/tmp/pavilion.dxf#$PAVILION#g" "$SCENES/blocks.txt" > "$BLOCKS_SCENE"
 
 # ── Form-finding & expressive structures ────────────────────────────────────
 render formfinding "$SCENES/formfinding.txt" persp
+render dieste      "$SCENES/dieste.txt"      persp
 
 # ── See (camera / display modes): same building, two ways ───────────────────
 render see_shaded "$SCENES/facade.txt" persp
@@ -126,6 +129,10 @@ render compliance "$SCENES/compliance.txt" persp
 # ── Document (the flagship curtain-wall building) ───────────────────────────
 render facade_persp "$SCENES/facade.txt" persp
 render facade_elev  "$SCENES/facade.txt" front
+
+# ── Facades (a Venetian palazzo, assembled from primitives) ──────────────────
+render venetian_elev  "$SCENES/venetian.txt" front
+render venetian_persp "$SCENES/venetian.txt" persp
 
 # ── Blocks & external references ────────────────────────────────────────────
 render blocks "$BLOCKS_SCENE" persp

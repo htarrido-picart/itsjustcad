@@ -1,0 +1,5 @@
+gaussvault 12 20 4 undulate
+gaussvault 9 20 3.2 straight
+move last 20,0,0
+funicular -5,0,6 5,0,6 24 1 2.4 invert
+move last 36,6,0
