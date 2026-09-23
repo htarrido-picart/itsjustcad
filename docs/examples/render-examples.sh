@@ -130,6 +130,33 @@ render compliance "$SCENES/compliance.txt" persp
 render facade_persp "$SCENES/facade.txt" persp
 render facade_elev  "$SCENES/facade.txt" front
 
+# ── Document (paper-space dimensioned drawing sheet) ────────────────────────
+# Unlike the GPU renders above, this one prints a real sheet to PDF (no GPU
+# needed) and rasterizes page 1 to a PNG. The scene ends with
+# `print A-101 <pdf>`; we rewrite that path to a temp file, run headless, then
+# pdftoppm/magick the first page and downscale it like the others.
+render_sheet() { # <out-name> <scene-file> <sheet-name>
+  local name="$1" scene="$2" sheet="$3"
+  local script="$TMP_DIR/$name.txt" pdf="$TMP_DIR/$name.pdf"
+  local raw="$TMP_DIR/${name}_page" out="$IMG_DIR/$name.png"
+  # Repoint the scene's `print` line at our temp PDF.
+  sed "s#^print .*#print $sheet $pdf#" "$scene" > "$script"
+  if "$BIN" --run "$script" --headless >/dev/null 2>"$TMP_DIR/$name.err"; then
+    if command -v pdftoppm >/dev/null 2>&1; then
+      pdftoppm -png -r 150 "$pdf" "$raw" && downscale "${raw}-1.png" "$out"
+    elif command -v magick >/dev/null 2>&1; then
+      magick -density 150 "${pdf}[0]" "${raw}-1.png" && downscale "${raw}-1.png" "$out"
+    else
+      echo "  ✗ $name: need pdftoppm or magick to rasterize the PDF"; FAILED=1; return
+    fi
+    echo "  ✓ $name → docs/examples/img/$name.png"
+  else
+    echo "  ✗ $name FAILED:"; sed 's/^/      /' "$TMP_DIR/$name.err"
+    FAILED=1
+  fi
+}
+render_sheet document_sheet "$SCENES/document.txt" A-101
+
 # ── Facades (a Venetian palazzo, assembled from primitives) ──────────────────
 render venetian_elev  "$SCENES/venetian.txt" front
 render venetian_persp "$SCENES/venetian.txt" persp

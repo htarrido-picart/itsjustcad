@@ -523,6 +523,50 @@ sheets → one multi-page PDF via `publish`) · **plot styles / pen tables**
 (`plotstyle`: named layer/color → pen color + weight + screening, applied only
 at print) · per-layer lineweights · vector PDF export
 
+#### Dimensioned drawing sheet (paper space)
+
+A real drawing sheet: a 24 × 14 m office floor plan (perimeter walls, a service
+core, a demising partition) placed on an **A3 sheet at 1:100**, dimensioned in
+**paper space** with `sheetdim`. The dimensions live on the sheet in millimetres
+at drawing scale — they are *not* baked into the 3D model — and `print` renders
+the sheet to a vector PDF:
+
+```
+layer walls
+box 0,0,0 24,0.25,3.2
+box 0,13.75,0 24,0.25,3.2
+box 0,0,0 0.25,14,3.2
+box 23.75,0,0 0.25,14,3.2
+layer core
+box 9,4.5,0 6,0.25,3.2
+box 9,9.5,0 6,0.25,3.2
+box 9,4.5,0 0.25,5,3.2
+box 14.75,4.5,0 0.25,5,3.2
+layer partition
+box 9,0,0 0.2,4.5,3.2
+box 9,9.5,0 0.2,4.5,3.2
+
+sheet A-101 a3
+sheetview A-101 top 1:100
+
+# paper-space dims (mm on the sheet): the plan is centred in the viewport,
+# so model (mx,my) → paper (mx*10 + 90, my*10 + 84.5) at 1:100.
+sheetdim A-101 90,84.5 330,84.5 -14      # overall width  (24 m)
+sheetdim A-101 90,84.5 90,224.5 -14      # overall depth  (14 m)
+sheetdim A-101 90,224.5 180,224.5 12     # west bay to core (9 m)
+
+sheettext A-101 250,282 A-101  GROUND FLOOR PLAN 5
+sheettext A-101 250,276 SCALE 1:100  --  A3 3.5
+
+print A-101 A-101.pdf
+```
+
+<img src="docs/examples/img/document_sheet.png" width="700">
+
+*The dimension lines, witness lines and measurements sit in document/paper space
+at 1:100 — `sheetdim` measures on the sheet, so the same plan re-dimensions
+correctly at any viewport scale. `print` outputs the drawing as a vector PDF.*
+
 A believable multi-storey building — a plinth, three floor slabs and a roof, a
 service core, and a real curtain-wall facade built by `array`-ing mullions and
 glazing panels across both long elevations:

@@ -1,0 +1,46 @@
+# Document-space (paper/sheet) dimensioned drawing.
+# A small office floor plan (24 x 14 m) with a service core and a
+# demising partition, laid out on an A2 sheet at 1:100. The dimensions
+# live on the SHEET in paper millimetres (via `sheetdim`), NOT baked
+# into the 3D model — `print` renders the real drawing to PDF.
+
+# ── Model: a legible plan ────────────────────────────────────────────
+layer walls
+# Outer shell (perimeter walls, 0.25 m thick), drawn as four boxes.
+box 0,0,0 24,0.25,3.2
+box 0,13.75,0 24,0.25,3.2
+box 0,0,0 0.25,14,3.2
+box 23.75,0,0 0.25,14,3.2
+
+layer core
+# Service / stair-lift core, 6 x 5 m, offset into the plan.
+box 9,4.5,0 6,0.25,3.2
+box 9,9.5,0 6,0.25,3.2
+box 9,4.5,0 0.25,5,3.2
+box 14.75,4.5,0 0.25,5,3.2
+
+layer partition
+# Demising partition splitting the west bay from the core zone at x = 9 m.
+box 9,0,0 0.2,4.5,3.2
+box 9,9.5,0 0.2,4.5,3.2
+
+# ── Sheet: A3 landscape, plan viewport at 1:100 ──────────────────────
+sheet A-101 a3
+sheetview A-101 top 1:100
+
+# ── Paper-space dimensions (mm on the sheet) ─────────────────────────
+# Viewport maths (single view, A3 420x297): the plan is centred in the
+# viewport, so model (mx,my) maps to paper (mx*10 + 90, my*10 + 84.5).
+# Overall 24 m -> 240 mm, 14 m -> 140 mm on paper at 1:100.
+# Overall width, below the plan:
+sheetdim A-101 90,84.5 330,84.5 -14
+# Overall depth, left of the plan:
+sheetdim A-101 90,84.5 90,224.5 -14
+# West-bay width to the core (0..9 m), above the plan:
+sheetdim A-101 90,224.5 180,224.5 12
+
+# ── Title block-ish label ────────────────────────────────────────────
+sheettext A-101 250,282 A-101  GROUND FLOOR PLAN 5
+sheettext A-101 250,276 SCALE 1:100  --  A3 3.5
+
+print A-101 /tmp/A-101.pdf
