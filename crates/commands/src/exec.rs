@@ -3234,15 +3234,11 @@ fn merge_faces(faces: &[Vec<[f64; 2]>], tol: f64) -> Vec<Vec<[f64; 2]>> {
     }
     // Chain surviving edges head-to-tail into rings.
     let mut rings: Vec<Vec<[f64; 2]>> = Vec::new();
-    loop {
-        // Pick any vertex that still has an outgoing edge.
-        let Some((&start, _)) = adj.iter().find(|(_, outs)| !outs.is_empty()) else {
-            break;
-        };
+    // Pick any vertex that still has an outgoing edge, tracing a ring from it.
+    while let Some((&start, _)) = adj.iter().find(|(_, outs)| !outs.is_empty()) {
         let mut ring: Vec<usize> = vec![start];
         let mut cur = start;
-        loop {
-            let Some(outs) = adj.get_mut(&cur) else { break };
+        while let Some(outs) = adj.get_mut(&cur) {
             if outs.is_empty() {
                 break;
             }
@@ -7611,12 +7607,14 @@ fn describe_cplane(c: &itsjustcad_doc::CPlane) -> String {
 /// coords (replay-stability invariant). World XY (the default) is a no-op.
 ///
 /// CPlane-aware verbs:
-///   - Fully aware (every defining vertex transformed, correct for ANY plane):
-///     `line`, `polyline`, `point` (PointLiteral).
-///   - Anchor-aware (the single defining point is transformed; the geometry
-///     still extends along world axes, so this is exact for a translated or
-///     +Z-normal plane and an accepted MVP limitation for a tilted/rotated
-///     plane): `rect`, `circle`, `box`.
+///
+/// - Fully aware (every defining vertex transformed, correct for ANY plane):
+///   `line`, `polyline`, `point` (PointLiteral).
+/// - Anchor-aware (the single defining point is transformed; the geometry still
+///   extends along world axes, so this is exact for a translated or +Z-normal
+///   plane and an accepted MVP limitation for a tilted/rotated plane): `rect`,
+///   `circle`, `box`.
+///
 /// All other verbs are world-only for now (see report / follow-ups).
 fn cplane_resolve(doc: &Document, cmd: Command) -> Result<Command, ExecError> {
     if doc.cplane.is_world() {
@@ -12637,10 +12635,10 @@ fn apply_forward(
             // Count live instances per xref name (plain block instances).
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
             for o in doc.objects() {
-                if let Geometry::Instance { block, source: None, .. } = &o.geometry {
-                    if doc.xrefs.contains_key(block) {
-                        *counts.entry(block.clone()).or_default() += 1;
-                    }
+                if let Geometry::Instance { block, source: None, .. } = &o.geometry
+                    && doc.xrefs.contains_key(block)
+                {
+                    *counts.entry(block.clone()).or_default() += 1;
                 }
             }
             let list: Vec<String> = doc
@@ -12745,10 +12743,10 @@ fn apply_forward(
                     continue;
                 }
                 let prev = doc.get(*id).expect("resolved").geometry.clone();
-                if let Some(o) = doc.get_mut(*id) {
-                    if let Geometry::Instance { clip, .. } = &mut o.geometry {
-                        *clip = rect;
-                    }
+                if let Some(o) = doc.get_mut(*id)
+                    && let Geometry::Instance { clip, .. } = &mut o.geometry
+                {
+                    *clip = rect;
                 }
                 snapshots.push((*id, prev));
                 touched += 1;

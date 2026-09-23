@@ -4484,8 +4484,9 @@ impl App {
                                 }
                             });
                         }
-                        if commit {
-                            if let Some(p) = self.pending_object_pos.take() {
+                        if commit
+                            && let Some(p) = self.pending_object_pos.take()
+                        {
                                 // Parse each field, falling back to the origin
                                 // component when a field is left blank/invalid.
                                 let parse = |s: &str, d: f64| s.trim().parse::<f64>().unwrap_or(d);
@@ -4500,7 +4501,6 @@ impl App {
                                         d.x, d.y, d.z
                                     ));
                                 }
-                            }
                         }
                     });
                     ui.end_row();
