@@ -55,6 +55,19 @@ impl CPlane {
             && self.normal.abs_diff_eq(DVec3::Z, EPS)
     }
 
+    /// True if the basis is rotated relative to world — i.e. `x_axis` is not
+    /// (anti)parallel to world +X or `y_axis` is not (anti)parallel to world +Y.
+    /// A pure translation / +Z-offset plane (world-aligned axes, any origin) is
+    /// NOT rotated. Verbs whose extents stay world-axis-aligned (rect/box/circle)
+    /// are only correct on a non-rotated plane; they use this as a guard.
+    pub fn is_rotated(&self) -> bool {
+        const EPS: f64 = 1e-9;
+        // |dot| ~ 1 means (anti)parallel to the world axis.
+        let x_aligned = self.x_axis.normalize_or_zero().dot(DVec3::X).abs() > 1.0 - EPS;
+        let y_aligned = self.y_axis.normalize_or_zero().dot(DVec3::Y).abs() > 1.0 - EPS;
+        !(x_aligned && y_aligned)
+    }
+
     /// Build a CPlane from an `origin` and a `normal`. The in-plane X axis is
     /// chosen to align as closely as possible with world +X (so an upright,
     /// +Z-normal plane keeps world-aligned axes — the intuitive "draw at

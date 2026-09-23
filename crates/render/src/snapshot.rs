@@ -160,6 +160,38 @@ fn push_hatch_segs(lines: &mut Vec<SceneLine>, segs: Vec<[DVec3; 2]>, color: [f3
     }
 }
 
+/// Does triangle `(a,b,c)` (world XY) overlap the clip `rect`? Approximate,
+/// cheap test used by the XCLIP mesh cull: true if any triangle vertex is inside
+/// the rect OR any of the rect's 4 corners is inside the triangle. This keeps a
+/// face whose interior covers the rect even when all its verts are outside (a
+/// clip window smaller than the triangle) — without full polygon clipping, so
+/// the face is drawn whole (no border split, documented approximation).
+fn face_overlaps_rect(rect: &itsjustcad_doc::ClipRect, a: DVec3, b: DVec3, c: DVec3) -> bool {
+    if rect.contains_xy(a) || rect.contains_xy(b) || rect.contains_xy(c) {
+        return true;
+    }
+    let (a2, b2, c2) = (a.truncate(), b.truncate(), c.truncate());
+    let corners = [
+        DVec2::new(rect.min.x, rect.min.y),
+        DVec2::new(rect.max.x, rect.min.y),
+        DVec2::new(rect.max.x, rect.max.y),
+        DVec2::new(rect.min.x, rect.max.y),
+    ];
+    corners.iter().any(|&p| point_in_triangle_2d(p, a2, b2, c2))
+}
+
+/// Point-in-triangle via barycentric sign test (inclusive of edges). 2D only.
+fn point_in_triangle_2d(p: DVec2, a: DVec2, b: DVec2, c: DVec2) -> bool {
+    let d = |u: DVec2, v: DVec2, w: DVec2| (v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x);
+    let d1 = d(a, b, p);
+    let d2 = d(b, c, p);
+    let d3 = d(c, a, p);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    // Inside if all cross products share a sign (allowing zero on an edge).
+    !(has_neg && has_pos)
+}
+
 /// Resolve the display color for an object given the active color mode.
 /// Selection always wins over everything; otherwise the mode determines priority.
 fn resolve_color(
@@ -401,13 +433,15 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
             // app still draws its own crisp overlay label on top.
             Geometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) => {
                 let color = resolve_color(obj, layer_color, theme, selected, mode, false);
-                let l1 = *vertex + (*p1 - *vertex).normalize_or_zero() * *radius;
-                let l2 = *vertex + (*p2 - *vertex).normalize_or_zero() * *radius;
                 let leg = |a: DVec3, b: DVec3| -> Vec<[f32; 3]> {
                     vec![[a.x as f32, a.y as f32, a.z as f32], [b.x as f32, b.y as f32, b.z as f32]]
                 };
-                scene.lines.push((leg(*vertex, l1), color, lw_mm));
-                scene.lines.push((leg(*vertex, l2), color, lw_mm));
+                // Leg endpoints from the shared helper (its first two segments are
+                // the legs); the arc stays a single scene polyline below.
+                let scaffold = itsjustcad_doc::angular_dim_segments(*vertex, *p1, *p2, *radius);
+                for &(a, b) in scaffold.iter().take(2) {
+                    scene.lines.push((leg(a, b), color, lw_mm));
+                }
                 let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
                 if arc.len() >= 2 {
                     let pts: Vec<[f32; 3]> =
@@ -463,12 +497,19 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
                                 let new_pos: Vec<DVec3> =
                                     m.positions().iter().map(|&p| transform(p)).collect();
                                 let faces: Vec<[u32; 3]> = match clip {
+                                    // Keep a face if it OVERLAPS the rect (not
+                                    // just fully-inside): any face vertex inside
+                                    // the rect, OR any rect corner inside the
+                                    // triangle. This shows the interior region
+                                    // when the clip window is smaller than a
+                                    // triangle (else the face is culled whole and
+                                    // the view goes blank). Still approximate — no
+                                    // border split (no Sutherland–Hodgman clip).
                                     Some(rect) => m
                                         .faces()
                                         .iter()
                                         .filter(|f| {
-                                            f.iter()
-                                                .all(|&vi| rect.contains_xy(new_pos[vi as usize]))
+                                            face_overlaps_rect(rect, new_pos[f[0] as usize], new_pos[f[1] as usize], new_pos[f[2] as usize])
                                         })
                                         .copied()
                                         .collect(),
@@ -975,6 +1016,74 @@ mod tests {
             )),
         );
         assert_eq!(snapshot(&doc, Theme::Dark).meshes.len(), 0, "outside-rect face culled");
+    }
+
+    #[test]
+    fn face_overlaps_rect_keeps_face_containing_the_clip() {
+        // Fix 8: a clip window smaller than a triangle (all triangle verts
+        // OUTSIDE the rect) must still be kept — otherwise the view goes blank.
+        let a = DVec3::new(-10.0, -10.0, 0.0);
+        let b = DVec3::new(10.0, -10.0, 0.0);
+        let c = DVec3::new(0.0, 10.0, 0.0);
+        // Tiny rect near the triangle's interior; no triangle vertex inside it.
+        let rect = itsjustcad_doc::ClipRect::new(
+            glam::DVec2::new(-0.5, -0.5),
+            glam::DVec2::new(0.5, 0.5),
+        );
+        assert!(!rect.contains_xy(a) && !rect.contains_xy(b) && !rect.contains_xy(c));
+        assert!(face_overlaps_rect(&rect, a, b, c), "face containing the clip is kept");
+
+        // A rect fully outside the triangle is not kept.
+        let far = itsjustcad_doc::ClipRect::new(
+            glam::DVec2::new(100.0, 100.0),
+            glam::DVec2::new(101.0, 101.0),
+        );
+        assert!(!face_overlaps_rect(&far, a, b, c), "disjoint rect culls the face");
+    }
+
+    #[test]
+    fn instance_clip_keeps_big_face_around_small_clip() {
+        // A 2-triangle quad fully containing a small clip rect must keep ≥1 face
+        // (not blank) — the overlap test, not just all-verts-inside.
+        use itsjustcad_doc::{ClipRect, ObjectId, SceneObject};
+        // Quad [-10,10]² as two triangles.
+        let quad = kernel_mesh::Mesh::new(
+            vec![
+                DVec3::new(-10.0, -10.0, 0.0),
+                DVec3::new(10.0, -10.0, 0.0),
+                DVec3::new(10.0, 10.0, 0.0),
+                DVec3::new(-10.0, 10.0, 0.0),
+            ],
+            vec![[0, 1, 2], [0, 2, 3]],
+        );
+        let mut doc = Document::default();
+        doc.blocks
+            .insert("quad".to_string(), vec![itsjustcad_doc::BlockGeometry::Mesh(quad)]);
+        doc.insert(SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: "default".into(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Instance {
+                block: "quad".into(),
+                position: DVec3::ZERO,
+                rotation_deg: 0.0,
+                scale: 1.0,
+                source: None,
+                params: Default::default(),
+                clip: Some(ClipRect::new(
+                    glam::DVec2::new(-1.0, -1.0),
+                    glam::DVec2::new(1.0, 1.0),
+                )),
+            },
+        });
+        assert!(
+            !snapshot(&doc, Theme::Dark).meshes.is_empty(),
+            "small clip inside a big quad must keep at least one face (not blank)"
+        );
     }
 
     // -- color mode tests --

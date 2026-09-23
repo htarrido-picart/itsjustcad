@@ -369,6 +369,27 @@ pub fn angular_arc_points(vertex: DVec3, p1: DVec3, p2: DVec3, radius: f64) -> V
         .collect()
 }
 
+/// Geometry scaffold of an angular dimension: the two legs (from `vertex` out
+/// to `radius` along each leg direction) plus the tessellated arc between them,
+/// as `(start, end)` segment pairs. Shared by every exporter/renderer so the
+/// leg+arc geometry is defined once (each site still places its own degree
+/// label). The label value comes from [`angle_degrees`] + [`format_angle`].
+pub fn angular_dim_segments(
+    vertex: DVec3,
+    p1: DVec3,
+    p2: DVec3,
+    radius: f64,
+) -> Vec<(DVec3, DVec3)> {
+    let l1 = vertex + (p1 - vertex).normalize_or_zero() * radius;
+    let l2 = vertex + (p2 - vertex).normalize_or_zero() * radius;
+    let mut segs = vec![(vertex, l1), (vertex, l2)];
+    let arc = angular_arc_points(vertex, p1, p2, radius);
+    for pair in arc.windows(2) {
+        segs.push((pair[0], pair[1]));
+    }
+    segs
+}
+
 /// A geometry snapshot stored in a block definition. The same enum as
 /// `Geometry` minus recursive Instance references (blocks are flat).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1056,6 +1077,34 @@ mod tests {
         // Outside on either axis.
         assert!(!r.contains_xy(DVec3::new(1.9, 6.0, 0.0)));
         assert!(!r.contains_xy(DVec3::new(5.0, 8.1, 0.0)));
+    }
+
+    #[test]
+    fn angular_dim_segments_returns_two_legs_and_arc() {
+        // A 90° corner: vertex at origin, legs along +X and +Y, radius 1.
+        let vertex = DVec3::ZERO;
+        let p1 = DVec3::new(2.0, 0.0, 0.0);
+        let p2 = DVec3::new(0.0, 2.0, 0.0);
+        let segs = angular_dim_segments(vertex, p1, p2, 1.0);
+        // The first two segments are the legs, both starting at the vertex and
+        // reaching out to radius 1 along each leg direction.
+        assert!(segs.len() > 2, "legs + arc segments");
+        assert!(segs[0].0.abs_diff_eq(vertex, 1e-12));
+        assert!(segs[0].1.abs_diff_eq(DVec3::new(1.0, 0.0, 0.0), 1e-12));
+        assert!(segs[1].0.abs_diff_eq(vertex, 1e-12));
+        assert!(segs[1].1.abs_diff_eq(DVec3::new(0.0, 1.0, 0.0), 1e-12));
+        // The remaining segments trace the arc: chained head-to-tail from the p1
+        // leg tip to the p2 leg tip, all at radius 1 from the vertex.
+        let arc = &segs[2..];
+        assert!(!arc.is_empty(), "arc segments present");
+        assert!(arc[0].0.abs_diff_eq(DVec3::new(1.0, 0.0, 0.0), 1e-9), "arc starts at p1 leg tip");
+        for &(a, _) in arc {
+            assert!(((a - vertex).length() - 1.0).abs() < 1e-9, "arc point at radius 1");
+        }
+        assert!(
+            arc.last().unwrap().1.abs_diff_eq(DVec3::new(0.0, 1.0, 0.0), 1e-9),
+            "arc ends at p2 leg tip"
+        );
     }
 
     #[test]

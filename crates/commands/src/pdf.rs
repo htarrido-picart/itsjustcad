@@ -87,14 +87,9 @@ fn geometry_segments(doc: &Document, geometry: &Geometry, out: &mut Vec<(DVec3, 
         // AngularDim: two legs (out to the arc radius) plus the tessellated arc
         // between them. The degree label is emitted in the second pass.
         Geometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) => {
-            let l1 = *vertex + (*p1 - *vertex).normalize_or_zero() * *radius;
-            let l2 = *vertex + (*p2 - *vertex).normalize_or_zero() * *radius;
-            out.push((*vertex, l1));
-            out.push((*vertex, l2));
-            let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
-            for pair in arc.windows(2) {
-                out.push((pair[0], pair[1]));
-            }
+            // Leg+arc geometry from the shared helper; the degree label is
+            // emitted in the second pass.
+            out.extend(itsjustcad_doc::angular_dim_segments(*vertex, *p1, *p2, *radius));
         }
         Geometry::Annotation(Annotation::Hatch { boundary, pattern }) => {
             use itsjustcad_doc::{

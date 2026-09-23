@@ -66,14 +66,9 @@ fn collect_segments(doc: &Document, geometry: &Geometry) -> Vec<(DVec3, DVec3)> 
         // AngularDim: two legs + the tessellated arc, plus the degree label
         // rendered as world-space Hershey strokes (so SVG carries the value).
         Geometry::Annotation(Annotation::AngularDim { vertex, p1, p2, radius }) => {
-            let l1 = *vertex + (*p1 - *vertex).normalize_or_zero() * *radius;
-            let l2 = *vertex + (*p2 - *vertex).normalize_or_zero() * *radius;
-            segs.push((*vertex, l1));
-            segs.push((*vertex, l2));
+            // Leg+arc geometry from the shared helper; the label is placed below.
+            segs.extend(itsjustcad_doc::angular_dim_segments(*vertex, *p1, *p2, *radius));
             let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
-            for pair in arc.windows(2) {
-                segs.push((pair[0], pair[1]));
-            }
             let mid = arc.get(arc.len() / 2).copied().unwrap_or(*vertex);
             let label = itsjustcad_doc::format_angle(
                 itsjustcad_doc::angle_degrees(*vertex, *p1, *p2),
@@ -89,7 +84,9 @@ fn collect_segments(doc: &Document, geometry: &Geometry) -> Vec<(DVec3, DVec3)> 
         }
         // Text annotations: tessellate via Hershey stroke font so they render
         // as world-space geometry (identical appearance across viewport/SVG/PDF/DXF).
-        Geometry::Annotation(Annotation::Text { pos, text, height }) => {
+        // Fields share the text path — `text` is the resolved field value (mirrors pdf.rs).
+        Geometry::Annotation(Annotation::Text { pos, text, height })
+        | Geometry::Annotation(Annotation::Field { pos, text, height, .. }) => {
             let strokes = itsjustcad_doc::hershey::text_strokes(text, [pos.x, pos.y], *height);
             for poly in strokes {
                 for pair in poly.windows(2) {
@@ -99,7 +96,36 @@ fn collect_segments(doc: &Document, geometry: &Geometry) -> Vec<(DVec3, DVec3)> 
                 }
             }
         }
-        Geometry::Annotation(_) => {}
+        // Hatch: generate fill lines via the same generators pdf.rs uses.
+        Geometry::Annotation(Annotation::Hatch { boundary, pattern }) => {
+            use itsjustcad_doc::{
+                hatch::{hatch_ansi, hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines, hatch_pat},
+                HatchPattern,
+            };
+            let hatch_segs: Vec<[DVec3; 2]> = match pattern {
+                HatchPattern::Solid => {
+                    let n = boundary.len();
+                    (0..n).map(|i| [boundary[i], boundary[(i + 1) % n]]).collect()
+                }
+                HatchPattern::Lines { angle_deg, spacing } => {
+                    hatch_lines(boundary, *angle_deg, *spacing)
+                }
+                HatchPattern::Crosshatch { angle_deg, spacing } => {
+                    let mut s = hatch_lines(boundary, *angle_deg, *spacing);
+                    s.extend(hatch_lines(boundary, *angle_deg + 90.0, *spacing));
+                    s
+                }
+                HatchPattern::Brick { spacing } => hatch_brick(boundary, *spacing),
+                HatchPattern::Concrete { spacing } => hatch_concrete(boundary, *spacing),
+                HatchPattern::Insulation { spacing } => hatch_insulation(boundary, *spacing),
+                HatchPattern::Earth { spacing } => hatch_earth(boundary, *spacing),
+                HatchPattern::Ansi { code, spacing } => hatch_ansi(boundary, *code, *spacing),
+                HatchPattern::Custom { lines, scale, .. } => hatch_pat(boundary, lines, *scale),
+            };
+            for [a, b] in hatch_segs {
+                segs.push((a, b));
+            }
+        }
         // Block instances are not directly renderable in SVG export.
         Geometry::Instance { .. } => {}
         // Point clouds are not rendered in SVG export.
@@ -360,6 +386,31 @@ mod tests {
         assert!(svg.matches("<g ").count() >= 2, "at least 2 <g> groups\n{svg}");
         // box has feature edges, line has 1 segment.
         assert!(svg.contains("<line "), "should contain <line> elements");
+    }
+
+    #[test]
+    fn svg_renders_field_and_hatch_segments() {
+        // Regression: SVG export used to swallow Annotation::Field and Hatch
+        // (catch-all `Annotation(_) => {}`). Both must now emit stroke segments.
+        let mut s = Session::default();
+        // A closed square to hatch, plus a hatch and a field over it.
+        s.run(parse("polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed").unwrap()).unwrap();
+        s.run(parse("hatch last lines").unwrap()).unwrap();
+        s.run(parse("field 1,1,0 layer 0.5").unwrap()).unwrap();
+
+        let (bytes, _) = export_svg(&s.doc);
+        let svg = String::from_utf8(bytes).unwrap();
+
+        // Hatch fill lines + field text strokes both surface as <line> elements.
+        let line_count = svg.matches("<line ").count();
+        assert!(line_count > 4, "expected hatch + field strokes, got {line_count}\n{svg}");
+
+        // Isolate: a doc with only a field still produces strokes (text present).
+        let mut s2 = Session::default();
+        s2.run(parse("field 0,0,0 layer 1.0").unwrap()).unwrap();
+        let (b2, _) = export_svg(&s2.doc);
+        let svg2 = String::from_utf8(b2).unwrap();
+        assert!(svg2.contains("<line "), "field text strokes present\n{svg2}");
     }
 
     #[test]

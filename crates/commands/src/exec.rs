@@ -740,7 +740,7 @@ impl Session {
                 // already-world logged op via `apply_forward` (not `run`), and
                 // full replay starts from a fresh world CPlane, so neither
                 // double-transforms.
-                let cmd = cplane_resolve(&self.doc, cmd);
+                let cmd = cplane_resolve(&self.doc, cmd)?;
                 let (op, inverse, outcome) = apply_forward(&mut self.doc, cmd)?;
                 if logged {
                     self.log.truncate(self.cursor);
@@ -1541,7 +1541,10 @@ impl Session {
             if self.doc.current_layer != layer {
                 self.run(Command::Layer { name: layer })?;
             }
-            created.extend(self.run(cmd)?.created);
+            // Entity coords are file/world coords — bypass the active CPlane
+            // (like `import_3dm`), else a non-world CPlane re-projects them.
+            // Layer switches above stay on `run` (no coords to transform).
+            created.extend(self.run_world(cmd)?.created);
         }
         if self.doc.current_layer != prev_layer {
             self.run(Command::Layer { name: prev_layer })?;
@@ -1577,7 +1580,10 @@ impl Session {
             if self.doc.current_layer != layer {
                 self.run(Command::Layer { name: layer })?;
             }
-            created.extend(self.run(cmd)?.created);
+            // Entity coords are file/world coords — bypass the active CPlane
+            // (like `import_3dm`), else a non-world CPlane re-projects them.
+            // Layer switches above stay on `run` (no coords to transform).
+            created.extend(self.run_world(cmd)?.created);
         }
         if self.doc.current_layer != prev_layer {
             self.run(Command::Layer { name: prev_layer })?;
@@ -3203,7 +3209,10 @@ fn merge_faces(faces: &[Vec<[f64; 2]>], tol: f64) -> Vec<Vec<[f64; 2]>> {
     };
     // Count directed edges; an internal edge appears once forward (u→v) on one
     // face and once reversed (v→u) on the neighbour. Net them out.
-    let mut count: std::collections::HashMap<(usize, usize), i32> = std::collections::HashMap::new();
+    // BTreeMap (not HashMap): iteration order over these maps determines ring
+    // trace order, and HashMap iteration is process-random → non-deterministic
+    // rings → op-log replay diverges. Keys are Ord, so BTree gives a stable order.
+    let mut count: std::collections::BTreeMap<(usize, usize), i32> = std::collections::BTreeMap::new();
     for face in faces {
         let n = face.len();
         for k in 0..n {
@@ -3217,7 +3226,7 @@ fn merge_faces(faces: &[Vec<[f64; 2]>], tol: f64) -> Vec<Vec<[f64; 2]>> {
         }
     }
     // Surviving directed edges: net count > 0 (perimeter, kept once).
-    let mut adj: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    let mut adj: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
     for (&(u, v), &c) in &count {
         for _ in 0..c.max(0) {
             adj.entry(u).or_default().push(v);
@@ -6645,12 +6654,20 @@ fn exec_site_path(
 }
 
 /// Station parameters for `arraycurve`: `count` values in `[0, 1]` spaced
-/// evenly, endpoints inclusive (like AutoCAD "Divide" measure). `count == 1`
-/// puts the single copy at the path start; `count >= 2` includes both ends.
-/// Pure function of `count`, so it is unit-tested directly.
-fn curve_station_ts(count: u32) -> Vec<f64> {
+/// evenly. On an OPEN path endpoints are inclusive (like AutoCAD "Divide"):
+/// `count == 1` → single copy at the start; `count >= 2` → both ends included.
+/// On a CLOSED path t=0 and t=1 are the SAME point, so the endpoints-inclusive
+/// scheme would place two overlapping copies there; instead stations span
+/// `[0, 1)` (step `1/count`) so `count` copies are evenly spaced with no overlap.
+/// Pure function of `count`/`closed`, so it is unit-tested directly.
+fn curve_station_ts(count: u32, closed: bool) -> Vec<f64> {
     if count <= 1 {
         return vec![0.0];
+    }
+    if closed {
+        // count stations over [0,1): 0, 1/count, ..., (count-1)/count.
+        let n = f64::from(count);
+        return (0..count).map(|i| f64::from(i) / n).collect();
     }
     let last = f64::from(count - 1);
     (0..count).map(|i| f64::from(i) / last).collect()
@@ -6754,7 +6771,15 @@ fn exec_array_curve(
     if src.is_empty() {
         return Err(ExecError::Invalid("arraycurve: nothing selected to array".into()));
     }
-    let ts = curve_station_ts(count);
+    // A closed path's first and last tessellated points coincide; detect either
+    // via the curve's own flag or the point coincidence so stations skip the
+    // duplicate endpoint (no overlapping copies at t=0 / t=1).
+    let closed = curve.is_closed()
+        || pts
+            .first()
+            .zip(pts.last())
+            .is_some_and(|(a, b)| (*a - *b).length() <= PROFILE_TOL);
+    let ts = curve_station_ts(count, closed);
     let total_new = src.len() * ts.len();
     // Reuse logged ids on replay; mint new ones live.
     let new_ids: Vec<ObjectId> = match ids {
@@ -7596,12 +7621,22 @@ fn describe_cplane(c: &itsjustcad_doc::CPlane) -> String {
 ///     +Z-normal plane and an accepted MVP limitation for a tilted/rotated
 ///     plane): `rect`, `circle`, `box`.
 /// All other verbs are world-only for now (see report / follow-ups).
-fn cplane_resolve(doc: &Document, cmd: Command) -> Command {
+fn cplane_resolve(doc: &Document, cmd: Command) -> Result<Command, ExecError> {
     if doc.cplane.is_world() {
-        return cmd;
+        return Ok(cmd);
     }
     let tw = |p: DVec3| doc.cplane_to_world(p);
-    match cmd {
+    // rect/box/circle only transform their anchor — their extents stay
+    // world-axis-aligned. That's exact for a translation-only (e.g. +Z-offset)
+    // plane, but silently mis-orients on a ROTATED plane. Guard rather than emit
+    // wrong geometry; polyline is the plane-aware alternative.
+    let rotated = doc.cplane.is_rotated();
+    let guard = || {
+        ExecError::Invalid(
+            "rect/box/circle need a world-aligned CPlane (rotation unsupported) — use polyline on this plane".into(),
+        )
+    };
+    Ok(match cmd {
         Command::Line { id, a, b } => Command::Line { id, a: tw(a), b: tw(b) },
         Command::Polyline { id, points, closed } => Command::Polyline {
             id,
@@ -7612,16 +7647,26 @@ fn cplane_resolve(doc: &Document, cmd: Command) -> Command {
             id,
             positions: positions.into_iter().map(tw).collect(),
         },
-        Command::Rectangle { id, corner, width, height } => Command::Rectangle {
-            id,
-            corner: tw(corner),
-            width,
-            height,
-        },
-        Command::Circle { id, center, radius } => Command::Circle { id, center: tw(center), radius },
-        Command::Box { id, corner, size } => Command::Box { id, corner: tw(corner), size },
+        Command::Rectangle { id, corner, width, height } => {
+            if rotated {
+                return Err(guard());
+            }
+            Command::Rectangle { id, corner: tw(corner), width, height }
+        }
+        Command::Circle { id, center, radius } => {
+            if rotated {
+                return Err(guard());
+            }
+            Command::Circle { id, center: tw(center), radius }
+        }
+        Command::Box { id, corner, size } => {
+            if rotated {
+                return Err(guard());
+            }
+            Command::Box { id, corner: tw(corner), size }
+        }
         other => other,
-    }
+    })
 }
 
 /// Apply a (non-undo) command. Returns the op with ids filled for the log.
@@ -7813,7 +7858,31 @@ fn sheetset_apply(
                 }
                 resolved.push(s);
             }
-            let out_path = path.clone().unwrap_or_else(|| format!("{}.pdf", set.name));
+            // Default output path is derived from the set NAME, which is a
+            // deserialized document field (untrusted: a malicious .ijc could set
+            // `name` to `../../etc/x` or an absolute path). Reduce it to a bare
+            // filename so publish can never write outside the CWD via a
+            // document-controlled path. An explicit user-typed `path` is honored
+            // as-is (that's a deliberate local action).
+            let out_path = match path.clone() {
+                Some(p) => p,
+                None => {
+                    let stem = std::path::Path::new(&set.name)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .filter(|s| !s.is_empty() && *s != "..");
+                    match stem {
+                        Some(s) => format!("{s}.pdf"),
+                        None => {
+                            return Err(ExecError::Invalid(
+                                "sheet set name is not a valid filename — publish with an \
+                                 explicit path: sheetset publish <file.pdf>"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            };
             let (bytes, drawn) = crate::pdf::sheets_pdf(doc, &resolved);
             let (pages, size) = (resolved.len(), bytes.len());
             std::fs::write(&out_path, bytes)
@@ -9553,6 +9622,9 @@ fn apply_forward(
                 )
             })?;
             let ids = resolve(doc, &targets)?;
+            if ids.is_empty() {
+                return Err(ExecError::Invalid("align: nothing selected".into()));
+            }
             // The pivot is already baked into `m`, so apply it about the origin
             // (center ZERO collapses the wrapper translations to identity).
             let (inverse, tessellated) = apply_about_center(doc, &ids, Some(DVec3::ZERO), m);
@@ -9806,6 +9878,16 @@ fn apply_forward(
             };
             if radius <= 0.0 {
                 return Err(ExecError::Invalid("dimradius: radius must be positive".into()));
+            }
+            // The rim point is built in world XY (center + [r·cos, r·sin, 0]).
+            // That is only correct for an XY-planar arc under a world CPlane; a
+            // non-world CPlane would silently emit a mis-placed dimension. Guard
+            // rather than draw a wrong dim (dimensions on tilted planes are a
+            // later kernel job once arcs carry an explicit plane).
+            if !doc.cplane.is_world() {
+                return Err(ExecError::Invalid(
+                    "dimradius/dimdiameter need a world CPlane (tilted-plane dims unsupported) — reset with: cplane world".into(),
+                ));
             }
             // Rim point at the arc's start angle (on-curve for a partial arc).
             let rim = center + DVec3::new(radius * start.cos(), radius * start.sin(), 0.0);
@@ -13794,6 +13876,43 @@ mod tests {
         assert!(err.to_string().contains("non-zero"), "{err}");
     }
 
+    /// align on an empty selection is rejected (mirrors tozero/flatten/stretch)
+    /// and logs no op. `resolve` guards the empty-`all` case, and the added
+    /// `ids.is_empty()` check guards any Ok(empty) resolution (e.g. a corrupted
+    /// `Ids` op-log that filters down to nothing) — either way: error, no op.
+    #[test]
+    fn align_empty_selection_errors_and_logs_nothing() {
+        let mut s = Session::default();
+        let before = s.history().0.len();
+        // Empty doc → `all` resolves to nothing. Distinct (non-zero) reference
+        // vecs so the failure is the selection, not the vector check.
+        let err = s
+            .run(parse("align all 0,0,0 5,5,0 1,1,0 6,6,0").unwrap())
+            .unwrap_err();
+        assert!(matches!(err, ExecError::EmptySelection(_)), "empty selection rejected: {err}");
+        assert_eq!(s.history().0.len(), before, "no op logged on empty align");
+
+        // Directly exercise the verb's own `ids.is_empty()` guard via an `Ids`
+        // op that filters to nothing (stale id in an otherwise non-empty doc).
+        run(&mut s, "box 0,0,0 1,1,1");
+        let before = s.history().0.len();
+        let err = s
+            .run(Command::Align {
+                targets: Selector::Ids { ids: vec![ObjectId::new()] },
+                src1: DVec3::ZERO,
+                tgt1: DVec3::new(5.0, 5.0, 0.0),
+                src2: DVec3::new(1.0, 1.0, 0.0),
+                tgt2: DVec3::new(6.0, 6.0, 0.0),
+                scale: false,
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("nothing selected") || matches!(err, ExecError::EmptySelection(_)),
+            "align guards an empty resolution: {err}"
+        );
+        assert_eq!(s.history().0.len(), before, "no op logged on empty align");
+    }
+
     // ── M-perf bench: one big analysis case, ignored by default ─────────────
 
     /// Build a 200-tower massing scene with a location set (the M-perf bench
@@ -14733,16 +14852,24 @@ mod tests {
 
     #[test]
     fn curve_station_ts_spacing() {
-        assert_eq!(curve_station_ts(1), vec![0.0]);
-        assert_eq!(curve_station_ts(2), vec![0.0, 1.0]);
-        assert_eq!(curve_station_ts(3), vec![0.0, 0.5, 1.0]);
-        let ts = curve_station_ts(5);
+        assert_eq!(curve_station_ts(1, false), vec![0.0]);
+        assert_eq!(curve_station_ts(2, false), vec![0.0, 1.0]);
+        assert_eq!(curve_station_ts(3, false), vec![0.0, 0.5, 1.0]);
+        let ts = curve_station_ts(5, false);
         assert_eq!(ts.len(), 5);
         assert!((ts[0] - 0.0).abs() < 1e-12 && (ts[4] - 1.0).abs() < 1e-12);
         // evenly spaced
         for w in ts.windows(2) {
             assert!(((w[1] - w[0]) - 0.25).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn curve_station_ts_closed_excludes_endpoint() {
+        // Closed path: count stations over [0,1), never t=1 (which == t=0).
+        let ts = curve_station_ts(4, true);
+        assert_eq!(ts, vec![0.0, 0.25, 0.5, 0.75]);
+        assert!(!ts.iter().any(|&t| (t - 1.0).abs() < 1e-12), "no duplicate endpoint");
     }
 
     #[test]
@@ -14805,6 +14932,42 @@ mod tests {
             s.x > 2.5 && s.y < 1.5
         });
         assert!(!any_rotated, "align off must not rotate copies");
+    }
+
+    #[test]
+    fn array_curve_closed_path_no_duplicate_copy() {
+        // On a CLOSED path, t=0 and t=1 coincide; stations must span [0,1) so
+        // `count` copies are distinct with no overlap at the seam.
+        let mut s = Session::default();
+        // Small source box at the origin.
+        run(&mut s, "box -0.1,-0.1,0 0.2,0.2,0.2");
+        run(&mut s, "name last widget");
+        // Closed square path.
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+        run(&mut s, "name last loop");
+        run(&mut s, "arraycurve widget loop 4 align off");
+
+        // Copy centers (all mesh objects except the source at the origin).
+        let mut centers: Vec<DVec3> = s
+            .doc
+            .objects()
+            .filter(|o| matches!(&o.geometry, Geometry::Mesh(_)))
+            .map(|o| o.geometry.aabb().center())
+            .collect();
+        // 1 source + 4 copies = 5 mesh objects.
+        assert_eq!(centers.len(), 5, "source + 4 copies, got {}", centers.len());
+        // No two placements coincide (a duplicate endpoint would overlap two).
+        centers.sort_by(|a, b| {
+            a.x.partial_cmp(&b.x).unwrap().then(a.y.partial_cmp(&b.y).unwrap())
+        });
+        for w in centers.windows(2) {
+            assert!(
+                (w[0] - w[1]).length() > 1e-6,
+                "no two placements coincide: {} vs {}",
+                w[0],
+                w[1]
+            );
+        }
     }
 
     #[test]
@@ -16694,6 +16857,71 @@ mod tests {
     }
 
     #[test]
+    fn curvebool_multi_ring_is_deterministic_and_replay_stable() {
+        // A union that yields ≥2 disjoint rings: two separated square pairs.
+        // merge_faces must emit rings in a stable order (BTreeMap, not HashMap)
+        // so the logged op replays byte-identically across fresh sessions.
+        let build = || {
+            let mut s = Session::default();
+            // Group A: two overlapping squares near the origin.
+            run(&mut s, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+            run(&mut s, "polyline 2,2,0 6,2,0 6,6,0 2,6,0 closed");
+            // Group B: two overlapping squares far away (disjoint from A).
+            run(&mut s, "polyline 20,0,0 24,0,0 24,4,0 20,4,0 closed");
+            run(&mut s, "polyline 22,2,0 26,2,0 26,6,0 22,6,0 closed");
+            run(&mut s, "curvebool union all");
+            // Collect every region's vertex sequence in doc order.
+            s.doc
+                .objects()
+                .filter_map(|o| match &o.geometry {
+                    Geometry::Curve(Curve::Polyline { points, .. }) => {
+                        Some(points.iter().map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = build();
+        let b = build();
+        assert!(a.len() >= 2, "expected ≥2 rings, got {}", a.len());
+        assert_eq!(a, b, "ring vertex sequences must be byte-identical across runs");
+
+        // Op-log replay reproduces identical geometry.
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0 0,4,0 closed");
+        run(&mut s, "polyline 2,2,0 6,2,0 6,6,0 2,6,0 closed");
+        run(&mut s, "polyline 20,0,0 24,0,0 24,4,0 20,4,0 closed");
+        run(&mut s, "polyline 22,2,0 26,2,0 26,6,0 22,6,0 closed");
+        run(&mut s, "curvebool union all");
+        let before: Vec<Vec<[f64; 3]>> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => {
+                    Some(points.iter().map(|p| [p.x, p.y, p.z]).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        let log = s.log.iter().map(|a| a.op.clone()).collect::<Vec<_>>();
+        let mut replay = Session::default();
+        for cmd in log {
+            replay.run(cmd).unwrap();
+        }
+        let after: Vec<Vec<[f64; 3]>> = replay
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => {
+                    Some(points.iter().map(|p| [p.x, p.y, p.z]).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(before, after, "op-log replay reproduces identical rings");
+    }
+
+    #[test]
     fn curvebool_verb_union_intersect_difference_and_undo() {
         let mut s = Session::default();
         // Two overlapping closed squares A=[0,4]², B=[2,6]².
@@ -17388,6 +17616,29 @@ mod tests {
     }
 
     #[test]
+    fn sheetset_publish_default_path_cannot_traverse() {
+        // Security: the no-arg publish path is derived from the set NAME, a
+        // deserialized (untrusted) document field. A traversal-only name must be
+        // rejected rather than writing outside the CWD.
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        run(&mut s, "sheet a-101 a3");
+        run(&mut s, "sheetview a-101 top 1:100");
+        // Forge a malicious set name directly (mirrors a hand-crafted .ijc).
+        s.doc.sheet_sets.push(itsjustcad_doc::SheetSet {
+            name: "..".into(),
+            sheets: vec!["a-101".into()],
+        });
+        let err = s
+            .run(parse("sheetset publish").unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("valid filename"),
+            "traversal-only set name must be rejected on no-arg publish: {err}"
+        );
+    }
+
+    #[test]
     fn export_writes_dxf_and_is_not_logged() {
         let dir = std::env::temp_dir().join("mydrafter-dxf-test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -17416,6 +17667,40 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("cannot write"), "{err}");
         assert_eq!(s.doc.len(), 3);
+    }
+
+    #[test]
+    fn import_dxf_uses_file_coords_under_non_world_cplane() {
+        // A DXF LINE lives at file coords Z=0. Importing under a non-world CPlane
+        // (Z-offset) must NOT re-project it up to Z=10 — importers use run_world.
+        let dir = std::env::temp_dir().join("mydrafter-dxf-import-cplane");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("line.dxf");
+        // Minimal R12 DXF: one LINE from (1,2,0) to (3,4,0) on layer 0.
+        let dxf = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n1.0\n20\n2.0\n30\n0.0\n11\n3.0\n21\n4.0\n31\n0.0\n0\nENDSEC\n0\nEOF\n";
+        std::fs::write(&path, dxf).unwrap();
+
+        let mut s = Session::default();
+        // Active CPlane offset +10 in Z (world-aligned axes, translation only).
+        run(&mut s, "cplane origin 0,0,10 normal 0,0,1");
+        assert!(!s.doc.cplane.is_world());
+        let out = run(&mut s, &format!("import {}", path.display()));
+        assert!(out.message.contains("imported"), "{}", out.message);
+
+        // The created line must be at the FILE Z (0), not shifted to the plane (10).
+        let line = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Line { a, b }) => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("imported line present");
+        assert!((line.0.z).abs() < 1e-9, "line.a at file Z=0, got {}", line.0.z);
+        assert!((line.1.z).abs() < 1e-9, "line.b at file Z=0, got {}", line.1.z);
+        assert!((line.0 - DVec3::new(1.0, 2.0, 0.0)).length() < 1e-9);
+        assert!((line.1 - DVec3::new(3.0, 4.0, 0.0)).length() < 1e-9);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -23473,6 +23758,23 @@ mod tests {
         assert!(s.run(parse("dimradius last").unwrap()).is_err());
     }
 
+    #[test]
+    fn dimradius_guards_non_world_cplane() {
+        // dimradius builds the rim point in world XY; on a non-world CPlane it
+        // would emit a mis-placed dim, so it must guard instead.
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0 2");
+        // Works on a world CPlane.
+        run(&mut s, "dimradius last");
+        s.undo().unwrap();
+        // A non-world CPlane (Z-offset is enough — the arc math ignores it) errors.
+        run(&mut s, "cplane origin 0,0,5 normal 0,0,1");
+        let err = s.run(parse("dimradius last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("world CPlane"), "guarded: {err}");
+        let err = s.run(parse("dimdiameter last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("world CPlane"), "guarded: {err}");
+    }
+
     // ── CPlane / UCS ────────────────────────────────────────────────────────
 
     /// AABB center of the most-recently-created object.
@@ -23554,6 +23856,38 @@ mod tests {
         // The report form never errors and mentions the plane.
         let out = run(&mut s, "cplane");
         assert!(out.message.contains("cplane"), "{}", out.message);
+    }
+
+    /// rect/box/circle only transform their anchor, so they mis-orient on a
+    /// ROTATED CPlane. They must error there; a pure Z-offset (translation-only)
+    /// plane is allowed and lands the geometry at the offset.
+    #[test]
+    fn rect_box_circle_guard_rotated_cplane() {
+        // Rotated plane: X axis along world Y (normal 1,0,0 → x_axis ≠ world X).
+        let mut s = Session::default();
+        run(&mut s, "cplane origin 0,0,0 normal 1,0,0");
+        assert!(s.doc.cplane.is_rotated(), "this plane's basis is rotated");
+        for verb in ["rect 0,0,0 2 2", "circle 0,0,0 1", "box 0,0,0 1,1,1"] {
+            let err = s.run(parse(verb).unwrap()).unwrap_err();
+            assert!(
+                err.to_string().contains("world-aligned CPlane"),
+                "{verb} must guard on a rotated plane, got: {err}"
+            );
+        }
+        assert_eq!(s.doc.len(), 0, "no geometry created on the rotated plane");
+
+        // Pure Z-offset plane (world-aligned axes): rect/circle/box succeed and
+        // land at Z=10.
+        let mut s2 = Session::default();
+        run(&mut s2, "cplane origin 0,0,10 normal 0,0,1");
+        assert!(!s2.doc.cplane.is_rotated(), "Z-offset plane is not rotated");
+        run(&mut s2, "rect 0,0,0 2 2");
+        run(&mut s2, "circle 0,0,0 1");
+        run(&mut s2, "box 0,0,0 1,1,1");
+        assert_eq!(s2.doc.len(), 3, "all three created on the offset plane");
+        let bb = s2.doc.scene_aabb().unwrap();
+        // Everything sits at (or above) Z=10 from the plane offset.
+        assert!(bb.min.z >= 10.0 - 1e-9, "geometry landed at the Z offset, min.z={}", bb.min.z);
     }
 
     /// Importers pass world coords; a user CPlane must NOT re-project them.

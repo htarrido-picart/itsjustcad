@@ -3973,30 +3973,20 @@ impl App {
                     }
                 }
                 Annotation::AngularDim { vertex, p1, p2, radius } => {
-                    // Two legs out to the arc radius, the arc between them, and
-                    // the degree label at the arc midpoint. Free model points.
-                    let l1 = *vertex + (*p1 - *vertex).normalize_or_zero() * *radius;
-                    let l2 = *vertex + (*p2 - *vertex).normalize_or_zero() * *radius;
-                    for (w0, w1) in [(*vertex, l1), (*vertex, l2)] {
+                    // Two legs out to the arc radius + the arc between them, from
+                    // the shared geometry helper; the degree label at the arc
+                    // midpoint is placed below. Free model points.
+                    for (w0, w1) in
+                        itsjustcad_doc::angular_dim_segments(*vertex, *p1, *p2, *radius)
+                    {
                         if let (Some(p), Some(q)) =
                             (project(view_proj, rect, w0), project(view_proj, rect, w1))
                         {
                             painter.line_segment([p, q], stroke);
                         }
                     }
-                    // Arc: project each tessellated point, stroke consecutive pairs.
+                    // Arc points (again) only for the label midpoint.
                     let arc = itsjustcad_doc::angular_arc_points(*vertex, *p1, *p2, *radius);
-                    let mut prev: Option<egui::Pos2> = None;
-                    for w in &arc {
-                        if let Some(p) = project(view_proj, rect, *w) {
-                            if let Some(pp) = prev {
-                                painter.line_segment([pp, p], stroke);
-                            }
-                            prev = Some(p);
-                        } else {
-                            prev = None;
-                        }
-                    }
                     // Degree label at the arc midpoint (derived value).
                     let mid = arc.get(arc.len() / 2).copied().unwrap_or(*vertex);
                     if let Some(p) = project(view_proj, rect, mid) {

@@ -84,7 +84,7 @@ pub fn scene_from_doc(doc: &Document, sky: Sky) -> Scene {
                 let mat = b.add_material(material_for(obj, layer_color));
                 b.add_mesh(mesh.positions(), mesh.faces(), mat);
             }
-            Geometry::Instance { block, position, rotation_deg, scale, .. } => {
+            Geometry::Instance { block, position, rotation_deg, scale, clip, .. } => {
                 let Some(defs) = doc.blocks.get(block) else { continue };
                 let s = *scale;
                 let rot = rotation_deg.to_radians();
@@ -99,12 +99,31 @@ pub fn scene_from_doc(doc: &Document, sky: Sky) -> Scene {
                         ps.z + position.z,
                     )
                 };
+                // XCLIP boundary (world XY): a face survives only if all its
+                // world verts are inside the rect (same all-or-nothing cull the
+                // viewport/DXF export use; no border splitting).
+                let clip = clip.as_ref();
                 let mat = b.add_material(material_for(obj, layer_color));
                 for def in defs {
                     if let itsjustcad_doc::BlockGeometry::Mesh(m) = def {
                         let positions: Vec<DVec3> =
                             m.positions().iter().map(|&p| transform(p)).collect();
-                        b.add_mesh(&positions, m.faces(), mat);
+                        match clip {
+                            Some(rect) => {
+                                let faces: Vec<[u32; 3]> = m
+                                    .faces()
+                                    .iter()
+                                    .filter(|f| {
+                                        f.iter().all(|&vi| rect.contains_xy(positions[vi as usize]))
+                                    })
+                                    .copied()
+                                    .collect();
+                                if !faces.is_empty() {
+                                    b.add_mesh(&positions, &faces, mat);
+                                }
+                            }
+                            None => b.add_mesh(&positions, m.faces(), mat),
+                        }
                     }
                 }
             }
