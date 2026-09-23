@@ -71,10 +71,33 @@ impl CallbackTrait for ViewportCallback {
 
     fn paint(
         &self,
-        _info: egui::PaintCallbackInfo,
+        info: egui::PaintCallbackInfo,
         render_pass: &mut wgpu::RenderPass<'static>,
         resources: &egui_wgpu::CallbackResources,
     ) {
+        // Confine the 3D to THIS pane's rect, in physical pixels. egui-wgpu sets a
+        // per-callback `viewport` but scissors only to the wider egui `clip_rect`
+        // (the whole central panel), and a fullscreen-triangle grid rasterises
+        // across the viewport regardless — so without our own scissor the grid
+        // bleeds past the pane and, when the pane momentarily overlaps the dock on
+        // a Retina relayout, paints under the chat. Scissoring to the pane rect
+        // (clamped to the clip rect and framebuffer) fixes the overlap at any DPI.
+        let vp = info.viewport_in_pixels();
+        let clip = info.clip_rect_in_pixels();
+        let x0 = vp.left_px.max(clip.left_px).max(0);
+        let y0 = vp.top_px.max(clip.top_px).max(0);
+        let x1 = (vp.left_px + vp.width_px).min(clip.left_px + clip.width_px);
+        let y1 = (vp.top_px + vp.height_px).min(clip.top_px + clip.height_px);
+        if x1 <= x0 || y1 <= y0 {
+            return; // pane fully clipped away this frame — nothing to draw
+        }
+        render_pass.set_scissor_rect(
+            x0 as u32,
+            y0 as u32,
+            (x1 - x0) as u32,
+            (y1 - y0) as u32,
+        );
+
         let renderer: &SceneRenderer = resources.get().expect("SceneRenderer registered");
         renderer.paint(render_pass, self.viewport, self.mode, self.edges_enabled);
     }

@@ -444,6 +444,13 @@ pub struct App {
     clipboard_armed: bool,
     /// In-progress drag-box selection: anchor position of the drag.
     box_drag: Option<egui::Pos2>,
+    /// True on frames where the pointer clicked/dragged inside a viewport pane.
+    /// Set in `viewport` (runs after the command line), read by the end-of-frame
+    /// "command line always listens" block so a viewport click is NOT immediately
+    /// stolen back by the command input re-grabbing keyboard focus — otherwise a
+    /// click in the scene just re-focuses the command line instead of picking /
+    /// placing a point. Reset at the top of each `viewport` call.
+    viewport_interacted: bool,
     /// Crash-recovery journal mirroring the op-log; deleted on save/clean exit.
     journal: Option<Journal>,
     /// Doc generation of the last journal sync (skip serializing every frame).
@@ -967,6 +974,7 @@ impl App {
             raytrace_save_path: None,
             clipboard_armed: false,
             box_drag: None,
+            viewport_interacted: false,
             journal,
             journaled_generation: None,
             status_cursor: None,
@@ -3406,18 +3414,9 @@ impl App {
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
-        let mut full = ui.available_rect_before_wrap();
-        // Guard against the one-frame dock/viewport width desync: if the dock
-        // drew slightly wider than the space it reserved (right after a relayout),
-        // the leftover `full` can overlap the dock, and the 3D wgpu callback —
-        // painted last and scissored to `full` — would overpaint the chat. Clamp
-        // the right edge to the dock's real left edge so 3D never bleeds over it.
-        if let Some(dock_left) = self.dock_left
-            && dock_left > full.left()
-            && dock_left < full.right()
-        {
-            full.max.x = dock_left;
-        }
+        let full = clamp_viewport_rect(ui.available_rect_before_wrap(), self.dock_left);
+        // Fresh each frame; set below if a pane is clicked/dragged this frame.
+        self.viewport_interacted = false;
         if !self.draw_tool.active() {
             self.status_snap = None; // no tool, no snap marker to report
         }
@@ -3508,6 +3507,16 @@ impl App {
                 || response.dragged()
             {
                 self.active_pane = pane;
+                // A viewport interaction owns the pointer this frame: keep the
+                // command line from re-grabbing keyboard focus (which would make
+                // the click merely re-focus the input instead of picking/drawing).
+                // Cancel any pending focus request AND surrender the input's live
+                // focus so egui routes the click to the pane, not the text field.
+                self.viewport_interacted = true;
+                self.command_line.cancel_focus();
+                if let Some(id) = ui.ctx().memory(|m| m.focused()) {
+                    ui.ctx().memory_mut(|m| m.surrender_focus(id));
+                }
             }
 
             // Rhino muscle memory: RMB orbit, Shift+RMB pan, scroll dolly.
@@ -8595,11 +8604,33 @@ impl eframe::App for App {
             || self.pending_nav.is_some();
         if !modal_open
             && !self.draw_tool.active()
+            && !self.viewport_interacted
             && ctx.memory(|m| m.focused()).is_none()
         {
             self.command_line.focus();
         }
     }
+}
+
+/// Clamp the central viewport rect so the 3D never overlaps the right dock.
+///
+/// `available` is the central-panel space egui handed us; `dock_left` is the
+/// dock's real drawn left edge this frame (`None` when the dock is hidden).
+/// egui normally leaves no overlap, but the resizable dock can draw a hair
+/// wider than the space it reserved for one frame after a relayout — the
+/// leftover `available` then spills under the dock, and the wgpu callback would
+/// paint the 3D there. Clamping the right edge to `dock_left` keeps them split
+/// at every DPI. Guarded so a stale/off-screen `dock_left` never inverts the
+/// rect (only clamps when the edge falls strictly inside the available rect).
+fn clamp_viewport_rect(available: egui::Rect, dock_left: Option<f32>) -> egui::Rect {
+    let mut full = available;
+    if let Some(dock_left) = dock_left
+        && dock_left > full.left()
+        && dock_left < full.right()
+    {
+        full.max.x = dock_left;
+    }
+    full
 }
 
 /// Snapshot the orbit camera as document-storable named-view parameters.
@@ -8679,6 +8710,34 @@ mod tests {
         assert_eq!(move_delta(o, o), None);
         // Sub-epsilon jitter → None (undo/replay stays one-op-per-real-edit).
         assert_eq!(move_delta(o, o + glam::DVec3::splat(1e-12)), None);
+    }
+
+    #[test]
+    fn clamp_viewport_rect_never_overlaps_the_dock() {
+        let avail = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0));
+
+        // No dock (hidden) → rect is unchanged.
+        assert_eq!(clamp_viewport_rect(avail, None), avail);
+
+        // Dock edge inside the available rect → right edge snaps to it, so the
+        // viewport ends exactly where the dock begins (no overlap). The wgpu
+        // scissor is derived from this rect × pixels_per_point, so a clean split
+        // in points is a clean split at 1× AND 2× (Retina): 700pt → 1400px.
+        let clamped = clamp_viewport_rect(avail, Some(700.0));
+        assert_eq!(clamped.max.x, 700.0);
+        assert_eq!(clamped.min, avail.min);
+        for ppp in [1.0_f32, 2.0] {
+            // The pane's right edge in physical pixels stays left of the dock's
+            // left edge in physical pixels — the property egui-wgpu's scissor and
+            // our own per-pane scissor both rely on.
+            assert!(clamped.max.x * ppp <= 700.0 * ppp);
+        }
+
+        // Stale dock edge at/left of the available left → ignored (no inversion).
+        assert_eq!(clamp_viewport_rect(avail, Some(-50.0)), avail);
+        assert_eq!(clamp_viewport_rect(avail, Some(0.0)), avail);
+        // Dock edge past the right edge → ignored (dock is off to the right).
+        assert_eq!(clamp_viewport_rect(avail, Some(2000.0)), avail);
     }
 
     #[test]

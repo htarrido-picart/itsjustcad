@@ -326,6 +326,13 @@ impl CommandLine {
         self.focus_next_frame = true;
     }
 
+    /// Cancel a pending focus request. Used when a viewport click takes the
+    /// pointer this frame: the command line must NOT re-grab keyboard focus, or
+    /// the click would just re-focus the input instead of picking / drawing.
+    pub fn cancel_focus(&mut self) {
+        self.focus_next_frame = false;
+    }
+
     /// True when the input buffer is empty — the app fires modeless hotkeys
     /// (Delete, G) only on an empty command line so they don't hijack mid-word.
     pub fn is_empty(&self) -> bool {
@@ -846,6 +853,18 @@ mod tests {
         assert_eq!(cl.input, "box ");
         assert!(cl.suggest_dismissed, "popup dismissed after click-accept");
         assert!(cl.focus_next_frame, "input re-focused after click-accept");
+    }
+
+    #[test]
+    fn cancel_focus_drops_a_pending_focus_grab() {
+        // A viewport click calls `cancel_focus` so the command line does NOT
+        // re-grab keyboard focus that frame — otherwise the click would just
+        // re-focus the input instead of picking/drawing in the scene.
+        let mut cl = CommandLine::default();
+        cl.focus(); // command line wants focus next frame (Rhino always-listen)
+        assert!(cl.focus_next_frame);
+        cl.cancel_focus();
+        assert!(!cl.focus_next_frame, "pending focus grab cancelled by viewport click");
     }
 
     // ── Plugins ─────────────────────────────────────────────────────────────
