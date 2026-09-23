@@ -58,3 +58,66 @@ jobs:
 
       - name: Clippy (no new warnings)
         run: cargo clippy --workspace -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # GPU-gated journey + snapshot UI tests (egui_kittest + wgpu).
+  #
+  # These `#[ignore]`d tests render the real app window / chat pane through
+  # egui_kittest's wgpu backend, which needs a working GPU adapter. They pass
+  # locally on macOS (Metal) but a GPU adapter is NOT guaranteed on GitHub's
+  # hosted, virtualized macOS runners — Metal availability under virtualization
+  # varies, and there is no software-adapter fallback path for wgpu here that
+  # would produce pixel-identical goldens (a CPU renderer would just diff).
+  #
+  # DECISION: this job is ADVISORY, not a required check.
+  #   * continue-on-error: true  -> it reports pass/fail but NEVER blocks merges.
+  #   * It is deliberately kept OUT of the required `test (…)` matrix above so an
+  #     absent/flaky hosted GPU adapter can't wedge the merge queue.
+  # For this to become a REQUIRED gate the robust answer is a SELF-HOSTED macOS
+  # runner with a real (non-virtualized) Metal GPU; flip continue-on-error off
+  # and add it to branch-protection once that exists.
+  #
+  # Goldens are COMPARED, never regenerated here: UPDATE_SNAPSHOTS is not set, so
+  # a mismatch surfaces as a test failure. The kittest diff/new artifacts are
+  # uploaded on failure so a human can eyeball the regression.
+  ui-tests:
+    name: ui-tests (macOS GPU, advisory)
+    runs-on: macos-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Journey + snapshot goldens live behind `--ignored` in the itsjustcad
+      # bin. --test-threads=1 because the kittest harnesses aren't parallel-safe
+      # (shared wgpu adapter + on-disk snapshot files). No UPDATE_SNAPSHOTS.
+      - name: Run journey + snapshot UI tests (ignored, GPU)
+        run: |
+          cargo test -p itsjustcad --bin itsjustcad -- \
+            --ignored --test-threads=1 \
+            journey_ app_preview_ chat_preview_
+
+      # egui_kittest writes <name>.diff.png / <name>.new.png next to the golden
+      # on a mismatch (gitignored). Surface them for human inspection.
+      - name: Upload kittest snapshot diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kittest-snapshot-diffs
+          path: |
+            crates/app/tests/snapshots/*.diff.png
+            crates/app/tests/snapshots/*.new.png
+          if-no-files-found: ignore

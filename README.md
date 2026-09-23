@@ -54,6 +54,10 @@ that draws with the exact same commands you type.
 - **UI** — Blocks tab (double-click a block to reveal it, search + library "+"),
   a Plugins popup and a root-level Plugins menu, a Sheets tab (per-sheet list +
   preview), reliable Quit / Close menu items, and a **⌘G** gumball toggle.
+- **~40 CAD-parity verbs** — a broad batch of AutoCAD/Rhino/DraftSight-style
+  drafting, selection, annotation, block/xref, sheet-set and interop commands.
+  See **[CAD-parity commands](#cad-parity-commands)** for the full grouped list;
+  highlights below.
 
 ---
 
@@ -346,7 +350,22 @@ perpendicular / tangent / quadrant / nearest / node / vertex — with a clickabl
 status-bar osnap chip, a **View ▸ Object Snap…** panel, and per-snap toggles
 (`osnap end on`) · typed coordinates mid-tool (`5.2,3`, `@2,3` relative, bare
 distances) · Shift ortho lock · window/crossing drag-select (Rhino convention) ·
-autosuggest with usage hints as you type · gumball on selection (⌘G to toggle)
+autosuggest with usage hints as you type · gumball on selection (⌘G to toggle) ·
+a movable **construction plane** (`cplane` / `ucs`: world / origin+normal /
+3-point / save+recall) so typed coordinates land on any drawing plane — logged
+geometry always stores world coords, so the CPlane never affects replay
+
+### Edit like a drafter
+Precision curve editing — `trim` (against picked cutters), `powertrim` (trim
+against *all* curves, pick the segment to drop), `stretch` (move only the
+vertices inside a box), `flatten` (project to the XY ground), `tozero` /
+`toorigin` (drop the bounding-box min onto the origin), and `align` / `orient`
+(match two source points to two targets, optional uniform scale) ·
+tangent/perpendicular construction lines (`linetan`, `lineperp`) and TTR circles
+(`circletan`, line–line case) · `arraycurve` distributes copies along a path ·
+rich selection: `selregion` / `selwindow` / `selcrossing` (rectangle),
+`selsimilar` (same layer / color / type / weight), `seldup` (find geometric
+duplicates) · an editable **Properties** panel for the current selection
 
 ### See
 Perspective, true-ortho plan/elevation views · **two-point perspective**
@@ -418,10 +437,33 @@ swap in without code.
 Plan/section cuts — heavy cut lines + light projected edges · elevation views
 · linear dimensions (model + paper space), incl. **associative dimensions** that
 bind to geometry — `dim @wall.start @wall.end` follows the object when it moves
-· text · hatches: solid, lines,
-crosshatch, brick, concrete, insulation, earth · sheets (A4–A0) with scaled
-ortho views, schedule tables, and dimensions · per-layer lineweights · vector
-PDF export
+· radial / diameter dimensions (`dimradius`, `dimdiameter`), **angular
+dimensions** (`dimangular`), and one-shot `autodim` (batch-dimension a whole
+selection) · **field text** (`field`) bound to a live value — area / length /
+count / layer / units — that auto-updates after edits · text · hatches: solid,
+lines, crosshatch, brick, concrete, insulation, earth, the ANSI31–38 set, and
+custom patterns imported from AutoCAD `.pat` files (`hatchpat`; dash cadence is
+read faithfully but rendered approximately) · `boundary` traces a closed region
+from a seed point, and `curvebool` unions / intersects / differences closed
+planar curves into new regions · sheets (A4–A0) with scaled ortho views,
+schedule tables, and dimensions · **sheet sets** (`sheetset`: ordered index over
+sheets → one multi-page PDF via `publish`) · **plot styles / pen tables**
+(`plotstyle`: named layer/color → pen color + weight + screening, applied only
+at print) · per-layer lineweights · vector PDF export
+
+### Drawings → BIM
+`fromlayer <layer> wall thick <t>` turns the 2D curves on a layer into typed BIM
+walls (exported as `IFCWALL`), extruded from a level base by an explicit height
+or a named story · `story` / `level` define building stories by name + base
+elevation (with an optional floor-to-floor height `fromlayer` reads), and
+`levels` lists them.
+
+### Blocks & external references
+`xref attach` links another drawing file in as a reloadable referenced instance
+(`xref list` / `reload` / `detach`) · `ncopy` copies one nested object out of a
+block/xref instance as an independent object · `xclip` clips a block/xref
+instance to a rectangular boundary · `dataextract` (alias `bom`) tabulates block
+instances by definition or per-instance, to a table or CSV.
 
 ![Elevation drawing — a three-storey facade outline with floor lines and a grid of windows](docs/shot-elevation.png)
 *`elevation south`: a clean projected facade — the drafting output, straight from the model.*
@@ -431,7 +473,7 @@ PDF export
 | Direction | Formats |
 |---|---|
 | Import | **DWG** (assisted) · DXF · OBJ · STL · glTF/GLB · Collada · **IFC** · **3DM** (Rhino) · GeoJSON · OSM (Overpass export) · LAS / **LAZ** / **E57** point clouds · EPW · STEP† |
-| Export | DXF · OBJ · STL · glTF/GLB · **IFC4** (incl. structural analysis model) · **3DM** · **SAF `.xlsx`** (structural handoff) · SVG · CSV · PDF · STEP† |
+| Export | DXF · OBJ · STL · glTF/GLB · **IFC4** (incl. structural analysis model) · **3DM** · **SAF `.xlsx`** (structural handoff) · SVG · CSV · PDF · **JPG** · **`.ai`** (Adobe Illustrator — SVG-content) · STEP† |
 
 IFC is the Revit bridge — both directions, hand-written, zero dependencies, and
 includes typed structural members + the `IfcStructuralAnalysisModel` graph. SAF
@@ -444,7 +486,96 @@ opt-in `kernel-occt` feature.
 user-installed `dwg2dxf` (LibreDWG, `brew install libredwg`) to convert to DXF,
 then imports through the hardened DXF path — LibreDWG is GPLv3 and is **never
 linked or bundled**, so the AGPLv3 distribution stays clean. A truncated
-conversion is rejected with a clear error, never a silent empty import.
+conversion is rejected with a clear error, never a silent empty import. Files can
+be **dragged and dropped** onto the window to import.
+
+A raster **image underlay** for tracing scans places a PNG flat on the ground
+(`underlay`), then repositions dynamically: `underlaymove`, `underlayscale`,
+`underlayrotate`, `underlayplace` (set corner + width + rotation in one shot for
+calibration), and `underlayopacity`.
+
+<a id="cad-parity-commands"></a>
+### CAD-parity commands
+
+A compact reference for the CAD-parity batch. Names and usage match the in-app
+registry exactly — type `help <verb>` for the full text, or see
+[docs/COMMANDS.txt](docs/COMMANDS.txt).
+
+**Drafting & edit**
+
+| Verb | Usage | What |
+|---|---|---|
+| `trim` | `trim <target> <cutter> <keep x,y>` | Cut a curve at a cutter, keep the picked piece |
+| `powertrim` | `powertrim <target> <pick x,y>` | Trim against *all* curves at once; delete only the picked segment |
+| `stretch` | `stretch <sel> <min> <max> <delta>` | Move only vertices inside a box (curves/points; meshes skipped) |
+| `flatten` | `flatten <sel>` | Project every vertex to the XY ground (Z=0) |
+| `tozero` | `tozero <sel>` | Move bounding-box min to the origin (alias `toorigin`) |
+| `align` | `align <sel> <s1> <t1> <s2> <t2> [scale on/off]` | Match two source points to targets (planar, about Z; alias `orient`) |
+| `arraycurve` | `arraycurve <sel> <path> <count> [align on/off]` | Distribute copies along a path curve |
+| `linetan` | `linetan <from x,y,z> <curve>` | Line from a point tangent to a curve |
+| `lineperp` | `lineperp <from x,y,z> <curve>` | Line from a point perpendicular to a curve |
+| `circletan` | `circletan <curveA> <curveB> <radius>` | TTR circle (line–line case; alias `circlettr`) |
+
+**Selection**
+
+| Verb | Usage | What |
+|---|---|---|
+| `selregion` | `selregion <min> <max> [window/crossing]` | Rectangle select (aliases `selwindow`, `selcrossing`) |
+| `selsimilar` | `selsimilar <sel> [layer/color/type/weight]` | Select all sharing a property (alias `selsim`) |
+| `seldup` | `seldup [<sel>]` | Select geometric duplicates (alias `selduplicate`) |
+
+**Dimensions & annotation**
+
+| Verb | Usage | What |
+|---|---|---|
+| `dimradius` | `dimradius <sel>` | Radial dimension for a circle/arc (alias `dimrad`) |
+| `dimdiameter` | `dimdiameter <sel>` | Diameter dimension (alias `dimdia`) |
+| `dimangular` | `dimangular <vertex> <p1> <p2> [radius]` | Angle p1-vertex-p2, labelled in degrees |
+| `autodim` | `autodim <sel> [offset <d>]` | Batch-dimension a selection (alias `autodimension`) |
+| `field` | `field <pos> <expr> [height]` | Live text: `area`/`length`/`count`/`layer`/`units` |
+
+**Curves & regions**
+
+| Verb | Usage | What |
+|---|---|---|
+| `boundary` | `boundary <seed x,y,z> [from <sel>]` | Trace a closed boundary polyline around a seed point |
+| `curvebool` | `curvebool <union/intersect/difference> <sel>` | Combine closed **planar** curves (aliases `cboolean`, `region`) |
+| `polygon` | `polygon <center> <radius> <sides>` | Regular polygon (also an interactive tool) |
+| `hatchpat` | `hatchpat <path.pat>` | Import AutoCAD `.pat` hatch patterns (dash cadence approximate) |
+
+**Drawings → BIM**
+
+| Verb | Usage | What |
+|---|---|---|
+| `fromlayer` | `fromlayer <layer> wall thick <t> [height <h> / level <name>]` | Layer curves → typed BIM walls (export `IFCWALL`) |
+| `story` | `story <name> <elevation> [height <h>]` | Define a building story/level (alias `level`) |
+| `levels` | `levels` | List defined stories/levels (query) |
+
+**Coordinate systems**
+
+| Verb | Usage | What |
+|---|---|---|
+| `cplane` | `cplane [world / origin <o> normal <n> / 3point <o> <px> <py> / save <name> / <name>]` | Construction plane / UCS (alias `ucs`). `rect`/`circle`/`box` support translated/upright planes only; `line`/`polyline` any plane |
+
+**Blocks & external references**
+
+| Verb | Usage | What |
+|---|---|---|
+| `xref` | `xref attach <path> [at] [scale] [rot] / list / reload <name> / detach <name>` | Link a drawing file as a reloadable referenced instance |
+| `ncopy` | `ncopy <instance> <index>` | Copy one nested object out of a block/xref instance |
+| `xclip` | `xclip <instance> <min> <max>` / `xclip <instance> off` | Clip a block/xref instance to a rectangle |
+
+**Sheets & output**
+
+| Verb | Usage | What |
+|---|---|---|
+| `sheetset` | `sheetset <new/add/remove/order/list/publish>` | Ordered index over sheets → one multi-page PDF |
+| `plotstyle` | `plotstyle <new/set/list/apply/none/delete>` | Named pen table (color + weight + screening), applied at print |
+| `dataextract` | `dataextract [by count/instance] [to <path.csv>]` | Tabulate block instances (aliases `dataextraction`, `bom`) |
+
+**Image underlay** — `underlay` places a PNG to trace over; `underlaymove` /
+`underlayscale` / `underlayrotate` / `underlayplace` / `underlayopacity` /
+`underlayoff` position and calibrate it.
 
 ### Automate
 
