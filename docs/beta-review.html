@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ItsJustCAD — Beta User Review (v0.5.5)</title>
+<title>ItsJustCAD — Beta User Review (v0.5.6)</title>
 <style>
   :root{
     --bg:#f7f7f5; --panel:#ffffff; --ink:#1c1c1e; --muted:#6b6b70;
@@ -90,7 +90,7 @@
 <div class="wrap">
 <nav>
   <div class="brand">ItsJustCAD</div>
-  <div class="date">Beta User Review &middot; v0.5.5</div>
+  <div class="date">Beta User Review &middot; v0.5.6</div>
   <button class="reset" onclick="resetChecks()">Reset checks</button>
   <h2>Start here</h2>
   <a href="#howto">How to test</a>
@@ -116,11 +116,11 @@
 
 <main>
 <header class="top">
-  <h1>ItsJustCAD &mdash; Beta User Review <span class="tag info" style="vertical-align:middle">v0.5.5</span></h1>
+  <h1>ItsJustCAD &mdash; Beta User Review <span class="tag info" style="vertical-align:middle">v0.5.6</span></h1>
   <p class="sub">Work through the checklist, then Export results and send the JSON to the developer.</p>
 </header>
 <div class="meta">
-  <span><b>Build under test:</b> latest v0.5.5 release (the app you downloaded)</span>
+  <span><b>Build under test:</b> latest v0.5.6 release (the app you downloaded)</span>
   <span><b>Report to:</b> <a href="mailto:htarrido@pm.me">htarrido@pm.me</a> or a GitHub issue</span>
 </div>
 
@@ -144,7 +144,7 @@
 <!-- ============ HONEST LIMITS ============ -->
 <section id="limits">
 <h2 class="sec">Honest limits <span class="tag warn">read first</span></h2>
-<p class="lead">Known, deliberate limits in v0.5.5. None of these block testing &mdash; they explain results you might otherwise flag as bugs:</p>
+<p class="lead">Known, deliberate limits in v0.5.6. None of these block testing &mdash; they explain results you might otherwise flag as bugs:</p>
 <ul>
   <li><b>intemfit euro_latam profile is placeholder.</b> Any run that resolves a rule from the <code>euro_latam</code> region prints <b>"using euro_latam defaults (placeholder &mdash; confirm with Manuel)"</b>. That banner is expected, not an error.</li>
   <li><b>Compliance is name-match + straight-line.</b> Guard/handrail/ceiling checks match by object name (no geometric modeling); travel distance is straight-line room-centroid &rarr; nearest exit, not a routed egress path. Advisory pre-check only &mdash; verify with a licensed professional / AHJ.</li>
@@ -493,7 +493,7 @@
 <div class="chk"><input type="checkbox" id="u9"><label for="u9">Select an object and press <b>&#8984;/Ctrl+G</b> <span class="exp"><b>Expect:</b> the gumball toggles on/off. Bare <code>g</code> no longer does this.</span></label></div>
 <div class="chk"><input type="checkbox" id="u10"><label for="u10">Open the <b>Blocks</b> tab, use the search box, click the library <b>&#43;</b>, and <b>double-click</b> a block <span class="exp"><b>Expect:</b> search filters the list; &#43; adds from the library; double-click reveals/loads the block into the drawing.</span></label></div>
 <div class="chk"><input type="checkbox" id="u11"><label for="u11">Open <b>Plugins</b> (root-level Plugins menu &rarr; popup) and the <b>Sheets</b> tab <span class="exp"><b>Expect:</b> the Plugins popup shows cards + search + install status; the Sheets tab lists each sheet with a preview thumbnail.</span></label></div>
-<div class="chk"><input type="checkbox" id="u12"><label for="u12"><b>Help &middot; Check for Updates&hellip;</b> <span class="exp"><b>Expect:</b> compares this build against the latest GitHub release &mdash; "You're on the latest (v0.5.5)." when current, or the newer version + a <b>Download</b> button; offline &rarr; "Couldn't check&hellip;" + Check-Again. Never blocks the app.</span></label></div>
+<div class="chk"><input type="checkbox" id="u12"><label for="u12"><b>Help &middot; Check for Updates&hellip;</b> <span class="exp"><b>Expect:</b> compares this build against the latest GitHub release &mdash; "You're on the latest (v0.5.6)." when current, or the newer version + a <b>Download</b> button; offline &rarr; "Couldn't check&hellip;" + Check-Again. Never blocks the app.</span></label></div>
 
 <div class="notes-wrap"><label for="note-ui">Notes for this section</label><textarea class="notes" id="note-ui" data-section="13 · UI, Menus & Gumball" placeholder="Notes..."></textarea></div>
 </details>
@@ -534,7 +534,7 @@
 <section id="export">
 <h2 class="sec">Export results &amp; send them back</h2>
 <p class="lead">When you're done, add any overall notes below, then <b>Download JSON</b> and email it to <a href="mailto:htarrido@pm.me">htarrido@pm.me</a> (or attach it to a GitHub issue). The JSON records every test id, whether it passed, and your notes.</p>
-<div class="notes-wrap"><label for="note-global">Overall notes (tester name, OS, version, general impressions)</label><textarea class="notes" id="note-global" data-section="_overall" placeholder="e.g. Tester: Jane · macOS 14 Apple Silicon · v0.5.5 · general feedback..." style="min-height:80px"></textarea></div>
+<div class="notes-wrap"><label for="note-global">Overall notes (tester name, OS, version, general impressions)</label><textarea class="notes" id="note-global" data-section="_overall" placeholder="e.g. Tester: Jane · macOS 14 Apple Silicon · v0.5.6 · general feedback..." style="min-height:80px"></textarea></div>
 </section>
 
 <div class="exportbar">
@@ -543,7 +543,7 @@
   <span class="progress" id="progress">0 of 0 tests checked</span>
 </div>
 
-<div class="foot">ItsJustCAD &mdash; Beta User Review &middot; v0.5.5 &middot; advisory checklist; compliance is a pre-check, not a certification. Your checkbox state &amp; notes are stored locally in your browser until you export them.</div>
+<div class="foot">ItsJustCAD &mdash; Beta User Review &middot; v0.5.6 &middot; advisory checklist; compliance is a pre-check, not a certification. Your checkbox state &amp; notes are stored locally in your browser until you export them.</div>
 </main>
 </div>
 
