@@ -622,6 +622,14 @@ pub struct App {
     /// pass has no depth attachment, which the scene callback requires). All the
     /// egui chrome — menus, dock, command line, viewport name tags — still draws.
     preview_no_viewport: bool,
+    /// Test-only: the active pane's screen rect and `view_proj` captured on the
+    /// last viewport pass. Journey tests read this to convert known world points
+    /// into screen positions (via [`project`]) so injected pointer clicks land
+    /// exactly where `ground_point` will invert them back. `None` until the first
+    /// viewport frame runs. Written unconditionally (cheap: two field stores);
+    /// only test code reads it.
+    #[cfg(test)]
+    last_active_viewport: Option<(egui::Rect, glam::Mat4)>,
 }
 
 /// A navigation intent deferred behind the unsaved-changes guard.
@@ -1042,6 +1050,8 @@ impl App {
             file_watch: None,
             external_change: None,
             preview_no_viewport: false,
+            #[cfg(test)]
+            last_active_viewport: None,
         }
     }
 
@@ -3538,6 +3548,12 @@ impl App {
                 self.status_cursor = response
                     .hover_pos()
                     .and_then(|pos| ground_point(view_proj, rect, pos));
+                // Journey tests convert world→screen through this exact pair so
+                // injected clicks invert back to the intended world point.
+                #[cfg(test)]
+                {
+                    self.last_active_viewport = Some((rect, view_proj));
+                }
             }
 
             if self.draw_tool.active() {
@@ -8922,6 +8938,95 @@ mod tests {
         harness.run_steps(2);
     }
 
+    /// The active pane's screen rect + `view_proj` from the last viewport frame.
+    /// Panics if no viewport has painted yet (the journey must `run_steps` at
+    /// least once — `run_app_journey` already settles 4 frames before the body).
+    #[cfg(test)]
+    fn active_viewport(
+        harness: &egui_kittest::Harness<'_, App>,
+    ) -> (egui::Rect, glam::Mat4) {
+        harness
+            .state()
+            .last_active_viewport
+            .expect("a viewport frame has painted (captures rect + view_proj)")
+    }
+
+    /// World point → screen position inside the active pane, using the exact
+    /// `view_proj`/`rect` pair the app used to paint — so a click here inverts
+    /// back through `ground_point` to (approximately) `world`.
+    #[cfg(test)]
+    fn world_to_screen(
+        harness: &egui_kittest::Harness<'_, App>,
+        world: glam::DVec3,
+    ) -> egui::Pos2 {
+        let (rect, view_proj) = active_viewport(harness);
+        project(view_proj, rect, world).expect("world point projects in front of camera")
+    }
+
+    /// Inject a full primary-button click (press → release) at a screen pos,
+    /// settling frames around each event so the app's `Response` sees a click.
+    #[cfg(test)]
+    fn click_at(harness: &mut egui_kittest::Harness<'_, App>, pos: egui::Pos2) {
+        let m = egui::Modifiers::default();
+        harness.input_mut().events.push(egui::Event::PointerMoved(pos));
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: m,
+        });
+        harness.run_steps(1);
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: m,
+        });
+        harness.run_steps(2);
+    }
+
+    /// Inject a primary-button drag: press at `from`, move to `to`, release —
+    /// the gesture egui reports as `drag_started`/`drag_stopped` for box-select.
+    ///
+    /// egui records the drag ANCHOR (`box_drag`) at the frame it first detects a
+    /// drag, i.e. the first move that crosses the threshold — NOT the press
+    /// frame. So we nudge a couple of pixels off `from` to arm the anchor right
+    /// at `from`, THEN travel to `to`; otherwise the rubber box would start at
+    /// the midpoint and a window drag would miss the enclosed object.
+    #[cfg(test)]
+    fn drag(
+        harness: &mut egui_kittest::Harness<'_, App>,
+        from: egui::Pos2,
+        to: egui::Pos2,
+    ) {
+        let m = egui::Modifiers::default();
+        harness.input_mut().events.push(egui::Event::PointerMoved(from));
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: from,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: m,
+        });
+        harness.run_steps(1);
+        // Nudge PAST egui's drag threshold (default ~6px) in its OWN frame, so
+        // `drag_started` fires while `interact_pointer_pos` is still near `from`
+        // — that is the frame the app captures as the box anchor. A sub-threshold
+        // nudge would defer the drag-start to the big jump below, collapsing the
+        // anchor onto `to` and yielding a zero-area rubber box.
+        let nudge = from + (to - from).normalized() * 8.0;
+        harness.input_mut().events.push(egui::Event::PointerMoved(nudge));
+        harness.run_steps(1);
+        harness.input_mut().events.push(egui::Event::PointerMoved(to));
+        harness.run_steps(1);
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: m,
+        });
+        harness.run_steps(2);
+    }
+
     #[test]
     #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
     fn journey_box_select_undo() {
@@ -8944,6 +9049,212 @@ mod tests {
                 0,
                 "undo (select is unlogged) removed the box"
             );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_polygon_draw_tool() {
+        // CAD-parity interactive draw: bare `polygon` arms the tool, a typed
+        // side-count feeds the buffer, then two viewport clicks (center, then a
+        // point on the circumradius) commit a closed N-gon through the same
+        // command substrate as typed geometry. We drive the world→screen mapping
+        // from the app's own captured view_proj so the clicks invert exactly.
+        run_app_journey(|h| {
+            submit_command(h, "polygon");
+            assert!(h.state().draw_tool.active(), "bare `polygon` armed the tool");
+            assert!(
+                h.state().draw_tool.prompt().unwrap().contains("polygon"),
+                "the tool prompt is showing"
+            );
+
+            // The command line surrenders focus to the canvas while a tool is
+            // armed; type the side count as raw key/text events so it lands in
+            // the draw-tool numeric buffer (→ pentagon).
+            h.key_press(egui::Key::Num5);
+            h.run_steps(2);
+
+            // Center at world origin, edge 3m out along +X — both on the ground
+            // plane so `ground_point` recovers them from the injected clicks.
+            let center = world_to_screen(h, glam::DVec3::new(0.0, 0.0, 0.0));
+            let edge = world_to_screen(h, glam::DVec3::new(3.0, 0.0, 0.0));
+            click_at(h, center);
+            assert!(
+                h.state().draw_tool.active(),
+                "one click (center) leaves the tool waiting for the radius"
+            );
+            click_at(h, edge);
+
+            // Two clicks complete the shape: the tool disarms and a closed
+            // polyline (the polygon) now exists in the doc.
+            assert!(
+                !h.state().draw_tool.active(),
+                "the second click finished and disarmed the tool"
+            );
+            let doc = &h.state().session.doc;
+            assert_eq!(doc.objects().count(), 1, "a polygon object was created");
+            let obj = doc.objects().next().unwrap();
+            match &obj.geometry {
+                itsjustcad_doc::Geometry::Curve(c) => assert!(
+                    c.is_closed(),
+                    "the polygon is a CLOSED curve (got {c:?})"
+                ),
+                other => panic!("expected a Curve polygon, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_polyline_close_c_key() {
+        // Rhino's polyline Close: pick three points, then press `C` to snap the
+        // loop shut. Asserts a CLOSED polyline lands in the doc (not three open
+        // segments) — the C-key handler routing through the command substrate.
+        run_app_journey(|h| {
+            submit_command(h, "polyline");
+            assert!(h.state().draw_tool.active(), "bare `polyline` armed the tool");
+
+            for w in [
+                glam::DVec3::new(0.0, 0.0, 0.0),
+                glam::DVec3::new(4.0, 0.0, 0.0),
+                glam::DVec3::new(4.0, 4.0, 0.0),
+            ] {
+                let p = world_to_screen(h, w);
+                click_at(h, p);
+            }
+            assert!(
+                h.state().draw_tool.active(),
+                "three picks: still drawing (open polyline)"
+            );
+
+            // `C` closes the loop (needs ≥3 points) and finishes the tool.
+            h.key_press(egui::Key::C);
+            h.run_steps(2);
+            assert!(!h.state().draw_tool.active(), "C closed and disarmed the tool");
+
+            let doc = &h.state().session.doc;
+            assert_eq!(doc.objects().count(), 1, "one polyline created");
+            match &doc.objects().next().unwrap().geometry {
+                itsjustcad_doc::Geometry::Curve(c) => {
+                    assert!(c.is_closed(), "the C key produced a CLOSED polyline");
+                }
+                other => panic!("expected a Curve polyline, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_box_select_drag() {
+        // Rubber-band box select: two boxes placed far apart on the ground, then
+        // a left→right WINDOW drag tightly around ONE of them selects only that
+        // box (fully-enclosed rule). A right→left CROSSING drag that merely
+        // touches the other box selects it too (touch counts).
+        run_app_journey(|h| {
+            // Two boxes offset along +X. The second is kept close enough that
+            // its projected rect stays fully inside the pane (a far box projects
+            // partly off-screen in the default 3/4 perspective, which would put
+            // the drag corners outside the pane and drop the gesture).
+            submit_command(h, "box 0,0,0 2,2,2");
+            submit_command(h, "box 4,0,0 6,2,2");
+            let ids: Vec<_> = h
+                .state()
+                .session
+                .doc
+                .objects()
+                .map(|o| (o.id, o.geometry.aabb()))
+                .collect();
+            assert_eq!(ids.len(), 2, "two boxes drawn");
+
+            // Projected screen rect of the FIRST box (near the origin); grow the
+            // drag a little past it so a window drag fully encloses it, and make
+            // sure it does not reach the second box.
+            let (rect, view_proj) = active_viewport(h);
+            let bb0 = ids[0].1;
+            // Margin ≫ the drag-arming nudge (8px) so the captured anchor still
+            // sits OUTSIDE the box → window mode fully encloses it.
+            let r0 = projected_rect(view_proj, rect, bb0.min, bb0.max)
+                .expect("box 0 projects in front of camera")
+                .expand(24.0)
+                .intersect(rect);
+            // Left→right (window): top-left → bottom-right.
+            drag(h, r0.left_top(), r0.right_bottom());
+            let sel = &h.state().session.doc.selection;
+            assert_eq!(sel.len(), 1, "window drag selected exactly one box");
+            assert!(sel.contains(&ids[0].0), "…and it is the enclosed box");
+
+            // Right→left CROSSING drag over the second box: bottom-right →
+            // top-left of its projected rect selects it by touch. Clamp the drag
+            // corners into the pane so the press always lands on the viewport.
+            let bb1 = ids[1].1;
+            let r1 = projected_rect(view_proj, rect, bb1.min, bb1.max)
+                .expect("box 1 projects in front of camera")
+                .expand(24.0)
+                .intersect(rect);
+            drag(h, r1.right_bottom(), r1.left_top());
+            let sel = &h.state().session.doc.selection;
+            assert!(
+                sel.contains(&ids[1].0),
+                "crossing drag (right→left) selected the second box"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_properties_edit() {
+        // The editable Properties panel: select an object, open the Properties
+        // section, and assert it renders the selection's live fields (count,
+        // Layer, Position, Size). Driving the nested X/Y/Z TextEdits + Enter
+        // through AccessKit is brittle, so per the plan we assert the panel is
+        // POPULATED for the selection (and snapshot it as a golden) rather than
+        // synthesizing a keystroke-perfect field commit.
+        run_app_journey(|h| {
+            use egui_kittest::kittest::Queryable as _;
+            submit_command(h, "box 0,0,0 5,5,3");
+            submit_command(h, "select all");
+            assert!(!h.state().session.doc.selection.is_empty(), "box selected");
+
+            // Properties lives under the Model workspace tab.
+            h.state_mut().panel_tabs.show(crate::tabstrip::PanelTab::Model);
+            h.run_steps(3);
+
+            // The panel reflects the selection: a count line and the field
+            // labels the editor lays out for a single object.
+            assert!(
+                h.query_all_by_label_contains("object(s) selected")
+                    .next()
+                    .is_some(),
+                "Properties shows the selection count"
+            );
+            for field in ["Layer", "Position", "Size"] {
+                assert!(
+                    h.query_all_by_label_contains(field).next().is_some(),
+                    "Properties renders the {field:?} row for the selection"
+                );
+            }
+
+            // Golden: the populated Properties panel (a new-feature UI state).
+            h.snapshot("journey_properties_populated");
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_polygon_ghost_preview() {
+        // Golden for the interactive polygon tool mid-gesture: arm the tool,
+        // click the center, then hover the cursor out at the circumradius so the
+        // blue ghost N-gon draws over the viewport. Captures the draw-tool
+        // preview affordance (prompt overlay + ghost) as a new-feature baseline.
+        run_app_journey(|h| {
+            submit_command(h, "polygon");
+            let center = world_to_screen(h, glam::DVec3::new(0.0, 0.0, 0.0));
+            click_at(h, center);
+            // Hover (no click) at the radius so `preview` draws the ghost ring.
+            let edge = world_to_screen(h, glam::DVec3::new(4.0, 0.0, 0.0));
+            h.input_mut().events.push(egui::Event::PointerMoved(edge));
+            h.run_steps(3);
+            h.snapshot("journey_polygon_ghost");
         });
     }
 
