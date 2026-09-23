@@ -242,6 +242,76 @@ last *n* commands into a tool the same way.
 ![The ItsJustCAD interface — perspective viewport, command line, a status bar with view/snap chips and gumball, and the right dock (Chat, Sessions, Layers, plus contextual Parameters/Sheets/Blocks tabs)](docs/shot-ui.png)
 *A familiar, Rhino-style interface: command line, viewport with view/snap chips, and a docked panel (Chat, Sessions, Layers, and contextual Parameters/Sheets/Blocks) — it adapts to the CAD you came from.*
 
+### Visual examples
+
+A few verbs, a few numbers — here's what they draw. Every thumbnail below is
+rendered by [`docs/examples/render-examples.sh`](docs/examples/render-examples.sh)
+from a tiny, deterministic command script through the same headless
+`--run … --shot` path used by CI; re-run it on any GPU machine to regenerate them.
+
+**Drawing & curves**
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/examples/img/polyline-arc.png" width="180"><br><code>polyline</code> + <code>arc</code></td>
+    <td align="center"><img src="docs/examples/img/polygon.png" width="180"><br><code>polygon</code></td>
+    <td align="center"><img src="docs/examples/img/circle-tangent.png" width="180"><br><code>circletan</code> (TTR)</td>
+  </tr>
+</table>
+
+**Sweeps & surfaces**
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/examples/img/sweep1.png" width="180"><br><code>sweep</code> (one rail)</td>
+    <td align="center"><img src="docs/examples/img/sweep2.png" width="180"><br><code>sweep2</code> (two rails)</td>
+    <td align="center"><img src="docs/examples/img/loft.png" width="180"><br><code>loft</code></td>
+    <td align="center"><img src="docs/examples/img/revolve.png" width="180"><br><code>revolve</code></td>
+  </tr>
+</table>
+
+**Form-finding & expressive structures**
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/examples/img/geodesic-dome.png" width="180"><br><code>geodesic</code> dome</td>
+    <td align="center"><img src="docs/examples/img/hypar.png" width="180"><br><code>hypar</code> shell</td>
+    <td align="center"><img src="docs/examples/img/gridshell.png" width="180"><br><code>gridshell</code></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/examples/img/funicular.png" width="180"><br><code>funicular</code> (inverted)</td>
+    <td align="center"><img src="docs/examples/img/tensegrity.png" width="180"><br><code>tensegrity</code></td>
+    <td align="center"><img src="docs/examples/img/minsurf.png" width="180"><br><code>minsurf</code> (soap film)</td>
+  </tr>
+</table>
+
+**Parametric structures** — live, re-derived from parameters (Parameters tab / `paramset`)
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/examples/img/spaceframe.png" width="180"><br><code>spaceframe</code> 6×4</td>
+    <td align="center"><img src="docs/examples/img/gaussvault.png" width="180"><br><code>gaussvault</code> (undulate)</td>
+  </tr>
+</table>
+
+**Drawings → BIM & massing**
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/examples/img/fromlayer-walls.png" width="180"><br><code>fromlayer … wall</code></td>
+    <td align="center"><img src="docs/examples/img/massing.png" width="180"><br><code>box</code> massing</td>
+  </tr>
+</table>
+
+**Hatches**
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/examples/img/hatch-brick.png" width="180"><br><code>hatch … brick</code></td>
+    <td align="center"><img src="docs/examples/img/hatch-concrete.png" width="180"><br><code>hatch … concrete</code></td>
+  </tr>
+</table>
+
 ### Model
 Boxes · extrude · revolve / loft (with guide curves) / **blend** / sweep /
 **sweep2 (two rails)** / rail-revolve / variable-radius pipe · booleans
