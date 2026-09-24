@@ -1011,6 +1011,40 @@ fn default_layer() -> String {
     DEFAULT_LAYER.to_string()
 }
 
+/// Curated, distinguishable default palette for auto-assigning colors to new
+/// layers (Rhino-style, but hand-picked to read well on both dark and light
+/// viewport backgrounds). Index 0 is the first/"Default" layer and is BLACK
+/// (matches Rhino); subsequent layers cycle through the palette below. Values
+/// are RGBA in 0..1, mirroring `LayerStyle::color`.
+///
+/// Palette (after black): red, blue, green, purple, orange, teal, brown, pink,
+/// olive, gray — the classic "tab10"-style set, which stays legible against
+/// dark and light backgrounds alike.
+const LAYER_COLOR_PALETTE: [[f32; 4]; 11] = [
+    [0.0, 0.0, 0.0, 1.0],                   // 0: black (Default)
+    [0.839_216, 0.152_941, 0.156_863, 1.0], // 1: red     #D62728
+    [0.121_569, 0.466_667, 0.705_882, 1.0], // 2: blue    #1F77B4
+    [0.172_549, 0.627_451, 0.172_549, 1.0], // 3: green   #2CA02C
+    [0.580_392, 0.403_922, 0.741_176, 1.0], // 4: purple  #9467BD
+    [1.0, 0.498_039, 0.054_902, 1.0],       // 5: orange  #FF7F0E
+    [0.090_196, 0.745_098, 0.811_765, 1.0], // 6: teal    #17BECF
+    [0.549_020, 0.337_255, 0.294_118, 1.0], // 7: brown   #8C564B
+    [0.890_196, 0.466_667, 0.760_784, 1.0], // 8: pink    #E377C2
+    [0.737_255, 0.741_176, 0.133_333, 1.0], // 9: olive   #BCBD22
+    [0.498_039, 0.498_039, 0.498_039, 1.0], // 10: gray   #7F7F7F
+];
+
+/// Default display color for the Nth layer created, as RGBA (0..1).
+///
+/// `index == 0` is BLACK (the first/"Default" layer, matching Rhino). Later
+/// indices cycle through a curated, distinguishable palette and wrap once the
+/// palette is exhausted, so `default_layer_color(n) == default_layer_color(n +
+/// LAYER_COLOR_PALETTE.len())`. Purely index-based → deterministic and
+/// replay-stable for the op-log (no randomness).
+pub fn default_layer_color(index: usize) -> [f32; 4] {
+    LAYER_COLOR_PALETTE[index % LAYER_COLOR_PALETTE.len()]
+}
+
 fn default_visible() -> bool {
     true
 }
@@ -1153,6 +1187,37 @@ pub struct SceneObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_layer_color_index_zero_is_black() {
+        assert_eq!(default_layer_color(0), [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn default_layer_color_distinct_for_first_ten() {
+        // Indices 1..=10 must all differ from each other and from black.
+        let mut seen: Vec<[f32; 4]> = Vec::new();
+        for i in 0..=10 {
+            let c = default_layer_color(i);
+            assert!(
+                !seen.contains(&c),
+                "index {i} color {c:?} collides with an earlier one"
+            );
+            seen.push(c);
+        }
+    }
+
+    #[test]
+    fn default_layer_color_wraps_at_palette_length() {
+        let len = LAYER_COLOR_PALETTE.len();
+        for n in 0..(2 * len + 3) {
+            assert_eq!(
+                default_layer_color(n),
+                default_layer_color(n + len),
+                "palette must wrap at length {len} (n = {n})"
+            );
+        }
+    }
 
     #[test]
     fn clip_rect_normalizes_and_contains() {
