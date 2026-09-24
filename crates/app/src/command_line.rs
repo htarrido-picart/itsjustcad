@@ -11,6 +11,14 @@ use crate::suggest::{self, Suggestion};
 /// Maximum number of autosuggest entries shown at once.
 const MAX_SUGGESTIONS: usize = 8;
 
+/// Pure helper: given the last non-destructive verb, produce the command to
+/// run on an empty Enter/Space — the bare verb ALONE (no args), so a guided
+/// command restarts and prompts fresh (Rhino behavior). `None` when no eligible
+/// verb has run yet (empty submit is then a no-op).
+fn recall_verb(last_verb: Option<&str>) -> Option<String> {
+    last_verb.map(str::to_string)
+}
+
 /// Rhino-style command line: single input row + scrollback, up/down history,
 /// plus as-you-type autosuggest popup and usage hints.
 pub struct CommandLine {
@@ -400,12 +408,16 @@ impl CommandLine {
     /// `preset_aliases` — active legacy-CAD alias map from `preset::preset_for`.
     /// `panel_h` — current height of the containing panel in logical pixels; used
     /// to compute the token-relative history scrollback height.
+    /// `last_verb` — the last non-destructive verb entered (App::last_verb); an
+    /// empty Enter/Space re-runs this verb ALONE (no args) so guided commands
+    /// restart and prompt fresh.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         object_names: &[String],
         preset_aliases: &'static [(&'static str, &'static str)],
         panel_h: f32,
+        last_verb: Option<&str>,
     ) -> Option<String> {
         // Recompute suggestions if input changed.
         self.refresh_suggestions(object_names, preset_aliases);
@@ -420,7 +432,7 @@ impl CommandLine {
         let history_h = crate::theme::Spacing::history_h_for(panel_h);
         let mut submitted = None;
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            submitted = self.input_row(ui);
+            submitted = self.input_row(ui, last_verb);
             self.suggestion_block(ui, true);
             egui::ScrollArea::vertical()
                 .id_salt("cmd_history")
@@ -560,7 +572,9 @@ impl CommandLine {
 
     /// The prompt + text input row, with history recall, popup navigation and
     /// suggestion acceptance. Returns Some(line) when the user pressed Enter.
-    fn input_row(&mut self, ui: &mut egui::Ui) -> Option<String> {
+    /// `last_verb` — an empty Enter/Space submits the last non-destructive verb
+    /// ALONE (no args, via `recall_verb`) so guided commands restart fresh.
+    fn input_row(&mut self, ui: &mut egui::Ui, last_verb: Option<&str>) -> Option<String> {
         let mut submitted = None;
         let show_popup = self.popup_visible();
         ui.horizontal(|ui| {
@@ -595,15 +609,39 @@ impl CommandLine {
 
             if response.has_focus() {
                 // Read all relevant keys in one go to avoid multiple borrows.
-                let (up, down, tab, right, esc) = ui.input(|i| {
+                let (up, down, tab, right, esc, space) = ui.input(|i| {
                     (
                         i.key_pressed(egui::Key::ArrowUp),
                         i.key_pressed(egui::Key::ArrowDown),
                         i.key_pressed(egui::Key::Tab),
                         i.key_pressed(egui::Key::ArrowRight),
                         i.key_pressed(egui::Key::Escape),
+                        i.key_pressed(egui::Key::Space),
                     )
                 });
+
+                // ── Space on an EMPTY line = re-run last VERB alone ──────────
+                // Rhino treats Space like Enter as a terminator, but ONLY when
+                // the line has no content. On an empty line, Space re-runs the
+                // last non-destructive verb ALONE (no args) so a guided command
+                // restarts and prompts fresh. The TextEdit above may have just
+                // inserted the space into `self.input`, so we test for "empty or
+                // whitespace-only" and clear it. When the line already has a real
+                // command, Space types a literal space as usual (this branch
+                // doesn't fire because the trimmed input is non-empty), so
+                // "line 0,0 1,1" keeps working. No-op when there is no eligible
+                // verb yet.
+                if space && !show_popup && self.input.trim().is_empty() {
+                    self.input.clear();
+                    if let Some(verb) = recall_verb(last_verb) {
+                        submitted = Some(verb);
+                        self.recall_pos = None;
+                        self.focus_next_frame = true;
+                        self.suggestions.clear();
+                        self.suggest_for.clear();
+                        self.suggest_dismissed = false;
+                    }
+                }
 
                 // ── History recall (Up/Down) ─────────────────────────────
                 // Only engage history when the popup is not showing, to avoid
@@ -647,13 +685,28 @@ impl CommandLine {
             }
 
             if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                submitted = Some(std::mem::take(&mut self.input));
-                self.recall_pos = None;
-                self.focus_next_frame = true;
-                // Clear suggestions on submit.
-                self.suggestions.clear();
-                self.suggest_for.clear();
-                self.suggest_dismissed = false;
+                if self.input.trim().is_empty() {
+                    // Empty Enter: re-run the last non-destructive verb ALONE
+                    // (no args) so guided commands restart and prompt fresh.
+                    // No-op when no eligible verb has run yet.
+                    self.input.clear();
+                    self.focus_next_frame = true;
+                    if let Some(verb) = recall_verb(last_verb) {
+                        submitted = Some(verb);
+                        self.recall_pos = None;
+                        self.suggestions.clear();
+                        self.suggest_for.clear();
+                        self.suggest_dismissed = false;
+                    }
+                } else {
+                    submitted = Some(std::mem::take(&mut self.input));
+                    self.recall_pos = None;
+                    self.focus_next_frame = true;
+                    // Clear suggestions on submit.
+                    self.suggestions.clear();
+                    self.suggest_for.clear();
+                    self.suggest_dismissed = false;
+                }
             }
         });
         submitted
@@ -663,6 +716,14 @@ impl CommandLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recall_verb_is_the_bare_verb_or_none() {
+        assert_eq!(recall_verb(None), None);
+        // The bare verb ALONE (no args, no trailing space) — it is submitted
+        // for execution so a guided command restarts fresh.
+        assert_eq!(recall_verb(Some("offset")), Some("offset".to_string()));
+    }
 
     #[test]
     fn push_line_caps_history_at_500() {

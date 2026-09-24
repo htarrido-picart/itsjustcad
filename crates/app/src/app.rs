@@ -342,6 +342,29 @@ fn move_delta(origin: glam::DVec3, target: glam::DVec3) -> Option<glam::DVec3> {
     }
 }
 
+/// Destructive verbs that must NEVER be stored as `last_verb` — an empty
+/// Enter/Space must never pre-arm a delete. Compared case-insensitively.
+const DESTRUCTIVE_VERBS: [&str; 5] = ["delete", "erase", "purge", "deleteall", "clear"];
+
+/// Pure helper: true when `verb` is a destructive command word (case-insensitive)
+/// that should be excluded from `last_verb` recall.
+fn is_destructive_verb(verb: &str) -> bool {
+    DESTRUCTIVE_VERBS
+        .iter()
+        .any(|d| verb.eq_ignore_ascii_case(d))
+}
+
+/// Pure helper: given the previous `last_verb` and a freshly-entered command
+/// `line`, return the verb to store. Extracts the FIRST whitespace-delimited
+/// token; keeps the previous value when the line is empty or its verb is
+/// destructive (so empty-Enter recall never pre-arms a delete).
+fn next_last_verb(prev: Option<String>, line: &str) -> Option<String> {
+    match line.split_whitespace().next() {
+        Some(verb) if !is_destructive_verb(verb) => Some(verb.to_string()),
+        _ => prev,
+    }
+}
+
 pub struct App {
     session: Session,
     command_line: CommandLine,
@@ -427,8 +450,13 @@ pub struct App {
     /// edit buffers plus the AABB-min snapshot they were seeded from, so the
     /// commit can compute a `move` delta against the live selection origin.
     pending_object_pos: Option<PendingPos>,
-    /// Last executed command line; Enter/Space on the canvas repeats it.
+    /// Last executed command line; viewport right-click repeats it verbatim.
     last_line: Option<String>,
+    /// Last non-destructive VERB entered at the command line (first token only).
+    /// An empty Enter/Space populates the input with `<verb> ` for fresh args;
+    /// destructive verbs (delete/erase/…) never overwrite it. Separate from
+    /// `last_line`, which drives verbatim right-click repeat.
+    last_verb: Option<String>,
     /// A `critique` request awaiting its viewport screenshot. Holds the
     /// optional user question; once the tagged Screenshot event lands, the PNG
     /// is written and a vision deck turn (Read tool enabled) is fired.
@@ -993,6 +1021,7 @@ impl App {
             pending_object_name: None,
             pending_object_pos: None,
             last_line: None,
+            last_verb: None,
             pending_critique: None,
             render_job: None,
             render_conn_test: None,
@@ -1303,20 +1332,31 @@ impl App {
 
     /// App-level verbs (save/open, camera) wrap the command substrate.
     fn execute_line(&mut self, line: String) {
+        // Empty submissions never reach here as executable input: the command line
+        // now populates the last verb on empty Enter/Space (see command_line.rs)
+        // rather than re-running. A stray empty line is a silent no-op.
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        // Remember the VERBATIM entered string (pre-alias-expansion) for the
+        // viewport right-click "repeat last command verbatim".
+        self.last_line = Some(trimmed.to_string());
+        // Track the last non-destructive VERB (first token) for empty-Enter/Space
+        // recall — destructive verbs (delete/erase/…) leave it pointing at the
+        // previous eligible verb.
+        self.last_verb = next_last_verb(self.last_verb.take(), trimmed);
         // Expand legacy-CAD alias BEFORE any dispatch (case-insensitive single-token).
         let expanded: String;
         let line = {
             let aliases = self.active_aliases();
-            if let Some(exp) = preset::expand_alias(line.trim(), aliases) {
+            if let Some(exp) = preset::expand_alias(trimmed, aliases) {
                 expanded = exp;
                 expanded.as_str()
             } else {
-                line.trim()
+                trimmed
             }
         };
-        if !line.is_empty() {
-            self.last_line = Some(line.to_string()); // Enter/Space repeat
-        }
         let mut words = line.split_whitespace();
         match words.next() {
             Some("save") => self.save(words.next().map(Into::into)),
@@ -5249,7 +5289,11 @@ impl App {
             .collect();
         let aliases = self.active_aliases();
         let panel_h = ui.available_height();
-        if let Some(line) = self.command_line.ui(ui, &object_names, aliases, panel_h) {
+        let last_verb = self.last_verb.clone();
+        if let Some(line) =
+            self.command_line
+                .ui(ui, &object_names, aliases, panel_h, last_verb.as_deref())
+        {
             self.execute_line(line);
         }
     }
@@ -8826,6 +8870,52 @@ mod tests {
             Some(Some("a"))
         );
         assert_eq!(shared_value([Some("a"), None].into_iter()), None);
+    }
+
+    #[test]
+    fn is_destructive_verb_flags_only_destructive_words_any_case() {
+        for v in ["delete", "erase", "purge", "deleteall", "clear"] {
+            assert!(is_destructive_verb(v), "{v} should be destructive");
+            assert!(is_destructive_verb(&v.to_uppercase()), "{v} upper");
+        }
+        assert!(is_destructive_verb("Delete"));
+        for v in ["offset", "box", "line"] {
+            assert!(!is_destructive_verb(v), "{v} should NOT be destructive");
+        }
+    }
+
+    #[test]
+    fn next_last_verb_stores_only_the_first_token() {
+        // `offset 5 last` → verb only ("offset"), args dropped.
+        assert_eq!(
+            next_last_verb(None, "offset 5 last"),
+            Some("offset".to_string())
+        );
+        // A new eligible verb replaces the previous one.
+        assert_eq!(
+            next_last_verb(Some("box".to_string()), "line 0,0 1,1"),
+            Some("line".to_string())
+        );
+    }
+
+    #[test]
+    fn next_last_verb_keeps_prev_for_destructive_or_empty() {
+        // `box ...` then `delete last`: last_verb stays "box".
+        assert_eq!(
+            next_last_verb(Some("box".to_string()), "delete last"),
+            Some("box".to_string())
+        );
+        // Any destructive verb (case-insensitive) leaves prev untouched.
+        assert_eq!(
+            next_last_verb(Some("box".to_string()), "ERASE all"),
+            Some("box".to_string())
+        );
+        // Empty / whitespace-only line: keep prev (here None → still None).
+        assert_eq!(next_last_verb(None, "   "), None);
+        assert_eq!(
+            next_last_verb(Some("box".to_string()), ""),
+            Some("box".to_string())
+        );
     }
 
     #[test]
