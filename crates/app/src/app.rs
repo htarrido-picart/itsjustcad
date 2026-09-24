@@ -16,6 +16,25 @@ use crate::keymap;
 use crate::preset::{self, CadOrigin};
 use crate::scene;
 
+/// Minimum command-line height (points): the input row plus ~4 history lines —
+/// always enough to type into AND read recent output, so a drag can't squeeze
+/// the command line down to a single cramped row.
+pub(crate) const CMD_HEIGHT_MIN: f32 = 4.0 * 16.0 + 44.0;
+/// Default command-line height (points) when nothing is persisted: ~5 history
+/// lines (≈16pt each) plus the input-row reserve — the height the region used
+/// before it became user-resizable.
+pub(crate) const CMD_HEIGHT_DEFAULT: f32 = 5.0 * 16.0 + 44.0;
+/// Thickness (points) of the draggable splitter handle strip at the top edge of
+/// the command line.
+const CMD_SPLITTER_H: f32 = 6.0;
+
+/// Clamp a candidate command-line height to `[CMD_HEIGHT_MIN, 0.6 * column_h]`
+/// so the deck body above always keeps a sane minimum. Pure — unit-tested.
+pub(crate) fn clamp_cmd_height(candidate: f32, column_h: f32) -> f32 {
+    let max = (column_h * 0.6).max(CMD_HEIGHT_MIN);
+    candidate.clamp(CMD_HEIGHT_MIN, max)
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) enum TemplateUnits {
     Meters,
@@ -520,6 +539,18 @@ pub struct App {
     /// tabs never changes it (the panel always renders at this width). This is
     /// the single width source of truth — see `right_panel`.
     dock_width: f32,
+    /// Height (points) of the command-line region docked at the bottom of the
+    /// right column. A user drags the thin handle strip at the TOP of the command
+    /// line to resize it: dragging UP grows the command line (and implicitly
+    /// shrinks the deck body above it); dragging DOWN does the reverse. The panel
+    /// itself is ALWAYS rendered with `.exact_size(cmd_height)` (never
+    /// `.resizable(true)`) so its rect is deterministic every frame — this is what
+    /// keeps the TextEdit's focus/keystroke handling stable (the c2cfcff dropped-
+    /// keystroke bug came from a *resizable* nested panel whose two resize handles
+    /// fought frame-to-frame). One manual splitter controls BOTH sizes. Clamped to
+    /// [`CMD_HEIGHT_MIN`, 60% of the column height] each frame. Persisted to
+    /// `ui.json` like `dock_width`.
+    cmd_height: f32,
     /// Screen-space x of the right dock's ACTUAL drawn left edge this frame, or
     /// `None` when the dock is hidden. The viewport clamps its right edge to this
     /// so the 3D wgpu callback (painted last, scissored to the central rect) can
@@ -999,6 +1030,7 @@ impl App {
             pending_plugin_delete: None,
             plugin_json_view: None,
             dock_width: crate::tabstrip::DOCK_WIDTH,
+            cmd_height: load_cmd_height().unwrap_or(CMD_HEIGHT_DEFAULT),
             dock_left: None,
             panel_visible: true,
             reduce_motion: load_reduce_motion(),
@@ -5222,6 +5254,38 @@ impl App {
         }
     }
 
+    /// Draggable divider strip at the TOP edge of the command line. Dragging it UP
+    /// grows the command line (deck body shrinks) and DOWN shrinks it. It only
+    /// adjusts the persisted `self.cmd_height`; the command panel keeps its
+    /// deterministic `.exact_size(cmd_height)` — never `.resizable(true)` — so the
+    /// keystroke handling stays stable. `column_h` is the right column's height
+    /// this frame, used to clamp so the deck keeps ≥40% of the column.
+    fn command_splitter(&mut self, ui: &mut egui::Ui, column_h: f32) {
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), CMD_SPLITTER_H),
+            egui::Sense::drag(),
+        );
+        if resp.hovered() || resp.dragged() {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
+        }
+        if resp.dragged() {
+            // Dragging UP (negative y) increases the command-line height.
+            self.cmd_height = clamp_cmd_height(self.cmd_height - resp.drag_delta().y, column_h);
+        }
+        if resp.drag_stopped() {
+            save_cmd_height(self.cmd_height);
+        }
+        // Draw a subtle grabbable divider: a centered line that brightens on hover.
+        let painter = ui.painter();
+        let color = if resp.hovered() || resp.dragged() {
+            ui.visuals().widgets.hovered.fg_stroke.color
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke.color
+        };
+        let y = rect.center().y;
+        painter.hline(rect.x_range(), y, egui::Stroke::new(1.0, color));
+    }
+
     /// Right docked tab panel (Layer 2): a hand-rolled tab strip over
     /// Layers / Properties / Chat, with the command line docked at the bottom
     /// (always visible, panel width). Clicking the active tab collapses the panel
@@ -5397,9 +5461,18 @@ impl App {
             // keeps identical focus/keystroke handling. It sits BELOW the tab strip
             // so it is present whether the deck body is collapsed or expanded.
             let cmd_fill = self.command_line_fill(ui);
-            // ~5 lines of history (≈16pt/line) + the input row reserve. Fixed —
-            // not resizable, to avoid the nested-resizable instability.
-            let cmd_h = (5.0f32 * 16.0 + 44.0).min(ui.available_height() * 0.6).max(90.0);
+            // MANUAL SPLITTER (deck body ↕ command line). The command panel is
+            // ALWAYS `.exact_size(self.cmd_height)` — NEVER `.resizable(true)` —
+            // so its rect is deterministic every frame (this is what keeps the
+            // TextEdit stable; a resizable nested panel was the c2cfcff keystroke
+            // bug). Resizing is done by a thin draggable handle strip drawn at the
+            // TOP edge of the command line (added below, only when the deck body is
+            // expanded). We clamp cmd_height to the CURRENT column height so the
+            // deck keeps a sane minimum even after the window is resized smaller.
+            let collapsed = self.panel_tabs.is_collapsed();
+            let column_h = ui.available_height();
+            self.cmd_height = clamp_cmd_height(self.cmd_height, column_h);
+            let cmd_h = self.cmd_height;
             egui::Panel::bottom("command_line")
                 .resizable(false)
                 .exact_size(cmd_h)
@@ -5408,9 +5481,17 @@ impl App {
                         .fill(cmd_fill)
                         .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::S as i8, 4)),
                 )
-                .show(ui, |ui| self.command_line_body(ui));
+                .show(ui, |ui| {
+                    // The grabbable divider only makes sense when there IS a deck
+                    // body above to trade space with. When collapsed, the command
+                    // line is the whole column — no splitter.
+                    if !collapsed {
+                        self.command_splitter(ui, column_h);
+                    }
+                    self.command_line_body(ui);
+                });
 
-            if self.panel_tabs.is_collapsed() {
+            if collapsed {
                 return;
             }
             // Breathing room below the tab strip so each tab's top content (deck
@@ -7405,6 +7486,21 @@ fn save_theme_pref(dark: Option<bool>) {
     save_ui_json(&v);
 }
 
+/// Restore the persisted command-line height from ui.json (`cmd_height`).
+fn load_cmd_height() -> Option<f32> {
+    load_ui_json()["cmd_height"]
+        .as_f64()
+        .map(|h| h as f32)
+        .filter(|h| h.is_finite() && *h > 0.0)
+}
+
+/// Persist the command-line height to ui.json (mirrors `save_dock`-style helpers).
+fn save_cmd_height(h: f32) {
+    let mut v = load_ui_json();
+    v["cmd_height"] = serde_json::json!(h);
+    save_ui_json(&v);
+}
+
 fn load_deck_visible() -> Option<bool> {
     load_ui_json()["deck_visible"].as_bool()
 }
@@ -8730,6 +8826,28 @@ mod tests {
             Some(Some("a"))
         );
         assert_eq!(shared_value([Some("a"), None].into_iter()), None);
+    }
+
+    #[test]
+    fn clamp_cmd_height_respects_min_and_deck_minimum() {
+        // A tall column: candidate passes through when within bounds.
+        assert_eq!(clamp_cmd_height(200.0, 800.0), 200.0);
+        // Dragging the splitter far UP (huge cmd height) is capped at 60% of the
+        // column so the deck body keeps a sane minimum (40%).
+        assert!((clamp_cmd_height(10_000.0, 800.0) - 480.0).abs() < 1e-3);
+        // Dragging far DOWN can never shrink below the input-lines minimum.
+        assert_eq!(clamp_cmd_height(0.0, 800.0), CMD_HEIGHT_MIN);
+        assert_eq!(clamp_cmd_height(-500.0, 800.0), CMD_HEIGHT_MIN);
+        // In a very short column the MIN still wins over the 60% cap so the
+        // command line is always usable.
+        assert_eq!(clamp_cmd_height(50.0, 60.0), CMD_HEIGHT_MIN);
+        // Simulated drag delta: dragging UP by 30px (delta.y = -30) grows height.
+        let start = CMD_HEIGHT_DEFAULT;
+        let after_up = clamp_cmd_height(start - (-30.0), 800.0);
+        assert!(after_up > start && after_up <= 480.0);
+        // Dragging DOWN by 30px (delta.y = +30) shrinks it.
+        let after_down = clamp_cmd_height(start - 30.0, 800.0);
+        assert!(after_down < start && after_down >= CMD_HEIGHT_MIN);
     }
 
     #[test]
