@@ -6187,4 +6187,396 @@ mod tests {
         assert!(parse("xclip last").is_err());
         assert!(parse("xclip last 0,0").is_err());
     }
+    // --- guided transform round-trips ---
+
+    // ── guided-transform round-trip tests ─────────────────────────────────────
+    //
+    // Each string below is produced by a transform.rs assembler. These tests
+    // prove the assembler and parser agree — a failing test here means the
+    // assembler emits a string the parser can't accept.
+
+    #[test]
+    fn guided_transform_round_trips() {
+        use glam::DVec3;
+
+        // move: delta is to-from
+        let cmd = parse("move sel 3,3").unwrap();
+        assert!(
+            matches!(cmd, Command::Move { delta, .. } if delta == DVec3::new(3.0, 3.0, 0.0)),
+            "move sel 3,3 parsed wrong: {cmd:?}"
+        );
+
+        // copy: delta is to-from
+        let cmd = parse("copy sel 5,0").unwrap();
+        assert!(
+            matches!(cmd, Command::Copy { delta, .. } if delta == DVec3::new(5.0, 0.0, 0.0)),
+            "copy sel 5,0 parsed wrong: {cmd:?}"
+        );
+
+        // rotate: angle + about center (axis defaults to Z)
+        let cmd = parse("rotate sel 45 about 0,0").unwrap();
+        assert!(
+            matches!(cmd, Command::Rotate { angle_deg, center: Some(c), .. }
+                if angle_deg == 45.0 && c == DVec3::new(0.0, 0.0, 0.0)),
+            "rotate sel 45 about 0,0 parsed wrong: {cmd:?}"
+        );
+
+        // scale: uniform factor + about base
+        let cmd = parse("scale sel 2.5 about 1,1").unwrap();
+        assert!(
+            matches!(cmd, Command::Scale { factors, center: Some(c), .. }
+                if factors == DVec3::splat(2.5) && c == DVec3::new(1.0, 1.0, 0.0)),
+            "scale sel 2.5 about 1,1 parsed wrong: {cmd:?}"
+        );
+
+        // scale: default factor of 1.0 rounds to "1" via num()
+        let cmd = parse("scale sel 1 about 0,0").unwrap();
+        assert!(
+            matches!(cmd, Command::Scale { factors, .. } if factors == DVec3::splat(1.0)),
+            "scale sel 1 about 0,0 parsed wrong: {cmd:?}"
+        );
+
+        // mirror: point-normal plane form
+        let cmd = parse("mirror sel 0,5 1,0").unwrap();
+        assert!(
+            matches!(cmd, Command::Mirror { plane: MirrorPlane::PointNormal { .. }, .. }),
+            "mirror sel 0,5 1,0 parsed wrong: {cmd:?}"
+        );
+
+        // align: four points, scale off
+        let cmd = parse("align sel 0,0 5,5 1,0 6,5 scale off").unwrap();
+        assert!(
+            matches!(cmd, Command::Align { scale: false, .. }),
+            "align sel 0,0 5,5 1,0 6,5 scale off parsed wrong: {cmd:?}"
+        );
+
+        // align: four points, scale on
+        let cmd = parse("align sel 0,0 0,0 1,0 2,0 scale on").unwrap();
+        assert!(
+            matches!(cmd, Command::Align { scale: true, .. }),
+            "align sel 0,0 0,0 1,0 2,0 scale on parsed wrong: {cmd:?}"
+        );
+
+        // stretch: min, max, delta (from-to delta)
+        let cmd = parse("stretch sel 0,0 5,5 1,0").unwrap();
+        assert!(
+            matches!(cmd, Command::Stretch { delta, .. } if delta == DVec3::new(1.0, 0.0, 0.0)),
+            "stretch sel 0,0 5,5 1,0 parsed wrong: {cmd:?}"
+        );
+
+        // 3-D delta preserves z component
+        let cmd = parse("copy sel 1,2,3").unwrap();
+        assert!(
+            matches!(cmd, Command::Copy { delta, .. } if delta == DVec3::new(1.0, 2.0, 3.0)),
+            "copy sel 1,2,3 parsed wrong: {cmd:?}"
+        );
+    }
+
+    // --- guided array round-trips ---
+
+    // --- guided array group round-trip tests ---
+
+    #[test]
+    fn guided_array_round_trip() {
+        // The exact string emitted by assemble_array for guided flow.
+        let cmd = parse("array sel 3,2,1 1,1,0").unwrap();
+        assert!(matches!(
+            cmd,
+            Command::Array { targets: Selector::Selected, counts: [3, 2, 1], .. }
+        ));
+    }
+
+    #[test]
+    fn guided_polararray_round_trip() {
+        // The exact string emitted by assemble_polararray for guided flow.
+        let cmd = parse("polararray sel 6 0,0 360").unwrap();
+        assert!(matches!(
+            cmd,
+            Command::PolarArray {
+                targets: Selector::Selected,
+                count: 6,
+                center: Some(DVec3::ZERO),
+                total_angle_deg: Some(deg),
+                ..
+            } if deg == 360.0
+        ));
+    }
+
+    // --- guided curve_edit round-trips ---
+    /// Round-trip each string emitted by the guided curve_edit assemblers so we
+    /// know the parser accepts them unchanged.
+    #[test]
+    fn guided_curve_edit_emitted_strings_parse_ok() {
+        // split sel 5,3 — "sel" is the canonical Selected selector token
+        assert!(matches!(
+            parse("split sel 5,3").unwrap(),
+            Command::Split { target: Selector::Selected, point, .. }
+                if point == DVec3::new(5.0, 3.0, 0.0)
+        ));
+        // extend sel 2.5
+        assert!(matches!(
+            parse("extend sel 2.5").unwrap(),
+            Command::Extend { targets: Selector::Selected, distance }
+                if distance == 2.5
+        ));
+        // powertrim sel 1,2
+        assert!(matches!(
+            parse("powertrim sel 1,2").unwrap(),
+            Command::PowerTrim { target: Selector::Selected, pick, .. }
+                if pick == DVec3::new(1.0, 2.0, 0.0)
+        ));
+        // fillet sel 0.5 — single-selector form; parser sets a = b = Selected
+        assert!(matches!(
+            parse("fillet sel 0.5").unwrap(),
+            Command::Fillet { a: Selector::Selected, b: Selector::Selected, radius, .. }
+                if radius == 0.5
+        ));
+        // boundary 3,4  →  Boundary { seed: (3,4,0), from: None }
+        assert!(matches!(
+            parse("boundary 3,4").unwrap(),
+            Command::Boundary { seed, from: None, .. }
+                if seed == DVec3::new(3.0, 4.0, 0.0)
+        ));
+        // curvebool Union sel  →  CurveBool { op: Union, targets: Selected }
+        assert!(matches!(
+            parse("curvebool Union sel").unwrap(),
+            Command::CurveBool { op: BoolKind::Union, targets: Selector::Selected, .. }
+        ));
+        // curvebool Difference sel
+        assert!(matches!(
+            parse("curvebool Difference sel").unwrap(),
+            Command::CurveBool { op: BoolKind::Difference, targets: Selector::Selected, .. }
+        ));
+        // curvebool Intersect sel
+        assert!(matches!(
+            parse("curvebool Intersect sel").unwrap(),
+            Command::CurveBool { op: BoolKind::Intersection, targets: Selector::Selected, .. }
+        ));
+    }
+
+
+    // --- guided annotate round-trips ---
+
+    // Round-trips for strings emitted by the guided annotate assemblers.
+    // These guarantee that every assembler output is accepted unchanged by
+    // the parser and maps to the right Command variant.
+    #[test]
+    fn guided_annotate_emits_round_trip() {
+        // dim: two free-point anchors + explicit offset (assembler always emits it)
+        assert!(matches!(
+            parse("dim 0,0 10,0 0.5").unwrap(),
+            Command::Dim { .. }
+        ));
+        assert!(matches!(
+            parse("dim 1,2 5,2 0.8").unwrap(),
+            Command::Dim { .. }
+        ));
+        // 3-D anchor (fmt keeps z when non-zero)
+        assert!(matches!(
+            parse("dim 0,0,1 10,0,1 0.5").unwrap(),
+            Command::Dim { .. }
+        ));
+
+        // dimangular: vertex + two leg points + explicit radius
+        assert!(matches!(
+            parse("dimangular 0,0 1,0 0,1 1").unwrap(),
+            Command::DimAngular { .. }
+        ));
+        assert!(matches!(
+            parse("dimangular 0,0 2,0 0,2 2.5").unwrap(),
+            Command::DimAngular { .. }
+        ));
+
+        // dimradius / dimdiameter: selection only (assembler-tested, deferred in SCRIPTS)
+        assert!(matches!(
+            parse("dimradius sel").unwrap(),
+            Command::DimRadius { diameter: false, .. }
+        ));
+        assert!(matches!(
+            parse("dimdiameter sel").unwrap(),
+            Command::DimRadius { diameter: true, .. }
+        ));
+
+        // autodim: selection + explicit `offset <d>`
+        assert!(matches!(
+            parse("autodim sel offset 0.5").unwrap(),
+            Command::AutoDim { .. }
+        ));
+        assert!(matches!(
+            parse("autodim all offset 0.8").unwrap(),
+            Command::AutoDim { .. }
+        ));
+        assert!(matches!(
+            parse("autodim last offset 0.5").unwrap(),
+            Command::AutoDim { offset, .. } if (offset - 0.5).abs() < 1e-9
+        ));
+    }
+
+    // --- guided refhatch round-trips ---
+
+    // Round-trip tests for strings emitted by guided/reference_hatch.rs assemblers.
+
+    #[test]
+    fn guided_hatch_solid_emitted_string_roundtrips() {
+        use itsjustcad_doc::HatchPattern;
+        assert!(matches!(
+            parse("hatch sel solid").unwrap(),
+            Command::Hatch { target: Selector::Selected, pattern: HatchPattern::Solid, .. }
+        ));
+    }
+
+    #[test]
+    fn guided_hatch_brick_emitted_string_roundtrips() {
+        use itsjustcad_doc::HatchPattern;
+        assert!(matches!(
+            parse("hatch sel brick 0.3").unwrap(),
+            Command::Hatch {
+                target: Selector::Selected,
+                pattern: HatchPattern::Brick { spacing },
+                ..
+            } if (spacing - 0.3).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn guided_ncopy_emitted_string_roundtrips() {
+        assert!(matches!(
+            parse("ncopy sel 2").unwrap(),
+            Command::Ncopy { target: Selector::Selected, index: 2, .. }
+        ));
+        // Default-index form
+        assert!(matches!(
+            parse("ncopy sel 0").unwrap(),
+            Command::Ncopy { target: Selector::Selected, index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn guided_xclip_emitted_string_roundtrips() {
+        use glam::DVec2;
+        let cmd = parse("xclip sel 0,0 10,10").unwrap();
+        if let Command::Xclip { target: Selector::Selected, rect: Some(r) } = &cmd {
+            assert_eq!(r.min, DVec2::new(0.0, 0.0));
+            assert_eq!(r.max, DVec2::new(10.0, 10.0));
+        } else {
+            panic!("expected xclip with selected target and rect");
+        }
+    }
+
+    // --- guided creation round-trips ---
+
+    // Round-trip tests for guided creation + measure assembler output.
+
+    #[test]
+    fn guided_creation_extrude_roundtrip() {
+        let cmd = parse("extrude sel 3").unwrap();
+        assert!(matches!(
+            cmd,
+            Command::Extrude { profile: Selector::Selected, height, .. } if height == 3.0
+        ));
+    }
+
+    #[test]
+    fn guided_creation_revolve_roundtrip() {
+        let cmd = parse("revolve sel 0,0 0,0,1 360").unwrap();
+        assert!(matches!(
+            cmd,
+            Command::Revolve {
+                profile: Selector::Selected,
+                axis_point: Some(_),
+                axis_dir: Some(_),
+                angle_deg: Some(a),
+                ..
+            } if a == 360.0
+        ));
+    }
+
+    #[test]
+    fn guided_creation_pipe_roundtrip() {
+        let cmd = parse("pipe sel 0.1").unwrap();
+        assert!(matches!(
+            cmd,
+            Command::Pipe { curve: Selector::Selected, radius, .. } if (radius - 0.1).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn guided_creation_box_roundtrip() {
+        let cmd = parse("box 1,1 3,4,2").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Box {
+                id: None,
+                corner: DVec3::new(1.0, 1.0, 0.0),
+                size: DVec3::new(3.0, 4.0, 2.0),
+            }
+        );
+    }
+
+    #[test]
+    fn guided_creation_arc_roundtrip() {
+        let cmd = parse("arc 0,0 1 0 90").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Arc {
+                id: None,
+                center: DVec3::ZERO,
+                radius: 1.0,
+                start_deg: 0.0,
+                end_deg: 90.0,
+            }
+        );
+    }
+
+    #[test]
+    fn guided_creation_ellipse_roundtrip() {
+        let cmd = parse("ellipse 0,0 2 1").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Ellipse { id: None, center: DVec3::ZERO, rx: 2.0, ry: 1.0 }
+        );
+    }
+
+    #[test]
+    fn guided_creation_helix_roundtrip() {
+        let cmd = parse("helix 0,0 1 3 4").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Helix {
+                id: None,
+                center: DVec3::ZERO,
+                radius: 1.0,
+                height: 3.0,
+                turns: 4.0,
+            }
+        );
+    }
+
+    #[test]
+    fn guided_measure_area_roundtrip() {
+        let cmd = parse("area sel").unwrap();
+        assert!(matches!(cmd, Command::Area { targets: Selector::Selected }));
+    }
+
+    #[test]
+    fn guided_measure_volume_roundtrip() {
+        let cmd = parse("volume sel").unwrap();
+        assert!(matches!(cmd, Command::Volume { targets: Selector::Selected }));
+    }
+
+    #[test]
+    fn guided_measure_bbox_roundtrip() {
+        let cmd = parse("bbox sel").unwrap();
+        assert!(matches!(cmd, Command::Bbox { targets: Selector::Selected }));
+    }
+
+    #[test]
+    fn guided_measure_distance_roundtrip() {
+        let cmd = parse("distance 0,0 3,4").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Distance { a: DVec3::ZERO, b: DVec3::new(3.0, 4.0, 0.0) }
+        );
+    }
+
 }

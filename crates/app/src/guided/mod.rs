@@ -19,6 +19,7 @@ use glam::DVec3;
 // slice folded into `lookup`. `offset` is the locked reference example.
 mod annotate;
 mod array;
+mod creation;
 mod curve_edit;
 mod offset;
 mod reference_hatch;
@@ -279,6 +280,15 @@ impl GuidedTool {
         self.maybe_finish()
     }
 
+    /// Emit immediately if every step is already satisfied — a zero-step verb
+    /// on a pre-selection (`area sel`, `volume sel`, `bbox sel`). The app calls
+    /// this right after `try_start` returns `Started`: `Some(Emit)` runs the
+    /// command now, `None` means there are steps to prompt for first.
+    pub fn emit_if_ready(&mut self) -> Option<StepResult> {
+        let script = self.script?;
+        (self.done.len() == script.steps.len()).then(|| self.maybe_finish())
+    }
+
     /// Ghost geometry to overlay. Offset needs the source curve (not available
     /// to this pure engine), so v1 draws no ghost — kept for parity with
     /// `draw_tool` and future verbs (mirror axis, array footprint, …).
@@ -313,6 +323,7 @@ fn all_scripts() -> impl Iterator<Item = &'static VerbScript> {
         .chain(curve_edit::SCRIPTS)
         .chain(annotate::SCRIPTS)
         .chain(reference_hatch::SCRIPTS)
+        .chain(creation::SCRIPTS)
 }
 
 /// Verb-script registry lookup. `None` → not a guided verb (fall through to the
@@ -401,7 +412,8 @@ mod tests {
         let mut t = GuidedTool::default();
         // Only a BARE verb starts guided; args fall through to the parser.
         assert_eq!(t.try_start("offset last 0.2", Some("sel")), StartResult::NotGuided);
-        assert_eq!(t.try_start("box", Some("sel")), StartResult::NotGuided);
+        // A verb that isn't in any group's registry is never guided.
+        assert_eq!(t.try_start("sphere", Some("sel")), StartResult::NotGuided);
     }
 
     #[test]

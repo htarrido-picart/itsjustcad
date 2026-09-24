@@ -154,3 +154,40 @@ Produce the authoritative list in the first session by grepping the registry; lo
 - [ ] `cargo build -p itsjustcad --profile quick` + `cargo clippy --workspace -- -D warnings` + `cargo test -p itsjustcad --bin itsjustcad` green.
 - [ ] Rebuild + swap `dist/ItsJustCAD.app`; manual: `offset` with pre-selected curve → prompted for distance/side → runs.
 - [ ] Commit; then fan out per group.
+
+---
+
+## 15. Progress + queued sessions (updated 2026-09-24)
+
+**Done (committed `ca5f14b`):** engine + offset (Session 1); engine extended with `Integer`
++ `Keyword` steps; `guided.rs` split into `guided/` per-group modules
+(`offset.rs` reference + `transform/array/curve_edit/annotate/reference_hatch`
+stubs) so fan-out is collision-free.
+
+**In flight (worktree agents, one file each):** transform, array, curve-edit,
+annotate, reference+hatch, and a new **creation+measure** group
+(extrude/revolve/pipe/box/arc/ellipse/helix + distance/area/volume/bbox).
+
+**Deferred by design — blocked on engine gaps (queued serial sessions):**
+
+- **S-A · Interactive object-pick engine upgrade.** Add a real `SelectObjects`
+  step: click/box-pick objects in the viewport (reuse the normal click-select
+  hit-test), Enter-to-finish, per-step object count/filter. This is foundational
+  (touches `guided/mod.rs` + `app.rs`), so run it **serially after** the current
+  fan-out merges — not in parallel. Unblocks the whole group below.
+- **S-B · Blocked verbs (after S-A).** Verbs needing a 2nd interactively-picked
+  object set: fillet, chamfer, trim, extend, powertrim, arraycurve/patharray,
+  Boolean (union/difference/intersect/exact_boolean), and multi-curve creation
+  (loft, sweep, sweep2, railrevolve, blend, circletan, linetan, lineperp).
+- **S-C · Variadic point input.** `interpcurve`-style verbs need a
+  variable-length point list with Enter-to-finish (mirror `draw_tool`'s polyline
+  close). Small engine addition.
+- **S-D · Free-text step.** `insert`/`block*`/`text`/`field`/`name`/`layer*`
+  need a typed string step (not point/number/keyword). Add a `Text` step that
+  routes to a text-entry affordance.
+- **S-E · Structure/AEC group (large).** wall/column/beam/slab/grid/levels/story/
+  room + the shape family (gridshell/hypar/vault/spaceframe/…); mostly point/line
+  input, guided-able once S-A lands (many take a base curve/points).
+
+**Not guided-relevant:** selection/edit ops (select/group/undo/delete), and
+batch/analysis/file verbs (report/schedule/export/import/sun studies).

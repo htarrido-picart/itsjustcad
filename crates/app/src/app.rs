@@ -1823,7 +1823,11 @@ impl App {
                 let selection = self.current_selection_selector();
                 match self.guided.try_start(line, selection.as_deref()) {
                     StartResult::Started => {
-                        if let Some(prompt) = self.guided.prompt() {
+                        // Zero-step verbs on a pre-selection (area/volume/bbox)
+                        // emit immediately; otherwise show the first prompt.
+                        if let Some(result) = self.guided.emit_if_ready() {
+                            self.handle_guided(result);
+                        } else if let Some(prompt) = self.guided.prompt() {
                             self.command_line.push_line(prompt);
                         }
                         return;
