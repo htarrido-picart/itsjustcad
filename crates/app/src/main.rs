@@ -35,6 +35,7 @@ mod preset;
 mod raytrace_ui;
 mod scene;
 mod sd_catalog;
+mod smarttrack;
 mod statusbar;
 mod suggest;
 mod tabstrip;

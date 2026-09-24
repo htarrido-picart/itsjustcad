@@ -52,6 +52,9 @@ pub fn keymap(key: Key, mods: Modifiers, ctx: KeyContext<'_>) -> Option<String> 
         // modifier (NOT bare G) so it never eats the first letter of a typed
         // command that starts with 'g' (geodesic, grid, group, gaussvault…).
         Key::G if cmd && !ctx.draw_active => "gumball",
+        // Persistent Ortho toggle (AutoCAD/Rhino F8). Fires while drawing too —
+        // toggling ortho mid-pick is the whole point.
+        Key::F8 if bare => "ortho",
         _ => return None,
     };
     Some(line.to_string())
@@ -105,6 +108,18 @@ mod tests {
         let drawing = KeyContext { draw_active: true, ..ctx() };
         assert_eq!(keymap(Key::Backspace, NONE, drawing), None);
         assert_eq!(keymap(Key::Delete, NONE, drawing), None);
+    }
+
+    #[test]
+    fn f8_toggles_ortho_even_while_drawing() {
+        assert_eq!(keymap(Key::F8, NONE, ctx()).unwrap(), "ortho");
+        let drawing = KeyContext { draw_active: true, ..ctx() };
+        assert_eq!(keymap(Key::F8, NONE, drawing).unwrap(), "ortho");
+        // Modified F8 is not ours.
+        assert_eq!(keymap(Key::F8, CMD, ctx()), None);
+        // Typing still suppresses it.
+        let typing = KeyContext { typing: true, ..ctx() };
+        assert_eq!(keymap(Key::F8, NONE, typing), None);
     }
 
     #[test]

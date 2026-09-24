@@ -517,6 +517,23 @@ pub struct App {
     /// Whether the modeless osnap popup (checkbox per snap kind) is open. Opened
     /// by clicking the status-bar osnap chip or the Draft ▸ Object Snap… menu.
     osnap_popup_open: bool,
+    /// Persistent Ortho toggle (AutoCAD/Rhino F8): when on, the draw cursor is
+    /// constrained to 0/90° from the last picked point every frame. Persisted to
+    /// ui.json. UI/session state, never part of the op-log.
+    ortho: bool,
+    /// Persistent SmartTrack toggle: when on, dwelling on an osnap point
+    /// acquires it and projects H/V construction guides the cursor snaps to.
+    /// Persisted to ui.json. UI/session state, never part of the op-log.
+    smarttrack: bool,
+    /// Sticky SmartTrack acquired points (pure store; capped FIFO). Cleared on
+    /// Esc or when the draw tool ends. Session state, never persisted/logged.
+    st_acquired: crate::smarttrack::Acquired,
+    /// Dwell tracking for SmartTrack acquisition: the osnap point currently
+    /// being hovered and the instant the dwell started. Reset when the hovered
+    /// point moves. Session state.
+    st_dwell: Option<(glam::DVec3, std::time::Instant)>,
+    /// SmartTrack guides active this frame (for rendering); rebuilt each frame.
+    st_active_guides: Vec<crate::smarttrack::GuideLine>,
     /// Decoded underlay pixels cached by path, so a scene rebuild (any doc
     /// change) does not re-decode the image every time.
     #[allow(clippy::type_complexity)]
@@ -1042,6 +1059,11 @@ impl App {
             status_snap: None,
             snap_settings: load_snap_settings(),
             osnap_popup_open: false,
+            ortho: load_ortho(),
+            smarttrack: load_smarttrack(),
+            st_acquired: crate::smarttrack::Acquired::new(),
+            st_dwell: None,
+            st_active_guides: Vec::new(),
             underlay_cache: None,
             deck_visible,
             panel_tabs: crate::tabstrip::TabState::default(),
@@ -1558,6 +1580,38 @@ impl App {
                         .command_line
                         .push_line("usage: osnap on|off | osnap <end|mid|cen|int|qua|perp|tan|nod|vtx|near|grid> on|off"),
                 }
+            }
+            // Persistent Ortho (AutoCAD/Rhino F8): `ortho [on|off|toggle]`.
+            // Constrains the draw cursor to 0/90° from the last picked point on
+            // every frame while a draw tool is active. Persisted to ui.json.
+            Some("ortho") => {
+                let on = match words.next() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => !self.ortho, // bare / "toggle"
+                };
+                self.ortho = on;
+                save_ortho(on);
+                self.command_line
+                    .push_line(format!("ortho: {}", if on { "on" } else { "off" }));
+            }
+            // SmartTrack construction guides: `smarttrack [on|off|toggle]`.
+            // Dwelling on an osnap point acquires it; H/V guides through the
+            // acquired points let the cursor align to them. Persisted to ui.json.
+            Some("smarttrack") => {
+                let on = match words.next() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => !self.smarttrack, // bare / "toggle"
+                };
+                self.smarttrack = on;
+                save_smarttrack(on);
+                if !on {
+                    self.st_acquired.clear();
+                    self.st_dwell = None;
+                }
+                self.command_line
+                    .push_line(format!("smarttrack: {}", if on { "on" } else { "off" }));
             }
             // "SketchUp" display preset: Working hemispheric shading + thick
             // profile edges + shaded display. Combines the ergonomics of the
@@ -2681,6 +2735,7 @@ impl App {
             egui::Key::Backspace,
             egui::Key::Escape,
             egui::Key::G,
+            egui::Key::F8,
         ];
         let pressed: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
             i.events
@@ -3646,6 +3701,13 @@ impl App {
                     self.drawing_input(ui, rect, &response, view_proj);
                 }
             } else {
+                // Draw tool ended: SmartTrack acquisitions are per-draw, so
+                // drop the sticky set and any live dwell/guides.
+                if !self.st_acquired.is_empty() || self.st_dwell.is_some() {
+                    self.st_acquired.clear();
+                    self.st_dwell = None;
+                    self.st_active_guides.clear();
+                }
                 // Gumball on the selection (active pane only). A completed
                 // drag emits ONE substrate command through Session::run so
                 // the op-log stays the single source of truth.
@@ -4903,16 +4965,34 @@ impl App {
             ui.ctx().memory_mut(|m| m.surrender_focus(id));
         }
 
-        let (esc, enter, shift, close_key) = ui.input(|i| {
+        let (esc, enter, shift, close_key, f8) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Enter),
                 i.modifiers.shift,
                 i.key_pressed(egui::Key::C),
+                i.key_pressed(egui::Key::F8),
             )
         });
+        // F8 toggles persistent Ortho mid-pick (early_hotkeys skips drawing).
+        if f8 {
+            self.ortho = !self.ortho;
+            save_ortho(self.ortho);
+            self.command_line
+                .push_line(format!("ortho: {}", if self.ortho { "on" } else { "off" }));
+        }
+        // Esc: if SmartTrack has acquired points, clear THEM first (consume Esc)
+        // so the draw is not cancelled; a second Esc (nothing acquired) cancels.
         if esc {
+            if !self.st_acquired.is_empty() {
+                self.st_acquired.clear();
+                self.st_dwell = None;
+                self.command_line.push_line("smarttrack: cleared");
+                return;
+            }
             self.draw_tool.cancel();
+            self.st_acquired.clear();
+            self.st_dwell = None;
             self.command_line.push_line("drawing cancelled");
             return;
         }
@@ -4961,7 +5041,7 @@ impl App {
             .or_else(|| response.interact_pointer_pos());
         let last_point = self.draw_tool.last_point();
         let snap_settings = self.snap_settings;
-        let mut snap_hit = cursor_px.and_then(|pos| {
+        let snap_hit = cursor_px.and_then(|pos| {
             // Screen-proximity cull: only objects whose projected AABB (grown by
             // the snap radius) covers the cursor contribute snap points. At 10k
             // objects this trims the candidate list from every vertex in the
@@ -4991,11 +5071,70 @@ impl App {
                 .and_then(|pos| ground_point(view_proj, rect, pos))
                 .map(|p| if grid_on { crate::osnap::grid_snap(p) } else { p })
         });
-        // Shift = ortho lock: 0°/90° from the last picked point overrides
-        // osnap (marker off, the constrained point is what a click commits).
-        if shift && let (Some(last), Some(c)) = (self.draw_tool.last_point(), cursor_world) {
-            cursor_world = Some(crate::precise::ortho_lock(last, c));
-            snap_hit = None;
+        // World-space tolerance = SNAP_RADIUS_PX converted through the current
+        // view scale (world units per screen pixel on the ground plane). Derived
+        // by projecting two ground points one pixel apart; falls back to a small
+        // constant if the projection is degenerate (e.g. edge-on view).
+        let world_per_px = cursor_px.and_then(|pos| {
+            let a = ground_point(view_proj, rect, pos)?;
+            let b = ground_point(view_proj, rect, pos + egui::vec2(1.0, 0.0))?;
+            let d = a.distance(b);
+            (d.is_finite() && d > 1e-9).then_some(d)
+        });
+        let st_tol = world_per_px.map(|w| w * crate::osnap::SNAP_RADIUS_PX as f64);
+
+        // SmartTrack acquisition (timing lives here): while on, dwelling on an
+        // osnap point for >= DWELL acquires it into the sticky set.
+        self.st_active_guides.clear();
+        if self.smarttrack {
+            const DWELL: std::time::Duration = std::time::Duration::from_millis(250);
+            let dedup = st_tol.unwrap_or(0.001);
+            match snap_hit {
+                Some((p, _)) => {
+                    let now = std::time::Instant::now();
+                    let restart = self
+                        .st_dwell
+                        .map(|(q, _)| q.distance(p) > dedup)
+                        .unwrap_or(true);
+                    if restart {
+                        self.st_dwell = Some((p, now));
+                    } else if let Some((_, since)) = self.st_dwell
+                        && now.duration_since(since) >= DWELL
+                    {
+                        self.st_acquired.acquire(p, dedup);
+                        // Keep the dwell so we don't re-acquire every frame; a
+                        // move away resets it via the `restart` branch.
+                    }
+                }
+                None => self.st_dwell = None,
+            }
+        } else {
+            self.st_dwell = None;
+        }
+
+        // Cursor resolution precedence:
+        //   (1) a DIRECT osnap hit wins — never overridden by a guide;
+        //   (2) else SmartTrack guide snap (records active guides to draw);
+        //   (3) else ortho lock (persistent toggle OR momentary Shift);
+        //   (4) else the plain ground/grid point resolved above.
+        let apply_ortho = self.ortho || shift;
+        if snap_hit.is_none() {
+            let mut handled = false;
+            if self.smarttrack
+                && let (Some(c), Some(tol)) = (cursor_world, st_tol)
+                && let Some(s) =
+                    crate::smarttrack::snap(&self.st_acquired, c, self.draw_tool.last_point(), tol)
+            {
+                cursor_world = Some(s.snapped);
+                self.st_active_guides = s.active;
+                handled = true;
+            }
+            if !handled
+                && apply_ortho
+                && let (Some(last), Some(c)) = (self.draw_tool.last_point(), cursor_world)
+            {
+                cursor_world = Some(crate::precise::ortho_lock(last, c));
+            }
         }
         self.status_snap = snap_hit.map(|(_, kind)| kind.label());
 
@@ -5033,8 +5172,45 @@ impl App {
             }
         }
 
-        // Ghost preview + prompt overlay
+        // SmartTrack: dashed construction guides (drawn UNDER the ghost line so
+        // the rubber-band segment stays legible) + a small cross on each
+        // acquired point. Rhino paints these a muted white/grey; a big world
+        // span past the origin covers the viewport in the top-ortho drafting view.
         let painter = ui.painter_at(rect);
+        if self.smarttrack {
+            let guide_color = egui::Color32::from_rgba_unmultiplied(210, 210, 210, 170);
+            let guide_stroke = egui::Stroke::new(1.0, guide_color);
+            const SPAN: f64 = 1.0e6;
+            for g in &self.st_active_guides {
+                let d = g.dir() * SPAN;
+                if let (Some(a), Some(b)) = (
+                    project(view_proj, rect, g.origin - d),
+                    project(view_proj, rect, g.origin + d),
+                ) {
+                    // Dashed: egui's dashed_line into the painter.
+                    let dashed = egui::Shape::dashed_line(&[a, b], guide_stroke, 6.0, 4.0);
+                    painter.extend(dashed);
+                }
+            }
+            // Acquired-point markers: a little cross/tick.
+            let mark_color = egui::Color32::from_rgb(230, 230, 230);
+            let mark_stroke = egui::Stroke::new(1.5, mark_color);
+            for &pt in self.st_acquired.points() {
+                if let Some(s) = project(view_proj, rect, pt) {
+                    let r = 4.0;
+                    painter.line_segment(
+                        [s + egui::vec2(-r, 0.0), s + egui::vec2(r, 0.0)],
+                        mark_stroke,
+                    );
+                    painter.line_segment(
+                        [s + egui::vec2(0.0, -r), s + egui::vec2(0.0, r)],
+                        mark_stroke,
+                    );
+                }
+            }
+        }
+
+        // Ghost preview + prompt overlay
         let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 160, 255));
         for strip in self.draw_tool.preview(cursor_world) {
             for pair in strip.windows(2) {
@@ -5142,6 +5318,38 @@ impl App {
                 .clicked()
             {
                 self.osnap_popup_open = !self.osnap_popup_open;
+            }
+            ui.separator();
+            // Ortho + SmartTrack toggle chips (mirror the `ortho`/`smarttrack`
+            // verbs, F8, and the resolution flow). Same look as the gumball chip:
+            // ON = accent fill + on-accent text; OFF = frameless dimmed text.
+            let (on_fill, on_txt) = crate::theme::viewport_active_tag(ui.visuals().dark_mode);
+            let toggle_chip = |ui: &mut egui::Ui, label: &str, on: bool, tip: &str| -> bool {
+                let txt = if on { on_txt } else { ui.visuals().weak_text_color() };
+                let mut btn = egui::Button::new(egui::RichText::new(label).color(txt))
+                    .frame(on)
+                    .corner_radius(egui::CornerRadius::same(4));
+                if on {
+                    btn = btn.fill(on_fill);
+                }
+                ui.add(btn).on_hover_text(tip.to_owned()).clicked()
+            };
+            if toggle_chip(ui, "ortho", self.ortho, "Toggle persistent ortho (F8)") {
+                self.ortho = !self.ortho;
+                save_ortho(self.ortho);
+            }
+            if toggle_chip(
+                ui,
+                "smarttrack",
+                self.smarttrack,
+                "Toggle SmartTrack construction guides",
+            ) {
+                self.smarttrack = !self.smarttrack;
+                save_smarttrack(self.smarttrack);
+                if !self.smarttrack {
+                    self.st_acquired.clear();
+                    self.st_dwell = None;
+                }
             }
             ui.separator();
             ui.label(format!(
@@ -7604,6 +7812,28 @@ fn load_snap_settings() -> crate::osnap::SnapSettings {
 fn save_snap_settings(s: &crate::osnap::SnapSettings) {
     let mut v = load_ui_json();
     v["osnap"] = (*s).to_json();
+    save_ui_json(&v);
+}
+
+/// Restore the persisted persistent-Ortho toggle (default OFF when absent).
+fn load_ortho() -> bool {
+    load_ui_json()["ortho"].as_bool().unwrap_or(false)
+}
+
+fn save_ortho(on: bool) {
+    let mut v = load_ui_json();
+    v["ortho"] = serde_json::json!(on);
+    save_ui_json(&v);
+}
+
+/// Restore the persisted SmartTrack toggle (default OFF when absent).
+fn load_smarttrack() -> bool {
+    load_ui_json()["smarttrack"].as_bool().unwrap_or(false)
+}
+
+fn save_smarttrack(on: bool) {
+    let mut v = load_ui_json();
+    v["smarttrack"] = serde_json::json!(on);
     save_ui_json(&v);
 }
 
