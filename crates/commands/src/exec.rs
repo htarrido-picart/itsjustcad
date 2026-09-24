@@ -10284,7 +10284,7 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Offset { id, target, distance } => {
+        Command::Offset { id, target, distance, side } => {
             let ids = resolve(doc, &target)?;
             if ids.len() != 1 {
                 return Err(ExecError::Invalid(format!(
@@ -10297,6 +10297,29 @@ fn apply_forward(
                 return Err(ExecError::Invalid(
                     "offset works on curves; meshes cannot be offset".into(),
                 ));
+            };
+            // A guided "side to offset toward" point picks the sign: try both
+            // signed offsets and keep whichever lands nearer the picked side.
+            // The magnitude is always honored; only the direction is inferred.
+            let distance = match side {
+                Some(side) => {
+                    let mag = distance.abs();
+                    let nearest = |d: f64| {
+                        curve.offset(d, PROFILE_TOL).map(|c| {
+                            c.tessellate(PROFILE_TOL)
+                                .into_iter()
+                                .map(|p| p.distance(side))
+                                .fold(f64::INFINITY, f64::min)
+                        })
+                    };
+                    match (nearest(mag), nearest(-mag)) {
+                        (Some(pos), Some(neg)) if neg < pos => -mag,
+                        (Some(_), _) => mag,
+                        (None, Some(_)) => -mag,
+                        (None, None) => mag, // both collapse; let offset() below error
+                    }
+                }
+                None => distance,
             };
             let offset = curve.offset(distance, PROFILE_TOL).ok_or_else(|| {
                 ExecError::Invalid(format!(
@@ -10319,7 +10342,7 @@ fn apply_forward(
                 geometry: Geometry::Curve(offset),
             });
             Ok((
-                Command::Offset { id: Some(id), target, distance },
+                Command::Offset { id: Some(id), target, distance, side: None },
                 Inverse::DeleteCreated(vec![id]),
                 ApplyOutcome {
                     created: vec![id],

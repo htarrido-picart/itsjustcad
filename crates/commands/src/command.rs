@@ -875,6 +875,12 @@ pub enum Command {
         id: Option<ObjectId>,
         target: Selector,
         distance: f64,
+        /// Optional "side to offset toward" point (guided flow / Rhino's side
+        /// pick). When present, the executor flips the sign of `distance` so the
+        /// result lands on the side of `side`; the echoed command drops it and
+        /// stores the resolved signed distance, keeping replay geometry-free.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        side: Option<DVec3>,
     },
     Copy {
         #[serde(default, skip_serializing_if = "Option::is_none")]

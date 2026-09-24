@@ -10,6 +10,7 @@ use itsjustcad_render::{
 use crate::command_line::CommandLine;
 use crate::deck_pane::DeckPane;
 use crate::draw_tool::DrawTool;
+use crate::guided::{GuidedTool, StartResult, StepResult};
 use crate::gumball::Gumball;
 use crate::journal::{self, Journal};
 use crate::keymap;
@@ -370,6 +371,10 @@ pub struct App {
     command_line: CommandLine,
     deck_pane: DeckPane,
     draw_tool: DrawTool,
+    /// Rhino-style guided command engine (bare-verb step machine); shares the
+    /// snap/ortho/smarttrack path with `draw_tool` and is mutually exclusive
+    /// with it. See [`crate::guided`].
+    guided: GuidedTool,
     gumball: Gumball,
     point_edit: crate::point_edit::PointEdit,
     tokio: tokio::runtime::Handle,
@@ -994,6 +999,7 @@ impl App {
             command_line,
             deck_pane: DeckPane::default(),
             draw_tool: DrawTool::default(),
+            guided: GuidedTool::default(),
             gumball: Gumball::default(),
             point_edit: crate::point_edit::PointEdit::default(),
             tokio,
@@ -1811,6 +1817,25 @@ impl App {
                         self.command_line.push_line(prompt);
                     }
                     return;
+                }
+                // Guided command engine: a bare guided verb walks the user
+                // through its steps and emits the canonical command string.
+                let selection = self.current_selection_selector();
+                match self.guided.try_start(line, selection.as_deref()) {
+                    StartResult::Started => {
+                        if let Some(prompt) = self.guided.prompt() {
+                            self.command_line.push_line(prompt);
+                        }
+                        return;
+                    }
+                    StartResult::NeedSelection => {
+                        self.command_line.push_line(format!(
+                            "{}: select object(s) first, then run the command",
+                            line.trim()
+                        ));
+                        return;
+                    }
+                    StartResult::NotGuided => {}
                 }
                 self.command_line.execute(&mut self.session, line);
             }
@@ -2725,6 +2750,7 @@ impl App {
         let chat_composing = focused == Some(chat_id);
         if modal
             || self.draw_tool.active()
+            || self.guided.active()
             || chat_composing
             || !self.command_line.is_empty()
         {
@@ -3544,7 +3570,7 @@ impl App {
         let full = clamp_viewport_rect(ui.available_rect_before_wrap(), self.dock_left);
         // Fresh each frame; set below if a pane is clicked/dragged this frame.
         self.viewport_interacted = false;
-        if !self.draw_tool.active() {
+        if !self.draw_tool.active() && !self.guided.active() {
             self.status_snap = None; // no tool, no snap marker to report
         }
         if self.active_pane >= self.layout.pane_count() {
@@ -3555,7 +3581,7 @@ impl App {
         // — no hover flicker. EXCEPTION: while a draw tool is armed, the pane under
         // the cursor becomes active so points can be picked in ANY viewport
         // mid-command (Rhino lets you pick across viewports during a command).
-        if self.draw_tool.active()
+        if (self.draw_tool.active() || self.guided.active())
             && let Some(pos) = ui.ctx().pointer_latest_pos()
             && let Some(pane) = self.layout.pane_at(full, pos)
         {
@@ -3692,7 +3718,7 @@ impl App {
                 }
             }
 
-            if self.draw_tool.active() {
+            if self.draw_tool.active() || self.guided.active() {
                 // Draw/osnap only in the active pane; one prompt, one ghost.
                 if pane == self.active_pane {
                     if response.hovered() {
@@ -3947,7 +3973,7 @@ impl App {
         // Only rendered over the active pane so multi-view layouts stay uncluttered.
         if show_empty_document(
             &self.session.doc,
-            self.draw_tool.active(),
+            self.draw_tool.active() || self.guided.active(),
             load_onboarding_done(),
         ) {
             let pane_rect = panes.get(self.active_pane).copied().unwrap_or(full);
@@ -3955,7 +3981,7 @@ impl App {
         } else if !self.preview_no_viewport
             && show_empty_document_hint(
                 &self.session.doc,
-                self.draw_tool.active(),
+                self.draw_tool.active() || self.guided.active(),
                 load_onboarding_done(),
             )
         {
@@ -4951,6 +4977,30 @@ impl App {
         }
     }
 
+    /// Canonical selector for the current selection, or `None` when nothing is
+    /// selected. Guided noun-verb flows seed their object step from this.
+    fn current_selection_selector(&self) -> Option<String> {
+        if self.session.doc.selection.is_empty() {
+            None
+        } else {
+            Some("sel".to_string())
+        }
+    }
+
+    /// Dispatch a guided-tool step outcome: run the emitted command, surface an
+    /// error, or re-show the next prompt.
+    fn handle_guided(&mut self, result: StepResult) {
+        match result {
+            StepResult::Emit(cmd) => self.execute_line(cmd),
+            StepResult::Error(e) => self.command_line.push_line(format!("error: {e}")),
+            StepResult::NeedMore => {
+                if let Some(prompt) = self.guided.prompt() {
+                    self.command_line.push_line(prompt);
+                }
+            }
+        }
+    }
+
     /// Interactive drawing: picks on the ground plane, ghost preview, prompt.
     fn drawing_input(
         &mut self,
@@ -4964,6 +5014,10 @@ impl App {
         if let Some(id) = ui.ctx().memory(|m| m.focused()) {
             ui.ctx().memory_mut(|m| m.surrender_focus(id));
         }
+        // Guided engine and draw tool are mutually exclusive; when guided is
+        // armed it drives the pick/enter/preview dispatch below, otherwise the
+        // draw tool does. They share the snap/ortho/smarttrack resolution.
+        let guided_active = self.guided.active();
 
         let (esc, enter, shift, close_key, f8) = ui.input(|i| {
             (
@@ -4991,6 +5045,7 @@ impl App {
                 return;
             }
             self.draw_tool.cancel();
+            self.guided.cancel();
             self.st_acquired.clear();
             self.st_dwell = None;
             self.command_line.push_line("drawing cancelled");
@@ -5025,11 +5080,19 @@ impl App {
             match event {
                 egui::Event::Text(t) => {
                     for c in t.chars() {
-                        self.draw_tool.push_input(c);
+                        if guided_active {
+                            self.guided.push_input(c);
+                        } else {
+                            self.draw_tool.push_input(c);
+                        }
                     }
                 }
                 _ => {
-                    self.draw_tool.pop_input();
+                    if guided_active {
+                        self.guided.pop_input();
+                    } else {
+                        self.draw_tool.pop_input();
+                    }
                 }
             }
         }
@@ -5039,7 +5102,11 @@ impl App {
         let cursor_px = response
             .hover_pos()
             .or_else(|| response.interact_pointer_pos());
-        let last_point = self.draw_tool.last_point();
+        let last_point = if guided_active {
+            self.guided.last_point()
+        } else {
+            self.draw_tool.last_point()
+        };
         let snap_settings = self.snap_settings;
         let snap_hit = cursor_px.and_then(|pos| {
             // Screen-proximity cull: only objects whose projected AABB (grown by
@@ -5122,8 +5189,7 @@ impl App {
             let mut handled = false;
             if self.smarttrack
                 && let (Some(c), Some(tol)) = (cursor_world, st_tol)
-                && let Some(s) =
-                    crate::smarttrack::snap(&self.st_acquired, c, self.draw_tool.last_point(), tol)
+                && let Some(s) = crate::smarttrack::snap(&self.st_acquired, c, last_point, tol)
             {
                 cursor_world = Some(s.snapped);
                 self.st_active_guides = s.active;
@@ -5131,7 +5197,7 @@ impl App {
             }
             if !handled
                 && apply_ortho
-                && let (Some(last), Some(c)) = (self.draw_tool.last_point(), cursor_world)
+                && let (Some(last), Some(c)) = (last_point, cursor_world)
             {
                 cursor_world = Some(crate::precise::ortho_lock(last, c));
             }
@@ -5139,14 +5205,32 @@ impl App {
         self.status_snap = snap_hit.map(|(_, kind)| kind.label());
 
         if enter {
+            if guided_active {
+                let buffer = self.guided.take_input();
+                if self.guided.current_is_point() {
+                    // A point step: typed coords resolve to a pick; a bare Enter
+                    // needs a click, so an empty buffer is a no-op here.
+                    if !buffer.is_empty() {
+                        match crate::precise::resolve_input(&buffer, last_point, cursor_world) {
+                            Ok(world) => {
+                                let r = self.guided.on_click(world);
+                                self.handle_guided(r);
+                            }
+                            Err(e) => self.command_line.push_line(format!("error: {e}")),
+                        }
+                    }
+                } else {
+                    // Number / Integer / Keyword step: empty Enter accepts the
+                    // default, otherwise the typed buffer is parsed per kind.
+                    let r = self.guided.commit_typed(&buffer);
+                    self.handle_guided(r);
+                }
+                return;
+            }
             let buffer = self.draw_tool.take_input();
             if !buffer.is_empty() {
                 // Precise input: resolve the typed point, feed it as a pick.
-                match crate::precise::resolve_input(
-                    &buffer,
-                    self.draw_tool.last_point(),
-                    cursor_world,
-                ) {
+                match crate::precise::resolve_input(&buffer, last_point, cursor_world) {
                     Ok(world) => {
                         if let Some(cmd) = self.draw_tool.on_click(world) {
                             self.execute_line(cmd);
@@ -5164,6 +5248,15 @@ impl App {
         }
 
         if response.clicked() && let Some(world) = cursor_world {
+            if guided_active {
+                // Clicks only advance point steps; ignored on number steps so a
+                // stray click doesn't spam the prompt.
+                if self.guided.current_is_point() {
+                    let r = self.guided.on_click(world);
+                    self.handle_guided(r);
+                }
+                return;
+            }
             if let Some(cmd) = self.draw_tool.on_click(world) {
                 self.execute_line(cmd);
                 return;
@@ -5212,7 +5305,12 @@ impl App {
 
         // Ghost preview + prompt overlay
         let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 160, 255));
-        for strip in self.draw_tool.preview(cursor_world) {
+        let preview = if guided_active {
+            self.guided.preview(cursor_world)
+        } else {
+            self.draw_tool.preview(cursor_world)
+        };
+        for strip in preview {
             for pair in strip.windows(2) {
                 if let (Some(a), Some(b)) = (
                     project(view_proj, rect, pair[0]),
@@ -5256,7 +5354,12 @@ impl App {
                 color,
             );
         }
-        if let Some(prompt) = self.draw_tool.prompt() {
+        let overlay_prompt = if guided_active {
+            self.guided.prompt()
+        } else {
+            self.draw_tool.prompt()
+        };
+        if let Some(prompt) = overlay_prompt {
             painter.text(
                 rect.center_top() + egui::vec2(0.0, 28.0),
                 egui::Align2::CENTER_TOP,
@@ -5304,7 +5407,10 @@ impl App {
             // opens the modeless osnap popup (checkbox per kind). This is the
             // "click the osnap toolbar → popup" discoverability surface.
             let label = if self.snap_settings.master {
-                crate::statusbar::snap_label(self.draw_tool.active(), self.status_snap)
+                crate::statusbar::snap_label(
+                    self.draw_tool.active() || self.guided.active(),
+                    self.status_snap,
+                )
             } else {
                 format!("{}: {}", crate::i18n::t("osnap.label"), crate::i18n::t("osnap.off"))
             };
@@ -8913,7 +9019,7 @@ impl eframe::App for App {
                 mods,
                 keymap::KeyContext {
                     typing,
-                    draw_active: self.draw_tool.active(),
+                    draw_active: self.draw_tool.active() || self.guided.active(),
                     has_selection: !self.session.doc.selection.is_empty(),
                     last_command: self.last_line.as_deref(),
                 },
@@ -9008,6 +9114,7 @@ impl eframe::App for App {
             || self.pending_nav.is_some();
         if !modal_open
             && !self.draw_tool.active()
+            && !self.guided.active()
             && !self.viewport_interacted
             && ctx.memory(|m| m.focused()).is_none()
         {

@@ -488,8 +488,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "offset",
-            usage: "offset <selector> <distance>",
-            summary: "Offset a curve in the XY plane; original kept. Closed curves: positive = outward, negative = inward (walls from centerlines: offset both ways, extrude). Example: offset last 0.2",
+            usage: "offset <selector> <distance> [side-point]",
+            summary: "Offset a curve in the XY plane; original kept. Closed curves: positive = outward, negative = inward (walls from centerlines: offset both ways, extrude). An optional trailing side point picks the direction (the guided flow supplies it). Example: offset last 0.2",
             category: Category::Curve,
         },
         CommandSpec {

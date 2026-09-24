@@ -974,12 +974,24 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             Ok(Command::DimRadius { id: None, target: sel, diameter: true })
         }
         "offset" => with_last_backtrack(&args, "offset", |sel, rest, args| {
-            let [dist] = take::<1>("offset", "a distance after the selector", rest)
-                .map_err(|_| wrong_err("offset", "a distance after the selector", args))?;
+            // `offset <sel> <dist> [side]` — the optional side point (guided /
+            // Rhino side-pick) is resolved to a sign by the executor.
+            let (dist, side) = match rest {
+                [d] => (*d, None),
+                [d, p] => (*d, Some(point(p)?)),
+                _ => {
+                    return Err(wrong_err(
+                        "offset",
+                        "a distance (and optional side point) after the selector",
+                        args,
+                    ));
+                }
+            };
             Ok(Command::Offset {
                 id: None,
                 target: sel,
                 distance: number(dist)?,
+                side,
             })
         }),
         "split" => {
@@ -4531,6 +4543,20 @@ mod tests {
             parse("offset walls -0.5").unwrap(),
             Command::Offset { distance, .. } if distance == -0.5
         ));
+        // A trailing side point parses into `side` (guided direction pick); the
+        // distance stays positive — the executor resolves the sign.
+        assert!(matches!(
+            parse("offset last 0.2 3,0").unwrap(),
+            Command::Offset { distance, side: Some(p), .. }
+                if distance == 0.2 && p.x == 3.0 && p.y == 0.0
+        ));
+        // No side point → `side` is None.
+        assert!(matches!(
+            parse("offset last 0.2").unwrap(),
+            Command::Offset { side: None, .. }
+        ));
+        // Garbage after the distance is still rejected.
+        assert!(parse("offset last 0.2 3,0 extra").is_err());
         // rotate needs an angle
         let err = parse("rotate last").unwrap_err();
         assert!(err.to_string().contains("angle"), "{err}");
