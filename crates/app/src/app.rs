@@ -16,6 +16,25 @@ use crate::keymap;
 use crate::preset::{self, CadOrigin};
 use crate::scene;
 
+/// Minimum command-line height (points): the input row plus ~4 history lines —
+/// always enough to type into AND read recent output, so a drag can't squeeze
+/// the command line down to a single cramped row.
+pub(crate) const CMD_HEIGHT_MIN: f32 = 4.0 * 16.0 + 44.0;
+/// Default command-line height (points) when nothing is persisted: ~5 history
+/// lines (≈16pt each) plus the input-row reserve — the height the region used
+/// before it became user-resizable.
+pub(crate) const CMD_HEIGHT_DEFAULT: f32 = 5.0 * 16.0 + 44.0;
+/// Thickness (points) of the draggable splitter handle strip at the top edge of
+/// the command line.
+const CMD_SPLITTER_H: f32 = 6.0;
+
+/// Clamp a candidate command-line height to `[CMD_HEIGHT_MIN, 0.6 * column_h]`
+/// so the deck body above always keeps a sane minimum. Pure — unit-tested.
+pub(crate) fn clamp_cmd_height(candidate: f32, column_h: f32) -> f32 {
+    let max = (column_h * 0.6).max(CMD_HEIGHT_MIN);
+    candidate.clamp(CMD_HEIGHT_MIN, max)
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) enum TemplateUnits {
     Meters,
@@ -323,6 +342,29 @@ fn move_delta(origin: glam::DVec3, target: glam::DVec3) -> Option<glam::DVec3> {
     }
 }
 
+/// Destructive verbs that must NEVER be stored as `last_verb` — an empty
+/// Enter/Space must never pre-arm a delete. Compared case-insensitively.
+const DESTRUCTIVE_VERBS: [&str; 5] = ["delete", "erase", "purge", "deleteall", "clear"];
+
+/// Pure helper: true when `verb` is a destructive command word (case-insensitive)
+/// that should be excluded from `last_verb` recall.
+fn is_destructive_verb(verb: &str) -> bool {
+    DESTRUCTIVE_VERBS
+        .iter()
+        .any(|d| verb.eq_ignore_ascii_case(d))
+}
+
+/// Pure helper: given the previous `last_verb` and a freshly-entered command
+/// `line`, return the verb to store. Extracts the FIRST whitespace-delimited
+/// token; keeps the previous value when the line is empty or its verb is
+/// destructive (so empty-Enter recall never pre-arms a delete).
+fn next_last_verb(prev: Option<String>, line: &str) -> Option<String> {
+    match line.split_whitespace().next() {
+        Some(verb) if !is_destructive_verb(verb) => Some(verb.to_string()),
+        _ => prev,
+    }
+}
+
 pub struct App {
     session: Session,
     command_line: CommandLine,
@@ -408,8 +450,13 @@ pub struct App {
     /// edit buffers plus the AABB-min snapshot they were seeded from, so the
     /// commit can compute a `move` delta against the live selection origin.
     pending_object_pos: Option<PendingPos>,
-    /// Last executed command line; Enter/Space on the canvas repeats it.
+    /// Last executed command line; viewport right-click repeats it verbatim.
     last_line: Option<String>,
+    /// Last non-destructive VERB entered at the command line (first token only).
+    /// An empty Enter/Space populates the input with `<verb> ` for fresh args;
+    /// destructive verbs (delete/erase/…) never overwrite it. Separate from
+    /// `last_line`, which drives verbatim right-click repeat.
+    last_verb: Option<String>,
     /// A `critique` request awaiting its viewport screenshot. Holds the
     /// optional user question; once the tagged Screenshot event lands, the PNG
     /// is written and a vision deck turn (Read tool enabled) is fired.
@@ -470,6 +517,23 @@ pub struct App {
     /// Whether the modeless osnap popup (checkbox per snap kind) is open. Opened
     /// by clicking the status-bar osnap chip or the Draft ▸ Object Snap… menu.
     osnap_popup_open: bool,
+    /// Persistent Ortho toggle (AutoCAD/Rhino F8): when on, the draw cursor is
+    /// constrained to 0/90° from the last picked point every frame. Persisted to
+    /// ui.json. UI/session state, never part of the op-log.
+    ortho: bool,
+    /// Persistent SmartTrack toggle: when on, dwelling on an osnap point
+    /// acquires it and projects H/V construction guides the cursor snaps to.
+    /// Persisted to ui.json. UI/session state, never part of the op-log.
+    smarttrack: bool,
+    /// Sticky SmartTrack acquired points (pure store; capped FIFO). Cleared on
+    /// Esc or when the draw tool ends. Session state, never persisted/logged.
+    st_acquired: crate::smarttrack::Acquired,
+    /// Dwell tracking for SmartTrack acquisition: the osnap point currently
+    /// being hovered and the instant the dwell started. Reset when the hovered
+    /// point moves. Session state.
+    st_dwell: Option<(glam::DVec3, std::time::Instant)>,
+    /// SmartTrack guides active this frame (for rendering); rebuilt each frame.
+    st_active_guides: Vec<crate::smarttrack::GuideLine>,
     /// Decoded underlay pixels cached by path, so a scene rebuild (any doc
     /// change) does not re-decode the image every time.
     #[allow(clippy::type_complexity)]
@@ -520,6 +584,18 @@ pub struct App {
     /// tabs never changes it (the panel always renders at this width). This is
     /// the single width source of truth — see `right_panel`.
     dock_width: f32,
+    /// Height (points) of the command-line region docked at the bottom of the
+    /// right column. A user drags the thin handle strip at the TOP of the command
+    /// line to resize it: dragging UP grows the command line (and implicitly
+    /// shrinks the deck body above it); dragging DOWN does the reverse. The panel
+    /// itself is ALWAYS rendered with `.exact_size(cmd_height)` (never
+    /// `.resizable(true)`) so its rect is deterministic every frame — this is what
+    /// keeps the TextEdit's focus/keystroke handling stable (the c2cfcff dropped-
+    /// keystroke bug came from a *resizable* nested panel whose two resize handles
+    /// fought frame-to-frame). One manual splitter controls BOTH sizes. Clamped to
+    /// [`CMD_HEIGHT_MIN`, 60% of the column height] each frame. Persisted to
+    /// `ui.json` like `dock_width`.
+    cmd_height: f32,
     /// Screen-space x of the right dock's ACTUAL drawn left edge this frame, or
     /// `None` when the dock is hidden. The viewport clamps its right edge to this
     /// so the 3D wgpu callback (painted last, scissored to the central rect) can
@@ -962,6 +1038,7 @@ impl App {
             pending_object_name: None,
             pending_object_pos: None,
             last_line: None,
+            last_verb: None,
             pending_critique: None,
             render_job: None,
             render_conn_test: None,
@@ -982,6 +1059,11 @@ impl App {
             status_snap: None,
             snap_settings: load_snap_settings(),
             osnap_popup_open: false,
+            ortho: load_ortho(),
+            smarttrack: load_smarttrack(),
+            st_acquired: crate::smarttrack::Acquired::new(),
+            st_dwell: None,
+            st_active_guides: Vec::new(),
             underlay_cache: None,
             deck_visible,
             panel_tabs: crate::tabstrip::TabState::default(),
@@ -999,6 +1081,7 @@ impl App {
             pending_plugin_delete: None,
             plugin_json_view: None,
             dock_width: crate::tabstrip::DOCK_WIDTH,
+            cmd_height: load_cmd_height().unwrap_or(CMD_HEIGHT_DEFAULT),
             dock_left: None,
             panel_visible: true,
             reduce_motion: load_reduce_motion(),
@@ -1271,20 +1354,31 @@ impl App {
 
     /// App-level verbs (save/open, camera) wrap the command substrate.
     fn execute_line(&mut self, line: String) {
+        // Empty submissions never reach here as executable input: the command line
+        // now populates the last verb on empty Enter/Space (see command_line.rs)
+        // rather than re-running. A stray empty line is a silent no-op.
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        // Remember the VERBATIM entered string (pre-alias-expansion) for the
+        // viewport right-click "repeat last command verbatim".
+        self.last_line = Some(trimmed.to_string());
+        // Track the last non-destructive VERB (first token) for empty-Enter/Space
+        // recall — destructive verbs (delete/erase/…) leave it pointing at the
+        // previous eligible verb.
+        self.last_verb = next_last_verb(self.last_verb.take(), trimmed);
         // Expand legacy-CAD alias BEFORE any dispatch (case-insensitive single-token).
         let expanded: String;
         let line = {
             let aliases = self.active_aliases();
-            if let Some(exp) = preset::expand_alias(line.trim(), aliases) {
+            if let Some(exp) = preset::expand_alias(trimmed, aliases) {
                 expanded = exp;
                 expanded.as_str()
             } else {
-                line.trim()
+                trimmed
             }
         };
-        if !line.is_empty() {
-            self.last_line = Some(line.to_string()); // Enter/Space repeat
-        }
         let mut words = line.split_whitespace();
         match words.next() {
             Some("save") => self.save(words.next().map(Into::into)),
@@ -1486,6 +1580,38 @@ impl App {
                         .command_line
                         .push_line("usage: osnap on|off | osnap <end|mid|cen|int|qua|perp|tan|nod|vtx|near|grid> on|off"),
                 }
+            }
+            // Persistent Ortho (AutoCAD/Rhino F8): `ortho [on|off|toggle]`.
+            // Constrains the draw cursor to 0/90° from the last picked point on
+            // every frame while a draw tool is active. Persisted to ui.json.
+            Some("ortho") => {
+                let on = match words.next() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => !self.ortho, // bare / "toggle"
+                };
+                self.ortho = on;
+                save_ortho(on);
+                self.command_line
+                    .push_line(format!("ortho: {}", if on { "on" } else { "off" }));
+            }
+            // SmartTrack construction guides: `smarttrack [on|off|toggle]`.
+            // Dwelling on an osnap point acquires it; H/V guides through the
+            // acquired points let the cursor align to them. Persisted to ui.json.
+            Some("smarttrack") => {
+                let on = match words.next() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => !self.smarttrack, // bare / "toggle"
+                };
+                self.smarttrack = on;
+                save_smarttrack(on);
+                if !on {
+                    self.st_acquired.clear();
+                    self.st_dwell = None;
+                }
+                self.command_line
+                    .push_line(format!("smarttrack: {}", if on { "on" } else { "off" }));
             }
             // "SketchUp" display preset: Working hemispheric shading + thick
             // profile edges + shaded display. Combines the ergonomics of the
@@ -2609,6 +2735,7 @@ impl App {
             egui::Key::Backspace,
             egui::Key::Escape,
             egui::Key::G,
+            egui::Key::F8,
         ];
         let pressed: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
             i.events
@@ -3574,6 +3701,13 @@ impl App {
                     self.drawing_input(ui, rect, &response, view_proj);
                 }
             } else {
+                // Draw tool ended: SmartTrack acquisitions are per-draw, so
+                // drop the sticky set and any live dwell/guides.
+                if !self.st_acquired.is_empty() || self.st_dwell.is_some() {
+                    self.st_acquired.clear();
+                    self.st_dwell = None;
+                    self.st_active_guides.clear();
+                }
                 // Gumball on the selection (active pane only). A completed
                 // drag emits ONE substrate command through Session::run so
                 // the op-log stays the single source of truth.
@@ -4831,16 +4965,34 @@ impl App {
             ui.ctx().memory_mut(|m| m.surrender_focus(id));
         }
 
-        let (esc, enter, shift, close_key) = ui.input(|i| {
+        let (esc, enter, shift, close_key, f8) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Enter),
                 i.modifiers.shift,
                 i.key_pressed(egui::Key::C),
+                i.key_pressed(egui::Key::F8),
             )
         });
+        // F8 toggles persistent Ortho mid-pick (early_hotkeys skips drawing).
+        if f8 {
+            self.ortho = !self.ortho;
+            save_ortho(self.ortho);
+            self.command_line
+                .push_line(format!("ortho: {}", if self.ortho { "on" } else { "off" }));
+        }
+        // Esc: if SmartTrack has acquired points, clear THEM first (consume Esc)
+        // so the draw is not cancelled; a second Esc (nothing acquired) cancels.
         if esc {
+            if !self.st_acquired.is_empty() {
+                self.st_acquired.clear();
+                self.st_dwell = None;
+                self.command_line.push_line("smarttrack: cleared");
+                return;
+            }
             self.draw_tool.cancel();
+            self.st_acquired.clear();
+            self.st_dwell = None;
             self.command_line.push_line("drawing cancelled");
             return;
         }
@@ -4889,7 +5041,7 @@ impl App {
             .or_else(|| response.interact_pointer_pos());
         let last_point = self.draw_tool.last_point();
         let snap_settings = self.snap_settings;
-        let mut snap_hit = cursor_px.and_then(|pos| {
+        let snap_hit = cursor_px.and_then(|pos| {
             // Screen-proximity cull: only objects whose projected AABB (grown by
             // the snap radius) covers the cursor contribute snap points. At 10k
             // objects this trims the candidate list from every vertex in the
@@ -4919,11 +5071,70 @@ impl App {
                 .and_then(|pos| ground_point(view_proj, rect, pos))
                 .map(|p| if grid_on { crate::osnap::grid_snap(p) } else { p })
         });
-        // Shift = ortho lock: 0°/90° from the last picked point overrides
-        // osnap (marker off, the constrained point is what a click commits).
-        if shift && let (Some(last), Some(c)) = (self.draw_tool.last_point(), cursor_world) {
-            cursor_world = Some(crate::precise::ortho_lock(last, c));
-            snap_hit = None;
+        // World-space tolerance = SNAP_RADIUS_PX converted through the current
+        // view scale (world units per screen pixel on the ground plane). Derived
+        // by projecting two ground points one pixel apart; falls back to a small
+        // constant if the projection is degenerate (e.g. edge-on view).
+        let world_per_px = cursor_px.and_then(|pos| {
+            let a = ground_point(view_proj, rect, pos)?;
+            let b = ground_point(view_proj, rect, pos + egui::vec2(1.0, 0.0))?;
+            let d = a.distance(b);
+            (d.is_finite() && d > 1e-9).then_some(d)
+        });
+        let st_tol = world_per_px.map(|w| w * crate::osnap::SNAP_RADIUS_PX as f64);
+
+        // SmartTrack acquisition (timing lives here): while on, dwelling on an
+        // osnap point for >= DWELL acquires it into the sticky set.
+        self.st_active_guides.clear();
+        if self.smarttrack {
+            const DWELL: std::time::Duration = std::time::Duration::from_millis(250);
+            let dedup = st_tol.unwrap_or(0.001);
+            match snap_hit {
+                Some((p, _)) => {
+                    let now = std::time::Instant::now();
+                    let restart = self
+                        .st_dwell
+                        .map(|(q, _)| q.distance(p) > dedup)
+                        .unwrap_or(true);
+                    if restart {
+                        self.st_dwell = Some((p, now));
+                    } else if let Some((_, since)) = self.st_dwell
+                        && now.duration_since(since) >= DWELL
+                    {
+                        self.st_acquired.acquire(p, dedup);
+                        // Keep the dwell so we don't re-acquire every frame; a
+                        // move away resets it via the `restart` branch.
+                    }
+                }
+                None => self.st_dwell = None,
+            }
+        } else {
+            self.st_dwell = None;
+        }
+
+        // Cursor resolution precedence:
+        //   (1) a DIRECT osnap hit wins — never overridden by a guide;
+        //   (2) else SmartTrack guide snap (records active guides to draw);
+        //   (3) else ortho lock (persistent toggle OR momentary Shift);
+        //   (4) else the plain ground/grid point resolved above.
+        let apply_ortho = self.ortho || shift;
+        if snap_hit.is_none() {
+            let mut handled = false;
+            if self.smarttrack
+                && let (Some(c), Some(tol)) = (cursor_world, st_tol)
+                && let Some(s) =
+                    crate::smarttrack::snap(&self.st_acquired, c, self.draw_tool.last_point(), tol)
+            {
+                cursor_world = Some(s.snapped);
+                self.st_active_guides = s.active;
+                handled = true;
+            }
+            if !handled
+                && apply_ortho
+                && let (Some(last), Some(c)) = (self.draw_tool.last_point(), cursor_world)
+            {
+                cursor_world = Some(crate::precise::ortho_lock(last, c));
+            }
         }
         self.status_snap = snap_hit.map(|(_, kind)| kind.label());
 
@@ -4961,8 +5172,45 @@ impl App {
             }
         }
 
-        // Ghost preview + prompt overlay
+        // SmartTrack: dashed construction guides (drawn UNDER the ghost line so
+        // the rubber-band segment stays legible) + a small cross on each
+        // acquired point. Rhino paints these a muted white/grey; a big world
+        // span past the origin covers the viewport in the top-ortho drafting view.
         let painter = ui.painter_at(rect);
+        if self.smarttrack {
+            let guide_color = egui::Color32::from_rgba_unmultiplied(210, 210, 210, 170);
+            let guide_stroke = egui::Stroke::new(1.0, guide_color);
+            const SPAN: f64 = 1.0e6;
+            for g in &self.st_active_guides {
+                let d = g.dir() * SPAN;
+                if let (Some(a), Some(b)) = (
+                    project(view_proj, rect, g.origin - d),
+                    project(view_proj, rect, g.origin + d),
+                ) {
+                    // Dashed: egui's dashed_line into the painter.
+                    let dashed = egui::Shape::dashed_line(&[a, b], guide_stroke, 6.0, 4.0);
+                    painter.extend(dashed);
+                }
+            }
+            // Acquired-point markers: a little cross/tick.
+            let mark_color = egui::Color32::from_rgb(230, 230, 230);
+            let mark_stroke = egui::Stroke::new(1.5, mark_color);
+            for &pt in self.st_acquired.points() {
+                if let Some(s) = project(view_proj, rect, pt) {
+                    let r = 4.0;
+                    painter.line_segment(
+                        [s + egui::vec2(-r, 0.0), s + egui::vec2(r, 0.0)],
+                        mark_stroke,
+                    );
+                    painter.line_segment(
+                        [s + egui::vec2(0.0, -r), s + egui::vec2(0.0, r)],
+                        mark_stroke,
+                    );
+                }
+            }
+        }
+
+        // Ghost preview + prompt overlay
         let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 160, 255));
         for strip in self.draw_tool.preview(cursor_world) {
             for pair in strip.windows(2) {
@@ -5070,6 +5318,38 @@ impl App {
                 .clicked()
             {
                 self.osnap_popup_open = !self.osnap_popup_open;
+            }
+            ui.separator();
+            // Ortho + SmartTrack toggle chips (mirror the `ortho`/`smarttrack`
+            // verbs, F8, and the resolution flow). Same look as the gumball chip:
+            // ON = accent fill + on-accent text; OFF = frameless dimmed text.
+            let (on_fill, on_txt) = crate::theme::viewport_active_tag(ui.visuals().dark_mode);
+            let toggle_chip = |ui: &mut egui::Ui, label: &str, on: bool, tip: &str| -> bool {
+                let txt = if on { on_txt } else { ui.visuals().weak_text_color() };
+                let mut btn = egui::Button::new(egui::RichText::new(label).color(txt))
+                    .frame(on)
+                    .corner_radius(egui::CornerRadius::same(4));
+                if on {
+                    btn = btn.fill(on_fill);
+                }
+                ui.add(btn).on_hover_text(tip.to_owned()).clicked()
+            };
+            if toggle_chip(ui, "ortho", self.ortho, "Toggle persistent ortho (F8)") {
+                self.ortho = !self.ortho;
+                save_ortho(self.ortho);
+            }
+            if toggle_chip(
+                ui,
+                "smarttrack",
+                self.smarttrack,
+                "Toggle SmartTrack construction guides",
+            ) {
+                self.smarttrack = !self.smarttrack;
+                save_smarttrack(self.smarttrack);
+                if !self.smarttrack {
+                    self.st_acquired.clear();
+                    self.st_dwell = None;
+                }
             }
             ui.separator();
             ui.label(format!(
@@ -5217,9 +5497,45 @@ impl App {
             .collect();
         let aliases = self.active_aliases();
         let panel_h = ui.available_height();
-        if let Some(line) = self.command_line.ui(ui, &object_names, aliases, panel_h) {
+        let last_verb = self.last_verb.clone();
+        if let Some(line) =
+            self.command_line
+                .ui(ui, &object_names, aliases, panel_h, last_verb.as_deref())
+        {
             self.execute_line(line);
         }
+    }
+
+    /// Draggable divider strip at the TOP edge of the command line. Dragging it UP
+    /// grows the command line (deck body shrinks) and DOWN shrinks it. It only
+    /// adjusts the persisted `self.cmd_height`; the command panel keeps its
+    /// deterministic `.exact_size(cmd_height)` — never `.resizable(true)` — so the
+    /// keystroke handling stays stable. `column_h` is the right column's height
+    /// this frame, used to clamp so the deck keeps ≥40% of the column.
+    fn command_splitter(&mut self, ui: &mut egui::Ui, column_h: f32) {
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), CMD_SPLITTER_H),
+            egui::Sense::drag(),
+        );
+        if resp.hovered() || resp.dragged() {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
+        }
+        if resp.dragged() {
+            // Dragging UP (negative y) increases the command-line height.
+            self.cmd_height = clamp_cmd_height(self.cmd_height - resp.drag_delta().y, column_h);
+        }
+        if resp.drag_stopped() {
+            save_cmd_height(self.cmd_height);
+        }
+        // Draw a subtle grabbable divider: a centered line that brightens on hover.
+        let painter = ui.painter();
+        let color = if resp.hovered() || resp.dragged() {
+            ui.visuals().widgets.hovered.fg_stroke.color
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke.color
+        };
+        let y = rect.center().y;
+        painter.hline(rect.x_range(), y, egui::Stroke::new(1.0, color));
     }
 
     /// Right docked tab panel (Layer 2): a hand-rolled tab strip over
@@ -5397,9 +5713,18 @@ impl App {
             // keeps identical focus/keystroke handling. It sits BELOW the tab strip
             // so it is present whether the deck body is collapsed or expanded.
             let cmd_fill = self.command_line_fill(ui);
-            // ~5 lines of history (≈16pt/line) + the input row reserve. Fixed —
-            // not resizable, to avoid the nested-resizable instability.
-            let cmd_h = (5.0f32 * 16.0 + 44.0).min(ui.available_height() * 0.6).max(90.0);
+            // MANUAL SPLITTER (deck body ↕ command line). The command panel is
+            // ALWAYS `.exact_size(self.cmd_height)` — NEVER `.resizable(true)` —
+            // so its rect is deterministic every frame (this is what keeps the
+            // TextEdit stable; a resizable nested panel was the c2cfcff keystroke
+            // bug). Resizing is done by a thin draggable handle strip drawn at the
+            // TOP edge of the command line (added below, only when the deck body is
+            // expanded). We clamp cmd_height to the CURRENT column height so the
+            // deck keeps a sane minimum even after the window is resized smaller.
+            let collapsed = self.panel_tabs.is_collapsed();
+            let column_h = ui.available_height();
+            self.cmd_height = clamp_cmd_height(self.cmd_height, column_h);
+            let cmd_h = self.cmd_height;
             egui::Panel::bottom("command_line")
                 .resizable(false)
                 .exact_size(cmd_h)
@@ -5408,9 +5733,17 @@ impl App {
                         .fill(cmd_fill)
                         .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::S as i8, 4)),
                 )
-                .show(ui, |ui| self.command_line_body(ui));
+                .show(ui, |ui| {
+                    // The grabbable divider only makes sense when there IS a deck
+                    // body above to trade space with. When collapsed, the command
+                    // line is the whole column — no splitter.
+                    if !collapsed {
+                        self.command_splitter(ui, column_h);
+                    }
+                    self.command_line_body(ui);
+                });
 
-            if self.panel_tabs.is_collapsed() {
+            if collapsed {
                 return;
             }
             // Breathing room below the tab strip so each tab's top content (deck
@@ -7405,6 +7738,21 @@ fn save_theme_pref(dark: Option<bool>) {
     save_ui_json(&v);
 }
 
+/// Restore the persisted command-line height from ui.json (`cmd_height`).
+fn load_cmd_height() -> Option<f32> {
+    load_ui_json()["cmd_height"]
+        .as_f64()
+        .map(|h| h as f32)
+        .filter(|h| h.is_finite() && *h > 0.0)
+}
+
+/// Persist the command-line height to ui.json (mirrors `save_dock`-style helpers).
+fn save_cmd_height(h: f32) {
+    let mut v = load_ui_json();
+    v["cmd_height"] = serde_json::json!(h);
+    save_ui_json(&v);
+}
+
 fn load_deck_visible() -> Option<bool> {
     load_ui_json()["deck_visible"].as_bool()
 }
@@ -7464,6 +7812,28 @@ fn load_snap_settings() -> crate::osnap::SnapSettings {
 fn save_snap_settings(s: &crate::osnap::SnapSettings) {
     let mut v = load_ui_json();
     v["osnap"] = (*s).to_json();
+    save_ui_json(&v);
+}
+
+/// Restore the persisted persistent-Ortho toggle (default OFF when absent).
+fn load_ortho() -> bool {
+    load_ui_json()["ortho"].as_bool().unwrap_or(false)
+}
+
+fn save_ortho(on: bool) {
+    let mut v = load_ui_json();
+    v["ortho"] = serde_json::json!(on);
+    save_ui_json(&v);
+}
+
+/// Restore the persisted SmartTrack toggle (default OFF when absent).
+fn load_smarttrack() -> bool {
+    load_ui_json()["smarttrack"].as_bool().unwrap_or(false)
+}
+
+fn save_smarttrack(on: bool) {
+    let mut v = load_ui_json();
+    v["smarttrack"] = serde_json::json!(on);
     save_ui_json(&v);
 }
 
@@ -8730,6 +9100,74 @@ mod tests {
             Some(Some("a"))
         );
         assert_eq!(shared_value([Some("a"), None].into_iter()), None);
+    }
+
+    #[test]
+    fn is_destructive_verb_flags_only_destructive_words_any_case() {
+        for v in ["delete", "erase", "purge", "deleteall", "clear"] {
+            assert!(is_destructive_verb(v), "{v} should be destructive");
+            assert!(is_destructive_verb(&v.to_uppercase()), "{v} upper");
+        }
+        assert!(is_destructive_verb("Delete"));
+        for v in ["offset", "box", "line"] {
+            assert!(!is_destructive_verb(v), "{v} should NOT be destructive");
+        }
+    }
+
+    #[test]
+    fn next_last_verb_stores_only_the_first_token() {
+        // `offset 5 last` → verb only ("offset"), args dropped.
+        assert_eq!(
+            next_last_verb(None, "offset 5 last"),
+            Some("offset".to_string())
+        );
+        // A new eligible verb replaces the previous one.
+        assert_eq!(
+            next_last_verb(Some("box".to_string()), "line 0,0 1,1"),
+            Some("line".to_string())
+        );
+    }
+
+    #[test]
+    fn next_last_verb_keeps_prev_for_destructive_or_empty() {
+        // `box ...` then `delete last`: last_verb stays "box".
+        assert_eq!(
+            next_last_verb(Some("box".to_string()), "delete last"),
+            Some("box".to_string())
+        );
+        // Any destructive verb (case-insensitive) leaves prev untouched.
+        assert_eq!(
+            next_last_verb(Some("box".to_string()), "ERASE all"),
+            Some("box".to_string())
+        );
+        // Empty / whitespace-only line: keep prev (here None → still None).
+        assert_eq!(next_last_verb(None, "   "), None);
+        assert_eq!(
+            next_last_verb(Some("box".to_string()), ""),
+            Some("box".to_string())
+        );
+    }
+
+    #[test]
+    fn clamp_cmd_height_respects_min_and_deck_minimum() {
+        // A tall column: candidate passes through when within bounds.
+        assert_eq!(clamp_cmd_height(200.0, 800.0), 200.0);
+        // Dragging the splitter far UP (huge cmd height) is capped at 60% of the
+        // column so the deck body keeps a sane minimum (40%).
+        assert!((clamp_cmd_height(10_000.0, 800.0) - 480.0).abs() < 1e-3);
+        // Dragging far DOWN can never shrink below the input-lines minimum.
+        assert_eq!(clamp_cmd_height(0.0, 800.0), CMD_HEIGHT_MIN);
+        assert_eq!(clamp_cmd_height(-500.0, 800.0), CMD_HEIGHT_MIN);
+        // In a very short column the MIN still wins over the 60% cap so the
+        // command line is always usable.
+        assert_eq!(clamp_cmd_height(50.0, 60.0), CMD_HEIGHT_MIN);
+        // Simulated drag delta: dragging UP by 30px (delta.y = -30) grows height.
+        let start = CMD_HEIGHT_DEFAULT;
+        let after_up = clamp_cmd_height(start - (-30.0), 800.0);
+        assert!(after_up > start && after_up <= 480.0);
+        // Dragging DOWN by 30px (delta.y = +30) shrinks it.
+        let after_down = clamp_cmd_height(start - 30.0, 800.0);
+        assert!(after_down < start && after_down >= CMD_HEIGHT_MIN);
     }
 
     #[test]

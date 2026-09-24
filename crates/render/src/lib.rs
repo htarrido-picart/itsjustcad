@@ -25,8 +25,8 @@ pub use pano::{
 };
 pub use layout::ViewportLayout;
 pub use renderer::{
-    hue_from_seed, CameraUniform, ColorMode, DisplayMode, LightMode, SceneData, SceneRenderer,
-    UnderlayData,
+    curve_px, hue_from_seed, CameraUniform, ColorMode, DisplayMode, LightMode, SceneData,
+    SceneRenderer, UnderlayData, RHINO_CURVE_PX,
 };
 pub use sketchy::{
     edge_seed, jitter_offset, sketchify_segments, SketchyParams,

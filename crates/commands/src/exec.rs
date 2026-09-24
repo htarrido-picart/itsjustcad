@@ -6,7 +6,8 @@ use kernel_curve::{clamped_uniform_knots, Curve};
 use kernel_mesh::extrude_profile;
 use rayon::prelude::*;
 use itsjustcad_doc::{
-    format_area, format_length, format_volume, AnalysisReport, AnalysisSample, Annotation,
+    default_layer_color, format_area, format_length, format_volume, AnalysisReport, AnalysisSample,
+    Annotation,
     DimAnchor, Document, FieldExpr, GeoLocation, Geometry, Grid, LayerStyle,
     LoadGeometry, Material, NamedView, ObjectId, Room, SceneObject, ScheduleRow,
     SheetDim, SheetLeader, SheetTable, SheetTag, SheetText, Story, StructLoad, StructSupport,
@@ -10565,7 +10566,12 @@ fn apply_forward(
             let prev = doc.current_layer.clone();
             let created = !doc.layers.contains_key(&name);
             if created {
-                doc.layers.insert(name.clone(), LayerStyle::default());
+                // Auto-assign a distinguishable default color by creation index
+                // (the Nth layer gets the Nth palette entry, wrapping). Purely
+                // index-based → deterministic and replay-stable for the op-log.
+                let color = default_layer_color(doc.layers.len());
+                doc.layers
+                    .insert(name.clone(), LayerStyle { color: Some(color), ..LayerStyle::default() });
             }
             doc.current_layer = name.clone();
             doc.generation += 1;
@@ -10588,7 +10594,13 @@ fn apply_forward(
             let ids = resolve(doc, &targets)?;
             let created = !doc.layers.contains_key(&layer);
             if created {
-                doc.layers.insert(layer.clone(), LayerStyle::default());
+                // Auto-assign a distinguishable default color by creation index
+                // (index-based → deterministic and replay-stable for the op-log).
+                let color = default_layer_color(doc.layers.len());
+                doc.layers.insert(
+                    layer.clone(),
+                    LayerStyle { color: Some(color), ..LayerStyle::default() },
+                );
             }
             let mut prev = Vec::with_capacity(ids.len());
             for id in &ids {
@@ -16198,6 +16210,10 @@ mod tests {
     fn layercolor_hide_show_undo() {
         let mut s = Session::default();
         run(&mut s, "layer walls");
+        // A brand-new layer is auto-assigned a distinguishable palette color
+        // (index = layer count at creation), not None.
+        let auto = itsjustcad_doc::default_layer_color(s.doc.layers.len() - 1);
+        assert_eq!(s.doc.layers["walls"].color, Some(auto));
         run(&mut s, "layercolor walls 0.8,0.2,0.1");
         let style = &s.doc.layers["walls"];
         assert_eq!(style.color, Some([0.8, 0.2, 0.1, 1.0]));
@@ -16212,8 +16228,8 @@ mod tests {
         assert!(!s.doc.layers["walls"].visible);
         run(&mut s, "undo"); // un-hide
         assert!(s.doc.layers["walls"].visible);
-        run(&mut s, "undo"); // un-color
-        assert_eq!(s.doc.layers["walls"].color, None);
+        run(&mut s, "undo"); // un-color → back to the auto-assigned palette color
+        assert_eq!(s.doc.layers["walls"].color, Some(auto));
     }
 
     #[test]
@@ -16443,10 +16459,15 @@ mod tests {
         assert_eq!(def_pen.color, [0.0, 0.0, 0.0]);
         assert_eq!(def_pen.weight_mm, s.doc.effective_lineweight(&default_obj));
 
-        // With no active style, even the walls object plots as base.
+        // With no active style, the walls object plots with its base pen —
+        // which now derives from the layer's auto-assigned palette color.
         run(&mut s, "plotstyle none");
+        let walls_layer_color = s.doc.layers["walls"].color.expect("auto-assigned");
         let wall_pen_none = s.doc.plot_pen(&walls_obj, [0.0, 0.0, 0.0]);
-        assert_eq!(wall_pen_none.color, [0.0, 0.0, 0.0]);
+        assert_eq!(
+            wall_pen_none.color,
+            [walls_layer_color[0], walls_layer_color[1], walls_layer_color[2]]
+        );
     }
 
     #[test]

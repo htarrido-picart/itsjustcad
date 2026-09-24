@@ -288,7 +288,9 @@ impl DrawTool {
                         })
                         .collect();
                     strip.push(strip[0]);
-                    vec![strip]
+                    // Rhino draws the center→cursor radius line while dragging so
+                    // the center stays visible for context; overlay it too.
+                    vec![strip, vec![c, edge]]
                 }
                 _ => Vec::new(),
             },
@@ -349,6 +351,23 @@ mod tests {
         t.on_click(DVec3::new(2.0, 2.0, 0.0));
         let cmd = t.on_click(DVec3::new(5.0, 2.0, 0.0)).unwrap();
         assert_eq!(cmd, "circle 2,2 3");
+    }
+
+    #[test]
+    fn circle_preview_includes_radius_line() {
+        // While dragging, the ghost is the ring PLUS a center→cursor radius
+        // line (Rhino behavior) so the center stays visible for context.
+        let mut t = DrawTool::default();
+        t.try_start("circle");
+        let center = DVec3::new(2.0, 2.0, 0.0);
+        t.on_click(center);
+        let edge = DVec3::new(5.0, 2.0, 0.0);
+        let ghost = t.preview(Some(edge));
+        assert_eq!(ghost.len(), 2, "ring + radius line");
+        // The radius line is the 2-point segment from center to the cursor.
+        let radius = ghost.iter().find(|p| p.len() == 2).expect("radius segment");
+        assert_eq!(radius[0], center);
+        assert_eq!(radius[1], edge);
     }
 
     #[test]
