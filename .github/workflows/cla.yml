@@ -30,6 +30,6 @@ jobs:
           path-to-signatures: '.github/cla-signatures.json'
           path-to-document: 'https://github.com/htarrido-picart/itsjustcad/blob/main/CLA.md'
           branch: 'main'
-          allowlist: 'htarrido-picart,dependabot[bot]'
+          allowlist: 'htarrido-picart,htarridopicart,dependabot[bot]'
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
           custom-notsigned-prcomment: 'Thanks for the PR. Before it can be merged, please read our [CLA](CLA.md) and sign it by commenting the exact line below. Your signature (GitHub id + timestamp + CLA version) is recorded in git.'
