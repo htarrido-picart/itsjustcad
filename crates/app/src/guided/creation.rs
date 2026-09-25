@@ -2,11 +2,13 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 //! Guided creation + measure verbs: `extrude`, `revolve`, `pipe`, `box`, `arc`,
-//! `ellipse`, `helix`, `area`, `volume`, `bbox`, `distance`. Every assembler
-//! emits the canonical string the existing parser already accepts, unchanged.
+//! `ellipse`, `helix`, `area`, `volume`, `bbox`, `distance`, plus the multi-curve
+//! builders that pick their operand curves interactively — `sweep`, `sweep2`,
+//! `blend`, `railrevolve`, `loft`, `circletan`, `linetan`, `lineperp`. Every
+//! assembler emits the canonical string the existing parser already accepts.
 
-use super::assemble::{int_at, num_at, point_at, selector};
-use super::{Input, Step, VerbScript, fmt, num};
+use super::assemble::{int_at, num_at, obj_at, point_at, selector};
+use super::{Input, ObjFilter, Step, VerbScript, fmt, num};
 
 pub static SCRIPTS: &[VerbScript] = &[
     VerbScript {
@@ -100,6 +102,81 @@ pub static SCRIPTS: &[VerbScript] = &[
         ],
         assemble: assemble_distance,
     },
+    // ── multi-curve builders (interactive operand picking) ──────────────────
+    VerbScript {
+        verb: "sweep",
+        needs_selection: false,
+        steps: &[
+            Step::SelectObject { prompt: "Select profile curve", filter: ObjFilter::Curve },
+            Step::SelectObject { prompt: "Select rail curve", filter: ObjFilter::Curve },
+        ],
+        assemble: assemble_sweep,
+    },
+    VerbScript {
+        verb: "sweep2",
+        needs_selection: false,
+        steps: &[
+            Step::SelectObject { prompt: "Select profile curve", filter: ObjFilter::Curve },
+            Step::SelectObject { prompt: "Select first rail", filter: ObjFilter::Curve },
+            Step::SelectObject { prompt: "Select second rail", filter: ObjFilter::Curve },
+        ],
+        assemble: assemble_sweep2,
+    },
+    VerbScript {
+        verb: "blend",
+        needs_selection: false,
+        steps: &[
+            Step::SelectObject { prompt: "Select first curve", filter: ObjFilter::Curve },
+            Step::SelectObject { prompt: "Select second curve", filter: ObjFilter::Curve },
+            Step::Number { prompt: "Bulge", default: Some(1.0) },
+        ],
+        assemble: assemble_blend,
+    },
+    VerbScript {
+        verb: "railrevolve",
+        needs_selection: false,
+        steps: &[
+            Step::SelectObject { prompt: "Select profile curve", filter: ObjFilter::Curve },
+            Step::SelectObject { prompt: "Select rail curve", filter: ObjFilter::Curve },
+            Step::PickPoint { prompt: "Axis start" },
+            Step::PickPoint { prompt: "Axis end" },
+        ],
+        assemble: assemble_railrevolve,
+    },
+    VerbScript {
+        verb: "loft",
+        needs_selection: true,
+        steps: &[],
+        assemble: assemble_loft,
+    },
+    VerbScript {
+        verb: "circletan",
+        needs_selection: false,
+        steps: &[
+            Step::SelectObject { prompt: "Select first tangent curve", filter: ObjFilter::Curve },
+            Step::SelectObject { prompt: "Select second tangent curve", filter: ObjFilter::Curve },
+            Step::Number { prompt: "Radius", default: Some(1.0) },
+        ],
+        assemble: assemble_circletan,
+    },
+    VerbScript {
+        verb: "linetan",
+        needs_selection: false,
+        steps: &[
+            Step::PickPoint { prompt: "Start point" },
+            Step::SelectObject { prompt: "Select tangent curve", filter: ObjFilter::Curve },
+        ],
+        assemble: assemble_linetan,
+    },
+    VerbScript {
+        verb: "lineperp",
+        needs_selection: false,
+        steps: &[
+            Step::PickPoint { prompt: "Start point" },
+            Step::SelectObject { prompt: "Select curve (perpendicular to)", filter: ObjFilter::Curve },
+        ],
+        assemble: assemble_lineperp,
+    },
 ];
 
 /// `[Objects(sel), Num(h)] -> "extrude sel <h>"`
@@ -190,6 +267,68 @@ fn assemble_distance(args: &[Input]) -> Result<String, String> {
     let a = point_at(args, 0, "distance")?;
     let b = point_at(args, 1, "distance")?;
     Ok(format!("distance {} {}", fmt(a), fmt(b)))
+}
+
+// ── multi-curve builders ────────────────────────────────────────────────────
+
+/// `[#profile, #rail] -> "sweep #profile #rail"`
+fn assemble_sweep(args: &[Input]) -> Result<String, String> {
+    let profile = obj_at(args, 0, "sweep")?;
+    let rail = obj_at(args, 1, "sweep")?;
+    Ok(format!("sweep {profile} {rail}"))
+}
+
+/// `[#profile, #railA, #railB] -> "sweep2 #profile #railA #railB"`
+fn assemble_sweep2(args: &[Input]) -> Result<String, String> {
+    let profile = obj_at(args, 0, "sweep2")?;
+    let rail_a = obj_at(args, 1, "sweep2")?;
+    let rail_b = obj_at(args, 2, "sweep2")?;
+    Ok(format!("sweep2 {profile} {rail_a} {rail_b}"))
+}
+
+/// `[#a, #b, Num(bulge)] -> "blend #a #b <bulge>"`
+fn assemble_blend(args: &[Input]) -> Result<String, String> {
+    let a = obj_at(args, 0, "blend")?;
+    let b = obj_at(args, 1, "blend")?;
+    let bulge = num_at(args, 2, "blend")?;
+    Ok(format!("blend {a} {b} {}", num(bulge)))
+}
+
+/// `[#profile, #rail, Point(start), Point(end)] -> "railrevolve #profile #rail <start> <dir>"`
+/// axis_dir = end - start.
+fn assemble_railrevolve(args: &[Input]) -> Result<String, String> {
+    let profile = obj_at(args, 0, "railrevolve")?;
+    let rail = obj_at(args, 1, "railrevolve")?;
+    let axis_start = point_at(args, 2, "railrevolve")?;
+    let axis_end = point_at(args, 3, "railrevolve")?;
+    Ok(format!("railrevolve {profile} {rail} {} {}", fmt(axis_start), fmt(axis_end - axis_start)))
+}
+
+/// `[Objects(sel)] -> "loft sel"` — profiles come from the pre-selection.
+fn assemble_loft(args: &[Input]) -> Result<String, String> {
+    Ok(format!("loft {}", selector(args, "loft")?))
+}
+
+/// `[#a, #b, Num(r)] -> "circletan #a #b <r>"`
+fn assemble_circletan(args: &[Input]) -> Result<String, String> {
+    let a = obj_at(args, 0, "circletan")?;
+    let b = obj_at(args, 1, "circletan")?;
+    let r = num_at(args, 2, "circletan")?;
+    Ok(format!("circletan {a} {b} {}", num(r)))
+}
+
+/// `[Point(from), #curve] -> "linetan <from> #curve"`
+fn assemble_linetan(args: &[Input]) -> Result<String, String> {
+    let from = point_at(args, 0, "linetan")?;
+    let curve = obj_at(args, 1, "linetan")?;
+    Ok(format!("linetan {} {curve}", fmt(from)))
+}
+
+/// `[Point(from), #curve] -> "lineperp <from> #curve"`
+fn assemble_lineperp(args: &[Input]) -> Result<String, String> {
+    let from = point_at(args, 0, "lineperp")?;
+    let curve = obj_at(args, 1, "lineperp")?;
+    Ok(format!("lineperp {} {curve}", fmt(from)))
 }
 
 #[cfg(test)]
@@ -303,6 +442,57 @@ mod tests {
         ];
         assert_eq!(assemble_distance(&args).unwrap(), "distance 0,0 3,4");
         assert!(assemble_distance(&args[..1]).is_err());
+    }
+
+    #[test]
+    fn assemble_multi_curve_builders_pure() {
+        let a = Input::Objects("#aaaa1111".into());
+        let b = Input::Objects("#bbbb2222".into());
+        let c = Input::Objects("#cccc3333".into());
+        assert_eq!(
+            assemble_sweep(&[a.clone(), b.clone()]).unwrap(),
+            "sweep #aaaa1111 #bbbb2222"
+        );
+        assert_eq!(
+            assemble_sweep2(&[a.clone(), b.clone(), c.clone()]).unwrap(),
+            "sweep2 #aaaa1111 #bbbb2222 #cccc3333"
+        );
+        assert_eq!(
+            assemble_blend(&[a.clone(), b.clone(), Input::Num(1.0)]).unwrap(),
+            "blend #aaaa1111 #bbbb2222 1"
+        );
+        assert_eq!(
+            assemble_circletan(&[a.clone(), b.clone(), Input::Num(2.0)]).unwrap(),
+            "circletan #aaaa1111 #bbbb2222 2"
+        );
+        assert_eq!(assemble_loft(&[Input::Objects("sel".into())]).unwrap(), "loft sel");
+        // railrevolve: axis dir = end - start.
+        let rr = [
+            a.clone(),
+            b.clone(),
+            Input::Point(DVec3::new(0.0, 0.0, 0.0)),
+            Input::Point(DVec3::new(0.0, 0.0, 5.0)),
+        ];
+        assert_eq!(
+            assemble_railrevolve(&rr).unwrap(),
+            "railrevolve #aaaa1111 #bbbb2222 0,0 0,0,5"
+        );
+        // linetan/lineperp: from point then a picked curve.
+        let lt = [Input::Point(DVec3::new(1.0, 2.0, 0.0)), a.clone()];
+        assert_eq!(assemble_linetan(&lt).unwrap(), "linetan 1,2 #aaaa1111");
+        assert_eq!(assemble_lineperp(&lt).unwrap(), "lineperp 1,2 #aaaa1111");
+    }
+
+    #[test]
+    fn sweep_walk_picks_profile_then_rail() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("sweep", None), StartResult::Started);
+        assert!(t.current_wants_object());
+        assert_eq!(t.commit_object("aaaa1111"), StepResult::NeedMore);
+        assert_eq!(
+            t.commit_object("bbbb2222"),
+            StepResult::Emit("sweep #aaaa1111 #bbbb2222".into())
+        );
     }
 
     // --- full GuidedTool walk tests ---

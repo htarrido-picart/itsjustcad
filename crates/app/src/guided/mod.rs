@@ -19,6 +19,7 @@ use glam::DVec3;
 // slice folded into `lookup`. `offset` is the locked reference example.
 mod annotate;
 mod array;
+mod boolean;
 mod creation;
 mod curve_edit;
 mod offset;
@@ -41,14 +42,30 @@ pub enum Step {
     /// prefix / first letter); a bare Enter takes `default`.
     #[allow(dead_code)]
     Keyword { prompt: &'static str, options: &'static [&'static str], default: &'static str },
+    /// Interactively pick ONE object in the viewport (Rhino's `GetObject.Get`).
+    /// The app hit-tests the click, enforces `filter`, and commits the object's
+    /// short id as an `Objects("#<id>")` selector token — so the picked object
+    /// rides through the parser like any other selector (no parser change). This
+    /// is how verb-first and two-role commands (trim, fillet, difference) pick
+    /// each role separately.
+    SelectObject { prompt: &'static str, filter: ObjFilter },
+}
+
+/// Restricts what a [`Step::SelectObject`] pick will accept (Rhino's
+/// `GeometryFilter`). The app matches this against the hit object's geometry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ObjFilter {
+    Any,
+    Curve,
+    /// A solid/mesh body (boolean operands).
+    Solid,
 }
 
 /// A value collected for a step (or seeded from a pre-selection).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Input {
     /// A canonical selector string for the objects the verb acts on (e.g.
-    /// `"sel"` for the current selection). Seeded at start, never a viewport
-    /// step in v1.
+    /// `"sel"` for the current selection, or `"#a1b2c3d4"` for a picked object).
     Objects(String),
     Point(DVec3),
     Num(f64),
@@ -149,6 +166,33 @@ impl GuidedTool {
         matches!(self.current_step(), Some(Step::PickPoint { .. }))
     }
 
+    /// True when the current step expects an interactive **object pick** (so the
+    /// app hit-tests the click to an `ObjectId` instead of a world point).
+    pub fn current_wants_object(&self) -> bool {
+        matches!(self.current_step(), Some(Step::SelectObject { .. }))
+    }
+
+    /// The geometry filter for the current [`Step::SelectObject`], if any.
+    pub fn current_filter(&self) -> Option<ObjFilter> {
+        match self.current_step() {
+            Some(Step::SelectObject { filter, .. }) => Some(*filter),
+            _ => None,
+        }
+    }
+
+    /// Commit an interactively picked object by its short id. The id is stored
+    /// as a `#`-prefixed selector token (`#a1b2c3d4`), which the parser resolves
+    /// via `find_named`'s short-id match — the `#` keeps it a valid selector even
+    /// when the id starts with a digit.
+    pub fn commit_object(&mut self, short_id: &str) -> StepResult {
+        if !matches!(self.current_step(), Some(Step::SelectObject { .. })) {
+            return StepResult::Error("not expecting an object pick here".into());
+        }
+        self.done.push(Input::Objects(format!("#{short_id}")));
+        self.input.clear();
+        self.maybe_finish()
+    }
+
     /// Last picked point among seed+collected — anchor for relative/ortho input.
     pub fn last_point(&self) -> Option<DVec3> {
         self.seed
@@ -170,6 +214,8 @@ impl GuidedTool {
         }
         let ok = match self.current_step() {
             Some(Step::Keyword { .. }) => c.is_alphanumeric(),
+            // Object picks are click-only — nothing to type into a buffer.
+            Some(Step::SelectObject { .. }) => false,
             _ => crate::precise::accepts_char(c),
         };
         if ok {
@@ -201,6 +247,7 @@ impl GuidedTool {
                 format!("{prompt} ( {} ) <{default}>:", options.join(" / "))
             }
             Step::PickPoint { prompt } => format!("{prompt} (Esc cancels):"),
+            Step::SelectObject { prompt, .. } => format!("{prompt} (Esc cancels):"),
         };
         Some(if self.input.is_empty() {
             base
@@ -265,6 +312,9 @@ impl GuidedTool {
             Some(Step::PickPoint { .. }) => {
                 StepResult::Error("pick a point, or type coordinates".into())
             }
+            Some(Step::SelectObject { .. }) => {
+                StepResult::Error("click an object to select it".into())
+            }
             None => StepResult::Error("no active step".into()),
         }
     }
@@ -324,6 +374,7 @@ fn all_scripts() -> impl Iterator<Item = &'static VerbScript> {
         .chain(annotate::SCRIPTS)
         .chain(reference_hatch::SCRIPTS)
         .chain(creation::SCRIPTS)
+        .chain(boolean::SCRIPTS)
 }
 
 /// Verb-script registry lookup. `None` → not a guided verb (fall through to the
@@ -343,6 +394,15 @@ mod assemble {
         match args.first() {
             Some(Input::Objects(s)) => Ok(s.clone()),
             _ => Err(format!("{verb}: no selection")),
+        }
+    }
+
+    /// An `Objects` selector token at index `i` — a seeded `sel` or an
+    /// interactively picked `#<id>` from a [`super::Step::SelectObject`].
+    pub fn obj_at(args: &[Input], i: usize, verb: &str) -> Result<String, String> {
+        match args.get(i) {
+            Some(Input::Objects(s)) => Ok(s.clone()),
+            _ => Err(format!("{verb}: missing object at step {i}")),
         }
     }
 
@@ -539,5 +599,46 @@ mod tests {
         assert!(t.push_input('r'));
         assert_eq!(t.take_input(), "r");
         assert!(matches!(t.commit_typed("xyz"), StepResult::Error(_)));
+    }
+
+    // A throwaway two-role object-pick script (like trim/fillet/difference).
+    static OBJ_TEST: VerbScript = VerbScript {
+        verb: "__objtest",
+        needs_selection: false,
+        steps: &[
+            Step::SelectObject { prompt: "First curve", filter: ObjFilter::Curve },
+            Step::SelectObject { prompt: "Second curve", filter: ObjFilter::Curve },
+        ],
+        assemble: |args| {
+            let a = super::assemble::obj_at(args, 0, "obj")?;
+            let b = super::assemble::obj_at(args, 1, "obj")?;
+            Ok(format!("obj {a} {b}"))
+        },
+    };
+
+    #[test]
+    fn select_object_steps_walk_and_emit_hash_ids() {
+        let mut t = GuidedTool { script: Some(&OBJ_TEST), ..Default::default() };
+        assert!(t.current_wants_object());
+        assert_eq!(t.current_filter(), Some(ObjFilter::Curve));
+        assert!(t.prompt().unwrap().starts_with("First curve"));
+        // Object steps are click-only: typing and point-clicks don't advance.
+        assert!(!t.push_input('a'), "object step takes no typed buffer");
+        assert_eq!(t.on_click(DVec3::ZERO), StepResult::NeedMore);
+        // A pick commits the short id as a #-prefixed selector token.
+        assert_eq!(t.commit_object("a1b2c3d4"), StepResult::NeedMore);
+        assert_eq!(
+            t.commit_object("00ffee11"),
+            StepResult::Emit("obj #a1b2c3d4 #00ffee11".into())
+        );
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn commit_object_rejects_when_not_an_object_step() {
+        let mut t = GuidedTool::default();
+        t.try_start("offset", Some("sel")); // first step is a Number
+        assert!(matches!(t.commit_object("a1b2c3d4"), StepResult::Error(_)));
+        assert!(!t.current_wants_object());
     }
 }

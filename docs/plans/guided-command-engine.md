@@ -168,17 +168,23 @@ stubs) so fan-out is collision-free.
 annotate, reference+hatch, and a new **creation+measure** group
 (extrude/revolve/pipe/box/arc/ellipse/helix + distance/area/volume/bbox).
 
-**Deferred by design — blocked on engine gaps (queued serial sessions):**
+**Done — S-A · Interactive object-pick engine upgrade.** Added `Step::SelectObject
+{ prompt, filter: ObjFilter }`: a viewport click hit-tests the nearest object
+(reusing `App::hit_object`, the BVH ray picker), enforces the geometry filter
+(Any/Curve/Solid, Rhino's GeometryFilter), and commits it as a `#<shortid>`
+selector token — which the parser already resolves via `find_named`'s short-id
+match, so **zero parser changes**. Verb-first and two-role commands now work.
+Verbs landed on S-A: **fillet** (pick curve A, curve B, radius — replaced the
+old single-selector form), **trim** (target, cutter, keep-point), **difference**
+(two solids), **union**/**intersect** (zero-step pre-selection), and the
+multi-curve builders **sweep, sweep2, blend, railrevolve, loft, circletan,
+linetan, lineperp**.
 
-- **S-A · Interactive object-pick engine upgrade.** Add a real `SelectObjects`
-  step: click/box-pick objects in the viewport (reuse the normal click-select
-  hit-test), Enter-to-finish, per-step object count/filter. This is foundational
-  (touches `guided/mod.rs` + `app.rs`), so run it **serially after** the current
-  fan-out merges — not in parallel. Unblocks the whole group below.
-- **S-B · Blocked verbs (after S-A).** Verbs needing a 2nd interactively-picked
-  object set: fillet, chamfer, trim, extend, powertrim, arraycurve/patharray,
-  Boolean (union/difference/intersect/exact_boolean), and multi-curve creation
-  (loft, sweep, sweep2, railrevolve, blend, circletan, linetan, lineperp).
+**S-B (mostly absorbed into S-A).** Remaining blocked verbs:
+- **chamfer, explode** — no parser arm exists (need a new `Command` + parser).
+- **arraycurve/patharray** — `arraycurve sel #path <count>`: fits the SelectObject
+  model now; just not yet wired (quick follow-up in `array.rs`).
+- **exact_boolean** — takes box corner/size literals, not picks (typed-only).
 - **S-C · Variadic point input.** `interpcurve`-style verbs need a
   variable-length point list with Enter-to-finish (mirror `draw_tool`'s polyline
   close). Small engine addition.

@@ -6579,4 +6579,37 @@ mod tests {
         );
     }
 
+
+    // --- guided S-A (interactive object-pick) round-trips ---
+    #[test]
+    fn guided_object_pick_verbs_round_trip() {
+        // Each string is produced by an S-A assembler (picked objects ride as
+        // `#<shortid>` selector tokens). Prove the parser accepts them all.
+        for s in [
+            "fillet #a1b2c3d4 #00ffee11 0.5",
+            "trim #aaaa1111 #bbbb2222 2,1",
+            "difference #aaaa1111 #bbbb2222",
+            "union sel",
+            "intersect sel",
+            "sweep #aaaa1111 #bbbb2222",
+            "sweep2 #aaaa1111 #bbbb2222 #cccc3333",
+            "blend #aaaa1111 #bbbb2222 1",
+            "railrevolve #aaaa1111 #bbbb2222 0,0 0,0,5",
+            "loft sel",
+            "circletan #aaaa1111 #bbbb2222 2",
+            "linetan 1,2 #aaaa1111",
+            "lineperp 1,2 #aaaa1111",
+        ] {
+            assert!(parse(s).is_ok(), "guided emission must parse: {s:?} -> {:?}", parse(s));
+        }
+    }
+
+    #[test]
+    fn hash_prefixed_selector_parses_as_named() {
+        // The `#` prefix keeps a digit-leading short id a valid selector token.
+        assert!(matches!(
+            parse("union #3fa8b2c1"),
+            Ok(Command::Union { targets: Selector::Named { .. }, .. })
+        ));
+    }
 }

@@ -3,26 +3,22 @@
 
 //! Guided verb scripts — curve_edit group.
 //!
-//! Implemented (pre-selection model, emits existing canonical syntax):
-//!   split     — sel + PickPoint  → `split sel <pt>`
-//!   extend    — sel + Number     → `extend sel <dist>`
-//!   powertrim — sel + PickPoint  → `powertrim sel <pt>`
-//!   fillet    — sel + Number     → `fillet sel <r>`  (same-selector form)
-//!   boundary  — no sel, PickPoint → `boundary <pt>`
-//!   curvebool — sel + Keyword    → `curvebool <op> sel`
+//! Implemented (emits existing canonical syntax):
+//!   split     — sel + PickPoint            → `split sel <pt>`
+//!   extend    — sel + Number               → `extend sel <dist>`
+//!   powertrim — sel + PickPoint            → `powertrim sel <pt>`
+//!   fillet    — pick curve A, curve B, radius → `fillet #a #b <r>`
+//!   trim      — pick target, cutter, keep pt  → `trim #target #cutter <pt>`
+//!   boundary  — no sel, PickPoint           → `boundary <pt>`
+//!   curvebool — sel + Keyword               → `curvebool <op> sel`
 //!
-//! Deferred (engine or parser limitation):
-//!   join      — zero steps; the engine has no "emit on start" path in v1
-//!               (try_start arms the tool but prompt() returns None for an
-//!               empty step list, leaving it permanently armed). Already trivial
-//!               to type directly.
-//!   trim      — requires target selector + independent cutter selector + keep pt;
-//!               interactive second-object picking unsupported in v1
+//! Deferred:
+//!   join      — zero steps; use the zero-step (emit-on-start) path when added.
 //!   explode   — no parser arm in commands/src/parse.rs
 //!   chamfer   — no parser arm in commands/src/parse.rs
 
-use super::assemble::{key_at, num_at, point_at, selector};
-use super::{fmt, num, Input, Step, VerbScript};
+use super::assemble::{key_at, num_at, obj_at, point_at, selector};
+use super::{fmt, num, Input, ObjFilter, Step, VerbScript};
 
 pub static SCRIPTS: &[VerbScript] = &[
     VerbScript {
@@ -45,9 +41,23 @@ pub static SCRIPTS: &[VerbScript] = &[
     },
     VerbScript {
         verb: "fillet",
-        needs_selection: true,
-        steps: &[Step::Number { prompt: "Fillet radius", default: Some(0.5) }],
+        needs_selection: false,
+        steps: &[
+            Step::SelectObject { prompt: "Select first curve to fillet", filter: ObjFilter::Curve },
+            Step::SelectObject { prompt: "Select second curve to fillet", filter: ObjFilter::Curve },
+            Step::Number { prompt: "Fillet radius", default: Some(0.5) },
+        ],
         assemble: assemble_fillet,
+    },
+    VerbScript {
+        verb: "trim",
+        needs_selection: false,
+        steps: &[
+            Step::SelectObject { prompt: "Select object to trim", filter: ObjFilter::Any },
+            Step::SelectObject { prompt: "Select cutting object", filter: ObjFilter::Any },
+            Step::PickPoint { prompt: "Pick the part to remove" },
+        ],
+        assemble: assemble_trim,
     },
     VerbScript {
         verb: "boundary",
@@ -90,14 +100,21 @@ fn assemble_powertrim(args: &[Input]) -> Result<String, String> {
     Ok(format!("powertrim {sel} {}", fmt(pt)))
 }
 
-/// `[Objects(sel), Num(r)] -> "fillet sel <r>"`
-///
-/// Uses the single-selector form accepted by the parser's fillet arm
-/// (`fillet <sel> <r>`), which resolves to `a = b = sel`.
+/// `[Objects(#a), Objects(#b), Num(r)] -> "fillet #a #b <r>"` — two curves
+/// picked interactively (Rhino's first/second curve prompts).
 fn assemble_fillet(args: &[Input]) -> Result<String, String> {
-    let sel = selector(args, "fillet")?;
-    let r = num_at(args, 1, "fillet")?;
-    Ok(format!("fillet {sel} {}", num(r)))
+    let a = obj_at(args, 0, "fillet")?;
+    let b = obj_at(args, 1, "fillet")?;
+    let r = num_at(args, 2, "fillet")?;
+    Ok(format!("fillet {a} {b} {}", num(r)))
+}
+
+/// `[Objects(#target), Objects(#cutter), Point(keep)] -> "trim #target #cutter <keep>"`
+fn assemble_trim(args: &[Input]) -> Result<String, String> {
+    let target = obj_at(args, 0, "trim")?;
+    let cutter = obj_at(args, 1, "trim")?;
+    let keep = point_at(args, 2, "trim")?;
+    Ok(format!("trim {target} {cutter} {}", fmt(keep)))
 }
 
 /// `[Point(seed)] -> "boundary <seed>"`
@@ -156,9 +173,41 @@ mod tests {
 
     #[test]
     fn assemble_fillet_pure() {
-        let args = [Input::Objects("sel".into()), Input::Num(0.5)];
-        assert_eq!(assemble_fillet(&args).unwrap(), "fillet sel 0.5");
+        let args = [
+            Input::Objects("#a1b2c3d4".into()),
+            Input::Objects("#00ffee11".into()),
+            Input::Num(0.5),
+        ];
+        assert_eq!(assemble_fillet(&args).unwrap(), "fillet #a1b2c3d4 #00ffee11 0.5");
         assert!(assemble_fillet(&args[..1]).is_err());
+    }
+
+    #[test]
+    fn assemble_trim_pure() {
+        let args = [
+            Input::Objects("#aaaa1111".into()),
+            Input::Objects("#bbbb2222".into()),
+            Input::Point(DVec3::new(2.0, 1.0, 0.0)),
+        ];
+        assert_eq!(assemble_trim(&args).unwrap(), "trim #aaaa1111 #bbbb2222 2,1");
+        assert!(assemble_trim(&args[..2]).is_err());
+    }
+
+    #[test]
+    fn fillet_walk_picks_two_curves_then_radius() {
+        let mut t = GuidedTool::default();
+        // Verb-first: no pre-selection needed; picks each curve interactively.
+        assert_eq!(t.try_start("fillet", None), StartResult::Started);
+        assert!(t.current_wants_object());
+        assert_eq!(t.commit_object("a1b2c3d4"), StepResult::NeedMore);
+        assert!(t.current_wants_object());
+        assert_eq!(t.commit_object("00ffee11"), StepResult::NeedMore);
+        // Now the radius.
+        assert!(!t.current_wants_object());
+        assert_eq!(
+            t.commit_typed("0.5"),
+            StepResult::Emit("fillet #a1b2c3d4 #00ffee11 0.5".into())
+        );
     }
 
     #[test]
@@ -225,18 +274,30 @@ mod tests {
     }
 
     #[test]
-    fn fillet_walk_default() {
+    fn fillet_walk_default_radius_after_two_picks() {
         let mut t = GuidedTool::default();
-        t.try_start("fillet", Some("sel"));
+        t.try_start("fillet", None);
+        t.commit_object("a1b2c3d4");
+        t.commit_object("00ffee11");
         assert_eq!(t.prompt().unwrap(), "Fillet radius <0.5>:");
-        assert_eq!(t.commit_typed(""), StepResult::Emit("fillet sel 0.5".into()));
+        // Bare Enter takes the default radius.
+        assert_eq!(
+            t.commit_typed(""),
+            StepResult::Emit("fillet #a1b2c3d4 #00ffee11 0.5".into())
+        );
     }
 
     #[test]
-    fn fillet_walk_typed_radius() {
+    fn trim_walk_picks_target_cutter_then_keep_point() {
         let mut t = GuidedTool::default();
-        t.try_start("fillet", Some("sel"));
-        assert_eq!(t.commit_typed("1.25"), StepResult::Emit("fillet sel 1.25".into()));
+        assert_eq!(t.try_start("trim", None), StartResult::Started);
+        t.commit_object("aaaa1111");
+        t.commit_object("bbbb2222");
+        assert!(t.current_is_point(), "third step is the keep point");
+        assert_eq!(
+            t.on_click(DVec3::new(2.0, 1.0, 0.0)),
+            StepResult::Emit("trim #aaaa1111 #bbbb2222 2,1".into())
+        );
     }
 
     #[test]

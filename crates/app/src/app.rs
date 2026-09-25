@@ -10,7 +10,7 @@ use itsjustcad_render::{
 use crate::command_line::CommandLine;
 use crate::deck_pane::DeckPane;
 use crate::draw_tool::DrawTool;
-use crate::guided::{GuidedTool, StartResult, StepResult};
+use crate::guided::{GuidedTool, ObjFilter, StartResult, StepResult};
 use crate::gumball::Gumball;
 use crate::journal::{self, Journal};
 use crate::keymap;
@@ -4991,6 +4991,25 @@ impl App {
         }
     }
 
+    /// Does object `id` satisfy the current guided `SelectObject` step's filter?
+    /// `Any` accepts everything; `Curve`/`Solid` gate on the geometry kind, so a
+    /// fillet won't accept a mesh nor a boolean a bare curve (Rhino's
+    /// GeometryFilter).
+    fn guided_pick_matches(&self, id: itsjustcad_doc::ObjectId) -> bool {
+        use itsjustcad_doc::Geometry;
+        let Some(filter) = self.guided.current_filter() else {
+            return false;
+        };
+        let Some(obj) = self.session.doc.get(id) else {
+            return false;
+        };
+        match filter {
+            ObjFilter::Any => true,
+            ObjFilter::Curve => matches!(obj.geometry, Geometry::Curve(_)),
+            ObjFilter::Solid => matches!(obj.geometry, Geometry::Mesh(_)),
+        }
+    }
+
     /// Dispatch a guided-tool step outcome: run the emitted command, surface an
     /// error, or re-show the next prompt.
     fn handle_guided(&mut self, result: StepResult) {
@@ -5249,6 +5268,31 @@ impl App {
                 self.execute_line(cmd);
                 return;
             }
+        }
+
+        // Guided object-pick step (Rhino GetObject): hit-test the click to an
+        // ObjectId, enforce the step's geometry filter, then commit it as a
+        // `#<id>` selector. Runs before the point/draw path since it needs the
+        // screen position, not a ground point.
+        if guided_active && self.guided.current_wants_object() && response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                match self.hit_object(view_proj, rect, pos) {
+                    Some(id) if self.guided_pick_matches(id) => {
+                        // Highlight the pick; the emitted command references it by
+                        // id, so selection state doesn't affect correctness.
+                        self.session.doc.selection.insert(id);
+                        self.session.doc.generation += 1;
+                        let short = id.short();
+                        let r = self.guided.commit_object(&short);
+                        self.handle_guided(r);
+                    }
+                    Some(_) => self
+                        .command_line
+                        .push_line("that object isn't the right type — pick again"),
+                    None => {} // empty space: keep waiting for a valid pick
+                }
+            }
+            return;
         }
 
         if response.clicked() && let Some(world) = cursor_world {
