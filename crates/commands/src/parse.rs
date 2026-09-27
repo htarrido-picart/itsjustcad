@@ -3977,6 +3977,20 @@ mod tests {
             "layer walls",
             "block sel door",
             "insert door 3,3",
+            // AEC / structural group (guided engine v3).
+            "beam 0,0,0 0,0,3 w12",
+            "column 0,0,0 0,0,3 w12",
+            "wall 0,0 5,0 5,5 thick 0.2",
+            "slab 0,0 5,0 5,5 thick 0.3",
+            "support 0,0,0 pinned",
+            "story L1 0 height 3",
+            "room #aaaa1111 office",
+            "minsurf #aaaa1111",
+            "funicular 0,0,0 5,0,0",
+            "cablenet 0,0 5,0 5,5 0,5",
+            "tensegrity 6",
+            "spaceframe 6 4 3 1.5",
+            "geodesic 3 5 dome",
         ] {
             assert!(parse(s).is_ok(), "guided-emitted string failed to parse: {s}");
         }

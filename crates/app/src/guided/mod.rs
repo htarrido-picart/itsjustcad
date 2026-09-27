@@ -25,6 +25,7 @@ mod curve_edit;
 mod offset;
 mod organize;
 mod reference_hatch;
+mod structure;
 mod transform;
 
 /// One prompt-and-collect step in a verb's guided flow.
@@ -497,6 +498,7 @@ fn all_scripts() -> impl Iterator<Item = &'static VerbScript> {
         .chain(creation::SCRIPTS)
         .chain(boolean::SCRIPTS)
         .chain(organize::SCRIPTS)
+        .chain(structure::SCRIPTS)
 }
 
 /// Verb-script registry lookup. `None` → not a guided verb (fall through to the
