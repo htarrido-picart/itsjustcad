@@ -13265,11 +13265,17 @@ fn apply_forward(
                     "frame member endpoints coincide (zero-length member)".into(),
                 ));
             }
-            let sec = *doc.sections.get(&section).ok_or_else(|| {
-                ExecError::Invalid(format!(
-                    "no section named '{section}' (define one with 'section {section} rect ...')"
-                ))
-            })?;
+            let sec = doc
+                .sections
+                .get(&section)
+                .copied()
+                .or_else(|| kernel_mesh::builtin_section(&section))
+                .ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "no section named '{section}' (define it with 'section {section} rect ...' \
+                         or use a built-in like IPE300)"
+                    ))
+                })?;
             if let Some(m) = &material
                 && !doc.materials.contains_key(m)
             {
@@ -21036,6 +21042,50 @@ mod tests {
             .run(parse("beam 0,0,0 5,0,0 b material nope").unwrap())
             .unwrap_err();
         assert!(err.to_string().contains("no material"), "{err}");
+    }
+
+    #[test]
+    fn beam_resolves_builtin_section_without_define() {
+        // No prior `section` define: the built-in catalog resolves IPE300.
+        let mut s = Session::default();
+        let out = run(&mut s, "beam 0,0,0 0,0,3 IPE300");
+        let id = out.created[0];
+        let Geometry::Frame { section, .. } = &s.doc.get(id).unwrap().geometry else {
+            panic!("beam should be a Frame geometry");
+        };
+        assert!(
+            matches!(section, kernel_mesh::StructSection::IWideFlange { .. }),
+            "IPE300 resolves to a wide-flange from the catalog"
+        );
+        assert_replay_stable(&s);
+    }
+
+    #[test]
+    fn column_resolves_builtin_hss_without_define() {
+        let mut s = Session::default();
+        let out = run(&mut s, "column 0,0,0 0,0,3 HSS6x6");
+        let id = out.created[0];
+        let Geometry::Frame { section, .. } = &s.doc.get(id).unwrap().geometry else {
+            panic!("column should be a Frame geometry");
+        };
+        assert!(matches!(section, kernel_mesh::StructSection::Hss { .. }));
+    }
+
+    #[test]
+    fn user_defined_section_overrides_builtin() {
+        // A doc section named "IPE300" shadows the catalog wide-flange.
+        let mut s = Session::default();
+        run(&mut s, "section IPE300 rect 1 1");
+        let out = run(&mut s, "beam 0,0,0 0,0,3 IPE300");
+        let id = out.created[0];
+        let Geometry::Frame { section, .. } = &s.doc.get(id).unwrap().geometry else {
+            panic!("beam should be a Frame geometry");
+        };
+        assert!(
+            matches!(section, kernel_mesh::StructSection::Rectangular { w, h }
+                if (*w - 1.0).abs() < 1e-9 && (*h - 1.0).abs() < 1e-9),
+            "user-defined rect must take precedence over the built-in, got {section:?}"
+        );
     }
 
     #[test]

@@ -25,6 +25,17 @@
 use super::assemble::{int_at, key_at, num_at, obj_at, point_at, points_at, text_at};
 use super::{fmt, num, Input, ObjFilter, Step, VerbScript};
 
+/// Built-in structural-section names offered by the guided beam/column section
+/// step. Kept in step with the kernel catalog (`kernel_mesh::builtin_section`);
+/// a test asserts every option here resolves through the catalog so they can't
+/// drift. Any of these resolves at exec without a prior `section` define.
+const SECTION_NAMES: &[&str] = &[
+    "IPE200", "IPE300", "IPE400", "HEA200", "HEA300", "HEB200", "W12x26", "W16x40", "W21x50",
+    "T150x150", "T200x200", "WT8x25", "UPN200", "UPN300", "C10x15", "L100x100", "L75x75", "L4x4",
+    "SHS150", "RHS200x100", "HSS6x6", "CHS168", "CHS219", "PIPE6", "RC300x600", "RC400x400",
+    "CIRC400", "GLT200x400", "GLT160x320", "GUADUA100",
+];
+
 pub static SCRIPTS: &[VerbScript] = &[
     VerbScript {
         verb: "beam",
@@ -32,7 +43,7 @@ pub static SCRIPTS: &[VerbScript] = &[
         steps: &[
             Step::PickPoint { prompt: "Start" },
             Step::PickPoint { prompt: "End" },
-            Step::Text { prompt: "Section (a defined section name)" },
+            Step::Keyword { prompt: "Section", options: SECTION_NAMES, default: "IPE300" },
         ],
         assemble: assemble_beam,
     },
@@ -42,7 +53,7 @@ pub static SCRIPTS: &[VerbScript] = &[
         steps: &[
             Step::PickPoint { prompt: "Base" },
             Step::PickPoint { prompt: "Top" },
-            Step::Text { prompt: "Section (a defined section name)" },
+            Step::Keyword { prompt: "Section", options: SECTION_NAMES, default: "IPE300" },
         ],
         assemble: assemble_column,
     },
@@ -172,19 +183,19 @@ pub static SCRIPTS: &[VerbScript] = &[
     },
 ];
 
-/// `[Point(a), Point(b), Text(section)] -> "beam <a> <b> <section>"`
+/// `[Point(a), Point(b), Key(section)] -> "beam <a> <b> <section>"`
 fn assemble_beam(args: &[Input]) -> Result<String, String> {
     let a = point_at(args, 0, "beam")?;
     let b = point_at(args, 1, "beam")?;
-    let section = text_at(args, 2, "beam")?;
+    let section = key_at(args, 2, "beam")?;
     Ok(format!("beam {} {} {section}", fmt(a), fmt(b)))
 }
 
-/// `[Point(a), Point(b), Text(section)] -> "column <a> <b> <section>"`
+/// `[Point(a), Point(b), Key(section)] -> "column <a> <b> <section>"`
 fn assemble_column(args: &[Input]) -> Result<String, String> {
     let a = point_at(args, 0, "column")?;
     let b = point_at(args, 1, "column")?;
-    let section = text_at(args, 2, "column")?;
+    let section = key_at(args, 2, "column")?;
     Ok(format!("column {} {} {section}", fmt(a), fmt(b)))
 }
 
@@ -283,10 +294,10 @@ mod tests {
         let frame = [
             Input::Point(DVec3::ZERO),
             Input::Point(DVec3::new(0.0, 0.0, 3.0)),
-            Input::Text("w12".into()),
+            Input::Key("IPE300".into()),
         ];
-        assert_eq!(assemble_beam(&frame).unwrap(), "beam 0,0 0,0,3 w12");
-        assert_eq!(assemble_column(&frame).unwrap(), "column 0,0 0,0,3 w12");
+        assert_eq!(assemble_beam(&frame).unwrap(), "beam 0,0 0,0,3 IPE300");
+        assert_eq!(assemble_column(&frame).unwrap(), "column 0,0 0,0,3 IPE300");
         assert!(assemble_beam(&frame[..2]).is_err());
 
         // wall / slab
@@ -345,13 +356,34 @@ mod tests {
         assert!(t.current_is_point());
         assert_eq!(t.on_click(DVec3::ZERO), StepResult::NeedMore);
         assert_eq!(t.on_click(DVec3::new(0.0, 0.0, 3.0)), StepResult::NeedMore);
-        // Section is a free-text token.
-        assert!(t.current_wants_text());
-        for c in "w12".chars() {
-            assert!(t.push_input(c));
-        }
-        assert_eq!(t.commit_text(), StepResult::Emit("beam 0,0 0,0,3 w12".into()));
+        // Section is a keyword chosen from the built-in catalog; a prefix
+        // (case-insensitive) resolves to the canonical catalog name.
+        assert_eq!(t.commit_typed("ipe3"), StepResult::Emit("beam 0,0 0,0,3 IPE300".into()));
         assert!(!t.active());
+    }
+
+    #[test]
+    fn column_walks_two_points_and_a_section() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("column", None), StartResult::Started);
+        assert_eq!(t.on_click(DVec3::ZERO), StepResult::NeedMore);
+        assert_eq!(t.on_click(DVec3::new(0.0, 0.0, 3.0)), StepResult::NeedMore);
+        // Bare Enter takes the IPE300 default.
+        assert_eq!(t.commit_typed(""), StepResult::Emit("column 0,0 0,0,3 IPE300".into()));
+    }
+
+    #[test]
+    fn guided_section_options_all_resolve_in_catalog() {
+        // Every guided section option must resolve through the kernel catalog,
+        // so the guided list and the built-in catalog can't drift apart.
+        for name in SECTION_NAMES {
+            assert!(
+                kernel_mesh::builtin_section(name).is_some(),
+                "guided section option {name} must resolve via builtin_section"
+            );
+        }
+        // And the guided list should cover the whole catalog.
+        assert_eq!(SECTION_NAMES.len(), kernel_mesh::builtin_section_names().len());
     }
 
     #[test]

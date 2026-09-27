@@ -12,6 +12,7 @@ mod delaunay;
 mod earcut;
 mod edges;
 mod expressive;
+mod catalog;
 mod formfind;
 mod mesh;
 mod primitives;
@@ -37,6 +38,7 @@ pub use formfind::{
 pub use mesh::{Mesh, RenderMesh};
 pub use primitives::{extrude_profile, make_box};
 pub use section::slice;
+pub use catalog::{builtin_section, builtin_section_names};
 pub use structsection::Section as StructSection;
 pub use solids::{
     area_member, blend_curves, frame_member, loft_profiles, loft_profiles_guided, pipe_curve,
