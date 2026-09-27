@@ -20983,6 +20983,32 @@ mod tests {
     }
 
     #[test]
+    fn tee_channel_angle_hss_beams_have_expected_area_and_mesh() {
+        let mut s = Session::default();
+        run(&mut s, "section T1 tee 0.2 0.15 0.012 0.008");
+        run(&mut s, "section C1 channel 0.3 0.1 0.012 0.008");
+        run(&mut s, "section L1 angle 0.1 0.15 0.012");
+        run(&mut s, "section H1 hss 0.2 0.1 0.01");
+
+        let cases: [(&str, f64); 4] = [
+            ("beam 0,0,0 4,0,0 T1", 0.15 * 0.012 + (0.2 - 0.012) * 0.008),
+            ("beam 0,1,0 4,1,0 C1", 2.0 * 0.1 * 0.012 + (0.3 - 2.0 * 0.012) * 0.008),
+            ("beam 0,2,0 4,2,0 L1", 0.012 * (0.1 + 0.15 - 0.012)),
+            ("beam 0,3,0 4,3,0 H1", 0.2 * 0.1 - (0.2 - 0.02) * (0.1 - 0.02)),
+        ];
+        for (line, expected_area) in cases {
+            let id = run(&mut s, line).created[0];
+            let Geometry::Frame { section, mesh, .. } = &s.doc.get(id).unwrap().geometry else {
+                panic!("beam should be a Frame geometry");
+            };
+            assert!((section.area() - expected_area).abs() < 1e-9, "area for {line}");
+            // The sweep produced a non-empty solid mesh.
+            assert!(!mesh.faces().is_empty(), "mesh for {line}");
+        }
+        assert_replay_stable(&s);
+    }
+
+    #[test]
     fn column_and_beam_exec_undo_redo() {
         let mut s = Session::default();
         run(&mut s, "section c rect 0.3 0.3");

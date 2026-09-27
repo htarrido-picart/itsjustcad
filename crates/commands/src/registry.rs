@@ -344,8 +344,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "section",
-            usage: "section <selector> <plane point x,y,z> <normal x,y,z>  |  section <name> rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t>",
-            summary: "Two uses. (1) Plane cut: cut meshes with a plane; each closed loop becomes a heavy polyline on layer 'sections'. Example: section all 0,0,1.2 0,0,1. (2) Structural section: define a named cross-section (profile) for beam/column members, chosen by a shape keyword in second position — rect (solid rectangle), circle, iwf (I / wide-flange: depth, flange width, flange thickness, web thickness), pipe (hollow round). Example: section W12 iwf 0.31 0.2 0.013 0.008 · section col rect 0.4 0.4",
+            usage: "section <selector> <plane point x,y,z> <normal x,y,z>  |  section <name> rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t> | tee <d> <bf> <tf> <tw> | channel <d> <bf> <tf> <tw> | angle <a> <b> <t> | hss <w> <h> <t>",
+            summary: "Two uses. (1) Plane cut: cut meshes with a plane; each closed loop becomes a heavy polyline on layer 'sections'. Example: section all 0,0,1.2 0,0,1. (2) Structural section: define a named cross-section (profile) for beam/column members, chosen by a shape keyword in second position — rect (solid rectangle), circle, iwf (I / wide-flange: depth, flange width, flange thickness, web thickness), pipe (hollow round), tee (T), channel (C/U), angle (L: leg a, leg b, thickness), hss (hollow square/rect tube). Example: section W12 iwf 0.31 0.2 0.013 0.008 · section col rect 0.4 0.4 · section T1 tee 0.2 0.15 0.012 0.008",
             category: Category::Dimension,
         },
         CommandSpec {

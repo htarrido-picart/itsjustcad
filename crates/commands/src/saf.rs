@@ -413,6 +413,10 @@ fn section_name(sec: &Section) -> String {
         Section::Pipe { d, t } => format!("PIPE_{:.0}x{:.0}", d * 1000.0, t * 1000.0),
         Section::Timber { w, h } => format!("TIMBER_{:.0}x{:.0}", w * 1000.0, h * 1000.0),
         Section::Guadua { d, t } => format!("GUADUA_{:.0}x{:.0}", d * 1000.0, t * 1000.0),
+        Section::Tee { d, bf, .. } => format!("TEE_{:.0}x{:.0}", d * 1000.0, bf * 1000.0),
+        Section::Channel { d, bf, .. } => format!("CHAN_{:.0}x{:.0}", d * 1000.0, bf * 1000.0),
+        Section::Angle { a, b, .. } => format!("ANGLE_{:.0}x{:.0}", a * 1000.0, b * 1000.0),
+        Section::Hss { w, h, .. } => format!("HSS_{:.0}x{:.0}", w * 1000.0, h * 1000.0),
     }
 }
 
@@ -424,7 +428,11 @@ fn section_type(sec: &Section) -> &'static str {
         | Section::Pipe { .. }
         | Section::IWideFlange { .. }
         | Section::Timber { .. }
-        | Section::Guadua { .. } => "Parametric",
+        | Section::Guadua { .. }
+        | Section::Tee { .. }
+        | Section::Channel { .. }
+        | Section::Angle { .. }
+        | Section::Hss { .. } => "Parametric",
     }
 }
 
@@ -437,6 +445,10 @@ fn section_shape(sec: &Section) -> &'static str {
         Section::IWideFlange { .. } => "I or H",
         Section::Timber { .. } => "Rectangle",
         Section::Guadua { .. } => "Circle hollow",
+        Section::Tee { .. } => "T",
+        Section::Channel { .. } => "U",
+        Section::Angle { .. } => "L",
+        Section::Hss { .. } => "Rectangle hollow",
     }
 }
 
@@ -455,6 +467,30 @@ fn section_params(sec: &Section) -> String {
         ),
         Section::Timber { w, h } => format!("{:.1};{:.1}", w * 1000.0, h * 1000.0),
         Section::Guadua { d, t } => format!("{:.1};{:.1}", d * 1000.0, t * 1000.0),
+        // SAF T shape: depth;flange width;web thickness;flange thickness.
+        Section::Tee { d, bf, tf, tw } => format!(
+            "{:.1};{:.1};{:.1};{:.1}",
+            d * 1000.0,
+            bf * 1000.0,
+            tw * 1000.0,
+            tf * 1000.0
+        ),
+        // SAF U shape: depth;flange width;web thickness;flange thickness.
+        Section::Channel { d, bf, tf, tw } => format!(
+            "{:.1};{:.1};{:.1};{:.1}",
+            d * 1000.0,
+            bf * 1000.0,
+            tw * 1000.0,
+            tf * 1000.0
+        ),
+        // SAF L shape: depth(=b);width(=a);thickness.
+        Section::Angle { a, b, t } => {
+            format!("{:.1};{:.1};{:.1}", b * 1000.0, a * 1000.0, t * 1000.0)
+        }
+        // SAF rectangular-hollow: width;height;wall thickness.
+        Section::Hss { w, h, t } => {
+            format!("{:.1};{:.1};{:.1}", w * 1000.0, h * 1000.0, t * 1000.0)
+        }
     }
 }
 

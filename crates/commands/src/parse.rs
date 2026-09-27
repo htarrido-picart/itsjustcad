@@ -696,9 +696,10 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             // definition ("section <name> rect|circle|iwf|pipe ...") and the
             // mesh plane-cut ("section <selector> <point> <normal>"). Disambiguate
             // on the shape keyword in the second position.
-            const SHAPES: [&str; 13] = [
+            const SHAPES: [&str; 21] = [
                 "rect", "rectangular", "circle", "circular", "iwf", "wideflange", "pipe",
                 "square", "timber", "glulam", "clt", "guadua", "bamboo",
+                "tee", "channel", "upn", "angle", "l", "hss", "shs", "rhs",
             ];
             if args.get(1).is_some_and(|t| SHAPES.contains(t)) {
                 return parse_section(&args);
@@ -2254,10 +2255,32 @@ fn parse_section(args: &[&str]) -> Result<Command, ParseError> {
         ["guadua", d, t] | ["bamboo", d, t] => {
             StructSection::Guadua { d: number(d)?, t: number(t)? }
         }
+        ["tee", d, bf, tf, tw] => StructSection::Tee {
+            d: number(d)?,
+            bf: number(bf)?,
+            tf: number(tf)?,
+            tw: number(tw)?,
+        },
+        ["channel", d, bf, tf, tw] | ["upn", d, bf, tf, tw] => StructSection::Channel {
+            d: number(d)?,
+            bf: number(bf)?,
+            tf: number(tf)?,
+            tw: number(tw)?,
+        },
+        ["angle", a, b, t] | ["l", a, b, t] => StructSection::Angle {
+            a: number(a)?,
+            b: number(b)?,
+            t: number(t)?,
+        },
+        ["hss", w, h, t] | ["shs", w, h, t] | ["rhs", w, h, t] => StructSection::Hss {
+            w: number(w)?,
+            h: number(h)?,
+            t: number(t)?,
+        },
         _ => {
             return wrong(
                 "section",
-                "a name then rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t> | timber <w> <h> | guadua <d> <t>",
+                "a name then rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t> | timber <w> <h> | guadua <d> <t> | tee <d> <bf> <tf> <tw> | channel <d> <bf> <tf> <tw> | angle <a> <b> <t> | hss <w> <h> <t>",
                 args,
             )
         }
@@ -4238,6 +4261,69 @@ mod tests {
             Command::DefSection {
                 name: "p".into(),
                 section: StructSection::Guadua { d: 0.09, t: 0.008 },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_tee_channel_angle_hss_sections() {
+        assert_eq!(
+            parse("section T1 tee 0.2 0.15 0.012 0.008").unwrap(),
+            Command::DefSection {
+                name: "T1".into(),
+                section: StructSection::Tee { d: 0.2, bf: 0.15, tf: 0.012, tw: 0.008 },
+            }
+        );
+        assert_eq!(
+            parse("section C1 channel 0.3 0.1 0.012 0.008").unwrap(),
+            Command::DefSection {
+                name: "C1".into(),
+                section: StructSection::Channel { d: 0.3, bf: 0.1, tf: 0.012, tw: 0.008 },
+            }
+        );
+        // `upn` alias resolves to Channel.
+        assert_eq!(
+            parse("section C2 upn 0.3 0.1 0.012 0.008").unwrap(),
+            Command::DefSection {
+                name: "C2".into(),
+                section: StructSection::Channel { d: 0.3, bf: 0.1, tf: 0.012, tw: 0.008 },
+            }
+        );
+        assert_eq!(
+            parse("section L1 angle 0.1 0.15 0.012").unwrap(),
+            Command::DefSection {
+                name: "L1".into(),
+                section: StructSection::Angle { a: 0.1, b: 0.15, t: 0.012 },
+            }
+        );
+        // `l` alias resolves to Angle.
+        assert_eq!(
+            parse("section L2 l 0.1 0.15 0.012").unwrap(),
+            Command::DefSection {
+                name: "L2".into(),
+                section: StructSection::Angle { a: 0.1, b: 0.15, t: 0.012 },
+            }
+        );
+        assert_eq!(
+            parse("section H1 hss 0.2 0.1 0.01").unwrap(),
+            Command::DefSection {
+                name: "H1".into(),
+                section: StructSection::Hss { w: 0.2, h: 0.1, t: 0.01 },
+            }
+        );
+        // `shs`/`rhs` aliases resolve to Hss.
+        assert_eq!(
+            parse("section H2 shs 0.1 0.1 0.008").unwrap(),
+            Command::DefSection {
+                name: "H2".into(),
+                section: StructSection::Hss { w: 0.1, h: 0.1, t: 0.008 },
+            }
+        );
+        assert_eq!(
+            parse("section H3 rhs 0.2 0.1 0.01").unwrap(),
+            Command::DefSection {
+                name: "H3".into(),
+                section: StructSection::Hss { w: 0.2, h: 0.1, t: 0.01 },
             }
         );
     }
