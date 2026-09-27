@@ -7,11 +7,10 @@
 //!   - `hatch`  — fill a closed curve with a hatch pattern (simple patterns only)
 //!   - `ncopy`  — copy a nested sub-object out of a block/xref by index
 //!   - `xclip`  — clip a block/xref instance to a rectangular boundary
-//!
-//! Deferred:
-//!   - `insert` — needs a free-text block name; the engine has no string-input step
+//!   - `block`  — capture a pre-selection as a named block definition
+//!   - `insert` — place an instance of a named block at a point
 
-use super::assemble::{int_at, key_at, num_at, point_at, selector};
+use super::assemble::{int_at, key_at, num_at, point_at, selector, text_at};
 use super::{fmt, num, Input, Step, VerbScript};
 
 pub static SCRIPTS: &[VerbScript] = &[
@@ -53,6 +52,21 @@ pub static SCRIPTS: &[VerbScript] = &[
         ],
         assemble: assemble_xclip,
     },
+    VerbScript {
+        verb: "block",
+        needs_selection: true,
+        steps: &[Step::Text { prompt: "Block name" }],
+        assemble: assemble_block,
+    },
+    VerbScript {
+        verb: "insert",
+        needs_selection: false,
+        steps: &[
+            Step::Text { prompt: "Block name" },
+            Step::PickPoint { prompt: "Insertion point" },
+        ],
+        assemble: assemble_insert,
+    },
 ];
 
 /// `[Objects(sel), Key(pattern), Num(spacing)] -> "hatch sel solid" | "hatch sel <pattern> <spacing>"`.
@@ -80,6 +94,21 @@ fn assemble_xclip(args: &[Input]) -> Result<String, String> {
     let min = point_at(args, 1, "xclip")?;
     let max = point_at(args, 2, "xclip")?;
     Ok(format!("xclip {sel} {} {}", fmt(min), fmt(max)))
+}
+
+/// `[Objects(sel), Text(name)] -> "block sel <name>"`.
+fn assemble_block(args: &[Input]) -> Result<String, String> {
+    let sel = selector(args, "block")?;
+    let name = text_at(args, 1, "block")?;
+    Ok(format!("block {sel} {name}"))
+}
+
+/// `[Text(name), Point(pos)] -> "insert <name> <pos>"`. Optional rotation/scale
+/// are deferred (v1 places at the point with defaults).
+fn assemble_insert(args: &[Input]) -> Result<String, String> {
+    let name = text_at(args, 0, "insert")?;
+    let pos = point_at(args, 1, "insert")?;
+    Ok(format!("insert {name} {}", fmt(pos)))
 }
 
 #[cfg(test)]
@@ -168,5 +197,60 @@ mod tests {
         let mut t = GuidedTool::default();
         assert_eq!(t.try_start("ncopy", Some("sel")), StartResult::Started);
         assert_eq!(t.commit_typed(""), StepResult::Emit("ncopy sel 0".into()));
+    }
+
+    // ── block ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn assemble_block_pure() {
+        let args = [Input::Objects("sel".into()), Input::Text("door".into())];
+        assert_eq!(assemble_block(&args).unwrap(), "block sel door");
+        assert!(assemble_block(&args[..1]).is_err());
+    }
+
+    #[test]
+    fn guided_block_walk() {
+        use super::super::{GuidedTool, StartResult, StepResult};
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("block", Some("sel")), StartResult::Started);
+        assert!(t.current_wants_text());
+        for c in "door".chars() {
+            assert!(t.push_input(c));
+        }
+        assert_eq!(t.commit_text(), StepResult::Emit("block sel door".into()));
+    }
+
+    #[test]
+    fn block_without_selection_is_refused() {
+        use super::super::{GuidedTool, StartResult};
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("block", None), StartResult::NeedSelection);
+    }
+
+    // ── insert ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn assemble_insert_pure() {
+        let args = [Input::Text("door".into()), Input::Point(DVec3::new(3.0, 3.0, 0.0))];
+        assert_eq!(assemble_insert(&args).unwrap(), "insert door 3,3");
+        assert!(assemble_insert(&args[..1]).is_err());
+    }
+
+    #[test]
+    fn guided_insert_walk() {
+        use super::super::{GuidedTool, StartResult, StepResult};
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("insert", None), StartResult::Started);
+        assert!(t.current_wants_text());
+        for c in "door".chars() {
+            assert!(t.push_input(c));
+        }
+        assert_eq!(t.commit_text(), StepResult::NeedMore);
+        assert!(t.current_is_point());
+        assert_eq!(
+            t.on_click(DVec3::new(3.0, 3.0, 0.0)),
+            StepResult::Emit("insert door 3,3".into())
+        );
+        assert!(!t.active());
     }
 }

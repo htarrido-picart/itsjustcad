@@ -5286,6 +5286,33 @@ impl App {
 
         if enter {
             if guided_active {
+                if self.guided.current_wants_point_list() {
+                    // A variadic point list: a typed Enter first commits any typed
+                    // coord in the buffer (as one more point), then finishes the
+                    // list if it has enough points.
+                    let buffer = self.guided.take_input();
+                    if !buffer.is_empty() {
+                        match crate::precise::resolve_input(&buffer, last_point, cursor_world) {
+                            Ok(world) => {
+                                self.guided.push_list_point(world);
+                            }
+                            Err(e) => {
+                                self.command_line.push_line(format!("error: {e}"));
+                                return;
+                            }
+                        }
+                    }
+                    let r = self.guided.finish_list();
+                    self.handle_guided(r);
+                    return;
+                }
+                if self.guided.current_wants_text() {
+                    // A free-text step: commit_text reads the typed buffer
+                    // directly (rejects empty), so don't drain it first.
+                    let r = self.guided.commit_text();
+                    self.handle_guided(r);
+                    return;
+                }
                 let buffer = self.guided.take_input();
                 if self.guided.current_is_point() {
                     // A point step: typed coords resolve to a pick; a bare Enter
@@ -5401,6 +5428,12 @@ impl App {
                 // stray click doesn't spam the prompt.
                 if self.guided.current_is_point() {
                     let r = self.guided.on_click(world);
+                    self.handle_guided(r);
+                } else if self.guided.current_wants_point_list() {
+                    // A variadic point list: each click appends one point and
+                    // stays on the step (Enter finishes). Re-show the prompt with
+                    // the running count.
+                    let r = self.guided.push_list_point(world);
                     self.handle_guided(r);
                 }
                 return;

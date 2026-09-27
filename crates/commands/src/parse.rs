@@ -3965,6 +3965,12 @@ mod tests {
             "arraycurve sel #aaaa1111 5",
             "tozero sel",
             "flatten sel",
+            // Text / PointList step kinds (guided engine v2).
+            "interpcurve 0,0 1,0 1,1",
+            "name sel widget",
+            "layer walls",
+            "block sel door",
+            "insert door 3,3",
         ] {
             assert!(parse(s).is_ok(), "guided-emitted string failed to parse: {s}");
         }

@@ -7,10 +7,18 @@
 //! `blend`, `railrevolve`, `loft`, `circletan`, `linetan`, `lineperp`. Every
 //! assembler emits the canonical string the existing parser already accepts.
 
-use super::assemble::{int_at, num_at, obj_at, point_at, selector};
+use super::assemble::{int_at, num_at, obj_at, point_at, points_at, selector};
 use super::{Input, ObjFilter, Step, VerbScript, fmt, num};
 
 pub static SCRIPTS: &[VerbScript] = &[
+    VerbScript {
+        verb: "interpcurve",
+        needs_selection: false,
+        // The parser requires at least 3 points for an interpolated curve, so
+        // the guided flow collects at least 3 before Enter finishes.
+        steps: &[Step::PointList { prompt: "Pick curve points (Enter to finish)", min: 3 }],
+        assemble: assemble_interpcurve,
+    },
     VerbScript {
         verb: "extrude",
         needs_selection: true,
@@ -181,6 +189,14 @@ pub static SCRIPTS: &[VerbScript] = &[
     },
 ];
 
+/// `[Points(p1..pn)] -> "interpcurve <p1> <p2> …"` (space-joined). The optional
+/// `closed` suffix is deferred (v1 collects an open point list only).
+fn assemble_interpcurve(args: &[Input]) -> Result<String, String> {
+    let pts = points_at(args, 0, "interpcurve")?;
+    let joined = pts.iter().map(|p| fmt(*p)).collect::<Vec<_>>().join(" ");
+    Ok(format!("interpcurve {joined}"))
+}
+
 /// `[Objects(sel), Num(h)] -> "extrude sel <h>"`
 fn assemble_extrude(args: &[Input]) -> Result<String, String> {
     let sel = selector(args, "extrude")?;
@@ -344,6 +360,31 @@ mod tests {
     use glam::DVec3;
 
     // --- pure assembler round-trips ---
+
+    #[test]
+    fn assemble_interpcurve_pure() {
+        let args = [Input::Points(vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+        ])];
+        assert_eq!(assemble_interpcurve(&args).unwrap(), "interpcurve 0,0 1,0 1,1");
+        assert!(assemble_interpcurve(&[]).is_err());
+    }
+
+    #[test]
+    fn guided_interpcurve_walk() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("interpcurve", None), StartResult::Started);
+        assert!(t.current_wants_point_list());
+        assert_eq!(t.push_list_point(DVec3::new(0.0, 0.0, 0.0)), StepResult::NeedMore);
+        assert_eq!(t.push_list_point(DVec3::new(1.0, 0.0, 0.0)), StepResult::NeedMore);
+        // Below min(3): Enter refuses.
+        assert!(matches!(t.finish_list(), StepResult::Error(_)));
+        assert_eq!(t.push_list_point(DVec3::new(1.0, 1.0, 0.0)), StepResult::NeedMore);
+        assert_eq!(t.finish_list(), StepResult::Emit("interpcurve 0,0 1,0 1,1".into()));
+        assert!(!t.active());
+    }
 
     #[test]
     fn assemble_extrude_pure() {

@@ -23,6 +23,7 @@ mod boolean;
 mod creation;
 mod curve_edit;
 mod offset;
+mod organize;
 mod reference_hatch;
 mod transform;
 
@@ -49,6 +50,14 @@ pub enum Step {
     /// is how verb-first and two-role commands (trim, fillet, difference) pick
     /// each role separately.
     SelectObject { prompt: &'static str, filter: ObjFilter },
+    /// A free-text token (an object name, block name, layer name). Collects a
+    /// single whitespace-free token so the value round-trips through the
+    /// whitespace-tokenized parser. Letters/digits plus `_`/`-` are accepted.
+    Text { prompt: &'static str },
+    /// A variadic list of world points (Rhino's `GetPoints`): each click/typed
+    /// coord appends one, Enter finishes once at least `min` are collected.
+    /// Modeled on the polyline draw tool.
+    PointList { prompt: &'static str, min: usize },
 }
 
 /// Restricts what a [`Step::SelectObject`] pick will accept (Rhino's
@@ -71,6 +80,10 @@ pub enum Input {
     Num(f64),
     Int(i64),
     Key(String),
+    /// A free-text token collected by a [`Step::Text`].
+    Text(String),
+    /// A variadic point list collected by a [`Step::PointList`].
+    Points(Vec<DVec3>),
 }
 
 /// A verb's guided script: its ordered steps plus a **pure** assembler turning
@@ -116,6 +129,9 @@ pub struct GuidedTool {
     done: Vec<Input>,
     /// Typed buffer for the current step (numbers, or typed coords for a point).
     input: String,
+    /// Points collected so far for an in-progress [`Step::PointList`] step.
+    /// Emptied when the step finishes (folded into an [`Input::Points`]).
+    list: Vec<DVec3>,
 }
 
 impl GuidedTool {
@@ -142,6 +158,7 @@ impl GuidedTool {
         self.script = Some(script);
         self.done.clear();
         self.input.clear();
+        self.list.clear();
         StartResult::Started
     }
 
@@ -154,6 +171,7 @@ impl GuidedTool {
         self.seed.clear();
         self.done.clear();
         self.input.clear();
+        self.list.clear();
     }
 
     fn current_step(&self) -> Option<&'static Step> {
@@ -170,6 +188,16 @@ impl GuidedTool {
     /// app hit-tests the click to an `ObjectId` instead of a world point).
     pub fn current_wants_object(&self) -> bool {
         matches!(self.current_step(), Some(Step::SelectObject { .. }))
+    }
+
+    /// True when the current step collects a free-text token ([`Step::Text`]).
+    pub fn current_wants_text(&self) -> bool {
+        matches!(self.current_step(), Some(Step::Text { .. }))
+    }
+
+    /// True when the current step is a variadic point list ([`Step::PointList`]).
+    pub fn current_wants_point_list(&self) -> bool {
+        matches!(self.current_step(), Some(Step::PointList { .. }))
     }
 
     /// The geometry filter for the current [`Step::SelectObject`], if any.
@@ -189,6 +217,53 @@ impl GuidedTool {
             return StepResult::Error("not expecting an object pick here".into());
         }
         self.done.push(Input::Objects(format!("#{short_id}")));
+        self.input.clear();
+        self.maybe_finish()
+    }
+
+    /// Commit the current typed buffer to a [`Step::Text`] step. An empty buffer
+    /// is rejected (a name is required). The value is a single whitespace-free
+    /// token, so it round-trips through the parser.
+    pub fn commit_text(&mut self) -> StepResult {
+        if !matches!(self.current_step(), Some(Step::Text { .. })) {
+            return StepResult::Error("not expecting a name here".into());
+        }
+        let buf = self.input.trim().to_string();
+        if buf.is_empty() {
+            return StepResult::Error("type a name".into());
+        }
+        self.done.push(Input::Text(buf));
+        self.input.clear();
+        self.maybe_finish()
+    }
+
+    /// Append one point to an in-progress [`Step::PointList`] (a click or typed
+    /// coord). No-op with `NeedMore` if the current step isn't a point list.
+    pub fn push_list_point(&mut self, world: DVec3) -> StepResult {
+        if !matches!(self.current_step(), Some(Step::PointList { .. })) {
+            return StepResult::NeedMore;
+        }
+        self.list.push(world);
+        self.input.clear();
+        StepResult::NeedMore
+    }
+
+    /// Finish a [`Step::PointList`] on Enter: if at least `min` points were
+    /// collected, fold them into an [`Input::Points`] and advance; otherwise
+    /// stay on the step and report how many more are needed.
+    pub fn finish_list(&mut self) -> StepResult {
+        let Some(Step::PointList { min, .. }) = self.current_step() else {
+            return StepResult::Error("not expecting a point list here".into());
+        };
+        let min = *min;
+        if self.list.len() < min {
+            return StepResult::Error(format!(
+                "pick at least {min} points ({} so far)",
+                self.list.len()
+            ));
+        }
+        let pts = std::mem::take(&mut self.list);
+        self.done.push(Input::Points(pts));
         self.input.clear();
         self.maybe_finish()
     }
@@ -214,6 +289,9 @@ impl GuidedTool {
         }
         let ok = match self.current_step() {
             Some(Step::Keyword { .. }) => c.is_alphanumeric(),
+            // A name token: letters/digits plus `_`/`-`, no whitespace (keeps the
+            // emitted value a single token for the whitespace-tokenized parser).
+            Some(Step::Text { .. }) => c.is_alphanumeric() || c == '_' || c == '-',
             // Object picks are click-only — nothing to type into a buffer.
             Some(Step::SelectObject { .. }) => false,
             _ => crate::precise::accepts_char(c),
@@ -248,6 +326,10 @@ impl GuidedTool {
             }
             Step::PickPoint { prompt } => format!("{prompt} (Esc cancels):"),
             Step::SelectObject { prompt, .. } => format!("{prompt} (Esc cancels):"),
+            Step::Text { prompt } => format!("{prompt}:"),
+            Step::PointList { prompt, .. } => {
+                format!("{prompt} ({} so far):", self.list.len())
+            }
         };
         Some(if self.input.is_empty() {
             base
@@ -315,6 +397,10 @@ impl GuidedTool {
             Some(Step::SelectObject { .. }) => {
                 StepResult::Error("click an object to select it".into())
             }
+            // Text/PointList have dedicated commit paths (commit_text /
+            // finish_list); the app routes their Enter there, not here.
+            Some(Step::Text { .. }) => self.commit_text(),
+            Some(Step::PointList { .. }) => self.finish_list(),
             None => StepResult::Error("no active step".into()),
         }
     }
@@ -364,6 +450,13 @@ impl GuidedTool {
         if script.verb == "arc" {
             return arc_preview(&pts, cursor);
         }
+        // A variadic point list draws a running polyline through the points
+        // collected so far plus the cursor (Rhino's `GetPoints` rubber-band).
+        if matches!(self.current_step(), Some(Step::PointList { .. })) {
+            let mut strip = self.list.clone();
+            strip.push(cursor);
+            return if strip.len() >= 2 { vec![strip] } else { Vec::new() };
+        }
         // Generic rubber-band: only while a point step is active.
         if !matches!(self.current_step(), Some(Step::PickPoint { .. })) {
             return Vec::new();
@@ -403,6 +496,7 @@ fn all_scripts() -> impl Iterator<Item = &'static VerbScript> {
         .chain(reference_hatch::SCRIPTS)
         .chain(creation::SCRIPTS)
         .chain(boolean::SCRIPTS)
+        .chain(organize::SCRIPTS)
 }
 
 /// Verb-script registry lookup. `None` → not a guided verb (fall through to the
@@ -498,6 +592,26 @@ mod assemble {
         match args.get(i) {
             Some(Input::Key(k)) => Ok(k.as_str()),
             _ => Err(format!("{verb}: missing option at step {i}")),
+        }
+    }
+
+    /// A free-text token at index `i` (a name, block name, layer name).
+    pub fn text_at<'a>(args: &'a [Input], i: usize, verb: &str) -> Result<&'a str, String> {
+        match args.get(i) {
+            Some(Input::Text(s)) => Ok(s.as_str()),
+            _ => Err(format!("{verb}: missing name at step {i}")),
+        }
+    }
+
+    /// A variadic point list at index `i`.
+    pub fn points_at<'a>(
+        args: &'a [Input],
+        i: usize,
+        verb: &str,
+    ) -> Result<&'a [glam::DVec3], String> {
+        match args.get(i) {
+            Some(Input::Points(p)) => Ok(p.as_slice()),
+            _ => Err(format!("{verb}: missing points at step {i}")),
         }
     }
 }
@@ -729,5 +843,78 @@ mod tests {
         let mut t = GuidedTool::default();
         t.try_start("offset", Some("sel"));
         assert!(t.preview(Some(DVec3::new(1.0, 1.0, 0.0))).is_empty());
+    }
+
+    // A throwaway script exercising the Text and PointList step kinds (the real
+    // verbs live in the per-group modules).
+    static TXT_LIST_TEST: VerbScript = VerbScript {
+        verb: "__txtlist",
+        needs_selection: false,
+        steps: &[
+            Step::Text { prompt: "Name" },
+            Step::PointList { prompt: "Pick points", min: 2 },
+        ],
+        assemble: |args| {
+            let name = super::assemble::text_at(args, 0, "tl")?;
+            let pts = super::assemble::points_at(args, 1, "tl")?;
+            let joined = pts.iter().map(|p| fmt(*p)).collect::<Vec<_>>().join(" ");
+            Ok(format!("tl {name} {joined}"))
+        },
+    };
+
+    #[test]
+    fn text_step_collects_a_name_and_rejects_empty() {
+        let mut t = GuidedTool { script: Some(&TXT_LIST_TEST), ..Default::default() };
+        assert!(t.current_wants_text());
+        assert_eq!(t.prompt().unwrap(), "Name:");
+        // Empty buffer is refused; the step stays put.
+        assert!(matches!(t.commit_text(), StepResult::Error(_)));
+        assert!(t.current_wants_text(), "still on the name step");
+        // Letters, digits, `_` and `-` feed the buffer; whitespace does not.
+        for c in "widget-1".chars() {
+            assert!(t.push_input(c));
+        }
+        assert!(!t.push_input(' '), "no spaces in a name token");
+        assert_eq!(t.commit_text(), StepResult::NeedMore);
+        assert!(t.current_wants_point_list());
+    }
+
+    #[test]
+    fn point_list_finishes_at_min_and_refuses_below() {
+        let mut t = GuidedTool { script: Some(&TXT_LIST_TEST), ..Default::default() };
+        // Skip past the text step.
+        for c in "n".chars() {
+            t.push_input(c);
+        }
+        t.commit_text();
+        assert!(t.current_wants_point_list());
+        assert_eq!(t.prompt().unwrap(), "Pick points (0 so far):");
+        // One point is below min(2): finishing is refused.
+        assert_eq!(t.push_list_point(DVec3::new(0.0, 0.0, 0.0)), StepResult::NeedMore);
+        assert!(matches!(t.finish_list(), StepResult::Error(_)));
+        assert_eq!(t.prompt().unwrap(), "Pick points (1 so far):");
+        // A second point reaches min → Enter emits.
+        assert_eq!(t.push_list_point(DVec3::new(1.0, 0.0, 0.0)), StepResult::NeedMore);
+        assert_eq!(t.finish_list(), StepResult::Emit("tl n 0,0 1,0".into()));
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn point_list_preview_shows_running_polyline() {
+        let mut t = GuidedTool { script: Some(&TXT_LIST_TEST), ..Default::default() };
+        t.push_input('n');
+        t.commit_text();
+        let cursor = DVec3::new(5.0, 0.0, 0.0);
+        // No points yet → nothing to rubber-band.
+        assert!(t.preview(Some(cursor)).is_empty());
+        t.push_list_point(DVec3::ZERO);
+        // One point + cursor → a live line.
+        assert_eq!(t.preview(Some(cursor)), vec![vec![DVec3::ZERO, cursor]]);
+        t.push_list_point(DVec3::new(1.0, 1.0, 0.0));
+        // Two points + cursor → a running strip.
+        assert_eq!(
+            t.preview(Some(cursor)),
+            vec![vec![DVec3::ZERO, DVec3::new(1.0, 1.0, 0.0), cursor]]
+        );
     }
 }
