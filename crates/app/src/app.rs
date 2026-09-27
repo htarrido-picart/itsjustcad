@@ -375,6 +375,12 @@ pub struct App {
     /// snap/ortho/smarttrack path with `draw_tool` and is mutually exclusive
     /// with it. See [`crate::guided`].
     guided: GuidedTool,
+    /// One-shot latch: the Enter keypress that *submitted* a bare guided verb in
+    /// the command line is still `key_pressed` for the rest of that same frame,
+    /// so `drawing_input` would otherwise re-read it and commit the tool's first
+    /// typed step at its default (skipping the prompt). Set when a guided flow
+    /// arms; the first `drawing_input` Enter pass swallows exactly that one Enter.
+    guided_suppress_enter: bool,
     gumball: Gumball,
     point_edit: crate::point_edit::PointEdit,
     tokio: tokio::runtime::Handle,
@@ -1000,6 +1006,7 @@ impl App {
             deck_pane: DeckPane::default(),
             draw_tool: DrawTool::default(),
             guided: GuidedTool::default(),
+            guided_suppress_enter: false,
             gumball: Gumball::default(),
             point_edit: crate::point_edit::PointEdit::default(),
             tokio,
@@ -1829,6 +1836,10 @@ impl App {
                             self.handle_guided(result);
                         } else if let Some(prompt) = self.guided.prompt() {
                             self.command_line.push_line(prompt);
+                            // The submitting Enter is still down this frame; keep
+                            // `drawing_input` from re-reading it and auto-committing
+                            // the first typed step at its default.
+                            self.guided_suppress_enter = true;
                         }
                         return;
                     }
@@ -5042,7 +5053,7 @@ impl App {
         // draw tool does. They share the snap/ortho/smarttrack resolution.
         let guided_active = self.guided.active();
 
-        let (esc, enter, shift, close_key, f8) = ui.input(|i| {
+        let (esc, mut enter, shift, close_key, f8) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Enter),
@@ -5051,6 +5062,15 @@ impl App {
                 i.key_pressed(egui::Key::F8),
             )
         });
+        // A guided flow that armed *this* frame set `guided_suppress_enter`: the
+        // Enter that submitted the bare verb in the command line is still down,
+        // and would otherwise auto-commit the first typed step at its default.
+        // Swallow exactly that one Enter (the latch only ever lives one frame —
+        // this drawing_input pass runs the same frame the tool armed, so a real
+        // Enter the user presses next frame still accepts the default).
+        if std::mem::take(&mut self.guided_suppress_enter) {
+            enter = false;
+        }
         // F8 toggles persistent Ortho mid-pick (early_hotkeys skips drawing).
         if f8 {
             self.ortho = !self.ortho;

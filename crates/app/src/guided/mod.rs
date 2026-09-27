@@ -339,11 +339,29 @@ impl GuidedTool {
         (self.done.len() == script.steps.len()).then(|| self.maybe_finish())
     }
 
-    /// Ghost geometry to overlay. Offset needs the source curve (not available
-    /// to this pure engine), so v1 draws no ghost — kept for parity with
-    /// `draw_tool` and future verbs (mirror axis, array footprint, …).
-    pub fn preview(&self, _cursor: Option<DVec3>) -> Vec<Vec<DVec3>> {
-        Vec::new()
+    /// Live ghost geometry to overlay while picking (Rhino-style rubber-band).
+    /// On a point step, connect the points picked so far to the cursor — so
+    /// `distance`/`dim` draw a line to the cursor, multi-point verbs draw a
+    /// running polyline. Only point steps get a ghost; typed/object steps and a
+    /// missing cursor draw nothing.
+    pub fn preview(&self, cursor: Option<DVec3>) -> Vec<Vec<DVec3>> {
+        if !matches!(self.current_step(), Some(Step::PickPoint { .. })) {
+            return Vec::new();
+        }
+        let Some(cursor) = cursor else {
+            return Vec::new();
+        };
+        let mut strip: Vec<DVec3> = self
+            .done
+            .iter()
+            .filter_map(|i| match i {
+                Input::Point(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        strip.push(cursor);
+        // Need at least one prior point to draw a rubber-band to the cursor.
+        if strip.len() >= 2 { vec![strip] } else { Vec::new() }
     }
 
     /// All steps collected → assemble and reset. Otherwise `NeedMore`.
@@ -640,5 +658,27 @@ mod tests {
         t.try_start("offset", Some("sel")); // first step is a Number
         assert!(matches!(t.commit_object("a1b2c3d4"), StepResult::Error(_)));
         assert!(!t.current_wants_object());
+    }
+
+    #[test]
+    fn point_step_preview_rubber_bands_to_cursor() {
+        let mut t = GuidedTool::default();
+        t.try_start("distance", None); // two point steps
+        let cursor = DVec3::new(5.0, 0.0, 0.0);
+        // First point step: nothing picked yet → no rubber-band to draw.
+        assert!(t.preview(Some(cursor)).is_empty());
+        t.on_click(DVec3::ZERO);
+        // Second point step: a live line from the first point to the cursor.
+        assert_eq!(t.preview(Some(cursor)), vec![vec![DVec3::ZERO, cursor]]);
+        // No cursor → nothing.
+        assert!(t.preview(None).is_empty());
+    }
+
+    #[test]
+    fn typed_and_object_steps_have_no_preview() {
+        // A Number step (offset distance) draws no ghost.
+        let mut t = GuidedTool::default();
+        t.try_start("offset", Some("sel"));
+        assert!(t.preview(Some(DVec3::new(1.0, 1.0, 0.0))).is_empty());
     }
 }

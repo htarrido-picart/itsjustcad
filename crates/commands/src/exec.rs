@@ -11653,13 +11653,7 @@ fn apply_forward(
                 Inverse::Rename(Vec::new()), // never logged; inverse unused
                 ApplyOutcome {
                     created: Vec::new(),
-                    message: format!(
-                        "distance: {} (dx {}, dy {}, dz {})",
-                        format_length(u, d.length()),
-                        format_length(u, d.x),
-                        format_length(u, d.y),
-                        format_length(u, d.z)
-                    ),
+                    message: format!("distance: {}", format_length(u, d.length())),
                 },
             ))
         }
@@ -17824,7 +17818,8 @@ mod tests {
         run(&mut s, "box 0,0,0 1,1,1"); // any content; distance ignores it
         let out = run(&mut s, "distance 0,0,0 3,4,0");
         assert!(out.message.contains("distance: 5.00 m"), "{}", out.message);
-        assert!(out.message.contains("dx 3.00 m"), "{}", out.message);
+        // Report is just the scalar distance now — no dx/dy/dz components.
+        assert!(!out.message.contains("dx"), "{}", out.message);
         run(&mut s, "units mm");
         let out = run(&mut s, "distance 0,0,0 3,4,0");
         assert!(out.message.contains("5000 mm"), "{}", out.message);
