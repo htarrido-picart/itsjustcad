@@ -59,6 +59,26 @@ pub enum Step {
     /// coord appends one, Enter finishes once at least `min` are collected.
     /// Modeled on the polyline draw tool.
     PointList { prompt: &'static str, min: usize },
+    /// A direction/vector, collected exactly like a [`Step::PickPoint`]: typed
+    /// `dx,dy,dz` resolves via precise-input, or a click supplies a point (the
+    /// vector from the origin, or relative to the prior pick). Stored as an
+    /// [`Input::Point`]; the assembler reads it with `point_at` and formats it
+    /// with `fmt`. Powers `load` directions and roller support axes.
+    Vector { prompt: &'static str },
+    /// A **keyword branch**: the user picks one arm by key (exact or
+    /// unique-prefix, case-insensitive), and that arm's `steps` become all the
+    /// remaining steps. MUST be the last entry in a script's `steps` (the chosen
+    /// arm supplies every following step — no base steps come after a Branch).
+    Branch { prompt: &'static str, arms: &'static [BranchArm] },
+}
+
+/// One arm of a [`Step::Branch`]: a keyword `key` and the `steps` that run once
+/// the user selects it. The selected `key` is committed as an [`Input::Key`] at
+/// the branch's own slot, followed by the arm's collected inputs.
+#[derive(Clone, Copy)]
+pub struct BranchArm {
+    pub key: &'static str,
+    pub steps: &'static [Step],
 }
 
 /// Restricts what a [`Step::SelectObject`] pick will accept (Rhino's
@@ -133,6 +153,9 @@ pub struct GuidedTool {
     /// Points collected so far for an in-progress [`Step::PointList`] step.
     /// Emptied when the step finishes (folded into an [`Input::Points`]).
     list: Vec<DVec3>,
+    /// The chosen [`Step::Branch`] arm's steps, once selected. `None` until the
+    /// branch is committed; then it supplies every step after the branch slot.
+    branch: Option<&'static [Step]>,
 }
 
 impl GuidedTool {
@@ -160,6 +183,7 @@ impl GuidedTool {
         self.done.clear();
         self.input.clear();
         self.list.clear();
+        self.branch = None;
         StartResult::Started
     }
 
@@ -173,16 +197,44 @@ impl GuidedTool {
         self.done.clear();
         self.input.clear();
         self.list.clear();
+        self.branch = None;
     }
 
+    /// Index of the (single, last-if-present) [`Step::Branch`] in the base
+    /// script, or `None` when the script has no branch.
+    fn branch_index(&self) -> Option<usize> {
+        let base = self.script?.steps;
+        base.iter().position(|s| matches!(s, Step::Branch { .. }))
+    }
+
+    /// The current step, branch-aware. Before the branch slot the base steps
+    /// drive; at the branch slot (still unchosen) the `Branch` step itself is
+    /// current; once an arm is chosen its steps supply everything after the slot.
     fn current_step(&self) -> Option<&'static Step> {
-        self.script?.steps.get(self.done.len())
+        let base = self.script?.steps;
+        let n = self.done.len();
+        match self.branch_index() {
+            None => base.get(n),
+            Some(bi) => {
+                if n < bi {
+                    base.get(n)
+                } else if n == bi && self.branch.is_none() {
+                    base.get(bi) // the Branch step (a keyword prompt)
+                } else {
+                    // The arm covers positions > bi; its committed Key sits at
+                    // done[bi], so the arm's own index is n - bi - 1.
+                    self.branch?.get(n - bi - 1)
+                }
+            }
+        }
     }
 
     /// True when the current step expects a picked/typed **point** (so the app
-    /// resolves Enter's typed buffer through `precise::resolve_input`).
+    /// resolves Enter's typed buffer through `precise::resolve_input`). A
+    /// [`Step::Vector`] is collected identically to a point (typed `dx,dy,dz` or
+    /// a click), so it also reports true here — the app path is the same.
     pub fn current_is_point(&self) -> bool {
-        matches!(self.current_step(), Some(Step::PickPoint { .. }))
+        matches!(self.current_step(), Some(Step::PickPoint { .. } | Step::Vector { .. }))
     }
 
     /// True when the current step expects an interactive **object pick** (so the
@@ -289,7 +341,8 @@ impl GuidedTool {
             return false;
         }
         let ok = match self.current_step() {
-            Some(Step::Keyword { .. }) => c.is_alphanumeric(),
+            // Keyword and Branch are both keyword-like: they take option/arm names.
+            Some(Step::Keyword { .. } | Step::Branch { .. }) => c.is_alphanumeric(),
             // A name token: letters/digits plus `_`/`-`, no whitespace (keeps the
             // emitted value a single token for the whitespace-tokenized parser).
             Some(Step::Text { .. }) => c.is_alphanumeric() || c == '_' || c == '-',
@@ -326,10 +379,16 @@ impl GuidedTool {
                 format!("{prompt} ( {} ) <{default}>:", options.join(" / "))
             }
             Step::PickPoint { prompt } => format!("{prompt} (Esc cancels):"),
+            Step::Vector { prompt } => format!("{prompt} (Esc cancels):"),
             Step::SelectObject { prompt, .. } => format!("{prompt} (Esc cancels):"),
             Step::Text { prompt } => format!("{prompt}:"),
             Step::PointList { prompt, .. } => {
                 format!("{prompt} ({} so far):", self.list.len())
+            }
+            Step::Branch { prompt, arms } => {
+                let keys = arms.iter().map(|a| a.key).collect::<Vec<_>>().join(" / ");
+                let first = arms.first().map(|a| a.key).unwrap_or("");
+                format!("{prompt} ( {keys} ) <{first}>:")
             }
         };
         Some(if self.input.is_empty() {
@@ -392,7 +451,31 @@ impl GuidedTool {
                 self.input.clear();
                 self.maybe_finish()
             }
-            Some(Step::PickPoint { .. }) => {
+            Some(Step::Branch { arms, .. }) => {
+                let chosen = if b.is_empty() {
+                    match arms.first() {
+                        Some(arm) => arm,
+                        None => return StepResult::Error("branch has no arms".into()),
+                    }
+                } else {
+                    let lb = b.to_lowercase();
+                    match arms.iter().find(|a| {
+                        let lk = a.key.to_lowercase();
+                        lk == lb || lk.starts_with(&lb)
+                    }) {
+                        Some(arm) => arm,
+                        None => {
+                            let keys = arms.iter().map(|a| a.key).collect::<Vec<_>>().join(" / ");
+                            return StepResult::Error(format!("unknown option '{buf}' — choose {keys}"));
+                        }
+                    }
+                };
+                self.done.push(Input::Key(chosen.key.to_string()));
+                self.branch = Some(chosen.steps);
+                self.input.clear();
+                self.maybe_finish()
+            }
+            Some(Step::PickPoint { .. } | Step::Vector { .. }) => {
                 StepResult::Error("pick a point, or type coordinates".into())
             }
             Some(Step::SelectObject { .. }) => {
@@ -409,7 +492,7 @@ impl GuidedTool {
     /// Register a canvas pick (already snap-resolved). No-op with `NeedMore` when
     /// the current step isn't a point step, so stray clicks are harmless.
     pub fn on_click(&mut self, world: DVec3) -> StepResult {
-        if !matches!(self.current_step(), Some(Step::PickPoint { .. })) {
+        if !matches!(self.current_step(), Some(Step::PickPoint { .. } | Step::Vector { .. })) {
             return StepResult::NeedMore;
         }
         self.done.push(Input::Point(world));
@@ -422,8 +505,7 @@ impl GuidedTool {
     /// this right after `try_start` returns `Started`: `Some(Emit)` runs the
     /// command now, `None` means there are steps to prompt for first.
     pub fn emit_if_ready(&mut self) -> Option<StepResult> {
-        let script = self.script?;
-        (self.done.len() == script.steps.len()).then(|| self.maybe_finish())
+        (self.steps_total() == Some(self.done.len())).then(|| self.maybe_finish())
     }
 
     /// Live ghost geometry to overlay while picking (Rhino-style rubber-band).
@@ -468,10 +550,25 @@ impl GuidedTool {
         if strip.len() >= 2 { vec![strip] } else { Vec::new() }
     }
 
+    /// Total steps to collect before the flow completes, branch-aware. Without a
+    /// branch it's just `base.len()`. With a branch: once an arm is chosen, it's
+    /// `bi + 1` (base steps up to and including the branch's own Key slot) plus
+    /// the arm's own steps. Before an arm is chosen the flow can't complete, so
+    /// this returns `None` (a sentinel `done.len()` can never reach).
+    fn steps_total(&self) -> Option<usize> {
+        let base = self.script?.steps;
+        match self.branch_index() {
+            None => Some(base.len()),
+            Some(bi) => self.branch.map(|arm| bi + 1 + arm.len()),
+        }
+    }
+
     /// All steps collected → assemble and reset. Otherwise `NeedMore`.
     fn maybe_finish(&mut self) -> StepResult {
         let script = self.script.expect("active during a step commit");
-        if self.done.len() < script.steps.len() {
+        let total = self.steps_total();
+        // No total yet (branch unchosen) or fewer steps done → keep going.
+        if total != Some(self.done.len()) {
             return StepResult::NeedMore;
         }
         let mut args = self.seed.clone();
@@ -899,6 +996,106 @@ mod tests {
         assert_eq!(t.push_list_point(DVec3::new(1.0, 0.0, 0.0)), StepResult::NeedMore);
         assert_eq!(t.finish_list(), StepResult::Emit("tl n 0,0 1,0".into()));
         assert!(!t.active());
+    }
+
+    // A throwaway branching script: arm "a" is a short one-number path, arm "b"
+    // is a longer two-number path. Exercises branch routing + step counting.
+    static BRANCH_TEST: VerbScript = VerbScript {
+        verb: "__branchtest",
+        needs_selection: false,
+        steps: &[
+            Step::Number { prompt: "Lead", default: Some(1.0) },
+            Step::Branch {
+                prompt: "Mode",
+                arms: &[
+                    BranchArm { key: "alpha", steps: &[Step::Number { prompt: "A1", default: None }] },
+                    BranchArm {
+                        key: "beta",
+                        steps: &[
+                            Step::Number { prompt: "B1", default: None },
+                            Step::Number { prompt: "B2", default: None },
+                        ],
+                    },
+                ],
+            },
+        ],
+        assemble: |args| {
+            let lead = super::assemble::num_at(args, 0, "br")?;
+            let key = super::assemble::key_at(args, 1, "br")?;
+            let rest = args[2..]
+                .iter()
+                .map(|i| match i {
+                    Input::Num(v) => num(*v).to_string(),
+                    _ => "?".into(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(format!("br {} {key} {rest}", num(lead)))
+        },
+    };
+
+    #[test]
+    fn branch_prompt_lists_arms_and_routes_short_arm() {
+        let mut t = GuidedTool { script: Some(&BRANCH_TEST), ..Default::default() };
+        // Base step before the branch.
+        assert_eq!(t.commit_typed("3"), StepResult::NeedMore);
+        // The Branch step prompts with its arm keys and the first as default.
+        assert_eq!(t.prompt().unwrap(), "Mode ( alpha / beta ) <alpha>:");
+        assert!(!t.current_is_point());
+        // Pick the short arm; it has one remaining step (not done yet).
+        assert_eq!(t.commit_typed("alpha"), StepResult::NeedMore);
+        assert_eq!(t.prompt().unwrap(), "A1:");
+        assert_eq!(t.commit_typed("7"), StepResult::Emit("br 3 alpha 7".into()));
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn branch_routes_long_arm_and_counts_all_steps() {
+        let mut t = GuidedTool { script: Some(&BRANCH_TEST), ..Default::default() };
+        t.commit_typed("3");
+        // Unique-prefix, case-insensitive arm match.
+        assert_eq!(t.commit_typed("BE"), StepResult::NeedMore);
+        assert_eq!(t.prompt().unwrap(), "B1:");
+        assert_eq!(t.commit_typed("5"), StepResult::NeedMore);
+        assert_eq!(t.prompt().unwrap(), "B2:");
+        assert_eq!(t.commit_typed("6"), StepResult::Emit("br 3 beta 5 6".into()));
+    }
+
+    #[test]
+    fn branch_bare_enter_takes_first_arm_and_rejects_unknown() {
+        let mut t = GuidedTool { script: Some(&BRANCH_TEST), ..Default::default() };
+        t.commit_typed("1");
+        assert!(matches!(t.commit_typed("zzz"), StepResult::Error(_)));
+        // Bare Enter selects the first arm (alpha).
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed("9"), StepResult::Emit("br 1 alpha 9".into()));
+    }
+
+    // A throwaway script with a Vector step (typed direction → Input::Point).
+    static VEC_TEST: VerbScript = VerbScript {
+        verb: "__vectest",
+        needs_selection: false,
+        steps: &[Step::Vector { prompt: "Direction" }],
+        assemble: |args| {
+            let v = super::assemble::point_at(args, 0, "vec")?;
+            Ok(format!("vec {}", fmt(v)))
+        },
+    };
+
+    #[test]
+    fn vector_step_is_point_like_and_emits_a_vector() {
+        let mut t = GuidedTool { script: Some(&VEC_TEST), ..Default::default() };
+        // A Vector is collected like a point: current_is_point is true, and a
+        // click/typed-coord (fed via on_click by the app) supplies the vector.
+        assert!(t.current_is_point());
+        assert!(t.prompt().unwrap().starts_with("Direction"));
+        // Typed coords go through commit_typed → rejected (the app resolves them
+        // to on_click); a resolved point commits and emits.
+        assert!(matches!(t.commit_typed("0,0,-1"), StepResult::Error(_)));
+        assert_eq!(
+            t.on_click(DVec3::new(0.0, 0.0, -1.0)),
+            StepResult::Emit("vec 0,0,-1".into())
+        );
     }
 
     #[test]

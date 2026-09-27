@@ -13,6 +13,7 @@
 //!   wall        — pick centerline points, type a thickness  → `wall <p…> thick <t>`
 //!   slab        — pick outline points, type a thickness     → `slab <p…> thick <t>`
 //!   support     — pick a location, choose a restraint       → `support <pt> <kind>`
+//!                 (roller branch adds an axis vector          → `support <pt> roller <dx,dy,dz>`)
 //!   story       — type a name, an elevation, a height       → `story <name> <elev> height <h>`
 //!   room        — pick a closed boundary, choose occupancy  → `room #<id> <occupancy>`
 //!   minsurf     — pick a closed boundary curve              → `minsurf #<id>`
@@ -21,9 +22,11 @@
 //!   tensegrity  — type a strut count                        → `tensegrity <n>`
 //!   spaceframe  — type nx, ny, bay spacing, depth           → `spaceframe <nx> <ny> <bay> <depth>`
 //!   geodesic    — type frequency, radius, extent            → `geodesic <f> <r> <mode>`
+//!   gridshell   — branch hypar|vault, type three numbers    → `gridshell hypar <a> <b> <c>`
+//!   load        — branch point|line|area, magnitude, dir    → `load point <pt> <mag> <dx,dy,dz>`
 
 use super::assemble::{int_at, key_at, num_at, obj_at, point_at, points_at, text_at};
-use super::{fmt, num, Input, ObjFilter, Step, VerbScript};
+use super::{fmt, num, BranchArm, Input, ObjFilter, Step, VerbScript};
 
 /// Built-in structural-section names offered by the guided beam/column section
 /// step. Kept in step with the kernel catalog (`kernel_mesh::builtin_section`);
@@ -80,13 +83,18 @@ pub static SCRIPTS: &[VerbScript] = &[
         needs_selection: false,
         steps: &[
             Step::PickPoint { prompt: "Support location" },
-            Step::Keyword {
-                // `roller` needs an axis vector the guided engine can't collect
-                // yet (no vector step) — it would error at exec — so offer only
-                // pinned/fixed here; roller stays available via the typed command.
+            // Branch on restraint type: pinned/fixed take no extra steps; roller
+            // adds an axis Vector so the guided engine can finally emit rollers.
+            Step::Branch {
                 prompt: "Support type",
-                options: &["pinned", "fixed"],
-                default: "pinned",
+                arms: &[
+                    BranchArm { key: "pinned", steps: &[] },
+                    BranchArm { key: "fixed", steps: &[] },
+                    BranchArm {
+                        key: "roller",
+                        steps: &[Step::Vector { prompt: "Roller axis (dx,dy,dz)" }],
+                    },
+                ],
             },
         ],
         assemble: assemble_support,
@@ -181,6 +189,71 @@ pub static SCRIPTS: &[VerbScript] = &[
         ],
         assemble: assemble_geodesic,
     },
+    VerbScript {
+        verb: "gridshell",
+        needs_selection: false,
+        // Branch on shell type; each arm collects its three defining numbers.
+        // Optional divisions (nu/nv, undulate) are skipped — the parser defaults
+        // them, and they stay reachable via the typed command.
+        steps: &[Step::Branch {
+            prompt: "Shell type",
+            arms: &[
+                BranchArm {
+                    key: "hypar",
+                    steps: &[
+                        Step::Number { prompt: "a (x half-extent)", default: Some(4.0) },
+                        Step::Number { prompt: "b (y half-extent)", default: Some(4.0) },
+                        Step::Number { prompt: "c (saddle height)", default: Some(2.0) },
+                    ],
+                },
+                BranchArm {
+                    key: "vault",
+                    steps: &[
+                        Step::Number { prompt: "span", default: Some(10.0) },
+                        Step::Number { prompt: "length", default: Some(20.0) },
+                        Step::Number { prompt: "rise", default: Some(3.0) },
+                    ],
+                },
+            ],
+        }],
+        assemble: assemble_gridshell,
+    },
+    VerbScript {
+        verb: "load",
+        needs_selection: false,
+        // Branch on load kind: point takes one application point; line/area take
+        // a point list. Each then takes a magnitude and a direction Vector.
+        steps: &[Step::Branch {
+            prompt: "Load kind",
+            arms: &[
+                BranchArm {
+                    key: "point",
+                    steps: &[
+                        Step::PickPoint { prompt: "Application point" },
+                        Step::Number { prompt: "Magnitude", default: Some(1.0) },
+                        Step::Vector { prompt: "Direction (dx,dy,dz)" },
+                    ],
+                },
+                BranchArm {
+                    key: "line",
+                    steps: &[
+                        Step::PointList { prompt: "Line points (Enter to finish)", min: 2 },
+                        Step::Number { prompt: "Magnitude", default: Some(1.0) },
+                        Step::Vector { prompt: "Direction (dx,dy,dz)" },
+                    ],
+                },
+                BranchArm {
+                    key: "area",
+                    steps: &[
+                        Step::PointList { prompt: "Area boundary points (Enter to finish)", min: 3 },
+                        Step::Number { prompt: "Magnitude", default: Some(1.0) },
+                        Step::Vector { prompt: "Direction (dx,dy,dz)" },
+                    ],
+                },
+            ],
+        }],
+        assemble: assemble_load,
+    },
 ];
 
 /// `[Point(a), Point(b), Key(section)] -> "beam <a> <b> <section>"`
@@ -215,11 +288,17 @@ fn assemble_slab(args: &[Input]) -> Result<String, String> {
     Ok(format!("slab {joined} thick {}", num(thickness)))
 }
 
-/// `[Point(pt), Key(kind)] -> "support <pt> <kind>"`
+/// `[Point(pt), Key(kind)] -> "support <pt> <kind>"`, plus the roller arm
+/// `[Point(pt), Key("roller"), Point(axis)] -> "support <pt> roller <dx,dy,dz>"`.
 fn assemble_support(args: &[Input]) -> Result<String, String> {
     let pt = point_at(args, 0, "support")?;
     let kind = key_at(args, 1, "support")?;
-    Ok(format!("support {} {kind}", fmt(pt)))
+    if kind == "roller" {
+        let axis = point_at(args, 2, "support")?;
+        Ok(format!("support {} roller {}", fmt(pt), fmt(axis)))
+    } else {
+        Ok(format!("support {} {kind}", fmt(pt)))
+    }
 }
 
 /// `[Text(name), Num(elev), Num(height)] -> "story <name> <elev> height <h>"`
@@ -280,6 +359,51 @@ fn assemble_geodesic(args: &[Input]) -> Result<String, String> {
     let radius = num_at(args, 1, "geodesic")?;
     let mode = key_at(args, 2, "geodesic")?;
     Ok(format!("geodesic {frequency} {} {mode}", num(radius)))
+}
+
+/// `[Key(kind), Num(a), Num(b), Num(c)] -> "gridshell hypar <a> <b> <c>"` or
+/// `"gridshell vault <span> <length> <rise>"`. The three numbers are positional
+/// for both arms; the branch Key selects the surface form.
+fn assemble_gridshell(args: &[Input]) -> Result<String, String> {
+    let kind = key_at(args, 0, "gridshell")?;
+    let a = num_at(args, 1, "gridshell")?;
+    let b = num_at(args, 2, "gridshell")?;
+    let c = num_at(args, 3, "gridshell")?;
+    Ok(format!("gridshell {kind} {} {} {}", num(a), num(b), num(c)))
+}
+
+/// `load` assembler, branch-keyed:
+/// - point: `[Key, Point(pt), Num(mag), Point(dir)] -> "load point <pt> <mag> <dir>"`
+/// - line:  `[Key, Points(p…), Num(mag), Point(dir)] -> "load line <p1> <p2> <mag> <dir>"`
+/// - area:  `[Key, Points(p…), Num(mag), Point(dir)] -> "load area <p1> … end <mag> <dir>"`
+///
+/// The `area` form emits the `end` sentinel the parser requires between the
+/// boundary points and the magnitude/direction (see `parse_load`).
+fn assemble_load(args: &[Input]) -> Result<String, String> {
+    let kind = key_at(args, 0, "load")?;
+    match kind {
+        "point" => {
+            let pt = point_at(args, 1, "load")?;
+            let mag = num_at(args, 2, "load")?;
+            let dir = point_at(args, 3, "load")?;
+            Ok(format!("load point {} {} {}", fmt(pt), num(mag), fmt(dir)))
+        }
+        "line" => {
+            let pts = points_at(args, 1, "load")?;
+            let mag = num_at(args, 2, "load")?;
+            let dir = point_at(args, 3, "load")?;
+            let joined = pts.iter().map(|p| fmt(*p)).collect::<Vec<_>>().join(" ");
+            Ok(format!("load line {joined} {} {}", num(mag), fmt(dir)))
+        }
+        "area" => {
+            let pts = points_at(args, 1, "load")?;
+            let mag = num_at(args, 2, "load")?;
+            let dir = point_at(args, 3, "load")?;
+            let joined = pts.iter().map(|p| fmt(*p)).collect::<Vec<_>>().join(" ");
+            Ok(format!("load area {joined} end {} {}", num(mag), fmt(dir)))
+        }
+        other => Err(format!("load: unknown kind '{other}'")),
+    }
 }
 
 #[cfg(test)]
@@ -453,5 +577,80 @@ mod tests {
         let mut t = GuidedTool::default();
         assert_eq!(t.try_start("tensegrity", None), StartResult::Started);
         assert_eq!(t.commit_typed("6"), StepResult::Emit("tensegrity 6".into()));
+    }
+
+    #[test]
+    fn gridshell_walks_hypar_arm() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("gridshell", None), StartResult::Started);
+        // The lone step is the shell-type branch.
+        assert_eq!(t.prompt().unwrap(), "Shell type ( hypar / vault ) <hypar>:");
+        assert_eq!(t.commit_typed("hypar"), StepResult::NeedMore);
+        assert_eq!(t.commit_typed("4"), StepResult::NeedMore);
+        assert_eq!(t.commit_typed("4"), StepResult::NeedMore);
+        assert_eq!(t.commit_typed("2"), StepResult::Emit("gridshell hypar 4 4 2".into()));
+    }
+
+    #[test]
+    fn gridshell_walks_vault_arm() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("gridshell", None), StartResult::Started);
+        assert_eq!(t.commit_typed("vault"), StepResult::NeedMore);
+        assert_eq!(t.commit_typed("10"), StepResult::NeedMore);
+        assert_eq!(t.commit_typed("20"), StepResult::NeedMore);
+        assert_eq!(t.commit_typed("3"), StepResult::Emit("gridshell vault 10 20 3".into()));
+    }
+
+    #[test]
+    fn support_roller_branch_collects_axis_vector() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("support", None), StartResult::Started);
+        assert_eq!(t.on_click(DVec3::ZERO), StepResult::NeedMore);
+        // Branch on type; roller adds a Vector step.
+        assert_eq!(t.commit_typed("roller"), StepResult::NeedMore);
+        assert!(t.current_is_point(), "roller axis is a point-like Vector step");
+        assert_eq!(
+            t.on_click(DVec3::new(0.0, 0.0, 1.0)),
+            StepResult::Emit("support 0,0 roller 0,0,1".into())
+        );
+    }
+
+    #[test]
+    fn support_pinned_branch_takes_no_extra_steps() {
+        let mut t = GuidedTool::default();
+        t.try_start("support", None);
+        t.on_click(DVec3::ZERO);
+        // Bare Enter selects the first arm (pinned); no further steps.
+        assert_eq!(t.commit_typed(""), StepResult::Emit("support 0,0 pinned".into()));
+    }
+
+    #[test]
+    fn load_point_branch_walks_to_emit() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("load", None), StartResult::Started);
+        assert_eq!(t.prompt().unwrap(), "Load kind ( point / line / area ) <point>:");
+        assert_eq!(t.commit_typed("point"), StepResult::NeedMore);
+        assert_eq!(t.on_click(DVec3::ZERO), StepResult::NeedMore); // application point
+        assert_eq!(t.commit_typed("5"), StepResult::NeedMore); // magnitude
+        assert_eq!(
+            t.on_click(DVec3::new(0.0, 0.0, -1.0)), // direction vector
+            StepResult::Emit("load point 0,0 5 0,0,-1".into())
+        );
+    }
+
+    #[test]
+    fn load_area_branch_emits_end_sentinel() {
+        let mut t = GuidedTool::default();
+        t.try_start("load", None);
+        assert_eq!(t.commit_typed("area"), StepResult::NeedMore);
+        t.push_list_point(DVec3::ZERO);
+        t.push_list_point(DVec3::new(5.0, 0.0, 0.0));
+        t.push_list_point(DVec3::new(5.0, 5.0, 0.0));
+        assert_eq!(t.finish_list(), StepResult::NeedMore);
+        assert_eq!(t.commit_typed("3"), StepResult::NeedMore); // magnitude
+        assert_eq!(
+            t.on_click(DVec3::new(0.0, 0.0, -1.0)),
+            StepResult::Emit("load area 0,0 5,0 5,5 end 3 0,0,-1".into())
+        );
     }
 }

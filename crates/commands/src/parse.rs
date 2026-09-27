@@ -4014,6 +4014,13 @@ mod tests {
             "tensegrity 6",
             "spaceframe 6 4 3 1.5",
             "geodesic 3 5 dome",
+            // Branch / Vector step kinds (guided engine v4).
+            "gridshell hypar 4 4 2",
+            "gridshell vault 10 20 3",
+            "support 0,0,0 roller 0,0,1",
+            "load point 0,0,0 5 0,0,-1",
+            "load line 0,0 5,0 5 0,0,-1",
+            "load area 0,0 5,0 5,5 end 3 0,0,-1",
         ] {
             assert!(parse(s).is_ok(), "guided-emitted string failed to parse: {s}");
         }
