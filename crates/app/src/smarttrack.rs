@@ -2,10 +2,13 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 //! SmartTrack construction guides (Rhino habit): after the cursor DWELLS on an
-//! object snap the point is "acquired", and horizontal / vertical guide lines
-//! are projected THROUGH each acquired point. The cursor then snaps onto the
-//! nearest guide, or to the INTERSECTION of two guides, giving align-to-object
-//! precision without extra clicks.
+//! object snap the point is "acquired", and construction guide lines are
+//! projected THROUGH each acquired point. Besides the horizontal / vertical
+//! ortho guides, a DIRECTIONAL guide is projected along the line connecting each
+//! pair of acquired points (extended both ways), so after two points you can
+//! draw along their extension — matching Rhino. The cursor then snaps onto the
+//! nearest guide, or to the INTERSECTION of two non-parallel guides, giving
+//! align-to-object precision without extra clicks.
 //!
 //! This module is the PURE geometry core: acquisition storage (dedup / cap /
 //! FIFO), guide construction, and the cursor→guide projection + intersection
@@ -17,53 +20,86 @@
 
 use glam::DVec3;
 
-/// Which world axis a guide line runs along. A horizontal guide holds Y
-/// constant (runs along X); a vertical guide holds X constant (runs along Y).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GuideAxis {
-    /// Constant Y, extends along world X.
-    Horizontal,
-    /// Constant X, extends along world Y.
-    Vertical,
-}
-
-/// A construction guide line: an origin it passes through plus the axis it runs
-/// along. The app extends `origin ± axis * big` across the viewport to draw it.
+/// A construction guide line: an origin it passes through plus a UNIT direction
+/// (in the ground plane XY) it runs along. The app extends `origin ± dir * big`
+/// across the viewport to draw it. Horizontal guides run along +X, vertical along
+/// +Y, and directional guides along the connecting line of two acquired points.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GuideLine {
     /// A point the line passes through (an acquired point, or the last-picked
     /// point for an align-to-last guide).
     pub origin: DVec3,
-    /// The direction the line runs along.
-    pub axis: GuideAxis,
+    /// Unit direction the line runs along, in the ground plane (z = 0).
+    dir: DVec3,
 }
 
 impl GuideLine {
+    /// Horizontal (constant Y) guide through `origin`: runs along world +X.
+    pub fn axis_h(origin: DVec3) -> GuideLine {
+        GuideLine { origin, dir: DVec3::X }
+    }
+
+    /// Vertical (constant X) guide through `origin`: runs along world +Y.
+    pub fn axis_v(origin: DVec3) -> GuideLine {
+        GuideLine { origin, dir: DVec3::Y }
+    }
+
+    /// Directional guide through `origin` along `dir` (projected + normalized in
+    /// the ground plane). Returns `None` for a near-zero direction.
+    pub fn through(origin: DVec3, dir: DVec3) -> Option<GuideLine> {
+        let flat = DVec3::new(dir.x, dir.y, 0.0);
+        let len = flat.length();
+        if len < 1e-9 {
+            return None;
+        }
+        Some(GuideLine { origin, dir: flat / len })
+    }
+
     /// Unit direction the guide runs along, in the ground plane.
     pub fn dir(self) -> DVec3 {
-        match self.axis {
-            GuideAxis::Horizontal => DVec3::X,
-            GuideAxis::Vertical => DVec3::Y,
-        }
+        self.dir
     }
 
-    /// Perpendicular distance (in the ground plane) from `p` to this line.
+    /// Perpendicular distance (in the ground plane) from `p` to this infinite
+    /// line: |dir.x·(p.y−o.y) − dir.y·(p.x−o.x)| (exact for a unit `dir`).
     fn distance_xy(self, p: DVec3) -> f64 {
-        match self.axis {
-            GuideAxis::Horizontal => (p.y - self.origin.y).abs(),
-            GuideAxis::Vertical => (p.x - self.origin.x).abs(),
-        }
+        (self.dir.x * (p.y - self.origin.y) - self.dir.y * (p.x - self.origin.x)).abs()
     }
 
-    /// Project `p` orthogonally onto this line (ground plane). The free
-    /// coordinate keeps the cursor's value; the locked coordinate takes the
-    /// origin's.
+    /// Project `p` orthogonally onto this line (ground plane): the closest point
+    /// o + ((p−o)·dir) dir, keeping the cursor's z.
     fn project_xy(self, p: DVec3) -> DVec3 {
-        match self.axis {
-            GuideAxis::Horizontal => DVec3::new(p.x, self.origin.y, p.z),
-            GuideAxis::Vertical => DVec3::new(self.origin.x, p.y, p.z),
-        }
+        let o = self.origin;
+        let t = (p.x - o.x) * self.dir.x + (p.y - o.y) * self.dir.y;
+        DVec3::new(o.x + t * self.dir.x, o.y + t * self.dir.y, p.z)
     }
+
+    /// Are two guides near-parallel (directions collinear within `eps`)? Uses the
+    /// 2D cross of unit directions.
+    fn near_parallel(self, other: GuideLine, eps: f64) -> bool {
+        (self.dir.x * other.dir.y - self.dir.y * other.dir.x).abs() <= eps
+    }
+}
+
+/// Intersection of the two infinite ground-plane lines (o1,d1) and (o2,d2).
+/// Parametric solve; returns `None` when the directions are (near-)parallel.
+/// z is taken from `keep_z`.
+fn line_intersection_xy(
+    o1: DVec3,
+    d1: DVec3,
+    o2: DVec3,
+    d2: DVec3,
+    keep_z: f64,
+) -> Option<DVec3> {
+    let cross = d1.x * d2.y - d1.y * d2.x;
+    if cross.abs() < 1e-12 {
+        return None;
+    }
+    // o1 + t·d1 = o2 + u·d2  ⇒ solve for t via Cramer's rule.
+    let dx = o2.x - o1.x;
+    let dy = o2.y - o1.y;
+    let t = (dx * d2.y - dy * d2.x) / cross;
+    Some(DVec3::new(o1.x + t * d1.x, o1.y + t * d1.y, keep_z))
 }
 
 /// Acquired-point store: sticky osnap points the guides are built from. Capped
@@ -134,20 +170,28 @@ fn dist_xy(a: DVec3, b: DVec3) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
+/// Two guide directions this close (2D cross of unit dirs) count as parallel:
+/// they can't form a stable intersection, and near-duplicates are deduped.
+const PARALLEL_EPS: f64 = 1e-6;
+
 /// Try to snap `cursor` onto the SmartTrack guides built from `acquired`.
 ///
 /// Guides considered:
 ///   * horizontal (constant Y) and vertical (constant X) THROUGH each acquired
 ///     point;
+///   * a DIRECTIONAL guide through each acquired point toward every OTHER
+///     acquired point — the connecting-line direction, extended both ways — so
+///     the cursor can draw along the extension of a line defined by two points;
 ///   * the ortho guides (H and V) through `last` (align-to-last), when a draw
 ///     is in progress, so the cursor can align its own segment to an acquired
 ///     point's row/column.
 ///
-/// Snapping rule: any guide within `tol` (perpendicular, ground-plane) is a
-/// candidate. When two candidates cross (one horizontal, one vertical) and the
-/// cursor is near BOTH, the cursor snaps to their INTERSECTION. Otherwise it
-/// snaps onto the single nearest guide. Returns `None` when nothing is within
-/// tolerance (the caller then keeps the plain ground/grid point).
+/// Snapping rule: find the nearest guide within `tol` (perpendicular, ground
+/// plane). Then find the nearest OTHER guide within `tol` that is NOT
+/// near-parallel to it; if found, snap to their line–line INTERSECTION and draw
+/// both. Otherwise snap onto the single nearest guide. Returns `None` when
+/// nothing is within tolerance (the caller then keeps the plain ground/grid
+/// point).
 ///
 /// The caller must NOT call this when a direct osnap hit already won — a hit
 /// takes precedence over any guide.
@@ -156,50 +200,71 @@ pub fn snap(acquired: &Acquired, cursor: DVec3, last: Option<DVec3>, tol: f64) -
         return None;
     }
 
-    // Build the candidate guide set: H + V through each acquired point, plus
-    // H + V through the last-picked point (align-to-last).
-    let mut guides: Vec<GuideLine> = Vec::with_capacity(acquired.points().len() * 2 + 2);
-    for &p in acquired.points() {
-        guides.push(GuideLine { origin: p, axis: GuideAxis::Horizontal });
-        guides.push(GuideLine { origin: p, axis: GuideAxis::Vertical });
+    // Build the candidate guide set.
+    let pts = acquired.points();
+    let mut guides: Vec<GuideLine> = Vec::with_capacity(pts.len() * (pts.len() + 1) + 2);
+    for (i, &p) in pts.iter().enumerate() {
+        guides.push(GuideLine::axis_h(p));
+        guides.push(GuideLine::axis_v(p));
+        // Directional guide toward every OTHER acquired point (connecting line).
+        for (j, &q) in pts.iter().enumerate() {
+            if i != j
+                && let Some(g) = GuideLine::through(p, q - p)
+            {
+                guides.push(g);
+            }
+        }
     }
     if let Some(l) = last {
-        guides.push(GuideLine { origin: l, axis: GuideAxis::Horizontal });
-        guides.push(GuideLine { origin: l, axis: GuideAxis::Vertical });
+        guides.push(GuideLine::axis_h(l));
+        guides.push(GuideLine::axis_v(l));
     }
 
-    // Nearest horizontal and nearest vertical guide within tolerance.
-    let nearest = |axis: GuideAxis| -> Option<GuideLine> {
-        guides
+    // Dedup guides that share an origin and a near-parallel direction.
+    let mut deduped: Vec<GuideLine> = Vec::with_capacity(guides.len());
+    for g in guides {
+        if !deduped
             .iter()
-            .copied()
-            .filter(|g| g.axis == axis && g.distance_xy(cursor) <= tol)
-            .min_by(|a, b| {
-                a.distance_xy(cursor)
-                    .partial_cmp(&b.distance_xy(cursor))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    };
-    let h = nearest(GuideAxis::Horizontal);
-    let v = nearest(GuideAxis::Vertical);
-
-    match (h, v) {
-        // Both axes in range: snap to their intersection (constant Y from H,
-        // constant X from V), and draw both.
-        (Some(h), Some(v)) => Some(Snap {
-            snapped: DVec3::new(v.origin.x, h.origin.y, cursor.z),
-            active: vec![h, v],
-        }),
-        (Some(h), None) => Some(Snap {
-            snapped: h.project_xy(cursor),
-            active: vec![h],
-        }),
-        (None, Some(v)) => Some(Snap {
-            snapped: v.project_xy(cursor),
-            active: vec![v],
-        }),
-        (None, None) => None,
+            .any(|d| dist_xy(d.origin, g.origin) < 1e-9 && d.near_parallel(g, PARALLEL_EPS))
+        {
+            deduped.push(g);
+        }
     }
+    let guides = deduped;
+
+    // Nearest guide within tolerance (index into `guides`).
+    let nearest_within = |exclude: Option<usize>, forbid_parallel_to: Option<GuideLine>| {
+        let mut best: Option<(usize, f64)> = None;
+        for (i, g) in guides.iter().enumerate() {
+            if Some(i) == exclude {
+                continue;
+            }
+            if let Some(ref other) = forbid_parallel_to
+                && g.near_parallel(*other, PARALLEL_EPS)
+            {
+                continue;
+            }
+            let d = g.distance_xy(cursor);
+            if d <= tol && best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((i, d));
+            }
+        }
+        best.map(|(i, _)| i)
+    };
+
+    let first = nearest_within(None, None)?;
+    let g1 = guides[first];
+
+    // Nearest OTHER, non-parallel guide within tolerance → intersection snap.
+    if let Some(second) = nearest_within(Some(first), Some(g1)) {
+        let g2 = guides[second];
+        if let Some(x) = line_intersection_xy(g1.origin, g1.dir(), g2.origin, g2.dir(), cursor.z) {
+            return Some(Snap { snapped: x, active: vec![g1, g2] });
+        }
+    }
+
+    // Single-guide projection.
+    Some(Snap { snapped: g1.project_xy(cursor), active: vec![g1] })
 }
 
 #[cfg(test)]
@@ -210,16 +275,30 @@ mod tests {
         DVec3::new(x, y, 0.0)
     }
 
+    fn approx(a: DVec3, b: DVec3) -> bool {
+        dist_xy(a, b) < 1e-9
+    }
+
+    /// Is `g` a horizontal (along +X) guide through `y`?
+    fn is_h(g: &GuideLine, y: f64) -> bool {
+        g.dir().y.abs() < 1e-9 && (g.origin.y - y).abs() < 1e-9
+    }
+    /// Is `g` a vertical (along +Y) guide through `x`?
+    fn is_v(g: &GuideLine, x: f64) -> bool {
+        g.dir().x.abs() < 1e-9 && (g.origin.x - x).abs() < 1e-9
+    }
+
     #[test]
     fn horizontal_projection_locks_y() {
         // Acquired at (5, 5); cursor drifts to (12, 5.05) with tol 0.2.
         // The horizontal guide (constant Y=5) is within tol; snap Y back to 5,
-        // keep X.
+        // keep X. Only one acquired point → no directional guide, single project.
         let mut acq = Acquired::new();
         acq.acquire(p(5.0, 5.0), 0.01);
         let s = snap(&acq, p(12.0, 5.05), None, 0.2).unwrap();
-        assert_eq!(s.snapped, p(12.0, 5.0));
-        assert_eq!(s.active, vec![GuideLine { origin: p(5.0, 5.0), axis: GuideAxis::Horizontal }]);
+        assert!(approx(s.snapped, p(12.0, 5.0)));
+        assert_eq!(s.active.len(), 1);
+        assert!(is_h(&s.active[0], 5.0));
     }
 
     #[test]
@@ -228,22 +307,42 @@ mod tests {
         acq.acquire(p(5.0, 5.0), 0.01);
         // Cursor near the vertical (constant X=5) but far in Y.
         let s = snap(&acq, p(5.08, 20.0), None, 0.2).unwrap();
-        assert_eq!(s.snapped, p(5.0, 20.0));
-        assert_eq!(s.active, vec![GuideLine { origin: p(5.0, 5.0), axis: GuideAxis::Vertical }]);
+        assert!(approx(s.snapped, p(5.0, 20.0)));
+        assert_eq!(s.active.len(), 1);
+        assert!(is_v(&s.active[0], 5.0));
     }
 
     #[test]
     fn two_guide_intersection_snap() {
         // A at (10, 2) → vertical X=10. B at (3, 8) → horizontal Y=8.
-        // Cursor near both → snap to (10, 8) intersection, both guides active.
+        // Cursor near both → snap to (10, 8) intersection, two guides active.
         let mut acq = Acquired::new();
         acq.acquire(p(10.0, 2.0), 0.01);
         acq.acquire(p(3.0, 8.0), 0.01);
         let s = snap(&acq, p(10.05, 7.95), None, 0.2).unwrap();
-        assert_eq!(s.snapped, p(10.0, 8.0));
+        assert!(approx(s.snapped, p(10.0, 8.0)));
         assert_eq!(s.active.len(), 2);
-        assert!(s.active.iter().any(|g| g.axis == GuideAxis::Vertical && g.origin.x == 10.0));
-        assert!(s.active.iter().any(|g| g.axis == GuideAxis::Horizontal && g.origin.y == 8.0));
+        assert!(s.active.iter().any(|g| is_v(g, 10.0)));
+        assert!(s.active.iter().any(|g| is_h(g, 8.0)));
+    }
+
+    #[test]
+    fn diagonal_guide_projects_along_connecting_direction() {
+        // Two acquired points define a 45° diagonal through the origin:
+        // (0,0) and (2,2) → direction (1,1). A cursor near the EXTENSION of that
+        // line (e.g. near (5,5)) snaps ONTO the diagonal, not to an ortho guide.
+        let mut acq = Acquired::new();
+        acq.acquire(p(0.0, 0.0), 0.01);
+        acq.acquire(p(2.0, 2.0), 0.01);
+        // Cursor at (5.05, 4.95): perpendicular distance to the y=x line is
+        // |5.05-4.95|/√2 ≈ 0.0707 < tol; but 5 units from every ortho guide.
+        let s = snap(&acq, p(5.05, 4.95), None, 0.2).unwrap();
+        // Projects onto y=x at the midpoint of the cursor's coords → (5,5).
+        assert!(approx(s.snapped, p(5.0, 5.0)), "got {:?}", s.snapped);
+        // The active guide must be the diagonal (unit dir (1,1)/√2), single guide.
+        assert_eq!(s.active.len(), 1);
+        let d = s.active[0].dir();
+        assert!((d.x - d.y).abs() < 1e-9 && d.x.abs() > 1e-3, "not diagonal: {d:?}");
     }
 
     #[test]
@@ -275,7 +374,7 @@ mod tests {
         let mut acq = Acquired::new();
         acq.acquire(p(0.0, 30.0), 0.01); // horizontal Y=30, vertical X=0 (both far)
         let s = snap(&acq, p(7.02, 4.0), Some(p(7.0, 0.0)), 0.2).unwrap();
-        assert_eq!(s.snapped.x, 7.0);
+        assert!((s.snapped.x - 7.0).abs() < 1e-9);
     }
 
     #[test]

@@ -317,6 +317,14 @@ fn curve_candidates(
             if settings.is_on(SnapKind::End) {
                 out.extend(points.iter().map(|p| (*p, SnapKind::End)));
             }
+            // A closed polygon (rectangle / square / arbitrary polygon) has a
+            // meaningful center: its area centroid. Rhino snaps to it.
+            if *closed
+                && settings.is_on(SnapKind::Center)
+                && let Some(c) = polygon_centroid(points)
+            {
+                out.push((c, SnapKind::Center));
+            }
             let segs = if *closed { points.len() } else { points.len().saturating_sub(1) };
             for i in 0..segs {
                 let a = points[i];
@@ -393,6 +401,40 @@ fn curve_candidates(
     {
         out.push((n, SnapKind::Nearest));
     }
+}
+
+/// Area centroid of a closed polygon (XY plane), via the shoelace formula.
+///
+/// Needs >= 3 points. `z` is the average of the vertices' z (polygons are
+/// planar-ish in the drafting view). When the signed area is degenerate
+/// (|A| < 1e-12 — collinear / zero-area loop), falls back to the plain average
+/// of the vertices. Returns `None` for < 3 points.
+pub fn polygon_centroid(points: &[DVec3]) -> Option<DVec3> {
+    let n = points.len();
+    if n < 3 {
+        return None;
+    }
+    let avg_z = points.iter().map(|p| p.z).sum::<f64>() / n as f64;
+    let mean = || {
+        let s: DVec3 = points.iter().copied().sum();
+        DVec3::new(s.x / n as f64, s.y / n as f64, avg_z)
+    };
+    let mut a2 = 0.0; // 2·signed area
+    let mut cx = 0.0;
+    let mut cy = 0.0;
+    for i in 0..n {
+        let p = points[i];
+        let q = points[(i + 1) % n];
+        let cross = p.x * q.y - q.x * p.y;
+        a2 += cross;
+        cx += (p.x + q.x) * cross;
+        cy += (p.y + q.y) * cross;
+    }
+    let area = a2 / 2.0;
+    if area.abs() < 1e-12 {
+        return Some(mean()); // degenerate / collinear loop
+    }
+    Some(DVec3::new(cx / (6.0 * area), cy / (6.0 * area), avg_z))
 }
 
 /// Foot of the perpendicular from `p` onto the infinite line through `a`,`b`,
@@ -685,6 +727,70 @@ mod tests {
         let c = candidates(&doc);
         assert!(c.contains(&(DVec3::new(0.0, 2.0, 0.0), SnapKind::Mid)));
         assert_eq!(c.iter().filter(|(_, k)| *k == SnapKind::Mid).count(), 4);
+    }
+
+    #[test]
+    fn polygon_centroid_of_unit_square_is_center() {
+        let sq = [
+            DVec3::ZERO,
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+        ];
+        let c = polygon_centroid(&sq).unwrap();
+        assert!(approx(c, DVec3::new(0.5, 0.5, 0.0)));
+    }
+
+    #[test]
+    fn polygon_centroid_l_shape_is_area_centroid_not_vertex_mean() {
+        // L-shape (6 verts). Area centroid ≠ vertex average.
+        let l = [
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(2.0, 1.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(1.0, 2.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+        ];
+        let c = polygon_centroid(&l).unwrap();
+        // Compose from two rects: A=[0,2]x[0,1] area 2 centroid (1,0.5);
+        // B=[0,1]x[1,2] area 1 centroid (0.5,1.5). Total area 3.
+        // cx=(2*1+1*0.5)/3=0.8333…, cy=(2*0.5+1*1.5)/3=0.8333…
+        assert!(approx(c, DVec3::new(5.0 / 6.0, 5.0 / 6.0, 0.0)), "got {c:?}");
+        // Vertex mean would be (1.0, 1.0) — must differ.
+        let mean = l.iter().copied().sum::<DVec3>() / 6.0;
+        assert!(mean.distance(c) > 0.1);
+    }
+
+    #[test]
+    fn polygon_centroid_rejects_too_few_and_open() {
+        assert!(polygon_centroid(&[DVec3::ZERO, DVec3::X]).is_none());
+        // Closed square emits a Center candidate; an OPEN polyline does not.
+        let closed = doc_with(Geometry::Curve(Curve::Polyline {
+            points: vec![
+                DVec3::ZERO,
+                DVec3::new(2.0, 0.0, 0.0),
+                DVec3::new(2.0, 2.0, 0.0),
+                DVec3::new(0.0, 2.0, 0.0),
+            ],
+            closed: true,
+        }));
+        let c = candidates(&closed);
+        assert!(c
+            .iter()
+            .any(|(p, k)| *k == SnapKind::Center && approx(*p, DVec3::new(1.0, 1.0, 0.0))));
+
+        let open = doc_with(Geometry::Curve(Curve::Polyline {
+            points: vec![
+                DVec3::ZERO,
+                DVec3::new(2.0, 0.0, 0.0),
+                DVec3::new(2.0, 2.0, 0.0),
+                DVec3::new(0.0, 2.0, 0.0),
+            ],
+            closed: false,
+        }));
+        let c = candidates(&open);
+        assert!(!c.iter().any(|(_, k)| *k == SnapKind::Center));
     }
 
     #[test]
