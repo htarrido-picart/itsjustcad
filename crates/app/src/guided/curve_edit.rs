@@ -8,14 +8,12 @@
 //!   extend    — sel + Number               → `extend sel <dist>`
 //!   powertrim — sel + PickPoint            → `powertrim sel <pt>`
 //!   fillet    — pick curve A, curve B, radius → `fillet #a #b <r>`
+//!   chamfer   — pick curve A, curve B, distance → `chamfer #a #b <d>`
 //!   trim      — pick target, cutter, keep pt  → `trim #target #cutter <pt>`
 //!   boundary  — no sel, PickPoint           → `boundary <pt>`
 //!   curvebool — sel + Keyword               → `curvebool <op> sel`
 //!   join      — sel, zero steps (emit-on-start) → `join sel`
-//!
-//! Deferred:
-//!   explode   — no parser arm in commands/src/parse.rs
-//!   chamfer   — no parser arm in commands/src/parse.rs
+//!   explode   — sel, zero steps (emit-on-start) → `explode sel`
 
 use super::assemble::{key_at, num_at, obj_at, point_at, selector};
 use super::{fmt, num, Input, ObjFilter, Step, VerbScript};
@@ -50,6 +48,16 @@ pub static SCRIPTS: &[VerbScript] = &[
         assemble: assemble_fillet,
     },
     VerbScript {
+        verb: "chamfer",
+        needs_selection: false,
+        steps: &[
+            Step::SelectObject { prompt: "Select first curve to chamfer", filter: ObjFilter::Curve },
+            Step::SelectObject { prompt: "Select second curve to chamfer", filter: ObjFilter::Curve },
+            Step::Number { prompt: "Chamfer distance", default: Some(0.5) },
+        ],
+        assemble: assemble_chamfer,
+    },
+    VerbScript {
         verb: "trim",
         needs_selection: false,
         steps: &[
@@ -80,6 +88,12 @@ pub static SCRIPTS: &[VerbScript] = &[
         needs_selection: true,
         steps: &[],
         assemble: assemble_join,
+    },
+    VerbScript {
+        verb: "explode",
+        needs_selection: true,
+        steps: &[],
+        assemble: assemble_explode,
     },
 ];
 
@@ -115,6 +129,15 @@ fn assemble_fillet(args: &[Input]) -> Result<String, String> {
     Ok(format!("fillet {a} {b} {}", num(r)))
 }
 
+/// `[Objects(#a), Objects(#b), Num(d)] -> "chamfer #a #b <d>"` — two curves
+/// picked interactively (mirrors the fillet flow, straight bevel instead).
+fn assemble_chamfer(args: &[Input]) -> Result<String, String> {
+    let a = obj_at(args, 0, "chamfer")?;
+    let b = obj_at(args, 1, "chamfer")?;
+    let d = num_at(args, 2, "chamfer")?;
+    Ok(format!("chamfer {a} {b} {}", num(d)))
+}
+
 /// `[Objects(#target), Objects(#cutter), Point(keep)] -> "trim #target #cutter <keep>"`
 fn assemble_trim(args: &[Input]) -> Result<String, String> {
     let target = obj_at(args, 0, "trim")?;
@@ -143,6 +166,12 @@ fn assemble_curvebool(args: &[Input]) -> Result<String, String> {
 fn assemble_join(args: &[Input]) -> Result<String, String> {
     let sel = selector(args, "join")?;
     Ok(format!("join {sel}"))
+}
+
+/// `[Objects(sel)] -> "explode sel"` — zero-step verb (emit-on-start).
+fn assemble_explode(args: &[Input]) -> Result<String, String> {
+    let sel = selector(args, "explode")?;
+    Ok(format!("explode {sel}"))
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -192,6 +221,17 @@ mod tests {
         ];
         assert_eq!(assemble_fillet(&args).unwrap(), "fillet #a1b2c3d4 #00ffee11 0.5");
         assert!(assemble_fillet(&args[..1]).is_err());
+    }
+
+    #[test]
+    fn assemble_chamfer_pure() {
+        let args = [
+            Input::Objects("#a1b2c3d4".into()),
+            Input::Objects("#00ffee11".into()),
+            Input::Num(0.5),
+        ];
+        assert_eq!(assemble_chamfer(&args).unwrap(), "chamfer #a1b2c3d4 #00ffee11 0.5");
+        assert!(assemble_chamfer(&args[..1]).is_err());
     }
 
     #[test]
@@ -352,6 +392,54 @@ mod tests {
             t.commit_typed("In"),
             StepResult::Emit("curvebool Intersect sel".into())
         );
+    }
+
+    #[test]
+    fn chamfer_walk_default_distance_after_two_picks() {
+        let mut t = GuidedTool::default();
+        t.try_start("chamfer", None);
+        t.commit_object("a1b2c3d4");
+        t.commit_object("00ffee11");
+        assert_eq!(t.prompt().unwrap(), "Chamfer distance <0.5>:");
+        assert_eq!(
+            t.commit_typed(""),
+            StepResult::Emit("chamfer #a1b2c3d4 #00ffee11 0.5".into())
+        );
+    }
+
+    #[test]
+    fn chamfer_walk_typed_distance() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("chamfer", None), StartResult::Started);
+        assert!(t.current_wants_object());
+        t.commit_object("aaaa1111");
+        t.commit_object("bbbb2222");
+        assert!(!t.current_wants_object());
+        assert_eq!(
+            t.commit_typed("1.25"),
+            StepResult::Emit("chamfer #aaaa1111 #bbbb2222 1.25".into())
+        );
+    }
+
+    #[test]
+    fn assemble_explode_pure() {
+        let args = [Input::Objects("sel".into())];
+        assert_eq!(assemble_explode(&args).unwrap(), "explode sel");
+        assert!(assemble_explode(&[]).is_err());
+    }
+
+    #[test]
+    fn explode_emits_on_start() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("explode", Some("sel")), StartResult::Started);
+        assert_eq!(t.emit_if_ready(), Some(StepResult::Emit("explode sel".into())));
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn explode_needs_selection() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("explode", None), StartResult::NeedSelection);
     }
 
     #[test]

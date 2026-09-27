@@ -463,6 +463,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Curve,
         },
         CommandSpec {
+            name: "explode",
+            usage: "explode <selector>",
+            summary: "Break polylines into their individual line segments (closed polylines include the closing segment); non-polyline curves are left as-is. Example: explode last",
+            category: Category::Curve,
+        },
+        CommandSpec {
             name: "constrain",
             usage: "constrain <kind> <selector> [selector] [value]",
             summary: "Add a sketch constraint over lines/circles and re-solve immediately. Kinds: coincident, horizontal, vertical, distance, length, angle (deg), parallel, perpendicular, equal, radius, fixed, tangent, midpoint, on. Endpoint pairs resolve nearest-first. Example: constrain horizontal last · constrain length name:l1 5 · constrain perpendicular name:l1 name:l2",
@@ -484,6 +490,12 @@ pub fn registry() -> &'static [CommandSpec] {
             name: "fillet",
             usage: "fillet <a selector> <b selector> <radius> | fillet <selector matching 2> <radius>",
             summary: "Round the corner between two lines with a tangent arc, trimming both lines to the tangency points. Example: fillet last 2 0.5",
+            category: Category::Curve,
+        },
+        CommandSpec {
+            name: "chamfer",
+            usage: "chamfer <selector> <selector> <distance>",
+            summary: "Bevel the corner between two lines/polylines with a straight setback line, trimming both sources back by the distance (the fillet analogue). Example: chamfer last 2 0.5",
             category: Category::Curve,
         },
         CommandSpec {

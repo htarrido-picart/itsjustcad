@@ -9688,6 +9688,77 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Explode { ids: replay_ids, targets } => {
+            let sel = resolve(doc, &targets)?;
+            if sel.is_empty() {
+                return Err(ExecError::Invalid("explode: nothing selected".into()));
+            }
+            // Build the segment lines per exploded polyline, remembering which
+            // source each batch came from so undo can restore the polylines.
+            struct Exploded {
+                obj: SceneObject,
+                index: usize,
+                segments: Vec<Curve>,
+            }
+            let mut exploded: Vec<Exploded> = Vec::new();
+            for cid in &sel {
+                let Geometry::Curve(Curve::Polyline { points, closed }) =
+                    &doc.get(*cid).expect("resolved").geometry
+                else {
+                    continue; // non-polyline curves (and non-curves) are left as-is
+                };
+                if points.len() < 2 {
+                    continue;
+                }
+                let n = points.len();
+                let seg_count = if *closed { n } else { n - 1 };
+                let segments: Vec<Curve> = (0..seg_count)
+                    .map(|i| Curve::Line { a: points[i], b: points[(i + 1) % n] })
+                    .collect();
+                let (obj, index) = doc.remove(*cid).expect("resolved");
+                exploded.push(Exploded { obj, index, segments });
+            }
+            if exploded.is_empty() {
+                return Err(ExecError::Invalid(
+                    "explode: selection has no polylines to explode".into(),
+                ));
+            }
+            let total: usize = exploded.iter().map(|e| e.segments.len()).sum();
+            // Reuse replay ids when they match the count, else mint fresh ones.
+            let created: Vec<ObjectId> = match replay_ids {
+                Some(ids) if ids.len() == total => ids,
+                _ => (0..total).map(|_| ObjectId::new()).collect(),
+            };
+            let mut consumed = Vec::with_capacity(exploded.len());
+            let mut next = created.iter();
+            for e in exploded {
+                for seg in e.segments {
+                    let id = *next.next().expect("created ids cover all segments");
+                    doc.insert(SceneObject {
+                        visible: true,
+                        id,
+                        name: e.obj.name.clone(),
+                        layer: e.obj.layer.clone(),
+                        color: e.obj.color,
+                        material: e.obj.material,
+                        lineweight_mm: e.obj.lineweight_mm,
+                        geometry: Geometry::Curve(seg),
+                    });
+                }
+                consumed.push((e.obj, e.index));
+            }
+            let polys = consumed.len();
+            Ok((
+                Command::Explode { ids: Some(created.clone()), targets },
+                Inverse::Replace { created: created.clone(), consumed },
+                ApplyOutcome {
+                    message: format!(
+                        "exploded {polys} polyline(s) -> {total} line segment(s)"
+                    ),
+                    created,
+                },
+            ))
+        }
         Command::Stretch { targets, min, max, delta } => {
             let ids = resolve(doc, &targets)?;
             // Snapshot BEFORE mutating, and only for objects that actually
@@ -10279,6 +10350,65 @@ fn apply_forward(
                     created: vec![id],
                     message: format!(
                         "filleted {} + {} r={radius} -> arc {id} (curves trimmed to tangency)",
+                        ids[0], ids[1]
+                    ),
+                },
+            ))
+        }
+        Command::Chamfer { id, a, b, dist } => {
+            if dist <= 0.0 {
+                return Err(ExecError::Invalid("chamfer distance must be positive".into()));
+            }
+            let mut ids = resolve(doc, &a)?;
+            for bid in resolve(doc, &b)? {
+                if !ids.contains(&bid) {
+                    ids.push(bid);
+                }
+            }
+            if ids.len() != 2 {
+                return Err(ExecError::Invalid(format!(
+                    "chamfer needs exactly 2 curves, selectors matched {}",
+                    ids.len()
+                )));
+            }
+            let curve_for = |cid: ObjectId| -> Result<Curve, ExecError> {
+                match curve_of(doc, cid, "chamfer")? {
+                    c @ (Curve::Line { .. } | Curve::Polyline { .. }) => Ok(c.clone()),
+                    _ => Err(ExecError::Invalid(format!(
+                        "chamfer works on lines and polylines; '{cid}' is neither"
+                    ))),
+                }
+            };
+            let (ca, cb) = (curve_for(ids[0])?, curve_for(ids[1])?);
+            let (ta, bevel, tb) = kernel_curve::chamfer_curves(&ca, &cb, dist).ok_or_else(|| {
+                ExecError::Invalid(format!(
+                    "cannot chamfer: segments are parallel or distance {dist} does not fit"
+                ))
+            })?;
+            let mut snapshots = Vec::with_capacity(2);
+            for (cid, trimmed) in [(ids[0], ta), (ids[1], tb)] {
+                let obj = doc.get_mut(cid).expect("resolved");
+                snapshots.push((cid, obj.geometry.clone()));
+                obj.geometry = Geometry::Curve(trimmed);
+            }
+            let id = id.unwrap_or_default();
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Curve(bevel),
+            });
+            Ok((
+                Command::Chamfer { id: Some(id), a, b, dist },
+                Inverse::CreatedAndGeometry { created: vec![id], snapshots },
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "chamfered {} + {} d={dist} -> bevel {id} (curves trimmed to setback)",
                         ids[0], ids[1]
                     ),
                 },
@@ -13601,6 +13731,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Align { .. } => "align",
         Command::ToOrigin { .. } => "tozero",
         Command::Flatten { .. } => "flatten",
+        Command::Explode { .. } => "explode",
         Command::Stretch { .. } => "stretch",
         Command::SelSimilar { .. } => "selsimilar",
         Command::SelDup { .. } => "seldup",
@@ -13615,6 +13746,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Extend { .. } => "extend",
         Command::Join { .. } => "join",
         Command::Fillet { .. } => "fillet",
+        Command::Chamfer { .. } => "chamfer",
         Command::Offset { .. } => "offset",
         Command::Copy { .. } => "copy",
         Command::Array { .. } => "array",
@@ -16209,6 +16341,129 @@ mod tests {
         assert!(restored[1][0].distance(DVec3::new(0.0, 0.0, 0.0)) < 1e-9);
         run(&mut s, "redo");
         assert_eq!(s.doc.len(), 3);
+    }
+
+    #[test]
+    fn chamfer_trims_lines_and_adds_bevel() {
+        let mut s = Session::default();
+        run(&mut s, "line -2,0 8,0");
+        run(&mut s, "line 0,-2 0,8");
+        let out = run(&mut s, "chamfer last 2 2");
+        assert!(out.message.contains("bevel"), "{}", out.message);
+        assert_eq!(s.doc.len(), 3); // two trimmed lines + bevel line
+
+        // The bevel is the straight line between the two setback points.
+        let lines: Vec<_> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Line { a, b }) => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 3);
+        let is_bevel = |(a, b): &(DVec3, DVec3)| {
+            let hits = |p: DVec3| {
+                p.distance(DVec3::new(2.0, 0.0, 0.0)) < 1e-9
+                    || p.distance(DVec3::new(0.0, 2.0, 0.0)) < 1e-9
+            };
+            hits(*a) && hits(*b)
+        };
+        assert!(lines.iter().any(is_bevel), "bevel line present");
+        // The two sources are trimmed to their setback points.
+        assert!(lines.iter().any(|(a, b)| a.distance(DVec3::new(2.0, 0.0, 0.0)) < 1e-9
+            && b.distance(DVec3::new(8.0, 0.0, 0.0)) < 1e-9));
+        assert!(lines.iter().any(|(a, b)| a.distance(DVec3::new(0.0, 2.0, 0.0)) < 1e-9
+            && b.distance(DVec3::new(0.0, 8.0, 0.0)) < 1e-9));
+
+        run(&mut s, "undo"); // bevel gone, lines restored exactly
+        assert_eq!(s.doc.len(), 2);
+        let Geometry::Curve(Curve::Line { a, b }) = &s.doc.objects().next().unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!(a.distance(DVec3::new(-2.0, 0.0, 0.0)) < 1e-9);
+        assert!(b.distance(DVec3::new(8.0, 0.0, 0.0)) < 1e-9);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
+
+        // parallel lines refuse; non-lines refuse
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 5,0");
+        run(&mut s, "line 0,1 5,1");
+        let err = s.run(parse("chamfer last 2 0.5").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("parallel"), "{err}");
+        run(&mut s, "circle 10,0 1");
+        let err = s.run(parse("chamfer last 2 0.5").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("line"), "{err}");
+    }
+
+    #[test]
+    fn chamfer_trims_polyline_corner() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,-2 0,8"); // vertical line up the y-axis
+        run(&mut s, "polyline 0,0,0 8,0,0 8,4,0"); // open polyline off the origin
+        run(&mut s, "chamfer last 2 2");
+        assert_eq!(s.doc.len(), 3);
+        // Polyline stays a polyline, corner vertex pulled back to (2,0).
+        let poly = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => Some(points.clone()),
+                _ => None,
+            })
+            .expect("polyline present");
+        assert_eq!(poly.len(), 3);
+        assert!(poly[0].distance(DVec3::new(2.0, 0.0, 0.0)) < 1e-9);
+        assert!(poly[1].distance(DVec3::new(8.0, 0.0, 0.0)) < 1e-9);
+        assert!(poly[2].distance(DVec3::new(8.0, 4.0, 0.0)) < 1e-9);
+    }
+
+    #[test]
+    fn explode_breaks_polyline_into_segments_and_undoes() {
+        let mut s = Session::default();
+        // Open 3-vertex polyline → 2 line segments.
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0");
+        let original = s.doc.objects().next().unwrap().clone();
+        let out = run(&mut s, "explode last");
+        assert_eq!(out.created.len(), 2, "{}", out.message);
+        assert_eq!(s.doc.len(), 2);
+        for o in s.doc.objects() {
+            assert!(matches!(o.geometry, Geometry::Curve(Curve::Line { .. })));
+        }
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+        assert_eq!(s.doc.objects().next().unwrap(), &original);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 2);
+
+        // Closed square (4 vertices) → 4 segments (includes the closing edge).
+        let mut s = Session::default();
+        run(&mut s, "rectangle 0,0,0 4 4"); // closed polyline, 4 vertices
+        assert_eq!(s.doc.len(), 1);
+        let out = run(&mut s, "explode last");
+        assert_eq!(out.created.len(), 4, "{}", out.message);
+        assert_eq!(s.doc.len(), 4);
+
+        // Non-polyline selection → error, doc untouched.
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 5,0");
+        let err = s.run(parse("explode last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("polyline"), "{err}");
+        assert_eq!(s.doc.len(), 1);
+    }
+
+    #[test]
+    fn explode_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0");
+        run(&mut s, "explode last");
+        let log = s.save_log();
+        let replayed = Session::replay(log).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
     }
 
     #[test]

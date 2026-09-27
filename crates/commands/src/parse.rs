@@ -898,6 +898,11 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("flatten", rest, &args)?;
             Ok(Command::Flatten { targets: sel })
         }
+        "explode" => {
+            let (sel, rest) = selector(&args, "explode")?;
+            expect_empty("explode", rest, &args)?;
+            Ok(Command::Explode { ids: None, targets: sel })
+        }
         "stretch" => {
             let (sel, rest) = selector(&args, "stretch")?;
             let [min, max, delta] = take::<3>(
@@ -1035,6 +1040,21 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                             wrong_err("fillet", "a radius after the selectors", &args)
                         })?;
                     Ok(Command::Fillet { id: None, a, b, radius: number(r)? })
+                }
+            }
+        }
+        "chamfer" => {
+            let (a, rest) = selector(&args, "chamfer")?;
+            match rest {
+                // "chamfer last 2 0.5": one selector naming both curves.
+                [d] => Ok(Command::Chamfer { id: None, a: a.clone(), b: a, dist: number(d)? }),
+                _ => {
+                    let (b, rest) = selector(rest, "chamfer")?;
+                    let [d] = take::<1>("chamfer", "a distance after the selectors", rest)
+                        .map_err(|_| {
+                            wrong_err("chamfer", "a distance after the selectors", &args)
+                        })?;
+                    Ok(Command::Chamfer { id: None, a, b, dist: number(d)? })
                 }
             }
         }
@@ -4919,12 +4939,29 @@ mod tests {
             parse("fillet last 2 50cm").unwrap(),
             Command::Fillet { radius, .. } if radius == 0.5
         ));
+        // chamfer: two selectors + distance, or one selector naming both curves
+        assert!(matches!(
+            parse("chamfer l1 l2 0.5").unwrap(),
+            Command::Chamfer { a: Selector::Named { .. }, b: Selector::Named { .. }, dist, .. }
+                if dist == 0.5
+        ));
+        assert!(matches!(
+            parse("chamfer sel 0.5").unwrap(),
+            Command::Chamfer { a: Selector::Selected, b: Selector::Selected, dist, .. }
+                if dist == 0.5
+        ));
+        // explode: bare selector
+        assert!(matches!(
+            parse("explode sel").unwrap(),
+            Command::Explode { ids: None, targets: Selector::Selected }
+        ));
         // errors carry hints
         assert!(parse("split last").unwrap_err().to_string().contains("point"));
         assert!(parse("trim last").unwrap_err().to_string().contains("selector"));
         assert!(parse("extend last").unwrap_err().to_string().contains("distance"));
         assert!(parse("join").unwrap_err().to_string().contains("selector"));
         assert!(parse("fillet last").unwrap_err().to_string().contains("radius"));
+        assert!(parse("chamfer last").unwrap_err().to_string().contains("distance"));
     }
 
     #[test]
@@ -4936,6 +4973,9 @@ mod tests {
             "extend last 0.5",
             "join last 3",
             "fillet last 2 0.5",
+            "chamfer l1 l2 0.5",
+            "chamfer sel 0.5",
+            "explode sel",
         ] {
             let cmd = parse(line).unwrap();
             let json = serde_json::to_string(&cmd).unwrap();

@@ -771,6 +771,15 @@ pub enum Command {
     Flatten {
         targets: Selector,
     },
+    /// Explode polylines into their individual line segments. Each `Curve::Polyline`
+    /// in the selection is replaced by one `Curve::Line` per segment (closed
+    /// polylines include the closing segment); non-polyline curves are left as-is.
+    /// `ids` caches the created segment ids so op-log replay reproduces them.
+    Explode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        targets: Selector,
+    },
     /// Stretch: the command-substrate half of AutoCAD's STRETCH. For each object
     /// in the selection, every mutable vertex whose position falls inside the
     /// [`min`, `max`] AABB (inclusive) is shifted by `delta`; vertices outside
@@ -868,6 +877,16 @@ pub enum Command {
         a: Selector,
         b: Selector,
         radius: f64,
+    },
+    /// Chamfer (bevel) two lines/polylines: cut off the corner with a straight
+    /// setback line, trimming both sources back by `dist`. The straight-line
+    /// analogue of `fillet`.
+    Chamfer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        a: Selector,
+        b: Selector,
+        dist: f64,
     },
     /// Offset a curve in the XY plane; the original is kept.
     Offset {

@@ -646,6 +646,81 @@ pub fn fillet_curves(a: &Curve, b: &Curve, radius: f64) -> Option<(Curve, Curve,
     Some((apply_trim(a, &seg_a, tan_a), arc, apply_trim(b, &seg_b, tan_b)))
 }
 
+// ----------------------------------------------------------------- chamfer
+
+/// Chamfer (bevel) two line segments in the XY plane: cut off the corner with a
+/// straight line. From the corner where the two segments meet (or the point
+/// where their supporting lines cross), each source is set back by `dist` along
+/// its own direction; the bevel is a straight [`Curve::Line`] between the two
+/// setback points. Each source line keeps the endpoint farther from the corner
+/// and is rebuilt to its setback point. Returns `(trimmed a, bevel, trimmed b)`,
+/// or `None` when the lines are parallel or `dist` does not fit on either line.
+pub fn chamfer_lines(
+    a: (DVec3, DVec3),
+    b: (DVec3, DVec3),
+    dist: f64,
+) -> Option<(Curve, Curve, Curve)> {
+    let d1 = (a.1 - a.0).truncate();
+    let d2 = (b.1 - b.0).truncate();
+    let denom = d1.perp_dot(d2);
+    if denom.abs() < 1e-12 || dist <= 0.0 {
+        return None;
+    }
+    let w = (b.0 - a.0).truncate();
+    let t1 = w.perp_dot(d2) / denom;
+    let z = a.0.z;
+    // The corner: where the two supporting lines cross.
+    let p = (a.0.truncate() + d1 * t1).extend(z);
+    // Keep the endpoint of each line farther from the corner.
+    let keep = |l: (DVec3, DVec3)| {
+        if l.0.distance_squared(p) >= l.1.distance_squared(p) { l.0 } else { l.1 }
+    };
+    let (e1, e2) = (keep(a), keep(b));
+    let u = (e1 - p).truncate().normalize_or_zero();
+    let v = (e2 - p).truncate().normalize_or_zero();
+    if u == DVec2::ZERO || v == DVec2::ZERO {
+        return None;
+    }
+    // Colinear (no real corner) → nothing to bevel.
+    let cos_theta = u.dot(v).clamp(-1.0, 1.0);
+    if cos_theta.acos() < 1e-6 {
+        return None;
+    }
+    // Set back `dist` along each segment toward its kept end.
+    if dist > (e1 - p).truncate().length() + EPS || dist > (e2 - p).truncate().length() + EPS {
+        return None; // distance too large for the available line length
+    }
+    let s1 = p + (u * dist).extend(0.0);
+    let s2 = p + (v * dist).extend(0.0);
+    Some((
+        Curve::Line { a: s1, b: e1 },
+        Curve::Line { a: s1, b: s2 },
+        Curve::Line { a: s2, b: e2 },
+    ))
+}
+
+/// Chamfer two curves (lines and/or polylines): bevel the two segments that meet
+/// — or come closest to meeting — at a shared corner with a straight setback
+/// line of `dist`. A line is trimmed to its setback point; a polyline keeps its
+/// shape but its corner vertex is pulled back to the setback point. Returns
+/// `(trimmed a, bevel line, trimmed b)`, or `None` when a source is neither a
+/// line nor a polyline, the chosen segments are parallel, or `dist` does not fit.
+pub fn chamfer_curves(a: &Curve, b: &Curve, dist: f64) -> Option<(Curve, Curve, Curve)> {
+    // Same segment-selection strategy as `fillet_curves`.
+    let toward_a = closest_point(b, fillet_seed(a), 0.01);
+    let toward_b = closest_point(a, fillet_seed(b), 0.01);
+    let seg_a = pick_fillet_segment(a, toward_a)?;
+    let seg_b = pick_fillet_segment(b, toward_b)?;
+    let (la, bevel, lb) = chamfer_lines(
+        (seg_a.corner, seg_a.far),
+        (seg_b.corner, seg_b.far),
+        dist,
+    )?;
+    let Curve::Line { a: set_a, .. } = la else { return None };
+    let Curve::Line { a: set_b, .. } = lb else { return None };
+    Some((apply_trim(a, &seg_a, set_a), bevel, apply_trim(b, &seg_b, set_b)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,5 +1113,107 @@ mod tests {
         assert!(points[2].distance(DVec3::new(2.0, 2.0, 0.0)) > EPS); // moved back
         assert!(points[3].distance(DVec3::new(-2.0, 2.0, 0.0)) < EPS);
         assert!(matches!(arc, Curve::Arc { .. }));
+    }
+
+    #[test]
+    fn chamfer_perpendicular_lines() {
+        // Two lines crossing at the origin corner; keep the far +x / +y ends.
+        let (la, bevel, lb) = chamfer_lines(
+            (DVec3::new(-2.0, 0.0, 0.0), DVec3::new(8.0, 0.0, 0.0)),
+            (DVec3::new(0.0, -2.0, 0.0), DVec3::new(0.0, 8.0, 0.0)),
+            2.0,
+        )
+        .unwrap();
+        // a trimmed to setback (2,0), far end (8,0) kept.
+        let Curve::Line { a, b } = la else { panic!() };
+        assert!(a.distance(DVec3::new(2.0, 0.0, 0.0)) < EPS);
+        assert!(b.distance(DVec3::new(8.0, 0.0, 0.0)) < EPS);
+        // b trimmed to setback (0,2), far end (0,8) kept.
+        let Curve::Line { a, b } = lb else { panic!() };
+        assert!(a.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
+        assert!(b.distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
+        // bevel: straight line between the two setback points.
+        let Curve::Line { a, b } = bevel else { panic!() };
+        assert!(a.distance(DVec3::new(2.0, 0.0, 0.0)) < EPS);
+        assert!(b.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
+
+        // parallel lines: no chamfer
+        assert!(chamfer_lines(
+            (DVec3::ZERO, DVec3::new(5.0, 0.0, 0.0)),
+            (DVec3::new(0.0, 1.0, 0.0), DVec3::new(5.0, 1.0, 0.0)),
+            1.0,
+        )
+        .is_none());
+        // distance larger than the lines: no chamfer
+        assert!(chamfer_lines(
+            (DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)),
+            (DVec3::ZERO, DVec3::new(0.0, 1.0, 0.0)),
+            5.0,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn chamfer_curves_line_and_polyline() {
+        // Vertical line up the y-axis; open polyline off the origin along +x.
+        let a = line(0.0, -2.0, 0.0, 8.0);
+        let b = polyline(&[(0.0, 0.0), (8.0, 0.0), (8.0, 4.0)], false);
+        let (ta, bevel, tb) = chamfer_curves(&a, &b, 2.0).unwrap();
+
+        // Line trimmed to setback (0,2), far end (0,8) kept.
+        let Curve::Line { a: la, b: lb } = ta else { panic!("line stays a line") };
+        assert!(la.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
+        assert!(lb.distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
+
+        // Polyline stays a polyline; corner vertex 0 pulled to (2,0); rest fixed.
+        let Curve::Polyline { points, closed } = tb else { panic!("polyline stays a polyline") };
+        assert!(!closed);
+        assert_eq!(points.len(), 3);
+        assert!(points[0].distance(DVec3::new(2.0, 0.0, 0.0)) < EPS);
+        assert!(points[1].distance(DVec3::new(8.0, 0.0, 0.0)) < EPS);
+        assert!(points[2].distance(DVec3::new(8.0, 4.0, 0.0)) < EPS);
+
+        // Bevel joins the two setback points.
+        let Curve::Line { a: bva, b: bvb } = bevel else { panic!() };
+        let hits = |p: DVec3| {
+            p.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS || p.distance(DVec3::new(2.0, 0.0, 0.0)) < EPS
+        };
+        assert!(hits(bva) && hits(bvb));
+    }
+
+    #[test]
+    fn chamfer_curves_two_polylines_share_corner() {
+        // Two open polylines approaching the origin corner.
+        let a = polyline(&[(-8.0, 0.0), (0.0, 0.0)], false); // last vertex = corner
+        let b = polyline(&[(0.0, 0.0), (0.0, 8.0)], false); // first vertex = corner
+        let (ta, bevel, tb) = chamfer_curves(&a, &b, 2.0).unwrap();
+
+        // a: last vertex moves to (-2,0); first vertex untouched.
+        let Curve::Polyline { points: pa, .. } = ta else { panic!() };
+        assert!(pa[0].distance(DVec3::new(-8.0, 0.0, 0.0)) < EPS);
+        assert!(pa[1].distance(DVec3::new(-2.0, 0.0, 0.0)) < EPS);
+
+        // b: first vertex moves to (0,2); last untouched.
+        let Curve::Polyline { points: pb, .. } = tb else { panic!() };
+        assert!(pb[0].distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
+        assert!(pb[1].distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
+
+        let Curve::Line { a: bva, b: bvb } = bevel else { panic!() };
+        let hits = |p: DVec3| {
+            p.distance(DVec3::new(-2.0, 0.0, 0.0)) < EPS
+                || p.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS
+        };
+        assert!(hits(bva) && hits(bvb));
+    }
+
+    #[test]
+    fn chamfer_curves_rejects_parallel_and_bad_kinds() {
+        assert!(chamfer_curves(
+            &line(0.0, 0.0, 5.0, 0.0),
+            &line(0.0, 1.0, 5.0, 1.0),
+            1.0,
+        )
+        .is_none());
+        assert!(chamfer_curves(&line(0.0, 0.0, 5.0, 0.0), &circle(0.0, 0.0, 2.0), 1.0).is_none());
     }
 }

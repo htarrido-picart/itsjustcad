@@ -17,6 +17,6 @@ pub use build::{helix, interpolate_curve, rebuild};
 pub use curve::{clamped_uniform_knots, Curve};
 pub use nurbs::{insert_knot, nurbs_point};
 pub use ops::{
-    closest_point, extend, fillet_curves, fillet_lines, intersections, join_curves,
-    split_at_points, JOIN_TOL,
+    chamfer_curves, chamfer_lines, closest_point, extend, fillet_curves, fillet_lines,
+    intersections, join_curves, split_at_points, JOIN_TOL,
 };
