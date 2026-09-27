@@ -5021,6 +5021,43 @@ impl App {
         }
     }
 
+    /// Resolve a guided object-pick DRAG to a single object. Runs the same
+    /// projected-rect window/crossing test the normal `box_select` uses, but keeps
+    /// only candidates that satisfy the current step's geometry filter
+    /// (`guided_pick_matches`). Since a guided step fills exactly one role, the
+    /// winner is the match whose projected center is nearest the drag-box center.
+    /// Returns `None` when the region contains no matching object.
+    fn guided_box_pick(
+        &self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        drag: egui::Rect,
+        mode: crate::boxsel::BoxMode,
+    ) -> Option<itsjustcad_doc::ObjectId> {
+        let items: Vec<(itsjustcad_doc::ObjectId, egui::Rect)> = self
+            .session
+            .doc
+            .objects()
+            .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
+            .filter(|obj| self.guided_pick_matches(obj.id))
+            .filter_map(|obj| {
+                let bb = obj.geometry.aabb();
+                Some((obj.id, projected_rect(view_proj, rect, bb.min, bb.max)?))
+            })
+            .collect();
+        let hits = crate::boxsel::box_select(&items, drag, mode);
+        // Prefer the object whose projected rect center is closest to the drag-box
+        // center — the most-intended pick when a region catches several matches.
+        let target = drag.center();
+        hits.into_iter()
+            .filter_map(|id| {
+                let (_, r) = items.iter().find(|(i, _)| *i == id)?;
+                Some((id, r.center().distance_sq(target)))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
+    }
+
     /// Dispatch a guided-tool step outcome: run the emitted command, surface an
     /// error, or re-show the next prompt.
     fn handle_guided(&mut self, result: StepResult) {
@@ -5293,26 +5330,69 @@ impl App {
         // Guided object-pick step (Rhino GetObject): hit-test the click to an
         // ObjectId, enforce the step's geometry filter, then commit it as a
         // `#<id>` selector. Runs before the point/draw path since it needs the
-        // screen position, not a ground point.
-        if guided_active && self.guided.current_wants_object() && response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                match self.hit_object(view_proj, rect, pos) {
-                    Some(id) if self.guided_pick_matches(id) => {
-                        // Highlight the pick; the emitted command references it by
-                        // id, so selection state doesn't affect correctness.
-                        self.session.doc.selection.insert(id);
-                        self.session.doc.generation += 1;
-                        let short = id.short();
-                        let r = self.guided.commit_object(&short);
-                        self.handle_guided(r);
-                    }
-                    Some(_) => self
-                        .command_line
-                        .push_line("that object isn't the right type — pick again"),
-                    None => {} // empty space: keep waiting for a valid pick
-                }
+        // screen position, not a ground point. A DRAG here behaves like the
+        // pointer-tool's rubber box (window left→right, crossing right→left), but
+        // — because a guided object step fills exactly ONE role — resolves to the
+        // single best-matching object rather than a set.
+        if guided_active && self.guided.current_wants_object() {
+            // Arm the rubber-box anchor when a primary drag begins over the
+            // canvas. Reuses the same `box_drag` field the normal-mode drag path
+            // uses; that path is skipped whenever a tool/guided flow is active, so
+            // there is no double-fire.
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                self.box_drag = Some(pos);
             }
-            return;
+            // Mid-drag: draw the live rubber box; on release resolve it to one
+            // object filtered by the step. A plain click never sets `box_drag`, so
+            // it falls through to the single hit_object path below unchanged.
+            if let Some(start) = self.box_drag
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let mode = crate::boxsel::mode(start, pos);
+                let drag_rect = egui::Rect::from_two_pos(start, pos);
+                draw_rubber_box(&ui.painter_at(rect), drag_rect, mode, ui.visuals());
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    self.box_drag = None;
+                    match self.guided_box_pick(view_proj, rect, drag_rect, mode) {
+                        Some(id) => {
+                            // Highlight the pick; the emitted command references it
+                            // by id, so selection state doesn't affect correctness.
+                            self.session.doc.selection.insert(id);
+                            self.session.doc.generation += 1;
+                            let short = id.short();
+                            let r = self.guided.commit_object(&short);
+                            self.handle_guided(r);
+                        }
+                        None => self
+                            .command_line
+                            .push_line("no matching object in that region — pick again"),
+                    }
+                }
+                ui.ctx().request_repaint(); // live rubber box
+                return;
+            }
+            if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    match self.hit_object(view_proj, rect, pos) {
+                        Some(id) if self.guided_pick_matches(id) => {
+                            // Highlight the pick; the emitted command references it
+                            // by id, so selection state doesn't affect correctness.
+                            self.session.doc.selection.insert(id);
+                            self.session.doc.generation += 1;
+                            let short = id.short();
+                            let r = self.guided.commit_object(&short);
+                            self.handle_guided(r);
+                        }
+                        Some(_) => self
+                            .command_line
+                            .push_line("that object isn't the right type — pick again"),
+                        None => {} // empty space: keep waiting for a valid pick
+                    }
+                }
+                return;
+            }
         }
 
         if response.clicked() && let Some(world) = cursor_world {
@@ -9960,6 +10040,66 @@ mod tests {
             assert!(
                 sel.contains(&ids[1].0),
                 "crossing drag (right→left) selected the second box"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_guided_object_pick_drag() {
+        // Guided SelectObject via a DRAG (not just a click): arm `trim` (first
+        // step is `Select object to trim`), then window-drag a rubber box tightly
+        // around a single box. The region resolves to that one object, the guided
+        // step commits it, and the tool advances to its NEXT step (still active,
+        // now asking for the cutting object) — proving the drag path fed the pick.
+        run_app_journey(|h| {
+            submit_command(h, "box 0,0,0 2,2,2");
+            submit_command(h, "box 4,0,0 6,2,2");
+            let ids: Vec<_> = h
+                .state()
+                .session
+                .doc
+                .objects()
+                .map(|o| (o.id, o.geometry.aabb()))
+                .collect();
+            assert_eq!(ids.len(), 2, "two boxes drawn");
+
+            // Stable, size-independent projection (see `top_ortho_view`).
+            top_ortho_view(h);
+
+            // Arm the guided verb. `trim` needs no pre-selection; its first step
+            // is a SelectObject, so the canvas now wants an object pick.
+            submit_command(h, "trim");
+            assert!(h.state().guided.active(), "bare `trim` armed the guided flow");
+            assert!(
+                h.state().guided.current_wants_object(),
+                "the first trim step is a SelectObject pick"
+            );
+
+            // Window-drag (left→right) tightly around the FIRST box, expanded past
+            // it so it is fully enclosed but the second box is untouched.
+            let (rect, view_proj) = active_viewport(h);
+            let bb0 = ids[0].1;
+            let r0 = projected_rect(view_proj, rect, bb0.min, bb0.max)
+                .expect("box 0 projects in front of camera")
+                .expand(24.0)
+                .intersect(rect);
+            drag(h, r0.left_top(), r0.right_bottom());
+
+            // The drag resolved to exactly the enclosed box: it is highlighted,
+            // and the guided flow advanced to its second SelectObject step (still
+            // active, still wanting an object — the cutting object).
+            assert!(
+                h.state().session.doc.selection.contains(&ids[0].0),
+                "the dragged box was picked and highlighted"
+            );
+            assert!(
+                h.state().guided.active(),
+                "trim still active after the first object commit (awaiting the cutter)"
+            );
+            assert!(
+                h.state().guided.current_wants_object(),
+                "the guided flow advanced to the second SelectObject step"
             );
         });
     }

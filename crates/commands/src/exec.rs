@@ -10241,18 +10241,18 @@ fn apply_forward(
                     ids.len()
                 )));
             }
-            let line_of = |cid: ObjectId| -> Result<(DVec3, DVec3), ExecError> {
+            let curve_for = |cid: ObjectId| -> Result<Curve, ExecError> {
                 match curve_of(doc, cid, "fillet")? {
-                    Curve::Line { a, b } => Ok((*a, *b)),
+                    c @ (Curve::Line { .. } | Curve::Polyline { .. }) => Ok(c.clone()),
                     _ => Err(ExecError::Invalid(format!(
-                        "fillet works on lines for now; '{cid}' is not a line"
+                        "fillet works on lines and polylines; '{cid}' is neither"
                     ))),
                 }
             };
-            let (la, lb) = (line_of(ids[0])?, line_of(ids[1])?);
-            let (ta, arc, tb) = kernel_curve::fillet_lines(la, lb, radius).ok_or_else(|| {
+            let (ca, cb) = (curve_for(ids[0])?, curve_for(ids[1])?);
+            let (ta, arc, tb) = kernel_curve::fillet_curves(&ca, &cb, radius).ok_or_else(|| {
                 ExecError::Invalid(format!(
-                    "cannot fillet: lines are parallel or radius {radius} does not fit"
+                    "cannot fillet: segments are parallel or radius {radius} does not fit"
                 ))
             })?;
             let mut snapshots = Vec::with_capacity(2);
@@ -10278,7 +10278,7 @@ fn apply_forward(
                 ApplyOutcome {
                     created: vec![id],
                     message: format!(
-                        "filleted {} + {} r={radius} -> arc {id} (lines trimmed to tangency)",
+                        "filleted {} + {} r={radius} -> arc {id} (curves trimmed to tangency)",
                         ids[0], ids[1]
                     ),
                 },
@@ -16152,6 +16152,63 @@ mod tests {
         run(&mut s, "circle 10,0 1");
         let err = s.run(parse("fillet last 2 0.5").unwrap()).unwrap_err();
         assert!(err.to_string().contains("line"), "{err}");
+    }
+
+    #[test]
+    fn fillet_trims_polylines_and_adds_arc() {
+        let mut s = Session::default();
+        // Two open polylines whose end segments meet at the origin corner.
+        run(&mut s, "polyline -8,0,0 0,0,0"); // last vertex = corner (0,0)
+        run(&mut s, "polyline 0,0,0 0,8,0"); // first vertex = corner (0,0)
+        let out = run(&mut s, "fillet last 2 2");
+        assert!(out.message.contains("arc"), "{}", out.message);
+        assert_eq!(s.doc.len(), 3); // two trimmed polylines + arc
+
+        // Arc tangent to both segments: center (-2,2), radius 2.
+        let arc = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Curve(c @ Curve::Arc { .. }) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("fillet arc present");
+        let Curve::Arc { center, radius, .. } = arc else { panic!() };
+        assert!(center.distance(DVec3::new(-2.0, 2.0, 0.0)) < 1e-9, "{center}");
+        assert!((radius - 2.0).abs() < 1e-9);
+
+        // Both sources stay polylines with their corner vertex pulled back.
+        let polylines: Vec<_> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => Some(points.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polylines.len(), 2);
+        // First polyline: far end (-8,0) kept, corner moved to (-2,0).
+        assert!(polylines[0][0].distance(DVec3::new(-8.0, 0.0, 0.0)) < 1e-9);
+        assert!(polylines[0][1].distance(DVec3::new(-2.0, 0.0, 0.0)) < 1e-9);
+        // Second polyline: corner moved to (0,2), far end (0,8) kept.
+        assert!(polylines[1][0].distance(DVec3::new(0.0, 2.0, 0.0)) < 1e-9);
+        assert!(polylines[1][1].distance(DVec3::new(0.0, 8.0, 0.0)) < 1e-9);
+
+        // Undo restores both polylines exactly and drops the arc.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        let restored: Vec<_> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => Some(points.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(restored[0][1].distance(DVec3::new(0.0, 0.0, 0.0)) < 1e-9); // corner back
+        assert!(restored[1][0].distance(DVec3::new(0.0, 0.0, 0.0)) < 1e-9);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
     }
 
     #[test]

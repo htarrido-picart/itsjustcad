@@ -539,6 +539,113 @@ pub fn fillet_lines(
     ))
 }
 
+/// A segment chosen for filleting on a source curve: its two endpoints plus,
+/// for polylines, the index of the corner vertex to pull back to the tangency.
+struct FilletSeg {
+    /// The corner endpoint (near the other curve) — this one moves.
+    corner: DVec3,
+    /// The far endpoint — kept in place.
+    far: DVec3,
+    /// `Some(index)` when the source is a polyline: the corner vertex index.
+    /// `None` for a plain line (rebuilt as a line).
+    corner_idx: Option<usize>,
+}
+
+/// Pick the segment of `c` to fillet, given a reference point `toward` that
+/// lies on the other curve. Lines use the whole line (the nearer endpoint is
+/// the corner). Open polylines may only fillet their two end segments; closed
+/// polylines consider every segment. Returns `None` for curve kinds we cannot
+/// fillet on (Arc/Ellipse/NURBS) or degenerate inputs.
+fn pick_fillet_segment(c: &Curve, toward: DVec3) -> Option<FilletSeg> {
+    match c {
+        Curve::Line { a, b } => {
+            let (corner, far) = if a.distance_squared(toward) <= b.distance_squared(toward) {
+                (*a, *b)
+            } else {
+                (*b, *a)
+            };
+            Some(FilletSeg { corner, far, corner_idx: None })
+        }
+        Curve::Polyline { points, closed } => {
+            if points.len() < 2 {
+                return None;
+            }
+            let n = points.len();
+            // Candidate segments as (corner_idx, far_idx).
+            let candidates: Vec<(usize, usize)> = if *closed && n >= 3 {
+                (0..n)
+                    .flat_map(|i| [(i, (i + 1) % n), ((i + 1) % n, i)])
+                    .collect()
+            } else {
+                vec![(0, 1), (n - 1, n - 2)]
+            };
+            // Choose the candidate whose corner vertex is nearest `toward`.
+            let (corner_idx, far_idx) = candidates.into_iter().min_by(|&(ci, _), &(cj, _)| {
+                points[ci]
+                    .distance_squared(toward)
+                    .total_cmp(&points[cj].distance_squared(toward))
+            })?;
+            Some(FilletSeg {
+                corner: points[corner_idx],
+                far: points[far_idx],
+                corner_idx: Some(corner_idx),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Rebuild `src` after its chosen segment was trimmed to tangency point `tan`.
+/// A line becomes `Line { a: tan, b: far }`; a polyline keeps all its vertices
+/// but its corner vertex is moved to `tan`.
+fn apply_trim(src: &Curve, seg: &FilletSeg, tan: DVec3) -> Curve {
+    match (src, seg.corner_idx) {
+        (Curve::Polyline { points, closed }, Some(idx)) => {
+            let mut points = points.clone();
+            points[idx] = tan;
+            Curve::Polyline { points, closed: *closed }
+        }
+        // Lines (and, defensively, anything without a polyline index) rebuild
+        // as a trimmed line — matching the historical `fillet_lines` behavior.
+        _ => Curve::Line { a: tan, b: seg.far },
+    }
+}
+
+/// A representative interior point of a curve, used only to seed the
+/// nearest-segment search in `fillet_curves`.
+fn fillet_seed(c: &Curve) -> DVec3 {
+    match c {
+        Curve::Line { a, b } => (*a + *b) * 0.5,
+        Curve::Polyline { points, .. } if !points.is_empty() => {
+            points.iter().copied().sum::<DVec3>() / points.len() as f64
+        }
+        _ => closest_point(c, DVec3::ZERO, 0.01),
+    }
+}
+
+/// Fillet two curves (lines and/or polylines) with a tangent arc of `radius`,
+/// trimming the two segments that meet — or come closest to meeting — at a
+/// shared corner. A line is trimmed to the tangency point; a polyline keeps its
+/// shape but its corner vertex is pulled back to the tangency point. Returns
+/// `(trimmed a, arc, trimmed b)`, or `None` when a source is neither a line nor
+/// a polyline, the chosen segments are parallel, or the radius does not fit.
+pub fn fillet_curves(a: &Curve, b: &Curve, radius: f64) -> Option<(Curve, Curve, Curve)> {
+    // Reference each curve toward a point on the other so we pick the end
+    // segments that approach a shared corner.
+    let toward_a = closest_point(b, fillet_seed(a), 0.01);
+    let toward_b = closest_point(a, fillet_seed(b), 0.01);
+    let seg_a = pick_fillet_segment(a, toward_a)?;
+    let seg_b = pick_fillet_segment(b, toward_b)?;
+    let (la, arc, lb) = fillet_lines(
+        (seg_a.corner, seg_a.far),
+        (seg_b.corner, seg_b.far),
+        radius,
+    )?;
+    let Curve::Line { a: tan_a, .. } = la else { return None };
+    let Curve::Line { a: tan_b, .. } = lb else { return None };
+    Some((apply_trim(a, &seg_a, tan_a), arc, apply_trim(b, &seg_b, tan_b)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -820,5 +927,116 @@ mod tests {
         let hits = |p: DVec3| p.distance(ta) < 1e-9 || p.distance(tb) < 1e-9;
         assert!(hits(sp) && hits(ep));
         assert!(end > start && end - start < std::f64::consts::PI);
+    }
+
+    fn polyline(pts: &[(f64, f64)], closed: bool) -> Curve {
+        Curve::Polyline {
+            points: pts.iter().map(|&(x, y)| DVec3::new(x, y, 0.0)).collect(),
+            closed,
+        }
+    }
+
+    #[test]
+    fn fillet_curves_two_lines_matches_fillet_lines() {
+        // Regression: line × line goes through the same math, same result.
+        let a = line(-2.0, 0.0, 8.0, 0.0);
+        let b = line(0.0, -2.0, 0.0, 8.0);
+        let (ta, arc, tb) = fillet_curves(&a, &b, 2.0).unwrap();
+        let Curve::Line { a: aa, b: ab } = ta else { panic!("a stays a line") };
+        assert!(aa.distance(DVec3::new(2.0, 0.0, 0.0)) < EPS); // tangency
+        assert!(ab.distance(DVec3::new(8.0, 0.0, 0.0)) < EPS); // far end kept
+        let Curve::Line { a: ba, b: bb } = tb else { panic!("b stays a line") };
+        assert!(ba.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
+        assert!(bb.distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
+        let Curve::Arc { center, radius, .. } = arc else { panic!() };
+        assert!(center.distance(DVec3::new(2.0, 2.0, 0.0)) < EPS);
+        assert!((radius - 2.0).abs() < EPS);
+    }
+
+    #[test]
+    fn fillet_curves_line_and_polyline() {
+        // Vertical line up the y-axis; open polyline whose first vertex sits at
+        // the origin corner and runs off along +x. They meet at (0,0).
+        let a = line(0.0, -2.0, 0.0, 8.0);
+        let b = polyline(&[(0.0, 0.0), (8.0, 0.0), (8.0, 4.0)], false);
+        let (ta, arc, tb) = fillet_curves(&a, &b, 2.0).unwrap();
+
+        // Line trimmed to tangency (0,2), far end (0,8) kept.
+        let Curve::Line { a: la, b: lb } = ta else { panic!("line stays a line") };
+        assert!(la.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
+        assert!(lb.distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
+
+        // Polyline stays a polyline; corner vertex 0 pulled to (2,0); the other
+        // two vertices untouched.
+        let Curve::Polyline { points, closed } = tb else { panic!("polyline stays a polyline") };
+        assert!(!closed);
+        assert_eq!(points.len(), 3);
+        assert!(points[0].distance(DVec3::new(2.0, 0.0, 0.0)) < EPS);
+        assert!(points[1].distance(DVec3::new(8.0, 0.0, 0.0)) < EPS);
+        assert!(points[2].distance(DVec3::new(8.0, 4.0, 0.0)) < EPS);
+
+        // Arc tangent at both trim points.
+        let Curve::Arc { center, radius, start, end } = arc else { panic!() };
+        assert!(center.distance(DVec3::new(2.0, 2.0, 0.0)) < EPS);
+        assert!((radius - 2.0).abs() < EPS);
+        let sp = arc_point(center, radius, start);
+        let ep = arc_point(center, radius, end);
+        let hits = |p: DVec3| p.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS
+            || p.distance(DVec3::new(2.0, 0.0, 0.0)) < EPS;
+        assert!(hits(sp) && hits(ep));
+    }
+
+    #[test]
+    fn fillet_curves_two_polylines_share_corner() {
+        // Two open polylines approaching the origin corner: one along -x→origin,
+        // one along origin→+y (their end segments meet at (0,0)).
+        let a = polyline(&[(-8.0, 0.0), (0.0, 0.0)], false); // last vertex = corner
+        let b = polyline(&[(0.0, 0.0), (0.0, 8.0)], false); // first vertex = corner
+        let (ta, arc, tb) = fillet_curves(&a, &b, 2.0).unwrap();
+
+        // a: last vertex (index 1) moves to (-2,0); first vertex untouched.
+        let Curve::Polyline { points: pa, .. } = ta else { panic!() };
+        assert!(pa[0].distance(DVec3::new(-8.0, 0.0, 0.0)) < EPS);
+        assert!(pa[1].distance(DVec3::new(-2.0, 0.0, 0.0)) < EPS);
+
+        // b: first vertex (index 0) moves to (0,2); last untouched.
+        let Curve::Polyline { points: pb, .. } = tb else { panic!() };
+        assert!(pb[0].distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
+        assert!(pb[1].distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
+
+        let Curve::Arc { center, radius, .. } = arc else { panic!() };
+        assert!(center.distance(DVec3::new(-2.0, 2.0, 0.0)) < EPS);
+        assert!((radius - 2.0).abs() < EPS);
+    }
+
+    #[test]
+    fn fillet_curves_rejects_parallel_and_bad_kinds() {
+        // Parallel lines: no fillet.
+        assert!(fillet_curves(
+            &line(0.0, 0.0, 5.0, 0.0),
+            &line(0.0, 1.0, 5.0, 1.0),
+            1.0,
+        )
+        .is_none());
+        // Arc as a source: unsupported kind → None.
+        assert!(fillet_curves(&line(0.0, 0.0, 5.0, 0.0), &circle(0.0, 0.0, 2.0), 1.0).is_none());
+    }
+
+    #[test]
+    fn fillet_curves_closed_polyline_picks_nearest_segment() {
+        // Closed square with a top-right corner at (2,2); a horizontal line
+        // running left into that corner along y=2. They form a right angle.
+        let sq = polyline(&[(-2.0, -2.0), (2.0, -2.0), (2.0, 2.0), (-2.0, 2.0)], true);
+        let l = line(8.0, 2.0, 2.0, 2.0); // corner endpoint (2,2), far (8,2)
+        let (tsq, arc, _tl) = fillet_curves(&sq, &l, 1.0).unwrap();
+        let Curve::Polyline { points, closed } = tsq else { panic!() };
+        assert!(closed);
+        assert_eq!(points.len(), 4);
+        // The (2,2) vertex (index 2) is nearest; it should have moved, rest fixed.
+        assert!(points[0].distance(DVec3::new(-2.0, -2.0, 0.0)) < EPS);
+        assert!(points[1].distance(DVec3::new(2.0, -2.0, 0.0)) < EPS);
+        assert!(points[2].distance(DVec3::new(2.0, 2.0, 0.0)) > EPS); // moved back
+        assert!(points[3].distance(DVec3::new(-2.0, 2.0, 0.0)) < EPS);
+        assert!(matches!(arc, Curve::Arc { .. }));
     }
 }
