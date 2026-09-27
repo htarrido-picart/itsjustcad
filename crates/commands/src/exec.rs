@@ -6670,6 +6670,21 @@ fn curve_station_ts(count: u32, closed: bool) -> Vec<f64> {
     (0..count).map(|i| f64::from(i) / last).collect()
 }
 
+/// Fractional-arc-length stations for `divide` (Rhino's Divide). Unlike
+/// `curve_station_ts` (array copies), divide places DIVISION points:
+///   OPEN curve → `count + 1` points at t = 0, 1/count, …, 1 (both ends).
+///   CLOSED curve → `count` points at t = 0, 1/count, …, (count-1)/count (the
+///   seam is not duplicated).
+/// Caller guarantees `count >= 1`. Pure, so it is unit-tested directly.
+fn divide_ts(count: u32, closed: bool) -> Vec<f64> {
+    let n = f64::from(count);
+    if closed {
+        return (0..count).map(|i| f64::from(i) / n).collect();
+    }
+    // Open: 0, 1/count, …, count/count (== 1) → count + 1 stations.
+    (0..=count).map(|i| f64::from(i) / n).collect()
+}
+
 /// Point and unit tangent at fractional arc-length `t` (0..=1) along a dense
 /// on-curve polyline `pts` (from `Curve::tessellate`). Works for every curve
 /// type because tessellation samples the true curve. The tangent is the local
@@ -10024,6 +10039,52 @@ fn apply_forward(
                         ids.len(),
                         tessellation_note(tessellated)
                     ),
+                },
+            ))
+        }
+        Command::Divide { id, target, count } => {
+            if count < 1 {
+                return Err(ExecError::Invalid("divide count must be at least 1".into()));
+            }
+            // Resolve to curve(s): a single-object selector divides that curve; a
+            // multi-match selector divides each. Non-curve geometry is a clean
+            // Invalid error (no partial work).
+            let ids = resolve(doc, &target)?;
+            if ids.is_empty() {
+                return Err(ExecError::Invalid("divide: nothing selected".into()));
+            }
+            let mut positions: Vec<DVec3> = Vec::new();
+            for cid in &ids {
+                let curve = curve_of(doc, *cid, "divide")?;
+                let pts = curve.tessellate(PROFILE_TOL);
+                if pts.len() < 2 {
+                    return Err(ExecError::Invalid("divide: curve has no length".into()));
+                }
+                let closed = curve.is_closed();
+                for t in divide_ts(count, closed) {
+                    positions.push(polyline_point_tangent(&pts, t).0);
+                }
+            }
+            // One point-cloud object holds every division point → single undo and
+            // a single logged id reused on replay (byte-identical geometry).
+            let new_id = id.unwrap_or_default();
+            let n = positions.len();
+            doc.insert(SceneObject {
+                visible: true,
+                id: new_id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Points { positions },
+            });
+            Ok((
+                Command::Divide { id: Some(new_id), target, count },
+                Inverse::DeleteCreated(vec![new_id]),
+                ApplyOutcome {
+                    created: vec![new_id],
+                    message: format!("divide -> {new_id} ({n} points)"),
                 },
             ))
         }
@@ -13740,6 +13801,7 @@ fn describe(cmd: &Command) -> &'static str {
             if *diameter { "dimdiameter" } else { "dimradius" }
         }
         Command::Mirror { .. } => "mirror",
+        Command::Divide { .. } => "divide",
         Command::Split { .. } => "split",
         Command::Trim { .. } => "trim",
         Command::PowerTrim { .. } => "powertrim",
@@ -16076,6 +16138,75 @@ mod tests {
         run(&mut s, "box 5,0,0 1,1,1");
         let err = s.run(parse("split last 5,0").unwrap()).unwrap_err();
         assert!(err.to_string().contains("curves"), "{err}");
+    }
+
+    #[test]
+    fn divide_ts_open_and_closed() {
+        // Open: count + 1 stations, endpoints inclusive.
+        assert_eq!(divide_ts(4, false), vec![0.0, 0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(divide_ts(1, false), vec![0.0, 1.0]);
+        // Closed: count stations over [0, 1), no seam duplicate.
+        assert_eq!(divide_ts(6, true).len(), 6);
+        assert_eq!(divide_ts(4, true), vec![0.0, 0.25, 0.5, 0.75]);
+    }
+
+    #[test]
+    fn divide_open_line_places_endpoint_inclusive_points() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        let out = run(&mut s, "divide last 4");
+        assert_eq!(out.created.len(), 1, "one point-cloud object");
+        // Line survives + one Points object.
+        assert_eq!(s.doc.len(), 2);
+        let pts = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Points { positions } => Some(positions.clone()),
+                _ => None,
+            })
+            .expect("points object");
+        assert_eq!(pts.len(), 5, "count+1 points on an open curve");
+        let xs: Vec<f64> = pts.iter().map(|p| p.x).collect();
+        for (got, want) in xs.iter().zip([0.0, 2.5, 5.0, 7.5, 10.0]) {
+            assert!((got - want).abs() < 1e-6, "x={got} want={want}");
+        }
+
+        // Undo removes the points; redo re-creates them.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 2);
+    }
+
+    #[test]
+    fn divide_closed_circle_has_count_points() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0 2");
+        let out = run(&mut s, "divide last 6");
+        assert_eq!(out.created.len(), 1);
+        let pts = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Points { positions } => Some(positions.clone()),
+                _ => None,
+            })
+            .expect("points object");
+        assert_eq!(pts.len(), 6, "count points on a closed curve (no seam dup)");
+    }
+
+    #[test]
+    fn divide_count_zero_errors_and_non_curve_errors() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        let err = s.run(parse("divide last 0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "{err}");
+
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        let err = s.run(parse("divide last 4").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("curve"), "{err}");
     }
 
     #[test]

@@ -1005,6 +1005,11 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 .map_err(|_| wrong_err("split", "a point after the selector", &args))?;
             Ok(Command::Split { ids: None, target: sel, point: point(p)? })
         }
+        "divide" => with_last_backtrack(&args, "divide", |sel, rest, args| {
+            let [n] = take::<1>("divide", "a segment count after the selector", rest)
+                .map_err(|_| wrong_err("divide", "a segment count after the selector", args))?;
+            Ok(Command::Divide { id: None, target: sel, count: integer(n, "divide")? })
+        }),
         "trim" => {
             let (target, rest) = selector(&args, "trim")?;
             let (cutter, rest) = selector(rest, "trim")?;
@@ -3963,6 +3968,7 @@ mod tests {
             "dimdiameter sel",
             "join sel",
             "arraycurve sel #aaaa1111 5",
+            "divide sel 8",
             "tozero sel",
             "flatten sel",
             // Text / PointList step kinds (guided engine v2).
@@ -4892,6 +4898,20 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"exact_boolean\""), "cmd tag: {json}");
         assert!(json.contains("\"difference\""), "op tag: {json}");
+    }
+
+    #[test]
+    fn parse_divide() {
+        assert!(matches!(
+            parse("divide last 8").unwrap(),
+            Command::Divide { id: None, target: Selector::Last { n: 1 }, count: 8 }
+        ));
+        // Missing count is a clean error.
+        assert!(parse("divide last").unwrap_err().to_string().contains("count"));
+        // JSON round-trip preserves the variant.
+        let cmd = parse("divide last 8").unwrap();
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
     }
 
     #[test]

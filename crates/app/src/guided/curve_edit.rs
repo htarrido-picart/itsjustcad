@@ -11,11 +11,12 @@
 //!   chamfer   — pick curve A, curve B, distance → `chamfer #a #b <d>`
 //!   trim      — pick target, cutter, keep pt  → `trim #target #cutter <pt>`
 //!   boundary  — no sel, PickPoint           → `boundary <pt>`
+//!   divide    — sel + Integer               → `divide sel <count>`
 //!   curvebool — sel + Keyword               → `curvebool <op> sel`
 //!   join      — sel, zero steps (emit-on-start) → `join sel`
 //!   explode   — sel, zero steps (emit-on-start) → `explode sel`
 
-use super::assemble::{key_at, num_at, obj_at, point_at, selector};
+use super::assemble::{int_at, key_at, num_at, obj_at, point_at, selector};
 use super::{fmt, num, Input, ObjFilter, Step, VerbScript};
 
 pub static SCRIPTS: &[VerbScript] = &[
@@ -66,6 +67,12 @@ pub static SCRIPTS: &[VerbScript] = &[
             Step::PickPoint { prompt: "Pick the part to remove" },
         ],
         assemble: assemble_trim,
+    },
+    VerbScript {
+        verb: "divide",
+        needs_selection: true,
+        steps: &[Step::Integer { prompt: "Number of segments", default: Some(10) }],
+        assemble: assemble_divide,
     },
     VerbScript {
         verb: "boundary",
@@ -144,6 +151,13 @@ fn assemble_trim(args: &[Input]) -> Result<String, String> {
     let cutter = obj_at(args, 1, "trim")?;
     let keep = point_at(args, 2, "trim")?;
     Ok(format!("trim {target} {cutter} {}", fmt(keep)))
+}
+
+/// `[Objects(sel), Int(count)] -> "divide sel <count>"`
+fn assemble_divide(args: &[Input]) -> Result<String, String> {
+    let sel = selector(args, "divide")?;
+    let count = int_at(args, 1, "divide")?;
+    Ok(format!("divide {sel} {count}"))
 }
 
 /// `[Point(seed)] -> "boundary <seed>"`
@@ -270,6 +284,14 @@ mod tests {
     }
 
     #[test]
+    fn assemble_divide_pure() {
+        let args = [Input::Objects("sel".into()), Input::Int(8)];
+        assert_eq!(assemble_divide(&args).unwrap(), "divide sel 8");
+        assert!(assemble_divide(&args[..1]).is_err());
+        assert!(assemble_divide(&[]).is_err());
+    }
+
+    #[test]
     fn assemble_curvebool_pure() {
         let args = [Input::Objects("sel".into()), Input::Key("Union".into())];
         assert_eq!(assemble_curvebool(&args).unwrap(), "curvebool Union sel");
@@ -361,6 +383,30 @@ mod tests {
             t.on_click(DVec3::new(3.0, 4.0, 0.0)),
             StepResult::Emit("boundary 3,4".into())
         );
+    }
+
+    #[test]
+    fn divide_guided_walk_typed_count() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("divide", Some("sel")), StartResult::Started);
+        assert!(t.active());
+        assert_eq!(t.commit_typed("8"), StepResult::Emit("divide sel 8".into()));
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn divide_walk_default_count() {
+        let mut t = GuidedTool::default();
+        t.try_start("divide", Some("sel"));
+        assert_eq!(t.prompt().unwrap(), "Number of segments <10>:");
+        // Bare Enter accepts the default (10).
+        assert_eq!(t.commit_typed(""), StepResult::Emit("divide sel 10".into()));
+    }
+
+    #[test]
+    fn divide_needs_selection() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("divide", None), StartResult::NeedSelection);
     }
 
     #[test]

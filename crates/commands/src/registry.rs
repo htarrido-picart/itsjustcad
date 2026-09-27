@@ -433,6 +433,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Dimension,
         },
         CommandSpec {
+            name: "divide",
+            usage: "divide <selector> <count>",
+            summary: "Place equally-spaced division points along a curve (points only; the curve stays intact — use split to break it). Open curves get count+1 points (both ends included); closed curves get count points (no seam duplicate). Example: divide last 8",
+            category: Category::Curve,
+        },
+        CommandSpec {
             name: "split",
             usage: "split <selector> <point x,y>",
             summary: "Split a curve in two at the nearest point on it to the given point; the original is replaced by the pieces. Example: split last 5,0",

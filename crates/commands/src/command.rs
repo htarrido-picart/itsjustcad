@@ -840,6 +840,18 @@ pub enum Command {
         target: Selector,
         point: DVec3,
     },
+    /// Divide a curve into `count` equal-arc-length segments, placing division
+    /// points as one point-cloud object per resolved curve; the curve itself is
+    /// left intact (points-only — use `split` to break a curve). Open curves get
+    /// `count + 1` points (endpoints inclusive: t = 0, 1/count, …, 1); closed
+    /// curves get `count` points (t = 0, 1/count, …, (count-1)/count — no seam
+    /// duplicate).
+    Divide {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        target: Selector,
+        count: u32,
+    },
     /// Trim a curve at its intersections with cutter curves, keeping only the
     /// piece nearest `keep`; the rest is removed.
     Trim {
