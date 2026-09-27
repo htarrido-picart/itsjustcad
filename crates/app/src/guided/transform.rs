@@ -144,6 +144,23 @@ fn assemble_stretch(args: &[Input]) -> Result<String, String> {
     Ok(format!("stretch {sel} {} {} {}", fmt(min), fmt(max), fmt(to - from)))
 }
 
+// ── tozero / flatten ──────────────────────────────────────────────────────────
+//
+// Parser:  `tozero sel` / `flatten sel`
+// Guided:  zero-step verbs on a pre-selection (emit-on-start), like `area`.
+
+/// `[Objects(sel)] -> "tozero sel"`.
+fn assemble_tozero(args: &[Input]) -> Result<String, String> {
+    let sel = selector(args, "tozero")?;
+    Ok(format!("tozero {sel}"))
+}
+
+/// `[Objects(sel)] -> "flatten sel"`.
+fn assemble_flatten(args: &[Input]) -> Result<String, String> {
+    let sel = selector(args, "flatten")?;
+    Ok(format!("flatten {sel}"))
+}
+
 // ── SCRIPTS ─────────────────────────────────────────────────────────────────
 
 pub static SCRIPTS: &[VerbScript] = &[
@@ -188,6 +205,18 @@ pub static SCRIPTS: &[VerbScript] = &[
         needs_selection: true,
         steps: STRETCH_STEPS,
         assemble: assemble_stretch,
+    },
+    VerbScript {
+        verb: "tozero",
+        needs_selection: true,
+        steps: &[],
+        assemble: assemble_tozero,
+    },
+    VerbScript {
+        verb: "flatten",
+        needs_selection: true,
+        steps: &[],
+        assemble: assemble_flatten,
     },
 ];
 
@@ -409,5 +438,39 @@ mod tests {
         t.on_click(DVec3::new(2.0, 0.0, 0.0)); // from
         let result = t.on_click(DVec3::new(4.0, 0.0, 0.0)); // to → delta (2,0)
         assert_eq!(result, StepResult::Emit("stretch sel 0,0 5,5 2,0".into()));
+    }
+
+    // ── tozero / flatten (zero-step, emit-on-start) ──────────────────────────
+
+    #[test]
+    fn assemble_tozero_and_flatten_pure() {
+        let args = [Input::Objects("sel".into())];
+        assert_eq!(assemble_tozero(&args).unwrap(), "tozero sel");
+        assert_eq!(assemble_flatten(&args).unwrap(), "flatten sel");
+        assert!(assemble_tozero(&[]).is_err());
+        assert!(assemble_flatten(&[]).is_err());
+    }
+
+    #[test]
+    fn tozero_emits_on_start() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("tozero", Some("sel")), StartResult::Started);
+        assert_eq!(t.emit_if_ready(), Some(StepResult::Emit("tozero sel".into())));
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn flatten_emits_on_start() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("flatten", Some("sel")), StartResult::Started);
+        assert_eq!(t.emit_if_ready(), Some(StepResult::Emit("flatten sel".into())));
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn tozero_and_flatten_need_selection() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("tozero", None), StartResult::NeedSelection);
+        assert_eq!(t.try_start("flatten", None), StartResult::NeedSelection);
     }
 }

@@ -9,14 +9,11 @@
 //! - `dimangular`   — angular dimension, vertex + two leg points + optional radius
 //! - `autodim`      — batch-dimension a selection with an optional offset
 //!
+//! - `dimradius` / `dimdiameter` — zero-step verbs (selection only). Wired via
+//!   the emit-on-start path (`emit_if_ready`), like `area`/`volume`.
+//!
 //! Deferred verbs
 //! --------------
-//! - `dimradius` / `dimdiameter` — zero-step verbs (selection only). The current
-//!   engine has no `Confirm` step; `try_start` returns `Started` but `prompt()`
-//!   returns `None`, so no prompt is shown and the tool silently waits. Needs
-//!   either a `Step::Confirm` kind in mod.rs, or an app.rs change to call
-//!   `commit_typed("")` when `prompt()` is `None` after `Started`. Defer until
-//!   the engine gains that support. The assemblers are tested below.
 //! - `field`  — the expression argument (`area <sel>`, `length <sel>`, `layer`,
 //!   `units`, …) is free text that the guided engine cannot collect via
 //!   PickPoint / Number / Keyword steps; defer until the engine gains a
@@ -56,6 +53,20 @@ pub static SCRIPTS: &[VerbScript] = &[
         steps: &[Step::Number { prompt: "Dimension line offset", default: Some(0.5) }],
         assemble: assemble_autodim,
     },
+    // --- dimradius (zero-step, emit-on-start) ------------------------------
+    VerbScript {
+        verb: "dimradius",
+        needs_selection: true,
+        steps: &[],
+        assemble: assemble_dimradius,
+    },
+    // --- dimdiameter (zero-step, emit-on-start) ----------------------------
+    VerbScript {
+        verb: "dimdiameter",
+        needs_selection: true,
+        steps: &[],
+        assemble: assemble_dimdiameter,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -85,17 +96,13 @@ fn assemble_dimangular(args: &[Input]) -> Result<String, String> {
     ))
 }
 
-/// `[Objects(sel)] -> "dimradius <sel>"`
-// Deferred from SCRIPTS (zero-step verb); tested in the test module below.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `[Objects(sel)] -> "dimradius <sel>"` — zero-step verb (emit-on-start).
 fn assemble_dimradius(args: &[Input]) -> Result<String, String> {
     let sel = selector(args, "dimradius")?;
     Ok(format!("dimradius {sel}"))
 }
 
-/// `[Objects(sel)] -> "dimdiameter <sel>"`
-// Deferred from SCRIPTS (zero-step verb); tested in the test module below.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `[Objects(sel)] -> "dimdiameter <sel>"` — zero-step verb (emit-on-start).
 fn assemble_dimdiameter(args: &[Input]) -> Result<String, String> {
     let sel = selector(args, "dimdiameter")?;
     Ok(format!("dimdiameter {sel}"))
@@ -159,8 +166,6 @@ mod tests {
         assert!(assemble_dimangular(&args[..2]).is_err());
     }
 
-    // assembler tests for deferred dimradius/dimdiameter — the assemblers are
-    // correct and exercised here even though the verbs aren't in SCRIPTS yet.
     #[test]
     fn assemble_dimradius_and_dimdiameter_emit_canonical_strings() {
         let args = [Input::Objects("sel".into())];
@@ -241,6 +246,31 @@ mod tests {
             t.commit_typed("0.8"),
             StepResult::Emit("autodim all offset 0.8".into())
         );
+    }
+
+    // -- zero-step emit-on-start walks for dimradius/dimdiameter ------------
+
+    #[test]
+    fn guided_dimradius_emits_on_start() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("dimradius", Some("sel")), StartResult::Started);
+        assert_eq!(t.emit_if_ready(), Some(StepResult::Emit("dimradius sel".into())));
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn guided_dimdiameter_emits_on_start() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("dimdiameter", Some("sel")), StartResult::Started);
+        assert_eq!(t.emit_if_ready(), Some(StepResult::Emit("dimdiameter sel".into())));
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn guided_dimradius_needs_selection() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("dimradius", None), StartResult::NeedSelection);
+        assert_eq!(t.try_start("dimdiameter", None), StartResult::NeedSelection);
     }
 
     #[test]

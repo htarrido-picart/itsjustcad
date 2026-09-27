@@ -11,9 +11,9 @@
 //!   trim      — pick target, cutter, keep pt  → `trim #target #cutter <pt>`
 //!   boundary  — no sel, PickPoint           → `boundary <pt>`
 //!   curvebool — sel + Keyword               → `curvebool <op> sel`
+//!   join      — sel, zero steps (emit-on-start) → `join sel`
 //!
 //! Deferred:
-//!   join      — zero steps; use the zero-step (emit-on-start) path when added.
 //!   explode   — no parser arm in commands/src/parse.rs
 //!   chamfer   — no parser arm in commands/src/parse.rs
 
@@ -75,6 +75,12 @@ pub static SCRIPTS: &[VerbScript] = &[
         }],
         assemble: assemble_curvebool,
     },
+    VerbScript {
+        verb: "join",
+        needs_selection: true,
+        steps: &[],
+        assemble: assemble_join,
+    },
 ];
 
 // ── assemblers ────────────────────────────────────────────────────────────────
@@ -131,6 +137,12 @@ fn assemble_curvebool(args: &[Input]) -> Result<String, String> {
     let sel = selector(args, "curvebool")?;
     let op = key_at(args, 1, "curvebool")?;
     Ok(format!("curvebool {op} {sel}"))
+}
+
+/// `[Objects(sel)] -> "join sel"` — zero-step verb (emit-on-start).
+fn assemble_join(args: &[Input]) -> Result<String, String> {
+    let sel = selector(args, "join")?;
+    Ok(format!("join {sel}"))
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -340,5 +352,26 @@ mod tests {
             t.commit_typed("In"),
             StepResult::Emit("curvebool Intersect sel".into())
         );
+    }
+
+    #[test]
+    fn assemble_join_pure() {
+        let args = [Input::Objects("sel".into())];
+        assert_eq!(assemble_join(&args).unwrap(), "join sel");
+        assert!(assemble_join(&[]).is_err());
+    }
+
+    #[test]
+    fn join_emits_on_start() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("join", Some("sel")), StartResult::Started);
+        assert_eq!(t.emit_if_ready(), Some(StepResult::Emit("join sel".into())));
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn join_needs_selection() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("join", None), StartResult::NeedSelection);
     }
 }

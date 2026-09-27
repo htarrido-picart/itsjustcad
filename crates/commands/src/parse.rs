@@ -3934,6 +3934,22 @@ fn levenshtein(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
 
+    /// Guided-engine emitted strings for the zero-step and object-pick verbs
+    /// must all `parse()` cleanly — this guards the engine ↔ parser contract.
+    #[test]
+    fn guided_emitted_strings_round_trip() {
+        for s in [
+            "dimradius sel",
+            "dimdiameter sel",
+            "join sel",
+            "arraycurve sel #aaaa1111 5",
+            "tozero sel",
+            "flatten sel",
+        ] {
+            assert!(parse(s).is_ok(), "guided-emitted string failed to parse: {s}");
+        }
+    }
+
     #[test]
     fn parse_box() {
         let cmd = parse("box 0,0,0 5,5,3").unwrap();

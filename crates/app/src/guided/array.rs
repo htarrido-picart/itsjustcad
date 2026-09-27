@@ -6,15 +6,11 @@
 //! Implemented:
 //! - `array`      — rectangular/grid array (nx,ny counts + dx,dy spacing)
 //! - `polararray` — polar/rotational array (count, center point, total angle)
-//!
-//! Deferred (engine gap):
-//! - `arraycurve`/`patharray` — needs a second interactive object pick (path
-//!   curve selector). The guided engine v1 has no step for picking a second
-//!   object interactively; all selectors are seeded from a pre-selection.
-//!   Re-enable once the engine gains an `ObjectPick` step type.
+//! - `arraycurve` — distribute copies along a path curve (targets from the
+//!   pre-selection, path picked interactively, then a count)
 
-use super::assemble::{int_at, num_at, point_at, selector};
-use super::{Input, Step, VerbScript, fmt, num};
+use super::assemble::{int_at, num_at, obj_at, point_at, selector};
+use super::{Input, ObjFilter, Step, VerbScript, fmt, num};
 
 pub static SCRIPTS: &[VerbScript] = &[
     VerbScript {
@@ -38,6 +34,15 @@ pub static SCRIPTS: &[VerbScript] = &[
         ],
         assemble: assemble_polararray,
     },
+    VerbScript {
+        verb: "arraycurve",
+        needs_selection: true,
+        steps: &[
+            Step::SelectObject { prompt: "Select path curve", filter: ObjFilter::Curve },
+            Step::Integer { prompt: "Number of items along path", default: Some(5) },
+        ],
+        assemble: assemble_arraycurve,
+    },
 ];
 
 /// `[Objects(sel), Int(nx), Int(ny), Num(dx), Num(dy)] -> "array sel nx,ny,1 dx,dy,0"`.
@@ -57,6 +62,15 @@ fn assemble_polararray(args: &[Input]) -> Result<String, String> {
     let center = point_at(args, 2, "polararray")?;
     let angle = num_at(args, 3, "polararray")?;
     Ok(format!("polararray {sel} {count} {} {}", fmt(center), num(angle)))
+}
+
+/// `[Objects(sel), Objects(#path), Int(count)] -> "arraycurve sel #path count"`.
+/// Alignment defaults on in the parser, so it is omitted here.
+fn assemble_arraycurve(args: &[Input]) -> Result<String, String> {
+    let sel = selector(args, "arraycurve")?;
+    let path = obj_at(args, 1, "arraycurve")?;
+    let count = int_at(args, 2, "arraycurve")?;
+    Ok(format!("arraycurve {sel} {path} {count}"))
 }
 
 #[cfg(test)]
@@ -196,6 +210,62 @@ mod tests {
     fn polararray_needs_selection() {
         let mut t = GuidedTool::default();
         assert_eq!(t.try_start("polararray", None), StartResult::NeedSelection);
+        assert!(!t.active());
+    }
+
+    // --- arraycurve ---
+
+    #[test]
+    fn assemble_arraycurve_is_pure() {
+        let args = [
+            Input::Objects("sel".into()),
+            Input::Objects("#aaaa1111".into()),
+            Input::Int(5),
+        ];
+        assert_eq!(assemble_arraycurve(&args).unwrap(), "arraycurve sel #aaaa1111 5");
+    }
+
+    #[test]
+    fn assemble_arraycurve_missing_args_is_err() {
+        let args = [Input::Objects("sel".into())];
+        assert!(assemble_arraycurve(&args).is_err());
+        assert!(assemble_arraycurve(&[]).is_err());
+    }
+
+    #[test]
+    fn arraycurve_guided_walk_emits_correct_command() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("arraycurve", Some("sel")), StartResult::Started);
+        assert!(t.active());
+        // Step 1: pick the path curve interactively.
+        assert!(t.current_wants_object());
+        assert!(t.prompt().unwrap().starts_with("Select path curve"));
+        assert_eq!(t.commit_object("aaaa1111"), StepResult::NeedMore);
+        // Step 2: count (default 5).
+        assert!(t.prompt().unwrap().contains("Number of items along path"));
+        assert_eq!(
+            t.commit_typed("5"),
+            StepResult::Emit("arraycurve sel #aaaa1111 5".into())
+        );
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn arraycurve_guided_walk_default_count() {
+        let mut t = GuidedTool::default();
+        t.try_start("arraycurve", Some("sel"));
+        t.commit_object("bbbb2222");
+        // Bare Enter takes the default count (5).
+        assert_eq!(
+            t.commit_typed(""),
+            StepResult::Emit("arraycurve sel #bbbb2222 5".into())
+        );
+    }
+
+    #[test]
+    fn arraycurve_needs_selection() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("arraycurve", None), StartResult::NeedSelection);
         assert!(!t.active());
     }
 }
