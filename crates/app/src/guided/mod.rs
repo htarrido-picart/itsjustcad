@@ -340,18 +340,19 @@ impl GuidedTool {
     }
 
     /// Live ghost geometry to overlay while picking (Rhino-style rubber-band).
-    /// On a point step, connect the points picked so far to the cursor — so
-    /// `distance`/`dim` draw a line to the cursor, multi-point verbs draw a
-    /// running polyline. Only point steps get a ghost; typed/object steps and a
+    /// Verb-specific ghosts (arc) render their true shape as the cursor moves;
+    /// every other point step falls back to connecting the points picked so far
+    /// to the cursor — so `distance`/`dim` draw a line to the cursor and
+    /// multi-point verbs draw a running polyline. Typed/object steps and a
     /// missing cursor draw nothing.
     pub fn preview(&self, cursor: Option<DVec3>) -> Vec<Vec<DVec3>> {
-        if !matches!(self.current_step(), Some(Step::PickPoint { .. })) {
+        let Some(script) = self.script else {
             return Vec::new();
-        }
+        };
         let Some(cursor) = cursor else {
             return Vec::new();
         };
-        let mut strip: Vec<DVec3> = self
+        let pts: Vec<DVec3> = self
             .done
             .iter()
             .filter_map(|i| match i {
@@ -359,6 +360,15 @@ impl GuidedTool {
                 _ => None,
             })
             .collect();
+        // Verb-specific live ghosts.
+        if script.verb == "arc" {
+            return arc_preview(&pts, cursor);
+        }
+        // Generic rubber-band: only while a point step is active.
+        if !matches!(self.current_step(), Some(Step::PickPoint { .. })) {
+            return Vec::new();
+        }
+        let mut strip = pts;
         strip.push(cursor);
         // Need at least one prior point to draw a rubber-band to the cursor.
         if strip.len() >= 2 { vec![strip] } else { Vec::new() }
@@ -399,6 +409,45 @@ fn all_scripts() -> impl Iterator<Item = &'static VerbScript> {
 /// parser).
 fn lookup(verb: &str) -> Option<&'static VerbScript> {
     all_scripts().find(|s| s.verb == verb)
+}
+
+/// A CCW arc/circle as a 48-segment polyline: from `a0` sweeping `sweep`
+/// radians about `center` at `radius`.
+fn arc_polyline(center: DVec3, radius: f64, a0: f64, sweep: f64) -> Vec<DVec3> {
+    const N: usize = 48;
+    (0..=N)
+        .map(|i| {
+            let t = a0 + sweep * (i as f64) / (N as f64);
+            center + DVec3::new(radius * t.cos(), radius * t.sin(), 0.0)
+        })
+        .collect()
+}
+
+/// Live ghost for the guided `arc` (center → start point → end point):
+/// after the center, a radius ring + radius line to the cursor; after the start
+/// point, the CCW arc from the start angle to the cursor angle + radius lines.
+fn arc_preview(pts: &[DVec3], cursor: DVec3) -> Vec<Vec<DVec3>> {
+    match pts {
+        [c] => {
+            let r = c.distance(cursor);
+            if r < 1e-9 {
+                return Vec::new();
+            }
+            vec![arc_polyline(*c, r, 0.0, std::f64::consts::TAU), vec![*c, cursor]]
+        }
+        [c, p1] => {
+            let r = c.distance(*p1);
+            if r < 1e-9 {
+                return Vec::new();
+            }
+            let a0 = (p1.y - c.y).atan2(p1.x - c.x);
+            let a1 = (cursor.y - c.y).atan2(cursor.x - c.x);
+            let tau = std::f64::consts::TAU;
+            let sweep = ((a1 - a0) % tau + tau) % tau; // CCW start→cursor
+            vec![arc_polyline(*c, r, a0, sweep), vec![*c, *p1], vec![*c, cursor]]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Shared assembler helpers for the per-group modules.

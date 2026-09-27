@@ -46,11 +46,13 @@ pub static SCRIPTS: &[VerbScript] = &[
     VerbScript {
         verb: "arc",
         needs_selection: false,
+        // Center → start point → end point (Rhino's center-start-end arc). Each
+        // point drives a live ghost (see GuidedTool::preview). Points can still
+        // be typed as coordinates for precision.
         steps: &[
-            Step::PickPoint { prompt: "Center" },
-            Step::Number { prompt: "Radius", default: Some(1.0) },
-            Step::Number { prompt: "Start angle", default: Some(0.0) },
-            Step::Number { prompt: "End angle", default: Some(90.0) },
+            Step::PickPoint { prompt: "Center of arc" },
+            Step::PickPoint { prompt: "Start point (sets radius + start angle)" },
+            Step::PickPoint { prompt: "End point (sets end angle)" },
         ],
         assemble: assemble_arc,
     },
@@ -219,12 +221,16 @@ fn assemble_box(args: &[Input]) -> Result<String, String> {
 }
 
 /// `[Point(center), Num(r), Num(s), Num(e)] -> "arc <center> <r> <s> <e>"`
+/// `[Point(center), Point(start), Point(end)] -> "arc <center> <r> <start°> <end°>"`
+/// Radius = |start-center|; angles = CCW from +X of the start/end points.
 fn assemble_arc(args: &[Input]) -> Result<String, String> {
     let center = point_at(args, 0, "arc")?;
-    let r = num_at(args, 1, "arc")?;
-    let s = num_at(args, 2, "arc")?;
-    let e = num_at(args, 3, "arc")?;
-    Ok(format!("arc {} {} {} {}", fmt(center), num(r), num(s), num(e)))
+    let start = point_at(args, 1, "arc")?;
+    let end = point_at(args, 2, "arc")?;
+    let r = center.distance(start);
+    let start_deg = (start.y - center.y).atan2(start.x - center.x).to_degrees();
+    let end_deg = (end.y - center.y).atan2(end.x - center.x).to_degrees();
+    Ok(format!("arc {} {} {} {}", fmt(center), num(r), num(start_deg), num(end_deg)))
 }
 
 /// `[Point(center), Num(rx), Num(ry)] -> "ellipse <center> <rx> <ry>"`
@@ -380,13 +386,13 @@ mod tests {
 
     #[test]
     fn assemble_arc_pure() {
+        // center, start point (2,0 → r=2, 0°), end point (0,2 → 90°).
         let args = [
             Input::Point(DVec3::new(0.0, 0.0, 0.0)),
-            Input::Num(1.0),
-            Input::Num(0.0),
-            Input::Num(90.0),
+            Input::Point(DVec3::new(2.0, 0.0, 0.0)),
+            Input::Point(DVec3::new(0.0, 2.0, 0.0)),
         ];
-        assert_eq!(assemble_arc(&args).unwrap(), "arc 0,0 1 0 90");
+        assert_eq!(assemble_arc(&args).unwrap(), "arc 0,0 2 0 90");
         assert!(assemble_arc(&args[..2]).is_err());
     }
 
@@ -522,20 +528,33 @@ mod tests {
     fn guided_arc_walk() {
         let mut t = GuidedTool::default();
         assert_eq!(t.try_start("arc", None), StartResult::Started);
-        // Step 1: center
+        // Center → start point → end point, all interactive (live ghost).
         assert!(t.current_is_point());
         assert_eq!(t.on_click(DVec3::new(0.0, 0.0, 0.0)), StepResult::NeedMore);
-        // Step 2: radius
-        assert!(!t.current_is_point());
-        assert_eq!(t.commit_typed("2"), StepResult::NeedMore);
-        // Step 3: start angle (default 0.0, bare Enter)
-        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
-        // Step 4: end angle
+        assert!(t.current_is_point());
+        assert_eq!(t.on_click(DVec3::new(2.0, 0.0, 0.0)), StepResult::NeedMore);
+        assert!(t.current_is_point());
         assert_eq!(
-            t.commit_typed("180"),
-            StepResult::Emit("arc 0,0 2 0 180".into())
+            t.on_click(DVec3::new(0.0, 2.0, 0.0)),
+            StepResult::Emit("arc 0,0 2 0 90".into())
         );
         assert!(!t.active());
+    }
+
+    #[test]
+    fn arc_preview_shows_ring_then_arc() {
+        let mut t = GuidedTool::default();
+        t.try_start("arc", None);
+        // Before the center is picked, nothing to preview.
+        assert!(t.preview(Some(DVec3::new(1.0, 0.0, 0.0))).is_empty());
+        t.on_click(DVec3::ZERO); // center
+        // On the start-point step: a radius ring + a radius line to the cursor.
+        let g = t.preview(Some(DVec3::new(2.0, 0.0, 0.0)));
+        assert_eq!(g.len(), 2, "ring + radius line");
+        t.on_click(DVec3::new(2.0, 0.0, 0.0)); // start point
+        // On the end-point step: an arc ghost + two radius lines.
+        let g = t.preview(Some(DVec3::new(0.0, 2.0, 0.0)));
+        assert!(g.len() >= 1, "arc ghost present");
     }
 
     #[test]
