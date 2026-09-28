@@ -3712,6 +3712,15 @@ fn selector<'a>(
         }
         "all" => Ok((Selector::All, rest)),
         "sel" | "selected" => Ok((Selector::Selected, rest)),
+        // Explicit `name:<n>` / `id:<n>` prefixes (as written in command help and
+        // examples, e.g. `loft name:rings guides name:rail`). Strip the prefix
+        // and resolve by name-or-short-id through `find_named`.
+        tok if tok.starts_with("name:") && tok.len() > 5 => {
+            Ok((Selector::Named { name: tok[5..].to_string() }, rest))
+        }
+        tok if tok.starts_with("id:") && tok.len() > 3 => {
+            Ok((Selector::Named { name: tok[3..].to_string() }, rest))
+        }
         name if name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '#') => Ok((
             Selector::Named {
                 name: name.trim_start_matches('#').to_string(),
@@ -3984,6 +3993,29 @@ mod tests {
 
     /// Guided-engine emitted strings for the zero-step and object-pick verbs
     /// must all `parse()` cleanly — this guards the engine ↔ parser contract.
+    #[test]
+    fn name_and_id_selector_prefixes_resolve() {
+        use crate::Selector;
+        // `name:<n>` strips the prefix → Named{n} (the documented form).
+        assert!(matches!(
+            selector(&["name:rings"], "t").unwrap().0,
+            Selector::Named { name } if name == "rings"
+        ));
+        assert!(matches!(
+            selector(&["id:a1b2c3d4"], "t").unwrap().0,
+            Selector::Named { name } if name == "a1b2c3d4"
+        ));
+        // The documented multi-selector examples now parse.
+        assert!(parse("loft name:rings guides name:rail").is_ok());
+        assert!(parse("constrain perpendicular name:l1 name:l2").is_ok());
+        assert!(parse("blend name:top name:bottom 1.5").is_ok());
+        // A bare name still works; `name:` with nothing after is treated literally.
+        assert!(matches!(
+            selector(&["rings"], "t").unwrap().0,
+            Selector::Named { name } if name == "rings"
+        ));
+    }
+
     #[test]
     fn guided_emitted_strings_round_trip() {
         for s in [
