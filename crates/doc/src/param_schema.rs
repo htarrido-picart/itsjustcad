@@ -195,7 +195,14 @@ impl GeneratorKind {
     /// `derive_mesh` for such a generator must return a *surface* grid mesh
     /// whose edges are the intended grid lines.
     pub fn renders_as_wireframe(self) -> bool {
-        matches!(self, GeneratorKind::Cablenet)
+        // Smooth form-found SURFACES render as their mesh-edge grid (Frei-Otto
+        // physical-model look). Strut lattices (spaceframe/geodesic/tensegrity/
+        // funicular/gridshell) instead render their member segments — handled
+        // separately — since their tube-mesh edges would be facet clutter.
+        matches!(
+            self,
+            GeneratorKind::Cablenet | GeneratorKind::Hypar | GeneratorKind::GaussVault
+        )
     }
 }
 
@@ -709,9 +716,12 @@ mod tests {
     }
 
     #[test]
-    fn only_cablenet_renders_as_wireframe_for_now() {
+    fn form_found_surfaces_render_as_wireframe() {
         for &k in GeneratorKind::ALL {
-            let want = matches!(k, GeneratorKind::Cablenet);
+            let want = matches!(
+                k,
+                GeneratorKind::Cablenet | GeneratorKind::Hypar | GeneratorKind::GaussVault
+            );
             assert_eq!(k.renders_as_wireframe(), want, "{k:?} wireframe flag");
         }
     }
