@@ -27,8 +27,9 @@ pub use delaunay::triangulate;
 pub use earcut::{earcut, signed_area};
 pub use edges::{feature_edges, project_edges_behind, project_edges_onto};
 pub use expressive::{
-    diagrid_segments, gaussvault_surface, geodesic_network, gridshell, gridshell_segments,
-    hypar_surface, reciprocal_segments, spaceframe_struts, strut_lattice, waffle_segments,
+    catenary_vault_surface, diagrid_segments, gaussvault_surface, geodesic_network, gridshell,
+    gridshell_segments, hypar_surface, reciprocal_segments, schwedler_segments, spaceframe_struts,
+    strut_lattice, voronoishell_segments, waffle_segments,
     GridshellSurface,
 };
 pub use formfind::{

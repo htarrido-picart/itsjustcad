@@ -139,6 +139,24 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Structure,
         },
         CommandSpec {
+            name: "voronoishell",
+            usage: "voronoishell <cells> <width> <length> [seed]",
+            summary: "Voronoi cell pattern over a width×length rectangle in the XY plane from 'cells' deterministic seed points (placed by 'seed'); the clipped cell edges render as member lines. Example: voronoishell 24 20 20 1",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "schwedler",
+            usage: "schwedler <meridians> <rings> <radius> [dome|full]",
+            summary: "Schwedler ribbed dome: 'meridians' meridional ribs + 'rings' latitude rings + one diagonal brace per panel on a sphere of 'radius'; 'full' builds the whole sphere. Renders as member lines. Example: schwedler 12 6 8 dome",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "catenaryvault",
+            usage: "catenaryvault <span> <length> <rise> [nu] [nv]",
+            summary: "Compression vault whose cross-section is a true catenary of 'span'/'rise' lofted along 'length', meshed nu×nv (default 16) and drawn as a wireframe. Example: catenaryvault 8 12 4",
+            category: Category::Structure,
+        },
+        CommandSpec {
             name: "hypar",
             usage: "hypar <a> <b> <c> [nu] [nv]",
             summary: "Hyperbolic-paraboloid (Candela) saddle shell z = x*y/c over [-a,a]×[-b,b], meshed nu×nv (default 12). Example: hypar 5 5 5",

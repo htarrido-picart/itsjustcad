@@ -461,6 +461,44 @@ pub enum Command {
         length: f64,
         depth: f64,
     },
+    /// Voronoi shell: a planar Voronoi cell pattern over a `width × length`
+    /// rectangle (XY plane) from `cells` deterministic seed points placed by
+    /// `seed`. The clipped cell edges render as lightweight member lines.
+    VoronoiShell {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        cells: u32,
+        width: f64,
+        length: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<i64>,
+    },
+    /// Schwedler ribbed dome: `meridians` meridional ribs, `rings` latitude rings
+    /// and one Schwedler diagonal per panel on a sphere of `radius`; `full` builds
+    /// the whole sphere instead of the upper hemisphere. Renders as member lines.
+    Schwedler {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        meridians: u32,
+        rings: u32,
+        radius: f64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        full: bool,
+    },
+    /// Catenary vault: a compression vault whose cross-section is a true catenary
+    /// of `span` and crown `rise`, lofted along `length`. Meshed as a `nu×nv`
+    /// surface whose edges render as the vault wireframe.
+    CatenaryVault {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        span: f64,
+        length: f64,
+        rise: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nu: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nv: Option<u32>,
+    },
     /// Minimal surface / soap film (Frei Otto): stretch a discrete soap film
     /// across a selected **closed** curve boundary using the shared
     /// form-finding engine (force-density harmonic net). One logged surface

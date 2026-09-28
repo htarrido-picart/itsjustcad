@@ -42,6 +42,9 @@ pub enum GeneratorKind {
     Diagrid,
     Reciprocal,
     Waffle,
+    VoronoiShell,
+    Schwedler,
+    CatenaryVault,
 }
 
 impl GeneratorKind {
@@ -58,6 +61,9 @@ impl GeneratorKind {
         GeneratorKind::Diagrid,
         GeneratorKind::Reciprocal,
         GeneratorKind::Waffle,
+        GeneratorKind::VoronoiShell,
+        GeneratorKind::Schwedler,
+        GeneratorKind::CatenaryVault,
     ];
 
     /// Stable token (matches the creating verb): `geodesic`, `hypar`, …
@@ -74,6 +80,9 @@ impl GeneratorKind {
             GeneratorKind::Diagrid => "diagrid",
             GeneratorKind::Reciprocal => "reciprocal",
             GeneratorKind::Waffle => "waffle",
+            GeneratorKind::VoronoiShell => "voronoishell",
+            GeneratorKind::Schwedler => "schwedler",
+            GeneratorKind::CatenaryVault => "catenaryvault",
         }
     }
 
@@ -91,6 +100,9 @@ impl GeneratorKind {
             GeneratorKind::Diagrid => "param.gen.diagrid",
             GeneratorKind::Reciprocal => "param.gen.reciprocal",
             GeneratorKind::Waffle => "param.gen.waffle",
+            GeneratorKind::VoronoiShell => "param.gen.voronoishell",
+            GeneratorKind::Schwedler => "param.gen.schwedler",
+            GeneratorKind::CatenaryVault => "param.gen.catenaryvault",
         }
     }
 
@@ -215,6 +227,34 @@ impl GeneratorKind {
                     ParamField::float("depth", "param.waffle.depth", 1.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
                 ],
             },
+            GeneratorKind::VoronoiShell => ParamSchema {
+                kind: self,
+                fields: vec![
+                    ParamField::int("cells", "param.voronoishell.cells", 24, 1, 4096, 1, Widget::Slider),
+                    ParamField::float("width", "param.voronoishell.width", 20.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("length", "param.voronoishell.length", 20.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::int("seed", "param.voronoishell.seed", 1, 0, 1_000_000, 1, Widget::Numeric),
+                ],
+            },
+            GeneratorKind::Schwedler => ParamSchema {
+                kind: self,
+                fields: vec![
+                    ParamField::int("meridians", "param.schwedler.meridians", 12, 3, 256, 1, Widget::Slider),
+                    ParamField::int("rings", "param.schwedler.rings", 6, 1, 256, 1, Widget::Slider),
+                    ParamField::float("radius", "param.schwedler.radius", 8.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::enum_("mode", "param.schwedler.mode", "dome", &["dome", "full"]),
+                ],
+            },
+            GeneratorKind::CatenaryVault => ParamSchema {
+                kind: self,
+                fields: vec![
+                    ParamField::float("span", "param.catenaryvault.span", 8.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("length", "param.catenaryvault.length", 12.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("rise", "param.catenaryvault.rise", 4.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::int("nu", "param.catenaryvault.nu", 16, 2, 256, 1, Widget::Slider),
+                    ParamField::int("nv", "param.catenaryvault.nv", 16, 2, 256, 1, Widget::Slider),
+                ],
+            },
         }
     }
 
@@ -240,7 +280,10 @@ impl GeneratorKind {
         // separately — since their tube-mesh edges would be facet clutter.
         matches!(
             self,
-            GeneratorKind::Cablenet | GeneratorKind::Hypar | GeneratorKind::GaussVault
+            GeneratorKind::Cablenet
+                | GeneratorKind::Hypar
+                | GeneratorKind::GaussVault
+                | GeneratorKind::CatenaryVault
         )
     }
 
@@ -264,6 +307,8 @@ impl GeneratorKind {
                 | GeneratorKind::Diagrid
                 | GeneratorKind::Reciprocal
                 | GeneratorKind::Waffle
+                | GeneratorKind::VoronoiShell
+                | GeneratorKind::Schwedler
         )
     }
 }
@@ -705,6 +750,32 @@ pub fn derive_mesh(kind: GeneratorKind, params: &ParamMap) -> Result<Mesh, Deriv
             let strut = (depth * 0.06).clamp(0.02, 0.3);
             Ok(kernel_mesh::strut_lattice(&segs, strut))
         }
+        GeneratorKind::VoronoiShell => {
+            let cells = get_i(&p, "cells").max(1) as u32;
+            let width = get_f(&p, "width");
+            let length = get_f(&p, "length");
+            let seed = get_i(&p, "seed");
+            let segs = kernel_mesh::voronoishell_segments(cells, width, length, seed);
+            let strut = ((width.min(length)) * 0.01).clamp(0.02, 0.3);
+            Ok(kernel_mesh::strut_lattice(&segs, strut))
+        }
+        GeneratorKind::Schwedler => {
+            let meridians = get_i(&p, "meridians").max(3) as u32;
+            let rings = get_i(&p, "rings").max(1) as u32;
+            let radius = get_f(&p, "radius");
+            let dome = p.get("mode").and_then(|v| v.as_enum()) != Some("full");
+            let segs = kernel_mesh::schwedler_segments(meridians, rings, radius, dome);
+            let strut = (radius * 0.02).clamp(0.01, 0.5);
+            Ok(kernel_mesh::strut_lattice(&segs, strut))
+        }
+        GeneratorKind::CatenaryVault => {
+            let span = get_f(&p, "span");
+            let length = get_f(&p, "length");
+            let rise = get_f(&p, "rise");
+            let nu = get_i(&p, "nu").max(2) as u32;
+            let nv = get_i(&p, "nv").max(2) as u32;
+            Ok(kernel_mesh::catenary_vault_surface(span, length, rise, nu, nv))
+        }
     }
 }
 
@@ -793,10 +864,25 @@ pub fn derive_segments(
             let depth = get_f(&p, "depth");
             kernel_mesh::waffle_segments(nx, ny, width, length, depth)
         }
+        GeneratorKind::VoronoiShell => {
+            let cells = get_i(&p, "cells").max(1) as u32;
+            let width = get_f(&p, "width");
+            let length = get_f(&p, "length");
+            let seed = get_i(&p, "seed");
+            kernel_mesh::voronoishell_segments(cells, width, length, seed)
+        }
+        GeneratorKind::Schwedler => {
+            let meridians = get_i(&p, "meridians").max(3) as u32;
+            let rings = get_i(&p, "rings").max(1) as u32;
+            let radius = get_f(&p, "radius");
+            let dome = p.get("mode").and_then(|v| v.as_enum()) != Some("full");
+            kernel_mesh::schwedler_segments(meridians, rings, radius, dome)
+        }
         // Non-lattice kinds are handled by the early return above.
         GeneratorKind::Hypar
         | GeneratorKind::GaussVault
-        | GeneratorKind::Cablenet => Vec::new(),
+        | GeneratorKind::Cablenet
+        | GeneratorKind::CatenaryVault => Vec::new(),
     };
     Ok(pairs.into_iter().map(|(a, b)| [a, b]).collect())
 }
@@ -902,7 +988,10 @@ mod tests {
         for &k in GeneratorKind::ALL {
             let want = matches!(
                 k,
-                GeneratorKind::Cablenet | GeneratorKind::Hypar | GeneratorKind::GaussVault
+                GeneratorKind::Cablenet
+                    | GeneratorKind::Hypar
+                    | GeneratorKind::GaussVault
+                    | GeneratorKind::CatenaryVault
             );
             assert_eq!(k.renders_as_wireframe(), want, "{k:?} wireframe flag");
         }
@@ -924,6 +1013,8 @@ mod tests {
             GeneratorKind::Diagrid,
             GeneratorKind::Reciprocal,
             GeneratorKind::Waffle,
+            GeneratorKind::VoronoiShell,
+            GeneratorKind::Schwedler,
         ] {
             assert!(k.renders_as_segments(), "{k:?} renders as segments");
             let d = k.default_params();
@@ -934,6 +1025,18 @@ mod tests {
             assert!(!m.positions().is_empty(), "{k:?} strut solid non-empty");
             assert_eq!(m.positions().len() % 8, 0, "{k:?} strut solid is boxes");
         }
+    }
+
+    #[test]
+    fn catenaryvault_derives_a_grid_surface_mesh() {
+        // nu=nv=16 defaults → 17×17 = 289 vertices, 16·16·2 = 512 triangles;
+        // its edges are the vault grid the renderer draws as a wireframe.
+        let d = GeneratorKind::CatenaryVault.default_params();
+        let m = derive_mesh(GeneratorKind::CatenaryVault, &d).unwrap();
+        assert_eq!(m.positions().len(), 17 * 17);
+        assert_eq!(m.faces().len(), 512);
+        // No member segments (it's a surface).
+        assert!(derive_segments(GeneratorKind::CatenaryVault, &d).unwrap().is_empty());
     }
 
     #[test]

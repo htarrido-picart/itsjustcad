@@ -213,6 +213,38 @@ pub static SCRIPTS: &[VerbScript] = &[
         assemble: assemble_waffle,
     },
     VerbScript {
+        verb: "voronoishell",
+        needs_selection: false,
+        steps: &[
+            Step::Integer { prompt: "Cell count", default: Some(24) },
+            Step::Number { prompt: "Width", default: Some(20.0) },
+            Step::Number { prompt: "Length", default: Some(20.0) },
+            Step::Integer { prompt: "Seed", default: Some(1) },
+        ],
+        assemble: assemble_voronoishell,
+    },
+    VerbScript {
+        verb: "schwedler",
+        needs_selection: false,
+        steps: &[
+            Step::Integer { prompt: "Meridians", default: Some(12) },
+            Step::Integer { prompt: "Rings", default: Some(6) },
+            Step::Number { prompt: "Radius", default: Some(8.0) },
+            Step::Keyword { prompt: "Extent", options: &["dome", "full"], default: "dome" },
+        ],
+        assemble: assemble_schwedler,
+    },
+    VerbScript {
+        verb: "catenaryvault",
+        needs_selection: false,
+        steps: &[
+            Step::Number { prompt: "Span", default: Some(8.0) },
+            Step::Number { prompt: "Length", default: Some(12.0) },
+            Step::Number { prompt: "Rise", default: Some(4.0) },
+        ],
+        assemble: assemble_catenaryvault,
+    },
+    VerbScript {
         verb: "geodesic",
         needs_selection: false,
         steps: &[
@@ -412,6 +444,34 @@ fn assemble_waffle(args: &[Input]) -> Result<String, String> {
     let length = num_at(args, 3, "waffle")?;
     let depth = num_at(args, 4, "waffle")?;
     Ok(format!("waffle {nx} {ny} {} {} {}", num(width), num(length), num(depth)))
+}
+
+/// `[Int(cells), Num(width), Num(length), Int(seed)]`
+/// `-> "voronoishell <cells> <width> <length> <seed>"`
+fn assemble_voronoishell(args: &[Input]) -> Result<String, String> {
+    let cells = int_at(args, 0, "voronoishell")?;
+    let width = num_at(args, 1, "voronoishell")?;
+    let length = num_at(args, 2, "voronoishell")?;
+    let seed = int_at(args, 3, "voronoishell")?;
+    Ok(format!("voronoishell {cells} {} {} {seed}", num(width), num(length)))
+}
+
+/// `[Int(meridians), Int(rings), Num(radius), Key(mode)]`
+/// `-> "schwedler <meridians> <rings> <radius> <mode>"`
+fn assemble_schwedler(args: &[Input]) -> Result<String, String> {
+    let meridians = int_at(args, 0, "schwedler")?;
+    let rings = int_at(args, 1, "schwedler")?;
+    let radius = num_at(args, 2, "schwedler")?;
+    let mode = key_at(args, 3, "schwedler")?;
+    Ok(format!("schwedler {meridians} {rings} {} {mode}", num(radius)))
+}
+
+/// `[Num(span), Num(length), Num(rise)] -> "catenaryvault <span> <length> <rise>"`
+fn assemble_catenaryvault(args: &[Input]) -> Result<String, String> {
+    let span = num_at(args, 0, "catenaryvault")?;
+    let length = num_at(args, 1, "catenaryvault")?;
+    let rise = num_at(args, 2, "catenaryvault")?;
+    Ok(format!("catenaryvault {} {} {}", num(span), num(length), num(rise)))
 }
 
 /// `[Int(f), Num(r), Key(mode)] -> "geodesic <f> <r> <mode>"`
@@ -660,6 +720,45 @@ mod tests {
             Input::Num(1.0),
         ];
         assert_eq!(assemble_waffle(&wf).unwrap(), "waffle 5 8 10 16 1");
+    }
+
+    #[test]
+    fn voronoishell_walks_integers_and_numbers() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("voronoishell", None), StartResult::Started);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::Emit("voronoishell 24 20 20 1".into()));
+    }
+
+    #[test]
+    fn schwedler_walks_to_keyword() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("schwedler", None), StartResult::Started);
+        assert_eq!(t.commit_typed("8"), StepResult::NeedMore);
+        assert_eq!(t.commit_typed("4"), StepResult::NeedMore);
+        assert_eq!(t.commit_typed("5"), StepResult::NeedMore);
+        assert_eq!(t.commit_typed("full"), StepResult::Emit("schwedler 8 4 5 full".into()));
+    }
+
+    #[test]
+    fn catenaryvault_walks_numbers() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("catenaryvault", None), StartResult::Started);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::Emit("catenaryvault 8 12 4".into()));
+    }
+
+    #[test]
+    fn assemble_voronoishell_schwedler_catenaryvault_pure() {
+        let vs = [Input::Int(24), Input::Num(20.0), Input::Num(20.0), Input::Int(1)];
+        assert_eq!(assemble_voronoishell(&vs).unwrap(), "voronoishell 24 20 20 1");
+        let sc = [Input::Int(12), Input::Int(6), Input::Num(8.0), Input::Key("dome".into())];
+        assert_eq!(assemble_schwedler(&sc).unwrap(), "schwedler 12 6 8 dome");
+        let cv = [Input::Num(8.0), Input::Num(12.0), Input::Num(4.0)];
+        assert_eq!(assemble_catenaryvault(&cv).unwrap(), "catenaryvault 8 12 4");
     }
 
     #[test]

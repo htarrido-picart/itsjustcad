@@ -216,6 +216,76 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 depth: number(depth)?,
             })
         }
+        "voronoishell" => {
+            // voronoishell <cells> <width> <length> [seed]
+            let (cells, width, length, seed) = match args.as_slice() {
+                [c, w, l] => (c, w, l, None),
+                [c, w, l, s] => (c, w, l, Some(integer_signed(s, "voronoishell")?)),
+                _ => {
+                    return wrong(
+                        "voronoishell",
+                        "a cell count, a width, a length and an optional seed",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::VoronoiShell {
+                id: None,
+                cells: integer(cells, "voronoishell")?,
+                width: number(width)?,
+                length: number(length)?,
+                seed,
+            })
+        }
+        "schwedler" => {
+            // schwedler <meridians> <rings> <radius> [dome|full]
+            let (mer, rings, radius, mode) = match args.as_slice() {
+                [m, r, rad] => (m, r, rad, None),
+                [m, r, rad, mode] => (m, r, rad, Some(*mode)),
+                _ => {
+                    return wrong(
+                        "schwedler",
+                        "meridians, rings, a radius and an optional dome|full",
+                        &args,
+                    )
+                }
+            };
+            let full = match mode {
+                None | Some("dome") => false,
+                Some("full") | Some("sphere") => true,
+                Some(_) => return wrong("schwedler", "dome or full as the fourth argument", &args),
+            };
+            Ok(Command::Schwedler {
+                id: None,
+                meridians: integer(mer, "schwedler")?,
+                rings: integer(rings, "schwedler")?,
+                radius: number(radius)?,
+                full,
+            })
+        }
+        "catenaryvault" => {
+            // catenaryvault <span> <length> <rise> [nu] [nv]
+            let (span, length, rise, nu, nv) = match args.as_slice() {
+                [s, l, r] => (s, l, r, None, None),
+                [s, l, r, nu] => (s, l, r, Some(integer(nu, "catenaryvault")?), None),
+                [s, l, r, nu, nv] => (
+                    s,
+                    l,
+                    r,
+                    Some(integer(nu, "catenaryvault")?),
+                    Some(integer(nv, "catenaryvault")?),
+                ),
+                _ => return wrong("catenaryvault", "span, length, rise and optional nu, nv", &args),
+            };
+            Ok(Command::CatenaryVault {
+                id: None,
+                span: number(span)?,
+                length: number(length)?,
+                rise: number(rise)?,
+                nu,
+                nv,
+            })
+        }
         "hypar" => {
             // hypar <a> <b> <c> [nu] [nv]
             let (a, b, c, nu, nv) = match args.as_slice() {
@@ -3208,6 +3278,11 @@ fn integer(s: &str, _command: &'static str) -> Result<u32, ParseError> {
     s.parse::<u32>().map_err(|_| ParseError::BadNumber(s.to_string()))
 }
 
+/// A signed integer argument (e.g. a PRNG seed, which may be negative).
+fn integer_signed(s: &str, _command: &'static str) -> Result<i64, ParseError> {
+    s.parse::<i64>().map_err(|_| ParseError::BadNumber(s.to_string()))
+}
+
 /// `gridshell hypar <a> <b> <c> [nu] [nv]` | `gridshell vault <span> <length>
 /// <rise> [undulate] [nu] [nv]`.
 fn parse_gridshell(args: &[&str]) -> Result<Command, ParseError> {
@@ -4081,6 +4156,9 @@ mod tests {
             "diagrid 6 10 20 40",
             "reciprocal 8 3 4",
             "waffle 5 8 10 16 1",
+            "voronoishell 24 20 20 1",
+            "schwedler 12 6 8 dome",
+            "catenaryvault 8 12 4",
             "geodesic 3 5 dome",
             // Branch / Vector step kinds (guided engine v4).
             "gridshell hypar 4 4 2",
@@ -4174,6 +4252,41 @@ mod tests {
         assert_eq!(
             parse("waffle 5 8 10 16 1").unwrap(),
             Command::Waffle { id: None, nx: 5, ny: 8, width: 10.0, length: 16.0, depth: 1.0 }
+        );
+    }
+
+    #[test]
+    fn parse_voronoishell_schwedler_catenaryvault() {
+        assert_eq!(
+            parse("voronoishell 24 20 20").unwrap(),
+            Command::VoronoiShell { id: None, cells: 24, width: 20.0, length: 20.0, seed: None }
+        );
+        assert_eq!(
+            parse("voronoishell 30 10 12 7").unwrap(),
+            Command::VoronoiShell { id: None, cells: 30, width: 10.0, length: 12.0, seed: Some(7) }
+        );
+        assert_eq!(
+            parse("schwedler 12 6 8").unwrap(),
+            Command::Schwedler { id: None, meridians: 12, rings: 6, radius: 8.0, full: false }
+        );
+        assert_eq!(
+            parse("schwedler 8 4 5 full").unwrap(),
+            Command::Schwedler { id: None, meridians: 8, rings: 4, radius: 5.0, full: true }
+        );
+        assert_eq!(
+            parse("catenaryvault 8 12 4").unwrap(),
+            Command::CatenaryVault { id: None, span: 8.0, length: 12.0, rise: 4.0, nu: None, nv: None }
+        );
+        assert_eq!(
+            parse("catenaryvault 6 10 3 20 24").unwrap(),
+            Command::CatenaryVault {
+                id: None,
+                span: 6.0,
+                length: 10.0,
+                rise: 3.0,
+                nu: Some(20),
+                nv: Some(24),
+            }
         );
     }
 

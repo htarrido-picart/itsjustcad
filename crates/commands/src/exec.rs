@@ -8448,6 +8448,106 @@ fn apply_forward(
                 },
             ))
         }
+        Command::VoronoiShell { id, cells, width, length, seed } => {
+            if cells == 0 {
+                return Err(ExecError::Invalid("voronoishell cells must be >= 1".into()));
+            }
+            let width = finite(width, "voronoishell width")?;
+            let length = finite(length, "voronoishell length")?;
+            if width <= 0.0 || length <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "voronoishell width and length must be positive".into(),
+                ));
+            }
+            let seed = seed.unwrap_or(1);
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("cells".into(), ParamValue::Int(cells as i64));
+            params.insert("width".into(), ParamValue::Float(width));
+            params.insert("length".into(), ParamValue::Float(length));
+            params.insert("seed".into(), ParamValue::Int(seed));
+            let id = parametric_object(doc, id, GeneratorKind::VoronoiShell, params)?;
+            Ok((
+                Command::VoronoiShell { id: Some(id), cells, width, length, seed: Some(seed) },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "voronoishell {id} ({cells} cells, {width}x{length}, seed={seed})"
+                    ),
+                },
+            ))
+        }
+        Command::Schwedler { id, meridians, rings, radius, full } => {
+            if meridians < 3 {
+                return Err(ExecError::Invalid("schwedler meridians must be >= 3".into()));
+            }
+            if rings == 0 {
+                return Err(ExecError::Invalid("schwedler rings must be >= 1".into()));
+            }
+            let radius = finite(radius, "schwedler radius")?;
+            if radius <= 0.0 {
+                return Err(ExecError::Invalid("schwedler radius must be positive".into()));
+            }
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("meridians".into(), ParamValue::Int(meridians as i64));
+            params.insert("rings".into(), ParamValue::Int(rings as i64));
+            params.insert("radius".into(), ParamValue::Float(radius));
+            params.insert(
+                "mode".into(),
+                ParamValue::Enum(if full { "full".into() } else { "dome".into() }),
+            );
+            let id = parametric_object(doc, id, GeneratorKind::Schwedler, params)?;
+            Ok((
+                Command::Schwedler { id: Some(id), meridians, rings, radius, full },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "schwedler {id} ({meridians} meridians, {rings} rings, r={radius}, {})",
+                        if full { "sphere" } else { "dome" }
+                    ),
+                },
+            ))
+        }
+        Command::CatenaryVault { id, span, length, rise, nu, nv } => {
+            let span = finite(span, "catenaryvault span")?;
+            let length = finite(length, "catenaryvault length")?;
+            let rise = finite(rise, "catenaryvault rise")?;
+            if span <= 0.0 || length <= 0.0 || rise <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "catenaryvault span, length and rise must be positive".into(),
+                ));
+            }
+            let nu_v = clamp_grid(nu.unwrap_or(16));
+            let nv_v = clamp_grid(nv.unwrap_or(16));
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("span".into(), ParamValue::Float(span));
+            params.insert("length".into(), ParamValue::Float(length));
+            params.insert("rise".into(), ParamValue::Float(rise));
+            params.insert("nu".into(), ParamValue::Int(nu_v as i64));
+            params.insert("nv".into(), ParamValue::Int(nv_v as i64));
+            let id = parametric_object(doc, id, GeneratorKind::CatenaryVault, params)?;
+            Ok((
+                Command::CatenaryVault {
+                    id: Some(id),
+                    span,
+                    length,
+                    rise,
+                    nu: Some(nu_v),
+                    nv: Some(nv_v),
+                },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "catenaryvault {id} (span={span}, len={length}, rise={rise})"
+                    ),
+                },
+            ))
+        }
         Command::Hypar { id, a, b, c, nu, nv } => {
             let (a, b, c) = (finite(a, "hypar a")?, finite(b, "hypar b")?, finite(c, "hypar c")?);
             if a <= 0.0 || b <= 0.0 {
@@ -13878,6 +13978,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Diagrid { .. } => "diagrid",
         Command::Reciprocal { .. } => "reciprocal",
         Command::Waffle { .. } => "waffle",
+        Command::VoronoiShell { .. } => "voronoishell",
+        Command::Schwedler { .. } => "schwedler",
+        Command::CatenaryVault { .. } => "catenaryvault",
         Command::MinSurf { .. } => "minsurf",
         Command::Line { .. } => "line",
         Command::LineTan { .. } => "linetan",
