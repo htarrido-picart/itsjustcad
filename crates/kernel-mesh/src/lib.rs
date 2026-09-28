@@ -31,7 +31,8 @@ pub use expressive::{
     strut_lattice, GridshellSurface,
 };
 pub use formfind::{
-    cable_net, dynamic_relaxation, force_density, funicular_chain, invert_funicular, max_residual,
+    cable_net, cable_net_surface, dynamic_relaxation, force_density, funicular_chain,
+    invert_funicular, max_residual,
     minimal_surface, minimal_surface_grid, tensegrity_prism, Link, Network, RelaxParams,
     RelaxReport, Tensegrity,
 };

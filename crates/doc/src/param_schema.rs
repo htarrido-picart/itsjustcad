@@ -183,6 +183,20 @@ impl GeneratorKind {
     pub fn default_params(self) -> ParamMap {
         self.schema().defaults()
     }
+
+    /// Whether the renderer should draw this generator's derived mesh as its
+    /// **edge grid** (a wireframe of mesh edges, drawn as lines respecting the
+    /// object's color + lineweight) rather than as shaded triangles. This is the
+    /// Frei-Otto / Munich cable-net look: the mesh's natural edges *are* the
+    /// cable grid, so we draw those and skip the solid fill.
+    ///
+    /// Generic hook: add a generator here to make it render as a wireframe
+    /// (hypar / gaussvault / gridshell / minsurf are the planned one-liners).
+    /// `derive_mesh` for such a generator must return a *surface* grid mesh
+    /// whose edges are the intended grid lines.
+    pub fn renders_as_wireframe(self) -> bool {
+        matches!(self, GeneratorKind::Cablenet)
+    }
 }
 
 /// One typed parameter value. Serde tag keeps saved files self-describing and
@@ -586,13 +600,14 @@ pub fn derive_mesh(kind: GeneratorKind, params: &ParamMap) -> Result<Mesh, Deriv
             let corners = [get_v(&p, "c0"), get_v(&p, "c1"), get_v(&p, "c2"), get_v(&p, "c3")];
             let n = get_i(&p, "n").clamp(2, 256) as u32;
             let sag = get_f(&p, "sag");
-            let (_, _, segsv) = kernel_mesh::cable_net(corners, n, sag);
-            if segsv.is_empty() {
-                return Err(DeriveError::Invalid("cablenet produced no links".into()));
+            // Surface mesh of the relaxed grid: the mesh's natural edges ARE the
+            // cable grid, so the renderer (see `renders_as_wireframe`) draws it
+            // as the cable-net wireframe rather than shaded struts.
+            let mesh = kernel_mesh::cable_net_surface(corners, n, sag);
+            if mesh.positions().is_empty() || mesh.faces().is_empty() {
+                return Err(DeriveError::Invalid("cablenet produced no surface".into()));
             }
-            let span = (corners[1] - corners[0]).length().max(1e-3);
-            let strut = (span * 0.01).clamp(0.01, 0.2);
-            Ok(kernel_mesh::strut_lattice(&segsv, strut))
+            Ok(mesh)
         }
     }
 }
@@ -691,6 +706,24 @@ mod tests {
         p.insert("mode".into(), ParamValue::Enum("bogus".into()));
         let out = s.sanitize(&p);
         assert_eq!(out.get("mode").unwrap().as_enum(), Some("dome"));
+    }
+
+    #[test]
+    fn only_cablenet_renders_as_wireframe_for_now() {
+        for &k in GeneratorKind::ALL {
+            let want = matches!(k, GeneratorKind::Cablenet);
+            assert_eq!(k.renders_as_wireframe(), want, "{k:?} wireframe flag");
+        }
+    }
+
+    #[test]
+    fn cablenet_derives_a_grid_surface_mesh() {
+        // n=8 → (n+2)² = 100 vertices, 9×9×2 = 162 triangles; its edges are the
+        // cable grid the renderer draws as a wireframe.
+        let d = GeneratorKind::Cablenet.default_params();
+        let m = derive_mesh(GeneratorKind::Cablenet, &d).unwrap();
+        assert_eq!(m.positions().len(), 100);
+        assert_eq!(m.faces().len(), 162);
     }
 
     #[test]

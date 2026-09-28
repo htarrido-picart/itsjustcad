@@ -529,12 +529,47 @@ pub fn cable_net(
             }
         }
     }
+    // Self-weight = the shape lever. With only prestress (no load) a taut net
+    // relaxes to the *minimal* surface, which for a linear-edged quad frame is
+    // just the bilinear ruled surface — flat, no anticlastic curvature. Loading
+    // the free nodes downward makes the net hang into a real sagging cable-net
+    // (the Frei-Otto / Munich form): interior nodes dip below the ruled surface,
+    // giving measurable anticlastic curvature. `sag` (the design param) drives
+    // the load, so a bigger sag = a deeper saddle. Scale chosen so the default
+    // sag=1.5 dips ~0.4 m below bilinear on the reference 8×8 net (see test
+    // `cable_net_is_an_anticlastic_saddle`).
+    net.gravity = sag.max(0.0);
     dynamic_relaxation(
         &mut net,
-        RelaxParams { dt: 0.05, damping: 0.95, ..Default::default() },
+        RelaxParams { dt: 0.02, damping: 0.95, max_iters: 60_000, ..Default::default() },
     );
     let segs = net.segments();
     (net.positions, g as u32, segs)
+}
+
+/// The relaxed cable-net as a triangulated **surface** [`Mesh`] over the grid.
+///
+/// [`cable_net`] returns the settled `g × g` grid (row-major, boundary
+/// included); here we triangulate that grid into a quad-mesh (two triangles per
+/// cell). The mesh's *natural edges are the cable grid*, so drawing the mesh's
+/// [`Mesh::unique_edges`] reproduces the Frei-Otto / Munich cable-net look
+/// directly. The relaxation (anticlastic saddle sag) is preserved — this only
+/// changes how the settled grid is packaged (surface mesh vs strut segments).
+pub fn cable_net_surface(corners: [DVec3; 4], n: u32, sag: f64) -> Mesh {
+    let (positions, g, _) = cable_net(corners, n, sag);
+    let idx = |i: u32, j: u32| i * g + j;
+    let mut faces = Vec::with_capacity(((g - 1) * (g - 1) * 2) as usize);
+    for i in 0..g - 1 {
+        for j in 0..g - 1 {
+            let a0 = idx(i, j);
+            let a1 = idx(i, j + 1);
+            let a2 = idx(i + 1, j + 1);
+            let a3 = idx(i + 1, j);
+            faces.push([a0, a1, a2]);
+            faces.push([a0, a2, a3]);
+        }
+    }
+    Mesh::new(positions, faces)
 }
 
 // ── soap film / minimal surface over an arbitrary boundary ───────────────────
@@ -992,6 +1027,55 @@ mod tests {
                 assert!((p.z - r.z).abs() < 1e-6, "mirror asymmetry at {i},{j}");
             }
         }
+    }
+
+    /// The relaxed cable-net is a real anticlastic **saddle**: interior nodes
+    /// dip meaningfully below the bilinear interpolation of the four corners
+    /// (the Frei-Otto tensile form), not a flat ruled quad. Also checks the
+    /// surface-mesh packaging has the right vertex/face/edge counts.
+    #[test]
+    fn cable_net_is_an_anticlastic_saddle() {
+        let corners = [
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(8.0, 0.0, 0.0),
+            DVec3::new(8.0, 8.0, 3.0),
+            DVec3::new(0.0, 8.0, 3.0),
+        ];
+        let (pos, g, _) = cable_net(corners, 8, 1.5);
+        let g = g as usize;
+        let last = g - 1;
+        let idx = |i: usize, j: usize| i * g + j;
+        // Bilinear surface of the four corners, matching cable_net's own layout:
+        // c00=corner0, c10=corner1, c11=corner2, c01=corner3.
+        let [c00, c10, c11, c01] = corners;
+        let bilinear = |i: usize, j: usize| -> DVec3 {
+            let u = i as f64 / last as f64;
+            let v = j as f64 / last as f64;
+            let bottom = c00.lerp(c10, v);
+            let top = c01.lerp(c11, v);
+            bottom.lerp(top, u)
+        };
+        // Largest downward deviation of an interior node below the bilinear
+        // (ruled) surface — the measured saddle sag.
+        let mut max_dip = 0.0f64;
+        for i in 1..last {
+            for j in 1..last {
+                let dip = bilinear(i, j).z - pos[idx(i, j)].z;
+                max_dip = max_dip.max(dip);
+            }
+        }
+        assert!(
+            max_dip > 0.3,
+            "cable-net has no anticlastic sag (max dip {max_dip:.3} below bilinear)"
+        );
+        // Surface-mesh packaging: (n+2)² vertices, 2·(g-1)² triangles.
+        let mesh = cable_net_surface(corners, 8, 1.5);
+        assert_eq!(mesh.positions().len(), g * g);
+        assert_eq!(mesh.faces().len(), (g - 1) * (g - 1) * 2);
+        // Unique edges of an m×m grid: 2·m·(m-1) grid lines + (m-1)² diagonals.
+        let m = g;
+        let expected_edges = 2 * m * (m - 1) + (m - 1) * (m - 1);
+        assert_eq!(mesh.unique_edges().len(), expected_edges);
     }
 
     /// Force density on a flat square boundary returns the interior to the

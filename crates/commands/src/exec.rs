@@ -20907,12 +20907,24 @@ mod tests {
 
     #[test]
     fn cablenet_exec_undo_redo_replay() {
+        use itsjustcad_doc::GeneratorKind;
         let mut s = Session::default();
         let out = run(&mut s, "cablenet 0,0,0 8,0,0 8,8,3 0,8,3 5 1.5");
         let id = out.created[0];
+        // cablenet is a live parametric object with generator = Cablenet whose
+        // derived mesh is the relaxed grid SURFACE (n+2)² = 7×7 = 49 vertices,
+        // 6×6×2 = 72 triangles — its edges are the cable grid, drawn as a
+        // wireframe by the renderer.
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { generator, mesh, .. } => {
+                assert_eq!(*generator, GeneratorKind::Cablenet);
+                assert!(generator.renders_as_wireframe(), "cablenet is a wireframe generator");
+                assert_eq!(mesh.positions().len(), 49);
+                assert_eq!(mesh.faces().len(), 72);
+            }
+            g => panic!("expected Parametric/Cablenet, got {g:?}"),
+        }
         let m = mesh_of(&s, id);
-        assert_eq!(m.positions().len() % 8, 0);
-        assert!(!m.positions().is_empty());
         // Net lives inside the corner bounding box in z.
         let zmax = m.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
         assert!(zmax <= 3.5, "net within corner span, zmax={zmax}");

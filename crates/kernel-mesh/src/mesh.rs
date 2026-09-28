@@ -36,6 +36,26 @@ impl Mesh {
         &self.faces
     }
 
+    /// The mesh's unique undirected edges as world-space segment pairs. Each
+    /// triangle contributes its three edges; an edge shared by two triangles is
+    /// emitted once. This is the natural "wireframe" of the mesh — used to draw
+    /// grid/net generators (cablenet, and later hypar/gaussvault/gridshell/
+    /// minsurf) as their edge grid rather than a shaded solid.
+    pub fn unique_edges(&self) -> Vec<[DVec3; 2]> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for f in &self.faces {
+            for &(a, b) in &[(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
+                // Canonical undirected key: smaller index first.
+                let key = if a <= b { (a, b) } else { (b, a) };
+                if seen.insert(key) {
+                    out.push([self.positions[a as usize], self.positions[b as usize]]);
+                }
+            }
+        }
+        out
+    }
+
     /// Append another mesh into this one, offsetting the other's face indices.
     /// The two vertex sets are concatenated; no welding is performed.
     pub fn merge(&mut self, other: &Mesh) {
@@ -99,6 +119,25 @@ mod tests {
             ],
             vec![[0, 1, 2]],
         )
+    }
+
+    #[test]
+    fn unique_edges_dedupes_shared_quad_diagonal() {
+        // A quad split into two triangles sharing the 0-2 diagonal:
+        // outer edges 0-1,1-2,2-3,3-0 (4) + shared diagonal 0-2 (1) = 5 edges,
+        // not the 6 the two triangles' raw edges would give.
+        let mesh = Mesh::new(
+            vec![
+                DVec3::ZERO,
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(1.0, 1.0, 0.0),
+                DVec3::new(0.0, 1.0, 0.0),
+            ],
+            vec![[0, 1, 2], [0, 2, 3]],
+        );
+        assert_eq!(mesh.unique_edges().len(), 5);
+        // A single triangle → 3 edges.
+        assert_eq!(xy_triangle().unique_edges().len(), 3);
     }
 
     #[test]
