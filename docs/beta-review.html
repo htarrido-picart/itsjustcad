@@ -50,10 +50,13 @@
     background:var(--accent-soft); color:var(--accent); border-radius:50%; font-size:11px; font-weight:700;
     display:flex; align-items:center; justify-content:center;
   }
-  .chk{display:flex; gap:9px; align-items:flex-start; padding:5px 6px; border-radius:6px;}
+  .chk{display:flex; gap:9px; align-items:flex-start; flex-wrap:wrap; padding:5px 6px; border-radius:6px;}
   .chk:hover{background:#fafafa;}
   .chk input{margin-top:3px; width:16px; height:16px; flex:none;}
-  .chk label{cursor:pointer;}
+  .chk label{cursor:pointer; flex:1; min-width:0;}
+  textarea.cmt{flex:none; width:230px; min-height:34px; resize:vertical; align-self:flex-start; margin-top:1px; font:12.5px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; padding:5px 8px; border:1px solid var(--line); border-radius:6px; background:#fcfcfb; color:var(--ink);}
+  textarea.cmt::placeholder{color:var(--muted); opacity:.7;}
+  @media (max-width:640px){ textarea.cmt{width:100%;} }
   code{background:var(--code-bg); padding:1.5px 6px; border-radius:5px; font:13px/1.4 "SF Mono",ui-monospace,Menlo,Consolas,monospace;}
   .cmd{position:relative; display:block; background:#1c1c1e; color:#e6e6e6; padding:8px 42px 8px 12px; border-radius:7px; margin:5px 0; font:13px/1.5 "SF Mono",ui-monospace,Menlo,Consolas,monospace; overflow-x:auto;}
   .cmd .p{color:#7fb4e6;}
@@ -589,12 +592,36 @@
 (function(){
   var KEY = "ijc-beta-review-checks";
   var NKEY = "ijc-beta-review-notes";
-  var saved = {}, notes = {};
+  var CKEY = "ijc-beta-review-comments";
+  var saved = {}, notes = {}, comments = {};
   try { saved = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch(e){}
   try { notes = JSON.parse(localStorage.getItem(NKEY) || "{}"); } catch(e){}
+  try { comments = JSON.parse(localStorage.getItem(CKEY) || "{}"); } catch(e){}
 
   var boxes = document.querySelectorAll('input[type=checkbox]');
   var areas = document.querySelectorAll('textarea.notes');
+
+  // --- Per-test comment fields -----------------------------------------
+  // For each .chk, append a comment textarea AFTER the <label> (a sibling,
+  // never inside it) so typing/clicking never toggles the checkbox. Keyed
+  // by the item's checkbox id via data-cmt, persisted under CKEY.
+  document.querySelectorAll('.chk').forEach(function(chk){
+    var box = chk.querySelector('input[type=checkbox]');
+    if(!box || !box.id) return;
+    var cmt = document.createElement('textarea');
+    cmt.className = 'cmt';
+    cmt.rows = 1;
+    cmt.placeholder = 'Comment…';
+    cmt.setAttribute('data-cmt', box.id);
+    cmt.setAttribute('aria-label', 'Comment for this test');
+    if(comments[box.id]) cmt.value = comments[box.id];
+    cmt.addEventListener('input', function(){
+      comments[box.id] = cmt.value;
+      try { localStorage.setItem(CKEY, JSON.stringify(comments)); } catch(e){}
+    });
+    chk.appendChild(cmt);
+  });
+  var cmts = document.querySelectorAll('textarea.cmt');
 
   function updateProgress(){
     var total = boxes.length, done = 0;
@@ -693,12 +720,15 @@
   function buildReport(){
     var tests = [];
     boxes.forEach(function(b){
-      tests.push({
+      var entry = {
         id: b.id,
         section: sectionOf(b),
         label: labelOf(b),
         passed: !!b.checked
-      });
+      };
+      var c = (comments[b.id] || "").trim();
+      if(c) entry.comment = c;
+      tests.push(entry);
     });
     var sectionNotes = {};
     areas.forEach(function(a){
@@ -756,8 +786,9 @@
     if(!confirm("Clear all checkboxes and notes?")) return;
     boxes.forEach(function(b){ b.checked = false; });
     areas.forEach(function(a){ a.value = ""; });
-    saved = {}; notes = {};
-    try { localStorage.removeItem(KEY); localStorage.removeItem(NKEY); } catch(e){}
+    cmts.forEach(function(c){ c.value = ""; });
+    saved = {}; notes = {}; comments = {};
+    try { localStorage.removeItem(KEY); localStorage.removeItem(NKEY); localStorage.removeItem(CKEY); } catch(e){}
     updateProgress();
   };
 })();
