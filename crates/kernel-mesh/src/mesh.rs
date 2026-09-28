@@ -10,7 +10,7 @@ use crate::Aabb;
 ///
 /// The internal representation is triangles; the public API is designed so a
 /// half-edge structure can replace the storage later without breaking callers.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Mesh {
     positions: Vec<DVec3>,
     faces: Vec<[u32; 3]>,

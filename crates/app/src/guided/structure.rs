@@ -180,6 +180,39 @@ pub static SCRIPTS: &[VerbScript] = &[
         assemble: assemble_spaceframe,
     },
     VerbScript {
+        verb: "diagrid",
+        needs_selection: false,
+        steps: &[
+            Step::Integer { prompt: "Cells in X", default: Some(6) },
+            Step::Integer { prompt: "Cells in Y", default: Some(10) },
+            Step::Number { prompt: "Width", default: Some(20.0) },
+            Step::Number { prompt: "Height", default: Some(40.0) },
+        ],
+        assemble: assemble_diagrid,
+    },
+    VerbScript {
+        verb: "reciprocal",
+        needs_selection: false,
+        steps: &[
+            Step::Integer { prompt: "Member count", default: Some(8) },
+            Step::Number { prompt: "Radius", default: Some(3.0) },
+            Step::Number { prompt: "Member length", default: Some(4.0) },
+        ],
+        assemble: assemble_reciprocal,
+    },
+    VerbScript {
+        verb: "waffle",
+        needs_selection: false,
+        steps: &[
+            Step::Integer { prompt: "Ribs in X", default: Some(5) },
+            Step::Integer { prompt: "Ribs in Y", default: Some(8) },
+            Step::Number { prompt: "Width", default: Some(10.0) },
+            Step::Number { prompt: "Length", default: Some(16.0) },
+            Step::Number { prompt: "Depth", default: Some(1.0) },
+        ],
+        assemble: assemble_waffle,
+    },
+    VerbScript {
         verb: "geodesic",
         needs_selection: false,
         steps: &[
@@ -351,6 +384,34 @@ fn assemble_spaceframe(args: &[Input]) -> Result<String, String> {
     let bay = num_at(args, 2, "spaceframe")?;
     let depth = num_at(args, 3, "spaceframe")?;
     Ok(format!("spaceframe {nx} {ny} {} {}", num(bay), num(depth)))
+}
+
+/// `[Int(nx), Int(ny), Num(width), Num(height)] -> "diagrid <nx> <ny> <width> <height>"`
+fn assemble_diagrid(args: &[Input]) -> Result<String, String> {
+    let nx = int_at(args, 0, "diagrid")?;
+    let ny = int_at(args, 1, "diagrid")?;
+    let width = num_at(args, 2, "diagrid")?;
+    let height = num_at(args, 3, "diagrid")?;
+    Ok(format!("diagrid {nx} {ny} {} {}", num(width), num(height)))
+}
+
+/// `[Int(count), Num(radius), Num(length)] -> "reciprocal <count> <radius> <length>"`
+fn assemble_reciprocal(args: &[Input]) -> Result<String, String> {
+    let count = int_at(args, 0, "reciprocal")?;
+    let radius = num_at(args, 1, "reciprocal")?;
+    let length = num_at(args, 2, "reciprocal")?;
+    Ok(format!("reciprocal {count} {} {}", num(radius), num(length)))
+}
+
+/// `[Int(nx), Int(ny), Num(width), Num(length), Num(depth)]`
+/// `-> "waffle <nx> <ny> <width> <length> <depth>"`
+fn assemble_waffle(args: &[Input]) -> Result<String, String> {
+    let nx = int_at(args, 0, "waffle")?;
+    let ny = int_at(args, 1, "waffle")?;
+    let width = num_at(args, 2, "waffle")?;
+    let length = num_at(args, 3, "waffle")?;
+    let depth = num_at(args, 4, "waffle")?;
+    Ok(format!("waffle {nx} {ny} {} {} {}", num(width), num(length), num(depth)))
 }
 
 /// `[Int(f), Num(r), Key(mode)] -> "geodesic <f> <r> <mode>"`
@@ -553,6 +614,52 @@ mod tests {
         assert_eq!(t.commit_typed(""), StepResult::NeedMore);
         assert_eq!(t.commit_typed(""), StepResult::NeedMore);
         assert_eq!(t.commit_typed(""), StepResult::Emit("spaceframe 6 4 3 1.5".into()));
+    }
+
+    #[test]
+    fn diagrid_walks_integers_and_numbers() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("diagrid", None), StartResult::Started);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::Emit("diagrid 6 10 20 40".into()));
+    }
+
+    #[test]
+    fn reciprocal_walks_integer_and_numbers() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("reciprocal", None), StartResult::Started);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::Emit("reciprocal 8 3 4".into()));
+    }
+
+    #[test]
+    fn waffle_walks_integers_and_numbers() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("waffle", None), StartResult::Started);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore);
+        assert_eq!(t.commit_typed(""), StepResult::Emit("waffle 5 8 10 16 1".into()));
+    }
+
+    #[test]
+    fn assemble_diagrid_reciprocal_waffle_pure() {
+        let dg = [Input::Int(6), Input::Int(10), Input::Num(20.0), Input::Num(40.0)];
+        assert_eq!(assemble_diagrid(&dg).unwrap(), "diagrid 6 10 20 40");
+        let rc = [Input::Int(8), Input::Num(3.0), Input::Num(4.0)];
+        assert_eq!(assemble_reciprocal(&rc).unwrap(), "reciprocal 8 3 4");
+        let wf = [
+            Input::Int(5),
+            Input::Int(8),
+            Input::Num(10.0),
+            Input::Num(16.0),
+            Input::Num(1.0),
+        ];
+        assert_eq!(assemble_waffle(&wf).unwrap(), "waffle 5 8 10 16 1");
     }
 
     #[test]

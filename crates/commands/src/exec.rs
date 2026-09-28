@@ -8368,6 +8368,86 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Diagrid { id, nx, ny, width, height } => {
+            if nx == 0 || ny == 0 {
+                return Err(ExecError::Invalid("diagrid nx and ny must be >= 1".into()));
+            }
+            let width = finite(width, "diagrid width")?;
+            let height = finite(height, "diagrid height")?;
+            if width <= 0.0 || height <= 0.0 {
+                return Err(ExecError::Invalid("diagrid width and height must be positive".into()));
+            }
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("nx".into(), ParamValue::Int(nx as i64));
+            params.insert("ny".into(), ParamValue::Int(ny as i64));
+            params.insert("width".into(), ParamValue::Float(width));
+            params.insert("height".into(), ParamValue::Float(height));
+            let id = parametric_object(doc, id, GeneratorKind::Diagrid, params)?;
+            Ok((
+                Command::Diagrid { id: Some(id), nx, ny, width, height },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("diagrid {id} ({nx}x{ny}, {width}x{height})"),
+                },
+            ))
+        }
+        Command::Reciprocal { id, count, radius, length } => {
+            if count < 2 {
+                return Err(ExecError::Invalid("reciprocal count must be >= 2".into()));
+            }
+            let radius = finite(radius, "reciprocal radius")?;
+            let length = finite(length, "reciprocal length")?;
+            if radius <= 0.0 || length <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "reciprocal radius and length must be positive".into(),
+                ));
+            }
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("count".into(), ParamValue::Int(count as i64));
+            params.insert("radius".into(), ParamValue::Float(radius));
+            params.insert("length".into(), ParamValue::Float(length));
+            let id = parametric_object(doc, id, GeneratorKind::Reciprocal, params)?;
+            Ok((
+                Command::Reciprocal { id: Some(id), count, radius, length },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("reciprocal {id} ({count} members, r={radius}, len={length})"),
+                },
+            ))
+        }
+        Command::Waffle { id, nx, ny, width, length, depth } => {
+            if nx < 2 || ny < 2 {
+                return Err(ExecError::Invalid("waffle nx and ny must be >= 2".into()));
+            }
+            let width = finite(width, "waffle width")?;
+            let length = finite(length, "waffle length")?;
+            let depth = finite(depth, "waffle depth")?;
+            if width <= 0.0 || length <= 0.0 || depth <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "waffle width, length and depth must be positive".into(),
+                ));
+            }
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("nx".into(), ParamValue::Int(nx as i64));
+            params.insert("ny".into(), ParamValue::Int(ny as i64));
+            params.insert("width".into(), ParamValue::Float(width));
+            params.insert("length".into(), ParamValue::Float(length));
+            params.insert("depth".into(), ParamValue::Float(depth));
+            let id = parametric_object(doc, id, GeneratorKind::Waffle, params)?;
+            Ok((
+                Command::Waffle { id: Some(id), nx, ny, width, length, depth },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("waffle {id} ({nx}x{ny}, {width}x{length}, depth={depth})"),
+                },
+            ))
+        }
         Command::Hypar { id, a, b, c, nu, nv } => {
             let (a, b, c) = (finite(a, "hypar a")?, finite(b, "hypar b")?, finite(c, "hypar c")?);
             if a <= 0.0 || b <= 0.0 {
@@ -13795,6 +13875,9 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Funicular { .. } => "funicular",
         Command::Tensegrity { .. } => "tensegrity",
         Command::Cablenet { .. } => "cablenet",
+        Command::Diagrid { .. } => "diagrid",
+        Command::Reciprocal { .. } => "reciprocal",
+        Command::Waffle { .. } => "waffle",
         Command::MinSurf { .. } => "minsurf",
         Command::Line { .. } => "line",
         Command::LineTan { .. } => "linetan",
@@ -20792,6 +20875,9 @@ mod tests {
             "funicular -5,0,0 5,0,0 20 1 1.4",
             "tensegrity 3 1 2",
             "cablenet 0,0,0 8,0,0 8,8,3 0,8,3 5 1.5",
+            "diagrid 6 10 20 40",
+            "reciprocal 8 3 4",
+            "waffle 5 8 10 16 1",
         ];
         for verb in cases {
             let mut s = Session::default();
@@ -20870,6 +20956,44 @@ mod tests {
         assert!(s.doc.get(id).is_none());
         run(&mut s, "redo");
         assert!(s.doc.get(id).is_some());
+    }
+
+    #[test]
+    fn diagrid_reciprocal_waffle_exec_wire_freeze_replay() {
+        for (verb, freeze_expected) in [
+            ("diagrid 6 10 20 40", true),
+            ("reciprocal 8 3 4", true),
+            ("waffle 5 8 10 16 1", true),
+        ] {
+            let mut s = Session::default();
+            let id = run(&mut s, verb).created[0];
+            // Renders as member lines: non-empty wire, empty display mesh.
+            assert!(mesh_of(&s, id).positions().is_empty(), "{verb}: no tube mesh");
+            assert!(!wire_of(&s, id).is_empty(), "{verb}: non-empty wire");
+            assert_replay_stable(&s);
+            // Freeze bakes a non-empty strut solid (8 verts/strut).
+            run(&mut s, "freeze last");
+            if freeze_expected {
+                let m = mesh_of(&s, id);
+                assert!(!m.positions().is_empty(), "{verb}: frozen solid non-empty");
+                assert_eq!(m.positions().len() % 8, 0, "{verb}: frozen is strut boxes");
+            }
+            run(&mut s, "undo");
+            run(&mut s, "undo");
+            assert!(s.doc.get(id).is_none(), "{verb}: undo removes object");
+            run(&mut s, "redo");
+            assert!(s.doc.get(id).is_some(), "{verb}: redo restores");
+        }
+    }
+
+    #[test]
+    fn diagrid_wire_matches_kernel_count() {
+        let mut s = Session::default();
+        let id = run(&mut s, "diagrid 6 10 20 40").created[0];
+        assert_eq!(
+            wire_of(&s, id).len(),
+            kernel_mesh::diagrid_segments(6, 10, 20.0, 40.0).len(),
+        );
     }
 
     #[test]

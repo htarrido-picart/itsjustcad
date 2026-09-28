@@ -272,6 +272,125 @@ pub fn spaceframe_struts(nx: u32, ny: u32, bay: f64, depth: f64) -> Vec<(DVec3, 
     segs
 }
 
+// ── diagrid (planar diagonal facade grid) ────────────────────────────────────
+
+/// Planar diagonal grid ("diagrid") over a `width × height` rectangle in the XY
+/// plane (z = 0), divided into `nx × ny` cells. Emits BOTH diagonal families
+/// (the "/" and "\" diagonals of every cell) forming the classic diamond diagrid
+/// mesh, plus the four perimeter edges of the rectangle. Returns the segments.
+///
+/// Plane choice: XY (z = 0). The rectangle spans x∈[0,width], y∈[0,height]; the
+/// origin corner is at (0,0,0). Segment count = `2·nx·ny` diagonals + `4`
+/// perimeter edges. (Deterministic: cells are visited in row-major order.)
+pub fn diagrid_segments(nx: u32, ny: u32, width: f64, height: f64) -> Vec<(DVec3, DVec3)> {
+    let nx = nx.max(1);
+    let ny = ny.max(1);
+    let cw = width / nx as f64;
+    let ch = height / ny as f64;
+    let p = |i: u32, j: u32| DVec3::new(i as f64 * cw, j as f64 * ch, 0.0);
+    let mut segs: Vec<(DVec3, DVec3)> = Vec::new();
+    // Both diagonal families per cell.
+    for i in 0..nx {
+        for j in 0..ny {
+            // "/" diagonal: bottom-left → top-right.
+            segs.push((p(i, j), p(i + 1, j + 1)));
+            // "\" diagonal: top-left → bottom-right.
+            segs.push((p(i, j + 1), p(i + 1, j)));
+        }
+    }
+    // Perimeter (bottom, right, top, left).
+    segs.push((p(0, 0), p(nx, 0)));
+    segs.push((p(nx, 0), p(nx, ny)));
+    segs.push((p(nx, ny), p(0, ny)));
+    segs.push((p(0, ny), p(0, 0)));
+    segs
+}
+
+// ── reciprocal frame (rotational fan) ────────────────────────────────────────
+
+/// Reciprocal frame: `count` straight members arranged in a rotational fan
+/// around the origin. Each member's endpoints sit on a pitch circle of `radius`
+/// but are rotated tangentially by an `engagement` angle so consecutive members
+/// mutually overlap, leaving the characteristic central polygon opening and an
+/// outer ring. Returns the `count` member segments (in the XY plane, z = 0).
+///
+/// Engagement rule: member `k` (k = 0..count) starts at angle `θ = k·2π/count`
+/// on the pitch circle and ends at `θ + Δ` where the engagement offset
+/// `Δ = 2π/count` (one full pitch — each member spans to its neighbor's start
+/// point, so members lap over one another and the inner ends define the central
+/// opening). Member length is then scaled to `length`: the raw chord from the
+/// start point along the (end−start) direction is normalized and extended to the
+/// requested `length`. Deterministic (equal angular spacing, fixed member order).
+pub fn reciprocal_segments(count: u32, radius: f64, length: f64) -> Vec<(DVec3, DVec3)> {
+    let count = count.max(2);
+    let n = count as f64;
+    let step = std::f64::consts::TAU / n;
+    // Engagement: each member laps to the next station's pitch point.
+    let engage = step;
+    let mut segs: Vec<(DVec3, DVec3)> = Vec::new();
+    for k in 0..count {
+        let a0 = k as f64 * step;
+        let a1 = a0 + engage;
+        let start = DVec3::new(radius * a0.cos(), radius * a0.sin(), 0.0);
+        let pitch_end = DVec3::new(radius * a1.cos(), radius * a1.sin(), 0.0);
+        let dir = pitch_end - start;
+        let len = dir.length();
+        let end = if len < 1e-9 {
+            pitch_end
+        } else {
+            start + dir / len * length
+        };
+        segs.push((start, end));
+    }
+    segs
+}
+
+// ── waffle (egg-crate rib grid) ──────────────────────────────────────────────
+
+/// Egg-crate / "waffle" grid: `nx` ribs running along Y and `ny` ribs running
+/// along X, over a `width × length` footprint, each rib a vertical plane of
+/// `depth` (top at z = `depth`, bottom at z = 0). As lines it returns the rib
+/// TOP edges and BOTTOM edges (so the grid reads at two levels) plus the
+/// vertical edges at every rib intersection — a full 3D grid of line segments.
+///
+/// Layout: X ribs sit at x = i·width/(nx−1) for i∈0..nx (spanning y∈[0,length]);
+/// Y ribs at y = j·length/(ny−1) for j∈0..ny (spanning x∈[0,width]). Segment
+/// count = 2·nx (X-rib top+bottom edges) + 2·ny (Y-rib top+bottom edges) +
+/// nx·ny verticals at the intersection lattice. Deterministic.
+pub fn waffle_segments(
+    nx: u32,
+    ny: u32,
+    width: f64,
+    length: f64,
+    depth: f64,
+) -> Vec<(DVec3, DVec3)> {
+    let nx = nx.max(2);
+    let ny = ny.max(2);
+    let xs = |i: u32| width * i as f64 / (nx - 1) as f64;
+    let ys = |j: u32| length * j as f64 / (ny - 1) as f64;
+    let mut segs: Vec<(DVec3, DVec3)> = Vec::new();
+    // X ribs (constant x, spanning y): top edge at z=depth, bottom at z=0.
+    for i in 0..nx {
+        let x = xs(i);
+        segs.push((DVec3::new(x, 0.0, depth), DVec3::new(x, length, depth)));
+        segs.push((DVec3::new(x, 0.0, 0.0), DVec3::new(x, length, 0.0)));
+    }
+    // Y ribs (constant y, spanning x): top and bottom edges.
+    for j in 0..ny {
+        let y = ys(j);
+        segs.push((DVec3::new(0.0, y, depth), DVec3::new(width, y, depth)));
+        segs.push((DVec3::new(0.0, y, 0.0), DVec3::new(width, y, 0.0)));
+    }
+    // Vertical edges at every rib intersection.
+    for i in 0..nx {
+        for j in 0..ny {
+            let (x, y) = (xs(i), ys(j));
+            segs.push((DVec3::new(x, y, 0.0), DVec3::new(x, y, depth)));
+        }
+    }
+    segs
+}
+
 // ── hyperbolic paraboloid (hypar) surface ───────────────────────────────────
 
 /// Ruled hyperbolic-paraboloid (Candela) surface `z = x*y/c` sampled over the
@@ -540,6 +659,48 @@ mod tests {
         let m = strut_lattice(&segs, 0.1);
         assert_eq!(m.positions().len(), 8); // one box = 8 verts
         assert_eq!(m.faces().len(), 12); // 6 quads = 12 tris
+    }
+
+    #[test]
+    fn diagrid_counts_and_deterministic() {
+        // nx=2, ny=3 → 2·2·3 = 12 diagonals + 4 perimeter = 16 segments.
+        let a = diagrid_segments(2, 3, 20.0, 40.0);
+        assert_eq!(a.len(), 2 * 2 * 3 + 4);
+        let b = diagrid_segments(2, 3, 20.0, 40.0);
+        assert_eq!(a, b, "diagrid is deterministic");
+        // All planar (z = 0).
+        for &(p, q) in &a {
+            assert!(p.z.abs() < 1e-12 && q.z.abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn reciprocal_counts_and_deterministic() {
+        let a = reciprocal_segments(8, 3.0, 4.0);
+        assert_eq!(a.len(), 8, "one member per count");
+        let b = reciprocal_segments(8, 3.0, 4.0);
+        assert_eq!(a, b, "reciprocal is deterministic");
+        // Every member has the requested length.
+        for &(p, q) in &a {
+            assert!(((q - p).length() - 4.0).abs() < 1e-9, "member length == length");
+        }
+        // Start points lie on the pitch circle.
+        for &(p, _) in &a {
+            assert!((p.length() - 3.0).abs() < 1e-9, "start on pitch circle r=3");
+        }
+    }
+
+    #[test]
+    fn waffle_counts_and_deterministic() {
+        // nx=3, ny=4 → 2·3 + 2·4 + 3·4 = 6 + 8 + 12 = 26 segments.
+        let a = waffle_segments(3, 4, 10.0, 16.0, 1.0);
+        assert_eq!(a.len(), 2 * 3 + 2 * 4 + 3 * 4);
+        let b = waffle_segments(3, 4, 10.0, 16.0, 1.0);
+        assert_eq!(a, b, "waffle is deterministic");
+        // Z extent spans [0, depth].
+        let zmax = a.iter().flat_map(|&(p, q)| [p.z, q.z]).fold(f64::MIN, f64::max);
+        let zmin = a.iter().flat_map(|&(p, q)| [p.z, q.z]).fold(f64::MAX, f64::min);
+        assert!((zmax - 1.0).abs() < 1e-12 && zmin.abs() < 1e-12);
     }
 
     #[test]

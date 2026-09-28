@@ -183,6 +183,39 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 depth: number(depth)?,
             })
         }
+        "diagrid" => {
+            let [nx, ny, width, height] =
+                take::<4>("diagrid", "nx, ny, a width and a height", &args)?;
+            Ok(Command::Diagrid {
+                id: None,
+                nx: integer(nx, "diagrid")?,
+                ny: integer(ny, "diagrid")?,
+                width: number(width)?,
+                height: number(height)?,
+            })
+        }
+        "reciprocal" => {
+            let [count, radius, length] =
+                take::<3>("reciprocal", "a member count, a radius and a length", &args)?;
+            Ok(Command::Reciprocal {
+                id: None,
+                count: integer(count, "reciprocal")?,
+                radius: number(radius)?,
+                length: number(length)?,
+            })
+        }
+        "waffle" => {
+            let [nx, ny, width, length, depth] =
+                take::<5>("waffle", "nx, ny, a width, a length and a depth", &args)?;
+            Ok(Command::Waffle {
+                id: None,
+                nx: integer(nx, "waffle")?,
+                ny: integer(ny, "waffle")?,
+                width: number(width)?,
+                length: number(length)?,
+                depth: number(depth)?,
+            })
+        }
         "hypar" => {
             // hypar <a> <b> <c> [nu] [nv]
             let (a, b, c, nu, nv) = match args.as_slice() {
@@ -4045,6 +4078,9 @@ mod tests {
             "cablenet 0,0 5,0 5,5 0,5",
             "tensegrity 6",
             "spaceframe 6 4 3 1.5",
+            "diagrid 6 10 20 40",
+            "reciprocal 8 3 4",
+            "waffle 5 8 10 16 1",
             "geodesic 3 5 dome",
             // Branch / Vector step kinds (guided engine v4).
             "gridshell hypar 4 4 2",
@@ -4122,6 +4158,22 @@ mod tests {
         assert_eq!(
             parse("spaceframe 6 4 3 1.5").unwrap(),
             Command::SpaceFrame { id: None, nx: 6, ny: 4, bay: 3.0, depth: 1.5 }
+        );
+    }
+
+    #[test]
+    fn parse_diagrid_reciprocal_waffle() {
+        assert_eq!(
+            parse("diagrid 6 10 20 40").unwrap(),
+            Command::Diagrid { id: None, nx: 6, ny: 10, width: 20.0, height: 40.0 }
+        );
+        assert_eq!(
+            parse("reciprocal 8 3 4").unwrap(),
+            Command::Reciprocal { id: None, count: 8, radius: 3.0, length: 4.0 }
+        );
+        assert_eq!(
+            parse("waffle 5 8 10 16 1").unwrap(),
+            Command::Waffle { id: None, nx: 5, ny: 8, width: 10.0, length: 16.0, depth: 1.0 }
         );
     }
 

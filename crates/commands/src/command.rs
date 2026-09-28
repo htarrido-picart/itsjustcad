@@ -428,6 +428,39 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sag: Option<f64>,
     },
+    /// Diagrid: planar diagonal facade grid over a `width × height` rectangle in
+    /// the XY plane, divided into `nx × ny` cells; both diagonal families plus the
+    /// perimeter render as lightweight member lines.
+    Diagrid {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        nx: u32,
+        ny: u32,
+        width: f64,
+        height: f64,
+    },
+    /// Reciprocal frame: `count` straight members in a rotational fan around a
+    /// center, tangentially engaged so they mutually overlap into a central
+    /// polygon opening + outer ring. Renders as the member lines.
+    Reciprocal {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        count: u32,
+        radius: f64,
+        length: f64,
+    },
+    /// Waffle: egg-crate rib grid — `nx` ribs one way + `ny` ribs the other over a
+    /// `width × length` footprint, each rib a vertical plane of `depth`. Renders
+    /// as the rib top/bottom edges + intersection verticals (a 3D line grid).
+    Waffle {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        nx: u32,
+        ny: u32,
+        width: f64,
+        length: f64,
+        depth: f64,
+    },
     /// Minimal surface / soap film (Frei Otto): stretch a discrete soap film
     /// across a selected **closed** curve boundary using the shared
     /// form-finding engine (force-density harmonic net). One logged surface

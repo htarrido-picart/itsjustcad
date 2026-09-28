@@ -33,7 +33,7 @@ pub use object::{
     ParamBlockDef, ParamBlockParam, PatLine, SceneObject, DEFAULT_LAYER,
 };
 pub use param_schema::{
-    derive_mesh, param_summary, DeriveError, FieldKind, GeneratorKind, ParamField, ParamMap,
+    derive_mesh, derive_segments, param_summary, DeriveError, FieldKind, GeneratorKind, ParamField, ParamMap,
     ParamSchema, ParamValue, Unit, Widget,
 };
 pub use plotstyle::{PlotStyleEntry, PlotStyleTable, ResolvedPen};

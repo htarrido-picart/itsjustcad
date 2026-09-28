@@ -39,6 +39,9 @@ pub enum GeneratorKind {
     Funicular,
     Tensegrity,
     Cablenet,
+    Diagrid,
+    Reciprocal,
+    Waffle,
 }
 
 impl GeneratorKind {
@@ -52,6 +55,9 @@ impl GeneratorKind {
         GeneratorKind::Funicular,
         GeneratorKind::Tensegrity,
         GeneratorKind::Cablenet,
+        GeneratorKind::Diagrid,
+        GeneratorKind::Reciprocal,
+        GeneratorKind::Waffle,
     ];
 
     /// Stable token (matches the creating verb): `geodesic`, `hypar`, …
@@ -65,6 +71,9 @@ impl GeneratorKind {
             GeneratorKind::Funicular => "funicular",
             GeneratorKind::Tensegrity => "tensegrity",
             GeneratorKind::Cablenet => "cablenet",
+            GeneratorKind::Diagrid => "diagrid",
+            GeneratorKind::Reciprocal => "reciprocal",
+            GeneratorKind::Waffle => "waffle",
         }
     }
 
@@ -79,6 +88,9 @@ impl GeneratorKind {
             GeneratorKind::Funicular => "param.gen.funicular",
             GeneratorKind::Tensegrity => "param.gen.tensegrity",
             GeneratorKind::Cablenet => "param.gen.cablenet",
+            GeneratorKind::Diagrid => "param.gen.diagrid",
+            GeneratorKind::Reciprocal => "param.gen.reciprocal",
+            GeneratorKind::Waffle => "param.gen.waffle",
         }
     }
 
@@ -176,6 +188,33 @@ impl GeneratorKind {
                     ParamField::float("sag", "param.cablenet.sag", 1.5, Some(0.0), None, 0.1, Widget::Numeric, Unit::Meter),
                 ],
             },
+            GeneratorKind::Diagrid => ParamSchema {
+                kind: self,
+                fields: vec![
+                    ParamField::int("nx", "param.diagrid.nx", 6, 1, 256, 1, Widget::Slider),
+                    ParamField::int("ny", "param.diagrid.ny", 10, 1, 256, 1, Widget::Slider),
+                    ParamField::float("width", "param.diagrid.width", 20.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("height", "param.diagrid.height", 40.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                ],
+            },
+            GeneratorKind::Reciprocal => ParamSchema {
+                kind: self,
+                fields: vec![
+                    ParamField::int("count", "param.reciprocal.count", 8, 2, 256, 1, Widget::Slider),
+                    ParamField::float("radius", "param.reciprocal.radius", 3.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("length", "param.reciprocal.length", 4.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                ],
+            },
+            GeneratorKind::Waffle => ParamSchema {
+                kind: self,
+                fields: vec![
+                    ParamField::int("nx", "param.waffle.nx", 5, 2, 256, 1, Widget::Slider),
+                    ParamField::int("ny", "param.waffle.ny", 8, 2, 256, 1, Widget::Slider),
+                    ParamField::float("width", "param.waffle.width", 10.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("length", "param.waffle.length", 16.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("depth", "param.waffle.depth", 1.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                ],
+            },
         }
     }
 
@@ -222,6 +261,9 @@ impl GeneratorKind {
                 | GeneratorKind::Tensegrity
                 | GeneratorKind::Funicular
                 | GeneratorKind::Gridshell
+                | GeneratorKind::Diagrid
+                | GeneratorKind::Reciprocal
+                | GeneratorKind::Waffle
         )
     }
 }
@@ -636,6 +678,33 @@ pub fn derive_mesh(kind: GeneratorKind, params: &ParamMap) -> Result<Mesh, Deriv
             }
             Ok(mesh)
         }
+        GeneratorKind::Diagrid => {
+            let nx = get_i(&p, "nx").max(1) as u32;
+            let ny = get_i(&p, "ny").max(1) as u32;
+            let width = get_f(&p, "width");
+            let height = get_f(&p, "height");
+            let segs = kernel_mesh::diagrid_segments(nx, ny, width, height);
+            let strut = ((width.min(height)) * 0.01).clamp(0.02, 0.3);
+            Ok(kernel_mesh::strut_lattice(&segs, strut))
+        }
+        GeneratorKind::Reciprocal => {
+            let count = get_i(&p, "count").max(2) as u32;
+            let radius = get_f(&p, "radius");
+            let length = get_f(&p, "length");
+            let segs = kernel_mesh::reciprocal_segments(count, radius, length);
+            let strut = (radius * 0.04).clamp(0.02, 0.3);
+            Ok(kernel_mesh::strut_lattice(&segs, strut))
+        }
+        GeneratorKind::Waffle => {
+            let nx = get_i(&p, "nx").max(2) as u32;
+            let ny = get_i(&p, "ny").max(2) as u32;
+            let width = get_f(&p, "width");
+            let length = get_f(&p, "length");
+            let depth = get_f(&p, "depth");
+            let segs = kernel_mesh::waffle_segments(nx, ny, width, length, depth);
+            let strut = (depth * 0.06).clamp(0.02, 0.3);
+            Ok(kernel_mesh::strut_lattice(&segs, strut))
+        }
     }
 }
 
@@ -702,6 +771,27 @@ pub fn derive_segments(
             let nv = get_i(&p, "nv").max(2) as u32;
             let surface = kernel_mesh::GridshellSurface::Hypar { a, b, c };
             kernel_mesh::gridshell_segments(surface, nu, nv)
+        }
+        GeneratorKind::Diagrid => {
+            let nx = get_i(&p, "nx").max(1) as u32;
+            let ny = get_i(&p, "ny").max(1) as u32;
+            let width = get_f(&p, "width");
+            let height = get_f(&p, "height");
+            kernel_mesh::diagrid_segments(nx, ny, width, height)
+        }
+        GeneratorKind::Reciprocal => {
+            let count = get_i(&p, "count").max(2) as u32;
+            let radius = get_f(&p, "radius");
+            let length = get_f(&p, "length");
+            kernel_mesh::reciprocal_segments(count, radius, length)
+        }
+        GeneratorKind::Waffle => {
+            let nx = get_i(&p, "nx").max(2) as u32;
+            let ny = get_i(&p, "ny").max(2) as u32;
+            let width = get_f(&p, "width");
+            let length = get_f(&p, "length");
+            let depth = get_f(&p, "depth");
+            kernel_mesh::waffle_segments(nx, ny, width, length, depth)
         }
         // Non-lattice kinds are handled by the early return above.
         GeneratorKind::Hypar
@@ -826,6 +916,24 @@ mod tests {
         let m = derive_mesh(GeneratorKind::Cablenet, &d).unwrap();
         assert_eq!(m.positions().len(), 100);
         assert_eq!(m.faces().len(), 162);
+    }
+
+    #[test]
+    fn new_lattices_derive_segments_and_render_as_segments() {
+        for &k in &[
+            GeneratorKind::Diagrid,
+            GeneratorKind::Reciprocal,
+            GeneratorKind::Waffle,
+        ] {
+            assert!(k.renders_as_segments(), "{k:?} renders as segments");
+            let d = k.default_params();
+            let segs = derive_segments(k, &d).unwrap();
+            assert!(!segs.is_empty(), "{k:?} derive_segments non-empty");
+            // freeze path: strut solid non-empty (8 verts/strut).
+            let m = derive_mesh(k, &d).unwrap();
+            assert!(!m.positions().is_empty(), "{k:?} strut solid non-empty");
+            assert_eq!(m.positions().len() % 8, 0, "{k:?} strut solid is boxes");
+        }
     }
 
     #[test]

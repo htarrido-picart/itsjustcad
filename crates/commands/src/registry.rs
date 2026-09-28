@@ -121,6 +121,24 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Structure,
         },
         CommandSpec {
+            name: "diagrid",
+            usage: "diagrid <nx> <ny> <width> <height>",
+            summary: "Planar diagonal grid (diagrid) over a width×height rectangle in the XY plane, divided into nx×ny cells; both diagonal families + perimeter render as member lines. Example: diagrid 6 10 20 40",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "reciprocal",
+            usage: "reciprocal <count> <radius> <length>",
+            summary: "Reciprocal frame: 'count' straight members fanned around a center on a pitch circle of 'radius', tangentially engaged so they mutually overlap into a central opening + outer ring. Example: reciprocal 8 3 4",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "waffle",
+            usage: "waffle <nx> <ny> <width> <length> <depth>",
+            summary: "Egg-crate/waffle grid: nx ribs one way + ny ribs the other over a width×length footprint, each a vertical plane of 'depth'; rib top/bottom edges + intersection verticals render as a 3D line grid. Example: waffle 5 8 10 16 1",
+            category: Category::Structure,
+        },
+        CommandSpec {
             name: "hypar",
             usage: "hypar <a> <b> <c> [nu] [nv]",
             summary: "Hyperbolic-paraboloid (Candela) saddle shell z = x*y/c over [-a,a]×[-b,b], meshed nu×nv (default 12). Example: hypar 5 5 5",
