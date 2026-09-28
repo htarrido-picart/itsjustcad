@@ -683,6 +683,14 @@ pub enum Geometry {
         )]
         placement: glam::DMat4,
         mesh: Mesh,
+        /// Member segments for strut-lattice generators (spaceframe, geodesic,
+        /// tensegrity, funicular, gridshell). Populated instead of `mesh` for
+        /// those kinds so the renderer draws lightweight lines rather than 3D
+        /// strut tubes; `mesh` stays empty for them. Surface generators
+        /// (cablenet/hypar/gaussvault) and normal kinds leave this empty and use
+        /// `mesh`. `placement` is baked into these endpoints, same as `mesh`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        wire: Vec<[DVec3; 2]>,
     },
 }
 
@@ -781,10 +789,14 @@ impl Geometry {
             // does not re-derive (it would snap the shape back to the origin).
             // Accumulate the move into `placement` so a later `paramset`
             // re-derive can re-apply it and keep the object where the user put it.
-            Geometry::Parametric { mesh, placement, .. } => {
+            Geometry::Parametric { mesh, placement, wire, .. } => {
                 let t = glam::DMat4::from_translation(d);
                 *placement = t * *placement;
                 mesh.transform(t);
+                for [a, b] in wire.iter_mut() {
+                    *a += d;
+                    *b += d;
+                }
             }
         }
     }
@@ -883,9 +895,13 @@ impl Geometry {
             // Transform bakes into the mesh cache (params stay canonical shape),
             // and accumulates into `placement` so a `paramset` re-derive lands
             // the fresh shape at the same world position.
-            Geometry::Parametric { mesh, placement, .. } => {
+            Geometry::Parametric { mesh, placement, wire, .. } => {
                 *placement = *m * *placement;
                 mesh.transform(*m);
+                for [a, b] in wire.iter_mut() {
+                    *a = m.transform_point3(*a);
+                    *b = m.transform_point3(*b);
+                }
                 true
             }
         }
@@ -904,9 +920,19 @@ impl Geometry {
                 Aabb::from_points(vec![*position - DVec3::splat(s), *position + DVec3::splat(s)])
             }
             Geometry::Points { positions } => Aabb::from_points(positions.clone()),
-            Geometry::Frame { mesh, .. }
-            | Geometry::Area { mesh, .. }
-            | Geometry::Parametric { mesh, .. } => mesh.aabb(),
+            Geometry::Frame { mesh, .. } | Geometry::Area { mesh, .. } => mesh.aabb(),
+            // A strut-lattice parametric object has an EMPTY mesh (it renders as
+            // `wire` line segments), so its AABB/selection bounds must come from
+            // the wire endpoints; a surface/normal parametric has an empty wire
+            // and uses the mesh. Union both so either representation is covered.
+            Geometry::Parametric { mesh, wire, .. } => {
+                let mut pts: Vec<DVec3> = mesh.positions().to_vec();
+                for [a, b] in wire {
+                    pts.push(*a);
+                    pts.push(*b);
+                }
+                Aabb::from_points(pts)
+            }
         }
     }
 
@@ -924,7 +950,15 @@ impl Geometry {
             Geometry::Points { positions } => positions.clone(),
             Geometry::Frame { a, b, .. } => vec![*a, *b],
             Geometry::Area { boundary, .. } => boundary.clone(),
-            Geometry::Parametric { mesh, .. } => mesh.positions().to_vec(),
+            // Wire-lattice parametrics expose their segment endpoints (the mesh
+            // is empty); surface/normal parametrics expose mesh vertices.
+            Geometry::Parametric { mesh, wire, .. } => {
+                if wire.is_empty() {
+                    mesh.positions().to_vec()
+                } else {
+                    wire.iter().flat_map(|[a, b]| [*a, *b]).collect()
+                }
+            }
         }
     }
 }

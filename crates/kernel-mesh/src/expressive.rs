@@ -411,6 +411,15 @@ impl GridshellSurface {
 /// struts of side `thickness`. This is the gridshell — a reciprocal net of
 /// slender members that gets its stiffness from the double curvature.
 pub fn gridshell(surface: GridshellSurface, nu: u32, nv: u32, thickness: f64) -> Mesh {
+    strut_lattice(&gridshell_segments(surface, nu, nv), thickness)
+}
+
+/// The gridshell's member segments (the two UV families of grid lines) as raw
+/// `(start, end)` pairs — the same members `gridshell` sweeps into strut tubes,
+/// but returned as lightweight lines for a wireframe render. `u`-members run in
+/// the u direction (constant j), then `v`-members (constant i), so the ordering
+/// matches `gridshell`'s tube meshing.
+pub fn gridshell_segments(surface: GridshellSurface, nu: u32, nv: u32) -> Vec<(DVec3, DVec3)> {
     let nu = nu.max(1);
     let nv = nv.max(1);
     let p = |i: u32, j: u32| surface.point(i, j, nu, nv);
@@ -427,7 +436,7 @@ pub fn gridshell(surface: GridshellSurface, nu: u32, nv: u32, thickness: f64) ->
             segs.push((p(i, j), p(i, j + 1)));
         }
     }
-    strut_lattice(&segs, thickness)
+    segs
 }
 
 #[cfg(test)]

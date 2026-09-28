@@ -3311,8 +3311,19 @@ fn parametric_object(
     params: itsjustcad_doc::ParamMap,
 ) -> Result<ObjectId, ExecError> {
     let params = generator.schema().sanitize(&params);
-    let mesh = itsjustcad_doc::derive_mesh(generator, &params)
-        .map_err(|e| ExecError::Invalid(e.to_string()))?;
+    // Strut-lattice generators render as lightweight member LINES: populate
+    // `wire` from `derive_segments` and leave `mesh` empty (no tubes). Surface
+    // (cablenet/hypar/gaussvault) and normal kinds keep `wire` empty and derive
+    // the display mesh as before. Same live re-derive path is used by `paramset`.
+    let (mesh, wire) = if generator.renders_as_segments() {
+        let wire = itsjustcad_doc::derive_segments(generator, &params)
+            .map_err(|e| ExecError::Invalid(e.to_string()))?;
+        (kernel_mesh::Mesh::default(), wire)
+    } else {
+        let mesh = itsjustcad_doc::derive_mesh(generator, &params)
+            .map_err(|e| ExecError::Invalid(e.to_string()))?;
+        (mesh, Vec::new())
+    };
     let id = id.unwrap_or_default();
     doc.insert(SceneObject {
         visible: true,
@@ -3327,6 +3338,7 @@ fn parametric_object(
             params,
             placement: glam::DMat4::IDENTITY,
             mesh,
+            wire,
         },
     });
     Ok(id)
@@ -12618,12 +12630,24 @@ fn apply_forward(
                 new_values.insert(k.clone(), pv);
             }
             let new_values = schema.sanitize(&new_values);
-            let mut mesh = itsjustcad_doc::derive_mesh(generator, &new_values)
-                .map_err(|e| ExecError::Invalid(e.to_string()))?;
-            // derive_mesh returns the shape at the canonical origin. Re-apply the
-            // stored placement so a param edit does NOT teleport the object back
-            // to 0,0,0 (Blocker 3).
-            mesh.transform(placement);
+            // Re-derive at the canonical origin, then re-apply `placement` so a
+            // param edit does NOT teleport the object back to 0,0,0 (Blocker 3).
+            // Strut-lattice kinds re-derive their member LINES (empty mesh); all
+            // others re-derive the display mesh — mirrors `parametric_object`.
+            let (mesh, wire) = if generator.renders_as_segments() {
+                let mut wire = itsjustcad_doc::derive_segments(generator, &new_values)
+                    .map_err(|e| ExecError::Invalid(e.to_string()))?;
+                for [a, b] in wire.iter_mut() {
+                    *a = placement.transform_point3(*a);
+                    *b = placement.transform_point3(*b);
+                }
+                (kernel_mesh::Mesh::default(), wire)
+            } else {
+                let mut mesh = itsjustcad_doc::derive_mesh(generator, &new_values)
+                    .map_err(|e| ExecError::Invalid(e.to_string()))?;
+                mesh.transform(placement);
+                (mesh, Vec::new())
+            };
             let prev_geometry = doc.get(id).expect("resolved").geometry.clone();
             if let Some(o) = doc.get_mut(id) {
                 o.geometry = Geometry::Parametric {
@@ -12631,6 +12655,7 @@ fn apply_forward(
                     params: new_values,
                     placement,
                     mesh,
+                    wire,
                 };
             }
             doc.generation += 1;
@@ -12656,10 +12681,22 @@ fn apply_forward(
                     continue;
                 }
                 let prev = doc.get(*id).expect("resolved").geometry.clone();
-                if let Geometry::Parametric { mesh, .. } = &prev {
-                    let flat = Geometry::Mesh(mesh.clone());
+                if let Geometry::Parametric { generator, params, placement, mesh, .. } = &prev {
+                    // Freeze bakes the parametric object to a plain mesh. Surface/
+                    // normal kinds already carry their mesh. Strut-lattice kinds
+                    // render as member LINES (empty display mesh), so freeze re-
+                    // derives their solid strut-tube mesh (via `derive_mesh`) and
+                    // re-applies `placement`, giving a real solid to keep.
+                    let baked = if generator.renders_as_segments() {
+                        let mut m = itsjustcad_doc::derive_mesh(*generator, params)
+                            .map_err(|e| ExecError::Invalid(e.to_string()))?;
+                        m.transform(*placement);
+                        m
+                    } else {
+                        mesh.clone()
+                    };
                     if let Some(o) = doc.get_mut(*id) {
-                        o.geometry = flat;
+                        o.geometry = Geometry::Mesh(baked);
                     }
                     snapshots.push((*id, prev));
                     frozen += 1;
@@ -14499,34 +14536,36 @@ mod tests {
         let mut s = Session::default();
         run(&mut s, "geodesic 10 5");
         let id = s.doc.all_ids()[0];
-        let verts = match &s.doc.get(id).unwrap().geometry {
-            Geometry::Parametric { params, mesh, .. } => {
+        // Geodesic is a strut lattice → member segments live in `wire`, mesh empty.
+        let members = match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { params, mesh, wire, .. } => {
                 assert_eq!(
                     params.get("frequency").unwrap().as_i64(),
                     Some(10),
                     "frequency must survive at 10, not clamp to the old slider max"
                 );
-                mesh.positions().len()
+                assert!(mesh.positions().is_empty(), "lattice renders as lines, empty mesh");
+                wire.len()
             }
             g => panic!("expected Parametric, got {g:?}"),
         };
 
-        // Direct derive at freq 10 must match the verb-created mesh.
+        // Direct segment-derive at freq 10 must match the verb-created wire.
         let mut p10 = GeneratorKind::Geodesic.default_params();
         p10.insert("frequency".into(), ParamValue::Int(10));
         p10.insert("radius".into(), ParamValue::Float(5.0));
-        let m10 = itsjustcad_doc::derive_mesh(GeneratorKind::Geodesic, &p10).unwrap();
-        assert_eq!(verts, m10.positions().len(), "verb mesh == direct freq-10 derive");
+        let w10 = itsjustcad_doc::derive_segments(GeneratorKind::Geodesic, &p10).unwrap();
+        assert_eq!(members, w10.len(), "verb wire == direct freq-10 derive");
 
-        // And strictly larger than the freq-6 mesh (proves no clamp to 6).
+        // And strictly more members than the freq-6 lattice (proves no clamp to 6).
         let mut p6 = GeneratorKind::Geodesic.default_params();
         p6.insert("frequency".into(), ParamValue::Int(6));
         p6.insert("radius".into(), ParamValue::Float(5.0));
-        let m6 = itsjustcad_doc::derive_mesh(GeneratorKind::Geodesic, &p6).unwrap();
+        let w6 = itsjustcad_doc::derive_segments(GeneratorKind::Geodesic, &p6).unwrap();
         assert!(
-            verts > m6.positions().len(),
-            "freq-10 mesh must be larger than freq-6 (not clamped): {verts} vs {}",
-            m6.positions().len()
+            members > w6.len(),
+            "freq-10 lattice must have more members than freq-6 (not clamped): {members} vs {}",
+            w6.len()
         );
     }
 
@@ -20604,20 +20643,31 @@ mod tests {
         }
     }
 
+    /// The member segments of a strut-lattice parametric object (spaceframe,
+    /// geodesic, tensegrity, funicular, gridshell) — these render as lines and
+    /// carry the object's actual geometry (its `mesh` is empty).
+    fn wire_of(s: &Session, id: ObjectId) -> &[[DVec3; 2]] {
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { wire, .. } => wire,
+            g => panic!("expected parametric geometry, got {g:?}"),
+        }
+    }
+
     #[test]
     fn geodesic_exec_undo_redo_replay() {
         let mut s = Session::default();
         let out = run(&mut s, "geodesic 3 5 dome");
         let id = out.created[0];
-        // A freq-3 dome has struts; the mesh is a non-empty strut lattice
-        // (8 verts per strut).
-        let m = mesh_of(&s, id);
-        assert!(!m.positions().is_empty());
-        assert_eq!(m.positions().len() % 8, 0, "8 verts per strut prism");
-        // All vertices lie near the sphere radius (dome projected onto r=5),
-        // allowing for the strut cross-section thickness (~0.1 side).
-        let rmax = m.positions().iter().map(|p| p.length()).fold(0.0, f64::max);
-        assert!(rmax <= 5.0 + 0.2, "verts near r=5, got rmax={rmax}");
+        // A freq-3 dome renders as member LINES: non-empty wire, EMPTY mesh.
+        assert!(mesh_of(&s, id).positions().is_empty(), "lattice has no tube mesh");
+        let wire = wire_of(&s, id);
+        assert!(!wire.is_empty(), "freq-3 dome has member segments");
+        // All member endpoints lie on the sphere radius (dome projected onto r=5).
+        let rmax = wire
+            .iter()
+            .flat_map(|[a, b]| [a.length(), b.length()])
+            .fold(0.0, f64::max);
+        assert!((rmax - 5.0).abs() < 1e-6, "endpoints on r=5, got rmax={rmax}");
         assert_replay_stable(&s);
         run(&mut s, "undo");
         assert!(s.doc.get(id).is_none());
@@ -20629,11 +20679,12 @@ mod tests {
     fn paramset_geodesic_frequency_changes_mesh_undo_redo_replay() {
         let mut s = Session::default();
         let id = run(&mut s, "geodesic 3 5 dome").created[0];
-        let before = mesh_of(&s, id).positions().len();
+        // Geodesic renders as member lines: re-derive changes the WIRE, not a mesh.
+        let before = wire_of(&s, id).len();
         let out = run(&mut s, "paramset last frequency=5");
         assert!(out.created.is_empty(), "paramset creates nothing");
-        let after = mesh_of(&s, id).positions().len();
-        assert!(after > before, "freq 5 mesh should be larger: {before} -> {after}");
+        let after = wire_of(&s, id).len();
+        assert!(after > before, "freq 5 lattice should have more members: {before} -> {after}");
         // The stored params reflect the change.
         match &s.doc.get(id).unwrap().geometry {
             Geometry::Parametric { params, .. } => {
@@ -20643,9 +20694,9 @@ mod tests {
         }
         assert_replay_stable(&s);
         run(&mut s, "undo");
-        assert_eq!(mesh_of(&s, id).positions().len(), before, "undo restores mesh");
+        assert_eq!(wire_of(&s, id).len(), before, "undo restores wire");
         run(&mut s, "redo");
-        assert_eq!(mesh_of(&s, id).positions().len(), after, "redo re-applies");
+        assert_eq!(wire_of(&s, id).len(), after, "redo re-applies");
     }
 
     #[test]
@@ -20697,11 +20748,18 @@ mod tests {
             &s.doc.get(id).unwrap().geometry,
             Geometry::Parametric { .. }
         ));
-        let before = mesh_of(&s, id).positions().len();
+        // Geodesic is a strut lattice → renders as member lines (empty display
+        // mesh). Freeze bakes it to a solid strut-tube mesh.
+        assert!(mesh_of(&s, id).positions().is_empty(), "lattice has no display mesh");
         run(&mut s, "freeze last");
-        // Now a plain mesh, same geometry, not parametric.
+        // Now a plain mesh, not parametric — and a real (non-empty) strut solid.
         assert!(matches!(&s.doc.get(id).unwrap().geometry, Geometry::Mesh(_)));
-        assert_eq!(mesh_of(&s, id).positions().len(), before, "geometry preserved");
+        assert_eq!(
+            mesh_of(&s, id).positions().len() % 8,
+            0,
+            "frozen lattice is a strut-tube mesh (8 verts/strut)"
+        );
+        assert!(!mesh_of(&s, id).positions().is_empty(), "frozen mesh is non-empty");
         // paramset no longer applies.
         assert!(s.run(parse("paramset last frequency=5").unwrap()).is_err());
         assert_replay_stable(&s);
@@ -20750,7 +20808,8 @@ mod tests {
         let mut s = Session::default();
         let dome = run(&mut s, "geodesic 3 5 dome").created[0];
         let full = run(&mut s, "geodesic 3 5 full").created[0];
-        assert!(mesh_of(&s, full).positions().len() > mesh_of(&s, dome).positions().len());
+        // Both render as member lines; the full sphere has more members than the dome.
+        assert!(wire_of(&s, full).len() > wire_of(&s, dome).len());
     }
 
     #[test]
@@ -20794,11 +20853,18 @@ mod tests {
         let mut s = Session::default();
         let out = run(&mut s, "spaceframe 4 3 3 1.5");
         let id = out.created[0];
-        let m = mesh_of(&s, id);
-        assert_eq!(m.positions().len() % 8, 0);
-        // Top chord at z=1.5; strut prisms add a little half-thickness on top.
-        let zmax = m.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
-        assert!((zmax - 1.5).abs() < 0.2, "top chord near z=1.5, got {zmax}");
+        // Renders as member lines: non-empty wire, empty mesh.
+        assert!(mesh_of(&s, id).positions().is_empty(), "lattice has no tube mesh");
+        let wire = wire_of(&s, id);
+        // 4×3 spaceframe: verb count matches a direct segment derive.
+        assert_eq!(
+            wire.len(),
+            kernel_mesh::spaceframe_struts(4, 3, 3.0, 1.5).len(),
+            "wire == direct spaceframe_struts count"
+        );
+        // Top chord at z=1.5 (endpoints are exact — no half-thickness now).
+        let zmax = wire.iter().flat_map(|[a, b]| [a.z, b.z]).fold(f64::MIN, f64::max);
+        assert!((zmax - 1.5).abs() < 1e-9, "top chord at z=1.5, got {zmax}");
         assert_replay_stable(&s);
         run(&mut s, "undo");
         assert!(s.doc.get(id).is_none());
@@ -20843,9 +20909,15 @@ mod tests {
     fn gridshell_hypar_and_vault_exec_replay() {
         let mut s = Session::default();
         let h = run(&mut s, "gridshell hypar 5 5 5 4 4").created[0];
-        assert_eq!(mesh_of(&s, h).positions().len() % 8, 0);
+        // Gridshell renders as member lines: non-empty wire, empty mesh.
+        assert!(mesh_of(&s, h).positions().is_empty(), "gridshell has no tube mesh");
+        // nu=nv=4 hypar: u-members (nv+1)*nu=20 + v-members (nu+1)*nv=20 = 40.
+        assert_eq!(wire_of(&s, h).len(), 40, "hypar gridshell member count");
         assert_replay_stable(&s);
+        // The vault variant is NOT parametric (schema exposes only hypar params);
+        // it bakes to a plain strut-tube mesh, so it still has 8 verts/strut.
         let v = run(&mut s, "gridshell vault 6 12 3 undulate 5 5").created[0];
+        assert!(matches!(&s.doc.get(v).unwrap().geometry, Geometry::Mesh(_)));
         assert_eq!(mesh_of(&s, v).positions().len() % 8, 0);
         assert_replay_stable(&s);
         run(&mut s, "undo");
@@ -20857,11 +20929,12 @@ mod tests {
         let mut s = Session::default();
         let out = run(&mut s, "funicular -5,0,0 5,0,0 20 1 1.4");
         let id = out.created[0];
-        let m = mesh_of(&s, id);
-        // 20 links → 20 strut prisms × 8 verts.
-        assert_eq!(m.positions().len(), 20 * 8);
+        // Renders as member lines: 20 links → 20 chain segments, empty mesh.
+        assert!(mesh_of(&s, id).positions().is_empty(), "chain has no tube mesh");
+        let wire = wire_of(&s, id);
+        assert_eq!(wire.len(), 20, "20 chain segments");
         // The hanging chain sags below the springing line (z < 0 somewhere).
-        let zmin = m.positions().iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        let zmin = wire.iter().flat_map(|[a, b]| [a.z, b.z]).fold(f64::MAX, f64::min);
         assert!(zmin < -0.5, "funicular should sag, zmin={zmin}");
         assert_replay_stable(&s);
         run(&mut s, "undo");
@@ -20875,8 +20948,8 @@ mod tests {
         let mut s = Session::default();
         let hung = run(&mut s, "funicular -5,0,0 5,0,0 20 1 1.4").created[0];
         let arch = run(&mut s, "funicular -5,0,0 5,0,0 20 1 1.4 invert").created[0];
-        let hz = mesh_of(&s, hung).positions().iter().map(|p| p.z).fold(f64::MAX, f64::min);
-        let az = mesh_of(&s, arch).positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        let hz = wire_of(&s, hung).iter().flat_map(|[a, b]| [a.z, b.z]).fold(f64::MAX, f64::min);
+        let az = wire_of(&s, arch).iter().flat_map(|[a, b]| [a.z, b.z]).fold(f64::MIN, f64::max);
         // Hung form dips below the supports; inverted form rises above them.
         assert!(hz < 0.0 && az > 0.0, "hung zmin={hz}, arch zmax={az}");
         assert_replay_stable(&s);
@@ -20887,10 +20960,12 @@ mod tests {
         let mut s = Session::default();
         let out = run(&mut s, "tensegrity 3 1 2");
         let id = out.created[0];
-        let m = mesh_of(&s, id);
-        assert_eq!(m.positions().len() % 8, 0, "8 verts per strut prism");
+        // Renders as member lines (struts + cables): non-empty wire, empty mesh.
+        assert!(mesh_of(&s, id).positions().is_empty(), "tensegrity has no tube mesh");
+        let wire = wire_of(&s, id);
+        assert!(!wire.is_empty(), "tensegrity has struts + cables");
         // Spans z from ~0 (bottom ring) to ~2 (top ring).
-        let zmax = m.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        let zmax = wire.iter().flat_map(|[a, b]| [a.z, b.z]).fold(f64::MIN, f64::max);
         assert!(zmax > 1.5, "tensegrity height ~2, zmax={zmax}");
         assert_replay_stable(&s);
         run(&mut s, "undo");

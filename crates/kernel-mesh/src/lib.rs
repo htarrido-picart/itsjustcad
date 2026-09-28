@@ -27,8 +27,8 @@ pub use delaunay::triangulate;
 pub use earcut::{earcut, signed_area};
 pub use edges::{feature_edges, project_edges_behind, project_edges_onto};
 pub use expressive::{
-    gaussvault_surface, geodesic_network, gridshell, hypar_surface, spaceframe_struts,
-    strut_lattice, GridshellSurface,
+    gaussvault_surface, geodesic_network, gridshell, gridshell_segments, hypar_surface,
+    spaceframe_struts, strut_lattice, GridshellSurface,
 };
 pub use formfind::{
     cable_net, cable_net_surface, dynamic_relaxation, force_density, funicular_chain,

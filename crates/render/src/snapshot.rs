@@ -268,11 +268,23 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
         let selected = doc.selection.contains(&obj.id);
         let lw_mm = doc.effective_lineweight(obj) as f32;
         match &obj.geometry {
-            // Wireframe parametric generators (cablenet, later hypar/gaussvault/
-            // gridshell/minsurf): the derived mesh is a surface grid whose edges
-            // ARE the intended grid lines. Draw those edges as lines (respecting
-            // color + lineweight, like a curve) and skip the shaded triangles —
-            // the Frei-Otto / Munich cable-net look.
+            // Strut-lattice parametric generators (spaceframe/geodesic/
+            // tensegrity/funicular/gridshell): the derived MEMBER SEGMENTS live
+            // in `wire` (the mesh is empty — no 3D strut tubes). Draw the wire as
+            // lightweight lines (respecting color + lineweight, like a curve).
+            // Order: wire wins over the wireframe/shaded arms below.
+            Geometry::Parametric { wire, .. } if !wire.is_empty() => {
+                let color = resolve_color(obj, layer_color, theme, selected, mode, false);
+                // Each member is its own 2-point strip (scene.lines entries are
+                // independent polylines — same convention as hatch segments), so
+                // disjoint members don't get joined by stray connectors.
+                push_hatch_segs(&mut scene.lines, wire.clone(), color, lw_mm);
+            }
+            // Wireframe parametric generators (cablenet, hypar, gaussvault): the
+            // derived mesh is a surface grid whose edges ARE the intended grid
+            // lines. Draw those edges as lines (respecting color + lineweight,
+            // like a curve) and skip the shaded triangles — the Frei-Otto /
+            // Munich cable-net look.
             Geometry::Parametric { generator, mesh, .. }
                 if generator.renders_as_wireframe() =>
             {
@@ -622,10 +634,10 @@ mod tests {
     }
 
     #[test]
-    fn cablenet_renders_as_wireframe_lines_geodesic_stays_shaded() {
-        use itsjustcad_doc::{derive_mesh, GeneratorKind};
+    fn cablenet_wireframe_geodesic_segments_plain_mesh_stays_shaded() {
+        use itsjustcad_doc::{derive_mesh, derive_segments, GeneratorKind};
         let mut doc = Document::default();
-        // A cablenet: wireframe generator → lines, no shaded mesh.
+        // A cablenet: wireframe SURFACE generator → mesh-edge lines, no shaded mesh.
         let cn = GeneratorKind::Cablenet;
         let cn_params = cn.default_params();
         doc.insert(SceneObject {
@@ -641,11 +653,15 @@ mod tests {
                 params: cn_params.clone(),
                 placement: glam::DMat4::IDENTITY,
                 mesh: derive_mesh(cn, &cn_params).unwrap(),
+                wire: Vec::new(),
             },
         });
-        // A geodesic: normal parametric → shaded mesh, not lines.
+        // A geodesic: strut LATTICE → member-segment lines (empty mesh), no tubes.
         let gd = GeneratorKind::Geodesic;
         let gd_params = gd.default_params();
+        let gd_wire = derive_segments(gd, &gd_params).unwrap();
+        let gd_wire_len = gd_wire.len();
+        assert!(gd_wire_len > 0, "geodesic derives member segments");
         doc.insert(SceneObject {
             visible: true,
             id: ObjectId::new(),
@@ -658,17 +674,24 @@ mod tests {
                 generator: gd,
                 params: gd_params.clone(),
                 placement: glam::DMat4::IDENTITY,
-                mesh: derive_mesh(gd, &gd_params).unwrap(),
+                mesh: kernel_mesh::Mesh::default(),
+                wire: gd_wire,
             },
         });
+        // A plain mesh triangle: the only shaded thing in the scene.
+        insert_tri(&mut doc, "default");
+
         let scene = snapshot(&doc, Theme::Dark);
-        // Exactly one shaded mesh (the geodesic); the cablenet contributes none.
-        assert_eq!(scene.meshes.len(), 1, "only the geodesic is a shaded mesh");
-        // The cablenet's grid edges are in scene.lines. A 10×10 grid surface has
-        // 2·10·9 + 9·9 = 261 unique edges → 261 line strips.
-        let expected_edges = 2 * 10 * 9 + 9 * 9;
-        assert_eq!(scene.lines.len(), expected_edges, "cablenet grid edges as lines");
-        assert!(scene.lines.iter().all(|(pts, _, _)| pts.len() == 2), "each edge is a 2-point strip");
+        // Exactly one shaded mesh (the plain triangle); cablenet + geodesic are lines.
+        assert_eq!(scene.meshes.len(), 1, "only the plain mesh is shaded");
+        // cablenet grid edges (10×10 surface: 2·10·9 + 9·9 = 261) + geodesic members.
+        let cablenet_edges = 2 * 10 * 9 + 9 * 9;
+        assert_eq!(
+            scene.lines.len(),
+            cablenet_edges + gd_wire_len,
+            "cablenet grid edges + geodesic member segments as lines"
+        );
+        assert!(scene.lines.iter().all(|(pts, _, _)| pts.len() == 2), "each line is a 2-point strip");
     }
 
     #[test]

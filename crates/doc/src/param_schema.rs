@@ -204,6 +204,26 @@ impl GeneratorKind {
             GeneratorKind::Cablenet | GeneratorKind::Hypar | GeneratorKind::GaussVault
         )
     }
+
+    /// Whether this generator is a strut LATTICE rendered as its member segments
+    /// (lightweight lines), NOT as 3D strut tubes. For these kinds the parametric
+    /// object stores its members in `Geometry::Parametric::wire` and leaves
+    /// `mesh` empty; the renderer draws the wire as line segments (respecting the
+    /// object color + lineweight). [`derive_segments`] produces those members.
+    ///
+    /// Distinct from [`renders_as_wireframe`](Self::renders_as_wireframe): that
+    /// path draws a form-found SURFACE mesh's natural edges; this path draws raw
+    /// member segments (a tube mesh's edges would be facet clutter).
+    pub fn renders_as_segments(self) -> bool {
+        matches!(
+            self,
+            GeneratorKind::SpaceFrame
+                | GeneratorKind::Geodesic
+                | GeneratorKind::Tensegrity
+                | GeneratorKind::Funicular
+                | GeneratorKind::Gridshell
+        )
+    }
 }
 
 /// One typed parameter value. Serde tag keeps saved files self-describing and
@@ -617,6 +637,78 @@ pub fn derive_mesh(kind: GeneratorKind, params: &ParamMap) -> Result<Mesh, Deriv
             Ok(mesh)
         }
     }
+}
+
+/// Derive the member SEGMENTS for a strut-lattice generator (spaceframe,
+/// geodesic, tensegrity, funicular, gridshell). **Pure** function of
+/// `(generator, params)` — same input yields byte-identical segments, so a param
+/// change replays deterministically. Returns an EMPTY vec for surface/normal
+/// generators (they use [`derive_mesh`]). The caller sanitizes params; this
+/// re-sanitizes to stay self-contained. Each segment is `[start, end]`.
+///
+/// This is the SINGLE segment-derive path shared by the creating verbs,
+/// `paramset`, and op-log replay — mirroring [`derive_mesh`].
+pub fn derive_segments(
+    kind: GeneratorKind,
+    params: &ParamMap,
+) -> Result<Vec<[DVec3; 2]>, DeriveError> {
+    if !kind.renders_as_segments() {
+        return Ok(Vec::new());
+    }
+    let p = kind.schema().sanitize(params);
+    let pairs: Vec<(DVec3, DVec3)> = match kind {
+        GeneratorKind::Geodesic => {
+            let frequency = get_i(&p, "frequency").max(1) as u32;
+            let radius = get_f(&p, "radius");
+            let dome = p.get("mode").and_then(|v| v.as_enum()) != Some("full");
+            let (_, segs) = kernel_mesh::geodesic_network(frequency, radius, dome);
+            segs
+        }
+        GeneratorKind::SpaceFrame => {
+            let nx = get_i(&p, "nx").max(1) as u32;
+            let ny = get_i(&p, "ny").max(1) as u32;
+            let bay = get_f(&p, "bay");
+            let depth = get_f(&p, "depth");
+            kernel_mesh::spaceframe_struts(nx, ny, bay, depth)
+        }
+        GeneratorKind::Tensegrity => {
+            let struts = get_i(&p, "struts").clamp(3, 256) as u32;
+            let r = get_f(&p, "radius");
+            let h = get_f(&p, "height");
+            let tw = get_f(&p, "twist_deg").to_radians();
+            let t = kernel_mesh::tensegrity_prism(struts, r, h, tw);
+            let mut segs = t.net.strut_segments();
+            segs.extend(t.net.cable_segments());
+            segs
+        }
+        GeneratorKind::Funicular => {
+            let sa = get_v(&p, "support_a");
+            let sb = get_v(&p, "support_b");
+            if (sb - sa).length() < 1e-6 {
+                return Err(DeriveError::Invalid("funicular supports must be distinct".into()));
+            }
+            let seg = get_i(&p, "segments").clamp(2, 256) as u32;
+            let load = get_f(&p, "load").max(0.0);
+            let slack = get_f(&p, "slack");
+            let mut pts = kernel_mesh::funicular_chain(sa, sb, seg, load, slack);
+            if get_b(&p, "invert") {
+                pts = kernel_mesh::invert_funicular(&pts);
+            }
+            pts.windows(2).map(|w| (w[0], w[1])).collect()
+        }
+        GeneratorKind::Gridshell => {
+            let (a, b, c) = (get_f(&p, "a"), get_f(&p, "b"), get_f(&p, "c"));
+            let nu = get_i(&p, "nu").max(2) as u32;
+            let nv = get_i(&p, "nv").max(2) as u32;
+            let surface = kernel_mesh::GridshellSurface::Hypar { a, b, c };
+            kernel_mesh::gridshell_segments(surface, nu, nv)
+        }
+        // Non-lattice kinds are handled by the early return above.
+        GeneratorKind::Hypar
+        | GeneratorKind::GaussVault
+        | GeneratorKind::Cablenet => Vec::new(),
+    };
+    Ok(pairs.into_iter().map(|(a, b)| [a, b]).collect())
 }
 
 /// A short one-line summary of the key params for a card ("freq 3, r=5 m").
