@@ -9,14 +9,17 @@
 //!   powertrim — sel + PickPoint            → `powertrim sel <pt>`
 //!   fillet    — pick curve A, curve B, radius → `fillet #a #b <r>`
 //!   chamfer   — pick curve A, curve B, distance → `chamfer #a #b <d>`
-//!   trim      — pick target, cutter, keep pt  → `trim #target #cutter <pt>`
+//!   trim      — select cutters (Enter), click parts to remove (Enter)
+//!               → `trim #c1 #c2 … remove <p1> <p2> …`
 //!   boundary  — no sel, PickPoint           → `boundary <pt>`
 //!   divide    — sel + Integer               → `divide sel <count>`
 //!   curvebool — sel + Keyword               → `curvebool <op> sel`
 //!   join      — sel, zero steps (emit-on-start) → `join sel`
 //!   explode   — sel, zero steps (emit-on-start) → `explode sel`
 
-use super::assemble::{captured_points, int_at, key_at, num_at, obj_at, point_at, selector};
+use super::assemble::{
+    captured_points, int_at, key_at, num_at, obj_at, object_set_at, point_at, points_at, selector,
+};
 use super::{fmt, num, Input, ObjFilter, Step, VerbScript};
 
 pub static SCRIPTS: &[VerbScript] = &[
@@ -82,17 +85,14 @@ pub static SCRIPTS: &[VerbScript] = &[
         verb: "trim",
         needs_selection: false,
         steps: &[
-            Step::SelectObject {
-                prompt: "Select object to trim",
+            // Rhino's two-phase trim: pick the cutting objects as a SET (Enter when
+            // done), then click each piece to REMOVE (Enter finishes).
+            Step::SelectObjects {
+                prompt: "Select cutting objects (Enter when done)",
                 filter: ObjFilter::Any,
-                capture_point: false,
+                min: 1,
             },
-            Step::SelectObject {
-                prompt: "Select cutting object",
-                filter: ObjFilter::Any,
-                capture_point: false,
-            },
-            Step::PickPoint { prompt: "Pick the part to remove" },
+            Step::PointList { prompt: "Click the parts to remove (Enter to finish)", min: 1 },
         ],
         assemble: assemble_trim,
     },
@@ -186,12 +186,16 @@ fn assemble_chamfer(args: &[Input]) -> Result<String, String> {
     Ok(format!("chamfer {a} {b} {}", num(d)))
 }
 
-/// `[Objects(#target), Objects(#cutter), Point(keep)] -> "trim #target #cutter <keep>"`
+/// `[ObjectSet([#c1,#c2,…]), Points([p1,p2,…])] -> "trim #c1 #c2 … remove <p1> <p2> …"`
+///
+/// Rhino two-phase trim: the cutter SET, the literal `remove`, then the click
+/// points identifying the pieces to delete. (The `extend` variant is reachable
+/// via the typed command; the guided flow always emits `remove`.)
 fn assemble_trim(args: &[Input]) -> Result<String, String> {
-    let target = obj_at(args, 0, "trim")?;
-    let cutter = obj_at(args, 1, "trim")?;
-    let keep = point_at(args, 2, "trim")?;
-    Ok(format!("trim {target} {cutter} {}", fmt(keep)))
+    let cutters = object_set_at(args, 0, "trim")?;
+    let removes = points_at(args, 1, "trim")?;
+    let pts = removes.iter().map(|p| fmt(*p)).collect::<Vec<_>>().join(" ");
+    Ok(format!("trim {cutters} remove {pts}"))
 }
 
 /// `[Objects(sel), Int(count)] -> "divide sel <count>"`
@@ -316,13 +320,17 @@ mod tests {
 
     #[test]
     fn assemble_trim_pure() {
+        // Cutter SET + a run of removal points → `trim #c1 #c2 remove <p1> <p2>`.
         let args = [
-            Input::Objects("#aaaa1111".into()),
-            Input::Objects("#bbbb2222".into()),
-            Input::Point(DVec3::new(2.0, 1.0, 0.0)),
+            Input::ObjectSet(vec!["#aaaa1111".into(), "#bbbb2222".into()]),
+            Input::Points(vec![DVec3::new(2.0, 1.0, 0.0), DVec3::new(8.0, 0.0, 0.0)]),
         ];
-        assert_eq!(assemble_trim(&args).unwrap(), "trim #aaaa1111 #bbbb2222 2,1");
-        assert!(assemble_trim(&args[..2]).is_err());
+        assert_eq!(
+            assemble_trim(&args).unwrap(),
+            "trim #aaaa1111 #bbbb2222 remove 2,1 8,0"
+        );
+        // Missing the removal points is an error.
+        assert!(assemble_trim(&args[..1]).is_err());
     }
 
     #[test]
@@ -447,16 +455,23 @@ mod tests {
     }
 
     #[test]
-    fn trim_walk_picks_target_cutter_then_keep_point() {
+    fn trim_walk_selects_cutters_then_removal_points() {
         let mut t = GuidedTool::default();
         assert_eq!(t.try_start("trim", None), StartResult::Started);
-        t.commit_object("aaaa1111");
-        t.commit_object("bbbb2222");
-        assert!(t.current_is_point(), "third step is the keep point");
+        // Phase 1: multi-select the cutting objects, Enter (finish_objects).
+        assert!(t.current_wants_objects());
+        assert_eq!(t.push_selected_object("aaaa1111"), StepResult::NeedMore);
+        assert_eq!(t.push_selected_object("bbbb2222"), StepResult::NeedMore);
+        assert_eq!(t.finish_objects(), StepResult::NeedMore);
+        // Phase 2: click the parts to remove, Enter (finish_list).
+        assert!(t.current_wants_point_list());
+        assert_eq!(t.push_list_point(DVec3::new(2.0, 1.0, 0.0)), StepResult::NeedMore);
+        assert_eq!(t.push_list_point(DVec3::new(8.0, 0.0, 0.0)), StepResult::NeedMore);
         assert_eq!(
-            t.on_click(DVec3::new(2.0, 1.0, 0.0)),
-            StepResult::Emit("trim #aaaa1111 #bbbb2222 2,1".into())
+            t.finish_list(),
+            StepResult::Emit("trim #aaaa1111 #bbbb2222 remove 2,1 8,0".into())
         );
+        assert!(!t.active());
     }
 
     #[test]

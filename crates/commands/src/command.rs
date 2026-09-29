@@ -923,14 +923,22 @@ pub enum Command {
         target: Selector,
         count: u32,
     },
-    /// Trim a curve at its intersections with cutter curves, keeping only the
-    /// piece nearest `keep`; the rest is removed.
+    /// Rhino two-phase trim: intersect the target curve(s) with a SET of cutter
+    /// curves, then for each point in `removes` delete the piece of the crossed
+    /// curve that CONTAINS the point (the clicked segment). When `extend` is true,
+    /// each point instead extends the curve it lands on to the nearest cutter.
+    ///
+    /// The target curve for each removal point is found implicitly (the curve
+    /// nearest that point among all non-cutter curves), so removal points may hit
+    /// different objects. `ids` holds the flat list of created replacement-curve
+    /// ids across all removals, reused on replay for stability.
     Trim {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        id: Option<ObjectId>,
-        target: Selector,
-        cutter: Selector,
-        keep: DVec3,
+        ids: Option<Vec<ObjectId>>,
+        cutters: Vec<Selector>,
+        removes: Vec<DVec3>,
+        #[serde(default)]
+        extend: bool,
     },
     /// PowerTrim a curve against *every* other curve in the document at once
     /// (DraftSight/AutoCAD PowerTrim): split the target at all its intersections

@@ -482,8 +482,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "trim",
-            usage: "trim <target selector> <cutter selector> <keep point x,y>",
-            summary: "Cut a curve where it crosses the cutter curve(s) and keep only the piece nearest the keep point; the rest is removed. Example: trim wall slab 1,1",
+            usage: "trim <cutter selector…> remove <point x,y…>  |  trim <cutter…> extend <point…>",
+            summary: "Rhino two-phase trim: pick cutting curves, then click each piece to remove (the clicked segment between crossings is deleted). 'extend' instead grows the picked curve to the nearest cutter. Example: trim #a #b remove 2,0 8,0",
             category: Category::Curve,
         },
         CommandSpec {

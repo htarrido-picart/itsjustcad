@@ -1114,13 +1114,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 .map_err(|_| wrong_err("divide", "a segment count after the selector", args))?;
             Ok(Command::Divide { id: None, target: sel, count: integer(n, "divide")? })
         }),
-        "trim" => {
-            let (target, rest) = selector(&args, "trim")?;
-            let (cutter, rest) = selector(rest, "trim")?;
-            let [keep] = take::<1>("trim", "a keep point after the two selectors", rest)
-                .map_err(|_| wrong_err("trim", "a keep point after the two selectors", &args))?;
-            Ok(Command::Trim { id: None, target, cutter, keep: point(keep)? })
-        }
+        "trim" => trim_command(&args),
         "powertrim" => {
             let (target, rest) = selector(&args, "powertrim")?;
             let [pick] = take::<1>("powertrim", "a pick point after the selector", rest)
@@ -3891,6 +3885,45 @@ fn selector<'a>(
     }
 }
 
+/// Parse a Rhino two-phase `trim`:
+/// `trim <cutter…> remove <p…>` or `trim <cutter…> extend <p…>`.
+///
+/// The cutters are a run of selector tokens (typically `#<id>`) up to the literal
+/// `remove` or `extend` keyword; everything after is the run of removal/extend
+/// points. Requires at least one cutter and at least one point.
+fn trim_command(args: &[&str]) -> Result<Command, ParseError> {
+    // Find the mode keyword splitting cutters from points.
+    let split = args
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case("remove") || t.eq_ignore_ascii_case("extend"));
+    let Some(kw_at) = split else {
+        return Err(wrong_err(
+            "trim",
+            "cutter selectors, then 'remove' (or 'extend'), then points",
+            args,
+        ));
+    };
+    let extend = args[kw_at].eq_ignore_ascii_case("extend");
+    let cutter_toks = &args[..kw_at];
+    let point_toks = &args[kw_at + 1..];
+    if cutter_toks.is_empty() {
+        return Err(wrong_err("trim", "at least one cutter selector before the keyword", args));
+    }
+    if point_toks.is_empty() {
+        return Err(wrong_err("trim", "at least one point after the keyword", args));
+    }
+    // Each cutter token is its own single selector (so `#a #b` → two selectors).
+    let mut cutters = Vec::with_capacity(cutter_toks.len());
+    for tok in cutter_toks {
+        cutters.push(selector_one(tok)?);
+    }
+    let mut removes = Vec::with_capacity(point_toks.len());
+    for tok in point_toks {
+        removes.push(point(tok)?);
+    }
+    Ok(Command::Trim { ids: None, cutters, removes, extend })
+}
+
 pub(crate) fn selector_one(s: &str) -> Result<Selector, ParseError> {
     let args = [s];
     selector(&args, "extrude").map(|(sel, _)| sel)
@@ -5277,15 +5310,24 @@ mod tests {
             Command::Split { ids: None, target: Selector::Last { n: 1 }, point }
                 if point == DVec3::new(5.0, 0.0, 0.0)
         ));
+        // Two-phase trim: cutter set + `remove` + points.
+        let trim = parse("trim #a #b remove 2,0 8,0").unwrap();
         assert!(matches!(
-            parse("trim wall slab 1,1").unwrap(),
-            Command::Trim {
-                id: None,
-                target: Selector::Named { .. },
-                cutter: Selector::Named { .. },
-                keep,
-            } if keep == DVec3::new(1.0, 1.0, 0.0)
+            &trim,
+            Command::Trim { ids: None, cutters, removes, extend: false }
+                if cutters.len() == 2
+                    && removes == &vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(8.0, 0.0, 0.0)]
         ));
+        // The `extend` variant flips the mode flag.
+        assert!(matches!(
+            parse("trim #a extend 5,5").unwrap(),
+            Command::Trim { ids: None, cutters, removes, extend: true }
+                if cutters.len() == 1 && removes == vec![DVec3::new(5.0, 5.0, 0.0)]
+        ));
+        // Missing the keyword or a side is an error.
+        assert!(parse("trim #a #b 2,0").is_err());
+        assert!(parse("trim remove 2,0").is_err());
+        assert!(parse("trim #a remove").is_err());
         assert!(matches!(
             parse("powertrim wall 5,0").unwrap(),
             Command::PowerTrim { ids: None, target: Selector::Named { .. }, pick }
@@ -5380,7 +5422,9 @@ mod tests {
     fn curve_edit_command_json_roundtrip() {
         for line in [
             "split last 5,0",
-            "trim wall slab 1,1",
+            "trim wall slab remove 1,1",
+            "trim #a #b remove 2,0 8,0",
+            "trim #a extend 5,5",
             "powertrim wall 5,0",
             "extend last 0.5",
             "join last 3",
@@ -7058,7 +7102,7 @@ mod tests {
         // `#<shortid>` selector tokens). Prove the parser accepts them all.
         for s in [
             "fillet #a1b2c3d4 #00ffee11 0.5",
-            "trim #aaaa1111 #bbbb2222 2,1",
+            "trim #aaaa1111 #bbbb2222 remove 2,1",
             "difference #aaaa1111 #bbbb2222",
             "union sel",
             "intersect sel",

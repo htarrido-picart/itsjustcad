@@ -57,6 +57,13 @@ pub enum Step {
     /// curve chooses which corner gets the arc (Rhino behavior). Plain object
     /// picks (trim/difference) leave it false — no point is captured.
     SelectObject { prompt: &'static str, filter: ObjFilter, capture_point: bool },
+    /// Interactively pick a **set** of objects (Rhino's "select … press Enter"):
+    /// each click (or box-drag) adds one object's short id to a growing set, and
+    /// Enter finishes the step once at least `min` are collected. Modeled on
+    /// [`Step::PointList`] but for objects — the collected ids are folded into an
+    /// [`Input::Objects`] token run (`#a #b …`) at the step's slot. Powers trim's
+    /// "select cutting objects" phase.
+    SelectObjects { prompt: &'static str, filter: ObjFilter, min: usize },
     /// A free-text token (an object name, block name, layer name). Collects a
     /// single whitespace-free token so the value round-trips through the
     /// whitespace-tokenized parser. Letters/digits plus `_`/`-` are accepted.
@@ -111,6 +118,9 @@ pub enum Input {
     Text(String),
     /// A variadic point list collected by a [`Step::PointList`].
     Points(Vec<DVec3>),
+    /// A variadic set of picked object selector tokens (each already `#`-prefixed),
+    /// collected by a [`Step::SelectObjects`]. Assemblers join them with spaces.
+    ObjectSet(Vec<String>),
 }
 
 /// A verb's guided script: its ordered steps plus a **pure** assembler turning
@@ -159,6 +169,10 @@ pub struct GuidedTool {
     /// Points collected so far for an in-progress [`Step::PointList`] step.
     /// Emptied when the step finishes (folded into an [`Input::Points`]).
     list: Vec<DVec3>,
+    /// Object short-ids (`#`-prefixed) collected so far for an in-progress
+    /// [`Step::SelectObjects`] step. Emptied when the step finishes (folded into
+    /// an [`Input::ObjectSet`]).
+    selected: Vec<String>,
     /// The chosen [`Step::Branch`] arm's steps, once selected. `None` until the
     /// branch is committed; then it supplies every step after the branch slot.
     branch: Option<&'static [Step]>,
@@ -193,6 +207,7 @@ impl GuidedTool {
         self.done.clear();
         self.input.clear();
         self.list.clear();
+        self.selected.clear();
         self.branch = None;
         self.captured.clear();
         StartResult::Started
@@ -208,6 +223,7 @@ impl GuidedTool {
         self.done.clear();
         self.input.clear();
         self.list.clear();
+        self.selected.clear();
         self.branch = None;
         self.captured.clear();
     }
@@ -255,6 +271,20 @@ impl GuidedTool {
         matches!(self.current_step(), Some(Step::SelectObject { .. }))
     }
 
+    /// True when the current step is a variadic multi-object select
+    /// ([`Step::SelectObjects`]).
+    pub fn current_wants_objects(&self) -> bool {
+        matches!(self.current_step(), Some(Step::SelectObjects { .. }))
+    }
+
+    /// How many objects have been picked so far for an in-progress
+    /// [`Step::SelectObjects`] step. Public accessor for the app's status/HUD; the
+    /// prompt itself already folds in the count.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn selected_count(&self) -> usize {
+        self.selected.len()
+    }
+
     /// True when the current step collects a free-text token ([`Step::Text`]).
     pub fn current_wants_text(&self) -> bool {
         matches!(self.current_step(), Some(Step::Text { .. }))
@@ -286,10 +316,13 @@ impl GuidedTool {
         )
     }
 
-    /// The geometry filter for the current [`Step::SelectObject`], if any.
+    /// The geometry filter for the current object-pick step — single
+    /// ([`Step::SelectObject`]) or multi ([`Step::SelectObjects`]) — if any.
     pub fn current_filter(&self) -> Option<ObjFilter> {
         match self.current_step() {
-            Some(Step::SelectObject { filter, .. }) => Some(*filter),
+            Some(Step::SelectObject { filter, .. } | Step::SelectObjects { filter, .. }) => {
+                Some(*filter)
+            }
             _ => None,
         }
     }
@@ -378,6 +411,43 @@ impl GuidedTool {
         self.maybe_finish()
     }
 
+    /// Append one picked object (by short id) to an in-progress
+    /// [`Step::SelectObjects`] set. Stored as a `#`-prefixed selector token (like
+    /// [`Self::commit_object_at`]). Duplicate picks are ignored so a double-click
+    /// on the same object doesn't add it twice. No-op with `NeedMore` when the
+    /// current step isn't a multi-object select.
+    pub fn push_selected_object(&mut self, short_id: &str) -> StepResult {
+        if !matches!(self.current_step(), Some(Step::SelectObjects { .. })) {
+            return StepResult::NeedMore;
+        }
+        let tok = format!("#{short_id}");
+        if !self.selected.contains(&tok) {
+            self.selected.push(tok);
+        }
+        self.input.clear();
+        StepResult::NeedMore
+    }
+
+    /// Finish a [`Step::SelectObjects`] on Enter: if at least `min` objects were
+    /// collected, fold them into an [`Input::ObjectSet`] and advance; otherwise
+    /// stay on the step and report how many more are needed.
+    pub fn finish_objects(&mut self) -> StepResult {
+        let Some(Step::SelectObjects { min, .. }) = self.current_step() else {
+            return StepResult::Error("not expecting an object selection here".into());
+        };
+        let min = *min;
+        if self.selected.len() < min {
+            return StepResult::Error(format!(
+                "select at least {min} object(s) ({} so far)",
+                self.selected.len()
+            ));
+        }
+        let ids = std::mem::take(&mut self.selected);
+        self.done.push(Input::ObjectSet(ids));
+        self.input.clear();
+        self.maybe_finish()
+    }
+
     /// Last picked point among seed+collected — anchor for relative/ortho input.
     pub fn last_point(&self) -> Option<DVec3> {
         self.seed
@@ -404,7 +474,7 @@ impl GuidedTool {
             // emitted value a single token for the whitespace-tokenized parser).
             Some(Step::Text { .. }) => c.is_alphanumeric() || c == '_' || c == '-',
             // Object picks are click-only — nothing to type into a buffer.
-            Some(Step::SelectObject { .. }) => false,
+            Some(Step::SelectObject { .. } | Step::SelectObjects { .. }) => false,
             _ => crate::precise::accepts_char(c),
         };
         if ok {
@@ -441,6 +511,9 @@ impl GuidedTool {
             Step::PickPoint { prompt } => format!("{prompt} (Esc cancels):"),
             Step::Vector { prompt } => format!("{prompt} (Esc cancels):"),
             Step::SelectObject { prompt, .. } => format!("{prompt} (Esc cancels):"),
+            Step::SelectObjects { prompt, .. } => {
+                format!("{prompt} ({} so far):", self.selected.len())
+            }
             Step::Text { prompt } => format!("{prompt}:"),
             Step::PointList { prompt, .. } => {
                 format!("{prompt} ({} so far):", self.list.len())
@@ -542,6 +615,9 @@ impl GuidedTool {
             Some(Step::SelectObject { .. }) => {
                 StepResult::Error("click an object to select it".into())
             }
+            // A multi-object select: Enter finishes the set (routed by the app to
+            // finish_objects), typing does nothing.
+            Some(Step::SelectObjects { .. }) => self.finish_objects(),
             // Text/PointList have dedicated commit paths (commit_text /
             // finish_list); the app routes their Enter there, not here.
             Some(Step::Text { .. }) => self.commit_text(),
@@ -787,6 +863,15 @@ mod assemble {
         let mut tail: Vec<glam::DVec3> = pts.into_iter().take(count).collect();
         tail.reverse();
         Some(tail)
+    }
+
+    /// A variadic object set at index `i` (from a [`super::Step::SelectObjects`]),
+    /// as a run of `#`-prefixed selector tokens joined by spaces (`"#a #b"`).
+    pub fn object_set_at(args: &[Input], i: usize, verb: &str) -> Result<String, String> {
+        match args.get(i) {
+            Some(Input::ObjectSet(ids)) => Ok(ids.join(" ")),
+            _ => Err(format!("{verb}: missing object selection at step {i}")),
+        }
     }
 
     /// A variadic point list at index `i`.
@@ -1063,6 +1148,61 @@ mod tests {
             StepResult::Emit("obj #a1b2c3d4 #00ffee11".into())
         );
         assert!(!t.active());
+    }
+
+    // A throwaway script exercising the multi-object SelectObjects step (trim's
+    // cutter phase), followed by a point list (the removal phase).
+    static OBJSET_TEST: VerbScript = VerbScript {
+        verb: "__objsettest",
+        needs_selection: false,
+        steps: &[
+            Step::SelectObjects { prompt: "Cutters", filter: ObjFilter::Any, min: 1 },
+            Step::PointList { prompt: "Removals", min: 1 },
+        ],
+        assemble: |args| {
+            let cutters = super::assemble::object_set_at(args, 0, "os")?;
+            let pts = super::assemble::points_at(args, 1, "os")?;
+            let joined = pts.iter().map(|p| fmt(*p)).collect::<Vec<_>>().join(" ");
+            Ok(format!("os {cutters} remove {joined}"))
+        },
+    };
+
+    #[test]
+    fn select_objects_step_collects_a_set_and_finishes_at_min() {
+        let mut t = GuidedTool { script: Some(&OBJSET_TEST), ..Default::default() };
+        assert!(t.current_wants_objects());
+        assert_eq!(t.current_filter(), Some(ObjFilter::Any));
+        assert_eq!(t.prompt().unwrap(), "Cutters (0 so far):");
+        // Click-only: typing does nothing.
+        assert!(!t.push_input('a'));
+        // Below min(1): finishing is refused, step stays put.
+        assert!(matches!(t.finish_objects(), StepResult::Error(_)));
+        // Add two cutters (a duplicate pick is ignored).
+        assert_eq!(t.push_selected_object("aaaa1111"), StepResult::NeedMore);
+        assert_eq!(t.push_selected_object("aaaa1111"), StepResult::NeedMore);
+        assert_eq!(t.push_selected_object("bbbb2222"), StepResult::NeedMore);
+        assert_eq!(t.selected_count(), 2, "duplicate is not double-counted");
+        assert_eq!(t.prompt().unwrap(), "Cutters (2 so far):");
+        // Enter finishes the set → advances to the point list.
+        assert_eq!(t.finish_objects(), StepResult::NeedMore);
+        assert!(t.current_wants_point_list());
+        // Removal points, Enter emits.
+        t.push_list_point(DVec3::new(5.0, 0.0, 0.0));
+        assert_eq!(
+            t.finish_list(),
+            StepResult::Emit("os #aaaa1111 #bbbb2222 remove 5,0".into())
+        );
+        assert!(!t.active());
+    }
+
+    #[test]
+    fn select_objects_ignores_stray_calls_on_wrong_step() {
+        let mut t = GuidedTool::default();
+        t.try_start("offset", Some("sel")); // first step is a Number
+        assert!(!t.current_wants_objects());
+        // push_selected_object is a harmless no-op off-step.
+        assert_eq!(t.push_selected_object("aaaa1111"), StepResult::NeedMore);
+        assert!(matches!(t.finish_objects(), StepResult::Error(_)));
     }
 
     #[test]

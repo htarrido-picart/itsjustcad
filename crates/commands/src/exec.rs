@@ -7564,6 +7564,84 @@ fn powertrim_drop_index(pieces: &[Curve], pick: DVec3) -> usize {
         .expect("pieces is non-empty")
 }
 
+/// The curve in `doc` whose geometry passes nearest `point`, excluding the
+/// cutter set (Rhino's "click the object to trim"). Returns `None` when the doc
+/// has no eligible curve or the nearest one is farther than [`TRIM_PICK_TOL`].
+fn nearest_curve_to_point(doc: &Document, point: DVec3, cutters: &[ObjectId]) -> Option<ObjectId> {
+    /// A click must land within this world distance of a curve to select it —
+    /// generous so imprecise picks still catch the intended curve, but finite so a
+    /// stray click in empty space hits nothing (skipped with a note).
+    const TRIM_PICK_TOL: f64 = 1.0;
+    doc.objects()
+        .filter(|o| !cutters.contains(&o.id))
+        .filter_map(|o| match &o.geometry {
+            Geometry::Curve(c) => {
+                let d = kernel_curve::closest_point(c, point, PROFILE_TOL).distance(point);
+                Some((o.id, d))
+            }
+            _ => None,
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).expect("finite distances"))
+        .filter(|(_, d)| *d <= TRIM_PICK_TOL)
+        .map(|(id, _)| id)
+}
+
+/// Extend the open end of `curve` NEAREST `pick` to meet the closest cutter.
+///
+/// Grows the curve by a large distance, intersects the grown curve with the
+/// cutters, and clamps the extended end back to the nearest new intersection that
+/// lies BEYOND the original end (in the extension direction). Returns `None` when
+/// the curve is closed/unextendable or no cutter lies ahead of the picked end.
+fn extend_to_cutters(curve: &Curve, pick: DVec3, cutters: &[Curve]) -> Option<Curve> {
+    // Which end are we extending? The endpoint nearest the pick.
+    let (a, b) = match curve {
+        Curve::Line { a, b } => (*a, *b),
+        Curve::Polyline { points, closed: false } if points.len() >= 2 => {
+            (points[0], *points.last().expect("len>=2"))
+        }
+        _ => return None,
+    };
+    let extend_start = pick.distance(a) <= pick.distance(b);
+    // Grow both ends by a large span, then find the nearest cutter hit ahead of
+    // the picked end.
+    const SPAN: f64 = 1.0e6;
+    let grown = kernel_curve::extend(curve, SPAN)?;
+    let end = if extend_start { a } else { b };
+    let dir = if extend_start { (a - b).normalize_or_zero() } else { (b - a).normalize_or_zero() };
+    if dir == DVec3::ZERO {
+        return None;
+    }
+    let mut best: Option<(f64, DVec3)> = None;
+    for cc in cutters {
+        for hit in kernel_curve::intersections(&grown, cc, PROFILE_TOL) {
+            let t = (hit - end).dot(dir); // signed distance ahead of the end
+            if t > PROFILE_TOL && best.is_none_or(|(bt, _)| t < bt) {
+                best = Some((t, hit));
+            }
+        }
+    }
+    let (_, target) = best?;
+    // Rebuild the curve with the picked end moved to the cutter intersection.
+    match curve {
+        Curve::Line { a, b } => Some(if extend_start {
+            Curve::Line { a: target, b: *b }
+        } else {
+            Curve::Line { a: *a, b: target }
+        }),
+        Curve::Polyline { points, .. } => {
+            let mut points = points.clone();
+            if extend_start {
+                points[0] = target;
+            } else {
+                let last = points.len() - 1;
+                points[last] = target;
+            }
+            Some(Curve::Polyline { points, closed: false })
+        }
+        _ => None,
+    }
+}
+
 fn curve_of<'a>(doc: &'a Document, id: ObjectId, verb: &str) -> Result<&'a Curve, ExecError> {
     match &doc.get(id).expect("resolved").geometry {
         Geometry::Curve(c) => Ok(c),
@@ -10323,74 +10401,164 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Trim { id, target, cutter, keep } => {
-            let cutter_ids = resolve(doc, &cutter)?;
-            // Cutters win overlaps, so "trim last 2 last <point>" reads
-            // naturally: target = the older of the two most recent curves.
-            let target_ids: Vec<ObjectId> = resolve(doc, &target)?
-                .into_iter()
-                .filter(|tid| !cutter_ids.contains(tid))
-                .collect();
-            let [tid] = target_ids[..] else {
+        Command::Trim { ids, cutters, removes, extend } => {
+            // Resolve the cutter SET (Rhino phase 1). Every cutter must be a curve;
+            // cutters are never themselves trimmed.
+            let mut cutter_ids: Vec<ObjectId> = Vec::new();
+            for sel in &cutters {
+                for cid in resolve(doc, sel)? {
+                    if !cutter_ids.contains(&cid) {
+                        cutter_ids.push(cid);
+                    }
+                }
+            }
+            if cutter_ids.is_empty() {
+                return Err(ExecError::Invalid("trim: no cutting objects".into()));
+            }
+            let cutter_curves: Vec<Curve> = cutter_ids
+                .iter()
+                .map(|cid| curve_of(doc, *cid, "trim (cutter)").cloned())
+                .collect::<Result<_, _>>()?;
+
+            // Map each removal/extend point to the target curve nearest it (Rhino:
+            // click the object to trim). Points that hit no curve are skipped with a
+            // note. GROUP by target so a curve hit by several picks is split ONCE
+            // and all its clicked segments drop together — this matches Rhino and
+            // avoids re-stripping an already-trimmed piece (which would leave a
+            // cutter-to-cutter span with no interior crossing).
+            let mut notes: Vec<String> = Vec::new();
+            // Preserve first-hit order of targets for deterministic id assignment.
+            let mut order: Vec<ObjectId> = Vec::new();
+            let mut picks_by_target: std::collections::HashMap<ObjectId, Vec<DVec3>> =
+                std::collections::HashMap::new();
+            for (i, pick) in removes.iter().copied().enumerate() {
+                match nearest_curve_to_point(doc, pick, &cutter_ids) {
+                    Some(tid) => {
+                        if !picks_by_target.contains_key(&tid) {
+                            order.push(tid);
+                        }
+                        picks_by_target.entry(tid).or_default().push(pick);
+                    }
+                    None => notes.push(format!("point {i}: no curve there — skipped")),
+                }
+            }
+
+            let mut consumed: Vec<(SceneObject, usize)> = Vec::new();
+            let mut created: Vec<ObjectId> = Vec::new();
+            let mut removed_pieces = 0usize;
+            let mut extended = 0usize;
+            // Replay: hand out pre-assigned ids in order; live: fresh ids.
+            let mut id_pool = ids.clone().unwrap_or_default().into_iter();
+
+            for tid in order {
+                let picks = &picks_by_target[&tid];
+                let curve = curve_of(doc, tid, "trim")?.clone();
+
+                if extend {
+                    // Extend each picked end to the nearest cutter, in sequence
+                    // (later picks see the already-extended curve).
+                    let mut cur = curve;
+                    let mut any = false;
+                    for pick in picks {
+                        match extend_to_cutters(&cur, *pick, &cutter_curves) {
+                            Some(new) => {
+                                cur = new;
+                                any = true;
+                            }
+                            None => notes.push("point: nothing to extend to — skipped".into()),
+                        }
+                    }
+                    if !any {
+                        continue;
+                    }
+                    let (obj, index) = doc.remove(tid).expect("resolved");
+                    consumed.push((obj.clone(), index));
+                    let pid = id_pool.next().unwrap_or_default();
+                    created.push(pid);
+                    doc.insert(SceneObject {
+                        visible: true,
+                        id: pid,
+                        name: obj.name.clone(),
+                        layer: obj.layer.clone(),
+                        color: None,
+                        material: None,
+                        lineweight_mm: None,
+                        geometry: Geometry::Curve(cur),
+                    });
+                    extended += 1;
+                    continue;
+                }
+
+                // Trim-remove: split the target ONCE at its intersections with the
+                // cutter SET, then delete every segment a pick lands in.
+                let mut cuts = Vec::new();
+                for cc in &cutter_curves {
+                    cuts.extend(kernel_curve::intersections(&curve, cc, PROFILE_TOL));
+                }
+                if cuts.is_empty() {
+                    notes.push("point: no intersection with the cutters — skipped".into());
+                    continue;
+                }
+                let Some(pieces) =
+                    kernel_curve::split_at_points(&curve, &cuts, kernel_curve::JOIN_TOL)
+                else {
+                    notes.push("point: cannot trim that curve — skipped".into());
+                    continue;
+                };
+                if pieces.len() < 2 {
+                    notes.push("point: cutters only touch the ends — skipped".into());
+                    continue;
+                }
+                // Every piece a pick lands in is dropped; the rest survive.
+                let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                for pick in picks {
+                    drop.insert(powertrim_drop_index(&pieces, *pick));
+                }
+                let survivors: Vec<Curve> = pieces
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(j, _)| !drop.contains(j))
+                    .map(|(_, c)| c)
+                    .collect();
+                let (obj, index) = doc.remove(tid).expect("resolved");
+                consumed.push((obj.clone(), index));
+                for piece in &survivors {
+                    let pid = id_pool.next().unwrap_or_default();
+                    created.push(pid);
+                    doc.insert(SceneObject {
+                        visible: true,
+                        id: pid,
+                        name: obj.name.clone(),
+                        layer: obj.layer.clone(),
+                        color: None,
+                        material: None,
+                        lineweight_mm: None,
+                        geometry: Geometry::Curve(piece.clone()),
+                    });
+                }
+                removed_pieces += drop.len();
+            }
+
+            if consumed.is_empty() {
                 return Err(ExecError::Invalid(format!(
-                    "trim target selector matched {} objects (excluding cutters), expected exactly 1",
-                    target_ids.len()
+                    "trim: nothing changed ({})",
+                    if notes.is_empty() { "no removal points".into() } else { notes.join("; ") }
                 )));
+            }
+            let mut message = if extend {
+                format!("trim: extended {extended} curve(s) to the cutters")
+            } else {
+                format!("trim: removed {removed_pieces} piece(s), {} new curve(s)", created.len())
             };
-            let curve = curve_of(doc, tid, "trim")?;
-            let mut cuts = Vec::new();
-            for cid in &cutter_ids {
-                let cut_curve = curve_of(doc, *cid, "trim (cutter)")?;
-                cuts.extend(kernel_curve::intersections(curve, cut_curve, PROFILE_TOL));
+            if !notes.is_empty() {
+                message.push_str(&format!(" ({})", notes.join("; ")));
             }
-            if cuts.is_empty() {
-                return Err(ExecError::Invalid(
-                    "target and cutter curves do not intersect — nothing to trim".into(),
-                ));
-            }
-            let pieces = kernel_curve::split_at_points(curve, &cuts, kernel_curve::JOIN_TOL)
-                .ok_or_else(|| {
-                    ExecError::Invalid(
-                        "cannot trim this curve: closed curves need 2+ intersections, \
-                         and NURBS/ellipse trimming is not supported yet"
-                            .into(),
-                    )
-                })?;
-            if pieces.len() < 2 {
-                return Err(ExecError::Invalid(
-                    "the cutter only touches the curve's ends — nothing to trim".into(),
-                ));
-            }
-            let count = pieces.len();
-            let kept = pieces
-                .into_iter()
-                .min_by(|a, b| {
-                    let da = kernel_curve::closest_point(a, keep, PROFILE_TOL).distance(keep);
-                    let db = kernel_curve::closest_point(b, keep, PROFILE_TOL).distance(keep);
-                    da.partial_cmp(&db).expect("finite distances")
-                })
-                .expect("count >= 2");
-            let id = id.unwrap_or_default();
-            let (obj, index) = doc.remove(tid).expect("resolved");
-            doc.insert(SceneObject {
-                visible: true,
-                id,
-                name: obj.name.clone(),
-                layer: obj.layer.clone(),
-                color: None,
-                material: None,
-                lineweight_mm: None,
-                geometry: Geometry::Curve(kept),
-            });
+            // `consumed` is in removal order; Inverse::Replace's undo restores it
+            // in reverse (last-removed first), which is the correct un-removal order.
             Ok((
-                Command::Trim { id: Some(id), target, cutter, keep },
-                Inverse::Replace { created: vec![id], consumed: vec![(obj, index)] },
-                ApplyOutcome {
-                    created: vec![id],
-                    message: format!(
-                        "trimmed {tid} -> {id} (kept 1 of {count} pieces)"
-                    ),
-                },
+                Command::Trim { ids: Some(created.clone()), cutters, removes, extend },
+                Inverse::Replace { created: created.clone(), consumed },
+                ApplyOutcome { created, message },
             ))
         }
         Command::PowerTrim { ids, target, pick } => {
@@ -16503,54 +16671,115 @@ mod tests {
     }
 
     #[test]
-    fn trim_keeps_piece_nearest_keep_point() {
+    fn trim_removes_clicked_piece_between_two_cutters() {
+        // Horizontal line crossed by two vertical cutters at x=3 and x=7. Clicking
+        // the MIDDLE segment (x=5) deletes it, keeping the two end pieces (Rhino).
         let mut s = Session::default();
         run(&mut s, "line 0,0 10,0");
         run(&mut s, "name last wall");
-        run(&mut s, "line 4,-1 4,1");
-        let out = run(&mut s, "trim wall last 0,0"); // keep the left piece
-        assert!(out.message.contains("kept 1 of 2"), "{}", out.message);
-        assert_eq!(s.doc.len(), 2);
-        let kept = s.doc.find_named("wall");
-        assert_eq!(kept.len(), 1, "trimmed piece keeps the name");
-        let Geometry::Curve(Curve::Line { a, b }) = &s.doc.get(kept[0]).unwrap().geometry
-        else {
-            panic!()
-        };
-        assert!(a.distance(DVec3::ZERO) < 1e-9);
-        assert!(b.distance(DVec3::new(4.0, 0.0, 0.0)) < 1e-9);
+        run(&mut s, "line 3,-1 3,1");
+        run(&mut s, "name last c1");
+        run(&mut s, "line 7,-1 7,1");
+        run(&mut s, "name last c2");
+        let out = run(&mut s, "trim #c1 #c2 remove 5,0");
+        assert!(out.message.contains("removed 1 piece"), "{}", out.message);
+        // wall → two survivors (0..3 and 7..10); cutters untouched → 4 curves total.
+        assert_eq!(s.doc.len(), 4);
+        let lines: Vec<(DVec3, DVec3)> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Line { a, b }) if o.name.as_deref() == Some("wall") => {
+                    Some((*a, *b))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 2, "two end pieces survive");
+        let spans: Vec<f64> = lines.iter().map(|(a, b)| a.x.min(b.x)).collect();
+        assert!(spans.contains(&0.0) && spans.contains(&7.0), "kept 0..3 and 7..10: {lines:?}");
 
+        // Undo restores the single full line.
         run(&mut s, "undo");
-        let Geometry::Curve(Curve::Line { b, .. }) =
+        assert_eq!(s.doc.len(), 3);
+        let Geometry::Curve(Curve::Line { a, b }) =
             &s.doc.get(s.doc.find_named("wall")[0]).unwrap().geometry
         else {
             panic!()
         };
-        assert!(b.distance(DVec3::new(10.0, 0.0, 0.0)) < 1e-9, "undo restores full line");
+        assert!(a.x.min(b.x) < 1e-9 && a.x.max(b.x) > 9.999, "undo restores full line");
+        // Redo re-applies.
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 4);
+    }
 
-        // circle trimmed by a crossing line keeps the arc nearest the keep point
-        run(&mut s, "circle 20,0 2");
-        run(&mut s, "line 20,-5 20,5");
-        run(&mut s, "trim last 2 last 17,0"); // keep the left arc
-        let arcs: Vec<_> = s
+    #[test]
+    fn trim_multiple_removal_points_delete_multiple_pieces() {
+        // Line crossed at x=2,4,6,8. Two removal points (x=3 and x=7) each remove
+        // a distinct middle segment.
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last wall");
+        for (i, x) in [2, 4, 6, 8].iter().enumerate() {
+            run(&mut s, &format!("line {x},-1 {x},1"));
+            run(&mut s, &format!("name last c{i}"));
+        }
+        let out = run(&mut s, "trim #c0 #c1 #c2 #c3 remove 3,0 7,0");
+        assert!(out.message.contains("removed 2 piece"), "{}", out.message);
+        // Segments 2..4 and 6..8 gone; survivors 0..2, 4..6, 8..10.
+        let walls = s
             .doc
             .objects()
-            .filter_map(|o| match &o.geometry {
-                Geometry::Curve(c @ Curve::Arc { .. }) => Some(c.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(arcs.len(), 1);
-        let Curve::Arc { start, end, .. } = arcs[0] else { panic!() };
-        assert!((end - start - std::f64::consts::PI).abs() < 1e-9, "half circle kept");
+            .filter(|o| o.name.as_deref() == Some("wall"))
+            .count();
+        assert_eq!(walls, 3, "three surviving wall pieces");
+        run(&mut s, "undo");
+        assert_eq!(s.doc.objects().filter(|o| o.name.as_deref() == Some("wall")).count(), 1);
+    }
 
-        // no intersections → error, doc untouched
+    #[test]
+    fn trim_extend_grows_curve_to_nearest_cutter() {
+        // A short horizontal line ending at x=5; a vertical cutter at x=8. Extend
+        // pulls the right end out to x=8.
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 5,0");
+        run(&mut s, "name last wall");
+        run(&mut s, "line 8,-2 8,2");
+        run(&mut s, "name last cut");
+        let out = run(&mut s, "trim #cut extend 5,0");
+        assert!(out.message.contains("extended 1"), "{}", out.message);
+        let Geometry::Curve(Curve::Line { a, b }) =
+            &s.doc.get(s.doc.find_named("wall")[0]).unwrap().geometry
+        else {
+            panic!()
+        };
+        let far = if a.x > b.x { a } else { b };
+        assert!((far.x - 8.0).abs() < 1e-6, "right end reaches the cutter: {far:?}");
+        run(&mut s, "undo");
+        let Geometry::Curve(Curve::Line { a, b }) =
+            &s.doc.get(s.doc.find_named("wall")[0]).unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!((a.x.max(b.x) - 5.0).abs() < 1e-6, "undo restores the short line");
+    }
+
+    #[test]
+    fn trim_skips_points_that_hit_nothing() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last wall");
+        run(&mut s, "line 5,-1 5,1");
+        run(&mut s, "name last cut");
+        // One good removal point (x=3, hits the wall) + one in empty space far away.
+        let out = run(&mut s, "trim #cut remove 3,0 500,500");
+        assert!(out.message.contains("removed 1 piece"), "{}", out.message);
+        assert!(out.message.contains("skipped"), "note about the missed point: {}", out.message);
+        // All removal points missing → error, doc untouched.
         let n = s.doc.len();
-        run(&mut s, "line 100,0 110,0");
-        run(&mut s, "line 100,5 110,5");
-        let err = s.run(parse("trim last 2 last 100,0").unwrap()).unwrap_err();
-        assert!(err.to_string().contains("do not intersect"), "{err}");
-        assert_eq!(s.doc.len(), n + 2);
+        let err = s.run(parse("trim #cut remove 900,900").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("nothing changed"), "{err}");
+        assert_eq!(s.doc.len(), n);
     }
 
     #[test]
@@ -16978,7 +17207,7 @@ mod tests {
         run(&mut s, "line 50,0 60,0");
         run(&mut s, "name last wall");
         run(&mut s, "line 55,-1 55,1");
-        run(&mut s, "trim wall last 50,0");
+        run(&mut s, "trim last remove 56,0");
         run(&mut s, "undo");
         run(&mut s, "redo");
 

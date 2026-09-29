@@ -5060,6 +5060,32 @@ impl App {
             .map(|(id, _)| id)
     }
 
+    /// Resolve a guided MULTI-object DRAG (`Step::SelectObjects`) to EVERY object
+    /// in the region that satisfies the step's geometry filter — the box-select
+    /// analogue of picking a set (trim's cutter phase). Runs the same
+    /// window/crossing test as [`Self::guided_box_pick`] but returns all hits
+    /// instead of the single nearest.
+    fn guided_box_pick_all(
+        &self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        drag: egui::Rect,
+        mode: crate::boxsel::BoxMode,
+    ) -> Vec<itsjustcad_doc::ObjectId> {
+        let items: Vec<(itsjustcad_doc::ObjectId, egui::Rect)> = self
+            .session
+            .doc
+            .objects()
+            .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
+            .filter(|obj| self.guided_pick_matches(obj.id))
+            .filter_map(|obj| {
+                let bb = obj.geometry.aabb();
+                Some((obj.id, projected_rect(view_proj, rect, bb.min, bb.max)?))
+            })
+            .collect();
+        crate::boxsel::box_select(&items, drag, mode)
+    }
+
     /// Dispatch a guided-tool step outcome: run the emitted command, surface an
     /// error, or re-show the next prompt.
     fn handle_guided(&mut self, result: StepResult) {
@@ -5392,6 +5418,13 @@ impl App {
 
         if enter {
             if guided_active {
+                if self.guided.current_wants_objects() {
+                    // A multi-object select (trim's cutter phase): Enter finishes
+                    // the set once at least `min` objects are picked.
+                    let r = self.guided.finish_objects();
+                    self.handle_guided(r);
+                    return;
+                }
                 if self.guided.current_wants_point_list() {
                     // A variadic point list: a typed Enter first commits any typed
                     // coord in the buffer (as one more point), then finishes the
@@ -5467,7 +5500,9 @@ impl App {
         // pointer-tool's rubber box (window left→right, crossing right→left), but
         // — because a guided object step fills exactly ONE role — resolves to the
         // single best-matching object rather than a set.
-        if guided_active && self.guided.current_wants_object() {
+        if guided_active && (self.guided.current_wants_object() || self.guided.current_wants_objects())
+        {
+            let multi = self.guided.current_wants_objects();
             // Arm the rubber-box anchor when a primary drag begins over the
             // canvas. Reuses the same `box_drag` field the normal-mode drag path
             // uses; that path is skipped whenever a tool/guided flow is active, so
@@ -5488,26 +5523,47 @@ impl App {
                 draw_rubber_box(&ui.painter_at(rect), drag_rect, mode, ui.visuals());
                 if response.drag_stopped_by(egui::PointerButton::Primary) {
                     self.box_drag = None;
-                    match self.guided_box_pick(view_proj, rect, drag_rect, mode) {
-                        Some(id) => {
-                            // Highlight the pick; the emitted command references it
-                            // by id, so selection state doesn't affect correctness.
-                            self.session.doc.selection.insert(id);
+                    if multi {
+                        // Multi-object select (trim cutters): add ALL matches in the
+                        // region to the growing set, not just the nearest.
+                        let ids = self.guided_box_pick_all(view_proj, rect, drag_rect, mode);
+                        if ids.is_empty() {
+                            self.command_line
+                                .push_line("no matching object in that region — pick again");
+                        } else {
+                            for id in ids {
+                                self.session.doc.selection.insert(id);
+                                self.guided.push_selected_object(&id.short());
+                            }
                             self.session.doc.generation += 1;
-                            let short = id.short();
-                            // Capture the pick location (drag center → world) when
-                            // the step wants it (fillet corner selection).
-                            let pt = if self.guided.current_wants_object_point() {
-                                ground_point(view_proj, rect, drag_rect.center())
-                            } else {
-                                None
-                            };
-                            let r = self.guided.commit_object_at(&short, pt);
-                            self.handle_guided(r);
+                            // Re-show the prompt once with the updated running count.
+                            if let Some(prompt) = self.guided.prompt() {
+                                self.command_line.push_line(prompt);
+                            }
                         }
-                        None => self
-                            .command_line
-                            .push_line("no matching object in that region — pick again"),
+                    } else {
+                        match self.guided_box_pick(view_proj, rect, drag_rect, mode) {
+                            Some(id) => {
+                                // Highlight the pick; the emitted command references
+                                // it by id, so selection state doesn't affect
+                                // correctness.
+                                self.session.doc.selection.insert(id);
+                                self.session.doc.generation += 1;
+                                let short = id.short();
+                                // Capture the pick location (drag center → world)
+                                // when the step wants it (fillet corner selection).
+                                let pt = if self.guided.current_wants_object_point() {
+                                    ground_point(view_proj, rect, drag_rect.center())
+                                } else {
+                                    None
+                                };
+                                let r = self.guided.commit_object_at(&short, pt);
+                                self.handle_guided(r);
+                            }
+                            None => self
+                                .command_line
+                                .push_line("no matching object in that region — pick again"),
+                        }
                     }
                 }
                 ui.ctx().request_repaint(); // live rubber box
@@ -5522,14 +5578,20 @@ impl App {
                             self.session.doc.selection.insert(id);
                             self.session.doc.generation += 1;
                             let short = id.short();
-                            // Capture the snapped click location when the step
-                            // wants it (fillet corner selection).
-                            let pt = if self.guided.current_wants_object_point() {
-                                cursor_world
+                            let r = if multi {
+                                // Multi-object select: each click adds to the set and
+                                // stays on the step (Enter finishes).
+                                self.guided.push_selected_object(&short)
                             } else {
-                                None
+                                // Single object: capture the snapped click location
+                                // when the step wants it (fillet corner selection).
+                                let pt = if self.guided.current_wants_object_point() {
+                                    cursor_world
+                                } else {
+                                    None
+                                };
+                                self.guided.commit_object_at(&short, pt)
                             };
-                            let r = self.guided.commit_object_at(&short, pt);
                             self.handle_guided(r);
                         }
                         Some(_) => self
