@@ -1611,7 +1611,9 @@ impl App {
             // SmartTrack construction guides: `smarttrack [on|off|toggle]`.
             // Dwelling on an osnap point acquires it; H/V guides through the
             // acquired points let the cursor align to them. Persisted to ui.json.
-            Some("smarttrack") => {
+            // `smartguides` is the user-facing verb; `smarttrack` stays as an
+            // alias for muscle memory. Echoes always say "smart guides".
+            Some("smartguides" | "smarttrack") => {
                 let on = match words.next() {
                     Some("on" | "true" | "1") => true,
                     Some("off" | "false" | "0") => false,
@@ -1624,7 +1626,7 @@ impl App {
                     self.st_dwell = None;
                 }
                 self.command_line
-                    .push_line(format!("smarttrack: {}", if on { "on" } else { "off" }));
+                    .push_line(format!("smart guides: {}", if on { "on" } else { "off" }));
             }
             // "SketchUp" display preset: Working hemispheric shading + thick
             // profile edges + shaded display. Combines the ergonomics of the
@@ -5073,6 +5075,66 @@ impl App {
     }
 
     /// Interactive drawing: picks on the ground plane, ghost preview, prompt.
+    /// Smart Guides tangent/perpendicular tracking: for each acquired point,
+    /// gather osnap's perpendicular-foot and tangent candidate POINTS on curves
+    /// near the cursor and turn each into an extra guide from that acquired point
+    /// THROUGH the candidate. Fed into `smarttrack::snap` so the cursor can align
+    /// along a perp/tangent line to a nearby curve (and to its intersections with
+    /// other guides) — smarttrack.rs stays pure; the curve access lives here.
+    fn st_extra_guides(
+        &self,
+        cursor_px: Option<egui::Pos2>,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+    ) -> Vec<crate::smarttrack::GuideLine> {
+        let mut extra = Vec::new();
+        let Some(pos) = cursor_px else { return extra };
+        if self.st_acquired.is_empty() {
+            return extra;
+        }
+        // Only track perp/tangent when the user has those osnaps enabled (master
+        // on); reuse their settings but force the two kinds we derive guides from.
+        if !self.snap_settings.master {
+            return extra;
+        }
+        let mut settings = self.snap_settings;
+        settings.set(crate::osnap::SnapKind::Perpendicular, true);
+        settings.set(crate::osnap::SnapKind::Tangent, true);
+        for &ap in self.st_acquired.points() {
+            // Perp foot / tangent points are computed relative to a reference
+            // point; use the acquired point so the guide is anchored there.
+            let cands = crate::osnap::candidates_filtered(
+                &self.session.doc,
+                &settings,
+                Some(ap),
+                |bb| match projected_rect(view_proj, rect, bb.min, bb.max) {
+                    Some(r) => r.expand(crate::osnap::SNAP_RADIUS_PX).contains(pos),
+                    None => true,
+                },
+            );
+            for (world, kind) in cands {
+                if !matches!(
+                    kind,
+                    crate::osnap::SnapKind::Perpendicular | crate::osnap::SnapKind::Tangent
+                ) {
+                    continue;
+                }
+                // Only keep candidates whose screen projection is near the cursor
+                // (the per-object cull is coarse; this is the fine gate).
+                let near = project(view_proj, rect, world)
+                    .map(|p| p.distance(pos) <= crate::osnap::SNAP_RADIUS_PX)
+                    .unwrap_or(false);
+                if !near {
+                    continue;
+                }
+                if let Some(g) = crate::smarttrack::GuideLine::through(ap, world - ap) {
+                    extra.push(g);
+                }
+            }
+        }
+        extra
+    }
+
     fn drawing_input(
         &mut self,
         ui: &mut egui::Ui,
@@ -5090,7 +5152,7 @@ impl App {
         // draw tool does. They share the snap/ortho/smarttrack resolution.
         let guided_active = self.guided.active();
 
-        let (esc, mut enter, shift, close_key, f8, tab) = ui.input(|i| {
+        let (esc, mut enter, shift, close_key, f8, tab, mark_key) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Enter),
@@ -5098,6 +5160,11 @@ impl App {
                 i.key_pressed(egui::Key::C),
                 i.key_pressed(egui::Key::F8),
                 i.key_pressed(egui::Key::Tab),
+                // `M` (bare) manually captures the osnap point under the cursor
+                // into the Smart Guides acquired set (Rhino's on-demand Mark),
+                // complementing the dwell auto-capture. Bare only, so Cmd/Ctrl-M
+                // (minimize / other shortcuts) is left alone.
+                i.key_pressed(egui::Key::M) && !i.modifiers.command && !i.modifiers.ctrl,
             )
         });
         // Tab accepts the current best keyword match on a guided keyword/branch
@@ -5139,7 +5206,7 @@ impl App {
             if !self.st_acquired.is_empty() {
                 self.st_acquired.clear();
                 self.st_dwell = None;
-                self.command_line.push_line("smarttrack: cleared");
+                self.command_line.push_line("smart guides: cleared");
                 return;
             }
             self.draw_tool.cancel();
@@ -5273,6 +5340,17 @@ impl App {
                 }
                 None => self.st_dwell = None,
             }
+            // Manual capture: `M` grabs the osnap point under the cursor now
+            // (Rhino's on-demand Mark), instead of waiting out the dwell.
+            if mark_key
+                && let Some((p, _)) = snap_hit
+            {
+                let dedup = st_tol.unwrap_or(0.001);
+                if self.st_acquired.acquire(p, dedup) {
+                    self.command_line.push_line("smart guides: point marked");
+                }
+                self.st_dwell = Some((p, std::time::Instant::now()));
+            }
         } else {
             self.st_dwell = None;
         }
@@ -5287,11 +5365,21 @@ impl App {
             let mut handled = false;
             if self.smarttrack
                 && let (Some(c), Some(tol)) = (cursor_world, st_tol)
-                && let Some(s) = crate::smarttrack::snap(&self.st_acquired, c, last_point, tol)
             {
-                cursor_world = Some(s.snapped);
-                self.st_active_guides = s.active;
-                handled = true;
+                // Tangent/perpendicular tracking: gather osnap's perp-foot and
+                // tangent candidate POINTS near the cursor and turn each into an
+                // extra guide from an acquired point THROUGH that candidate, so
+                // the cursor can snap along a perp/tangent line to a nearby curve
+                // and to its intersections with other guides. smarttrack.rs stays
+                // pure; the curve access lives here.
+                let extra = self.st_extra_guides(cursor_px, view_proj, rect);
+                if let Some(s) =
+                    crate::smarttrack::snap(&self.st_acquired, c, last_point, tol, &extra)
+                {
+                    cursor_world = Some(s.snapped);
+                    self.st_active_guides = s.active;
+                    handled = true;
+                }
             }
             if !handled
                 && apply_ortho
@@ -5470,8 +5558,11 @@ impl App {
         // span past the origin covers the viewport in the top-ortho drafting view.
         let painter = ui.painter_at(rect);
         if self.smarttrack {
-            let guide_color = egui::Color32::from_rgba_unmultiplied(210, 210, 210, 170);
-            let guide_stroke = egui::Stroke::new(1.0, guide_color);
+            // Mirror Rhino: ACTIVE guides + the points feeding them are drawn in
+            // the highlight (blue) style; captured-but-inactive points sit as a
+            // muted gray cross until the cursor lines up with one.
+            let active_color = egui::Color32::from_rgb(90, 160, 255);
+            let guide_stroke = egui::Stroke::new(1.0, active_color.gamma_multiply(0.75));
             const SPAN: f64 = 1.0e6;
             for g in &self.st_active_guides {
                 let d = g.dir() * SPAN;
@@ -5484,19 +5575,29 @@ impl App {
                     painter.extend(dashed);
                 }
             }
-            // Acquired-point markers: a little cross/tick.
-            let mark_color = egui::Color32::from_rgb(230, 230, 230);
-            let mark_stroke = egui::Stroke::new(1.5, mark_color);
+            // Acquired-point markers: muted gray = captured/inactive; brighter
+            // blue = a guide through this point is active this frame.
+            let inactive_stroke = egui::Stroke::new(1.5, egui::Color32::from_gray(140));
+            let active_stroke = egui::Stroke::new(1.8, active_color);
+            let is_active = |pt: glam::DVec3| {
+                self.st_active_guides
+                    .iter()
+                    .any(|g| g.origin.distance(pt) < 1e-6)
+            };
             for &pt in self.st_acquired.points() {
                 if let Some(s) = project(view_proj, rect, pt) {
-                    let r = 4.0;
+                    let (r, stroke) = if is_active(pt) {
+                        (5.0, active_stroke)
+                    } else {
+                        (4.0, inactive_stroke)
+                    };
                     painter.line_segment(
                         [s + egui::vec2(-r, 0.0), s + egui::vec2(r, 0.0)],
-                        mark_stroke,
+                        stroke,
                     );
                     painter.line_segment(
                         [s + egui::vec2(0.0, -r), s + egui::vec2(0.0, r)],
-                        mark_stroke,
+                        stroke,
                     );
                 }
             }
@@ -5671,9 +5772,9 @@ impl App {
             }
             if toggle_chip(
                 ui,
-                "smarttrack",
+                "smart guides",
                 self.smarttrack,
-                "Toggle SmartTrack construction guides",
+                "Toggle Smart Guides construction guides (dwell or M to capture a point)",
             ) {
                 self.smarttrack = !self.smarttrack;
                 save_smarttrack(self.smarttrack);
