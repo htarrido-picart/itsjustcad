@@ -790,7 +790,7 @@ mod tests {
         let mut t = GuidedTool::default();
         assert_eq!(t.try_start("gridshell", None), StartResult::Started);
         // The lone step is the shell-type branch.
-        assert_eq!(t.prompt().unwrap(), "Shell type ( hypar / vault ) <hypar>:");
+        assert_eq!(t.prompt().unwrap(), "Shell type <hypar>:");
         assert_eq!(t.commit_typed("hypar"), StepResult::NeedMore);
         assert_eq!(t.commit_typed("4"), StepResult::NeedMore);
         assert_eq!(t.commit_typed("4"), StepResult::NeedMore);
@@ -834,7 +834,7 @@ mod tests {
     fn load_point_branch_walks_to_emit() {
         let mut t = GuidedTool::default();
         assert_eq!(t.try_start("load", None), StartResult::Started);
-        assert_eq!(t.prompt().unwrap(), "Load kind ( point / line / area ) <point>:");
+        assert_eq!(t.prompt().unwrap(), "Load kind <point>:");
         assert_eq!(t.commit_typed("point"), StepResult::NeedMore);
         assert_eq!(t.on_click(DVec3::ZERO), StepResult::NeedMore); // application point
         assert_eq!(t.commit_typed("5"), StepResult::NeedMore); // magnitude

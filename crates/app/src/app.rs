@@ -5090,15 +5090,33 @@ impl App {
         // draw tool does. They share the snap/ortho/smarttrack resolution.
         let guided_active = self.guided.active();
 
-        let (esc, mut enter, shift, close_key, f8) = ui.input(|i| {
+        let (esc, mut enter, shift, close_key, f8, tab) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Enter),
                 i.modifiers.shift,
                 i.key_pressed(egui::Key::C),
                 i.key_pressed(egui::Key::F8),
+                i.key_pressed(egui::Key::Tab),
             )
         });
+        // Tab accepts the current best keyword match on a guided keyword/branch
+        // step: type a prefix, Tab completes the buffer to the top match, Enter
+        // accepts. Only intercepted here while a guided keyword step is active
+        // (matches is `Some` only then), so other Tab behavior is untouched. Zero
+        // matches → no-op.
+        if tab
+            && guided_active
+            && let Some(best) = self
+                .guided
+                .current_keyword_matches()
+                .and_then(|m| m.first().copied())
+        {
+            self.guided.take_input();
+            for c in best.chars() {
+                self.guided.push_input(c);
+            }
+        }
         // A guided flow that armed *this* frame set `guided_suppress_enter`: the
         // Enter that submitted the bare verb in the command line is still down,
         // and would otherwise auto-commit the first typed step at its default.
@@ -5548,6 +5566,32 @@ impl App {
                 egui::TextStyle::Body.resolve(ui.style()),
                 ui.visuals().strong_text_color(),
             );
+            // Live type-ahead: below the prompt, paint the keyword matches
+            // filtered by the typed buffer so long catalogs (30+ sections) stay
+            // usable. The best (first) match is bracketed — the Tab/Enter target.
+            if guided_active && let Some(matches) = self.guided.current_keyword_matches() {
+                const MAX: usize = 8;
+                let shown = matches.iter().take(MAX).enumerate().map(|(i, m)| {
+                    if i == 0 {
+                        format!("[{m}]")
+                    } else {
+                        (*m).to_string()
+                    }
+                });
+                let mut line = shown.collect::<Vec<_>>().join("  ");
+                if matches.is_empty() {
+                    line = "(no match)".to_string();
+                } else if matches.len() > MAX {
+                    line.push_str(&format!("  +{} more", matches.len() - MAX));
+                }
+                painter.text(
+                    rect.center_top() + egui::vec2(0.0, 48.0),
+                    egui::Align2::CENTER_TOP,
+                    line,
+                    egui::TextStyle::Small.resolve(ui.style()),
+                    ui.visuals().weak_text_color(),
+                );
+            }
         }
         ui.ctx().request_repaint(); // live rubber-band
     }

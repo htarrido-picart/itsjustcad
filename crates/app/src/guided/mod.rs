@@ -253,6 +253,27 @@ impl GuidedTool {
         matches!(self.current_step(), Some(Step::PointList { .. }))
     }
 
+    /// The keyword options for the current step, filtered by the typed buffer.
+    /// Applies to both [`Step::Keyword`] (its `options`) and [`Step::Branch`]
+    /// (its arm keys). Case-insensitive prefix match against `self.input`; an
+    /// empty buffer returns every option. Option order is preserved. Returns
+    /// `None` when the current step isn't a keyword/branch — the app uses this to
+    /// paint a live-filtered suggestion list and to drive Tab-completion.
+    pub fn current_keyword_matches(&self) -> Option<Vec<&'static str>> {
+        let options: Vec<&'static str> = match self.current_step()? {
+            Step::Keyword { options, .. } => options.to_vec(),
+            Step::Branch { arms, .. } => arms.iter().map(|a| a.key).collect(),
+            _ => return None,
+        };
+        let lb = self.input.trim().to_lowercase();
+        Some(
+            options
+                .into_iter()
+                .filter(|o| lb.is_empty() || o.to_lowercase().starts_with(&lb))
+                .collect(),
+        )
+    }
+
     /// The geometry filter for the current [`Step::SelectObject`], if any.
     pub fn current_filter(&self) -> Option<ObjFilter> {
         match self.current_step() {
@@ -375,8 +396,11 @@ impl GuidedTool {
                 Some(d) => format!("{prompt} <{d}>:"),
                 None => format!("{prompt}:"),
             },
-            Step::Keyword { prompt, options, default } => {
-                format!("{prompt} ( {} ) <{default}>:", options.join(" / "))
+            // Options are NOT dumped inline — long catalogs (e.g. 30 sections)
+            // would flood the prompt. The app paints the live-filtered matches
+            // separately (see `current_keyword_matches`); we keep the default.
+            Step::Keyword { prompt, default, .. } => {
+                format!("{prompt} <{default}>:")
             }
             Step::PickPoint { prompt } => format!("{prompt} (Esc cancels):"),
             Step::Vector { prompt } => format!("{prompt} (Esc cancels):"),
@@ -385,10 +409,11 @@ impl GuidedTool {
             Step::PointList { prompt, .. } => {
                 format!("{prompt} ({} so far):", self.list.len())
             }
+            // Like Keyword: arm keys are shown as live-filtered matches by the
+            // app, not dumped inline. Keep the first arm as the default hint.
             Step::Branch { prompt, arms } => {
-                let keys = arms.iter().map(|a| a.key).collect::<Vec<_>>().join(" / ");
                 let first = arms.first().map(|a| a.key).unwrap_or("");
-                format!("{prompt} ( {keys} ) <{first}>:")
+                format!("{prompt} <{first}>:")
             }
         };
         Some(if self.input.is_empty() {
@@ -866,9 +891,73 @@ mod tests {
         assert_eq!(t.prompt().unwrap(), "Count <3>:");
         // Integer: bare Enter takes the default.
         assert_eq!(t.commit_typed(""), StepResult::NeedMore);
-        assert_eq!(t.prompt().unwrap(), "Type ( Sharp / Round ) <Sharp>:");
+        // The prompt is concise now — options are NOT dumped inline.
+        assert_eq!(t.prompt().unwrap(), "Type <Sharp>:");
+        assert!(!t.prompt().unwrap().contains(" / "), "no inline option join");
         // Keyword: a unique prefix resolves the option.
         assert_eq!(t.commit_typed("ro"), StepResult::Emit("kw 3 Round".into()));
+    }
+
+    // A throwaway keyword script over a longer catalog to exercise type-ahead
+    // filtering (mirrors the real beam/column Section keyword).
+    static FILTER_TEST: VerbScript = VerbScript {
+        verb: "__filtertest",
+        needs_selection: false,
+        steps: &[Step::Keyword {
+            prompt: "Section",
+            options: &["IPE200", "IPE300", "IPE400", "HEA200", "HEB300"],
+            default: "IPE300",
+        }],
+        assemble: |args| {
+            let k = super::assemble::key_at(args, 0, "flt")?;
+            Ok(format!("flt {k}"))
+        },
+    };
+
+    #[test]
+    fn keyword_matches_filter_by_typed_buffer() {
+        let mut t = GuidedTool { script: Some(&FILTER_TEST), ..Default::default() };
+        // Empty buffer → all options, order preserved.
+        assert_eq!(
+            t.current_keyword_matches(),
+            Some(vec!["IPE200", "IPE300", "IPE400", "HEA200", "HEB300"])
+        );
+        // Case-insensitive prefix "ip" → the three IPE options in order.
+        for c in "ip".chars() {
+            t.push_input(c);
+        }
+        assert_eq!(
+            t.current_keyword_matches(),
+            Some(vec!["IPE200", "IPE300", "IPE400"])
+        );
+        // A non-matching prefix → empty (Some, not None).
+        t.take_input();
+        for c in "zz".chars() {
+            t.push_input(c);
+        }
+        assert_eq!(t.current_keyword_matches(), Some(vec![]));
+        // The concise prompt keeps the default but drops the option join.
+        t.take_input();
+        assert_eq!(t.prompt().unwrap(), "Section <IPE300>:");
+        assert!(!t.prompt().unwrap().contains(" / "));
+    }
+
+    #[test]
+    fn keyword_matches_none_on_non_keyword_step() {
+        let mut t = GuidedTool::default();
+        t.try_start("offset", Some("sel")); // first step is a Number
+        assert_eq!(t.current_keyword_matches(), None);
+    }
+
+    #[test]
+    fn branch_matches_filter_arm_keys() {
+        let mut t = GuidedTool { script: Some(&BRANCH_TEST), ..Default::default() };
+        t.commit_typed("3"); // advance to the branch step
+        assert_eq!(t.current_keyword_matches(), Some(vec!["alpha", "beta"]));
+        for c in "be".chars() {
+            t.push_input(c);
+        }
+        assert_eq!(t.current_keyword_matches(), Some(vec!["beta"]));
     }
 
     #[test]
@@ -1039,8 +1128,9 @@ mod tests {
         let mut t = GuidedTool { script: Some(&BRANCH_TEST), ..Default::default() };
         // Base step before the branch.
         assert_eq!(t.commit_typed("3"), StepResult::NeedMore);
-        // The Branch step prompts with its arm keys and the first as default.
-        assert_eq!(t.prompt().unwrap(), "Mode ( alpha / beta ) <alpha>:");
+        // The Branch step prompts concisely with the first arm as default;
+        // arm keys are shown as live matches, not dumped inline.
+        assert_eq!(t.prompt().unwrap(), "Mode <alpha>:");
         assert!(!t.current_is_point());
         // Pick the short arm; it has one remaining step (not done yet).
         assert_eq!(t.commit_typed("alpha"), StepResult::NeedMore);
