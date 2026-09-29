@@ -161,6 +161,12 @@ fn assemble_flatten(args: &[Input]) -> Result<String, String> {
     Ok(format!("flatten {sel}"))
 }
 
+/// `[Objects(sel)] -> "freeze sel"`
+fn assemble_freeze(args: &[Input]) -> Result<String, String> {
+    let sel = selector(args, "freeze")?;
+    Ok(format!("freeze {sel}"))
+}
+
 // ── SCRIPTS ─────────────────────────────────────────────────────────────────
 
 pub static SCRIPTS: &[VerbScript] = &[
@@ -217,6 +223,14 @@ pub static SCRIPTS: &[VerbScript] = &[
         needs_selection: true,
         steps: &[],
         assemble: assemble_flatten,
+    },
+    // Bake a parametric object to an editable mesh; consumes the selection so a
+    // bare `freeze` with something selected just works (was: "expects a selector").
+    VerbScript {
+        verb: "freeze",
+        needs_selection: true,
+        steps: &[],
+        assemble: assemble_freeze,
     },
 ];
 
@@ -447,8 +461,19 @@ mod tests {
         let args = [Input::Objects("sel".into())];
         assert_eq!(assemble_tozero(&args).unwrap(), "tozero sel");
         assert_eq!(assemble_flatten(&args).unwrap(), "flatten sel");
+        assert_eq!(assemble_freeze(&args).unwrap(), "freeze sel");
         assert!(assemble_tozero(&[]).is_err());
         assert!(assemble_flatten(&[]).is_err());
+        assert!(assemble_freeze(&[]).is_err());
+    }
+
+    #[test]
+    fn freeze_emits_on_start_with_selection() {
+        let mut t = GuidedTool::default();
+        assert_eq!(t.try_start("freeze", Some("sel")), StartResult::Started);
+        assert_eq!(t.emit_if_ready(), Some(StepResult::Emit("freeze sel".into())));
+        // Bare freeze with nothing selected asks for a selection instead of erroring.
+        assert_eq!(t.try_start("freeze", None), StartResult::NeedSelection);
     }
 
     #[test]
