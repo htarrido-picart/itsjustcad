@@ -1525,7 +1525,7 @@ impl App {
             }
             // Toggle the transform gumball/gizmo (Rhino-style persistent
             // toggle). View state, never logged; persisted to ui.json.
-            Some("gumball" | "gizmo") => {
+            Some("handles" | "transformhandles" | "gumball" | "gizmo") => {
                 let on = match words.next() {
                     Some("on" | "true" | "1") => true,
                     Some("off" | "false" | "0") => false,
@@ -1534,7 +1534,7 @@ impl App {
                 self.show_gumball = on;
                 save_gumball_visible(on);
                 self.command_line
-                    .push_line(format!("gumball: {}", if on { "on" } else { "off" }));
+                    .push_line(format!("transform handles: {}", if on { "on" } else { "off" }));
             }
             // Object-snap control: `osnap on|off` flips the master switch,
             // `osnap <kind> on|off` a single kind (`osnap grid on|off` the grid
@@ -5801,7 +5801,7 @@ impl App {
             // still leaves egui's widget frame, which read as a wrong grey box).
             let (on_fill, on_txt) = crate::theme::viewport_active_tag(ui.visuals().dark_mode);
             let txt = if on { on_txt } else { ui.visuals().weak_text_color() };
-            let mut btn = egui::Button::new(egui::RichText::new("gumball").color(txt))
+            let mut btn = egui::Button::new(egui::RichText::new("handles").color(txt))
                 .frame(on)
                 .corner_radius(egui::CornerRadius::same(4));
             if on {
@@ -5809,7 +5809,7 @@ impl App {
             }
             if ui
                 .add(btn)
-                .on_hover_text("Toggle transform gizmo (G)")
+                .on_hover_text("Toggle Transform Handles (G)")
                 .clicked()
             {
                 self.show_gumball = !on;
