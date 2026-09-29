@@ -116,6 +116,7 @@ pub static SCRIPTS: &[VerbScript] = &[
             Step::SelectObject {
                 prompt: "Select the room's closed boundary curve",
                 filter: ObjFilter::Curve,
+                capture_point: false,
             },
             Step::Keyword {
                 prompt: "Occupancy",
@@ -139,6 +140,7 @@ pub static SCRIPTS: &[VerbScript] = &[
         steps: &[Step::SelectObject {
             prompt: "Select the closed boundary curve",
             filter: ObjFilter::Curve,
+                capture_point: false,
         }],
         assemble: assemble_minsurf,
     },

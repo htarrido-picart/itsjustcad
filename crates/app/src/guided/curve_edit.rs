@@ -16,7 +16,7 @@
 //!   join      — sel, zero steps (emit-on-start) → `join sel`
 //!   explode   — sel, zero steps (emit-on-start) → `explode sel`
 
-use super::assemble::{int_at, key_at, num_at, obj_at, point_at, selector};
+use super::assemble::{captured_points, int_at, key_at, num_at, obj_at, point_at, selector};
 use super::{fmt, num, Input, ObjFilter, Step, VerbScript};
 
 pub static SCRIPTS: &[VerbScript] = &[
@@ -42,9 +42,21 @@ pub static SCRIPTS: &[VerbScript] = &[
         verb: "fillet",
         needs_selection: false,
         steps: &[
-            Step::SelectObject { prompt: "Select first curve to fillet", filter: ObjFilter::Curve },
-            Step::SelectObject { prompt: "Select second curve to fillet", filter: ObjFilter::Curve },
+            // Pick each curve NEAR THE END to round — the click LOCATION chooses
+            // the corner (Rhino). Both picks capture their world point.
+            Step::SelectObject {
+                prompt: "Select first curve to fillet",
+                filter: ObjFilter::Curve,
+                capture_point: true,
+            },
+            Step::SelectObject {
+                prompt: "Select second curve to fillet",
+                filter: ObjFilter::Curve,
+                capture_point: true,
+            },
             Step::Number { prompt: "Fillet radius", default: Some(0.5) },
+            Step::Keyword { prompt: "Trim", options: &["Yes", "No"], default: "Yes" },
+            Step::Keyword { prompt: "Join", options: &["No", "Yes"], default: "No" },
         ],
         assemble: assemble_fillet,
     },
@@ -52,8 +64,16 @@ pub static SCRIPTS: &[VerbScript] = &[
         verb: "chamfer",
         needs_selection: false,
         steps: &[
-            Step::SelectObject { prompt: "Select first curve to chamfer", filter: ObjFilter::Curve },
-            Step::SelectObject { prompt: "Select second curve to chamfer", filter: ObjFilter::Curve },
+            Step::SelectObject {
+                prompt: "Select first curve to chamfer",
+                filter: ObjFilter::Curve,
+                capture_point: false,
+            },
+            Step::SelectObject {
+                prompt: "Select second curve to chamfer",
+                filter: ObjFilter::Curve,
+                capture_point: false,
+            },
             Step::Number { prompt: "Chamfer distance", default: Some(0.5) },
         ],
         assemble: assemble_chamfer,
@@ -62,8 +82,16 @@ pub static SCRIPTS: &[VerbScript] = &[
         verb: "trim",
         needs_selection: false,
         steps: &[
-            Step::SelectObject { prompt: "Select object to trim", filter: ObjFilter::Any },
-            Step::SelectObject { prompt: "Select cutting object", filter: ObjFilter::Any },
+            Step::SelectObject {
+                prompt: "Select object to trim",
+                filter: ObjFilter::Any,
+                capture_point: false,
+            },
+            Step::SelectObject {
+                prompt: "Select cutting object",
+                filter: ObjFilter::Any,
+                capture_point: false,
+            },
             Step::PickPoint { prompt: "Pick the part to remove" },
         ],
         assemble: assemble_trim,
@@ -127,13 +155,26 @@ fn assemble_powertrim(args: &[Input]) -> Result<String, String> {
     Ok(format!("powertrim {sel} {}", fmt(pt)))
 }
 
-/// `[Objects(#a), Objects(#b), Num(r)] -> "fillet #a #b <r>"` — two curves
-/// picked interactively (Rhino's first/second curve prompts).
+/// `[Objects(#a), Objects(#b), Num(r), Key(trim), Key(join), <Point(ptA), Point(ptB)>]`
+/// → `"fillet #a #b <r> [at <ptA> <ptB>] trim <yes|no> join <yes|no>"`.
+///
+/// Rhino parity: each curve is picked NEAR THE END to round, so the captured
+/// pick points (the `at` clause) choose the corner; Trim/Join mirror Rhino's
+/// options. Emits the bare `at`-less form when no points were captured (unit
+/// tests / non-capturing callers).
 fn assemble_fillet(args: &[Input]) -> Result<String, String> {
     let a = obj_at(args, 0, "fillet")?;
     let b = obj_at(args, 1, "fillet")?;
     let r = num_at(args, 2, "fillet")?;
-    Ok(format!("fillet {a} {b} {}", num(r)))
+    let trim = key_at(args, 3, "fillet")?;
+    let join = key_at(args, 4, "fillet")?;
+    let mut cmd = format!("fillet {a} {b} {}", num(r));
+    if let Some(pts) = captured_points(args, 2) {
+        cmd.push_str(&format!(" at {} {}", fmt(pts[0]), fmt(pts[1])));
+    }
+    let yn = |k: &str| if k.eq_ignore_ascii_case("yes") { "yes" } else { "no" };
+    cmd.push_str(&format!(" trim {} join {}", yn(trim), yn(join)));
+    Ok(cmd)
 }
 
 /// `[Objects(#a), Objects(#b), Num(d)] -> "chamfer #a #b <d>"` — two curves
@@ -228,13 +269,38 @@ mod tests {
 
     #[test]
     fn assemble_fillet_pure() {
+        // Bare form (no captured points): default Trim/Join keywords.
         let args = [
             Input::Objects("#a1b2c3d4".into()),
             Input::Objects("#00ffee11".into()),
             Input::Num(0.5),
+            Input::Key("Yes".into()),
+            Input::Key("No".into()),
         ];
-        assert_eq!(assemble_fillet(&args).unwrap(), "fillet #a1b2c3d4 #00ffee11 0.5");
+        assert_eq!(
+            assemble_fillet(&args).unwrap(),
+            "fillet #a1b2c3d4 #00ffee11 0.5 trim yes join no"
+        );
         assert!(assemble_fillet(&args[..1]).is_err());
+    }
+
+    #[test]
+    fn assemble_fillet_with_captured_points_and_options() {
+        // Two captured pick points ride at the tail → `at <pA> <pB>`; Trim=No,
+        // Join=Yes flip the option flags.
+        let args = [
+            Input::Objects("#a1b2c3d4".into()),
+            Input::Objects("#00ffee11".into()),
+            Input::Num(0.5),
+            Input::Key("No".into()),
+            Input::Key("Yes".into()),
+            Input::Point(DVec3::new(0.0, 0.0, 0.0)),
+            Input::Point(DVec3::new(5.0, 5.0, 0.0)),
+        ];
+        assert_eq!(
+            assemble_fillet(&args).unwrap(),
+            "fillet #a1b2c3d4 #00ffee11 0.5 at 0,0 5,5 trim no join yes"
+        );
     }
 
     #[test]
@@ -265,14 +331,27 @@ mod tests {
         // Verb-first: no pre-selection needed; picks each curve interactively.
         assert_eq!(t.try_start("fillet", None), StartResult::Started);
         assert!(t.current_wants_object());
-        assert_eq!(t.commit_object("a1b2c3d4"), StepResult::NeedMore);
-        assert!(t.current_wants_object());
-        assert_eq!(t.commit_object("00ffee11"), StepResult::NeedMore);
-        // Now the radius.
-        assert!(!t.current_wants_object());
+        // Both picks capture the click location (Rhino corner selection).
+        assert!(t.current_wants_object_point());
         assert_eq!(
-            t.commit_typed("0.5"),
-            StepResult::Emit("fillet #a1b2c3d4 #00ffee11 0.5".into())
+            t.commit_object_at("a1b2c3d4", Some(DVec3::new(1.0, 0.0, 0.0))),
+            StepResult::NeedMore
+        );
+        assert!(t.current_wants_object());
+        assert!(t.current_wants_object_point());
+        assert_eq!(
+            t.commit_object_at("00ffee11", Some(DVec3::new(0.0, 1.0, 0.0))),
+            StepResult::NeedMore
+        );
+        // Radius, then Trim/Join keywords.
+        assert!(!t.current_wants_object());
+        assert_eq!(t.commit_typed("0.5"), StepResult::NeedMore); // radius
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore); // Trim default Yes
+        assert_eq!(
+            t.commit_typed(""), // Join default No → emit
+            StepResult::Emit(
+                "fillet #a1b2c3d4 #00ffee11 0.5 at 1,0 0,1 trim yes join no".into()
+            )
         );
     }
 
@@ -348,16 +427,22 @@ mod tests {
     }
 
     #[test]
-    fn fillet_walk_default_radius_after_two_picks() {
+    fn fillet_walk_default_radius_and_options_after_two_picks() {
         let mut t = GuidedTool::default();
         t.try_start("fillet", None);
-        t.commit_object("a1b2c3d4");
-        t.commit_object("00ffee11");
+        t.commit_object_at("a1b2c3d4", Some(DVec3::new(2.0, 0.0, 0.0)));
+        t.commit_object_at("00ffee11", Some(DVec3::new(0.0, 2.0, 0.0)));
         assert_eq!(t.prompt().unwrap(), "Fillet radius <0.5>:");
-        // Bare Enter takes the default radius.
+        // Bare Enter takes the default radius, then the Trim/Join defaults.
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore); // radius 0.5
+        assert_eq!(t.prompt().unwrap(), "Trim <Yes>:");
+        assert_eq!(t.commit_typed(""), StepResult::NeedMore); // Trim Yes
+        assert_eq!(t.prompt().unwrap(), "Join <No>:");
         assert_eq!(
             t.commit_typed(""),
-            StepResult::Emit("fillet #a1b2c3d4 #00ffee11 0.5".into())
+            StepResult::Emit(
+                "fillet #a1b2c3d4 #00ffee11 0.5 at 2,0 0,2 trim yes join no".into()
+            )
         );
     }
 

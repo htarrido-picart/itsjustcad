@@ -551,15 +551,23 @@ struct FilletSeg {
     corner_idx: Option<usize>,
 }
 
-/// Pick the segment of `c` to fillet, given a reference point `toward` that
-/// lies on the other curve. Lines use the whole line (the nearer endpoint is
-/// the corner). Open polylines may only fillet their two end segments; closed
-/// polylines consider every segment. Returns `None` for curve kinds we cannot
-/// fillet on (Arc/Ellipse/NURBS) or degenerate inputs.
-fn pick_fillet_segment(c: &Curve, toward: DVec3) -> Option<FilletSeg> {
+/// Pick the segment of `c` to fillet.
+///
+/// `toward` is a reference point on the *other* curve, used to find the segment
+/// approaching the shared corner. `pick` (when `Some`) is the world point where
+/// the user clicked NEAR the end to round: it overrides the corner choice so the
+/// pick LOCATION selects the corner (Rhino). Lines use the whole line (the
+/// endpoint nearer the governing point is the corner). Open polylines may only
+/// fillet their two end segments; closed polylines consider every segment.
+/// Returns `None` for kinds we cannot fillet (Arc/Ellipse/NURBS) or degenerate
+/// inputs.
+fn pick_fillet_segment(c: &Curve, toward: DVec3, pick: Option<DVec3>) -> Option<FilletSeg> {
     match c {
         Curve::Line { a, b } => {
-            let (corner, far) = if a.distance_squared(toward) <= b.distance_squared(toward) {
+            // With a pick point, the corner is the line END nearest the click;
+            // without, fall back to the end nearest the other curve.
+            let govern = pick.unwrap_or(toward);
+            let (corner, far) = if a.distance_squared(govern) <= b.distance_squared(govern) {
                 (*a, *b)
             } else {
                 (*b, *a)
@@ -579,11 +587,15 @@ fn pick_fillet_segment(c: &Curve, toward: DVec3) -> Option<FilletSeg> {
             } else {
                 vec![(0, 1), (n - 1, n - 2)]
             };
-            // Choose the candidate whose corner vertex is nearest `toward`.
+            // With a pick: the corner vertex is the end nearest the click. Without:
+            // nearest the other curve. (Both use vertex-nearest; the pick just
+            // changes the governing point, so a click near one end of a polyline
+            // rounds that end.)
+            let govern = pick.unwrap_or(toward);
             let (corner_idx, far_idx) = candidates.into_iter().min_by(|&(ci, _), &(cj, _)| {
                 points[ci]
-                    .distance_squared(toward)
-                    .total_cmp(&points[cj].distance_squared(toward))
+                    .distance_squared(govern)
+                    .total_cmp(&points[cj].distance_squared(govern))
             })?;
             Some(FilletSeg {
                 corner: points[corner_idx],
@@ -630,12 +642,32 @@ fn fillet_seed(c: &Curve) -> DVec3 {
 /// `(trimmed a, arc, trimmed b)`, or `None` when a source is neither a line nor
 /// a polyline, the chosen segments are parallel, or the radius does not fit.
 pub fn fillet_curves(a: &Curve, b: &Curve, radius: f64) -> Option<(Curve, Curve, Curve)> {
+    fillet_curves_at(a, b, radius, None, None)
+}
+
+/// Fillet two curves, choosing each corner by the pick point near that curve.
+///
+/// `pick_a`/`pick_b` are the world points where the user clicked NEAR the end of
+/// each curve to round; each overrides the corner selection so the pick LOCATION
+/// decides which corner gets the arc (Rhino). Passing `None` for a pick keeps the
+/// nearest-approaching-corner heuristic for that curve — so
+/// `fillet_curves_at(a, b, r, None, None)` is exactly [`fillet_curves`].
+///
+/// Returns `(trimmed a, arc, trimmed b)`. Callers that don't want the inputs
+/// trimmed keep the arc and discard the trimmed pair.
+pub fn fillet_curves_at(
+    a: &Curve,
+    b: &Curve,
+    radius: f64,
+    pick_a: Option<DVec3>,
+    pick_b: Option<DVec3>,
+) -> Option<(Curve, Curve, Curve)> {
     // Reference each curve toward a point on the other so we pick the end
-    // segments that approach a shared corner.
+    // segments that approach a shared corner (used when no pick is supplied).
     let toward_a = closest_point(b, fillet_seed(a), 0.01);
     let toward_b = closest_point(a, fillet_seed(b), 0.01);
-    let seg_a = pick_fillet_segment(a, toward_a)?;
-    let seg_b = pick_fillet_segment(b, toward_b)?;
+    let seg_a = pick_fillet_segment(a, toward_a, pick_a)?;
+    let seg_b = pick_fillet_segment(b, toward_b, pick_b)?;
     let (la, arc, lb) = fillet_lines(
         (seg_a.corner, seg_a.far),
         (seg_b.corner, seg_b.far),
@@ -709,8 +741,8 @@ pub fn chamfer_curves(a: &Curve, b: &Curve, dist: f64) -> Option<(Curve, Curve, 
     // Same segment-selection strategy as `fillet_curves`.
     let toward_a = closest_point(b, fillet_seed(a), 0.01);
     let toward_b = closest_point(a, fillet_seed(b), 0.01);
-    let seg_a = pick_fillet_segment(a, toward_a)?;
-    let seg_b = pick_fillet_segment(b, toward_b)?;
+    let seg_a = pick_fillet_segment(a, toward_a, None)?;
+    let seg_b = pick_fillet_segment(b, toward_b, None)?;
     let (la, bevel, lb) = chamfer_lines(
         (seg_a.corner, seg_a.far),
         (seg_b.corner, seg_b.far),
@@ -1113,6 +1145,62 @@ mod tests {
         assert!(points[2].distance(DVec3::new(2.0, 2.0, 0.0)) > EPS); // moved back
         assert!(points[3].distance(DVec3::new(-2.0, 2.0, 0.0)) < EPS);
         assert!(matches!(arc, Curve::Arc { .. }));
+    }
+
+    #[test]
+    fn fillet_curves_at_pick_chooses_corner_nearest_the_click() {
+        // Two open polylines that BOTH pass through the origin AND meet again at a
+        // second shared corner (4,4): a shares corners at (0,0) and (4,4). Picking
+        // near one corner vs the other must round that corner.
+        //
+        // a: (−4,0)→(0,0)→(4,4)  b: (0,−4)→(0,0)→(4,4)? Keep it simple: a runs
+        // horizontally, b vertically, but each has TWO ends near a distinct corner.
+        // Use two L-shaped polylines sharing corners at (0,0) and (10,10).
+        let a = polyline(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)], false);
+        let b = polyline(&[(0.0, 0.0), (0.0, 10.0), (10.0, 10.0)], false);
+
+        // Pick near the (0,0) corner on both → round there: a's vertex 0 and b's
+        // vertex 0 move; the (10,10) ends stay put.
+        let (ta, arc, tb) =
+            fillet_curves_at(&a, &b, 2.0, Some(DVec3::new(0.5, 0.0, 0.0)), Some(DVec3::new(0.0, 0.5, 0.0)))
+                .unwrap();
+        let Curve::Polyline { points: pa, .. } = ta else { panic!() };
+        let Curve::Polyline { points: pb, .. } = tb else { panic!() };
+        assert!(pa[0].distance(DVec3::new(0.0, 0.0, 0.0)) > EPS, "a corner 0 moved");
+        assert!(pa[2].distance(DVec3::new(10.0, 10.0, 0.0)) < EPS, "a far end fixed");
+        assert!(pb[0].distance(DVec3::new(0.0, 0.0, 0.0)) > EPS, "b corner 0 moved");
+        assert!(pb[2].distance(DVec3::new(10.0, 10.0, 0.0)) < EPS, "b far end fixed");
+        let Curve::Arc { center, .. } = arc else { panic!() };
+        assert!(center.distance(DVec3::new(2.0, 2.0, 0.0)) < EPS, "arc at origin corner");
+
+        // Pick near the (10,10) corner on both → round THERE instead: the far ends
+        // (index 2) move, the (0,0) ends stay.
+        let (ta, arc, tb) = fillet_curves_at(
+            &a,
+            &b,
+            2.0,
+            Some(DVec3::new(10.0, 9.5, 0.0)),
+            Some(DVec3::new(9.5, 10.0, 0.0)),
+        )
+        .unwrap();
+        let Curve::Polyline { points: pa, .. } = ta else { panic!() };
+        let Curve::Polyline { points: pb, .. } = tb else { panic!() };
+        assert!(pa[0].distance(DVec3::new(0.0, 0.0, 0.0)) < EPS, "a corner 0 fixed");
+        assert!(pa[2].distance(DVec3::new(10.0, 10.0, 0.0)) > EPS, "a far end moved");
+        assert!(pb[0].distance(DVec3::new(0.0, 0.0, 0.0)) < EPS, "b corner 0 fixed");
+        assert!(pb[2].distance(DVec3::new(10.0, 10.0, 0.0)) > EPS, "b far end moved");
+        let Curve::Arc { center, .. } = arc else { panic!() };
+        assert!(center.distance(DVec3::new(8.0, 8.0, 0.0)) < EPS, "arc at (10,10) corner");
+    }
+
+    #[test]
+    fn fillet_curves_at_none_matches_no_pick_behavior() {
+        // Regression: passing None for both picks is identical to fillet_curves.
+        let a = line(-2.0, 0.0, 8.0, 0.0);
+        let b = line(0.0, -2.0, 0.0, 8.0);
+        let without = fillet_curves(&a, &b, 2.0).unwrap();
+        let with_none = fillet_curves_at(&a, &b, 2.0, None, None).unwrap();
+        assert_eq!(without, with_none);
     }
 
     #[test]

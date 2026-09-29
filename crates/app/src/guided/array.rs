@@ -38,7 +38,7 @@ pub static SCRIPTS: &[VerbScript] = &[
         verb: "arraycurve",
         needs_selection: true,
         steps: &[
-            Step::SelectObject { prompt: "Select path curve", filter: ObjFilter::Curve },
+            Step::SelectObject { prompt: "Select path curve", filter: ObjFilter::Curve, capture_point: false },
             Step::Integer { prompt: "Number of items along path", default: Some(5) },
         ],
         assemble: assemble_arraycurve,

@@ -50,7 +50,13 @@ pub enum Step {
     /// rides through the parser like any other selector (no parser change). This
     /// is how verb-first and two-role commands (trim, fillet, difference) pick
     /// each role separately.
-    SelectObject { prompt: &'static str, filter: ObjFilter },
+    ///
+    /// When `capture_point` is true the app also records the **world point** where
+    /// the user clicked (snap-resolved), stored as an [`Input::Point`] appended
+    /// after all collected inputs. Fillet uses this so the pick LOCATION on each
+    /// curve chooses which corner gets the arc (Rhino behavior). Plain object
+    /// picks (trim/difference) leave it false — no point is captured.
+    SelectObject { prompt: &'static str, filter: ObjFilter, capture_point: bool },
     /// A free-text token (an object name, block name, layer name). Collects a
     /// single whitespace-free token so the value round-trips through the
     /// whitespace-tokenized parser. Letters/digits plus `_`/`-` are accepted.
@@ -156,6 +162,10 @@ pub struct GuidedTool {
     /// The chosen [`Step::Branch`] arm's steps, once selected. `None` until the
     /// branch is committed; then it supplies every step after the branch slot.
     branch: Option<&'static [Step]>,
+    /// World points captured by `capture_point` [`Step::SelectObject`] picks, in
+    /// pick order. Appended (as [`Input::Point`]) after `seed ++ done` when the
+    /// flow completes, so the assembler can read them (fillet's `at` clause).
+    captured: Vec<DVec3>,
 }
 
 impl GuidedTool {
@@ -184,6 +194,7 @@ impl GuidedTool {
         self.input.clear();
         self.list.clear();
         self.branch = None;
+        self.captured.clear();
         StartResult::Started
     }
 
@@ -198,6 +209,7 @@ impl GuidedTool {
         self.input.clear();
         self.list.clear();
         self.branch = None;
+        self.captured.clear();
     }
 
     /// Index of the (single, last-if-present) [`Step::Branch`] in the base
@@ -282,15 +294,39 @@ impl GuidedTool {
         }
     }
 
+    /// True when the current [`Step::SelectObject`] wants the pick's world point
+    /// captured (`capture_point: true`). The app supplies that snapped point to
+    /// [`Self::commit_object_at`]; steps that don't want it use [`Self::commit_object`].
+    pub fn current_wants_object_point(&self) -> bool {
+        matches!(self.current_step(), Some(Step::SelectObject { capture_point: true, .. }))
+    }
+
     /// Commit an interactively picked object by its short id. The id is stored
     /// as a `#`-prefixed selector token (`#a1b2c3d4`), which the parser resolves
     /// via `find_named`'s short-id match — the `#` keeps it a valid selector even
     /// when the id starts with a digit.
+    ///
+    /// A thin wrapper over [`Self::commit_object_at`] with no point; kept for
+    /// non-capturing callers and the guided walk tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn commit_object(&mut self, short_id: &str) -> StepResult {
-        if !matches!(self.current_step(), Some(Step::SelectObject { .. })) {
-            return StepResult::Error("not expecting an object pick here".into());
-        }
+        self.commit_object_at(short_id, None)
+    }
+
+    /// Commit a picked object plus (optionally) the world point where the user
+    /// clicked. When the current step has `capture_point: true` and a point is
+    /// given, it is recorded (appended after all inputs on completion) so the
+    /// assembler can read it — this is how fillet's pick LOCATION selects the
+    /// corner. A `None` point (or a non-capturing step) records only the object.
+    pub fn commit_object_at(&mut self, short_id: &str, point: Option<DVec3>) -> StepResult {
+        let capture = match self.current_step() {
+            Some(Step::SelectObject { capture_point, .. }) => *capture_point,
+            _ => return StepResult::Error("not expecting an object pick here".into()),
+        };
         self.done.push(Input::Objects(format!("#{short_id}")));
+        if capture && let Some(p) = point {
+            self.captured.push(p);
+        }
         self.input.clear();
         self.maybe_finish()
     }
@@ -598,6 +634,10 @@ impl GuidedTool {
         }
         let mut args = self.seed.clone();
         args.extend(self.done.iter().cloned());
+        // Captured pick points (from `capture_point` SelectObject steps) ride at
+        // the tail so assemblers that want them (fillet's `at` clause) can read
+        // them via `captured_points`; assemblers that don't simply ignore them.
+        args.extend(self.captured.iter().copied().map(Input::Point));
         let result = match (script.assemble)(&args) {
             Ok(cmd) => StepResult::Emit(cmd),
             Err(e) => StepResult::Error(e),
@@ -725,6 +765,28 @@ mod assemble {
             Some(Input::Text(s)) => Ok(s.as_str()),
             _ => Err(format!("{verb}: missing name at step {i}")),
         }
+    }
+
+    /// The trailing `count` captured pick points (appended by `capture_point`
+    /// SelectObject steps). Returns them in pick order. `None` when fewer than
+    /// `count` trailing [`super::Input::Point`]s are present — the assembler then
+    /// falls back to a point-free command form.
+    pub fn captured_points(args: &[super::Input], count: usize) -> Option<Vec<glam::DVec3>> {
+        let pts: Vec<glam::DVec3> = args
+            .iter()
+            .rev()
+            .map_while(|i| match i {
+                super::Input::Point(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        if pts.len() < count {
+            return None;
+        }
+        // `pts` is reversed (last-first); take the last `count` in pick order.
+        let mut tail: Vec<glam::DVec3> = pts.into_iter().take(count).collect();
+        tail.reverse();
+        Some(tail)
     }
 
     /// A variadic point list at index `i`.
@@ -975,8 +1037,8 @@ mod tests {
         verb: "__objtest",
         needs_selection: false,
         steps: &[
-            Step::SelectObject { prompt: "First curve", filter: ObjFilter::Curve },
-            Step::SelectObject { prompt: "Second curve", filter: ObjFilter::Curve },
+            Step::SelectObject { prompt: "First curve", filter: ObjFilter::Curve, capture_point: false },
+            Step::SelectObject { prompt: "Second curve", filter: ObjFilter::Curve, capture_point: false },
         ],
         assemble: |args| {
             let a = super::assemble::obj_at(args, 0, "obj")?;

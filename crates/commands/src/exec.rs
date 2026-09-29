@@ -10549,7 +10549,7 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Fillet { id, a, b, radius } => {
+        Command::Fillet { id, a, b, radius, at, trim, join } => {
             if radius <= 0.0 {
                 return Err(ExecError::Invalid("fillet radius must be positive".into()));
             }
@@ -10574,18 +10574,80 @@ fn apply_forward(
                 }
             };
             let (ca, cb) = (curve_for(ids[0])?, curve_for(ids[1])?);
-            let (ta, arc, tb) = kernel_curve::fillet_curves(&ca, &cb, radius).ok_or_else(|| {
-                ExecError::Invalid(format!(
-                    "cannot fillet: segments are parallel or radius {radius} does not fit"
-                ))
-            })?;
-            let mut snapshots = Vec::with_capacity(2);
-            for (cid, trimmed) in [(ids[0], ta), (ids[1], tb)] {
-                let obj = doc.get_mut(cid).expect("resolved");
-                snapshots.push((cid, obj.geometry.clone()));
-                obj.geometry = Geometry::Curve(trimmed);
-            }
+            // The pick points (if any) map a→ids[0], b→ids[1]; they choose the
+            // corner to round (Rhino picks each curve near the end to fillet).
+            let (pa, pb) = match at {
+                Some((pa, pb)) => (Some(pa), Some(pb)),
+                None => (None, None),
+            };
+            let (ta, arc, tb) = kernel_curve::fillet_curves_at(&ca, &cb, radius, pa, pb)
+                .ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "cannot fillet: segments are parallel or radius {radius} does not fit"
+                    ))
+                })?;
             let id = id.unwrap_or_default();
+            let round = Command::Fillet { id: Some(id), a, b, radius, at, trim, join };
+            // Join implies trim: the trimmed pieces must touch the arc to weld.
+            if join {
+                let joined = kernel_curve::join_curves(
+                    &[ta, arc, tb],
+                    kernel_curve::JOIN_TOL,
+                    PROFILE_TOL,
+                )
+                .ok_or_else(|| {
+                    ExecError::Invalid(
+                        "cannot join the filleted result end-to-end (unexpected gap)".into(),
+                    )
+                })?;
+                let (name, layer) = {
+                    let first = doc.get(ids[0]).expect("resolved");
+                    (first.name.clone(), first.layer.clone())
+                };
+                let mut consumed = Vec::new();
+                for cid in [ids[0], ids[1]] {
+                    if let Some(pair) = doc.remove(cid) {
+                        consumed.push(pair);
+                    }
+                }
+                doc.insert(SceneObject {
+                    visible: true,
+                    id,
+                    name,
+                    layer,
+                    color: None,
+                    material: None,
+                    lineweight_mm: None,
+                    geometry: Geometry::Curve(joined),
+                });
+                return Ok((
+                    round,
+                    Inverse::Replace { created: vec![id], consumed },
+                    ApplyOutcome {
+                        created: vec![id],
+                        message: format!(
+                            "filleted {} + {} r={radius} -> joined curve {id}",
+                            ids[0], ids[1]
+                        ),
+                    },
+                ));
+            }
+            // Not joining: add the arc as a new object. Trim (default) pulls the
+            // inputs back to tangency; trim=no leaves the inputs untouched.
+            let (inverse, msg_tail) = if trim {
+                let mut snapshots = Vec::with_capacity(2);
+                for (cid, trimmed) in [(ids[0], ta), (ids[1], tb)] {
+                    let obj = doc.get_mut(cid).expect("resolved");
+                    snapshots.push((cid, obj.geometry.clone()));
+                    obj.geometry = Geometry::Curve(trimmed);
+                }
+                (
+                    Inverse::CreatedAndGeometry { created: vec![id], snapshots },
+                    "curves trimmed to tangency",
+                )
+            } else {
+                (Inverse::DeleteCreated(vec![id]), "inputs untrimmed")
+            };
             doc.insert(SceneObject {
                 visible: true,
                 id,
@@ -10597,12 +10659,12 @@ fn apply_forward(
                 geometry: Geometry::Curve(arc),
             });
             Ok((
-                Command::Fillet { id: Some(id), a, b, radius },
-                Inverse::CreatedAndGeometry { created: vec![id], snapshots },
+                round,
+                inverse,
                 ApplyOutcome {
                     created: vec![id],
                     message: format!(
-                        "filleted {} + {} r={radius} -> arc {id} (curves trimmed to tangency)",
+                        "filleted {} + {} r={radius} -> arc {id} ({msg_tail})",
                         ids[0], ids[1]
                     ),
                 },
@@ -16703,6 +16765,79 @@ mod tests {
         assert!(restored[1][0].distance(DVec3::new(0.0, 0.0, 0.0)) < 1e-9);
         run(&mut s, "redo");
         assert_eq!(s.doc.len(), 3);
+    }
+
+    #[test]
+    fn fillet_trim_no_leaves_inputs_untouched() {
+        let mut s = Session::default();
+        run(&mut s, "line -2,0 8,0");
+        run(&mut s, "line 0,-2 0,8");
+        let out = run(&mut s, "fillet last 2 2 trim no");
+        assert!(out.message.contains("untrimmed"), "{}", out.message);
+        assert_eq!(s.doc.len(), 3); // two ORIGINAL lines + arc
+        // Both source lines keep their original endpoints (no trim).
+        let lines: Vec<_> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Line { a, b }) => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].0.distance(DVec3::new(-2.0, 0.0, 0.0)) < 1e-9);
+        assert!(lines[0].1.distance(DVec3::new(8.0, 0.0, 0.0)) < 1e-9);
+        assert!(lines[1].0.distance(DVec3::new(0.0, -2.0, 0.0)) < 1e-9);
+        assert!(lines[1].1.distance(DVec3::new(0.0, 8.0, 0.0)) < 1e-9);
+        // Arc still present at the corner.
+        let arc = s.doc.objects().find_map(|o| match &o.geometry {
+            Geometry::Curve(c @ Curve::Arc { .. }) => Some(c.clone()),
+            _ => None,
+        });
+        assert!(arc.is_some());
+        // Undo drops the arc, leaving the two untouched lines.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
+    }
+
+    #[test]
+    fn fillet_join_welds_into_one_curve() {
+        let mut s = Session::default();
+        run(&mut s, "line -2,0 8,0");
+        run(&mut s, "line 0,-2 0,8");
+        let out = run(&mut s, "fillet last 2 2 join yes");
+        assert!(out.message.contains("joined"), "{}", out.message);
+        // Two inputs consumed, one welded polyline remains.
+        assert_eq!(s.doc.len(), 1);
+        let joined = s.doc.objects().next().unwrap();
+        assert!(matches!(joined.geometry, Geometry::Curve(Curve::Polyline { .. })));
+        // Undo restores the two inputs.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 1);
+    }
+
+    #[test]
+    fn fillet_at_pick_selects_the_corner() {
+        // Two L-shaped polylines sharing corners at (0,0) and (10,10).
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 10,0,0 10,10,0");
+        run(&mut s, "polyline 0,0,0 0,10,0 10,10,0");
+        // Pick near the (10,10) corner on both → arc at (8,8).
+        run(&mut s, "fillet last 2 2 at 10,9.5 9.5,10");
+        let arc = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Curve(c @ Curve::Arc { .. }) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("arc present");
+        let Curve::Arc { center, .. } = arc else { panic!() };
+        assert!(center.distance(DVec3::new(8.0, 8.0, 0.0)) < 1e-9, "{center}");
     }
 
     #[test]

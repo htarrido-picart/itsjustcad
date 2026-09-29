@@ -31,8 +31,8 @@ pub static SCRIPTS: &[VerbScript] = &[
         verb: "difference",
         needs_selection: false,
         steps: &[
-            Step::SelectObject { prompt: "Select solid to subtract from", filter: ObjFilter::Solid },
-            Step::SelectObject { prompt: "Select cutting solid", filter: ObjFilter::Solid },
+            Step::SelectObject { prompt: "Select solid to subtract from", filter: ObjFilter::Solid, capture_point: false },
+            Step::SelectObject { prompt: "Select cutting solid", filter: ObjFilter::Solid, capture_point: false },
         ],
         assemble: assemble_difference,
     },

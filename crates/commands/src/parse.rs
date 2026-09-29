@@ -1139,18 +1139,21 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }
         "fillet" => {
             let (a, rest) = selector(&args, "fillet")?;
-            match rest {
-                // "fillet last 2 0.5": one selector naming both curves.
-                [r] => Ok(Command::Fillet { id: None, a: a.clone(), b: a, radius: number(r)? }),
+            // Two-selector form unless the next token already parses as the radius
+            // (single-selector form `fillet last 2 0.5`, a == b).
+            let (a, b, rest) = match rest.first() {
+                Some(tok) if number(tok).is_ok() => (a.clone(), a, rest),
                 _ => {
                     let (b, rest) = selector(rest, "fillet")?;
-                    let [r] = take::<1>("fillet", "a radius after the selectors", rest)
-                        .map_err(|_| {
-                            wrong_err("fillet", "a radius after the selectors", &args)
-                        })?;
-                    Ok(Command::Fillet { id: None, a, b, radius: number(r)? })
+                    (a, b, rest)
                 }
-            }
+            };
+            let (&r, rest) = rest
+                .split_first()
+                .ok_or_else(|| wrong_err("fillet", "a radius after the selectors", &args))?;
+            let radius = number(r)?;
+            let (at, trim, join) = parse_fillet_options(rest, &args)?;
+            Ok(Command::Fillet { id: None, a, b, radius, at, trim, join })
         }
         "chamfer" => {
             let (a, rest) = selector(&args, "chamfer")?;
@@ -3801,6 +3804,55 @@ fn scale_denominator(s: &str) -> Result<f64, ParseError> {
 }
 
 /// Parse a selector from the front of `args`, returning the rest.
+/// Parse the optional trailing `fillet` clauses: `[at <ptA> <ptB>] [trim yes|no]
+/// [join yes|no]`, in any order. Returns `(at, trim, join)` with Rhino defaults
+/// (trim=true, join=false) for absent clauses.
+/// `(at pick points, trim flag, join flag)` parsed from the trailing clauses.
+type FilletOptions = (Option<(DVec3, DVec3)>, bool, bool);
+
+fn parse_fillet_options(mut rest: &[&str], args: &[&str]) -> Result<FilletOptions, ParseError> {
+    let mut at = None;
+    let mut trim = true;
+    let mut join = false;
+    let yes_no = |v: &str| -> Result<bool, ParseError> {
+        match v.to_ascii_lowercase().as_str() {
+            "yes" | "on" | "true" | "1" | "y" => Ok(true),
+            "no" | "off" | "false" | "0" | "n" => Ok(false),
+            _ => Err(wrong_err("fillet", "yes or no", args)),
+        }
+    };
+    while let Some((&key, tail)) = rest.split_first() {
+        if key.eq_ignore_ascii_case("at") {
+            match tail {
+                [pa, pb, more @ ..] => {
+                    at = Some((point(pa)?, point(pb)?));
+                    rest = more;
+                }
+                _ => return Err(wrong_err("fillet", "two pick points after 'at'", args)),
+            }
+        } else if key.eq_ignore_ascii_case("trim") {
+            match tail {
+                [v, more @ ..] => {
+                    trim = yes_no(v)?;
+                    rest = more;
+                }
+                _ => return Err(wrong_err("fillet", "yes or no after 'trim'", args)),
+            }
+        } else if key.eq_ignore_ascii_case("join") {
+            match tail {
+                [v, more @ ..] => {
+                    join = yes_no(v)?;
+                    rest = more;
+                }
+                _ => return Err(wrong_err("fillet", "yes or no after 'join'", args)),
+            }
+        } else {
+            return Err(wrong_err("fillet", "at / trim / join", args));
+        }
+    }
+    Ok((at, trim, join))
+}
+
 fn selector<'a>(
     args: &'a [&'a str],
     command: &'static str,
@@ -5269,6 +5321,36 @@ mod tests {
             parse("fillet last 2 50cm").unwrap(),
             Command::Fillet { radius, .. } if radius == 0.5
         ));
+        // bare form: Rhino defaults trim=yes, join=no, no pick points.
+        assert!(matches!(
+            parse("fillet l1 l2 0.5").unwrap(),
+            Command::Fillet { at: None, trim: true, join: false, .. }
+        ));
+        // trim/join keywords flip the flags (order-independent).
+        assert!(matches!(
+            parse("fillet l1 l2 0.5 trim no join yes").unwrap(),
+            Command::Fillet { at: None, trim: false, join: true, .. }
+        ));
+        assert!(matches!(
+            parse("fillet l1 l2 0.5 join yes trim no").unwrap(),
+            Command::Fillet { trim: false, join: true, .. }
+        ));
+        // `at <ptA> <ptB>` captures the corner-selecting pick points.
+        match parse("fillet l1 l2 0.5 at 0,0 5,5").unwrap() {
+            Command::Fillet { at: Some((pa, pb)), .. } => {
+                assert!(pa.distance(DVec3::ZERO) < 1e-9);
+                assert!(pb.distance(DVec3::new(5.0, 5.0, 0.0)) < 1e-9);
+            }
+            other => panic!("expected fillet with pick points, got {other:?}"),
+        }
+        // full clause: at + trim + join together.
+        assert!(matches!(
+            parse("fillet l1 l2 0.5 at 0,0 5,5 trim no join yes").unwrap(),
+            Command::Fillet { at: Some(_), trim: false, join: true, .. }
+        ));
+        // bad option keyword / bad yes-no are rejected.
+        assert!(parse("fillet l1 l2 0.5 wibble").is_err());
+        assert!(parse("fillet l1 l2 0.5 trim maybe").is_err());
         // chamfer: two selectors + distance, or one selector naming both curves
         assert!(matches!(
             parse("chamfer l1 l2 0.5").unwrap(),
@@ -5303,6 +5385,9 @@ mod tests {
             "extend last 0.5",
             "join last 3",
             "fillet last 2 0.5",
+            "fillet l1 l2 0.5 trim no join yes",
+            "fillet l1 l2 0.5 at 0,0 5,5",
+            "fillet l1 l2 0.5 at 0,0 5,5 trim no join yes",
             "chamfer l1 l2 0.5",
             "chamfer sel 0.5",
             "explode sel",

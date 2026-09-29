@@ -5495,7 +5495,14 @@ impl App {
                             self.session.doc.selection.insert(id);
                             self.session.doc.generation += 1;
                             let short = id.short();
-                            let r = self.guided.commit_object(&short);
+                            // Capture the pick location (drag center → world) when
+                            // the step wants it (fillet corner selection).
+                            let pt = if self.guided.current_wants_object_point() {
+                                ground_point(view_proj, rect, drag_rect.center())
+                            } else {
+                                None
+                            };
+                            let r = self.guided.commit_object_at(&short, pt);
                             self.handle_guided(r);
                         }
                         None => self
@@ -5515,7 +5522,14 @@ impl App {
                             self.session.doc.selection.insert(id);
                             self.session.doc.generation += 1;
                             let short = id.short();
-                            let r = self.guided.commit_object(&short);
+                            // Capture the snapped click location when the step
+                            // wants it (fillet corner selection).
+                            let pt = if self.guided.current_wants_object_point() {
+                                cursor_world
+                            } else {
+                                None
+                            };
+                            let r = self.guided.commit_object_at(&short, pt);
                             self.handle_guided(r);
                         }
                         Some(_) => self

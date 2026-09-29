@@ -953,13 +953,26 @@ pub enum Command {
         id: Option<ObjectId>,
         targets: Selector,
     },
-    /// Fillet two lines with a tangent arc, trimming both to tangency.
+    /// Fillet two lines with a tangent arc. `at` (optional) holds the world
+    /// points where each curve was picked NEAR the end to round — the pick
+    /// LOCATION chooses which corner gets the arc (Rhino). `trim` (default true)
+    /// pulls the inputs back to the tangency points; `join` (default false) welds
+    /// the trimmed inputs + arc into one polyline.
     Fillet {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
         a: Selector,
         b: Selector,
         radius: f64,
+        /// Pick points near each curve's corner-to-round (`(nearA, nearB)`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<(DVec3, DVec3)>,
+        /// Trim the inputs back to tangency (Rhino default Yes).
+        #[serde(default = "crate::command::default_true")]
+        trim: bool,
+        /// Weld trimmed inputs + arc into one curve (Rhino default No).
+        #[serde(default)]
+        join: bool,
     },
     /// Chamfer (bevel) two lines/polylines: cut off the corner with a straight
     /// setback line, trimming both sources back by `dist`. The straight-line
