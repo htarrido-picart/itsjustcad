@@ -102,6 +102,25 @@ impl CommandLine {
         }
     }
 
+    /// Clear the visible scrollback (the printed output lines). The up-arrow
+    /// recall history, logged inputs, and current input are untouched — so the
+    /// `clear` command wipes the display without forgetting past commands.
+    pub fn clear_scrollback(&mut self) {
+        self.history.clear();
+    }
+
+    /// Lines currently shown in the scrollback (for tests).
+    #[cfg(test)]
+    pub(crate) fn scrollback_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Up-arrow recall depth (for tests).
+    #[cfg(test)]
+    pub(crate) fn recall_len(&self) -> usize {
+        self.recall.len()
+    }
+
     /// Run one command line through the session, echoing results.
     /// Returns true when the document changed.
     pub fn execute(&mut self, session: &mut Session, line: &str) -> bool {
@@ -734,6 +753,26 @@ mod tests {
         assert_eq!(cl.history.len(), 500);
         assert_eq!(cl.history.first().unwrap(), "line 100");
         assert_eq!(cl.history.last().unwrap(), "line 599");
+    }
+
+    #[test]
+    fn clear_scrollback_keeps_recall() {
+        let mut cl = CommandLine::default();
+        let mut session = Session::default();
+        // A raw scrollback line plus two executed commands — each `execute`
+        // appends to BOTH the scrollback and the up-arrow recall.
+        cl.push_line("some output");
+        cl.execute(&mut session, "box 0,0,0 1,1,1");
+        cl.execute(&mut session, "box 2,0,0 1,1,1");
+        assert!(cl.scrollback_len() > 0);
+        assert!(cl.recall_len() >= 2, "both commands are in recall");
+
+        let recall_before = cl.recall_len();
+        cl.clear_scrollback();
+
+        // Scrollback wiped, recall (up-arrow history) preserved.
+        assert_eq!(cl.scrollback_len(), 0);
+        assert_eq!(cl.recall_len(), recall_before, "recall must survive clear");
     }
 
     #[test]

@@ -1394,6 +1394,10 @@ impl App {
         };
         let mut words = line.split_whitespace();
         match words.next() {
+            // `clear` / `cls`: wipe the command-line scrollback (the printed
+            // output) but KEEP the up-arrow recall history — a display cleanup,
+            // not a destructive command. Never reaches the parser.
+            Some("clear" | "cls") => self.command_line.clear_scrollback(),
             Some("save") => self.save(words.next().map(Into::into)),
             Some("copyselection") => {
                 let n = self.session.doc.selection.len();
