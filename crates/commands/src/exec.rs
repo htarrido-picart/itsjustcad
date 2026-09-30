@@ -7564,16 +7564,18 @@ fn powertrim_drop_index(pieces: &[Curve], pick: DVec3) -> usize {
         .expect("pieces is non-empty")
 }
 
-/// The curve in `doc` whose geometry passes nearest `point`, excluding the
-/// cutter set (Rhino's "click the object to trim"). Returns `None` when the doc
-/// has no eligible curve or the nearest one is farther than [`TRIM_PICK_TOL`].
-fn nearest_curve_to_point(doc: &Document, point: DVec3, cutters: &[ObjectId]) -> Option<ObjectId> {
+/// The curve in `doc` whose geometry passes nearest `point` (Rhino's "click the
+/// object to trim"). A cutter MAY itself be a trim target — the classic two
+/// crossing lines trim each other, so the clicked curve is picked whether or not
+/// it is in the cutter set; the caller excludes the target from its own cutters
+/// when splitting. Returns `None` when the doc has no eligible curve or the
+/// nearest one is farther than [`TRIM_PICK_TOL`].
+fn nearest_curve_to_point(doc: &Document, point: DVec3) -> Option<ObjectId> {
     /// A click must land within this world distance of a curve to select it —
     /// generous so imprecise picks still catch the intended curve, but finite so a
     /// stray click in empty space hits nothing (skipped with a note).
     const TRIM_PICK_TOL: f64 = 1.0;
     doc.objects()
-        .filter(|o| !cutters.contains(&o.id))
         .filter_map(|o| match &o.geometry {
             Geometry::Curve(c) => {
                 let d = kernel_curve::closest_point(c, point, PROFILE_TOL).distance(point);
@@ -10432,7 +10434,7 @@ fn apply_forward(
             let mut picks_by_target: std::collections::HashMap<ObjectId, Vec<DVec3>> =
                 std::collections::HashMap::new();
             for (i, pick) in removes.iter().copied().enumerate() {
-                match nearest_curve_to_point(doc, pick, &cutter_ids) {
+                match nearest_curve_to_point(doc, pick) {
                     Some(tid) => {
                         if !picks_by_target.contains_key(&tid) {
                             order.push(tid);
@@ -10454,13 +10456,27 @@ fn apply_forward(
                 let picks = &picks_by_target[&tid];
                 let curve = curve_of(doc, tid, "trim")?.clone();
 
+                // A curve cannot cut itself: when the target is also a cutter
+                // (two crossing lines trimming each other), split/extend it
+                // against the OTHER cutters only.
+                let others: Vec<Curve> = cutter_ids
+                    .iter()
+                    .zip(&cutter_curves)
+                    .filter(|(cid, _)| **cid != tid)
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                if others.is_empty() {
+                    notes.push("point: only cutter clicked, nothing to cut it — skipped".into());
+                    continue;
+                }
+
                 if extend {
                     // Extend each picked end to the nearest cutter, in sequence
                     // (later picks see the already-extended curve).
                     let mut cur = curve;
                     let mut any = false;
                     for pick in picks {
-                        match extend_to_cutters(&cur, *pick, &cutter_curves) {
+                        match extend_to_cutters(&cur, *pick, &others) {
                             Some(new) => {
                                 cur = new;
                                 any = true;
@@ -10492,7 +10508,7 @@ fn apply_forward(
                 // Trim-remove: split the target ONCE at its intersections with the
                 // cutter SET, then delete every segment a pick lands in.
                 let mut cuts = Vec::new();
-                for cc in &cutter_curves {
+                for cc in &others {
                     cuts.extend(kernel_curve::intersections(&curve, cc, PROFILE_TOL));
                 }
                 if cuts.is_empty() {
@@ -16711,6 +16727,38 @@ mod tests {
         // Redo re-applies.
         run(&mut s, "redo");
         assert_eq!(s.doc.len(), 4);
+    }
+
+    #[test]
+    fn trim_curve_that_is_also_a_cutter() {
+        // The canonical two-crossing-lines trim: a horizontal and a vertical line
+        // crossing at (5,0), BOTH selected as cutters. Clicking the right overhang
+        // of the horizontal line (x=8) removes it, even though that line is itself
+        // a cutter — a curve can be its own trim target (it just can't cut itself).
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last beam");
+        run(&mut s, "line 5,-5 5,5");
+        run(&mut s, "name last post");
+        let out = run(&mut s, "trim #beam #post remove 8,0");
+        assert!(out.message.contains("removed 1 piece"), "{}", out.message);
+        // beam → single survivor 0..5; post untouched → 2 curves total.
+        assert_eq!(s.doc.len(), 2);
+        let Geometry::Curve(Curve::Line { a, b }) =
+            &s.doc.get(s.doc.find_named("beam")[0]).unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!(a.x.min(b.x) < 1e-9 && a.x.max(b.x) < 5.0 + 1e-6, "beam kept 0..5: {a:?} {b:?}");
+        // post survives whole.
+        let Geometry::Curve(Curve::Line { a, b }) =
+            &s.doc.get(s.doc.find_named("post")[0]).unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!((a.y.min(b.y) + 5.0).abs() < 1e-9 && (a.y.max(b.y) - 5.0).abs() < 1e-9, "post whole");
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
     }
 
     #[test]

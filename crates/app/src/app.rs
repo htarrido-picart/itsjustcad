@@ -5090,6 +5090,51 @@ impl App {
         crate::boxsel::box_select(&items, drag, mode)
     }
 
+    /// Resolve a guided object step from a single CLICK (or a drag too small to
+    /// be a deliberate rubber box): hit-test the point to ONE object, enforce
+    /// the step's geometry filter, then commit it (single) or add it (multi).
+    /// Shared by the click path and the tiny-drag fallback so a click-jitter
+    /// never triggers box-select — which, for two crossing curves, grabs BOTH
+    /// via their overlapping AABBs, so a single click would select two and (in
+    /// trim) wrongly mark both as cutters, leaving no target to remove.
+    fn guided_single_pick(
+        &mut self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        world: Option<glam::DVec3>,
+        multi: bool,
+    ) {
+        match self.hit_object(view_proj, rect, pos) {
+            Some(id) if self.guided_pick_matches(id) => {
+                // Highlight the pick; the emitted command references it by id, so
+                // selection state doesn't affect correctness.
+                self.session.doc.selection.insert(id);
+                self.session.doc.generation += 1;
+                let short = id.short();
+                let r = if multi {
+                    // Multi-object select: each click adds to the set and stays
+                    // on the step (Enter finishes).
+                    self.guided.push_selected_object(&short)
+                } else {
+                    // Single object: capture the click location when the step
+                    // wants it (fillet corner selection).
+                    let pt = if self.guided.current_wants_object_point() {
+                        world
+                    } else {
+                        None
+                    };
+                    self.guided.commit_object_at(&short, pt)
+                };
+                self.handle_guided(r);
+            }
+            Some(_) => self
+                .command_line
+                .push_line("that object isn't the right type — pick again"),
+            None => {} // empty space: keep waiting for a valid pick
+        }
+    }
+
     /// Dispatch a guided-tool step outcome: run the emitted command, surface an
     /// error, or re-show the next prompt.
     fn handle_guided(&mut self, result: StepResult) {
@@ -5527,7 +5572,16 @@ impl App {
                 draw_rubber_box(&ui.painter_at(rect), drag_rect, mode, ui.visuals());
                 if response.drag_stopped_by(egui::PointerButton::Primary) {
                     self.box_drag = None;
-                    if multi {
+                    // A drag smaller than this is a click with pointer jitter,
+                    // not a deliberate rubber box. Resolving it as a box is wrong
+                    // for a guided object step: the AABB box-select would grab
+                    // both of two crossing curves, so one click selects two (and
+                    // in trim marks both as cutters). Fall back to a single pick.
+                    const MIN_BOX_PX: f32 = 6.0;
+                    if drag_rect.width() < MIN_BOX_PX && drag_rect.height() < MIN_BOX_PX {
+                        let world = ground_point(view_proj, rect, pos);
+                        self.guided_single_pick(view_proj, rect, pos, world, multi);
+                    } else if multi {
                         // Multi-object select (trim cutters): add ALL matches in the
                         // region to the growing set, not just the nearest.
                         let ids = self.guided_box_pick_all(view_proj, rect, drag_rect, mode);
@@ -5575,34 +5629,7 @@ impl App {
             }
             if response.clicked() {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    match self.hit_object(view_proj, rect, pos) {
-                        Some(id) if self.guided_pick_matches(id) => {
-                            // Highlight the pick; the emitted command references it
-                            // by id, so selection state doesn't affect correctness.
-                            self.session.doc.selection.insert(id);
-                            self.session.doc.generation += 1;
-                            let short = id.short();
-                            let r = if multi {
-                                // Multi-object select: each click adds to the set and
-                                // stays on the step (Enter finishes).
-                                self.guided.push_selected_object(&short)
-                            } else {
-                                // Single object: capture the snapped click location
-                                // when the step wants it (fillet corner selection).
-                                let pt = if self.guided.current_wants_object_point() {
-                                    cursor_world
-                                } else {
-                                    None
-                                };
-                                self.guided.commit_object_at(&short, pt)
-                            };
-                            self.handle_guided(r);
-                        }
-                        Some(_) => self
-                            .command_line
-                            .push_line("that object isn't the right type — pick again"),
-                        None => {} // empty space: keep waiting for a valid pick
-                    }
+                    self.guided_single_pick(view_proj, rect, pos, cursor_world, multi);
                 }
                 return;
             }
