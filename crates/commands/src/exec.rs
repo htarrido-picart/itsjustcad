@@ -7588,6 +7588,107 @@ fn nearest_curve_to_point(doc: &Document, point: DVec3) -> Option<ObjectId> {
         .map(|(id, _)| id)
 }
 
+/// The polyline of the piece a trim-remove click at `pick` would DELETE — for
+/// live GUI preview so the user sees which segment disappears before committing.
+/// Mirrors the Trim exec's remove path: find the curve nearest `pick`, split it
+/// at its intersections with the OTHER cutters (a curve can't cut itself), and
+/// return the tessellated segment the pick lands in. `None` when the pick hits
+/// no curve, the target only meets cutters at its ends, or the target is the
+/// sole cutter.
+pub fn trim_removed_piece(doc: &Document, cutters: &[ObjectId], pick: DVec3) -> Option<Vec<DVec3>> {
+    /// Chord tolerance for the preview polyline — fine enough to read as the real
+    /// curve, matching the app's pick tessellation.
+    const PREVIEW_TOL: f64 = 0.05;
+    let tid = nearest_curve_to_point(doc, pick)?;
+    let Geometry::Curve(target) = &doc.get(tid)?.geometry else {
+        return None;
+    };
+    let mut cuts = Vec::new();
+    for cid in cutters {
+        if *cid == tid {
+            continue; // a curve can't cut itself
+        }
+        if let Some(obj) = doc.get(*cid)
+            && let Geometry::Curve(cc) = &obj.geometry
+        {
+            cuts.extend(kernel_curve::intersections(target, cc, PROFILE_TOL));
+        }
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let pieces = kernel_curve::split_at_points(target, &cuts, kernel_curve::JOIN_TOL)?;
+    if pieces.len() < 2 {
+        return None;
+    }
+    let idx = powertrim_drop_index(&pieces, pick);
+    Some(pieces[idx].tessellate(PREVIEW_TOL))
+}
+
+/// Live preview of an in-progress trim-remove. Given the cutters and the removal
+/// points clicked so far, returns (a) the target curves that should be HIDDEN
+/// from the view — each has at least one piece queued for removal — and (b) the
+/// SURVIVING piece polylines to draw in their place, so the clicked pieces look
+/// deleted before Enter commits. Mirrors the Trim exec's grouping/split/drop, so
+/// the preview matches the committed result exactly.
+pub fn trim_preview(
+    doc: &Document,
+    cutters: &[ObjectId],
+    picks: &[DVec3],
+) -> (Vec<ObjectId>, Vec<Vec<DVec3>>) {
+    const PREVIEW_TOL: f64 = 0.05;
+    // Group picks by the curve nearest each (same as the exec remove path).
+    let mut by_target: std::collections::HashMap<ObjectId, Vec<DVec3>> =
+        std::collections::HashMap::new();
+    let mut order: Vec<ObjectId> = Vec::new();
+    for pick in picks {
+        if let Some(tid) = nearest_curve_to_point(doc, *pick) {
+            if !by_target.contains_key(&tid) {
+                order.push(tid);
+            }
+            by_target.entry(tid).or_default().push(*pick);
+        }
+    }
+    let mut hidden = Vec::new();
+    let mut survivors = Vec::new();
+    for tid in order {
+        let Some(obj) = doc.get(tid) else { continue };
+        let Geometry::Curve(target) = &obj.geometry else { continue };
+        let mut cuts = Vec::new();
+        for cid in cutters {
+            if *cid == tid {
+                continue; // a curve can't cut itself
+            }
+            if let Some(o) = doc.get(*cid)
+                && let Geometry::Curve(cc) = &o.geometry
+            {
+                cuts.extend(kernel_curve::intersections(target, cc, PROFILE_TOL));
+            }
+        }
+        if cuts.is_empty() {
+            continue;
+        }
+        let Some(pieces) = kernel_curve::split_at_points(target, &cuts, kernel_curve::JOIN_TOL)
+        else {
+            continue;
+        };
+        if pieces.len() < 2 {
+            continue;
+        }
+        let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for pick in &by_target[&tid] {
+            drop.insert(powertrim_drop_index(&pieces, *pick));
+        }
+        hidden.push(tid);
+        for (j, piece) in pieces.iter().enumerate() {
+            if !drop.contains(&j) {
+                survivors.push(piece.tessellate(PREVIEW_TOL));
+            }
+        }
+    }
+    (hidden, survivors)
+}
+
 /// Extend the open end of `curve` NEAREST `pick` to meet the closest cutter.
 ///
 /// Grows the curve by a large distance, intersects the grown curve with the
@@ -16759,6 +16860,52 @@ mod tests {
         assert!((a.y.min(b.y) + 5.0).abs() < 1e-9 && (a.y.max(b.y) - 5.0).abs() < 1e-9, "post whole");
         run(&mut s, "undo");
         assert_eq!(s.doc.len(), 2);
+    }
+
+    #[test]
+    fn trim_removed_piece_previews_the_segment_under_the_pick() {
+        // Same geometry as the cutter-is-also-a-target test. The preview of a
+        // click at (8,0) is the beam segment from the crossing (5,0) to the end
+        // (10,0) — the piece that trim would delete.
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last beam");
+        run(&mut s, "line 5,-5 5,5");
+        run(&mut s, "name last post");
+        let beam = s.doc.find_named("beam")[0];
+        let post = s.doc.find_named("post")[0];
+        let piece = super::trim_removed_piece(&s.doc, &[beam, post], DVec3::new(8.0, 0.0, 0.0))
+            .expect("a piece under the pick");
+        let xs: Vec<f64> = piece.iter().map(|p| p.x).collect();
+        let lo = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!((lo - 5.0).abs() < 1e-6 && (hi - 10.0).abs() < 1e-6, "piece spans 5..10: {piece:?}");
+        // A pick in empty space previews nothing.
+        assert!(super::trim_removed_piece(&s.doc, &[beam, post], DVec3::new(50.0, 50.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn trim_preview_hides_target_and_keeps_survivor() {
+        // Two crossing lines, both cutters. A click at (8,0) queues the beam's
+        // 5..10 piece for removal → the beam is hidden and its 0..5 survivor is
+        // returned to draw in place (what the user sees before Enter commits).
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last beam");
+        run(&mut s, "line 5,-5 5,5");
+        run(&mut s, "name last post");
+        let beam = s.doc.find_named("beam")[0];
+        let post = s.doc.find_named("post")[0];
+        let (hidden, survivors) =
+            super::trim_preview(&s.doc, &[beam, post], &[DVec3::new(8.0, 0.0, 0.0)]);
+        assert_eq!(hidden, vec![beam], "only the clicked target is hidden");
+        assert_eq!(survivors.len(), 1, "one surviving piece (0..5)");
+        let xs: Vec<f64> = survivors[0].iter().map(|p| p.x).collect();
+        let lo = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!((lo - 0.0).abs() < 1e-6 && (hi - 5.0).abs() < 1e-6, "survivor spans 0..5: {:?}", survivors[0]);
+        // No picks → nothing hidden.
+        assert!(super::trim_preview(&s.doc, &[beam, post], &[]).0.is_empty());
     }
 
     #[test]

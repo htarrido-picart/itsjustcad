@@ -31,7 +31,7 @@ pub use renderer::{
 pub use sketchy::{
     edge_seed, jitter_offset, sketchify_segments, SketchyParams,
 };
-pub use snapshot::{snapshot, snapshot_with_mode, ColorModeSnapshot, Theme};
+pub use snapshot::{snapshot, snapshot_hiding, snapshot_with_mode, ColorModeSnapshot, Theme};
 pub use viewport_callback::ViewportCallback;
 
 pub fn camera_uniform(view_proj: glam::Mat4, eye: glam::Vec3) -> CameraUniform {

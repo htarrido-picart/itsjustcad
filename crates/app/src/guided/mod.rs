@@ -298,6 +298,31 @@ impl GuidedTool {
         matches!(self.current_step(), Some(Step::PointList { .. }))
     }
 
+    /// The active verb, if a script is running (e.g. `"trim"`). Lets the app
+    /// render verb-specific affordances like the trim-removal preview.
+    pub fn active_verb(&self) -> Option<&'static str> {
+        self.script.map(|s| s.verb)
+    }
+
+    /// The `#`-prefixed selector tokens of the first finished object SET
+    /// ([`Step::SelectObjects`], e.g. trim's cutters), once that phase is done.
+    /// Empty until the set is committed.
+    pub fn collected_object_set(&self) -> &[String] {
+        self.done
+            .iter()
+            .find_map(|i| match i {
+                Input::ObjectSet(v) => Some(v.as_slice()),
+                _ => None,
+            })
+            .unwrap_or(&[])
+    }
+
+    /// Points collected so far on the in-progress [`Step::PointList`] (trim's
+    /// removal picks), for live preview before Enter commits them.
+    pub fn list_points(&self) -> &[DVec3] {
+        &self.list
+    }
+
     /// The keyword options for the current step, filtered by the typed buffer.
     /// Applies to both [`Step::Keyword`] (its `options`) and [`Step::Branch`]
     /// (its arm keys). Case-insensitive prefix match against `self.input`; an

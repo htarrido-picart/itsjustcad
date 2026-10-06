@@ -40,7 +40,7 @@ pub use command::{
     MirrorPlane, OptionOp, PlotStyleOp, RegionMode, Selector, SheetSetOp, SimilarBy,
 };
 pub use error::{ExecError, ParseError};
-pub use exec::{ApplyOutcome, ImportSummary, Session, MAIN_BRANCH};
+pub use exec::{trim_preview, trim_removed_piece, ApplyOutcome, ImportSummary, Session, MAIN_BRANCH};
 pub use parse::parse;
 pub use plugin::{Plugin, PluginError, PluginParam, PluginRegistry};
 pub use registry::{registry, Category, CommandSpec, SELECTOR_HELP};

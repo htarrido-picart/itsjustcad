@@ -4,7 +4,7 @@
 use glam::{DVec2, DVec3};
 use itsjustcad_doc::{
     hatch::{hatch_ansi, hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
-    Annotation, Document, Geometry, HatchPattern, SceneObject,
+    Annotation, Document, Geometry, HatchPattern, ObjectId, SceneObject,
 };
 
 use crate::renderer::{hue_from_seed, ColorMode, SceneData};
@@ -241,6 +241,20 @@ pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
 
 /// Snapshot with an explicit color mode.
 pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) -> SceneData {
+    snapshot_hiding(doc, theme, cms, &std::collections::HashSet::new())
+}
+
+/// Like [`snapshot_with_mode`] but omits drawing the objects in `hidden`. This
+/// is a DRAW-only suppression: the objects stay in the document and remain
+/// hit-testable — used for the trim preview, where pieces the user has clicked
+/// to remove vanish from view while they keep picking more, until Enter commits
+/// the real trim.
+pub fn snapshot_hiding(
+    doc: &Document,
+    theme: Theme,
+    cms: ColorModeSnapshot,
+    hidden: &std::collections::HashSet<ObjectId>,
+) -> SceneData {
     let mode = cms.color_mode;
     let mut scene = SceneData {
         meshes: Vec::new(),
@@ -259,6 +273,9 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
     for obj in doc.objects() {
         if !obj.visible {
             continue; // hidden object (hideobj)
+        }
+        if hidden.contains(&obj.id) {
+            continue; // draw-only suppression (trim preview)
         }
         let style = doc.layers.get(&obj.layer);
         if style.is_some_and(|s| !s.visible) {

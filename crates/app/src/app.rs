@@ -424,6 +424,10 @@ pub struct App {
     uploaded_plant_symbols: Option<bool>,
     /// Sketchy params of the last GPU upload; changes force a re-upload.
     uploaded_sketchy: Option<itsjustcad_render::SketchyParams>,
+    /// Marked-removal count of the last upload during a trim preview (`None`
+    /// when not in trim's parts-to-remove phase); changes force a re-upload so
+    /// clicked pieces disappear even though doc.generation hasn't moved.
+    uploaded_trim_marks: Option<usize>,
     /// Last zoom factor written to ui.json (avoid rewriting every frame).
     saved_zoom: f32,
     /// Dev self-verification: ITSJUSTCAD_SHOT=<path.png> captures a frame and exits.
@@ -1037,6 +1041,7 @@ impl App {
             uploaded_profile_edges: None,
             uploaded_plant_symbols: None,
             uploaded_sketchy: None,
+            uploaded_trim_marks: None,
             saved_zoom: zoom,
             shot_path: std::env::var("ITSJUSTCAD_SHOT").ok(),
             startup_script: std::env::var("ITSJUSTCAD_RUN").ok(),
@@ -3617,12 +3622,21 @@ impl App {
         let generation = self.session.doc.generation;
         // Color mode of the active pane drives the snapshot; changes stale it.
         let active_color_mode = self.color_modes[self.layout.camera_index(self.active_pane)];
+        // Trim removal preview: while picking "parts to remove", the clicked
+        // pieces are hidden from the snapshot so they look deleted (Rhino). The
+        // number of marks is a staleness signal — clicking a removal point does
+        // NOT bump doc.generation, so without this the hide wouldn't refresh.
+        let trim_marks = (self.guided.active()
+            && self.guided.active_verb() == Some("trim")
+            && self.guided.current_wants_point_list())
+        .then(|| self.guided.list_points().len());
         let stale = self.uploaded_generation != Some(generation)
             || self.uploaded_theme != Some(theme)
             || self.uploaded_color_mode != Some(active_color_mode)
             || self.uploaded_profile_edges != Some(self.profile_edges)
             || self.uploaded_plant_symbols != Some(self.plant_symbols)
-            || self.uploaded_sketchy != Some(self.sketchy);
+            || self.uploaded_sketchy != Some(self.sketchy)
+            || self.uploaded_trim_marks != trim_marks;
         // Scene is uploaded once (renderer shared); only the first pane's
         // callback carries the snapshot, the rest just set their camera.
         let mut scene = if stale {
@@ -3632,6 +3646,7 @@ impl App {
             self.uploaded_profile_edges = Some(self.profile_edges);
             self.uploaded_plant_symbols = Some(self.plant_symbols);
             self.uploaded_sketchy = Some(self.sketchy);
+            self.uploaded_trim_marks = trim_marks;
             // Sketchy depth cue: bias by the active pane's eye + scene radius.
             let (sketchy_eye, sketchy_radius) = if self.sketchy.active() {
                 let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
@@ -3645,17 +3660,49 @@ impl App {
             } else {
                 (None, 0.0)
             };
-            let mut s = scene::snapshot_with_mode(
-                &self.session.doc,
-                theme,
-                itsjustcad_render::ColorModeSnapshot {
-                    color_mode: active_color_mode,
-                    profile_edges: self.profile_edges,
-                    sketchy: self.sketchy,
-                    sketchy_eye,
-                    sketchy_radius,
-                },
-            );
+            let cms = itsjustcad_render::ColorModeSnapshot {
+                color_mode: active_color_mode,
+                profile_edges: self.profile_edges,
+                sketchy: self.sketchy,
+                sketchy_eye,
+                sketchy_radius,
+            };
+            // Trim removal preview: hide the target curves that have ≥1 piece
+            // queued for removal and draw their SURVIVING pieces in place, so the
+            // clicked pieces vanish from view until Enter commits the real trim.
+            let mut s = if trim_marks.unwrap_or(0) > 0 {
+                let cutters: Vec<itsjustcad_doc::ObjectId> = self
+                    .guided
+                    .collected_object_set()
+                    .iter()
+                    .filter_map(|tok| {
+                        let short = tok.strip_prefix('#').unwrap_or(tok);
+                        self.session.doc.find_named(short).first().copied()
+                    })
+                    .collect();
+                let (hidden_ids, survivors) = itsjustcad_commands::trim_preview(
+                    &self.session.doc,
+                    &cutters,
+                    self.guided.list_points(),
+                );
+                let hidden: std::collections::HashSet<itsjustcad_doc::ObjectId> =
+                    hidden_ids.into_iter().collect();
+                let mut s = scene::snapshot_hiding(&self.session.doc, theme, cms, &hidden);
+                // Draw the survivors in the curve color so the untrimmed parts of
+                // a hidden target stay visible (a transient overlay — may differ
+                // slightly from a curve's custom object/layer color).
+                let color = theme.curve();
+                for poly in &survivors {
+                    let pts: Vec<[f32; 3]> =
+                        poly.iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]).collect();
+                    if pts.len() >= 2 {
+                        s.lines.push((pts, color, 1.0));
+                    }
+                }
+                s
+            } else {
+                scene::snapshot_with_mode(&self.session.doc, theme, cms)
+            };
             // Planting plan overlay: add 2D top-view plant symbols when toggled
             // on. The 3D canopy meshes stay in `s`; symbols lie flat on the
             // ground and read as a planting plan in the top view.
@@ -5809,6 +5856,42 @@ impl App {
                     project(view_proj, rect, pair[1]),
                 ) {
                     painter.line_segment([a, b], stroke);
+                }
+            }
+        }
+
+        // Trim removal hover cue: during the "click parts to remove" phase, the
+        // pieces already clicked VANISH from the view (hidden in the scene
+        // snapshot, see the scene build) — Rhino's preview-delete. The only
+        // overlay here is a faint highlight of the piece UNDER THE CURSOR that the
+        // next click would remove, so the user can see the target before clicking.
+        if guided_active
+            && self.guided.active_verb() == Some("trim")
+            && self.guided.current_wants_point_list()
+            && let Some(c) = cursor_world
+        {
+            let cutters: Vec<itsjustcad_doc::ObjectId> = self
+                .guided
+                .collected_object_set()
+                .iter()
+                .filter_map(|tok| {
+                    let short = tok.strip_prefix('#').unwrap_or(tok);
+                    self.session.doc.find_named(short).first().copied()
+                })
+                .collect();
+            if !cutters.is_empty()
+                && let Some(piece) =
+                    itsjustcad_commands::trim_removed_piece(&self.session.doc, &cutters, c)
+            {
+                // Faint, slightly-thick ghost of the hovered piece.
+                let hint = egui::Stroke::new(3.0, egui::Color32::from_rgb(150, 150, 160));
+                for pair in piece.windows(2) {
+                    if let (Some(a), Some(b)) = (
+                        project(view_proj, rect, pair[0]),
+                        project(view_proj, rect, pair[1]),
+                    ) {
+                        painter.line_segment([a, b], hint);
+                    }
                 }
             }
         }
