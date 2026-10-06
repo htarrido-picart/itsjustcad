@@ -5135,6 +5135,42 @@ impl App {
         }
     }
 
+    /// Resolve a rubber-box drag in trim's "click parts to remove" phase to one
+    /// interior REMOVAL point per curve the box catches (Rhino lets you window a
+    /// batch of segments to trim at once, not just click them one by one). Each
+    /// curve is tessellated to world samples, projected to screen, and fed to
+    /// [`crate::boxsel::box_pick_point`], which applies the window/crossing rule
+    /// and returns a point ON the boxed portion. No cutter filter here — in phase
+    /// two any visible curve is a trim target.
+    fn guided_pointlist_box_pick(
+        &self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        drag: egui::Rect,
+        mode: crate::boxsel::BoxMode,
+    ) -> Vec<glam::DVec3> {
+        use itsjustcad_doc::Geometry;
+        /// Chord tolerance for tessellating a curve into box-test samples. Fine
+        /// enough that a boxed piece always yields an interior sample.
+        const TESS_TOL: f64 = 0.05;
+        self.session
+            .doc
+            .objects()
+            .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
+            .filter_map(|obj| match &obj.geometry {
+                Geometry::Curve(c) => {
+                    let samples: Vec<(Option<egui::Pos2>, glam::DVec3)> = c
+                        .tessellate(TESS_TOL)
+                        .into_iter()
+                        .map(|w| (project(view_proj, rect, w), w))
+                        .collect();
+                    crate::boxsel::box_pick_point(&samples, drag, mode)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Dispatch a guided-tool step outcome: run the emitted command, surface an
     /// error, or re-show the next prompt.
     fn handle_guided(&mut self, result: StepResult) {
@@ -5631,6 +5667,55 @@ impl App {
                 if let Some(pos) = response.interact_pointer_pos() {
                     self.guided_single_pick(view_proj, rect, pos, cursor_world, multi);
                 }
+                return;
+            }
+        }
+
+        // Guided variadic point-list step (trim's "click the parts to remove"):
+        // like the object-pick step, a DRAG is a rubber box — but here each curve
+        // the box catches contributes ONE interior removal point, so the user can
+        // window a batch of pieces at once (Rhino). A plain click still adds a
+        // single point (handled in the click path below).
+        if guided_active && self.guided.current_wants_point_list() {
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                self.box_drag = Some(pos);
+            }
+            if let Some(start) = self.box_drag
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let mode = crate::boxsel::mode(start, pos);
+                let drag_rect = egui::Rect::from_two_pos(start, pos);
+                draw_rubber_box(&ui.painter_at(rect), drag_rect, mode, ui.visuals());
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    self.box_drag = None;
+                    // Same click-vs-box guard as the object step: a sub-6px drag
+                    // is a jittery click, so add ONE point at the release instead
+                    // of running the box test.
+                    const MIN_BOX_PX: f32 = 6.0;
+                    if drag_rect.width() < MIN_BOX_PX && drag_rect.height() < MIN_BOX_PX {
+                        if let Some(world) = ground_point(view_proj, rect, pos) {
+                            let r = self.guided.push_list_point(world);
+                            self.handle_guided(r);
+                        }
+                    } else {
+                        let pts = self.guided_pointlist_box_pick(view_proj, rect, drag_rect, mode);
+                        if pts.is_empty() {
+                            self.command_line
+                                .push_line("no curve in that region — draw the box again");
+                        } else {
+                            for p in pts {
+                                self.guided.push_list_point(p);
+                            }
+                            // Re-show the prompt once with the updated running count.
+                            if let Some(prompt) = self.guided.prompt() {
+                                self.command_line.push_line(prompt);
+                            }
+                        }
+                    }
+                }
+                ui.ctx().request_repaint(); // live rubber box
                 return;
             }
         }

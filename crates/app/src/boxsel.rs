@@ -27,6 +27,34 @@ pub fn mode(start: egui::Pos2, end: egui::Pos2) -> BoxMode {
     }
 }
 
+/// Pick ONE interior point from a curve's tessellated samples when a drag box
+/// catches it — the removal point for trim's "click parts to remove" phase.
+/// Each sample is `(screen, world)`; `screen` is `None` when the point projects
+/// off-camera (counted as outside). A curve passes when (window) EVERY sample
+/// lies inside the box, or (crossing) ANY sample does; the MEDIAN inside sample
+/// is returned so the point lands on the boxed portion of the curve. Returns
+/// `None` when nothing qualifies. Pure screen-space geometry, like the rest of
+/// this module, so it unit-tests without a camera or document.
+pub fn box_pick_point(
+    samples: &[(Option<egui::Pos2>, glam::DVec3)],
+    drag: egui::Rect,
+    mode: BoxMode,
+) -> Option<glam::DVec3> {
+    let inside: Vec<glam::DVec3> = samples
+        .iter()
+        .filter(|(s, _)| s.is_some_and(|p| drag.contains(p)))
+        .map(|(_, w)| *w)
+        .collect();
+    if inside.is_empty() {
+        return None;
+    }
+    let passes = match mode {
+        BoxMode::Crossing => true,
+        BoxMode::Window => inside.len() == samples.len(),
+    };
+    passes.then(|| inside[inside.len() / 2])
+}
+
 /// Ids whose projected screen rect matches the drag rect under `mode`.
 pub fn box_select(
     items: &[(ObjectId, egui::Rect)],
@@ -99,5 +127,60 @@ mod tests {
         let items = vec![(id(1), rect(10.0, 10.0, 20.0, 20.0))];
         let drag = rect(30.0, 30.0, 30.0, 30.0);
         assert!(box_select(&items, drag, BoxMode::Window).is_empty());
+    }
+
+    // Build (screen, world) samples with screen == world.xy for easy reasoning.
+    fn sample(x: f32, y: f32) -> (Option<egui::Pos2>, glam::DVec3) {
+        (Some(egui::pos2(x, y)), glam::DVec3::new(x as f64, y as f64, 0.0))
+    }
+
+    #[test]
+    fn box_pick_point_crossing_returns_median_inside_sample() {
+        // Three samples; the box covers the last two → median of {1,2} is index 0
+        // of the inside list (len 2 → idx 1) = the second inside sample.
+        let samples = vec![sample(5.0, 5.0), sample(20.0, 20.0), sample(30.0, 30.0)];
+        let drag = rect(10.0, 10.0, 40.0, 40.0);
+        let got = box_pick_point(&samples, drag, BoxMode::Crossing).unwrap();
+        // inside = [(20,20),(30,30)]; median idx = 2/2 = 1 → (30,30).
+        assert_eq!(got, glam::DVec3::new(30.0, 30.0, 0.0));
+    }
+
+    #[test]
+    fn box_pick_point_window_requires_all_inside() {
+        let samples = vec![sample(15.0, 15.0), sample(50.0, 50.0)];
+        let drag = rect(10.0, 10.0, 40.0, 40.0);
+        // One sample is outside → window mode rejects the whole curve.
+        assert!(box_pick_point(&samples, drag, BoxMode::Window).is_none());
+        // Crossing still catches it (one sample inside), returns that sample.
+        assert_eq!(
+            box_pick_point(&samples, drag, BoxMode::Crossing).unwrap(),
+            glam::DVec3::new(15.0, 15.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn box_pick_point_window_all_inside_returns_median() {
+        let samples = vec![sample(12.0, 12.0), sample(20.0, 20.0), sample(30.0, 30.0)];
+        let drag = rect(10.0, 10.0, 40.0, 40.0);
+        // All inside → median idx 3/2 = 1 → (20,20).
+        assert_eq!(
+            box_pick_point(&samples, drag, BoxMode::Window).unwrap(),
+            glam::DVec3::new(20.0, 20.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn box_pick_point_no_sample_inside_is_none() {
+        let samples = vec![sample(100.0, 100.0), sample(200.0, 200.0)];
+        let drag = rect(10.0, 10.0, 40.0, 40.0);
+        assert!(box_pick_point(&samples, drag, BoxMode::Crossing).is_none());
+    }
+
+    #[test]
+    fn box_pick_point_offscreen_sample_counts_as_outside() {
+        // An un-projected (None) sample disqualifies window mode.
+        let samples = vec![sample(15.0, 15.0), (None, glam::DVec3::new(9.0, 9.0, 9.0))];
+        let drag = rect(10.0, 10.0, 40.0, 40.0);
+        assert!(box_pick_point(&samples, drag, BoxMode::Window).is_none());
     }
 }

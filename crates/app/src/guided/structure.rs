@@ -64,7 +64,7 @@ pub static SCRIPTS: &[VerbScript] = &[
         verb: "wall",
         needs_selection: false,
         steps: &[
-            Step::PointList { prompt: "Wall centerline points (Enter to finish)", min: 3 },
+            Step::PointList { prompt: "Wall centerline points (Enter to finish)", min: 3, connect: true },
             Step::Number { prompt: "Thickness", default: Some(0.2) },
         ],
         assemble: assemble_wall,
@@ -73,7 +73,7 @@ pub static SCRIPTS: &[VerbScript] = &[
         verb: "slab",
         needs_selection: false,
         steps: &[
-            Step::PointList { prompt: "Slab outline points (Enter to finish)", min: 3 },
+            Step::PointList { prompt: "Slab outline points (Enter to finish)", min: 3, connect: true },
             Step::Number { prompt: "Thickness", default: Some(0.2) },
         ],
         assemble: assemble_slab,
@@ -304,7 +304,7 @@ pub static SCRIPTS: &[VerbScript] = &[
                 BranchArm {
                     key: "line",
                     steps: &[
-                        Step::PointList { prompt: "Line points (Enter to finish)", min: 2 },
+                        Step::PointList { prompt: "Line points (Enter to finish)", min: 2, connect: true },
                         Step::Number { prompt: "Magnitude", default: Some(1.0) },
                         Step::Vector { prompt: "Direction (dx,dy,dz)" },
                     ],
@@ -312,7 +312,7 @@ pub static SCRIPTS: &[VerbScript] = &[
                 BranchArm {
                     key: "area",
                     steps: &[
-                        Step::PointList { prompt: "Area boundary points (Enter to finish)", min: 3 },
+                        Step::PointList { prompt: "Area boundary points (Enter to finish)", min: 3, connect: true },
                         Step::Number { prompt: "Magnitude", default: Some(1.0) },
                         Step::Vector { prompt: "Direction (dx,dy,dz)" },
                     ],

@@ -9,8 +9,8 @@
 //!   powertrim — sel + PickPoint            → `powertrim sel <pt>`
 //!   fillet    — pick curve A, curve B, radius → `fillet #a #b <r>`
 //!   chamfer   — pick curve A, curve B, distance → `chamfer #a #b <d>`
-//!   trim      — select cutters (Enter), click parts to remove (Enter)
-//!               → `trim #c1 #c2 … remove <p1> <p2> …`
+//!   trim      — select cutters (click/window, Enter), then click OR window the
+//!               parts to remove (Enter) → `trim #c1 #c2 … remove <p1> <p2> …`
 //!   boundary  — no sel, PickPoint           → `boundary <pt>`
 //!   divide    — sel + Integer               → `divide sel <count>`
 //!   curvebool — sel + Keyword               → `curvebool <op> sel`
@@ -85,14 +85,17 @@ pub static SCRIPTS: &[VerbScript] = &[
         verb: "trim",
         needs_selection: false,
         steps: &[
-            // Rhino's two-phase trim: pick the cutting objects as a SET (Enter when
-            // done), then click each piece to REMOVE (Enter finishes).
+            // Rhino's two-phase trim: pick the cutting objects as a SET (click or
+            // window, Enter when done), then click OR window each piece to REMOVE
+            // (Enter finishes).
             Step::SelectObjects {
                 prompt: "Select cutting objects (Enter when done)",
                 filter: ObjFilter::Any,
                 min: 1,
             },
-            Step::PointList { prompt: "Click the parts to remove (Enter to finish)", min: 1 },
+            // Pick markers, not vertices — `connect: false` so no rubber-band
+            // line is drawn joining the clicked pieces (it's a trim, not a shape).
+            Step::PointList { prompt: "Click the parts to remove (Enter to finish)", min: 1, connect: false },
         ],
         assemble: assemble_trim,
     },

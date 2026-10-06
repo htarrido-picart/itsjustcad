@@ -16,7 +16,7 @@ pub static SCRIPTS: &[VerbScript] = &[
         needs_selection: false,
         // The parser requires at least 3 points for an interpolated curve, so
         // the guided flow collects at least 3 before Enter finishes.
-        steps: &[Step::PointList { prompt: "Pick curve points (Enter to finish)", min: 3 }],
+        steps: &[Step::PointList { prompt: "Pick curve points (Enter to finish)", min: 3, connect: true }],
         assemble: assemble_interpcurve,
     },
     VerbScript {

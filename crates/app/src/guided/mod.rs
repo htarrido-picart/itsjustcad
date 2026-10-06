@@ -70,8 +70,11 @@ pub enum Step {
     Text { prompt: &'static str },
     /// A variadic list of world points (Rhino's `GetPoints`): each click/typed
     /// coord appends one, Enter finishes once at least `min` are collected.
-    /// Modeled on the polyline draw tool.
-    PointList { prompt: &'static str, min: usize },
+    /// Modeled on the polyline draw tool. `connect` draws the Rhino rubber-band
+    /// polyline through the picked points (true for shape verbs whose points are
+    /// vertices — polyline/curve/wall/slab/area); set false when the points are
+    /// just pick markers that must NOT be visually joined (trim's parts-to-remove).
+    PointList { prompt: &'static str, min: usize, connect: bool },
     /// A direction/vector, collected exactly like a [`Step::PickPoint`]: typed
     /// `dx,dy,dz` resolves via precise-input, or a click supplies a point (the
     /// vector from the origin, or relative to the prior pick). Stored as an
@@ -671,8 +674,13 @@ impl GuidedTool {
             return arc_preview(&pts, cursor);
         }
         // A variadic point list draws a running polyline through the points
-        // collected so far plus the cursor (Rhino's `GetPoints` rubber-band).
-        if matches!(self.current_step(), Some(Step::PointList { .. })) {
+        // collected so far plus the cursor (Rhino's `GetPoints` rubber-band) —
+        // but only when `connect` is set. Trim's parts-to-remove picks are
+        // markers, not vertices, so they draw no joining line.
+        if let Some(Step::PointList { connect, .. }) = self.current_step() {
+            if !connect {
+                return Vec::new();
+            }
             let mut strip = self.list.clone();
             strip.push(cursor);
             return if strip.len() >= 2 { vec![strip] } else { Vec::new() };
@@ -1157,7 +1165,7 @@ mod tests {
         needs_selection: false,
         steps: &[
             Step::SelectObjects { prompt: "Cutters", filter: ObjFilter::Any, min: 1 },
-            Step::PointList { prompt: "Removals", min: 1 },
+            Step::PointList { prompt: "Removals", min: 1, connect: false },
         ],
         assemble: |args| {
             let cutters = super::assemble::object_set_at(args, 0, "os")?;
@@ -1242,7 +1250,7 @@ mod tests {
         needs_selection: false,
         steps: &[
             Step::Text { prompt: "Name" },
-            Step::PointList { prompt: "Pick points", min: 2 },
+            Step::PointList { prompt: "Pick points", min: 2, connect: true },
         ],
         assemble: |args| {
             let name = super::assemble::text_at(args, 0, "tl")?;
@@ -1407,5 +1415,20 @@ mod tests {
             t.preview(Some(cursor)),
             vec![vec![DVec3::ZERO, DVec3::new(1.0, 1.0, 0.0), cursor]]
         );
+    }
+
+    #[test]
+    fn point_list_without_connect_draws_no_line() {
+        // Trim's parts-to-remove picks (OBJSET_TEST uses connect: false) are
+        // markers, not vertices — the preview must stay empty even with several
+        // points collected and a live cursor, so no stray line is drawn.
+        let mut t = GuidedTool { script: Some(&OBJSET_TEST), ..Default::default() };
+        t.push_selected_object("aaaa1111");
+        t.finish_objects(); // advance to the point-list (connect: false) step
+        assert!(t.current_wants_point_list());
+        let cursor = DVec3::new(5.0, 0.0, 0.0);
+        t.push_list_point(DVec3::ZERO);
+        t.push_list_point(DVec3::new(1.0, 1.0, 0.0));
+        assert!(t.preview(Some(cursor)).is_empty(), "no rubber-band when connect is false");
     }
 }
