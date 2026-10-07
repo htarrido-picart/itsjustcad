@@ -6401,10 +6401,19 @@ impl App {
         let aliases = self.active_aliases();
         let panel_h = ui.available_height();
         let last_verb = self.last_verb.clone();
-        if let Some(line) =
-            self.command_line
-                .ui(ui, &object_names, aliases, panel_h, last_verb.as_deref())
-        {
+        // While a guided flow is running, the command line must NOT hijack a bare
+        // Space/Enter to re-run the last verb — those keys belong to the guided
+        // flow (the viewport handler finishes the step). Otherwise a Space meant
+        // to finish the verb would restart it.
+        let guided_active = self.guided.active();
+        if let Some(line) = self.command_line.ui(
+            ui,
+            &object_names,
+            aliases,
+            panel_h,
+            last_verb.as_deref(),
+            guided_active,
+        ) {
             self.execute_line(line);
         }
     }
@@ -10780,8 +10789,8 @@ mod tests {
             submit_command(h, "trim");
             assert!(h.state().guided.active(), "bare `trim` armed the guided flow");
             assert!(
-                h.state().guided.current_wants_object(),
-                "the first trim step is a SelectObject pick"
+                h.state().guided.current_wants_objects(),
+                "the first trim step is a SelectObjects (cutters) multi-pick"
             );
 
             // Window-drag (left→right) tightly around the FIRST box, expanded past
@@ -10794,21 +10803,81 @@ mod tests {
                 .intersect(rect);
             drag(h, r0.left_top(), r0.right_bottom());
 
-            // The drag resolved to exactly the enclosed box: it is highlighted,
-            // and the guided flow advanced to its second SelectObject step (still
-            // active, still wanting an object — the cutting object).
+            // The drag resolved to exactly the enclosed box: it is highlighted
+            // and added to the cutter SET. A multi-object SelectObjects step
+            // STAYS put (Enter/Space finishes it), so the flow is still on the
+            // same cutters step — not advanced.
             assert!(
                 h.state().session.doc.selection.contains(&ids[0].0),
                 "the dragged box was picked and highlighted"
             );
             assert!(
                 h.state().guided.active(),
-                "trim still active after the first object commit (awaiting the cutter)"
+                "trim still active after adding a cutter (awaiting Enter/more cutters)"
             );
             assert!(
-                h.state().guided.current_wants_object(),
-                "the guided flow advanced to the second SelectObject step"
+                h.state().guided.current_wants_objects(),
+                "still on the SelectObjects cutters step (multi-select stays until Enter)"
             );
+            assert_eq!(
+                h.state().guided.selected_count(),
+                1,
+                "exactly the one dragged box is in the cutter set"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_space_finishes_guided_trim() {
+        // Rhino parity: SPACE finishes/advances a guided verb exactly like Enter.
+        // Two crossing lines; trim both as mutual cutters, then click the overhang
+        // and SPACE to commit. Each phase is finished with Space, never Enter.
+        run_app_journey(|h| {
+            submit_command(h, "line 0,0 10,10");
+            submit_command(h, "line 0,10 10,0");
+            assert_eq!(h.state().session.doc.objects().count(), 2, "two lines drawn");
+            top_ortho_view(h);
+
+            submit_command(h, "trim");
+            assert!(h.state().guided.current_wants_objects(), "phase 1: pick cutters");
+
+            // Pick both lines as cutters (clicks land on each line, away from the
+            // (5,5) crossing so each resolves to a distinct line).
+            // A crossing drag (right→left) over the scene catches BOTH lines as
+            // cutters in one gesture: each line's AABB spans the whole drawing, so
+            // the box intersects both (also how a user grabs two crossing lines).
+            let tl = pane_point(h, 0.3, 0.3);
+            let br = pane_point(h, 0.7, 0.7);
+            drag(h, br, tl); // start-right → end-left = crossing
+            let n = h.state().guided.selected_count();
+            assert_eq!(n, 2, "both lines picked as cutters, got {n}");
+
+            // SPACE (not Enter) finishes the cutter phase → advance to removals.
+            h.key_press(egui::Key::Space);
+            h.run_steps(2);
+            assert!(
+                h.state().guided.current_wants_point_list(),
+                "SPACE finished the cutter phase and advanced to parts-to-remove"
+            );
+
+            // Click the overhang of line A past the crossing (8,8), then SPACE to
+            // commit the whole trim verb.
+            click_at(h, world_to_screen(h, glam::DVec3::new(8.0, 8.0, 0.0)));
+            h.key_press(egui::Key::Space);
+            h.run_steps(2);
+            assert!(
+                !h.state().guided.active(),
+                "SPACE committed the trim — the guided verb finished (like Enter)"
+            );
+            // The trim actually ran: line A's overhang past the (5,5) crossing was
+            // dropped, so its survivor's bounding box now tops out at (5,5) —
+            // neither original line had that aabb max before the trim.
+            let trimmed = h.state().session.doc.objects().any(|o| {
+                let m = o.geometry.aabb().max;
+                (m.x - 5.0).abs() < 1e-6 && (m.y - 5.0).abs() < 1e-6
+            });
+            assert!(trimmed, "line A was trimmed back to the (5,5) crossing");
         });
     }
 

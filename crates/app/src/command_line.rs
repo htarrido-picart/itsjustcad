@@ -437,6 +437,7 @@ impl CommandLine {
         preset_aliases: &'static [(&'static str, &'static str)],
         panel_h: f32,
         last_verb: Option<&str>,
+        guided_active: bool,
     ) -> Option<String> {
         // Recompute suggestions if input changed.
         self.refresh_suggestions(object_names, preset_aliases);
@@ -451,7 +452,7 @@ impl CommandLine {
         let history_h = crate::theme::Spacing::history_h_for(panel_h);
         let mut submitted = None;
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            submitted = self.input_row(ui, last_verb);
+            submitted = self.input_row(ui, last_verb, guided_active);
             self.suggestion_block(ui, true);
             egui::ScrollArea::vertical()
                 .id_salt("cmd_history")
@@ -593,7 +594,12 @@ impl CommandLine {
     /// suggestion acceptance. Returns Some(line) when the user pressed Enter.
     /// `last_verb` — an empty Enter/Space submits the last non-destructive verb
     /// ALONE (no args, via `recall_verb`) so guided commands restart fresh.
-    fn input_row(&mut self, ui: &mut egui::Ui, last_verb: Option<&str>) -> Option<String> {
+    fn input_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        last_verb: Option<&str>,
+        guided_active: bool,
+    ) -> Option<String> {
         let mut submitted = None;
         let show_popup = self.popup_visible();
         ui.horizontal(|ui| {
@@ -650,7 +656,7 @@ impl CommandLine {
                 // doesn't fire because the trimmed input is non-empty), so
                 // "line 0,0 1,1" keeps working. No-op when there is no eligible
                 // verb yet.
-                if space && !show_popup && self.input.trim().is_empty() {
+                if space && !show_popup && self.input.trim().is_empty() && !guided_active {
                     self.input.clear();
                     if let Some(verb) = recall_verb(last_verb) {
                         submitted = Some(verb);
@@ -716,15 +722,21 @@ impl CommandLine {
                 if self.input.trim().is_empty() {
                     // Empty Enter: re-run the last non-destructive verb ALONE
                     // (no args) so guided commands restart and prompt fresh.
-                    // No-op when no eligible verb has run yet.
+                    // No-op when no eligible verb has run yet. SUPPRESSED while a
+                    // guided flow is active — then a bare Enter (and Space) belongs
+                    // to the guided step, finished by the viewport handler; letting
+                    // the command line re-run the verb here would restart it
+                    // instead of finishing it.
                     self.input.clear();
-                    self.focus_next_frame = true;
-                    if let Some(verb) = recall_verb(last_verb) {
-                        submitted = Some(verb);
-                        self.recall_pos = None;
-                        self.suggestions.clear();
-                        self.suggest_for.clear();
-                        self.suggest_dismissed = false;
+                    if !guided_active {
+                        self.focus_next_frame = true;
+                        if let Some(verb) = recall_verb(last_verb) {
+                            submitted = Some(verb);
+                            self.recall_pos = None;
+                            self.suggestions.clear();
+                            self.suggest_for.clear();
+                            self.suggest_dismissed = false;
+                        }
                     }
                 } else {
                     submitted = Some(std::mem::take(&mut self.input));
