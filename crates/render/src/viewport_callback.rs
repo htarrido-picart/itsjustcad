@@ -30,6 +30,11 @@ pub struct ViewportCallback {
     /// Draw mesh feature edges. On by default (the Shaded "+ edges" look);
     /// user-toggleable. Ignored by modes that always need edges.
     pub edges_enabled: bool,
+    /// Force a scene re-upload even when `generation` is unchanged. The trim
+    /// removal preview rebuilds the scene (hiding clicked pieces) without bumping
+    /// `doc.generation`, so the usual generation gate would skip the upload and
+    /// the pieces would never visibly disappear.
+    pub force: bool,
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -62,7 +67,7 @@ impl CallbackTrait for ViewportCallback {
         };
         renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene
-            && renderer.generation != self.generation
+            && (renderer.generation != self.generation || self.force)
         {
             renderer.set_scene(device, queue, scene, self.generation);
         }

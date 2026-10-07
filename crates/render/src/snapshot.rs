@@ -1211,6 +1211,43 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_hiding_omits_the_hidden_object() {
+        // The trim preview hides clicked target curves from the scene. Prove the
+        // hidden object's line soup is dropped while the rest stays, and that an
+        // empty hidden set is identical to the normal snapshot.
+        let mut doc = Document::default();
+        let keep = ObjectId::new();
+        let hide = ObjectId::new();
+        for id in [keep, hide] {
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: "default".into(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
+                    points: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+                    closed: false,
+                }),
+            });
+        }
+        let cms = ColorModeSnapshot::default();
+        let full = snapshot_with_mode(&doc, Theme::Dark, cms);
+        let hidden: std::collections::HashSet<ObjectId> = std::iter::once(hide).collect();
+        let partial = snapshot_hiding(&doc, Theme::Dark, cms, &hidden);
+        assert!(
+            partial.lines.len() < full.lines.len(),
+            "hidden curve's lines must be omitted ({} vs {})",
+            partial.lines.len(),
+            full.lines.len()
+        );
+        let none = snapshot_hiding(&doc, Theme::Dark, cms, &std::collections::HashSet::new());
+        assert_eq!(none.lines.len(), full.lines.len(), "empty hidden set == normal snapshot");
+    }
+
+    #[test]
     fn random_mode_differs_per_object() {
         let doc = two_mesh_doc();
         let cms = ColorModeSnapshot { color_mode: crate::renderer::ColorMode::Random, ..Default::default() };

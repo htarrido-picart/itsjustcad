@@ -3630,13 +3630,19 @@ impl App {
             && self.guided.active_verb() == Some("trim")
             && self.guided.current_wants_point_list())
         .then(|| self.guided.list_points().len());
+        // Trim preview marks change WITHOUT a doc.generation bump, so this drives
+        // both the snapshot rebuild AND a forced GPU re-upload (the viewport
+        // callback otherwise skips uploading when the generation is unchanged).
+        // True on enter/change/leave of the preview, so Esc restores the scene.
+        let trim_mark_change = self.uploaded_trim_marks != trim_marks;
+        let force_upload = trim_mark_change;
         let stale = self.uploaded_generation != Some(generation)
             || self.uploaded_theme != Some(theme)
             || self.uploaded_color_mode != Some(active_color_mode)
             || self.uploaded_profile_edges != Some(self.profile_edges)
             || self.uploaded_plant_symbols != Some(self.plant_symbols)
             || self.uploaded_sketchy != Some(self.sketchy)
-            || self.uploaded_trim_marks != trim_marks;
+            || trim_mark_change;
         // Scene is uploaded once (renderer shared); only the first pane's
         // callback carries the snapshot, the rest just set their camera.
         let mut scene = if stale {
@@ -3914,6 +3920,7 @@ impl App {
                         light: self.light_mode,
                         background_gradient: self.profile_edges,
                         edges_enabled: self.shaded_edges,
+                        force: force_upload,
                     },
                 ));
             }
