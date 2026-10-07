@@ -3300,17 +3300,14 @@ impl App {
         mode: crate::boxsel::BoxMode,
         additive: bool,
     ) {
-        let items: Vec<(itsjustcad_doc::ObjectId, egui::Rect)> = self
+        let ids: Vec<itsjustcad_doc::ObjectId> = self
             .session
             .doc
             .objects()
             .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
-            .filter_map(|obj| {
-                let bb = obj.geometry.aabb();
-                Some((obj.id, projected_rect(view_proj, rect, bb.min, bb.max)?))
-            })
+            .filter(|obj| obj_matches_box(&obj.geometry, view_proj, rect, drag, mode))
+            .map(|obj| obj.id)
             .collect();
-        let ids = crate::boxsel::box_select(&items, drag, mode);
         let doc = &mut self.session.doc;
         if !additive {
             doc.selection.clear();
@@ -5187,25 +5184,23 @@ impl App {
         drag: egui::Rect,
         mode: crate::boxsel::BoxMode,
     ) -> Option<itsjustcad_doc::ObjectId> {
-        let items: Vec<(itsjustcad_doc::ObjectId, egui::Rect)> = self
-            .session
+        // Prefer the object whose projected AABB center is closest to the drag-box
+        // center — the most-intended pick when a region catches several matches.
+        // Inclusion uses the PRECISE geometry test (not the AABB), so a diagonal
+        // line whose bounding box merely overlaps the drag isn't a candidate.
+        let target = drag.center();
+        self.session
             .doc
             .objects()
             .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
             .filter(|obj| self.guided_pick_matches(obj.id))
-            .filter_map(|obj| {
+            .filter(|obj| obj_matches_box(&obj.geometry, view_proj, rect, drag, mode))
+            .map(|obj| {
                 let bb = obj.geometry.aabb();
-                Some((obj.id, projected_rect(view_proj, rect, bb.min, bb.max)?))
-            })
-            .collect();
-        let hits = crate::boxsel::box_select(&items, drag, mode);
-        // Prefer the object whose projected rect center is closest to the drag-box
-        // center — the most-intended pick when a region catches several matches.
-        let target = drag.center();
-        hits.into_iter()
-            .filter_map(|id| {
-                let (_, r) = items.iter().find(|(i, _)| *i == id)?;
-                Some((id, r.center().distance_sq(target)))
+                let d = projected_rect(view_proj, rect, bb.min, bb.max)
+                    .map(|r| r.center().distance_sq(target))
+                    .unwrap_or(f32::MAX);
+                (obj.id, d)
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(id, _)| id)
@@ -5223,18 +5218,14 @@ impl App {
         drag: egui::Rect,
         mode: crate::boxsel::BoxMode,
     ) -> Vec<itsjustcad_doc::ObjectId> {
-        let items: Vec<(itsjustcad_doc::ObjectId, egui::Rect)> = self
-            .session
+        self.session
             .doc
             .objects()
             .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
             .filter(|obj| self.guided_pick_matches(obj.id))
-            .filter_map(|obj| {
-                let bb = obj.geometry.aabb();
-                Some((obj.id, projected_rect(view_proj, rect, bb.min, bb.max)?))
-            })
-            .collect();
-        crate::boxsel::box_select(&items, drag, mode)
+            .filter(|obj| obj_matches_box(&obj.geometry, view_proj, rect, drag, mode))
+            .map(|obj| obj.id)
+            .collect()
     }
 
     /// Resolve a guided object step from a single CLICK (or a drag too small to
@@ -9217,6 +9208,41 @@ fn projected_rect(
     out
 }
 
+/// Chord tolerance for tessellating a curve into box-select samples.
+const BOX_SELECT_TOL: f64 = 0.05;
+
+/// Does an object's ACTUAL projected geometry match the drag box under `mode`?
+/// Curves are tested as their tessellated polyline (so a diagonal line isn't
+/// grabbed by a box that only overlaps its bounding-box corner — the reported
+/// bug); other geometry (meshes/solids) falls back to the projected-AABB rect
+/// test, which is adequate for their filled footprint.
+fn obj_matches_box(
+    geom: &itsjustcad_doc::Geometry,
+    view_proj: glam::Mat4,
+    rect: egui::Rect,
+    drag: egui::Rect,
+    mode: crate::boxsel::BoxMode,
+) -> bool {
+    use itsjustcad_doc::Geometry;
+    match geom {
+        Geometry::Curve(c) => {
+            let pts: Vec<Option<egui::Pos2>> = c
+                .tessellate(BOX_SELECT_TOL)
+                .into_iter()
+                .map(|w| project(view_proj, rect, w))
+                .collect();
+            crate::boxsel::box_select_polyline(&pts, drag, mode)
+        }
+        _ => match projected_rect(view_proj, rect, geom.aabb().min, geom.aabb().max) {
+            Some(r) => match mode {
+                crate::boxsel::BoxMode::Window => drag.contains_rect(r),
+                crate::boxsel::BoxMode::Crossing => drag.intersects(r),
+            },
+            None => false,
+        },
+    }
+}
+
 /// Rubber box: solid stroke for a window drag, dashed for a crossing drag.
 fn draw_rubber_box(
     painter: &egui::Painter,
@@ -10814,6 +10840,67 @@ mod tests {
             assert!(
                 sel.contains(&ids[1].0),
                 "crossing drag (right→left) selected the second box"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_perspective_box_select_excludes_outside_line() {
+        // Regression: in PERSPECTIVE, a rubber box placed over a diagonal line's
+        // bounding-box CORNER — where the line does NOT pass — must select
+        // NOTHING. The old test used the object's projected AABB rect, which a
+        // corner box overlaps, so it wrongly selected the line. We now test the
+        // actual projected polyline. Positions come from `world_to_screen` (the
+        // live view_proj), so they are accurate despite perspective foreshortening.
+        run_app_journey(|h| {
+            submit_command(h, "line -6,-6,0 6,6,0");
+            let ids: Vec<_> = h.state().session.doc.objects().map(|o| o.id).collect();
+            assert_eq!(ids.len(), 1, "one diagonal line drawn");
+            let line = ids[0];
+
+            submit_command(h, "perspective");
+            submit_command(h, "ze");
+            h.run_steps(2);
+
+            let (rect, view_proj) = active_viewport(h);
+            let aabb_rect = projected_rect(
+                view_proj,
+                rect,
+                glam::DVec3::new(-6.0, -6.0, 0.0),
+                glam::DVec3::new(6.0, 6.0, 0.0),
+            )
+            .expect("line AABB projects in front of the camera");
+
+            // The line is x=y, so world (5,-5,0) is far OFF it but still inside its
+            // AABB — its projection lands inside the projected AABB rect (which the
+            // old code tested) yet nowhere near the actual line. A box here is the
+            // reported bug: overlaps the AABB corner, misses the geometry.
+            let half = 12.0;
+            let off_line = world_to_screen(h, glam::DVec3::new(5.0, -5.0, 0.0));
+            let empty_box =
+                egui::Rect::from_center_size(off_line, egui::vec2(2.0 * half, 2.0 * half))
+                    .intersect(rect);
+            assert!(
+                aabb_rect.intersects(empty_box),
+                "the empty box overlaps the line's projected AABB (so the OLD code would mis-select)"
+            );
+
+            // Right→left CROSSING drag over the empty region → selects NOTHING.
+            drag(h, empty_box.right_bottom(), empty_box.left_top());
+            assert!(
+                h.state().session.doc.selection.is_empty(),
+                "a box overlapping only the line's AABB (not the line) must NOT select it"
+            );
+
+            // A CROSSING drag over a box ON the line (its midpoint) selects it.
+            let mid = world_to_screen(h, glam::DVec3::new(0.0, 0.0, 0.0));
+            let on_line =
+                egui::Rect::from_center_size(mid, egui::vec2(2.0 * half, 2.0 * half)).intersect(rect);
+            drag(h, on_line.right_bottom(), on_line.left_top());
+            assert!(
+                h.state().session.doc.selection.contains(&line),
+                "a box over the line itself DOES select it"
             );
         });
     }

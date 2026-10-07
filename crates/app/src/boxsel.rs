@@ -4,11 +4,10 @@
 //! Drag-box selection: pure screen-space geometry, Rhino convention.
 //!
 //! Left→right drag = window (only objects fully inside), right→left =
-//! crossing (touching counts). The caller projects object AABBs to screen
-//! rects; this module only compares rectangles, so it is unit-testable
-//! without a camera or a document.
-
-use itsjustcad_doc::ObjectId;
+//! crossing (touching counts). The caller projects an object's actual geometry
+//! (a curve's tessellated polyline) to screen points; this module compares
+//! points/segments against the drag rect, so it is unit-testable without a
+//! camera or a document.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BoxMode {
@@ -55,29 +54,81 @@ pub fn box_pick_point(
     passes.then(|| inside[inside.len() / 2])
 }
 
-/// Ids whose projected screen rect matches the drag rect under `mode`.
-pub fn box_select(
-    items: &[(ObjectId, egui::Rect)],
-    drag: egui::Rect,
-    mode: BoxMode,
-) -> Vec<ObjectId> {
-    items
-        .iter()
-        .filter(|(_, r)| match mode {
-            BoxMode::Window => drag.contains_rect(*r),
-            BoxMode::Crossing => drag.intersects(*r),
-        })
-        .map(|(id, _)| *id)
-        .collect()
+/// Does segment `p0→p1` properly intersect segment `p2→p3`? Orientation test
+/// (with a collinear-on-segment fallback). Pure screen-space.
+fn segs_cross(p0: egui::Pos2, p1: egui::Pos2, p2: egui::Pos2, p3: egui::Pos2) -> bool {
+    fn orient(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> f32 {
+        (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+    }
+    // `c` lies within segment `a→b`'s bbox (used only when already collinear).
+    fn on_seg(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> bool {
+        c.x >= a.x.min(b.x) && c.x <= a.x.max(b.x) && c.y >= a.y.min(b.y) && c.y <= a.y.max(b.y)
+    }
+    let d0 = orient(p2, p3, p0);
+    let d1 = orient(p2, p3, p1);
+    let d2 = orient(p0, p1, p2);
+    let d3 = orient(p0, p1, p3);
+    // Strict straddle on BOTH segments → a genuine crossing.
+    if (d0 > 0.0) != (d1 > 0.0)
+        && (d2 > 0.0) != (d3 > 0.0)
+        && (d0 != 0.0 || d1 != 0.0)
+        && (d2 != 0.0 || d3 != 0.0)
+    {
+        return true;
+    }
+    // Collinear touch: an endpoint lies on the other segment.
+    (d0 == 0.0 && on_seg(p2, p3, p0))
+        || (d1 == 0.0 && on_seg(p2, p3, p1))
+        || (d2 == 0.0 && on_seg(p0, p1, p2))
+        || (d3 == 0.0 && on_seg(p0, p1, p3))
+}
+
+/// Does segment `a→b` touch axis-aligned `r`? True if either endpoint is inside,
+/// or the segment crosses any of the rect's four edges (catches a segment that
+/// passes straight THROUGH with both endpoints outside).
+fn seg_hits_rect(a: egui::Pos2, b: egui::Pos2, r: egui::Rect) -> bool {
+    if r.contains(a) || r.contains(b) {
+        return true;
+    }
+    let tl = r.min;
+    let tr = egui::pos2(r.max.x, r.min.y);
+    let br = r.max;
+    let bl = egui::pos2(r.min.x, r.max.y);
+    segs_cross(a, b, tl, tr)
+        || segs_cross(a, b, tr, br)
+        || segs_cross(a, b, br, bl)
+        || segs_cross(a, b, bl, tl)
+}
+
+/// Does a projected polyline match the drag box under `mode`? Tests the ACTUAL
+/// geometry, not its AABB — so a diagonal line is NOT selected by a box that
+/// merely overlaps the corner of its bounding rectangle. `pts` are the curve's
+/// tessellated points projected to screen; `None` entries fall off-camera
+/// (never inside, and break a window's full-enclosure requirement).
+///
+/// - Window: EVERY point must project on-screen AND lie inside `drag`.
+/// - Crossing: ANY point inside `drag`, OR any on-screen segment touches it.
+pub fn box_select_polyline(pts: &[Option<egui::Pos2>], drag: egui::Rect, mode: BoxMode) -> bool {
+    if pts.is_empty() {
+        return false;
+    }
+    match mode {
+        BoxMode::Window => pts.iter().all(|p| p.is_some_and(|q| drag.contains(q))),
+        BoxMode::Crossing => {
+            if pts.iter().any(|p| p.is_some_and(|q| drag.contains(q))) {
+                return true;
+            }
+            pts.windows(2).any(|w| match (w[0], w[1]) {
+                (Some(a), Some(b)) => seg_hits_rect(a, b, drag),
+                _ => false,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn id(n: u128) -> ObjectId {
-        ObjectId(uuid::Uuid::from_u128(n))
-    }
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> egui::Rect {
         egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
@@ -89,44 +140,6 @@ mod tests {
         assert_eq!(mode(egui::pos2(50.0, 10.0), egui::pos2(10.0, 40.0)), BoxMode::Crossing);
         // Pure vertical drag counts as window.
         assert_eq!(mode(egui::pos2(30.0, 10.0), egui::pos2(30.0, 40.0)), BoxMode::Window);
-    }
-
-    #[test]
-    fn window_requires_full_enclosure() {
-        let items = vec![
-            (id(1), rect(10.0, 10.0, 20.0, 20.0)),  // fully inside
-            (id(2), rect(25.0, 25.0, 45.0, 45.0)),  // partially overlapping
-            (id(3), rect(100.0, 100.0, 110.0, 110.0)), // outside
-        ];
-        let drag = rect(0.0, 0.0, 40.0, 40.0);
-        assert_eq!(box_select(&items, drag, BoxMode::Window), vec![id(1)]);
-    }
-
-    #[test]
-    fn crossing_counts_touching() {
-        let items = vec![
-            (id(1), rect(10.0, 10.0, 20.0, 20.0)),  // fully inside
-            (id(2), rect(25.0, 25.0, 45.0, 45.0)),  // partially overlapping
-            (id(3), rect(100.0, 100.0, 110.0, 110.0)), // outside
-        ];
-        let drag = rect(0.0, 0.0, 40.0, 40.0);
-        assert_eq!(box_select(&items, drag, BoxMode::Crossing), vec![id(1), id(2)]);
-    }
-
-    #[test]
-    fn crossing_edge_touch_counts() {
-        // Shares only the drag rect's right edge — still a crossing hit.
-        let items = vec![(id(1), rect(40.0, 10.0, 60.0, 20.0))];
-        let drag = rect(0.0, 0.0, 40.0, 40.0);
-        assert_eq!(box_select(&items, drag, BoxMode::Crossing), vec![id(1)]);
-        assert!(box_select(&items, drag, BoxMode::Window).is_empty());
-    }
-
-    #[test]
-    fn empty_drag_selects_nothing_in_window_mode() {
-        let items = vec![(id(1), rect(10.0, 10.0, 20.0, 20.0))];
-        let drag = rect(30.0, 30.0, 30.0, 30.0);
-        assert!(box_select(&items, drag, BoxMode::Window).is_empty());
     }
 
     // Build (screen, world) samples with screen == world.xy for easy reasoning.
@@ -182,5 +195,54 @@ mod tests {
         let samples = vec![sample(15.0, 15.0), (None, glam::DVec3::new(9.0, 9.0, 9.0))];
         let drag = rect(10.0, 10.0, 40.0, 40.0);
         assert!(box_pick_point(&samples, drag, BoxMode::Window).is_none());
+    }
+
+    fn p(x: f32, y: f32) -> Option<egui::Pos2> {
+        Some(egui::pos2(x, y))
+    }
+
+    #[test]
+    fn diagonal_line_in_empty_corner_is_not_selected() {
+        // A diagonal line from (0,0) to (100,100). Its AABB is the whole
+        // 0..100 square, but the line only passes through the main diagonal.
+        let line = vec![p(0.0, 0.0), p(100.0, 100.0)];
+        // A box in the TOP-RIGHT corner (near (80,10)) overlaps the AABB but the
+        // line is nowhere near it → must NOT be selected (the reported bug).
+        let corner = rect(70.0, 5.0, 95.0, 25.0);
+        assert!(!box_select_polyline(&line, corner, BoxMode::Crossing), "empty corner");
+        assert!(!box_select_polyline(&line, corner, BoxMode::Window), "empty corner window");
+        // A box ON the diagonal (around (50,50)) → crossing hit.
+        let on_line = rect(40.0, 40.0, 60.0, 60.0);
+        assert!(box_select_polyline(&line, on_line, BoxMode::Crossing), "box on the line");
+    }
+
+    #[test]
+    fn crossing_catches_line_passing_straight_through() {
+        // Horizontal line crossing a box with BOTH endpoints outside it.
+        let line = vec![p(0.0, 30.0), p(100.0, 30.0)];
+        let drag = rect(40.0, 10.0, 60.0, 50.0);
+        assert!(box_select_polyline(&line, drag, BoxMode::Crossing), "passes through");
+        // Window requires full enclosure — endpoints are outside, so no.
+        assert!(!box_select_polyline(&line, drag, BoxMode::Window), "not enclosed");
+    }
+
+    #[test]
+    fn window_requires_whole_polyline_inside() {
+        let line = vec![p(15.0, 15.0), p(25.0, 25.0), p(35.0, 20.0)];
+        let encloses = rect(10.0, 10.0, 40.0, 40.0);
+        assert!(box_select_polyline(&line, encloses, BoxMode::Window), "fully inside");
+        let partial = rect(10.0, 10.0, 30.0, 30.0); // last vertex (35,20) outside
+        assert!(!box_select_polyline(&line, partial, BoxMode::Window), "one vertex out");
+        assert!(box_select_polyline(&line, partial, BoxMode::Crossing), "crossing still hits");
+    }
+
+    #[test]
+    fn offscreen_point_breaks_window_but_crossing_uses_onscreen_segments() {
+        // Middle vertex off-camera (None): window fails; crossing still tests the
+        // on-screen segments (here the first point is inside the box).
+        let line = vec![p(20.0, 20.0), None, p(90.0, 90.0)];
+        let drag = rect(10.0, 10.0, 40.0, 40.0);
+        assert!(!box_select_polyline(&line, drag, BoxMode::Window), "offscreen breaks window");
+        assert!(box_select_polyline(&line, drag, BoxMode::Crossing), "inside point hits");
     }
 }
