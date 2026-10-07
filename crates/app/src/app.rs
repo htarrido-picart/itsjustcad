@@ -3223,12 +3223,35 @@ impl App {
             .map(|obj| (obj.id, obj.geometry.aabb()))
             .collect();
         let bvh = kernel_mesh::Bvh::build(&pickable.iter().map(|(_, bb)| *bb).collect::<Vec<_>>());
+        // A curve is HIT only when the click lands within this many pixels of the
+        // ACTUAL projected line — not anywhere inside its bounding box. Without
+        // this, clicking empty space inside a diagonal line's AABB re-selects the
+        // line (so an empty-space click never appears to deselect). Meshes/solids
+        // stay on the AABB ray test (a filled footprint picks fine by bounds).
+        const PICK_PX: f32 = 6.0;
+        /// Chord tolerance for tessellating a curve into screen-distance samples.
+        const PICK_TESS_TOL: f64 = 0.05;
         let mut best: Option<(f64, itsjustcad_doc::ObjectId)> = None;
         for i in bvh.ray_candidates(origin, dir) {
             let (id, bb) = pickable[i as usize];
-            if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
-                && best.is_none_or(|(bt, _)| t < bt)
+            // Depth along the ray (nearest wins); None when the ray misses the AABB.
+            let Some(t) = ray_aabb(origin, dir, bb.min, bb.max) else { continue };
+            // Narrow phase: a Curve must also pass near its drawn polyline.
+            if let Some(obj) = self.session.doc.get(id)
+                && let itsjustcad_doc::Geometry::Curve(c) = &obj.geometry
             {
+                let pts: Vec<Option<egui::Pos2>> = c
+                    .tessellate(PICK_TESS_TOL)
+                    .iter()
+                    .map(|w| project(view_proj, rect, *w))
+                    .collect();
+                let near = crate::boxsel::dist_to_polyline(&pts, pos)
+                    .is_some_and(|d| d <= PICK_PX);
+                if !near {
+                    continue;
+                }
+            }
+            if best.is_none_or(|(bt, _)| t < bt) {
                 best = Some((t, id));
             }
         }
@@ -10840,6 +10863,49 @@ mod tests {
             assert!(
                 sel.contains(&ids[1].0),
                 "crossing drag (right→left) selected the second box"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_empty_click_deselects() {
+        // Rhino behavior: click an object to select it, then click EMPTY canvas
+        // space to DESELECT. The bug was that `hit_object` ray-tested the object
+        // AABB, so clicking empty space INSIDE a diagonal line's bounding box
+        // (but off the line) re-selected the line instead of deselecting.
+        run_app_journey(|h| {
+            submit_command(h, "line 0,0,0 10,10,0");
+            assert_eq!(h.state().session.doc.objects().count(), 1, "line drawn");
+            let id = h.state().session.doc.objects().next().unwrap().id;
+            top_ortho_view(h);
+
+            // Click ON the line's midpoint → selected.
+            let on_line = world_to_screen(h, glam::DVec3::new(5.0, 5.0, 0.0));
+            click_at(h, on_line);
+            assert!(
+                h.state().session.doc.selection.contains(&id),
+                "clicking on the line selected it"
+            );
+            // Click empty space INSIDE the line's bbox [0,10]² but far from the
+            // y=x line (8,2). Pre-fix this re-selected the line (AABB hit); now it
+            // must deselect.
+            click_at(h, world_to_screen(h, glam::DVec3::new(8.0, 2.0, 0.0)));
+            assert!(
+                h.state().session.doc.selection.is_empty(),
+                "empty click inside the line's bbox deselected (was the bug)"
+            );
+
+            // Sanity: re-select, then a far empty corner also deselects, with
+            // Transform Handles ON (gumball must not eat a clearly-empty click).
+            click_at(h, on_line);
+            assert!(h.state().session.doc.selection.contains(&id), "re-selected");
+            h.state_mut().show_gumball = true;
+            h.run_steps(2);
+            click_at(h, pane_point(h, 0.04, 0.04));
+            assert!(
+                h.state().session.doc.selection.is_empty(),
+                "empty corner click deselected (handles on)"
             );
         });
     }

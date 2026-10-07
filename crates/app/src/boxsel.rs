@@ -126,12 +126,68 @@ pub fn box_select_polyline(pts: &[Option<egui::Pos2>], drag: egui::Rect, mode: B
     }
 }
 
+/// Screen-space distance from `p` to segment `a→b` (0 if the foot of the
+/// perpendicular lies on the segment, else the distance to the nearer endpoint).
+fn dist_point_seg(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let len_sq = ab.length_sq();
+    let t = if len_sq <= f32::EPSILON {
+        0.0
+    } else {
+        ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0)
+    };
+    (p - (a + ab * t)).length()
+}
+
+/// Smallest screen-space distance from `pos` to a projected polyline — used by
+/// the single-click PICK so a curve is hit only when the click lands within a
+/// few pixels of the ACTUAL drawn line, not anywhere inside its bounding box.
+/// `pts` are the curve's tessellated points projected to screen (`None` = a
+/// point that fell off-camera, skipped). Returns `None` when no segment or point
+/// is on-screen. A straight line tessellates to 2 points, so the segment test is
+/// what makes a mid-line click register.
+pub fn dist_to_polyline(pts: &[Option<egui::Pos2>], pos: egui::Pos2) -> Option<f32> {
+    let mut best: Option<f32> = None;
+    for w in pts.windows(2) {
+        if let (Some(a), Some(b)) = (w[0], w[1]) {
+            let d = dist_point_seg(pos, a, b);
+            best = Some(best.map_or(d, |m| m.min(d)));
+        }
+    }
+    if best.is_none() {
+        // No on-screen segment (e.g. a single point): fall back to point distance.
+        for p in pts.iter().flatten() {
+            let d = (*p - pos).length();
+            best = Some(best.map_or(d, |m| m.min(d)));
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> egui::Rect {
         egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+    }
+
+    #[test]
+    fn dist_to_polyline_measures_to_the_segment_not_the_bbox() {
+        // A diagonal line from (0,0) to (100,100). A click at (90,10) is far from
+        // the line (~56px) even though it's INSIDE the line's bounding box — this
+        // is exactly the empty-click-near-a-line case that must NOT register.
+        let line = [Some(egui::pos2(0.0, 0.0)), Some(egui::pos2(100.0, 100.0))];
+        let d_far = dist_to_polyline(&line, egui::pos2(90.0, 10.0)).unwrap();
+        assert!(d_far > 50.0, "click in the bbox corner is far from the line: {d_far}");
+        // A click right on the middle of the line registers ~0.
+        let d_on = dist_to_polyline(&line, egui::pos2(50.0, 50.0)).unwrap();
+        assert!(d_on < 0.001, "click on the line is ~0: {d_on}");
+        // A few px off the mid-line is a small distance (within a pick tolerance).
+        let d_near = dist_to_polyline(&line, egui::pos2(52.0, 48.0)).unwrap();
+        assert!(d_near < 3.0, "click 2px off the line: {d_near}");
+        // Off-screen points are skipped.
+        assert!(dist_to_polyline(&[None, None], egui::pos2(0.0, 0.0)).is_none());
     }
 
     #[test]
