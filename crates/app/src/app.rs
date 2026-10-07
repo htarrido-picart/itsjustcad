@@ -3215,47 +3215,61 @@ impl App {
         let (origin, dir) = screen_ray(view_proj, rect, pos);
         // Build a BVH over visible object AABBs so the ray only tests the boxes
         // it actually crosses rather than every object in the scene.
-        let pickable: Vec<(itsjustcad_doc::ObjectId, kernel_mesh::Aabb)> = self
-            .session
-            .doc
-            .objects()
-            .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
-            .map(|obj| (obj.id, obj.geometry.aabb()))
-            .collect();
-        let bvh = kernel_mesh::Bvh::build(&pickable.iter().map(|(_, bb)| *bb).collect::<Vec<_>>());
+        // Keep the Curve ref alongside the AABB so the narrow phase doesn't
+        // re-fetch the object by id (the ref is valid for this whole `&self`
+        // borrow). `None` = non-curve geometry (mesh/solid), picked by bounds.
+        let pickable: Vec<(itsjustcad_doc::ObjectId, kernel_mesh::Aabb, Option<&kernel_curve::Curve>)> =
+            self.session
+                .doc
+                .objects()
+                .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
+                .map(|obj| {
+                    let curve = match &obj.geometry {
+                        itsjustcad_doc::Geometry::Curve(c) => Some(c),
+                        _ => None,
+                    };
+                    (obj.id, obj.geometry.aabb(), curve)
+                })
+                .collect();
+        let bvh = kernel_mesh::Bvh::build(&pickable.iter().map(|(_, bb, _)| *bb).collect::<Vec<_>>());
         // A curve is HIT only when the click lands within this many pixels of the
-        // ACTUAL projected line — not anywhere inside its bounding box. Without
-        // this, clicking empty space inside a diagonal line's AABB re-selects the
-        // line (so an empty-space click never appears to deselect). Meshes/solids
-        // stay on the AABB ray test (a filled footprint picks fine by bounds).
-        const PICK_PX: f32 = 6.0;
-        /// Chord tolerance for tessellating a curve into screen-distance samples.
-        const PICK_TESS_TOL: f64 = 0.05;
-        let mut best: Option<(f64, itsjustcad_doc::ObjectId)> = None;
+        // ACTUAL projected line — not anywhere inside its bounding box (clicking
+        // empty space inside a diagonal line's AABB must NOT re-select it). 8px is
+        // comfortable for thin lines. Meshes/solids pick by their AABB footprint.
+        const PICK_PX: f32 = 8.0;
+        // A fully on-screen curve is ranked by its SCREEN distance to the cursor
+        // (so a click dead-on the nearer line wins over one that merely has a
+        // closer bounding box); meshes/off-screen curves are ranked by ray depth.
+        // A qualifying curve is preferred over a mesh — a thin wireframe reads as
+        // foreground in CAD.
+        let mut best_curve: Option<(f32, itsjustcad_doc::ObjectId)> = None; // (screen dist, id)
+        let mut best_depth: Option<(f64, itsjustcad_doc::ObjectId)> = None; // (ray t, id)
         for i in bvh.ray_candidates(origin, dir) {
-            let (id, bb) = pickable[i as usize];
+            let (id, bb, curve) = pickable[i as usize];
             // Depth along the ray (nearest wins); None when the ray misses the AABB.
             let Some(t) = ray_aabb(origin, dir, bb.min, bb.max) else { continue };
-            // Narrow phase: a Curve must also pass near its drawn polyline.
-            if let Some(obj) = self.session.doc.get(id)
-                && let itsjustcad_doc::Geometry::Curve(c) = &obj.geometry
-            {
-                let pts: Vec<Option<egui::Pos2>> = c
-                    .tessellate(PICK_TESS_TOL)
-                    .iter()
-                    .map(|w| project(view_proj, rect, *w))
-                    .collect();
-                let near = crate::boxsel::dist_to_polyline(&pts, pos)
-                    .is_some_and(|d| d <= PICK_PX);
-                if !near {
-                    continue;
+            if let Some(c) = curve {
+                let pts = curve_screen_pts(c, view_proj, rect);
+                // Any point behind the camera makes the screen polyline unreliable
+                // (a visible span can have no on-screen segment); fall back to the
+                // AABB depth test so a partially-off-screen curve stays pickable.
+                if !pts.iter().any(|p| p.is_none()) {
+                    if let Some(d) = crate::boxsel::dist_to_polyline(&pts, pos)
+                        && d <= PICK_PX
+                        && best_curve.is_none_or(|(bd, _)| d < bd)
+                    {
+                        best_curve = Some((d, id));
+                    }
+                    continue; // on-screen curve decided by screen distance only
                 }
             }
-            if best.is_none_or(|(bt, _)| t < bt) {
-                best = Some((t, id));
+            if best_depth.is_none_or(|(bt, _)| t < bt) {
+                best_depth = Some((t, id));
             }
         }
-        best.map(|(_, id)| id)
+        best_curve
+            .map(|(_, id)| id)
+            .or(best_depth.map(|(_, id)| id))
     }
 
     /// A viewport double-click: if it lands on a block instance, reveal the
@@ -9231,8 +9245,32 @@ fn projected_rect(
     out
 }
 
-/// Chord tolerance for tessellating a curve into box-select samples.
-const BOX_SELECT_TOL: f64 = 0.05;
+/// Chord tolerance for tessellating a curve into screen-space points. ONE source
+/// for both single-click pick and drag-box select so they agree on fidelity.
+const CURVE_SCREEN_TOL: f64 = 0.05;
+
+/// A curve's tessellated points projected to screen, CLOSURE-AWARE: for a closed
+/// curve (rectangle/polygon, full circle, ellipse) the first point is appended so
+/// the last→first (closing) segment exists. `Curve::tessellate` omits that vertex
+/// for closed curves, so without this both pick and box-select would miss a click
+/// or box on the closing edge. `None` entries are points behind the camera.
+/// Shared by `App::hit_object` (pick) and `obj_matches_box` (box-select) so the
+/// two never diverge on what a curve's screen footprint is.
+fn curve_screen_pts(
+    c: &kernel_curve::Curve,
+    view_proj: glam::Mat4,
+    rect: egui::Rect,
+) -> Vec<Option<egui::Pos2>> {
+    let mut pts: Vec<Option<egui::Pos2>> = c
+        .tessellate(CURVE_SCREEN_TOL)
+        .iter()
+        .map(|w| project(view_proj, rect, *w))
+        .collect();
+    if c.is_closed() && pts.len() >= 2 {
+        pts.push(pts[0]);
+    }
+    pts
+}
 
 /// Does an object's ACTUAL projected geometry match the drag box under `mode`?
 /// Curves are tested as their tessellated polyline (so a diagonal line isn't
@@ -9249,12 +9287,7 @@ fn obj_matches_box(
     use itsjustcad_doc::Geometry;
     match geom {
         Geometry::Curve(c) => {
-            let pts: Vec<Option<egui::Pos2>> = c
-                .tessellate(BOX_SELECT_TOL)
-                .into_iter()
-                .map(|w| project(view_proj, rect, w))
-                .collect();
-            crate::boxsel::box_select_polyline(&pts, drag, mode)
+            crate::boxsel::box_select_polyline(&curve_screen_pts(c, view_proj, rect), drag, mode)
         }
         _ => match projected_rect(view_proj, rect, geom.aabb().min, geom.aabb().max) {
             Some(r) => match mode {
@@ -10868,6 +10901,38 @@ mod tests {
     }
 
     #[test]
+    fn curve_screen_pts_closes_the_loop() {
+        // Identity view_proj → clip=(x,y,z,1), w=1, ndc=(x,y,z). In a 200×200
+        // rect, world (x,y,0) projects to ((x+1)*100, (1-y)*100).
+        let vp = glam::Mat4::IDENTITY;
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        let corners = vec![
+            glam::DVec3::new(-0.5, -0.5, 0.0),
+            glam::DVec3::new(0.5, -0.5, 0.0),
+            glam::DVec3::new(0.5, 0.5, 0.0),
+            glam::DVec3::new(-0.5, 0.5, 0.0),
+        ];
+        let closed = kernel_curve::Curve::Polyline { points: corners.clone(), closed: true };
+        let pts = curve_screen_pts(&closed, vp, rect);
+        // 4 vertices + appended first = 5, last repeats first (the closing vertex).
+        assert_eq!(pts.len(), 5, "closed curve appends the first point");
+        assert_eq!(pts[0], pts[4], "closing vertex repeats the first");
+        // Closing edge = last→first = the left side (x=-0.5 → screen x=50, y 50..150).
+        // Its midpoint world (-0.5,0,0) → screen (50,100): on the line only because
+        // the closing segment now exists.
+        let mid = egui::pos2(50.0, 100.0);
+        let d = crate::boxsel::dist_to_polyline(&pts, mid).unwrap();
+        assert!(d < 0.001, "click on the closing edge is on the line: {d}");
+        // The OPEN version lacks that edge, so the same click is far (~50px) — the
+        // append is exactly what fixes the closed-curve pick.
+        let open = kernel_curve::Curve::Polyline { points: corners, closed: false };
+        let open_pts = curve_screen_pts(&open, vp, rect);
+        assert_eq!(open_pts.len(), 4, "open curve is not closed");
+        let d_open = crate::boxsel::dist_to_polyline(&open_pts, mid).unwrap();
+        assert!(d_open > 40.0, "open square's missing left edge: click is far: {d_open}");
+    }
+
+    #[test]
     #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
     fn journey_empty_click_deselects() {
         // Rhino behavior: click an object to select it, then click EMPTY canvas
@@ -10906,6 +10971,37 @@ mod tests {
             assert!(
                 h.state().session.doc.selection.is_empty(),
                 "empty corner click deselected (handles on)"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_click_closing_edge_of_rectangle_selects() {
+        // A rectangle is a CLOSED polyline; its 4th (closing) edge is the segment
+        // from the last vertex back to the first. `Curve::tessellate` omits that
+        // vertex, so before the closure-aware `curve_screen_pts` a click on the
+        // closing edge missed the rectangle entirely. Here the left edge (x=0,
+        // from the last corner (0,10) back to the first (0,0)) IS the closing
+        // segment; clicking its midpoint must select the rectangle.
+        run_app_journey(|h| {
+            submit_command(h, "rect 0,0,0 10 10");
+            assert_eq!(h.state().session.doc.objects().count(), 1, "rectangle drawn");
+            let id = h.state().session.doc.objects().next().unwrap().id;
+            top_ortho_view(h);
+
+            // Midpoint of the CLOSING edge (left side, x=0, y=5).
+            click_at(h, world_to_screen(h, glam::DVec3::new(0.0, 5.0, 0.0)));
+            assert!(
+                h.state().session.doc.selection.contains(&id),
+                "clicking the rectangle's closing edge selected it"
+            );
+            // Interior click (center, off every wireframe edge) deselects — the
+            // rectangle is an outline, not a filled face.
+            click_at(h, world_to_screen(h, glam::DVec3::new(5.0, 5.0, 0.0)));
+            assert!(
+                h.state().session.doc.selection.is_empty(),
+                "clicking the hollow interior deselected"
             );
         });
     }

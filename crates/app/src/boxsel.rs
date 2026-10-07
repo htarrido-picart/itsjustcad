@@ -191,6 +191,40 @@ mod tests {
     }
 
     #[test]
+    fn closing_edge_is_covered_once_the_first_point_is_appended() {
+        // A square's 4 corners. The closing edge (last→first) is the left side.
+        let open = [
+            Some(egui::pos2(0.0, 0.0)),
+            Some(egui::pos2(100.0, 0.0)),
+            Some(egui::pos2(100.0, 100.0)),
+            Some(egui::pos2(0.0, 100.0)),
+        ];
+        // Closed: the caller (curve_screen_pts) appends the first point so the
+        // last→first segment exists.
+        let closed = [
+            Some(egui::pos2(0.0, 0.0)),
+            Some(egui::pos2(100.0, 0.0)),
+            Some(egui::pos2(100.0, 100.0)),
+            Some(egui::pos2(0.0, 100.0)),
+            Some(egui::pos2(0.0, 0.0)),
+        ];
+        // A click on the middle of the LEFT (closing) edge, (0,50).
+        let on_closing = egui::pos2(0.0, 50.0);
+        assert!(dist_to_polyline(&open, on_closing).unwrap() > 40.0, "open misses the closing edge");
+        assert!(dist_to_polyline(&closed, on_closing).unwrap() < 0.001, "closed is on the line");
+        // Box-select crossing: a small box straddling the left edge only.
+        let box_on_left = rect(-5.0, 40.0, 5.0, 60.0);
+        assert!(
+            !box_select_polyline(&open, box_on_left, BoxMode::Crossing),
+            "open square: box on the missing left edge catches nothing"
+        );
+        assert!(
+            box_select_polyline(&closed, box_on_left, BoxMode::Crossing),
+            "closed square: box on the closing edge catches it"
+        );
+    }
+
+    #[test]
     fn direction_sets_mode() {
         assert_eq!(mode(egui::pos2(10.0, 10.0), egui::pos2(50.0, 40.0)), BoxMode::Window);
         assert_eq!(mode(egui::pos2(50.0, 10.0), egui::pos2(10.0, 40.0)), BoxMode::Crossing);

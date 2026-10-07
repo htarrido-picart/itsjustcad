@@ -162,8 +162,17 @@ impl Curve {
                 knots,
                 degree,
             } => {
-                // Fixed sampling proportional to control count; adaptive later.
-                let n = (control.len() * 8).max(32);
+                // Sample count honors `tol`: scale from the control-polygon
+                // length (a cheap upper bound on the curve length) so a tighter
+                // tolerance subdivides a tightly-curved span more finely instead
+                // of a fixed count. Floor keeps simple curves smooth; capped so a
+                // huge curve can't blow up the vertex count.
+                let poly_len: f64 = control.windows(2).map(|w| w[0].distance(w[1])).sum();
+                let n = if tol > 0.0 {
+                    ((poly_len / tol).ceil() as usize).clamp((control.len() * 8).max(32), 512)
+                } else {
+                    (control.len() * 8).max(32)
+                };
                 let (t0, t1) = (knots[*degree], knots[knots.len() - degree - 1]);
                 (0..=n)
                     .map(|i| {
