@@ -688,10 +688,19 @@ impl CommandLine {
                     }
                 }
 
-                // ── Accept suggestion (Tab or Right at end-of-line) ──────
+                // ── Accept suggestion (Tab, Right at end-of-line, or Space) ──
+                // Rhino treats Space like Enter to accept/complete: while the
+                // autosuggest popup is visible, Space accepts the highlighted (or
+                // first) suggestion instead of typing a literal space. The
+                // TextEdit above may have just inserted a space into `self.input`,
+                // but `accept_suggestion` trim_end()s and rebuilds the input from
+                // the completion, so the stray space is discarded. With the popup
+                // closed Space stays literal (so "line 0,0 5,5" still works) and
+                // the empty-line re-run-last-verb branch above (guarded by
+                // `!show_popup`) handles the empty case.
                 let at_end = self.input.len() == self.input.trim_end_matches(' ').len()
                     || !self.input.is_empty();
-                if (tab || (right && at_end)) && show_popup {
+                if (tab || (right && at_end) || space) && show_popup {
                     self.accept_suggestion();
                 }
 
@@ -858,6 +867,22 @@ mod tests {
         cl.suggest_sel = Some(0); // should be 'box'
         cl.accept_suggestion();
         assert_eq!(cl.input, "box ");
+    }
+
+    #[test]
+    fn space_accepts_suggestion_and_discards_stray_space() {
+        // Rhino parity: with the popup visible, Space accepts the suggestion like
+        // Tab. In the real frame, suggestions are built from the pre-space input
+        // ("bo"), then the TextEdit inserts a literal space ("bo ") before the
+        // accept runs. The accept path must discard that stray space and still
+        // complete to "box " (not "bo box " or "box  ").
+        let mut cl = CommandLine { input: "bo".to_string(), ..CommandLine::default() };
+        cl.refresh_suggestions(&[], &[]);
+        assert!(!cl.suggestions.is_empty());
+        cl.suggest_sel = Some(0); // 'box'
+        cl.input.push(' '); // the TextEdit's just-inserted stray space
+        cl.accept_suggestion();
+        assert_eq!(cl.input, "box ", "stray space discarded, verb completed");
     }
 
     #[test]
