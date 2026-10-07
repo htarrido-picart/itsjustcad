@@ -4,7 +4,7 @@
 use glam::{DVec2, DVec3};
 use itsjustcad_doc::{
     hatch::{hatch_ansi, hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
-    Annotation, Document, Geometry, HatchPattern, SceneObject,
+    Annotation, Document, Geometry, HatchPattern, ObjectId, SceneObject,
 };
 
 use crate::renderer::{hue_from_seed, ColorMode, SceneData};
@@ -241,6 +241,20 @@ pub fn snapshot(doc: &Document, theme: Theme) -> SceneData {
 
 /// Snapshot with an explicit color mode.
 pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) -> SceneData {
+    snapshot_hiding(doc, theme, cms, &std::collections::HashSet::new())
+}
+
+/// Like [`snapshot_with_mode`] but omits drawing the objects in `hidden`. This
+/// is a DRAW-only suppression: the objects stay in the document and remain
+/// hit-testable — used for the trim preview, where pieces the user has clicked
+/// to remove vanish from view while they keep picking more, until Enter commits
+/// the real trim.
+pub fn snapshot_hiding(
+    doc: &Document,
+    theme: Theme,
+    cms: ColorModeSnapshot,
+    hidden: &std::collections::HashSet<ObjectId>,
+) -> SceneData {
     let mode = cms.color_mode;
     let mut scene = SceneData {
         meshes: Vec::new(),
@@ -260,6 +274,9 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
         if !obj.visible {
             continue; // hidden object (hideobj)
         }
+        if hidden.contains(&obj.id) {
+            continue; // draw-only suppression (trim preview)
+        }
         let style = doc.layers.get(&obj.layer);
         if style.is_some_and(|s| !s.visible) {
             continue; // hidden layer
@@ -268,6 +285,32 @@ pub fn snapshot_with_mode(doc: &Document, theme: Theme, cms: ColorModeSnapshot) 
         let selected = doc.selection.contains(&obj.id);
         let lw_mm = doc.effective_lineweight(obj) as f32;
         match &obj.geometry {
+            // Strut-lattice parametric generators (spaceframe/geodesic/
+            // tensegrity/funicular/gridshell): the derived MEMBER SEGMENTS live
+            // in `wire` (the mesh is empty — no 3D strut tubes). Draw the wire as
+            // lightweight lines (respecting color + lineweight, like a curve).
+            // Order: wire wins over the wireframe/shaded arms below.
+            Geometry::Parametric { wire, .. } if !wire.is_empty() => {
+                let color = resolve_color(obj, layer_color, theme, selected, mode, false);
+                // Each member is its own 2-point strip (scene.lines entries are
+                // independent polylines — same convention as hatch segments), so
+                // disjoint members don't get joined by stray connectors.
+                push_hatch_segs(&mut scene.lines, wire.clone(), color, lw_mm);
+            }
+            // Wireframe parametric generators (cablenet, hypar, gaussvault): the
+            // derived mesh is a surface grid whose edges ARE the intended grid
+            // lines. Draw those edges as lines (respecting color + lineweight,
+            // like a curve) and skip the shaded triangles — the Frei-Otto /
+            // Munich cable-net look.
+            Geometry::Parametric { generator, mesh, .. }
+                if generator.renders_as_wireframe() =>
+            {
+                let color = resolve_color(obj, layer_color, theme, selected, mode, false);
+                // Each unique edge is its own 2-point strip (scene.lines entries
+                // are independent polylines — same convention as hatch segments),
+                // so disjoint grid edges don't get joined by stray connectors.
+                push_hatch_segs(&mut scene.lines, mesh.unique_edges(), color, lw_mm);
+            }
             // Frame/area structural members carry a derived mesh; render them
             // exactly like a solid mesh.
             Geometry::Mesh(mesh)
@@ -605,6 +648,67 @@ mod tests {
         let scene = snapshot(&doc, Theme::Dark);
         assert_eq!(scene.meshes.len(), 1);
         assert_eq!(scene.edges.len(), 1, "hidden mesh contributes no edges");
+    }
+
+    #[test]
+    fn cablenet_wireframe_geodesic_segments_plain_mesh_stays_shaded() {
+        use itsjustcad_doc::{derive_mesh, derive_segments, GeneratorKind};
+        let mut doc = Document::default();
+        // A cablenet: wireframe SURFACE generator → mesh-edge lines, no shaded mesh.
+        let cn = GeneratorKind::Cablenet;
+        let cn_params = cn.default_params();
+        doc.insert(SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: "default".into(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Parametric {
+                generator: cn,
+                params: cn_params.clone(),
+                placement: glam::DMat4::IDENTITY,
+                mesh: derive_mesh(cn, &cn_params).unwrap(),
+                wire: Vec::new(),
+            },
+        });
+        // A geodesic: strut LATTICE → member-segment lines (empty mesh), no tubes.
+        let gd = GeneratorKind::Geodesic;
+        let gd_params = gd.default_params();
+        let gd_wire = derive_segments(gd, &gd_params).unwrap();
+        let gd_wire_len = gd_wire.len();
+        assert!(gd_wire_len > 0, "geodesic derives member segments");
+        doc.insert(SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: "default".into(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Parametric {
+                generator: gd,
+                params: gd_params.clone(),
+                placement: glam::DMat4::IDENTITY,
+                mesh: kernel_mesh::Mesh::default(),
+                wire: gd_wire,
+            },
+        });
+        // A plain mesh triangle: the only shaded thing in the scene.
+        insert_tri(&mut doc, "default");
+
+        let scene = snapshot(&doc, Theme::Dark);
+        // Exactly one shaded mesh (the plain triangle); cablenet + geodesic are lines.
+        assert_eq!(scene.meshes.len(), 1, "only the plain mesh is shaded");
+        // cablenet grid edges (10×10 surface: 2·10·9 + 9·9 = 261) + geodesic members.
+        let cablenet_edges = 2 * 10 * 9 + 9 * 9;
+        assert_eq!(
+            scene.lines.len(),
+            cablenet_edges + gd_wire_len,
+            "cablenet grid edges + geodesic member segments as lines"
+        );
+        assert!(scene.lines.iter().all(|(pts, _, _)| pts.len() == 2), "each line is a 2-point strip");
     }
 
     #[test]
@@ -1104,6 +1208,43 @@ mod tests {
         assert_eq!(scene.meshes[0].1, [0.35, 0.75, 0.72, 1.0]);
         // Curve color is theme curve (not mesh)
         assert_ne!(scene.lines[0].1, scene.meshes[0].1);
+    }
+
+    #[test]
+    fn snapshot_hiding_omits_the_hidden_object() {
+        // The trim preview hides clicked target curves from the scene. Prove the
+        // hidden object's line soup is dropped while the rest stays, and that an
+        // empty hidden set is identical to the normal snapshot.
+        let mut doc = Document::default();
+        let keep = ObjectId::new();
+        let hide = ObjectId::new();
+        for id in [keep, hide] {
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: "default".into(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
+                    points: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+                    closed: false,
+                }),
+            });
+        }
+        let cms = ColorModeSnapshot::default();
+        let full = snapshot_with_mode(&doc, Theme::Dark, cms);
+        let hidden: std::collections::HashSet<ObjectId> = std::iter::once(hide).collect();
+        let partial = snapshot_hiding(&doc, Theme::Dark, cms, &hidden);
+        assert!(
+            partial.lines.len() < full.lines.len(),
+            "hidden curve's lines must be omitted ({} vs {})",
+            partial.lines.len(),
+            full.lines.len()
+        );
+        let none = snapshot_hiding(&doc, Theme::Dark, cms, &std::collections::HashSet::new());
+        assert_eq!(none.lines.len(), full.lines.len(), "empty hidden set == normal snapshot");
     }
 
     #[test]

@@ -121,6 +121,42 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Structure,
         },
         CommandSpec {
+            name: "diagrid",
+            usage: "diagrid <nx> <ny> <width> <height>",
+            summary: "Planar diagonal grid (diagrid) over a width×height rectangle in the XY plane, divided into nx×ny cells; both diagonal families + perimeter render as member lines. Example: diagrid 6 10 20 40",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "reciprocal",
+            usage: "reciprocal <count> <radius> <length>",
+            summary: "Reciprocal frame: 'count' straight members fanned around a center on a pitch circle of 'radius', tangentially engaged so they mutually overlap into a central opening + outer ring. Example: reciprocal 8 3 4",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "waffle",
+            usage: "waffle <nx> <ny> <width> <length> <depth>",
+            summary: "Egg-crate/waffle grid: nx ribs one way + ny ribs the other over a width×length footprint, each a vertical plane of 'depth'; rib top/bottom edges + intersection verticals render as a 3D line grid. Example: waffle 5 8 10 16 1",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "voronoishell",
+            usage: "voronoishell <cells> <width> <length> [seed]",
+            summary: "Voronoi cell pattern over a width×length rectangle in the XY plane from 'cells' deterministic seed points (placed by 'seed'); the clipped cell edges render as member lines. Example: voronoishell 24 20 20 1",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "schwedler",
+            usage: "schwedler <meridians> <rings> <radius> [dome|full]",
+            summary: "Schwedler ribbed dome: 'meridians' meridional ribs + 'rings' latitude rings + one diagonal brace per panel on a sphere of 'radius'; 'full' builds the whole sphere. Renders as member lines. Example: schwedler 12 6 8 dome",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "catenaryvault",
+            usage: "catenaryvault <span> <length> <rise> [nu] [nv]",
+            summary: "Compression vault whose cross-section is a true catenary of 'span'/'rise' lofted along 'length', meshed nu×nv (default 16) and drawn as a wireframe. Example: catenaryvault 8 12 4",
+            category: Category::Structure,
+        },
+        CommandSpec {
             name: "hypar",
             usage: "hypar <a> <b> <c> [nu] [nv]",
             summary: "Hyperbolic-paraboloid (Candela) saddle shell z = x*y/c over [-a,a]×[-b,b], meshed nu×nv (default 12). Example: hypar 5 5 5",
@@ -344,8 +380,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "section",
-            usage: "section <selector> <plane point x,y,z> <normal x,y,z>  |  section <name> rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t>",
-            summary: "Two uses. (1) Plane cut: cut meshes with a plane; each closed loop becomes a heavy polyline on layer 'sections'. Example: section all 0,0,1.2 0,0,1. (2) Structural section: define a named cross-section (profile) for beam/column members, chosen by a shape keyword in second position — rect (solid rectangle), circle, iwf (I / wide-flange: depth, flange width, flange thickness, web thickness), pipe (hollow round). Example: section W12 iwf 0.31 0.2 0.013 0.008 · section col rect 0.4 0.4",
+            usage: "section <selector> <plane point x,y,z> <normal x,y,z>  |  section <name> rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t> | tee <d> <bf> <tf> <tw> | channel <d> <bf> <tf> <tw> | angle <a> <b> <t> | hss <w> <h> <t>",
+            summary: "Two uses. (1) Plane cut: cut meshes with a plane; each closed loop becomes a heavy polyline on layer 'sections'. Example: section all 0,0,1.2 0,0,1. (2) Structural section: define a named cross-section (profile) for beam/column members, chosen by a shape keyword in second position — rect (solid rectangle), circle, iwf (I / wide-flange: depth, flange width, flange thickness, web thickness), pipe (hollow round), tee (T), channel (C/U), angle (L: leg a, leg b, thickness), hss (hollow square/rect tube). Example: section W12 iwf 0.31 0.2 0.013 0.008 · section col rect 0.4 0.4 · section T1 tee 0.2 0.15 0.012 0.008",
             category: Category::Dimension,
         },
         CommandSpec {
@@ -433,6 +469,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Dimension,
         },
         CommandSpec {
+            name: "divide",
+            usage: "divide <selector> <count>",
+            summary: "Place equally-spaced division points along a curve (points only; the curve stays intact — use split to break it). Open curves get count+1 points (both ends included); closed curves get count points (no seam duplicate). Example: divide last 8",
+            category: Category::Curve,
+        },
+        CommandSpec {
             name: "split",
             usage: "split <selector> <point x,y>",
             summary: "Split a curve in two at the nearest point on it to the given point; the original is replaced by the pieces. Example: split last 5,0",
@@ -440,8 +482,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "trim",
-            usage: "trim <target selector> <cutter selector> <keep point x,y>",
-            summary: "Cut a curve where it crosses the cutter curve(s) and keep only the piece nearest the keep point; the rest is removed. Example: trim wall slab 1,1",
+            usage: "trim <cutter selector…> remove <point x,y…>  |  trim <cutter…> extend <point…>",
+            summary: "Rhino two-phase trim: pick cutting curves, then click each piece to remove (the clicked segment between crossings is deleted). 'extend' instead grows the picked curve to the nearest cutter. Example: trim #a #b remove 2,0 8,0",
             category: Category::Curve,
         },
         CommandSpec {
@@ -460,6 +502,12 @@ pub fn registry() -> &'static [CommandSpec] {
             name: "join",
             usage: "join <selector>",
             summary: "Join end-touching curves (1e-6 gap tolerance) into one polyline; inputs are consumed, arcs are tessellated. Example: join last 3",
+            category: Category::Curve,
+        },
+        CommandSpec {
+            name: "explode",
+            usage: "explode <selector>",
+            summary: "Break polylines into their individual line segments (closed polylines include the closing segment); non-polyline curves are left as-is. Example: explode last",
             category: Category::Curve,
         },
         CommandSpec {
@@ -487,9 +535,15 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Curve,
         },
         CommandSpec {
+            name: "chamfer",
+            usage: "chamfer <selector> <selector> <distance>",
+            summary: "Bevel the corner between two lines/polylines with a straight setback line, trimming both sources back by the distance (the fillet analogue). Example: chamfer last 2 0.5",
+            category: Category::Curve,
+        },
+        CommandSpec {
             name: "offset",
-            usage: "offset <selector> <distance>",
-            summary: "Offset a curve in the XY plane; original kept. Closed curves: positive = outward, negative = inward (walls from centerlines: offset both ways, extrude). Example: offset last 0.2",
+            usage: "offset <selector> <distance> [side-point]",
+            summary: "Offset a curve in the XY plane; original kept. Closed curves: positive = outward, negative = inward (walls from centerlines: offset both ways, extrude). An optional trailing side point picks the direction (the guided flow supplies it). Example: offset last 0.2",
             category: Category::Curve,
         },
         CommandSpec {

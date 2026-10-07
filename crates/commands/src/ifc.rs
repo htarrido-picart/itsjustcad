@@ -1184,6 +1184,42 @@ fn write_profile(body: &mut String, ids: &mut Ids, section: &Section, name: &str
             num(d * 0.5),
             num(t)
         ),
+        // IfcTShapeProfileDef(ProfileType, Name, Position, Depth, FlangeWidth,
+        //   WebThickness, FlangeThickness, FilletRadius, FlangeEdgeRadius,
+        //   WebEdgeRadius, WebSlope, FlangeSlope)
+        Section::Tee { d, bf, tf, tw } => format!(
+            "IFCTSHAPEPROFILEDEF(.AREA.,'{label}',$,{},{},{},{},$,$,$,$,$)",
+            num(d),
+            num(bf),
+            num(tw),
+            num(tf)
+        ),
+        // IfcUShapeProfileDef(ProfileType, Name, Position, Depth, FlangeWidth,
+        //   WebThickness, FlangeThickness, FilletRadius, EdgeRadius, FlangeSlope)
+        Section::Channel { d, bf, tf, tw } => format!(
+            "IFCUSHAPEPROFILEDEF(.AREA.,'{label}',$,{},{},{},{},$,$,$)",
+            num(d),
+            num(bf),
+            num(tw),
+            num(tf)
+        ),
+        // IfcLShapeProfileDef(ProfileType, Name, Position, Depth, Width,
+        //   Thickness, FilletRadius, EdgeRadius, LegSlope)
+        // Depth = leg along y (b), Width = leg along x (a).
+        Section::Angle { a, b, t } => format!(
+            "IFCLSHAPEPROFILEDEF(.AREA.,'{label}',$,{},{},{},$,$,$)",
+            num(b),
+            num(a),
+            num(t)
+        ),
+        // IfcRectangleHollowProfileDef(ProfileType, Name, Position, XDim, YDim,
+        //   WallThickness, InnerFilletRadius, OuterFilletRadius)
+        Section::Hss { w, h, t } => format!(
+            "IFCRECTANGLEHOLLOWPROFILEDEF(.AREA.,'{label}',$,{},{},{},$,$)",
+            num(w),
+            num(h),
+            num(t)
+        ),
     };
     line(body, profile, &entity);
     profile
@@ -2138,6 +2174,22 @@ fn sections_equal(a: &Section, b: &Section) -> bool {
         (Section::Guadua { d: d1, t: t1 }, Section::Guadua { d: d2, t: t2 }) => {
             eq(*d1, *d2) && eq(*t1, *t2)
         }
+        (
+            Section::Tee { d: d1, bf: bf1, tf: tf1, tw: tw1 },
+            Section::Tee { d: d2, bf: bf2, tf: tf2, tw: tw2 },
+        ) => eq(*d1, *d2) && eq(*bf1, *bf2) && eq(*tf1, *tf2) && eq(*tw1, *tw2),
+        (
+            Section::Channel { d: d1, bf: bf1, tf: tf1, tw: tw1 },
+            Section::Channel { d: d2, bf: bf2, tf: tf2, tw: tw2 },
+        ) => eq(*d1, *d2) && eq(*bf1, *bf2) && eq(*tf1, *tf2) && eq(*tw1, *tw2),
+        (
+            Section::Angle { a: a1, b: b1, t: t1 },
+            Section::Angle { a: a2, b: b2, t: t2 },
+        ) => eq(*a1, *a2) && eq(*b1, *b2) && eq(*t1, *t2),
+        (
+            Section::Hss { w: w1, h: h1, t: t1 },
+            Section::Hss { w: w2, h: h2, t: t2 },
+        ) => eq(*w1, *w2) && eq(*h1, *h2) && eq(*t1, *t2),
         _ => false,
     }
 }
@@ -2380,6 +2432,39 @@ fn profile_to_section(records: &Records, id: u64) -> Option<Section> {
             let tw = as_num(args.get(5)?)?;
             let tf = as_num(args.get(6)?)?;
             Some(Section::IWideFlange { d, bf, tf, tw })
+        }
+        // (ProfileType, Name, Position, Depth, FlangeWidth, WebThickness,
+        //  FlangeThickness, ...)
+        "IFCTSHAPEPROFILEDEF" => {
+            let d = as_num(args.get(3)?)?;
+            let bf = as_num(args.get(4)?)?;
+            let tw = as_num(args.get(5)?)?;
+            let tf = as_num(args.get(6)?)?;
+            Some(Section::Tee { d, bf, tf, tw })
+        }
+        // (ProfileType, Name, Position, Depth, FlangeWidth, WebThickness,
+        //  FlangeThickness, ...)
+        "IFCUSHAPEPROFILEDEF" => {
+            let d = as_num(args.get(3)?)?;
+            let bf = as_num(args.get(4)?)?;
+            let tw = as_num(args.get(5)?)?;
+            let tf = as_num(args.get(6)?)?;
+            Some(Section::Channel { d, bf, tf, tw })
+        }
+        // (ProfileType, Name, Position, Depth(=b along y), Width(=a along x),
+        //  Thickness, ...)
+        "IFCLSHAPEPROFILEDEF" => {
+            let b = as_num(args.get(3)?)?;
+            let a = as_num(args.get(4)?)?;
+            let t = as_num(args.get(5)?)?;
+            Some(Section::Angle { a, b, t })
+        }
+        // (ProfileType, Name, Position, XDim, YDim, WallThickness, ...)
+        "IFCRECTANGLEHOLLOWPROFILEDEF" => {
+            let w = as_num(args.get(3)?)?;
+            let h = as_num(args.get(4)?)?;
+            let t = as_num(args.get(5)?)?;
+            Some(Section::Hss { w, h, t })
         }
         _ => None,
     }

@@ -3311,8 +3311,19 @@ fn parametric_object(
     params: itsjustcad_doc::ParamMap,
 ) -> Result<ObjectId, ExecError> {
     let params = generator.schema().sanitize(&params);
-    let mesh = itsjustcad_doc::derive_mesh(generator, &params)
-        .map_err(|e| ExecError::Invalid(e.to_string()))?;
+    // Strut-lattice generators render as lightweight member LINES: populate
+    // `wire` from `derive_segments` and leave `mesh` empty (no tubes). Surface
+    // (cablenet/hypar/gaussvault) and normal kinds keep `wire` empty and derive
+    // the display mesh as before. Same live re-derive path is used by `paramset`.
+    let (mesh, wire) = if generator.renders_as_segments() {
+        let wire = itsjustcad_doc::derive_segments(generator, &params)
+            .map_err(|e| ExecError::Invalid(e.to_string()))?;
+        (kernel_mesh::Mesh::default(), wire)
+    } else {
+        let mesh = itsjustcad_doc::derive_mesh(generator, &params)
+            .map_err(|e| ExecError::Invalid(e.to_string()))?;
+        (mesh, Vec::new())
+    };
     let id = id.unwrap_or_default();
     doc.insert(SceneObject {
         visible: true,
@@ -3327,6 +3338,7 @@ fn parametric_object(
             params,
             placement: glam::DMat4::IDENTITY,
             mesh,
+            wire,
         },
     });
     Ok(id)
@@ -6670,6 +6682,21 @@ fn curve_station_ts(count: u32, closed: bool) -> Vec<f64> {
     (0..count).map(|i| f64::from(i) / last).collect()
 }
 
+/// Fractional-arc-length stations for `divide` (Rhino's Divide). Unlike
+/// `curve_station_ts` (array copies), divide places DIVISION points:
+///   OPEN curve → `count + 1` points at t = 0, 1/count, …, 1 (both ends).
+///   CLOSED curve → `count` points at t = 0, 1/count, …, (count-1)/count (the
+///   seam is not duplicated).
+/// Caller guarantees `count >= 1`. Pure, so it is unit-tested directly.
+fn divide_ts(count: u32, closed: bool) -> Vec<f64> {
+    let n = f64::from(count);
+    if closed {
+        return (0..count).map(|i| f64::from(i) / n).collect();
+    }
+    // Open: 0, 1/count, …, count/count (== 1) → count + 1 stations.
+    (0..=count).map(|i| f64::from(i) / n).collect()
+}
+
 /// Point and unit tangent at fractional arc-length `t` (0..=1) along a dense
 /// on-curve polyline `pts` (from `Curve::tessellate`). Works for every curve
 /// type because tessellation samples the true curve. The tangent is the local
@@ -7537,6 +7564,187 @@ fn powertrim_drop_index(pieces: &[Curve], pick: DVec3) -> usize {
         .expect("pieces is non-empty")
 }
 
+/// The curve in `doc` whose geometry passes nearest `point` (Rhino's "click the
+/// object to trim"). A cutter MAY itself be a trim target — the classic two
+/// crossing lines trim each other, so the clicked curve is picked whether or not
+/// it is in the cutter set; the caller excludes the target from its own cutters
+/// when splitting. Returns `None` when the doc has no eligible curve or the
+/// nearest one is farther than [`TRIM_PICK_TOL`].
+fn nearest_curve_to_point(doc: &Document, point: DVec3) -> Option<ObjectId> {
+    /// A click must land within this world distance of a curve to select it —
+    /// generous so imprecise picks still catch the intended curve, but finite so a
+    /// stray click in empty space hits nothing (skipped with a note).
+    const TRIM_PICK_TOL: f64 = 1.0;
+    doc.objects()
+        .filter_map(|o| match &o.geometry {
+            Geometry::Curve(c) => {
+                let d = kernel_curve::closest_point(c, point, PROFILE_TOL).distance(point);
+                Some((o.id, d))
+            }
+            _ => None,
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).expect("finite distances"))
+        .filter(|(_, d)| *d <= TRIM_PICK_TOL)
+        .map(|(id, _)| id)
+}
+
+/// The polyline of the piece a trim-remove click at `pick` would DELETE — for
+/// live GUI preview so the user sees which segment disappears before committing.
+/// Mirrors the Trim exec's remove path: find the curve nearest `pick`, split it
+/// at its intersections with the OTHER cutters (a curve can't cut itself), and
+/// return the tessellated segment the pick lands in. `None` when the pick hits
+/// no curve, the target only meets cutters at its ends, or the target is the
+/// sole cutter.
+pub fn trim_removed_piece(doc: &Document, cutters: &[ObjectId], pick: DVec3) -> Option<Vec<DVec3>> {
+    /// Chord tolerance for the preview polyline — fine enough to read as the real
+    /// curve, matching the app's pick tessellation.
+    const PREVIEW_TOL: f64 = 0.05;
+    let tid = nearest_curve_to_point(doc, pick)?;
+    let Geometry::Curve(target) = &doc.get(tid)?.geometry else {
+        return None;
+    };
+    let mut cuts = Vec::new();
+    for cid in cutters {
+        if *cid == tid {
+            continue; // a curve can't cut itself
+        }
+        if let Some(obj) = doc.get(*cid)
+            && let Geometry::Curve(cc) = &obj.geometry
+        {
+            cuts.extend(kernel_curve::intersections(target, cc, PROFILE_TOL));
+        }
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let pieces = kernel_curve::split_at_points(target, &cuts, kernel_curve::JOIN_TOL)?;
+    if pieces.len() < 2 {
+        return None;
+    }
+    let idx = powertrim_drop_index(&pieces, pick);
+    Some(pieces[idx].tessellate(PREVIEW_TOL))
+}
+
+/// Live preview of an in-progress trim-remove. Given the cutters and the removal
+/// points clicked so far, returns (a) the target curves that should be HIDDEN
+/// from the view — each has at least one piece queued for removal — and (b) the
+/// SURVIVING piece polylines to draw in their place, so the clicked pieces look
+/// deleted before Enter commits. Mirrors the Trim exec's grouping/split/drop, so
+/// the preview matches the committed result exactly.
+pub fn trim_preview(
+    doc: &Document,
+    cutters: &[ObjectId],
+    picks: &[DVec3],
+) -> (Vec<ObjectId>, Vec<Vec<DVec3>>) {
+    const PREVIEW_TOL: f64 = 0.05;
+    // Group picks by the curve nearest each (same as the exec remove path).
+    let mut by_target: std::collections::HashMap<ObjectId, Vec<DVec3>> =
+        std::collections::HashMap::new();
+    let mut order: Vec<ObjectId> = Vec::new();
+    for pick in picks {
+        if let Some(tid) = nearest_curve_to_point(doc, *pick) {
+            if !by_target.contains_key(&tid) {
+                order.push(tid);
+            }
+            by_target.entry(tid).or_default().push(*pick);
+        }
+    }
+    let mut hidden = Vec::new();
+    let mut survivors = Vec::new();
+    for tid in order {
+        let Some(obj) = doc.get(tid) else { continue };
+        let Geometry::Curve(target) = &obj.geometry else { continue };
+        let mut cuts = Vec::new();
+        for cid in cutters {
+            if *cid == tid {
+                continue; // a curve can't cut itself
+            }
+            if let Some(o) = doc.get(*cid)
+                && let Geometry::Curve(cc) = &o.geometry
+            {
+                cuts.extend(kernel_curve::intersections(target, cc, PROFILE_TOL));
+            }
+        }
+        if cuts.is_empty() {
+            continue;
+        }
+        let Some(pieces) = kernel_curve::split_at_points(target, &cuts, kernel_curve::JOIN_TOL)
+        else {
+            continue;
+        };
+        if pieces.len() < 2 {
+            continue;
+        }
+        let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for pick in &by_target[&tid] {
+            drop.insert(powertrim_drop_index(&pieces, *pick));
+        }
+        hidden.push(tid);
+        for (j, piece) in pieces.iter().enumerate() {
+            if !drop.contains(&j) {
+                survivors.push(piece.tessellate(PREVIEW_TOL));
+            }
+        }
+    }
+    (hidden, survivors)
+}
+
+/// Extend the open end of `curve` NEAREST `pick` to meet the closest cutter.
+///
+/// Grows the curve by a large distance, intersects the grown curve with the
+/// cutters, and clamps the extended end back to the nearest new intersection that
+/// lies BEYOND the original end (in the extension direction). Returns `None` when
+/// the curve is closed/unextendable or no cutter lies ahead of the picked end.
+fn extend_to_cutters(curve: &Curve, pick: DVec3, cutters: &[Curve]) -> Option<Curve> {
+    // Which end are we extending? The endpoint nearest the pick.
+    let (a, b) = match curve {
+        Curve::Line { a, b } => (*a, *b),
+        Curve::Polyline { points, closed: false } if points.len() >= 2 => {
+            (points[0], *points.last().expect("len>=2"))
+        }
+        _ => return None,
+    };
+    let extend_start = pick.distance(a) <= pick.distance(b);
+    // Grow both ends by a large span, then find the nearest cutter hit ahead of
+    // the picked end.
+    const SPAN: f64 = 1.0e6;
+    let grown = kernel_curve::extend(curve, SPAN)?;
+    let end = if extend_start { a } else { b };
+    let dir = if extend_start { (a - b).normalize_or_zero() } else { (b - a).normalize_or_zero() };
+    if dir == DVec3::ZERO {
+        return None;
+    }
+    let mut best: Option<(f64, DVec3)> = None;
+    for cc in cutters {
+        for hit in kernel_curve::intersections(&grown, cc, PROFILE_TOL) {
+            let t = (hit - end).dot(dir); // signed distance ahead of the end
+            if t > PROFILE_TOL && best.is_none_or(|(bt, _)| t < bt) {
+                best = Some((t, hit));
+            }
+        }
+    }
+    let (_, target) = best?;
+    // Rebuild the curve with the picked end moved to the cutter intersection.
+    match curve {
+        Curve::Line { a, b } => Some(if extend_start {
+            Curve::Line { a: target, b: *b }
+        } else {
+            Curve::Line { a: *a, b: target }
+        }),
+        Curve::Polyline { points, .. } => {
+            let mut points = points.clone();
+            if extend_start {
+                points[0] = target;
+            } else {
+                let last = points.len() - 1;
+                points[last] = target;
+            }
+            Some(Curve::Polyline { points, closed: false })
+        }
+        _ => None,
+    }
+}
+
 fn curve_of<'a>(doc: &'a Document, id: ObjectId, verb: &str) -> Result<&'a Curve, ExecError> {
     match &doc.get(id).expect("resolved").geometry {
         Geometry::Curve(c) => Ok(c),
@@ -8338,6 +8546,186 @@ fn apply_forward(
                 ApplyOutcome {
                     created: vec![id],
                     message: format!("spaceframe {id} ({nx}x{ny}, bay={bay}, depth={depth})"),
+                },
+            ))
+        }
+        Command::Diagrid { id, nx, ny, width, height } => {
+            if nx == 0 || ny == 0 {
+                return Err(ExecError::Invalid("diagrid nx and ny must be >= 1".into()));
+            }
+            let width = finite(width, "diagrid width")?;
+            let height = finite(height, "diagrid height")?;
+            if width <= 0.0 || height <= 0.0 {
+                return Err(ExecError::Invalid("diagrid width and height must be positive".into()));
+            }
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("nx".into(), ParamValue::Int(nx as i64));
+            params.insert("ny".into(), ParamValue::Int(ny as i64));
+            params.insert("width".into(), ParamValue::Float(width));
+            params.insert("height".into(), ParamValue::Float(height));
+            let id = parametric_object(doc, id, GeneratorKind::Diagrid, params)?;
+            Ok((
+                Command::Diagrid { id: Some(id), nx, ny, width, height },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("diagrid {id} ({nx}x{ny}, {width}x{height})"),
+                },
+            ))
+        }
+        Command::Reciprocal { id, count, radius, length } => {
+            if count < 2 {
+                return Err(ExecError::Invalid("reciprocal count must be >= 2".into()));
+            }
+            let radius = finite(radius, "reciprocal radius")?;
+            let length = finite(length, "reciprocal length")?;
+            if radius <= 0.0 || length <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "reciprocal radius and length must be positive".into(),
+                ));
+            }
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("count".into(), ParamValue::Int(count as i64));
+            params.insert("radius".into(), ParamValue::Float(radius));
+            params.insert("length".into(), ParamValue::Float(length));
+            let id = parametric_object(doc, id, GeneratorKind::Reciprocal, params)?;
+            Ok((
+                Command::Reciprocal { id: Some(id), count, radius, length },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("reciprocal {id} ({count} members, r={radius}, len={length})"),
+                },
+            ))
+        }
+        Command::Waffle { id, nx, ny, width, length, depth } => {
+            if nx < 2 || ny < 2 {
+                return Err(ExecError::Invalid("waffle nx and ny must be >= 2".into()));
+            }
+            let width = finite(width, "waffle width")?;
+            let length = finite(length, "waffle length")?;
+            let depth = finite(depth, "waffle depth")?;
+            if width <= 0.0 || length <= 0.0 || depth <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "waffle width, length and depth must be positive".into(),
+                ));
+            }
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("nx".into(), ParamValue::Int(nx as i64));
+            params.insert("ny".into(), ParamValue::Int(ny as i64));
+            params.insert("width".into(), ParamValue::Float(width));
+            params.insert("length".into(), ParamValue::Float(length));
+            params.insert("depth".into(), ParamValue::Float(depth));
+            let id = parametric_object(doc, id, GeneratorKind::Waffle, params)?;
+            Ok((
+                Command::Waffle { id: Some(id), nx, ny, width, length, depth },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!("waffle {id} ({nx}x{ny}, {width}x{length}, depth={depth})"),
+                },
+            ))
+        }
+        Command::VoronoiShell { id, cells, width, length, seed } => {
+            if cells == 0 {
+                return Err(ExecError::Invalid("voronoishell cells must be >= 1".into()));
+            }
+            let width = finite(width, "voronoishell width")?;
+            let length = finite(length, "voronoishell length")?;
+            if width <= 0.0 || length <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "voronoishell width and length must be positive".into(),
+                ));
+            }
+            let seed = seed.unwrap_or(1);
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("cells".into(), ParamValue::Int(cells as i64));
+            params.insert("width".into(), ParamValue::Float(width));
+            params.insert("length".into(), ParamValue::Float(length));
+            params.insert("seed".into(), ParamValue::Int(seed));
+            let id = parametric_object(doc, id, GeneratorKind::VoronoiShell, params)?;
+            Ok((
+                Command::VoronoiShell { id: Some(id), cells, width, length, seed: Some(seed) },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "voronoishell {id} ({cells} cells, {width}x{length}, seed={seed})"
+                    ),
+                },
+            ))
+        }
+        Command::Schwedler { id, meridians, rings, radius, full } => {
+            if meridians < 3 {
+                return Err(ExecError::Invalid("schwedler meridians must be >= 3".into()));
+            }
+            if rings == 0 {
+                return Err(ExecError::Invalid("schwedler rings must be >= 1".into()));
+            }
+            let radius = finite(radius, "schwedler radius")?;
+            if radius <= 0.0 {
+                return Err(ExecError::Invalid("schwedler radius must be positive".into()));
+            }
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("meridians".into(), ParamValue::Int(meridians as i64));
+            params.insert("rings".into(), ParamValue::Int(rings as i64));
+            params.insert("radius".into(), ParamValue::Float(radius));
+            params.insert(
+                "mode".into(),
+                ParamValue::Enum(if full { "full".into() } else { "dome".into() }),
+            );
+            let id = parametric_object(doc, id, GeneratorKind::Schwedler, params)?;
+            Ok((
+                Command::Schwedler { id: Some(id), meridians, rings, radius, full },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "schwedler {id} ({meridians} meridians, {rings} rings, r={radius}, {})",
+                        if full { "sphere" } else { "dome" }
+                    ),
+                },
+            ))
+        }
+        Command::CatenaryVault { id, span, length, rise, nu, nv } => {
+            let span = finite(span, "catenaryvault span")?;
+            let length = finite(length, "catenaryvault length")?;
+            let rise = finite(rise, "catenaryvault rise")?;
+            if span <= 0.0 || length <= 0.0 || rise <= 0.0 {
+                return Err(ExecError::Invalid(
+                    "catenaryvault span, length and rise must be positive".into(),
+                ));
+            }
+            let nu_v = clamp_grid(nu.unwrap_or(16));
+            let nv_v = clamp_grid(nv.unwrap_or(16));
+            use itsjustcad_doc::{GeneratorKind, ParamValue};
+            let mut params = itsjustcad_doc::ParamMap::new();
+            params.insert("span".into(), ParamValue::Float(span));
+            params.insert("length".into(), ParamValue::Float(length));
+            params.insert("rise".into(), ParamValue::Float(rise));
+            params.insert("nu".into(), ParamValue::Int(nu_v as i64));
+            params.insert("nv".into(), ParamValue::Int(nv_v as i64));
+            let id = parametric_object(doc, id, GeneratorKind::CatenaryVault, params)?;
+            Ok((
+                Command::CatenaryVault {
+                    id: Some(id),
+                    span,
+                    length,
+                    rise,
+                    nu: Some(nu_v),
+                    nv: Some(nv_v),
+                },
+                Inverse::DeleteCreated(vec![id]),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "catenaryvault {id} (span={span}, len={length}, rise={rise})"
+                    ),
                 },
             ))
         }
@@ -9688,6 +10076,77 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Explode { ids: replay_ids, targets } => {
+            let sel = resolve(doc, &targets)?;
+            if sel.is_empty() {
+                return Err(ExecError::Invalid("explode: nothing selected".into()));
+            }
+            // Build the segment lines per exploded polyline, remembering which
+            // source each batch came from so undo can restore the polylines.
+            struct Exploded {
+                obj: SceneObject,
+                index: usize,
+                segments: Vec<Curve>,
+            }
+            let mut exploded: Vec<Exploded> = Vec::new();
+            for cid in &sel {
+                let Geometry::Curve(Curve::Polyline { points, closed }) =
+                    &doc.get(*cid).expect("resolved").geometry
+                else {
+                    continue; // non-polyline curves (and non-curves) are left as-is
+                };
+                if points.len() < 2 {
+                    continue;
+                }
+                let n = points.len();
+                let seg_count = if *closed { n } else { n - 1 };
+                let segments: Vec<Curve> = (0..seg_count)
+                    .map(|i| Curve::Line { a: points[i], b: points[(i + 1) % n] })
+                    .collect();
+                let (obj, index) = doc.remove(*cid).expect("resolved");
+                exploded.push(Exploded { obj, index, segments });
+            }
+            if exploded.is_empty() {
+                return Err(ExecError::Invalid(
+                    "explode: selection has no polylines to explode".into(),
+                ));
+            }
+            let total: usize = exploded.iter().map(|e| e.segments.len()).sum();
+            // Reuse replay ids when they match the count, else mint fresh ones.
+            let created: Vec<ObjectId> = match replay_ids {
+                Some(ids) if ids.len() == total => ids,
+                _ => (0..total).map(|_| ObjectId::new()).collect(),
+            };
+            let mut consumed = Vec::with_capacity(exploded.len());
+            let mut next = created.iter();
+            for e in exploded {
+                for seg in e.segments {
+                    let id = *next.next().expect("created ids cover all segments");
+                    doc.insert(SceneObject {
+                        visible: true,
+                        id,
+                        name: e.obj.name.clone(),
+                        layer: e.obj.layer.clone(),
+                        color: e.obj.color,
+                        material: e.obj.material,
+                        lineweight_mm: e.obj.lineweight_mm,
+                        geometry: Geometry::Curve(seg),
+                    });
+                }
+                consumed.push((e.obj, e.index));
+            }
+            let polys = consumed.len();
+            Ok((
+                Command::Explode { ids: Some(created.clone()), targets },
+                Inverse::Replace { created: created.clone(), consumed },
+                ApplyOutcome {
+                    message: format!(
+                        "exploded {polys} polyline(s) -> {total} line segment(s)"
+                    ),
+                    created,
+                },
+            ))
+        }
         Command::Stretch { targets, min, max, delta } => {
             let ids = resolve(doc, &targets)?;
             // Snapshot BEFORE mutating, and only for objects that actually
@@ -9956,6 +10415,52 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Divide { id, target, count } => {
+            if count < 1 {
+                return Err(ExecError::Invalid("divide count must be at least 1".into()));
+            }
+            // Resolve to curve(s): a single-object selector divides that curve; a
+            // multi-match selector divides each. Non-curve geometry is a clean
+            // Invalid error (no partial work).
+            let ids = resolve(doc, &target)?;
+            if ids.is_empty() {
+                return Err(ExecError::Invalid("divide: nothing selected".into()));
+            }
+            let mut positions: Vec<DVec3> = Vec::new();
+            for cid in &ids {
+                let curve = curve_of(doc, *cid, "divide")?;
+                let pts = curve.tessellate(PROFILE_TOL);
+                if pts.len() < 2 {
+                    return Err(ExecError::Invalid("divide: curve has no length".into()));
+                }
+                let closed = curve.is_closed();
+                for t in divide_ts(count, closed) {
+                    positions.push(polyline_point_tangent(&pts, t).0);
+                }
+            }
+            // One point-cloud object holds every division point → single undo and
+            // a single logged id reused on replay (byte-identical geometry).
+            let new_id = id.unwrap_or_default();
+            let n = positions.len();
+            doc.insert(SceneObject {
+                visible: true,
+                id: new_id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Points { positions },
+            });
+            Ok((
+                Command::Divide { id: Some(new_id), target, count },
+                Inverse::DeleteCreated(vec![new_id]),
+                ApplyOutcome {
+                    created: vec![new_id],
+                    message: format!("divide -> {new_id} ({n} points)"),
+                },
+            ))
+        }
         Command::Split { ids, target, point } => {
             let (tid, curve) = one_curve(doc, &target, "split")?;
             let cp = kernel_curve::closest_point(curve, point, PROFILE_TOL);
@@ -9999,74 +10504,178 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Trim { id, target, cutter, keep } => {
-            let cutter_ids = resolve(doc, &cutter)?;
-            // Cutters win overlaps, so "trim last 2 last <point>" reads
-            // naturally: target = the older of the two most recent curves.
-            let target_ids: Vec<ObjectId> = resolve(doc, &target)?
-                .into_iter()
-                .filter(|tid| !cutter_ids.contains(tid))
-                .collect();
-            let [tid] = target_ids[..] else {
+        Command::Trim { ids, cutters, removes, extend } => {
+            // Resolve the cutter SET (Rhino phase 1). Every cutter must be a curve;
+            // cutters are never themselves trimmed.
+            let mut cutter_ids: Vec<ObjectId> = Vec::new();
+            for sel in &cutters {
+                for cid in resolve(doc, sel)? {
+                    if !cutter_ids.contains(&cid) {
+                        cutter_ids.push(cid);
+                    }
+                }
+            }
+            if cutter_ids.is_empty() {
+                return Err(ExecError::Invalid("trim: no cutting objects".into()));
+            }
+            let cutter_curves: Vec<Curve> = cutter_ids
+                .iter()
+                .map(|cid| curve_of(doc, *cid, "trim (cutter)").cloned())
+                .collect::<Result<_, _>>()?;
+
+            // Map each removal/extend point to the target curve nearest it (Rhino:
+            // click the object to trim). Points that hit no curve are skipped with a
+            // note. GROUP by target so a curve hit by several picks is split ONCE
+            // and all its clicked segments drop together — this matches Rhino and
+            // avoids re-stripping an already-trimmed piece (which would leave a
+            // cutter-to-cutter span with no interior crossing).
+            let mut notes: Vec<String> = Vec::new();
+            // Preserve first-hit order of targets for deterministic id assignment.
+            let mut order: Vec<ObjectId> = Vec::new();
+            let mut picks_by_target: std::collections::HashMap<ObjectId, Vec<DVec3>> =
+                std::collections::HashMap::new();
+            for (i, pick) in removes.iter().copied().enumerate() {
+                match nearest_curve_to_point(doc, pick) {
+                    Some(tid) => {
+                        if !picks_by_target.contains_key(&tid) {
+                            order.push(tid);
+                        }
+                        picks_by_target.entry(tid).or_default().push(pick);
+                    }
+                    None => notes.push(format!("point {i}: no curve there — skipped")),
+                }
+            }
+
+            let mut consumed: Vec<(SceneObject, usize)> = Vec::new();
+            let mut created: Vec<ObjectId> = Vec::new();
+            let mut removed_pieces = 0usize;
+            let mut extended = 0usize;
+            // Replay: hand out pre-assigned ids in order; live: fresh ids.
+            let mut id_pool = ids.clone().unwrap_or_default().into_iter();
+
+            for tid in order {
+                let picks = &picks_by_target[&tid];
+                let curve = curve_of(doc, tid, "trim")?.clone();
+
+                // A curve cannot cut itself: when the target is also a cutter
+                // (two crossing lines trimming each other), split/extend it
+                // against the OTHER cutters only.
+                let others: Vec<Curve> = cutter_ids
+                    .iter()
+                    .zip(&cutter_curves)
+                    .filter(|(cid, _)| **cid != tid)
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                if others.is_empty() {
+                    notes.push("point: only cutter clicked, nothing to cut it — skipped".into());
+                    continue;
+                }
+
+                if extend {
+                    // Extend each picked end to the nearest cutter, in sequence
+                    // (later picks see the already-extended curve).
+                    let mut cur = curve;
+                    let mut any = false;
+                    for pick in picks {
+                        match extend_to_cutters(&cur, *pick, &others) {
+                            Some(new) => {
+                                cur = new;
+                                any = true;
+                            }
+                            None => notes.push("point: nothing to extend to — skipped".into()),
+                        }
+                    }
+                    if !any {
+                        continue;
+                    }
+                    let (obj, index) = doc.remove(tid).expect("resolved");
+                    consumed.push((obj.clone(), index));
+                    let pid = id_pool.next().unwrap_or_default();
+                    created.push(pid);
+                    doc.insert(SceneObject {
+                        visible: true,
+                        id: pid,
+                        name: obj.name.clone(),
+                        layer: obj.layer.clone(),
+                        color: None,
+                        material: None,
+                        lineweight_mm: None,
+                        geometry: Geometry::Curve(cur),
+                    });
+                    extended += 1;
+                    continue;
+                }
+
+                // Trim-remove: split the target ONCE at its intersections with the
+                // cutter SET, then delete every segment a pick lands in.
+                let mut cuts = Vec::new();
+                for cc in &others {
+                    cuts.extend(kernel_curve::intersections(&curve, cc, PROFILE_TOL));
+                }
+                if cuts.is_empty() {
+                    notes.push("point: no intersection with the cutters — skipped".into());
+                    continue;
+                }
+                let Some(pieces) =
+                    kernel_curve::split_at_points(&curve, &cuts, kernel_curve::JOIN_TOL)
+                else {
+                    notes.push("point: cannot trim that curve — skipped".into());
+                    continue;
+                };
+                if pieces.len() < 2 {
+                    notes.push("point: cutters only touch the ends — skipped".into());
+                    continue;
+                }
+                // Every piece a pick lands in is dropped; the rest survive.
+                let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                for pick in picks {
+                    drop.insert(powertrim_drop_index(&pieces, *pick));
+                }
+                let survivors: Vec<Curve> = pieces
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(j, _)| !drop.contains(j))
+                    .map(|(_, c)| c)
+                    .collect();
+                let (obj, index) = doc.remove(tid).expect("resolved");
+                consumed.push((obj.clone(), index));
+                for piece in &survivors {
+                    let pid = id_pool.next().unwrap_or_default();
+                    created.push(pid);
+                    doc.insert(SceneObject {
+                        visible: true,
+                        id: pid,
+                        name: obj.name.clone(),
+                        layer: obj.layer.clone(),
+                        color: None,
+                        material: None,
+                        lineweight_mm: None,
+                        geometry: Geometry::Curve(piece.clone()),
+                    });
+                }
+                removed_pieces += drop.len();
+            }
+
+            if consumed.is_empty() {
                 return Err(ExecError::Invalid(format!(
-                    "trim target selector matched {} objects (excluding cutters), expected exactly 1",
-                    target_ids.len()
+                    "trim: nothing changed ({})",
+                    if notes.is_empty() { "no removal points".into() } else { notes.join("; ") }
                 )));
+            }
+            let mut message = if extend {
+                format!("trim: extended {extended} curve(s) to the cutters")
+            } else {
+                format!("trim: removed {removed_pieces} piece(s), {} new curve(s)", created.len())
             };
-            let curve = curve_of(doc, tid, "trim")?;
-            let mut cuts = Vec::new();
-            for cid in &cutter_ids {
-                let cut_curve = curve_of(doc, *cid, "trim (cutter)")?;
-                cuts.extend(kernel_curve::intersections(curve, cut_curve, PROFILE_TOL));
+            if !notes.is_empty() {
+                message.push_str(&format!(" ({})", notes.join("; ")));
             }
-            if cuts.is_empty() {
-                return Err(ExecError::Invalid(
-                    "target and cutter curves do not intersect — nothing to trim".into(),
-                ));
-            }
-            let pieces = kernel_curve::split_at_points(curve, &cuts, kernel_curve::JOIN_TOL)
-                .ok_or_else(|| {
-                    ExecError::Invalid(
-                        "cannot trim this curve: closed curves need 2+ intersections, \
-                         and NURBS/ellipse trimming is not supported yet"
-                            .into(),
-                    )
-                })?;
-            if pieces.len() < 2 {
-                return Err(ExecError::Invalid(
-                    "the cutter only touches the curve's ends — nothing to trim".into(),
-                ));
-            }
-            let count = pieces.len();
-            let kept = pieces
-                .into_iter()
-                .min_by(|a, b| {
-                    let da = kernel_curve::closest_point(a, keep, PROFILE_TOL).distance(keep);
-                    let db = kernel_curve::closest_point(b, keep, PROFILE_TOL).distance(keep);
-                    da.partial_cmp(&db).expect("finite distances")
-                })
-                .expect("count >= 2");
-            let id = id.unwrap_or_default();
-            let (obj, index) = doc.remove(tid).expect("resolved");
-            doc.insert(SceneObject {
-                visible: true,
-                id,
-                name: obj.name.clone(),
-                layer: obj.layer.clone(),
-                color: None,
-                material: None,
-                lineweight_mm: None,
-                geometry: Geometry::Curve(kept),
-            });
+            // `consumed` is in removal order; Inverse::Replace's undo restores it
+            // in reverse (last-removed first), which is the correct un-removal order.
             Ok((
-                Command::Trim { id: Some(id), target, cutter, keep },
-                Inverse::Replace { created: vec![id], consumed: vec![(obj, index)] },
-                ApplyOutcome {
-                    created: vec![id],
-                    message: format!(
-                        "trimmed {tid} -> {id} (kept 1 of {count} pieces)"
-                    ),
-                },
+                Command::Trim { ids: Some(created.clone()), cutters, removes, extend },
+                Inverse::Replace { created: created.clone(), consumed },
+                ApplyOutcome { created, message },
             ))
         }
         Command::PowerTrim { ids, target, pick } => {
@@ -10225,7 +10834,7 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Fillet { id, a, b, radius } => {
+        Command::Fillet { id, a, b, radius, at, trim, join } => {
             if radius <= 0.0 {
                 return Err(ExecError::Invalid("fillet radius must be positive".into()));
             }
@@ -10241,18 +10850,139 @@ fn apply_forward(
                     ids.len()
                 )));
             }
-            let line_of = |cid: ObjectId| -> Result<(DVec3, DVec3), ExecError> {
+            let curve_for = |cid: ObjectId| -> Result<Curve, ExecError> {
                 match curve_of(doc, cid, "fillet")? {
-                    Curve::Line { a, b } => Ok((*a, *b)),
+                    c @ (Curve::Line { .. } | Curve::Polyline { .. }) => Ok(c.clone()),
                     _ => Err(ExecError::Invalid(format!(
-                        "fillet works on lines for now; '{cid}' is not a line"
+                        "fillet works on lines and polylines; '{cid}' is neither"
                     ))),
                 }
             };
-            let (la, lb) = (line_of(ids[0])?, line_of(ids[1])?);
-            let (ta, arc, tb) = kernel_curve::fillet_lines(la, lb, radius).ok_or_else(|| {
+            let (ca, cb) = (curve_for(ids[0])?, curve_for(ids[1])?);
+            // The pick points (if any) map a→ids[0], b→ids[1]; they choose the
+            // corner to round (Rhino picks each curve near the end to fillet).
+            let (pa, pb) = match at {
+                Some((pa, pb)) => (Some(pa), Some(pb)),
+                None => (None, None),
+            };
+            let (ta, arc, tb) = kernel_curve::fillet_curves_at(&ca, &cb, radius, pa, pb)
+                .ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "cannot fillet: segments are parallel or radius {radius} does not fit"
+                    ))
+                })?;
+            let id = id.unwrap_or_default();
+            let round = Command::Fillet { id: Some(id), a, b, radius, at, trim, join };
+            // Join implies trim: the trimmed pieces must touch the arc to weld.
+            if join {
+                let joined = kernel_curve::join_curves(
+                    &[ta, arc, tb],
+                    kernel_curve::JOIN_TOL,
+                    PROFILE_TOL,
+                )
+                .ok_or_else(|| {
+                    ExecError::Invalid(
+                        "cannot join the filleted result end-to-end (unexpected gap)".into(),
+                    )
+                })?;
+                let (name, layer) = {
+                    let first = doc.get(ids[0]).expect("resolved");
+                    (first.name.clone(), first.layer.clone())
+                };
+                let mut consumed = Vec::new();
+                for cid in [ids[0], ids[1]] {
+                    if let Some(pair) = doc.remove(cid) {
+                        consumed.push(pair);
+                    }
+                }
+                doc.insert(SceneObject {
+                    visible: true,
+                    id,
+                    name,
+                    layer,
+                    color: None,
+                    material: None,
+                    lineweight_mm: None,
+                    geometry: Geometry::Curve(joined),
+                });
+                return Ok((
+                    round,
+                    Inverse::Replace { created: vec![id], consumed },
+                    ApplyOutcome {
+                        created: vec![id],
+                        message: format!(
+                            "filleted {} + {} r={radius} -> joined curve {id}",
+                            ids[0], ids[1]
+                        ),
+                    },
+                ));
+            }
+            // Not joining: add the arc as a new object. Trim (default) pulls the
+            // inputs back to tangency; trim=no leaves the inputs untouched.
+            let (inverse, msg_tail) = if trim {
+                let mut snapshots = Vec::with_capacity(2);
+                for (cid, trimmed) in [(ids[0], ta), (ids[1], tb)] {
+                    let obj = doc.get_mut(cid).expect("resolved");
+                    snapshots.push((cid, obj.geometry.clone()));
+                    obj.geometry = Geometry::Curve(trimmed);
+                }
+                (
+                    Inverse::CreatedAndGeometry { created: vec![id], snapshots },
+                    "curves trimmed to tangency",
+                )
+            } else {
+                (Inverse::DeleteCreated(vec![id]), "inputs untrimmed")
+            };
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: None,
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Curve(arc),
+            });
+            Ok((
+                round,
+                inverse,
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "filleted {} + {} r={radius} -> arc {id} ({msg_tail})",
+                        ids[0], ids[1]
+                    ),
+                },
+            ))
+        }
+        Command::Chamfer { id, a, b, dist } => {
+            if dist <= 0.0 {
+                return Err(ExecError::Invalid("chamfer distance must be positive".into()));
+            }
+            let mut ids = resolve(doc, &a)?;
+            for bid in resolve(doc, &b)? {
+                if !ids.contains(&bid) {
+                    ids.push(bid);
+                }
+            }
+            if ids.len() != 2 {
+                return Err(ExecError::Invalid(format!(
+                    "chamfer needs exactly 2 curves, selectors matched {}",
+                    ids.len()
+                )));
+            }
+            let curve_for = |cid: ObjectId| -> Result<Curve, ExecError> {
+                match curve_of(doc, cid, "chamfer")? {
+                    c @ (Curve::Line { .. } | Curve::Polyline { .. }) => Ok(c.clone()),
+                    _ => Err(ExecError::Invalid(format!(
+                        "chamfer works on lines and polylines; '{cid}' is neither"
+                    ))),
+                }
+            };
+            let (ca, cb) = (curve_for(ids[0])?, curve_for(ids[1])?);
+            let (ta, bevel, tb) = kernel_curve::chamfer_curves(&ca, &cb, dist).ok_or_else(|| {
                 ExecError::Invalid(format!(
-                    "cannot fillet: lines are parallel or radius {radius} does not fit"
+                    "cannot chamfer: segments are parallel or distance {dist} does not fit"
                 ))
             })?;
             let mut snapshots = Vec::with_capacity(2);
@@ -10270,21 +11000,21 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
-                geometry: Geometry::Curve(arc),
+                geometry: Geometry::Curve(bevel),
             });
             Ok((
-                Command::Fillet { id: Some(id), a, b, radius },
+                Command::Chamfer { id: Some(id), a, b, dist },
                 Inverse::CreatedAndGeometry { created: vec![id], snapshots },
                 ApplyOutcome {
                     created: vec![id],
                     message: format!(
-                        "filleted {} + {} r={radius} -> arc {id} (lines trimmed to tangency)",
+                        "chamfered {} + {} d={dist} -> bevel {id} (curves trimmed to setback)",
                         ids[0], ids[1]
                     ),
                 },
             ))
         }
-        Command::Offset { id, target, distance } => {
+        Command::Offset { id, target, distance, side } => {
             let ids = resolve(doc, &target)?;
             if ids.len() != 1 {
                 return Err(ExecError::Invalid(format!(
@@ -10297,6 +11027,29 @@ fn apply_forward(
                 return Err(ExecError::Invalid(
                     "offset works on curves; meshes cannot be offset".into(),
                 ));
+            };
+            // A guided "side to offset toward" point picks the sign: try both
+            // signed offsets and keep whichever lands nearer the picked side.
+            // The magnitude is always honored; only the direction is inferred.
+            let distance = match side {
+                Some(side) => {
+                    let mag = distance.abs();
+                    let nearest = |d: f64| {
+                        curve.offset(d, PROFILE_TOL).map(|c| {
+                            c.tessellate(PROFILE_TOL)
+                                .into_iter()
+                                .map(|p| p.distance(side))
+                                .fold(f64::INFINITY, f64::min)
+                        })
+                    };
+                    match (nearest(mag), nearest(-mag)) {
+                        (Some(pos), Some(neg)) if neg < pos => -mag,
+                        (Some(_), _) => mag,
+                        (None, Some(_)) => -mag,
+                        (None, None) => mag, // both collapse; let offset() below error
+                    }
+                }
+                None => distance,
             };
             let offset = curve.offset(distance, PROFILE_TOL).ok_or_else(|| {
                 ExecError::Invalid(format!(
@@ -10319,7 +11072,7 @@ fn apply_forward(
                 geometry: Geometry::Curve(offset),
             });
             Ok((
-                Command::Offset { id: Some(id), target, distance },
+                Command::Offset { id: Some(id), target, distance, side: None },
                 Inverse::DeleteCreated(vec![id]),
                 ApplyOutcome {
                     created: vec![id],
@@ -11630,13 +12383,7 @@ fn apply_forward(
                 Inverse::Rename(Vec::new()), // never logged; inverse unused
                 ApplyOutcome {
                     created: Vec::new(),
-                    message: format!(
-                        "distance: {} (dx {}, dy {}, dz {})",
-                        format_length(u, d.length()),
-                        format_length(u, d.x),
-                        format_length(u, d.y),
-                        format_length(u, d.z)
-                    ),
+                    message: format!("distance: {}", format_length(u, d.length())),
                 },
             ))
         }
@@ -12410,12 +13157,24 @@ fn apply_forward(
                 new_values.insert(k.clone(), pv);
             }
             let new_values = schema.sanitize(&new_values);
-            let mut mesh = itsjustcad_doc::derive_mesh(generator, &new_values)
-                .map_err(|e| ExecError::Invalid(e.to_string()))?;
-            // derive_mesh returns the shape at the canonical origin. Re-apply the
-            // stored placement so a param edit does NOT teleport the object back
-            // to 0,0,0 (Blocker 3).
-            mesh.transform(placement);
+            // Re-derive at the canonical origin, then re-apply `placement` so a
+            // param edit does NOT teleport the object back to 0,0,0 (Blocker 3).
+            // Strut-lattice kinds re-derive their member LINES (empty mesh); all
+            // others re-derive the display mesh — mirrors `parametric_object`.
+            let (mesh, wire) = if generator.renders_as_segments() {
+                let mut wire = itsjustcad_doc::derive_segments(generator, &new_values)
+                    .map_err(|e| ExecError::Invalid(e.to_string()))?;
+                for [a, b] in wire.iter_mut() {
+                    *a = placement.transform_point3(*a);
+                    *b = placement.transform_point3(*b);
+                }
+                (kernel_mesh::Mesh::default(), wire)
+            } else {
+                let mut mesh = itsjustcad_doc::derive_mesh(generator, &new_values)
+                    .map_err(|e| ExecError::Invalid(e.to_string()))?;
+                mesh.transform(placement);
+                (mesh, Vec::new())
+            };
             let prev_geometry = doc.get(id).expect("resolved").geometry.clone();
             if let Some(o) = doc.get_mut(id) {
                 o.geometry = Geometry::Parametric {
@@ -12423,6 +13182,7 @@ fn apply_forward(
                     params: new_values,
                     placement,
                     mesh,
+                    wire,
                 };
             }
             doc.generation += 1;
@@ -12448,10 +13208,22 @@ fn apply_forward(
                     continue;
                 }
                 let prev = doc.get(*id).expect("resolved").geometry.clone();
-                if let Geometry::Parametric { mesh, .. } = &prev {
-                    let flat = Geometry::Mesh(mesh.clone());
+                if let Geometry::Parametric { generator, params, placement, mesh, .. } = &prev {
+                    // Freeze bakes the parametric object to a plain mesh. Surface/
+                    // normal kinds already carry their mesh. Strut-lattice kinds
+                    // render as member LINES (empty display mesh), so freeze re-
+                    // derives their solid strut-tube mesh (via `derive_mesh`) and
+                    // re-applies `placement`, giving a real solid to keep.
+                    let baked = if generator.renders_as_segments() {
+                        let mut m = itsjustcad_doc::derive_mesh(*generator, params)
+                            .map_err(|e| ExecError::Invalid(e.to_string()))?;
+                        m.transform(*placement);
+                        m
+                    } else {
+                        mesh.clone()
+                    };
                     if let Some(o) = doc.get_mut(*id) {
-                        o.geometry = flat;
+                        o.geometry = Geometry::Mesh(baked);
                     }
                     snapshots.push((*id, prev));
                     frozen += 1;
@@ -13057,11 +13829,17 @@ fn apply_forward(
                     "frame member endpoints coincide (zero-length member)".into(),
                 ));
             }
-            let sec = *doc.sections.get(&section).ok_or_else(|| {
-                ExecError::Invalid(format!(
-                    "no section named '{section}' (define one with 'section {section} rect ...')"
-                ))
-            })?;
+            let sec = doc
+                .sections
+                .get(&section)
+                .copied()
+                .or_else(|| kernel_mesh::builtin_section(&section))
+                .ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "no section named '{section}' (define it with 'section {section} rect ...' \
+                         or use a built-in like IPE300)"
+                    ))
+                })?;
             if let Some(m) = &material
                 && !doc.materials.contains_key(m)
             {
@@ -13544,6 +14322,12 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Funicular { .. } => "funicular",
         Command::Tensegrity { .. } => "tensegrity",
         Command::Cablenet { .. } => "cablenet",
+        Command::Diagrid { .. } => "diagrid",
+        Command::Reciprocal { .. } => "reciprocal",
+        Command::Waffle { .. } => "waffle",
+        Command::VoronoiShell { .. } => "voronoishell",
+        Command::Schwedler { .. } => "schwedler",
+        Command::CatenaryVault { .. } => "catenaryvault",
         Command::MinSurf { .. } => "minsurf",
         Command::Line { .. } => "line",
         Command::LineTan { .. } => "linetan",
@@ -13584,6 +14368,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Align { .. } => "align",
         Command::ToOrigin { .. } => "tozero",
         Command::Flatten { .. } => "flatten",
+        Command::Explode { .. } => "explode",
         Command::Stretch { .. } => "stretch",
         Command::SelSimilar { .. } => "selsimilar",
         Command::SelDup { .. } => "seldup",
@@ -13592,12 +14377,14 @@ fn describe(cmd: &Command) -> &'static str {
             if *diameter { "dimdiameter" } else { "dimradius" }
         }
         Command::Mirror { .. } => "mirror",
+        Command::Divide { .. } => "divide",
         Command::Split { .. } => "split",
         Command::Trim { .. } => "trim",
         Command::PowerTrim { .. } => "powertrim",
         Command::Extend { .. } => "extend",
         Command::Join { .. } => "join",
         Command::Fillet { .. } => "fillet",
+        Command::Chamfer { .. } => "chamfer",
         Command::Offset { .. } => "offset",
         Command::Copy { .. } => "copy",
         Command::Array { .. } => "array",
@@ -14282,34 +15069,36 @@ mod tests {
         let mut s = Session::default();
         run(&mut s, "geodesic 10 5");
         let id = s.doc.all_ids()[0];
-        let verts = match &s.doc.get(id).unwrap().geometry {
-            Geometry::Parametric { params, mesh, .. } => {
+        // Geodesic is a strut lattice → member segments live in `wire`, mesh empty.
+        let members = match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { params, mesh, wire, .. } => {
                 assert_eq!(
                     params.get("frequency").unwrap().as_i64(),
                     Some(10),
                     "frequency must survive at 10, not clamp to the old slider max"
                 );
-                mesh.positions().len()
+                assert!(mesh.positions().is_empty(), "lattice renders as lines, empty mesh");
+                wire.len()
             }
             g => panic!("expected Parametric, got {g:?}"),
         };
 
-        // Direct derive at freq 10 must match the verb-created mesh.
+        // Direct segment-derive at freq 10 must match the verb-created wire.
         let mut p10 = GeneratorKind::Geodesic.default_params();
         p10.insert("frequency".into(), ParamValue::Int(10));
         p10.insert("radius".into(), ParamValue::Float(5.0));
-        let m10 = itsjustcad_doc::derive_mesh(GeneratorKind::Geodesic, &p10).unwrap();
-        assert_eq!(verts, m10.positions().len(), "verb mesh == direct freq-10 derive");
+        let w10 = itsjustcad_doc::derive_segments(GeneratorKind::Geodesic, &p10).unwrap();
+        assert_eq!(members, w10.len(), "verb wire == direct freq-10 derive");
 
-        // And strictly larger than the freq-6 mesh (proves no clamp to 6).
+        // And strictly more members than the freq-6 lattice (proves no clamp to 6).
         let mut p6 = GeneratorKind::Geodesic.default_params();
         p6.insert("frequency".into(), ParamValue::Int(6));
         p6.insert("radius".into(), ParamValue::Float(5.0));
-        let m6 = itsjustcad_doc::derive_mesh(GeneratorKind::Geodesic, &p6).unwrap();
+        let w6 = itsjustcad_doc::derive_segments(GeneratorKind::Geodesic, &p6).unwrap();
         assert!(
-            verts > m6.positions().len(),
-            "freq-10 mesh must be larger than freq-6 (not clamped): {verts} vs {}",
-            m6.positions().len()
+            members > w6.len(),
+            "freq-10 lattice must have more members than freq-6 (not clamped): {members} vs {}",
+            w6.len()
         );
     }
 
@@ -15930,54 +16719,262 @@ mod tests {
     }
 
     #[test]
-    fn trim_keeps_piece_nearest_keep_point() {
+    fn divide_ts_open_and_closed() {
+        // Open: count + 1 stations, endpoints inclusive.
+        assert_eq!(divide_ts(4, false), vec![0.0, 0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(divide_ts(1, false), vec![0.0, 1.0]);
+        // Closed: count stations over [0, 1), no seam duplicate.
+        assert_eq!(divide_ts(6, true).len(), 6);
+        assert_eq!(divide_ts(4, true), vec![0.0, 0.25, 0.5, 0.75]);
+    }
+
+    #[test]
+    fn divide_open_line_places_endpoint_inclusive_points() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        let out = run(&mut s, "divide last 4");
+        assert_eq!(out.created.len(), 1, "one point-cloud object");
+        // Line survives + one Points object.
+        assert_eq!(s.doc.len(), 2);
+        let pts = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Points { positions } => Some(positions.clone()),
+                _ => None,
+            })
+            .expect("points object");
+        assert_eq!(pts.len(), 5, "count+1 points on an open curve");
+        let xs: Vec<f64> = pts.iter().map(|p| p.x).collect();
+        for (got, want) in xs.iter().zip([0.0, 2.5, 5.0, 7.5, 10.0]) {
+            assert!((got - want).abs() < 1e-6, "x={got} want={want}");
+        }
+
+        // Undo removes the points; redo re-creates them.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 2);
+    }
+
+    #[test]
+    fn divide_closed_circle_has_count_points() {
+        let mut s = Session::default();
+        run(&mut s, "circle 0,0 2");
+        let out = run(&mut s, "divide last 6");
+        assert_eq!(out.created.len(), 1);
+        let pts = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Points { positions } => Some(positions.clone()),
+                _ => None,
+            })
+            .expect("points object");
+        assert_eq!(pts.len(), 6, "count points on a closed curve (no seam dup)");
+    }
+
+    #[test]
+    fn divide_count_zero_errors_and_non_curve_errors() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        let err = s.run(parse("divide last 0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "{err}");
+
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        let err = s.run(parse("divide last 4").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("curve"), "{err}");
+    }
+
+    #[test]
+    fn trim_removes_clicked_piece_between_two_cutters() {
+        // Horizontal line crossed by two vertical cutters at x=3 and x=7. Clicking
+        // the MIDDLE segment (x=5) deletes it, keeping the two end pieces (Rhino).
         let mut s = Session::default();
         run(&mut s, "line 0,0 10,0");
         run(&mut s, "name last wall");
-        run(&mut s, "line 4,-1 4,1");
-        let out = run(&mut s, "trim wall last 0,0"); // keep the left piece
-        assert!(out.message.contains("kept 1 of 2"), "{}", out.message);
-        assert_eq!(s.doc.len(), 2);
-        let kept = s.doc.find_named("wall");
-        assert_eq!(kept.len(), 1, "trimmed piece keeps the name");
-        let Geometry::Curve(Curve::Line { a, b }) = &s.doc.get(kept[0]).unwrap().geometry
-        else {
-            panic!()
-        };
-        assert!(a.distance(DVec3::ZERO) < 1e-9);
-        assert!(b.distance(DVec3::new(4.0, 0.0, 0.0)) < 1e-9);
+        run(&mut s, "line 3,-1 3,1");
+        run(&mut s, "name last c1");
+        run(&mut s, "line 7,-1 7,1");
+        run(&mut s, "name last c2");
+        let out = run(&mut s, "trim #c1 #c2 remove 5,0");
+        assert!(out.message.contains("removed 1 piece"), "{}", out.message);
+        // wall → two survivors (0..3 and 7..10); cutters untouched → 4 curves total.
+        assert_eq!(s.doc.len(), 4);
+        let lines: Vec<(DVec3, DVec3)> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Line { a, b }) if o.name.as_deref() == Some("wall") => {
+                    Some((*a, *b))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 2, "two end pieces survive");
+        let spans: Vec<f64> = lines.iter().map(|(a, b)| a.x.min(b.x)).collect();
+        assert!(spans.contains(&0.0) && spans.contains(&7.0), "kept 0..3 and 7..10: {lines:?}");
 
+        // Undo restores the single full line.
         run(&mut s, "undo");
-        let Geometry::Curve(Curve::Line { b, .. }) =
+        assert_eq!(s.doc.len(), 3);
+        let Geometry::Curve(Curve::Line { a, b }) =
             &s.doc.get(s.doc.find_named("wall")[0]).unwrap().geometry
         else {
             panic!()
         };
-        assert!(b.distance(DVec3::new(10.0, 0.0, 0.0)) < 1e-9, "undo restores full line");
+        assert!(a.x.min(b.x) < 1e-9 && a.x.max(b.x) > 9.999, "undo restores full line");
+        // Redo re-applies.
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 4);
+    }
 
-        // circle trimmed by a crossing line keeps the arc nearest the keep point
-        run(&mut s, "circle 20,0 2");
-        run(&mut s, "line 20,-5 20,5");
-        run(&mut s, "trim last 2 last 17,0"); // keep the left arc
-        let arcs: Vec<_> = s
+    #[test]
+    fn trim_curve_that_is_also_a_cutter() {
+        // The canonical two-crossing-lines trim: a horizontal and a vertical line
+        // crossing at (5,0), BOTH selected as cutters. Clicking the right overhang
+        // of the horizontal line (x=8) removes it, even though that line is itself
+        // a cutter — a curve can be its own trim target (it just can't cut itself).
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last beam");
+        run(&mut s, "line 5,-5 5,5");
+        run(&mut s, "name last post");
+        let out = run(&mut s, "trim #beam #post remove 8,0");
+        assert!(out.message.contains("removed 1 piece"), "{}", out.message);
+        // beam → single survivor 0..5; post untouched → 2 curves total.
+        assert_eq!(s.doc.len(), 2);
+        let Geometry::Curve(Curve::Line { a, b }) =
+            &s.doc.get(s.doc.find_named("beam")[0]).unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!(a.x.min(b.x) < 1e-9 && a.x.max(b.x) < 5.0 + 1e-6, "beam kept 0..5: {a:?} {b:?}");
+        // post survives whole.
+        let Geometry::Curve(Curve::Line { a, b }) =
+            &s.doc.get(s.doc.find_named("post")[0]).unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!((a.y.min(b.y) + 5.0).abs() < 1e-9 && (a.y.max(b.y) - 5.0).abs() < 1e-9, "post whole");
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+    }
+
+    #[test]
+    fn trim_removed_piece_previews_the_segment_under_the_pick() {
+        // Same geometry as the cutter-is-also-a-target test. The preview of a
+        // click at (8,0) is the beam segment from the crossing (5,0) to the end
+        // (10,0) — the piece that trim would delete.
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last beam");
+        run(&mut s, "line 5,-5 5,5");
+        run(&mut s, "name last post");
+        let beam = s.doc.find_named("beam")[0];
+        let post = s.doc.find_named("post")[0];
+        let piece = super::trim_removed_piece(&s.doc, &[beam, post], DVec3::new(8.0, 0.0, 0.0))
+            .expect("a piece under the pick");
+        let xs: Vec<f64> = piece.iter().map(|p| p.x).collect();
+        let lo = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!((lo - 5.0).abs() < 1e-6 && (hi - 10.0).abs() < 1e-6, "piece spans 5..10: {piece:?}");
+        // A pick in empty space previews nothing.
+        assert!(super::trim_removed_piece(&s.doc, &[beam, post], DVec3::new(50.0, 50.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn trim_preview_hides_target_and_keeps_survivor() {
+        // Two crossing lines, both cutters. A click at (8,0) queues the beam's
+        // 5..10 piece for removal → the beam is hidden and its 0..5 survivor is
+        // returned to draw in place (what the user sees before Enter commits).
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last beam");
+        run(&mut s, "line 5,-5 5,5");
+        run(&mut s, "name last post");
+        let beam = s.doc.find_named("beam")[0];
+        let post = s.doc.find_named("post")[0];
+        let (hidden, survivors) =
+            super::trim_preview(&s.doc, &[beam, post], &[DVec3::new(8.0, 0.0, 0.0)]);
+        assert_eq!(hidden, vec![beam], "only the clicked target is hidden");
+        assert_eq!(survivors.len(), 1, "one surviving piece (0..5)");
+        let xs: Vec<f64> = survivors[0].iter().map(|p| p.x).collect();
+        let lo = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!((lo - 0.0).abs() < 1e-6 && (hi - 5.0).abs() < 1e-6, "survivor spans 0..5: {:?}", survivors[0]);
+        // No picks → nothing hidden.
+        assert!(super::trim_preview(&s.doc, &[beam, post], &[]).0.is_empty());
+    }
+
+    #[test]
+    fn trim_multiple_removal_points_delete_multiple_pieces() {
+        // Line crossed at x=2,4,6,8. Two removal points (x=3 and x=7) each remove
+        // a distinct middle segment.
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last wall");
+        for (i, x) in [2, 4, 6, 8].iter().enumerate() {
+            run(&mut s, &format!("line {x},-1 {x},1"));
+            run(&mut s, &format!("name last c{i}"));
+        }
+        let out = run(&mut s, "trim #c0 #c1 #c2 #c3 remove 3,0 7,0");
+        assert!(out.message.contains("removed 2 piece"), "{}", out.message);
+        // Segments 2..4 and 6..8 gone; survivors 0..2, 4..6, 8..10.
+        let walls = s
             .doc
             .objects()
-            .filter_map(|o| match &o.geometry {
-                Geometry::Curve(c @ Curve::Arc { .. }) => Some(c.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(arcs.len(), 1);
-        let Curve::Arc { start, end, .. } = arcs[0] else { panic!() };
-        assert!((end - start - std::f64::consts::PI).abs() < 1e-9, "half circle kept");
+            .filter(|o| o.name.as_deref() == Some("wall"))
+            .count();
+        assert_eq!(walls, 3, "three surviving wall pieces");
+        run(&mut s, "undo");
+        assert_eq!(s.doc.objects().filter(|o| o.name.as_deref() == Some("wall")).count(), 1);
+    }
 
-        // no intersections → error, doc untouched
+    #[test]
+    fn trim_extend_grows_curve_to_nearest_cutter() {
+        // A short horizontal line ending at x=5; a vertical cutter at x=8. Extend
+        // pulls the right end out to x=8.
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 5,0");
+        run(&mut s, "name last wall");
+        run(&mut s, "line 8,-2 8,2");
+        run(&mut s, "name last cut");
+        let out = run(&mut s, "trim #cut extend 5,0");
+        assert!(out.message.contains("extended 1"), "{}", out.message);
+        let Geometry::Curve(Curve::Line { a, b }) =
+            &s.doc.get(s.doc.find_named("wall")[0]).unwrap().geometry
+        else {
+            panic!()
+        };
+        let far = if a.x > b.x { a } else { b };
+        assert!((far.x - 8.0).abs() < 1e-6, "right end reaches the cutter: {far:?}");
+        run(&mut s, "undo");
+        let Geometry::Curve(Curve::Line { a, b }) =
+            &s.doc.get(s.doc.find_named("wall")[0]).unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!((a.x.max(b.x) - 5.0).abs() < 1e-6, "undo restores the short line");
+    }
+
+    #[test]
+    fn trim_skips_points_that_hit_nothing() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 10,0");
+        run(&mut s, "name last wall");
+        run(&mut s, "line 5,-1 5,1");
+        run(&mut s, "name last cut");
+        // One good removal point (x=3, hits the wall) + one in empty space far away.
+        let out = run(&mut s, "trim #cut remove 3,0 500,500");
+        assert!(out.message.contains("removed 1 piece"), "{}", out.message);
+        assert!(out.message.contains("skipped"), "note about the missed point: {}", out.message);
+        // All removal points missing → error, doc untouched.
         let n = s.doc.len();
-        run(&mut s, "line 100,0 110,0");
-        run(&mut s, "line 100,5 110,5");
-        let err = s.run(parse("trim last 2 last 100,0").unwrap()).unwrap_err();
-        assert!(err.to_string().contains("do not intersect"), "{err}");
-        assert_eq!(s.doc.len(), n + 2);
+        let err = s.run(parse("trim #cut remove 900,900").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("nothing changed"), "{err}");
+        assert_eq!(s.doc.len(), n);
     }
 
     #[test]
@@ -16138,6 +17135,259 @@ mod tests {
     }
 
     #[test]
+    fn fillet_trims_polylines_and_adds_arc() {
+        let mut s = Session::default();
+        // Two open polylines whose end segments meet at the origin corner.
+        run(&mut s, "polyline -8,0,0 0,0,0"); // last vertex = corner (0,0)
+        run(&mut s, "polyline 0,0,0 0,8,0"); // first vertex = corner (0,0)
+        let out = run(&mut s, "fillet last 2 2");
+        assert!(out.message.contains("arc"), "{}", out.message);
+        assert_eq!(s.doc.len(), 3); // two trimmed polylines + arc
+
+        // Arc tangent to both segments: center (-2,2), radius 2.
+        let arc = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Curve(c @ Curve::Arc { .. }) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("fillet arc present");
+        let Curve::Arc { center, radius, .. } = arc else { panic!() };
+        assert!(center.distance(DVec3::new(-2.0, 2.0, 0.0)) < 1e-9, "{center}");
+        assert!((radius - 2.0).abs() < 1e-9);
+
+        // Both sources stay polylines with their corner vertex pulled back.
+        let polylines: Vec<_> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => Some(points.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polylines.len(), 2);
+        // First polyline: far end (-8,0) kept, corner moved to (-2,0).
+        assert!(polylines[0][0].distance(DVec3::new(-8.0, 0.0, 0.0)) < 1e-9);
+        assert!(polylines[0][1].distance(DVec3::new(-2.0, 0.0, 0.0)) < 1e-9);
+        // Second polyline: corner moved to (0,2), far end (0,8) kept.
+        assert!(polylines[1][0].distance(DVec3::new(0.0, 2.0, 0.0)) < 1e-9);
+        assert!(polylines[1][1].distance(DVec3::new(0.0, 8.0, 0.0)) < 1e-9);
+
+        // Undo restores both polylines exactly and drops the arc.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        let restored: Vec<_> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => Some(points.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(restored[0][1].distance(DVec3::new(0.0, 0.0, 0.0)) < 1e-9); // corner back
+        assert!(restored[1][0].distance(DVec3::new(0.0, 0.0, 0.0)) < 1e-9);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
+    }
+
+    #[test]
+    fn fillet_trim_no_leaves_inputs_untouched() {
+        let mut s = Session::default();
+        run(&mut s, "line -2,0 8,0");
+        run(&mut s, "line 0,-2 0,8");
+        let out = run(&mut s, "fillet last 2 2 trim no");
+        assert!(out.message.contains("untrimmed"), "{}", out.message);
+        assert_eq!(s.doc.len(), 3); // two ORIGINAL lines + arc
+        // Both source lines keep their original endpoints (no trim).
+        let lines: Vec<_> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Line { a, b }) => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].0.distance(DVec3::new(-2.0, 0.0, 0.0)) < 1e-9);
+        assert!(lines[0].1.distance(DVec3::new(8.0, 0.0, 0.0)) < 1e-9);
+        assert!(lines[1].0.distance(DVec3::new(0.0, -2.0, 0.0)) < 1e-9);
+        assert!(lines[1].1.distance(DVec3::new(0.0, 8.0, 0.0)) < 1e-9);
+        // Arc still present at the corner.
+        let arc = s.doc.objects().find_map(|o| match &o.geometry {
+            Geometry::Curve(c @ Curve::Arc { .. }) => Some(c.clone()),
+            _ => None,
+        });
+        assert!(arc.is_some());
+        // Undo drops the arc, leaving the two untouched lines.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
+    }
+
+    #[test]
+    fn fillet_join_welds_into_one_curve() {
+        let mut s = Session::default();
+        run(&mut s, "line -2,0 8,0");
+        run(&mut s, "line 0,-2 0,8");
+        let out = run(&mut s, "fillet last 2 2 join yes");
+        assert!(out.message.contains("joined"), "{}", out.message);
+        // Two inputs consumed, one welded polyline remains.
+        assert_eq!(s.doc.len(), 1);
+        let joined = s.doc.objects().next().unwrap();
+        assert!(matches!(joined.geometry, Geometry::Curve(Curve::Polyline { .. })));
+        // Undo restores the two inputs.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 1);
+    }
+
+    #[test]
+    fn fillet_at_pick_selects_the_corner() {
+        // Two L-shaped polylines sharing corners at (0,0) and (10,10).
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 10,0,0 10,10,0");
+        run(&mut s, "polyline 0,0,0 0,10,0 10,10,0");
+        // Pick near the (10,10) corner on both → arc at (8,8).
+        run(&mut s, "fillet last 2 2 at 10,9.5 9.5,10");
+        let arc = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Curve(c @ Curve::Arc { .. }) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("arc present");
+        let Curve::Arc { center, .. } = arc else { panic!() };
+        assert!(center.distance(DVec3::new(8.0, 8.0, 0.0)) < 1e-9, "{center}");
+    }
+
+    #[test]
+    fn chamfer_trims_lines_and_adds_bevel() {
+        let mut s = Session::default();
+        run(&mut s, "line -2,0 8,0");
+        run(&mut s, "line 0,-2 0,8");
+        let out = run(&mut s, "chamfer last 2 2");
+        assert!(out.message.contains("bevel"), "{}", out.message);
+        assert_eq!(s.doc.len(), 3); // two trimmed lines + bevel line
+
+        // The bevel is the straight line between the two setback points.
+        let lines: Vec<_> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Line { a, b }) => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 3);
+        let is_bevel = |(a, b): &(DVec3, DVec3)| {
+            let hits = |p: DVec3| {
+                p.distance(DVec3::new(2.0, 0.0, 0.0)) < 1e-9
+                    || p.distance(DVec3::new(0.0, 2.0, 0.0)) < 1e-9
+            };
+            hits(*a) && hits(*b)
+        };
+        assert!(lines.iter().any(is_bevel), "bevel line present");
+        // The two sources are trimmed to their setback points.
+        assert!(lines.iter().any(|(a, b)| a.distance(DVec3::new(2.0, 0.0, 0.0)) < 1e-9
+            && b.distance(DVec3::new(8.0, 0.0, 0.0)) < 1e-9));
+        assert!(lines.iter().any(|(a, b)| a.distance(DVec3::new(0.0, 2.0, 0.0)) < 1e-9
+            && b.distance(DVec3::new(0.0, 8.0, 0.0)) < 1e-9));
+
+        run(&mut s, "undo"); // bevel gone, lines restored exactly
+        assert_eq!(s.doc.len(), 2);
+        let Geometry::Curve(Curve::Line { a, b }) = &s.doc.objects().next().unwrap().geometry
+        else {
+            panic!()
+        };
+        assert!(a.distance(DVec3::new(-2.0, 0.0, 0.0)) < 1e-9);
+        assert!(b.distance(DVec3::new(8.0, 0.0, 0.0)) < 1e-9);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 3);
+
+        // parallel lines refuse; non-lines refuse
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 5,0");
+        run(&mut s, "line 0,1 5,1");
+        let err = s.run(parse("chamfer last 2 0.5").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("parallel"), "{err}");
+        run(&mut s, "circle 10,0 1");
+        let err = s.run(parse("chamfer last 2 0.5").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("line"), "{err}");
+    }
+
+    #[test]
+    fn chamfer_trims_polyline_corner() {
+        let mut s = Session::default();
+        run(&mut s, "line 0,-2 0,8"); // vertical line up the y-axis
+        run(&mut s, "polyline 0,0,0 8,0,0 8,4,0"); // open polyline off the origin
+        run(&mut s, "chamfer last 2 2");
+        assert_eq!(s.doc.len(), 3);
+        // Polyline stays a polyline, corner vertex pulled back to (2,0).
+        let poly = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, .. }) => Some(points.clone()),
+                _ => None,
+            })
+            .expect("polyline present");
+        assert_eq!(poly.len(), 3);
+        assert!(poly[0].distance(DVec3::new(2.0, 0.0, 0.0)) < 1e-9);
+        assert!(poly[1].distance(DVec3::new(8.0, 0.0, 0.0)) < 1e-9);
+        assert!(poly[2].distance(DVec3::new(8.0, 4.0, 0.0)) < 1e-9);
+    }
+
+    #[test]
+    fn explode_breaks_polyline_into_segments_and_undoes() {
+        let mut s = Session::default();
+        // Open 3-vertex polyline → 2 line segments.
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0");
+        let original = s.doc.objects().next().unwrap().clone();
+        let out = run(&mut s, "explode last");
+        assert_eq!(out.created.len(), 2, "{}", out.message);
+        assert_eq!(s.doc.len(), 2);
+        for o in s.doc.objects() {
+            assert!(matches!(o.geometry, Geometry::Curve(Curve::Line { .. })));
+        }
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+        assert_eq!(s.doc.objects().next().unwrap(), &original);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 2);
+
+        // Closed square (4 vertices) → 4 segments (includes the closing edge).
+        let mut s = Session::default();
+        run(&mut s, "rectangle 0,0,0 4 4"); // closed polyline, 4 vertices
+        assert_eq!(s.doc.len(), 1);
+        let out = run(&mut s, "explode last");
+        assert_eq!(out.created.len(), 4, "{}", out.message);
+        assert_eq!(s.doc.len(), 4);
+
+        // Non-polyline selection → error, doc untouched.
+        let mut s = Session::default();
+        run(&mut s, "line 0,0 5,0");
+        let err = s.run(parse("explode last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("polyline"), "{err}");
+        assert_eq!(s.doc.len(), 1);
+    }
+
+    #[test]
+    fn explode_replay_stable() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 4,0,0 4,4,0");
+        run(&mut s, "explode last");
+        let log = s.save_log();
+        let replayed = Session::replay(log).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+    }
+
+    #[test]
     fn curve_edit_replay_stable() {
         let mut s = Session::default();
         run(&mut s, "line -2,0 8,0");
@@ -16152,7 +17402,7 @@ mod tests {
         run(&mut s, "line 50,0 60,0");
         run(&mut s, "name last wall");
         run(&mut s, "line 55,-1 55,1");
-        run(&mut s, "trim wall last 50,0");
+        run(&mut s, "trim last remove 56,0");
         run(&mut s, "undo");
         run(&mut s, "redo");
 
@@ -17801,7 +19051,8 @@ mod tests {
         run(&mut s, "box 0,0,0 1,1,1"); // any content; distance ignores it
         let out = run(&mut s, "distance 0,0,0 3,4,0");
         assert!(out.message.contains("distance: 5.00 m"), "{}", out.message);
-        assert!(out.message.contains("dx 3.00 m"), "{}", out.message);
+        // Report is just the scalar distance now — no dx/dy/dz components.
+        assert!(!out.message.contains("dx"), "{}", out.message);
         run(&mut s, "units mm");
         let out = run(&mut s, "distance 0,0,0 3,4,0");
         assert!(out.message.contains("5000 mm"), "{}", out.message);
@@ -20137,20 +21388,31 @@ mod tests {
         }
     }
 
+    /// The member segments of a strut-lattice parametric object (spaceframe,
+    /// geodesic, tensegrity, funicular, gridshell) — these render as lines and
+    /// carry the object's actual geometry (its `mesh` is empty).
+    fn wire_of(s: &Session, id: ObjectId) -> &[[DVec3; 2]] {
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { wire, .. } => wire,
+            g => panic!("expected parametric geometry, got {g:?}"),
+        }
+    }
+
     #[test]
     fn geodesic_exec_undo_redo_replay() {
         let mut s = Session::default();
         let out = run(&mut s, "geodesic 3 5 dome");
         let id = out.created[0];
-        // A freq-3 dome has struts; the mesh is a non-empty strut lattice
-        // (8 verts per strut).
-        let m = mesh_of(&s, id);
-        assert!(!m.positions().is_empty());
-        assert_eq!(m.positions().len() % 8, 0, "8 verts per strut prism");
-        // All vertices lie near the sphere radius (dome projected onto r=5),
-        // allowing for the strut cross-section thickness (~0.1 side).
-        let rmax = m.positions().iter().map(|p| p.length()).fold(0.0, f64::max);
-        assert!(rmax <= 5.0 + 0.2, "verts near r=5, got rmax={rmax}");
+        // A freq-3 dome renders as member LINES: non-empty wire, EMPTY mesh.
+        assert!(mesh_of(&s, id).positions().is_empty(), "lattice has no tube mesh");
+        let wire = wire_of(&s, id);
+        assert!(!wire.is_empty(), "freq-3 dome has member segments");
+        // All member endpoints lie on the sphere radius (dome projected onto r=5).
+        let rmax = wire
+            .iter()
+            .flat_map(|[a, b]| [a.length(), b.length()])
+            .fold(0.0, f64::max);
+        assert!((rmax - 5.0).abs() < 1e-6, "endpoints on r=5, got rmax={rmax}");
         assert_replay_stable(&s);
         run(&mut s, "undo");
         assert!(s.doc.get(id).is_none());
@@ -20162,11 +21424,12 @@ mod tests {
     fn paramset_geodesic_frequency_changes_mesh_undo_redo_replay() {
         let mut s = Session::default();
         let id = run(&mut s, "geodesic 3 5 dome").created[0];
-        let before = mesh_of(&s, id).positions().len();
+        // Geodesic renders as member lines: re-derive changes the WIRE, not a mesh.
+        let before = wire_of(&s, id).len();
         let out = run(&mut s, "paramset last frequency=5");
         assert!(out.created.is_empty(), "paramset creates nothing");
-        let after = mesh_of(&s, id).positions().len();
-        assert!(after > before, "freq 5 mesh should be larger: {before} -> {after}");
+        let after = wire_of(&s, id).len();
+        assert!(after > before, "freq 5 lattice should have more members: {before} -> {after}");
         // The stored params reflect the change.
         match &s.doc.get(id).unwrap().geometry {
             Geometry::Parametric { params, .. } => {
@@ -20176,9 +21439,9 @@ mod tests {
         }
         assert_replay_stable(&s);
         run(&mut s, "undo");
-        assert_eq!(mesh_of(&s, id).positions().len(), before, "undo restores mesh");
+        assert_eq!(wire_of(&s, id).len(), before, "undo restores wire");
         run(&mut s, "redo");
-        assert_eq!(mesh_of(&s, id).positions().len(), after, "redo re-applies");
+        assert_eq!(wire_of(&s, id).len(), after, "redo re-applies");
     }
 
     #[test]
@@ -20230,11 +21493,18 @@ mod tests {
             &s.doc.get(id).unwrap().geometry,
             Geometry::Parametric { .. }
         ));
-        let before = mesh_of(&s, id).positions().len();
+        // Geodesic is a strut lattice → renders as member lines (empty display
+        // mesh). Freeze bakes it to a solid strut-tube mesh.
+        assert!(mesh_of(&s, id).positions().is_empty(), "lattice has no display mesh");
         run(&mut s, "freeze last");
-        // Now a plain mesh, same geometry, not parametric.
+        // Now a plain mesh, not parametric — and a real (non-empty) strut solid.
         assert!(matches!(&s.doc.get(id).unwrap().geometry, Geometry::Mesh(_)));
-        assert_eq!(mesh_of(&s, id).positions().len(), before, "geometry preserved");
+        assert_eq!(
+            mesh_of(&s, id).positions().len() % 8,
+            0,
+            "frozen lattice is a strut-tube mesh (8 verts/strut)"
+        );
+        assert!(!mesh_of(&s, id).positions().is_empty(), "frozen mesh is non-empty");
         // paramset no longer applies.
         assert!(s.run(parse("paramset last frequency=5").unwrap()).is_err());
         assert_replay_stable(&s);
@@ -20267,6 +21537,9 @@ mod tests {
             "funicular -5,0,0 5,0,0 20 1 1.4",
             "tensegrity 3 1 2",
             "cablenet 0,0,0 8,0,0 8,8,3 0,8,3 5 1.5",
+            "diagrid 6 10 20 40",
+            "reciprocal 8 3 4",
+            "waffle 5 8 10 16 1",
         ];
         for verb in cases {
             let mut s = Session::default();
@@ -20283,7 +21556,8 @@ mod tests {
         let mut s = Session::default();
         let dome = run(&mut s, "geodesic 3 5 dome").created[0];
         let full = run(&mut s, "geodesic 3 5 full").created[0];
-        assert!(mesh_of(&s, full).positions().len() > mesh_of(&s, dome).positions().len());
+        // Both render as member lines; the full sphere has more members than the dome.
+        assert!(wire_of(&s, full).len() > wire_of(&s, dome).len());
     }
 
     #[test]
@@ -20327,16 +21601,61 @@ mod tests {
         let mut s = Session::default();
         let out = run(&mut s, "spaceframe 4 3 3 1.5");
         let id = out.created[0];
-        let m = mesh_of(&s, id);
-        assert_eq!(m.positions().len() % 8, 0);
-        // Top chord at z=1.5; strut prisms add a little half-thickness on top.
-        let zmax = m.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
-        assert!((zmax - 1.5).abs() < 0.2, "top chord near z=1.5, got {zmax}");
+        // Renders as member lines: non-empty wire, empty mesh.
+        assert!(mesh_of(&s, id).positions().is_empty(), "lattice has no tube mesh");
+        let wire = wire_of(&s, id);
+        // 4×3 spaceframe: verb count matches a direct segment derive.
+        assert_eq!(
+            wire.len(),
+            kernel_mesh::spaceframe_struts(4, 3, 3.0, 1.5).len(),
+            "wire == direct spaceframe_struts count"
+        );
+        // Top chord at z=1.5 (endpoints are exact — no half-thickness now).
+        let zmax = wire.iter().flat_map(|[a, b]| [a.z, b.z]).fold(f64::MIN, f64::max);
+        assert!((zmax - 1.5).abs() < 1e-9, "top chord at z=1.5, got {zmax}");
         assert_replay_stable(&s);
         run(&mut s, "undo");
         assert!(s.doc.get(id).is_none());
         run(&mut s, "redo");
         assert!(s.doc.get(id).is_some());
+    }
+
+    #[test]
+    fn diagrid_reciprocal_waffle_exec_wire_freeze_replay() {
+        for (verb, freeze_expected) in [
+            ("diagrid 6 10 20 40", true),
+            ("reciprocal 8 3 4", true),
+            ("waffle 5 8 10 16 1", true),
+        ] {
+            let mut s = Session::default();
+            let id = run(&mut s, verb).created[0];
+            // Renders as member lines: non-empty wire, empty display mesh.
+            assert!(mesh_of(&s, id).positions().is_empty(), "{verb}: no tube mesh");
+            assert!(!wire_of(&s, id).is_empty(), "{verb}: non-empty wire");
+            assert_replay_stable(&s);
+            // Freeze bakes a non-empty strut solid (8 verts/strut).
+            run(&mut s, "freeze last");
+            if freeze_expected {
+                let m = mesh_of(&s, id);
+                assert!(!m.positions().is_empty(), "{verb}: frozen solid non-empty");
+                assert_eq!(m.positions().len() % 8, 0, "{verb}: frozen is strut boxes");
+            }
+            run(&mut s, "undo");
+            run(&mut s, "undo");
+            assert!(s.doc.get(id).is_none(), "{verb}: undo removes object");
+            run(&mut s, "redo");
+            assert!(s.doc.get(id).is_some(), "{verb}: redo restores");
+        }
+    }
+
+    #[test]
+    fn diagrid_wire_matches_kernel_count() {
+        let mut s = Session::default();
+        let id = run(&mut s, "diagrid 6 10 20 40").created[0];
+        assert_eq!(
+            wire_of(&s, id).len(),
+            kernel_mesh::diagrid_segments(6, 10, 20.0, 40.0).len(),
+        );
     }
 
     #[test]
@@ -20376,9 +21695,15 @@ mod tests {
     fn gridshell_hypar_and_vault_exec_replay() {
         let mut s = Session::default();
         let h = run(&mut s, "gridshell hypar 5 5 5 4 4").created[0];
-        assert_eq!(mesh_of(&s, h).positions().len() % 8, 0);
+        // Gridshell renders as member lines: non-empty wire, empty mesh.
+        assert!(mesh_of(&s, h).positions().is_empty(), "gridshell has no tube mesh");
+        // nu=nv=4 hypar: u-members (nv+1)*nu=20 + v-members (nu+1)*nv=20 = 40.
+        assert_eq!(wire_of(&s, h).len(), 40, "hypar gridshell member count");
         assert_replay_stable(&s);
+        // The vault variant is NOT parametric (schema exposes only hypar params);
+        // it bakes to a plain strut-tube mesh, so it still has 8 verts/strut.
         let v = run(&mut s, "gridshell vault 6 12 3 undulate 5 5").created[0];
+        assert!(matches!(&s.doc.get(v).unwrap().geometry, Geometry::Mesh(_)));
         assert_eq!(mesh_of(&s, v).positions().len() % 8, 0);
         assert_replay_stable(&s);
         run(&mut s, "undo");
@@ -20390,11 +21715,12 @@ mod tests {
         let mut s = Session::default();
         let out = run(&mut s, "funicular -5,0,0 5,0,0 20 1 1.4");
         let id = out.created[0];
-        let m = mesh_of(&s, id);
-        // 20 links → 20 strut prisms × 8 verts.
-        assert_eq!(m.positions().len(), 20 * 8);
+        // Renders as member lines: 20 links → 20 chain segments, empty mesh.
+        assert!(mesh_of(&s, id).positions().is_empty(), "chain has no tube mesh");
+        let wire = wire_of(&s, id);
+        assert_eq!(wire.len(), 20, "20 chain segments");
         // The hanging chain sags below the springing line (z < 0 somewhere).
-        let zmin = m.positions().iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        let zmin = wire.iter().flat_map(|[a, b]| [a.z, b.z]).fold(f64::MAX, f64::min);
         assert!(zmin < -0.5, "funicular should sag, zmin={zmin}");
         assert_replay_stable(&s);
         run(&mut s, "undo");
@@ -20408,8 +21734,8 @@ mod tests {
         let mut s = Session::default();
         let hung = run(&mut s, "funicular -5,0,0 5,0,0 20 1 1.4").created[0];
         let arch = run(&mut s, "funicular -5,0,0 5,0,0 20 1 1.4 invert").created[0];
-        let hz = mesh_of(&s, hung).positions().iter().map(|p| p.z).fold(f64::MAX, f64::min);
-        let az = mesh_of(&s, arch).positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        let hz = wire_of(&s, hung).iter().flat_map(|[a, b]| [a.z, b.z]).fold(f64::MAX, f64::min);
+        let az = wire_of(&s, arch).iter().flat_map(|[a, b]| [a.z, b.z]).fold(f64::MIN, f64::max);
         // Hung form dips below the supports; inverted form rises above them.
         assert!(hz < 0.0 && az > 0.0, "hung zmin={hz}, arch zmax={az}");
         assert_replay_stable(&s);
@@ -20420,10 +21746,12 @@ mod tests {
         let mut s = Session::default();
         let out = run(&mut s, "tensegrity 3 1 2");
         let id = out.created[0];
-        let m = mesh_of(&s, id);
-        assert_eq!(m.positions().len() % 8, 0, "8 verts per strut prism");
+        // Renders as member lines (struts + cables): non-empty wire, empty mesh.
+        assert!(mesh_of(&s, id).positions().is_empty(), "tensegrity has no tube mesh");
+        let wire = wire_of(&s, id);
+        assert!(!wire.is_empty(), "tensegrity has struts + cables");
         // Spans z from ~0 (bottom ring) to ~2 (top ring).
-        let zmax = m.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        let zmax = wire.iter().flat_map(|[a, b]| [a.z, b.z]).fold(f64::MIN, f64::max);
         assert!(zmax > 1.5, "tensegrity height ~2, zmax={zmax}");
         assert_replay_stable(&s);
         run(&mut s, "undo");
@@ -20440,12 +21768,24 @@ mod tests {
 
     #[test]
     fn cablenet_exec_undo_redo_replay() {
+        use itsjustcad_doc::GeneratorKind;
         let mut s = Session::default();
         let out = run(&mut s, "cablenet 0,0,0 8,0,0 8,8,3 0,8,3 5 1.5");
         let id = out.created[0];
+        // cablenet is a live parametric object with generator = Cablenet whose
+        // derived mesh is the relaxed grid SURFACE (n+2)² = 7×7 = 49 vertices,
+        // 6×6×2 = 72 triangles — its edges are the cable grid, drawn as a
+        // wireframe by the renderer.
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { generator, mesh, .. } => {
+                assert_eq!(*generator, GeneratorKind::Cablenet);
+                assert!(generator.renders_as_wireframe(), "cablenet is a wireframe generator");
+                assert_eq!(mesh.positions().len(), 49);
+                assert_eq!(mesh.faces().len(), 72);
+            }
+            g => panic!("expected Parametric/Cablenet, got {g:?}"),
+        }
         let m = mesh_of(&s, id);
-        assert_eq!(m.positions().len() % 8, 0);
-        assert!(!m.positions().is_empty());
         // Net lives inside the corner bounding box in z.
         let zmax = m.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
         assert!(zmax <= 3.5, "net within corner span, zmax={zmax}");
@@ -20522,6 +21862,32 @@ mod tests {
     }
 
     #[test]
+    fn tee_channel_angle_hss_beams_have_expected_area_and_mesh() {
+        let mut s = Session::default();
+        run(&mut s, "section T1 tee 0.2 0.15 0.012 0.008");
+        run(&mut s, "section C1 channel 0.3 0.1 0.012 0.008");
+        run(&mut s, "section L1 angle 0.1 0.15 0.012");
+        run(&mut s, "section H1 hss 0.2 0.1 0.01");
+
+        let cases: [(&str, f64); 4] = [
+            ("beam 0,0,0 4,0,0 T1", 0.15 * 0.012 + (0.2 - 0.012) * 0.008),
+            ("beam 0,1,0 4,1,0 C1", 2.0 * 0.1 * 0.012 + (0.3 - 2.0 * 0.012) * 0.008),
+            ("beam 0,2,0 4,2,0 L1", 0.012 * (0.1 + 0.15 - 0.012)),
+            ("beam 0,3,0 4,3,0 H1", 0.2 * 0.1 - (0.2 - 0.02) * (0.1 - 0.02)),
+        ];
+        for (line, expected_area) in cases {
+            let id = run(&mut s, line).created[0];
+            let Geometry::Frame { section, mesh, .. } = &s.doc.get(id).unwrap().geometry else {
+                panic!("beam should be a Frame geometry");
+            };
+            assert!((section.area() - expected_area).abs() < 1e-9, "area for {line}");
+            // The sweep produced a non-empty solid mesh.
+            assert!(!mesh.faces().is_empty(), "mesh for {line}");
+        }
+        assert_replay_stable(&s);
+    }
+
+    #[test]
     fn column_and_beam_exec_undo_redo() {
         let mut s = Session::default();
         run(&mut s, "section c rect 0.3 0.3");
@@ -20549,6 +21915,50 @@ mod tests {
             .run(parse("beam 0,0,0 5,0,0 b material nope").unwrap())
             .unwrap_err();
         assert!(err.to_string().contains("no material"), "{err}");
+    }
+
+    #[test]
+    fn beam_resolves_builtin_section_without_define() {
+        // No prior `section` define: the built-in catalog resolves IPE300.
+        let mut s = Session::default();
+        let out = run(&mut s, "beam 0,0,0 0,0,3 IPE300");
+        let id = out.created[0];
+        let Geometry::Frame { section, .. } = &s.doc.get(id).unwrap().geometry else {
+            panic!("beam should be a Frame geometry");
+        };
+        assert!(
+            matches!(section, kernel_mesh::StructSection::IWideFlange { .. }),
+            "IPE300 resolves to a wide-flange from the catalog"
+        );
+        assert_replay_stable(&s);
+    }
+
+    #[test]
+    fn column_resolves_builtin_hss_without_define() {
+        let mut s = Session::default();
+        let out = run(&mut s, "column 0,0,0 0,0,3 HSS6x6");
+        let id = out.created[0];
+        let Geometry::Frame { section, .. } = &s.doc.get(id).unwrap().geometry else {
+            panic!("column should be a Frame geometry");
+        };
+        assert!(matches!(section, kernel_mesh::StructSection::Hss { .. }));
+    }
+
+    #[test]
+    fn user_defined_section_overrides_builtin() {
+        // A doc section named "IPE300" shadows the catalog wide-flange.
+        let mut s = Session::default();
+        run(&mut s, "section IPE300 rect 1 1");
+        let out = run(&mut s, "beam 0,0,0 0,0,3 IPE300");
+        let id = out.created[0];
+        let Geometry::Frame { section, .. } = &s.doc.get(id).unwrap().geometry else {
+            panic!("beam should be a Frame geometry");
+        };
+        assert!(
+            matches!(section, kernel_mesh::StructSection::Rectangular { w, h }
+                if (*w - 1.0).abs() < 1e-9 && (*h - 1.0).abs() < 1e-9),
+            "user-defined rect must take precedence over the built-in, got {section:?}"
+        );
     }
 
     #[test]

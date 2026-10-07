@@ -428,6 +428,77 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sag: Option<f64>,
     },
+    /// Diagrid: planar diagonal facade grid over a `width × height` rectangle in
+    /// the XY plane, divided into `nx × ny` cells; both diagonal families plus the
+    /// perimeter render as lightweight member lines.
+    Diagrid {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        nx: u32,
+        ny: u32,
+        width: f64,
+        height: f64,
+    },
+    /// Reciprocal frame: `count` straight members in a rotational fan around a
+    /// center, tangentially engaged so they mutually overlap into a central
+    /// polygon opening + outer ring. Renders as the member lines.
+    Reciprocal {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        count: u32,
+        radius: f64,
+        length: f64,
+    },
+    /// Waffle: egg-crate rib grid — `nx` ribs one way + `ny` ribs the other over a
+    /// `width × length` footprint, each rib a vertical plane of `depth`. Renders
+    /// as the rib top/bottom edges + intersection verticals (a 3D line grid).
+    Waffle {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        nx: u32,
+        ny: u32,
+        width: f64,
+        length: f64,
+        depth: f64,
+    },
+    /// Voronoi shell: a planar Voronoi cell pattern over a `width × length`
+    /// rectangle (XY plane) from `cells` deterministic seed points placed by
+    /// `seed`. The clipped cell edges render as lightweight member lines.
+    VoronoiShell {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        cells: u32,
+        width: f64,
+        length: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<i64>,
+    },
+    /// Schwedler ribbed dome: `meridians` meridional ribs, `rings` latitude rings
+    /// and one Schwedler diagonal per panel on a sphere of `radius`; `full` builds
+    /// the whole sphere instead of the upper hemisphere. Renders as member lines.
+    Schwedler {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        meridians: u32,
+        rings: u32,
+        radius: f64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        full: bool,
+    },
+    /// Catenary vault: a compression vault whose cross-section is a true catenary
+    /// of `span` and crown `rise`, lofted along `length`. Meshed as a `nu×nv`
+    /// surface whose edges render as the vault wireframe.
+    CatenaryVault {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        span: f64,
+        length: f64,
+        rise: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nu: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nv: Option<u32>,
+    },
     /// Minimal surface / soap film (Frei Otto): stretch a discrete soap film
     /// across a selected **closed** curve boundary using the shared
     /// form-finding engine (force-density harmonic net). One logged surface
@@ -771,6 +842,15 @@ pub enum Command {
     Flatten {
         targets: Selector,
     },
+    /// Explode polylines into their individual line segments. Each `Curve::Polyline`
+    /// in the selection is replaced by one `Curve::Line` per segment (closed
+    /// polylines include the closing segment); non-polyline curves are left as-is.
+    /// `ids` caches the created segment ids so op-log replay reproduces them.
+    Explode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        targets: Selector,
+    },
     /// Stretch: the command-substrate half of AutoCAD's STRETCH. For each object
     /// in the selection, every mutable vertex whose position falls inside the
     /// [`min`, `max`] AABB (inclusive) is shifted by `delta`; vertices outside
@@ -831,14 +911,34 @@ pub enum Command {
         target: Selector,
         point: DVec3,
     },
-    /// Trim a curve at its intersections with cutter curves, keeping only the
-    /// piece nearest `keep`; the rest is removed.
-    Trim {
+    /// Divide a curve into `count` equal-arc-length segments, placing division
+    /// points as one point-cloud object per resolved curve; the curve itself is
+    /// left intact (points-only — use `split` to break a curve). Open curves get
+    /// `count + 1` points (endpoints inclusive: t = 0, 1/count, …, 1); closed
+    /// curves get `count` points (t = 0, 1/count, …, (count-1)/count — no seam
+    /// duplicate).
+    Divide {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
         target: Selector,
-        cutter: Selector,
-        keep: DVec3,
+        count: u32,
+    },
+    /// Rhino two-phase trim: intersect the target curve(s) with a SET of cutter
+    /// curves, then for each point in `removes` delete the piece of the crossed
+    /// curve that CONTAINS the point (the clicked segment). When `extend` is true,
+    /// each point instead extends the curve it lands on to the nearest cutter.
+    ///
+    /// The target curve for each removal point is found implicitly (the curve
+    /// nearest that point among all non-cutter curves), so removal points may hit
+    /// different objects. `ids` holds the flat list of created replacement-curve
+    /// ids across all removals, reused on replay for stability.
+    Trim {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        cutters: Vec<Selector>,
+        removes: Vec<DVec3>,
+        #[serde(default)]
+        extend: bool,
     },
     /// PowerTrim a curve against *every* other curve in the document at once
     /// (DraftSight/AutoCAD PowerTrim): split the target at all its intersections
@@ -861,13 +961,36 @@ pub enum Command {
         id: Option<ObjectId>,
         targets: Selector,
     },
-    /// Fillet two lines with a tangent arc, trimming both to tangency.
+    /// Fillet two lines with a tangent arc. `at` (optional) holds the world
+    /// points where each curve was picked NEAR the end to round — the pick
+    /// LOCATION chooses which corner gets the arc (Rhino). `trim` (default true)
+    /// pulls the inputs back to the tangency points; `join` (default false) welds
+    /// the trimmed inputs + arc into one polyline.
     Fillet {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
         a: Selector,
         b: Selector,
         radius: f64,
+        /// Pick points near each curve's corner-to-round (`(nearA, nearB)`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<(DVec3, DVec3)>,
+        /// Trim the inputs back to tangency (Rhino default Yes).
+        #[serde(default = "crate::command::default_true")]
+        trim: bool,
+        /// Weld trimmed inputs + arc into one curve (Rhino default No).
+        #[serde(default)]
+        join: bool,
+    },
+    /// Chamfer (bevel) two lines/polylines: cut off the corner with a straight
+    /// setback line, trimming both sources back by `dist`. The straight-line
+    /// analogue of `fillet`.
+    Chamfer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        a: Selector,
+        b: Selector,
+        dist: f64,
     },
     /// Offset a curve in the XY plane; the original is kept.
     Offset {
@@ -875,6 +998,12 @@ pub enum Command {
         id: Option<ObjectId>,
         target: Selector,
         distance: f64,
+        /// Optional "side to offset toward" point (guided flow / Rhino's side
+        /// pick). When present, the executor flips the sign of `distance` so the
+        /// result lands on the side of `side`; the echoed command drops it and
+        /// stores the resolved signed distance, keeping replay geometry-free.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        side: Option<DVec3>,
     },
     Copy {
         #[serde(default, skip_serializing_if = "Option::is_none")]

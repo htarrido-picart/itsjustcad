@@ -10,11 +10,38 @@ use itsjustcad_render::{
 use crate::command_line::CommandLine;
 use crate::deck_pane::DeckPane;
 use crate::draw_tool::DrawTool;
+use crate::guided::{GuidedTool, ObjFilter, StartResult, StepResult};
 use crate::gumball::Gumball;
 use crate::journal::{self, Journal};
 use crate::keymap;
 use crate::preset::{self, CadOrigin};
 use crate::scene;
+
+/// Pure core of [`App::effective_camera_index`]: while maximized every pane
+/// resolves to the maximized camera `slot`; otherwise the layout's mapping.
+fn effective_cam_index(maximized: Option<usize>, layout: ViewportLayout, pane: usize) -> usize {
+    match maximized {
+        Some(slot) => slot,
+        None => layout.camera_index(pane),
+    }
+}
+
+/// Pure core of the maximize toggle. Given the current maximized slot, the
+/// double-clicked `pane` and its camera `slot`, and the saved `restore_pane`,
+/// returns `(next maximized, next active_pane, next restore_pane)`. Maximizing
+/// remembers `pane` as the pane to restore and activates the single pane (0); a
+/// second toggle clears the override and re-activates the remembered pane.
+fn next_maximize(
+    maximized: Option<usize>,
+    pane: usize,
+    slot: usize,
+    restore_pane: usize,
+) -> (Option<usize>, usize, usize) {
+    match maximized {
+        Some(_) => (None, restore_pane, restore_pane),
+        None => (Some(slot), 0, pane),
+    }
+}
 
 /// Minimum command-line height (points): the input row plus ~4 history lines —
 /// always enough to type into AND read recent output, so a drag can't squeeze
@@ -370,6 +397,16 @@ pub struct App {
     command_line: CommandLine,
     deck_pane: DeckPane,
     draw_tool: DrawTool,
+    /// Rhino-style guided command engine (bare-verb step machine); shares the
+    /// snap/ortho/smarttrack path with `draw_tool` and is mutually exclusive
+    /// with it. See [`crate::guided`].
+    guided: GuidedTool,
+    /// One-shot latch: the Enter keypress that *submitted* a bare guided verb in
+    /// the command line is still `key_pressed` for the rest of that same frame,
+    /// so `drawing_input` would otherwise re-read it and commit the tool's first
+    /// typed step at its default (skipping the prompt). Set when a guided flow
+    /// arms; the first `drawing_input` Enter pass swallows exactly that one Enter.
+    guided_suppress_enter: bool,
     gumball: Gumball,
     point_edit: crate::point_edit::PointEdit,
     tokio: tokio::runtime::Handle,
@@ -401,6 +438,13 @@ pub struct App {
     layout: ViewportLayout,
     /// Last hovered pane; view commands and tools target its camera.
     active_pane: usize,
+    /// Double-click a viewport's name tag to MAXIMIZE that pane to a single
+    /// full-size viewport (Rhino). `Some(slot)` holds the CAMERA SLOT being shown
+    /// maximized; `None` = normal `layout`. Kept separate from `layout` so a
+    /// second double-click restores the exact previous multi-viewport layout.
+    maximized: Option<usize>,
+    /// Pane to re-activate when a maximize is toggled off.
+    maximized_restore_pane: usize,
     /// Generation of the last GPU upload; compare with `session.doc.generation`.
     uploaded_generation: Option<u64>,
     /// Theme of the last GPU upload; theme flips force a re-upload.
@@ -413,6 +457,18 @@ pub struct App {
     uploaded_plant_symbols: Option<bool>,
     /// Sketchy params of the last GPU upload; changes force a re-upload.
     uploaded_sketchy: Option<itsjustcad_render::SketchyParams>,
+    /// Marked-removal count of the last upload during a trim preview (`None`
+    /// when not in trim's parts-to-remove phase); changes force a re-upload so
+    /// clicked pieces disappear even though doc.generation hasn't moved.
+    uploaded_trim_marks: Option<usize>,
+    /// Trim command-panel option: when set, picks EXTEND the curve to the
+    /// cutters instead of removing a piece (emits `trim … extend …`). Reset
+    /// each time a guided flow starts / is cancelled. While on, the disappear
+    /// preview + hover cue are suppressed (they describe removal, not extend).
+    trim_extend: bool,
+    /// Trim command-panel option "Apparent Intersections" — UI state only; the
+    /// projected/apparent-intersection trimming behavior is not implemented yet.
+    trim_apparent: bool,
     /// Last zoom factor written to ui.json (avoid rewriting every frame).
     saved_zoom: f32,
     /// Dev self-verification: ITSJUSTCAD_SHOT=<path.png> captures a frame and exits.
@@ -994,6 +1050,8 @@ impl App {
             command_line,
             deck_pane: DeckPane::default(),
             draw_tool: DrawTool::default(),
+            guided: GuidedTool::default(),
+            guided_suppress_enter: false,
             gumball: Gumball::default(),
             point_edit: crate::point_edit::PointEdit::default(),
             tokio,
@@ -1018,12 +1076,17 @@ impl App {
                 _ => ViewportLayout::Single,
             },
             active_pane: 0,
+            maximized: None,
+            maximized_restore_pane: 0,
             uploaded_generation: None,
             uploaded_theme: None,
             uploaded_color_mode: None,
             uploaded_profile_edges: None,
             uploaded_plant_symbols: None,
             uploaded_sketchy: None,
+            uploaded_trim_marks: None,
+            trim_extend: false,
+            trim_apparent: true,
             saved_zoom: zoom,
             shot_path: std::env::var("ITSJUSTCAD_SHOT").ok(),
             startup_script: std::env::var("ITSJUSTCAD_RUN").ok(),
@@ -1381,6 +1444,10 @@ impl App {
         };
         let mut words = line.split_whitespace();
         match words.next() {
+            // `clear` / `cls`: wipe the command-line scrollback (the printed
+            // output) but KEEP the up-arrow recall history — a display cleanup,
+            // not a destructive command. Never reaches the parser.
+            Some("clear" | "cls") => self.command_line.clear_scrollback(),
             Some("save") => self.save(words.next().map(Into::into)),
             Some("copyselection") => {
                 let n = self.session.doc.selection.len();
@@ -1448,7 +1515,7 @@ impl App {
             // Verb/mode mapping is shared with the headless runner via app_verbs.
             Some("display") => match words.next().and_then(DisplayMode::parse) {
                 Some(mode) => {
-                    self.display_modes[self.layout.camera_index(self.active_pane)] = mode;
+                    self.display_modes[self.effective_camera_index(self.active_pane)] = mode;
                     self.command_line
                         .push_line(format!("display: {}", mode.label().to_lowercase()));
                 }
@@ -1512,7 +1579,7 @@ impl App {
             }
             // Toggle the transform gumball/gizmo (Rhino-style persistent
             // toggle). View state, never logged; persisted to ui.json.
-            Some("gumball" | "gizmo") => {
+            Some("handles" | "transformhandles" | "gumball" | "gizmo") => {
                 let on = match words.next() {
                     Some("on" | "true" | "1") => true,
                     Some("off" | "false" | "0") => false,
@@ -1521,7 +1588,7 @@ impl App {
                 self.show_gumball = on;
                 save_gumball_visible(on);
                 self.command_line
-                    .push_line(format!("gumball: {}", if on { "on" } else { "off" }));
+                    .push_line(format!("transform handles: {}", if on { "on" } else { "off" }));
             }
             // Object-snap control: `osnap on|off` flips the master switch,
             // `osnap <kind> on|off` a single kind (`osnap grid on|off` the grid
@@ -1598,7 +1665,9 @@ impl App {
             // SmartTrack construction guides: `smarttrack [on|off|toggle]`.
             // Dwelling on an osnap point acquires it; H/V guides through the
             // acquired points let the cursor align to them. Persisted to ui.json.
-            Some("smarttrack") => {
+            // `smartguides` is the user-facing verb; `smarttrack` stays as an
+            // alias for muscle memory. Echoes always say "smart guides".
+            Some("smartguides" | "smarttrack") => {
                 let on = match words.next() {
                     Some("on" | "true" | "1") => true,
                     Some("off" | "false" | "0") => false,
@@ -1611,7 +1680,7 @@ impl App {
                     self.st_dwell = None;
                 }
                 self.command_line
-                    .push_line(format!("smarttrack: {}", if on { "on" } else { "off" }));
+                    .push_line(format!("smart guides: {}", if on { "on" } else { "off" }));
             }
             // "SketchUp" display preset: Working hemispheric shading + thick
             // profile edges + shaded display. Combines the ergonomics of the
@@ -1619,7 +1688,7 @@ impl App {
             Some("sketchup" | "su") => {
                 self.light_mode = itsjustcad_render::LightMode::Working;
                 self.profile_edges = true;
-                self.display_modes[self.layout.camera_index(self.active_pane)] =
+                self.display_modes[self.effective_camera_index(self.active_pane)] =
                     DisplayMode::Shaded;
                 self.command_line
                     .push_line("preset: sketchup (working light + profile edges)");
@@ -1812,6 +1881,36 @@ impl App {
                     }
                     return;
                 }
+                // Guided command engine: a bare guided verb walks the user
+                // through its steps and emits the canonical command string.
+                let selection = self.current_selection_selector();
+                match self.guided.try_start(line, selection.as_deref()) {
+                    StartResult::Started => {
+                        // Fresh guided flow → reset the trim command-panel options.
+                        self.trim_extend = false;
+                        self.trim_apparent = true;
+                        // Zero-step verbs on a pre-selection (area/volume/bbox)
+                        // emit immediately; otherwise show the first prompt.
+                        if let Some(result) = self.guided.emit_if_ready() {
+                            self.handle_guided(result);
+                        } else if let Some(prompt) = self.guided.prompt() {
+                            self.command_line.push_line(prompt);
+                            // The submitting Enter is still down this frame; keep
+                            // `drawing_input` from re-reading it and auto-committing
+                            // the first typed step at its default.
+                            self.guided_suppress_enter = true;
+                        }
+                        return;
+                    }
+                    StartResult::NeedSelection => {
+                        self.command_line.push_line(format!(
+                            "{}: select object(s) first, then run the command",
+                            line.trim()
+                        ));
+                        return;
+                    }
+                    StartResult::NotGuided => {}
+                }
                 self.command_line.execute(&mut self.session, line);
             }
         }
@@ -1819,7 +1918,37 @@ impl App {
 
     fn set_layout(&mut self, layout: ViewportLayout) {
         self.layout = layout;
+        self.maximized = None; // an explicit layout change exits maximize
         self.active_pane = 0;
+    }
+
+    /// Pane rects for the live view: a single full-size pane while maximized
+    /// (double-click a viewport tag), otherwise the normal `layout` split.
+    fn effective_panes(&self, full: egui::Rect) -> Vec<egui::Rect> {
+        if self.maximized.is_some() {
+            vec![full]
+        } else {
+            self.layout.split(full)
+        }
+    }
+
+    /// Camera slot for a pane, honoring maximize: while maximized every pane
+    /// resolves to the maximized camera slot (there is only pane 0); otherwise
+    /// the layout's per-pane mapping.
+    fn effective_camera_index(&self, pane: usize) -> usize {
+        effective_cam_index(self.maximized, self.layout, pane)
+    }
+
+    /// Toggle maximize for `pane`'s viewport (its name-tag was double-clicked):
+    /// maximize to that pane's camera, or restore the previous layout if already
+    /// maximized.
+    fn toggle_maximize(&mut self, pane: usize) {
+        let slot = self.layout.camera_index(pane);
+        let (maximized, active, restore) =
+            next_maximize(self.maximized, pane, slot, self.maximized_restore_pane);
+        self.maximized = maximized;
+        self.active_pane = active;
+        self.maximized_restore_pane = restore;
     }
 
     /// Decode the document's underlay image into GPU-ready `UnderlayData`,
@@ -1938,7 +2067,8 @@ impl App {
 
     /// Camera of the active (last hovered) pane.
     fn active_camera(&mut self) -> &mut OrbitCamera {
-        &mut self.cameras[self.layout.camera_index(self.active_pane)]
+        let idx = self.effective_camera_index(self.active_pane);
+        &mut self.cameras[idx]
     }
 
     fn set_view(&mut self, name: &str) {
@@ -1974,7 +2104,7 @@ impl App {
         h: u32,
     ) -> Result<itsjustcad_render::ControlImagePaths, String> {
         let aspect = w as f32 / h as f32;
-        let cam_idx = self.layout.camera_index(self.active_pane);
+        let cam_idx = self.effective_camera_index(self.active_pane);
         let camera = self.cameras[cam_idx];
         let view_proj = camera.view_proj(aspect);
         let eye = camera.eye();
@@ -2090,7 +2220,7 @@ impl App {
     /// (w/h), matching the viewport's eye/target/up/fov. Shared by the verb, the
     /// file-save path, and the progressive window.
     fn raytrace_camera(&self, aspect: f64) -> itsjustcad_raytrace::Camera {
-        let cam_idx = self.layout.camera_index(self.active_pane);
+        let cam_idx = self.effective_camera_index(self.active_pane);
         let camera = self.cameras[cam_idx];
         let eye = camera.eye();
         let target = camera.target;
@@ -2725,6 +2855,7 @@ impl App {
         let chat_composing = focused == Some(chat_id);
         if modal
             || self.draw_tool.active()
+            || self.guided.active()
             || chat_composing
             || !self.command_line.is_empty()
         {
@@ -3084,24 +3215,61 @@ impl App {
         let (origin, dir) = screen_ray(view_proj, rect, pos);
         // Build a BVH over visible object AABBs so the ray only tests the boxes
         // it actually crosses rather than every object in the scene.
-        let pickable: Vec<(itsjustcad_doc::ObjectId, kernel_mesh::Aabb)> = self
-            .session
-            .doc
-            .objects()
-            .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
-            .map(|obj| (obj.id, obj.geometry.aabb()))
-            .collect();
-        let bvh = kernel_mesh::Bvh::build(&pickable.iter().map(|(_, bb)| *bb).collect::<Vec<_>>());
-        let mut best: Option<(f64, itsjustcad_doc::ObjectId)> = None;
+        // Keep the Curve ref alongside the AABB so the narrow phase doesn't
+        // re-fetch the object by id (the ref is valid for this whole `&self`
+        // borrow). `None` = non-curve geometry (mesh/solid), picked by bounds.
+        let pickable: Vec<(itsjustcad_doc::ObjectId, kernel_mesh::Aabb, Option<&kernel_curve::Curve>)> =
+            self.session
+                .doc
+                .objects()
+                .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
+                .map(|obj| {
+                    let curve = match &obj.geometry {
+                        itsjustcad_doc::Geometry::Curve(c) => Some(c),
+                        _ => None,
+                    };
+                    (obj.id, obj.geometry.aabb(), curve)
+                })
+                .collect();
+        let bvh = kernel_mesh::Bvh::build(&pickable.iter().map(|(_, bb, _)| *bb).collect::<Vec<_>>());
+        // A curve is HIT only when the click lands within this many pixels of the
+        // ACTUAL projected line — not anywhere inside its bounding box (clicking
+        // empty space inside a diagonal line's AABB must NOT re-select it). 8px is
+        // comfortable for thin lines. Meshes/solids pick by their AABB footprint.
+        const PICK_PX: f32 = 8.0;
+        // A fully on-screen curve is ranked by its SCREEN distance to the cursor
+        // (so a click dead-on the nearer line wins over one that merely has a
+        // closer bounding box); meshes/off-screen curves are ranked by ray depth.
+        // A qualifying curve is preferred over a mesh — a thin wireframe reads as
+        // foreground in CAD.
+        let mut best_curve: Option<(f32, itsjustcad_doc::ObjectId)> = None; // (screen dist, id)
+        let mut best_depth: Option<(f64, itsjustcad_doc::ObjectId)> = None; // (ray t, id)
         for i in bvh.ray_candidates(origin, dir) {
-            let (id, bb) = pickable[i as usize];
-            if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
-                && best.is_none_or(|(bt, _)| t < bt)
-            {
-                best = Some((t, id));
+            let (id, bb, curve) = pickable[i as usize];
+            // Depth along the ray (nearest wins); None when the ray misses the AABB.
+            let Some(t) = ray_aabb(origin, dir, bb.min, bb.max) else { continue };
+            if let Some(c) = curve {
+                let pts = curve_screen_pts(c, view_proj, rect);
+                // Any point behind the camera makes the screen polyline unreliable
+                // (a visible span can have no on-screen segment); fall back to the
+                // AABB depth test so a partially-off-screen curve stays pickable.
+                if !pts.iter().any(|p| p.is_none()) {
+                    if let Some(d) = crate::boxsel::dist_to_polyline(&pts, pos)
+                        && d <= PICK_PX
+                        && best_curve.is_none_or(|(bd, _)| d < bd)
+                    {
+                        best_curve = Some((d, id));
+                    }
+                    continue; // on-screen curve decided by screen distance only
+                }
+            }
+            if best_depth.is_none_or(|(bt, _)| t < bt) {
+                best_depth = Some((t, id));
             }
         }
-        best.map(|(_, id)| id)
+        best_curve
+            .map(|(_, id)| id)
+            .or(best_depth.map(|(_, id)| id))
     }
 
     /// A viewport double-click: if it lands on a block instance, reveal the
@@ -3169,17 +3337,14 @@ impl App {
         mode: crate::boxsel::BoxMode,
         additive: bool,
     ) {
-        let items: Vec<(itsjustcad_doc::ObjectId, egui::Rect)> = self
+        let ids: Vec<itsjustcad_doc::ObjectId> = self
             .session
             .doc
             .objects()
             .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
-            .filter_map(|obj| {
-                let bb = obj.geometry.aabb();
-                Some((obj.id, projected_rect(view_proj, rect, bb.min, bb.max)?))
-            })
+            .filter(|obj| obj_matches_box(&obj.geometry, view_proj, rect, drag, mode))
+            .map(|obj| obj.id)
             .collect();
-        let ids = crate::boxsel::box_select(&items, drag, mode);
         let doc = &mut self.session.doc;
         if !additive {
             doc.selection.clear();
@@ -3544,7 +3709,7 @@ impl App {
         let full = clamp_viewport_rect(ui.available_rect_before_wrap(), self.dock_left);
         // Fresh each frame; set below if a pane is clicked/dragged this frame.
         self.viewport_interacted = false;
-        if !self.draw_tool.active() {
+        if !self.draw_tool.active() && !self.guided.active() {
             self.status_snap = None; // no tool, no snap marker to report
         }
         if self.active_pane >= self.layout.pane_count() {
@@ -3555,7 +3720,10 @@ impl App {
         // — no hover flicker. EXCEPTION: while a draw tool is armed, the pane under
         // the cursor becomes active so points can be picked in ANY viewport
         // mid-command (Rhino lets you pick across viewports during a command).
-        if self.draw_tool.active()
+        if self.maximized.is_some() {
+            // Only one pane exists while maximized; everything targets it.
+            self.active_pane = 0;
+        } else if (self.draw_tool.active() || self.guided.active())
             && let Some(pos) = ui.ctx().pointer_latest_pos()
             && let Some(pane) = self.layout.pane_at(full, pos)
         {
@@ -3569,13 +3737,33 @@ impl App {
         };
         let generation = self.session.doc.generation;
         // Color mode of the active pane drives the snapshot; changes stale it.
-        let active_color_mode = self.color_modes[self.layout.camera_index(self.active_pane)];
+        let active_color_mode = self.color_modes[self.effective_camera_index(self.active_pane)];
+        // Trim removal preview: while picking "parts to remove", the clicked
+        // pieces are hidden from the snapshot so they look deleted (Rhino). The
+        // number of marks is a staleness signal — clicking a removal point does
+        // NOT bump doc.generation, so without this the hide wouldn't refresh.
+        // Extend mode (`trim_extend`) suppresses the disappear preview: it
+        // describes REMOVAL, not extension. Flipping the toggle changes
+        // trim_marks (Some(n) ↔ None), which drives the rebuild + re-upload so
+        // hidden pieces reappear the moment Extend is turned on.
+        let trim_marks = (self.guided.active()
+            && self.guided.active_verb() == Some("trim")
+            && self.guided.current_wants_point_list()
+            && !self.trim_extend)
+        .then(|| self.guided.list_points().len());
+        // Trim preview marks change WITHOUT a doc.generation bump, so this drives
+        // both the snapshot rebuild AND a forced GPU re-upload (the viewport
+        // callback otherwise skips uploading when the generation is unchanged).
+        // True on enter/change/leave of the preview, so Esc restores the scene.
+        let trim_mark_change = self.uploaded_trim_marks != trim_marks;
+        let force_upload = trim_mark_change;
         let stale = self.uploaded_generation != Some(generation)
             || self.uploaded_theme != Some(theme)
             || self.uploaded_color_mode != Some(active_color_mode)
             || self.uploaded_profile_edges != Some(self.profile_edges)
             || self.uploaded_plant_symbols != Some(self.plant_symbols)
-            || self.uploaded_sketchy != Some(self.sketchy);
+            || self.uploaded_sketchy != Some(self.sketchy)
+            || trim_mark_change;
         // Scene is uploaded once (renderer shared); only the first pane's
         // callback carries the snapshot, the rest just set their camera.
         let mut scene = if stale {
@@ -3585,9 +3773,10 @@ impl App {
             self.uploaded_profile_edges = Some(self.profile_edges);
             self.uploaded_plant_symbols = Some(self.plant_symbols);
             self.uploaded_sketchy = Some(self.sketchy);
+            self.uploaded_trim_marks = trim_marks;
             // Sketchy depth cue: bias by the active pane's eye + scene radius.
             let (sketchy_eye, sketchy_radius) = if self.sketchy.active() {
-                let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
+                let cam = &self.cameras[self.effective_camera_index(self.active_pane)];
                 let r = self
                     .session
                     .doc
@@ -3598,17 +3787,49 @@ impl App {
             } else {
                 (None, 0.0)
             };
-            let mut s = scene::snapshot_with_mode(
-                &self.session.doc,
-                theme,
-                itsjustcad_render::ColorModeSnapshot {
-                    color_mode: active_color_mode,
-                    profile_edges: self.profile_edges,
-                    sketchy: self.sketchy,
-                    sketchy_eye,
-                    sketchy_radius,
-                },
-            );
+            let cms = itsjustcad_render::ColorModeSnapshot {
+                color_mode: active_color_mode,
+                profile_edges: self.profile_edges,
+                sketchy: self.sketchy,
+                sketchy_eye,
+                sketchy_radius,
+            };
+            // Trim removal preview: hide the target curves that have ≥1 piece
+            // queued for removal and draw their SURVIVING pieces in place, so the
+            // clicked pieces vanish from view until Enter commits the real trim.
+            let mut s = if trim_marks.unwrap_or(0) > 0 {
+                let cutters: Vec<itsjustcad_doc::ObjectId> = self
+                    .guided
+                    .collected_object_set()
+                    .iter()
+                    .filter_map(|tok| {
+                        let short = tok.strip_prefix('#').unwrap_or(tok);
+                        self.session.doc.find_named(short).first().copied()
+                    })
+                    .collect();
+                let (hidden_ids, survivors) = itsjustcad_commands::trim_preview(
+                    &self.session.doc,
+                    &cutters,
+                    self.guided.list_points(),
+                );
+                let hidden: std::collections::HashSet<itsjustcad_doc::ObjectId> =
+                    hidden_ids.into_iter().collect();
+                let mut s = scene::snapshot_hiding(&self.session.doc, theme, cms, &hidden);
+                // Draw the survivors in the curve color so the untrimmed parts of
+                // a hidden target stay visible (a transient overlay — may differ
+                // slightly from a curve's custom object/layer color).
+                let color = theme.curve();
+                for poly in &survivors {
+                    let pts: Vec<[f32; 3]> =
+                        poly.iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]).collect();
+                    if pts.len() >= 2 {
+                        s.lines.push((pts, color, 1.0));
+                    }
+                }
+                s
+            } else {
+                scene::snapshot_with_mode(&self.session.doc, theme, cms)
+            };
             // Planting plan overlay: add 2D top-view plant symbols when toggled
             // on. The 3D canopy meshes stay in `s`; symbols lie flat on the
             // ground and read as a planting plan in the top view.
@@ -3622,9 +3843,9 @@ impl App {
             None
         };
 
-        let panes = self.layout.split(full);
+        let panes = self.effective_panes(full);
         for (pane, rect) in panes.iter().copied().enumerate() {
-            let cam_idx = self.layout.camera_index(pane);
+            let cam_idx = self.effective_camera_index(pane);
             let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
             // Click (or drag/RMB) inside a pane makes it the active viewport,
@@ -3692,7 +3913,7 @@ impl App {
                 }
             }
 
-            if self.draw_tool.active() {
+            if self.draw_tool.active() || self.guided.active() {
                 // Draw/osnap only in the active pane; one prompt, one ghost.
                 if pane == self.active_pane {
                     if response.hovered() {
@@ -3820,6 +4041,7 @@ impl App {
                         light: self.light_mode,
                         background_gradient: self.profile_edges,
                         edges_enabled: self.shaded_edges,
+                        force: force_upload,
                     },
                 ));
             }
@@ -3853,7 +4075,13 @@ impl App {
                     ui.id().with(("view_tag", pane)),
                     egui::Sense::click(),
                 );
-                if tag_resp.clicked() {
+                if tag_resp.double_clicked() {
+                    // Double-click the tag: maximize this pane to a single
+                    // viewport, or restore the previous layout if already
+                    // maximized (Rhino). `pane` is 0 while maximized, which
+                    // `toggle_maximize` reads as "restore".
+                    self.toggle_maximize(pane);
+                } else if tag_resp.clicked() {
                     self.active_pane = pane;
                 }
                 let text_color = if active {
@@ -3947,7 +4175,7 @@ impl App {
         // Only rendered over the active pane so multi-view layouts stay uncluttered.
         if show_empty_document(
             &self.session.doc,
-            self.draw_tool.active(),
+            self.draw_tool.active() || self.guided.active(),
             load_onboarding_done(),
         ) {
             let pane_rect = panes.get(self.active_pane).copied().unwrap_or(full);
@@ -3955,7 +4183,7 @@ impl App {
         } else if !self.preview_no_viewport
             && show_empty_document_hint(
                 &self.session.doc,
-                self.draw_tool.active(),
+                self.draw_tool.active() || self.guided.active(),
                 load_onboarding_done(),
             )
         {
@@ -4951,7 +5179,327 @@ impl App {
         }
     }
 
+    /// Canonical selector for the current selection, or `None` when nothing is
+    /// selected. Guided noun-verb flows seed their object step from this.
+    fn current_selection_selector(&self) -> Option<String> {
+        if self.session.doc.selection.is_empty() {
+            None
+        } else {
+            Some("sel".to_string())
+        }
+    }
+
+    /// Does object `id` satisfy the current guided `SelectObject` step's filter?
+    /// `Any` accepts everything; `Curve`/`Solid` gate on the geometry kind, so a
+    /// fillet won't accept a mesh nor a boolean a bare curve (Rhino's
+    /// GeometryFilter).
+    fn guided_pick_matches(&self, id: itsjustcad_doc::ObjectId) -> bool {
+        use itsjustcad_doc::Geometry;
+        let Some(filter) = self.guided.current_filter() else {
+            return false;
+        };
+        let Some(obj) = self.session.doc.get(id) else {
+            return false;
+        };
+        match filter {
+            ObjFilter::Any => true,
+            ObjFilter::Curve => matches!(obj.geometry, Geometry::Curve(_)),
+            ObjFilter::Solid => matches!(obj.geometry, Geometry::Mesh(_)),
+        }
+    }
+
+    /// Resolve a guided object-pick DRAG to a single object. Runs the same
+    /// projected-rect window/crossing test the normal `box_select` uses, but keeps
+    /// only candidates that satisfy the current step's geometry filter
+    /// (`guided_pick_matches`). Since a guided step fills exactly one role, the
+    /// winner is the match whose projected center is nearest the drag-box center.
+    /// Returns `None` when the region contains no matching object.
+    fn guided_box_pick(
+        &self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        drag: egui::Rect,
+        mode: crate::boxsel::BoxMode,
+    ) -> Option<itsjustcad_doc::ObjectId> {
+        // Prefer the object whose projected AABB center is closest to the drag-box
+        // center — the most-intended pick when a region catches several matches.
+        // Inclusion uses the PRECISE geometry test (not the AABB), so a diagonal
+        // line whose bounding box merely overlaps the drag isn't a candidate.
+        let target = drag.center();
+        self.session
+            .doc
+            .objects()
+            .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
+            .filter(|obj| self.guided_pick_matches(obj.id))
+            .filter(|obj| obj_matches_box(&obj.geometry, view_proj, rect, drag, mode))
+            .map(|obj| {
+                let bb = obj.geometry.aabb();
+                let d = projected_rect(view_proj, rect, bb.min, bb.max)
+                    .map(|r| r.center().distance_sq(target))
+                    .unwrap_or(f32::MAX);
+                (obj.id, d)
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
+    }
+
+    /// Resolve a guided MULTI-object DRAG (`Step::SelectObjects`) to EVERY object
+    /// in the region that satisfies the step's geometry filter — the box-select
+    /// analogue of picking a set (trim's cutter phase). Runs the same
+    /// window/crossing test as [`Self::guided_box_pick`] but returns all hits
+    /// instead of the single nearest.
+    fn guided_box_pick_all(
+        &self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        drag: egui::Rect,
+        mode: crate::boxsel::BoxMode,
+    ) -> Vec<itsjustcad_doc::ObjectId> {
+        self.session
+            .doc
+            .objects()
+            .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
+            .filter(|obj| self.guided_pick_matches(obj.id))
+            .filter(|obj| obj_matches_box(&obj.geometry, view_proj, rect, drag, mode))
+            .map(|obj| obj.id)
+            .collect()
+    }
+
+    /// Resolve a guided object step from a single CLICK (or a drag too small to
+    /// be a deliberate rubber box): hit-test the point to ONE object, enforce
+    /// the step's geometry filter, then commit it (single) or add it (multi).
+    /// Shared by the click path and the tiny-drag fallback so a click-jitter
+    /// never triggers box-select — which, for two crossing curves, grabs BOTH
+    /// via their overlapping AABBs, so a single click would select two and (in
+    /// trim) wrongly mark both as cutters, leaving no target to remove.
+    fn guided_single_pick(
+        &mut self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        world: Option<glam::DVec3>,
+        multi: bool,
+    ) {
+        match self.hit_object(view_proj, rect, pos) {
+            Some(id) if self.guided_pick_matches(id) => {
+                // Highlight the pick; the emitted command references it by id, so
+                // selection state doesn't affect correctness.
+                self.session.doc.selection.insert(id);
+                self.session.doc.generation += 1;
+                let short = id.short();
+                let r = if multi {
+                    // Multi-object select: each click adds to the set and stays
+                    // on the step (Enter finishes).
+                    self.guided.push_selected_object(&short)
+                } else {
+                    // Single object: capture the click location when the step
+                    // wants it (fillet corner selection).
+                    let pt = if self.guided.current_wants_object_point() {
+                        world
+                    } else {
+                        None
+                    };
+                    self.guided.commit_object_at(&short, pt)
+                };
+                self.handle_guided(r);
+            }
+            Some(_) => self
+                .command_line
+                .push_line("that object isn't the right type — pick again"),
+            None => {} // empty space: keep waiting for a valid pick
+        }
+    }
+
+    /// Resolve a rubber-box drag in trim's "click parts to remove" phase to one
+    /// interior REMOVAL point per curve the box catches (Rhino lets you window a
+    /// batch of segments to trim at once, not just click them one by one). Each
+    /// curve is tessellated to world samples, projected to screen, and fed to
+    /// [`crate::boxsel::box_pick_point`], which applies the window/crossing rule
+    /// and returns a point ON the boxed portion. No cutter filter here — in phase
+    /// two any visible curve is a trim target.
+    fn guided_pointlist_box_pick(
+        &self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        drag: egui::Rect,
+        mode: crate::boxsel::BoxMode,
+    ) -> Vec<glam::DVec3> {
+        use itsjustcad_doc::Geometry;
+        /// Chord tolerance for tessellating a curve into box-test samples. Fine
+        /// enough that a boxed piece always yields an interior sample.
+        const TESS_TOL: f64 = 0.05;
+        self.session
+            .doc
+            .objects()
+            .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
+            .filter_map(|obj| match &obj.geometry {
+                Geometry::Curve(c) => {
+                    let samples: Vec<(Option<egui::Pos2>, glam::DVec3)> = c
+                        .tessellate(TESS_TOL)
+                        .into_iter()
+                        .map(|w| (project(view_proj, rect, w), w))
+                        .collect();
+                    crate::boxsel::box_pick_point(&samples, drag, mode)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Dispatch a guided-tool step outcome: run the emitted command, surface an
+    /// error, or re-show the next prompt.
+    fn handle_guided(&mut self, result: StepResult) {
+        match result {
+            StepResult::Emit(cmd) => self.execute_line(cmd),
+            StepResult::Error(e) => self.command_line.push_line(format!("error: {e}")),
+            StepResult::NeedMore => {
+                if let Some(prompt) = self.guided.prompt() {
+                    self.command_line.push_line(prompt);
+                }
+            }
+        }
+    }
+
+    /// When the trim panel's "Extend Cutting Lines" option is on, rewrite a
+    /// `trim … remove …` emission into the `trim … extend …` variant the exec
+    /// already supports (grows each picked end to the cutters instead of
+    /// deleting a piece). Only touches a trim remove-emission; everything else
+    /// passes through unchanged.
+    fn trim_extend_rewrite(&self, result: StepResult) -> StepResult {
+        match result {
+            StepResult::Emit(cmd)
+                if self.trim_extend && cmd.starts_with("trim ") && cmd.contains(" remove ") =>
+            {
+                StepResult::Emit(cmd.replacen(" remove ", " extend ", 1))
+            }
+            other => other,
+        }
+    }
+
+    /// Rhino-style command-options panel for the guided `trim` verb, shown in the
+    /// dock while a trim is in progress. It drives the SAME `GuidedTool` engine
+    /// as the command line (which still works as a fallback): Done = Enter
+    /// (finish the current phase / commit), Cancel = Esc (abort + restore),
+    /// Undo = un-mark the last removal pick. The two checkboxes mirror Rhino;
+    /// "Extend Cutting Lines" switches picks to the extend variant, "Apparent
+    /// Intersections" is UI-only for now (behavior not implemented).
+    fn trim_command_panel(&mut self, ui: &mut egui::Ui) {
+        let phase_targets = self.guided.current_wants_point_list();
+        ui.add_space(4.0);
+        ui.heading("Trim");
+        ui.add_space(6.0);
+        let prompt = if phase_targets {
+            "Select object to trim, select pressing Shift to extend:"
+        } else {
+            "Select cutting objects:"
+        };
+        ui.label(egui::RichText::new(prompt).strong());
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("Press Enter when done").weak());
+        ui.add_space(8.0);
+
+        ui.checkbox(&mut self.trim_extend, "Extend Cutting Lines");
+        ui.checkbox(&mut self.trim_apparent, "Apparent Intersections");
+        ui.add_space(8.0);
+
+        // Buttons. Collect the clicks first (each borrows `ui`), then act once
+        // the UI borrows are released, so we can touch `self.guided` freely.
+        let undo = phase_targets
+            && ui
+                .add_enabled(self.guided.list_len() > 0, egui::Button::new("Undo"))
+                .clicked();
+        let (cancel, done) = ui
+            .horizontal(|ui| {
+                let c = ui.button("Cancel").clicked();
+                let d = ui.button("Done").clicked();
+                (c, d)
+            })
+            .inner;
+
+        if undo
+            && self.guided.pop_list_point()
+            && let Some(p) = self.guided.prompt()
+        {
+            self.command_line.push_line(p);
+        }
+        if cancel {
+            self.guided.cancel();
+            self.trim_extend = false;
+            self.trim_apparent = true;
+            self.command_line.push_line("drawing cancelled");
+        } else if done {
+            if self.guided.current_wants_objects() {
+                let r = self.guided.finish_objects();
+                self.handle_guided(r);
+            } else if self.guided.current_wants_point_list() {
+                let r = self.guided.finish_list();
+                let r = self.trim_extend_rewrite(r);
+                self.handle_guided(r);
+            }
+        }
+    }
+
     /// Interactive drawing: picks on the ground plane, ghost preview, prompt.
+    /// Smart Guides tangent/perpendicular tracking: for each acquired point,
+    /// gather osnap's perpendicular-foot and tangent candidate POINTS on curves
+    /// near the cursor and turn each into an extra guide from that acquired point
+    /// THROUGH the candidate. Fed into `smarttrack::snap` so the cursor can align
+    /// along a perp/tangent line to a nearby curve (and to its intersections with
+    /// other guides) — smarttrack.rs stays pure; the curve access lives here.
+    fn st_extra_guides(
+        &self,
+        cursor_px: Option<egui::Pos2>,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+    ) -> Vec<crate::smarttrack::GuideLine> {
+        let mut extra = Vec::new();
+        let Some(pos) = cursor_px else { return extra };
+        if self.st_acquired.is_empty() {
+            return extra;
+        }
+        // Only track perp/tangent when the user has those osnaps enabled (master
+        // on); reuse their settings but force the two kinds we derive guides from.
+        if !self.snap_settings.master {
+            return extra;
+        }
+        let mut settings = self.snap_settings;
+        settings.set(crate::osnap::SnapKind::Perpendicular, true);
+        settings.set(crate::osnap::SnapKind::Tangent, true);
+        for &ap in self.st_acquired.points() {
+            // Perp foot / tangent points are computed relative to a reference
+            // point; use the acquired point so the guide is anchored there.
+            let cands = crate::osnap::candidates_filtered(
+                &self.session.doc,
+                &settings,
+                Some(ap),
+                |bb| match projected_rect(view_proj, rect, bb.min, bb.max) {
+                    Some(r) => r.expand(crate::osnap::SNAP_RADIUS_PX).contains(pos),
+                    None => true,
+                },
+            );
+            for (world, kind) in cands {
+                if !matches!(
+                    kind,
+                    crate::osnap::SnapKind::Perpendicular | crate::osnap::SnapKind::Tangent
+                ) {
+                    continue;
+                }
+                // Only keep candidates whose screen projection is near the cursor
+                // (the per-object cull is coarse; this is the fine gate).
+                let near = project(view_proj, rect, world)
+                    .map(|p| p.distance(pos) <= crate::osnap::SNAP_RADIUS_PX)
+                    .unwrap_or(false);
+                if !near {
+                    continue;
+                }
+                if let Some(g) = crate::smarttrack::GuideLine::through(ap, world - ap) {
+                    extra.push(g);
+                }
+            }
+        }
+        extra
+    }
+
     fn drawing_input(
         &mut self,
         ui: &mut egui::Ui,
@@ -4964,16 +5512,74 @@ impl App {
         if let Some(id) = ui.ctx().memory(|m| m.focused()) {
             ui.ctx().memory_mut(|m| m.surrender_focus(id));
         }
+        // Guided engine and draw tool are mutually exclusive; when guided is
+        // armed it drives the pick/enter/preview dispatch below, otherwise the
+        // draw tool does. They share the snap/ortho/smarttrack resolution.
+        let guided_active = self.guided.active();
 
-        let (esc, enter, shift, close_key, f8) = ui.input(|i| {
+        let (esc, mut enter, shift, close_key, f8, tab, mark_key, space) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Enter),
                 i.modifiers.shift,
                 i.key_pressed(egui::Key::C),
                 i.key_pressed(egui::Key::F8),
+                i.key_pressed(egui::Key::Tab),
+                // `M` (bare) manually captures the osnap point under the cursor
+                // into the Smart Guides acquired set (Rhino's on-demand Mark),
+                // complementing the dwell auto-capture. Bare only, so Cmd/Ctrl-M
+                // (minimize / other shortcuts) is left alone.
+                i.key_pressed(egui::Key::M) && !i.modifiers.command && !i.modifiers.ctrl,
+                // Spacebar accepts/advances a guided step like Enter (Rhino: Space
+                // == Enter on the command line). Folded into `enter` below, with
+                // the literal space filtered from the typed buffer.
+                i.key_pressed(egui::Key::Space),
             )
         });
+        // Tab accepts the current best keyword match on a guided keyword/branch
+        // step: type a prefix, Tab completes the buffer to the top match, Enter
+        // accepts. Only intercepted here while a guided keyword step is active
+        // (matches is `Some` only then), so other Tab behavior is untouched. Zero
+        // matches → no-op.
+        if tab
+            && guided_active
+            && let Some(best) = self
+                .guided
+                .current_keyword_matches()
+                .and_then(|m| m.first().copied())
+        {
+            self.guided.take_input();
+            for c in best.chars() {
+                self.guided.push_input(c);
+            }
+        }
+        // A guided flow that armed *this* frame set `guided_suppress_enter`: the
+        // Enter that submitted the bare verb in the command line is still down,
+        // and would otherwise auto-commit the first typed step at its default.
+        // Swallow exactly that one Enter (the latch only ever lives one frame —
+        // this drawing_input pass runs the same frame the tool armed, so a real
+        // Enter the user presses next frame still accepts the default).
+        let suppressed = std::mem::take(&mut self.guided_suppress_enter);
+        if suppressed {
+            enter = false;
+        }
+        // Space acts like Enter inside a guided flow OR a draw tool (Rhino
+        // parity): finish the cutter/removal phase, accept a keyword/number
+        // default, commit a typed coord, or finish a polyline/line/arc — whatever
+        // Enter would do. Excluded on a guided Text step (there a space is a
+        // literal character) and on the one suppressed arm-frame (same reason
+        // Enter is swallowed, so the first step isn't auto-committed). The literal
+        // space is filtered from the typed buffer below so it never lands in the
+        // step's/tool's input.
+        if space_acts_as_enter(
+            guided_active,
+            self.draw_tool.active(),
+            space,
+            suppressed,
+            self.guided.current_wants_text(),
+        ) {
+            enter = true;
+        }
         // F8 toggles persistent Ortho mid-pick (early_hotkeys skips drawing).
         if f8 {
             self.ortho = !self.ortho;
@@ -4987,10 +5593,13 @@ impl App {
             if !self.st_acquired.is_empty() {
                 self.st_acquired.clear();
                 self.st_dwell = None;
-                self.command_line.push_line("smarttrack: cleared");
+                self.command_line.push_line("smart guides: cleared");
                 return;
             }
             self.draw_tool.cancel();
+            self.guided.cancel();
+            self.trim_extend = false;
+            self.trim_apparent = true;
             self.st_acquired.clear();
             self.st_dwell = None;
             self.command_line.push_line("drawing cancelled");
@@ -5004,19 +5613,19 @@ impl App {
         }
         // Typed characters feed the numeric buffer; Backspace edits it
         // (keymap keeps delete-selection off while drawing).
+        // On a non-Text guided step or while a draw tool is active, a space is
+        // consumed as "advance/finish" (above), so drop the matching Text(" ")
+        // event here — otherwise it would also get typed into the buffer. Guided
+        // Text steps keep spaces as literals.
+        let suppress_space_char = (guided_active && !self.guided.current_wants_text())
+            || self.draw_tool.active();
         let typed: Vec<egui::Event> = ui.input(|i| {
             i.events
                 .iter()
-                .filter(|e| {
-                    matches!(
-                        e,
-                        egui::Event::Text(_)
-                            | egui::Event::Key {
-                                key: egui::Key::Backspace,
-                                pressed: true,
-                                ..
-                            }
-                    )
+                .filter(|e| match e {
+                    egui::Event::Text(t) => !(suppress_space_char && t == " "),
+                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => true,
+                    _ => false,
                 })
                 .cloned()
                 .collect()
@@ -5025,11 +5634,19 @@ impl App {
             match event {
                 egui::Event::Text(t) => {
                     for c in t.chars() {
-                        self.draw_tool.push_input(c);
+                        if guided_active {
+                            self.guided.push_input(c);
+                        } else {
+                            self.draw_tool.push_input(c);
+                        }
                     }
                 }
                 _ => {
-                    self.draw_tool.pop_input();
+                    if guided_active {
+                        self.guided.pop_input();
+                    } else {
+                        self.draw_tool.pop_input();
+                    }
                 }
             }
         }
@@ -5039,7 +5656,11 @@ impl App {
         let cursor_px = response
             .hover_pos()
             .or_else(|| response.interact_pointer_pos());
-        let last_point = self.draw_tool.last_point();
+        let last_point = if guided_active {
+            self.guided.last_point()
+        } else {
+            self.draw_tool.last_point()
+        };
         let snap_settings = self.snap_settings;
         let snap_hit = cursor_px.and_then(|pos| {
             // Screen-proximity cull: only objects whose projected AABB (grown by
@@ -5108,6 +5729,17 @@ impl App {
                 }
                 None => self.st_dwell = None,
             }
+            // Manual capture: `M` grabs the osnap point under the cursor now
+            // (Rhino's on-demand Mark), instead of waiting out the dwell.
+            if mark_key
+                && let Some((p, _)) = snap_hit
+            {
+                let dedup = st_tol.unwrap_or(0.001);
+                if self.st_acquired.acquire(p, dedup) {
+                    self.command_line.push_line("smart guides: point marked");
+                }
+                self.st_dwell = Some((p, std::time::Instant::now()));
+            }
         } else {
             self.st_dwell = None;
         }
@@ -5122,16 +5754,25 @@ impl App {
             let mut handled = false;
             if self.smarttrack
                 && let (Some(c), Some(tol)) = (cursor_world, st_tol)
-                && let Some(s) =
-                    crate::smarttrack::snap(&self.st_acquired, c, self.draw_tool.last_point(), tol)
             {
-                cursor_world = Some(s.snapped);
-                self.st_active_guides = s.active;
-                handled = true;
+                // Tangent/perpendicular tracking: gather osnap's perp-foot and
+                // tangent candidate POINTS near the cursor and turn each into an
+                // extra guide from an acquired point THROUGH that candidate, so
+                // the cursor can snap along a perp/tangent line to a nearby curve
+                // and to its intersections with other guides. smarttrack.rs stays
+                // pure; the curve access lives here.
+                let extra = self.st_extra_guides(cursor_px, view_proj, rect);
+                if let Some(s) =
+                    crate::smarttrack::snap(&self.st_acquired, c, last_point, tol, &extra)
+                {
+                    cursor_world = Some(s.snapped);
+                    self.st_active_guides = s.active;
+                    handled = true;
+                }
             }
             if !handled
                 && apply_ortho
-                && let (Some(last), Some(c)) = (self.draw_tool.last_point(), cursor_world)
+                && let (Some(last), Some(c)) = (last_point, cursor_world)
             {
                 cursor_world = Some(crate::precise::ortho_lock(last, c));
             }
@@ -5139,14 +5780,67 @@ impl App {
         self.status_snap = snap_hit.map(|(_, kind)| kind.label());
 
         if enter {
+            if guided_active {
+                if self.guided.current_wants_objects() {
+                    // A multi-object select (trim's cutter phase): Enter finishes
+                    // the set once at least `min` objects are picked.
+                    let r = self.guided.finish_objects();
+                    self.handle_guided(r);
+                    return;
+                }
+                if self.guided.current_wants_point_list() {
+                    // A variadic point list: a typed Enter first commits any typed
+                    // coord in the buffer (as one more point), then finishes the
+                    // list if it has enough points.
+                    let buffer = self.guided.take_input();
+                    if !buffer.is_empty() {
+                        match crate::precise::resolve_input(&buffer, last_point, cursor_world) {
+                            Ok(world) => {
+                                self.guided.push_list_point(world);
+                            }
+                            Err(e) => {
+                                self.command_line.push_line(format!("error: {e}"));
+                                return;
+                            }
+                        }
+                    }
+                    let r = self.guided.finish_list();
+                    let r = self.trim_extend_rewrite(r);
+                    self.handle_guided(r);
+                    return;
+                }
+                if self.guided.current_wants_text() {
+                    // A free-text step: commit_text reads the typed buffer
+                    // directly (rejects empty), so don't drain it first.
+                    let r = self.guided.commit_text();
+                    self.handle_guided(r);
+                    return;
+                }
+                let buffer = self.guided.take_input();
+                if self.guided.current_is_point() {
+                    // A point step: typed coords resolve to a pick; a bare Enter
+                    // needs a click, so an empty buffer is a no-op here.
+                    if !buffer.is_empty() {
+                        match crate::precise::resolve_input(&buffer, last_point, cursor_world) {
+                            Ok(world) => {
+                                let r = self.guided.on_click(world);
+                                self.handle_guided(r);
+                            }
+                            Err(e) => self.command_line.push_line(format!("error: {e}")),
+                        }
+                    }
+                } else {
+                    // Number / Integer / Keyword step: empty Enter accepts the
+                    // default, otherwise the typed buffer is parsed per kind.
+                    let r = self.guided.commit_typed(&buffer);
+                    self.handle_guided(r);
+                }
+                return;
+            }
             let buffer = self.draw_tool.take_input();
             if !buffer.is_empty() {
                 // Precise input: resolve the typed point, feed it as a pick.
-                match crate::precise::resolve_input(
-                    &buffer,
-                    self.draw_tool.last_point(),
-                    cursor_world,
-                ) {
+                match crate::precise::resolve_input(&buffer, last_point, cursor_world) {
                     Ok(world) => {
                         if let Some(cmd) = self.draw_tool.on_click(world) {
                             self.execute_line(cmd);
@@ -5163,7 +5857,164 @@ impl App {
             }
         }
 
+        // Guided object-pick step (Rhino GetObject): hit-test the click to an
+        // ObjectId, enforce the step's geometry filter, then commit it as a
+        // `#<id>` selector. Runs before the point/draw path since it needs the
+        // screen position, not a ground point. A DRAG here behaves like the
+        // pointer-tool's rubber box (window left→right, crossing right→left), but
+        // — because a guided object step fills exactly ONE role — resolves to the
+        // single best-matching object rather than a set.
+        if guided_active && (self.guided.current_wants_object() || self.guided.current_wants_objects())
+        {
+            let multi = self.guided.current_wants_objects();
+            // Arm the rubber-box anchor when a primary drag begins over the
+            // canvas. Reuses the same `box_drag` field the normal-mode drag path
+            // uses; that path is skipped whenever a tool/guided flow is active, so
+            // there is no double-fire.
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                self.box_drag = Some(pos);
+            }
+            // Mid-drag: draw the live rubber box; on release resolve it to one
+            // object filtered by the step. A plain click never sets `box_drag`, so
+            // it falls through to the single hit_object path below unchanged.
+            if let Some(start) = self.box_drag
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let mode = crate::boxsel::mode(start, pos);
+                let drag_rect = egui::Rect::from_two_pos(start, pos);
+                draw_rubber_box(&ui.painter_at(rect), drag_rect, mode, ui.visuals());
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    self.box_drag = None;
+                    // A drag smaller than this is a click with pointer jitter,
+                    // not a deliberate rubber box. Resolving it as a box is wrong
+                    // for a guided object step: the AABB box-select would grab
+                    // both of two crossing curves, so one click selects two (and
+                    // in trim marks both as cutters). Fall back to a single pick.
+                    const MIN_BOX_PX: f32 = 6.0;
+                    if drag_rect.width() < MIN_BOX_PX && drag_rect.height() < MIN_BOX_PX {
+                        let world = ground_point(view_proj, rect, pos);
+                        self.guided_single_pick(view_proj, rect, pos, world, multi);
+                    } else if multi {
+                        // Multi-object select (trim cutters): add ALL matches in the
+                        // region to the growing set, not just the nearest.
+                        let ids = self.guided_box_pick_all(view_proj, rect, drag_rect, mode);
+                        if ids.is_empty() {
+                            self.command_line
+                                .push_line("no matching object in that region — pick again");
+                        } else {
+                            for id in ids {
+                                self.session.doc.selection.insert(id);
+                                self.guided.push_selected_object(&id.short());
+                            }
+                            self.session.doc.generation += 1;
+                            // Re-show the prompt once with the updated running count.
+                            if let Some(prompt) = self.guided.prompt() {
+                                self.command_line.push_line(prompt);
+                            }
+                        }
+                    } else {
+                        match self.guided_box_pick(view_proj, rect, drag_rect, mode) {
+                            Some(id) => {
+                                // Highlight the pick; the emitted command references
+                                // it by id, so selection state doesn't affect
+                                // correctness.
+                                self.session.doc.selection.insert(id);
+                                self.session.doc.generation += 1;
+                                let short = id.short();
+                                // Capture the pick location (drag center → world)
+                                // when the step wants it (fillet corner selection).
+                                let pt = if self.guided.current_wants_object_point() {
+                                    ground_point(view_proj, rect, drag_rect.center())
+                                } else {
+                                    None
+                                };
+                                let r = self.guided.commit_object_at(&short, pt);
+                                self.handle_guided(r);
+                            }
+                            None => self
+                                .command_line
+                                .push_line("no matching object in that region — pick again"),
+                        }
+                    }
+                }
+                ui.ctx().request_repaint(); // live rubber box
+                return;
+            }
+            if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    self.guided_single_pick(view_proj, rect, pos, cursor_world, multi);
+                }
+                return;
+            }
+        }
+
+        // Guided variadic point-list step (trim's "click the parts to remove"):
+        // like the object-pick step, a DRAG is a rubber box — but here each curve
+        // the box catches contributes ONE interior removal point, so the user can
+        // window a batch of pieces at once (Rhino). A plain click still adds a
+        // single point (handled in the click path below).
+        if guided_active && self.guided.current_wants_point_list() {
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                self.box_drag = Some(pos);
+            }
+            if let Some(start) = self.box_drag
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let mode = crate::boxsel::mode(start, pos);
+                let drag_rect = egui::Rect::from_two_pos(start, pos);
+                draw_rubber_box(&ui.painter_at(rect), drag_rect, mode, ui.visuals());
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    self.box_drag = None;
+                    // Same click-vs-box guard as the object step: a sub-6px drag
+                    // is a jittery click, so add ONE point at the release instead
+                    // of running the box test.
+                    const MIN_BOX_PX: f32 = 6.0;
+                    if drag_rect.width() < MIN_BOX_PX && drag_rect.height() < MIN_BOX_PX {
+                        if let Some(world) = ground_point(view_proj, rect, pos) {
+                            let r = self.guided.push_list_point(world);
+                            self.handle_guided(r);
+                        }
+                    } else {
+                        let pts = self.guided_pointlist_box_pick(view_proj, rect, drag_rect, mode);
+                        if pts.is_empty() {
+                            self.command_line
+                                .push_line("no curve in that region — draw the box again");
+                        } else {
+                            for p in pts {
+                                self.guided.push_list_point(p);
+                            }
+                            // Re-show the prompt once with the updated running count.
+                            if let Some(prompt) = self.guided.prompt() {
+                                self.command_line.push_line(prompt);
+                            }
+                        }
+                    }
+                }
+                ui.ctx().request_repaint(); // live rubber box
+                return;
+            }
+        }
+
         if response.clicked() && let Some(world) = cursor_world {
+            if guided_active {
+                // Clicks only advance point steps; ignored on number steps so a
+                // stray click doesn't spam the prompt.
+                if self.guided.current_is_point() {
+                    let r = self.guided.on_click(world);
+                    self.handle_guided(r);
+                } else if self.guided.current_wants_point_list() {
+                    // A variadic point list: each click appends one point and
+                    // stays on the step (Enter finishes). Re-show the prompt with
+                    // the running count.
+                    let r = self.guided.push_list_point(world);
+                    self.handle_guided(r);
+                }
+                return;
+            }
             if let Some(cmd) = self.draw_tool.on_click(world) {
                 self.execute_line(cmd);
                 return;
@@ -5178,8 +6029,11 @@ impl App {
         // span past the origin covers the viewport in the top-ortho drafting view.
         let painter = ui.painter_at(rect);
         if self.smarttrack {
-            let guide_color = egui::Color32::from_rgba_unmultiplied(210, 210, 210, 170);
-            let guide_stroke = egui::Stroke::new(1.0, guide_color);
+            // Mirror Rhino: ACTIVE guides + the points feeding them are drawn in
+            // the highlight (blue) style; captured-but-inactive points sit as a
+            // muted gray cross until the cursor lines up with one.
+            let active_color = egui::Color32::from_rgb(90, 160, 255);
+            let guide_stroke = egui::Stroke::new(1.0, active_color.gamma_multiply(0.75));
             const SPAN: f64 = 1.0e6;
             for g in &self.st_active_guides {
                 let d = g.dir() * SPAN;
@@ -5192,19 +6046,29 @@ impl App {
                     painter.extend(dashed);
                 }
             }
-            // Acquired-point markers: a little cross/tick.
-            let mark_color = egui::Color32::from_rgb(230, 230, 230);
-            let mark_stroke = egui::Stroke::new(1.5, mark_color);
+            // Acquired-point markers: muted gray = captured/inactive; brighter
+            // blue = a guide through this point is active this frame.
+            let inactive_stroke = egui::Stroke::new(1.5, egui::Color32::from_gray(140));
+            let active_stroke = egui::Stroke::new(1.8, active_color);
+            let is_active = |pt: glam::DVec3| {
+                self.st_active_guides
+                    .iter()
+                    .any(|g| g.origin.distance(pt) < 1e-6)
+            };
             for &pt in self.st_acquired.points() {
                 if let Some(s) = project(view_proj, rect, pt) {
-                    let r = 4.0;
+                    let (r, stroke) = if is_active(pt) {
+                        (5.0, active_stroke)
+                    } else {
+                        (4.0, inactive_stroke)
+                    };
                     painter.line_segment(
                         [s + egui::vec2(-r, 0.0), s + egui::vec2(r, 0.0)],
-                        mark_stroke,
+                        stroke,
                     );
                     painter.line_segment(
                         [s + egui::vec2(0.0, -r), s + egui::vec2(0.0, r)],
-                        mark_stroke,
+                        stroke,
                     );
                 }
             }
@@ -5212,13 +6076,55 @@ impl App {
 
         // Ghost preview + prompt overlay
         let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 160, 255));
-        for strip in self.draw_tool.preview(cursor_world) {
+        let preview = if guided_active {
+            self.guided.preview(cursor_world)
+        } else {
+            self.draw_tool.preview(cursor_world)
+        };
+        for strip in preview {
             for pair in strip.windows(2) {
                 if let (Some(a), Some(b)) = (
                     project(view_proj, rect, pair[0]),
                     project(view_proj, rect, pair[1]),
                 ) {
                     painter.line_segment([a, b], stroke);
+                }
+            }
+        }
+
+        // Trim removal hover cue: during the "click parts to remove" phase, the
+        // pieces already clicked VANISH from the view (hidden in the scene
+        // snapshot, see the scene build) — Rhino's preview-delete. The only
+        // overlay here is a faint highlight of the piece UNDER THE CURSOR that the
+        // next click would remove, so the user can see the target before clicking.
+        if guided_active
+            && self.guided.active_verb() == Some("trim")
+            && self.guided.current_wants_point_list()
+            && !self.trim_extend
+            && let Some(c) = cursor_world
+        {
+            let cutters: Vec<itsjustcad_doc::ObjectId> = self
+                .guided
+                .collected_object_set()
+                .iter()
+                .filter_map(|tok| {
+                    let short = tok.strip_prefix('#').unwrap_or(tok);
+                    self.session.doc.find_named(short).first().copied()
+                })
+                .collect();
+            if !cutters.is_empty()
+                && let Some(piece) =
+                    itsjustcad_commands::trim_removed_piece(&self.session.doc, &cutters, c)
+            {
+                // Faint, slightly-thick ghost of the hovered piece.
+                let hint = egui::Stroke::new(3.0, egui::Color32::from_rgb(150, 150, 160));
+                for pair in piece.windows(2) {
+                    if let (Some(a), Some(b)) = (
+                        project(view_proj, rect, pair[0]),
+                        project(view_proj, rect, pair[1]),
+                    ) {
+                        painter.line_segment([a, b], hint);
+                    }
                 }
             }
         }
@@ -5256,7 +6162,12 @@ impl App {
                 color,
             );
         }
-        if let Some(prompt) = self.draw_tool.prompt() {
+        let overlay_prompt = if guided_active {
+            self.guided.prompt()
+        } else {
+            self.draw_tool.prompt()
+        };
+        if let Some(prompt) = overlay_prompt {
             painter.text(
                 rect.center_top() + egui::vec2(0.0, 28.0),
                 egui::Align2::CENTER_TOP,
@@ -5264,6 +6175,32 @@ impl App {
                 egui::TextStyle::Body.resolve(ui.style()),
                 ui.visuals().strong_text_color(),
             );
+            // Live type-ahead: below the prompt, paint the keyword matches
+            // filtered by the typed buffer so long catalogs (30+ sections) stay
+            // usable. The best (first) match is bracketed — the Tab/Enter target.
+            if guided_active && let Some(matches) = self.guided.current_keyword_matches() {
+                const MAX: usize = 8;
+                let shown = matches.iter().take(MAX).enumerate().map(|(i, m)| {
+                    if i == 0 {
+                        format!("[{m}]")
+                    } else {
+                        (*m).to_string()
+                    }
+                });
+                let mut line = shown.collect::<Vec<_>>().join("  ");
+                if matches.is_empty() {
+                    line = "(no match)".to_string();
+                } else if matches.len() > MAX {
+                    line.push_str(&format!("  +{} more", matches.len() - MAX));
+                }
+                painter.text(
+                    rect.center_top() + egui::vec2(0.0, 48.0),
+                    egui::Align2::CENTER_TOP,
+                    line,
+                    egui::TextStyle::Small.resolve(ui.style()),
+                    ui.visuals().weak_text_color(),
+                );
+            }
         }
         ui.ctx().request_repaint(); // live rubber-band
     }
@@ -5271,7 +6208,7 @@ impl App {
     /// Bottom strip: cursor coords, active layer, counts, snap state, view.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let doc = &self.session.doc;
-        let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
+        let cam = &self.cameras[self.effective_camera_index(self.active_pane)];
         ui.horizontal(|ui| {
             // Fixed-width slot for the x/y/z readout so growing coordinate values
             // never widen it and shift the rest of the status bar. The text is
@@ -5304,7 +6241,10 @@ impl App {
             // opens the modeless osnap popup (checkbox per kind). This is the
             // "click the osnap toolbar → popup" discoverability surface.
             let label = if self.snap_settings.master {
-                crate::statusbar::snap_label(self.draw_tool.active(), self.status_snap)
+                crate::statusbar::snap_label(
+                    self.draw_tool.active() || self.guided.active(),
+                    self.status_snap,
+                )
             } else {
                 format!("{}: {}", crate::i18n::t("osnap.label"), crate::i18n::t("osnap.off"))
             };
@@ -5340,9 +6280,9 @@ impl App {
             }
             if toggle_chip(
                 ui,
-                "smarttrack",
+                "smart guides",
                 self.smarttrack,
-                "Toggle SmartTrack construction guides",
+                "Toggle Smart Guides construction guides (dwell or M to capture a point)",
             ) {
                 self.smarttrack = !self.smarttrack;
                 save_smarttrack(self.smarttrack);
@@ -5369,7 +6309,7 @@ impl App {
             // still leaves egui's widget frame, which read as a wrong grey box).
             let (on_fill, on_txt) = crate::theme::viewport_active_tag(ui.visuals().dark_mode);
             let txt = if on { on_txt } else { ui.visuals().weak_text_color() };
-            let mut btn = egui::Button::new(egui::RichText::new("gumball").color(txt))
+            let mut btn = egui::Button::new(egui::RichText::new("handles").color(txt))
                 .frame(on)
                 .corner_radius(egui::CornerRadius::same(4));
             if on {
@@ -5377,7 +6317,7 @@ impl App {
             }
             if ui
                 .add(btn)
-                .on_hover_text("Toggle transform gizmo (G)")
+                .on_hover_text("Toggle Transform Handles (G)")
                 .clicked()
             {
                 self.show_gumball = !on;
@@ -5404,7 +6344,7 @@ impl App {
         let named: Vec<String> = self.session.doc.named_views.keys().cloned().collect();
         let roles = self.live_roles(ui.visuals().dark_mode);
         // Highlight the tab matching the active pane's current view.
-        let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
+        let cam = &self.cameras[self.effective_camera_index(self.active_pane)];
         let current = crate::statusbar::view_label(cam.yaw, cam.pitch, cam.ortho);
         let mut chosen: Option<String> = None;
         ui.horizontal(|ui| {
@@ -5435,7 +6375,7 @@ impl App {
             // right_to_left lays out in reverse, so paint them in reverse order
             // to read `ZE | Shaded▾ | ByLayer▾ | [1 2 4]` left→right.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let slot = self.layout.camera_index(self.active_pane);
+                let slot = self.effective_camera_index(self.active_pane);
                 // Layout 1/2/4 as a segmented control (single-select, equal-width).
                 let layout_variants =
                     [ViewportLayout::Single, ViewportLayout::Two, ViewportLayout::Four];
@@ -5498,10 +6438,19 @@ impl App {
         let aliases = self.active_aliases();
         let panel_h = ui.available_height();
         let last_verb = self.last_verb.clone();
-        if let Some(line) =
-            self.command_line
-                .ui(ui, &object_names, aliases, panel_h, last_verb.as_deref())
-        {
+        // While a guided flow OR a draw tool is running, the command line must NOT
+        // hijack a bare Space/Enter to re-run the last verb — those keys belong to
+        // the active flow (the viewport handler finishes the step/tool). Otherwise
+        // a Space meant to finish the verb would restart it.
+        let flow_active = self.guided.active() || self.draw_tool.active();
+        if let Some(line) = self.command_line.ui(
+            ui,
+            &object_names,
+            aliases,
+            panel_h,
+            last_verb.as_deref(),
+            flow_active,
+        ) {
             self.execute_line(line);
         }
     }
@@ -5757,6 +6706,13 @@ impl App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| {
+                // Guided command-options panel (Rhino-style): while a trim is in
+                // progress, the dock body shows the Trim panel INSTEAD of the
+                // normal tab content. The command-line prompts still work too.
+                if self.guided.active() && self.guided.active_verb() == Some("trim") {
+                    self.trim_command_panel(ui);
+                    return;
+                }
                 match self.panel_tabs.active() {
                     // Rhino-style "Model" workspace: Layers AND Properties shown
                     // together as stacked, independently-collapsible sections
@@ -6573,7 +7529,7 @@ impl App {
     fn view_state(&self) -> crate::menu::ViewState {
         use crate::menu::{CameraTag, DisplayModeTag, LightModeTag};
         use itsjustcad_render::{DisplayMode, LightMode, PanoProjection};
-        let disp = self.display_modes[self.layout.camera_index(self.active_pane)];
+        let disp = self.display_modes[self.effective_camera_index(self.active_pane)];
         let display = match disp {
             DisplayMode::Shaded => Some(DisplayModeTag::Shaded),
             DisplayMode::Wireframe => Some(DisplayModeTag::Wireframe),
@@ -6590,7 +7546,7 @@ impl App {
         // Camera projection of the focused viewport: pano/fisheye win (they
         // replace the pinhole entirely), then two-point, then plain
         // perspective; ortho standard views check nothing.
-        let cam = self.cameras[self.layout.camera_index(self.active_pane)];
+        let cam = self.cameras[self.effective_camera_index(self.active_pane)];
         let camera = if cam.ortho {
             None
         } else {
@@ -8226,6 +9182,22 @@ fn empty_deletable_layers(doc: &itsjustcad_doc::Document) -> Vec<String> {
         .collect()
 }
 
+/// Whether a Space press should act like Enter to finish/advance a step-based
+/// flow (Rhino: Space == Enter on the command line). True when Space was pressed,
+/// the one-frame arm suppression isn't in effect, and EITHER a guided flow is
+/// active on a non-Text step (a space is a literal character on a Text step) OR a
+/// draw tool is active (polyline/line/arc/… — these have no text entry, so Space
+/// always finishes like Enter).
+fn space_acts_as_enter(
+    guided_active: bool,
+    draw_active: bool,
+    space: bool,
+    suppressed: bool,
+    wants_text: bool,
+) -> bool {
+    space && !suppressed && ((guided_active && !wants_text) || draw_active)
+}
+
 /// Screen position -> point on the z=0 ground plane.
 fn ground_point(view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> Option<glam::DVec3> {
     let (origin, dir) = screen_ray(view_proj, rect, pos);
@@ -8273,6 +9245,60 @@ fn projected_rect(
     out
 }
 
+/// Chord tolerance for tessellating a curve into screen-space points. ONE source
+/// for both single-click pick and drag-box select so they agree on fidelity.
+const CURVE_SCREEN_TOL: f64 = 0.05;
+
+/// A curve's tessellated points projected to screen, CLOSURE-AWARE: for a closed
+/// curve (rectangle/polygon, full circle, ellipse) the first point is appended so
+/// the last→first (closing) segment exists. `Curve::tessellate` omits that vertex
+/// for closed curves, so without this both pick and box-select would miss a click
+/// or box on the closing edge. `None` entries are points behind the camera.
+/// Shared by `App::hit_object` (pick) and `obj_matches_box` (box-select) so the
+/// two never diverge on what a curve's screen footprint is.
+fn curve_screen_pts(
+    c: &kernel_curve::Curve,
+    view_proj: glam::Mat4,
+    rect: egui::Rect,
+) -> Vec<Option<egui::Pos2>> {
+    let mut pts: Vec<Option<egui::Pos2>> = c
+        .tessellate(CURVE_SCREEN_TOL)
+        .iter()
+        .map(|w| project(view_proj, rect, *w))
+        .collect();
+    if c.is_closed() && pts.len() >= 2 {
+        pts.push(pts[0]);
+    }
+    pts
+}
+
+/// Does an object's ACTUAL projected geometry match the drag box under `mode`?
+/// Curves are tested as their tessellated polyline (so a diagonal line isn't
+/// grabbed by a box that only overlaps its bounding-box corner — the reported
+/// bug); other geometry (meshes/solids) falls back to the projected-AABB rect
+/// test, which is adequate for their filled footprint.
+fn obj_matches_box(
+    geom: &itsjustcad_doc::Geometry,
+    view_proj: glam::Mat4,
+    rect: egui::Rect,
+    drag: egui::Rect,
+    mode: crate::boxsel::BoxMode,
+) -> bool {
+    use itsjustcad_doc::Geometry;
+    match geom {
+        Geometry::Curve(c) => {
+            crate::boxsel::box_select_polyline(&curve_screen_pts(c, view_proj, rect), drag, mode)
+        }
+        _ => match projected_rect(view_proj, rect, geom.aabb().min, geom.aabb().max) {
+            Some(r) => match mode {
+                crate::boxsel::BoxMode::Window => drag.contains_rect(r),
+                crate::boxsel::BoxMode::Crossing => drag.intersects(r),
+            },
+            None => false,
+        },
+    }
+}
+
 /// Rubber box: solid stroke for a window drag, dashed for a crossing drag.
 fn draw_rubber_box(
     painter: &egui::Painter,
@@ -8314,7 +9340,7 @@ impl eframe::App for App {
         // Pencil mode forces paper white regardless of the egui theme.
         // Use the active pane's display mode to drive the clear colour.
         let active_mode =
-            self.display_modes[self.layout.camera_index(self.active_pane)];
+            self.display_modes[self.effective_camera_index(self.active_pane)];
         if active_mode == itsjustcad_render::DisplayMode::Pencil {
             return itsjustcad_render::DisplayMode::pencil_background();
         }
@@ -8913,7 +9939,7 @@ impl eframe::App for App {
                 mods,
                 keymap::KeyContext {
                     typing,
-                    draw_active: self.draw_tool.active(),
+                    draw_active: self.draw_tool.active() || self.guided.active(),
                     has_selection: !self.session.doc.selection.is_empty(),
                     last_command: self.last_line.as_deref(),
                 },
@@ -9008,6 +10034,7 @@ impl eframe::App for App {
             || self.pending_nav.is_some();
         if !modal_open
             && !self.draw_tool.active()
+            && !self.guided.active()
             && !self.viewport_interacted
             && ctx.memory(|m| m.focused()).is_none()
         {
@@ -9085,6 +10112,52 @@ fn pano_from_view(v: itsjustcad_doc::PanoView) -> itsjustcad_render::PanoProject
 mod tests {
     use super::*;
     use itsjustcad_commands::registry;
+
+    #[test]
+    fn space_acts_as_enter_only_on_non_text_guided_steps() {
+        // Args: (guided_active, draw_active, space, suppressed, wants_text).
+        // In a guided flow on a non-Text step, Space advances like Enter.
+        assert!(space_acts_as_enter(true, false, true, false, false));
+        // Text step: Space stays a literal character, never advances.
+        assert!(!space_acts_as_enter(true, false, true, false, true));
+        // The one-frame arm suppression swallows Space too (no auto-skip of step 1).
+        assert!(!space_acts_as_enter(true, false, true, true, false));
+        // No flow at all: Space is never an advance here (command line handles it).
+        assert!(!space_acts_as_enter(false, false, true, false, false));
+        // No Space pressed: no-op.
+        assert!(!space_acts_as_enter(true, false, false, false, false));
+        // Draw tool active: Space finishes like Enter (no text entry, so wants_text
+        // is irrelevant on the draw path).
+        assert!(space_acts_as_enter(false, true, true, false, false));
+        assert!(space_acts_as_enter(false, true, true, false, true));
+        // Suppression still gates the draw path on the arm-frame.
+        assert!(!space_acts_as_enter(false, true, true, true, false));
+    }
+
+    #[test]
+    fn effective_cam_index_honors_maximize() {
+        // Not maximized: follows the layout's per-pane mapping.
+        assert_eq!(effective_cam_index(None, ViewportLayout::Four, 0), 1); // TL = Top
+        assert_eq!(effective_cam_index(None, ViewportLayout::Four, 1), 0); // TR = Persp
+        assert_eq!(effective_cam_index(None, ViewportLayout::Two, 1), 1);
+        // Maximized: every pane resolves to the stored slot, ignoring the layout.
+        assert_eq!(effective_cam_index(Some(3), ViewportLayout::Four, 0), 3);
+        assert_eq!(effective_cam_index(Some(2), ViewportLayout::Two, 0), 2);
+    }
+
+    #[test]
+    fn next_maximize_toggles_and_restores() {
+        // Double-click pane 2 in a Four layout (its cam slot is camera_index(2)=2,
+        // Front). Not yet maximized → maximize to that slot, activate pane 0,
+        // remember pane 2 to restore.
+        let slot = ViewportLayout::Four.camera_index(2);
+        let (m, active, restore) = next_maximize(None, 2, slot, 0);
+        assert_eq!((m, active, restore), (Some(slot), 0, 2));
+        // Double-click again (now maximized) → restore: clear override, re-activate
+        // the remembered pane (2), keep restore unchanged.
+        let (m2, active2, restore2) = next_maximize(m, 0, slot, restore);
+        assert_eq!((m2, active2, restore2), (None, 2, 2));
+    }
 
     #[test]
     fn shared_value_detects_agreement_and_mixed() {
@@ -9727,6 +10800,44 @@ mod tests {
 
     #[test]
     #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_space_finishes_polyline() {
+        // SPACE finishes a DRAW-TOOL verb exactly like Enter (Rhino parity): arm
+        // `polyline`, pick three points, then press SPACE (never Enter) to finish.
+        // Proves the draw-tool Space-as-Enter fold AND that the command line does
+        // not hijack the Space to re-run the verb mid-draw.
+        run_app_journey(|h| {
+            top_ortho_view(h);
+
+            submit_command(h, "polyline");
+            assert!(h.state().draw_tool.active(), "bare `polyline` armed the tool");
+
+            for (fx, fy) in [(0.4, 0.6), (0.6, 0.6), (0.6, 0.4)] {
+                let p = pane_point(h, fx, fy);
+                click_at(h, p);
+            }
+            assert!(h.state().draw_tool.active(), "three picks: still drawing");
+
+            // SPACE (not Enter, not C) finishes the open polyline and disarms.
+            h.key_press(egui::Key::Space);
+            h.run_steps(2);
+            assert!(
+                !h.state().draw_tool.active(),
+                "SPACE finished the polyline draw tool (like Enter)"
+            );
+
+            let doc = &h.state().session.doc;
+            assert_eq!(doc.objects().count(), 1, "SPACE committed one polyline");
+            match &doc.objects().next().unwrap().geometry {
+                itsjustcad_doc::Geometry::Curve(c) => {
+                    assert!(!c.is_closed(), "SPACE finishes an OPEN polyline (C closes)");
+                }
+                other => panic!("expected a Curve polyline, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
     fn journey_box_select_drag() {
         // Rubber-band box select: two boxes placed far apart on the ground, then
         // a left→right WINDOW drag tightly around ONE of them selects only that
@@ -9786,6 +10897,293 @@ mod tests {
                 sel.contains(&ids[1].0),
                 "crossing drag (right→left) selected the second box"
             );
+        });
+    }
+
+    #[test]
+    fn curve_screen_pts_closes_the_loop() {
+        // Identity view_proj → clip=(x,y,z,1), w=1, ndc=(x,y,z). In a 200×200
+        // rect, world (x,y,0) projects to ((x+1)*100, (1-y)*100).
+        let vp = glam::Mat4::IDENTITY;
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        let corners = vec![
+            glam::DVec3::new(-0.5, -0.5, 0.0),
+            glam::DVec3::new(0.5, -0.5, 0.0),
+            glam::DVec3::new(0.5, 0.5, 0.0),
+            glam::DVec3::new(-0.5, 0.5, 0.0),
+        ];
+        let closed = kernel_curve::Curve::Polyline { points: corners.clone(), closed: true };
+        let pts = curve_screen_pts(&closed, vp, rect);
+        // 4 vertices + appended first = 5, last repeats first (the closing vertex).
+        assert_eq!(pts.len(), 5, "closed curve appends the first point");
+        assert_eq!(pts[0], pts[4], "closing vertex repeats the first");
+        // Closing edge = last→first = the left side (x=-0.5 → screen x=50, y 50..150).
+        // Its midpoint world (-0.5,0,0) → screen (50,100): on the line only because
+        // the closing segment now exists.
+        let mid = egui::pos2(50.0, 100.0);
+        let d = crate::boxsel::dist_to_polyline(&pts, mid).unwrap();
+        assert!(d < 0.001, "click on the closing edge is on the line: {d}");
+        // The OPEN version lacks that edge, so the same click is far (~50px) — the
+        // append is exactly what fixes the closed-curve pick.
+        let open = kernel_curve::Curve::Polyline { points: corners, closed: false };
+        let open_pts = curve_screen_pts(&open, vp, rect);
+        assert_eq!(open_pts.len(), 4, "open curve is not closed");
+        let d_open = crate::boxsel::dist_to_polyline(&open_pts, mid).unwrap();
+        assert!(d_open > 40.0, "open square's missing left edge: click is far: {d_open}");
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_empty_click_deselects() {
+        // Rhino behavior: click an object to select it, then click EMPTY canvas
+        // space to DESELECT. The bug was that `hit_object` ray-tested the object
+        // AABB, so clicking empty space INSIDE a diagonal line's bounding box
+        // (but off the line) re-selected the line instead of deselecting.
+        run_app_journey(|h| {
+            submit_command(h, "line 0,0,0 10,10,0");
+            assert_eq!(h.state().session.doc.objects().count(), 1, "line drawn");
+            let id = h.state().session.doc.objects().next().unwrap().id;
+            top_ortho_view(h);
+
+            // Click ON the line's midpoint → selected.
+            let on_line = world_to_screen(h, glam::DVec3::new(5.0, 5.0, 0.0));
+            click_at(h, on_line);
+            assert!(
+                h.state().session.doc.selection.contains(&id),
+                "clicking on the line selected it"
+            );
+            // Click empty space INSIDE the line's bbox [0,10]² but far from the
+            // y=x line (8,2). Pre-fix this re-selected the line (AABB hit); now it
+            // must deselect.
+            click_at(h, world_to_screen(h, glam::DVec3::new(8.0, 2.0, 0.0)));
+            assert!(
+                h.state().session.doc.selection.is_empty(),
+                "empty click inside the line's bbox deselected (was the bug)"
+            );
+
+            // Sanity: re-select, then a far empty corner also deselects, with
+            // Transform Handles ON (gumball must not eat a clearly-empty click).
+            click_at(h, on_line);
+            assert!(h.state().session.doc.selection.contains(&id), "re-selected");
+            h.state_mut().show_gumball = true;
+            h.run_steps(2);
+            click_at(h, pane_point(h, 0.04, 0.04));
+            assert!(
+                h.state().session.doc.selection.is_empty(),
+                "empty corner click deselected (handles on)"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_click_closing_edge_of_rectangle_selects() {
+        // A rectangle is a CLOSED polyline; its 4th (closing) edge is the segment
+        // from the last vertex back to the first. `Curve::tessellate` omits that
+        // vertex, so before the closure-aware `curve_screen_pts` a click on the
+        // closing edge missed the rectangle entirely. Here the left edge (x=0,
+        // from the last corner (0,10) back to the first (0,0)) IS the closing
+        // segment; clicking its midpoint must select the rectangle.
+        run_app_journey(|h| {
+            submit_command(h, "rect 0,0,0 10 10");
+            assert_eq!(h.state().session.doc.objects().count(), 1, "rectangle drawn");
+            let id = h.state().session.doc.objects().next().unwrap().id;
+            top_ortho_view(h);
+
+            // Midpoint of the CLOSING edge (left side, x=0, y=5).
+            click_at(h, world_to_screen(h, glam::DVec3::new(0.0, 5.0, 0.0)));
+            assert!(
+                h.state().session.doc.selection.contains(&id),
+                "clicking the rectangle's closing edge selected it"
+            );
+            // Interior click (center, off every wireframe edge) deselects — the
+            // rectangle is an outline, not a filled face.
+            click_at(h, world_to_screen(h, glam::DVec3::new(5.0, 5.0, 0.0)));
+            assert!(
+                h.state().session.doc.selection.is_empty(),
+                "clicking the hollow interior deselected"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_perspective_box_select_excludes_outside_line() {
+        // Regression: in PERSPECTIVE, a rubber box placed over a diagonal line's
+        // bounding-box CORNER — where the line does NOT pass — must select
+        // NOTHING. The old test used the object's projected AABB rect, which a
+        // corner box overlaps, so it wrongly selected the line. We now test the
+        // actual projected polyline. Positions come from `world_to_screen` (the
+        // live view_proj), so they are accurate despite perspective foreshortening.
+        run_app_journey(|h| {
+            submit_command(h, "line -6,-6,0 6,6,0");
+            let ids: Vec<_> = h.state().session.doc.objects().map(|o| o.id).collect();
+            assert_eq!(ids.len(), 1, "one diagonal line drawn");
+            let line = ids[0];
+
+            submit_command(h, "perspective");
+            submit_command(h, "ze");
+            h.run_steps(2);
+
+            let (rect, view_proj) = active_viewport(h);
+            let aabb_rect = projected_rect(
+                view_proj,
+                rect,
+                glam::DVec3::new(-6.0, -6.0, 0.0),
+                glam::DVec3::new(6.0, 6.0, 0.0),
+            )
+            .expect("line AABB projects in front of the camera");
+
+            // The line is x=y, so world (5,-5,0) is far OFF it but still inside its
+            // AABB — its projection lands inside the projected AABB rect (which the
+            // old code tested) yet nowhere near the actual line. A box here is the
+            // reported bug: overlaps the AABB corner, misses the geometry.
+            let half = 12.0;
+            let off_line = world_to_screen(h, glam::DVec3::new(5.0, -5.0, 0.0));
+            let empty_box =
+                egui::Rect::from_center_size(off_line, egui::vec2(2.0 * half, 2.0 * half))
+                    .intersect(rect);
+            assert!(
+                aabb_rect.intersects(empty_box),
+                "the empty box overlaps the line's projected AABB (so the OLD code would mis-select)"
+            );
+
+            // Right→left CROSSING drag over the empty region → selects NOTHING.
+            drag(h, empty_box.right_bottom(), empty_box.left_top());
+            assert!(
+                h.state().session.doc.selection.is_empty(),
+                "a box overlapping only the line's AABB (not the line) must NOT select it"
+            );
+
+            // A CROSSING drag over a box ON the line (its midpoint) selects it.
+            let mid = world_to_screen(h, glam::DVec3::new(0.0, 0.0, 0.0));
+            let on_line =
+                egui::Rect::from_center_size(mid, egui::vec2(2.0 * half, 2.0 * half)).intersect(rect);
+            drag(h, on_line.right_bottom(), on_line.left_top());
+            assert!(
+                h.state().session.doc.selection.contains(&line),
+                "a box over the line itself DOES select it"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_guided_object_pick_drag() {
+        // Guided SelectObject via a DRAG (not just a click): arm `trim` (first
+        // step is `Select object to trim`), then window-drag a rubber box tightly
+        // around a single box. The region resolves to that one object, the guided
+        // step commits it, and the tool advances to its NEXT step (still active,
+        // now asking for the cutting object) — proving the drag path fed the pick.
+        run_app_journey(|h| {
+            submit_command(h, "box 0,0,0 2,2,2");
+            submit_command(h, "box 4,0,0 6,2,2");
+            let ids: Vec<_> = h
+                .state()
+                .session
+                .doc
+                .objects()
+                .map(|o| (o.id, o.geometry.aabb()))
+                .collect();
+            assert_eq!(ids.len(), 2, "two boxes drawn");
+
+            // Stable, size-independent projection (see `top_ortho_view`).
+            top_ortho_view(h);
+
+            // Arm the guided verb. `trim` needs no pre-selection; its first step
+            // is a SelectObject, so the canvas now wants an object pick.
+            submit_command(h, "trim");
+            assert!(h.state().guided.active(), "bare `trim` armed the guided flow");
+            assert!(
+                h.state().guided.current_wants_objects(),
+                "the first trim step is a SelectObjects (cutters) multi-pick"
+            );
+
+            // Window-drag (left→right) tightly around the FIRST box, expanded past
+            // it so it is fully enclosed but the second box is untouched.
+            let (rect, view_proj) = active_viewport(h);
+            let bb0 = ids[0].1;
+            let r0 = projected_rect(view_proj, rect, bb0.min, bb0.max)
+                .expect("box 0 projects in front of camera")
+                .expand(24.0)
+                .intersect(rect);
+            drag(h, r0.left_top(), r0.right_bottom());
+
+            // The drag resolved to exactly the enclosed box: it is highlighted
+            // and added to the cutter SET. A multi-object SelectObjects step
+            // STAYS put (Enter/Space finishes it), so the flow is still on the
+            // same cutters step — not advanced.
+            assert!(
+                h.state().session.doc.selection.contains(&ids[0].0),
+                "the dragged box was picked and highlighted"
+            );
+            assert!(
+                h.state().guided.active(),
+                "trim still active after adding a cutter (awaiting Enter/more cutters)"
+            );
+            assert!(
+                h.state().guided.current_wants_objects(),
+                "still on the SelectObjects cutters step (multi-select stays until Enter)"
+            );
+            assert_eq!(
+                h.state().guided.selected_count(),
+                1,
+                "exactly the one dragged box is in the cutter set"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_space_finishes_guided_trim() {
+        // Rhino parity: SPACE finishes/advances a guided verb exactly like Enter.
+        // Two crossing lines; trim both as mutual cutters, then click the overhang
+        // and SPACE to commit. Each phase is finished with Space, never Enter.
+        run_app_journey(|h| {
+            submit_command(h, "line 0,0 10,10");
+            submit_command(h, "line 0,10 10,0");
+            assert_eq!(h.state().session.doc.objects().count(), 2, "two lines drawn");
+            top_ortho_view(h);
+
+            submit_command(h, "trim");
+            assert!(h.state().guided.current_wants_objects(), "phase 1: pick cutters");
+
+            // Pick both lines as cutters (clicks land on each line, away from the
+            // (5,5) crossing so each resolves to a distinct line).
+            // A crossing drag (right→left) over the scene catches BOTH lines as
+            // cutters in one gesture: each line's AABB spans the whole drawing, so
+            // the box intersects both (also how a user grabs two crossing lines).
+            let tl = pane_point(h, 0.3, 0.3);
+            let br = pane_point(h, 0.7, 0.7);
+            drag(h, br, tl); // start-right → end-left = crossing
+            let n = h.state().guided.selected_count();
+            assert_eq!(n, 2, "both lines picked as cutters, got {n}");
+
+            // SPACE (not Enter) finishes the cutter phase → advance to removals.
+            h.key_press(egui::Key::Space);
+            h.run_steps(2);
+            assert!(
+                h.state().guided.current_wants_point_list(),
+                "SPACE finished the cutter phase and advanced to parts-to-remove"
+            );
+
+            // Click the overhang of line A past the crossing (8,8), then SPACE to
+            // commit the whole trim verb.
+            click_at(h, world_to_screen(h, glam::DVec3::new(8.0, 8.0, 0.0)));
+            h.key_press(egui::Key::Space);
+            h.run_steps(2);
+            assert!(
+                !h.state().guided.active(),
+                "SPACE committed the trim — the guided verb finished (like Enter)"
+            );
+            // The trim actually ran: line A's overhang past the (5,5) crossing was
+            // dropped, so its survivor's bounding box now tops out at (5,5) —
+            // neither original line had that aabb max before the trim.
+            let trimmed = h.state().session.doc.objects().any(|o| {
+                let m = o.geometry.aabb().max;
+                (m.x - 5.0).abs() < 1e-6 && (m.y - 5.0).abs() < 1e-6
+            });
+            assert!(trimmed, "line A was trimmed back to the (5,5) crossing");
         });
     }
 

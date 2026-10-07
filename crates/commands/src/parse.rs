@@ -183,6 +183,109 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 depth: number(depth)?,
             })
         }
+        "diagrid" => {
+            let [nx, ny, width, height] =
+                take::<4>("diagrid", "nx, ny, a width and a height", &args)?;
+            Ok(Command::Diagrid {
+                id: None,
+                nx: integer(nx, "diagrid")?,
+                ny: integer(ny, "diagrid")?,
+                width: number(width)?,
+                height: number(height)?,
+            })
+        }
+        "reciprocal" => {
+            let [count, radius, length] =
+                take::<3>("reciprocal", "a member count, a radius and a length", &args)?;
+            Ok(Command::Reciprocal {
+                id: None,
+                count: integer(count, "reciprocal")?,
+                radius: number(radius)?,
+                length: number(length)?,
+            })
+        }
+        "waffle" => {
+            let [nx, ny, width, length, depth] =
+                take::<5>("waffle", "nx, ny, a width, a length and a depth", &args)?;
+            Ok(Command::Waffle {
+                id: None,
+                nx: integer(nx, "waffle")?,
+                ny: integer(ny, "waffle")?,
+                width: number(width)?,
+                length: number(length)?,
+                depth: number(depth)?,
+            })
+        }
+        "voronoishell" => {
+            // voronoishell <cells> <width> <length> [seed]
+            let (cells, width, length, seed) = match args.as_slice() {
+                [c, w, l] => (c, w, l, None),
+                [c, w, l, s] => (c, w, l, Some(integer_signed(s, "voronoishell")?)),
+                _ => {
+                    return wrong(
+                        "voronoishell",
+                        "a cell count, a width, a length and an optional seed",
+                        &args,
+                    )
+                }
+            };
+            Ok(Command::VoronoiShell {
+                id: None,
+                cells: integer(cells, "voronoishell")?,
+                width: number(width)?,
+                length: number(length)?,
+                seed,
+            })
+        }
+        "schwedler" => {
+            // schwedler <meridians> <rings> <radius> [dome|full]
+            let (mer, rings, radius, mode) = match args.as_slice() {
+                [m, r, rad] => (m, r, rad, None),
+                [m, r, rad, mode] => (m, r, rad, Some(*mode)),
+                _ => {
+                    return wrong(
+                        "schwedler",
+                        "meridians, rings, a radius and an optional dome|full",
+                        &args,
+                    )
+                }
+            };
+            let full = match mode {
+                None | Some("dome") => false,
+                Some("full") | Some("sphere") => true,
+                Some(_) => return wrong("schwedler", "dome or full as the fourth argument", &args),
+            };
+            Ok(Command::Schwedler {
+                id: None,
+                meridians: integer(mer, "schwedler")?,
+                rings: integer(rings, "schwedler")?,
+                radius: number(radius)?,
+                full,
+            })
+        }
+        "catenaryvault" => {
+            // catenaryvault <span> <length> <rise> [nu] [nv]
+            let (span, length, rise, nu, nv) = match args.as_slice() {
+                [s, l, r] => (s, l, r, None, None),
+                [s, l, r, nu] => (s, l, r, Some(integer(nu, "catenaryvault")?), None),
+                [s, l, r, nu, nv] => (
+                    s,
+                    l,
+                    r,
+                    Some(integer(nu, "catenaryvault")?),
+                    Some(integer(nv, "catenaryvault")?),
+                ),
+                _ => return wrong("catenaryvault", "span, length, rise and optional nu, nv", &args),
+            };
+            Ok(Command::CatenaryVault {
+                id: None,
+                span: number(span)?,
+                length: number(length)?,
+                rise: number(rise)?,
+                nu,
+                nv,
+            })
+        }
         "hypar" => {
             // hypar <a> <b> <c> [nu] [nv]
             let (a, b, c, nu, nv) = match args.as_slice() {
@@ -696,9 +799,10 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             // definition ("section <name> rect|circle|iwf|pipe ...") and the
             // mesh plane-cut ("section <selector> <point> <normal>"). Disambiguate
             // on the shape keyword in the second position.
-            const SHAPES: [&str; 13] = [
+            const SHAPES: [&str; 21] = [
                 "rect", "rectangular", "circle", "circular", "iwf", "wideflange", "pipe",
                 "square", "timber", "glulam", "clt", "guadua", "bamboo",
+                "tee", "channel", "upn", "angle", "l", "hss", "shs", "rhs",
             ];
             if args.get(1).is_some_and(|t| SHAPES.contains(t)) {
                 return parse_section(&args);
@@ -898,6 +1002,11 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             expect_empty("flatten", rest, &args)?;
             Ok(Command::Flatten { targets: sel })
         }
+        "explode" => {
+            let (sel, rest) = selector(&args, "explode")?;
+            expect_empty("explode", rest, &args)?;
+            Ok(Command::Explode { ids: None, targets: sel })
+        }
         "stretch" => {
             let (sel, rest) = selector(&args, "stretch")?;
             let [min, max, delta] = take::<3>(
@@ -974,12 +1083,24 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             Ok(Command::DimRadius { id: None, target: sel, diameter: true })
         }
         "offset" => with_last_backtrack(&args, "offset", |sel, rest, args| {
-            let [dist] = take::<1>("offset", "a distance after the selector", rest)
-                .map_err(|_| wrong_err("offset", "a distance after the selector", args))?;
+            // `offset <sel> <dist> [side]` — the optional side point (guided /
+            // Rhino side-pick) is resolved to a sign by the executor.
+            let (dist, side) = match rest {
+                [d] => (*d, None),
+                [d, p] => (*d, Some(point(p)?)),
+                _ => {
+                    return Err(wrong_err(
+                        "offset",
+                        "a distance (and optional side point) after the selector",
+                        args,
+                    ));
+                }
+            };
             Ok(Command::Offset {
                 id: None,
                 target: sel,
                 distance: number(dist)?,
+                side,
             })
         }),
         "split" => {
@@ -988,13 +1109,12 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 .map_err(|_| wrong_err("split", "a point after the selector", &args))?;
             Ok(Command::Split { ids: None, target: sel, point: point(p)? })
         }
-        "trim" => {
-            let (target, rest) = selector(&args, "trim")?;
-            let (cutter, rest) = selector(rest, "trim")?;
-            let [keep] = take::<1>("trim", "a keep point after the two selectors", rest)
-                .map_err(|_| wrong_err("trim", "a keep point after the two selectors", &args))?;
-            Ok(Command::Trim { id: None, target, cutter, keep: point(keep)? })
-        }
+        "divide" => with_last_backtrack(&args, "divide", |sel, rest, args| {
+            let [n] = take::<1>("divide", "a segment count after the selector", rest)
+                .map_err(|_| wrong_err("divide", "a segment count after the selector", args))?;
+            Ok(Command::Divide { id: None, target: sel, count: integer(n, "divide")? })
+        }),
+        "trim" => trim_command(&args),
         "powertrim" => {
             let (target, rest) = selector(&args, "powertrim")?;
             let [pick] = take::<1>("powertrim", "a pick point after the selector", rest)
@@ -1013,16 +1133,34 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }
         "fillet" => {
             let (a, rest) = selector(&args, "fillet")?;
-            match rest {
-                // "fillet last 2 0.5": one selector naming both curves.
-                [r] => Ok(Command::Fillet { id: None, a: a.clone(), b: a, radius: number(r)? }),
+            // Two-selector form unless the next token already parses as the radius
+            // (single-selector form `fillet last 2 0.5`, a == b).
+            let (a, b, rest) = match rest.first() {
+                Some(tok) if number(tok).is_ok() => (a.clone(), a, rest),
                 _ => {
                     let (b, rest) = selector(rest, "fillet")?;
-                    let [r] = take::<1>("fillet", "a radius after the selectors", rest)
+                    (a, b, rest)
+                }
+            };
+            let (&r, rest) = rest
+                .split_first()
+                .ok_or_else(|| wrong_err("fillet", "a radius after the selectors", &args))?;
+            let radius = number(r)?;
+            let (at, trim, join) = parse_fillet_options(rest, &args)?;
+            Ok(Command::Fillet { id: None, a, b, radius, at, trim, join })
+        }
+        "chamfer" => {
+            let (a, rest) = selector(&args, "chamfer")?;
+            match rest {
+                // "chamfer last 2 0.5": one selector naming both curves.
+                [d] => Ok(Command::Chamfer { id: None, a: a.clone(), b: a, dist: number(d)? }),
+                _ => {
+                    let (b, rest) = selector(rest, "chamfer")?;
+                    let [d] = take::<1>("chamfer", "a distance after the selectors", rest)
                         .map_err(|_| {
-                            wrong_err("fillet", "a radius after the selectors", &args)
+                            wrong_err("chamfer", "a distance after the selectors", &args)
                         })?;
-                    Ok(Command::Fillet { id: None, a, b, radius: number(r)? })
+                    Ok(Command::Chamfer { id: None, a, b, dist: number(d)? })
                 }
             }
         }
@@ -2217,10 +2355,32 @@ fn parse_section(args: &[&str]) -> Result<Command, ParseError> {
         ["guadua", d, t] | ["bamboo", d, t] => {
             StructSection::Guadua { d: number(d)?, t: number(t)? }
         }
+        ["tee", d, bf, tf, tw] => StructSection::Tee {
+            d: number(d)?,
+            bf: number(bf)?,
+            tf: number(tf)?,
+            tw: number(tw)?,
+        },
+        ["channel", d, bf, tf, tw] | ["upn", d, bf, tf, tw] => StructSection::Channel {
+            d: number(d)?,
+            bf: number(bf)?,
+            tf: number(tf)?,
+            tw: number(tw)?,
+        },
+        ["angle", a, b, t] | ["l", a, b, t] => StructSection::Angle {
+            a: number(a)?,
+            b: number(b)?,
+            t: number(t)?,
+        },
+        ["hss", w, h, t] | ["shs", w, h, t] | ["rhs", w, h, t] => StructSection::Hss {
+            w: number(w)?,
+            h: number(h)?,
+            t: number(t)?,
+        },
         _ => {
             return wrong(
                 "section",
-                "a name then rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t> | timber <w> <h> | guadua <d> <t>",
+                "a name then rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t> | timber <w> <h> | guadua <d> <t> | tee <d> <bf> <tf> <tw> | channel <d> <bf> <tf> <tw> | angle <a> <b> <t> | hss <w> <h> <t>",
                 args,
             )
         }
@@ -3115,6 +3275,11 @@ fn integer(s: &str, _command: &'static str) -> Result<u32, ParseError> {
     s.parse::<u32>().map_err(|_| ParseError::BadNumber(s.to_string()))
 }
 
+/// A signed integer argument (e.g. a PRNG seed, which may be negative).
+fn integer_signed(s: &str, _command: &'static str) -> Result<i64, ParseError> {
+    s.parse::<i64>().map_err(|_| ParseError::BadNumber(s.to_string()))
+}
+
 /// `gridshell hypar <a> <b> <c> [nu] [nv]` | `gridshell vault <span> <length>
 /// <rise> [undulate] [nu] [nv]`.
 fn parse_gridshell(args: &[&str]) -> Result<Command, ParseError> {
@@ -3633,6 +3798,55 @@ fn scale_denominator(s: &str) -> Result<f64, ParseError> {
 }
 
 /// Parse a selector from the front of `args`, returning the rest.
+/// Parse the optional trailing `fillet` clauses: `[at <ptA> <ptB>] [trim yes|no]
+/// [join yes|no]`, in any order. Returns `(at, trim, join)` with Rhino defaults
+/// (trim=true, join=false) for absent clauses.
+/// `(at pick points, trim flag, join flag)` parsed from the trailing clauses.
+type FilletOptions = (Option<(DVec3, DVec3)>, bool, bool);
+
+fn parse_fillet_options(mut rest: &[&str], args: &[&str]) -> Result<FilletOptions, ParseError> {
+    let mut at = None;
+    let mut trim = true;
+    let mut join = false;
+    let yes_no = |v: &str| -> Result<bool, ParseError> {
+        match v.to_ascii_lowercase().as_str() {
+            "yes" | "on" | "true" | "1" | "y" => Ok(true),
+            "no" | "off" | "false" | "0" | "n" => Ok(false),
+            _ => Err(wrong_err("fillet", "yes or no", args)),
+        }
+    };
+    while let Some((&key, tail)) = rest.split_first() {
+        if key.eq_ignore_ascii_case("at") {
+            match tail {
+                [pa, pb, more @ ..] => {
+                    at = Some((point(pa)?, point(pb)?));
+                    rest = more;
+                }
+                _ => return Err(wrong_err("fillet", "two pick points after 'at'", args)),
+            }
+        } else if key.eq_ignore_ascii_case("trim") {
+            match tail {
+                [v, more @ ..] => {
+                    trim = yes_no(v)?;
+                    rest = more;
+                }
+                _ => return Err(wrong_err("fillet", "yes or no after 'trim'", args)),
+            }
+        } else if key.eq_ignore_ascii_case("join") {
+            match tail {
+                [v, more @ ..] => {
+                    join = yes_no(v)?;
+                    rest = more;
+                }
+                _ => return Err(wrong_err("fillet", "yes or no after 'join'", args)),
+            }
+        } else {
+            return Err(wrong_err("fillet", "at / trim / join", args));
+        }
+    }
+    Ok((at, trim, join))
+}
+
 fn selector<'a>(
     args: &'a [&'a str],
     command: &'static str,
@@ -3652,6 +3866,15 @@ fn selector<'a>(
         }
         "all" => Ok((Selector::All, rest)),
         "sel" | "selected" => Ok((Selector::Selected, rest)),
+        // Explicit `name:<n>` / `id:<n>` prefixes (as written in command help and
+        // examples, e.g. `loft name:rings guides name:rail`). Strip the prefix
+        // and resolve by name-or-short-id through `find_named`.
+        tok if tok.starts_with("name:") && tok.len() > 5 => {
+            Ok((Selector::Named { name: tok[5..].to_string() }, rest))
+        }
+        tok if tok.starts_with("id:") && tok.len() > 3 => {
+            Ok((Selector::Named { name: tok[3..].to_string() }, rest))
+        }
         name if name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '#') => Ok((
             Selector::Named {
                 name: name.trim_start_matches('#').to_string(),
@@ -3660,6 +3883,45 @@ fn selector<'a>(
         )),
         other => Err(ParseError::BadSelector(other.to_string())),
     }
+}
+
+/// Parse a Rhino two-phase `trim`:
+/// `trim <cutter…> remove <p…>` or `trim <cutter…> extend <p…>`.
+///
+/// The cutters are a run of selector tokens (typically `#<id>`) up to the literal
+/// `remove` or `extend` keyword; everything after is the run of removal/extend
+/// points. Requires at least one cutter and at least one point.
+fn trim_command(args: &[&str]) -> Result<Command, ParseError> {
+    // Find the mode keyword splitting cutters from points.
+    let split = args
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case("remove") || t.eq_ignore_ascii_case("extend"));
+    let Some(kw_at) = split else {
+        return Err(wrong_err(
+            "trim",
+            "cutter selectors, then 'remove' (or 'extend'), then points",
+            args,
+        ));
+    };
+    let extend = args[kw_at].eq_ignore_ascii_case("extend");
+    let cutter_toks = &args[..kw_at];
+    let point_toks = &args[kw_at + 1..];
+    if cutter_toks.is_empty() {
+        return Err(wrong_err("trim", "at least one cutter selector before the keyword", args));
+    }
+    if point_toks.is_empty() {
+        return Err(wrong_err("trim", "at least one point after the keyword", args));
+    }
+    // Each cutter token is its own single selector (so `#a #b` → two selectors).
+    let mut cutters = Vec::with_capacity(cutter_toks.len());
+    for tok in cutter_toks {
+        cutters.push(selector_one(tok)?);
+    }
+    let mut removes = Vec::with_capacity(point_toks.len());
+    for tok in point_toks {
+        removes.push(point(tok)?);
+    }
+    Ok(Command::Trim { ids: None, cutters, removes, extend })
 }
 
 pub(crate) fn selector_one(s: &str) -> Result<Selector, ParseError> {
@@ -3922,6 +4184,79 @@ fn levenshtein(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
 
+    /// Guided-engine emitted strings for the zero-step and object-pick verbs
+    /// must all `parse()` cleanly — this guards the engine ↔ parser contract.
+    #[test]
+    fn name_and_id_selector_prefixes_resolve() {
+        use crate::Selector;
+        // `name:<n>` strips the prefix → Named{n} (the documented form).
+        assert!(matches!(
+            selector(&["name:rings"], "t").unwrap().0,
+            Selector::Named { name } if name == "rings"
+        ));
+        assert!(matches!(
+            selector(&["id:a1b2c3d4"], "t").unwrap().0,
+            Selector::Named { name } if name == "a1b2c3d4"
+        ));
+        // The documented multi-selector examples now parse.
+        assert!(parse("loft name:rings guides name:rail").is_ok());
+        assert!(parse("constrain perpendicular name:l1 name:l2").is_ok());
+        assert!(parse("blend name:top name:bottom 1.5").is_ok());
+        // A bare name still works; `name:` with nothing after is treated literally.
+        assert!(matches!(
+            selector(&["rings"], "t").unwrap().0,
+            Selector::Named { name } if name == "rings"
+        ));
+    }
+
+    #[test]
+    fn guided_emitted_strings_round_trip() {
+        for s in [
+            "dimradius sel",
+            "dimdiameter sel",
+            "join sel",
+            "arraycurve sel #aaaa1111 5",
+            "divide sel 8",
+            "tozero sel",
+            "flatten sel",
+            // Text / PointList step kinds (guided engine v2).
+            "interpcurve 0,0 1,0 1,1",
+            "name sel widget",
+            "layer walls",
+            "block sel door",
+            "insert door 3,3",
+            // AEC / structural group (guided engine v3).
+            "beam 0,0,0 0,0,3 w12",
+            "column 0,0,0 0,0,3 w12",
+            "wall 0,0 5,0 5,5 thick 0.2",
+            "slab 0,0 5,0 5,5 thick 0.3",
+            "support 0,0,0 pinned",
+            "story L1 0 height 3",
+            "room #aaaa1111 office",
+            "minsurf #aaaa1111",
+            "funicular 0,0,0 5,0,0",
+            "cablenet 0,0 5,0 5,5 0,5",
+            "tensegrity 6",
+            "spaceframe 6 4 3 1.5",
+            "diagrid 6 10 20 40",
+            "reciprocal 8 3 4",
+            "waffle 5 8 10 16 1",
+            "voronoishell 24 20 20 1",
+            "schwedler 12 6 8 dome",
+            "catenaryvault 8 12 4",
+            "geodesic 3 5 dome",
+            // Branch / Vector step kinds (guided engine v4).
+            "gridshell hypar 4 4 2",
+            "gridshell vault 10 20 3",
+            "support 0,0,0 roller 0,0,1",
+            "load point 0,0,0 5 0,0,-1",
+            "load line 0,0 5,0 5 0,0,-1",
+            "load area 0,0 5,0 5,5 end 3 0,0,-1",
+        ] {
+            assert!(parse(s).is_ok(), "guided-emitted string failed to parse: {s}");
+        }
+    }
+
     #[test]
     fn parse_box() {
         let cmd = parse("box 0,0,0 5,5,3").unwrap();
@@ -3986,6 +4321,57 @@ mod tests {
         assert_eq!(
             parse("spaceframe 6 4 3 1.5").unwrap(),
             Command::SpaceFrame { id: None, nx: 6, ny: 4, bay: 3.0, depth: 1.5 }
+        );
+    }
+
+    #[test]
+    fn parse_diagrid_reciprocal_waffle() {
+        assert_eq!(
+            parse("diagrid 6 10 20 40").unwrap(),
+            Command::Diagrid { id: None, nx: 6, ny: 10, width: 20.0, height: 40.0 }
+        );
+        assert_eq!(
+            parse("reciprocal 8 3 4").unwrap(),
+            Command::Reciprocal { id: None, count: 8, radius: 3.0, length: 4.0 }
+        );
+        assert_eq!(
+            parse("waffle 5 8 10 16 1").unwrap(),
+            Command::Waffle { id: None, nx: 5, ny: 8, width: 10.0, length: 16.0, depth: 1.0 }
+        );
+    }
+
+    #[test]
+    fn parse_voronoishell_schwedler_catenaryvault() {
+        assert_eq!(
+            parse("voronoishell 24 20 20").unwrap(),
+            Command::VoronoiShell { id: None, cells: 24, width: 20.0, length: 20.0, seed: None }
+        );
+        assert_eq!(
+            parse("voronoishell 30 10 12 7").unwrap(),
+            Command::VoronoiShell { id: None, cells: 30, width: 10.0, length: 12.0, seed: Some(7) }
+        );
+        assert_eq!(
+            parse("schwedler 12 6 8").unwrap(),
+            Command::Schwedler { id: None, meridians: 12, rings: 6, radius: 8.0, full: false }
+        );
+        assert_eq!(
+            parse("schwedler 8 4 5 full").unwrap(),
+            Command::Schwedler { id: None, meridians: 8, rings: 4, radius: 5.0, full: true }
+        );
+        assert_eq!(
+            parse("catenaryvault 8 12 4").unwrap(),
+            Command::CatenaryVault { id: None, span: 8.0, length: 12.0, rise: 4.0, nu: None, nv: None }
+        );
+        assert_eq!(
+            parse("catenaryvault 6 10 3 20 24").unwrap(),
+            Command::CatenaryVault {
+                id: None,
+                span: 6.0,
+                length: 10.0,
+                rise: 3.0,
+                nu: Some(20),
+                nv: Some(24),
+            }
         );
     }
 
@@ -4164,6 +4550,69 @@ mod tests {
             Command::DefSection {
                 name: "p".into(),
                 section: StructSection::Guadua { d: 0.09, t: 0.008 },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_tee_channel_angle_hss_sections() {
+        assert_eq!(
+            parse("section T1 tee 0.2 0.15 0.012 0.008").unwrap(),
+            Command::DefSection {
+                name: "T1".into(),
+                section: StructSection::Tee { d: 0.2, bf: 0.15, tf: 0.012, tw: 0.008 },
+            }
+        );
+        assert_eq!(
+            parse("section C1 channel 0.3 0.1 0.012 0.008").unwrap(),
+            Command::DefSection {
+                name: "C1".into(),
+                section: StructSection::Channel { d: 0.3, bf: 0.1, tf: 0.012, tw: 0.008 },
+            }
+        );
+        // `upn` alias resolves to Channel.
+        assert_eq!(
+            parse("section C2 upn 0.3 0.1 0.012 0.008").unwrap(),
+            Command::DefSection {
+                name: "C2".into(),
+                section: StructSection::Channel { d: 0.3, bf: 0.1, tf: 0.012, tw: 0.008 },
+            }
+        );
+        assert_eq!(
+            parse("section L1 angle 0.1 0.15 0.012").unwrap(),
+            Command::DefSection {
+                name: "L1".into(),
+                section: StructSection::Angle { a: 0.1, b: 0.15, t: 0.012 },
+            }
+        );
+        // `l` alias resolves to Angle.
+        assert_eq!(
+            parse("section L2 l 0.1 0.15 0.012").unwrap(),
+            Command::DefSection {
+                name: "L2".into(),
+                section: StructSection::Angle { a: 0.1, b: 0.15, t: 0.012 },
+            }
+        );
+        assert_eq!(
+            parse("section H1 hss 0.2 0.1 0.01").unwrap(),
+            Command::DefSection {
+                name: "H1".into(),
+                section: StructSection::Hss { w: 0.2, h: 0.1, t: 0.01 },
+            }
+        );
+        // `shs`/`rhs` aliases resolve to Hss.
+        assert_eq!(
+            parse("section H2 shs 0.1 0.1 0.008").unwrap(),
+            Command::DefSection {
+                name: "H2".into(),
+                section: StructSection::Hss { w: 0.1, h: 0.1, t: 0.008 },
+            }
+        );
+        assert_eq!(
+            parse("section H3 rhs 0.2 0.1 0.01").unwrap(),
+            Command::DefSection {
+                name: "H3".into(),
+                section: StructSection::Hss { w: 0.2, h: 0.1, t: 0.01 },
             }
         );
     }
@@ -4531,6 +4980,20 @@ mod tests {
             parse("offset walls -0.5").unwrap(),
             Command::Offset { distance, .. } if distance == -0.5
         ));
+        // A trailing side point parses into `side` (guided direction pick); the
+        // distance stays positive — the executor resolves the sign.
+        assert!(matches!(
+            parse("offset last 0.2 3,0").unwrap(),
+            Command::Offset { distance, side: Some(p), .. }
+                if distance == 0.2 && p.x == 3.0 && p.y == 0.0
+        ));
+        // No side point → `side` is None.
+        assert!(matches!(
+            parse("offset last 0.2").unwrap(),
+            Command::Offset { side: None, .. }
+        ));
+        // Garbage after the distance is still rejected.
+        assert!(parse("offset last 0.2 3,0 extra").is_err());
         // rotate needs an angle
         let err = parse("rotate last").unwrap_err();
         assert!(err.to_string().contains("angle"), "{err}");
@@ -4827,21 +5290,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_divide() {
+        assert!(matches!(
+            parse("divide last 8").unwrap(),
+            Command::Divide { id: None, target: Selector::Last { n: 1 }, count: 8 }
+        ));
+        // Missing count is a clean error.
+        assert!(parse("divide last").unwrap_err().to_string().contains("count"));
+        // JSON round-trip preserves the variant.
+        let cmd = parse("divide last 8").unwrap();
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
+    }
+
+    #[test]
     fn parse_curve_edit_commands() {
         assert!(matches!(
             parse("split last 5,0").unwrap(),
             Command::Split { ids: None, target: Selector::Last { n: 1 }, point }
                 if point == DVec3::new(5.0, 0.0, 0.0)
         ));
+        // Two-phase trim: cutter set + `remove` + points.
+        let trim = parse("trim #a #b remove 2,0 8,0").unwrap();
         assert!(matches!(
-            parse("trim wall slab 1,1").unwrap(),
-            Command::Trim {
-                id: None,
-                target: Selector::Named { .. },
-                cutter: Selector::Named { .. },
-                keep,
-            } if keep == DVec3::new(1.0, 1.0, 0.0)
+            &trim,
+            Command::Trim { ids: None, cutters, removes, extend: false }
+                if cutters.len() == 2
+                    && removes == &vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(8.0, 0.0, 0.0)]
         ));
+        // The `extend` variant flips the mode flag.
+        assert!(matches!(
+            parse("trim #a extend 5,5").unwrap(),
+            Command::Trim { ids: None, cutters, removes, extend: true }
+                if cutters.len() == 1 && removes == vec![DVec3::new(5.0, 5.0, 0.0)]
+        ));
+        // Missing the keyword or a side is an error.
+        assert!(parse("trim #a #b 2,0").is_err());
+        assert!(parse("trim remove 2,0").is_err());
+        assert!(parse("trim #a remove").is_err());
         assert!(matches!(
             parse("powertrim wall 5,0").unwrap(),
             Command::PowerTrim { ids: None, target: Selector::Named { .. }, pick }
@@ -4877,23 +5363,78 @@ mod tests {
             parse("fillet last 2 50cm").unwrap(),
             Command::Fillet { radius, .. } if radius == 0.5
         ));
+        // bare form: Rhino defaults trim=yes, join=no, no pick points.
+        assert!(matches!(
+            parse("fillet l1 l2 0.5").unwrap(),
+            Command::Fillet { at: None, trim: true, join: false, .. }
+        ));
+        // trim/join keywords flip the flags (order-independent).
+        assert!(matches!(
+            parse("fillet l1 l2 0.5 trim no join yes").unwrap(),
+            Command::Fillet { at: None, trim: false, join: true, .. }
+        ));
+        assert!(matches!(
+            parse("fillet l1 l2 0.5 join yes trim no").unwrap(),
+            Command::Fillet { trim: false, join: true, .. }
+        ));
+        // `at <ptA> <ptB>` captures the corner-selecting pick points.
+        match parse("fillet l1 l2 0.5 at 0,0 5,5").unwrap() {
+            Command::Fillet { at: Some((pa, pb)), .. } => {
+                assert!(pa.distance(DVec3::ZERO) < 1e-9);
+                assert!(pb.distance(DVec3::new(5.0, 5.0, 0.0)) < 1e-9);
+            }
+            other => panic!("expected fillet with pick points, got {other:?}"),
+        }
+        // full clause: at + trim + join together.
+        assert!(matches!(
+            parse("fillet l1 l2 0.5 at 0,0 5,5 trim no join yes").unwrap(),
+            Command::Fillet { at: Some(_), trim: false, join: true, .. }
+        ));
+        // bad option keyword / bad yes-no are rejected.
+        assert!(parse("fillet l1 l2 0.5 wibble").is_err());
+        assert!(parse("fillet l1 l2 0.5 trim maybe").is_err());
+        // chamfer: two selectors + distance, or one selector naming both curves
+        assert!(matches!(
+            parse("chamfer l1 l2 0.5").unwrap(),
+            Command::Chamfer { a: Selector::Named { .. }, b: Selector::Named { .. }, dist, .. }
+                if dist == 0.5
+        ));
+        assert!(matches!(
+            parse("chamfer sel 0.5").unwrap(),
+            Command::Chamfer { a: Selector::Selected, b: Selector::Selected, dist, .. }
+                if dist == 0.5
+        ));
+        // explode: bare selector
+        assert!(matches!(
+            parse("explode sel").unwrap(),
+            Command::Explode { ids: None, targets: Selector::Selected }
+        ));
         // errors carry hints
         assert!(parse("split last").unwrap_err().to_string().contains("point"));
         assert!(parse("trim last").unwrap_err().to_string().contains("selector"));
         assert!(parse("extend last").unwrap_err().to_string().contains("distance"));
         assert!(parse("join").unwrap_err().to_string().contains("selector"));
         assert!(parse("fillet last").unwrap_err().to_string().contains("radius"));
+        assert!(parse("chamfer last").unwrap_err().to_string().contains("distance"));
     }
 
     #[test]
     fn curve_edit_command_json_roundtrip() {
         for line in [
             "split last 5,0",
-            "trim wall slab 1,1",
+            "trim wall slab remove 1,1",
+            "trim #a #b remove 2,0 8,0",
+            "trim #a extend 5,5",
             "powertrim wall 5,0",
             "extend last 0.5",
             "join last 3",
             "fillet last 2 0.5",
+            "fillet l1 l2 0.5 trim no join yes",
+            "fillet l1 l2 0.5 at 0,0 5,5",
+            "fillet l1 l2 0.5 at 0,0 5,5 trim no join yes",
+            "chamfer l1 l2 0.5",
+            "chamfer sel 0.5",
+            "explode sel",
         ] {
             let cmd = parse(line).unwrap();
             let json = serde_json::to_string(&cmd).unwrap();
@@ -6160,5 +6701,430 @@ mod tests {
         assert!(parse("xclip").is_err());
         assert!(parse("xclip last").is_err());
         assert!(parse("xclip last 0,0").is_err());
+    }
+    // --- guided transform round-trips ---
+
+    // ── guided-transform round-trip tests ─────────────────────────────────────
+    //
+    // Each string below is produced by a transform.rs assembler. These tests
+    // prove the assembler and parser agree — a failing test here means the
+    // assembler emits a string the parser can't accept.
+
+    #[test]
+    fn guided_transform_round_trips() {
+        use glam::DVec3;
+
+        // move: delta is to-from
+        let cmd = parse("move sel 3,3").unwrap();
+        assert!(
+            matches!(cmd, Command::Move { delta, .. } if delta == DVec3::new(3.0, 3.0, 0.0)),
+            "move sel 3,3 parsed wrong: {cmd:?}"
+        );
+
+        // copy: delta is to-from
+        let cmd = parse("copy sel 5,0").unwrap();
+        assert!(
+            matches!(cmd, Command::Copy { delta, .. } if delta == DVec3::new(5.0, 0.0, 0.0)),
+            "copy sel 5,0 parsed wrong: {cmd:?}"
+        );
+
+        // rotate: angle + about center (axis defaults to Z)
+        let cmd = parse("rotate sel 45 about 0,0").unwrap();
+        assert!(
+            matches!(cmd, Command::Rotate { angle_deg, center: Some(c), .. }
+                if angle_deg == 45.0 && c == DVec3::new(0.0, 0.0, 0.0)),
+            "rotate sel 45 about 0,0 parsed wrong: {cmd:?}"
+        );
+
+        // scale: uniform factor + about base
+        let cmd = parse("scale sel 2.5 about 1,1").unwrap();
+        assert!(
+            matches!(cmd, Command::Scale { factors, center: Some(c), .. }
+                if factors == DVec3::splat(2.5) && c == DVec3::new(1.0, 1.0, 0.0)),
+            "scale sel 2.5 about 1,1 parsed wrong: {cmd:?}"
+        );
+
+        // scale: default factor of 1.0 rounds to "1" via num()
+        let cmd = parse("scale sel 1 about 0,0").unwrap();
+        assert!(
+            matches!(cmd, Command::Scale { factors, .. } if factors == DVec3::splat(1.0)),
+            "scale sel 1 about 0,0 parsed wrong: {cmd:?}"
+        );
+
+        // mirror: point-normal plane form
+        let cmd = parse("mirror sel 0,5 1,0").unwrap();
+        assert!(
+            matches!(cmd, Command::Mirror { plane: MirrorPlane::PointNormal { .. }, .. }),
+            "mirror sel 0,5 1,0 parsed wrong: {cmd:?}"
+        );
+
+        // align: four points, scale off
+        let cmd = parse("align sel 0,0 5,5 1,0 6,5 scale off").unwrap();
+        assert!(
+            matches!(cmd, Command::Align { scale: false, .. }),
+            "align sel 0,0 5,5 1,0 6,5 scale off parsed wrong: {cmd:?}"
+        );
+
+        // align: four points, scale on
+        let cmd = parse("align sel 0,0 0,0 1,0 2,0 scale on").unwrap();
+        assert!(
+            matches!(cmd, Command::Align { scale: true, .. }),
+            "align sel 0,0 0,0 1,0 2,0 scale on parsed wrong: {cmd:?}"
+        );
+
+        // stretch: min, max, delta (from-to delta)
+        let cmd = parse("stretch sel 0,0 5,5 1,0").unwrap();
+        assert!(
+            matches!(cmd, Command::Stretch { delta, .. } if delta == DVec3::new(1.0, 0.0, 0.0)),
+            "stretch sel 0,0 5,5 1,0 parsed wrong: {cmd:?}"
+        );
+
+        // 3-D delta preserves z component
+        let cmd = parse("copy sel 1,2,3").unwrap();
+        assert!(
+            matches!(cmd, Command::Copy { delta, .. } if delta == DVec3::new(1.0, 2.0, 3.0)),
+            "copy sel 1,2,3 parsed wrong: {cmd:?}"
+        );
+    }
+
+    // --- guided array round-trips ---
+
+    // --- guided array group round-trip tests ---
+
+    #[test]
+    fn guided_array_round_trip() {
+        // The exact string emitted by assemble_array for guided flow.
+        let cmd = parse("array sel 3,2,1 1,1,0").unwrap();
+        assert!(matches!(
+            cmd,
+            Command::Array { targets: Selector::Selected, counts: [3, 2, 1], .. }
+        ));
+    }
+
+    #[test]
+    fn guided_polararray_round_trip() {
+        // The exact string emitted by assemble_polararray for guided flow.
+        let cmd = parse("polararray sel 6 0,0 360").unwrap();
+        assert!(matches!(
+            cmd,
+            Command::PolarArray {
+                targets: Selector::Selected,
+                count: 6,
+                center: Some(DVec3::ZERO),
+                total_angle_deg: Some(deg),
+                ..
+            } if deg == 360.0
+        ));
+    }
+
+    // --- guided curve_edit round-trips ---
+    /// Round-trip each string emitted by the guided curve_edit assemblers so we
+    /// know the parser accepts them unchanged.
+    #[test]
+    fn guided_curve_edit_emitted_strings_parse_ok() {
+        // split sel 5,3 — "sel" is the canonical Selected selector token
+        assert!(matches!(
+            parse("split sel 5,3").unwrap(),
+            Command::Split { target: Selector::Selected, point, .. }
+                if point == DVec3::new(5.0, 3.0, 0.0)
+        ));
+        // extend sel 2.5
+        assert!(matches!(
+            parse("extend sel 2.5").unwrap(),
+            Command::Extend { targets: Selector::Selected, distance }
+                if distance == 2.5
+        ));
+        // powertrim sel 1,2
+        assert!(matches!(
+            parse("powertrim sel 1,2").unwrap(),
+            Command::PowerTrim { target: Selector::Selected, pick, .. }
+                if pick == DVec3::new(1.0, 2.0, 0.0)
+        ));
+        // fillet sel 0.5 — single-selector form; parser sets a = b = Selected
+        assert!(matches!(
+            parse("fillet sel 0.5").unwrap(),
+            Command::Fillet { a: Selector::Selected, b: Selector::Selected, radius, .. }
+                if radius == 0.5
+        ));
+        // boundary 3,4  →  Boundary { seed: (3,4,0), from: None }
+        assert!(matches!(
+            parse("boundary 3,4").unwrap(),
+            Command::Boundary { seed, from: None, .. }
+                if seed == DVec3::new(3.0, 4.0, 0.0)
+        ));
+        // curvebool Union sel  →  CurveBool { op: Union, targets: Selected }
+        assert!(matches!(
+            parse("curvebool Union sel").unwrap(),
+            Command::CurveBool { op: BoolKind::Union, targets: Selector::Selected, .. }
+        ));
+        // curvebool Difference sel
+        assert!(matches!(
+            parse("curvebool Difference sel").unwrap(),
+            Command::CurveBool { op: BoolKind::Difference, targets: Selector::Selected, .. }
+        ));
+        // curvebool Intersect sel
+        assert!(matches!(
+            parse("curvebool Intersect sel").unwrap(),
+            Command::CurveBool { op: BoolKind::Intersection, targets: Selector::Selected, .. }
+        ));
+    }
+
+
+    // --- guided annotate round-trips ---
+
+    // Round-trips for strings emitted by the guided annotate assemblers.
+    // These guarantee that every assembler output is accepted unchanged by
+    // the parser and maps to the right Command variant.
+    #[test]
+    fn guided_annotate_emits_round_trip() {
+        // dim: two free-point anchors + explicit offset (assembler always emits it)
+        assert!(matches!(
+            parse("dim 0,0 10,0 0.5").unwrap(),
+            Command::Dim { .. }
+        ));
+        assert!(matches!(
+            parse("dim 1,2 5,2 0.8").unwrap(),
+            Command::Dim { .. }
+        ));
+        // 3-D anchor (fmt keeps z when non-zero)
+        assert!(matches!(
+            parse("dim 0,0,1 10,0,1 0.5").unwrap(),
+            Command::Dim { .. }
+        ));
+
+        // dimangular: vertex + two leg points + explicit radius
+        assert!(matches!(
+            parse("dimangular 0,0 1,0 0,1 1").unwrap(),
+            Command::DimAngular { .. }
+        ));
+        assert!(matches!(
+            parse("dimangular 0,0 2,0 0,2 2.5").unwrap(),
+            Command::DimAngular { .. }
+        ));
+
+        // dimradius / dimdiameter: selection only (assembler-tested, deferred in SCRIPTS)
+        assert!(matches!(
+            parse("dimradius sel").unwrap(),
+            Command::DimRadius { diameter: false, .. }
+        ));
+        assert!(matches!(
+            parse("dimdiameter sel").unwrap(),
+            Command::DimRadius { diameter: true, .. }
+        ));
+
+        // autodim: selection + explicit `offset <d>`
+        assert!(matches!(
+            parse("autodim sel offset 0.5").unwrap(),
+            Command::AutoDim { .. }
+        ));
+        assert!(matches!(
+            parse("autodim all offset 0.8").unwrap(),
+            Command::AutoDim { .. }
+        ));
+        assert!(matches!(
+            parse("autodim last offset 0.5").unwrap(),
+            Command::AutoDim { offset, .. } if (offset - 0.5).abs() < 1e-9
+        ));
+    }
+
+    // --- guided refhatch round-trips ---
+
+    // Round-trip tests for strings emitted by guided/reference_hatch.rs assemblers.
+
+    #[test]
+    fn guided_hatch_solid_emitted_string_roundtrips() {
+        use itsjustcad_doc::HatchPattern;
+        assert!(matches!(
+            parse("hatch sel solid").unwrap(),
+            Command::Hatch { target: Selector::Selected, pattern: HatchPattern::Solid, .. }
+        ));
+    }
+
+    #[test]
+    fn guided_hatch_brick_emitted_string_roundtrips() {
+        use itsjustcad_doc::HatchPattern;
+        assert!(matches!(
+            parse("hatch sel brick 0.3").unwrap(),
+            Command::Hatch {
+                target: Selector::Selected,
+                pattern: HatchPattern::Brick { spacing },
+                ..
+            } if (spacing - 0.3).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn guided_ncopy_emitted_string_roundtrips() {
+        assert!(matches!(
+            parse("ncopy sel 2").unwrap(),
+            Command::Ncopy { target: Selector::Selected, index: 2, .. }
+        ));
+        // Default-index form
+        assert!(matches!(
+            parse("ncopy sel 0").unwrap(),
+            Command::Ncopy { target: Selector::Selected, index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn guided_xclip_emitted_string_roundtrips() {
+        use glam::DVec2;
+        let cmd = parse("xclip sel 0,0 10,10").unwrap();
+        if let Command::Xclip { target: Selector::Selected, rect: Some(r) } = &cmd {
+            assert_eq!(r.min, DVec2::new(0.0, 0.0));
+            assert_eq!(r.max, DVec2::new(10.0, 10.0));
+        } else {
+            panic!("expected xclip with selected target and rect");
+        }
+    }
+
+    // --- guided creation round-trips ---
+
+    // Round-trip tests for guided creation + measure assembler output.
+
+    #[test]
+    fn guided_creation_extrude_roundtrip() {
+        let cmd = parse("extrude sel 3").unwrap();
+        assert!(matches!(
+            cmd,
+            Command::Extrude { profile: Selector::Selected, height, .. } if height == 3.0
+        ));
+    }
+
+    #[test]
+    fn guided_creation_revolve_roundtrip() {
+        let cmd = parse("revolve sel 0,0 0,0,1 360").unwrap();
+        assert!(matches!(
+            cmd,
+            Command::Revolve {
+                profile: Selector::Selected,
+                axis_point: Some(_),
+                axis_dir: Some(_),
+                angle_deg: Some(a),
+                ..
+            } if a == 360.0
+        ));
+    }
+
+    #[test]
+    fn guided_creation_pipe_roundtrip() {
+        let cmd = parse("pipe sel 0.1").unwrap();
+        assert!(matches!(
+            cmd,
+            Command::Pipe { curve: Selector::Selected, radius, .. } if (radius - 0.1).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn guided_creation_box_roundtrip() {
+        let cmd = parse("box 1,1 3,4,2").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Box {
+                id: None,
+                corner: DVec3::new(1.0, 1.0, 0.0),
+                size: DVec3::new(3.0, 4.0, 2.0),
+            }
+        );
+    }
+
+    #[test]
+    fn guided_creation_arc_roundtrip() {
+        let cmd = parse("arc 0,0 1 0 90").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Arc {
+                id: None,
+                center: DVec3::ZERO,
+                radius: 1.0,
+                start_deg: 0.0,
+                end_deg: 90.0,
+            }
+        );
+    }
+
+    #[test]
+    fn guided_creation_ellipse_roundtrip() {
+        let cmd = parse("ellipse 0,0 2 1").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Ellipse { id: None, center: DVec3::ZERO, rx: 2.0, ry: 1.0 }
+        );
+    }
+
+    #[test]
+    fn guided_creation_helix_roundtrip() {
+        let cmd = parse("helix 0,0 1 3 4").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Helix {
+                id: None,
+                center: DVec3::ZERO,
+                radius: 1.0,
+                height: 3.0,
+                turns: 4.0,
+            }
+        );
+    }
+
+    #[test]
+    fn guided_measure_area_roundtrip() {
+        let cmd = parse("area sel").unwrap();
+        assert!(matches!(cmd, Command::Area { targets: Selector::Selected }));
+    }
+
+    #[test]
+    fn guided_measure_volume_roundtrip() {
+        let cmd = parse("volume sel").unwrap();
+        assert!(matches!(cmd, Command::Volume { targets: Selector::Selected }));
+    }
+
+    #[test]
+    fn guided_measure_bbox_roundtrip() {
+        let cmd = parse("bbox sel").unwrap();
+        assert!(matches!(cmd, Command::Bbox { targets: Selector::Selected }));
+    }
+
+    #[test]
+    fn guided_measure_distance_roundtrip() {
+        let cmd = parse("distance 0,0 3,4").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Distance { a: DVec3::ZERO, b: DVec3::new(3.0, 4.0, 0.0) }
+        );
+    }
+
+
+    // --- guided S-A (interactive object-pick) round-trips ---
+    #[test]
+    fn guided_object_pick_verbs_round_trip() {
+        // Each string is produced by an S-A assembler (picked objects ride as
+        // `#<shortid>` selector tokens). Prove the parser accepts them all.
+        for s in [
+            "fillet #a1b2c3d4 #00ffee11 0.5",
+            "trim #aaaa1111 #bbbb2222 remove 2,1",
+            "difference #aaaa1111 #bbbb2222",
+            "union sel",
+            "intersect sel",
+            "sweep #aaaa1111 #bbbb2222",
+            "sweep2 #aaaa1111 #bbbb2222 #cccc3333",
+            "blend #aaaa1111 #bbbb2222 1",
+            "railrevolve #aaaa1111 #bbbb2222 0,0 0,0,5",
+            "loft sel",
+            "circletan #aaaa1111 #bbbb2222 2",
+            "linetan 1,2 #aaaa1111",
+            "lineperp 1,2 #aaaa1111",
+        ] {
+            assert!(parse(s).is_ok(), "guided emission must parse: {s:?} -> {:?}", parse(s));
+        }
+    }
+
+    #[test]
+    fn hash_prefixed_selector_parses_as_named() {
+        // The `#` prefix keeps a digit-leading short id a valid selector token.
+        assert!(matches!(
+            parse("union #3fa8b2c1"),
+            Ok(Command::Union { targets: Selector::Named { .. }, .. })
+        ));
     }
 }

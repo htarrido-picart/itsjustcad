@@ -210,5 +210,6 @@ fn main() {
         light: itsjustcad_render::LightMode::default(),
         background_gradient: false,
         edges_enabled: true,
+        force: false,
     };
 }

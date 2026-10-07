@@ -38,11 +38,11 @@ const CLOSE_SNAP: f64 = 0.5;
 
 /// Millimeter rounding for emitted command strings — points arrive already
 /// resolved (osnap hit or grid snap), this only strips float noise.
-fn num(v: f64) -> f64 {
+pub(crate) fn num(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
-fn fmt(p: DVec3) -> String {
+pub(crate) fn fmt(p: DVec3) -> String {
     if p.z.abs() < 1e-9 {
         format!("{},{}", num(p.x), num(p.y))
     } else {

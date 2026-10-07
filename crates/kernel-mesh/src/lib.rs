@@ -12,6 +12,7 @@ mod delaunay;
 mod earcut;
 mod edges;
 mod expressive;
+mod catalog;
 mod formfind;
 mod mesh;
 mod primitives;
@@ -26,17 +27,21 @@ pub use delaunay::triangulate;
 pub use earcut::{earcut, signed_area};
 pub use edges::{feature_edges, project_edges_behind, project_edges_onto};
 pub use expressive::{
-    gaussvault_surface, geodesic_network, gridshell, hypar_surface, spaceframe_struts,
-    strut_lattice, GridshellSurface,
+    catenary_vault_surface, diagrid_segments, gaussvault_surface, geodesic_network, gridshell,
+    gridshell_segments, hypar_surface, reciprocal_segments, schwedler_segments, spaceframe_struts,
+    strut_lattice, voronoishell_segments, waffle_segments,
+    GridshellSurface,
 };
 pub use formfind::{
-    cable_net, dynamic_relaxation, force_density, funicular_chain, invert_funicular, max_residual,
+    cable_net, cable_net_surface, dynamic_relaxation, force_density, funicular_chain,
+    invert_funicular, max_residual,
     minimal_surface, minimal_surface_grid, tensegrity_prism, Link, Network, RelaxParams,
     RelaxReport, Tensegrity,
 };
 pub use mesh::{Mesh, RenderMesh};
 pub use primitives::{extrude_profile, make_box};
 pub use section::slice;
+pub use catalog::{builtin_section, builtin_section_names};
 pub use structsection::Section as StructSection;
 pub use solids::{
     area_member, blend_curves, frame_member, loft_profiles, loft_profiles_guided, pipe_curve,

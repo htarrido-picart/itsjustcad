@@ -102,6 +102,25 @@ impl CommandLine {
         }
     }
 
+    /// Clear the visible scrollback (the printed output lines). The up-arrow
+    /// recall history, logged inputs, and current input are untouched — so the
+    /// `clear` command wipes the display without forgetting past commands.
+    pub fn clear_scrollback(&mut self) {
+        self.history.clear();
+    }
+
+    /// Lines currently shown in the scrollback (for tests).
+    #[cfg(test)]
+    pub(crate) fn scrollback_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Up-arrow recall depth (for tests).
+    #[cfg(test)]
+    pub(crate) fn recall_len(&self) -> usize {
+        self.recall.len()
+    }
+
     /// Run one command line through the session, echoing results.
     /// Returns true when the document changed.
     pub fn execute(&mut self, session: &mut Session, line: &str) -> bool {
@@ -418,6 +437,7 @@ impl CommandLine {
         preset_aliases: &'static [(&'static str, &'static str)],
         panel_h: f32,
         last_verb: Option<&str>,
+        flow_active: bool,
     ) -> Option<String> {
         // Recompute suggestions if input changed.
         self.refresh_suggestions(object_names, preset_aliases);
@@ -432,7 +452,7 @@ impl CommandLine {
         let history_h = crate::theme::Spacing::history_h_for(panel_h);
         let mut submitted = None;
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            submitted = self.input_row(ui, last_verb);
+            submitted = self.input_row(ui, last_verb, flow_active);
             self.suggestion_block(ui, true);
             egui::ScrollArea::vertical()
                 .id_salt("cmd_history")
@@ -574,7 +594,12 @@ impl CommandLine {
     /// suggestion acceptance. Returns Some(line) when the user pressed Enter.
     /// `last_verb` — an empty Enter/Space submits the last non-destructive verb
     /// ALONE (no args, via `recall_verb`) so guided commands restart fresh.
-    fn input_row(&mut self, ui: &mut egui::Ui, last_verb: Option<&str>) -> Option<String> {
+    fn input_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        last_verb: Option<&str>,
+        flow_active: bool,
+    ) -> Option<String> {
         let mut submitted = None;
         let show_popup = self.popup_visible();
         ui.horizontal(|ui| {
@@ -631,7 +656,7 @@ impl CommandLine {
                 // doesn't fire because the trimmed input is non-empty), so
                 // "line 0,0 1,1" keeps working. No-op when there is no eligible
                 // verb yet.
-                if space && !show_popup && self.input.trim().is_empty() {
+                if space && !show_popup && self.input.trim().is_empty() && !flow_active {
                     self.input.clear();
                     if let Some(verb) = recall_verb(last_verb) {
                         submitted = Some(verb);
@@ -669,10 +694,19 @@ impl CommandLine {
                     }
                 }
 
-                // ── Accept suggestion (Tab or Right at end-of-line) ──────
+                // ── Accept suggestion (Tab, Right at end-of-line, or Space) ──
+                // Rhino treats Space like Enter to accept/complete: while the
+                // autosuggest popup is visible, Space accepts the highlighted (or
+                // first) suggestion instead of typing a literal space. The
+                // TextEdit above may have just inserted a space into `self.input`,
+                // but `accept_suggestion` trim_end()s and rebuilds the input from
+                // the completion, so the stray space is discarded. With the popup
+                // closed Space stays literal (so "line 0,0 5,5" still works) and
+                // the empty-line re-run-last-verb branch above (guarded by
+                // `!show_popup`) handles the empty case.
                 let at_end = self.input.len() == self.input.trim_end_matches(' ').len()
                     || !self.input.is_empty();
-                if (tab || (right && at_end)) && show_popup {
+                if (tab || (right && at_end) || space) && show_popup {
                     self.accept_suggestion();
                 }
 
@@ -688,15 +722,21 @@ impl CommandLine {
                 if self.input.trim().is_empty() {
                     // Empty Enter: re-run the last non-destructive verb ALONE
                     // (no args) so guided commands restart and prompt fresh.
-                    // No-op when no eligible verb has run yet.
+                    // No-op when no eligible verb has run yet. SUPPRESSED while a
+                    // guided flow OR a draw tool is active — then a bare Enter (and
+                    // Space) belongs to the active step/tool, finished by the
+                    // viewport handler; letting the command line re-run the verb
+                    // here would restart it instead of finishing it.
                     self.input.clear();
-                    self.focus_next_frame = true;
-                    if let Some(verb) = recall_verb(last_verb) {
-                        submitted = Some(verb);
-                        self.recall_pos = None;
-                        self.suggestions.clear();
-                        self.suggest_for.clear();
-                        self.suggest_dismissed = false;
+                    if !flow_active {
+                        self.focus_next_frame = true;
+                        if let Some(verb) = recall_verb(last_verb) {
+                            submitted = Some(verb);
+                            self.recall_pos = None;
+                            self.suggestions.clear();
+                            self.suggest_for.clear();
+                            self.suggest_dismissed = false;
+                        }
                     }
                 } else {
                     submitted = Some(std::mem::take(&mut self.input));
@@ -734,6 +774,26 @@ mod tests {
         assert_eq!(cl.history.len(), 500);
         assert_eq!(cl.history.first().unwrap(), "line 100");
         assert_eq!(cl.history.last().unwrap(), "line 599");
+    }
+
+    #[test]
+    fn clear_scrollback_keeps_recall() {
+        let mut cl = CommandLine::default();
+        let mut session = Session::default();
+        // A raw scrollback line plus two executed commands — each `execute`
+        // appends to BOTH the scrollback and the up-arrow recall.
+        cl.push_line("some output");
+        cl.execute(&mut session, "box 0,0,0 1,1,1");
+        cl.execute(&mut session, "box 2,0,0 1,1,1");
+        assert!(cl.scrollback_len() > 0);
+        assert!(cl.recall_len() >= 2, "both commands are in recall");
+
+        let recall_before = cl.recall_len();
+        cl.clear_scrollback();
+
+        // Scrollback wiped, recall (up-arrow history) preserved.
+        assert_eq!(cl.scrollback_len(), 0);
+        assert_eq!(cl.recall_len(), recall_before, "recall must survive clear");
     }
 
     #[test]
@@ -819,6 +879,22 @@ mod tests {
         cl.suggest_sel = Some(0); // should be 'box'
         cl.accept_suggestion();
         assert_eq!(cl.input, "box ");
+    }
+
+    #[test]
+    fn space_accepts_suggestion_and_discards_stray_space() {
+        // Rhino parity: with the popup visible, Space accepts the suggestion like
+        // Tab. In the real frame, suggestions are built from the pre-space input
+        // ("bo"), then the TextEdit inserts a literal space ("bo ") before the
+        // accept runs. The accept path must discard that stray space and still
+        // complete to "box " (not "bo box " or "box  ").
+        let mut cl = CommandLine { input: "bo".to_string(), ..CommandLine::default() };
+        cl.refresh_suggestions(&[], &[]);
+        assert!(!cl.suggestions.is_empty());
+        cl.suggest_sel = Some(0); // 'box'
+        cl.input.push(' '); // the TextEdit's just-inserted stray space
+        cl.accept_suggestion();
+        assert_eq!(cl.input, "box ", "stray space discarded, verb completed");
     }
 
     #[test]
