@@ -5535,14 +5535,21 @@ impl App {
         if suppressed {
             enter = false;
         }
-        // Space acts like Enter inside a guided flow (Rhino parity): finish the
-        // cutter/removal phase, accept a keyword/number default, or commit a typed
-        // coord — whatever Enter would do on this step. Excluded on a Text step
-        // (there a space is a literal character) and on the one suppressed
-        // arm-frame (same reason Enter is swallowed, so the first step isn't
-        // auto-committed). The literal space is filtered from the typed buffer
-        // below so it never lands in the step's input.
-        if space_acts_as_enter(guided_active, space, suppressed, self.guided.current_wants_text()) {
+        // Space acts like Enter inside a guided flow OR a draw tool (Rhino
+        // parity): finish the cutter/removal phase, accept a keyword/number
+        // default, commit a typed coord, or finish a polyline/line/arc — whatever
+        // Enter would do. Excluded on a guided Text step (there a space is a
+        // literal character) and on the one suppressed arm-frame (same reason
+        // Enter is swallowed, so the first step isn't auto-committed). The literal
+        // space is filtered from the typed buffer below so it never lands in the
+        // step's/tool's input.
+        if space_acts_as_enter(
+            guided_active,
+            self.draw_tool.active(),
+            space,
+            suppressed,
+            self.guided.current_wants_text(),
+        ) {
             enter = true;
         }
         // F8 toggles persistent Ortho mid-pick (early_hotkeys skips drawing).
@@ -5578,10 +5585,12 @@ impl App {
         }
         // Typed characters feed the numeric buffer; Backspace edits it
         // (keymap keeps delete-selection off while drawing).
-        // On a non-Text guided step, a space is consumed as "advance" (above), so
-        // drop the matching Text(" ") event here — otherwise it would also get
-        // typed into the step's buffer. Text steps keep spaces as literals.
-        let suppress_space_char = guided_active && !self.guided.current_wants_text();
+        // On a non-Text guided step or while a draw tool is active, a space is
+        // consumed as "advance/finish" (above), so drop the matching Text(" ")
+        // event here — otherwise it would also get typed into the buffer. Guided
+        // Text steps keep spaces as literals.
+        let suppress_space_char = (guided_active && !self.guided.current_wants_text())
+            || self.draw_tool.active();
         let typed: Vec<egui::Event> = ui.input(|i| {
             i.events
                 .iter()
@@ -6401,18 +6410,18 @@ impl App {
         let aliases = self.active_aliases();
         let panel_h = ui.available_height();
         let last_verb = self.last_verb.clone();
-        // While a guided flow is running, the command line must NOT hijack a bare
-        // Space/Enter to re-run the last verb — those keys belong to the guided
-        // flow (the viewport handler finishes the step). Otherwise a Space meant
-        // to finish the verb would restart it.
-        let guided_active = self.guided.active();
+        // While a guided flow OR a draw tool is running, the command line must NOT
+        // hijack a bare Space/Enter to re-run the last verb — those keys belong to
+        // the active flow (the viewport handler finishes the step/tool). Otherwise
+        // a Space meant to finish the verb would restart it.
+        let flow_active = self.guided.active() || self.draw_tool.active();
         if let Some(line) = self.command_line.ui(
             ui,
             &object_names,
             aliases,
             panel_h,
             last_verb.as_deref(),
-            guided_active,
+            flow_active,
         ) {
             self.execute_line(line);
         }
@@ -9145,17 +9154,20 @@ fn empty_deletable_layers(doc: &itsjustcad_doc::Document) -> Vec<String> {
         .collect()
 }
 
-/// Whether a Space press should act like Enter to advance a guided step
-/// (Rhino: Space == Enter on the command line). True only while a guided flow is
-/// active, Space was pressed, the one-frame arm suppression isn't in effect, and
-/// the current step is NOT a Text step (where a space is a literal character).
+/// Whether a Space press should act like Enter to finish/advance a step-based
+/// flow (Rhino: Space == Enter on the command line). True when Space was pressed,
+/// the one-frame arm suppression isn't in effect, and EITHER a guided flow is
+/// active on a non-Text step (a space is a literal character on a Text step) OR a
+/// draw tool is active (polyline/line/arc/… — these have no text entry, so Space
+/// always finishes like Enter).
 fn space_acts_as_enter(
     guided_active: bool,
+    draw_active: bool,
     space: bool,
     suppressed: bool,
     wants_text: bool,
 ) -> bool {
-    guided_active && space && !suppressed && !wants_text
+    space && !suppressed && ((guided_active && !wants_text) || draw_active)
 }
 
 /// Screen position -> point on the z=0 ground plane.
@@ -10021,16 +10033,23 @@ mod tests {
 
     #[test]
     fn space_acts_as_enter_only_on_non_text_guided_steps() {
+        // Args: (guided_active, draw_active, space, suppressed, wants_text).
         // In a guided flow on a non-Text step, Space advances like Enter.
-        assert!(space_acts_as_enter(true, true, false, false));
+        assert!(space_acts_as_enter(true, false, true, false, false));
         // Text step: Space stays a literal character, never advances.
-        assert!(!space_acts_as_enter(true, true, false, true));
+        assert!(!space_acts_as_enter(true, false, true, false, true));
         // The one-frame arm suppression swallows Space too (no auto-skip of step 1).
-        assert!(!space_acts_as_enter(true, true, true, false));
-        // No guided flow: Space is never an advance here (command line handles it).
-        assert!(!space_acts_as_enter(false, true, false, false));
+        assert!(!space_acts_as_enter(true, false, true, true, false));
+        // No flow at all: Space is never an advance here (command line handles it).
+        assert!(!space_acts_as_enter(false, false, true, false, false));
         // No Space pressed: no-op.
-        assert!(!space_acts_as_enter(true, false, false, false));
+        assert!(!space_acts_as_enter(true, false, false, false, false));
+        // Draw tool active: Space finishes like Enter (no text entry, so wants_text
+        // is irrelevant on the draw path).
+        assert!(space_acts_as_enter(false, true, true, false, false));
+        assert!(space_acts_as_enter(false, true, true, false, true));
+        // Suppression still gates the draw path on the arm-frame.
+        assert!(!space_acts_as_enter(false, true, true, true, false));
     }
 
     #[test]
@@ -10691,6 +10710,44 @@ mod tests {
             match &doc.objects().next().unwrap().geometry {
                 itsjustcad_doc::Geometry::Curve(c) => {
                     assert!(c.is_closed(), "the C key produced a CLOSED polyline");
+                }
+                other => panic!("expected a Curve polyline, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_space_finishes_polyline() {
+        // SPACE finishes a DRAW-TOOL verb exactly like Enter (Rhino parity): arm
+        // `polyline`, pick three points, then press SPACE (never Enter) to finish.
+        // Proves the draw-tool Space-as-Enter fold AND that the command line does
+        // not hijack the Space to re-run the verb mid-draw.
+        run_app_journey(|h| {
+            top_ortho_view(h);
+
+            submit_command(h, "polyline");
+            assert!(h.state().draw_tool.active(), "bare `polyline` armed the tool");
+
+            for (fx, fy) in [(0.4, 0.6), (0.6, 0.6), (0.6, 0.4)] {
+                let p = pane_point(h, fx, fy);
+                click_at(h, p);
+            }
+            assert!(h.state().draw_tool.active(), "three picks: still drawing");
+
+            // SPACE (not Enter, not C) finishes the open polyline and disarms.
+            h.key_press(egui::Key::Space);
+            h.run_steps(2);
+            assert!(
+                !h.state().draw_tool.active(),
+                "SPACE finished the polyline draw tool (like Enter)"
+            );
+
+            let doc = &h.state().session.doc;
+            assert_eq!(doc.objects().count(), 1, "SPACE committed one polyline");
+            match &doc.objects().next().unwrap().geometry {
+                itsjustcad_doc::Geometry::Curve(c) => {
+                    assert!(!c.is_closed(), "SPACE finishes an OPEN polyline (C closes)");
                 }
                 other => panic!("expected a Curve polyline, got {other:?}"),
             }
