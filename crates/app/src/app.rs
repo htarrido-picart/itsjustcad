@@ -5489,7 +5489,7 @@ impl App {
         // draw tool does. They share the snap/ortho/smarttrack resolution.
         let guided_active = self.guided.active();
 
-        let (esc, mut enter, shift, close_key, f8, tab, mark_key) = ui.input(|i| {
+        let (esc, mut enter, shift, close_key, f8, tab, mark_key, space) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Enter),
@@ -5502,6 +5502,10 @@ impl App {
                 // complementing the dwell auto-capture. Bare only, so Cmd/Ctrl-M
                 // (minimize / other shortcuts) is left alone.
                 i.key_pressed(egui::Key::M) && !i.modifiers.command && !i.modifiers.ctrl,
+                // Spacebar accepts/advances a guided step like Enter (Rhino: Space
+                // == Enter on the command line). Folded into `enter` below, with
+                // the literal space filtered from the typed buffer.
+                i.key_pressed(egui::Key::Space),
             )
         });
         // Tab accepts the current best keyword match on a guided keyword/branch
@@ -5527,8 +5531,19 @@ impl App {
         // Swallow exactly that one Enter (the latch only ever lives one frame —
         // this drawing_input pass runs the same frame the tool armed, so a real
         // Enter the user presses next frame still accepts the default).
-        if std::mem::take(&mut self.guided_suppress_enter) {
+        let suppressed = std::mem::take(&mut self.guided_suppress_enter);
+        if suppressed {
             enter = false;
+        }
+        // Space acts like Enter inside a guided flow (Rhino parity): finish the
+        // cutter/removal phase, accept a keyword/number default, or commit a typed
+        // coord — whatever Enter would do on this step. Excluded on a Text step
+        // (there a space is a literal character) and on the one suppressed
+        // arm-frame (same reason Enter is swallowed, so the first step isn't
+        // auto-committed). The literal space is filtered from the typed buffer
+        // below so it never lands in the step's input.
+        if space_acts_as_enter(guided_active, space, suppressed, self.guided.current_wants_text()) {
+            enter = true;
         }
         // F8 toggles persistent Ortho mid-pick (early_hotkeys skips drawing).
         if f8 {
@@ -5563,19 +5578,17 @@ impl App {
         }
         // Typed characters feed the numeric buffer; Backspace edits it
         // (keymap keeps delete-selection off while drawing).
+        // On a non-Text guided step, a space is consumed as "advance" (above), so
+        // drop the matching Text(" ") event here — otherwise it would also get
+        // typed into the step's buffer. Text steps keep spaces as literals.
+        let suppress_space_char = guided_active && !self.guided.current_wants_text();
         let typed: Vec<egui::Event> = ui.input(|i| {
             i.events
                 .iter()
-                .filter(|e| {
-                    matches!(
-                        e,
-                        egui::Event::Text(_)
-                            | egui::Event::Key {
-                                key: egui::Key::Backspace,
-                                pressed: true,
-                                ..
-                            }
-                    )
+                .filter(|e| match e {
+                    egui::Event::Text(t) => !(suppress_space_char && t == " "),
+                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => true,
+                    _ => false,
                 })
                 .cloned()
                 .collect()
@@ -9123,6 +9136,19 @@ fn empty_deletable_layers(doc: &itsjustcad_doc::Document) -> Vec<String> {
         .collect()
 }
 
+/// Whether a Space press should act like Enter to advance a guided step
+/// (Rhino: Space == Enter on the command line). True only while a guided flow is
+/// active, Space was pressed, the one-frame arm suppression isn't in effect, and
+/// the current step is NOT a Text step (where a space is a literal character).
+fn space_acts_as_enter(
+    guided_active: bool,
+    space: bool,
+    suppressed: bool,
+    wants_text: bool,
+) -> bool {
+    guided_active && space && !suppressed && !wants_text
+}
+
 /// Screen position -> point on the z=0 ground plane.
 fn ground_point(view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> Option<glam::DVec3> {
     let (origin, dir) = screen_ray(view_proj, rect, pos);
@@ -9983,6 +10009,20 @@ fn pano_from_view(v: itsjustcad_doc::PanoView) -> itsjustcad_render::PanoProject
 mod tests {
     use super::*;
     use itsjustcad_commands::registry;
+
+    #[test]
+    fn space_acts_as_enter_only_on_non_text_guided_steps() {
+        // In a guided flow on a non-Text step, Space advances like Enter.
+        assert!(space_acts_as_enter(true, true, false, false));
+        // Text step: Space stays a literal character, never advances.
+        assert!(!space_acts_as_enter(true, true, false, true));
+        // The one-frame arm suppression swallows Space too (no auto-skip of step 1).
+        assert!(!space_acts_as_enter(true, true, true, false));
+        // No guided flow: Space is never an advance here (command line handles it).
+        assert!(!space_acts_as_enter(false, true, false, false));
+        // No Space pressed: no-op.
+        assert!(!space_acts_as_enter(true, false, false, false));
+    }
 
     #[test]
     fn effective_cam_index_honors_maximize() {
