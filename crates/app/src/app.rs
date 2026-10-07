@@ -428,6 +428,14 @@ pub struct App {
     /// when not in trim's parts-to-remove phase); changes force a re-upload so
     /// clicked pieces disappear even though doc.generation hasn't moved.
     uploaded_trim_marks: Option<usize>,
+    /// Trim command-panel option: when set, picks EXTEND the curve to the
+    /// cutters instead of removing a piece (emits `trim … extend …`). Reset
+    /// each time a guided flow starts / is cancelled. While on, the disappear
+    /// preview + hover cue are suppressed (they describe removal, not extend).
+    trim_extend: bool,
+    /// Trim command-panel option "Apparent Intersections" — UI state only; the
+    /// projected/apparent-intersection trimming behavior is not implemented yet.
+    trim_apparent: bool,
     /// Last zoom factor written to ui.json (avoid rewriting every frame).
     saved_zoom: f32,
     /// Dev self-verification: ITSJUSTCAD_SHOT=<path.png> captures a frame and exits.
@@ -1042,6 +1050,8 @@ impl App {
             uploaded_plant_symbols: None,
             uploaded_sketchy: None,
             uploaded_trim_marks: None,
+            trim_extend: false,
+            trim_apparent: true,
             saved_zoom: zoom,
             shot_path: std::env::var("ITSJUSTCAD_SHOT").ok(),
             startup_script: std::env::var("ITSJUSTCAD_RUN").ok(),
@@ -1841,6 +1851,9 @@ impl App {
                 let selection = self.current_selection_selector();
                 match self.guided.try_start(line, selection.as_deref()) {
                     StartResult::Started => {
+                        // Fresh guided flow → reset the trim command-panel options.
+                        self.trim_extend = false;
+                        self.trim_apparent = true;
                         // Zero-step verbs on a pre-selection (area/volume/bbox)
                         // emit immediately; otherwise show the first prompt.
                         if let Some(result) = self.guided.emit_if_ready() {
@@ -3626,9 +3639,14 @@ impl App {
         // pieces are hidden from the snapshot so they look deleted (Rhino). The
         // number of marks is a staleness signal — clicking a removal point does
         // NOT bump doc.generation, so without this the hide wouldn't refresh.
+        // Extend mode (`trim_extend`) suppresses the disappear preview: it
+        // describes REMOVAL, not extension. Flipping the toggle changes
+        // trim_marks (Some(n) ↔ None), which drives the rebuild + re-upload so
+        // hidden pieces reappear the moment Extend is turned on.
         let trim_marks = (self.guided.active()
             && self.guided.active_verb() == Some("trim")
-            && self.guided.current_wants_point_list())
+            && self.guided.current_wants_point_list()
+            && !self.trim_extend)
         .then(|| self.guided.list_points().len());
         // Trim preview marks change WITHOUT a doc.generation bump, so this drives
         // both the snapshot rebuild AND a forced GPU re-upload (the viewport
@@ -5239,6 +5257,85 @@ impl App {
         }
     }
 
+    /// When the trim panel's "Extend Cutting Lines" option is on, rewrite a
+    /// `trim … remove …` emission into the `trim … extend …` variant the exec
+    /// already supports (grows each picked end to the cutters instead of
+    /// deleting a piece). Only touches a trim remove-emission; everything else
+    /// passes through unchanged.
+    fn trim_extend_rewrite(&self, result: StepResult) -> StepResult {
+        match result {
+            StepResult::Emit(cmd)
+                if self.trim_extend && cmd.starts_with("trim ") && cmd.contains(" remove ") =>
+            {
+                StepResult::Emit(cmd.replacen(" remove ", " extend ", 1))
+            }
+            other => other,
+        }
+    }
+
+    /// Rhino-style command-options panel for the guided `trim` verb, shown in the
+    /// dock while a trim is in progress. It drives the SAME `GuidedTool` engine
+    /// as the command line (which still works as a fallback): Done = Enter
+    /// (finish the current phase / commit), Cancel = Esc (abort + restore),
+    /// Undo = un-mark the last removal pick. The two checkboxes mirror Rhino;
+    /// "Extend Cutting Lines" switches picks to the extend variant, "Apparent
+    /// Intersections" is UI-only for now (behavior not implemented).
+    fn trim_command_panel(&mut self, ui: &mut egui::Ui) {
+        let phase_targets = self.guided.current_wants_point_list();
+        ui.add_space(4.0);
+        ui.heading("Trim");
+        ui.add_space(6.0);
+        let prompt = if phase_targets {
+            "Select object to trim, select pressing Shift to extend:"
+        } else {
+            "Select cutting objects:"
+        };
+        ui.label(egui::RichText::new(prompt).strong());
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("Press Enter when done").weak());
+        ui.add_space(8.0);
+
+        ui.checkbox(&mut self.trim_extend, "Extend Cutting Lines");
+        ui.checkbox(&mut self.trim_apparent, "Apparent Intersections");
+        ui.add_space(8.0);
+
+        // Buttons. Collect the clicks first (each borrows `ui`), then act once
+        // the UI borrows are released, so we can touch `self.guided` freely.
+        let undo = phase_targets
+            && ui
+                .add_enabled(self.guided.list_len() > 0, egui::Button::new("Undo"))
+                .clicked();
+        let (cancel, done) = ui
+            .horizontal(|ui| {
+                let c = ui.button("Cancel").clicked();
+                let d = ui.button("Done").clicked();
+                (c, d)
+            })
+            .inner;
+
+        if undo
+            && self.guided.pop_list_point()
+            && let Some(p) = self.guided.prompt()
+        {
+            self.command_line.push_line(p);
+        }
+        if cancel {
+            self.guided.cancel();
+            self.trim_extend = false;
+            self.trim_apparent = true;
+            self.command_line.push_line("drawing cancelled");
+        } else if done {
+            if self.guided.current_wants_objects() {
+                let r = self.guided.finish_objects();
+                self.handle_guided(r);
+            } else if self.guided.current_wants_point_list() {
+                let r = self.guided.finish_list();
+                let r = self.trim_extend_rewrite(r);
+                self.handle_guided(r);
+            }
+        }
+    }
+
     /// Interactive drawing: picks on the ground plane, ghost preview, prompt.
     /// Smart Guides tangent/perpendicular tracking: for each acquired point,
     /// gather osnap's perpendicular-foot and tangent candidate POINTS on curves
@@ -5376,6 +5473,8 @@ impl App {
             }
             self.draw_tool.cancel();
             self.guided.cancel();
+            self.trim_extend = false;
+            self.trim_apparent = true;
             self.st_acquired.clear();
             self.st_dwell = None;
             self.command_line.push_line("drawing cancelled");
@@ -5581,6 +5680,7 @@ impl App {
                         }
                     }
                     let r = self.guided.finish_list();
+                    let r = self.trim_extend_rewrite(r);
                     self.handle_guided(r);
                     return;
                 }
@@ -5875,6 +5975,7 @@ impl App {
         if guided_active
             && self.guided.active_verb() == Some("trim")
             && self.guided.current_wants_point_list()
+            && !self.trim_extend
             && let Some(c) = cursor_world
         {
             let cutters: Vec<itsjustcad_doc::ObjectId> = self
@@ -6471,6 +6572,13 @@ impl App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| {
+                // Guided command-options panel (Rhino-style): while a trim is in
+                // progress, the dock body shows the Trim panel INSTEAD of the
+                // normal tab content. The command-line prompts still work too.
+                if self.guided.active() && self.guided.active_verb() == Some("trim") {
+                    self.trim_command_panel(ui);
+                    return;
+                }
                 match self.panel_tabs.active() {
                     // Rhino-style "Model" workspace: Layers AND Properties shown
                     // together as stacked, independently-collapsible sections

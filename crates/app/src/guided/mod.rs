@@ -419,6 +419,21 @@ impl GuidedTool {
         StepResult::NeedMore
     }
 
+    /// Remove the LAST point collected on an in-progress [`Step::PointList`]
+    /// (the command panel's Undo for trim — un-marks the last piece so it
+    /// reappears). Returns `true` if a point was removed. No-op off a point list.
+    pub fn pop_list_point(&mut self) -> bool {
+        if !matches!(self.current_step(), Some(Step::PointList { .. })) {
+            return false;
+        }
+        self.list.pop().is_some()
+    }
+
+    /// Number of points collected so far on the in-progress [`Step::PointList`].
+    pub fn list_len(&self) -> usize {
+        self.list.len()
+    }
+
     /// Finish a [`Step::PointList`] on Enter: if at least `min` points were
     /// collected, fold them into an [`Input::Points`] and advance; otherwise
     /// stay on the step and report how many more are needed.
@@ -1455,5 +1470,24 @@ mod tests {
         t.push_list_point(DVec3::ZERO);
         t.push_list_point(DVec3::new(1.0, 1.0, 0.0));
         assert!(t.preview(Some(cursor)).is_empty(), "no rubber-band when connect is false");
+    }
+
+    #[test]
+    fn pop_list_point_undoes_the_last_removal_pick() {
+        // The trim panel's Undo pops the last collected removal point so the
+        // vanished piece reappears; it stays on the point-list step.
+        let mut t = GuidedTool { script: Some(&OBJSET_TEST), ..Default::default() };
+        t.push_selected_object("aaaa1111");
+        t.finish_objects();
+        assert!(t.current_wants_point_list());
+        t.push_list_point(DVec3::ZERO);
+        t.push_list_point(DVec3::new(1.0, 1.0, 0.0));
+        assert_eq!(t.list_len(), 2);
+        assert!(t.pop_list_point(), "popped the last point");
+        assert_eq!(t.list_len(), 1);
+        assert!(t.pop_list_point());
+        assert_eq!(t.list_len(), 0);
+        assert!(!t.pop_list_point(), "nothing left to pop");
+        assert!(t.current_wants_point_list(), "still on the removal step");
     }
 }
