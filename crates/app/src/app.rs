@@ -17,6 +17,32 @@ use crate::keymap;
 use crate::preset::{self, CadOrigin};
 use crate::scene;
 
+/// Pure core of [`App::effective_camera_index`]: while maximized every pane
+/// resolves to the maximized camera `slot`; otherwise the layout's mapping.
+fn effective_cam_index(maximized: Option<usize>, layout: ViewportLayout, pane: usize) -> usize {
+    match maximized {
+        Some(slot) => slot,
+        None => layout.camera_index(pane),
+    }
+}
+
+/// Pure core of the maximize toggle. Given the current maximized slot, the
+/// double-clicked `pane` and its camera `slot`, and the saved `restore_pane`,
+/// returns `(next maximized, next active_pane, next restore_pane)`. Maximizing
+/// remembers `pane` as the pane to restore and activates the single pane (0); a
+/// second toggle clears the override and re-activates the remembered pane.
+fn next_maximize(
+    maximized: Option<usize>,
+    pane: usize,
+    slot: usize,
+    restore_pane: usize,
+) -> (Option<usize>, usize, usize) {
+    match maximized {
+        Some(_) => (None, restore_pane, restore_pane),
+        None => (Some(slot), 0, pane),
+    }
+}
+
 /// Minimum command-line height (points): the input row plus ~4 history lines —
 /// always enough to type into AND read recent output, so a drag can't squeeze
 /// the command line down to a single cramped row.
@@ -412,6 +438,13 @@ pub struct App {
     layout: ViewportLayout,
     /// Last hovered pane; view commands and tools target its camera.
     active_pane: usize,
+    /// Double-click a viewport's name tag to MAXIMIZE that pane to a single
+    /// full-size viewport (Rhino). `Some(slot)` holds the CAMERA SLOT being shown
+    /// maximized; `None` = normal `layout`. Kept separate from `layout` so a
+    /// second double-click restores the exact previous multi-viewport layout.
+    maximized: Option<usize>,
+    /// Pane to re-activate when a maximize is toggled off.
+    maximized_restore_pane: usize,
     /// Generation of the last GPU upload; compare with `session.doc.generation`.
     uploaded_generation: Option<u64>,
     /// Theme of the last GPU upload; theme flips force a re-upload.
@@ -1043,6 +1076,8 @@ impl App {
                 _ => ViewportLayout::Single,
             },
             active_pane: 0,
+            maximized: None,
+            maximized_restore_pane: 0,
             uploaded_generation: None,
             uploaded_theme: None,
             uploaded_color_mode: None,
@@ -1480,7 +1515,7 @@ impl App {
             // Verb/mode mapping is shared with the headless runner via app_verbs.
             Some("display") => match words.next().and_then(DisplayMode::parse) {
                 Some(mode) => {
-                    self.display_modes[self.layout.camera_index(self.active_pane)] = mode;
+                    self.display_modes[self.effective_camera_index(self.active_pane)] = mode;
                     self.command_line
                         .push_line(format!("display: {}", mode.label().to_lowercase()));
                 }
@@ -1653,7 +1688,7 @@ impl App {
             Some("sketchup" | "su") => {
                 self.light_mode = itsjustcad_render::LightMode::Working;
                 self.profile_edges = true;
-                self.display_modes[self.layout.camera_index(self.active_pane)] =
+                self.display_modes[self.effective_camera_index(self.active_pane)] =
                     DisplayMode::Shaded;
                 self.command_line
                     .push_line("preset: sketchup (working light + profile edges)");
@@ -1883,7 +1918,37 @@ impl App {
 
     fn set_layout(&mut self, layout: ViewportLayout) {
         self.layout = layout;
+        self.maximized = None; // an explicit layout change exits maximize
         self.active_pane = 0;
+    }
+
+    /// Pane rects for the live view: a single full-size pane while maximized
+    /// (double-click a viewport tag), otherwise the normal `layout` split.
+    fn effective_panes(&self, full: egui::Rect) -> Vec<egui::Rect> {
+        if self.maximized.is_some() {
+            vec![full]
+        } else {
+            self.layout.split(full)
+        }
+    }
+
+    /// Camera slot for a pane, honoring maximize: while maximized every pane
+    /// resolves to the maximized camera slot (there is only pane 0); otherwise
+    /// the layout's per-pane mapping.
+    fn effective_camera_index(&self, pane: usize) -> usize {
+        effective_cam_index(self.maximized, self.layout, pane)
+    }
+
+    /// Toggle maximize for `pane`'s viewport (its name-tag was double-clicked):
+    /// maximize to that pane's camera, or restore the previous layout if already
+    /// maximized.
+    fn toggle_maximize(&mut self, pane: usize) {
+        let slot = self.layout.camera_index(pane);
+        let (maximized, active, restore) =
+            next_maximize(self.maximized, pane, slot, self.maximized_restore_pane);
+        self.maximized = maximized;
+        self.active_pane = active;
+        self.maximized_restore_pane = restore;
     }
 
     /// Decode the document's underlay image into GPU-ready `UnderlayData`,
@@ -2002,7 +2067,8 @@ impl App {
 
     /// Camera of the active (last hovered) pane.
     fn active_camera(&mut self) -> &mut OrbitCamera {
-        &mut self.cameras[self.layout.camera_index(self.active_pane)]
+        let idx = self.effective_camera_index(self.active_pane);
+        &mut self.cameras[idx]
     }
 
     fn set_view(&mut self, name: &str) {
@@ -2038,7 +2104,7 @@ impl App {
         h: u32,
     ) -> Result<itsjustcad_render::ControlImagePaths, String> {
         let aspect = w as f32 / h as f32;
-        let cam_idx = self.layout.camera_index(self.active_pane);
+        let cam_idx = self.effective_camera_index(self.active_pane);
         let camera = self.cameras[cam_idx];
         let view_proj = camera.view_proj(aspect);
         let eye = camera.eye();
@@ -2154,7 +2220,7 @@ impl App {
     /// (w/h), matching the viewport's eye/target/up/fov. Shared by the verb, the
     /// file-save path, and the progressive window.
     fn raytrace_camera(&self, aspect: f64) -> itsjustcad_raytrace::Camera {
-        let cam_idx = self.layout.camera_index(self.active_pane);
+        let cam_idx = self.effective_camera_index(self.active_pane);
         let camera = self.cameras[cam_idx];
         let eye = camera.eye();
         let target = camera.target;
@@ -3620,7 +3686,10 @@ impl App {
         // — no hover flicker. EXCEPTION: while a draw tool is armed, the pane under
         // the cursor becomes active so points can be picked in ANY viewport
         // mid-command (Rhino lets you pick across viewports during a command).
-        if (self.draw_tool.active() || self.guided.active())
+        if self.maximized.is_some() {
+            // Only one pane exists while maximized; everything targets it.
+            self.active_pane = 0;
+        } else if (self.draw_tool.active() || self.guided.active())
             && let Some(pos) = ui.ctx().pointer_latest_pos()
             && let Some(pane) = self.layout.pane_at(full, pos)
         {
@@ -3634,7 +3703,7 @@ impl App {
         };
         let generation = self.session.doc.generation;
         // Color mode of the active pane drives the snapshot; changes stale it.
-        let active_color_mode = self.color_modes[self.layout.camera_index(self.active_pane)];
+        let active_color_mode = self.color_modes[self.effective_camera_index(self.active_pane)];
         // Trim removal preview: while picking "parts to remove", the clicked
         // pieces are hidden from the snapshot so they look deleted (Rhino). The
         // number of marks is a staleness signal — clicking a removal point does
@@ -3673,7 +3742,7 @@ impl App {
             self.uploaded_trim_marks = trim_marks;
             // Sketchy depth cue: bias by the active pane's eye + scene radius.
             let (sketchy_eye, sketchy_radius) = if self.sketchy.active() {
-                let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
+                let cam = &self.cameras[self.effective_camera_index(self.active_pane)];
                 let r = self
                     .session
                     .doc
@@ -3740,9 +3809,9 @@ impl App {
             None
         };
 
-        let panes = self.layout.split(full);
+        let panes = self.effective_panes(full);
         for (pane, rect) in panes.iter().copied().enumerate() {
-            let cam_idx = self.layout.camera_index(pane);
+            let cam_idx = self.effective_camera_index(pane);
             let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
             // Click (or drag/RMB) inside a pane makes it the active viewport,
@@ -3972,7 +4041,13 @@ impl App {
                     ui.id().with(("view_tag", pane)),
                     egui::Sense::click(),
                 );
-                if tag_resp.clicked() {
+                if tag_resp.double_clicked() {
+                    // Double-click the tag: maximize this pane to a single
+                    // viewport, or restore the previous layout if already
+                    // maximized (Rhino). `pane` is 0 while maximized, which
+                    // `toggle_maximize` reads as "restore".
+                    self.toggle_maximize(pane);
+                } else if tag_resp.clicked() {
                     self.active_pane = pane;
                 }
                 let text_color = if active {
@@ -6083,7 +6158,7 @@ impl App {
     /// Bottom strip: cursor coords, active layer, counts, snap state, view.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let doc = &self.session.doc;
-        let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
+        let cam = &self.cameras[self.effective_camera_index(self.active_pane)];
         ui.horizontal(|ui| {
             // Fixed-width slot for the x/y/z readout so growing coordinate values
             // never widen it and shift the rest of the status bar. The text is
@@ -6219,7 +6294,7 @@ impl App {
         let named: Vec<String> = self.session.doc.named_views.keys().cloned().collect();
         let roles = self.live_roles(ui.visuals().dark_mode);
         // Highlight the tab matching the active pane's current view.
-        let cam = &self.cameras[self.layout.camera_index(self.active_pane)];
+        let cam = &self.cameras[self.effective_camera_index(self.active_pane)];
         let current = crate::statusbar::view_label(cam.yaw, cam.pitch, cam.ortho);
         let mut chosen: Option<String> = None;
         ui.horizontal(|ui| {
@@ -6250,7 +6325,7 @@ impl App {
             // right_to_left lays out in reverse, so paint them in reverse order
             // to read `ZE | Shaded▾ | ByLayer▾ | [1 2 4]` left→right.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let slot = self.layout.camera_index(self.active_pane);
+                let slot = self.effective_camera_index(self.active_pane);
                 // Layout 1/2/4 as a segmented control (single-select, equal-width).
                 let layout_variants =
                     [ViewportLayout::Single, ViewportLayout::Two, ViewportLayout::Four];
@@ -7395,7 +7470,7 @@ impl App {
     fn view_state(&self) -> crate::menu::ViewState {
         use crate::menu::{CameraTag, DisplayModeTag, LightModeTag};
         use itsjustcad_render::{DisplayMode, LightMode, PanoProjection};
-        let disp = self.display_modes[self.layout.camera_index(self.active_pane)];
+        let disp = self.display_modes[self.effective_camera_index(self.active_pane)];
         let display = match disp {
             DisplayMode::Shaded => Some(DisplayModeTag::Shaded),
             DisplayMode::Wireframe => Some(DisplayModeTag::Wireframe),
@@ -7412,7 +7487,7 @@ impl App {
         // Camera projection of the focused viewport: pano/fisheye win (they
         // replace the pinhole entirely), then two-point, then plain
         // perspective; ortho standard views check nothing.
-        let cam = self.cameras[self.layout.camera_index(self.active_pane)];
+        let cam = self.cameras[self.effective_camera_index(self.active_pane)];
         let camera = if cam.ortho {
             None
         } else {
@@ -9136,7 +9211,7 @@ impl eframe::App for App {
         // Pencil mode forces paper white regardless of the egui theme.
         // Use the active pane's display mode to drive the clear colour.
         let active_mode =
-            self.display_modes[self.layout.camera_index(self.active_pane)];
+            self.display_modes[self.effective_camera_index(self.active_pane)];
         if active_mode == itsjustcad_render::DisplayMode::Pencil {
             return itsjustcad_render::DisplayMode::pencil_background();
         }
@@ -9908,6 +9983,31 @@ fn pano_from_view(v: itsjustcad_doc::PanoView) -> itsjustcad_render::PanoProject
 mod tests {
     use super::*;
     use itsjustcad_commands::registry;
+
+    #[test]
+    fn effective_cam_index_honors_maximize() {
+        // Not maximized: follows the layout's per-pane mapping.
+        assert_eq!(effective_cam_index(None, ViewportLayout::Four, 0), 1); // TL = Top
+        assert_eq!(effective_cam_index(None, ViewportLayout::Four, 1), 0); // TR = Persp
+        assert_eq!(effective_cam_index(None, ViewportLayout::Two, 1), 1);
+        // Maximized: every pane resolves to the stored slot, ignoring the layout.
+        assert_eq!(effective_cam_index(Some(3), ViewportLayout::Four, 0), 3);
+        assert_eq!(effective_cam_index(Some(2), ViewportLayout::Two, 0), 2);
+    }
+
+    #[test]
+    fn next_maximize_toggles_and_restores() {
+        // Double-click pane 2 in a Four layout (its cam slot is camera_index(2)=2,
+        // Front). Not yet maximized → maximize to that slot, activate pane 0,
+        // remember pane 2 to restore.
+        let slot = ViewportLayout::Four.camera_index(2);
+        let (m, active, restore) = next_maximize(None, 2, slot, 0);
+        assert_eq!((m, active, restore), (Some(slot), 0, 2));
+        // Double-click again (now maximized) → restore: clear override, re-activate
+        // the remembered pane (2), keep restore unchanged.
+        let (m2, active2, restore2) = next_maximize(m, 0, slot, restore);
+        assert_eq!((m2, active2, restore2), (None, 2, 2));
+    }
 
     #[test]
     fn shared_value_detects_agreement_and_mixed() {
