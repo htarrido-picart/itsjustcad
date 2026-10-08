@@ -74,6 +74,7 @@ enum CamOp {
     Orbit(f32, f32),
     Pan(f32, f32),
     Dolly(f32),
+    Frame,
 }
 
 /// Deck delta kinds handed to the Swift callback.
@@ -809,6 +810,22 @@ pub unsafe extern "C" fn ijc_camera_zoom(h: *mut AppHandle, factor: f32) {
     })
 }
 
+/// Zoom-to-fit: frame the entire scene (center on its bounding box and back the
+/// camera off to show everything). No-op on an empty scene. Applied on the next
+/// [`ijc_render_frame`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_zoom_extents(h: *mut AppHandle) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(PendingOp::Camera(CamOp::Frame));
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------------
@@ -840,6 +857,7 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
                     CamOp::Orbit(dx, dy) => app.camera.orbit(dx, dy),
                     CamOp::Pan(dx, dy) => app.camera.pan(dx, dy),
                     CamOp::Dolly(d) => app.camera.dolly(d),
+                    CamOp::Frame => frame_camera(app),
                 },
             }
         }
