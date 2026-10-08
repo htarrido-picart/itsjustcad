@@ -73,6 +73,11 @@ pub enum MenuAction {
     /// Start a new file session: fresh document AND a fresh chat/deck session
     /// (drops the provider conversation handle and transcript).
     NewSession,
+    /// Re-open the first-run setup wizard (units/scale/language/skin/deck brain)
+    /// on demand. Resets the wizard to step 1. Fired by the Help ▸ Run Setup
+    /// Again… item; does NOT clear the "onboarding done" flag until the user
+    /// clicks Start again.
+    RestartOnboarding,
     /// Pop a native file-open dialog for import, then run `import <path>` through
     /// the substrate. Fired by the File → Import… menu item.
     ImportDialog,
@@ -900,6 +905,14 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                 label: tr("menu.help.palette").into(),
                 action: MenuAction::CommandPalette,
                 shortcut: action_shortcut(&MenuAction::CommandPalette).map(str::to_string),
+                enabled: true,
+            },
+            NativeItem::Separator,
+            NativeItem::Leaf {
+                id: "Help/onboarding".into(),
+                label: tr("menu.help.onboarding").into(),
+                action: MenuAction::RestartOnboarding,
+                shortcut: None,
                 enabled: true,
             },
             NativeItem::Separator,

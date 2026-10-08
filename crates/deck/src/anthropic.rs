@@ -45,12 +45,15 @@ impl AnthropicDeck {
             })
             .collect();
 
+        // NOTE: `temperature` is intentionally omitted — newer models (e.g.
+        // Opus 4.8) reject it with "`temperature` is deprecated for this model",
+        // and the API defaults it sensibly when absent. The app exposes no
+        // temperature control, so there's nothing to forward.
         let mut body = json!({
             "model": if req.model.is_empty() { &self.model } else { &req.model },
             "system": req.system,
             "messages": messages,
             "max_tokens": req.max_tokens,
-            "temperature": req.temperature,
             "stream": true,
         });
         // OPT-IN web search: only attach the server-side tool when this turn
