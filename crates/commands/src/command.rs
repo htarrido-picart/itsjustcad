@@ -1994,6 +1994,16 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Recompute an associative subdivision (W1): re-derive the lots for the
+    /// link keyed by `source` from the source block's CURRENT geometry + the
+    /// link's stored settings, replacing the produced lot children. `ids` are
+    /// the written-back new lot ids so replay is byte-identical. A frozen link
+    /// is a no-op. Logged; the inverse restores the previous lots + link state.
+    LotRefresh {
+        source: ObjectId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// Show or set the sticky `SubdivisionSettings` on the document
     /// (M-intemfit). With no `sets`, the exec message reports the current
     /// settings; otherwise each `key=value` updates one field. Logged so saved

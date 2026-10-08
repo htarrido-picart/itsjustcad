@@ -129,6 +129,23 @@ enum Inverse {
         created: Vec<ObjectId>,
         layers_created: Vec<String>,
     },
+    /// `lotsubdivide` (W1 associative): like `CreatedOnLayer`, plus it drops the
+    /// subdivision link keyed by `link_source` so undo leaves no dangling
+    /// source→lots association.
+    CreatedOnLayerLinked {
+        created: Vec<ObjectId>,
+        layers_created: Vec<String>,
+        link_source: ObjectId,
+    },
+    /// `lotrefresh` (W1 associative recompute): delete the recomputed lots,
+    /// restore the previous lots (with their creation indices), and restore the
+    /// link's prior state (produced ids + source_z).
+    LotRefreshed {
+        source: ObjectId,
+        created: Vec<ObjectId>,
+        restored: Vec<(SceneObject, usize)>,
+        prev_link: itsjustcad_doc::SubdivLink,
+    },
     /// `layer`: restore the previous current layer, dropping the layer this
     /// command created (if any).
     LayerCurrent {
@@ -824,6 +841,28 @@ impl Session {
                     self.doc.layers.remove(&name);
                     self.doc.generation += 1;
                 }
+            }
+            Inverse::CreatedOnLayerLinked { created, layers_created, link_source } => {
+                for id in created.clone() {
+                    self.doc.remove(id);
+                }
+                for name in layers_created.clone() {
+                    self.doc.layers.remove(&name);
+                }
+                // Drop the associative link so undo leaves no stale source→lots
+                // binding (redo re-inserts it).
+                self.doc.subdivision_links.remove(link_source);
+                self.doc.generation += 1;
+            }
+            Inverse::LotRefreshed { source, created, restored, prev_link } => {
+                for id in created.clone() {
+                    self.doc.remove(id);
+                }
+                for (obj, index) in restored.iter().rev() {
+                    self.doc.restore(obj.clone(), *index);
+                }
+                self.doc.subdivision_links.insert(*source, prev_link.clone());
+                self.doc.generation += 1;
             }
             Inverse::LayerCurrent { prev, created } => {
                 if let Some(name) = created {
@@ -5205,9 +5244,11 @@ fn exec_lot_subdivide(
         settings.seed = s;
     }
 
-    // Gather closed block polygons from the selection.
+    // Gather closed block polygons from the selection (tracking their source
+    // ids so a single-block subdivide can record an associative link).
     let sel_ids = resolve(doc, &targets)?;
     let mut blocks: Vec<(subdivision::Polygon2d, f64)> = Vec::new();
+    let mut source_ids: Vec<ObjectId> = Vec::new();
     for id in &sel_ids {
         if let Some(obj) = doc.get(*id)
             && let Geometry::Curve(c) = &obj.geometry
@@ -5222,6 +5263,7 @@ fn exec_lot_subdivide(
                 pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
             };
             blocks.push((poly, z));
+            source_ids.push(*id);
         }
     }
     if blocks.is_empty() {
@@ -5243,9 +5285,38 @@ fn exec_lot_subdivide(
         layers_created.push(name);
     }
     crate::lot::insert_lots(doc, &bake, &new_ids);
+
+    // W1 associativity: for a SINGLE source block, record a link (source → the
+    // settings + produced lots) so the division recomputes when the block is
+    // edited. Multi-block subdivide bakes a flat lot list with no per-block
+    // attribution, so it stays unlinked (v1 scope). Re-subdividing the same
+    // block overwrites its link to track the latest result.
+    let link_source = if source_ids.len() == 1 {
+        let src = source_ids[0];
+        doc.subdivision_links.insert(
+            src,
+            itsjustcad_doc::SubdivLink {
+                settings: settings.clone(),
+                produced: new_ids.clone(),
+                source_z: blocks[0].1,
+                frozen: false,
+            },
+        );
+        Some(src)
+    } else {
+        None
+    };
     doc.generation += 1;
 
     let n = new_ids.len();
+    let inverse = match link_source {
+        Some(src) => Inverse::CreatedOnLayerLinked {
+            created: new_ids.clone(),
+            layers_created,
+            link_source: src,
+        },
+        None => Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+    };
     Ok((
         Command::LotSubdivide {
             targets,
@@ -5256,7 +5327,7 @@ fn exec_lot_subdivide(
             seed,
             ids: Some(new_ids.clone()),
         },
-        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        inverse,
         ApplyOutcome {
             message: {
                 let mut msg = format!(
@@ -5280,6 +5351,80 @@ fn exec_lot_subdivide(
             },
             created: new_ids,
         },
+    ))
+}
+
+/// `lotrefresh` (W1 associative recompute): re-derive the lots for the link
+/// keyed by `source` from the source block's CURRENT geometry + the link's
+/// stored settings, replacing the produced lot children. Written-back `ids`
+/// keep replay byte-identical. A frozen link is rejected.
+fn exec_lot_refresh(
+    doc: &mut Document,
+    source: ObjectId,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let link = doc.subdivision_links.get(&source).cloned().ok_or_else(|| {
+        ExecError::Invalid(
+            "lotrefresh: no subdivision link for this object (run lotsubdivide first)".into(),
+        )
+    })?;
+    if link.frozen {
+        return Err(ExecError::Invalid(
+            "lotrefresh: this result is frozen — unfreeze to recompute".into(),
+        ));
+    }
+    let Some(obj) = doc.get(source) else {
+        return Err(ExecError::Invalid("lotrefresh: source block no longer exists".into()));
+    };
+    let Geometry::Curve(c) = &obj.geometry else {
+        return Err(ExecError::Invalid("lotrefresh: source is not a curve".into()));
+    };
+    if !c.is_closed() {
+        return Err(ExecError::Invalid("lotrefresh: source block curve must be closed".into()));
+    }
+    let Some(poly) = crate::lot::curve_to_polygon(c) else {
+        return Err(ExecError::Invalid("lotrefresh: could not read source block polygon".into()));
+    };
+    let pts = c.tessellate(PROFILE_TOL);
+    let z = if pts.is_empty() {
+        link.source_z
+    } else {
+        pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
+    };
+
+    let bake =
+        crate::lot::derive_subdivision(&poly, z, &link.settings).map_err(ExecError::Invalid)?;
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == bake.polygons.len() => ids,
+        _ => (0..bake.polygons.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    // Snapshot + remove the OLD produced lots (for undo), then insert the new.
+    let mut restored: Vec<(SceneObject, usize)> = Vec::new();
+    for id in &link.produced {
+        if let Some(removed) = doc.remove(*id) {
+            restored.push(removed);
+        }
+    }
+    crate::lot::insert_lots(doc, &bake, &new_ids);
+    let prev_link = link.clone();
+    doc.subdivision_links.insert(
+        source,
+        itsjustcad_doc::SubdivLink {
+            settings: link.settings.clone(),
+            produced: new_ids.clone(),
+            source_z: z,
+            frozen: false,
+        },
+    );
+    doc.generation += 1;
+
+    let n = new_ids.len();
+    Ok((
+        Command::LotRefresh { source, ids: Some(new_ids.clone()) },
+        Inverse::LotRefreshed { source, created: new_ids.clone(), restored, prev_link },
+        ApplyOutcome { created: new_ids, message: format!("lotrefresh: {n} lot(s) recomputed") },
     ))
 }
 
@@ -12052,6 +12197,7 @@ fn apply_forward(
         Command::LotSubdivide { targets, method, area, width, irregularity, seed, ids } => {
             exec_lot_subdivide(doc, targets, method, area, width, irregularity, seed, ids)
         }
+        Command::LotRefresh { source, ids } => exec_lot_refresh(doc, source, ids),
         Command::LotSettings { sets, prev } => exec_lot_settings(doc, sets, prev),
         Command::LotLoading { targets, mode, prev } => exec_lot_loading(doc, targets, mode, prev),
         Command::LotGenerateSite {
@@ -14445,6 +14591,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Pad { .. } => "pad",
         Command::CutFill { .. } => "cutfill",
         Command::LotSubdivide { .. } => "lotsubdivide",
+        Command::LotRefresh { .. } => "lotrefresh",
         Command::LotSettings { .. } => "lotsettings",
         Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",
@@ -25462,5 +25609,60 @@ mod tests {
         run(&mut s, "polyline 0,0,0 1,0,0 1,1,0 0,1,0 closed");
         let err = s.run(parse("hatch last pattern NOPE").unwrap()).unwrap_err();
         assert!(err.to_string().contains("no imported hatch pattern 'NOPE'"), "{err}");
+    }
+
+    /// W1b associative recompute: lotsubdivide records a source→lots link;
+    /// LotRefresh re-derives the lots (new ids), and undo restores the prior
+    /// lots + the link's previous `produced` list.
+    #[test]
+    fn lotrefresh_recomputes_and_undo_restores_link() {
+        let mut s = Session::default();
+        // A closed 40x40 square block curve.
+        run(&mut s, "polyline 0,0,0 40,0,0 40,40,0 0,40,0 closed");
+        let source = s.doc.objects().next().expect("one block").id;
+
+        // Subdivide it (grid). The single-source subdivide must record a link.
+        s.run(Command::LotSubdivide {
+            targets: Selector::Ids { ids: vec![source] },
+            method: "grid".into(),
+            area: None,
+            width: None,
+            irregularity: None,
+            seed: None,
+            ids: None,
+        })
+        .expect("lotsubdivide ok");
+
+        let link = s.doc.subdivision_links.get(&source).expect("link recorded").clone();
+        assert!(!link.produced.is_empty(), "subdivide produced lots");
+        let old_ids = link.produced.clone();
+        for id in &old_ids {
+            assert!(s.doc.get(*id).is_some(), "old lot {id:?} exists before refresh");
+        }
+
+        // Recompute. Fresh ids, old lots gone, new lots present.
+        s.run(Command::LotRefresh { source, ids: None }).expect("lotrefresh ok");
+        let refreshed = s.doc.subdivision_links.get(&source).expect("link still present").clone();
+        assert!(!refreshed.produced.is_empty(), "refresh produced lots");
+        assert_ne!(refreshed.produced, old_ids, "refresh minted fresh ids");
+        for id in &old_ids {
+            assert!(s.doc.get(*id).is_none(), "old lot {id:?} removed by refresh");
+        }
+        for id in &refreshed.produced {
+            assert!(s.doc.get(*id).is_some(), "new lot {id:?} present after refresh");
+        }
+        let new_ids = refreshed.produced.clone();
+
+        // Undo the refresh: link reverts to the pre-refresh produced ids and the
+        // previous lots are restored; the refreshed lots are gone.
+        run(&mut s, "undo");
+        let reverted = s.doc.subdivision_links.get(&source).expect("link after undo").clone();
+        assert_eq!(reverted.produced, old_ids, "undo restored prior produced ids");
+        for id in &old_ids {
+            assert!(s.doc.get(*id).is_some(), "prior lot {id:?} restored by undo");
+        }
+        for id in &new_ids {
+            assert!(s.doc.get(*id).is_none(), "refreshed lot {id:?} removed by undo");
+        }
     }
 }
