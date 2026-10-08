@@ -1150,7 +1150,39 @@ pub unsafe extern "C" fn ijc_scene_digest(h: *mut AppHandle) -> *mut c_char {
     })
 }
 
-/// Free a C string returned by [`ijc_command_brief`] / [`ijc_scene_digest`].
+/// Serialize the current document to ItsJustCAD op-log JSON (the same format
+/// [`ijc_open_json`] reads). For persistence/export on the host side. Returns an
+/// empty (non-null) string for a null/invalid handle. Caller must
+/// [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer must
+/// be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_save_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::new());
+        };
+        into_c_string(io::to_json(&app.session))
+    })
+}
+
+/// The document's monotonic generation counter — it bumps on every mutation.
+/// Lets the host cheaply gate work (autosave, cached reads) on actual change
+/// rather than polling. Returns 0 for a null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_doc_generation(h: *mut AppHandle) -> u64 {
+    guard_ffi(0, || {
+        (unsafe { handle_ref(h) }).map_or(0, |app| app.session.doc.generation)
+    })
+}
+
+/// Free a C string returned by [`ijc_command_brief`] / [`ijc_scene_digest`] /
+/// [`ijc_save_json`].
 /// Null-safe; must be called at most once per returned pointer.
 ///
 /// # Safety
