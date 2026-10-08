@@ -435,7 +435,7 @@ impl ParamField {
     // columns (name, label, default, min, max, step, widget, unit) — grouping
     // them into a struct would add ceremony without clarity.
     #[allow(clippy::too_many_arguments)]
-    fn float(
+    pub fn float(
         name: &'static str,
         label_key: &'static str,
         default: f64,
@@ -458,7 +458,7 @@ impl ParamField {
             choices: vec![],
         }
     }
-    fn int(
+    pub fn int(
         name: &'static str,
         label_key: &'static str,
         default: i64,
@@ -480,7 +480,7 @@ impl ParamField {
             choices: vec![],
         }
     }
-    fn bool(name: &'static str, label_key: &'static str, default: bool) -> Self {
+    pub fn bool(name: &'static str, label_key: &'static str, default: bool) -> Self {
         ParamField {
             name,
             label_key,
@@ -494,7 +494,7 @@ impl ParamField {
             choices: vec![],
         }
     }
-    fn vec3(name: &'static str, label_key: &'static str, default: DVec3) -> Self {
+    pub fn vec3(name: &'static str, label_key: &'static str, default: DVec3) -> Self {
         ParamField {
             name,
             label_key,
@@ -508,7 +508,7 @@ impl ParamField {
             choices: vec![],
         }
     }
-    fn enum_(
+    pub fn enum_(
         name: &'static str,
         label_key: &'static str,
         default: &'static str,
@@ -554,54 +554,63 @@ impl ParamSchema {
     /// fill missing fields from defaults, clamp numerics into [min, max],
     /// snap enums to a valid choice. Pure; the ground truth for re-derive.
     pub fn sanitize(&self, params: &ParamMap) -> ParamMap {
-        let mut out = ParamMap::new();
-        for f in &self.fields {
-            let v = params.get(f.name).cloned().unwrap_or_else(|| f.default.clone());
-            out.insert(f.name.to_string(), self.clamp_field(f, v));
-        }
-        out
+        sanitize_fields(&self.fields, params)
     }
+}
 
-    fn clamp_field(&self, f: &ParamField, v: ParamValue) -> ParamValue {
-        match f.kind {
-            FieldKind::Float => {
-                let mut x = v.as_f64().unwrap_or_else(|| f.default.as_f64().unwrap_or(0.0));
-                if !x.is_finite() {
-                    x = f.default.as_f64().unwrap_or(0.0);
-                }
-                if let Some(mn) = f.min {
-                    x = x.max(mn);
-                }
-                if let Some(mx) = f.max {
-                    x = x.min(mx);
-                }
-                ParamValue::Float(x)
+/// Coerce/clamp `params` against a bare field list (no [`GeneratorKind`]): fill
+/// missing fields from defaults, clamp numerics into `[min, max]`, snap enums to
+/// a valid choice. The reusable core of [`ParamSchema::sanitize`] so other
+/// schema domains (e.g. subdivision) can reuse the exact same coercion. Pure.
+pub fn sanitize_fields(fields: &[ParamField], params: &ParamMap) -> ParamMap {
+    let mut out = ParamMap::new();
+    for f in fields {
+        let v = params.get(f.name).cloned().unwrap_or_else(|| f.default.clone());
+        out.insert(f.name.to_string(), clamp_field(f, v));
+    }
+    out
+}
+
+/// Clamp/coerce one value to a field's type + bounds. Pure, stateless.
+pub fn clamp_field(f: &ParamField, v: ParamValue) -> ParamValue {
+    match f.kind {
+        FieldKind::Float => {
+            let mut x = v.as_f64().unwrap_or_else(|| f.default.as_f64().unwrap_or(0.0));
+            if !x.is_finite() {
+                x = f.default.as_f64().unwrap_or(0.0);
             }
-            FieldKind::Int => {
-                let mut x = v.as_i64().unwrap_or_else(|| f.default.as_i64().unwrap_or(0));
-                if let Some(mn) = f.min {
-                    x = x.max(mn as i64);
-                }
-                if let Some(mx) = f.max {
-                    x = x.min(mx as i64);
-                }
-                ParamValue::Int(x)
+            if let Some(mn) = f.min {
+                x = x.max(mn);
             }
-            FieldKind::Bool => {
-                ParamValue::Bool(v.as_bool().unwrap_or_else(|| f.default.as_bool().unwrap_or(false)))
+            if let Some(mx) = f.max {
+                x = x.min(mx);
             }
-            FieldKind::Vec3 => {
-                let d = v.as_vec3().unwrap_or_else(|| f.default.as_vec3().unwrap_or(DVec3::ZERO));
-                let d = if d.is_finite() { d } else { f.default.as_vec3().unwrap_or(DVec3::ZERO) };
-                ParamValue::Vec3(d.to_array())
+            ParamValue::Float(x)
+        }
+        FieldKind::Int => {
+            let mut x = v.as_i64().unwrap_or_else(|| f.default.as_i64().unwrap_or(0));
+            if let Some(mn) = f.min {
+                x = x.max(mn as i64);
             }
-            FieldKind::Enum => {
-                let cur = v.as_enum().unwrap_or("");
-                if f.choices.contains(&cur) {
-                    ParamValue::Enum(cur.to_string())
-                } else {
-                    f.default.clone()
-                }
+            if let Some(mx) = f.max {
+                x = x.min(mx as i64);
+            }
+            ParamValue::Int(x)
+        }
+        FieldKind::Bool => {
+            ParamValue::Bool(v.as_bool().unwrap_or_else(|| f.default.as_bool().unwrap_or(false)))
+        }
+        FieldKind::Vec3 => {
+            let d = v.as_vec3().unwrap_or_else(|| f.default.as_vec3().unwrap_or(DVec3::ZERO));
+            let d = if d.is_finite() { d } else { f.default.as_vec3().unwrap_or(DVec3::ZERO) };
+            ParamValue::Vec3(d.to_array())
+        }
+        FieldKind::Enum => {
+            let cur = v.as_enum().unwrap_or("");
+            if f.choices.contains(&cur) {
+                ParamValue::Enum(cur.to_string())
+            } else {
+                f.default.clone()
             }
         }
     }

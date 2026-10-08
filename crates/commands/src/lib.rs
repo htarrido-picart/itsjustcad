@@ -32,6 +32,7 @@ mod registry;
 pub mod rhino3dm;
 pub mod saf;
 pub mod sketch;
+pub mod subdiv_params;
 pub mod svg;
 pub mod workdir;
 
