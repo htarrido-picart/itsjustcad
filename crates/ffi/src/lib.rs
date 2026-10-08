@@ -43,8 +43,8 @@ use std::sync::{Arc, Mutex};
 
 use itsjustcad_commands::{io, parse, Command, Session};
 use itsjustcad_deck::{
-    digest, make_deck, system_prompt, ChatMessage, ChatRequest, DeckConfig, DeckDelta, DeckKind,
-    ExtractEvent, Extractor, LlmDeck, Role,
+    compact_command_catalog, digest, make_deck, system_prompt, ChatMessage, ChatRequest,
+    DeckConfig, DeckDelta, DeckKind, ExtractEvent, Extractor, LlmDeck, Role,
 };
 use itsjustcad_render::{
     camera_uniform_with_mode, snapshot, DisplayMode, OrbitCamera, SceneRenderer, StandardView,
@@ -739,6 +739,77 @@ pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char)
 }
 
 // ---------------------------------------------------------------------------
+// Interactive camera (touch gestures)
+// ---------------------------------------------------------------------------
+//
+// These mirror the typed camera verbs (`orbit`/`pan`/`zoom`) but take raw
+// screen-space deltas straight from UIKit gesture recognizers, so a drag can
+// feed one op per frame without routing a text command per gesture change. Each
+// op is queued on the shared `pending` list and applied on the next
+// `ijc_render_frame` (same contract as `ijc_run_command`). They use the shared
+// `handle_ref` (not `handle_mut`): they only push onto the `Mutex`-guarded
+// queue, touching no `&mut` session/GPU/camera state directly.
+
+/// Orbit (tumble) the camera by a screen-space delta in points. `dx`/`dy` are
+/// incremental finger translation; the core scales them to radians (≈0.29°/px),
+/// so pass raw pixel deltas. Applied on the next `ijc_render_frame`.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_orbit(h: *mut AppHandle, dx: f32, dy: f32) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(PendingOp::Camera(CamOp::Orbit(dx, dy)));
+        }
+    })
+}
+
+/// Pan the camera by a screen-space delta in points. `dx`/`dy` are incremental
+/// finger translation; the core scales them by the view distance so the point
+/// under the fingers stays roughly fixed. Applied on the next `ijc_render_frame`.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_pan(h: *mut AppHandle, dx: f32, dy: f32) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(PendingOp::Camera(CamOp::Pan(dx, dy)));
+        }
+    })
+}
+
+/// Zoom (dolly) the camera by a multiplicative `factor` from a pinch gesture:
+/// `factor > 1` zooms in (closer), `factor < 1` zooms out. The core's `dolly`
+/// takes an additive scroll amount where `distance *= 1 - scroll * 0.002`; we
+/// map the pinch ratio to that scroll so a pinch-apart moves the camera nearer.
+/// Applied on the next `ijc_render_frame`.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_zoom(h: *mut AppHandle, factor: f32) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        // A non-finite / non-positive factor is a no-op (a pinch recognizer can
+        // momentarily report 0 or NaN scale between touches).
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        // `dolly` applies `distance *= 1 - scroll * 0.002`. To make `factor`
+        // behave multiplicatively (zoom in by `factor`), pick `scroll` such that
+        // `1 - scroll * 0.002 ≈ 1 / factor`, i.e. divide distance by `factor`.
+        let scroll = (1.0 - 1.0 / factor) / 0.002;
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(PendingOp::Camera(CamOp::Dolly(scroll)));
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------------
 
@@ -1030,6 +1101,72 @@ pub unsafe extern "C" fn ijc_deck_send(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Prompt helpers for the Swift on-device deck
+// ---------------------------------------------------------------------------
+//
+// The on-device (Apple Foundation Models) path runs entirely in Swift but needs
+// the same command cheatsheet + scene digest the FFI deck feeds its system
+// prompt. These return heap-allocated, NUL-terminated UTF-8 C strings the caller
+// must release with [`ijc_string_free`]. Returning an owned `*mut c_char`
+// (rather than writing into a caller buffer) keeps the ABI simple and matches
+// the Swift side's `copyFFIString` (copy then free).
+
+/// Allocate a C string the host owns and must free via [`ijc_string_free`].
+/// Returns null if the text contains an interior NUL (cannot be a C string).
+fn into_c_string(s: String) -> *mut c_char {
+    match CString::new(s) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// The compact command catalog (verb cheatsheet) for the on-device model's
+/// instructions. Handle-free: the catalog is static. Caller must
+/// [`ijc_string_free`] the result.
+///
+/// # Safety
+/// The returned pointer must be freed exactly once via [`ijc_string_free`] and
+/// not otherwise retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_command_brief() -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || into_c_string(compact_command_catalog()))
+}
+
+/// A compact digest of the current scene for the on-device model's instructions.
+/// Returns an empty (but non-null) string for a null/invalid handle. Caller must
+/// [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer must
+/// be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_scene_digest(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::new());
+        };
+        into_c_string(digest(&app.session.doc))
+    })
+}
+
+/// Free a C string returned by [`ijc_command_brief`] / [`ijc_scene_digest`].
+/// Null-safe; must be called at most once per returned pointer.
+///
+/// # Safety
+/// `s` must be null or a pointer previously returned by one of the string
+/// accessors above and not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_string_free(s: *mut c_char) {
+    guard_ffi((), || {
+        if s.is_null() {
+            return;
+        }
+        // Reclaim the `CString` allocated by `into_c_string`/`into_raw`.
+        drop(unsafe { CString::from_raw(s) });
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,6 +1188,38 @@ mod tests {
         ));
         assert!(matches!(route_line("orbit 0.1 0.2"), Some(PendingOp::Camera(CamOp::Orbit(..)))));
         assert!(matches!(route_line("zoom in"), Some(PendingOp::Camera(CamOp::Dolly(..)))));
+    }
+
+    #[test]
+    fn camera_ffi_entrypoints_are_null_safe() {
+        let nil = std::ptr::null_mut::<AppHandle>();
+        unsafe {
+            // Must not panic / deref a null handle.
+            ijc_camera_orbit(nil, 1.0, 2.0);
+            ijc_camera_pan(nil, 1.0, 2.0);
+            ijc_camera_zoom(nil, 1.5);
+            // Degenerate zoom factors are a no-op, not a panic.
+            ijc_camera_zoom(nil, 0.0);
+            ijc_camera_zoom(nil, f32::NAN);
+        }
+    }
+
+    #[test]
+    fn zoom_factor_maps_to_dolly_toward_target() {
+        // A pinch-apart (factor > 1, zoom in) must shrink the camera distance;
+        // a pinch-together (factor < 1) must grow it. Verify the scroll we feed
+        // `dolly` produces the right sign and roughly divides distance by factor.
+        let mut cam = OrbitCamera { distance: 100.0, ..OrbitCamera::default() };
+        let factor = 2.0f32;
+        let scroll = (1.0 - 1.0 / factor) / 0.002;
+        cam.dolly(scroll);
+        assert!(cam.distance < 100.0, "zoom-in must bring the camera closer");
+        assert!((cam.distance - 50.0).abs() < 1e-3, "factor 2 ≈ halve distance");
+
+        let mut cam2 = OrbitCamera { distance: 100.0, ..OrbitCamera::default() };
+        let out = 0.5f32;
+        cam2.dolly((1.0 - 1.0 / out) / 0.002);
+        assert!(cam2.distance > 100.0, "zoom-out must push the camera away");
     }
 
     #[test]
