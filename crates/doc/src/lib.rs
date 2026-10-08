@@ -22,7 +22,7 @@ mod view;
 
 pub use constraint::{PointRef, SketchConstraint};
 pub use cplane::CPlane;
-pub use document::Document;
+pub use document::{Document, SubdivLink};
 pub use loads::{LoadGeometry, RestraintKind, StructLoad, StructSupport};
 pub use object::{
     angle_degrees, angular_arc_points, angular_dim_segments, Annotation, AreaKind, BlockGeometry,
