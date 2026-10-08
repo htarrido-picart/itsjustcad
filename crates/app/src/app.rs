@@ -688,6 +688,10 @@ pub struct App {
     forced_dark: Option<bool>,
     /// Whether to show the first-run template picker on next frame.
     show_template_picker: bool,
+    /// Current step of the first-run onboarding wizard (0-based). The picker is
+    /// a compact, horizontally-dominant, multi-step flow so it never needs to
+    /// scroll on short windows.
+    onboard_step: u8,
     template_units: TemplateUnits,
     template_scale: TemplateScale,
     /// Legacy-CAD origin selected in the template picker (persisted to ui.json).
@@ -1164,6 +1168,7 @@ impl App {
                 _ => load_theme_pref(),
             },
             show_template_picker: !load_template_done(),
+            onboard_step: 0,
             template_units: TemplateUnits::Meters,
             template_scale: TemplateScale::Building,
             cad_origin,
@@ -7625,6 +7630,10 @@ impl App {
             MenuAction::ExportDialog => self.export(None),
             MenuAction::NewDocument => self.guarded_nav(ctx, PendingNav::New),
             MenuAction::NewSession => self.new_session(),
+            MenuAction::RestartOnboarding => {
+                self.show_template_picker = true;
+                self.onboard_step = 0;
+            }
             MenuAction::SetTheme(dark) => self.set_theme_pref(ctx, dark),
             MenuAction::ZoomStep(bigger) => {
                 let delta = if bigger { 0.1 } else { -0.1 };
@@ -9484,102 +9493,150 @@ impl eframe::App for App {
 
         if self.show_template_picker {
             let mut done = false;
-            egui::Window::new("New Document Setup")
+            // Compact, horizontally-dominant, multi-step wizard. Each step shows
+            // one question so the window stays short and never needs to scroll on
+            // small screens. Steps: 0 Document (units+scale), 1 Language,
+            // 2 Coming-from (skin), 3 Deck brain.
+            const STEP_COUNT: u8 = 4;
+            let step = self.onboard_step.min(STEP_COUNT - 1);
+            // Per-step heading, shown next to the step counter.
+            let titles = [
+                "Document — units & scale".to_string(),
+                crate::i18n::t("onboard.language.prompt").to_string(),
+                crate::i18n::t("onboard.skin.prompt").to_string(),
+                "Deck brain — where should the assistant run?".to_string(),
+            ];
+            egui::Window::new("Set up ItsJustCAD")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .fixed_size([560.0, 0.0])
                 .show(ui.ctx(), |ui| {
-                    ui.label("Units:");
-                    ui.radio_value(&mut self.template_units, TemplateUnits::Meters, "Meters");
-                    ui.radio_value(&mut self.template_units, TemplateUnits::Millimeters, "Millimeters");
-                    ui.radio_value(&mut self.template_units, TemplateUnits::FeetInches, "Feet-inches");
-                    ui.add_space(8.0);
-                    ui.label("Scale:");
-                    ui.radio_value(&mut self.template_scale, TemplateScale::Object, "Object (~5m)");
-                    ui.radio_value(&mut self.template_scale, TemplateScale::Building, "Building (~30m)");
-                    ui.radio_value(&mut self.template_scale, TemplateScale::Urban, "Urban (~300m)");
-                    ui.add_space(8.0);
-                    // Language picker — sets the UI locale for the whole app
-                    // (and re-localizes the rest of this dialog live). Persisted
-                    // on Start; also flippable later via Settings / `language`.
-                    ui.label(crate::i18n::t("onboard.language.prompt"));
-                    for l in crate::i18n::Lang::ALL {
-                        let mut sel = crate::i18n::current_lang() == l;
-                        if ui.radio(sel, l.native_name()).clicked() {
-                            sel = true;
-                            crate::i18n::set_lang(l);
-                        }
-                        let _ = sel;
-                    }
-                    ui.add_space(8.0);
-                    // Skin picker — the legacy-CAD look + command aliases. Labels
-                    // go through the i18n catalog so they localize with the choice
-                    // above.
-                    ui.label(crate::i18n::t("onboard.skin.prompt"));
-                    for origin in CadOrigin::all() {
-                        ui.radio_value(
-                            &mut self.cad_origin,
-                            origin,
-                            crate::i18n::t(origin.label_key()),
-                        );
-                    }
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.label("Deck brain — where should the assistant run?");
-                    ui.radio_value(&mut self.deck_brain, DeckBrain::Cloud, DeckBrain::Cloud.label());
-                    ui.radio_value(&mut self.deck_brain, DeckBrain::Ollama, DeckBrain::Ollama.label());
-                    ui.radio_value(
-                        &mut self.deck_brain,
-                        DeckBrain::Download,
-                        DeckBrain::Download.label(),
-                    );
-                    ui.radio_value(&mut self.deck_brain, DeckBrain::Skip, DeckBrain::Skip.label());
-
-                    // For the "download a local model" path, show the hardware
-                    // recommendation and gate tiers the RAM can't run.
-                    if self.deck_brain == DeckBrain::Download {
-                        use crate::hardware::ModelTier;
-                        let hw = &self.hardware;
-                        let tier = hw.tier();
-                        ui.add_space(4.0);
-                        ui.group(|ui| {
-                            ui.label(egui::RichText::new(hw.recommendation()).strong());
-                            ui.label(format!("Suggested: {}", tier.label()));
-                            // 3B is always offered; 7B only when the machine can run it.
-                            ui.label("• 3B model — fits ~8 GB machines");
-                            let can_7b = matches!(tier, ModelTier::Mid7B);
-                            if can_7b {
-                                ui.label("• 7B model — recommended for this machine");
-                            } else {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "• 7B model — needs 16 GB+ RAM (unavailable)",
-                                    )
-                                    .weak(),
-                                );
-                            }
-                            if matches!(tier, ModelTier::None) {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Low RAM — a cloud brain will likely feel better.",
-                                    )
-                                    .italics(),
-                                );
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "Pick a model in Model Setup after Start \
-                                     (also under Tools → Model Setup).",
-                                )
+                    // Header: step counter + the current step's heading.
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Step {} of {}", step + 1, STEP_COUNT))
                                 .weak()
                                 .small(),
-                            );
-                        });
-                    }
+                        );
+                        ui.separator();
+                        ui.label(egui::RichText::new(&titles[step as usize]).strong());
+                    });
                     ui.add_space(8.0);
-                    if ui.button("Start").clicked() {
-                        done = true;
-                    }
+
+                    // Body — a fixed-height band keeps every step the same size so
+                    // the window doesn't jump as the user clicks Next.
+                    ui.allocate_ui(egui::vec2(ui.available_width(), 180.0), |ui| match step {
+                        0 => {
+                            // Units + scale side by side (horizontally dominant).
+                            ui.columns(2, |cols| {
+                                cols[0].label(egui::RichText::new("Units").strong());
+                                cols[0].radio_value(&mut self.template_units, TemplateUnits::Meters, "Meters");
+                                cols[0].radio_value(&mut self.template_units, TemplateUnits::Millimeters, "Millimeters");
+                                cols[0].radio_value(&mut self.template_units, TemplateUnits::FeetInches, "Feet-inches");
+                                cols[1].label(egui::RichText::new("Scale").strong());
+                                cols[1].radio_value(&mut self.template_scale, TemplateScale::Object, "Object (~5m)");
+                                cols[1].radio_value(&mut self.template_scale, TemplateScale::Building, "Building (~30m)");
+                                cols[1].radio_value(&mut self.template_scale, TemplateScale::Urban, "Urban (~300m)");
+                            });
+                        }
+                        1 => {
+                            // Language picker — sets the UI locale for the whole app
+                            // (and re-localizes the rest of this dialog live). Wrapped
+                            // horizontally so the ~9 options tile instead of stacking.
+                            ui.horizontal_wrapped(|ui| {
+                                for l in crate::i18n::Lang::ALL {
+                                    let sel = crate::i18n::current_lang() == l;
+                                    if ui.radio(sel, l.native_name()).clicked() {
+                                        crate::i18n::set_lang(l);
+                                    }
+                                }
+                            });
+                        }
+                        2 => {
+                            // Skin picker — the legacy-CAD look + command aliases.
+                            // Labels go through the i18n catalog so they localize.
+                            ui.horizontal_wrapped(|ui| {
+                                for origin in CadOrigin::all() {
+                                    ui.radio_value(
+                                        &mut self.cad_origin,
+                                        origin,
+                                        crate::i18n::t(origin.label_key()),
+                                    );
+                                }
+                            });
+                        }
+                        _ => {
+                            ui.radio_value(&mut self.deck_brain, DeckBrain::Cloud, DeckBrain::Cloud.label());
+                            ui.radio_value(&mut self.deck_brain, DeckBrain::Ollama, DeckBrain::Ollama.label());
+                            ui.radio_value(
+                                &mut self.deck_brain,
+                                DeckBrain::Download,
+                                DeckBrain::Download.label(),
+                            );
+                            ui.radio_value(&mut self.deck_brain, DeckBrain::Skip, DeckBrain::Skip.label());
+
+                            // For the "download a local model" path, show the hardware
+                            // recommendation and gate tiers the RAM can't run.
+                            if self.deck_brain == DeckBrain::Download {
+                                use crate::hardware::ModelTier;
+                                let hw = &self.hardware;
+                                let tier = hw.tier();
+                                ui.add_space(4.0);
+                                ui.group(|ui| {
+                                    ui.label(egui::RichText::new(hw.recommendation()).strong());
+                                    ui.label(format!("Suggested: {}", tier.label()));
+                                    // 3B is always offered; 7B only when the machine can run it.
+                                    ui.label("• 3B model — fits ~8 GB machines");
+                                    let can_7b = matches!(tier, ModelTier::Mid7B);
+                                    if can_7b {
+                                        ui.label("• 7B model — recommended for this machine");
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "• 7B model — needs 16 GB+ RAM (unavailable)",
+                                            )
+                                            .weak(),
+                                        );
+                                    }
+                                    if matches!(tier, ModelTier::None) {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Low RAM — a cloud brain will likely feel better.",
+                                            )
+                                            .italics(),
+                                        );
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Pick a model in Model Setup after Start \
+                                             (also under Tools → Model Setup).",
+                                        )
+                                        .weak()
+                                        .small(),
+                                    );
+                                });
+                            }
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    // Footer navigation: Back on the left, Next/Start on the right.
+                    ui.horizontal(|ui| {
+                        if step > 0 && ui.button("← Back").clicked() {
+                            self.onboard_step = step - 1;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if step + 1 == STEP_COUNT {
+                                if ui.button("Start").clicked() {
+                                    done = true;
+                                }
+                            } else if ui.button("Next →").clicked() {
+                                self.onboard_step = step + 1;
+                            }
+                        });
+                    });
                 });
             if done {
                 self.show_template_picker = false;
