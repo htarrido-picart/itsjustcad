@@ -146,6 +146,11 @@ enum Inverse {
         restored: Vec<(SceneObject, usize)>,
         prev_link: itsjustcad_doc::SubdivLink,
     },
+    /// `lotfreeze` (W1 associative): restore the link's prior `frozen` flag.
+    LotFrozen {
+        source: ObjectId,
+        prev: bool,
+    },
     /// `layer`: restore the previous current layer, dropping the layer this
     /// command created (if any).
     LayerCurrent {
@@ -863,6 +868,12 @@ impl Session {
                 }
                 self.doc.subdivision_links.insert(*source, prev_link.clone());
                 self.doc.generation += 1;
+            }
+            Inverse::LotFrozen { source, prev } => {
+                if let Some(link) = self.doc.subdivision_links.get_mut(source) {
+                    link.frozen = *prev;
+                    self.doc.generation += 1;
+                }
             }
             Inverse::LayerCurrent { prev, created } => {
                 if let Some(name) = created {
@@ -5425,6 +5436,124 @@ fn exec_lot_refresh(
         Command::LotRefresh { source, ids: Some(new_ids.clone()) },
         Inverse::LotRefreshed { source, created: new_ids.clone(), restored, prev_link },
         ApplyOutcome { created: new_ids, message: format!("lotrefresh: {n} lot(s) recomputed") },
+    ))
+}
+
+/// W1c: edit a link's exposed subdivision params then recompute (like
+/// `exec_lot_refresh`, but the link's settings are first updated from `params`).
+fn exec_lot_set_params(
+    doc: &mut Document,
+    source: ObjectId,
+    params: BTreeMap<String, String>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let link = doc.subdivision_links.get(&source).cloned().ok_or_else(|| {
+        ExecError::Invalid(
+            "lotsetparams: no subdivision link for this object (run lotsubdivide first)".into(),
+        )
+    })?;
+    if link.frozen {
+        return Err(ExecError::Invalid(
+            "lotsetparams: this result is frozen — unfreeze to recompute".into(),
+        ));
+    }
+
+    // Build a typed ParamMap: start from the link's current exposed params, then
+    // overwrite each provided (k, v) parsed against its schema field. Unknown
+    // keys error; bad values fall back to the field default (same tolerance as
+    // sanitize). params_to_settings then sanitizes + preserves unexposed fields.
+    let fields = crate::subdiv_params::subdivision_fields();
+    let mut param_map = crate::subdiv_params::settings_to_params(&link.settings);
+    for (k, v) in &params {
+        let Some(field) = fields.iter().find(|f| f.name == k.as_str()) else {
+            return Err(ExecError::Invalid(format!(
+                "lotsetparams: no subdivision parameter '{k}'"
+            )));
+        };
+        let pv = parse_param_value(field, v).unwrap_or_else(|| field.default.clone());
+        param_map.insert(k.clone(), pv);
+    }
+    let new_settings = crate::subdiv_params::params_to_settings(&link.settings, &param_map);
+
+    // Read the source block's CURRENT geometry (same as exec_lot_refresh).
+    let Some(obj) = doc.get(source) else {
+        return Err(ExecError::Invalid("lotsetparams: source block no longer exists".into()));
+    };
+    let Geometry::Curve(c) = &obj.geometry else {
+        return Err(ExecError::Invalid("lotsetparams: source is not a curve".into()));
+    };
+    if !c.is_closed() {
+        return Err(ExecError::Invalid("lotsetparams: source block curve must be closed".into()));
+    }
+    let Some(poly) = crate::lot::curve_to_polygon(c) else {
+        return Err(ExecError::Invalid("lotsetparams: could not read source block polygon".into()));
+    };
+    let pts = c.tessellate(PROFILE_TOL);
+    let z = if pts.is_empty() {
+        link.source_z
+    } else {
+        pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
+    };
+
+    let bake =
+        crate::lot::derive_subdivision(&poly, z, &new_settings).map_err(ExecError::Invalid)?;
+
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == bake.polygons.len() => ids,
+        _ => (0..bake.polygons.len()).map(|_| ObjectId::new()).collect(),
+    };
+
+    // Snapshot + remove the OLD produced lots (for undo), then insert the new.
+    let mut restored: Vec<(SceneObject, usize)> = Vec::new();
+    for id in &link.produced {
+        if let Some(removed) = doc.remove(*id) {
+            restored.push(removed);
+        }
+    }
+    crate::lot::insert_lots(doc, &bake, &new_ids);
+    let prev_link = link.clone();
+    doc.subdivision_links.insert(
+        source,
+        itsjustcad_doc::SubdivLink {
+            settings: new_settings,
+            produced: new_ids.clone(),
+            source_z: z,
+            frozen: false,
+        },
+    );
+    doc.generation += 1;
+
+    let n = new_ids.len();
+    Ok((
+        Command::LotSetParams { source, params, ids: Some(new_ids.clone()) },
+        // Reuse LotRefreshed: prev_link carries the OLD settings, so undo
+        // restores both the prior lots and the prior params — exactly right.
+        Inverse::LotRefreshed { source, created: new_ids.clone(), restored, prev_link },
+        ApplyOutcome { created: new_ids, message: format!("lotsetparams: {n} lot(s) recomputed") },
+    ))
+}
+
+/// W1d: toggle a link's `frozen` flag. Frozen bakes the result (recompute is
+/// rejected); unfreeze re-enables it. `prev` carries the old flag for replay.
+fn exec_lot_freeze(
+    doc: &mut Document,
+    source: ObjectId,
+    frozen: bool,
+    _prev: Option<bool>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let link = doc.subdivision_links.get_mut(&source).ok_or_else(|| {
+        ExecError::Invalid(
+            "lotfreeze: no subdivision link for this object (run lotsubdivide first)".into(),
+        )
+    })?;
+    let was = link.frozen;
+    link.frozen = frozen;
+    doc.generation += 1;
+    let message = if frozen { "lotfreeze: subdivision frozen" } else { "lotfreeze: subdivision unfrozen" };
+    Ok((
+        Command::LotFreeze { source, frozen, prev: Some(was) },
+        Inverse::LotFrozen { source, prev: was },
+        ApplyOutcome { created: Vec::new(), message: message.into() },
     ))
 }
 
@@ -12198,6 +12327,10 @@ fn apply_forward(
             exec_lot_subdivide(doc, targets, method, area, width, irregularity, seed, ids)
         }
         Command::LotRefresh { source, ids } => exec_lot_refresh(doc, source, ids),
+        Command::LotSetParams { source, params, ids } => {
+            exec_lot_set_params(doc, source, params, ids)
+        }
+        Command::LotFreeze { source, frozen, prev } => exec_lot_freeze(doc, source, frozen, prev),
         Command::LotSettings { sets, prev } => exec_lot_settings(doc, sets, prev),
         Command::LotLoading { targets, mode, prev } => exec_lot_loading(doc, targets, mode, prev),
         Command::LotGenerateSite {
@@ -14592,6 +14725,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::CutFill { .. } => "cutfill",
         Command::LotSubdivide { .. } => "lotsubdivide",
         Command::LotRefresh { .. } => "lotrefresh",
+        Command::LotSetParams { .. } => "lotsetparams",
+        Command::LotFreeze { .. } => "lotfreeze",
         Command::LotSettings { .. } => "lotsettings",
         Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",
@@ -25664,5 +25799,101 @@ mod tests {
         for id in &new_ids {
             assert!(s.doc.get(*id).is_none(), "refreshed lot {id:?} removed by undo");
         }
+    }
+
+    /// W1c: LotSetParams edits a link's exposed params (settings updated) then
+    /// recomputes; undo restores both the prior settings and the prior lots.
+    #[test]
+    fn lot_set_params_updates_settings_and_recomputes() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 40,0,0 40,40,0 0,40,0 closed");
+        let source = s.doc.objects().next().expect("one block").id;
+
+        s.run(Command::LotSubdivide {
+            targets: Selector::Ids { ids: vec![source] },
+            method: "grid".into(),
+            area: None,
+            width: None,
+            irregularity: None,
+            seed: None,
+            ids: None,
+        })
+        .expect("lotsubdivide ok");
+
+        let before = s.doc.subdivision_links.get(&source).expect("link recorded").clone();
+        let old_area_min = before.settings.lot_area_min;
+        let old_ids = before.produced.clone();
+        let new_area_min = old_area_min + 1234.0;
+
+        let mut params = BTreeMap::new();
+        params.insert("lot_area_min".to_string(), new_area_min.to_string());
+        s.run(Command::LotSetParams { source, params, ids: None }).expect("lotsetparams ok");
+
+        let after = s.doc.subdivision_links.get(&source).expect("link still present").clone();
+        assert_eq!(after.settings.lot_area_min, new_area_min, "settings param updated");
+        assert_ne!(after.produced, old_ids, "recompute minted fresh ids");
+        for id in &old_ids {
+            assert!(s.doc.get(*id).is_none(), "old lot {id:?} removed");
+        }
+        for id in &after.produced {
+            assert!(s.doc.get(*id).is_some(), "new lot {id:?} present");
+        }
+        let new_ids = after.produced.clone();
+
+        // Undo: settings + lots restored.
+        run(&mut s, "undo");
+        let reverted = s.doc.subdivision_links.get(&source).expect("link after undo").clone();
+        assert_eq!(reverted.settings.lot_area_min, old_area_min, "undo restored prior settings");
+        assert_eq!(reverted.produced, old_ids, "undo restored prior produced ids");
+        for id in &old_ids {
+            assert!(s.doc.get(*id).is_some(), "prior lot {id:?} restored");
+        }
+        for id in &new_ids {
+            assert!(s.doc.get(*id).is_none(), "recomputed lot {id:?} removed by undo");
+        }
+    }
+
+    /// W1d: LotFreeze blocks recompute; unfreeze re-enables it; undo of a freeze
+    /// restores the prior flag.
+    #[test]
+    fn lot_freeze_blocks_refresh() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 40,0,0 40,40,0 0,40,0 closed");
+        let source = s.doc.objects().next().expect("one block").id;
+
+        s.run(Command::LotSubdivide {
+            targets: Selector::Ids { ids: vec![source] },
+            method: "grid".into(),
+            area: None,
+            width: None,
+            irregularity: None,
+            seed: None,
+            ids: None,
+        })
+        .expect("lotsubdivide ok");
+        assert!(!s.doc.subdivision_links.get(&source).unwrap().frozen, "starts unfrozen");
+
+        // Freeze → recompute paths error with the frozen message.
+        s.run(Command::LotFreeze { source, frozen: true, prev: None }).expect("freeze ok");
+        assert!(s.doc.subdivision_links.get(&source).unwrap().frozen, "now frozen");
+
+        let err = s.run(Command::LotRefresh { source, ids: None }).unwrap_err();
+        assert!(err.to_string().contains("frozen"), "lotrefresh rejected: {err}");
+
+        let mut params = BTreeMap::new();
+        params.insert("lot_area_min".to_string(), "7000".to_string());
+        let err = s.run(Command::LotSetParams { source, params, ids: None }).unwrap_err();
+        assert!(err.to_string().contains("frozen"), "lotsetparams rejected: {err}");
+
+        // Unfreeze → refresh works again.
+        s.run(Command::LotFreeze { source, frozen: false, prev: None }).expect("unfreeze ok");
+        assert!(!s.doc.subdivision_links.get(&source).unwrap().frozen, "unfrozen");
+        s.run(Command::LotRefresh { source, ids: None }).expect("refresh ok after unfreeze");
+
+        // Undo the unfreeze restores the frozen flag (undo order: refresh, then
+        // the unfreeze). First undo reverts the refresh; second undo the unfreeze.
+        run(&mut s, "undo"); // undo refresh
+        run(&mut s, "undo"); // undo the unfreeze → back to frozen
+        assert!(s.doc.subdivision_links.get(&source).unwrap().frozen, "undo restored frozen flag");
     }
 }

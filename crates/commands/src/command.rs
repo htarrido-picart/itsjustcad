@@ -2004,6 +2004,30 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Edit the exposed subdivision params of an associative link (W1c), then
+    /// recompute like `LotRefresh`. The link's settings are first updated from
+    /// `params` (schema keys → values; unexposed settings fields preserved via
+    /// `subdiv_params::params_to_settings`), then the lots are re-derived from
+    /// the source block's CURRENT geometry. `ids` are written-back so replay is
+    /// byte-identical. A frozen link errors. Logged; the inverse (reused
+    /// `LotRefreshed`) restores the previous lots + link state (incl. settings).
+    LotSetParams {
+        source: ObjectId,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        params: std::collections::BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
+    /// Toggle an associative subdivision link's `frozen` flag (W1d). Freezing
+    /// bakes the current result (future recompute is rejected); unfreezing
+    /// re-enables `LotRefresh`/`LotSetParams`. `prev` carries the old flag for
+    /// undo/replay. Logged; the inverse restores the prior flag.
+    LotFreeze {
+        source: ObjectId,
+        frozen: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prev: Option<bool>,
+    },
     /// Show or set the sticky `SubdivisionSettings` on the document
     /// (M-intemfit). With no `sets`, the exec message reports the current
     /// settings; otherwise each `key=value` updates one field. Logged so saved
