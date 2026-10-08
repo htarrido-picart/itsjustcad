@@ -933,6 +933,31 @@ impl DeckPane {
         Some(cassette_name.to_string())
     }
 
+    /// Reload cassettes from disk after an external edit (the "LLM ▸ API Keys…"
+    /// dialog updated a key/model, or wrote a new provider cassette) so the live
+    /// pane uses the new config on the next turn. Keeps the active selection on
+    /// the same cassette by name when possible, then forces a re-probe.
+    pub fn reload_decks(&mut self) {
+        let active_name = self
+            .decks
+            .decks
+            .get(self.decks.active)
+            .map(|d| d.name.clone());
+        self.decks = DecksFile::load_or_default();
+        if let Some(name) = active_name
+            && let Some(i) = self.decks.decks.iter().position(|d| d.name == name)
+        {
+            self.decks.active = i;
+        }
+        self.decks.active = self
+            .decks
+            .active
+            .min(self.decks.decks.len().saturating_sub(1));
+        // Re-probe the (possibly updated) active deck on the next frame.
+        self.probed_deck = None;
+        self.probe = ProbeState::Unknown;
+    }
+
     /// Push a status line into the chat transcript. Used by the app to surface
     /// out-of-band events (e.g. a background model download failing while the
     /// Model Setup window is closed) IN the deck UI instead of only in the log.
@@ -1769,6 +1794,40 @@ impl DeckPane {
                         });
                         self.pending_ui_actions.push(action);
                         continue;
+                    }
+                    // USER-HOTKEY TOOL (W4): the assistant may bind/unbind
+                    // hotkeys ONLY when the user opted in (LLM ▸ Keybindings →
+                    // "Let the assistant set hotkeys"). Otherwise refuse — a
+                    // prompt-injected bind could remap keys to destructive verbs.
+                    // `hotkeys`/`keybindings` (opens the editor) is GUI-only and
+                    // never driven from the deck. Allowed binds are queued for the
+                    // app to run through `App::execute_line`, like other app-verbs.
+                    {
+                        let verb0 = line.split_whitespace().next().unwrap_or("");
+                        if matches!(verb0, "bind_hotkey" | "bindkey" | "unbind_hotkey" | "unbindkey")
+                        {
+                            if crate::keybindings::KeybindingsFile::load_or_default().allow_assistant
+                            {
+                                self.current_commands.push(ExecutedCommand {
+                                    line: line.clone(),
+                                    result: Ok("hotkey updated".to_string()),
+                                });
+                                self.pending_app_verbs.push(line);
+                            } else {
+                                self.current_commands.push(ExecutedCommand {
+                                    line: line.clone(),
+                                    result: Err("assistant hotkey changes are off — enable “Let the assistant set hotkeys” in LLM ▸ Keybindings".to_string()),
+                                });
+                            }
+                            continue;
+                        }
+                        if matches!(verb0, "hotkeys" | "keybindings") {
+                            self.current_commands.push(ExecutedCommand {
+                                line: line.clone(),
+                                result: Err("open LLM ▸ Keybindings to edit hotkeys".to_string()),
+                            });
+                            continue;
+                        }
                     }
                     // APP-VERB PLANE (distinct from document commands and ui
                     // actions): view/camera/display/lighting verbs like

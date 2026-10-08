@@ -44,6 +44,13 @@ pub enum MenuAction {
     /// Open the Model Setup panel (download/manage local models). Available any
     /// time from Tools, not just at first run.
     ModelSetup,
+    /// Open the API Keys settings dialog (set/update the Anthropic + OpenAI keys
+    /// and pick a model). Fired by the LLM ▸ API Keys… item; works any time, not
+    /// just at onboarding.
+    ShowApiKeys,
+    /// Open the Keybindings editor (view/add/remove user hotkeys, assistant
+    /// opt-in). Fired by the LLM ▸ Keybindings… item; works any time.
+    ShowKeybindings,
     /// Open the Local Renderer Setup panel (download a local Stable Diffusion
     /// model + detect the `sd` binary, then auto-register the LocalSd render
     /// cassette). The SD twin of Model Setup; fired by Render ▸ Local Renderer
@@ -785,6 +792,20 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
         let t = "LLM";
         let items = vec![
             wired_leaf(t, "model_setup", tr("menu.llm.model_setup"), MenuAction::ModelSetup),
+            NativeItem::Leaf {
+                id: format!("{t}/api_keys"),
+                label: tr("menu.llm.api_keys").into(),
+                shortcut: None,
+                enabled: true,
+                action: MenuAction::ShowApiKeys,
+            },
+            NativeItem::Leaf {
+                id: format!("{t}/keybindings"),
+                label: tr("menu.llm.keybindings").into(),
+                shortcut: None,
+                enabled: true,
+                action: MenuAction::ShowKeybindings,
+            },
             NativeItem::Leaf {
                 id: format!("{t}/reveal_models"),
                 label: tr("menu.llm.reveal_models").into(),

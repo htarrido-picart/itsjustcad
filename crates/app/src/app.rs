@@ -81,9 +81,14 @@ pub(crate) enum TemplateScale {
 /// writes a cassette entry into `decks.json`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DeckBrain {
-    /// Point at a cloud API later (Anthropic/OpenAI-compatible). No cassette
-    /// written now — the user enters a key in the deck settings.
+    /// Claude via the Anthropic API. Creates the `claude` cassette (defaulting
+    /// to `env:ANTHROPIC_API_KEY`) and opens LLM ▸ API Keys… so the user can
+    /// paste a key.
     Cloud,
+    /// ChatGPT via the OpenAI API. Creates the `openai` cassette (defaulting to
+    /// `env:OPENAI_API_KEY`) and opens LLM ▸ API Keys… so the user can paste a
+    /// key.
+    OpenAi,
     /// Local via an already-running Ollama at http://localhost:11434.
     Ollama,
     /// Download a local model (the fetch is a later sub-phase; here we only
@@ -96,7 +101,8 @@ pub(crate) enum DeckBrain {
 impl DeckBrain {
     fn label(self) -> &'static str {
         match self {
-            DeckBrain::Cloud => "Cloud (enter an API key later)",
+            DeckBrain::Cloud => "Claude (Anthropic) — paste an API key",
+            DeckBrain::OpenAi => "OpenAI (ChatGPT) — paste an API key",
             DeckBrain::Ollama => "Local via Ollama (http://localhost:11434)",
             DeckBrain::Download => "Download a local model",
             DeckBrain::Skip => "Skip — decide later",
@@ -107,6 +113,7 @@ impl DeckBrain {
     fn as_pref(self) -> &'static str {
         match self {
             DeckBrain::Cloud => "cloud",
+            DeckBrain::OpenAi => "openai",
             DeckBrain::Ollama => "ollama",
             DeckBrain::Download => "download",
             DeckBrain::Skip => "skip",
@@ -710,6 +717,16 @@ pub struct App {
     /// Whether the Tools → Model Setup panel is open (works any time, not just
     /// first-run).
     show_model_setup: bool,
+    /// The "LLM ▸ API Keys…" settings dialog (set/update Anthropic + OpenAI
+    /// keys and pick a model). Modeless, like Model Setup.
+    api_keys: crate::api_keys::ApiKeysPanel,
+    /// User-defined hotkeys (W4), overlaid on the built-in keymap. Loaded once
+    /// at startup; the editor + `bind_hotkey` verb write through it.
+    keybindings: crate::keybindings::KeybindingsFile,
+    /// Whether the "LLM ▸ Keybindings…" editor window is open.
+    show_keybindings: bool,
+    /// UI-only state for the keybindings editor (key capture, pending verb).
+    keybindings_editor: crate::keybindings_editor::KeybindingsEditor,
     /// A DXF import running in time-boxed batches (progress modal). `None` when
     /// no import is in flight.
     import_job: Option<ImportJob>,
@@ -962,6 +979,50 @@ fn download_outcome(
     }
 }
 
+/// egui 0.35's bundled fonts (Ubuntu-Light / NotoEmoji / emoji-icon-font) don't
+/// cover common symbol glyphs — in particular the arrows `←` `→`, which show up
+/// in menus, guided-command prompts and hints and render as tofu boxes without a
+/// fallback. Load the first available system font that DOES cover them and
+/// append it as the LAST entry in both font families: as a fallback it only
+/// supplies glyphs the primary font is missing, so ordinary text keeps the
+/// Ubuntu look. No-op (with a warning) when no candidate exists — same visual as
+/// before, never a crash. Order favours a light symbol font over a heavy
+/// everything-font.
+fn install_symbol_fallback(ctx: &egui::Context) {
+    // Per-platform candidates, lightest-with-arrow-coverage first.
+    const CANDIDATES: &[&str] = &[
+        // macOS: Apple Symbols (~0.9 MB, has ← → — •); Arial Unicode as the
+        // comprehensive last resort (~22 MB, covers ✓ and much more).
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        // Linux
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        // Windows: Segoe UI Symbol has the arrows; Arial is the broad fallback.
+        "C:\\Windows\\Fonts\\seguisym.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ];
+    let Some((path, bytes)) = CANDIDATES
+        .iter()
+        .find_map(|p| std::fs::read(p).ok().map(|b| (*p, b)))
+    else {
+        tracing::warn!("no symbol-fallback font found; arrows/symbols may render as boxes");
+        return;
+    };
+    const KEY: &str = "symbol_fallback";
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        KEY.to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(fam).or_default().push(KEY.to_owned());
+    }
+    ctx.set_fonts(fonts);
+    tracing::info!("loaded symbol-fallback font: {path}");
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, tokio: tokio::runtime::Handle) -> Self {
         // One-time prefs carry-over from the old product name.
@@ -985,6 +1046,10 @@ impl App {
         // Cmd+= / Cmd+- / Cmd+0 also work (egui built-in zoom).
         let zoom = load_zoom().unwrap_or(1.3);
         cc.egui_ctx.set_zoom_factor(zoom);
+
+        // egui's bundled fonts lack common symbol glyphs (notably the arrows
+        // ← →), which otherwise render as tofu boxes in UI strings and menus.
+        install_symbol_fallback(&cc.egui_ctx);
 
         // Legacy-CAD-informed font sizes (see docs/ui-legacy-research.md):
         //   command line / monospace prompt: 13 px  (~10 pt at 96 DPI)
@@ -1167,8 +1232,14 @@ impl App {
                 Some("light") => Some(false),
                 _ => load_theme_pref(),
             },
-            show_template_picker: !load_template_done(),
-            onboard_step: 0,
+            show_template_picker: !load_template_done()
+                || std::env::var("ITSJUSTCAD_ONBOARD").is_ok(),
+            // Dev hook: ITSJUSTCAD_ONBOARD=<step> opens the wizard at a given step
+            // (0-based) so ITSJUSTCAD_SHOT frames can capture any step directly.
+            onboard_step: std::env::var("ITSJUSTCAD_ONBOARD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
             template_units: TemplateUnits::Meters,
             template_scale: TemplateScale::Building,
             cad_origin,
@@ -1179,12 +1250,27 @@ impl App {
                 Some("download") => DeckBrain::Download,
                 Some("ollama") => DeckBrain::Ollama,
                 Some("cloud") => DeckBrain::Cloud,
+                Some("openai") => DeckBrain::OpenAi,
                 _ => DeckBrain::Skip,
             },
             hardware: crate::hardware::detect(),
             // Dev hook: ITSJUSTCAD_MODEL_SETUP=1 opens the Model Setup panel on
             // startup so ITSJUSTCAD_SHOT frames can capture it without a click.
             show_model_setup: std::env::var("ITSJUSTCAD_MODEL_SETUP").is_ok(),
+            // Dev hook: ITSJUSTCAD_API_KEYS=1 opens the API Keys dialog on startup
+            // so ITSJUSTCAD_SHOT frames can capture it without a click.
+            api_keys: {
+                let mut p = crate::api_keys::ApiKeysPanel::default();
+                if std::env::var("ITSJUSTCAD_API_KEYS").is_ok() {
+                    p.open();
+                }
+                p
+            },
+            keybindings: crate::keybindings::KeybindingsFile::load_or_default(),
+            // Dev hook: ITSJUSTCAD_KEYBINDINGS=1 opens the editor on startup for
+            // ITSJUSTCAD_SHOT frames.
+            show_keybindings: std::env::var("ITSJUSTCAD_KEYBINDINGS").is_ok(),
+            keybindings_editor: crate::keybindings_editor::KeybindingsEditor::default(),
             import_job: None,
             import_result: None,
             catalog: crate::model_catalog::Catalog::load(),
@@ -1421,6 +1507,67 @@ impl App {
     }
 
     /// App-level verbs (save/open, camera) wrap the command substrate.
+    /// `bind_hotkey <combo>=<verb>` (or `<combo> <verb>`): persist a user
+    /// hotkey. Validates the chord and the target verb, refuses OS-reserved
+    /// chords, and reports on the command line. Shared by the human command line
+    /// and (gated) the assistant.
+    fn bind_hotkey(&mut self, args: &str) {
+        let args = args.trim();
+        // Accept "combo=verb" or "combo verb…" (split on the first '=' else the
+        // first whitespace run).
+        let (combo_str, verb) = if let Some((c, v)) = args.split_once('=') {
+            (c.trim(), v.trim())
+        } else if let Some((c, v)) = args.split_once(char::is_whitespace) {
+            (c.trim(), v.trim())
+        } else {
+            ("", "")
+        };
+        if combo_str.is_empty() || verb.is_empty() {
+            self.command_line.push_line(
+                "usage: bind_hotkey <combo>=<verb>  (e.g. bind_hotkey Cmd+K=select all)",
+            );
+            return;
+        }
+        let Some(combo) = crate::keybindings::KeyCombo::parse(combo_str) else {
+            self.command_line
+                .push_line(format!("unrecognized key combo '{combo_str}'"));
+            return;
+        };
+        if combo.is_reserved() {
+            self.command_line
+                .push_line(format!("{combo} is reserved by the OS — pick another chord"));
+            return;
+        }
+        if !crate::keybindings::target_is_valid(verb) {
+            self.command_line
+                .push_line(format!("unknown verb '{verb}' — not bound"));
+            return;
+        }
+        let overwrote = self.keybindings.set(combo.clone(), verb.to_string());
+        self.keybindings.save();
+        self.command_line.push_line(format!(
+            "{} {combo} → {verb}",
+            if overwrote { "rebound" } else { "bound" }
+        ));
+    }
+
+    /// `unbind_hotkey <combo>`: remove a user hotkey.
+    fn unbind_hotkey(&mut self, args: &str) {
+        let combo_str = args.trim();
+        let Some(combo) = crate::keybindings::KeyCombo::parse(combo_str) else {
+            self.command_line
+                .push_line(format!("unrecognized key combo '{combo_str}'"));
+            return;
+        };
+        if self.keybindings.remove(&combo) {
+            self.keybindings.save();
+            self.command_line.push_line(format!("unbound {combo}"));
+        } else {
+            self.command_line
+                .push_line(format!("no user binding for {combo}"));
+        }
+    }
+
     fn execute_line(&mut self, line: String) {
         // Empty submissions never reach here as executable input: the command line
         // now populates the last verb on empty Enter/Space (see command_line.rs)
@@ -1483,6 +1630,19 @@ impl App {
                     self.command_line
                         .push_line(format!("cut {n} object(s) — Cmd+V pastes"));
                 }
+            }
+            // User-definable hotkeys (W4). `hotkeys` opens the editor;
+            // `bind_hotkey <combo>=<verb>` / `unbind_hotkey <combo>` edit the
+            // persisted map from the command line (also the LLM's path, gated at
+            // the deck plane). The combo accepts `=` or a space before the verb.
+            Some("hotkeys" | "keybindings") => self.show_keybindings = true,
+            Some("bind_hotkey" | "bindkey") => {
+                let rest = words.collect::<Vec<_>>().join(" ");
+                self.bind_hotkey(&rest);
+            }
+            Some("unbind_hotkey" | "unbindkey") => {
+                let rest = words.collect::<Vec<_>>().join(" ");
+                self.unbind_hotkey(&rest);
             }
             Some("controlimages") => {
                 match words.next() {
@@ -7616,6 +7776,8 @@ impl App {
                 self.show_update = true;
             }
             MenuAction::ModelSetup => self.show_model_setup = true,
+            MenuAction::ShowApiKeys => self.api_keys.open(),
+            MenuAction::ShowKeybindings => self.show_keybindings = true,
             MenuAction::RenderSetup => self.show_render_setup = true,
             MenuAction::RevealSdModelsFolder => {
                 if let Some(dir) = crate::sd_catalog::sd_models_dir() {
@@ -8872,6 +9034,7 @@ fn save_deck_brain(brain: DeckBrain) {
 fn load_deck_brain() -> Option<DeckBrain> {
     match load_ui_json()["deck_brain"].as_str()? {
         "cloud" => Some(DeckBrain::Cloud),
+        "openai" => Some(DeckBrain::OpenAi),
         "ollama" => Some(DeckBrain::Ollama),
         "download" => Some(DeckBrain::Download),
         "skip" => Some(DeckBrain::Skip),
@@ -8923,7 +9086,7 @@ fn model_id_for_tier(tier: crate::hardware::ModelTier) -> &'static str {
 /// Returns the deck name that was made active, if any. Pure enough to unit-test
 /// via [`deck_brain_into_decks`]; this wrapper just handles load/save I/O.
 fn apply_deck_brain(brain: DeckBrain, tier: crate::hardware::ModelTier) {
-    if matches!(brain, DeckBrain::Cloud | DeckBrain::Skip) {
+    if matches!(brain, DeckBrain::Skip) {
         return;
     }
     let mut decks = itsjustcad_deck::DecksFile::load_or_default();
@@ -8941,11 +9104,30 @@ fn deck_brain_into_decks(
     brain: DeckBrain,
     tier: crate::hardware::ModelTier,
 ) -> Option<String> {
-    use itsjustcad_deck::{DeckConfig, DeckKind};
+    use itsjustcad_deck::{CloudProvider, DeckConfig, DeckKind};
+    // Cloud brains create (or reuse) the provider's canonical cassette and make
+    // it active. A brand-new cassette defaults to env-var key indirection; an
+    // existing one keeps whatever key it already has (don't clobber on re-run).
+    // The user pastes the actual key in LLM ▸ API Keys…, opened right after.
+    let provider = match brain {
+        DeckBrain::Cloud => Some(CloudProvider::Anthropic),
+        DeckBrain::OpenAi => Some(CloudProvider::OpenAi),
+        _ => None,
+    };
+    if let Some(p) = provider {
+        let key = if decks.provider_index(p).is_some() {
+            None
+        } else {
+            Some(format!("env:{}", p.env_var()))
+        };
+        let i = decks.set_cloud_provider(p, key, None);
+        decks.active = i;
+        return Some(p.cassette_name().to_string());
+    }
     let (name, model) = match brain {
         DeckBrain::Ollama => ("ollama", "qwen3".to_string()),
         DeckBrain::Download => ("local-download", model_id_for_tier(tier).to_string()),
-        DeckBrain::Cloud | DeckBrain::Skip => return None,
+        DeckBrain::Cloud | DeckBrain::OpenAi | DeckBrain::Skip => return None,
     };
     let entry = DeckConfig {
         name: name.to_string(),
@@ -9524,9 +9706,17 @@ impl eframe::App for App {
                     });
                     ui.add_space(8.0);
 
-                    // Body — a fixed-height band keeps every step the same size so
-                    // the window doesn't jump as the user clicks Next.
-                    ui.allocate_ui(egui::vec2(ui.available_width(), 180.0), |ui| match step {
+                    // Body — a fixed-height band keeps every step the same size
+                    // so the window doesn't jump as the user clicks Next. The
+                    // inner scroll area caps the height so a taller step (the
+                    // deck-brain "Download" panel) scrolls instead of growing
+                    // the window.
+                    const BODY_H: f32 = 268.0;
+                    ui.allocate_ui(egui::vec2(ui.available_width(), BODY_H), |ui| {
+                      egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(BODY_H)
+                        .show(ui, |ui| match step {
                         0 => {
                             // Units + scale side by side (horizontally dominant).
                             ui.columns(2, |cols| {
@@ -9568,6 +9758,7 @@ impl eframe::App for App {
                         }
                         _ => {
                             ui.radio_value(&mut self.deck_brain, DeckBrain::Cloud, DeckBrain::Cloud.label());
+                            ui.radio_value(&mut self.deck_brain, DeckBrain::OpenAi, DeckBrain::OpenAi.label());
                             ui.radio_value(&mut self.deck_brain, DeckBrain::Ollama, DeckBrain::Ollama.label());
                             ui.radio_value(
                                 &mut self.deck_brain,
@@ -9609,8 +9800,7 @@ impl eframe::App for App {
                                     }
                                     ui.label(
                                         egui::RichText::new(
-                                            "Pick a model in Model Setup after Start \
-                                             (also under Tools → Model Setup).",
+                                            "Pick a model in Model Setup, which opens after Start.",
                                         )
                                         .weak()
                                         .small(),
@@ -9618,6 +9808,7 @@ impl eframe::App for App {
                                 });
                             }
                         }
+                      });
                     });
 
                     ui.add_space(8.0);
@@ -9651,6 +9842,11 @@ impl eframe::App for App {
                 // user can pick + fetch a model right away.
                 if self.deck_brain == DeckBrain::Download {
                     self.show_model_setup = true;
+                }
+                // The cloud paths open API Keys… so the user can paste a key
+                // immediately (the cassette was just created by apply_deck_brain).
+                if matches!(self.deck_brain, DeckBrain::Cloud | DeckBrain::OpenAi) {
+                    self.api_keys.open();
                 }
                 apply_preset(ui.ctx().clone(), self.cad_origin);
                 let units_cmd = units_cmd_for(&self.template_units);
@@ -9851,6 +10047,14 @@ impl eframe::App for App {
         // Tools → Model Setup panel (also the onboarding "download a local
         // model" entry point). Renders any time show_model_setup is set.
         self.model_setup_ui(ui.ctx());
+        // LLM ▸ API Keys… dialog. If it changed a key/model, reload the live
+        // deck pane so the next turn uses the updated cassette.
+        if self.api_keys.ui(ui.ctx(), &self.tokio) {
+            self.deck_pane.reload_decks();
+        }
+        // LLM ▸ Keybindings… editor (W4). Mutates + saves self.keybindings live.
+        self.keybindings_editor
+            .ui(ui.ctx(), &mut self.show_keybindings, &mut self.keybindings);
         // Render ▸ Local Renderer Setup panel (SD twin of Model Setup).
         self.render_setup_ui(ui.ctx());
         // Compact corner chip so a download can continue with the panel hidden.
@@ -9970,6 +10174,43 @@ impl eframe::App for App {
             self.command_palette_ui(&ctx);
         }
 
+        // User-defined hotkeys that carry a Cmd/Alt modifier fire GLOBALLY —
+        // even while the command line has focus — exactly like ⌘K above. A
+        // modifier chord is an explicit launcher, so consume the key (so the
+        // focused text field doesn't also receive it) and run its verb. Bare
+        // (modifier-less) user bindings are intentionally NOT handled here; they
+        // stay in the canvas keymap path below so they never hijack typing.
+        let mut user_global: Option<String> = None;
+        for b in &self.keybindings.bindings {
+            if !(b.combo.cmd || b.combo.alt) {
+                continue;
+            }
+            let Some(key) = b.combo.egui_key() else {
+                continue;
+            };
+            let mut mods = egui::Modifiers::NONE;
+            if b.combo.cmd {
+                mods = mods | egui::Modifiers::COMMAND;
+            }
+            if b.combo.shift {
+                mods = mods | egui::Modifiers::SHIFT;
+            }
+            if b.combo.alt {
+                mods = mods | egui::Modifiers::ALT;
+            }
+            if ui.input_mut(|i| i.consume_key(mods, key)) {
+                user_global = Some(b.verb.clone());
+                break;
+            }
+        }
+        if let Some(verb) = user_global {
+            self.execute_line(verb);
+            // The viewport scene for this frame was already built before this
+            // hotkey ran; repaint so the selection highlight (and any other
+            // visual effect of the verb) shows immediately, not on next input.
+            ui.ctx().request_repaint();
+        }
+
         // Canvas shortcuts: pure keymap resolves each key press to a command
         // line; nothing fires while a text field owns the keyboard.
         let typing = ui.ctx().memory(|m| m.focused().is_some());
@@ -9990,8 +10231,9 @@ impl eframe::App for App {
         });
         for (key, mods) in pressed {
             // Context is rebuilt per key: an earlier press this frame may have
-            // started a tool or changed the selection.
-            let line = keymap::keymap(
+            // started a tool or changed the selection. User bindings overlay the
+            // built-in keymap (resolve() checks the user map first).
+            let line = crate::keybindings::resolve(
                 key,
                 mods,
                 keymap::KeyContext {
@@ -10000,6 +10242,7 @@ impl eframe::App for App {
                     has_selection: !self.session.doc.selection.is_empty(),
                     last_command: self.last_line.as_deref(),
                 },
+                &self.keybindings,
             );
             if let Some(line) = line {
                 self.execute_line(line);
@@ -11822,6 +12065,7 @@ mod tests {
         // The pref string maps back to the same enum for every variant.
         for brain in [
             DeckBrain::Cloud,
+            DeckBrain::OpenAi,
             DeckBrain::Ollama,
             DeckBrain::Download,
             DeckBrain::Skip,
@@ -11829,6 +12073,7 @@ mod tests {
             let s = brain.as_pref();
             let back = match s {
                 "cloud" => DeckBrain::Cloud,
+                "openai" => DeckBrain::OpenAi,
                 "ollama" => DeckBrain::Ollama,
                 "download" => DeckBrain::Download,
                 "skip" => DeckBrain::Skip,
@@ -11839,12 +12084,40 @@ mod tests {
     }
 
     #[test]
-    fn cloud_and_skip_write_no_cassette() {
+    fn skip_writes_no_cassette() {
         let mut decks = DecksFile::default();
         let before = decks.decks.len();
-        assert!(deck_brain_into_decks(&mut decks, DeckBrain::Cloud, ModelTier::Mid7B).is_none());
         assert!(deck_brain_into_decks(&mut decks, DeckBrain::Skip, ModelTier::Mid7B).is_none());
-        assert_eq!(decks.decks.len(), before, "no cassette added for cloud/skip");
+        assert_eq!(decks.decks.len(), before, "no cassette added for skip");
+    }
+
+    #[test]
+    fn cloud_brain_activates_anthropic_cassette() {
+        // The default file already ships a "claude" Anthropic cassette: Cloud
+        // reuses it (no duplicate) and makes it active.
+        let mut decks = DecksFile::default();
+        let before = decks.decks.len();
+        let name = deck_brain_into_decks(&mut decks, DeckBrain::Cloud, ModelTier::Mid7B).unwrap();
+        assert_eq!(name, "claude");
+        assert_eq!(decks.decks.len(), before, "existing cassette reused");
+        assert_eq!(decks.decks[decks.active].kind, DeckKind::Anthropic);
+    }
+
+    #[test]
+    fn openai_brain_creates_and_activates_openai_cassette() {
+        // Start empty so the new "openai" cassette is the only one.
+        let mut decks = DecksFile {
+            decks: vec![],
+            active: 0,
+            local_only: false,
+        };
+        let name = deck_brain_into_decks(&mut decks, DeckBrain::OpenAi, ModelTier::Mid7B).unwrap();
+        assert_eq!(name, "openai");
+        let active = &decks.decks[decks.active];
+        assert_eq!(active.kind, DeckKind::OpenaiCompat);
+        assert_eq!(active.base_url, "https://api.openai.com/v1");
+        // Brand-new cassette defaults to env-var key indirection.
+        assert_eq!(active.api_key.as_deref(), Some("env:OPENAI_API_KEY"));
     }
 
     #[test]
