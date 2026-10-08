@@ -178,6 +178,23 @@ pub fn subdivide_blocks(
     })
 }
 
+/// Pure derive for an ASSOCIATIVE subdivision (W1): one source block polygon +
+/// settings → baked lots. Mirrors the `derive_mesh`/`derive_segments` contract
+/// (deterministic, replay-stable) so a stored `source_block → settings` link can
+/// recompute its lot children when the source polygon or a param changes.
+///
+/// A thin wrapper over [`subdivide_blocks`] for the single-block case; kept as a
+/// named entry point so the associativity layer has one obvious call site and so
+/// the contract (same source + settings ⇒ byte-identical lots) is documented
+/// where callers look.
+pub fn derive_subdivision(
+    source_block: &Polygon2d,
+    z: f64,
+    settings: &SubdivisionSettings,
+) -> Result<LotBake, String> {
+    subdivide_blocks(&[(source_block.clone(), z)], settings)
+}
+
 /// Ensure the `lots` layer exists; returns `Some(name)` if it was newly created.
 pub fn ensure_lots_layer(doc: &mut Document) -> Option<String> {
     if doc.layers.contains_key(LOTS_LAYER) {
@@ -1155,6 +1172,27 @@ mod tests {
             let sum: f64 = bake.blocks.iter().map(|p| p.area()).sum();
             assert!(sum <= poly.area() + 1.0, "{p:?}: blocks exceed site");
         }
+    }
+
+    #[test]
+    fn derive_subdivision_is_deterministic_and_matches_blocks() {
+        // W1 associative derive: same source polygon + settings ⇒ byte-identical
+        // lots across runs (replay-stable), and equal to subdivide_blocks of the
+        // same single block.
+        let poly = curve_to_polygon(&rect_curve(80.0, 60.0)).unwrap();
+        let s = SubdivisionSettings {
+            lot_area_min: 200.0,
+            lot_width_min: 8.0,
+            seed: 42,
+            ..SubdivisionSettings::default()
+        };
+        let a = derive_subdivision(&poly, 0.0, &s).expect("lots");
+        let b = derive_subdivision(&poly, 0.0, &s).expect("lots");
+        assert!(!a.polygons.is_empty(), "expected lots");
+        assert_eq!(a.polygons, b.polygons, "derive must be deterministic");
+        // Equivalent to the single-block form of the core bridge.
+        let c = subdivide_blocks(&[(poly, 0.0)], &s).expect("lots");
+        assert_eq!(a.polygons, c.polygons);
     }
 
     #[test]
