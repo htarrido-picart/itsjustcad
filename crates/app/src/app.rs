@@ -634,6 +634,18 @@ pub struct App {
     /// `paramset` op is committed once the slider is released or the debounce
     /// window elapses (see `PARAM_DEBOUNCE`).
     param_pending: Option<ParamPending>,
+    /// Subdivision inspector: pending debounced `lotsetparams` re-derive. Holds
+    /// the source block id, the full pending param map, and the instant of the
+    /// last change — committed once the gesture settles (mirrors `param_pending`
+    /// but keyed on the subdivision source rather than a parametric object).
+    subdiv_pending: Option<ParamPending>,
+    /// Auto-recompute: per-source signature of the last-observed source block
+    /// geometry. A change (after the first observation) fires a `lotrefresh` so
+    /// non-frozen subdivisions track edits to their boundary block.
+    subdiv_sig_cache: std::collections::HashMap<itsjustcad_doc::ObjectId, u64>,
+    /// Auto-recompute: the `doc.generation` at the last signature scan. Lets the
+    /// per-frame check early-out on idle frames (no mutation since last scan).
+    subdiv_last_generation: u64,
     /// Plugins popup: whether the Plugins window (cards + search) is open.
     show_plugins: bool,
     /// Plugins popup: case-insensitive search filter over the plugin cards.
@@ -1207,6 +1219,9 @@ impl App {
             sheet_selected: None,
             parametric_selected: None,
             param_pending: None,
+            subdiv_pending: None,
+            subdiv_sig_cache: std::collections::HashMap::new(),
+            subdiv_last_generation: 0,
             blocklib_cache: None,
             show_plugins: std::env::var("ITSJUSTCAD_PLUGINS_POPUP").is_ok(),
             plugins_search: String::new(),
@@ -7330,7 +7345,193 @@ impl App {
                 ui.separator();
                 self.parametric_editor(ui, row);
             }
+
+            // Subdivision inspector: when EXACTLY one object is selected and it
+            // resolves to a subdivision link (either the source block or one of
+            // its produced lots), render the associative params + controls.
+            let subdiv_source = if self.session.doc.selection.len() == 1 {
+                let sel = *self.session.doc.selection.iter().next().unwrap();
+                if self.session.doc.subdivision_links.contains_key(&sel) {
+                    Some(sel)
+                } else {
+                    self.session.doc.subdiv_source_of(sel)
+                }
+            } else {
+                None
+            };
+            if let Some(source) = subdiv_source {
+                ui.separator();
+                self.subdivision_inspector(ui, source);
+            }
         });
+    }
+
+    /// Associative subdivision inspector for `source` (a block with a
+    /// [`SubdivLink`]). Renders schema-driven params (reusing `param_editor`)
+    /// with a debounced `lotsetparams` commit, plus Freeze/Refresh controls.
+    /// Mirrors `parametric_editor` but keys the pending edit on the source id.
+    fn subdivision_inspector(
+        &mut self,
+        ui: &mut egui::Ui,
+        source: itsjustcad_doc::ObjectId,
+    ) {
+        use crate::i18n::t;
+        use itsjustcad_commands::subdiv_params;
+        let Some(link) = self.session.doc.subdiv_link(source).cloned() else {
+            return;
+        };
+        let short_id = source.short();
+
+        ui.horizontal(|ui| {
+            ui.strong(t("param.subdivision.header"));
+            ui.weak(short_id);
+        });
+
+        // Current values = the link's settings projected to the exposed map; the
+        // live editing map is the pending edit if a gesture is in flight here.
+        let current = subdiv_params::settings_to_params(&link.settings);
+        let mut values = match &self.subdiv_pending {
+            Some(p) if p.id == source => p.params.clone(),
+            _ => current.clone(),
+        };
+
+        let fields = subdiv_params::subdivision_fields();
+        let mut changed = false;
+        let mut still_active = false;
+        for field in &fields {
+            let (c, a) = crate::param_editor::render_field(ui, field, &mut values);
+            changed |= c;
+            still_active |= a;
+        }
+
+        if changed {
+            self.subdiv_pending = Some(ParamPending {
+                id: source,
+                params: values.clone(),
+                last_change: std::time::Instant::now(),
+            });
+        }
+        // Commit once the gesture settled (debounce elapsed, nothing dragging).
+        if let Some(p) = &self.subdiv_pending
+            && p.id == source
+            && !still_active
+            && p.last_change.elapsed() >= PARAM_DEBOUNCE
+        {
+            let params = p.params.clone();
+            self.subdiv_pending = None;
+            self.commit_subdiv_params(source, &current, &params);
+        } else if self.subdiv_pending.is_some() {
+            ui.ctx().request_repaint();
+        }
+
+        // Freeze / Refresh controls.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let mut frozen = link.frozen;
+            if ui.checkbox(&mut frozen, t("param.subdivision.freeze")).changed() {
+                let _ = self.session.run(itsjustcad_commands::Command::LotFreeze {
+                    source,
+                    frozen,
+                    prev: None,
+                });
+            }
+            ui.add_enabled_ui(!link.frozen, |ui| {
+                if ui.button(t("param.subdivision.refresh")).clicked() {
+                    let _ = self.session.run(itsjustcad_commands::Command::LotRefresh {
+                        source,
+                        ids: None,
+                    });
+                }
+            });
+        });
+        ui.weak(format!(
+            "{} lot(s){}",
+            link.produced.len(),
+            if link.frozen { " · frozen" } else { "" }
+        ));
+    }
+
+    /// Commit a debounced subdivision params edit as one `lotsetparams` op.
+    /// Diffs the pending map against the link's current exposed params so only
+    /// changed key→token pairs are sent; a no-op diff is skipped.
+    fn commit_subdiv_params(
+        &mut self,
+        source: itsjustcad_doc::ObjectId,
+        current: &itsjustcad_doc::ParamMap,
+        pending: &itsjustcad_doc::ParamMap,
+    ) {
+        let mut pairs: std::collections::BTreeMap<String, String> = Default::default();
+        for (k, v) in pending {
+            if current.get(k) != Some(v) {
+                pairs.insert(k.clone(), crate::param_editor::value_to_token(v));
+            }
+        }
+        if pairs.is_empty() {
+            return;
+        }
+        let _ = self.session.run(itsjustcad_commands::Command::LotSetParams {
+            source,
+            params: pairs,
+            ids: None,
+        });
+    }
+
+    /// Auto-recompute non-frozen subdivisions whose SOURCE block geometry
+    /// changed since the last scan. Hashes each source curve's tessellated
+    /// points; a changed signature (after the first observation) fires a
+    /// `lotrefresh` so the division tracks an edit/redraw of its boundary.
+    /// Collect-then-run to avoid mutating the link map mid-iteration.
+    fn auto_refresh_subdivisions(&mut self) {
+        use std::hash::{Hash, Hasher};
+        let generation = self.session.doc.generation;
+        if generation == self.subdiv_last_generation {
+            return;
+        }
+        self.subdiv_last_generation = generation;
+
+        let mut to_refresh: Vec<itsjustcad_doc::ObjectId> = Vec::new();
+        // Track live sources so we can prune stale cache entries afterwards.
+        let mut live: std::collections::HashSet<itsjustcad_doc::ObjectId> =
+            std::collections::HashSet::new();
+        for (source, link) in &self.session.doc.subdivision_links {
+            live.insert(*source);
+            if link.frozen {
+                continue;
+            }
+            let Some(obj) = self.session.doc.get(*source) else {
+                continue;
+            };
+            let itsjustcad_doc::Geometry::Curve(c) = &obj.geometry else {
+                continue;
+            };
+            if !c.is_closed() {
+                continue;
+            }
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for p in c.tessellate(0.01) {
+                p.x.to_bits().hash(&mut hasher);
+                p.y.to_bits().hash(&mut hasher);
+                p.z.to_bits().hash(&mut hasher);
+            }
+            let sig = hasher.finish();
+            let had = self.subdiv_sig_cache.get(source).copied();
+            if had.is_some() && had != Some(sig) {
+                to_refresh.push(*source);
+            }
+            self.subdiv_sig_cache.insert(*source, sig);
+        }
+        // Prune cache entries whose source no longer has a link.
+        self.subdiv_sig_cache.retain(|k, _| live.contains(k));
+
+        for source in to_refresh {
+            let _ = self
+                .session
+                .run(itsjustcad_commands::Command::LotRefresh { source, ids: None });
+        }
+        // Refresh bumps generation but does NOT change the source geometry, so
+        // its signature is unchanged; re-latch the generation to avoid a churn
+        // of re-scans triggered by our own refresh ops.
+        self.subdiv_last_generation = self.session.doc.generation;
     }
 
     /// Render one control per schema field for the selected parametric object
@@ -10063,6 +10264,13 @@ impl eframe::App for App {
         // Drive an in-flight DXF import one batch per frame, then draw its modal.
         self.step_import(ui.ctx());
         self.import_ui(ui.ctx());
+
+        // Associative subdivision auto-recompute: after any op edits a source
+        // block, fire `lotrefresh` for non-frozen links so the division tracks
+        // the boundary. Runs before the journal sync so the refresh ops are
+        // mirrored in the same frame (its own generation check keeps idle
+        // frames free).
+        self.auto_refresh_subdivisions();
 
         // Mirror the op-log to the crash journal. One hook covers every
         // mutation path (command line, gumball, deck, history jumps); the
