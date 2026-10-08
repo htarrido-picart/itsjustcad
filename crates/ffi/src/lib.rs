@@ -827,6 +827,101 @@ pub unsafe extern "C" fn ijc_camera_zoom_extents(h: *mut AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+/// Export the current document to `fmt` (a bare extension: `svg`, `dxf`, `obj`,
+/// `stl`, `gltf`/`glb`, `ifc`, `3dm`, `csv`, `jpg`). Writes the byte count to
+/// `*out_len` and returns a heap buffer of the file bytes — or null on error, an
+/// empty result, or an unsupported format. `step`/`stp` are unsupported in this
+/// build (they need the OCCT tier). Mirrors the `Command::Export` dispatch minus
+/// the filesystem write. Caller MUST free the buffer with [`ijc_bytes_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `fmt` must be a valid
+/// NUL-terminated C string. `out_len` must be null or a writable `usize*`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_export(
+    h: *mut AppHandle,
+    fmt: *const c_char,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard_ffi(std::ptr::null_mut(), || {
+        if !out_len.is_null() {
+            unsafe { *out_len = 0 };
+        }
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return std::ptr::null_mut();
+        };
+        if fmt.is_null() {
+            return std::ptr::null_mut();
+        }
+        let Ok(fmt) = (unsafe { CStr::from_ptr(fmt) }).to_str() else {
+            return std::ptr::null_mut();
+        };
+        let fmt = fmt.trim().trim_start_matches('.').to_ascii_lowercase();
+
+        use itsjustcad_commands::{csv, dxf, ifc, mesh_export, raster, rhino3dm, saf, svg};
+        let doc = &app.session.doc;
+        // Synthetic path: some exporters infer the format from the extension or
+        // embed a file name; none of them touch the filesystem here.
+        let path = format!("model.{fmt}");
+        let bytes: Vec<u8> = match fmt.as_str() {
+            "dxf" => dxf::document_dxf(doc).0.into_bytes(),
+            "svg" | "ai" => svg::export_svg(doc).0,
+            "csv" => csv::export_csv(doc).0,
+            "3dm" => rhino3dm::export(doc).0,
+            "jpg" | "jpeg" => match raster::export_jpg(doc) {
+                Ok((b, _)) => b,
+                Err(_) => return std::ptr::null_mut(),
+            },
+            "ifc" => match ifc::export(doc, &path) {
+                Ok((b, _)) => b,
+                Err(_) => return std::ptr::null_mut(),
+            },
+            "saf" | "xlsx" => match saf::export(doc) {
+                Ok((b, _)) => b,
+                Err(_) => return std::ptr::null_mut(),
+            },
+            // STEP needs the OCCT tier (off in this build) and a filesystem path.
+            "step" | "stp" => return std::ptr::null_mut(),
+            // obj / stl / gltf / glb / ... — mesh_export picks by the extension.
+            _ => match mesh_export::export(doc, &path) {
+                Ok((b, _)) => b,
+                Err(_) => return std::ptr::null_mut(),
+            },
+        };
+        if bytes.is_empty() {
+            return std::ptr::null_mut();
+        }
+        let mut boxed = bytes.into_boxed_slice();
+        let len = boxed.len();
+        let ptr = boxed.as_mut_ptr();
+        std::mem::forget(boxed);
+        if !out_len.is_null() {
+            unsafe { *out_len = len };
+        }
+        ptr
+    })
+}
+
+/// Free a byte buffer returned by [`ijc_export`]. Null-safe; call at most once
+/// per returned pointer, with the exact `len` that `ijc_export` reported.
+///
+/// # Safety
+/// `ptr`/`len` must be a buffer previously returned by [`ijc_export`] and not
+/// yet freed, or `ptr` null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_bytes_free(ptr: *mut u8, len: usize) {
+    guard_ffi((), || {
+        if ptr.is_null() {
+            return;
+        }
+        drop(unsafe { Box::from_raw(std::slice::from_raw_parts_mut(ptr, len)) });
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------------
 
