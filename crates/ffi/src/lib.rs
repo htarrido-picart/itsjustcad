@@ -74,6 +74,7 @@ enum CamOp {
     Orbit(f32, f32),
     Pan(f32, f32),
     Dolly(f32),
+    Frame,
 }
 
 /// Deck delta kinds handed to the Swift callback.
@@ -809,6 +810,22 @@ pub unsafe extern "C" fn ijc_camera_zoom(h: *mut AppHandle, factor: f32) {
     })
 }
 
+/// Zoom-to-fit: frame the entire scene (center on its bounding box and back the
+/// camera off to show everything). No-op on an empty scene. Applied on the next
+/// [`ijc_render_frame`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_zoom_extents(h: *mut AppHandle) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(PendingOp::Camera(CamOp::Frame));
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------------
@@ -840,6 +857,7 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
                     CamOp::Orbit(dx, dy) => app.camera.orbit(dx, dy),
                     CamOp::Pan(dx, dy) => app.camera.pan(dx, dy),
                     CamOp::Dolly(d) => app.camera.dolly(d),
+                    CamOp::Frame => frame_camera(app),
                 },
             }
         }
@@ -1150,7 +1168,39 @@ pub unsafe extern "C" fn ijc_scene_digest(h: *mut AppHandle) -> *mut c_char {
     })
 }
 
-/// Free a C string returned by [`ijc_command_brief`] / [`ijc_scene_digest`].
+/// Serialize the current document to ItsJustCAD op-log JSON (the same format
+/// [`ijc_open_json`] reads). For persistence/export on the host side. Returns an
+/// empty (non-null) string for a null/invalid handle. Caller must
+/// [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer must
+/// be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_save_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::new());
+        };
+        into_c_string(io::to_json(&app.session))
+    })
+}
+
+/// The document's monotonic generation counter — it bumps on every mutation.
+/// Lets the host cheaply gate work (autosave, cached reads) on actual change
+/// rather than polling. Returns 0 for a null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_doc_generation(h: *mut AppHandle) -> u64 {
+    guard_ffi(0, || {
+        (unsafe { handle_ref(h) }).map_or(0, |app| app.session.doc.generation)
+    })
+}
+
+/// Free a C string returned by [`ijc_command_brief`] / [`ijc_scene_digest`] /
+/// [`ijc_save_json`].
 /// Null-safe; must be called at most once per returned pointer.
 ///
 /// # Safety
