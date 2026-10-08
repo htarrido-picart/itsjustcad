@@ -5,3 +5,7 @@ dist/
 
 # internal review docs — never publish
 review*.html
+
+# local LLM runtime logs
+llama.log
+**/llama.log
