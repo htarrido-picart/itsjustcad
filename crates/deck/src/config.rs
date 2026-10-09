@@ -34,6 +34,70 @@ pub enum DeckKind {
     ClaudeCode,
 }
 
+/// The two first-class cloud providers the "LLM ▸ API Keys…" dialog manages.
+/// Each maps to one canonical cassette in `decks.json` (created if absent), so
+/// the dialog can set a key / pick a model without the user hand-editing JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloudProvider {
+    /// Claude via the Anthropic API (`x-api-key` auth).
+    Anthropic,
+    /// ChatGPT via the OpenAI API (served through the OpenAI-compatible adapter).
+    OpenAi,
+}
+
+impl CloudProvider {
+    /// Canonical cassette name written to `decks.json`.
+    pub fn cassette_name(self) -> &'static str {
+        match self {
+            CloudProvider::Anthropic => "claude",
+            CloudProvider::OpenAi => "openai",
+        }
+    }
+
+    /// Adapter kind for this provider.
+    pub fn deck_kind(self) -> DeckKind {
+        match self {
+            CloudProvider::Anthropic => DeckKind::Anthropic,
+            CloudProvider::OpenAi => DeckKind::OpenaiCompat,
+        }
+    }
+
+    /// Canonical API base URL.
+    pub fn base_url(self) -> &'static str {
+        match self {
+            CloudProvider::Anthropic => "https://api.anthropic.com",
+            CloudProvider::OpenAi => "https://api.openai.com/v1",
+        }
+    }
+
+    /// Environment variable the key is read from when the user prefers env
+    /// indirection over a stored literal.
+    pub fn env_var(self) -> &'static str {
+        match self {
+            CloudProvider::Anthropic => "ANTHROPIC_API_KEY",
+            CloudProvider::OpenAi => "OPENAI_API_KEY",
+        }
+    }
+
+    /// Fallback model when creating a brand-new cassette (before a probe picks).
+    pub fn default_model(self) -> &'static str {
+        match self {
+            CloudProvider::Anthropic => "claude-sonnet-4-6",
+            // Sol = flagship-class at mid price; a sensible default for a CAD
+            // assistant. The live /models probe lets the user switch.
+            CloudProvider::OpenAi => "gpt-6-sol",
+        }
+    }
+
+    /// Human-facing label for the dialog row.
+    pub fn label(self) -> &'static str {
+        match self {
+            CloudProvider::Anthropic => "Anthropic (Claude)",
+            CloudProvider::OpenAi => "OpenAI (ChatGPT)",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeckConfig {
     pub name: String,
@@ -334,6 +398,108 @@ mod tests {
         let back: DeckConfig =
             serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back.terse, Some(false));
+    }
+
+    #[test]
+    fn provider_index_matches_default_cassettes() {
+        let df = DecksFile::default();
+        // Default file ships a "claude" (Anthropic) cassette.
+        let ai = df.provider_index(CloudProvider::Anthropic);
+        assert_eq!(ai.map(|i| df.decks[i].name.as_str()), Some("claude"));
+        // No OpenAI cassette in the default (kimi is OpenAI-compat but on
+        // moonshot.ai, which must NOT be matched as OpenAI).
+        assert_eq!(df.provider_index(CloudProvider::OpenAi), None);
+    }
+
+    #[test]
+    fn set_cloud_provider_creates_then_updates() {
+        let mut df = DecksFile { decks: vec![], active: 0, local_only: false };
+        // Create: paste a literal OpenAI key.
+        let i = df.set_cloud_provider(
+            CloudProvider::OpenAi,
+            Some("sk-test".into()),
+            None,
+        );
+        assert_eq!(df.decks.len(), 1);
+        assert_eq!(df.decks[i].name, "openai");
+        assert_eq!(df.decks[i].kind, DeckKind::OpenaiCompat);
+        assert_eq!(df.decks[i].base_url, "https://api.openai.com/v1");
+        assert_eq!(df.decks[i].api_key.as_deref(), Some("sk-test"));
+        // Default model used when none supplied.
+        assert_eq!(df.decks[i].model, "gpt-6-sol");
+
+        // Update model only — key is left untouched (api_key = None).
+        let j = df.set_cloud_provider(CloudProvider::OpenAi, None, Some("gpt-4.1".into()));
+        assert_eq!(j, i, "updates the same cassette, no duplicate");
+        assert_eq!(df.decks.len(), 1);
+        assert_eq!(df.decks[i].model, "gpt-4.1");
+        assert_eq!(df.decks[i].api_key.as_deref(), Some("sk-test"));
+
+        // Switch to env indirection.
+        df.set_cloud_provider(
+            CloudProvider::OpenAi,
+            Some("env:OPENAI_API_KEY".into()),
+            None,
+        );
+        assert_eq!(df.decks[i].api_key.as_deref(), Some("env:OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn set_cloud_provider_heals_drifted_endpoint() {
+        // A cassette named "claude" that drifted to the wrong kind/url.
+        let mut df = DecksFile {
+            decks: vec![DeckConfig {
+                name: "claude".into(),
+                kind: DeckKind::OpenaiCompat,
+                base_url: "http://wrong".into(),
+                model: "x".into(),
+                api_key: None,
+                grammar: false,
+                terse: None,
+            }],
+            active: 0,
+            local_only: false,
+        };
+        df.set_cloud_provider(CloudProvider::Anthropic, Some("k".into()), None);
+        assert_eq!(df.decks.len(), 1, "matched by name, not duplicated");
+        assert_eq!(df.decks[0].kind, DeckKind::Anthropic);
+        assert_eq!(df.decks[0].base_url, "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn openai_class_models_support_vision() {
+        let mk = |model: &str| DeckConfig {
+            name: "x".into(),
+            kind: DeckKind::OpenaiCompat,
+            base_url: "https://api.openai.com/v1".into(),
+            model: model.into(),
+            api_key: None,
+            grammar: false,
+            terse: None,
+        };
+        assert!(mk("gpt-4o").supports_vision());
+        assert!(mk("gpt-4o-mini").supports_vision());
+        assert!(mk("gpt-4.1").supports_vision());
+        assert!(mk("gpt-4-turbo").supports_vision());
+        // Unknown future models on the real OpenAI cloud are trusted as
+        // multimodal (endpoint-based, not name-based) — codenames we can't
+        // predict (e.g. "gpt-5.6-sol", "astra") must still allow image attach.
+        assert!(mk("gpt-5.6-sol").supports_vision());
+        assert!(mk("astra").supports_vision());
+
+        // But an arbitrary OpenAI-compatible endpoint (e.g. a local gateway)
+        // still name-gates: an unknown text model there is treated as blind.
+        let local = |model: &str| DeckConfig {
+            name: "x".into(),
+            kind: DeckKind::OpenaiCompat,
+            base_url: "http://localhost:8080/v1".into(),
+            model: model.into(),
+            api_key: None,
+            grammar: false,
+            terse: None,
+        };
+        assert!(!local("some-text-model").supports_vision());
+        assert!(local("qwen2.5-vl-7b").supports_vision());
     }
 
     #[test]

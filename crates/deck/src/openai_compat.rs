@@ -41,10 +41,21 @@ impl OpenAiCompatDeck {
         let mut body = json!({
             "model": if req.model.is_empty() { &self.model } else { &req.model },
             "messages": messages,
-            "max_tokens": req.max_tokens,
-            "temperature": req.temperature,
             "stream": true,
         });
+        // Newer OpenAI cloud models (gpt-5.x / gpt-6.x / o-series) reject
+        // `max_tokens` (they require `max_completion_tokens`) and reject a
+        // non-default `temperature`. Only the real OpenAI cloud behaves this
+        // way; every other OpenAI-compatible endpoint (Ollama, llama.cpp, Kimi,
+        // gateways) wants the classic `max_tokens` + `temperature` pair and does
+        // not understand `max_completion_tokens`.
+        let is_openai = self.base_url.contains("api.openai.com");
+        if is_openai {
+            body["max_completion_tokens"] = json!(req.max_tokens);
+        } else {
+            body["max_tokens"] = json!(req.max_tokens);
+            body["temperature"] = json!(req.temperature);
+        }
         if self.grammar {
             body["grammar"] = Value::String(itsjustcad_commands::gbnf::command_grammar());
         }
@@ -249,6 +260,42 @@ mod tests {
         let r = ChatRequest::text(system, Vec::new(), String::new(), cap, 0.2, None);
         let body = deck.build_body(&r, Value::Array(vec![]));
         assert_eq!(body["max_tokens"], crate::prompt::TERSE_MAX_TOKENS);
+    }
+
+    #[test]
+    fn local_base_uses_max_tokens_and_temperature() {
+        // A local / non-openai.com endpoint keeps the classic pair and never
+        // emits max_completion_tokens.
+        let deck = OpenAiCompatDeck::new(&config(false)); // base_url = localhost:11434/v1
+        let body = deck.build_body(&req(), Value::Array(vec![]));
+        assert_eq!(body["max_tokens"], 512);
+        assert!(
+            body["temperature"].is_number(),
+            "temperature must be present on a local endpoint: {body}"
+        );
+        assert!(
+            body["max_completion_tokens"].is_null(),
+            "local endpoint must not emit max_completion_tokens: {body}"
+        );
+    }
+
+    #[test]
+    fn openai_cloud_uses_max_completion_tokens_and_no_temperature() {
+        // api.openai.com gets max_completion_tokens and NO temperature (newer
+        // models 400 on both max_tokens and a custom temperature).
+        let mut cfg = config(false);
+        cfg.base_url = "https://api.openai.com/v1".into();
+        let deck = OpenAiCompatDeck::new(&cfg);
+        let body = deck.build_body(&req(), Value::Array(vec![]));
+        assert_eq!(body["max_completion_tokens"], 512);
+        assert!(
+            body["max_tokens"].is_null(),
+            "openai cloud must not emit max_tokens: {body}"
+        );
+        assert!(
+            body["temperature"].is_null(),
+            "openai cloud must omit temperature: {body}"
+        );
     }
 
     #[test]
