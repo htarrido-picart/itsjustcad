@@ -390,7 +390,7 @@ mod tests {
         let s = 1000.0;
         let slab = make_box(DVec3::ZERO, DVec3::new(8.0 * s, 8.0 * s, 3.0 * s));
         let void = make_box(
-            DVec3::new(2.0 * s, 2.0 * s, -1.0 * s),
+            DVec3::new(2.0 * s, 2.0 * s, -s),
             DVec3::new(4.0 * s, 4.0 * s, 5.0 * s),
         );
         let big = feature_edges(&crate::csg_difference(&slab, &void)).len();

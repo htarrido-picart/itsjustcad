@@ -441,7 +441,7 @@ mod tests {
         }
         // Union-find over vertices connected through shared faces.
         let mut parent: Vec<usize> = (0..n).collect();
-        fn find(p: &mut Vec<usize>, mut x: usize) -> usize {
+        fn find(p: &mut [usize], mut x: usize) -> usize {
             while p[x] != x {
                 p[x] = p[p[x]];
                 x = p[x];
@@ -464,8 +464,8 @@ mod tests {
             }
         }
         let mut roots = std::collections::HashSet::new();
-        for i in 0..n {
-            if used[i] {
+        for (i, &is_used) in used.iter().enumerate() {
+            if is_used {
                 roots.insert(find(&mut parent, i));
             }
         }
