@@ -130,12 +130,12 @@ enum Inverse {
         layers_created: Vec<String>,
     },
     /// `lotsubdivide` (W1 associative): like `CreatedOnLayer`, plus it drops the
-    /// subdivision link keyed by `link_source` so undo leaves no dangling
-    /// source→lots association.
+    /// subdivision links keyed by `link_sources` (one per source block) so undo
+    /// leaves no dangling source→lots associations.
     CreatedOnLayerLinked {
         created: Vec<ObjectId>,
         layers_created: Vec<String>,
-        link_source: ObjectId,
+        link_sources: Vec<ObjectId>,
     },
     /// `lotrefresh` (W1 associative recompute): delete the recomputed lots,
     /// restore the previous lots (with their creation indices), and restore the
@@ -847,16 +847,18 @@ impl Session {
                     self.doc.generation += 1;
                 }
             }
-            Inverse::CreatedOnLayerLinked { created, layers_created, link_source } => {
+            Inverse::CreatedOnLayerLinked { created, layers_created, link_sources } => {
                 for id in created.clone() {
                     self.doc.remove(id);
                 }
                 for name in layers_created.clone() {
                     self.doc.layers.remove(&name);
                 }
-                // Drop the associative link so undo leaves no stale source→lots
-                // binding (redo re-inserts it).
-                self.doc.subdivision_links.remove(link_source);
+                // Drop the associative links so undo leaves no stale source→lots
+                // bindings (redo re-inserts them).
+                for src in link_sources {
+                    self.doc.subdivision_links.remove(src);
+                }
                 self.doc.generation += 1;
             }
             Inverse::LotRefreshed { source, created, restored, prev_link } => {
@@ -5297,36 +5299,47 @@ fn exec_lot_subdivide(
     }
     crate::lot::insert_lots(doc, &bake, &new_ids);
 
-    // W1 associativity: for a SINGLE source block, record a link (source → the
-    // settings + produced lots) so the division recomputes when the block is
-    // edited. Multi-block subdivide bakes a flat lot list with no per-block
-    // attribution, so it stays unlinked (v1 scope). Re-subdividing the same
-    // block overwrites its link to track the latest result.
-    let link_source = if source_ids.len() == 1 {
-        let src = source_ids[0];
+    // W1 associativity: record one link PER source block (source → settings +
+    // its produced lots) so each block's division recomputes when THAT block is
+    // edited. The combined bake appends each block's lots in block order, so we
+    // slice `new_ids` by each block's own derive count — deterministic, so the
+    // slices line up with the combined bake. Re-subdividing a block overwrites
+    // its link to track the latest result.
+    let mut link_sources: Vec<ObjectId> = Vec::new();
+    let mut offset = 0usize;
+    for ((poly, z), src) in blocks.iter().zip(&source_ids) {
+        let count = crate::lot::derive_subdivision(poly, *z, &settings)
+            .map(|b| b.polygons.len())
+            .unwrap_or(0);
+        // Guard against any slice overflow (determinism should prevent it).
+        if count == 0 || offset + count > new_ids.len() {
+            offset += count;
+            continue;
+        }
+        let produced = new_ids[offset..offset + count].to_vec();
+        offset += count;
         doc.subdivision_links.insert(
-            src,
+            *src,
             itsjustcad_doc::SubdivLink {
                 settings: settings.clone(),
-                produced: new_ids.clone(),
-                source_z: blocks[0].1,
+                produced,
+                source_z: *z,
                 frozen: false,
             },
         );
-        Some(src)
-    } else {
-        None
-    };
+        link_sources.push(*src);
+    }
     doc.generation += 1;
 
     let n = new_ids.len();
-    let inverse = match link_source {
-        Some(src) => Inverse::CreatedOnLayerLinked {
+    let inverse = if link_sources.is_empty() {
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created }
+    } else {
+        Inverse::CreatedOnLayerLinked {
             created: new_ids.clone(),
             layers_created,
-            link_source: src,
-        },
-        None => Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+            link_sources,
+        }
     };
     Ok((
         Command::LotSubdivide {
@@ -25799,6 +25812,55 @@ mod tests {
         for id in &new_ids {
             assert!(s.doc.get(*id).is_none(), "refreshed lot {id:?} removed by undo");
         }
+    }
+
+    /// W1 multi-block: subdividing TWO selected blocks records one link per
+    /// block with DISJOINT lots; refreshing one leaves the other untouched; undo
+    /// drops both links.
+    #[test]
+    fn multi_block_subdivide_records_a_link_per_block() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 40,0,0 40,40,0 0,40,0 closed");
+        run(&mut s, "polyline 100,0,0 160,0,0 160,60,0 100,60,0 closed");
+        let ids: Vec<_> = s.doc.objects().map(|o| o.id).collect();
+        assert_eq!(ids.len(), 2, "two blocks");
+        let (b1, b2) = (ids[0], ids[1]);
+
+        // Force several lots per block so the per-block id slices are non-trivial.
+        s.run(Command::LotSubdivide {
+            targets: Selector::Ids { ids: vec![b1, b2] },
+            method: "grid".into(),
+            area: Some(500.0),
+            width: Some(5.0),
+            irregularity: None,
+            seed: Some(1),
+            ids: None,
+        })
+        .expect("lotsubdivide ok");
+
+        let l1 = s.doc.subdivision_links.get(&b1).expect("link for block 1").clone();
+        let l2 = s.doc.subdivision_links.get(&b2).expect("link for block 2").clone();
+        assert!(!l1.produced.is_empty() && !l2.produced.is_empty(), "both blocks produced lots");
+        // Disjoint id sets; every lot exists.
+        for id in &l1.produced {
+            assert!(!l2.produced.contains(id), "links must not share a lot id");
+            assert!(s.doc.get(*id).is_some(), "block1 lot {id:?} present");
+        }
+        for id in &l2.produced {
+            assert!(s.doc.get(*id).is_some(), "block2 lot {id:?} present");
+        }
+
+        // Refreshing block 1 leaves block 2's lots untouched.
+        let b2_before = l2.produced.clone();
+        s.run(Command::LotRefresh { source: b1, ids: None }).expect("refresh b1");
+        let l2_after = s.doc.subdivision_links.get(&b2).expect("b2 link intact").clone();
+        assert_eq!(l2_after.produced, b2_before, "refreshing b1 left b2's lots untouched");
+
+        // Undo the refresh, then the subdivide → both links dropped.
+        run(&mut s, "undo");
+        run(&mut s, "undo");
+        assert!(s.doc.subdivision_links.get(&b1).is_none(), "b1 link dropped on undo");
+        assert!(s.doc.subdivision_links.get(&b2).is_none(), "b2 link dropped on undo");
     }
 
     /// W1c: LotSetParams edits a link's exposed params (settings updated) then
