@@ -7283,7 +7283,21 @@ impl App {
         }
 
         egui::ScrollArea::vertical().id_salt("parameters_scroll").show(ui, |ui| {
-            if rows.is_empty() {
+            // Does the current selection map to a subdivision link? Computed up
+            // front so the tab still renders its inspector when there are no
+            // parametric (expressive-structure) objects but there IS a
+            // subdivision to edit (the common case).
+            let subdiv_source = if self.session.doc.selection.len() == 1 {
+                let sel = *self.session.doc.selection.iter().next().unwrap();
+                if self.session.doc.subdivision_links.contains_key(&sel) {
+                    Some(sel)
+                } else {
+                    self.session.doc.subdiv_source_of(sel)
+                }
+            } else {
+                None
+            };
+            if rows.is_empty() && subdiv_source.is_none() {
                 ui.weak(t("parameters.empty"));
                 ui.weak(t("parameters.empty.hint"));
                 return;
@@ -7346,19 +7360,8 @@ impl App {
                 self.parametric_editor(ui, row);
             }
 
-            // Subdivision inspector: when EXACTLY one object is selected and it
-            // resolves to a subdivision link (either the source block or one of
-            // its produced lots), render the associative params + controls.
-            let subdiv_source = if self.session.doc.selection.len() == 1 {
-                let sel = *self.session.doc.selection.iter().next().unwrap();
-                if self.session.doc.subdivision_links.contains_key(&sel) {
-                    Some(sel)
-                } else {
-                    self.session.doc.subdiv_source_of(sel)
-                }
-            } else {
-                None
-            };
+            // Subdivision inspector (source resolved up front, so it renders even
+            // with no parametric objects present — source block OR a lot child).
             if let Some(source) = subdiv_source {
                 ui.separator();
                 self.subdivision_inspector(ui, source);
