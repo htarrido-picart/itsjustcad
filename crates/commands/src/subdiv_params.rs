@@ -155,6 +155,52 @@ pub fn subdivision_fields() -> Vec<ParamField> {
             Widget::Numeric,
             Unit::Meter,
         ),
+        ParamField::float(
+            "offset_width",
+            "param.subdivision.offset_width",
+            120.0,
+            Some(1.0),
+            Some(1000.0),
+            1.0,
+            Widget::Numeric,
+            Unit::Meter,
+        ),
+        ParamField::float(
+            "corner_width",
+            "param.subdivision.corner_width",
+            0.0,
+            Some(0.0),
+            Some(500.0),
+            1.0,
+            Widget::Numeric,
+            Unit::Meter,
+        ),
+        ParamField::float(
+            "lot_depth_target",
+            "param.subdivision.lot_depth_target",
+            0.0,
+            Some(0.0),
+            Some(1000.0),
+            1.0,
+            Widget::Numeric,
+            Unit::Meter,
+        ),
+        ParamField::float(
+            "alley_width",
+            "param.subdivision.alley_width",
+            20.0,
+            Some(0.0),
+            Some(200.0),
+            0.5,
+            Widget::Numeric,
+            Unit::Meter,
+        ),
+        ParamField::bool("merge_slivers", "param.subdivision.merge_slivers", true),
+        ParamField::bool(
+            "draw_buildable_envelope",
+            "param.subdivision.draw_buildable_envelope",
+            true,
+        ),
     ]
 }
 
@@ -172,6 +218,15 @@ pub fn settings_to_params(s: &SubdivisionSettings) -> ParamMap {
     m.insert("setback_rear".into(), ParamValue::Float(s.setback_rear));
     m.insert("road_width".into(), ParamValue::Float(s.road_width));
     m.insert("block_depth".into(), ParamValue::Float(s.block_depth));
+    m.insert("offset_width".into(), ParamValue::Float(s.offset_width));
+    m.insert("corner_width".into(), ParamValue::Float(s.corner_width));
+    m.insert("lot_depth_target".into(), ParamValue::Float(s.lot_depth_target));
+    m.insert("alley_width".into(), ParamValue::Float(s.alley_width));
+    m.insert("merge_slivers".into(), ParamValue::Bool(s.merge_slivers));
+    m.insert(
+        "draw_buildable_envelope".into(),
+        ParamValue::Bool(s.draw_buildable_envelope),
+    );
     m
 }
 
@@ -214,6 +269,24 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
     }
     if let Some(v) = p.get("block_depth").and_then(|v| v.as_f64()) {
         s.block_depth = v;
+    }
+    if let Some(v) = p.get("offset_width").and_then(|v| v.as_f64()) {
+        s.offset_width = v;
+    }
+    if let Some(v) = p.get("corner_width").and_then(|v| v.as_f64()) {
+        s.corner_width = v;
+    }
+    if let Some(v) = p.get("lot_depth_target").and_then(|v| v.as_f64()) {
+        s.lot_depth_target = v;
+    }
+    if let Some(v) = p.get("alley_width").and_then(|v| v.as_f64()) {
+        s.alley_width = v;
+    }
+    if let Some(v) = p.get("merge_slivers").and_then(|v| v.as_bool()) {
+        s.merge_slivers = v;
+    }
+    if let Some(v) = p.get("draw_buildable_envelope").and_then(|v| v.as_bool()) {
+        s.draw_buildable_envelope = v;
     }
     s
 }
@@ -277,6 +350,27 @@ mod tests {
         // Un-exposed fields are carried through from base.
         assert_eq!(out.coverage_frac, 0.33);
         assert_eq!(out.floor_count, 5);
+    }
+
+    #[test]
+    fn new_fields_round_trip() {
+        let s = SubdivisionSettings {
+            offset_width: 250.0,
+            corner_width: 12.0,
+            lot_depth_target: 30.0,
+            alley_width: 8.5,
+            merge_slivers: false,
+            draw_buildable_envelope: false,
+            ..SubdivisionSettings::default()
+        };
+        let params = settings_to_params(&s);
+        let back = params_to_settings(&SubdivisionSettings::default(), &params);
+        assert_eq!(back.offset_width, 250.0);
+        assert_eq!(back.corner_width, 12.0);
+        assert_eq!(back.lot_depth_target, 30.0);
+        assert_eq!(back.alley_width, 8.5);
+        assert!(!back.merge_slivers);
+        assert!(!back.draw_buildable_envelope);
     }
 
     #[test]
