@@ -2,17 +2,35 @@
 
 Branch: `feat/intemfit-and-config`
 
-## Resuming in a fresh session
-This doc is self-contained — start here. Next action: **begin W2** (see
-Sequencing below). Decisions already locked with the user:
+## STATUS (2026-10-09) — W1 + W2 + W4 SHIPPED on this branch (PR #16)
+All three workstreams are implemented, tested, and manually verified; bundled
+into one PR (#16) off `feat/intemfit-and-config`. The sections below are kept as
+the original design record. See "Queued follow-ups" at the bottom for what's next.
+
+What shipped:
+- **W1 IntemFit associativity** — `SubdivLink` (kind Lots|Site) + a per-frame
+  geometry-signature scan → `LotRefresh`; `lotsubdivide` (per block) and
+  `lotgeneratesite` record source→output links and auto-recompute on boundary
+  edit. Parameters-tab inspector (17 curated `SubdivisionSettings` fields,
+  kind-filtered) with debounced `LotSetParams`, `LotFreeze`, Refresh.
+  Undo-symmetric + replay-stable. Deleting a source cascades to its children +
+  drops the link. Lots are clipped to the block (no spill on non-convex sites).
+  Viewport cue: source curves cyan (live) / slate (frozen). Verified by unit +
+  GPU-journey tests and a manual click-through.
+- **W2 cloud keys** — LLM ▸ API Keys dialog (Anthropic + OpenAI), onboarding
+  OpenAI path, endpoint-based vision, curated OpenAI model list (default
+  `gpt-6-sol`), `max_completion_tokens`/no-`temperature` fix for gpt-5/6/o-series.
+- **W4 hotkeys** — keybindings.json, keymap overlay, modeless editor
+  (autocomplete + chord capture), `bind_hotkey` gated at the deck plane.
+- Plus: onboarding window-size fix, system symbol-font fallback for ←/→,
+  i18n parity across 8 catalogs.
+
+Original decisions (all honored):
 - **IntemFit (W1):** associative + live params, auto-update on polygon edit,
   with a freeze toggle.
 - **Cloud (W2):** first-class in onboarding AND a menu-bar **LLM ▸ API Keys…**
   dialog covering both Claude (Anthropic) and ChatGPT (OpenAI).
 - **Hotkeys (W4):** both a UI editor and an LLM `bind_hotkey` tool.
-
-Build order: **W2 → W4 → W1+W3** (see Sequencing). Each workstream ships as its
-own PR off this branch. Nothing implemented yet.
 
 ---
 
@@ -196,3 +214,67 @@ this branch.**
      and recompute-on-edit.
    - (c) **inspector** — schema-driven param panel with debounced commit.
    - (d) **freeze** — freeze/refresh toggles (`lotfreeze` / `lotrefresh`).
+
+---
+
+## Queued follow-ups (next session)
+
+Captured on-branch (GitHub issue creation was permission-blocked). Priority order.
+
+### F1 — CityEngine-style meta site-plan (BIG, the headline next step)
+Match CityEngine: ONE component + ONE attribute panel driving the whole site
+plan (streets → blocks → lots → setbacks → buildings), fully associative. The
+individual `lot*` verbs stay as composable primitives; this adds the composed,
+discoverable path.
+
+Foundation already in place:
+- `SubdivisionSettings` is ALREADY one struct spanning every phase (streets,
+  lots, irregularity, setbacks, typology/floors/roof/coverage, open space). The
+  17-field inspector is a curated slice of it.
+- W1 associativity machinery (`SubdivLink` + per-frame signature scan →
+  `LotRefresh`, kind-generic) is reusable.
+
+Proposed:
+1. **Meta-command** (`siteplan` / `urbanize` — name TBD): boundary + unified
+   settings → runs the full chain (roads+blocks → lots → setbacks → building
+   masses) as ONE associative result.
+2. **One grouped inspector**: collapsible sections (Streets / Lots / Setbacks /
+   Buildings / Open space), all editing the single `SubdivisionSettings`.
+3. **End-to-end associativity via one meta-object** that owns ALL produced ids
+   and regenerates them together on boundary/param edit. This avoids the
+   multi-level DAG id-re-keying problem of extending associativity verb-by-verb
+   (a single deterministic re-derive, streets→…→buildings, in one pass).
+
+Open questions: regen coalescing/perf (a full chain regen per param nudge — ties
+into op-log churn; debounce + maybe "heavy phases off during drag"); partial
+freeze (freeze buildings while still editing lots); naming.
+
+NOTE: this SUPERSEDES the narrower "extend associativity to lotsetbacks +
+lotbuilding verb-by-verb" idea — the meta-object owning the whole output is the
+cleaner model.
+
+### F2 — Op-log churn from auto-recompute
+Every source edit fires a logged `LotRefresh`, so a drag = one undo step per
+commit and the op-log bloats under heavy editing. Add op-level coalescing /
+debounce (one refresh per gesture, not per commit).
+
+### F3 — Expose more of the ~50 `SubdivisionSettings` in the inspector
+Currently 17 curated fields; unexposed ones are preserved through re-derive but
+not editable. (Largely subsumed by F1's grouped inspector.)
+
+### F4 — Cross-platform verification
+Everything verified on macOS. Font fallback, keybindings paths, and the bundle
+are macOS-centric; the app also targets Linux — verify there.
+
+### F5 — Deferred to a SEPARATE session (already discussed)
+- Ticket-worthy: assistant produces malformed ramps/stairs — no generator / no
+  design rules (only after-the-fact `codecheck` ibc2021/ada2010 validation).
+  Proposal: a parametric `ramp`/`stair` command reusing those rule packs.
+- Ticket-worthy: macOS app ships without a visible icon — the `.icns` IS in the
+  bundle; the blank icon is from the app being unsigned + quarantined (Launch
+  Services won't cache it). Fix is distribution-side (ad-hoc codesign + strip
+  quarantine + asset catalog + icon-cache reset).
+
+### F6 — Process
+PR #16 bundles W1+W2+W4 (the plan wanted one PR per workstream). Decide whether
+to split before merge or accept the combined PR.
