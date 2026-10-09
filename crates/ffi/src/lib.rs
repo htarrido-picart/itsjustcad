@@ -695,6 +695,25 @@ pub unsafe extern "C" fn ijc_open_json(h: *mut AppHandle, ptr: *const u8, len: u
     })
 }
 
+/// Reset to a blank document (new scene): a fresh empty session, cleared deck
+/// history, and a forced re-snapshot next frame. Mirrors the post-parse reset of
+/// [`ijc_open_json`]. The host should also clear its autosave if "new" must
+/// persist across launches.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_new_document(h: *mut AppHandle) {
+    guard_ffi((), || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return };
+        app.session = Session::default();
+        if let Ok(mut hist) = app.history.lock() {
+            hist.clear();
+        }
+        app.last_gen = None; // force re-snapshot next frame
+    })
+}
+
 /// Point the camera at the whole scene (used after opening a document).
 fn frame_camera(app: &mut AppHandle) {
     if let Some(bb) = app.session.doc.scene_aabb() {
