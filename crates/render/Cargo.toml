@@ -18,3 +18,4 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [dev-dependencies]
 itsjustcad-commands.workspace = true
 pollster = "0.4"
+naga = { version = "29", features = ["wgsl-in"] }

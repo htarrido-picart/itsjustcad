@@ -44,7 +44,11 @@ struct FsOut {
 
 fn grid_factor(coord: vec2<f32>, spacing: f32) -> f32 {
     let c = coord / spacing;
-    let d = abs(fract(c - 0.5) - 0.5) / fwidth(c);
+    // Clamp the derivative away from zero: f32 precision in the unproject can
+    // collapse fwidth to 0 in spots, and the resulting NaN discards the pixel
+    // (reads as dotted/broken lines).
+    let fw = max(fwidth(c), vec2(1e-9));
+    let d = abs(fract(c - 0.5) - 0.5) / fw;
     let line = min(d.x, d.y);
     return 1.0 - min(line, 1.0);
 }
@@ -99,9 +103,10 @@ fn fs_main(in: VsOut) -> FsOut {
     let minor = grid_factor(hit.xy, 1.0);
     let major = grid_factor(hit.xy, 10.0);
 
-    // Axes tint: X red-ish, Y green-ish along the origin lines
-    let ax = 1.0 - min(abs(hit.y) / fwidth(hit.y), 1.0);
-    let ay = 1.0 - min(abs(hit.x) / fwidth(hit.x), 1.0);
+    // Axes tint: X red-ish, Y green-ish along the origin lines. Same NaN guard
+    // as grid_factor: a zero derivative must not break the axis into dots.
+    let ax = 1.0 - min(abs(hit.y) / max(fwidth(hit.y), 1e-9), 1.0);
+    let ay = 1.0 - min(abs(hit.x) / max(fwidth(hit.x), 1e-9), 1.0);
 
     let dist = length(hit - camera.eye.xyz);
     let fade = exp(-dist * 0.008);

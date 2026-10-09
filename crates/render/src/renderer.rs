@@ -903,7 +903,17 @@ impl SceneRenderer {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
-                bias: Default::default(),
+                // The underlay quad is coplanar with the grid plane (both z=0),
+                // but the grid writes an ANALYTIC frag_depth while this quad
+                // rasterizes interpolated depth — the two quantize differently
+                // in Depth24Plus, so without an offset the depth test flips
+                // per-pixel and the grid's axis lines stipple over the image.
+                // A small constant bias pushes the quad behind the grid plane.
+                bias: wgpu::DepthBiasState {
+                    constant: 4,
+                    slope_scale: 0.0,
+                    clamp: 0.0,
+                },
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
