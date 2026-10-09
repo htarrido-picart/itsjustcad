@@ -160,6 +160,50 @@ fn push_hatch_segs(lines: &mut Vec<SceneLine>, segs: Vec<[DVec3; 2]>, color: [f3
     }
 }
 
+/// Extract an object's display wireframe in WORLD SPACE as a flat segment soup
+/// (each entry is one line segment `[start, end]`). This is the exact geometry
+/// the normal snapshot draws as curves / feature edges — meshes contribute
+/// [`kernel_mesh::feature_edges`], curves contribute their [`DISPLAY_TOL`]
+/// tessellation split into consecutive segments, parametric wire/grid members
+/// their segments — so a caller (the FFI gumball ghost) can transform every
+/// endpoint by a preview matrix and render a faithful ghost outline.
+///
+/// Fill-only / label-only geometry (points, hatches, text, dims) returns no
+/// segments: the ghost only needs the object silhouette, not its annotations.
+pub fn object_wireframe_world(obj: &SceneObject) -> Vec<[DVec3; 2]> {
+    let mut segs: Vec<[DVec3; 2]> = Vec::new();
+    match &obj.geometry {
+        Geometry::Parametric { wire, .. } if !wire.is_empty() => {
+            segs.extend_from_slice(wire);
+        }
+        Geometry::Parametric { generator, mesh, .. } if generator.renders_as_wireframe() => {
+            segs.extend(mesh.unique_edges());
+        }
+        Geometry::Mesh(mesh)
+        | Geometry::Frame { mesh, .. }
+        | Geometry::Area { mesh, .. }
+        | Geometry::Parametric { mesh, .. } => {
+            for (a, b) in kernel_mesh::feature_edges(mesh) {
+                segs.push([a, b]);
+            }
+        }
+        Geometry::Curve(curve) => {
+            let mut pts = curve.tessellate(DISPLAY_TOL);
+            if curve.is_closed()
+                && let Some(first) = pts.first().copied()
+            {
+                pts.push(first);
+            }
+            for w in pts.windows(2) {
+                segs.push([w[0], w[1]]);
+            }
+        }
+        // Points / annotations (hatch, text, field, dims): no wire silhouette.
+        _ => {}
+    }
+    segs
+}
+
 /// Resolve the display color for an object given the active color mode.
 /// Selection always wins over everything; otherwise the mode determines priority.
 fn resolve_color(

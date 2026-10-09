@@ -25,13 +25,15 @@ pub use pano::{
 };
 pub use layout::ViewportLayout;
 pub use renderer::{
-    curve_px, hue_from_seed, CameraUniform, ColorMode, DisplayMode, LightMode, SceneData,
-    SceneRenderer, UnderlayData, RHINO_CURVE_PX,
+    curve_px, hue_from_seed, CameraUniform, ColorMode, DisplayMode, LightMode, LineEntry,
+    SceneData, SceneRenderer, UnderlayData, RHINO_CURVE_PX,
 };
 pub use sketchy::{
     edge_seed, jitter_offset, sketchify_segments, SketchyParams,
 };
-pub use snapshot::{snapshot, snapshot_hiding, snapshot_with_mode, ColorModeSnapshot, Theme};
+pub use snapshot::{
+    object_wireframe_world, snapshot, snapshot_hiding, snapshot_with_mode, ColorModeSnapshot, Theme,
+};
 pub use viewport_callback::ViewportCallback;
 
 pub fn camera_uniform(view_proj: glam::Mat4, eye: glam::Vec3) -> CameraUniform {
