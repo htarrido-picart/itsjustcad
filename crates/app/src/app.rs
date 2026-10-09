@@ -11511,6 +11511,82 @@ mod tests {
 
     #[test]
     #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_moving_block_auto_recomputes_lots() {
+        // End-to-end proof of W1 auto-recompute in the REAL frame loop: subdivide
+        // a block, move it, and the lots re-derive to track the new boundary
+        // (fresh ids + shifted positions) — something a headless single-shot
+        // can't show because the signature cache needs a frame before the edit.
+        run_app_journey(|h| {
+            submit_command(h, "polyline 0,0,0 40,0,0 40,40,0 0,40,0 closed");
+            submit_command(h, "select last");
+            submit_command(h, "lotsubdivide area=500 width=5");
+            h.run_steps(4); // seed the auto-refresh signature cache
+
+            let source = *h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .keys()
+                .next()
+                .expect("subdivide recorded a link");
+            let before = h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .get(&source)
+                .unwrap()
+                .produced
+                .clone();
+            assert!(!before.is_empty(), "subdivide produced lots");
+
+            // Mean x of a lot set (via tessellated curve points) — proves the lots
+            // actually moved, not just churned ids.
+            let mean_x = |h: &egui_kittest::Harness<'_, App>,
+                          ids: &[itsjustcad_doc::ObjectId]|
+             -> f64 {
+                let doc = &h.state().session.doc;
+                let (mut sx, mut n) = (0.0, 0.0);
+                for id in ids {
+                    if let Some(itsjustcad_doc::Geometry::Curve(c)) =
+                        doc.get(*id).map(|o| &o.geometry)
+                    {
+                        for p in c.tessellate(0.5) {
+                            sx += p.x;
+                            n += 1.0;
+                        }
+                    }
+                }
+                if n > 0.0 { sx / n } else { f64::NAN }
+            };
+            let x_before = mean_x(h, &before);
+
+            // Move only the block (lots aren't selected). Auto-recompute must
+            // then re-derive the lots under the moved boundary.
+            submit_command(h, "move sel 50,0,0");
+            h.run_steps(6);
+
+            let after = h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .get(&source)
+                .unwrap()
+                .produced
+                .clone();
+            assert_ne!(before, after, "moving the block auto-recomputed its lots (fresh ids)");
+            let x_after = mean_x(h, &after);
+            assert!(
+                x_after - x_before > 40.0,
+                "recomputed lots tracked the moved block: x {x_before:.1} → {x_after:.1}"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
     fn journey_empty_click_deselects() {
         // Rhino behavior: click an object to select it, then click EMPTY canvas
         // space to DESELECT. The bug was that `hit_object` ray-tested the object
