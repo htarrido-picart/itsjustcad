@@ -213,6 +213,14 @@ fn resolve_color(
 /// dielectric. Matches the shader's neutral appearance for legacy objects.
 const DEFAULT_ROUGH_METAL: [f32; 2] = [0.5, 0.0];
 
+/// Viewport cue for a LIVE associative-subdivision source curve (a block/site
+/// that recomputes on edit): a cyan accent, distinct from amber selection and
+/// the magenta lots layer, readable on both backgrounds.
+const SUBDIV_LIVE_CUE: [f32; 4] = [0.20, 0.78, 0.86, 1.0];
+/// Viewport cue for a FROZEN subdivision source (baked, no recompute): a muted
+/// slate so it reads as "locked" rather than active.
+const SUBDIV_FROZEN_CUE: [f32; 4] = [0.55, 0.60, 0.70, 1.0];
+
 /// Resolve the mesh fill color AND its roughness/metallic for the shader. A
 /// `material2` on the object overrides the base color (unless selection wins)
 /// and supplies the PBR scalars; otherwise we fall back to the flat color path
@@ -270,6 +278,11 @@ pub fn snapshot_hiding(
         basemap: None,
         show_lineweights: doc.show_lineweights,
     };
+    // Subdivision source outlines are collected here and appended to
+    // `scene.lines` AFTER the main loop, so the live/frozen cue draws on TOP of
+    // its children (lot/road boundaries coincide with the source and would
+    // otherwise overdraw the cue).
+    let mut deferred_source_lines: Vec<(Vec<[f32; 3]>, [f32; 4], f32)> = Vec::new();
     for obj in doc.objects() {
         if !obj.visible {
             continue; // hidden object (hideobj)
@@ -283,6 +296,17 @@ pub fn snapshot_hiding(
         }
         let layer_color = style.and_then(|s| s.color);
         let selected = doc.selection.contains(&obj.id);
+        // W1 viewport cue: a subdivision SOURCE curve (a block/site that drives a
+        // live lot/road division) reads with a distinct accent — cyan when live,
+        // slate when frozen — so you can tell it's a parametric source without
+        // opening the inspector. Selection still wins over the cue.
+        let source_cue: Option<[f32; 4]> = if selected {
+            None
+        } else {
+            doc.subdivision_links.get(&obj.id).map(|link| {
+                if link.frozen { SUBDIV_FROZEN_CUE } else { SUBDIV_LIVE_CUE }
+            })
+        };
         let lw_mm = doc.effective_lineweight(obj) as f32;
         match &obj.geometry {
             // Strut-lattice parametric generators (spaceframe/geodesic/
@@ -351,7 +375,6 @@ pub fn snapshot_hiding(
                 }
             }
             Geometry::Curve(curve) => {
-                let color = resolve_color(obj, layer_color, theme, selected, mode, false);
                 let mut pts: Vec<[f32; 3]> = curve
                     .tessellate(DISPLAY_TOL)
                     .iter()
@@ -362,7 +385,16 @@ pub fn snapshot_hiding(
                 {
                     pts.push(first); // close the strip
                 }
-                scene.lines.push((pts, color, lw_mm));
+                match source_cue {
+                    // Defer source outlines so the cue isn't overdrawn by its
+                    // coincident lot/road children (appended after the loop).
+                    Some(cue) => deferred_source_lines.push((pts, cue, lw_mm)),
+                    None => {
+                        let color =
+                            resolve_color(obj, layer_color, theme, selected, mode, false);
+                        scene.lines.push((pts, color, lw_mm));
+                    }
+                }
             }
             // Hatches are scene geometry (fill triangles / pattern lines);
             // dimensions and text are drawn as an egui overlay by the app.
@@ -590,6 +622,9 @@ pub fn snapshot_hiding(
             }
         }
     }
+    // Source outlines last, so the live/frozen cue sits visibly on top of its
+    // lot/road children (whose boundaries coincide with the source).
+    scene.lines.extend(deferred_source_lines);
     scene
 }
 

@@ -7445,7 +7445,10 @@ impl App {
             _ => current.clone(),
         };
 
-        let fields = subdiv_params::subdivision_fields();
+        // Only the params relevant to this link's kind (Lots vs Site) — a site
+        // link doesn't use lot sizing/setbacks, a lot link doesn't use the road
+        // network params.
+        let fields = subdiv_params::fields_for_kind(link.kind);
         let mut changed = false;
         let mut still_active = false;
         for field in &fields {

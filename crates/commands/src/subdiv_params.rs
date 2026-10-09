@@ -204,6 +204,29 @@ pub fn subdivision_fields() -> Vec<ParamField> {
     ]
 }
 
+/// The subset of [`subdivision_fields`] relevant to a given link kind, so the
+/// inspector never shows irrelevant controls. A `Lots` link (lotsubdivide) never
+/// uses the road-network params (`road_width`/`block_depth`); a `Site` link
+/// (lotgeneratesite) uses only those road-network params + `seed` — the lot
+/// sizing / setback params don't affect `generate_site`.
+pub fn fields_for_kind(kind: itsjustcad_doc::SubdivKind) -> Vec<ParamField> {
+    subdivision_fields()
+        .into_iter()
+        .filter(|f| field_applies(f.name, kind))
+        .collect()
+}
+
+/// Road-network params that only apply to `lotgeneratesite` (Site links).
+const SITE_ONLY_FIELDS: &[&str] = &["road_width", "block_depth"];
+
+fn field_applies(name: &str, kind: itsjustcad_doc::SubdivKind) -> bool {
+    use itsjustcad_doc::SubdivKind;
+    match kind {
+        SubdivKind::Lots => !SITE_ONLY_FIELDS.contains(&name),
+        SubdivKind::Site => name == "seed" || SITE_ONLY_FIELDS.contains(&name),
+    }
+}
+
 /// Project a full [`SubdivisionSettings`] down to the exposed parameter map.
 pub fn settings_to_params(s: &SubdivisionSettings) -> ParamMap {
     let mut m = ParamMap::new();
@@ -294,6 +317,29 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fields_for_kind_filters_by_link_kind() {
+        use itsjustcad_doc::SubdivKind;
+        let names = |k| {
+            fields_for_kind(k)
+                .into_iter()
+                .map(|f| f.name)
+                .collect::<Vec<_>>()
+        };
+        let lots = names(SubdivKind::Lots);
+        let site = names(SubdivKind::Site);
+        // Lots: has lot sizing, no road-network params.
+        assert!(lots.contains(&"lot_area_min"));
+        assert!(!lots.contains(&"road_width"));
+        assert!(!lots.contains(&"block_depth"));
+        // Site: road-network params + seed only, no lot sizing/setbacks.
+        assert!(site.contains(&"road_width"));
+        assert!(site.contains(&"block_depth"));
+        assert!(site.contains(&"seed"));
+        assert!(!site.contains(&"lot_area_min"));
+        assert!(!site.contains(&"setback_front"));
+    }
 
     #[test]
     fn method_token_round_trips() {

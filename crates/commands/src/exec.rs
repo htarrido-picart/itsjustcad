@@ -109,6 +109,12 @@ enum Inverse {
     DeleteCreated(Vec<ObjectId>),
     MoveBack { ids: Vec<ObjectId>, delta: DVec3 },
     Restore(Vec<(SceneObject, usize)>),
+    /// `delete` of a subdivision SOURCE: restore the removed objects (source +
+    /// cascaded children) AND re-insert the dropped subdivision links.
+    RestoreWithLinks {
+        removed: Vec<(SceneObject, usize)>,
+        links: Vec<(ObjectId, itsjustcad_doc::SubdivLink)>,
+    },
     Rename(Vec<(ObjectId, Option<String>)>),
     /// Booleans: delete the result, restore the consumed inputs.
     Replace {
@@ -813,6 +819,15 @@ impl Session {
                 for (obj, index) in objs.iter().rev() {
                     self.doc.restore(obj.clone(), *index);
                 }
+            }
+            Inverse::RestoreWithLinks { removed, links } => {
+                for (obj, index) in removed.iter().rev() {
+                    self.doc.restore(obj.clone(), *index);
+                }
+                for (src, link) in links {
+                    self.doc.subdivision_links.insert(*src, link.clone());
+                }
+                self.doc.generation += 1;
             }
             Inverse::Rename(prev) => {
                 for (id, name) in prev {
@@ -11593,8 +11608,27 @@ fn apply_forward(
             // fallback rather than the stale creation-time point. Pure function
             // of current doc state at a fixed point => replay-stable.
             doc.refresh_dim_anchors();
-            let mut removed = Vec::new();
+            // W1: deleting a subdivision SOURCE cascades to its produced children
+            // and drops the link, so no orphaned lots / dangling associations
+            // remain. Capture the links for undo and expand the delete set with
+            // their produced ids (recomputed from doc state => replay-stable).
+            let mut removed_links: Vec<(ObjectId, itsjustcad_doc::SubdivLink)> = Vec::new();
+            let mut to_remove: Vec<ObjectId> = ids.clone();
             for id in &ids {
+                if let Some(link) = doc.subdivision_links.get(id).cloned() {
+                    for child in &link.produced {
+                        if !to_remove.contains(child) {
+                            to_remove.push(*child);
+                        }
+                    }
+                    removed_links.push((*id, link));
+                }
+            }
+            for (src, _) in &removed_links {
+                doc.subdivision_links.remove(src);
+            }
+            let mut removed = Vec::new();
+            for id in &to_remove {
                 if let Some(pair) = doc.remove(*id) {
                     removed.push(pair);
                 }
@@ -11603,12 +11637,18 @@ fn apply_forward(
             // deletion. Fields whose referent just vanished keep their last-good
             // text (eval failure is ignored by refresh_fields).
             refresh_fields(doc);
+            let n = removed.len();
+            let inverse = if removed_links.is_empty() {
+                Inverse::Restore(removed)
+            } else {
+                Inverse::RestoreWithLinks { removed, links: removed_links }
+            };
             Ok((
                 Command::Delete { targets },
-                Inverse::Restore(removed),
+                inverse,
                 ApplyOutcome {
                     created: Vec::new(),
-                    message: format!("deleted {} object(s)", ids.len()),
+                    message: format!("deleted {n} object(s)"),
                 },
             ))
         }
@@ -25989,6 +26029,46 @@ mod tests {
         run(&mut s, "undo");
         assert!(s.doc.subdivision_links.get(&b1).is_none(), "b1 link dropped on undo");
         assert!(s.doc.subdivision_links.get(&b2).is_none(), "b2 link dropped on undo");
+    }
+
+    /// W1 gap 1: deleting a subdivision SOURCE cascades to its lots and drops
+    /// the link (no orphans / dangling links); undo restores source + lots +
+    /// link.
+    #[test]
+    fn deleting_source_cascades_lots_and_drops_link() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 40,0,0 40,40,0 0,40,0 closed");
+        let source = s.doc.objects().next().expect("block").id;
+        s.run(Command::LotSubdivide {
+            targets: Selector::Ids { ids: vec![source] },
+            method: "grid".into(),
+            area: Some(500.0),
+            width: Some(5.0),
+            irregularity: None,
+            seed: None,
+            ids: None,
+        })
+        .expect("subdivide");
+        let lots = s.doc.subdivision_links.get(&source).expect("link").produced.clone();
+        assert!(!lots.is_empty());
+
+        // Delete the source → link dropped, lots cascade-deleted, source gone.
+        s.run(Command::Delete { targets: Selector::Ids { ids: vec![source] } })
+            .expect("delete");
+        assert!(s.doc.subdivision_links.get(&source).is_none(), "link dropped");
+        assert!(s.doc.get(source).is_none(), "source removed");
+        for id in &lots {
+            assert!(s.doc.get(*id).is_none(), "cascaded lot {id:?} removed");
+        }
+
+        // Undo → source, lots, and link all restored.
+        run(&mut s, "undo");
+        assert!(s.doc.get(source).is_some(), "source restored");
+        for id in &lots {
+            assert!(s.doc.get(*id).is_some(), "lot {id:?} restored");
+        }
+        let relinked = s.doc.subdivision_links.get(&source).expect("link restored").clone();
+        assert_eq!(relinked.produced, lots, "link restored with its produced ids");
     }
 
     /// W1c: LotSetParams edits a link's exposed params (settings updated) then
