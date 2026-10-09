@@ -153,10 +153,34 @@ pub fn subdivide_blocks(
             placeholder_note = report.placeholder_banner();
         }
         for lot in lots {
-            if lot.has_street {
-                with_street += 1;
+            // Hard invariant: a lot can never extend beyond its block. The
+            // skeleton / street-following method can emit faces that spill past a
+            // non-convex boundary (reflex vertices). Clip each lot to the block:
+            //   • already inside (clip ≈ full area) → keep as-is (no retessellation,
+            //     so convex/grid output stays byte-stable),
+            //   • partly outside → keep the clipped piece,
+            //   • entirely outside (clip ~empty) → drop the spurious lot.
+            let has_street = lot.has_street;
+            let orig_area = lot.polygon.area();
+            let best = subdivision::clip_bridge::intersection(&lot.polygon, block)
+                .into_iter()
+                .max_by(|a, b| {
+                    a.area().partial_cmp(&b.area()).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            let keep = match best {
+                // A real piece survives: clipped if it lost area, else the original.
+                Some(cp) if cp.area() > 1e-6 => {
+                    if cp.area() + 1e-6 < orig_area { Some(cp) } else { Some(lot.polygon) }
+                }
+                // Entirely outside the block → drop it.
+                _ => None,
+            };
+            if let Some(poly) = keep {
+                if has_street {
+                    with_street += 1;
+                }
+                polygons.push(poly);
             }
-            polygons.push(lot.polygon);
         }
         z_acc += *z;
         z_n += 1;
@@ -1193,6 +1217,46 @@ mod tests {
         // Equivalent to the single-block form of the core bridge.
         let c = subdivide_blocks(&[(poly, 0.0)], &s).expect("lots");
         assert_eq!(a.polygons, c.polygons);
+    }
+
+    #[test]
+    fn lots_never_exceed_a_nonconvex_block() {
+        // L-shaped (concave) block: the skeleton / street-following method can
+        // emit faces that spill past the reflex corner. The final clip must keep
+        // every lot inside the block.
+        let block = Polygon2d::new(vec![
+            DVec2::new(0.0, 0.0),
+            DVec2::new(60.0, 0.0),
+            DVec2::new(60.0, 20.0),
+            DVec2::new(20.0, 20.0),
+            DVec2::new(20.0, 60.0),
+            DVec2::new(0.0, 60.0),
+        ])
+        .expect("valid L-shaped polygon");
+        let s = SubdivisionSettings {
+            method: SubdivisionMethod::Skeleton,
+            lot_area_min: 100.0,
+            lot_width_min: 5.0,
+            irregularity: 0.55,
+            seed: 37,
+            ..SubdivisionSettings::default()
+        };
+        let bake = subdivide_blocks(&[(block.clone(), 0.0)], &s).expect("lots");
+        assert!(!bake.polygons.is_empty());
+        for (i, lot) in bake.polygons.iter().enumerate() {
+            // The portion of the lot inside the block ≈ its whole area, i.e. it
+            // doesn't stick out past the boundary.
+            let inside: f64 = subdivision::clip_bridge::intersection(lot, &block)
+                .iter()
+                .map(|p| p.area())
+                .sum();
+            assert!(
+                (inside - lot.area()).abs() < 1.0,
+                "lot {i} exceeds the block: area {:.1}, inside {:.1}",
+                lot.area(),
+                inside
+            );
+        }
     }
 
     #[test]
