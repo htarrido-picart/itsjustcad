@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright © 2026 Hector Tarrido-Picart
 
+mod api_keys;
 mod app;
 mod app_verbs;
 mod basemap;
@@ -21,6 +22,8 @@ mod headless;
 mod i18n;
 mod icons;
 mod journal;
+mod keybindings;
+mod keybindings_editor;
 mod keymap;
 mod local_runtime;
 mod menu;

@@ -918,6 +918,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Tools,
         },
         CommandSpec {
+            name: "siteplan",
+            usage: "siteplan [selector]",
+            summary: "META site plan: from the selected site boundary, generate the full chain — streets + blocks → lots → buildable setbacks → building masses — as ONE associative result that recomputes when the boundary (or its params in the Parameters tab) changes. Uses the sticky lotsettings; freeze/refresh like other subdivisions. Example: siteplan last",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "lotloading",
             usage: "lotloading [selector] front|alley",
             summary: "Set the sticky lot loading mode (M-intemfit Phase 6): front (front-loaded — a continuous street facade, the euro_latam default) or alley (alley-loaded — two-frontage lots that run street→alley at half the block depth; takes effect when the block carries an alley edge from lotgeneratesite alleys=on). A thin convenience over `lotsettings loading=…`; the mode is sticky document state applied on the next `lotsubdivide`, so the selection is advisory. Logged so replay reproduces it. Example: lotloading alley · lotloading last front",

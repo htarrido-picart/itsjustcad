@@ -81,9 +81,14 @@ pub(crate) enum TemplateScale {
 /// writes a cassette entry into `decks.json`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DeckBrain {
-    /// Point at a cloud API later (Anthropic/OpenAI-compatible). No cassette
-    /// written now — the user enters a key in the deck settings.
+    /// Claude via the Anthropic API. Creates the `claude` cassette (defaulting
+    /// to `env:ANTHROPIC_API_KEY`) and opens LLM ▸ API Keys… so the user can
+    /// paste a key.
     Cloud,
+    /// ChatGPT via the OpenAI API. Creates the `openai` cassette (defaulting to
+    /// `env:OPENAI_API_KEY`) and opens LLM ▸ API Keys… so the user can paste a
+    /// key.
+    OpenAi,
     /// Local via an already-running Ollama at http://localhost:11434.
     Ollama,
     /// Download a local model (the fetch is a later sub-phase; here we only
@@ -96,7 +101,8 @@ pub(crate) enum DeckBrain {
 impl DeckBrain {
     fn label(self) -> &'static str {
         match self {
-            DeckBrain::Cloud => "Cloud (enter an API key later)",
+            DeckBrain::Cloud => "Claude (Anthropic) — paste an API key",
+            DeckBrain::OpenAi => "OpenAI (ChatGPT) — paste an API key",
             DeckBrain::Ollama => "Local via Ollama (http://localhost:11434)",
             DeckBrain::Download => "Download a local model",
             DeckBrain::Skip => "Skip — decide later",
@@ -107,6 +113,7 @@ impl DeckBrain {
     fn as_pref(self) -> &'static str {
         match self {
             DeckBrain::Cloud => "cloud",
+            DeckBrain::OpenAi => "openai",
             DeckBrain::Ollama => "ollama",
             DeckBrain::Download => "download",
             DeckBrain::Skip => "skip",
@@ -627,6 +634,18 @@ pub struct App {
     /// `paramset` op is committed once the slider is released or the debounce
     /// window elapses (see `PARAM_DEBOUNCE`).
     param_pending: Option<ParamPending>,
+    /// Subdivision inspector: pending debounced `lotsetparams` re-derive. Holds
+    /// the source block id, the full pending param map, and the instant of the
+    /// last change — committed once the gesture settles (mirrors `param_pending`
+    /// but keyed on the subdivision source rather than a parametric object).
+    subdiv_pending: Option<ParamPending>,
+    /// Auto-recompute: per-source signature of the last-observed source block
+    /// geometry. A change (after the first observation) fires a `lotrefresh` so
+    /// non-frozen subdivisions track edits to their boundary block.
+    subdiv_sig_cache: std::collections::HashMap<itsjustcad_doc::ObjectId, u64>,
+    /// Auto-recompute: the `doc.generation` at the last signature scan. Lets the
+    /// per-frame check early-out on idle frames (no mutation since last scan).
+    subdiv_last_generation: u64,
     /// Plugins popup: whether the Plugins window (cards + search) is open.
     show_plugins: bool,
     /// Plugins popup: case-insensitive search filter over the plugin cards.
@@ -710,6 +729,16 @@ pub struct App {
     /// Whether the Tools → Model Setup panel is open (works any time, not just
     /// first-run).
     show_model_setup: bool,
+    /// The "LLM ▸ API Keys…" settings dialog (set/update Anthropic + OpenAI
+    /// keys and pick a model). Modeless, like Model Setup.
+    api_keys: crate::api_keys::ApiKeysPanel,
+    /// User-defined hotkeys (W4), overlaid on the built-in keymap. Loaded once
+    /// at startup; the editor + `bind_hotkey` verb write through it.
+    keybindings: crate::keybindings::KeybindingsFile,
+    /// Whether the "LLM ▸ Keybindings…" editor window is open.
+    show_keybindings: bool,
+    /// UI-only state for the keybindings editor (key capture, pending verb).
+    keybindings_editor: crate::keybindings_editor::KeybindingsEditor,
     /// A DXF import running in time-boxed batches (progress modal). `None` when
     /// no import is in flight.
     import_job: Option<ImportJob>,
@@ -962,6 +991,97 @@ fn download_outcome(
     }
 }
 
+/// Pure core of [`App::auto_refresh_subdivisions`]: given the document + a
+/// signature cache, return the non-frozen subdivision link sources whose
+/// boundary geometry changed since the cache was last updated, updating the
+/// cache in place. The FIRST observation of a source never triggers (so
+/// just-created lots aren't immediately re-derived); a later change does. Pure
+/// (no egui / no command execution) so the auto-recompute trigger is unit-
+/// testable without a live frame loop.
+fn subdivisions_to_refresh(
+    doc: &itsjustcad_doc::Document,
+    cache: &mut std::collections::HashMap<itsjustcad_doc::ObjectId, u64>,
+) -> Vec<itsjustcad_doc::ObjectId> {
+    use std::hash::{Hash, Hasher};
+    let mut to_refresh: Vec<itsjustcad_doc::ObjectId> = Vec::new();
+    let mut live: std::collections::HashSet<itsjustcad_doc::ObjectId> =
+        std::collections::HashSet::new();
+    for (source, link) in &doc.subdivision_links {
+        live.insert(*source);
+        if link.frozen {
+            continue;
+        }
+        let Some(obj) = doc.get(*source) else {
+            continue;
+        };
+        let itsjustcad_doc::Geometry::Curve(c) = &obj.geometry else {
+            continue;
+        };
+        if !c.is_closed() {
+            continue;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for p in c.tessellate(0.01) {
+            p.x.to_bits().hash(&mut hasher);
+            p.y.to_bits().hash(&mut hasher);
+            p.z.to_bits().hash(&mut hasher);
+        }
+        let sig = hasher.finish();
+        let had = cache.get(source).copied();
+        if had.is_some() && had != Some(sig) {
+            to_refresh.push(*source);
+        }
+        cache.insert(*source, sig);
+    }
+    // Prune cache entries whose source no longer has a link.
+    cache.retain(|k, _| live.contains(k));
+    to_refresh
+}
+
+/// egui 0.35's bundled fonts (Ubuntu-Light / NotoEmoji / emoji-icon-font) don't
+/// cover common symbol glyphs — in particular the arrows `←` `→`, which show up
+/// in menus, guided-command prompts and hints and render as tofu boxes without a
+/// fallback. Load the first available system font that DOES cover them and
+/// append it as the LAST entry in both font families: as a fallback it only
+/// supplies glyphs the primary font is missing, so ordinary text keeps the
+/// Ubuntu look. No-op (with a warning) when no candidate exists — same visual as
+/// before, never a crash. Order favours a light symbol font over a heavy
+/// everything-font.
+fn install_symbol_fallback(ctx: &egui::Context) {
+    // Per-platform candidates, lightest-with-arrow-coverage first.
+    const CANDIDATES: &[&str] = &[
+        // macOS: Apple Symbols (~0.9 MB, has ← → — •); Arial Unicode as the
+        // comprehensive last resort (~22 MB, covers ✓ and much more).
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        // Linux
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        // Windows: Segoe UI Symbol has the arrows; Arial is the broad fallback.
+        "C:\\Windows\\Fonts\\seguisym.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ];
+    let Some((path, bytes)) = CANDIDATES
+        .iter()
+        .find_map(|p| std::fs::read(p).ok().map(|b| (*p, b)))
+    else {
+        tracing::warn!("no symbol-fallback font found; arrows/symbols may render as boxes");
+        return;
+    };
+    const KEY: &str = "symbol_fallback";
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        KEY.to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(fam).or_default().push(KEY.to_owned());
+    }
+    ctx.set_fonts(fonts);
+    tracing::info!("loaded symbol-fallback font: {path}");
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, tokio: tokio::runtime::Handle) -> Self {
         // One-time prefs carry-over from the old product name.
@@ -985,6 +1105,10 @@ impl App {
         // Cmd+= / Cmd+- / Cmd+0 also work (egui built-in zoom).
         let zoom = load_zoom().unwrap_or(1.3);
         cc.egui_ctx.set_zoom_factor(zoom);
+
+        // egui's bundled fonts lack common symbol glyphs (notably the arrows
+        // ← →), which otherwise render as tofu boxes in UI strings and menus.
+        install_symbol_fallback(&cc.egui_ctx);
 
         // Legacy-CAD-informed font sizes (see docs/ui-legacy-research.md):
         //   command line / monospace prompt: 13 px  (~10 pt at 96 DPI)
@@ -1142,6 +1266,9 @@ impl App {
             sheet_selected: None,
             parametric_selected: None,
             param_pending: None,
+            subdiv_pending: None,
+            subdiv_sig_cache: std::collections::HashMap::new(),
+            subdiv_last_generation: 0,
             blocklib_cache: None,
             show_plugins: std::env::var("ITSJUSTCAD_PLUGINS_POPUP").is_ok(),
             plugins_search: String::new(),
@@ -1167,8 +1294,14 @@ impl App {
                 Some("light") => Some(false),
                 _ => load_theme_pref(),
             },
-            show_template_picker: !load_template_done(),
-            onboard_step: 0,
+            show_template_picker: !load_template_done()
+                || std::env::var("ITSJUSTCAD_ONBOARD").is_ok(),
+            // Dev hook: ITSJUSTCAD_ONBOARD=<step> opens the wizard at a given step
+            // (0-based) so ITSJUSTCAD_SHOT frames can capture any step directly.
+            onboard_step: std::env::var("ITSJUSTCAD_ONBOARD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
             template_units: TemplateUnits::Meters,
             template_scale: TemplateScale::Building,
             cad_origin,
@@ -1179,12 +1312,27 @@ impl App {
                 Some("download") => DeckBrain::Download,
                 Some("ollama") => DeckBrain::Ollama,
                 Some("cloud") => DeckBrain::Cloud,
+                Some("openai") => DeckBrain::OpenAi,
                 _ => DeckBrain::Skip,
             },
             hardware: crate::hardware::detect(),
             // Dev hook: ITSJUSTCAD_MODEL_SETUP=1 opens the Model Setup panel on
             // startup so ITSJUSTCAD_SHOT frames can capture it without a click.
             show_model_setup: std::env::var("ITSJUSTCAD_MODEL_SETUP").is_ok(),
+            // Dev hook: ITSJUSTCAD_API_KEYS=1 opens the API Keys dialog on startup
+            // so ITSJUSTCAD_SHOT frames can capture it without a click.
+            api_keys: {
+                let mut p = crate::api_keys::ApiKeysPanel::default();
+                if std::env::var("ITSJUSTCAD_API_KEYS").is_ok() {
+                    p.open();
+                }
+                p
+            },
+            keybindings: crate::keybindings::KeybindingsFile::load_or_default(),
+            // Dev hook: ITSJUSTCAD_KEYBINDINGS=1 opens the editor on startup for
+            // ITSJUSTCAD_SHOT frames.
+            show_keybindings: std::env::var("ITSJUSTCAD_KEYBINDINGS").is_ok(),
+            keybindings_editor: crate::keybindings_editor::KeybindingsEditor::default(),
             import_job: None,
             import_result: None,
             catalog: crate::model_catalog::Catalog::load(),
@@ -1421,6 +1569,67 @@ impl App {
     }
 
     /// App-level verbs (save/open, camera) wrap the command substrate.
+    /// `bind_hotkey <combo>=<verb>` (or `<combo> <verb>`): persist a user
+    /// hotkey. Validates the chord and the target verb, refuses OS-reserved
+    /// chords, and reports on the command line. Shared by the human command line
+    /// and (gated) the assistant.
+    fn bind_hotkey(&mut self, args: &str) {
+        let args = args.trim();
+        // Accept "combo=verb" or "combo verb…" (split on the first '=' else the
+        // first whitespace run).
+        let (combo_str, verb) = if let Some((c, v)) = args.split_once('=') {
+            (c.trim(), v.trim())
+        } else if let Some((c, v)) = args.split_once(char::is_whitespace) {
+            (c.trim(), v.trim())
+        } else {
+            ("", "")
+        };
+        if combo_str.is_empty() || verb.is_empty() {
+            self.command_line.push_line(
+                "usage: bind_hotkey <combo>=<verb>  (e.g. bind_hotkey Cmd+K=select all)",
+            );
+            return;
+        }
+        let Some(combo) = crate::keybindings::KeyCombo::parse(combo_str) else {
+            self.command_line
+                .push_line(format!("unrecognized key combo '{combo_str}'"));
+            return;
+        };
+        if combo.is_reserved() {
+            self.command_line
+                .push_line(format!("{combo} is reserved by the OS — pick another chord"));
+            return;
+        }
+        if !crate::keybindings::target_is_valid(verb) {
+            self.command_line
+                .push_line(format!("unknown verb '{verb}' — not bound"));
+            return;
+        }
+        let overwrote = self.keybindings.set(combo.clone(), verb.to_string());
+        self.keybindings.save();
+        self.command_line.push_line(format!(
+            "{} {combo} → {verb}",
+            if overwrote { "rebound" } else { "bound" }
+        ));
+    }
+
+    /// `unbind_hotkey <combo>`: remove a user hotkey.
+    fn unbind_hotkey(&mut self, args: &str) {
+        let combo_str = args.trim();
+        let Some(combo) = crate::keybindings::KeyCombo::parse(combo_str) else {
+            self.command_line
+                .push_line(format!("unrecognized key combo '{combo_str}'"));
+            return;
+        };
+        if self.keybindings.remove(&combo) {
+            self.keybindings.save();
+            self.command_line.push_line(format!("unbound {combo}"));
+        } else {
+            self.command_line
+                .push_line(format!("no user binding for {combo}"));
+        }
+    }
+
     fn execute_line(&mut self, line: String) {
         // Empty submissions never reach here as executable input: the command line
         // now populates the last verb on empty Enter/Space (see command_line.rs)
@@ -1483,6 +1692,19 @@ impl App {
                     self.command_line
                         .push_line(format!("cut {n} object(s) — Cmd+V pastes"));
                 }
+            }
+            // User-definable hotkeys (W4). `hotkeys` opens the editor;
+            // `bind_hotkey <combo>=<verb>` / `unbind_hotkey <combo>` edit the
+            // persisted map from the command line (also the LLM's path, gated at
+            // the deck plane). The combo accepts `=` or a space before the verb.
+            Some("hotkeys" | "keybindings") => self.show_keybindings = true,
+            Some("bind_hotkey" | "bindkey") => {
+                let rest = words.collect::<Vec<_>>().join(" ");
+                self.bind_hotkey(&rest);
+            }
+            Some("unbind_hotkey" | "unbindkey") => {
+                let rest = words.collect::<Vec<_>>().join(" ");
+                self.unbind_hotkey(&rest);
             }
             Some("controlimages") => {
                 match words.next() {
@@ -6572,7 +6794,11 @@ impl App {
         // The Parameters tab appears on demand: whenever the document holds ≥1
         // live parametric object (geodesic/hypar/…), or when pinned open via
         // `panel tab parameters` / a menu. Content-driven, like Sheets.
-        let has_parametric = crate::dyntabs::has_parametric(&self.session.doc);
+        // The Parameters tab also hosts the associative-subdivision inspector, so
+        // reveal it when there are subdivision links too (not only expressive
+        // parametric objects).
+        let has_parametric = crate::dyntabs::has_parametric(&self.session.doc)
+            || !self.session.doc.subdivision_links.is_empty();
         self.panel_tabs.sync_dynamic(has_blocks, has_sheets, has_parametric);
         let visible_tabs = self.panel_tabs.visible_tabs(has_blocks, has_sheets, has_parametric);
 
@@ -7108,7 +7334,21 @@ impl App {
         }
 
         egui::ScrollArea::vertical().id_salt("parameters_scroll").show(ui, |ui| {
-            if rows.is_empty() {
+            // Does the current selection map to a subdivision link? Computed up
+            // front so the tab still renders its inspector when there are no
+            // parametric (expressive-structure) objects but there IS a
+            // subdivision to edit (the common case).
+            let subdiv_source = if self.session.doc.selection.len() == 1 {
+                let sel = *self.session.doc.selection.iter().next().unwrap();
+                if self.session.doc.subdivision_links.contains_key(&sel) {
+                    Some(sel)
+                } else {
+                    self.session.doc.subdiv_source_of(sel)
+                }
+            } else {
+                None
+            };
+            if rows.is_empty() && subdiv_source.is_none() {
                 ui.weak(t("parameters.empty"));
                 ui.weak(t("parameters.empty.hint"));
                 return;
@@ -7170,7 +7410,163 @@ impl App {
                 ui.separator();
                 self.parametric_editor(ui, row);
             }
+
+            // Subdivision inspector (source resolved up front, so it renders even
+            // with no parametric objects present — source block OR a lot child).
+            if let Some(source) = subdiv_source {
+                ui.separator();
+                self.subdivision_inspector(ui, source);
+            }
         });
+    }
+
+    /// Associative subdivision inspector for `source` (a block with a
+    /// [`SubdivLink`]). Renders schema-driven params (reusing `param_editor`)
+    /// with a debounced `lotsetparams` commit, plus Freeze/Refresh controls.
+    /// Mirrors `parametric_editor` but keys the pending edit on the source id.
+    fn subdivision_inspector(
+        &mut self,
+        ui: &mut egui::Ui,
+        source: itsjustcad_doc::ObjectId,
+    ) {
+        use crate::i18n::t;
+        use itsjustcad_commands::subdiv_params;
+        let Some(link) = self.session.doc.subdiv_link(source).cloned() else {
+            return;
+        };
+        let short_id = source.short();
+
+        ui.horizontal(|ui| {
+            ui.strong(t("param.subdivision.header"));
+            ui.weak(short_id);
+        });
+
+        // Current values = the link's settings projected to the exposed map; the
+        // live editing map is the pending edit if a gesture is in flight here.
+        let current = subdiv_params::settings_to_params(&link.settings);
+        let mut values = match &self.subdiv_pending {
+            Some(p) if p.id == source => p.params.clone(),
+            _ => current.clone(),
+        };
+
+        // Phase-grouped params relevant to this link's kind (CityEngine-style):
+        // a SitePlan drives every phase, a Site link only the street network, a
+        // Lots link only the lot-sizing params. Each group is a collapsible
+        // section; edits across all groups accumulate into one debounced commit.
+        let groups = subdiv_params::grouped_fields_for_kind(link.kind);
+        let mut changed = false;
+        let mut still_active = false;
+        for (group_key, fields) in &groups {
+            if fields.is_empty() {
+                continue;
+            }
+            egui::CollapsingHeader::new(t(group_key))
+                .default_open(true)
+                .id_salt(("subdiv_group", *group_key, source))
+                .show(ui, |ui| {
+                    for field in fields {
+                        let (c, a) = crate::param_editor::render_field(ui, field, &mut values);
+                        changed |= c;
+                        still_active |= a;
+                    }
+                });
+        }
+
+        if changed {
+            self.subdiv_pending = Some(ParamPending {
+                id: source,
+                params: values.clone(),
+                last_change: std::time::Instant::now(),
+            });
+        }
+        // Commit once the gesture settled (debounce elapsed, nothing dragging).
+        if let Some(p) = &self.subdiv_pending
+            && p.id == source
+            && !still_active
+            && p.last_change.elapsed() >= PARAM_DEBOUNCE
+        {
+            let params = p.params.clone();
+            self.subdiv_pending = None;
+            self.commit_subdiv_params(source, &current, &params);
+        } else if self.subdiv_pending.is_some() {
+            ui.ctx().request_repaint();
+        }
+
+        // Freeze / Refresh controls.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let mut frozen = link.frozen;
+            if ui.checkbox(&mut frozen, t("param.subdivision.freeze")).changed() {
+                let _ = self.session.run(itsjustcad_commands::Command::LotFreeze {
+                    source,
+                    frozen,
+                    prev: None,
+                });
+            }
+            ui.add_enabled_ui(!link.frozen, |ui| {
+                if ui.button(t("param.subdivision.refresh")).clicked() {
+                    let _ = self.session.run(itsjustcad_commands::Command::LotRefresh {
+                        source,
+                        ids: None,
+                    });
+                }
+            });
+        });
+        ui.weak(format!(
+            "{} lot(s){}",
+            link.produced.len(),
+            if link.frozen { " · frozen" } else { "" }
+        ));
+    }
+
+    /// Commit a debounced subdivision params edit as one `lotsetparams` op.
+    /// Diffs the pending map against the link's current exposed params so only
+    /// changed key→token pairs are sent; a no-op diff is skipped.
+    fn commit_subdiv_params(
+        &mut self,
+        source: itsjustcad_doc::ObjectId,
+        current: &itsjustcad_doc::ParamMap,
+        pending: &itsjustcad_doc::ParamMap,
+    ) {
+        let mut pairs: std::collections::BTreeMap<String, String> = Default::default();
+        for (k, v) in pending {
+            if current.get(k) != Some(v) {
+                pairs.insert(k.clone(), crate::param_editor::value_to_token(v));
+            }
+        }
+        if pairs.is_empty() {
+            return;
+        }
+        let _ = self.session.run(itsjustcad_commands::Command::LotSetParams {
+            source,
+            params: pairs,
+            ids: None,
+        });
+    }
+
+    /// Auto-recompute non-frozen subdivisions whose SOURCE block geometry
+    /// changed since the last scan. Hashes each source curve's tessellated
+    /// points; a changed signature (after the first observation) fires a
+    /// `lotrefresh` so the division tracks an edit/redraw of its boundary.
+    /// Collect-then-run to avoid mutating the link map mid-iteration.
+    fn auto_refresh_subdivisions(&mut self) {
+        let generation = self.session.doc.generation;
+        if generation == self.subdiv_last_generation {
+            return;
+        }
+        self.subdiv_last_generation = generation;
+
+        let to_refresh =
+            subdivisions_to_refresh(&self.session.doc, &mut self.subdiv_sig_cache);
+        for source in to_refresh {
+            let _ = self
+                .session
+                .run(itsjustcad_commands::Command::LotRefresh { source, ids: None });
+        }
+        // Refresh bumps generation but does NOT change the source geometry, so
+        // its signature is unchanged; re-latch the generation to avoid a churn
+        // of re-scans triggered by our own refresh ops.
+        self.subdiv_last_generation = self.session.doc.generation;
     }
 
     /// Render one control per schema field for the selected parametric object
@@ -7616,6 +8012,8 @@ impl App {
                 self.show_update = true;
             }
             MenuAction::ModelSetup => self.show_model_setup = true,
+            MenuAction::ShowApiKeys => self.api_keys.open(),
+            MenuAction::ShowKeybindings => self.show_keybindings = true,
             MenuAction::RenderSetup => self.show_render_setup = true,
             MenuAction::RevealSdModelsFolder => {
                 if let Some(dir) = crate::sd_catalog::sd_models_dir() {
@@ -8872,6 +9270,7 @@ fn save_deck_brain(brain: DeckBrain) {
 fn load_deck_brain() -> Option<DeckBrain> {
     match load_ui_json()["deck_brain"].as_str()? {
         "cloud" => Some(DeckBrain::Cloud),
+        "openai" => Some(DeckBrain::OpenAi),
         "ollama" => Some(DeckBrain::Ollama),
         "download" => Some(DeckBrain::Download),
         "skip" => Some(DeckBrain::Skip),
@@ -8923,7 +9322,7 @@ fn model_id_for_tier(tier: crate::hardware::ModelTier) -> &'static str {
 /// Returns the deck name that was made active, if any. Pure enough to unit-test
 /// via [`deck_brain_into_decks`]; this wrapper just handles load/save I/O.
 fn apply_deck_brain(brain: DeckBrain, tier: crate::hardware::ModelTier) {
-    if matches!(brain, DeckBrain::Cloud | DeckBrain::Skip) {
+    if matches!(brain, DeckBrain::Skip) {
         return;
     }
     let mut decks = itsjustcad_deck::DecksFile::load_or_default();
@@ -8941,11 +9340,30 @@ fn deck_brain_into_decks(
     brain: DeckBrain,
     tier: crate::hardware::ModelTier,
 ) -> Option<String> {
-    use itsjustcad_deck::{DeckConfig, DeckKind};
+    use itsjustcad_deck::{CloudProvider, DeckConfig, DeckKind};
+    // Cloud brains create (or reuse) the provider's canonical cassette and make
+    // it active. A brand-new cassette defaults to env-var key indirection; an
+    // existing one keeps whatever key it already has (don't clobber on re-run).
+    // The user pastes the actual key in LLM ▸ API Keys…, opened right after.
+    let provider = match brain {
+        DeckBrain::Cloud => Some(CloudProvider::Anthropic),
+        DeckBrain::OpenAi => Some(CloudProvider::OpenAi),
+        _ => None,
+    };
+    if let Some(p) = provider {
+        let key = if decks.provider_index(p).is_some() {
+            None
+        } else {
+            Some(format!("env:{}", p.env_var()))
+        };
+        let i = decks.set_cloud_provider(p, key, None);
+        decks.active = i;
+        return Some(p.cassette_name().to_string());
+    }
     let (name, model) = match brain {
         DeckBrain::Ollama => ("ollama", "qwen3".to_string()),
         DeckBrain::Download => ("local-download", model_id_for_tier(tier).to_string()),
-        DeckBrain::Cloud | DeckBrain::Skip => return None,
+        DeckBrain::Cloud | DeckBrain::OpenAi | DeckBrain::Skip => return None,
     };
     let entry = DeckConfig {
         name: name.to_string(),
@@ -9524,9 +9942,17 @@ impl eframe::App for App {
                     });
                     ui.add_space(8.0);
 
-                    // Body — a fixed-height band keeps every step the same size so
-                    // the window doesn't jump as the user clicks Next.
-                    ui.allocate_ui(egui::vec2(ui.available_width(), 180.0), |ui| match step {
+                    // Body — a fixed-height band keeps every step the same size
+                    // so the window doesn't jump as the user clicks Next. The
+                    // inner scroll area caps the height so a taller step (the
+                    // deck-brain "Download" panel) scrolls instead of growing
+                    // the window.
+                    const BODY_H: f32 = 268.0;
+                    ui.allocate_ui(egui::vec2(ui.available_width(), BODY_H), |ui| {
+                      egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(BODY_H)
+                        .show(ui, |ui| match step {
                         0 => {
                             // Units + scale side by side (horizontally dominant).
                             ui.columns(2, |cols| {
@@ -9568,6 +9994,7 @@ impl eframe::App for App {
                         }
                         _ => {
                             ui.radio_value(&mut self.deck_brain, DeckBrain::Cloud, DeckBrain::Cloud.label());
+                            ui.radio_value(&mut self.deck_brain, DeckBrain::OpenAi, DeckBrain::OpenAi.label());
                             ui.radio_value(&mut self.deck_brain, DeckBrain::Ollama, DeckBrain::Ollama.label());
                             ui.radio_value(
                                 &mut self.deck_brain,
@@ -9609,8 +10036,7 @@ impl eframe::App for App {
                                     }
                                     ui.label(
                                         egui::RichText::new(
-                                            "Pick a model in Model Setup after Start \
-                                             (also under Tools → Model Setup).",
+                                            "Pick a model in Model Setup, which opens after Start.",
                                         )
                                         .weak()
                                         .small(),
@@ -9618,6 +10044,7 @@ impl eframe::App for App {
                                 });
                             }
                         }
+                      });
                     });
 
                     ui.add_space(8.0);
@@ -9651,6 +10078,11 @@ impl eframe::App for App {
                 // user can pick + fetch a model right away.
                 if self.deck_brain == DeckBrain::Download {
                     self.show_model_setup = true;
+                }
+                // The cloud paths open API Keys… so the user can paste a key
+                // immediately (the cassette was just created by apply_deck_brain).
+                if matches!(self.deck_brain, DeckBrain::Cloud | DeckBrain::OpenAi) {
+                    self.api_keys.open();
                 }
                 apply_preset(ui.ctx().clone(), self.cad_origin);
                 let units_cmd = units_cmd_for(&self.template_units);
@@ -9851,6 +10283,14 @@ impl eframe::App for App {
         // Tools → Model Setup panel (also the onboarding "download a local
         // model" entry point). Renders any time show_model_setup is set.
         self.model_setup_ui(ui.ctx());
+        // LLM ▸ API Keys… dialog. If it changed a key/model, reload the live
+        // deck pane so the next turn uses the updated cassette.
+        if self.api_keys.ui(ui.ctx(), &self.tokio) {
+            self.deck_pane.reload_decks();
+        }
+        // LLM ▸ Keybindings… editor (W4). Mutates + saves self.keybindings live.
+        self.keybindings_editor
+            .ui(ui.ctx(), &mut self.show_keybindings, &mut self.keybindings);
         // Render ▸ Local Renderer Setup panel (SD twin of Model Setup).
         self.render_setup_ui(ui.ctx());
         // Compact corner chip so a download can continue with the panel hidden.
@@ -9859,6 +10299,13 @@ impl eframe::App for App {
         // Drive an in-flight DXF import one batch per frame, then draw its modal.
         self.step_import(ui.ctx());
         self.import_ui(ui.ctx());
+
+        // Associative subdivision auto-recompute: after any op edits a source
+        // block, fire `lotrefresh` for non-frozen links so the division tracks
+        // the boundary. Runs before the journal sync so the refresh ops are
+        // mirrored in the same frame (its own generation check keeps idle
+        // frames free).
+        self.auto_refresh_subdivisions();
 
         // Mirror the op-log to the crash journal. One hook covers every
         // mutation path (command line, gumball, deck, history jumps); the
@@ -9970,6 +10417,43 @@ impl eframe::App for App {
             self.command_palette_ui(&ctx);
         }
 
+        // User-defined hotkeys that carry a Cmd/Alt modifier fire GLOBALLY —
+        // even while the command line has focus — exactly like ⌘K above. A
+        // modifier chord is an explicit launcher, so consume the key (so the
+        // focused text field doesn't also receive it) and run its verb. Bare
+        // (modifier-less) user bindings are intentionally NOT handled here; they
+        // stay in the canvas keymap path below so they never hijack typing.
+        let mut user_global: Option<String> = None;
+        for b in &self.keybindings.bindings {
+            if !(b.combo.cmd || b.combo.alt) {
+                continue;
+            }
+            let Some(key) = b.combo.egui_key() else {
+                continue;
+            };
+            let mut mods = egui::Modifiers::NONE;
+            if b.combo.cmd {
+                mods |= egui::Modifiers::COMMAND;
+            }
+            if b.combo.shift {
+                mods |= egui::Modifiers::SHIFT;
+            }
+            if b.combo.alt {
+                mods |= egui::Modifiers::ALT;
+            }
+            if ui.input_mut(|i| i.consume_key(mods, key)) {
+                user_global = Some(b.verb.clone());
+                break;
+            }
+        }
+        if let Some(verb) = user_global {
+            self.execute_line(verb);
+            // The viewport scene for this frame was already built before this
+            // hotkey ran; repaint so the selection highlight (and any other
+            // visual effect of the verb) shows immediately, not on next input.
+            ui.ctx().request_repaint();
+        }
+
         // Canvas shortcuts: pure keymap resolves each key press to a command
         // line; nothing fires while a text field owns the keyboard.
         let typing = ui.ctx().memory(|m| m.focused().is_some());
@@ -9990,8 +10474,9 @@ impl eframe::App for App {
         });
         for (key, mods) in pressed {
             // Context is rebuilt per key: an earlier press this frame may have
-            // started a tool or changed the selection.
-            let line = keymap::keymap(
+            // started a tool or changed the selection. User bindings overlay the
+            // built-in keymap (resolve() checks the user map first).
+            let line = crate::keybindings::resolve(
                 key,
                 mods,
                 keymap::KeyContext {
@@ -10000,6 +10485,7 @@ impl eframe::App for App {
                     has_selection: !self.session.doc.selection.is_empty(),
                     last_command: self.last_line.as_deref(),
                 },
+                &self.keybindings,
             );
             if let Some(line) = line {
                 self.execute_line(line);
@@ -10990,6 +11476,180 @@ mod tests {
     }
 
     #[test]
+    fn auto_refresh_fires_only_after_a_boundary_change() {
+        use itsjustcad_doc::{Document, Geometry, ObjectId, SceneObject, SubdivLink};
+        let square = |s: f64| kernel_curve::Curve::Polyline {
+            points: vec![
+                glam::DVec3::new(0.0, 0.0, 0.0),
+                glam::DVec3::new(s, 0.0, 0.0),
+                glam::DVec3::new(s, s, 0.0),
+                glam::DVec3::new(0.0, s, 0.0),
+            ],
+            closed: true,
+        };
+        let mut doc = Document::default();
+        let block = ObjectId::new();
+        doc.insert(SceneObject {
+            visible: true,
+            id: block,
+            name: None,
+            layer: "Default".into(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(square(40.0)),
+        });
+        doc.subdivision_links.insert(
+            block,
+            SubdivLink {
+                settings: itsjustcad_doc::SubdivisionSettings::default(),
+                produced: vec![],
+                source_z: 0.0,
+                frozen: false,
+                kind: itsjustcad_doc::SubdivKind::Lots,
+            },
+        );
+
+        let mut cache = std::collections::HashMap::new();
+        // First observation seeds the cache but does NOT refresh (don't re-derive
+        // the just-created lots).
+        assert!(subdivisions_to_refresh(&doc, &mut cache).is_empty());
+        // No change → still nothing.
+        assert!(subdivisions_to_refresh(&doc, &mut cache).is_empty());
+        // Reshape the block boundary → the next scan flags it (this is the
+        // "redraw → lots recompute" trigger).
+        doc.get_mut(block).unwrap().geometry = Geometry::Curve(square(60.0));
+        assert_eq!(subdivisions_to_refresh(&doc, &mut cache), vec![block]);
+        // Signature re-cached → no repeat until the next change.
+        assert!(subdivisions_to_refresh(&doc, &mut cache).is_empty());
+        // A FROZEN link never flags, even when its boundary changes.
+        doc.subdivision_links.get_mut(&block).unwrap().frozen = true;
+        doc.get_mut(block).unwrap().geometry = Geometry::Curve(square(80.0));
+        assert!(subdivisions_to_refresh(&doc, &mut cache).is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_moving_block_auto_recomputes_lots() {
+        // End-to-end proof of W1 auto-recompute in the REAL frame loop: subdivide
+        // a block, move it, and the lots re-derive to track the new boundary
+        // (fresh ids + shifted positions) — something a headless single-shot
+        // can't show because the signature cache needs a frame before the edit.
+        run_app_journey(|h| {
+            submit_command(h, "polyline 0,0,0 40,0,0 40,40,0 0,40,0 closed");
+            submit_command(h, "select last");
+            submit_command(h, "lotsubdivide area=500 width=5");
+            h.run_steps(4); // seed the auto-refresh signature cache
+
+            let source = *h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .keys()
+                .next()
+                .expect("subdivide recorded a link");
+            let before = h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .get(&source)
+                .unwrap()
+                .produced
+                .clone();
+            assert!(!before.is_empty(), "subdivide produced lots");
+
+            // Mean x of a lot set (via tessellated curve points) — proves the lots
+            // actually moved, not just churned ids.
+            let mean_x = |h: &egui_kittest::Harness<'_, App>,
+                          ids: &[itsjustcad_doc::ObjectId]|
+             -> f64 {
+                let doc = &h.state().session.doc;
+                let (mut sx, mut n) = (0.0, 0.0);
+                for id in ids {
+                    if let Some(itsjustcad_doc::Geometry::Curve(c)) =
+                        doc.get(*id).map(|o| &o.geometry)
+                    {
+                        for p in c.tessellate(0.5) {
+                            sx += p.x;
+                            n += 1.0;
+                        }
+                    }
+                }
+                if n > 0.0 { sx / n } else { f64::NAN }
+            };
+            let x_before = mean_x(h, &before);
+
+            // Move only the block (lots aren't selected). Auto-recompute must
+            // then re-derive the lots under the moved boundary.
+            submit_command(h, "move sel 50,0,0");
+            h.run_steps(6);
+
+            let after = h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .get(&source)
+                .unwrap()
+                .produced
+                .clone();
+            assert_ne!(before, after, "moving the block auto-recomputed its lots (fresh ids)");
+            let x_after = mean_x(h, &after);
+            assert!(
+                x_after - x_before > 40.0,
+                "recomputed lots tracked the moved block: x {x_before:.1} → {x_after:.1}"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_moving_site_boundary_recomputes_roads_blocks() {
+        // W1 gap 1 live proof: lotgeneratesite records a site link; moving the
+        // site boundary auto-recomputes its roads + blocks (fresh ids).
+        run_app_journey(|h| {
+            submit_command(h, "polyline 0,0,0 400,0,0 400,300,0 0,300,0 closed");
+            submit_command(h, "select last");
+            submit_command(h, "lotgeneratesite pattern=orthogonal");
+            h.run_steps(4);
+
+            let source = *h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .keys()
+                .next()
+                .expect("generatesite recorded a link");
+            let before = h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .get(&source)
+                .unwrap()
+                .produced
+                .clone();
+            assert!(!before.is_empty(), "site produced roads/blocks");
+
+            submit_command(h, "move sel 500,0,0");
+            h.run_steps(6);
+            let after = h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .get(&source)
+                .unwrap()
+                .produced
+                .clone();
+            assert_ne!(before, after, "moving the site boundary recomputed its roads/blocks");
+        });
+    }
+
+    #[test]
     #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
     fn journey_empty_click_deselects() {
         // Rhino behavior: click an object to select it, then click EMPTY canvas
@@ -11822,6 +12482,7 @@ mod tests {
         // The pref string maps back to the same enum for every variant.
         for brain in [
             DeckBrain::Cloud,
+            DeckBrain::OpenAi,
             DeckBrain::Ollama,
             DeckBrain::Download,
             DeckBrain::Skip,
@@ -11829,6 +12490,7 @@ mod tests {
             let s = brain.as_pref();
             let back = match s {
                 "cloud" => DeckBrain::Cloud,
+                "openai" => DeckBrain::OpenAi,
                 "ollama" => DeckBrain::Ollama,
                 "download" => DeckBrain::Download,
                 "skip" => DeckBrain::Skip,
@@ -11839,12 +12501,40 @@ mod tests {
     }
 
     #[test]
-    fn cloud_and_skip_write_no_cassette() {
+    fn skip_writes_no_cassette() {
         let mut decks = DecksFile::default();
         let before = decks.decks.len();
-        assert!(deck_brain_into_decks(&mut decks, DeckBrain::Cloud, ModelTier::Mid7B).is_none());
         assert!(deck_brain_into_decks(&mut decks, DeckBrain::Skip, ModelTier::Mid7B).is_none());
-        assert_eq!(decks.decks.len(), before, "no cassette added for cloud/skip");
+        assert_eq!(decks.decks.len(), before, "no cassette added for skip");
+    }
+
+    #[test]
+    fn cloud_brain_activates_anthropic_cassette() {
+        // The default file already ships a "claude" Anthropic cassette: Cloud
+        // reuses it (no duplicate) and makes it active.
+        let mut decks = DecksFile::default();
+        let before = decks.decks.len();
+        let name = deck_brain_into_decks(&mut decks, DeckBrain::Cloud, ModelTier::Mid7B).unwrap();
+        assert_eq!(name, "claude");
+        assert_eq!(decks.decks.len(), before, "existing cassette reused");
+        assert_eq!(decks.decks[decks.active].kind, DeckKind::Anthropic);
+    }
+
+    #[test]
+    fn openai_brain_creates_and_activates_openai_cassette() {
+        // Start empty so the new "openai" cassette is the only one.
+        let mut decks = DecksFile {
+            decks: vec![],
+            active: 0,
+            local_only: false,
+        };
+        let name = deck_brain_into_decks(&mut decks, DeckBrain::OpenAi, ModelTier::Mid7B).unwrap();
+        assert_eq!(name, "openai");
+        let active = &decks.decks[decks.active];
+        assert_eq!(active.kind, DeckKind::OpenaiCompat);
+        assert_eq!(active.base_url, "https://api.openai.com/v1");
+        // Brand-new cassette defaults to env-var key indirection.
+        assert_eq!(active.api_key.as_deref(), Some("env:OPENAI_API_KEY"));
     }
 
     #[test]

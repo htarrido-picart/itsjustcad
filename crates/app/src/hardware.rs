@@ -62,14 +62,14 @@ impl HardwareInfo {
             .unwrap_or_else(|| "unknown RAM".to_string());
         match self.tier() {
             ModelTier::Mid7B => {
-                format!("Detected {ram}, {} cores → a 7B model runs well.", self.cores)
+                format!("Detected {ram}, {} cores — a 7B model runs well.", self.cores)
             }
             ModelTier::Small3B => format!(
-                "Detected {ram}, {} cores → use a 3B model (a 7B may be tight).",
+                "Detected {ram}, {} cores — use a 3B model (a 7B may be tight).",
                 self.cores
             ),
             ModelTier::None => format!(
-                "Detected {ram}, {} cores → too little RAM; use a 3B model or cloud.",
+                "Detected {ram}, {} cores — too little RAM; use a 3B model or cloud.",
                 self.cores
             ),
         }

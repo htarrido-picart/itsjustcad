@@ -153,10 +153,34 @@ pub fn subdivide_blocks(
             placeholder_note = report.placeholder_banner();
         }
         for lot in lots {
-            if lot.has_street {
-                with_street += 1;
+            // Hard invariant: a lot can never extend beyond its block. The
+            // skeleton / street-following method can emit faces that spill past a
+            // non-convex boundary (reflex vertices). Clip each lot to the block:
+            //   • already inside (clip ≈ full area) → keep as-is (no retessellation,
+            //     so convex/grid output stays byte-stable),
+            //   • partly outside → keep the clipped piece,
+            //   • entirely outside (clip ~empty) → drop the spurious lot.
+            let has_street = lot.has_street;
+            let orig_area = lot.polygon.area();
+            let best = subdivision::clip_bridge::intersection(&lot.polygon, block)
+                .into_iter()
+                .max_by(|a, b| {
+                    a.area().partial_cmp(&b.area()).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            let keep = match best {
+                // A real piece survives: clipped if it lost area, else the original.
+                Some(cp) if cp.area() > 1e-6 => {
+                    if cp.area() + 1e-6 < orig_area { Some(cp) } else { Some(lot.polygon) }
+                }
+                // Entirely outside the block → drop it.
+                _ => None,
+            };
+            if let Some(poly) = keep {
+                if has_street {
+                    with_street += 1;
+                }
+                polygons.push(poly);
             }
-            polygons.push(lot.polygon);
         }
         z_acc += *z;
         z_n += 1;
@@ -176,6 +200,23 @@ pub fn subdivide_blocks(
         placeholder_note,
         width_mix_error,
     })
+}
+
+/// Pure derive for an ASSOCIATIVE subdivision (W1): one source block polygon +
+/// settings → baked lots. Mirrors the `derive_mesh`/`derive_segments` contract
+/// (deterministic, replay-stable) so a stored `source_block → settings` link can
+/// recompute its lot children when the source polygon or a param changes.
+///
+/// A thin wrapper over [`subdivide_blocks`] for the single-block case; kept as a
+/// named entry point so the associativity layer has one obvious call site and so
+/// the contract (same source + settings ⇒ byte-identical lots) is documented
+/// where callers look.
+pub fn derive_subdivision(
+    source_block: &Polygon2d,
+    z: f64,
+    settings: &SubdivisionSettings,
+) -> Result<LotBake, String> {
+    subdivide_blocks(&[(source_block.clone(), z)], settings)
 }
 
 /// Ensure the `lots` layer exists; returns `Some(name)` if it was newly created.
@@ -1154,6 +1195,67 @@ mod tests {
             assert!(!bake.blocks.is_empty(), "{p:?}: expected blocks");
             let sum: f64 = bake.blocks.iter().map(|p| p.area()).sum();
             assert!(sum <= poly.area() + 1.0, "{p:?}: blocks exceed site");
+        }
+    }
+
+    #[test]
+    fn derive_subdivision_is_deterministic_and_matches_blocks() {
+        // W1 associative derive: same source polygon + settings ⇒ byte-identical
+        // lots across runs (replay-stable), and equal to subdivide_blocks of the
+        // same single block.
+        let poly = curve_to_polygon(&rect_curve(80.0, 60.0)).unwrap();
+        let s = SubdivisionSettings {
+            lot_area_min: 200.0,
+            lot_width_min: 8.0,
+            seed: 42,
+            ..SubdivisionSettings::default()
+        };
+        let a = derive_subdivision(&poly, 0.0, &s).expect("lots");
+        let b = derive_subdivision(&poly, 0.0, &s).expect("lots");
+        assert!(!a.polygons.is_empty(), "expected lots");
+        assert_eq!(a.polygons, b.polygons, "derive must be deterministic");
+        // Equivalent to the single-block form of the core bridge.
+        let c = subdivide_blocks(&[(poly, 0.0)], &s).expect("lots");
+        assert_eq!(a.polygons, c.polygons);
+    }
+
+    #[test]
+    fn lots_never_exceed_a_nonconvex_block() {
+        // L-shaped (concave) block: the skeleton / street-following method can
+        // emit faces that spill past the reflex corner. The final clip must keep
+        // every lot inside the block.
+        let block = Polygon2d::new(vec![
+            DVec2::new(0.0, 0.0),
+            DVec2::new(60.0, 0.0),
+            DVec2::new(60.0, 20.0),
+            DVec2::new(20.0, 20.0),
+            DVec2::new(20.0, 60.0),
+            DVec2::new(0.0, 60.0),
+        ])
+        .expect("valid L-shaped polygon");
+        let s = SubdivisionSettings {
+            method: SubdivisionMethod::Skeleton,
+            lot_area_min: 100.0,
+            lot_width_min: 5.0,
+            irregularity: 0.55,
+            seed: 37,
+            ..SubdivisionSettings::default()
+        };
+        let bake = subdivide_blocks(&[(block.clone(), 0.0)], &s).expect("lots");
+        assert!(!bake.polygons.is_empty());
+        for (i, lot) in bake.polygons.iter().enumerate() {
+            // The portion of the lot inside the block ≈ its whole area, i.e. it
+            // doesn't stick out past the boundary.
+            let inside: f64 = subdivision::clip_bridge::intersection(lot, &block)
+                .iter()
+                .map(|p| p.area())
+                .sum();
+            assert!(
+                (inside - lot.area()).abs() < 1.0,
+                "lot {i} exceeds the block: area {:.1}, inside {:.1}",
+                lot.area(),
+                inside
+            );
         }
     }
 

@@ -22,7 +22,10 @@ mod view;
 
 pub use constraint::{PointRef, SketchConstraint};
 pub use cplane::CPlane;
-pub use document::Document;
+pub use document::{Document, SubdivKind, SubdivLink};
+// Re-export the settings type carried by `SubdivLink` so consumers can build /
+// inspect links without a direct `subdivision` dependency.
+pub use subdivision::SubdivisionSettings;
 pub use loads::{LoadGeometry, RestraintKind, StructLoad, StructSupport};
 pub use object::{
     angle_degrees, angular_arc_points, angular_dim_segments, Annotation, AreaKind, BlockGeometry,
@@ -33,8 +36,8 @@ pub use object::{
     ParamBlockDef, ParamBlockParam, PatLine, SceneObject, DEFAULT_LAYER,
 };
 pub use param_schema::{
-    derive_mesh, derive_segments, param_summary, DeriveError, FieldKind, GeneratorKind, ParamField, ParamMap,
-    ParamSchema, ParamValue, Unit, Widget,
+    clamp_field, derive_mesh, derive_segments, param_summary, sanitize_fields, DeriveError,
+    FieldKind, GeneratorKind, ParamField, ParamMap, ParamSchema, ParamValue, Unit, Widget,
 };
 pub use plotstyle::{PlotStyleEntry, PlotStyleTable, ResolvedPen};
 pub use sheet::{

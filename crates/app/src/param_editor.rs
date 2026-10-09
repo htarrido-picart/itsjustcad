@@ -120,7 +120,12 @@ pub fn render_field(
                 ui.label(label);
                 if field.kind == FieldKind::Int {
                     let mut x = cur.as_i64().unwrap_or(0);
-                    let resp = ui.add(egui::DragValue::new(&mut x).speed(field.step));
+                    // Clamp the input to the field's bounds; default the lower
+                    // bound to 0 so no param accepts a negative value.
+                    let mn = field.min.unwrap_or(0.0) as i64;
+                    let mx = field.max.map(|m| m as i64).unwrap_or(i64::MAX);
+                    let resp =
+                        ui.add(egui::DragValue::new(&mut x).speed(field.step).range(mn..=mx));
                     if resp.changed() {
                         values.insert(field.name.into(), ParamValue::Int(x));
                         changed = true;
@@ -128,10 +133,13 @@ pub fn render_field(
                     active |= resp.dragged();
                 } else {
                     let mut x = cur.as_f64().unwrap_or(0.0);
+                    let mn = field.min.unwrap_or(0.0);
+                    let mx = field.max.unwrap_or(f64::MAX);
                     let resp = ui.add(
                         egui::DragValue::new(&mut x)
                             .speed(field.step)
-                            .suffix(field.unit.suffix()),
+                            .suffix(field.unit.suffix())
+                            .range(mn..=mx),
                     );
                     if resp.changed() {
                         values.insert(field.name.into(), ParamValue::Float(x));

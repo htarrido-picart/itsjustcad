@@ -1588,6 +1588,16 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }
         "lotsubdivide" => parse_lotsubdivide(&args),
         "lotgeneratesite" => parse_lotgeneratesite(&args),
+        "siteplan" => {
+            // Optional selector; a bare `siteplan` targets the current selection
+            // (the site boundary), like lotsubdivide / lotgeneratesite.
+            let targets = if args.is_empty() {
+                Selector::Selected
+            } else {
+                selector(&args, "siteplan")?.0
+            };
+            Ok(Command::SitePlan { targets, ids: None })
+        }
         "lotloading" => parse_lotloading(&args),
         "lotsetbacks" => parse_lotsetbacks(&args),
         "lotfrontage" => parse_lotfrontage(&args),

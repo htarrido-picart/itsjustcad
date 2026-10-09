@@ -32,6 +32,51 @@ fn seed_default_layers() -> BTreeMap<String, LayerStyle> {
     layers
 }
 
+/// An associative subdivision result (W1): ties a SOURCE block object to the
+/// settings its lots were generated with and the lot child ids it produced. When
+/// the source block is edited, a non-`frozen` link re-derives its lots so the
+/// division tracks the redraw; `frozen` bakes the result (edits stop
+/// propagating). Serde-defaulted so pre-W1 files load with no links.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SubdivLink {
+    /// Full settings the lots were generated with. The inspector edits the
+    /// exposed subset; the unexposed fields are preserved here so a re-derive
+    /// keeps them.
+    pub settings: subdivision::SubdivisionSettings,
+    /// The lot child object ids produced from the source block, in bake order.
+    pub produced: Vec<ObjectId>,
+    /// Elevation the source block sat at when generated (lots bake at this z).
+    #[serde(default)]
+    pub source_z: f64,
+    /// When `true`, the result is baked: source edits no longer recompute it.
+    #[serde(default)]
+    pub frozen: bool,
+    /// Which generator produced `produced`, so a re-derive runs the right one:
+    /// `Lots` (block → lots via `derive_subdivision`/`insert_lots`) or `Site`
+    /// (site boundary → roads + blocks via `generate_site`/`insert_site`).
+    /// serde-defaulted to `Lots` so pre-kind links (all lot subdivisions) load
+    /// unchanged. For `Site`, `produced` is roads first then blocks.
+    #[serde(default)]
+    pub kind: SubdivKind,
+}
+
+/// Which associative subdivision generator a `SubdivLink` drives. Serialized
+/// snake_case; defaults to `Lots` so links written before this field existed
+/// (every one was a lot subdivision) deserialize unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubdivKind {
+    /// Block → lots (`derive_subdivision` → `insert_lots`).
+    #[default]
+    Lots,
+    /// Site boundary → roads + blocks (`generate_site` → `insert_site`).
+    Site,
+    /// META: site boundary → full chain (streets + blocks → lots → buildable
+    /// setbacks → building masses) as one associative result. Recomputed by
+    /// `regenerate_by_kind` through all phases.
+    SitePlan,
+}
+
 /// Scene state. Mutation happens exclusively through `commands::Session`.
 ///
 /// `Serialize`/`Deserialize` exist only for the optional checkpoint sidecar
@@ -174,6 +219,12 @@ pub struct Document {
     /// logged via the settings/subdivide ops so saved files replay identically.
     #[serde(default)]
     pub subdivision_settings: subdivision::SubdivisionSettings,
+    /// Associative subdivision links (W1): source block id → the settings it was
+    /// generated with + the lot children it produced. A non-frozen link
+    /// recomputes its lots when the source block is edited (moved / reshaped).
+    /// serde-defaulted + skipped when empty so pre-W1 files load with no links.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subdivision_links: BTreeMap<ObjectId, SubdivLink>,
     /// Active construction plane (CPlane / UCS). Typed coordinates are resolved
     /// against this before geometry is built. TRANSIENT: `#[serde(skip)]` keeps
     /// it out of the op-log and save file, and replay always starts from the
@@ -243,6 +294,7 @@ impl Default for Document {
             constraints: Vec::new(),
             pregrade_terrain: None,
             subdivision_settings: subdivision::SubdivisionSettings::default(),
+            subdivision_links: BTreeMap::new(),
             cplane: CPlane::world(),
             named_cplanes: BTreeMap::new(),
             plot_styles: BTreeMap::new(),
@@ -254,6 +306,21 @@ impl Default for Document {
 }
 
 impl Document {
+    /// The associative subdivision link keyed by its `source` block, if any.
+    pub fn subdiv_link(&self, source: ObjectId) -> Option<&SubdivLink> {
+        self.subdivision_links.get(&source)
+    }
+
+    /// Reverse lookup: the source block whose subdivision produced `produced`,
+    /// if any. Lets the inspector show a result's params when a lot child is
+    /// picked, not just when the source block is selected.
+    pub fn subdiv_source_of(&self, produced: ObjectId) -> Option<ObjectId> {
+        self.subdivision_links
+            .iter()
+            .find(|(_, link)| link.produced.contains(&produced))
+            .map(|(src, _)| *src)
+    }
+
     /// Visibility of the layer an object sits on (unknown layers are visible).
     pub fn layer_visible(&self, layer: &str) -> bool {
         self.layers.get(layer).is_none_or(|l| l.visible)
@@ -558,6 +625,68 @@ mod tests {
 
     use super::*;
     use crate::{Geometry, SceneObject};
+
+    #[test]
+    fn subdiv_links_round_trip_and_default_empty() {
+        // Pre-W1 snapshot (no subdivision_links field) must load with an empty map.
+        let old = r#"{"objects":{},"creation_order":[],"selection":[]}"#;
+        let doc: Document = serde_json::from_str(old).expect("old snapshot loads");
+        assert!(doc.subdivision_links.is_empty());
+
+        // A link round-trips and the reverse lookup finds its source.
+        let mut doc = Document::default();
+        let source = ObjectId::new();
+        let lot_a = ObjectId::new();
+        let lot_b = ObjectId::new();
+        doc.subdivision_links.insert(
+            source,
+            SubdivLink {
+                settings: subdivision::SubdivisionSettings::default(),
+                produced: vec![lot_a, lot_b],
+                source_z: 3.5,
+                frozen: false,
+                kind: SubdivKind::Lots,
+            },
+        );
+        assert_eq!(doc.subdiv_source_of(lot_b), Some(source));
+        assert_eq!(doc.subdiv_source_of(ObjectId::new()), None);
+
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: Document = serde_json::from_str(&json).unwrap();
+        let link = back.subdiv_link(source).expect("link survives round trip");
+        assert_eq!(link.produced, vec![lot_a, lot_b]);
+        assert_eq!(link.source_z, 3.5);
+        assert!(!link.frozen);
+        assert_eq!(link.kind, SubdivKind::Lots);
+
+        // A link JSON written before `kind` existed must default to Lots.
+        let mut v = serde_json::to_value(&doc).unwrap();
+        for link in v["subdivision_links"].as_object_mut().unwrap().values_mut() {
+            link.as_object_mut().unwrap().remove("kind");
+        }
+        let back: Document = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.subdiv_link(source).unwrap().kind,
+            SubdivKind::Lots,
+            "pre-kind links default to Lots"
+        );
+
+        // A Site link round-trips its kind.
+        let site_src = ObjectId::new();
+        doc.subdivision_links.insert(
+            site_src,
+            SubdivLink {
+                settings: subdivision::SubdivisionSettings::default(),
+                produced: vec![ObjectId::new()],
+                source_z: 0.0,
+                frozen: false,
+                kind: SubdivKind::Site,
+            },
+        );
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subdiv_link(site_src).unwrap().kind, SubdivKind::Site);
+    }
 
     fn obj_at(name: Option<&str>, origin: DVec3) -> SceneObject {
         let mesh = Mesh::new(
