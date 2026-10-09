@@ -1929,6 +1929,12 @@ fn layers_json(doc: &itsjustcad_doc::Document) -> String {
     // Theme-default swatch for layers whose color is `None`.
     const DEFAULT_RGBA: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
 
+    // Objects per layer, so the client can hide empty/unused layers.
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for obj in doc.objects() {
+        *counts.entry(obj.layer.as_str()).or_insert(0) += 1;
+    }
+
     let mut layers: Vec<(&String, &itsjustcad_doc::LayerStyle)> = doc.layers.iter().collect();
     layers.sort_by(|(an, a), (bn, b)| a.order.cmp(&b.order).then_with(|| an.cmp(bn)));
 
@@ -1938,8 +1944,9 @@ fn layers_json(doc: &itsjustcad_doc::Document) -> String {
             out.push(',');
         }
         let rgba = style.color.unwrap_or(DEFAULT_RGBA);
+        let object_count = counts.get(name.as_str()).copied().unwrap_or(0);
         out.push_str(&format!(
-            "{{\"name\":\"{}\",\"colorRgba\":[{},{},{},{}],\"hasColor\":{},\"visible\":{},\"locked\":{},\"active\":{},\"order\":{},\"linetype\":\"{}\"}}",
+            "{{\"name\":\"{}\",\"colorRgba\":[{},{},{},{}],\"hasColor\":{},\"visible\":{},\"locked\":{},\"active\":{},\"order\":{},\"objectCount\":{},\"linetype\":\"{}\"}}",
             esc(name),
             rgba[0],
             rgba[1],
@@ -1950,6 +1957,7 @@ fn layers_json(doc: &itsjustcad_doc::Document) -> String {
             style.locked,
             *name == &doc.current_layer,
             style.order,
+            object_count,
             style.linetype.token(),
         ));
     }
