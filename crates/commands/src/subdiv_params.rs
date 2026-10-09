@@ -307,7 +307,7 @@ pub fn subdivision_fields() -> Vec<ParamField> {
         ParamField::enum_(
             "footprint_mode",
             "param.subdivision.footprint_mode",
-            "typology",
+            "full",
             FOOTPRINT_MODE_CHOICES,
         ),
         ParamField::float(

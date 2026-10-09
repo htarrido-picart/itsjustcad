@@ -202,10 +202,11 @@ pub fn resolve(
     ctx: crate::keymap::KeyContext<'_>,
     user: &KeybindingsFile,
 ) -> Option<String> {
-    if !ctx.typing && !ctx.draw_active {
-        if let Some(verb) = user.lookup(key, mods) {
-            return Some(verb.to_string());
-        }
+    if !ctx.typing
+        && !ctx.draw_active
+        && let Some(verb) = user.lookup(key, mods)
+    {
+        return Some(verb.to_string());
     }
     crate::keymap::keymap(key, mods, ctx)
 }

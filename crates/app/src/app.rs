@@ -10433,13 +10433,13 @@ impl eframe::App for App {
             };
             let mut mods = egui::Modifiers::NONE;
             if b.combo.cmd {
-                mods = mods | egui::Modifiers::COMMAND;
+                mods |= egui::Modifiers::COMMAND;
             }
             if b.combo.shift {
-                mods = mods | egui::Modifiers::SHIFT;
+                mods |= egui::Modifiers::SHIFT;
             }
             if b.combo.alt {
-                mods = mods | egui::Modifiers::ALT;
+                mods |= egui::Modifiers::ALT;
             }
             if ui.input_mut(|i| i.consume_key(mods, key)) {
                 user_global = Some(b.verb.clone());

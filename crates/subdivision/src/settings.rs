@@ -351,7 +351,7 @@ impl Default for SubdivisionSettings {
             open_space_reserve_frac: 0.0,
             // Buildings (Phase 10). euro_latam placeholders flagged in-verb.
             typology: Typology::Detached,
-            footprint_mode: FootprintMode::TypologyDriven,
+            footprint_mode: FootprintMode::FullEnvelope,
             coverage_frac: 0.5,
             footprint_inset: 2.0,
             floor_height: 3.0,
