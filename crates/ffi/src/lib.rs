@@ -1197,10 +1197,10 @@ pub unsafe extern "C" fn ijc_deck_send(
                                     // Auto-apply mode: run as it streams. Approval
                                     // mode (auto_apply=false): emit only (already
                                     // did above) and let the host run approved ones.
-                                    if auto_apply.load(Ordering::Relaxed) {
-                                        if let Ok(mut p) = pending.lock() {
-                                            p.push(op);
-                                        }
+                                    if auto_apply.load(Ordering::Relaxed)
+                                        && let Ok(mut p) = pending.lock()
+                                    {
+                                        p.push(op);
                                     }
                                 }
                             }
