@@ -166,10 +166,11 @@ To compare options: `lotreport`, change a setting (e.g. lotsettings, re-subdivid
 /// instead of inventing dimensions or picking a target at random. Injected into
 /// both the full and the brief system prompts.
 pub const CLARIFY_HELP: &str = "\
-## Ask before guessing
-If the request is ambiguous — a missing dimension, an unclear target (\"make it bigger\" with several objects selected), or a placement you would have to invent — do NOT draw. Reply with exactly one line and NO ```draft block:
+## Act first — ask only as a last resort
+Default to DOING the request. For a clear command — erase/delete the selection or a named target, draw a shape (use sensible defaults for any size the user left out), move/rotate/scale a clear target — just emit the commands; do NOT ask. Prefer reasonable defaults (a sensible size, the current selection or the most recent object, the origin) over a question.
+ONLY emit a QUESTION when you genuinely cannot proceed — a REQUIRED value is missing with no reasonable default, or the target is truly ambiguous among several candidates. Then reply with exactly one line and NO ```draft block:
 QUESTION: <one short clarifying question>
-The user's next message answers it; then proceed normally. Never mix commands and a QUESTION in the same turn, and ask at most one question per turn, only when genuinely needed.
+The user's next message answers it; then proceed. Never mix commands and a QUESTION in the same turn, ask at most one question per turn, and only as a last resort — a clear command must never produce a question.
 ";
 
 /// The "Multi-step plans" section: for prolonged tasks the model first emits
