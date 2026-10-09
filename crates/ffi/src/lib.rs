@@ -1214,6 +1214,26 @@ pub unsafe extern "C" fn ijc_deck_send(
     })
 }
 
+/// Stop any in-flight deck stream: abort the streaming task(s) without tearing
+/// down the handle. The partial text already delivered to the callback stays;
+/// no further deltas or a `done` callback arrive for the aborted turn. Safe to
+/// call when nothing is streaming (a no-op). Mirrors the abort loop in
+/// [`ijc_free`] minus the teardown.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_deck_stop(h: *mut AppHandle) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        if let Ok(mut tasks) = app.tasks.lock() {
+            for t in tasks.drain(..) {
+                t.abort();
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Prompt helpers for the Swift on-device deck
 // ---------------------------------------------------------------------------
