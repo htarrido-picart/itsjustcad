@@ -7449,16 +7449,27 @@ impl App {
             _ => current.clone(),
         };
 
-        // Only the params relevant to this link's kind (Lots vs Site) — a site
-        // link doesn't use lot sizing/setbacks, a lot link doesn't use the road
-        // network params.
-        let fields = subdiv_params::fields_for_kind(link.kind);
+        // Phase-grouped params relevant to this link's kind (CityEngine-style):
+        // a SitePlan drives every phase, a Site link only the street network, a
+        // Lots link only the lot-sizing params. Each group is a collapsible
+        // section; edits across all groups accumulate into one debounced commit.
+        let groups = subdiv_params::grouped_fields_for_kind(link.kind);
         let mut changed = false;
         let mut still_active = false;
-        for field in &fields {
-            let (c, a) = crate::param_editor::render_field(ui, field, &mut values);
-            changed |= c;
-            still_active |= a;
+        for (group_key, fields) in &groups {
+            if fields.is_empty() {
+                continue;
+            }
+            egui::CollapsingHeader::new(t(group_key))
+                .default_open(true)
+                .id_salt(("subdiv_group", *group_key, source))
+                .show(ui, |ui| {
+                    for field in fields {
+                        let (c, a) = crate::param_editor::render_field(ui, field, &mut values);
+                        changed |= c;
+                        still_active |= a;
+                    }
+                });
         }
 
         if changed {

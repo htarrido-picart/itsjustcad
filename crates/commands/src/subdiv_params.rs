@@ -19,7 +19,9 @@
 //! `lotsubdivide method=…` verb accepts (grid/perimeter/streetfollowing).
 
 use itsjustcad_doc::{sanitize_fields, ParamField, ParamMap, ParamValue, Unit, Widget};
-use subdivision::{SubdivisionMethod, SubdivisionSettings};
+use subdivision::{
+    FootprintMode, RoofType, StreetPattern, SubdivisionMethod, SubdivisionSettings, Typology,
+};
 
 /// Method enum tokens exposed in the schema (match the `lotsubdivide method=…`
 /// verb's accepted spellings; the primary token is listed).
@@ -42,6 +44,82 @@ pub fn method_from_token(s: &str) -> Option<SubdivisionMethod> {
         "streetfollowing" | "skeleton" => Some(SubdivisionMethod::Skeleton),
         _ => None,
     }
+}
+
+// ── Enum token round-trips for the phase params ─────────────────────────────
+
+const STREET_PATTERN_CHOICES: &[&str] =
+    &["orthogonal", "skewed", "organic", "culdesac", "radial", "hexagonal", "voronoi"];
+
+pub fn street_pattern_token(p: StreetPattern) -> &'static str {
+    match p {
+        StreetPattern::Orthogonal => "orthogonal",
+        StreetPattern::Skewed => "skewed",
+        StreetPattern::Organic => "organic",
+        StreetPattern::CulDeSac => "culdesac",
+        StreetPattern::Radial => "radial",
+        StreetPattern::Hexagonal => "hexagonal",
+        StreetPattern::Voronoi => "voronoi",
+    }
+}
+
+pub fn street_pattern_from_token(s: &str) -> Option<StreetPattern> {
+    match s.to_lowercase().as_str() {
+        "orthogonal" | "grid" => Some(StreetPattern::Orthogonal),
+        "skewed" => Some(StreetPattern::Skewed),
+        "organic" => Some(StreetPattern::Organic),
+        "culdesac" | "cul-de-sac" => Some(StreetPattern::CulDeSac),
+        "radial" => Some(StreetPattern::Radial),
+        "hexagonal" | "hex" => Some(StreetPattern::Hexagonal),
+        "voronoi" => Some(StreetPattern::Voronoi),
+        _ => None,
+    }
+}
+
+const TYPOLOGY_CHOICES: &[&str] = &["detached", "row", "courtyard", "slab"];
+
+pub fn typology_token(t: Typology) -> &'static str {
+    match t {
+        Typology::Detached => "detached",
+        Typology::Row => "row",
+        Typology::Courtyard => "courtyard",
+        Typology::Slab => "slab",
+    }
+}
+
+pub fn typology_from_token(s: &str) -> Option<Typology> {
+    Typology::parse(s)
+}
+
+const FOOTPRINT_MODE_CHOICES: &[&str] = &["full", "coverage", "inset", "typology"];
+
+pub fn footprint_mode_token(m: FootprintMode) -> &'static str {
+    match m {
+        FootprintMode::FullEnvelope => "full",
+        FootprintMode::CoverageRatio => "coverage",
+        FootprintMode::Inset => "inset",
+        FootprintMode::TypologyDriven => "typology",
+    }
+}
+
+pub fn footprint_mode_from_token(s: &str) -> Option<FootprintMode> {
+    FootprintMode::parse(s)
+}
+
+const ROOF_TYPE_CHOICES: &[&str] = &["flat", "gable", "hip", "shed", "auto"];
+
+pub fn roof_type_token(r: RoofType) -> &'static str {
+    match r {
+        RoofType::Flat => "flat",
+        RoofType::Gable => "gable",
+        RoofType::Hip => "hip",
+        RoofType::Shed => "shed",
+        RoofType::PerTypology => "auto",
+    }
+}
+
+pub fn roof_type_from_token(s: &str) -> Option<RoofType> {
+    RoofType::parse(s)
 }
 
 /// The curated field set shown in the subdivision inspector / stored as a
@@ -201,32 +279,228 @@ pub fn subdivision_fields() -> Vec<ParamField> {
             "param.subdivision.draw_buildable_envelope",
             true,
         ),
+        // ── Streets ──
+        ParamField::enum_(
+            "street_pattern",
+            "param.subdivision.street_pattern",
+            "orthogonal",
+            STREET_PATTERN_CHOICES,
+        ),
+        // ── Setbacks ──
+        ParamField::float(
+            "build_to_line",
+            "param.subdivision.build_to_line",
+            0.0,
+            Some(0.0),
+            Some(500.0),
+            1.0,
+            Widget::Numeric,
+            Unit::Meter,
+        ),
+        // ── Buildings ──
+        ParamField::enum_(
+            "typology",
+            "param.subdivision.typology",
+            "detached",
+            TYPOLOGY_CHOICES,
+        ),
+        ParamField::enum_(
+            "footprint_mode",
+            "param.subdivision.footprint_mode",
+            "typology",
+            FOOTPRINT_MODE_CHOICES,
+        ),
+        ParamField::float(
+            "coverage_frac",
+            "param.subdivision.coverage_frac",
+            0.5,
+            Some(0.0),
+            Some(1.0),
+            0.05,
+            Widget::Slider,
+            Unit::None,
+        ),
+        ParamField::int(
+            "floor_count",
+            "param.subdivision.floor_count",
+            2,
+            1,
+            200,
+            1,
+            Widget::Numeric,
+        ),
+        ParamField::float(
+            "floor_height",
+            "param.subdivision.floor_height",
+            3.0,
+            Some(1.0),
+            Some(20.0),
+            0.5,
+            Widget::Numeric,
+            Unit::Meter,
+        ),
+        ParamField::int(
+            "stepback_start_floor",
+            "param.subdivision.stepback_start_floor",
+            3,
+            0,
+            200,
+            1,
+            Widget::Numeric,
+        ),
+        ParamField::float(
+            "stepback_depth",
+            "param.subdivision.stepback_depth",
+            0.0,
+            Some(0.0),
+            Some(50.0),
+            0.5,
+            Widget::Numeric,
+            Unit::Meter,
+        ),
+        ParamField::enum_(
+            "roof_type",
+            "param.subdivision.roof_type",
+            "auto",
+            ROOF_TYPE_CHOICES,
+        ),
+        ParamField::float(
+            "roof_pitch",
+            "param.subdivision.roof_pitch",
+            30.0,
+            Some(0.0),
+            Some(89.0),
+            1.0,
+            Widget::Numeric,
+            Unit::Degree,
+        ),
+        // ── Open space ──
+        ParamField::float(
+            "open_space_reserve_frac",
+            "param.subdivision.open_space_reserve_frac",
+            0.0,
+            Some(0.0),
+            Some(1.0),
+            0.05,
+            Widget::Slider,
+            Unit::None,
+        ),
     ]
 }
 
-/// The subset of [`subdivision_fields`] relevant to a given link kind, so the
-/// inspector never shows irrelevant controls. A `Lots` link (lotsubdivide) never
-/// uses the road-network params (`road_width`/`block_depth`); a `Site` link
-/// (lotgeneratesite) uses only those road-network params + `seed` — the lot
-/// sizing / setback params don't affect `generate_site`.
-pub fn fields_for_kind(kind: itsjustcad_doc::SubdivKind) -> Vec<ParamField> {
-    subdivision_fields()
-        .into_iter()
-        .filter(|f| field_applies(f.name, kind))
+/// Ordered phase groups for the inspector: each `(group i18n key, [field names])`.
+/// The field names are resolved against [`subdivision_fields`] in order.
+const FIELD_GROUPS: &[(&str, &[&str])] = &[
+    ("param.subdivision.group.general", &["seed"]),
+    (
+        "param.subdivision.group.streets",
+        &["street_pattern", "road_width", "block_depth"],
+    ),
+    (
+        "param.subdivision.group.lots",
+        &[
+            "method",
+            "lot_area_min",
+            "lot_area_max",
+            "lot_width_min",
+            "irregularity",
+            "offset_width",
+            "corner_width",
+            "lot_depth_target",
+            "alley_width",
+            "merge_slivers",
+        ],
+    ),
+    (
+        "param.subdivision.group.setbacks",
+        &[
+            "setback_front",
+            "setback_side",
+            "setback_rear",
+            "build_to_line",
+            "draw_buildable_envelope",
+        ],
+    ),
+    (
+        "param.subdivision.group.buildings",
+        &[
+            "typology",
+            "footprint_mode",
+            "coverage_frac",
+            "floor_count",
+            "floor_height",
+            "stepback_start_floor",
+            "stepback_depth",
+            "roof_type",
+            "roof_pitch",
+        ],
+    ),
+    (
+        "param.subdivision.group.openspace",
+        &["open_space_reserve_frac"],
+    ),
+];
+
+/// Which phase groups apply to a given link kind (CityEngine-style visibility):
+/// - `SitePlan` (the meta plan) drives the whole chain → every group.
+/// - `Lots` (lotsubdivide) → general + lots only (it consumes an existing block).
+/// - `Site` (lotgeneratesite) → general + streets only (road network).
+fn groups_for_kind(kind: itsjustcad_doc::SubdivKind) -> &'static [&'static str] {
+    use itsjustcad_doc::SubdivKind;
+    match kind {
+        SubdivKind::Lots => &[
+            "param.subdivision.group.general",
+            "param.subdivision.group.lots",
+        ],
+        SubdivKind::Site => &[
+            "param.subdivision.group.general",
+            "param.subdivision.group.streets",
+        ],
+        SubdivKind::SitePlan => &[
+            "param.subdivision.group.general",
+            "param.subdivision.group.streets",
+            "param.subdivision.group.lots",
+            "param.subdivision.group.setbacks",
+            "param.subdivision.group.buildings",
+            "param.subdivision.group.openspace",
+        ],
+    }
+}
+
+/// The fields for a link kind, partitioned into ordered collapsible groups
+/// (CityEngine-style inspector). Empty groups are omitted.
+pub fn grouped_fields_for_kind(
+    kind: itsjustcad_doc::SubdivKind,
+) -> Vec<(&'static str, Vec<ParamField>)> {
+    let all = subdivision_fields();
+    let by_name = |name: &str| all.iter().find(|f| f.name == name).cloned();
+    let visible = groups_for_kind(kind);
+    FIELD_GROUPS
+        .iter()
+        .filter(|(key, _)| visible.contains(key))
+        .filter_map(|(key, names)| {
+            let fields: Vec<ParamField> = names.iter().filter_map(|n| by_name(n)).collect();
+            if fields.is_empty() {
+                None
+            } else {
+                Some((*key, fields))
+            }
+        })
         .collect()
 }
 
-/// Road-network params that only apply to `lotgeneratesite` (Site links).
-const SITE_ONLY_FIELDS: &[&str] = &["road_width", "block_depth"];
-
-fn field_applies(name: &str, kind: itsjustcad_doc::SubdivKind) -> bool {
-    use itsjustcad_doc::SubdivKind;
-    match kind {
-        SubdivKind::Lots => !SITE_ONLY_FIELDS.contains(&name),
-        SubdivKind::Site => name == "seed" || SITE_ONLY_FIELDS.contains(&name),
-        // The META plan spans every phase → expose all fields.
-        SubdivKind::SitePlan => true,
-    }
+/// The flat list of fields relevant to a given link kind, so the inspector (and
+/// callers that don't want groups) never shows irrelevant controls. Derived from
+/// [`grouped_fields_for_kind`] so the flat and grouped views always agree.
+///
+/// A `Lots` link (lotsubdivide) uses general + lot-sizing params; a `Site` link
+/// (lotgeneratesite) uses general + road-network params; a `SitePlan` link (the
+/// meta plan) drives the whole chain and exposes every phase group.
+pub fn fields_for_kind(kind: itsjustcad_doc::SubdivKind) -> Vec<ParamField> {
+    grouped_fields_for_kind(kind)
+        .into_iter()
+        .flat_map(|(_, fields)| fields)
+        .collect()
 }
 
 /// Project a full [`SubdivisionSettings`] down to the exposed parameter map.
@@ -251,6 +525,34 @@ pub fn settings_to_params(s: &SubdivisionSettings) -> ParamMap {
     m.insert(
         "draw_buildable_envelope".into(),
         ParamValue::Bool(s.draw_buildable_envelope),
+    );
+    // Streets
+    m.insert(
+        "street_pattern".into(),
+        ParamValue::Enum(street_pattern_token(s.street_pattern).into()),
+    );
+    // Setbacks
+    m.insert("build_to_line".into(), ParamValue::Float(s.build_to_line));
+    // Buildings
+    m.insert("typology".into(), ParamValue::Enum(typology_token(s.typology).into()));
+    m.insert(
+        "footprint_mode".into(),
+        ParamValue::Enum(footprint_mode_token(s.footprint_mode).into()),
+    );
+    m.insert("coverage_frac".into(), ParamValue::Float(s.coverage_frac));
+    m.insert("floor_count".into(), ParamValue::Int(s.floor_count as i64));
+    m.insert("floor_height".into(), ParamValue::Float(s.floor_height));
+    m.insert(
+        "stepback_start_floor".into(),
+        ParamValue::Int(s.stepback_start_floor as i64),
+    );
+    m.insert("stepback_depth".into(), ParamValue::Float(s.stepback_depth));
+    m.insert("roof_type".into(), ParamValue::Enum(roof_type_token(s.roof_type).into()));
+    m.insert("roof_pitch".into(), ParamValue::Float(s.roof_pitch));
+    // Open space
+    m.insert(
+        "open_space_reserve_frac".into(),
+        ParamValue::Float(s.open_space_reserve_frac),
     );
     m
 }
@@ -313,6 +615,54 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
     if let Some(v) = p.get("draw_buildable_envelope").and_then(|v| v.as_bool()) {
         s.draw_buildable_envelope = v;
     }
+    // Streets
+    if let Some(v) = p
+        .get("street_pattern")
+        .and_then(|v| v.as_enum())
+        .and_then(street_pattern_from_token)
+    {
+        s.street_pattern = v;
+    }
+    // Setbacks
+    if let Some(v) = p.get("build_to_line").and_then(|v| v.as_f64()) {
+        s.build_to_line = v;
+    }
+    // Buildings
+    if let Some(v) = p.get("typology").and_then(|v| v.as_enum()).and_then(typology_from_token) {
+        s.typology = v;
+    }
+    if let Some(v) = p
+        .get("footprint_mode")
+        .and_then(|v| v.as_enum())
+        .and_then(footprint_mode_from_token)
+    {
+        s.footprint_mode = v;
+    }
+    if let Some(v) = p.get("coverage_frac").and_then(|v| v.as_f64()) {
+        s.coverage_frac = v;
+    }
+    if let Some(v) = p.get("floor_count").and_then(|v| v.as_i64()) {
+        s.floor_count = v.max(0) as usize;
+    }
+    if let Some(v) = p.get("floor_height").and_then(|v| v.as_f64()) {
+        s.floor_height = v;
+    }
+    if let Some(v) = p.get("stepback_start_floor").and_then(|v| v.as_i64()) {
+        s.stepback_start_floor = v.max(0) as usize;
+    }
+    if let Some(v) = p.get("stepback_depth").and_then(|v| v.as_f64()) {
+        s.stepback_depth = v;
+    }
+    if let Some(v) = p.get("roof_type").and_then(|v| v.as_enum()).and_then(roof_type_from_token) {
+        s.roof_type = v;
+    }
+    if let Some(v) = p.get("roof_pitch").and_then(|v| v.as_f64()) {
+        s.roof_pitch = v;
+    }
+    // Open space
+    if let Some(v) = p.get("open_space_reserve_frac").and_then(|v| v.as_f64()) {
+        s.open_space_reserve_frac = v;
+    }
     s
 }
 
@@ -341,6 +691,91 @@ mod tests {
         assert!(site.contains(&"seed"));
         assert!(!site.contains(&"lot_area_min"));
         assert!(!site.contains(&"setback_front"));
+    }
+
+    #[test]
+    fn grouped_fields_cover_expected_groups() {
+        use itsjustcad_doc::SubdivKind;
+        let keys = |k| {
+            grouped_fields_for_kind(k)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>()
+        };
+        // SitePlan exposes all six phase groups.
+        let plan = keys(SubdivKind::SitePlan);
+        for g in [
+            "param.subdivision.group.general",
+            "param.subdivision.group.streets",
+            "param.subdivision.group.lots",
+            "param.subdivision.group.setbacks",
+            "param.subdivision.group.buildings",
+            "param.subdivision.group.openspace",
+        ] {
+            assert!(plan.contains(&g), "SitePlan missing group {g}");
+        }
+        // Site → general + streets only.
+        assert_eq!(
+            keys(SubdivKind::Site),
+            vec![
+                "param.subdivision.group.general",
+                "param.subdivision.group.streets",
+            ]
+        );
+        // Lots → general + lots only.
+        assert_eq!(
+            keys(SubdivKind::Lots),
+            vec![
+                "param.subdivision.group.general",
+                "param.subdivision.group.lots",
+            ]
+        );
+        // Flat view agrees with the flattened grouped view.
+        let flat: Vec<_> = fields_for_kind(SubdivKind::SitePlan)
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        let grouped_flat: Vec<_> = grouped_fields_for_kind(SubdivKind::SitePlan)
+            .into_iter()
+            .flat_map(|(_, fs)| fs)
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(flat, grouped_flat);
+    }
+
+    #[test]
+    fn phase_params_round_trip() {
+        // An enum field (typology) and a usize numeric (floor_count) survive the
+        // settings → params → settings round trip, plus a few neighbours.
+        let s = SubdivisionSettings {
+            street_pattern: StreetPattern::Organic,
+            typology: Typology::Courtyard,
+            footprint_mode: FootprintMode::CoverageRatio,
+            roof_type: RoofType::Hip,
+            coverage_frac: 0.42,
+            floor_count: 7,
+            floor_height: 3.5,
+            stepback_start_floor: 4,
+            stepback_depth: 1.5,
+            roof_pitch: 22.0,
+            build_to_line: 6.0,
+            open_space_reserve_frac: 0.2,
+            ..SubdivisionSettings::default()
+        };
+        let params = settings_to_params(&s);
+        let back = params_to_settings(&SubdivisionSettings::default(), &params);
+        assert_eq!(back.street_pattern, StreetPattern::Organic);
+        assert_eq!(back.typology, Typology::Courtyard);
+        assert_eq!(back.footprint_mode, FootprintMode::CoverageRatio);
+        assert_eq!(back.roof_type, RoofType::Hip);
+        assert_eq!(back.coverage_frac, 0.42);
+        assert_eq!(back.floor_count, 7);
+        assert_eq!(back.floor_height, 3.5);
+        assert_eq!(back.stepback_start_floor, 4);
+        assert_eq!(back.stepback_depth, 1.5);
+        assert_eq!(back.roof_pitch, 22.0);
+        assert_eq!(back.build_to_line, 6.0);
+        assert_eq!(back.open_space_reserve_frac, 0.2);
     }
 
     #[test]
