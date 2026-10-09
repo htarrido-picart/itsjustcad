@@ -99,6 +99,63 @@ fn mismatch_error(configured: &str, base: &str, available: &[String]) -> String 
     )
 }
 
+/// Curate the OpenAI cloud `/models` list down to the chat + reasoning families,
+/// newest-first, dropping embeddings/tts/audio/image/moderation/etc. `current`
+/// is always kept so the active selection stays visible even if it's an older
+/// model that would otherwise be filtered out.
+fn curate_openai_models(models: &[String], current: &str) -> Vec<String> {
+    let mut out: Vec<String> = models
+        .iter()
+        .filter(|m| is_openai_chat_model(m) || m.as_str() == current)
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| openai_rank(a).cmp(&openai_rank(b)).then_with(|| a.cmp(b)));
+    out.dedup();
+    out
+}
+
+/// Is `id` an OpenAI chat/reasoning model (vs an embedding/tts/image/etc model)?
+fn is_openai_chat_model(id: &str) -> bool {
+    let m = id.to_ascii_lowercase();
+    const DENY: &[&str] = &[
+        "embedding", "tts", "whisper", "audio", "realtime", "dall-e", "image",
+        "moderation", "search", "transcribe",
+    ];
+    if DENY.iter().any(|d| m.contains(d)) {
+        return false;
+    }
+    if m.starts_with("gpt-3") {
+        return false; // legacy 3.x
+    }
+    m.starts_with("gpt-")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m == "chat-latest"
+}
+
+/// Newest-first ordering rank for an OpenAI chat model (lower = newer).
+fn openai_rank(id: &str) -> u8 {
+    let m = id.to_ascii_lowercase();
+    if m.starts_with("gpt-6") {
+        0
+    } else if m.starts_with("gpt-5") || m == "chat-latest" {
+        1
+    } else if m.starts_with("gpt-4.1") {
+        2
+    } else if m.starts_with("gpt-4o") {
+        3
+    } else if m.starts_with("o4") {
+        4
+    } else if m.starts_with("o3") {
+        5
+    } else if m.starts_with("o1") {
+        6
+    } else {
+        7
+    }
+}
+
 /// Check whether a cassette is actually usable before enabling the deck UI:
 /// endpoint reachable, key present/valid, model available.
 pub async fn probe(config: &DeckConfig) -> Result<ProbeInfo, String> {
@@ -166,6 +223,15 @@ pub async fn probe(config: &DeckConfig) -> Result<ProbeInfo, String> {
             if !model_available(&config.model, &models) {
                 return Err(mismatch_error(&config.model, base, &models));
             }
+            // The real OpenAI cloud returns 100+ ids (embeddings, tts, audio,
+            // image, …). Curate the PICKER list down to the chat/reasoning
+            // families, newest-first. Other OpenAI-compatible endpoints (Ollama,
+            // gateways) return their own short lists, so leave those untouched.
+            let models = if base.contains("api.openai.com") {
+                curate_openai_models(&models, &config.model)
+            } else {
+                models
+            };
             Ok(ProbeInfo {
                 detail: format!("ready — {} @ {base}", config.model),
                 models,
@@ -219,6 +285,54 @@ mod tests {
 
     fn list(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn curate_openai_filters_and_orders_newest_first() {
+        let raw = list(&[
+            "gpt-4o",
+            "text-embedding-3-large",
+            "gpt-6-sol",
+            "whisper-1",
+            "gpt-5.6-sol",
+            "dall-e-3",
+            "gpt-6-astra",
+            "gpt-4.1",
+            "tts-1",
+            "o3",
+            "gpt-3.5-turbo",
+            "omni-moderation-latest",
+            "gpt-4o-realtime-preview",
+        ]);
+        let out = curate_openai_models(&raw, "gpt-6-sol");
+        // Non-chat models are gone; gpt-3.5 (legacy) + realtime dropped.
+        for bad in [
+            "text-embedding-3-large",
+            "whisper-1",
+            "dall-e-3",
+            "tts-1",
+            "gpt-3.5-turbo",
+            "omni-moderation-latest",
+            "gpt-4o-realtime-preview",
+        ] {
+            assert!(!out.contains(&bad.to_string()), "{bad} should be filtered");
+        }
+        // gpt-6 family is first, then gpt-5.x, then 4.1, then 4o, then o3.
+        assert_eq!(out.first().map(String::as_str), Some("gpt-6-astra")); // alpha within gpt-6
+        assert!(out.contains(&"gpt-6-sol".to_string()));
+        let pos = |id: &str| out.iter().position(|m| m == id).unwrap();
+        assert!(pos("gpt-6-sol") < pos("gpt-5.6-sol"));
+        assert!(pos("gpt-5.6-sol") < pos("gpt-4.1"));
+        assert!(pos("gpt-4.1") < pos("gpt-4o"));
+        assert!(pos("gpt-4o") < pos("o3"));
+    }
+
+    #[test]
+    fn curate_openai_keeps_current_selection_even_if_legacy() {
+        // A configured legacy model that would normally be filtered is retained.
+        let raw = list(&["gpt-6-sol", "gpt-3.5-turbo"]);
+        let out = curate_openai_models(&raw, "gpt-3.5-turbo");
+        assert!(out.contains(&"gpt-3.5-turbo".to_string()));
     }
 
     // ── model_available: the probe's mismatch rule ─────────────────────────

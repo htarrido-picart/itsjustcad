@@ -83,7 +83,9 @@ impl CloudProvider {
     pub fn default_model(self) -> &'static str {
         match self {
             CloudProvider::Anthropic => "claude-sonnet-4-6",
-            CloudProvider::OpenAi => "gpt-4o",
+            // Sol = flagship-class at mid price; a sensible default for a CAD
+            // assistant. The live /models probe lets the user switch.
+            CloudProvider::OpenAi => "gpt-6-sol",
         }
     }
 
@@ -497,7 +499,7 @@ mod tests {
         assert_eq!(df.decks[i].base_url, "https://api.openai.com/v1");
         assert_eq!(df.decks[i].api_key.as_deref(), Some("sk-test"));
         // Default model used when none supplied.
-        assert_eq!(df.decks[i].model, "gpt-4o");
+        assert_eq!(df.decks[i].model, "gpt-6-sol");
 
         // Update model only — key is left untouched (api_key = None).
         let j = df.set_cloud_provider(CloudProvider::OpenAi, None, Some("gpt-4.1".into()));
