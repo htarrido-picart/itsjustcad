@@ -1313,6 +1313,54 @@ pub unsafe extern "C" fn ijc_command_brief() -> *mut c_char {
     guard_ffi(std::ptr::null_mut(), || into_c_string(compact_command_catalog()))
 }
 
+/// The full command registry as a JSON array, for a client-side command palette:
+/// `[{"name","usage","summary","category"}, …]`. Handle-free: the registry is
+/// static. Caller must [`ijc_string_free`] the result.
+///
+/// # Safety
+/// The returned pointer must be freed exactly once via [`ijc_string_free`] and
+/// not otherwise retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_command_catalog_json() -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || into_c_string(command_catalog_json()))
+}
+
+/// Serialize the command registry to a compact JSON array. Built by hand (no
+/// serde dep in this crate); every string field is JSON-escaped.
+fn command_catalog_json() -> String {
+    fn esc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    let mut out = String::from("[");
+    for (i, spec) in itsjustcad_commands::registry().iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"name\":\"{}\",\"usage\":\"{}\",\"summary\":\"{}\",\"category\":\"{}\"}}",
+            esc(spec.name),
+            esc(spec.usage),
+            esc(spec.summary),
+            esc(spec.category.key()),
+        ));
+    }
+    out.push(']');
+    out
+}
+
 /// A compact digest of the current scene for the on-device model's instructions.
 /// Returns an empty (but non-null) string for a null/invalid handle. Caller must
 /// [`ijc_string_free`] the result.
