@@ -1885,6 +1885,86 @@ fn command_catalog_json() -> String {
     out
 }
 
+/// The document's layers as a JSON array, for the iOS layers inspector:
+/// `[{"name","colorRgba":[r,g,b,a],"hasColor","visible","locked","active","order","linetype"}, …]`,
+/// ordered by `(order, name)` for a stable client list. `active` is the current
+/// layer; `hasColor` is false when the style uses the theme default, and in that
+/// case `colorRgba` falls back to a neutral grey so the client still has a swatch.
+/// Returns `"[]"` (non-null) for a null/invalid handle. Caller must
+/// [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer must
+/// be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_layers_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::from("[]"));
+        };
+        into_c_string(layers_json(&app.session.doc))
+    })
+}
+
+/// Serialize the document's layers to a compact JSON array. Built by hand (no
+/// serde dep in this crate); the layer name is JSON-escaped. Sorted by
+/// `(order, name)` so the client list stays stable across reads.
+fn layers_json(doc: &itsjustcad_doc::Document) -> String {
+    fn esc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    // Theme-default swatch for layers whose color is `None`.
+    const DEFAULT_RGBA: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
+
+    // Objects per layer, so the client can hide empty/unused layers.
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for obj in doc.objects() {
+        *counts.entry(obj.layer.as_str()).or_insert(0) += 1;
+    }
+
+    let mut layers: Vec<(&String, &itsjustcad_doc::LayerStyle)> = doc.layers.iter().collect();
+    layers.sort_by(|(an, a), (bn, b)| a.order.cmp(&b.order).then_with(|| an.cmp(bn)));
+
+    let mut out = String::from("[");
+    for (i, (name, style)) in layers.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let rgba = style.color.unwrap_or(DEFAULT_RGBA);
+        let object_count = counts.get(name.as_str()).copied().unwrap_or(0);
+        out.push_str(&format!(
+            "{{\"name\":\"{}\",\"colorRgba\":[{},{},{},{}],\"hasColor\":{},\"visible\":{},\"locked\":{},\"active\":{},\"order\":{},\"objectCount\":{},\"linetype\":\"{}\"}}",
+            esc(name),
+            rgba[0],
+            rgba[1],
+            rgba[2],
+            rgba[3],
+            style.color.is_some(),
+            style.visible,
+            style.locked,
+            *name == &doc.current_layer,
+            style.order,
+            object_count,
+            style.linetype.token(),
+        ));
+    }
+    out.push(']');
+    out
+}
+
 /// A compact digest of the current scene for the on-device model's instructions.
 /// Returns an empty (but non-null) string for a null/invalid handle. Caller must
 /// [`ijc_string_free`] the result.
@@ -2004,6 +2084,29 @@ mod tests {
         let out = 0.5f32;
         cam2.dolly((1.0 - 1.0 / out) / 0.002);
         assert!(cam2.distance > 100.0, "zoom-out must push the camera away");
+    }
+
+    #[test]
+    fn layers_json_is_null_safe_and_well_formed() {
+        // Null handle yields a non-null, empty JSON array.
+        let nil = std::ptr::null_mut::<AppHandle>();
+        unsafe {
+            let p = ijc_layers_json(nil);
+            assert!(!p.is_null());
+            let s = CStr::from_ptr(p).to_str().unwrap();
+            assert_eq!(s, "[]");
+            ijc_string_free(p);
+        }
+
+        // A default document has seeded layers; the array must be sorted by
+        // (order, name) and expose the expected keys for the active layer.
+        let doc = itsjustcad_doc::Document::default();
+        let json = layers_json(&doc);
+        assert!(json.starts_with('['));
+        assert!(json.ends_with(']'));
+        assert!(json.contains("\"colorRgba\":["));
+        assert!(json.contains("\"active\":true"));
+        assert!(json.contains("\"linetype\":\"continuous\""));
     }
 
     #[test]
