@@ -133,6 +133,12 @@ pub struct AppHandle {
     /// no detached task outlives the handle it borrows shared state from.
     tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 
+    /// When true (the default), deck-emitted commands are applied automatically
+    /// as they stream. When false, they are only emitted to the callback (for
+    /// host-side approval) and NOT applied — the host runs approved ones via
+    /// [`ijc_run_command`]. Set via [`ijc_deck_set_auto_apply`].
+    deck_auto_apply: Arc<AtomicBool>,
+
     // GPU (render-thread only)
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -506,6 +512,7 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
             freeing: AtomicBool::new(false),
             alive: Arc::new(AtomicBool::new(true)),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            deck_auto_apply: Arc::new(AtomicBool::new(true)),
             device,
             queue,
             surface,
@@ -1121,6 +1128,7 @@ pub unsafe extern "C" fn ijc_deck_send(
         let pending = app.pending.clone();
         let history = app.history.clone();
         let tasks = app.tasks.clone();
+        let auto_apply = app.deck_auto_apply.clone();
 
         let join = app.runtime.spawn(async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DeckDelta>();
@@ -1167,8 +1175,13 @@ pub unsafe extern "C" fn ijc_deck_send(
                                         );
                                         continue;
                                     }
-                                    if let Ok(mut p) = pending.lock() {
-                                        p.push(op);
+                                    // Auto-apply mode: run as it streams. Approval
+                                    // mode (auto_apply=false): emit only (already
+                                    // did above) and let the host run approved ones.
+                                    if auto_apply.load(Ordering::Relaxed) {
+                                        if let Ok(mut p) = pending.lock() {
+                                            p.push(op);
+                                        }
                                     }
                                 }
                             }
@@ -1230,6 +1243,21 @@ pub unsafe extern "C" fn ijc_deck_stop(h: *mut AppHandle) {
             for t in tasks.drain(..) {
                 t.abort();
             }
+        }
+    })
+}
+
+/// Control whether deck-emitted commands are applied automatically (`true`, the
+/// default) or only emitted to the callback for host-side approval (`false`).
+/// In approval mode the host runs approved commands via [`ijc_run_command`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_deck_set_auto_apply(h: *mut AppHandle, enabled: bool) {
+    guard_ffi((), || {
+        if let Some(app) = unsafe { handle_ref(h) } {
+            app.deck_auto_apply.store(enabled, Ordering::Relaxed);
         }
     })
 }
