@@ -51,6 +51,26 @@ pub struct SubdivLink {
     /// When `true`, the result is baked: source edits no longer recompute it.
     #[serde(default)]
     pub frozen: bool,
+    /// Which generator produced `produced`, so a re-derive runs the right one:
+    /// `Lots` (block → lots via `derive_subdivision`/`insert_lots`) or `Site`
+    /// (site boundary → roads + blocks via `generate_site`/`insert_site`).
+    /// serde-defaulted to `Lots` so pre-kind links (all lot subdivisions) load
+    /// unchanged. For `Site`, `produced` is roads first then blocks.
+    #[serde(default)]
+    pub kind: SubdivKind,
+}
+
+/// Which associative subdivision generator a `SubdivLink` drives. Serialized
+/// snake_case; defaults to `Lots` so links written before this field existed
+/// (every one was a lot subdivision) deserialize unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubdivKind {
+    /// Block → lots (`derive_subdivision` → `insert_lots`).
+    #[default]
+    Lots,
+    /// Site boundary → roads + blocks (`generate_site` → `insert_site`).
+    Site,
 }
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.
@@ -621,6 +641,7 @@ mod tests {
                 produced: vec![lot_a, lot_b],
                 source_z: 3.5,
                 frozen: false,
+                kind: SubdivKind::Lots,
             },
         );
         assert_eq!(doc.subdiv_source_of(lot_b), Some(source));
@@ -632,6 +653,35 @@ mod tests {
         assert_eq!(link.produced, vec![lot_a, lot_b]);
         assert_eq!(link.source_z, 3.5);
         assert!(!link.frozen);
+        assert_eq!(link.kind, SubdivKind::Lots);
+
+        // A link JSON written before `kind` existed must default to Lots.
+        let mut v = serde_json::to_value(&doc).unwrap();
+        for link in v["subdivision_links"].as_object_mut().unwrap().values_mut() {
+            link.as_object_mut().unwrap().remove("kind");
+        }
+        let back: Document = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.subdiv_link(source).unwrap().kind,
+            SubdivKind::Lots,
+            "pre-kind links default to Lots"
+        );
+
+        // A Site link round-trips its kind.
+        let site_src = ObjectId::new();
+        doc.subdivision_links.insert(
+            site_src,
+            SubdivLink {
+                settings: subdivision::SubdivisionSettings::default(),
+                produced: vec![ObjectId::new()],
+                source_z: 0.0,
+                frozen: false,
+                kind: SubdivKind::Site,
+            },
+        );
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subdiv_link(site_src).unwrap().kind, SubdivKind::Site);
     }
 
     fn obj_at(name: Option<&str>, origin: DVec3) -> SceneObject {

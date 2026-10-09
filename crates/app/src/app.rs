@@ -11488,6 +11488,7 @@ mod tests {
                 produced: vec![],
                 source_z: 0.0,
                 frozen: false,
+                kind: itsjustcad_doc::SubdivKind::Lots,
             },
         );
 

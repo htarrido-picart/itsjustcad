@@ -5325,6 +5325,7 @@ fn exec_lot_subdivide(
                 produced,
                 source_z: *z,
                 frozen: false,
+                kind: itsjustcad_doc::SubdivKind::Lots,
             },
         );
         link_sources.push(*src);
@@ -5416,22 +5417,19 @@ fn exec_lot_refresh(
         pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
     };
 
-    let bake =
-        crate::lot::derive_subdivision(&poly, z, &link.settings).map_err(ExecError::Invalid)?;
-
-    let new_ids: Vec<ObjectId> = match ids {
-        Some(ids) if ids.len() == bake.polygons.len() => ids,
-        _ => (0..bake.polygons.len()).map(|_| ObjectId::new()).collect(),
-    };
-
-    // Snapshot + remove the OLD produced lots (for undo), then insert the new.
+    // Snapshot + remove the OLD produced children (for undo) up front; the
+    // generators below mint fresh ids regardless of kind.
     let mut restored: Vec<(SceneObject, usize)> = Vec::new();
     for id in &link.produced {
         if let Some(removed) = doc.remove(*id) {
             restored.push(removed);
         }
     }
-    crate::lot::insert_lots(doc, &bake, &new_ids);
+
+    // Re-derive by kind: Lots → derive_subdivision/insert_lots (produced = lots),
+    // Site → generate_site/insert_site (produced = roads ++ blocks).
+    let new_ids = regenerate_by_kind(doc, link.kind, &poly, z, &link.settings, ids)
+        .map_err(ExecError::Invalid)?;
     let prev_link = link.clone();
     doc.subdivision_links.insert(
         source,
@@ -5440,6 +5438,7 @@ fn exec_lot_refresh(
             produced: new_ids.clone(),
             source_z: z,
             frozen: false,
+            kind: link.kind,
         },
     );
     doc.generation += 1;
@@ -5448,8 +5447,59 @@ fn exec_lot_refresh(
     Ok((
         Command::LotRefresh { source, ids: Some(new_ids.clone()) },
         Inverse::LotRefreshed { source, created: new_ids.clone(), restored, prev_link },
-        ApplyOutcome { created: new_ids, message: format!("lotrefresh: {n} lot(s) recomputed") },
+        ApplyOutcome { created: new_ids, message: format!("lotrefresh: {n} object(s) recomputed") },
     ))
+}
+
+/// Re-derive an associative subdivision result by kind, inserting the new
+/// children and returning their ids (Lots: lots; Site: roads first then blocks).
+/// `ids`, when supplied and length-matching the fresh derivation, is reused so
+/// replay stays byte-identical; otherwise fresh ids are minted. Ensures the
+/// destination layer(s) exist (the caller already captured those for undo on
+/// first creation; a refresh onto an existing layer creates none).
+fn regenerate_by_kind(
+    doc: &mut Document,
+    kind: itsjustcad_doc::SubdivKind,
+    poly: &subdivision::Polygon2d,
+    z: f64,
+    settings: &subdivision::SubdivisionSettings,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<Vec<ObjectId>, String> {
+    match kind {
+        itsjustcad_doc::SubdivKind::Lots => {
+            let bake = crate::lot::derive_subdivision(poly, z, settings)?;
+            let new_ids: Vec<ObjectId> = match ids {
+                Some(ids) if ids.len() == bake.polygons.len() => ids,
+                _ => (0..bake.polygons.len()).map(|_| ObjectId::new()).collect(),
+            };
+            crate::lot::ensure_lots_layer(doc);
+            crate::lot::insert_lots(doc, &bake, &new_ids);
+            Ok(new_ids)
+        }
+        itsjustcad_doc::SubdivKind::Site => {
+            let bake = crate::lot::generate_site(poly, z, settings)?;
+            let n_roads = bake.roads.len();
+            let n_blocks = bake.blocks.len();
+            // Slice the flat incoming ids as roads ++ blocks when they line up;
+            // else mint fresh for each group.
+            let (road_ids, block_ids) = match ids {
+                Some(ids) if ids.len() == n_roads + n_blocks => {
+                    let (r, b) = ids.split_at(n_roads);
+                    (r.to_vec(), b.to_vec())
+                }
+                _ => (
+                    (0..n_roads).map(|_| ObjectId::new()).collect::<Vec<_>>(),
+                    (0..n_blocks).map(|_| ObjectId::new()).collect::<Vec<_>>(),
+                ),
+            };
+            crate::lot::ensure_roads_layer(doc);
+            crate::lot::ensure_blocks_layer(doc);
+            crate::lot::insert_site(doc, &bake, &road_ids, &block_ids);
+            let mut new_ids = road_ids;
+            new_ids.extend(block_ids);
+            Ok(new_ids)
+        }
+    }
 }
 
 /// W1c: edit a link's exposed subdivision params then recompute (like
@@ -5508,22 +5558,16 @@ fn exec_lot_set_params(
         pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
     };
 
-    let bake =
-        crate::lot::derive_subdivision(&poly, z, &new_settings).map_err(ExecError::Invalid)?;
-
-    let new_ids: Vec<ObjectId> = match ids {
-        Some(ids) if ids.len() == bake.polygons.len() => ids,
-        _ => (0..bake.polygons.len()).map(|_| ObjectId::new()).collect(),
-    };
-
-    // Snapshot + remove the OLD produced lots (for undo), then insert the new.
+    // Snapshot + remove the OLD produced children (for undo), then re-derive by
+    // kind onto the folded settings (Lots → lots, Site → roads ++ blocks).
     let mut restored: Vec<(SceneObject, usize)> = Vec::new();
     for id in &link.produced {
         if let Some(removed) = doc.remove(*id) {
             restored.push(removed);
         }
     }
-    crate::lot::insert_lots(doc, &bake, &new_ids);
+    let new_ids = regenerate_by_kind(doc, link.kind, &poly, z, &new_settings, ids)
+        .map_err(ExecError::Invalid)?;
     let prev_link = link.clone();
     doc.subdivision_links.insert(
         source,
@@ -5532,6 +5576,7 @@ fn exec_lot_set_params(
             produced: new_ids.clone(),
             source_z: z,
             frozen: false,
+            kind: link.kind,
         },
     );
     doc.generation += 1;
@@ -5863,9 +5908,10 @@ fn exec_lot_generate_site(
     }
 
     // Gather the (single) closed site boundary from the selection. If several
-    // closed curves are selected, use the largest by area (the site).
+    // closed curves are selected, use the largest by area (the site). Track its
+    // source id so we can record an associative site→roads+blocks link.
     let sel_ids = resolve(doc, &targets)?;
-    let mut best: Option<(subdivision::Polygon2d, f64)> = None;
+    let mut best: Option<(subdivision::Polygon2d, f64, ObjectId)> = None;
     for id in &sel_ids {
         if let Some(obj) = doc.get(*id)
             && let Geometry::Curve(c) = &obj.geometry
@@ -5879,12 +5925,12 @@ fn exec_lot_generate_site(
                 pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
             };
             let a = poly.area();
-            if best.as_ref().map(|(_, _)| a).is_none() || a > best.as_ref().map(|(p, _)| p.area()).unwrap_or(0.0) {
-                best = Some((poly, z));
+            if best.as_ref().map(|(p, _, _)| a > p.area()).unwrap_or(true) {
+                best = Some((poly, z, *id));
             }
         }
     }
-    let Some((site, z)) = best else {
+    let Some((site, z, site_source)) = best else {
         return Err(ExecError::Invalid(
             "lotgeneratesite needs a closed site boundary curve (draw or select one first)".into(),
         ));
@@ -5910,6 +5956,25 @@ fn exec_lot_generate_site(
         layers_created.push(name);
     }
     crate::lot::insert_site(doc, &bake, &new_road_ids, &new_block_ids);
+
+    // W1 associativity: record a site→(roads ++ blocks) link so editing the
+    // site boundary recomputes its roads and blocks via the same auto-recompute
+    // scan that drives lot subdivisions. `produced` is roads first then blocks
+    // (matching `created` and `insert_site`'s id order); `kind == Site` routes a
+    // re-derive through `generate_site`/`insert_site`. Regenerating on the same
+    // boundary overwrites its link to track the latest result.
+    let mut produced: Vec<ObjectId> = new_road_ids.clone();
+    produced.extend(new_block_ids.clone());
+    doc.subdivision_links.insert(
+        site_source,
+        itsjustcad_doc::SubdivLink {
+            settings: settings.clone(),
+            produced,
+            source_z: z,
+            frozen: false,
+            kind: itsjustcad_doc::SubdivKind::Site,
+        },
+    );
     doc.generation += 1;
 
     let mut created: Vec<ObjectId> = new_road_ids.clone();
@@ -5927,7 +5992,11 @@ fn exec_lot_generate_site(
             road_ids: Some(new_road_ids),
             block_ids: Some(new_block_ids),
         },
-        Inverse::CreatedOnLayer { created: created.clone(), layers_created },
+        Inverse::CreatedOnLayerLinked {
+            created: created.clone(),
+            layers_created,
+            link_sources: vec![site_source],
+        },
         ApplyOutcome {
             message: format!(
                 "lotgeneratesite {pattern_enum:?}: {n_roads} roads on '{}', {n_blocks} blocks on \
@@ -24384,6 +24453,65 @@ mod tests {
         let log: Vec<Command> = s.log.iter().map(|a| a.op.clone()).collect();
         let rebuilt = Session::replay(log).unwrap();
         assert_eq!(before, geo(&rebuilt), "replay recreated identical roads + blocks");
+    }
+
+    /// W1 (gap 1): lotgeneratesite records an associative site link whose kind is
+    /// `Site`, keyed by the site boundary, with the roads + blocks as `produced`.
+    #[test]
+    fn generatesite_records_site_link() {
+        use itsjustcad_doc::SubdivKind;
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 300");
+        let source = s.doc.objects().next().expect("one site boundary").id;
+        run(&mut s, "lotgeneratesite last orthogonal roadwidth=12 blockdepth=60 seed=7");
+
+        let link = s.doc.subdivision_links.get(&source).expect("site link recorded").clone();
+        assert_eq!(link.kind, SubdivKind::Site, "link kind is Site");
+        assert!(!link.produced.is_empty(), "site link carries roads + blocks");
+        for id in &link.produced {
+            assert!(s.doc.get(*id).is_some(), "produced object {id:?} exists");
+        }
+    }
+
+    /// W1 (gap 1): LotRefresh on a Site link regenerates roads + blocks with fresh
+    /// ids (old gone, new present on the roads/blocks layers); undo restores.
+    #[test]
+    fn site_refresh_regenerates_roads_and_blocks() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 400 300");
+        let source = s.doc.objects().next().expect("one site boundary").id;
+        run(&mut s, "lotgeneratesite last orthogonal roadwidth=12 blockdepth=60 seed=7");
+
+        let link = s.doc.subdivision_links.get(&source).expect("site link").clone();
+        let old_ids = link.produced.clone();
+        assert!(layer_count(&s, crate::lot::ROADS_LAYER) > 0, "roads baked");
+        assert!(layer_count(&s, crate::lot::BLOCKS_LAYER) > 0, "blocks baked");
+
+        s.run(Command::LotRefresh { source, ids: None }).expect("site lotrefresh ok");
+        let refreshed = s.doc.subdivision_links.get(&source).expect("link still present").clone();
+        assert_eq!(refreshed.kind, itsjustcad_doc::SubdivKind::Site, "kind preserved");
+        assert!(!refreshed.produced.is_empty(), "refresh produced roads + blocks");
+        assert_ne!(refreshed.produced, old_ids, "refresh minted fresh ids");
+        for id in &old_ids {
+            assert!(s.doc.get(*id).is_none(), "old object {id:?} removed by refresh");
+        }
+        for id in &refreshed.produced {
+            assert!(s.doc.get(*id).is_some(), "new object {id:?} present after refresh");
+        }
+        assert!(layer_count(&s, crate::lot::ROADS_LAYER) > 0, "roads re-baked");
+        assert!(layer_count(&s, crate::lot::BLOCKS_LAYER) > 0, "blocks re-baked");
+        let new_ids = refreshed.produced.clone();
+
+        // Undo restores the prior roads + blocks and drops the refreshed ones.
+        run(&mut s, "undo");
+        let reverted = s.doc.subdivision_links.get(&source).expect("link after undo").clone();
+        assert_eq!(reverted.produced, old_ids, "undo restored prior produced ids");
+        for id in &old_ids {
+            assert!(s.doc.get(*id).is_some(), "prior object {id:?} restored by undo");
+        }
+        for id in &new_ids {
+            assert!(s.doc.get(*id).is_none(), "refreshed object {id:?} removed by undo");
+        }
     }
 
     #[test]
