@@ -221,7 +221,15 @@ this branch.**
 
 Captured on-branch (GitHub issue creation was permission-blocked). Priority order.
 
-### F1 — CityEngine-style meta site-plan (BIG, the headline next step)
+### F1 — CityEngine-style meta site-plan ✅ SHIPPED (aca5730 engine, eff6343 UI, 062bb89 parser fix)
+`siteplan` command composes the full chain (streets+blocks→lots→setbacks→building
+masses) into ONE associative `SubdivKind::SitePlan` result; grouped inspector
+(General/Streets/Lots/Setbacks/Buildings/Open space) drives one settings object;
+editing the boundary or any param recomputes the whole plan via the existing
+auto-scan + LotRefresh. Verified: `siteplan` on a 400×300 boundary → 7 roads,
+8 blocks, 16 lots, 16 setbacks, 16 building masses (96 objects). Original design:
+
+#### (original F1 design)
 Match CityEngine: ONE component + ONE attribute panel driving the whole site
 plan (streets → blocks → lots → setbacks → buildings), fully associative. The
 individual `lot*` verbs stay as composable primitives; this adds the composed,
