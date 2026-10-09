@@ -133,6 +133,12 @@ pub struct AppHandle {
     /// no detached task outlives the handle it borrows shared state from.
     tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 
+    /// When true (the default), deck-emitted commands are applied automatically
+    /// as they stream. When false, they are only emitted to the callback (for
+    /// host-side approval) and NOT applied — the host runs approved ones via
+    /// [`ijc_run_command`]. Set via [`ijc_deck_set_auto_apply`].
+    deck_auto_apply: Arc<AtomicBool>,
+
     // GPU (render-thread only)
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -506,6 +512,7 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
             freeing: AtomicBool::new(false),
             alive: Arc::new(AtomicBool::new(true)),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            deck_auto_apply: Arc::new(AtomicBool::new(true)),
             device,
             queue,
             surface,
@@ -685,6 +692,25 @@ pub unsafe extern "C" fn ijc_open_json(h: *mut AppHandle, ptr: *const u8, len: u
             }
             Err(_) => false,
         }
+    })
+}
+
+/// Reset to a blank document (new scene): a fresh empty session, cleared deck
+/// history, and a forced re-snapshot next frame. Mirrors the post-parse reset of
+/// [`ijc_open_json`]. The host should also clear its autosave if "new" must
+/// persist across launches.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_new_document(h: *mut AppHandle) {
+    guard_ffi((), || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return };
+        app.session = Session::default();
+        if let Ok(mut hist) = app.history.lock() {
+            hist.clear();
+        }
+        app.last_gen = None; // force re-snapshot next frame
     })
 }
 
@@ -1121,6 +1147,7 @@ pub unsafe extern "C" fn ijc_deck_send(
         let pending = app.pending.clone();
         let history = app.history.clone();
         let tasks = app.tasks.clone();
+        let auto_apply = app.deck_auto_apply.clone();
 
         let join = app.runtime.spawn(async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DeckDelta>();
@@ -1167,7 +1194,12 @@ pub unsafe extern "C" fn ijc_deck_send(
                                         );
                                         continue;
                                     }
-                                    if let Ok(mut p) = pending.lock() {
+                                    // Auto-apply mode: run as it streams. Approval
+                                    // mode (auto_apply=false): emit only (already
+                                    // did above) and let the host run approved ones.
+                                    if auto_apply.load(Ordering::Relaxed)
+                                        && let Ok(mut p) = pending.lock()
+                                    {
                                         p.push(op);
                                     }
                                 }
@@ -1210,6 +1242,41 @@ pub unsafe extern "C" fn ijc_deck_send(
         if let Ok(mut t) = tasks.lock() {
             t.retain(|a| !a.is_finished());
             t.push(join.abort_handle());
+        }
+    })
+}
+
+/// Stop any in-flight deck stream: abort the streaming task(s) without tearing
+/// down the handle. The partial text already delivered to the callback stays;
+/// no further deltas or a `done` callback arrive for the aborted turn. Safe to
+/// call when nothing is streaming (a no-op). Mirrors the abort loop in
+/// [`ijc_free`] minus the teardown.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_deck_stop(h: *mut AppHandle) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        if let Ok(mut tasks) = app.tasks.lock() {
+            for t in tasks.drain(..) {
+                t.abort();
+            }
+        }
+    })
+}
+
+/// Control whether deck-emitted commands are applied automatically (`true`, the
+/// default) or only emitted to the callback for host-side approval (`false`).
+/// In approval mode the host runs approved commands via [`ijc_run_command`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_deck_set_auto_apply(h: *mut AppHandle, enabled: bool) {
+    guard_ffi((), || {
+        if let Some(app) = unsafe { handle_ref(h) } {
+            app.deck_auto_apply.store(enabled, Ordering::Relaxed);
         }
     })
 }
