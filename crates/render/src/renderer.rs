@@ -475,6 +475,11 @@ pub struct UnderlayData {
     pub opacity: f32,
 }
 
+/// One line entry shared by the scene lines and the gumball ghost:
+/// `(points, rgba, lineweight_mm)`. Points are a segment soup (LineList pairs)
+/// or a strip depending on the consuming pass.
+pub type LineEntry = (Vec<[f32; 3]>, [f32; 4], f32);
+
 /// CPU-side scene snapshot handed to the renderer when the document changes.
 pub struct SceneData {
     /// `(mesh, rgba, [roughness, metallic])`. The material scalars default to
@@ -535,6 +540,11 @@ pub struct SceneRenderer {
     /// they render visibly thicker than the 1-pixel interior edge lines.
     profile_ribbons: Vec<GpuMesh>,
     point_clouds: Vec<GpuLine>,
+    /// Transient ghost preview lines (the iOS gumball live wireframe). Rebuilt
+    /// every drag frame via [`SceneRenderer::set_ghost_lines`] and cleared on
+    /// commit/cancel. Drawn as hairline segments over the scene, under the grid.
+    /// Independent of the scene `generation` so it updates between doc changes.
+    ghost_lines: Vec<GpuLine>,
     underlay: Option<GpuUnderlay>,
     basemap: Option<GpuUnderlay>,
     /// Document generation the GPU buffers were built from.
@@ -917,6 +927,7 @@ impl SceneRenderer {
             edges: Vec::new(),
             profile_ribbons: Vec::new(),
             point_clouds: Vec::new(),
+            ghost_lines: Vec::new(),
             underlay: None,
             basemap: None,
             generation: u64::MAX,
@@ -1153,6 +1164,38 @@ impl SceneRenderer {
             .map(|u| self.build_underlay(device, queue, u));
     }
 
+    /// Replace the transient ghost preview lines (iOS gumball live wireframe).
+    /// Each entry is `(segment-soup points, rgba, lineweight_mm)` where the
+    /// points are flat LineList pairs in world space — the same shape the edge
+    /// pass consumes. Lineweight is ignored (ghost is always a 1-pixel hairline).
+    /// Uploads one vertex buffer per entry, mirroring [`SceneRenderer::set_scene`]'s
+    /// line path; call every drag frame. Additive — does not touch the scene.
+    pub fn set_ghost_lines(&mut self, device: &wgpu::Device, lines: &[LineEntry]) {
+        use wgpu::util::DeviceExt as _;
+        self.ghost_lines.clear();
+        for (points, color, _lw_mm) in lines {
+            if points.len() < 2 {
+                continue;
+            }
+            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ghost_vb"),
+                contents: bytemuck::cast_slice(points),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            self.ghost_lines.push(GpuLine {
+                vertex_buf,
+                vertex_count: points.len() as u32,
+                object_bind_group: self.object_bind_group(device, *color),
+            });
+        }
+    }
+
+    /// Drop all ghost preview lines (gumball commit / cancel). Cheap no-op when
+    /// already empty.
+    pub fn clear_ghost_lines(&mut self) {
+        self.ghost_lines.clear();
+    }
+
     /// Upload one underlay: an RGBA8 texture, a quad (two triangles) with uvs,
     /// and an opacity UBO, wired into one bind group.
     fn build_underlay(
@@ -1328,6 +1371,19 @@ impl SceneRenderer {
             render_pass.set_bind_group(1, &cloud.object_bind_group, &[]);
             render_pass.set_vertex_buffer(0, cloud.vertex_buf.slice(..));
             render_pass.draw(0..cloud.vertex_count, 0..1);
+        }
+
+        // Ghost preview lines (iOS gumball live wireframe): hairline segments
+        // drawn with the LineList edge pipeline (the ghost is a flat segment
+        // soup, not a strip). Over the scene, under the grid. Present only while
+        // a gumball drag is active; empty otherwise.
+        if !self.ghost_lines.is_empty() {
+            render_pass.set_pipeline(&self.edge_pipeline);
+            for ghost in &self.ghost_lines {
+                render_pass.set_bind_group(1, &ghost.object_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, ghost.vertex_buf.slice(..));
+                render_pass.draw(0..ghost.vertex_count, 0..1);
+            }
         }
 
         // Grid last: blends over background, depth-tested against meshes.

@@ -47,8 +47,8 @@ use itsjustcad_deck::{
     DeckConfig, DeckDelta, DeckKind, ExtractEvent, Extractor, LlmDeck, Role,
 };
 use itsjustcad_render::{
-    camera_uniform_with_mode, snapshot, DisplayMode, OrbitCamera, SceneRenderer, StandardView,
-    Theme, DEPTH_FORMAT,
+    camera_uniform_with_mode, object_wireframe_world, snapshot, DisplayMode, LineEntry,
+    OrbitCamera, SceneRenderer, StandardView, Theme, DEPTH_FORMAT,
 };
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, UiKitDisplayHandle, UiKitWindowHandle,
@@ -75,6 +75,74 @@ enum CamOp {
     Pan(f32, f32),
     Dolly(f32),
     Frame,
+}
+
+/// Amber ghost color (RGBA 255,210,80 at ~45% alpha) for the gumball preview
+/// wireframe. Matches the on-device gumball accent.
+const GHOST_COLOR: [f32; 4] = [1.0, 0.82, 0.31, 0.45];
+
+/// The pending transform behind a live gumball preview. Targets are always the
+/// current `doc.selection` (stable during a drag), so only the transform
+/// parameters are captured here; the ghost is recomputed from the selection
+/// every frame and the committed command resolves `Selector::Selected`.
+#[derive(Debug)]
+enum PreviewKind {
+    Move { delta: glam::DVec3 },
+    Rotate { angle_deg: f64, axis: glam::DVec3, center: glam::DVec3 },
+    Scale { factors: glam::DVec3, center: glam::DVec3 },
+}
+
+/// A live gumball preview: a pending transform shown as an amber ghost
+/// wireframe until [`ijc_gumball_commit`] turns it into a real undoable command
+/// (or [`ijc_gumball_cancel`] drops it).
+#[derive(Debug)]
+struct GumballPreview {
+    kind: PreviewKind,
+}
+
+impl PreviewKind {
+    /// The world-space transform this preview applies to the selection, as a
+    /// `DMat4`. Move is a pure translate; rotate/scale are conjugated by their
+    /// center: `T(c) · R|S · T(-c)`.
+    fn matrix(&self) -> glam::DMat4 {
+        use glam::DMat4;
+        match *self {
+            PreviewKind::Move { delta } => DMat4::from_translation(delta),
+            PreviewKind::Rotate { angle_deg, axis, center } => {
+                let axis = axis.normalize_or_zero();
+                DMat4::from_translation(center)
+                    * DMat4::from_axis_angle(axis, angle_deg.to_radians())
+                    * DMat4::from_translation(-center)
+            }
+            PreviewKind::Scale { factors, center } => {
+                DMat4::from_translation(center)
+                    * DMat4::from_scale(factors)
+                    * DMat4::from_translation(-center)
+            }
+        }
+    }
+
+    /// The undoable [`Command`] that realizes this preview on commit, targeting
+    /// the current selection. Rotate/scale pass an explicit `center`.
+    fn to_command(&self) -> Command {
+        match *self {
+            PreviewKind::Move { delta } => Command::Move {
+                targets: Selector::Selected,
+                delta,
+            },
+            PreviewKind::Rotate { angle_deg, axis, center } => Command::Rotate {
+                targets: Selector::Selected,
+                angle_deg,
+                axis,
+                center: Some(center),
+            },
+            PreviewKind::Scale { factors, center } => Command::Scale {
+                targets: Selector::Selected,
+                factors,
+                center: Some(center),
+            },
+        }
+    }
 }
 
 /// Deck delta kinds handed to the Swift callback.
@@ -153,6 +221,11 @@ pub struct AppHandle {
     last_gen: Option<u64>,
     theme: Theme,
     mode: DisplayMode,
+
+    /// Live gumball preview (iOS full gumball), or `None` when idle. When set,
+    /// `ijc_render_frame` draws an amber ghost wireframe of the selection under
+    /// the pending transform; `ijc_gumball_commit` turns it into a real command.
+    gumball_preview: Option<GumballPreview>,
 
     // async / deck (shared across threads via Arc)
     runtime: tokio::runtime::Runtime,
@@ -524,6 +597,7 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
             last_gen: None,
             theme: Theme::Dark,
             mode: DisplayMode::default(),
+            gumball_preview: None,
             runtime,
             deck: None,
             deck_config: None,
@@ -1096,6 +1170,179 @@ pub unsafe extern "C" fn ijc_move_selected(h: *mut AppHandle, dx: f64, dy: f64, 
 }
 
 // ---------------------------------------------------------------------------
+// Gumball (full on-screen transform gizmo): live ghost preview + commit
+// ---------------------------------------------------------------------------
+
+/// Arm a live MOVE preview: a ghost wireframe of the selection translated by
+/// `(dx, dy, dz)`. The host calls this continuously while dragging the gumball;
+/// each call replaces the pending transform and bumps `doc.generation` so the
+/// next [`ijc_render_frame`] redraws the ghost. No document mutation happens
+/// until [`ijc_gumball_commit`]. Returns `false` on a null/invalid handle, an
+/// empty selection, or a non-finite delta.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_gumball_preview_move(
+    h: *mut AppHandle,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+) -> bool {
+    guard_ffi(false, || {
+        if !dx.is_finite() || !dy.is_finite() || !dz.is_finite() {
+            return false;
+        }
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        if app.session.doc.selection.is_empty() {
+            return false;
+        }
+        app.gumball_preview = Some(GumballPreview {
+            kind: PreviewKind::Move { delta: glam::DVec3::new(dx, dy, dz) },
+        });
+        app.session.doc.generation += 1;
+        true
+    })
+}
+
+/// Arm a live ROTATE preview: a ghost of the selection rotated `angle_deg`
+/// about the axis `(ax, ay, az)` through the center `(cx, cy, cz)`. Same
+/// semantics as [`ijc_gumball_preview_move`] (replace + bump, no mutation).
+/// Returns `false` on a null/invalid handle, an empty selection, a non-finite
+/// argument, or a zero-length axis.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn ijc_gumball_preview_rotate(
+    h: *mut AppHandle,
+    angle_deg: f64,
+    ax: f64,
+    ay: f64,
+    az: f64,
+    cx: f64,
+    cy: f64,
+    cz: f64,
+) -> bool {
+    guard_ffi(false, || {
+        let all = [angle_deg, ax, ay, az, cx, cy, cz];
+        if all.iter().any(|v| !v.is_finite()) {
+            return false;
+        }
+        let axis = glam::DVec3::new(ax, ay, az);
+        if axis.length_squared() == 0.0 {
+            return false;
+        }
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        if app.session.doc.selection.is_empty() {
+            return false;
+        }
+        app.gumball_preview = Some(GumballPreview {
+            kind: PreviewKind::Rotate {
+                angle_deg,
+                axis,
+                center: glam::DVec3::new(cx, cy, cz),
+            },
+        });
+        app.session.doc.generation += 1;
+        true
+    })
+}
+
+/// Arm a live SCALE preview: a ghost of the selection scaled by per-axis
+/// factors `(sx, sy, sz)` about the center `(cx, cy, cz)`. Same semantics as
+/// [`ijc_gumball_preview_move`] (replace + bump, no mutation). Returns `false`
+/// on a null/invalid handle, an empty selection, or a non-finite argument.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn ijc_gumball_preview_scale(
+    h: *mut AppHandle,
+    sx: f64,
+    sy: f64,
+    sz: f64,
+    cx: f64,
+    cy: f64,
+    cz: f64,
+) -> bool {
+    guard_ffi(false, || {
+        let all = [sx, sy, sz, cx, cy, cz];
+        if all.iter().any(|v| !v.is_finite()) {
+            return false;
+        }
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        if app.session.doc.selection.is_empty() {
+            return false;
+        }
+        app.gumball_preview = Some(GumballPreview {
+            kind: PreviewKind::Scale {
+                factors: glam::DVec3::new(sx, sy, sz),
+                center: glam::DVec3::new(cx, cy, cz),
+            },
+        });
+        app.session.doc.generation += 1;
+        true
+    })
+}
+
+/// Cancel any live gumball preview without touching the document. The ghost is
+/// cleared on the next [`ijc_render_frame`]. Bumps `doc.generation` so that
+/// frame redraws. Always returns `true` on a valid handle (even with no
+/// preview armed); `false` only on a null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_gumball_cancel(h: *mut AppHandle) -> bool {
+    guard_ffi(false, || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        app.gumball_preview = None;
+        app.session.doc.generation += 1;
+        true
+    })
+}
+
+/// Commit the live gumball preview as ONE undoable, op-logged [`Command`]
+/// (`Move` / `Rotate` / `Scale`) targeting the current selection, run through
+/// the same [`Session::run`] path as [`ijc_move_selected`]. Rotate/scale pass
+/// the preview's explicit `center`. Clears the preview afterward. Returns
+/// `false` on a null/invalid handle, no armed preview, an empty selection, or
+/// if the command fails.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_gumball_commit(h: *mut AppHandle) -> bool {
+    guard_ffi(false, || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(preview) = app.gumball_preview.take() else {
+            return false;
+        };
+        // Empty selection: `Selector::Selected` would resolve to nothing. The
+        // preview is already taken (cleared) above, matching cancel semantics.
+        if app.session.doc.selection.is_empty() {
+            return false;
+        }
+        app.session.run(preview.kind.to_command()).is_ok()
+    })
+}
+
+/// Query whether a gumball preview is currently armed. Read-only. Returns
+/// `false` on a null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_gumball_has_preview(h: *mut AppHandle) -> bool {
+    guard_ffi(false, || {
+        (unsafe { handle_ref(h) }).is_some_and(|app| app.gumball_preview.is_some())
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Export
 // ---------------------------------------------------------------------------
 
@@ -1232,6 +1479,40 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
             let scene = snapshot(&app.session.doc, app.theme);
             app.renderer.set_scene(&app.device, &app.queue, &scene, doc_gen);
             app.last_gen = Some(doc_gen);
+        }
+
+        // Gumball ghost: an amber wireframe of the selection under the pending
+        // preview transform. Recomputed every frame from `doc.selection` (so it
+        // tracks the current preview params) and uploaded to the renderer's
+        // additive ghost buffers. Cleared when no preview is armed.
+        if let Some(preview) = &app.gumball_preview {
+            let mat = preview.kind.matrix();
+            let doc = &app.session.doc;
+            let ghost: Vec<LineEntry> = doc
+                .selection
+                .iter()
+                .filter_map(|id| doc.get(*id))
+                .filter_map(|obj| {
+                    let segs = object_wireframe_world(obj);
+                    if segs.is_empty() {
+                        return None;
+                    }
+                    // Transform both endpoints of every segment by the preview
+                    // matrix; keep the flat LineList pair layout the ghost pass
+                    // (edge pipeline) consumes.
+                    let mut pts: Vec<[f32; 3]> = Vec::with_capacity(segs.len() * 2);
+                    for [a, b] in segs {
+                        let a = mat.transform_point3(a);
+                        let b = mat.transform_point3(b);
+                        pts.push([a.x as f32, a.y as f32, a.z as f32]);
+                        pts.push([b.x as f32, b.y as f32, b.z as f32]);
+                    }
+                    Some((pts, GHOST_COLOR, 0.0))
+                })
+                .collect();
+            app.renderer.set_ghost_lines(&app.device, &ghost);
+        } else {
+            app.renderer.clear_ghost_lines();
         }
 
         // Camera uniform.
@@ -1736,6 +2017,43 @@ mod tests {
     }
 
     #[test]
+    fn gumball_preview_matrix_composes_about_center() {
+        use glam::DVec3;
+        // Move is a pure translate.
+        let m = PreviewKind::Move { delta: DVec3::new(1.0, 2.0, 3.0) }.matrix();
+        assert!(m.transform_point3(DVec3::ZERO).abs_diff_eq(DVec3::new(1.0, 2.0, 3.0), 1e-9));
+
+        // Rotate 90° about Z through center (1,0,0): the center is fixed, and a
+        // point on +X of the center swings to +Y of it.
+        let center = DVec3::new(1.0, 0.0, 0.0);
+        let r = PreviewKind::Rotate { angle_deg: 90.0, axis: DVec3::Z, center }.matrix();
+        assert!(r.transform_point3(center).abs_diff_eq(center, 1e-9));
+        assert!(r
+            .transform_point3(DVec3::new(2.0, 0.0, 0.0))
+            .abs_diff_eq(DVec3::new(1.0, 1.0, 0.0), 1e-9));
+
+        // Scale 2× about center (1,1,1): center fixed, distances double.
+        let c = DVec3::splat(1.0);
+        let s = PreviewKind::Scale { factors: DVec3::splat(2.0), center: c }.matrix();
+        assert!(s.transform_point3(c).abs_diff_eq(c, 1e-9));
+        assert!(s.transform_point3(DVec3::new(2.0, 1.0, 1.0)).abs_diff_eq(DVec3::new(3.0, 1.0, 1.0), 1e-9));
+    }
+
+    #[test]
+    fn gumball_preview_to_command_sets_explicit_center() {
+        use glam::DVec3;
+        let center = DVec3::new(1.0, 2.0, 3.0);
+        match (PreviewKind::Rotate { angle_deg: 30.0, axis: DVec3::Z, center }).to_command() {
+            Command::Rotate { center: Some(c), .. } => assert!(c.abs_diff_eq(center, 1e-12)),
+            other => panic!("expected Rotate with explicit center, got {other:?}"),
+        }
+        match (PreviewKind::Scale { factors: DVec3::splat(2.0), center }).to_command() {
+            Command::Scale { center: Some(c), .. } => assert!(c.abs_diff_eq(center, 1e-12)),
+            other => panic!("expected Scale with explicit center, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn open_json_roundtrips_sample() {
         // The op-log emitted by the `sample_doc` example must replay cleanly.
         let mut s = Session::default();
@@ -1777,6 +2095,14 @@ mod tests {
             assert!(!ijc_project_point(nil, std::ptr::null(), std::ptr::null_mut()));
             assert!(!ijc_move_selected(nil, 1.0, 0.0, 0.0));
             assert!(!ijc_move_selected(nil, f64::NAN, 0.0, 0.0));
+            // Full gumball: every entry point is null-safe and returns false on
+            // a null handle (including the always-true cancel path).
+            assert!(!ijc_gumball_preview_move(nil, 1.0, 0.0, 0.0));
+            assert!(!ijc_gumball_preview_rotate(nil, 45.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0));
+            assert!(!ijc_gumball_preview_scale(nil, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0));
+            assert!(!ijc_gumball_cancel(nil));
+            assert!(!ijc_gumball_commit(nil));
+            assert!(!ijc_gumball_has_preview(nil));
         }
     }
 
