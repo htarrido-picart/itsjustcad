@@ -224,6 +224,8 @@ fn field_applies(name: &str, kind: itsjustcad_doc::SubdivKind) -> bool {
     match kind {
         SubdivKind::Lots => !SITE_ONLY_FIELDS.contains(&name),
         SubdivKind::Site => name == "seed" || SITE_ONLY_FIELDS.contains(&name),
+        // The META plan spans every phase → expose all fields.
+        SubdivKind::SitePlan => true,
     }
 }
 

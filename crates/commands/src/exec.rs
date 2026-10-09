@@ -5514,6 +5514,75 @@ fn regenerate_by_kind(
             new_ids.extend(block_ids);
             Ok(new_ids)
         }
+        itsjustcad_doc::SubdivKind::SitePlan => {
+            // META: compose the whole chain from the site boundary. Produced
+            // ids are a FLAT vec in insertion order:
+            //   roads ++ blocks ++ lots ++ envelopes ++ buildings(×3).
+            // Deterministic, so replay reuses `ids` sliced by the recomputed
+            // counts (same pattern as the Site arm).
+
+            // Phase 1: streets + blocks.
+            let site = crate::lot::generate_site(poly, z, settings)?;
+
+            // Phase 2: subdivide EACH block (skip a block that fails — too
+            // small, etc. — never abort the whole plan).
+            let mut lot_polys: Vec<subdivision::Polygon2d> = Vec::new();
+            for b in &site.blocks {
+                if let Ok(lb) = crate::lot::subdivide_blocks(&[(b.clone(), site.z)], settings) {
+                    lot_polys.extend(lb.polygons);
+                }
+            }
+            let lots_z: Vec<(subdivision::Polygon2d, f64)> =
+                lot_polys.iter().map(|p| (p.clone(), site.z)).collect();
+
+            // Phase 3 + 4 (robust: empty on failure, never abort the plan).
+            let setbacks = crate::lot::compute_setbacks(&lots_z, settings).ok();
+            let buildings = crate::lot::compute_buildings(&lots_z, settings).ok();
+
+            let n_roads = site.roads.len();
+            let n_blocks = site.blocks.len();
+            let n_lots = lot_polys.len();
+            let n_env = setbacks.as_ref().map_or(0, |s| s.envelopes.len());
+            let n_bld_objs =
+                buildings.as_ref().map_or(0, |b| b.buildings.len() * crate::lot::OBJECTS_PER_BUILDING);
+            let total = n_roads + n_blocks + n_lots + n_env + n_bld_objs;
+
+            let all_ids: Vec<ObjectId> = match ids {
+                Some(v) if v.len() == total => v,
+                _ => (0..total).map(|_| ObjectId::new()).collect(),
+            };
+            // Slice in insertion order.
+            let (road_ids, rest) = all_ids.split_at(n_roads);
+            let (block_ids, rest) = rest.split_at(n_blocks);
+            let (lot_ids, rest) = rest.split_at(n_lots);
+            let (env_ids, bld_ids) = rest.split_at(n_env);
+
+            crate::lot::ensure_roads_layer(doc);
+            crate::lot::ensure_blocks_layer(doc);
+            crate::lot::insert_site(doc, &site, road_ids, block_ids);
+
+            crate::lot::ensure_lots_layer(doc);
+            let lot_bake = crate::lot::LotBake {
+                polygons: lot_polys.clone(),
+                z: site.z,
+                with_street: 0,
+                slivers_merged: 0,
+                corners_widened: 0,
+                placeholder_note: None,
+                width_mix_error: None,
+            };
+            crate::lot::insert_lots(doc, &lot_bake, lot_ids);
+
+            if let Some(sb) = &setbacks {
+                crate::lot::ensure_setbacks_layer(doc);
+                crate::lot::insert_setbacks(doc, sb, env_ids);
+            }
+            if let Some(bb) = &buildings {
+                crate::lot::ensure_buildings_layer(doc);
+                crate::lot::insert_buildings(doc, bb, bld_ids);
+            }
+            Ok(all_ids)
+        }
     }
 }
 
@@ -6022,6 +6091,133 @@ fn exec_lot_generate_site(
                 bake.alley_edges,
             ),
             created,
+        },
+    ))
+}
+
+/// `siteplan` (F1): META command composing the whole chain from the selected
+/// site boundary — streets + blocks → lots → buildable setbacks → building
+/// masses — as ONE associative result (`SubdivKind::SitePlan`). Mirrors
+/// `exec_lot_generate_site`'s boundary resolution (largest closed curve among
+/// the selection is the site). The sticky `lotsettings` drive the plan; the
+/// recorded `SubdivLink` makes the existing auto-recompute scan +
+/// `LotRefresh`/`LotSetParams`/`LotFreeze` recompute the whole chain. Undo-
+/// symmetric via `CreatedOnLayerLinked`.
+fn exec_site_plan(
+    doc: &mut Document,
+    targets: Selector,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    // Sticky settings drive the whole plan (no per-run overrides for v1 — the
+    // inspector drives params through LotSetParams).
+    let settings = doc.subdivision_settings.clone();
+
+    // Largest closed boundary among the selection is the site (same as
+    // lotgeneratesite). Track its source id for the associative link.
+    let sel_ids = resolve(doc, &targets)?;
+    let mut best: Option<(subdivision::Polygon2d, f64, ObjectId)> = None;
+    for id in &sel_ids {
+        if let Some(obj) = doc.get(*id)
+            && let Geometry::Curve(c) = &obj.geometry
+            && c.is_closed()
+            && let Some(poly) = crate::lot::curve_to_polygon(c)
+        {
+            let pts = c.tessellate(PROFILE_TOL);
+            let z = if pts.is_empty() {
+                0.0
+            } else {
+                pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
+            };
+            let a = poly.area();
+            if best.as_ref().map(|(p, _, _)| a > p.area()).unwrap_or(true) {
+                best = Some((poly, z, *id));
+            }
+        }
+    }
+    let Some((poly, z, site_source)) = best else {
+        return Err(ExecError::Invalid(
+            "siteplan needs a closed site boundary curve (draw or select one first)".into(),
+        ));
+    };
+
+    // Ensure all five layers BEFORE regenerating so we can capture which were
+    // freshly created (for undo); a refresh onto existing layers creates none.
+    let mut layers_created = Vec::new();
+    for name in [
+        crate::lot::ensure_roads_layer(doc),
+        crate::lot::ensure_blocks_layer(doc),
+        crate::lot::ensure_lots_layer(doc),
+        crate::lot::ensure_setbacks_layer(doc),
+        crate::lot::ensure_buildings_layer(doc),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        layers_created.push(name);
+    }
+
+    let produced = regenerate_by_kind(
+        doc,
+        itsjustcad_doc::SubdivKind::SitePlan,
+        &poly,
+        z,
+        &settings,
+        ids,
+    )
+    .map_err(ExecError::Invalid)?;
+
+    // Count the phases for the message (recompute from the same poly/settings is
+    // deterministic). Re-deriving here would double-insert, so derive counts
+    // from the produced slicing by recomputing just the geometry totals cheaply.
+    // Simplest: recompute the phase counts without inserting.
+    let site = crate::lot::generate_site(&poly, z, &settings)
+        .map_err(ExecError::Invalid)?;
+    let n_roads = site.roads.len();
+    let n_blocks = site.blocks.len();
+    let mut n_lots = 0usize;
+    let mut lots_z: Vec<(subdivision::Polygon2d, f64)> = Vec::new();
+    for b in &site.blocks {
+        if let Ok(lb) = crate::lot::subdivide_blocks(&[(b.clone(), site.z)], &settings) {
+            n_lots += lb.polygons.len();
+            for p in lb.polygons {
+                lots_z.push((p, site.z));
+            }
+        }
+    }
+    let n_env = crate::lot::compute_setbacks(&lots_z, &settings)
+        .map(|s| s.envelopes.len())
+        .unwrap_or(0);
+    let n_bld = crate::lot::compute_buildings(&lots_z, &settings)
+        .map(|b| b.buildings.len())
+        .unwrap_or(0);
+
+    // W1 associativity: record a site→(whole chain) link so editing the site
+    // boundary recomputes the whole plan via the auto-recompute scan.
+    doc.subdivision_links.insert(
+        site_source,
+        itsjustcad_doc::SubdivLink {
+            settings,
+            produced: produced.clone(),
+            source_z: z,
+            frozen: false,
+            kind: itsjustcad_doc::SubdivKind::SitePlan,
+        },
+    );
+    doc.generation += 1;
+
+    Ok((
+        Command::SitePlan { targets, ids: Some(produced.clone()) },
+        Inverse::CreatedOnLayerLinked {
+            created: produced.clone(),
+            layers_created,
+            link_sources: vec![site_source],
+        },
+        ApplyOutcome {
+            message: format!(
+                "siteplan: {n_roads} roads, {n_blocks} blocks, {n_lots} lots, \
+                 {n_env} setbacks, {n_bld} buildings"
+            ),
+            created: produced,
         },
     ))
 }
@@ -12467,6 +12663,7 @@ fn apply_forward(
         } => exec_lot_generate_site(
             doc, targets, pattern, roadwidth, blockdepth, alleys, seed, road_ids, block_ids,
         ),
+        Command::SitePlan { targets, ids } => exec_site_plan(doc, targets, ids),
         Command::LotSetbacks { targets, front, side, rear, buildto, envelope, ids } => {
             exec_lot_setbacks(doc, targets, front, side, rear, buildto, envelope, ids)
         }
@@ -14852,6 +15049,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LotSettings { .. } => "lotsettings",
         Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",
+        Command::SitePlan { .. } => "siteplan",
         Command::LotSetbacks { .. } => "lotsetbacks",
         Command::LotFrontage { .. } => "lotfrontage",
         Command::LotReport { .. } => "lotreport",
@@ -24543,6 +24741,70 @@ mod tests {
         let new_ids = refreshed.produced.clone();
 
         // Undo restores the prior roads + blocks and drops the refreshed ones.
+        run(&mut s, "undo");
+        let reverted = s.doc.subdivision_links.get(&source).expect("link after undo").clone();
+        assert_eq!(reverted.produced, old_ids, "undo restored prior produced ids");
+        for id in &old_ids {
+            assert!(s.doc.get(*id).is_some(), "prior object {id:?} restored by undo");
+        }
+        for id in &new_ids {
+            assert!(s.doc.get(*id).is_none(), "refreshed object {id:?} removed by undo");
+        }
+    }
+
+    /// F1: the META `siteplan` records a SitePlan link and produces the whole
+    /// chain — objects land on roads/blocks/lots (and setbacks/buildings when
+    /// those phases produced anything).
+    #[test]
+    fn siteplan_records_link_and_produces_full_chain() {
+        use itsjustcad_doc::SubdivKind;
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        let source = s.doc.objects().next().expect("one site boundary").id;
+        let out = run(&mut s, "siteplan last");
+
+        let link = s.doc.subdivision_links.get(&source).expect("siteplan link recorded").clone();
+        assert_eq!(link.kind, SubdivKind::SitePlan, "link kind is SitePlan");
+        assert!(!link.produced.is_empty(), "siteplan link carries the chain");
+        for id in &link.produced {
+            assert!(s.doc.get(*id).is_some(), "produced object {id:?} exists");
+        }
+        // produced == created and all exist.
+        assert_eq!(link.produced, out.created, "link.produced matches created");
+        // Early phases must have produced geometry.
+        assert!(layer_count(&s, crate::lot::ROADS_LAYER) > 0, "roads baked");
+        assert!(layer_count(&s, crate::lot::BLOCKS_LAYER) > 0, "blocks baked");
+        assert!(layer_count(&s, crate::lot::LOTS_LAYER) > 0, "lots baked");
+    }
+
+    /// F1: LotRefresh on a SitePlan link recomputes the WHOLE chain with fresh
+    /// ids (old gone, new present); undo restores the prior chain. This is the
+    /// free associativity — refresh routes through regenerate_by_kind by kind.
+    #[test]
+    fn siteplan_refresh_recomputes_whole_chain() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        let source = s.doc.objects().next().expect("one site boundary").id;
+        run(&mut s, "siteplan last");
+
+        let link = s.doc.subdivision_links.get(&source).expect("siteplan link").clone();
+        let old_ids = link.produced.clone();
+        assert!(!old_ids.is_empty(), "chain produced");
+
+        s.run(Command::LotRefresh { source, ids: None }).expect("siteplan lotrefresh ok");
+        let refreshed = s.doc.subdivision_links.get(&source).expect("link still present").clone();
+        assert_eq!(refreshed.kind, itsjustcad_doc::SubdivKind::SitePlan, "kind preserved");
+        assert!(!refreshed.produced.is_empty(), "refresh produced the chain");
+        assert_ne!(refreshed.produced, old_ids, "refresh minted fresh ids");
+        for id in &old_ids {
+            assert!(s.doc.get(*id).is_none(), "old object {id:?} removed by refresh");
+        }
+        for id in &refreshed.produced {
+            assert!(s.doc.get(*id).is_some(), "new object {id:?} present after refresh");
+        }
+        let new_ids = refreshed.produced.clone();
+
+        // Undo restores the prior chain and drops the refreshed one.
         run(&mut s, "undo");
         let reverted = s.doc.subdivision_links.get(&source).expect("link after undo").clone();
         assert_eq!(reverted.produced, old_ids, "undo restored prior produced ids");

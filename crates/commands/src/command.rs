@@ -2067,6 +2067,20 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         block_ids: Option<Vec<ObjectId>>,
     },
+    /// META site plan (F1): from the selected closed site boundary, generate the
+    /// WHOLE chain — streets + blocks → lots → buildable setbacks → building
+    /// masses — as ONE associative result (`SubdivKind::SitePlan`). Uses the
+    /// sticky `lotsettings`; editing the boundary (or its params in the
+    /// Parameters tab) recomputes the whole plan via the same auto-recompute
+    /// scan that drives lot subdivisions. Deterministic → written-back `ids`
+    /// (flat: roads ++ blocks ++ lots ++ envelopes ++ buildings×3) make replay
+    /// byte-identical.
+    SitePlan {
+        targets: Selector,
+        /// Baked ids for the whole chain, written back on first exec.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// Set the sticky lot loading mode (M-intemfit Phase 6): `front` (front-
     /// loaded, the euro_latam default) or `alley` (alley-loaded, two-frontage —
     /// takes effect when the block carries an alley edge). A thin convenience

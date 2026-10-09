@@ -71,6 +71,10 @@ pub enum SubdivKind {
     Lots,
     /// Site boundary → roads + blocks (`generate_site` → `insert_site`).
     Site,
+    /// META: site boundary → full chain (streets + blocks → lots → buildable
+    /// setbacks → building masses) as one associative result. Recomputed by
+    /// `regenerate_by_kind` through all phases.
+    SitePlan,
 }
 
 /// Scene state. Mutation happens exclusively through `commands::Session`.

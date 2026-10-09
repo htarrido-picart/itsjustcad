@@ -1588,6 +1588,10 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }
         "lotsubdivide" => parse_lotsubdivide(&args),
         "lotgeneratesite" => parse_lotgeneratesite(&args),
+        "siteplan" => {
+            let (sel, _rest) = selector(&args, "siteplan")?;
+            Ok(Command::SitePlan { targets: sel, ids: None })
+        }
         "lotloading" => parse_lotloading(&args),
         "lotsetbacks" => parse_lotsetbacks(&args),
         "lotfrontage" => parse_lotfrontage(&args),
