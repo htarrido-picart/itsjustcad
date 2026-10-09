@@ -41,7 +41,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use itsjustcad_commands::{io, parse, Command, Session};
+use itsjustcad_commands::{io, parse, Command, Selector, Session};
 use itsjustcad_deck::{
     compact_command_catalog, digest, make_deck, system_prompt, ChatMessage, ChatRequest,
     DeckConfig, DeckDelta, DeckKind, ExtractEvent, Extractor, LlmDeck, Role,
@@ -853,6 +853,249 @@ pub unsafe extern "C" fn ijc_camera_zoom_extents(h: *mut AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
+// Pick + gumball (tap-to-select, selection bbox, project, move)
+// ---------------------------------------------------------------------------
+//
+// Picking is authoritative in Rust: Swift forwards the tap/drag pixel
+// coordinates (same space as `ijc_resize` — physical drawable pixels) and Rust
+// owns the ray build, AABB hit test, selection mutation, and the single
+// undoable Move. Swift only draws the gizmo overlay, using `ijc_selection_bbox`
+// (where to put it in world space) + `ijc_project_point` (where that lands in
+// pixels). These reimplement COMPACT versions of the desktop's `screen_ray` /
+// `ray_aabb` / `project` (crates/app/src/app.rs) in pure glam, so the FFI does
+// not depend on the desktop crate.
+
+/// The camera's current aspect ratio from the configured drawable size.
+fn aspect_of(app: &AppHandle) -> f32 {
+    app.config.width as f32 / app.config.height.max(1) as f32
+}
+
+/// Build a world-space pick ray from a pixel coordinate, mirroring the desktop
+/// `screen_ray`: map pixels → NDC (y-flipped), unproject z=0 and z=1 through the
+/// inverse view-projection, and return `(origin, normalized_direction)` in
+/// double precision. Returns `None` if the view-projection is non-invertible or
+/// the unprojected direction is degenerate (e.g. a zero-area viewport).
+fn screen_ray(
+    vp: glam::Mat4,
+    w_px: f32,
+    h_px: f32,
+    x_px: f32,
+    y_px: f32,
+) -> Option<(glam::DVec3, glam::DVec3)> {
+    let dims_ok = w_px.is_finite() && h_px.is_finite() && w_px > 0.0 && h_px > 0.0;
+    if !dims_ok || !x_px.is_finite() || !y_px.is_finite() {
+        return None;
+    }
+    let inv = vp.inverse();
+    if !inv.is_finite() {
+        return None; // singular view_proj
+    }
+    let ndc = glam::Vec2::new(x_px / w_px * 2.0 - 1.0, 1.0 - y_px / h_px * 2.0);
+    let unproject = |z: f32| -> glam::DVec3 {
+        let p = inv * glam::Vec4::new(ndc.x, ndc.y, z, 1.0);
+        (p.truncate() / p.w).as_dvec3()
+    };
+    let origin = unproject(0.0);
+    let far = unproject(1.0);
+    let delta = far - origin;
+    if !origin.is_finite() || !delta.is_finite() || delta.length_squared() < 1e-18 {
+        return None;
+    }
+    Some((origin, delta.normalize()))
+}
+
+/// Slab ray/AABB test; returns the nearest non-negative hit distance `t` along
+/// the ray, or `None` on a miss. Compact reimplementation of the desktop
+/// `ray_aabb`.
+fn ray_aabb(origin: glam::DVec3, dir: glam::DVec3, min: glam::DVec3, max: glam::DVec3) -> Option<f64> {
+    let inv = dir.recip();
+    let t1 = (min - origin) * inv;
+    let t2 = (max - origin) * inv;
+    let t_min = t1.min(t2).max_element();
+    let t_max = t1.max(t2).min_element();
+    (t_max >= t_min.max(0.0)).then_some(t_min.max(0.0))
+}
+
+/// Tap-to-select. Builds a pick ray from `(x_px, y_px)` (physical drawable
+/// pixels, the same space as [`ijc_resize`]) and finds the nearest VISIBLE
+/// object whose world AABB the ray crosses (AABB broad-phase only — enough for
+/// v1; curve narrow-phase is left to a later pass).
+///
+/// * **Hit:** when `additive`, toggles that id in `doc.selection` (tap again to
+///   deselect); otherwise replaces the selection with just that id.
+/// * **Miss:** when not `additive`, clears the selection; an additive miss is a
+///   no-op (keeps the current multi-selection).
+///
+/// Bumps `doc.generation` on any selection change so the renderer recolors the
+/// highlight on the next [`ijc_render_frame`]. Returns whether an object was hit.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_pick(h: *mut AppHandle, x_px: f32, y_px: f32, additive: bool) -> bool {
+    guard_ffi(false, || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let app: &mut AppHandle = &mut app;
+
+        let vp = app.camera.view_proj(aspect_of(app));
+        let (w, h) = (app.config.width as f32, app.config.height as f32);
+        let Some((origin, dir)) = screen_ray(vp, w, h, x_px, y_px) else { return false };
+
+        // Broad phase: nearest visible object whose world AABB the ray hits.
+        let doc = &app.session.doc;
+        let mut best: Option<(f64, itsjustcad_doc::ObjectId)> = None;
+        for obj in doc.objects() {
+            if !(obj.visible && doc.layer_visible(&obj.layer)) {
+                continue;
+            }
+            let bb = obj.geometry.aabb();
+            if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
+                && best.is_none_or(|(bt, _)| t < bt)
+            {
+                best = Some((t, obj.id));
+            }
+        }
+
+        // Apply the selection change and report whether we hit anything. We only
+        // bump `generation` (via `get_mut`) when the selection actually changed,
+        // so a redundant tap doesn't force a needless re-snapshot.
+        match best {
+            Some((_, id)) => {
+                let doc = &mut app.session.doc;
+                if additive {
+                    if !doc.selection.remove(&id) {
+                        doc.selection.insert(id);
+                    }
+                } else {
+                    doc.selection.clear();
+                    doc.selection.insert(id);
+                }
+                doc.generation += 1;
+                true
+            }
+            None => {
+                let doc = &mut app.session.doc;
+                if !additive && !doc.selection.is_empty() {
+                    doc.selection.clear();
+                    doc.generation += 1;
+                }
+                false
+            }
+        }
+    })
+}
+
+/// World-space AABB over the current selection, for placing the gumball overlay.
+/// Writes 3 `f64` center then 3 `f64` size into the caller's `[3]` buffers and
+/// returns `true`; writes nothing and returns `false` when the selection is
+/// empty (or on a null/invalid handle). The size is `max - min`, so a point-like
+/// selection reports a zero size — the host should clamp the gizmo to a minimum
+/// on-screen size itself.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. If this returns `true`,
+/// `center` and `size` must each be non-null and valid for writes of 3 `f64`s;
+/// they are not touched otherwise.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_selection_bbox(
+    h: *mut AppHandle,
+    center: *mut f64,
+    size: *mut f64,
+) -> bool {
+    guard_ffi(false, || {
+        if center.is_null() || size.is_null() {
+            return false;
+        }
+        let Some(app) = (unsafe { handle_ref(h) }) else { return false };
+        let Some(bb) = app.session.doc.selection_aabb() else { return false };
+        let c = bb.center();
+        let s = bb.size();
+        unsafe {
+            std::slice::from_raw_parts_mut(center, 3).copy_from_slice(&[c.x, c.y, c.z]);
+            std::slice::from_raw_parts_mut(size, 3).copy_from_slice(&[s.x, s.y, s.z]);
+        }
+        true
+    })
+}
+
+/// Project a world point to screen PIXELS (the same space [`ijc_pick`] consumes),
+/// via the current camera view-projection and drawable size. Writes 2 `f32`
+/// (x, y) into `out_xy` and returns `true`; returns `false` (writing nothing)
+/// when the point is behind the camera / clipped (`clip.w <= 0`), or on a
+/// null/invalid handle or null `world`/`out_xy`. Compact reimplementation of the
+/// desktop `project`.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `world` must be null or
+/// valid for reads of 3 `f64`s; `out_xy` must be null or valid for writes of
+/// 2 `f32`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_project_point(
+    h: *mut AppHandle,
+    world: *const f64,
+    out_xy: *mut f32,
+) -> bool {
+    guard_ffi(false, || {
+        if world.is_null() || out_xy.is_null() {
+            return false;
+        }
+        let Some(app) = (unsafe { handle_ref(h) }) else { return false };
+        let p = unsafe { std::slice::from_raw_parts(world, 3) };
+        let (w, h_px) = (app.config.width as f32, app.config.height.max(1) as f32);
+        let vp = app.camera.view_proj(aspect_of(app));
+        let clip = vp * glam::Vec4::new(p[0] as f32, p[1] as f32, p[2] as f32, 1.0);
+        if clip.w.is_nan() || clip.w <= 0.0 {
+            return false; // behind the camera / clipped (NaN also fails)
+        }
+        let ndc = clip.truncate() / clip.w;
+        let x = (ndc.x + 1.0) * 0.5 * w;
+        let y = (1.0 - ndc.y) * 0.5 * h_px;
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
+        unsafe {
+            *out_xy = x;
+            *out_xy.add(1) = y;
+        }
+        true
+    })
+}
+
+/// Apply ONE relative translation `(dx, dy, dz)` to the current selection as a
+/// single undoable, op-logged [`Command::Move`] — the host calls this once on
+/// drag-release (not per frame) so the undo stack gets one entry per gesture.
+/// Runs synchronously through the same `Session::run` path as
+/// [`ijc_run_command`], so `doc.generation` bumps and the next
+/// [`ijc_render_frame`] re-renders. Returns `false` on a null/invalid handle, an
+/// empty selection, a non-finite delta, or if the underlying command fails.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_move_selected(h: *mut AppHandle, dx: f64, dy: f64, dz: f64) -> bool {
+    guard_ffi(false, || {
+        if !dx.is_finite() || !dy.is_finite() || !dz.is_finite() {
+            return false;
+        }
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        // Empty selection: nothing to move (and `Selector::Selected` would be a
+        // no-op resolve). Report false so the host can skip the gesture.
+        if app.session.doc.selection.is_empty() {
+            return false;
+        }
+        // Build the Command directly rather than formatting a `move selected
+        // dx,dy,dz` text line: this avoids a float→string→float round-trip and
+        // the comma-point syntax the parser expects, while still routing through
+        // the same undoable `Session::run` path `ijc_run_command` ultimately hits.
+        let cmd = Command::Move {
+            targets: Selector::Selected,
+            delta: glam::DVec3::new(dx, dy, dz),
+        };
+        app.session.run(cmd).is_ok()
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Export
 // ---------------------------------------------------------------------------
 
@@ -1521,6 +1764,19 @@ mod tests {
             assert!(!ijc_open_json(nil, b"{}".as_ptr(), 2));
             assert!(!ijc_run_command(nil, c"box 0,0,0 1,1,1".as_ptr()));
             assert!(!ijc_deck_configure(nil, 0, std::ptr::null(), std::ptr::null(), std::ptr::null()));
+            // Pick/gumball entry points: null handle → documented safe default.
+            assert!(!ijc_pick(nil, 10.0, 10.0, false));
+            assert!(!ijc_pick(nil, 10.0, 10.0, true));
+            let mut c3 = [0.0f64; 3];
+            let mut s3 = [0.0f64; 3];
+            assert!(!ijc_selection_bbox(nil, c3.as_mut_ptr(), s3.as_mut_ptr()));
+            assert!(!ijc_selection_bbox(nil, std::ptr::null_mut(), std::ptr::null_mut()));
+            let w = [1.0f64, 2.0, 3.0];
+            let mut xy = [0.0f32; 2];
+            assert!(!ijc_project_point(nil, w.as_ptr(), xy.as_mut_ptr()));
+            assert!(!ijc_project_point(nil, std::ptr::null(), std::ptr::null_mut()));
+            assert!(!ijc_move_selected(nil, 1.0, 0.0, 0.0));
+            assert!(!ijc_move_selected(nil, f64::NAN, 0.0, 0.0));
         }
     }
 
@@ -1788,6 +2044,38 @@ mod tests {
         // `from_raw_parts`. Pin the bound so it can't silently grow to an absurd
         // acceptable size. (usize::MAX rejection is covered by the null-handle test.)
         assert_eq!(MAX_JSON_LEN, 256 * 1024 * 1024);
+    }
+
+    // ---- Pick/gumball math: ray_aabb + screen_ray sanity (no GPU needed) ----
+
+    #[test]
+    fn ray_aabb_hits_front_box_and_misses_offset() {
+        // Ray from the origin down +X must hit a unit box centered at x=5 at
+        // its near face (t≈4), and miss a box parked off the ray's path.
+        let o = glam::DVec3::ZERO;
+        let d = glam::DVec3::X;
+        let hit = ray_aabb(o, d, glam::DVec3::new(4.0, -1.0, -1.0), glam::DVec3::new(6.0, 1.0, 1.0));
+        assert!(hit.is_some_and(|t| (t - 4.0).abs() < 1e-9));
+        let miss = ray_aabb(o, d, glam::DVec3::new(4.0, 5.0, 5.0), glam::DVec3::new(6.0, 7.0, 7.0));
+        assert!(miss.is_none());
+        // A box straddling the origin reports t=0 (we are inside it), not negative.
+        let inside = ray_aabb(o, d, glam::DVec3::splat(-1.0), glam::DVec3::splat(1.0));
+        assert_eq!(inside, Some(0.0));
+    }
+
+    #[test]
+    fn screen_ray_center_points_into_the_scene() {
+        // A default orbit camera: the center pixel's ray must originate near the
+        // eye side and point roughly toward the target (dot with eye→target > 0).
+        let cam = OrbitCamera::default();
+        let vp = cam.view_proj(1.0);
+        let (origin, dir) = screen_ray(vp, 100.0, 100.0, 50.0, 50.0).expect("center ray");
+        let eye = cam.eye().as_dvec3();
+        let to_target = (cam.target.as_dvec3() - eye).normalize();
+        assert!(dir.dot(to_target) > 0.9, "center ray should look toward the target");
+        assert!((dir.length() - 1.0).abs() < 1e-9, "direction must be unit length");
+        // Degenerate viewport is rejected rather than producing NaNs.
+        assert!(screen_ray(vp, 0.0, 100.0, 50.0, 50.0).is_none());
     }
 
     // ---- Finding #7: SSRF / credential-leak containment on base_url ----
