@@ -991,6 +991,53 @@ fn download_outcome(
     }
 }
 
+/// Pure core of [`App::auto_refresh_subdivisions`]: given the document + a
+/// signature cache, return the non-frozen subdivision link sources whose
+/// boundary geometry changed since the cache was last updated, updating the
+/// cache in place. The FIRST observation of a source never triggers (so
+/// just-created lots aren't immediately re-derived); a later change does. Pure
+/// (no egui / no command execution) so the auto-recompute trigger is unit-
+/// testable without a live frame loop.
+fn subdivisions_to_refresh(
+    doc: &itsjustcad_doc::Document,
+    cache: &mut std::collections::HashMap<itsjustcad_doc::ObjectId, u64>,
+) -> Vec<itsjustcad_doc::ObjectId> {
+    use std::hash::{Hash, Hasher};
+    let mut to_refresh: Vec<itsjustcad_doc::ObjectId> = Vec::new();
+    let mut live: std::collections::HashSet<itsjustcad_doc::ObjectId> =
+        std::collections::HashSet::new();
+    for (source, link) in &doc.subdivision_links {
+        live.insert(*source);
+        if link.frozen {
+            continue;
+        }
+        let Some(obj) = doc.get(*source) else {
+            continue;
+        };
+        let itsjustcad_doc::Geometry::Curve(c) = &obj.geometry else {
+            continue;
+        };
+        if !c.is_closed() {
+            continue;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for p in c.tessellate(0.01) {
+            p.x.to_bits().hash(&mut hasher);
+            p.y.to_bits().hash(&mut hasher);
+            p.z.to_bits().hash(&mut hasher);
+        }
+        let sig = hasher.finish();
+        let had = cache.get(source).copied();
+        if had.is_some() && had != Some(sig) {
+            to_refresh.push(*source);
+        }
+        cache.insert(*source, sig);
+    }
+    // Prune cache entries whose source no longer has a link.
+    cache.retain(|k, _| live.contains(k));
+    to_refresh
+}
+
 /// egui 0.35's bundled fonts (Ubuntu-Light / NotoEmoji / emoji-icon-font) don't
 /// cover common symbol glyphs — in particular the arrows `←` `→`, which show up
 /// in menus, guided-command prompts and hints and render as tofu boxes without a
@@ -7485,47 +7532,14 @@ impl App {
     /// `lotrefresh` so the division tracks an edit/redraw of its boundary.
     /// Collect-then-run to avoid mutating the link map mid-iteration.
     fn auto_refresh_subdivisions(&mut self) {
-        use std::hash::{Hash, Hasher};
         let generation = self.session.doc.generation;
         if generation == self.subdiv_last_generation {
             return;
         }
         self.subdiv_last_generation = generation;
 
-        let mut to_refresh: Vec<itsjustcad_doc::ObjectId> = Vec::new();
-        // Track live sources so we can prune stale cache entries afterwards.
-        let mut live: std::collections::HashSet<itsjustcad_doc::ObjectId> =
-            std::collections::HashSet::new();
-        for (source, link) in &self.session.doc.subdivision_links {
-            live.insert(*source);
-            if link.frozen {
-                continue;
-            }
-            let Some(obj) = self.session.doc.get(*source) else {
-                continue;
-            };
-            let itsjustcad_doc::Geometry::Curve(c) = &obj.geometry else {
-                continue;
-            };
-            if !c.is_closed() {
-                continue;
-            }
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            for p in c.tessellate(0.01) {
-                p.x.to_bits().hash(&mut hasher);
-                p.y.to_bits().hash(&mut hasher);
-                p.z.to_bits().hash(&mut hasher);
-            }
-            let sig = hasher.finish();
-            let had = self.subdiv_sig_cache.get(source).copied();
-            if had.is_some() && had != Some(sig) {
-                to_refresh.push(*source);
-            }
-            self.subdiv_sig_cache.insert(*source, sig);
-        }
-        // Prune cache entries whose source no longer has a link.
-        self.subdiv_sig_cache.retain(|k, _| live.contains(k));
-
+        let to_refresh =
+            subdivisions_to_refresh(&self.session.doc, &mut self.subdiv_sig_cache);
         for source in to_refresh {
             let _ = self
                 .session
@@ -11441,6 +11455,58 @@ mod tests {
         assert_eq!(open_pts.len(), 4, "open curve is not closed");
         let d_open = crate::boxsel::dist_to_polyline(&open_pts, mid).unwrap();
         assert!(d_open > 40.0, "open square's missing left edge: click is far: {d_open}");
+    }
+
+    #[test]
+    fn auto_refresh_fires_only_after_a_boundary_change() {
+        use itsjustcad_doc::{Document, Geometry, ObjectId, SceneObject, SubdivLink};
+        let square = |s: f64| kernel_curve::Curve::Polyline {
+            points: vec![
+                glam::DVec3::new(0.0, 0.0, 0.0),
+                glam::DVec3::new(s, 0.0, 0.0),
+                glam::DVec3::new(s, s, 0.0),
+                glam::DVec3::new(0.0, s, 0.0),
+            ],
+            closed: true,
+        };
+        let mut doc = Document::default();
+        let block = ObjectId::new();
+        doc.insert(SceneObject {
+            visible: true,
+            id: block,
+            name: None,
+            layer: "Default".into(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            geometry: Geometry::Curve(square(40.0)),
+        });
+        doc.subdivision_links.insert(
+            block,
+            SubdivLink {
+                settings: itsjustcad_doc::SubdivisionSettings::default(),
+                produced: vec![],
+                source_z: 0.0,
+                frozen: false,
+            },
+        );
+
+        let mut cache = std::collections::HashMap::new();
+        // First observation seeds the cache but does NOT refresh (don't re-derive
+        // the just-created lots).
+        assert!(subdivisions_to_refresh(&doc, &mut cache).is_empty());
+        // No change → still nothing.
+        assert!(subdivisions_to_refresh(&doc, &mut cache).is_empty());
+        // Reshape the block boundary → the next scan flags it (this is the
+        // "redraw → lots recompute" trigger).
+        doc.get_mut(block).unwrap().geometry = Geometry::Curve(square(60.0));
+        assert_eq!(subdivisions_to_refresh(&doc, &mut cache), vec![block]);
+        // Signature re-cached → no repeat until the next change.
+        assert!(subdivisions_to_refresh(&doc, &mut cache).is_empty());
+        // A FROZEN link never flags, even when its boundary changes.
+        doc.subdivision_links.get_mut(&block).unwrap().frozen = true;
+        doc.get_mut(block).unwrap().geometry = Geometry::Curve(square(80.0));
+        assert!(subdivisions_to_refresh(&doc, &mut cache).is_empty());
     }
 
     #[test]

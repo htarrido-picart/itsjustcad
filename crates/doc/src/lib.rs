@@ -23,6 +23,9 @@ mod view;
 pub use constraint::{PointRef, SketchConstraint};
 pub use cplane::CPlane;
 pub use document::{Document, SubdivLink};
+// Re-export the settings type carried by `SubdivLink` so consumers can build /
+// inspect links without a direct `subdivision` dependency.
+pub use subdivision::SubdivisionSettings;
 pub use loads::{LoadGeometry, RestraintKind, StructLoad, StructSupport};
 pub use object::{
     angle_degrees, angular_arc_points, angular_dim_segments, Annotation, AreaKind, BlockGeometry,
