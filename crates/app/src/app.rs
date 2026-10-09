@@ -6794,7 +6794,11 @@ impl App {
         // The Parameters tab appears on demand: whenever the document holds ≥1
         // live parametric object (geodesic/hypar/…), or when pinned open via
         // `panel tab parameters` / a menu. Content-driven, like Sheets.
-        let has_parametric = crate::dyntabs::has_parametric(&self.session.doc);
+        // The Parameters tab also hosts the associative-subdivision inspector, so
+        // reveal it when there are subdivision links too (not only expressive
+        // parametric objects).
+        let has_parametric = crate::dyntabs::has_parametric(&self.session.doc)
+            || !self.session.doc.subdivision_links.is_empty();
         self.panel_tabs.sync_dynamic(has_blocks, has_sheets, has_parametric);
         let visible_tabs = self.panel_tabs.visible_tabs(has_blocks, has_sheets, has_parametric);
 
@@ -11586,6 +11590,51 @@ mod tests {
                 x_after - x_before > 40.0,
                 "recomputed lots tracked the moved block: x {x_before:.1} → {x_after:.1}"
             );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_moving_site_boundary_recomputes_roads_blocks() {
+        // W1 gap 1 live proof: lotgeneratesite records a site link; moving the
+        // site boundary auto-recomputes its roads + blocks (fresh ids).
+        run_app_journey(|h| {
+            submit_command(h, "polyline 0,0,0 400,0,0 400,300,0 0,300,0 closed");
+            submit_command(h, "select last");
+            submit_command(h, "lotgeneratesite pattern=orthogonal");
+            h.run_steps(4);
+
+            let source = *h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .keys()
+                .next()
+                .expect("generatesite recorded a link");
+            let before = h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .get(&source)
+                .unwrap()
+                .produced
+                .clone();
+            assert!(!before.is_empty(), "site produced roads/blocks");
+
+            submit_command(h, "move sel 500,0,0");
+            h.run_steps(6);
+            let after = h
+                .state()
+                .session
+                .doc
+                .subdivision_links
+                .get(&source)
+                .unwrap()
+                .produced
+                .clone();
+            assert_ne!(before, after, "moving the site boundary recomputed its roads/blocks");
         });
     }
 
