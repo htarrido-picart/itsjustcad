@@ -834,7 +834,7 @@ mod tests {
             compact_system_prompt("", &PluginRegistry::new()),
         ] {
             assert!(p.contains(CLARIFY_HELP), "CLARIFY_HELP not injected");
-            assert!(p.contains("## Ask before guessing"));
+            assert!(p.contains("## Act first"));
             assert!(p.contains("QUESTION: <one short clarifying question>"));
         }
         // The advertised form round-trips through the parser.
