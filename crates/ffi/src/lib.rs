@@ -2754,7 +2754,7 @@ mod tests {
         // eye side and point roughly toward the target (dot with eye→target > 0).
         let cam = OrbitCamera::default();
         let vp = cam.view_proj(1.0);
-        let (origin, dir) = screen_ray(vp, 100.0, 100.0, 50.0, 50.0).expect("center ray");
+        let (_origin, dir) = screen_ray(vp, 100.0, 100.0, 50.0, 50.0).expect("center ray");
         let eye = cam.eye().as_dvec3();
         let to_target = (cam.target.as_dvec3() - eye).normalize();
         assert!(dir.dot(to_target) > 0.9, "center ray should look toward the target");

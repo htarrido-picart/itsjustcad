@@ -689,8 +689,10 @@ mod tests {
     }
 
     fn all_on() -> SnapSettings {
-        let mut s = SnapSettings::default();
-        s.master = true;
+        let mut s = SnapSettings {
+            master: true,
+            ..SnapSettings::default()
+        };
         for k in SnapKind::ALL {
             s.set(k, true);
         }
@@ -975,8 +977,10 @@ mod tests {
             a: DVec3::ZERO,
             b: DVec3::new(10.0, 0.0, 0.0),
         }));
-        let mut s = SnapSettings::default();
-        s.master = false;
+        let s = SnapSettings {
+            master: false,
+            ..SnapSettings::default()
+        };
         let c = candidates_filtered(&doc, &s, None, |_| true);
         assert!(c.is_empty());
     }
@@ -1020,9 +1024,11 @@ mod tests {
 
     #[test]
     fn settings_serde_round_trip() {
-        let mut s = SnapSettings::default();
-        s.master = true;
-        s.grid = false;
+        let mut s = SnapSettings {
+            master: true,
+            grid: false,
+            ..SnapSettings::default()
+        };
         s.set(SnapKind::Tangent, true);
         s.set(SnapKind::Mid, false);
         let json = s.to_json();

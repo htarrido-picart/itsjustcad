@@ -20,7 +20,8 @@
 
 use itsjustcad_doc::{sanitize_fields, ParamField, ParamMap, ParamValue, Unit, Widget};
 use subdivision::{
-    FootprintMode, RoofType, StreetPattern, SubdivisionMethod, SubdivisionSettings, Typology,
+    CornerAlignment, FootprintMode, LoadingType, RegionProfile, RoofType, SkeletonImpl,
+    StreetPattern, SubdivisionMethod, SubdivisionSettings, Typology,
 };
 
 /// Method enum tokens exposed in the schema (match the `lotsubdivide method=…`
@@ -74,6 +75,74 @@ pub fn street_pattern_from_token(s: &str) -> Option<StreetPattern> {
         "voronoi" => Some(StreetPattern::Voronoi),
         _ => None,
     }
+}
+
+const REGION_CHOICES: &[&str] = &["euro_latam", "us_suburban"];
+
+pub fn region_token(r: RegionProfile) -> &'static str {
+    match r {
+        RegionProfile::EuroLatam => "euro_latam",
+        RegionProfile::UsSuburban => "us_suburban",
+    }
+}
+
+pub fn region_from_token(s: &str) -> Option<RegionProfile> {
+    // Same aliases the `lotsettings region=…` verb accepts.
+    match s.to_lowercase().as_str() {
+        "euro_latam" | "eurolatam" | "metric" => Some(RegionProfile::EuroLatam),
+        "us_suburban" | "us" | "imperial" => Some(RegionProfile::UsSuburban),
+        _ => None,
+    }
+}
+
+const LOADING_CHOICES: &[&str] = &["front", "alley", "mixed"];
+
+pub fn loading_token(l: LoadingType) -> &'static str {
+    match l {
+        LoadingType::FrontLoaded => "front",
+        LoadingType::AlleyLoaded => "alley",
+        LoadingType::Mixed => "mixed",
+    }
+}
+
+pub fn loading_from_token(s: &str) -> Option<LoadingType> {
+    // Same aliases the `lotsettings loading=…` verb accepts.
+    match s.to_lowercase().as_str() {
+        "front" | "frontloaded" => Some(LoadingType::FrontLoaded),
+        "alley" | "alleyloaded" => Some(LoadingType::AlleyLoaded),
+        "mixed" => Some(LoadingType::Mixed),
+        _ => None,
+    }
+}
+
+const CORNER_ALIGN_CHOICES: &[&str] = &["streetwidth", "streetlength"];
+
+pub fn corner_align_token(c: CornerAlignment) -> &'static str {
+    match c {
+        CornerAlignment::StreetWidth => "streetwidth",
+        CornerAlignment::StreetLength => "streetlength",
+    }
+}
+
+pub fn corner_align_from_token(s: &str) -> Option<CornerAlignment> {
+    match s.to_lowercase().as_str() {
+        "streetwidth" | "width" => Some(CornerAlignment::StreetWidth),
+        "streetlength" | "length" => Some(CornerAlignment::StreetLength),
+        _ => None,
+    }
+}
+
+const SKELETON_IMPL_CHOICES: &[&str] = &["offset", "felkel"];
+
+pub fn skeleton_impl_token(i: SkeletonImpl) -> &'static str {
+    match i {
+        SkeletonImpl::Offset => "offset",
+        SkeletonImpl::Felkel => "felkel",
+    }
+}
+
+pub fn skeleton_impl_from_token(s: &str) -> Option<SkeletonImpl> {
+    SkeletonImpl::parse(s)
 }
 
 const TYPOLOGY_CHOICES: &[&str] = &["detached", "row", "courtyard", "slab"];
@@ -142,6 +211,12 @@ pub fn subdivision_fields() -> Vec<ParamField> {
             1,
             Widget::Numeric,
         ),
+        ParamField::enum_(
+            "region",
+            "param.subdivision.region",
+            "euro_latam",
+            REGION_CHOICES,
+        ),
         // Areas are in m² (no dedicated unit suffix — kept unitless in the UI).
         ParamField::float(
             "lot_area_min",
@@ -177,6 +252,16 @@ pub fn subdivision_fields() -> Vec<ParamField> {
             "irregularity",
             "param.subdivision.irregularity",
             0.0,
+            Some(0.0),
+            Some(1.0),
+            0.05,
+            Widget::Slider,
+            Unit::None,
+        ),
+        ParamField::float(
+            "force_street_access",
+            "param.subdivision.force_street_access",
+            1.0,
             Some(0.0),
             Some(1.0),
             0.05,
@@ -264,6 +349,38 @@ pub fn subdivision_fields() -> Vec<ParamField> {
             Unit::Meter,
         ),
         ParamField::float(
+            "lot_depth_tolerance",
+            "param.subdivision.lot_depth_tolerance",
+            0.0,
+            Some(0.0),
+            Some(100.0),
+            0.5,
+            Widget::Numeric,
+            Unit::Meter,
+        ),
+        ParamField::float(
+            "corner_lot_width_bonus",
+            "param.subdivision.corner_lot_width_bonus",
+            0.0,
+            Some(0.0),
+            Some(1.0),
+            0.05,
+            Widget::Slider,
+            Unit::None,
+        ),
+        ParamField::enum_(
+            "corner_align",
+            "param.subdivision.corner_align",
+            "streetwidth",
+            CORNER_ALIGN_CHOICES,
+        ),
+        ParamField::enum_(
+            "loading",
+            "param.subdivision.loading",
+            "front",
+            LOADING_CHOICES,
+        ),
+        ParamField::float(
             "alley_width",
             "param.subdivision.alley_width",
             20.0,
@@ -273,7 +390,60 @@ pub fn subdivision_fields() -> Vec<ParamField> {
             Widget::Numeric,
             Unit::Meter,
         ),
+        ParamField::bool("allow_flag_lots", "param.subdivision.allow_flag_lots", false),
+        ParamField::float(
+            "flag_pole_width_min",
+            "param.subdivision.flag_pole_width_min",
+            20.0,
+            Some(1.0),
+            Some(100.0),
+            0.5,
+            Widget::Numeric,
+            Unit::Meter,
+        ),
         ParamField::bool("merge_slivers", "param.subdivision.merge_slivers", true),
+        ParamField::float(
+            "sliver_area_frac",
+            "param.subdivision.sliver_area_frac",
+            0.5,
+            Some(0.0),
+            Some(1.0),
+            0.05,
+            Widget::Slider,
+            Unit::None,
+        ),
+        ParamField::float(
+            "shallow_lot_frac",
+            "param.subdivision.shallow_lot_frac",
+            0.0,
+            Some(0.0),
+            Some(1.0),
+            0.05,
+            Widget::Slider,
+            Unit::None,
+        ),
+        ParamField::bool("subdivide_core", "param.subdivision.subdivide_core", true),
+        ParamField::enum_(
+            "skeleton_impl",
+            "param.subdivision.skeleton_impl",
+            "offset",
+            SKELETON_IMPL_CHOICES,
+        ),
+        ParamField::float(
+            "simplify",
+            "param.subdivision.simplify",
+            0.0,
+            Some(0.0),
+            Some(10.0),
+            0.1,
+            Widget::Numeric,
+            Unit::Meter,
+        ),
+        ParamField::bool(
+            "frontage_at_setback",
+            "param.subdivision.frontage_at_setback",
+            true,
+        ),
         ParamField::bool(
             "draw_buildable_envelope",
             "param.subdivision.draw_buildable_envelope",
@@ -319,6 +489,16 @@ pub fn subdivision_fields() -> Vec<ParamField> {
             0.05,
             Widget::Slider,
             Unit::None,
+        ),
+        ParamField::float(
+            "footprint_inset",
+            "param.subdivision.footprint_inset",
+            2.0,
+            Some(0.0),
+            Some(50.0),
+            0.5,
+            Widget::Numeric,
+            Unit::Meter,
         ),
         ParamField::int(
             "floor_count",
@@ -391,7 +571,7 @@ pub fn subdivision_fields() -> Vec<ParamField> {
 /// Ordered phase groups for the inspector: each `(group i18n key, [field names])`.
 /// The field names are resolved against [`subdivision_fields`] in order.
 const FIELD_GROUPS: &[(&str, &[&str])] = &[
-    ("param.subdivision.group.general", &["seed"]),
+    ("param.subdivision.group.general", &["seed", "region"]),
     (
         "param.subdivision.group.streets",
         &["street_pattern", "road_width", "block_depth"],
@@ -404,11 +584,23 @@ const FIELD_GROUPS: &[(&str, &[&str])] = &[
             "lot_area_max",
             "lot_width_min",
             "irregularity",
+            "force_street_access",
             "offset_width",
+            "subdivide_core",
             "corner_width",
+            "corner_lot_width_bonus",
+            "corner_align",
             "lot_depth_target",
+            "lot_depth_tolerance",
+            "loading",
             "alley_width",
+            "allow_flag_lots",
+            "flag_pole_width_min",
             "merge_slivers",
+            "sliver_area_frac",
+            "shallow_lot_frac",
+            "skeleton_impl",
+            "simplify",
         ],
     ),
     (
@@ -418,6 +610,7 @@ const FIELD_GROUPS: &[(&str, &[&str])] = &[
             "setback_side",
             "setback_rear",
             "build_to_line",
+            "frontage_at_setback",
             "draw_buildable_envelope",
         ],
     ),
@@ -427,6 +620,7 @@ const FIELD_GROUPS: &[(&str, &[&str])] = &[
             "typology",
             "footprint_mode",
             "coverage_frac",
+            "footprint_inset",
             "floor_count",
             "floor_height",
             "stepback_start_floor",
@@ -508,10 +702,15 @@ pub fn settings_to_params(s: &SubdivisionSettings) -> ParamMap {
     let mut m = ParamMap::new();
     m.insert("method".into(), ParamValue::Enum(method_token(s.method).into()));
     m.insert("seed".into(), ParamValue::Int(s.seed as i64));
+    m.insert("region".into(), ParamValue::Enum(region_token(s.region).into()));
     m.insert("lot_area_min".into(), ParamValue::Float(s.lot_area_min));
     m.insert("lot_area_max".into(), ParamValue::Float(s.lot_area_max));
     m.insert("lot_width_min".into(), ParamValue::Float(s.lot_width_min));
     m.insert("irregularity".into(), ParamValue::Float(s.irregularity));
+    m.insert(
+        "force_street_access".into(),
+        ParamValue::Float(s.force_street_access),
+    );
     m.insert("setback_front".into(), ParamValue::Float(s.setback_front));
     m.insert("setback_side".into(), ParamValue::Float(s.setback_side));
     m.insert("setback_rear".into(), ParamValue::Float(s.setback_rear));
@@ -520,8 +719,34 @@ pub fn settings_to_params(s: &SubdivisionSettings) -> ParamMap {
     m.insert("offset_width".into(), ParamValue::Float(s.offset_width));
     m.insert("corner_width".into(), ParamValue::Float(s.corner_width));
     m.insert("lot_depth_target".into(), ParamValue::Float(s.lot_depth_target));
+    m.insert(
+        "lot_depth_tolerance".into(),
+        ParamValue::Float(s.lot_depth_tolerance),
+    );
+    m.insert(
+        "corner_lot_width_bonus".into(),
+        ParamValue::Float(s.corner_lot_width_bonus),
+    );
+    m.insert(
+        "corner_align".into(),
+        ParamValue::Enum(corner_align_token(s.corner_align).into()),
+    );
+    m.insert("loading".into(), ParamValue::Enum(loading_token(s.loading).into()));
     m.insert("alley_width".into(), ParamValue::Float(s.alley_width));
+    m.insert("allow_flag_lots".into(), ParamValue::Bool(s.allow_flag_lots));
+    m.insert(
+        "flag_pole_width_min".into(),
+        ParamValue::Float(s.flag_pole_width_min),
+    );
     m.insert("merge_slivers".into(), ParamValue::Bool(s.merge_slivers));
+    m.insert("sliver_area_frac".into(), ParamValue::Float(s.sliver_area_frac));
+    m.insert("shallow_lot_frac".into(), ParamValue::Float(s.shallow_lot_frac));
+    m.insert("subdivide_core".into(), ParamValue::Bool(s.subdivide_core));
+    m.insert(
+        "skeleton_impl".into(),
+        ParamValue::Enum(skeleton_impl_token(s.skeleton_impl).into()),
+    );
+    m.insert("simplify".into(), ParamValue::Float(s.simplify));
     m.insert(
         "draw_buildable_envelope".into(),
         ParamValue::Bool(s.draw_buildable_envelope),
@@ -533,6 +758,10 @@ pub fn settings_to_params(s: &SubdivisionSettings) -> ParamMap {
     );
     // Setbacks
     m.insert("build_to_line".into(), ParamValue::Float(s.build_to_line));
+    m.insert(
+        "frontage_at_setback".into(),
+        ParamValue::Bool(s.frontage_at_setback),
+    );
     // Buildings
     m.insert("typology".into(), ParamValue::Enum(typology_token(s.typology).into()));
     m.insert(
@@ -540,6 +769,7 @@ pub fn settings_to_params(s: &SubdivisionSettings) -> ParamMap {
         ParamValue::Enum(footprint_mode_token(s.footprint_mode).into()),
     );
     m.insert("coverage_frac".into(), ParamValue::Float(s.coverage_frac));
+    m.insert("footprint_inset".into(), ParamValue::Float(s.footprint_inset));
     m.insert("floor_count".into(), ParamValue::Int(s.floor_count as i64));
     m.insert("floor_height".into(), ParamValue::Float(s.floor_height));
     m.insert(
@@ -570,6 +800,9 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
     if let Some(v) = p.get("seed").and_then(|v| v.as_i64()) {
         s.seed = v.max(0) as u64;
     }
+    if let Some(v) = p.get("region").and_then(|v| v.as_enum()).and_then(region_from_token) {
+        s.region = v;
+    }
     if let Some(v) = p.get("lot_area_min").and_then(|v| v.as_f64()) {
         s.lot_area_min = v;
     }
@@ -581,6 +814,9 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
     }
     if let Some(v) = p.get("irregularity").and_then(|v| v.as_f64()) {
         s.irregularity = v;
+    }
+    if let Some(v) = p.get("force_street_access").and_then(|v| v.as_f64()) {
+        s.force_street_access = v;
     }
     if let Some(v) = p.get("setback_front").and_then(|v| v.as_f64()) {
         s.setback_front = v;
@@ -606,11 +842,52 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
     if let Some(v) = p.get("lot_depth_target").and_then(|v| v.as_f64()) {
         s.lot_depth_target = v;
     }
+    if let Some(v) = p.get("lot_depth_tolerance").and_then(|v| v.as_f64()) {
+        s.lot_depth_tolerance = v;
+    }
+    if let Some(v) = p.get("corner_lot_width_bonus").and_then(|v| v.as_f64()) {
+        s.corner_lot_width_bonus = v;
+    }
+    if let Some(v) = p
+        .get("corner_align")
+        .and_then(|v| v.as_enum())
+        .and_then(corner_align_from_token)
+    {
+        s.corner_align = v;
+    }
+    if let Some(v) = p.get("loading").and_then(|v| v.as_enum()).and_then(loading_from_token) {
+        s.loading = v;
+    }
     if let Some(v) = p.get("alley_width").and_then(|v| v.as_f64()) {
         s.alley_width = v;
     }
+    if let Some(v) = p.get("allow_flag_lots").and_then(|v| v.as_bool()) {
+        s.allow_flag_lots = v;
+    }
+    if let Some(v) = p.get("flag_pole_width_min").and_then(|v| v.as_f64()) {
+        s.flag_pole_width_min = v;
+    }
     if let Some(v) = p.get("merge_slivers").and_then(|v| v.as_bool()) {
         s.merge_slivers = v;
+    }
+    if let Some(v) = p.get("sliver_area_frac").and_then(|v| v.as_f64()) {
+        s.sliver_area_frac = v;
+    }
+    if let Some(v) = p.get("shallow_lot_frac").and_then(|v| v.as_f64()) {
+        s.shallow_lot_frac = v;
+    }
+    if let Some(v) = p.get("subdivide_core").and_then(|v| v.as_bool()) {
+        s.subdivide_core = v;
+    }
+    if let Some(v) = p
+        .get("skeleton_impl")
+        .and_then(|v| v.as_enum())
+        .and_then(skeleton_impl_from_token)
+    {
+        s.skeleton_impl = v;
+    }
+    if let Some(v) = p.get("simplify").and_then(|v| v.as_f64()) {
+        s.simplify = v;
     }
     if let Some(v) = p.get("draw_buildable_envelope").and_then(|v| v.as_bool()) {
         s.draw_buildable_envelope = v;
@@ -627,6 +904,9 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
     if let Some(v) = p.get("build_to_line").and_then(|v| v.as_f64()) {
         s.build_to_line = v;
     }
+    if let Some(v) = p.get("frontage_at_setback").and_then(|v| v.as_bool()) {
+        s.frontage_at_setback = v;
+    }
     // Buildings
     if let Some(v) = p.get("typology").and_then(|v| v.as_enum()).and_then(typology_from_token) {
         s.typology = v;
@@ -640,6 +920,9 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
     }
     if let Some(v) = p.get("coverage_frac").and_then(|v| v.as_f64()) {
         s.coverage_frac = v;
+    }
+    if let Some(v) = p.get("footprint_inset").and_then(|v| v.as_f64()) {
+        s.footprint_inset = v;
     }
     if let Some(v) = p.get("floor_count").and_then(|v| v.as_i64()) {
         s.floor_count = v.max(0) as usize;
@@ -779,6 +1062,120 @@ mod tests {
     }
 
     #[test]
+    fn issue25_enum_tokens_round_trip() {
+        for r in [RegionProfile::EuroLatam, RegionProfile::UsSuburban] {
+            assert_eq!(region_from_token(region_token(r)), Some(r));
+        }
+        // Verb aliases also parse.
+        assert_eq!(region_from_token("metric"), Some(RegionProfile::EuroLatam));
+        assert_eq!(region_from_token("us"), Some(RegionProfile::UsSuburban));
+        assert_eq!(region_from_token("bogus"), None);
+
+        for l in [
+            LoadingType::FrontLoaded,
+            LoadingType::AlleyLoaded,
+            LoadingType::Mixed,
+        ] {
+            assert_eq!(loading_from_token(loading_token(l)), Some(l));
+        }
+        assert_eq!(loading_from_token("frontloaded"), Some(LoadingType::FrontLoaded));
+        assert_eq!(loading_from_token("alleyloaded"), Some(LoadingType::AlleyLoaded));
+        assert_eq!(loading_from_token("bogus"), None);
+
+        for c in [CornerAlignment::StreetWidth, CornerAlignment::StreetLength] {
+            assert_eq!(corner_align_from_token(corner_align_token(c)), Some(c));
+        }
+        assert_eq!(corner_align_from_token("width"), Some(CornerAlignment::StreetWidth));
+        assert_eq!(corner_align_from_token("length"), Some(CornerAlignment::StreetLength));
+        assert_eq!(corner_align_from_token("bogus"), None);
+
+        for i in [SkeletonImpl::Offset, SkeletonImpl::Felkel] {
+            assert_eq!(skeleton_impl_from_token(skeleton_impl_token(i)), Some(i));
+        }
+        assert_eq!(skeleton_impl_from_token("exact"), Some(SkeletonImpl::Felkel));
+        assert_eq!(skeleton_impl_from_token("bogus"), None);
+    }
+
+    #[test]
+    fn issue25_fields_round_trip() {
+        // Every field newly exposed for issue 25 survives settings → params →
+        // settings, including the non-default enum variants.
+        let s = SubdivisionSettings {
+            region: RegionProfile::UsSuburban,
+            force_street_access: 0.5,
+            lot_depth_tolerance: 4.0,
+            corner_lot_width_bonus: 0.15,
+            corner_align: CornerAlignment::StreetLength,
+            loading: LoadingType::AlleyLoaded,
+            allow_flag_lots: true,
+            flag_pole_width_min: 6.0,
+            sliver_area_frac: 0.25,
+            shallow_lot_frac: 0.4,
+            subdivide_core: false,
+            skeleton_impl: SkeletonImpl::Felkel,
+            simplify: 1.5,
+            frontage_at_setback: false,
+            footprint_inset: 3.5,
+            ..SubdivisionSettings::default()
+        };
+        let params = settings_to_params(&s);
+        let back = params_to_settings(&SubdivisionSettings::default(), &params);
+        assert_eq!(back.region, RegionProfile::UsSuburban);
+        assert_eq!(back.force_street_access, 0.5);
+        assert_eq!(back.lot_depth_tolerance, 4.0);
+        assert_eq!(back.corner_lot_width_bonus, 0.15);
+        assert_eq!(back.corner_align, CornerAlignment::StreetLength);
+        assert_eq!(back.loading, LoadingType::AlleyLoaded);
+        assert!(back.allow_flag_lots);
+        assert_eq!(back.flag_pole_width_min, 6.0);
+        assert_eq!(back.sliver_area_frac, 0.25);
+        assert_eq!(back.shallow_lot_frac, 0.4);
+        assert!(!back.subdivide_core);
+        assert_eq!(back.skeleton_impl, SkeletonImpl::Felkel);
+        assert_eq!(back.simplify, 1.5);
+        assert!(!back.frontage_at_setback);
+        assert_eq!(back.footprint_inset, 3.5);
+    }
+
+    #[test]
+    fn issue25_fields_land_in_expected_groups() {
+        use itsjustcad_doc::SubdivKind;
+        let group_of = |field: &str| {
+            grouped_fields_for_kind(SubdivKind::SitePlan)
+                .into_iter()
+                .find(|(_, fs)| fs.iter().any(|f| f.name == field))
+                .map(|(key, _)| key)
+        };
+        assert_eq!(group_of("region"), Some("param.subdivision.group.general"));
+        for f in [
+            "force_street_access",
+            "lot_depth_tolerance",
+            "corner_lot_width_bonus",
+            "corner_align",
+            "loading",
+            "allow_flag_lots",
+            "flag_pole_width_min",
+            "sliver_area_frac",
+            "shallow_lot_frac",
+            "subdivide_core",
+            "skeleton_impl",
+            "simplify",
+        ] {
+            assert_eq!(group_of(f), Some("param.subdivision.group.lots"), "{f}");
+        }
+        assert_eq!(
+            group_of("frontage_at_setback"),
+            Some("param.subdivision.group.setbacks")
+        );
+        assert_eq!(
+            group_of("footprint_inset"),
+            Some("param.subdivision.group.buildings")
+        );
+        // width_mix stays unexposed (no widget for an Option<LotWidthMix>).
+        assert_eq!(group_of("width_mix"), None);
+    }
+
+    #[test]
     fn method_token_round_trips() {
         for m in [
             SubdivisionMethod::Recursive,
@@ -822,9 +1219,11 @@ mod tests {
 
     #[test]
     fn params_to_settings_preserves_unexposed_fields() {
-        let mut base = SubdivisionSettings::default();
-        base.coverage_frac = 0.33;
-        base.floor_count = 5;
+        let base = SubdivisionSettings {
+            coverage_frac: 0.33,
+            floor_count: 5,
+            ..SubdivisionSettings::default()
+        };
         // Only change one exposed param.
         let mut params = settings_to_params(&base);
         params.insert("lot_area_min".into(), ParamValue::Float(2000.0));

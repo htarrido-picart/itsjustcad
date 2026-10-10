@@ -1396,7 +1396,7 @@ mod tests {
             .find(|m| m.title == tr("menu.llm"))
             .expect("LLM menu present at top level");
         // Leaves: Model Setup, Reveal Models Folder, Download Default Model.
-        let ls = leaves(&[llm.clone()]);
+        let ls = leaves(std::slice::from_ref(&llm));
         let by_action = |a: &MenuAction| ls.iter().any(|(_, _, act)| act == a);
         assert!(by_action(&MenuAction::ModelSetup), "Model Setup missing");
         assert!(by_action(&MenuAction::RevealModelsFolder), "Reveal Models Folder missing");

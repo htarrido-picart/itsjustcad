@@ -595,7 +595,7 @@ mod tests {
         t.on_click(DVec3::new(2.0, 0.0, 0.0)); // start point
         // On the end-point step: an arc ghost + two radius lines.
         let g = t.preview(Some(DVec3::new(0.0, 2.0, 0.0)));
-        assert!(g.len() >= 1, "arc ghost present");
+        assert!(!g.is_empty(), "arc ghost present");
     }
 
     #[test]

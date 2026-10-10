@@ -2785,6 +2785,7 @@ dependencies = [
  "itsjustcad-doc",
  "kernel-curve",
  "kernel-mesh",
+ "naga",
  "pollster",
  "wgpu",
 ]

@@ -44,7 +44,11 @@ struct FsOut {
 
 fn grid_factor(coord: vec2<f32>, spacing: f32) -> f32 {
     let c = coord / spacing;
-    let d = abs(fract(c - 0.5) - 0.5) / fwidth(c);
+    // Clamp the derivative away from zero: f32 precision in the unproject can
+    // collapse fwidth to 0 in spots, and the resulting NaN discards the pixel
+    // (reads as dotted/broken lines).
+    let fw = max(fwidth(c), vec2(1e-9));
+    let d = abs(fract(c - 0.5) - 0.5) / fw;
     let line = min(d.x, d.y);
     return 1.0 - min(line, 1.0);
 }
@@ -99,27 +103,18 @@ fn fs_main(in: VsOut) -> FsOut {
     let minor = grid_factor(hit.xy, 1.0);
     let major = grid_factor(hit.xy, 10.0);
 
-    // Axes tint: X red-ish, Y green-ish along the origin lines
-    let ax = 1.0 - min(abs(hit.y) / fwidth(hit.y), 1.0);
-    let ay = 1.0 - min(abs(hit.x) / fwidth(hit.x), 1.0);
+    // NOTE: the origin axes (the z=0 datum lines, incl. the horizontal datum in
+    // Front/Back elevations) are NOT tinted here. An analytic tint from the
+    // per-fragment unprojected hit point wanders at far zoom (f32 precision
+    // makes hit.xy jitter by meters), rendering the axes as jagged dotted
+    // staircases. The renderer draws them as real depth-tested line geometry
+    // instead (see `world_axis_lines` in renderer.rs).
 
     let dist = length(hit - camera.eye.xyz);
     let fade = exp(-dist * 0.008);
 
-    var alpha = max(minor * 0.18, major * 0.42) * fade;
-    var color = vec3(0.62, 0.64, 0.68);
-    // Origin axes = the zero datum lines (X at y=0, Y at x=0, both on z=0). Draw
-    // them WITHOUT the distance fade so the datum stays clearly marked in every
-    // view — including Front/Back elevations, where the ground plane is edge-on
-    // and the X axis reads as the horizontal z=0 datum line.
-    if (ax > 0.0) {
-        color = mix(color, vec3(0.85, 0.25, 0.25), ax);
-        alpha = max(alpha, ax * 0.9);
-    }
-    if (ay > 0.0) {
-        color = mix(color, vec3(0.25, 0.75, 0.30), ay);
-        alpha = max(alpha, ay * 0.9);
-    }
+    let alpha = max(minor * 0.18, major * 0.42) * fade;
+    let color = vec3(0.62, 0.64, 0.68);
     if (gradient) {
         // Composite the grid lines over an opaque gradient ground so the sky
         // and ground read as one continuous background (SketchUp look). The

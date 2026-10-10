@@ -11017,8 +11017,8 @@ mod tests {
             }
             app.panel_tabs.show(crate::tabstrip::PanelTab::Model); // "Layers"
         };
-        snapshot_app("layers_dark", true, &seed);
-        snapshot_app("layers_light", false, &seed);
+        snapshot_app("layers_dark", true, seed);
+        snapshot_app("layers_light", false, seed);
     }
 
     #[test]
@@ -11030,8 +11030,8 @@ mod tests {
             app.execute_line("box 0,0,0 5,5,3".to_string());
             app.pending_nav = Some(PendingNav::New);
         };
-        snapshot_app("dialog_dark", true, &seed);
-        snapshot_app("dialog_light", false, &seed);
+        snapshot_app("dialog_dark", true, seed);
+        snapshot_app("dialog_light", false, seed);
     }
 
     // ── M-guitest: journey tests ─────────────────────────────────────────
