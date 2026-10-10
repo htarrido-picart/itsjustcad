@@ -292,7 +292,33 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::{curve_px, DisplayMode, LightMode, RHINO_CURVE_PX};
+    use super::{curve_px, world_axis_lines, DisplayMode, LightMode, AXIS_EXTENT, RHINO_CURVE_PX};
+
+    #[test]
+    fn world_axis_lines_geometry() {
+        let axes = world_axis_lines();
+        assert_eq!(axes.len(), 2);
+
+        let (x_pts, x_color) = axes[0];
+        let (y_pts, y_color) = axes[1];
+
+        // Finite, f32-exact extent, symmetric about the origin.
+        assert!(AXIS_EXTENT.is_finite() && AXIS_EXTENT > 0.0);
+        assert_eq!(x_pts, [[-AXIS_EXTENT, 0.0, 0.0], [AXIS_EXTENT, 0.0, 0.0]]);
+        assert_eq!(y_pts, [[0.0, -AXIS_EXTENT, 0.0], [0.0, AXIS_EXTENT, 0.0]]);
+
+        // Both axes lie exactly on the z=0 datum plane.
+        for p in x_pts.iter().chain(y_pts.iter()) {
+            assert_eq!(p[2], 0.0);
+        }
+
+        // X is the red axis, Y the green one (red channel dominates on X,
+        // green on Y), both fully opaque.
+        assert!(x_color[0] > x_color[1] && x_color[0] > x_color[2]);
+        assert!(y_color[1] > y_color[0] && y_color[1] > y_color[2]);
+        assert_eq!(x_color[3], 1.0);
+        assert_eq!(y_color[3], 1.0);
+    }
 
     #[test]
     fn curve_px_scales_with_dpr() {
@@ -458,6 +484,32 @@ struct GpuLine {
     object_bind_group: wgpu::BindGroup,
 }
 
+/// Half-length of the world axis lines in meters. Large enough to read as
+/// infinite at any practical zoom, small enough that f32 keeps full precision
+/// on the endpoints (1e5 is exactly representable; 2e5 m total span).
+pub const AXIS_EXTENT: f32 = 1.0e5;
+
+/// World-axis overlay geometry: the X (red) and Y (green) datum lines on z=0,
+/// returned as `(endpoints, rgba)` per axis. These are drawn as REAL line
+/// segments through the hairline pipeline — the old analytic tint in
+/// `grid.wgsl` wandered at far zoom (f32 precision in the per-fragment
+/// unproject jitters the hit point by meters), which rendered the axes as
+/// jagged dotted staircases.
+pub fn world_axis_lines() -> [([[f32; 3]; 2], [f32; 4]); 2] {
+    [
+        // X axis: red, along y=0.
+        (
+            [[-AXIS_EXTENT, 0.0, 0.0], [AXIS_EXTENT, 0.0, 0.0]],
+            [0.85, 0.25, 0.25, 1.0],
+        ),
+        // Y axis: green, along x=0.
+        (
+            [[0.0, -AXIS_EXTENT, 0.0], [0.0, AXIS_EXTENT, 0.0]],
+            [0.25, 0.75, 0.30, 1.0],
+        ),
+    ]
+}
+
 struct GpuUnderlay {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
@@ -522,6 +574,11 @@ pub struct SceneRenderer {
     curve_pipeline: wgpu::RenderPipeline,
     /// LineList variant of the curve pipeline for mesh feature edges.
     edge_pipeline: wgpu::RenderPipeline,
+    /// World-axis variant of the edge pipeline: LineList using the `vs_axis`
+    /// shader entry, which nudges depth slightly toward the camera so the
+    /// coplanar grid plane (which writes an ANALYTIC frag_depth that quantizes
+    /// differently from rasterized line depth) cannot stipple over the axes.
+    axis_pipeline: wgpu::RenderPipeline,
     /// PointList pipeline for point-cloud geometry.
     point_pipeline: wgpu::RenderPipeline,
     camera_layout: wgpu::BindGroupLayout,
@@ -545,6 +602,10 @@ pub struct SceneRenderer {
     /// commit/cancel. Drawn as hairline segments over the scene, under the grid.
     /// Independent of the scene `generation` so it updates between doc changes.
     ghost_lines: Vec<GpuLine>,
+    /// Persistent world X/Y axis segments (see [`world_axis_lines`]). Built
+    /// once in [`SceneRenderer::new`]; drawn every frame wherever the grid is
+    /// drawn, independent of document content.
+    axis_lines: Vec<GpuLine>,
     underlay: Option<GpuUnderlay>,
     basemap: Option<GpuUnderlay>,
     /// Document generation the GPU buffers were built from.
@@ -793,6 +854,54 @@ impl SceneRenderer {
             cache: None,
         });
 
+        // World axes: same shader/topology as feature edges, but with the
+        // `vs_axis` entry point, which nudges depth a few ULPs toward the
+        // camera. The axes are coplanar with the grid plane (z=0) but the grid
+        // writes an ANALYTIC frag_depth while lines rasterize interpolated
+        // depth — the two quantize differently in Depth24Plus, so without the
+        // nudge the depth test flips per-pixel and the (opaque, gradient-mode)
+        // grid stipples over the axes. The underlay solves the same problem
+        // with a fixed-function depth bias, but wgpu rejects depth bias on
+        // line topology, hence the vertex-shader nudge.
+        let axis_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("axis_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: wgpu::VertexState {
+                module: &curve_shader,
+                entry_point: Some("vs_axis"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &curve_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Point cloud: same shader as curves, PointList topology.
         let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("point_pipeline"),
@@ -920,12 +1029,13 @@ impl SceneRenderer {
             cache: None,
         });
 
-        Self {
+        let mut renderer = Self {
             grid_pipeline,
             mesh_pipeline,
             mesh_xray_pipeline,
             curve_pipeline,
             edge_pipeline,
+            axis_pipeline,
             point_pipeline,
             camera_layout,
             cameras: Vec::new(),
@@ -938,10 +1048,31 @@ impl SceneRenderer {
             profile_ribbons: Vec::new(),
             point_clouds: Vec::new(),
             ghost_lines: Vec::new(),
+            axis_lines: Vec::new(),
             underlay: None,
             basemap: None,
             generation: u64::MAX,
+        };
+
+        // Persistent world X/Y axis segments: two tiny vertex buffers uploaded
+        // once, drawn every frame alongside the grid.
+        {
+            use wgpu::util::DeviceExt as _;
+            for (points, color) in world_axis_lines() {
+                let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("axis_vb"),
+                    contents: bytemuck::cast_slice(&points),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let object_bind_group = renderer.object_bind_group(device, color);
+                renderer.axis_lines.push(GpuLine {
+                    vertex_buf,
+                    vertex_count: points.len() as u32,
+                    object_bind_group,
+                });
+            }
         }
+        renderer
     }
 
     /// Upload the camera for one viewport pane, growing the slot list on demand.
@@ -1399,5 +1530,19 @@ impl SceneRenderer {
         // Grid last: blends over background, depth-tested against meshes.
         render_pass.set_pipeline(&self.grid_pipeline);
         render_pass.draw(0..3, 0..1);
+
+        // World X/Y axes: the z=0 datum lines (incl. the horizontal datum in
+        // Front/Back elevations), as real line geometry so they stay straight
+        // at any zoom. Drawn after the grid (whose gradient mode is opaque)
+        // with the depth-biased axis pipeline so the coplanar grid plane does
+        // not stipple over them; still depth-tested, so meshes occlude them.
+        // They share the grid's visibility: any view that paints the grid
+        // paints the axes.
+        render_pass.set_pipeline(&self.axis_pipeline);
+        for axis in &self.axis_lines {
+            render_pass.set_bind_group(1, &axis.object_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, axis.vertex_buf.slice(..));
+            render_pass.draw(0..axis.vertex_count, 0..1);
+        }
     }
 }

@@ -23,6 +23,19 @@ fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
     return camera.view_proj * vec4(position, 1.0);
 }
 
+// World-axis variant: nudge the clip-space depth a few Depth24Plus ULPs toward
+// the camera. The axes are coplanar with the grid plane (z=0), but the grid
+// writes an ANALYTIC frag_depth while lines rasterize interpolated depth — the
+// two quantize differently, and without the nudge the depth test flips
+// per-pixel and the (opaque, gradient-mode) grid stipples over the axes.
+// A fixed-function depth bias can't be used: wgpu rejects it on line topology.
+@vertex
+fn vs_axis(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+    var clip = camera.view_proj * vec4(position, 1.0);
+    clip.z -= 5e-7 * clip.w; // ~8 ULPs of Depth24Plus in NDC
+    return clip;
+}
+
 @fragment
 fn fs_main() -> @location(0) vec4<f32> {
     // Pencil mode: black ink on paper white, but keep selection highlights
