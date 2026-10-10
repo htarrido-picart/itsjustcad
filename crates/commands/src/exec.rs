@@ -26289,8 +26289,8 @@ mod tests {
         // Undo the refresh, then the subdivide → both links dropped.
         run(&mut s, "undo");
         run(&mut s, "undo");
-        assert!(s.doc.subdivision_links.get(&b1).is_none(), "b1 link dropped on undo");
-        assert!(s.doc.subdivision_links.get(&b2).is_none(), "b2 link dropped on undo");
+        assert!(!s.doc.subdivision_links.contains_key(&b1), "b1 link dropped on undo");
+        assert!(!s.doc.subdivision_links.contains_key(&b2), "b2 link dropped on undo");
     }
 
     /// W1 gap 1: deleting a subdivision SOURCE cascades to its lots and drops
@@ -26317,7 +26317,7 @@ mod tests {
         // Delete the source → link dropped, lots cascade-deleted, source gone.
         s.run(Command::Delete { targets: Selector::Ids { ids: vec![source] } })
             .expect("delete");
-        assert!(s.doc.subdivision_links.get(&source).is_none(), "link dropped");
+        assert!(!s.doc.subdivision_links.contains_key(&source), "link dropped");
         assert!(s.doc.get(source).is_none(), "source removed");
         for id in &lots {
             assert!(s.doc.get(*id).is_none(), "cascaded lot {id:?} removed");

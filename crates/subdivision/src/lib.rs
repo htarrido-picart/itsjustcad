@@ -48,8 +48,8 @@ pub use reporting::{FrontageStats, YieldComparison, YieldInputs, YieldReport};
 pub use geometry::polyline::PolylineTools;
 pub use geometry::split::{split_by_line, Line2d};
 pub use settings::{
-    FootprintMode, LoadingType, LotWidthMix, RegionProfile, RoofType, SkeletonImpl,
-    StreetPattern, SubdivisionMethod, SubdivisionSettings, Typology,
+    CornerAlignment, FootprintMode, LoadingType, LotWidthMix, RegionProfile, RoofType,
+    SkeletonImpl, StreetPattern, SubdivisionMethod, SubdivisionSettings, Typology,
 };
 pub use subdivision::lot_rules::{
     apply_lot_rules, LotRulesReport, WidthMixResult, WidthMixSolver,

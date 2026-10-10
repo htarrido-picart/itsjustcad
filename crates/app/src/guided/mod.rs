@@ -946,7 +946,7 @@ mod tests {
         assert!(t.active());
         // Step 1: distance. Prompt shows the default.
         assert_eq!(t.prompt().unwrap(), "Offset distance <1>:");
-        assert!(t.current_is_point() == false);
+        assert!(!t.current_is_point());
         assert_eq!(t.commit_typed("5"), StepResult::NeedMore);
         // Step 2: side point.
         assert!(t.current_is_point());

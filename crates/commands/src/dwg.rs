@@ -318,7 +318,7 @@ mod tests {
             let dirs = dwg2dxf_search_dirs();
             let local = home.join(".local").join("bin");
             let local_idx = dirs.iter().position(|d| *d == local);
-            let usrlocal_idx = dirs.iter().position(|d| *d == PathBuf::from("/usr/local/bin"));
+            let usrlocal_idx = dirs.iter().position(|d| d.as_path() == std::path::Path::new("/usr/local/bin"));
             assert!(local_idx.is_some(), "{dirs:?}");
             assert!(usrlocal_idx.is_some(), "{dirs:?}");
             assert!(local_idx < usrlocal_idx, "~/.local/bin must precede /usr/local/bin: {dirs:?}");

@@ -1293,7 +1293,7 @@ mod tests {
             region: RegionProfile::UsSuburban,
             ..SubdivisionSettings::default()
         };
-        let m_setback = measure_frontage(&[poly.clone()], FrontageAt::Setback, &s);
+        let m_setback = measure_frontage(std::slice::from_ref(&poly), FrontageAt::Setback, &s);
         let m_curb = measure_frontage(&[poly], FrontageAt::Curb, &s);
         // Curb (40) vs setback (40 − 2*side = 32): they differ.
         assert!((m_curb[0].length - 40.0).abs() < 0.5, "curb {}", m_curb[0].length);
@@ -1336,7 +1336,7 @@ mod tests {
             ..SubdivisionSettings::default()
         };
         let out = subdivide_blocks(&[(block, 0.0)], &ss).unwrap();
-        assert!(out.polygons.len() >= 1);
+        assert!(!out.polygons.is_empty());
         // With force_street_access, every lot keeps a boundary (street) edge.
         assert_eq!(out.with_street, out.polygons.len(), "all lots must front a street");
     }
