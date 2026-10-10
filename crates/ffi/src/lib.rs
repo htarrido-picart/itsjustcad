@@ -1965,6 +1965,192 @@ fn layers_json(doc: &itsjustcad_doc::Document) -> String {
     out
 }
 
+/// The document's sheets and sheet sets as JSON, for the iPad Sheets (paper-space)
+/// UI: `{"sheets":[{"name","size","views":[{"direction","scale"}]}],"sets":[{"name","sheets":["<name>",…]}]}`.
+/// `size` is the paper-size label (`"a4"`…`"a0"`) and `direction` is the view
+/// direction token (`"top"`/`"front"`/`"right"`/`"persp"`); both lowercase and
+/// stable. Every name is JSON-escaped. Returns `{"sheets":[],"sets":[]}`
+/// (non-null) for a null/invalid handle. Caller must [`ijc_string_free`] the
+/// result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer must
+/// be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_sheets_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::from("{\"sheets\":[],\"sets\":[]}"));
+        };
+        into_c_string(sheets_json(&app.session.doc))
+    })
+}
+
+/// Serialize the document's sheets and sheet sets to compact JSON. Built by hand
+/// (no serde dep in this crate); every string field is JSON-escaped. Paper size
+/// and view direction use their stable lowercase labels.
+fn sheets_json(doc: &itsjustcad_doc::Document) -> String {
+    fn esc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    let mut out = String::from("{\"sheets\":[");
+    for (i, sheet) in doc.sheets.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"name\":\"{}\",\"size\":\"{}\",\"views\":[",
+            esc(&sheet.name),
+            sheet.paper.label(),
+        ));
+        for (j, view) in sheet.views.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"direction\":\"{}\",\"scale\":{}}}",
+                view.direction.label(),
+                view.scale,
+            ));
+        }
+        out.push_str("]}");
+    }
+    out.push_str("],\"sets\":[");
+    for (i, set) in doc.sheet_sets.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{{\"name\":\"{}\",\"sheets\":[", esc(&set.name)));
+        for (j, name) in set.sheets.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("\"{}\"", esc(name)));
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]}");
+    out
+}
+
+/// Render one sheet to a vector PDF for the iPad Sheets UI. Looks up the sheet in
+/// `doc.sheets` by `name`; on a hit, calls [`pdf::sheet_pdf`] and returns a heap
+/// buffer of the PDF bytes with the byte count written to `*out_len`. Returns null
+/// (and sets `*out_len = 0`) for a null/invalid handle, a null `name`, or an
+/// unknown sheet. Mirrors [`ijc_export`]'s allocation/return path. Caller MUST free
+/// the buffer with [`ijc_bytes_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `name` must be a valid
+/// NUL-terminated C string. `out_len` must be null or a writable `usize*`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_sheet_pdf(
+    h: *mut AppHandle,
+    name: *const c_char,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard_ffi(std::ptr::null_mut(), || {
+        if !out_len.is_null() {
+            unsafe { *out_len = 0 };
+        }
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return std::ptr::null_mut();
+        };
+        if name.is_null() {
+            return std::ptr::null_mut();
+        }
+        let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+            return std::ptr::null_mut();
+        };
+        let doc = &app.session.doc;
+        let Some(sheet) = doc.sheet(name) else {
+            return std::ptr::null_mut();
+        };
+        let bytes = itsjustcad_commands::pdf::sheet_pdf(doc, sheet).0;
+        if bytes.is_empty() {
+            return std::ptr::null_mut();
+        }
+        let mut boxed = bytes.into_boxed_slice();
+        let len = boxed.len();
+        let ptr = boxed.as_mut_ptr();
+        std::mem::forget(boxed);
+        if !out_len.is_null() {
+            unsafe { *out_len = len };
+        }
+        ptr
+    })
+}
+
+/// Render a whole sheet set to a multi-page vector PDF for the iPad Sheets UI.
+/// Looks up the [`SheetSet`] by `name`, resolves its member sheet names to live
+/// `&Sheet`s (skipping any that no longer exist), and calls [`pdf::sheets_pdf`].
+/// Returns a heap buffer of the PDF bytes with the byte count written to
+/// `*out_len`. Returns null (and sets `*out_len = 0`) for a null/invalid handle, a
+/// null `name`, an unknown set, or a set that resolves to no sheets. Mirrors
+/// [`ijc_export`]'s allocation/return path. Caller MUST free the buffer with
+/// [`ijc_bytes_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `name` must be a valid
+/// NUL-terminated C string. `out_len` must be null or a writable `usize*`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_sheetset_pdf(
+    h: *mut AppHandle,
+    name: *const c_char,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard_ffi(std::ptr::null_mut(), || {
+        if !out_len.is_null() {
+            unsafe { *out_len = 0 };
+        }
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return std::ptr::null_mut();
+        };
+        if name.is_null() {
+            return std::ptr::null_mut();
+        }
+        let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+            return std::ptr::null_mut();
+        };
+        let doc = &app.session.doc;
+        let Some(set) = doc.sheet_set(name) else {
+            return std::ptr::null_mut();
+        };
+        // Resolve each member name to its live sheet, skipping any that are
+        // missing (a set may linger a name after its sheet is deleted).
+        let resolved: Vec<&itsjustcad_doc::Sheet> =
+            set.sheets.iter().filter_map(|n| doc.sheet(n)).collect();
+        if resolved.is_empty() {
+            return std::ptr::null_mut();
+        }
+        let bytes = itsjustcad_commands::pdf::sheets_pdf(doc, &resolved).0;
+        if bytes.is_empty() {
+            return std::ptr::null_mut();
+        }
+        let mut boxed = bytes.into_boxed_slice();
+        let len = boxed.len();
+        let ptr = boxed.as_mut_ptr();
+        std::mem::forget(boxed);
+        if !out_len.is_null() {
+            unsafe { *out_len = len };
+        }
+        ptr
+    })
+}
+
 /// A compact digest of the current scene for the on-device model's instructions.
 /// Returns an empty (but non-null) string for a null/invalid handle. Caller must
 /// [`ijc_string_free`] the result.
@@ -2107,6 +2293,28 @@ mod tests {
         assert!(json.contains("\"colorRgba\":["));
         assert!(json.contains("\"active\":true"));
         assert!(json.contains("\"linetype\":\"continuous\""));
+    }
+
+    #[test]
+    fn sheets_fns_are_null_safe() {
+        let nil = std::ptr::null_mut::<AppHandle>();
+        unsafe {
+            // Null handle → a non-null, empty-but-well-formed sheets object.
+            let p = ijc_sheets_json(nil);
+            assert!(!p.is_null());
+            let s = CStr::from_ptr(p).to_str().unwrap();
+            assert_eq!(s, "{\"sheets\":[],\"sets\":[]}");
+            ijc_string_free(p);
+
+            // Null handle → null PDF bytes and a zeroed length.
+            let name = CString::new("plan").unwrap();
+            let mut len: usize = 123;
+            assert!(ijc_sheet_pdf(nil, name.as_ptr(), &mut len).is_null());
+            assert_eq!(len, 0);
+            len = 123;
+            assert!(ijc_sheetset_pdf(nil, name.as_ptr(), &mut len).is_null());
+            assert_eq!(len, 0);
+        }
     }
 
     #[test]
