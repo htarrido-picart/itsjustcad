@@ -2046,6 +2046,54 @@ fn sheets_json(doc: &itsjustcad_doc::Document) -> String {
     out
 }
 
+/// Rename a sheet. Returns false on null/invalid handle, null names, an unknown
+/// `old` name, or if `new` collides with an existing sheet. Updates sheet-set
+/// membership that referenced `old`, and bumps `doc.generation`.
+///
+/// This mutates the document directly (no shared `Command`), sidestepping the
+/// spaces-in-names parse problem; there is no op-log/undo for rename in v1.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `old` and `new` must each
+/// be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_sheet_rename(
+    h: *mut AppHandle,
+    old: *const c_char,
+    new: *const c_char,
+) -> bool {
+    guard_ffi(false, || {
+        if old.is_null() || new.is_null() {
+            return false;
+        }
+        let Ok(old) = (unsafe { CStr::from_ptr(old) }).to_str() else { return false };
+        let Ok(new) = (unsafe { CStr::from_ptr(new) }).to_str() else { return false };
+        if new.is_empty() {
+            return false;
+        }
+        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let doc = &mut app.session.doc;
+        // A no-op rename (old == new) is a success, but a different sheet named
+        // `new` is a collision.
+        if old != new && doc.sheets.iter().any(|s| s.name == new) {
+            return false;
+        }
+        let Some(sheet) = doc.sheets.iter_mut().find(|s| s.name == old) else {
+            return false;
+        };
+        sheet.name = new.to_owned();
+        for set in &mut doc.sheet_sets {
+            for member in &mut set.sheets {
+                if *member == old {
+                    *member = new.to_owned();
+                }
+            }
+        }
+        doc.generation += 1;
+        true
+    })
+}
+
 /// Render one sheet to a vector PDF for the iPad Sheets UI. Looks up the sheet in
 /// `doc.sheets` by `name`; on a hit, calls [`pdf::sheet_pdf`] and returns a heap
 /// buffer of the PDF bytes with the byte count written to `*out_len`. Returns null
