@@ -379,21 +379,49 @@ fn render_view(
     content: &mut String,
 ) -> usize {
     let (rmin, rmax) = rect;
-    // Border.
+    // No viewport border: the outline must not print. Line art is still clipped
+    // to the rect below (see `cmin`/`cmax`/`clip_segment`); only the visible
+    // rectangle is gone.
+
+    // Professional CAD callout in the bottom-left of the cell: a view title in a
+    // larger font, a thin underline rule, and a smaller scale line beneath it.
+    let title = match view.direction {
+        ViewDirection::Top => "PLAN".to_owned(),
+        ViewDirection::Front => "FRONT ELEVATION".to_owned(),
+        ViewDirection::Right => "SIDE ELEVATION".to_owned(),
+        ViewDirection::Iso => "PERSPECTIVE".to_owned(),
+    };
+    // Scale as an integer when whole (`1:100`, not `1:100.0`).
+    let scale = if view.scale.fract() == 0.0 {
+        format!("{}", view.scale as i64)
+    } else {
+        format!("{}", view.scale)
+    };
+    let title_x = rmin.x + 2.0;
+    let title_y = rmin.y + 6.0;
+    let scale_y = rmin.y + 1.5;
+    // Underline rule spanning the approximate title width (~2mm per glyph at
+    // 11pt), clamped to the cell width.
+    let rule_y = title_y - 1.5;
+    let rule_w = ((title.len() as f64) * 2.0).clamp(20.0, rmax.x - rmin.x - 2.0);
     content.push_str(&format!(
-        "0.6 w {} {} {} {} re S\n",
-        mm(rmin.x),
-        mm(rmin.y),
-        mm(rmax.x - rmin.x),
-        mm(rmax.y - rmin.y)
+        "BT /F1 11 Tf {} {} Td ({}) Tj ET\n",
+        mm(title_x),
+        mm(title_y),
+        escape_pdf_text(&title)
     ));
-    // Label: "top 1:100" under the top border.
     content.push_str(&format!(
-        "BT /F1 8 Tf {} {} Td ({} 1:{}) Tj ET\n",
-        mm(rmin.x + 2.0),
-        mm(rmax.y - 5.0),
-        view.direction.label(),
-        view.scale
+        "0.3 w {} {} m {} {} l S\n",
+        mm(title_x),
+        mm(rule_y),
+        mm(title_x + rule_w),
+        mm(rule_y)
+    ));
+    content.push_str(&format!(
+        "BT /F1 8 Tf {} {} Td ({}) Tj ET\n",
+        mm(title_x),
+        mm(scale_y),
+        escape_pdf_text(&format!("SCALE  1:{scale}"))
     ));
 
     // Collect (lineweight_mm, plot_color, world-segment) tuples.
@@ -1061,16 +1089,17 @@ mod tests {
             let mut s = Session::default();
             s.run(parse("sheet s1 a3").unwrap()).unwrap();
             s.run(parse(&format!("sheetview s1 top {scale}")).unwrap()).unwrap();
-            // 5 mm cap height ON PAPER.
-            s.run(parse("sheettext s1 20,180 PLAN 5").unwrap()).unwrap();
+            // 5 mm cap height ON PAPER. Use a content string that does NOT
+            // collide with any viewport callout title (which also emit `(…) Tj`).
+            s.run(parse("sheettext s1 20,180 ROOM 5").unwrap()).unwrap();
             let sheet = s.doc.sheet("s1").unwrap().clone();
             let (bytes, _) = sheet_pdf(&s.doc, &sheet);
             let content = String::from_utf8_lossy(&bytes).into_owned();
-            // Extract the "/F1 <pt> Tf ... (PLAN) Tj" font-size token.
+            // Extract the "/F1 <pt> Tf ... (ROOM) Tj" font-size token.
             let line = content
                 .lines()
-                .find(|l| l.contains("(PLAN)"))
-                .expect("PLAN text must be emitted")
+                .find(|l| l.contains("(ROOM)"))
+                .expect("ROOM text must be emitted")
                 .to_string();
             // token after "/F1"
             let toks: Vec<&str> = line.split_whitespace().collect();
