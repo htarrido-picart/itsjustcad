@@ -48,7 +48,7 @@ use itsjustcad_deck::{
 };
 use itsjustcad_render::{
     DEPTH_FORMAT, DisplayMode, LineEntry, OrbitCamera, SceneRenderer, StandardView, Theme,
-    camera_uniform_with_mode, object_wireframe_world, snapshot,
+    UnderlayData, camera_uniform_with_mode, object_wireframe_world, snapshot,
 };
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
 
@@ -183,6 +183,12 @@ struct SendCtx {
 unsafe impl Send for SendCtx {}
 unsafe impl Sync for SendCtx {}
 
+/// Decoded-underlay cache: `(stored underlay path, Arc<(rgba, width_px,
+/// height_px)>)`. An empty pixel buffer records a prior decode failure. Kept as
+/// a type alias so the FFI render loop and [`decode_underlay`] share one name
+/// (and to satisfy clippy's `type_complexity`).
+type UnderlayCache = Option<(String, Arc<(Vec<u8>, u32, u32)>)>;
+
 pub struct AppHandle {
     /// Liveness guard; must equal [`GUARD_LIVE`]. Poisoned on free.
     guard: u64,
@@ -236,6 +242,13 @@ pub struct AppHandle {
     last_gen: Option<u64>,
     theme: Theme,
     mode: DisplayMode,
+
+    /// Decoded-underlay cache: `(stored path, Arc<(rgba, w, h)>)`. Keyed on the
+    /// document's stored underlay path so the (potentially large) image is
+    /// decoded only when the path changes — not on every geometry edit while
+    /// tracing. An empty pixel buffer caches a prior decode failure. Mirrors the
+    /// desktop app's `underlay_cache`.
+    underlay_cache: UnderlayCache,
 
     /// Live gumball preview (iOS full gumball), or `None` when idle. When set,
     /// `ijc_render_frame` draws an amber ghost wireframe of the selection under
@@ -376,6 +389,85 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
         view_formats: &[],
     });
     tex.create_view(&Default::default())
+}
+
+/// Build the user-facing refusal message for a side-effecting deck command that
+/// the workdir gate rejected. For an `underlay`, pinpoint WHY it was refused
+/// (no workdir / file missing / escapes the workdir) so the chat surfaces an
+/// actionable reason instead of a generic "not allowed". Every other
+/// side-effecting command (import/export/print) keeps the generic message.
+fn side_effect_refusal(cmd: &Command) -> String {
+    if let Command::Underlay { path, .. } = cmd {
+        return match itsjustcad_commands::workdir::get() {
+            None => format!("refused: can't trace '{path}' — no workdir is set on the core"),
+            Some(dir) => {
+                let full = dir.join(path);
+                if !full.exists() {
+                    format!(
+                        "refused: can't trace '{path}' — not found in workdir ({})",
+                        dir.display()
+                    )
+                } else {
+                    format!("refused: can't trace '{path}' — resolves outside the workdir")
+                }
+            }
+        };
+    }
+    "refused: filesystem command from the assistant is not allowed".to_string()
+}
+
+/// Decode the document's underlay into GPU-ready [`UnderlayData`], caching the
+/// decoded pixels by stored path so a large image is decoded only when the path
+/// changes (not on every geometry edit while tracing). The stored portable bare
+/// NAME is mapped to the real file via the workdir resolver — exactly the file
+/// the gate authorized. A missing/unreadable file or unsupported format drops
+/// the texture (empty-pixel entry cached) rather than erroring: the placement
+/// still stands, matching the desktop's "warning not error" contract. iOS
+/// attachments are JPEG, so the ffi `image` dependency enables the jpeg feature.
+///
+/// Why this lives here (not in `snapshot`): the render crate has no `image`
+/// dependency by design — the host owns decoding. The desktop app does this in
+/// `App::decode_underlay`; this is the FFI/iOS twin, previously missing, which
+/// is why a granted underlay applied but never drew on device.
+fn decode_underlay(
+    doc: &itsjustcad_doc::Document,
+    cache: &mut UnderlayCache,
+) -> Option<UnderlayData> {
+    let u = doc.underlay.as_ref()?;
+    let pixels = match cache {
+        Some((path, px)) if *path == u.path => px.clone(),
+        _ => {
+            let open_path = itsjustcad_commands::workdir::resolve_for_open(&u.path);
+            let decoded = image::open(&open_path).ok().map(|img| {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                (rgba.into_raw(), w, h)
+            });
+            if decoded.is_none() {
+                eprintln!("[ijc] underlay image not shown: {} (decode failed)", u.path);
+            }
+            let px = Arc::new(decoded.unwrap_or_else(|| (Vec::new(), 0, 0)));
+            *cache = Some((u.path.clone(), px.clone()));
+            px
+        }
+    };
+    let (rgba, w, h) = (&pixels.0, pixels.1, pixels.2);
+    if rgba.is_empty() || w == 0 || h == 0 {
+        return None; // missing/failed decode cached as empty
+    }
+    let c = u.quad_corners();
+    Some(UnderlayData {
+        rgba: rgba.clone(),
+        width_px: w,
+        height_px: h,
+        corners: [
+            [c[0].x as f32, c[0].y as f32, 0.0],
+            [c[1].x as f32, c[1].y as f32, 0.0],
+            [c[2].x as f32, c[2].y as f32, 0.0],
+            [c[3].x as f32, c[3].y as f32, 0.0],
+        ],
+        opacity: u.opacity,
+    })
 }
 
 /// Route a command line to a deferred op: camera verbs go to the camera, every
@@ -619,6 +711,7 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
             last_gen: None,
             theme: Theme::Dark,
             mode: DisplayMode::default(),
+            underlay_cache: None,
             gumball_preview: None,
             runtime,
             deck: None,
@@ -869,7 +962,7 @@ pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char)
             && cmd.is_side_effecting()
             && !itsjustcad_commands::workdir::allows_underlay(cmd)
         {
-            eprintln!("[ijc] refused side-effecting host command (filesystem/network not allowed)");
+            eprintln!("[ijc] {}", side_effect_refusal(cmd));
             return false;
         }
         if let Ok(mut pending) = app.pending.lock() {
@@ -1612,7 +1705,12 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
         // Re-upload geometry only when the document changed.
         let doc_gen = app.session.doc.generation;
         if app.last_gen != Some(doc_gen) {
-            let scene = snapshot(&app.session.doc, app.theme);
+            let mut scene = snapshot(&app.session.doc, app.theme);
+            // The host owns image decoding (the render crate has no `image` dep),
+            // so attach the decoded underlay here — the FFI twin of the desktop's
+            // `App::decode_underlay`. Without this a granted underlay applies to
+            // the doc but never draws on device.
+            scene.underlay = decode_underlay(&app.session.doc, &mut app.underlay_cache);
             app.renderer
                 .set_scene(&app.device, &app.queue, &scene, doc_gen);
             app.last_gen = Some(doc_gen);
@@ -1955,12 +2053,7 @@ unsafe fn deck_send_inner(
                                         && cmd.is_side_effecting()
                                         && !itsjustcad_commands::workdir::allows_underlay(cmd)
                                     {
-                                        emit(
-                                            cb,
-                                            &ctx,
-                                            CB_ERROR,
-                                            "refused: filesystem command from the assistant is not allowed",
-                                        );
+                                        emit(cb, &ctx, CB_ERROR, &side_effect_refusal(cmd));
                                         continue;
                                     }
                                     // Auto-apply mode: run as it streams. Approval

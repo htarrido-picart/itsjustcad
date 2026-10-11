@@ -14,6 +14,19 @@
 
 use crate::command::Command;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// Process-global in-memory workdir grant. Populated by [`set`] the moment a
+/// workdir is granted, and consulted FIRST by [`get`]. This is what makes the
+/// grant work on hosts where the on-disk config (`$HOME/.config/itsjustcad/
+/// workdir.txt`) is not writable — notably the iOS app sandbox, whose data
+/// container root does not accept a new top-level `.config` directory. On the
+/// desktop it is simply a redundant cache of the same path the file holds, so
+/// behaviour (including cross-run persistence via the file) is unchanged.
+fn mem_workdir() -> &'static Mutex<Option<PathBuf>> {
+    static CELL: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
 
 /// Extensions the substrate can import (kept in sync with the `import` dispatch
 /// in `exec.rs`). Used to filter the workdir listing to files the deck can
@@ -35,6 +48,13 @@ fn dirs_home() -> Option<PathBuf> {
 /// The currently-granted workdir, if any (canonicalized on read so comparisons
 /// are stable). `None` when unset or the stored path no longer exists.
 pub fn get() -> Option<PathBuf> {
+    // In-memory grant (set this process) wins — authoritative where the on-disk
+    // config can't be written (iOS). Still revalidated as an existing directory.
+    if let Some(p) = mem_workdir().lock().ok().and_then(|g| g.clone())
+        && p.is_dir()
+    {
+        return Some(p.canonicalize().unwrap_or(p));
+    }
     let raw = std::fs::read_to_string(workdir_config_path()?).ok()?;
     let raw = raw.trim();
     if raw.is_empty() {
@@ -53,12 +73,26 @@ pub fn set(path: &str) -> Result<PathBuf, String> {
         return Err(format!("workdir '{path}' is not an existing directory"));
     }
     let canon = p.canonicalize().map_err(|e| format!("cannot resolve '{path}': {e}"))?;
-    let cfg = workdir_config_path().ok_or("cannot locate config dir (no $HOME)")?;
-    if let Some(parent) = cfg.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create config dir: {e}"))?;
+    // Record the grant in memory FIRST so it is live for this process even if the
+    // on-disk persistence below fails (iOS: the sandbox has no writable $HOME
+    // config dir). This is what [`get`] consults first.
+    if let Ok(mut g) = mem_workdir().lock() {
+        *g = Some(canon.clone());
     }
-    std::fs::write(&cfg, canon.to_string_lossy().as_bytes())
-        .map_err(|e| format!("cannot persist workdir: {e}"))?;
+    // Best-effort cross-run persistence to the config file. On hosts where this
+    // can't be written (no $HOME, read-only config dir) the grant still stands
+    // for the running process via the in-memory cell above — so a write failure
+    // here is non-fatal rather than failing the whole grant.
+    if let Some(cfg) = workdir_config_path() {
+        let persisted = cfg
+            .parent()
+            .map(std::fs::create_dir_all)
+            .transpose()
+            .and_then(|_| std::fs::write(&cfg, canon.to_string_lossy().as_bytes()));
+        if let Err(e) = persisted {
+            eprintln!("[workdir] in-memory grant set; could not persist to {}: {e}", cfg.display());
+        }
+    }
     Ok(canon)
 }
 
