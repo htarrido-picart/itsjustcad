@@ -43,23 +43,15 @@ fn next_maximize(
     }
 }
 
-/// Minimum command-line height (points): the input row plus ~4 history lines —
-/// always enough to type into AND read recent output, so a drag can't squeeze
-/// the command line down to a single cramped row.
-pub(crate) const CMD_HEIGHT_MIN: f32 = 4.0 * 16.0 + 44.0;
-/// Default command-line height (points) when nothing is persisted: ~5 history
-/// lines (≈16pt each) plus the input-row reserve — the height the region used
-/// before it became user-resizable.
-pub(crate) const CMD_HEIGHT_DEFAULT: f32 = 5.0 * 16.0 + 44.0;
-/// Thickness (points) of the draggable splitter handle strip at the top edge of
-/// the command line.
-const CMD_SPLITTER_H: f32 = 6.0;
-
-/// Clamp a candidate command-line height to `[CMD_HEIGHT_MIN, 0.6 * column_h]`
-/// so the deck body above always keeps a sane minimum. Pure — unit-tested.
-pub(crate) fn clamp_cmd_height(candidate: f32, column_h: f32) -> f32 {
-    let max = (column_h * 0.6).max(CMD_HEIGHT_MIN);
-    candidate.clamp(CMD_HEIGHT_MIN, max)
+/// The two surfaces of the Deck (right) pane, mirroring the iOS
+/// `Chat | Commands` segmented control (issue #28). The command-line bottom
+/// panel + `cmd_height` splitter it replaced were removed with this change: the
+/// commands history/input now lives in the Commands segment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum DeckSegment {
+    #[default]
+    Chat,
+    Commands,
 }
 
 #[derive(Clone, PartialEq)]
@@ -659,18 +651,10 @@ pub struct App {
     /// tabs never changes it (the panel always renders at this width). This is
     /// the single width source of truth — see `right_panel`.
     dock_width: f32,
-    /// Height (points) of the command-line region docked at the bottom of the
-    /// right column. A user drags the thin handle strip at the TOP of the command
-    /// line to resize it: dragging UP grows the command line (and implicitly
-    /// shrinks the deck body above it); dragging DOWN does the reverse. The panel
-    /// itself is ALWAYS rendered with `.exact_size(cmd_height)` (never
-    /// `.resizable(true)`) so its rect is deterministic every frame — this is what
-    /// keeps the TextEdit's focus/keystroke handling stable (the c2cfcff dropped-
-    /// keystroke bug came from a *resizable* nested panel whose two resize handles
-    /// fought frame-to-frame). One manual splitter controls BOTH sizes. Clamped to
-    /// [`CMD_HEIGHT_MIN`, 60% of the column height] each frame. Persisted to
-    /// `ui.json` like `dock_width`.
-    cmd_height: f32,
+    /// Which segment of the Deck tab is showing: the conversational Chat surface
+    /// or the Commands history + input (issue #28, mirroring the iOS
+    /// `Chat | Commands` segmented control). Default [`DeckSegment::Chat`].
+    deck_segment: DeckSegment,
     /// Screen-space x of the right dock's ACTUAL drawn left edge this frame, or
     /// `None` when the dock is hidden. The viewport clamps its right edge to this
     /// so the 3D wgpu callback (painted last, scissored to the central rect) can
@@ -1275,7 +1259,7 @@ impl App {
             pending_plugin_delete: None,
             plugin_json_view: None,
             dock_width: crate::tabstrip::DOCK_WIDTH,
-            cmd_height: load_cmd_height().unwrap_or(CMD_HEIGHT_DEFAULT),
+            deck_segment: DeckSegment::default(),
             dock_left: None,
             panel_visible: true,
             reduce_motion: load_reduce_motion(),
@@ -6658,10 +6642,46 @@ impl App {
         }
     }
 
-    /// Command-line panel body. Docked at the bottom of the right panel: history
-    /// (op-log scrollback) sits above the input and the autosuggest popup opens
-    /// upward — the Rhino/AutoCAD layout.
-    fn command_line_body(&mut self, ui: &mut egui::Ui) {
+    /// The Deck tab body: a `Chat | Commands` segmented control (issue #28,
+    /// mirroring iOS) then the active segment. Chat = the LLM composer/transcript
+    /// + `/` inline palette; Commands = the re-homed command history + input.
+    fn deck_tab(&mut self, ui: &mut egui::Ui) {
+        // ── Segmented control (egui button group) ───────────────────────────
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = crate::theme::Spacing::XS;
+            ui.selectable_value(&mut self.deck_segment, DeckSegment::Chat, "Chat");
+            ui.selectable_value(&mut self.deck_segment, DeckSegment::Commands, "Commands");
+        });
+        ui.add_space(crate::theme::Spacing::XS);
+
+        match self.deck_segment {
+            DeckSegment::Chat => {
+                let dark = ui.visuals().dark_mode;
+                let roles = self.live_roles(dark);
+                // A leading-`/` command submitted in Chat is returned here: run it
+                // through the same `execute_line` path as the command line and echo
+                // it into the Commands history (deck_pane already pushed a compact
+                // confirmation into the transcript).
+                if let Some(cmd) = self.deck_pane.ui(
+                    ui,
+                    &mut self.session,
+                    &self.tokio,
+                    &self.icons,
+                    &roles,
+                    dark,
+                    self.reduce_motion,
+                ) {
+                    self.execute_line(cmd);
+                }
+            }
+            DeckSegment::Commands => self.commands_segment(ui),
+        }
+    }
+
+    /// The Commands segment: the re-homed command history (iOS-style `✓` + syntax
+    /// colours, errors inline in RED) + a monospace input with up-arrow recall,
+    /// live slot highlighting, and inline guided-flow prompts.
+    fn commands_segment(&mut self, ui: &mut egui::Ui) {
         let object_names: Vec<String> = self
             .session
             .doc
@@ -6669,55 +6689,24 @@ impl App {
             .filter_map(|o| o.name.clone())
             .collect();
         let aliases = self.active_aliases();
-        let panel_h = ui.available_height();
         let last_verb = self.last_verb.clone();
         // While a guided flow OR a draw tool is running, the command line must NOT
         // hijack a bare Space/Enter to re-run the last verb — those keys belong to
-        // the active flow (the viewport handler finishes the step/tool). Otherwise
-        // a Space meant to finish the verb would restart it.
+        // the active flow (the viewport handler finishes the step/tool).
         let flow_active = self.guided.active() || self.draw_tool.active();
-        if let Some(line) = self.command_line.ui(
+        // Inline guided prompt → the input placeholder changes per step; the
+        // TextEdit id is stable so focus is held across steps (LOCKED #5).
+        let prompt = self.guided.prompt().or_else(|| self.draw_tool.prompt());
+        if let Some(line) = self.command_line.commands_segment_ui(
             ui,
             &object_names,
             aliases,
-            panel_h,
             last_verb.as_deref(),
             flow_active,
+            prompt.as_deref(),
         ) {
             self.execute_line(line);
         }
-    }
-
-    /// Draggable divider strip at the TOP edge of the command line. Dragging it UP
-    /// grows the command line (deck body shrinks) and DOWN shrinks it. It only
-    /// adjusts the persisted `self.cmd_height`; the command panel keeps its
-    /// deterministic `.exact_size(cmd_height)` — never `.resizable(true)` — so the
-    /// keystroke handling stays stable. `column_h` is the right column's height
-    /// this frame, used to clamp so the deck keeps ≥40% of the column.
-    fn command_splitter(&mut self, ui: &mut egui::Ui, column_h: f32) {
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), CMD_SPLITTER_H),
-            egui::Sense::drag(),
-        );
-        if resp.hovered() || resp.dragged() {
-            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
-        }
-        if resp.dragged() {
-            // Dragging UP (negative y) increases the command-line height.
-            self.cmd_height = clamp_cmd_height(self.cmd_height - resp.drag_delta().y, column_h);
-        }
-        if resp.drag_stopped() {
-            save_cmd_height(self.cmd_height);
-        }
-        // Draw a subtle grabbable divider: a centered line that brightens on hover.
-        let painter = ui.painter();
-        let color = if resp.hovered() || resp.dragged() {
-            ui.visuals().widgets.hovered.fg_stroke.color
-        } else {
-            ui.visuals().widgets.noninteractive.bg_stroke.color
-        };
-        let y = rect.center().y;
-        painter.hline(rect.x_range(), y, egui::Stroke::new(1.0, color));
     }
 
     /// Right docked tab panel (Layer 2): a hand-rolled tab strip over
@@ -6737,27 +6726,17 @@ impl App {
         )
     }
 
-    /// Width of the right column when the deck is hidden — the deck's stored width,
-    /// clamped to the same [floor, half-window] bounds the visible deck uses, so
-    /// hiding/showing the deck never jumps the command line's left edge.
-    fn command_column_width(&self, ui: &egui::Ui) -> f32 {
-        let max_w = (ui.ctx().viewport_rect().width() * 0.5).max(crate::tabstrip::DOCK_MIN);
-        self.dock_width.clamp(crate::tabstrip::DOCK_MIN, max_w)
-    }
-
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         use crate::tabstrip::PanelTab;
         if !self.panel_visible {
-            // Deck hidden — but the command line still lives in the right column
-            // (it must ALWAYS be visible: op-log + input for every mode). Draw a
-            // deck-width right column holding ONLY the command line, with a small ▸
-            // handle to reveal the deck again. This keeps the command line's screen
-            // position stable whether the deck is shown or hidden.
-            let width = self.command_column_width(ui);
+            // Deck hidden — the commands history + chat now live inside the deck's
+            // Chat|Commands segments (issue #28), so there is no always-visible
+            // command line to keep here. Draw only a slim reveal strip with a ▸
+            // handle to show the deck again (Cmd+\ also toggles it).
             let cmd_fill = self.command_line_fill(ui);
             let panel_resp = egui::Panel::right("right_panel")
                 .resizable(false)
-                .exact_size(width)
+                .exact_size(crate::theme::Spacing::XL + crate::theme::Spacing::M)
                 .frame(
                     egui::Frame::side_top_panel(ui.style())
                         .fill(cmd_fill)
@@ -6775,11 +6754,8 @@ impl App {
                             self.panel_visible = true;
                         }
                     });
-                    ui.separator();
-                    self.command_line_body(ui);
                 });
-            // The viewport still clamps to the right column's left edge so the 3D
-            // never paints under the command line.
+            // The viewport still clamps to the right column's left edge.
             self.dock_left = Some(panel_resp.response.rect.left());
             return;
         }
@@ -6889,46 +6865,12 @@ impl App {
                 }
             });
 
-            // COMMAND LINE — under the deck, in the right column. Rendered as a
-            // NON-resizable inner bottom region of this (resizable) right panel.
-            // The c2cfcff keystroke bug was a *resizable* bottom panel nested in
-            // the resizable right panel: the two resize handles fought each other
-            // frame-to-frame, destabilizing layout and dropping keystrokes. A
-            // fixed-height bottom region has a deterministic rect every frame no
-            // matter how the deck is width-dragged, so the TextEdit (stable id)
-            // keeps identical focus/keystroke handling. It sits BELOW the tab strip
-            // so it is present whether the deck body is collapsed or expanded.
-            let cmd_fill = self.command_line_fill(ui);
-            // MANUAL SPLITTER (deck body ↕ command line). The command panel is
-            // ALWAYS `.exact_size(self.cmd_height)` — NEVER `.resizable(true)` —
-            // so its rect is deterministic every frame (this is what keeps the
-            // TextEdit stable; a resizable nested panel was the c2cfcff keystroke
-            // bug). Resizing is done by a thin draggable handle strip drawn at the
-            // TOP edge of the command line (added below, only when the deck body is
-            // expanded). We clamp cmd_height to the CURRENT column height so the
-            // deck keeps a sane minimum even after the window is resized smaller.
+            // The command line is no longer a bottom panel here — it moved into the
+            // Deck tab's Commands segment (issue #28). The old nested *resizable*
+            // bottom panel was the c2cfcff dropped-keystroke bug (two resize handles
+            // fighting frame-to-frame); the Commands segment uses a stable explicit
+            // TextEdit id instead, with no nested resizable panel.
             let collapsed = self.panel_tabs.is_collapsed();
-            let column_h = ui.available_height();
-            self.cmd_height = clamp_cmd_height(self.cmd_height, column_h);
-            let cmd_h = self.cmd_height;
-            egui::Panel::bottom("command_line")
-                .resizable(false)
-                .exact_size(cmd_h)
-                .frame(
-                    egui::Frame::side_top_panel(ui.style())
-                        .fill(cmd_fill)
-                        .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::S as i8, 4)),
-                )
-                .show(ui, |ui| {
-                    // The grabbable divider only makes sense when there IS a deck
-                    // body above to trade space with. When collapsed, the command
-                    // line is the whole column — no splitter.
-                    if !collapsed {
-                        self.command_splitter(ui, column_h);
-                    }
-                    self.command_line_body(ui);
-                });
-
             if collapsed {
                 return;
             }
@@ -6986,17 +6928,7 @@ impl App {
                         }
                     }
                     PanelTab::Deck => {
-                        let dark = ui.visuals().dark_mode;
-                        let roles = self.live_roles(dark);
-                        self.deck_pane.ui(
-                            ui,
-                            &mut self.session,
-                            &self.tokio,
-                            &self.icons,
-                            &roles,
-                            dark,
-                            self.reduce_motion,
-                        );
+                        self.deck_tab(ui);
                     }
                     PanelTab::Blocks => self.blocks_tab(ui),
                     PanelTab::Sheets => self.sheets_tab(ui),
@@ -9107,21 +9039,6 @@ fn save_theme_pref(dark: Option<bool>) {
     save_ui_json(&v);
 }
 
-/// Restore the persisted command-line height from ui.json (`cmd_height`).
-fn load_cmd_height() -> Option<f32> {
-    load_ui_json()["cmd_height"]
-        .as_f64()
-        .map(|h| h as f32)
-        .filter(|h| h.is_finite() && *h > 0.0)
-}
-
-/// Persist the command-line height to ui.json (mirrors `save_dock`-style helpers).
-fn save_cmd_height(h: f32) {
-    let mut v = load_ui_json();
-    v["cmd_height"] = serde_json::json!(h);
-    save_ui_json(&v);
-}
-
 fn load_deck_visible() -> Option<bool> {
     load_ui_json()["deck_visible"].as_bool()
 }
@@ -10768,28 +10685,6 @@ mod tests {
             next_last_verb(Some("box".to_string()), ""),
             Some("box".to_string())
         );
-    }
-
-    #[test]
-    fn clamp_cmd_height_respects_min_and_deck_minimum() {
-        // A tall column: candidate passes through when within bounds.
-        assert_eq!(clamp_cmd_height(200.0, 800.0), 200.0);
-        // Dragging the splitter far UP (huge cmd height) is capped at 60% of the
-        // column so the deck body keeps a sane minimum (40%).
-        assert!((clamp_cmd_height(10_000.0, 800.0) - 480.0).abs() < 1e-3);
-        // Dragging far DOWN can never shrink below the input-lines minimum.
-        assert_eq!(clamp_cmd_height(0.0, 800.0), CMD_HEIGHT_MIN);
-        assert_eq!(clamp_cmd_height(-500.0, 800.0), CMD_HEIGHT_MIN);
-        // In a very short column the MIN still wins over the 60% cap so the
-        // command line is always usable.
-        assert_eq!(clamp_cmd_height(50.0, 60.0), CMD_HEIGHT_MIN);
-        // Simulated drag delta: dragging UP by 30px (delta.y = -30) grows height.
-        let start = CMD_HEIGHT_DEFAULT;
-        let after_up = clamp_cmd_height(start - (-30.0), 800.0);
-        assert!(after_up > start && after_up <= 480.0);
-        // Dragging DOWN by 30px (delta.y = +30) shrinks it.
-        let after_down = clamp_cmd_height(start - 30.0, 800.0);
-        assert!(after_down < start && after_down >= CMD_HEIGHT_MIN);
     }
 
     #[test]

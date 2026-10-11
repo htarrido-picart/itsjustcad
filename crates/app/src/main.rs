@@ -43,11 +43,13 @@ mod sd_catalog;
 mod smarttrack;
 mod statusbar;
 mod suggest;
+mod syntax_layout;
 mod tabstrip;
 mod text_context_menu;
 mod theme;
 mod ui_plane;
 mod update;
+mod usage_spec;
 mod widgets;
 
 fn cli_help_text() -> String {

@@ -19,6 +19,42 @@ fn recall_verb(last_verb: Option<&str>) -> Option<String> {
     last_verb.map(str::to_string)
 }
 
+/// Render one scrollback line in the Commands segment (issue #28):
+/// - `error: …` lines → RED (iOS hides errors; desktop shows them inline).
+/// - `> <command>` echoes → iOS-style `✓` + per-token syntax colours.
+/// - everything else (outcome messages, help) → plain monospace.
+fn render_history_line(ui: &mut egui::Ui, line: &str) {
+    if let Some(rest) = line.strip_prefix("error:") {
+        ui.label(
+            egui::RichText::new(format!("error:{rest}"))
+                .color(egui::Color32::from_rgb(0xe0, 0x4b, 0x3f))
+                .monospace(),
+        );
+    } else if let Some(cmd) = line.strip_prefix("> ") {
+        crate::syntax_layout::highlighted_command_label(ui, cmd);
+    } else {
+        ui.monospace(line);
+    }
+}
+
+/// Live slot hint for the command being typed, e.g. after `box 0,0,0 ` →
+/// `size (x,y,z)`. `None` when typing the verb, past the last slot, or the verb
+/// has no usage. Pure — resolves the verb's usage from the registry/app verbs.
+fn active_slot_hint(input: &str) -> Option<String> {
+    let verb = crate::suggest::verb_of(input.trim_start());
+    if verb.is_empty() {
+        return None;
+    }
+    let usage = crate::suggest::usage_for_verb(verb)?;
+    let slots = crate::usage_spec::parse_usage(usage);
+    let idx = crate::usage_spec::active_slot(input, slots.len())?;
+    let slot = slots.get(idx)?;
+    Some(match slot.req {
+        crate::usage_spec::SlotReq::Optional => format!("{} (optional)", slot.name),
+        crate::usage_spec::SlotReq::Required => slot.name.clone(),
+    })
+}
+
 /// Rhino-style command line: single input row + scrollback, up/down history,
 /// plus as-you-type autosuggest popup and usage hints.
 pub struct CommandLine {
@@ -421,51 +457,48 @@ impl CommandLine {
         }
     }
 
-    /// Returns Some(command) when the user pressed Enter.
-    /// `object_names` — names of named objects in the current document; used
-    /// to populate selector suggestions.
-    /// `preset_aliases` — active legacy-CAD alias map from `preset::preset_for`.
-    /// `panel_h` — current height of the containing panel in logical pixels; used
-    /// to compute the token-relative history scrollback height.
-    /// `last_verb` — the last non-destructive verb entered (App::last_verb); an
-    /// empty Enter/Space re-runs this verb ALONE (no args) so guided commands
-    /// restart and prompt fresh.
-    pub fn ui(
+    /// Render the Commands segment of the Deck pane (issue #28): the command
+    /// history scrollback (iOS-style `✓` + per-token syntax colours, errors in
+    /// RED) filling the space above a monospace input row with the autosuggest
+    /// popup. Returns `Some(line)` when the user pressed Enter.
+    ///
+    /// The input keeps the STABLE explicit id `command_line_input` and the
+    /// `bottom_up` layout (no nested resizable panel) so focus/keystrokes are
+    /// stable — the c2cfcff dropped-keystroke regression came from a resizable
+    /// nested panel; this layout has a deterministic rect every frame.
+    ///
+    /// `prompt_hint` — a guided-flow step prompt shown as the input's placeholder
+    /// (e.g. "pick lower corner (or type x,y,z)"); the TextEdit id never changes
+    /// across steps so focus is held for the whole flow.
+    pub fn commands_segment_ui(
         &mut self,
         ui: &mut egui::Ui,
         object_names: &[String],
         preset_aliases: &'static [(&'static str, &'static str)],
-        panel_h: f32,
         last_verb: Option<&str>,
         flow_active: bool,
+        prompt_hint: Option<&str>,
     ) -> Option<String> {
         // Recompute suggestions if input changed.
         self.refresh_suggestions(object_names, preset_aliases);
 
-        // Bottom-docked layout (Rhino/AutoCAD look): the input row is LOCKED to
-        // the very bottom via a `bottom_up` layout, the suggestion popup sits
-        // just above it, and the op-log history fills the space above (scroll).
-        // The history is CAPPED at `panel_h - input reserve` (bounded by the
-        // panel's real height passed in) — with `auto_shrink(false)` filling it
-        // exactly. Without this cap the fill grows the resizable panel each frame
-        // in a feedback loop until it hit the max (the "grows and grows" bug).
-        let history_h = crate::theme::Spacing::history_h_for(panel_h);
         let mut submitted = None;
+        // `bottom_up`: the input row LOCKS to the bottom, the suggestion popup
+        // sits just above it, and the history fills the remaining space above
+        // (scroll). A deterministic rect every frame — no resizable nested panel.
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            submitted = self.input_row(ui, last_verb, flow_active);
+            submitted = self.input_row_with_hint(ui, last_verb, flow_active, prompt_hint);
             self.suggestion_block(ui, true);
             egui::ScrollArea::vertical()
                 .id_salt("cmd_history")
-                .max_height(history_h)
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    // Force top-down INSIDE the scroll area — the outer bottom_up
-                    // layout would otherwise render the log lines bottom-to-top
-                    // (newest first), reversing the scrollback.
+                    // Force top-down INSIDE the scroll area so the oldest line is
+                    // at the top (the outer bottom_up would reverse it).
                     ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                         for line in &self.history {
-                            ui.monospace(line);
+                            render_history_line(ui, line);
                         }
                     });
                 });
@@ -594,21 +627,41 @@ impl CommandLine {
     /// suggestion acceptance. Returns Some(line) when the user pressed Enter.
     /// `last_verb` — an empty Enter/Space submits the last non-destructive verb
     /// ALONE (no args, via `recall_verb`) so guided commands restart fresh.
-    fn input_row(
+    /// `prompt_hint` — a guided-flow step prompt used as the placeholder.
+    fn input_row_with_hint(
         &mut self,
         ui: &mut egui::Ui,
         last_verb: Option<&str>,
         flow_active: bool,
+        prompt_hint: Option<&str>,
     ) -> Option<String> {
         let mut submitted = None;
         let show_popup = self.popup_visible();
+        // Live slot hint for the token being typed (issue #28), e.g. after
+        // `box 0,0,0 ` → `size (x,y,z)`. Shown below the input row.
+        let slot_hint = active_slot_hint(&self.input);
+        if let Some(h) = &slot_hint {
+            ui.label(egui::RichText::new(format!("↳ {h}")).weak().small());
+        }
         ui.horizontal(|ui| {
             ui.monospace(">");
+            // Highlight the live input by command-token role (verb/number/
+            // selector/string). A pure classifier drives the colours.
+            let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _w: f32| {
+                let job = crate::syntax_layout::highlight_job(
+                    ui,
+                    text.as_str(),
+                    egui::TextStyle::Monospace.resolve(ui.style()),
+                );
+                ui.ctx().fonts_mut(|f| f.layout_job(job))
+            };
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.input)
                     // Stable, explicit id so focus persists across frames
                     // regardless of layout changes above it — prevents dropped
-                    // keystrokes / flicker from an auto-generated positional id.
+                    // keystrokes / flicker from an auto-generated positional id
+                    // (the c2cfcff regression guard). The id NEVER changes across
+                    // guided-flow steps so focus is held for the whole flow.
                     .id(egui::Id::new("command_line_input"))
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
@@ -619,7 +672,8 @@ impl CommandLine {
                     // journey_autosuggest_accept kittest journey). With the
                     // popup closed Tab traverses focus as usual.
                     .lock_focus(show_popup)
-                    .hint_text("box 0,0,0 5,5,3"),
+                    .hint_text(prompt_hint.unwrap_or("box 0,0,0 5,5,3"))
+                    .layouter(&mut layouter),
             );
             if self.focus_next_frame {
                 response.request_focus();
