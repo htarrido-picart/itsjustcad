@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ItsJustCAD
+Comment=Open-source parametric CAD
+Exec=itsjustcad
+Icon=itsjustcad
+Terminal=false
+Categories=Graphics;Engineering;
+StartupWMClass=itsjustcad

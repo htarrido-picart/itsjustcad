@@ -68,3 +68,15 @@ objc2-foundation = "0.3"
 
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot", "eframe"] }
+# Round-trips the .ico synthesized by build_support/icon.rs in tests.
+ico = "0.4"
+
+# Windows exe icon embedding (issue #19). Both crates are tiny and pure Rust;
+# build.rs no-ops on non-Windows targets, so Linux/macOS builds only pay the
+# one-time cost of compiling these two small build deps.
+# (`[target.'cfg(windows)'.build-dependencies]` keys on the HOST, not the
+# target, so unconditional deps + a target check in build.rs is the correct
+# way to support cross-compiling to Windows.)
+[build-dependencies]
+ico = "0.4"
+winresource = "0.1"

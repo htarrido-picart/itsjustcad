@@ -81,6 +81,20 @@ jobs:
         run: |
           mkdir -p staging
           cp target/${{ matrix.target }}/release/${{ matrix.binary }} staging/
+
+          # Linux: ship a desktop entry + hicolor icons + per-user installer so
+          # the app shows its icon in launchers (issue #19).
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            cp packaging/linux/itsjustcad.desktop staging/
+            cp packaging/linux/install.sh staging/
+            chmod +x staging/install.sh
+            for size in 256 512; do
+              mkdir -p "staging/icons/hicolor/${size}x${size}/apps"
+              cp "assets/icon/${size}.png" \
+                 "staging/icons/hicolor/${size}x${size}/apps/itsjustcad.png"
+            done
+          fi
+
           tar -czvf ${{ matrix.artifact }}.tar.gz -C staging .
 
       - name: Stage artifact (Windows)
@@ -91,8 +105,11 @@ jobs:
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.binary }}" staging\
           Compress-Archive -Path staging\* -DestinationPath "${{ matrix.artifact }}.zip"
 
-      # ── macOS .app bundle (no signing) ────────────────────────────────
-      - name: Build macOS .app bundle (unsigned)
+      # ── macOS .app bundle (ad-hoc signed) ─────────────────────────────
+      # NOTE: this inline assembly mirrors scripts/bundle-macos.sh (as updated
+      # by PR #37). Once #37 merges, dedupe by calling the script with its
+      # ITSJUSTCAD_BUNDLE_BINARY / ITSJUSTCAD_DIST_DIR env overrides instead.
+      - name: Build macOS .app bundle (ad-hoc signed)
         if: runner.os == 'macOS'
         run: |
           BINARY="target/${{ matrix.target }}/release/itsjustcad"
@@ -136,9 +153,88 @@ jobs:
           cp "$BINARY" "$MACOS/ItsJustCAD"
           chmod +x "$MACOS/ItsJustCAD"
 
+          # Legacy icon path (CFBundleIconFile) — works everywhere.
           if [[ -f assets/icon/icon.icns ]]; then
             cp assets/icon/icon.icns "$RESOURCES/icon.icns"
           fi
+
+          # Modern icon path: CFBundleIconName + compiled asset catalog.
+          # Degrades gracefully (warn + skip) if actool or the PNGs are
+          # missing, falling back to icon.icns.
+          build_asset_catalog() {
+            local actool_bin
+            actool_bin="$(xcrun --find actool 2>/dev/null || command -v actool || true)"
+            if [[ -z "$actool_bin" || ! -x "$actool_bin" ]]; then
+              echo "WARN: actool not found — skipping Assets.car (falls back to icon.icns)."
+              return 0
+            fi
+            for px in 16 32 64 128 256 512 1024; do
+              if [[ ! -f "assets/icon/$px.png" ]]; then
+                echo "WARN: assets/icon/$px.png missing — skipping Assets.car."
+                return 0
+              fi
+            done
+
+            local tmp iconset
+            tmp="$(mktemp -d)"
+            iconset="$tmp/Assets.xcassets/AppIcon.appiconset"
+            mkdir -p "$iconset"
+            cp assets/icon/{16,32,64,128,256,512,1024}.png "$iconset/"
+            cat > "$tmp/Assets.xcassets/Contents.json" <<'JSON'
+          { "info": { "author": "xcode", "version": 1 } }
+          JSON
+            cat > "$iconset/Contents.json" <<'JSON'
+          {
+            "images": [
+              { "idiom": "mac", "size": "16x16",   "scale": "1x", "filename": "16.png" },
+              { "idiom": "mac", "size": "16x16",   "scale": "2x", "filename": "32.png" },
+              { "idiom": "mac", "size": "32x32",   "scale": "1x", "filename": "32.png" },
+              { "idiom": "mac", "size": "32x32",   "scale": "2x", "filename": "64.png" },
+              { "idiom": "mac", "size": "128x128", "scale": "1x", "filename": "128.png" },
+              { "idiom": "mac", "size": "128x128", "scale": "2x", "filename": "256.png" },
+              { "idiom": "mac", "size": "256x256", "scale": "1x", "filename": "256.png" },
+              { "idiom": "mac", "size": "256x256", "scale": "2x", "filename": "512.png" },
+              { "idiom": "mac", "size": "512x512", "scale": "1x", "filename": "512.png" },
+              { "idiom": "mac", "size": "512x512", "scale": "2x", "filename": "1024.png" }
+            ],
+            "info": { "author": "xcode", "version": 1 }
+          }
+          JSON
+
+            if ! "$actool_bin" "$tmp/Assets.xcassets" \
+                  --compile "$RESOURCES" \
+                  --platform macosx \
+                  --minimum-deployment-target 12.0 \
+                  --app-icon AppIcon \
+                  --output-partial-info-plist "$tmp/partial.plist" \
+                  > "$tmp/actool.log" 2>&1; then
+              echo "WARN: actool failed — skipping Assets.car (falls back to icon.icns)."
+              head -20 "$tmp/actool.log" || true
+              rm -rf "$tmp"
+              return 0
+            fi
+            rm -rf "$tmp"
+
+            if [[ ! -f "$RESOURCES/Assets.car" ]]; then
+              echo "WARN: actool produced no Assets.car — falls back to icon.icns."
+              return 0
+            fi
+            /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string AppIcon" \
+              "$APP/Contents/Info.plist" 2>/dev/null \
+              || /usr/libexec/PlistBuddy -c "Set :CFBundleIconName AppIcon" \
+                   "$APP/Contents/Info.plist"
+            echo "==> Assets.car compiled; CFBundleIconName=AppIcon set."
+          }
+          build_asset_catalog
+
+          # Ad-hoc sign + strip quarantine so Launch Services registers the
+          # bundle (and its icon) instead of showing the generic blank icon.
+          if command -v codesign >/dev/null 2>&1; then
+            codesign --force --deep --sign - "$APP"
+          else
+            echo "WARN: codesign not found — bundle left unsigned."
+          fi
+          xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
 
           tar -czvf ${{ matrix.artifact }}-app.tar.gz -C staging ItsJustCAD.app
 
