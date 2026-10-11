@@ -265,6 +265,43 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_underlay_through_a_symlink_escaping_the_workdir() {
+        // The symlink-escape guard was described but never exercised. Plant a
+        // real symlink inside the workdir pointing at a file OUTSIDE it: the
+        // bare name exists and is a file, but its canonical path leaves the
+        // workdir, so both the resolver and the gate must refuse it.
+        let dir = tmp("ul_symlink");
+        let outside = tmp("ul_symlink_outside");
+        fs::write(outside.join("secret.jpg"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.jpg"), dir.join("link.jpg")).unwrap();
+        assert!(dir.join("link.jpg").is_file(), "symlink should resolve to a file");
+        assert!(resolve_within_dir(&dir, "link.jpg").is_err(), "symlink escape must be refused");
+        assert!(!allows_underlay_in(&dir, &underlay("link.jpg")));
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn resolve_is_anchored_to_the_workdir_not_a_same_named_sibling() {
+        // Regression for the gate/exec divergence: resolution is anchored to the
+        // workdir and never selects a same-named file living elsewhere. The gate
+        // authorizes `<workdir>/a.jpg`, so exec (which calls this resolver for a
+        // bare name) must place exactly that — not a collision reachable by some
+        // other path. Here an identically-named file exists in a sibling dir;
+        // the resolved path must be the workdir's copy.
+        let dir = tmp("ul_anchor");
+        let sibling = tmp("ul_anchor_sibling");
+        fs::write(dir.join("a.jpg"), b"in-workdir").unwrap();
+        fs::write(sibling.join("a.jpg"), b"elsewhere").unwrap();
+        let resolved = resolve_within_dir(&dir, "a.jpg").expect("in-workdir file resolves");
+        assert_eq!(resolved, dir.canonicalize().unwrap().join("a.jpg"));
+        assert!(!resolved.starts_with(sibling.canonicalize().unwrap()));
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&sibling).unwrap();
+    }
+
     #[test]
     fn rejects_import_and_export_even_inside_the_workdir() {
         let dir = tmp("ul_notunderlay");
