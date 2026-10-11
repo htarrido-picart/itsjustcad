@@ -62,6 +62,44 @@ impl OpenAiCompatDeck {
         body
     }
 
+    /// Build the OpenAI `messages` array (system + transcript). Pure so the
+    /// image attachment is unit-testable without a live endpoint. Images (when
+    /// present) attach to the LAST user message only, as an OpenAI content-part
+    /// array (text part + one `image_url` data-URL part per image); every other
+    /// message keeps a plain-string `content`. Empty images → the exact
+    /// pre-vision array (every message takes the string branch).
+    fn messages(&self, req: &ChatRequest) -> Value {
+        let last_user = if req.images.is_empty() {
+            None
+        } else {
+            req.messages
+                .iter()
+                .rposition(|m| matches!(m.role, Role::User))
+        };
+        let mut messages = vec![json!({"role": "system", "content": req.system})];
+        for (i, m) in req.messages.iter().enumerate() {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            };
+            if Some(i) == last_user {
+                let mut parts = vec![json!({"type": "text", "text": m.content})];
+                for img in &req.images {
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{}", img.mime, img.data_base64),
+                        },
+                    }));
+                }
+                messages.push(json!({ "role": role, "content": parts }));
+            } else {
+                messages.push(json!({ "role": role, "content": m.content }));
+            }
+        }
+        Value::Array(messages)
+    }
+
     /// Best-effort fetch of the endpoint's advertised model ids (`GET /models`),
     /// used to enrich a "model not found" turn failure. Never errors — an empty
     /// list just means we couldn't enumerate (the message degrades gracefully).
@@ -94,15 +132,8 @@ impl OpenAiCompatDeck {
         req: ChatRequest,
         tx: &UnboundedSender<DeckDelta>,
     ) -> Result<(), DeckError> {
-        let mut messages = vec![json!({"role": "system", "content": req.system})];
-        messages.extend(req.messages.iter().map(|m| {
-            json!({
-                "role": match m.role { Role::User => "user", Role::Assistant => "assistant" },
-                "content": m.content,
-            })
-        }));
-
-        let body = self.build_body(&req, Value::Array(messages));
+        let messages = self.messages(&req);
+        let body = self.build_body(&req, messages);
         let mut request = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
@@ -235,7 +266,10 @@ mod tests {
             .as_str()
             .expect("grammar field present as string");
         // It is the registry-derived GBNF: has the root rule and real verbs.
-        assert!(grammar.contains("root      ::="), "not a GBNF grammar: {grammar}");
+        assert!(
+            grammar.contains("root      ::="),
+            "not a GBNF grammar: {grammar}"
+        );
         assert!(grammar.contains("\"box\""), "grammar missing a known verb");
         assert_eq!(grammar, itsjustcad_commands::gbnf::command_grammar());
     }
@@ -255,8 +289,7 @@ mod tests {
         // Terse mode's hard cap is plumbed as the request's `max_tokens`: build
         // a request through `terse_adjusted` and assert the wire body carries it.
         let deck = OpenAiCompatDeck::new(&config(true));
-        let (system, cap) =
-            crate::prompt::terse_adjusted("sys".into(), 4096, true);
+        let (system, cap) = crate::prompt::terse_adjusted("sys".into(), 4096, true);
         let r = ChatRequest::text(system, Vec::new(), String::new(), cap, 0.2, None);
         let body = deck.build_body(&r, Value::Array(vec![]));
         assert_eq!(body["max_tokens"], crate::prompt::TERSE_MAX_TOKENS);
@@ -298,14 +331,72 @@ mod tests {
         );
     }
 
+    fn user(content: &str) -> crate::deck::ChatMessage {
+        crate::deck::ChatMessage {
+            role: Role::User,
+            content: content.into(),
+        }
+    }
+    fn assistant(content: &str) -> crate::deck::ChatMessage {
+        crate::deck::ChatMessage {
+            role: Role::Assistant,
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn no_images_messages_is_byte_identical_to_text_path() {
+        let deck = OpenAiCompatDeck::new(&config(false));
+        let msgs = vec![user("hi"), assistant("hey"), user("look")];
+        let text = ChatRequest::text("sys".into(), msgs, String::new(), 512, 0.2, None);
+        let old = serde_json::to_string(&deck.messages(&text)).unwrap();
+        let empty = text.clone().with_images(Vec::new());
+        let new = serde_json::to_string(&deck.messages(&empty)).unwrap();
+        assert_eq!(old, new, "empty images must be byte-identical to text path");
+    }
+
+    #[test]
+    fn images_attach_as_image_url_on_last_user_message() {
+        use crate::deck::ImagePart;
+        let deck = OpenAiCompatDeck::new(&config(false));
+        let msgs = vec![user("first"), assistant("reply"), user("last")];
+        let req =
+            ChatRequest::text("sys".into(), msgs, String::new(), 512, 0.2, None).with_images(vec![
+                ImagePart {
+                    mime: "image/jpeg".into(),
+                    data_base64: "ZZZ".into(),
+                },
+            ]);
+        let m = deck.messages(&req);
+        let m = m.as_array().unwrap();
+        // m[0] = system, m[1] = first user, m[2] = assistant, m[3] = last user.
+        assert_eq!(m[0]["role"], "system");
+        assert!(m[1]["content"].is_string());
+        assert!(m[2]["content"].is_string());
+        let parts = m[3]["content"]
+            .as_array()
+            .expect("content-part array on last user");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "last");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/jpeg;base64,ZZZ");
+    }
+
     #[test]
     fn serialized_request_json_contains_grammar_string() {
         // End-to-end at the serialization boundary: what actually goes on the wire.
         let deck = OpenAiCompatDeck::new(&config(true));
         let body = deck.build_body(&req(), Value::Array(vec![]));
         let wire = serde_json::to_string(&body).expect("serializes");
-        assert!(wire.contains("\"grammar\""), "wire JSON lacks grammar field");
-        assert!(wire.contains("```draft"), "wire JSON lacks the draft fence rule");
+        assert!(
+            wire.contains("\"grammar\""),
+            "wire JSON lacks grammar field"
+        );
+        assert!(
+            wire.contains("```draft"),
+            "wire JSON lacks the draft fence rule"
+        );
     }
 
     // ── model-missing classification (Priority C) ──────────────────────────

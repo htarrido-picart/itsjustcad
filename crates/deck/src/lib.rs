@@ -26,7 +26,9 @@ pub use agent::{
 };
 pub use claude_code::{scoped_allowed_tools, turn_allowed_tools};
 pub use config::{is_local_url, CloudProvider, DeckConfig, DeckKind, DecksFile};
-pub use deck::{make_deck, ChatMessage, ChatRequest, DeckDelta, DeckError, LlmDeck, Role};
+pub use deck::{
+    make_deck, ChatMessage, ChatRequest, DeckDelta, DeckError, ImagePart, LlmDeck, Role,
+};
 pub use digest::digest;
 pub use extract::{Extractor, ExtractEvent};
 pub use probe::{probe, warm_model, ProbeInfo, WarmOutcome};

@@ -20,6 +20,16 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// One inline image attached to a chat turn. `mime` is a media type like
+/// `image/jpeg` or `image/png`; `data_base64` is the raw base64 payload
+/// **without** any `data:` URL prefix. Providers wrap it in their own format
+/// (Anthropic `image` source block, OpenAI `image_url` data URL).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImagePart {
+    pub mime: String,
+    pub data_base64: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatRequest {
     pub system: String,
@@ -57,6 +67,13 @@ pub struct ChatRequest {
     /// Off keeps the tool absent from the request entirely. Other cassettes
     /// (local grammar) ignore it.
     pub web_search: bool,
+    /// Images to attach to the LAST user message this turn. Empty = a plain
+    /// text turn (the wire body is byte-identical to the pre-vision path). Only
+    /// the cloud HTTP cassettes (Anthropic, OpenAI-compatible) honour this; the
+    /// final user turn carries the images as provider-native content blocks,
+    /// while every other message stays a plain text `content` string. History
+    /// `ChatMessage`s never carry images — this rides on the request instead.
+    pub images: Vec<ImagePart>,
 }
 
 impl ChatRequest {
@@ -82,7 +99,16 @@ impl ChatRequest {
             vision_shot_path: None,
             max_turns: 1,
             web_search: false,
+            images: Vec::new(),
         }
+    }
+
+    /// Attach images to this turn (they land on the last user message). A
+    /// builder so the `text(...)` signature stays unchanged for the desktop and
+    /// FFI `::text()` callers.
+    pub fn with_images(mut self, images: Vec<ImagePart>) -> Self {
+        self.images = images;
+        self
     }
 }
 

@@ -34,14 +34,44 @@ impl AnthropicDeck {
     /// Anthropic server-side `web_search` tool is attached; when it is off the
     /// `tools` key is entirely absent (offline/sealed stance).
     fn build_body(&self, req: &ChatRequest) -> Value {
+        // Images (when present) attach to the LAST user message only; every
+        // other message keeps a plain-string `content`. With no images this
+        // yields the exact pre-vision body (byte-for-byte), since every message
+        // takes the string branch.
+        let last_user = if req.images.is_empty() {
+            None
+        } else {
+            req.messages
+                .iter()
+                .rposition(|m| matches!(m.role, Role::User))
+        };
         let messages: Vec<Value> = req
             .messages
             .iter()
-            .map(|m| {
-                json!({
-                    "role": match m.role { Role::User => "user", Role::Assistant => "assistant" },
-                    "content": m.content,
-                })
+            .enumerate()
+            .map(|(i, m)| {
+                let role = match m.role {
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                };
+                if Some(i) == last_user {
+                    // Content-block array: a text block, then one image block
+                    // per image (Anthropic base64 `image` source).
+                    let mut blocks = vec![json!({"type": "text", "text": m.content})];
+                    for img in &req.images {
+                        blocks.push(json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.mime,
+                                "data": img.data_base64,
+                            },
+                        }));
+                    }
+                    json!({ "role": role, "content": blocks })
+                } else {
+                    json!({ "role": role, "content": m.content })
+                }
             })
             .collect();
 
@@ -177,17 +207,80 @@ mod tests {
         let body = deck().build_body(&r);
         assert_eq!(body["max_tokens"], crate::prompt::TERSE_MAX_TOKENS);
         assert!(
-            body["system"].as_str().unwrap().contains("## Response style (terse mode)"),
+            body["system"]
+                .as_str()
+                .unwrap()
+                .contains("## Response style (terse mode)"),
             "terse style section must ride the system prompt"
         );
+    }
+
+    fn user(content: &str) -> crate::deck::ChatMessage {
+        crate::deck::ChatMessage {
+            role: Role::User,
+            content: content.into(),
+        }
+    }
+    fn assistant(content: &str) -> crate::deck::ChatMessage {
+        crate::deck::ChatMessage {
+            role: Role::Assistant,
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn no_images_is_byte_identical_to_text_path() {
+        // The vision change must not perturb the text-only wire body at all.
+        let msgs = vec![user("hi"), assistant("hey"), user("look")];
+        let text = ChatRequest::text("sys".into(), msgs.clone(), String::new(), 512, 0.2, None);
+        let old = serde_json::to_string(&deck().build_body(&text)).unwrap();
+        // An explicit empty-images request must serialize identically.
+        let empty = text.with_images(Vec::new());
+        let new = serde_json::to_string(&deck().build_body(&empty)).unwrap();
+        assert_eq!(old, new, "empty images must be byte-identical to text path");
+    }
+
+    #[test]
+    fn images_attach_as_block_array_on_last_user_message() {
+        use crate::deck::ImagePart;
+        let msgs = vec![user("first"), assistant("reply"), user("last")];
+        let req =
+            ChatRequest::text("sys".into(), msgs, String::new(), 512, 0.2, None).with_images(vec![
+                ImagePart {
+                    mime: "image/png".into(),
+                    data_base64: "AAAA".into(),
+                },
+            ]);
+        let body = deck().build_body(&req);
+        let m = body["messages"].as_array().unwrap();
+        // Earlier messages stay plain strings.
+        assert!(m[0]["content"].is_string());
+        assert!(m[1]["content"].is_string());
+        // Last user message became a content-block array: text + image.
+        let blocks = m[2]["content"]
+            .as_array()
+            .expect("block array on last user msg");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "last");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "AAAA");
     }
 
     #[test]
     fn serialized_body_only_mentions_web_search_when_enabled() {
         // At the serialization boundary — what actually goes on the wire.
         let off = serde_json::to_string(&deck().build_body(&req(false))).unwrap();
-        assert!(!off.contains("web_search"), "off wire leaked web_search: {off}");
+        assert!(
+            !off.contains("web_search"),
+            "off wire leaked web_search: {off}"
+        );
         let on = serde_json::to_string(&deck().build_body(&req(true))).unwrap();
-        assert!(on.contains("web_search"), "on wire missing web_search: {on}");
+        assert!(
+            on.contains("web_search"),
+            "on wire missing web_search: {on}"
+        );
     }
 }
