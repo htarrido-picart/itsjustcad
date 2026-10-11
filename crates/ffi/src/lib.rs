@@ -434,6 +434,12 @@ fn decode_underlay(
     cache: &mut UnderlayCache,
 ) -> Option<UnderlayData> {
     let u = doc.underlay.as_ref()?;
+    // Honor the underlay's layer: hiding that layer (e.g. `hide Underlay` or the
+    // Layers inspector toggle) drops the raster, like any object on a hidden
+    // layer. Unknown layers read visible, so legacy underlays still draw.
+    if !doc.layer_visible(&u.layer) {
+        return None;
+    }
     let pixels = match cache {
         Some((path, px)) if *path == u.path => px.clone(),
         _ => {
@@ -2278,6 +2284,12 @@ fn layers_json(doc: &itsjustcad_doc::Document) -> String {
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for obj in doc.objects() {
         *counts.entry(obj.layer.as_str()).or_insert(0) += 1;
+    }
+    // Count the raster underlay as occupying its layer, so that layer reads as
+    // "in use" and shows in the inspector (where its visibility toggles the
+    // image) even before anything has been traced onto it.
+    if let Some(u) = &doc.underlay {
+        *counts.entry(u.layer.as_str()).or_insert(0) += 1;
     }
 
     let mut layers: Vec<(&String, &itsjustcad_doc::LayerStyle)> = doc.layers.iter().collect();

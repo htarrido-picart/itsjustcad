@@ -12591,10 +12591,22 @@ fn apply_forward(
                     _ => (width, " (image unreadable, assumed square)"),
                 },
             };
-            // Keep the previous opacity/rotation when swapping the image; new
-            // underlays start fully opaque and unrotated.
+            // Keep the previous opacity/rotation/layer when swapping the image;
+            // new underlays start fully opaque, unrotated, on the "Underlay"
+            // layer.
             let opacity = prev.as_ref().map_or(1.0, |u| u.opacity);
             let rotation_deg = prev.as_ref().map_or(0.0, |u| u.rotation_deg);
+            let layer = prev
+                .as_ref()
+                .map_or_else(itsjustcad_doc::default_underlay_layer, |u| u.layer.clone());
+            // Ensure the underlay's layer exists so it appears in the Layers
+            // inspector and its visibility can be toggled like any object.
+            // Idempotent; deterministic colour by creation index (replay-stable).
+            if !doc.layers.contains_key(&layer) {
+                let color = default_layer_color(doc.layers.len());
+                doc.layers
+                    .insert(layer.clone(), LayerStyle { color: Some(color), ..LayerStyle::default() });
+            }
             doc.underlay = Some(Underlay {
                 path: path.clone(),
                 corner: corner.truncate(),
@@ -12602,6 +12614,7 @@ fn apply_forward(
                 height,
                 opacity,
                 rotation_deg,
+                layer,
             });
             doc.generation += 1;
             Ok((

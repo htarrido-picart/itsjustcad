@@ -45,7 +45,7 @@ pub use sheet::{
     SheetTable, SheetTag, SheetText, SheetView, TagShape, TitleBlock, ViewDirection,
 };
 pub use structure::{Grid, Material, Room, Section, Story};
-pub use underlay::{Basemap, Underlay};
+pub use underlay::{Basemap, Underlay, default_underlay_layer};
 pub use units::{
     format_angle, format_area, format_length, format_volume, Units, METERS_PER_FOOT,
     METERS_PER_INCH,
