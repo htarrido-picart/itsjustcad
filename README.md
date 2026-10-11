@@ -926,7 +926,7 @@ crates/
 cargo build --release        # single ~10 MB binary
 cargo test --workspace       # 630+ tests
 cargo clippy --workspace
-scripts/bundle-macos.sh      # unsigned .app bundle
+scripts/bundle-macos.sh      # ad-hoc signed .app bundle
 
 # headless render, no window needed
 cargo run -p itsjustcad-render --example headless -- out.png scene.itsjustcad.json
