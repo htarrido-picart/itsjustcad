@@ -4,8 +4,8 @@
 use glam::DVec3;
 use itsjustcad_doc::{
     AreaKind, EndpointRef, FieldExpr, FrameKind, HatchPattern, LoadGeometry, PaperSize,
-    RestraintKind, Section as StructSection, TagShape, Units, ViewDirection, METERS_PER_FOOT,
-    METERS_PER_INCH,
+    RestraintKind, Section as StructSection, SheetDisplayMode, TagShape, Units, ViewDirection,
+    METERS_PER_FOOT, METERS_PER_INCH,
 };
 
 use crate::error::ParseError;
@@ -1465,9 +1465,17 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 index: parse_index(index)?,
                 set: SheetViewSet::Direction { direction: view_direction(dir)? },
             }),
+            [sheet, index, "mode", mode] => Ok(Command::SheetViewSet {
+                sheet: (*sheet).to_string(),
+                index: parse_index(index)?,
+                set: SheetViewSet::Mode {
+                    mode: SheetDisplayMode::parse(mode)
+                        .ok_or_else(|| ParseError::BadViewMode((*mode).to_string()))?,
+                },
+            }),
             _ => wrong(
                 "sheetviewset",
-                "<sheet> <index> <title <text>|scale <scale>|direction <top|front|right|persp>>",
+                "<sheet> <index> <title <text>|scale <scale>|direction <top|front|right|persp>|mode <wireframe|hiddenline|shaded>>",
                 &args,
             ),
         },
@@ -6226,9 +6234,25 @@ mod tests {
                 set: SheetViewSet::Direction { direction: ViewDirection::Iso }, ..
             }
         ));
+        // Render mode: canonical label + an alias both parse.
+        assert!(matches!(
+            parse("sheetviewset plan 2 mode shaded").unwrap(),
+            Command::SheetViewSet {
+                set: SheetViewSet::Mode { mode: SheetDisplayMode::Shaded }, index: 2, ..
+            }
+        ));
+        assert!(matches!(
+            parse("sheetviewset plan 1 mode hidden").unwrap(),
+            Command::SheetViewSet { set: SheetViewSet::Mode { mode: SheetDisplayMode::HiddenLine }, .. }
+        ));
         // errors
         assert!(parse("sheetviewdelete plan x").unwrap_err().to_string().contains('x'));
         assert!(parse("sheetviewset plan 1 bogus v").is_err());
+        // Invalid render mode is rejected with a helpful message.
+        assert!(parse("sheetviewset plan 1 mode solid")
+            .unwrap_err()
+            .to_string()
+            .contains("render mode"));
     }
 
     #[test]

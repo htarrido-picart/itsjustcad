@@ -12892,6 +12892,10 @@ fn apply_forward(
                     view.direction = *direction;
                     format!("direction = {}", direction.label())
                 }
+                crate::SheetViewSet::Mode { mode } => {
+                    view.display_mode = *mode;
+                    format!("mode = {}", mode.label())
+                }
             };
             doc.generation += 1;
             Ok((
@@ -19495,6 +19499,53 @@ mod tests {
         let json = crate::io::to_json(&s);
         let s2 = crate::io::from_json(&json).unwrap();
         assert_eq!(crate::io::to_json(&s2), json, "replay-stable JSON");
+    }
+
+    /// Item 5: `sheetviewset <sheet> <index> mode <mode>` sets the render style,
+    /// undo restores the prior mode, an invalid mode is rejected at parse, and
+    /// the state is replay-stable through JSON.
+    #[test]
+    fn sheetview_set_mode_and_undo() {
+        use itsjustcad_doc::SheetDisplayMode;
+        let mut s = Session::default();
+        run(&mut s, "sheet plan a3");
+        run(&mut s, "sheetview plan top 100");
+        // Default is Wireframe.
+        assert_eq!(
+            s.doc.sheet("plan").unwrap().views[0].display_mode,
+            SheetDisplayMode::Wireframe
+        );
+
+        run(&mut s, "sheetviewset plan 1 mode shaded");
+        assert_eq!(
+            s.doc.sheet("plan").unwrap().views[0].display_mode,
+            SheetDisplayMode::Shaded
+        );
+        run(&mut s, "sheetviewset plan 1 mode hiddenline");
+        assert_eq!(
+            s.doc.sheet("plan").unwrap().views[0].display_mode,
+            SheetDisplayMode::HiddenLine
+        );
+
+        // Undo: hiddenline → shaded (the immediately-prior value).
+        run(&mut s, "undo");
+        assert_eq!(
+            s.doc.sheet("plan").unwrap().views[0].display_mode,
+            SheetDisplayMode::Shaded
+        );
+
+        // Invalid mode rejected at parse time with a helpful message.
+        let e = parse("sheetviewset plan 1 mode solid").unwrap_err();
+        assert!(e.to_string().contains("render mode"), "{e}");
+
+        // Replay stability with a non-default mode set.
+        let json = crate::io::to_json(&s);
+        let s2 = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&s2), json, "replay-stable JSON");
+        assert_eq!(
+            s2.doc.sheet("plan").unwrap().views[0].display_mode,
+            SheetDisplayMode::Shaded
+        );
     }
 
     #[test]

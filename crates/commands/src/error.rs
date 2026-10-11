@@ -33,6 +33,8 @@ pub enum ParseError {
     BadPaperSize(String),
     #[error("'{0}' is not a view direction; use top, front, right or persp")]
     BadViewDirection(String),
+    #[error("'{0}' is not a view render mode; use wireframe, hiddenline or shaded")]
+    BadViewMode(String),
     #[error("'{0}' is not a scale; write 1:100 or just 100")]
     BadScale(String),
     #[error("'{0}' is not a tag shape; use bubble, square or diamond")]

@@ -41,8 +41,8 @@ pub use param_schema::{
 };
 pub use plotstyle::{PlotStyleEntry, PlotStyleTable, ResolvedPen};
 pub use sheet::{
-    PageRect, PaperSize, ScheduleRow, Sheet, SheetDim, SheetLeader, SheetSet, SheetTable, SheetTag,
-    SheetText, SheetView, TagShape, TitleBlock, ViewDirection,
+    PageRect, PaperSize, ScheduleRow, Sheet, SheetDim, SheetDisplayMode, SheetLeader, SheetSet,
+    SheetTable, SheetTag, SheetText, SheetView, TagShape, TitleBlock, ViewDirection,
 };
 pub use structure::{Grid, Material, Room, Section, Story};
 pub use underlay::{Basemap, Underlay};

@@ -4,7 +4,7 @@
 use glam::DVec3;
 use itsjustcad_doc::{
     AreaKind, EndpointRef, FieldExpr, FrameKind, HatchPattern, NamedView, ObjectId, PaperSize,
-    RestraintKind, Section as StructSection, Units, ViewDirection,
+    RestraintKind, Section as StructSection, SheetDisplayMode, Units, ViewDirection,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2352,6 +2352,8 @@ pub enum SheetViewSet {
     Scale { scale: f64 },
     /// Change the projection direction.
     Direction { direction: ViewDirection },
+    /// Change the render style (wireframe / hidden-line / shaded).
+    Mode { mode: SheetDisplayMode },
 }
 
 fn is_zero_opt(v: &Option<f64>) -> bool {

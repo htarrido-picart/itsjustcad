@@ -847,8 +847,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "sheetviewset",
-            usage: "sheetviewset <sheet> <index> <title <text>|scale <scale>|direction <top|front|right|persp>>",
-            summary: "Edit one property of an existing view (1-based index): 'title <text>' overrides the derived callout (PLAN/ELEVATION/…), empty text resets it; 'scale <scale>' changes the drawing scale; 'direction <dir>' changes the projection. Undoable. Example: sheetviewset plan 1 title GROUND FLOOR",
+            usage: "sheetviewset <sheet> <index> <title <text>|scale <scale>|direction <top|front|right|persp>|mode <wireframe|hiddenline|shaded>>",
+            summary: "Edit one property of an existing view (1-based index): 'title <text>' overrides the derived callout (PLAN/ELEVATION/…), empty text resets it; 'scale <scale>' changes the drawing scale; 'direction <dir>' changes the projection; 'mode <wireframe|hiddenline|shaded>' sets the render style (hidden-line removes occluded edges, shaded embeds a rendered raster). Undoable. Example: sheetviewset plan 1 mode shaded",
             category: Category::Dimension,
         },
         CommandSpec {
