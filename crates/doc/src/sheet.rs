@@ -71,6 +71,48 @@ pub struct PageRect {
     pub h: f64,
 }
 
+/// How a viewport's model geometry is drawn into the sheet.
+///
+/// * `Wireframe` (default): every feature edge is drawn as a vector line — the
+///   historical behavior, byte-identical for any document that predates this
+///   field (serde defaults missing values to `Wireframe`).
+/// * `HiddenLine`: vector output with edges occluded by solid mesh faces
+///   removed. See the PDF renderer for the exact (conservative, sampled)
+///   occlusion test — this is NOT a full HLR solve.
+/// * `Shaded`: the viewport is filled with a rasterized rendered image of the
+///   view, embedded in the PDF as an image. Producing the raster needs the GPU
+///   renderer, so the core/PDF layer only embeds pixels it is handed.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SheetDisplayMode {
+    #[default]
+    Wireframe,
+    HiddenLine,
+    Shaded,
+}
+
+impl SheetDisplayMode {
+    /// Stable lowercase label used by the command line, FFI, and JSON.
+    pub fn label(self) -> &'static str {
+        match self {
+            SheetDisplayMode::Wireframe => "wireframe",
+            SheetDisplayMode::HiddenLine => "hiddenline",
+            SheetDisplayMode::Shaded => "shaded",
+        }
+    }
+
+    /// Parse a user/FFI string into a mode. Accepts a couple of friendly
+    /// aliases; returns `None` for anything unrecognized so callers can error.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "wireframe" | "wire" => Some(SheetDisplayMode::Wireframe),
+            "hiddenline" | "hidden-line" | "hidden" | "hlr" => Some(SheetDisplayMode::HiddenLine),
+            "shaded" | "shade" | "rendered" => Some(SheetDisplayMode::Shaded),
+            _ => None,
+        }
+    }
+}
+
 /// One viewport on a sheet: a direction at a drawing scale. `scale` is the
 /// denominator — 100 means 1:100. Viewport rectangles are laid out at print
 /// time from the view count, so the stored state stays minimal.
@@ -89,14 +131,30 @@ pub struct SheetView {
     /// Explicit paper-space viewport rectangle (mm). `None` → auto-grid layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rect: Option<PageRect>,
+    /// How the viewport is drawn (wireframe / hidden-line / shaded). Serde
+    /// defaults to `Wireframe` so old documents replay exactly as before.
+    #[serde(default, skip_serializing_if = "is_wireframe")]
+    pub display_mode: SheetDisplayMode,
+}
+
+/// serde `skip_serializing_if` predicate: the default mode is omitted from
+/// JSON so existing drawings serialize byte-for-byte unchanged.
+fn is_wireframe(m: &SheetDisplayMode) -> bool {
+    *m == SheetDisplayMode::Wireframe
 }
 
 impl SheetView {
     /// A view with the default auto-layout behavior: no custom title, no pinned
-    /// rect. Construction-site helper so callers stay terse and future fields
-    /// default in one place.
+    /// rect, wireframe display. Construction-site helper so callers stay terse
+    /// and future fields default in one place.
     pub fn new(direction: ViewDirection, scale: f64) -> Self {
-        Self { direction, scale, title: None, rect: None }
+        Self {
+            direction,
+            scale,
+            title: None,
+            rect: None,
+            display_mode: SheetDisplayMode::Wireframe,
+        }
     }
 }
 
@@ -314,15 +372,65 @@ mod tests {
             scale: 100.0,
             title: Some("GROUND FLOOR".into()),
             rect: Some(PageRect { x: 10.0, y: 20.0, w: 100.0, h: 80.0 }),
+            display_mode: SheetDisplayMode::Shaded,
         };
         let json = serde_json::to_string(&v).unwrap();
         assert_eq!(v, serde_json::from_str::<SheetView>(&json).unwrap());
 
-        // A default view omits title/rect (skip_serializing_if).
+        // A default view omits title/rect/display_mode (skip_serializing_if).
         let plain = SheetView::new(ViewDirection::Front, 50.0);
         let plain_json = serde_json::to_string(&plain).unwrap();
         assert!(!plain_json.contains("\"title\""), "title omitted when None: {plain_json}");
         assert!(!plain_json.contains("\"rect\""), "rect omitted when None: {plain_json}");
+        assert!(
+            !plain_json.contains("display_mode"),
+            "wireframe (default) display_mode omitted: {plain_json}"
+        );
+    }
+
+    /// `SheetDisplayMode` parses every label + alias, rejects garbage, and the
+    /// label/parse pair round-trips. Also: a non-default mode IS serialized and
+    /// an old document (no `display_mode` key) defaults to `Wireframe`.
+    #[test]
+    fn display_mode_parse_label_and_serde() {
+        for (s, m) in [
+            ("wireframe", SheetDisplayMode::Wireframe),
+            ("wire", SheetDisplayMode::Wireframe),
+            ("hiddenline", SheetDisplayMode::HiddenLine),
+            ("hidden-line", SheetDisplayMode::HiddenLine),
+            ("hidden", SheetDisplayMode::HiddenLine),
+            ("hlr", SheetDisplayMode::HiddenLine),
+            ("shaded", SheetDisplayMode::Shaded),
+            ("SHADED", SheetDisplayMode::Shaded),
+            ("  Shaded  ", SheetDisplayMode::Shaded),
+            ("rendered", SheetDisplayMode::Shaded),
+        ] {
+            assert_eq!(SheetDisplayMode::parse(s), Some(m), "parse {s:?}");
+        }
+        assert_eq!(SheetDisplayMode::parse("solid"), None);
+        assert_eq!(SheetDisplayMode::parse(""), None);
+        // label → parse round-trips for the canonical labels.
+        for m in [
+            SheetDisplayMode::Wireframe,
+            SheetDisplayMode::HiddenLine,
+            SheetDisplayMode::Shaded,
+        ] {
+            assert_eq!(SheetDisplayMode::parse(m.label()), Some(m));
+        }
+
+        // A non-default mode is present in the serialized view.
+        let shaded = SheetView {
+            display_mode: SheetDisplayMode::Shaded,
+            ..SheetView::new(ViewDirection::Top, 100.0)
+        };
+        let json = serde_json::to_string(&shaded).unwrap();
+        assert!(json.contains("shaded"), "non-default mode serialized: {json}");
+        assert_eq!(shaded, serde_json::from_str::<SheetView>(&json).unwrap());
+
+        // Old JSON with no display_mode defaults to Wireframe.
+        let old = r#"{"direction":"top","scale":100.0}"#;
+        let v: SheetView = serde_json::from_str(old).unwrap();
+        assert_eq!(v.display_mode, SheetDisplayMode::Wireframe);
     }
 
     /// OLD documents — views with only `direction`/`scale`, sheets with no

@@ -2271,9 +2271,10 @@ fn sheets_json(doc: &itsjustcad_doc::Document) -> String {
                 out.push(',');
             }
             out.push_str(&format!(
-                "{{\"direction\":\"{}\",\"scale\":{}",
+                "{{\"direction\":\"{}\",\"scale\":{},\"displayMode\":\"{}\"",
                 view.direction.label(),
                 view.scale,
+                view.display_mode.label(),
             ));
             // Custom callout title (omitted when the view uses the derived one).
             if let Some(t) = &view.title {
@@ -2493,6 +2494,41 @@ pub unsafe extern "C" fn ijc_sheet_view_set_rect(
     })
 }
 
+/// Set a view's render style. `index` is 1-based. `mode` ∈
+/// {"wireframe","hiddenline","shaded"} (plus the aliases
+/// [`SheetDisplayMode::parse`] accepts). Returns false on null/invalid handle,
+/// a null/unparseable `mode`, an unknown sheet, or an out-of-range index. Bumps
+/// `doc.generation`. Direct mutation (no op-log/undo in v1), mirroring
+/// [`ijc_sheet_view_set_title`].
+///
+/// Wireframe draws every feature edge; hidden-line removes edges occluded by
+/// solid faces (a conservative vector cull); shaded fills the viewport with a
+/// rendered raster at PDF time (see [`ijc_sheet_pdf`]).
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `sheet` and `mode` must
+/// each be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_sheet_view_set_mode(
+    h: *mut AppHandle,
+    sheet: *const c_char,
+    index: usize,
+    mode: *const c_char,
+) -> bool {
+    guard_ffi(false, || {
+        if mode.is_null() {
+            return false;
+        }
+        let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
+            return false;
+        };
+        let Some(parsed) = itsjustcad_doc::SheetDisplayMode::parse(mode_str) else {
+            return false;
+        };
+        unsafe { with_sheet_view(h, sheet, index, |v| v.display_mode = parsed) }
+    })
+}
+
 /// Delete a view from a sheet by 1-based `index`. Returns false on null/invalid
 /// handle, a null/invalid `sheet`, an unknown sheet, or an out-of-range index.
 /// Bumps `doc.generation`. Direct mutation (no op-log/undo in v1), mirroring
@@ -2598,12 +2634,206 @@ pub unsafe extern "C" fn ijc_sheet_set_titleblock(
     })
 }
 
+/// Build the orthographic `view_proj` for a sheet view direction, framing the
+/// scene AABB to fill the viewport with a small margin. Mirrors the 2D
+/// projection axes the vector PDF uses in `pdf::project` so the shaded raster is
+/// registered with the vector drafting of the same model.
+fn sheet_ortho_view_proj(
+    dir: itsjustcad_doc::ViewDirection,
+    center: glam::Vec3,
+    radius: f32,
+    aspect: f32,
+) -> (glam::Mat4, glam::Vec3) {
+    use glam::{Mat4, Vec3};
+    use itsjustcad_doc::ViewDirection;
+    let dist = radius * 4.0;
+    // Eye/up per direction, matching pdf::project's view planes.
+    let (eye, up) = match dir {
+        ViewDirection::Top => (center + Vec3::Z * dist, Vec3::Y),
+        ViewDirection::Front => (center - Vec3::Y * dist, Vec3::Z),
+        ViewDirection::Right => (center + Vec3::X * dist, Vec3::Z),
+        ViewDirection::Iso => (center + Vec3::new(1.0, -1.0, 1.0).normalize() * dist, Vec3::Z),
+    };
+    let viewm = Mat4::look_at_rh(eye, center, up);
+    // Fit a square-ish ortho box around the scene; widen the horizontal half by
+    // aspect so nothing is squashed.
+    let half = radius * 1.1;
+    let (hx, hy) = if aspect >= 1.0 { (half * aspect, half) } else { (half, half / aspect) };
+    let proj = Mat4::orthographic_rh(-hx, hx, -hy, hy, 0.01, dist * 2.0 + radius);
+    (proj * viewm, eye)
+}
+
+/// Render every Shaded-mode view of `sheet` to an RGBA raster via an offscreen
+/// wgpu pass, reusing the app's `device`/`queue` (no second adapter). Each
+/// raster is sized from the view's paper rect (explicit `rect` or the auto-grid
+/// slot) at [`pdf::SHADED_DPI`]. A fresh [`SceneRenderer`] isolates this pass
+/// from the on-screen renderer. Returns an empty vec when no view is Shaded.
+///
+/// GPU-dependent: in a headless CI without an adapter, `ijc_init` would already
+/// have failed, so this is only reached with a live device. The non-GPU parts
+/// (rect→pixel math, PDF embed) are unit-tested separately in `commands`.
+fn render_shaded_view_rasters(
+    app: &AppHandle,
+    sheet: &itsjustcad_doc::Sheet,
+) -> Vec<itsjustcad_commands::pdf::ViewRaster> {
+    use itsjustcad_commands::pdf;
+    use itsjustcad_doc::SheetDisplayMode;
+
+    // Nothing to do unless at least one view is shaded.
+    if !sheet.views.iter().any(|v| v.display_mode == SheetDisplayMode::Shaded) {
+        return Vec::new();
+    }
+    let Some(bb) = app.session.doc.scene_aabb() else {
+        return Vec::new(); // empty model: nothing to shade
+    };
+    let c = bb.center();
+    let scene_center = glam::Vec3::new(c.x as f32, c.y as f32, c.z as f32);
+    let scene_radius = (bb.size().length() as f32 * 0.5).max(0.5);
+
+    // Per-view paper rect size in mm (same layout math as pdf::sheet_content).
+    let (paper_w, _paper_h) = sheet.paper.landscape_mm();
+    const MARGIN_MM: f64 = 10.0;
+    const TITLE_MM: f64 = 12.0;
+    const GUTTER_MM: f64 = 5.0;
+    let n = sheet.views.len();
+    let area_w = paper_w - 2.0 * MARGIN_MM;
+    let auto_w = if n > 0 { (area_w - GUTTER_MM * (n as f64 - 1.0)) / n as f64 } else { area_w };
+    let auto_h = sheet.paper.landscape_mm().1 - MARGIN_MM - TITLE_MM - MARGIN_MM;
+
+    let device = &app.device;
+    let queue = &app.queue;
+    const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let scene = snapshot(&app.session.doc, app.theme);
+    let [br, bg, bb_c, ba] = app.theme.background();
+
+    let mut out = Vec::new();
+    for (i, view) in sheet.views.iter().enumerate() {
+        if view.display_mode != SheetDisplayMode::Shaded {
+            continue;
+        }
+        let (w_mm, h_mm) = match view.rect {
+            Some(r) => (r.w, r.h),
+            None => (auto_w, auto_h.max(1.0)),
+        };
+        let (w_px, h_px) = pdf::rect_to_pixels(w_mm, h_mm, pdf::SHADED_DPI);
+
+        let mut renderer = SceneRenderer::new(device, FORMAT);
+        renderer.set_scene(device, queue, &scene, 0);
+        let aspect = w_px as f32 / h_px.max(1) as f32;
+        let (vp, eye) = sheet_ortho_view_proj(view.direction, scene_center, scene_radius, aspect);
+        let cam = camera_uniform_with_mode(vp, eye, DisplayMode::Shaded);
+        renderer.write_camera(device, queue, 0, &cam);
+
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sheet_shade_color"),
+            size: wgpu::Extent3d { width: w_px, height: h_px, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sheet_shade_depth"),
+            size: wgpu::Extent3d { width: w_px, height: h_px, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sheet_shade_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: br as f64,
+                            g: bg as f64,
+                            b: bb_c as f64,
+                            a: ba as f64,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let mut pass = pass.forget_lifetime();
+            renderer.paint(&mut pass, 0, DisplayMode::Shaded, true);
+        }
+
+        let bytes_per_row = (w_px * 4).next_multiple_of(256);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sheet_shade_readback"),
+            size: (bytes_per_row * h_px) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            color.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d { width: w_px, height: h_px, depth_or_array_layers: 1 },
+        );
+        queue.submit([encoder.finish()]);
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        if device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .is_err()
+        {
+            continue; // skip this view's raster; it falls back to vector
+        }
+        let data = slice.get_mapped_range();
+        // Repack to tight RGBA (drop row padding), forcing opaque alpha.
+        let mut rgba = Vec::with_capacity(w_px as usize * h_px as usize * 4);
+        for y in 0..h_px {
+            let row = &data[(y * bytes_per_row) as usize..][..(w_px * 4) as usize];
+            for x in 0..w_px as usize {
+                let px = &row[x * 4..][..4];
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+        out.push(pdf::ViewRaster { view_index: i, width: w_px, height: h_px, rgba });
+    }
+    out
+}
+
 /// Render one sheet to a vector PDF for the iPad Sheets UI. Looks up the sheet in
 /// `doc.sheets` by `name`; on a hit, calls [`pdf::sheet_pdf`] and returns a heap
 /// buffer of the PDF bytes with the byte count written to `*out_len`. Returns null
 /// (and sets `*out_len = 0`) for a null/invalid handle, a null `name`, or an
 /// unknown sheet. Mirrors [`ijc_export`]'s allocation/return path. Caller MUST free
 /// the buffer with [`ijc_bytes_free`].
+///
+/// Shaded-mode viewports are rendered to rasters (via the GPU) and embedded; all
+/// other viewports draw as vector line art (wireframe / hidden-line).
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`]. `name` must be a valid
@@ -2631,7 +2861,8 @@ pub unsafe extern "C" fn ijc_sheet_pdf(
         let Some(sheet) = doc.sheet(name) else {
             return std::ptr::null_mut();
         };
-        let bytes = itsjustcad_commands::pdf::sheet_pdf(doc, sheet).0;
+        let rasters = render_shaded_view_rasters(app, sheet);
+        let bytes = itsjustcad_commands::pdf::sheet_pdf_with_rasters(doc, sheet, &rasters).0;
         if bytes.is_empty() {
             return std::ptr::null_mut();
         }
@@ -2688,7 +2919,10 @@ pub unsafe extern "C" fn ijc_sheetset_pdf(
         if resolved.is_empty() {
             return std::ptr::null_mut();
         }
-        let bytes = itsjustcad_commands::pdf::sheets_pdf(doc, &resolved).0;
+        // Per-sheet shaded rasters, parallel to `resolved`.
+        let rasters: Vec<Vec<itsjustcad_commands::pdf::ViewRaster>> =
+            resolved.iter().map(|s| render_shaded_view_rasters(app, s)).collect();
+        let bytes = itsjustcad_commands::pdf::sheets_pdf_with_rasters(doc, &resolved, &rasters).0;
         if bytes.is_empty() {
             return std::ptr::null_mut();
         }
@@ -2887,6 +3121,8 @@ mod tests {
             let val = CString::new("Villa").unwrap();
             assert!(!ijc_sheet_view_set_title(nil, name.as_ptr(), 1, val.as_ptr()));
             assert!(!ijc_sheet_view_set_rect(nil, name.as_ptr(), 1, false, 0.0, 0.0, 10.0, 10.0));
+            let mode = CString::new("shaded").unwrap();
+            assert!(!ijc_sheet_view_set_mode(nil, name.as_ptr(), 1, mode.as_ptr()));
             assert!(!ijc_sheet_view_delete(nil, name.as_ptr(), 1));
             assert!(!ijc_sheet_set_titleblock(
                 nil,
@@ -2907,9 +3143,10 @@ mod tests {
         s.run(parse("sheet plan a3").unwrap()).unwrap();
         s.run(parse("sheetview plan top 100").unwrap()).unwrap();
 
-        // Default view: no title/rect in the JSON.
+        // Default view: no title/rect in the JSON; displayMode defaults wireframe.
         let j0 = sheets_json(&s.doc);
         assert!(j0.contains("\"direction\":\"top\""));
+        assert!(j0.contains("\"displayMode\":\"wireframe\""), "default mode: {j0}");
         assert!(!j0.contains("\"title\""), "no title when None: {j0}");
         assert!(!j0.contains("\"rect\""), "no rect when None: {j0}");
         assert!(!j0.contains("titleblock"), "no stamp when absent");
@@ -2919,15 +3156,156 @@ mod tests {
             let sheet = s.doc.sheet_mut("plan").unwrap();
             sheet.views[0].title = Some("GROUND FLOOR".into());
             sheet.views[0].rect = Some(PageRect { x: 10.0, y: 20.0, w: 100.0, h: 80.0 });
+            sheet.views[0].display_mode = itsjustcad_doc::SheetDisplayMode::Shaded;
             sheet.titleblock = Some(TitleBlock {
                 project: Some("Villa".into()),
                 ..TitleBlock::default()
             });
         }
         let j1 = sheets_json(&s.doc);
+        assert!(j1.contains("\"displayMode\":\"shaded\""), "{j1}");
         assert!(j1.contains("\"title\":\"GROUND FLOOR\""), "{j1}");
         assert!(j1.contains("\"rect\":{\"x\":10,\"y\":20,\"w\":100,\"h\":80}"), "{j1}");
         assert!(j1.contains("\"titleblock\":{\"project\":\"Villa\"}"), "{j1}");
+    }
+
+    /// End-to-end shaded sheet: render a box to an offscreen RGBA raster via the
+    /// GPU (the same `SceneRenderer` + ortho camera `ijc_sheet_pdf` uses), then
+    /// embed it with `pdf::sheet_pdf_with_rasters` and confirm the PDF carries an
+    /// image XObject. GPU-gated — it needs a wgpu adapter, so it is `#[ignore]`d
+    /// like the repo's other GPU tests and run explicitly. The non-GPU pieces
+    /// (rect→px math, PDF image embed, mode routing) are covered without a GPU in
+    /// `itsjustcad-commands`' `pdf` tests.
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to exercise shaded-sheet rasterization"]
+    fn shaded_sheet_end_to_end_embeds_gpu_raster() {
+        use itsjustcad_commands::pdf;
+        let mut s = Session::default();
+        s.run(parse("box 0,0,0 2,2,2").unwrap()).unwrap();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse("sheetview s1 persp 100").unwrap()).unwrap();
+        s.run(parse("sheetviewset s1 1 mode shaded").unwrap()).unwrap();
+
+        // Offscreen GPU render → RGBA, reusing the production camera builder.
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        )
+        .expect("a GPU adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("a device");
+        const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let (w_px, h_px) = pdf::rect_to_pixels(120.0, 90.0, pdf::SHADED_DPI);
+        let scene = snapshot(&s.doc, Theme::Light);
+        let bb = s.doc.scene_aabb().unwrap();
+        let c = bb.center();
+        let center = glam::Vec3::new(c.x as f32, c.y as f32, c.z as f32);
+        let radius = (bb.size().length() as f32 * 0.5).max(0.5);
+
+        let mut renderer = SceneRenderer::new(&device, FORMAT);
+        renderer.set_scene(&device, &queue, &scene, 0);
+        let aspect = w_px as f32 / h_px as f32;
+        let (vp, eye) =
+            sheet_ortho_view_proj(itsjustcad_doc::ViewDirection::Iso, center, radius, aspect);
+        renderer.write_camera(
+            &device,
+            &queue,
+            0,
+            &camera_uniform_with_mode(vp, eye, DisplayMode::Shaded),
+        );
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("t"),
+            size: wgpu::Extent3d { width: w_px, height: h_px, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("d"),
+            size: wgpu::Extent3d { width: w_px, height: h_px, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let cv = color.create_view(&Default::default());
+        let dv = depth.create_view(&Default::default());
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("p"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &cv,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &dv,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let mut pass = pass.forget_lifetime();
+            renderer.paint(&mut pass, 0, DisplayMode::Shaded, true);
+        }
+        let bpr = (w_px * 4).next_multiple_of(256);
+        let rb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rb"),
+            size: (bpr * h_px) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        enc.copy_texture_to_buffer(
+            color.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &rb,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d { width: w_px, height: h_px, depth_or_array_layers: 1 },
+        );
+        queue.submit([enc.finish()]);
+        rb.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .unwrap();
+        let data = rb.slice(..).get_mapped_range();
+        let mut rgba = Vec::with_capacity(w_px as usize * h_px as usize * 4);
+        for y in 0..h_px {
+            let row = &data[(y * bpr) as usize..][..(w_px * 4) as usize];
+            for x in 0..w_px as usize {
+                let px = &row[x * 4..][..4];
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+        let raster = pdf::ViewRaster { view_index: 0, width: w_px, height: h_px, rgba };
+
+        let sheet = s.doc.sheet("s1").unwrap().clone();
+        let (bytes, drawn) = pdf::sheet_pdf_with_rasters(&s.doc, &sheet, &[raster]);
+        assert_eq!(drawn, 0, "shaded viewport draws no vector geometry");
+        let content = String::from_utf8_lossy(&bytes);
+        assert!(content.contains("/Subtype /Image"), "GPU raster embedded as XObject");
+        assert!(content.contains("/Im0 Do"), "raster painted into the viewport");
+        assert!(bytes.starts_with(b"%PDF") && bytes.ends_with(b"%%EOF\n"));
     }
 
     #[test]

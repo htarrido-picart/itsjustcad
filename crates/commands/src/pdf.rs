@@ -22,6 +22,58 @@ const TITLE_MM: f64 = 12.0;
 const GUTTER_MM: f64 = 5.0;
 /// PDF user-space points per millimeter.
 const PT_PER_MM: f64 = 72.0 / 25.4;
+/// Default rasterization resolution for shaded viewports (dots per inch). 200
+/// DPI balances crisp line/edge detail against raster size on large sheets.
+pub const SHADED_DPI: f64 = 200.0;
+/// Hard cap on a shaded raster's longest side (pixels) so a huge A0 viewport at
+/// high DPI can't demand a multi-hundred-megapixel buffer.
+pub const SHADED_MAX_PX: u32 = 4096;
+
+/// Pixel dimensions for a shaded viewport: convert the rect's mm size to pixels
+/// at `dpi`, clamped to `[1, SHADED_MAX_PX]` on each axis AND to `SHADED_MAX_PX`
+/// on the longest side (preserving aspect). Pure math — unit-tested with no GPU.
+pub fn rect_to_pixels(w_mm: f64, h_mm: f64, dpi: f64) -> (u32, u32) {
+    const MM_PER_INCH: f64 = 25.4;
+    // Ideal (unclamped) pixel size at the requested DPI, floored at 1 px.
+    let wf = (w_mm.max(0.0) / MM_PER_INCH * dpi).round().max(1.0);
+    let hf = (h_mm.max(0.0) / MM_PER_INCH * dpi).round().max(1.0);
+    // If the longest side exceeds the cap, scale BOTH axes by the same factor so
+    // the aspect ratio is preserved; clamping each axis independently would
+    // distort a very wide or very tall viewport.
+    let longest = wf.max(hf);
+    let (wf, hf) = if longest > SHADED_MAX_PX as f64 {
+        let s = SHADED_MAX_PX as f64 / longest;
+        ((wf * s).round().max(1.0), (hf * s).round().max(1.0))
+    } else {
+        (wf, hf)
+    };
+    (wf as u32, hf as u32)
+}
+
+/// A rendered raster for one shaded viewport, supplied by the GPU layer (the
+/// FFI/app) because the `commands` crate has no graphics backend. `rgba` is
+/// tightly packed `width*height*4` bytes, row-major, top row first (image
+/// convention); the PDF embedder flips rows to PDF's bottom-up space.
+#[derive(Clone)]
+pub struct ViewRaster {
+    /// 0-based index of the `SheetView` this raster fills.
+    pub view_index: usize,
+    pub width: u32,
+    pub height: u32,
+    /// `width * height * 4` RGBA8 bytes, top-row-first.
+    pub rgba: Vec<u8>,
+}
+
+impl ViewRaster {
+    /// Validate the buffer length matches `width*height*4` and both dims are
+    /// non-zero. A malformed raster is ignored by the embedder (falls back to
+    /// vector), so this keeps the PDF writer total.
+    fn is_valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.rgba.len() == self.width as usize * self.height as usize * 4
+    }
+}
 
 /// Drawing-scale math: millimeters on paper for a world length in meters.
 /// At 1:100, 1 m = 10 mm.
@@ -41,6 +93,105 @@ fn project(dir: ViewDirection, p: DVec3) -> DVec2 {
             DVec2::new((p.x - p.y) * c30, (p.x + p.y) * s30 + p.z)
         }
     }
+}
+
+/// View-space depth of a world point: SMALLER means NEARER the camera. Used
+/// only for the hidden-line occlusion test's relative ordering, so the absolute
+/// scale is irrelevant — only the sign/direction along each view axis matters.
+///
+/// * `Top` looks straight down (+Z toward −Z): higher z is nearer → depth = −z.
+/// * `Front` looks along +Y: smaller y is nearer → depth = y.
+/// * `Right` looks along +X: smaller x is nearer → depth = x.
+/// * `Iso` is a 30° axonometric; the camera recedes up-and-back, so a point is
+///   nearer when x, y are larger and z is larger. depth = −(x + y + z) is a
+///   serviceable monotone approximation for this axonometric (iso HLR is
+///   inherently approximate here).
+fn view_depth(dir: ViewDirection, p: DVec3) -> f64 {
+    match dir {
+        ViewDirection::Top => -p.z,
+        ViewDirection::Front => p.y,
+        ViewDirection::Right => p.x,
+        ViewDirection::Iso => -(p.x + p.y + p.z),
+    }
+}
+
+/// Is 2D point `pt` inside triangle `a,b,c` (barycentric sign test)? Points on
+/// an edge count as inside. Degenerate (zero-area) triangles never contain
+/// anything.
+fn point_in_tri(pt: DVec2, a: DVec2, b: DVec2, c: DVec2) -> bool {
+    let d1 = (pt - b).perp_dot(a - b);
+    let d2 = (pt - c).perp_dot(b - c);
+    let d3 = (pt - a).perp_dot(c - a);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
+}
+
+/// A projected mesh triangle for the hidden-line occlusion pass: the three
+/// corners in projected view-plane meters plus the triangle's maximum depth
+/// (its farthest corner). An edge sample is occluded when it lies inside a
+/// triangle whose *every* corner is nearer than the sample (max depth < sample
+/// depth − eps), i.e. the whole facet is unambiguously in front.
+struct OccTri {
+    a: DVec2,
+    b: DVec2,
+    c: DVec2,
+    /// Depth of the NEAREST corner (smallest `view_depth`).
+    near: f64,
+}
+
+/// Gather occluder triangles for a view: every visible mesh face, projected to
+/// the view plane (meters, pre-scale — the occlusion test is scale-invariant in
+/// 2D since both edges and triangles use the same projection).
+fn gather_occluders(doc: &Document, dir: ViewDirection) -> Vec<OccTri> {
+    let mut tris = Vec::new();
+    for obj in doc.objects() {
+        if !obj.visible || !doc.layer_visible(&obj.layer) {
+            continue;
+        }
+        let mesh = match &obj.geometry {
+            Geometry::Mesh(m)
+            | Geometry::Frame { mesh: m, .. }
+            | Geometry::Area { mesh: m, .. }
+            | Geometry::Parametric { mesh: m, .. } => m,
+            _ => continue,
+        };
+        let pos = mesh.positions();
+        for f in mesh.faces() {
+            let (p0, p1, p2) = (
+                pos[f[0] as usize],
+                pos[f[1] as usize],
+                pos[f[2] as usize],
+            );
+            tris.push(OccTri {
+                a: project(dir, p0),
+                b: project(dir, p1),
+                c: project(dir, p2),
+                near: view_depth(dir, p0)
+                    .min(view_depth(dir, p1))
+                    .min(view_depth(dir, p2)),
+            });
+        }
+    }
+    tris
+}
+
+/// Hidden-line occlusion test (CONSERVATIVE, SAMPLED — not a full HLR solve):
+/// returns true when the segment `wa→wb` should be HIDDEN because its midpoint,
+/// projected to the view plane, falls inside at least one mesh triangle that is
+/// entirely nearer the camera than the segment's nearest endpoint. This removes
+/// edges buried behind solids (the common case: back faces, interior creases,
+/// geometry behind a wall) without splitting partially-occluded edges. Edges
+/// that are only partly hidden are kept whole, so the result under-removes
+/// rather than over-removes — honest and safe, never deleting a visible edge.
+fn edge_occluded(occ: &[OccTri], dir: ViewDirection, wa: DVec3, wb: DVec3) -> bool {
+    let mid = project(dir, (wa + wb) * 0.5);
+    // The segment's own nearest depth; an occluder must beat this to hide it.
+    let seg_near = view_depth(dir, wa).min(view_depth(dir, wb));
+    // Bias so an edge lying ON its own triangle (coplanar) is not self-hidden.
+    const EPS: f64 = 1e-4;
+    occ.iter()
+        .any(|t| t.near < seg_near - EPS && point_in_tri(mid, t.a, t.b, t.c))
 }
 
 /// World-space line segments worth drawing for one object.
@@ -371,11 +522,19 @@ fn mm(v: f64) -> String {
 /// Render one viewport's content (border + clipped scaled line art + label
 /// + model-space dim text) into `content`.
 ///
-/// Returns the number of geometry lines drawn.
+/// `image_name` is `Some("ImN")` when a valid shaded raster for this view was
+/// embedded as an XObject: the viewport rect is filled with that image and the
+/// vector geometry pass is skipped (the callout/scale label still print).
+/// Without it, `view.display_mode` selects wireframe (every edge) or hidden-line
+/// (edges occluded by solid faces removed — a conservative sampled cull, see
+/// [`edge_occluded`]); Shaded with no raster falls back to hidden-line vector.
+///
+/// Returns the number of geometry lines drawn (0 for a raster-filled viewport).
 fn render_view(
     doc: &Document,
     view: &SheetView,
     rect: (DVec2, DVec2), // (min, max) in mm, PDF coords (origin bottom-left)
+    image_name: Option<&str>,
     content: &mut String,
 ) -> usize {
     let (rmin, rmax) = rect;
@@ -428,6 +587,35 @@ fn render_view(
         mm(scale_y),
         escape_pdf_text(&format!("SCALE  1:{scale}"))
     ));
+
+    // Shaded mode with a supplied raster: paint the image into the viewport rect
+    // and skip the vector geometry pass entirely. The image is placed with a CTM
+    // that maps the unit image square onto the (padded) rect in PDF points, so
+    // the raster exactly fills the viewport. Callout/scale text above still show.
+    if let Some(img) = image_name {
+        let pad = 1.0;
+        let (ix0, iy0) = (rmin.x + pad, rmin.y + pad);
+        let (iw, ih) = ((rmax.x - rmin.x - 2.0 * pad).max(0.0), (rmax.y - rmin.y - 2.0 * pad).max(0.0));
+        content.push_str(&format!(
+            "q {} 0 0 {} {} {} cm /{} Do Q\n",
+            mm(iw),
+            mm(ih),
+            mm(ix0),
+            mm(iy0),
+            img,
+        ));
+        return 0;
+    }
+
+    // Hidden-line mode: precompute the projected occluder triangles once so the
+    // per-edge midpoint test can cull edges buried behind solid faces. Wireframe
+    // (and shaded-without-raster falls through to this) leaves `occ` empty so no
+    // edges are removed — byte-identical to the historical output.
+    let occ: Vec<OccTri> = if view.display_mode == itsjustcad_doc::SheetDisplayMode::HiddenLine {
+        gather_occluders(doc, view.direction)
+    } else {
+        Vec::new()
+    };
 
     // Collect (lineweight_mm, plot_color, world-segment) tuples.
     // Per-object lineweight beats layer lineweight (mirror the color override
@@ -493,6 +681,11 @@ fn render_view(
     let mut cur_w = -1.0_f64;
     let mut cur_c = [-1.0_f32; 3];
     for (w, color, wa, wb) in weighted_segs {
+        // Hidden-line cull: drop edges whose midpoint is behind a solid face.
+        // `occ` is empty in wireframe mode, so this is a no-op there.
+        if !occ.is_empty() && edge_occluded(&occ, view.direction, wa, wb) {
+            continue;
+        }
         let pa = {
             let p = project(view.direction, wa);
             DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
@@ -805,22 +998,87 @@ fn render_titleblock(tb: &TitleBlock, paper_w: f64, content: &mut String) {
     }
 }
 
+/// A decoded image XObject ready to embed: a PDF resource `/name`, pixel size,
+/// and the raw DeviceRGB sample bytes (3 per pixel, top row first — matching how
+/// a placed PDF image maps its first row to the top of the unit square). Alpha
+/// is intentionally dropped: shaded renders are opaque, and a DeviceRGB stream
+/// avoids an `/SMask` dependency, keeping the hand-rolled writer simple.
+struct SheetImage {
+    name: String,
+    width: u32,
+    height: u32,
+    /// `width * height * 3` DeviceRGB bytes, top row first.
+    rgb: Vec<u8>,
+}
+
+impl SheetImage {
+    /// Flatten a validated RGBA raster to opaque DeviceRGB (drop the alpha
+    /// byte). Returns `None` for a malformed raster so the caller falls back to
+    /// vector rendering. Pure, GPU-free — unit-tested with synthetic pixels.
+    fn from_raster(name: String, r: &ViewRaster) -> Option<Self> {
+        if !r.is_valid() {
+            return None;
+        }
+        let mut rgb = Vec::with_capacity(r.width as usize * r.height as usize * 3);
+        let (pixels, _) = r.rgba.as_chunks::<4>();
+        for px in pixels {
+            rgb.extend_from_slice(&px[..3]);
+        }
+        Some(SheetImage { name, width: r.width, height: r.height, rgb })
+    }
+
+    /// The PDF object body for this image XObject (dictionary + binary stream).
+    fn to_object(&self) -> Vec<u8> {
+        let mut out = format!(
+            "<< /Type /XObject /Subtype /Image /Width {} /Height {} \
+             /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >>\nstream\n",
+            self.width,
+            self.height,
+            self.rgb.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(&self.rgb);
+        out.extend_from_slice(b"\nendstream");
+        out
+    }
+}
+
 /// Build the complete PDF for a sheet. Returns the file bytes and the number
-/// of geometry lines drawn across all viewports.
+/// of geometry lines drawn across all viewports. No shaded rasters: any
+/// Shaded-mode viewport falls back to hidden-line vector output.
 pub fn sheet_pdf(doc: &Document, sheet: &Sheet) -> (Vec<u8>, usize) {
+    sheet_pdf_with_rasters(doc, sheet, &[])
+}
+
+/// Like [`sheet_pdf`], but Shaded-mode viewports whose index appears in
+/// `rasters` are filled with the supplied rendered image (embedded as a PDF
+/// image XObject). The GPU layer (FFI/app) produces the pixels; this crate only
+/// embeds them. A raster with no matching Shaded view — or a malformed buffer —
+/// is ignored, and that viewport falls back to hidden-line vector output.
+pub fn sheet_pdf_with_rasters(
+    doc: &Document,
+    sheet: &Sheet,
+    rasters: &[ViewRaster],
+) -> (Vec<u8>, usize) {
     let (paper_w, paper_h) = sheet.paper.landscape_mm();
-    let (content, drawn) = sheet_content(doc, sheet);
-    (write_pdf(paper_w, paper_h, content.as_bytes()), drawn)
+    let (content, drawn, images) = sheet_content(doc, sheet, rasters);
+    (write_pdf(paper_w, paper_h, content.as_bytes(), &images), drawn)
 }
 
 /// Build the PDF content-stream operators for a single sheet (frame, title,
-/// viewports, annotations) plus a count of drawn model lines. Shared by
+/// viewports, annotations) plus a count of drawn model lines and the image
+/// XObjects to embed (one per Shaded viewport with a valid raster). Shared by
 /// [`sheet_pdf`] (one page) and [`sheets_pdf`] (multi-page publish) so the two
 /// render byte-identically per sheet.
-fn sheet_content(doc: &Document, sheet: &Sheet) -> (String, usize) {
+fn sheet_content(
+    doc: &Document,
+    sheet: &Sheet,
+    rasters: &[ViewRaster],
+) -> (String, usize, Vec<SheetImage>) {
     let (paper_w, paper_h) = sheet.paper.landscape_mm();
     let mut content = String::new();
     let mut drawn = 0usize;
+    let mut images: Vec<SheetImage> = Vec::new();
 
     // Sheet frame + title.
     content.push_str(&format!(
@@ -863,7 +1121,23 @@ fn sheet_content(doc: &Document, sheet: &Sheet) -> (String, usize) {
                     (DVec2::new(x0, y0), DVec2::new(x0 + view_w, y1))
                 }
             };
-            drawn += render_view(doc, view, rect, &mut content);
+            // Shaded viewport with a matching, valid raster → embed it as an
+            // image XObject and paint it into the rect. Anything else (wrong
+            // mode, no raster, bad buffer) renders as vector line art.
+            let image_name = if view.display_mode == itsjustcad_doc::SheetDisplayMode::Shaded {
+                rasters
+                    .iter()
+                    .find(|r| r.view_index == i)
+                    .and_then(|r| SheetImage::from_raster(format!("Im{i}"), r))
+                    .map(|img| {
+                        let name = img.name.clone();
+                        images.push(img);
+                        name
+                    })
+            } else {
+                None
+            };
+            drawn += render_view(doc, view, rect, image_name.as_deref(), &mut content);
         }
     }
 
@@ -893,7 +1167,7 @@ fn sheet_content(doc: &Document, sheet: &Sheet) -> (String, usize) {
         render_titleblock(tb, paper_w, &mut content);
     }
 
-    (content, drawn)
+    (content, drawn, images)
 }
 
 /// Batch-publish several sheets into one multi-page PDF (AutoCAD Sheet Set
@@ -902,78 +1176,120 @@ fn sheet_content(doc: &Document, sheet: &Sheet) -> (String, usize) {
 /// Sheets are rendered in the order given — the caller passes them already in
 /// the set's publication (numbering) order.
 pub fn sheets_pdf(doc: &Document, sheets: &[&Sheet]) -> (Vec<u8>, usize) {
-    let mut pages: Vec<(f64, f64, String)> = Vec::with_capacity(sheets.len());
+    sheets_pdf_with_rasters(doc, sheets, &[])
+}
+
+/// Like [`sheets_pdf`], but each sheet may carry shaded rasters. `rasters` is
+/// parallel to `sheets`: `rasters[i]` holds the `ViewRaster`s for `sheets[i]`
+/// (empty slice = all vector). A shorter `rasters` than `sheets` is fine — the
+/// missing tail is treated as all-vector.
+pub fn sheets_pdf_with_rasters(
+    doc: &Document,
+    sheets: &[&Sheet],
+    rasters: &[Vec<ViewRaster>],
+) -> (Vec<u8>, usize) {
+    let mut pages: Vec<Page> = Vec::with_capacity(sheets.len());
     let mut drawn_total = 0usize;
-    for s in sheets {
+    for (i, s) in sheets.iter().enumerate() {
         let (paper_w, paper_h) = s.paper.landscape_mm();
-        let (content, drawn) = sheet_content(doc, s);
+        let rs = rasters.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        let (content, drawn, images) = sheet_content(doc, s, rs);
         drawn_total += drawn;
-        pages.push((paper_w, paper_h, content));
+        pages.push(Page { w: paper_w, h: paper_h, content, images });
     }
     (write_pdf_pages(&pages), drawn_total)
 }
 
-/// Minimal single-page PDF: catalog, page tree, page, content stream, and a
-/// built-in Helvetica font. Cross-reference offsets are exact.
-fn write_pdf(paper_w_mm: f64, paper_h_mm: f64, content: &[u8]) -> Vec<u8> {
-    let objects: Vec<Vec<u8>> = vec![
-        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] \
-             /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
-            mm(paper_w_mm),
-            mm(paper_h_mm)
-        )
-        .into_bytes(),
-        {
-            let mut s = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
-            s.extend_from_slice(content);
-            s.extend_from_slice(b"\nendstream");
-            s
-        },
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
-    ];
-
-    assemble_pdf(&objects)
+/// One page's worth of writer input: paper size (mm), the content stream, and
+/// the image XObjects referenced by that content.
+struct Page {
+    w: f64,
+    h: f64,
+    content: String,
+    images: Vec<SheetImage>,
 }
 
-/// Multi-page PDF writer: one `/Page` per `(paper_w_mm, paper_h_mm, content)`,
-/// each with its own MediaBox, all sharing a single Helvetica font. Object
-/// layout: 1 Catalog, 2 Pages, then per page a Page object + a Contents stream,
-/// and finally the shared Font. Cross-reference offsets are exact, matching the
-/// single-page [`write_pdf`].
-fn write_pdf_pages(pages: &[(f64, f64, String)]) -> Vec<u8> {
+/// Minimal single-page PDF: catalog, page tree, page, content stream, a
+/// built-in Helvetica font, and any image XObjects. Cross-reference offsets are
+/// exact. Delegates to [`write_pdf_pages`] so the single- and multi-page paths
+/// share one object-layout implementation.
+fn write_pdf(paper_w_mm: f64, paper_h_mm: f64, content: &[u8], images: &[SheetImage]) -> Vec<u8> {
+    // Clone the images into an owned single-page `Page` for the shared writer.
+    // (One-shot export; the clone cost is irrelevant next to the raster bytes.)
+    let page = Page {
+        w: paper_w_mm,
+        h: paper_h_mm,
+        content: String::from_utf8_lossy(content).into_owned(),
+        images: images
+            .iter()
+            .map(|im| SheetImage {
+                name: im.name.clone(),
+                width: im.width,
+                height: im.height,
+                rgb: im.rgb.clone(),
+            })
+            .collect(),
+    };
+    write_pdf_pages(std::slice::from_ref(&page))
+}
+
+/// Multi-page PDF writer: one `/Page` per [`Page`], each with its own MediaBox,
+/// all sharing a single Helvetica font. Image XObjects are appended after the
+/// font and referenced from each page's `/Resources /XObject` dict.
+///
+/// Object layout (1-based): 1=Catalog, 2=Pages, then for page i (0-based) a Page
+/// object (`3 + 2*i`) + a Contents stream (`4 + 2*i`); then the shared Font;
+/// then every page's images in order. Cross-reference offsets are exact.
+fn write_pdf_pages(pages: &[Page]) -> Vec<u8> {
     let n = pages.len();
-    // Object numbering: 1=Catalog, 2=Pages, then for page i (0-based):
-    //   page obj  = 3 + 2*i
-    //   content   = 4 + 2*i
-    // font obj = 3 + 2*n (last).
     let font_obj = 3 + 2 * n;
 
-    let mut objects: Vec<Vec<u8>> = Vec::with_capacity(2 + 2 * n + 1);
+    // Assign image object numbers after the font, in page order. Record, per
+    // page, the `/XObject` resource entries (`/Name obj 0 R`).
+    let mut image_objects: Vec<Vec<u8>> = Vec::new();
+    let mut xobj_entries: Vec<String> = Vec::with_capacity(n);
+    let mut next_obj = font_obj + 1;
+    for page in pages {
+        let mut entries = String::new();
+        for im in &page.images {
+            entries.push_str(&format!("/{} {} 0 R ", im.name, next_obj));
+            image_objects.push(im.to_object());
+            next_obj += 1;
+        }
+        xobj_entries.push(entries);
+    }
+
+    let mut objects: Vec<Vec<u8>> = Vec::with_capacity(2 + 2 * n + 1 + image_objects.len());
     objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
     let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 3 + 2 * i)).collect();
     objects.push(
         format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), n).into_bytes(),
     );
-    for (i, (w, h, content)) in pages.iter().enumerate() {
+    for (i, page) in pages.iter().enumerate() {
         let content_obj = 4 + 2 * i;
+        // Only emit an /XObject sub-dictionary when this page has images, so
+        // image-free pages serialize byte-identically to the historical output.
+        let xobj = if xobj_entries[i].is_empty() {
+            String::new()
+        } else {
+            format!("/XObject << {}>> ", xobj_entries[i].trim_end())
+        };
         objects.push(
             format!(
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] \
-                 /Contents {content_obj} 0 R /Resources << /Font << /F1 {font_obj} 0 R >> >> >>",
-                mm(*w),
-                mm(*h)
+                 /Contents {content_obj} 0 R /Resources << /Font << /F1 {font_obj} 0 R >> {xobj}>> >>",
+                mm(page.w),
+                mm(page.h)
             )
             .into_bytes(),
         );
-        let mut s = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
-        s.extend_from_slice(content.as_bytes());
+        let mut s = format!("<< /Length {} >>\nstream\n", page.content.len()).into_bytes();
+        s.extend_from_slice(page.content.as_bytes());
         s.extend_from_slice(b"\nendstream");
         objects.push(s);
     }
     objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
+    objects.extend(image_objects);
 
     assemble_pdf(&objects)
 }
@@ -1508,5 +1824,149 @@ mod tests {
         assert!(present_pdf.contains("(Villa)"), "project value present");
         assert!(present_pdf.contains("(DRAWN BY)") && present_pdf.contains("(HTP)"));
         assert!(!present_pdf.contains("(CLIENT)"), "empty fields skipped");
+    }
+
+    // --- Item 5: render style per viewport (no GPU needed for any of these) ---
+
+    /// `rect_to_pixels`: mm→px at a DPI, with clamping. 200 DPI → 1 mm ≈ 7.874 px.
+    #[test]
+    fn rect_to_pixels_math() {
+        // 100 mm × 50 mm at 200 DPI: 100/25.4*200 = 787.4 → 787; 50 → 394.
+        let (w, h) = rect_to_pixels(100.0, 50.0, 200.0);
+        assert_eq!((w, h), (787, 394));
+        // 25.4 mm (1 inch) at 150 DPI = exactly 150 px.
+        assert_eq!(rect_to_pixels(25.4, 25.4, 150.0), (150, 150));
+        // Zero / negative sizes clamp up to 1 px (never a zero-dimension image).
+        assert_eq!(rect_to_pixels(0.0, 0.0, 200.0), (1, 1));
+        assert_eq!(rect_to_pixels(-5.0, 10.0, 200.0), (1, 79));
+        // Huge request is capped at SHADED_MAX_PX on the longest side, aspect kept.
+        let (bw, bh) = rect_to_pixels(10_000.0, 5_000.0, 600.0);
+        assert!(bw.max(bh) <= SHADED_MAX_PX, "longest side capped: {bw}x{bh}");
+        assert_eq!(bw, SHADED_MAX_PX);
+        // 2:1 aspect preserved within rounding.
+        assert!((bw as i64 - 2 * bh as i64).abs() <= 2, "2:1 aspect kept: {bw}x{bh}");
+    }
+
+    /// `ViewRaster::is_valid` + `SheetImage::from_raster`: a correct buffer
+    /// flattens RGBA→RGB (alpha dropped) and produces a DeviceRGB XObject whose
+    /// `/Length` matches `w*h*3`; a malformed buffer is rejected.
+    #[test]
+    fn image_xobject_from_synthetic_pixels() {
+        // 2×1 red/green image. RGBA in, RGB out.
+        let raster = ViewRaster {
+            view_index: 0,
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 128],
+        };
+        assert!(raster.is_valid());
+        let img = SheetImage::from_raster("Im0".into(), &raster).expect("valid raster");
+        assert_eq!(img.rgb, vec![255, 0, 0, 0, 255, 0], "alpha dropped, RGB kept");
+        let obj = img.to_object();
+        let head = String::from_utf8_lossy(&obj[..obj.len().min(160)]).into_owned();
+        assert!(head.contains("/Subtype /Image"), "image XObject: {head}");
+        assert!(head.contains("/ColorSpace /DeviceRGB"));
+        assert!(head.contains("/Width 2") && head.contains("/Height 1"));
+        assert!(head.contains("/Length 6"), "RGB length = 2*1*3: {head}");
+
+        // Wrong-length buffer → rejected (falls back to vector).
+        let bad = ViewRaster { view_index: 0, width: 2, height: 2, rgba: vec![0; 3] };
+        assert!(!bad.is_valid());
+        assert!(SheetImage::from_raster("Im0".into(), &bad).is_none());
+    }
+
+    /// A shaded viewport with a supplied raster embeds an image XObject in the
+    /// PDF, references it via a `/XObject` resource + a `cm … /Im0 Do` paint, and
+    /// skips the vector geometry pass (so a box's 12 edges are NOT drawn).
+    #[test]
+    fn shaded_viewport_embeds_raster_and_skips_vectors() {
+        use crate::{parse, Session};
+        let mut s = Session::default();
+        s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse("sheetview s1 top 100").unwrap()).unwrap();
+        s.run(parse("sheetviewset s1 1 mode shaded").unwrap()).unwrap();
+
+        let sheet = s.doc.sheet("s1").unwrap().clone();
+        // 10×10 opaque grey raster for view 0.
+        let raster = ViewRaster {
+            view_index: 0,
+            width: 10,
+            height: 10,
+            rgba: vec![128u8; 10 * 10 * 4],
+        };
+        let (bytes, drawn) = sheet_pdf_with_rasters(&s.doc, &sheet, &[raster]);
+        assert_eq!(drawn, 0, "shaded viewport draws no vector geometry");
+        let content = String::from_utf8_lossy(&bytes);
+        assert!(content.contains("/Subtype /Image"), "image XObject embedded");
+        assert!(content.contains("/XObject <<"), "page references the XObject");
+        assert!(content.contains("/Im0 Do"), "image painted into the viewport");
+        assert!(bytes.starts_with(b"%PDF") && bytes.ends_with(b"%%EOF\n"), "valid PDF");
+    }
+
+    /// Shaded mode with NO raster (or a mismatched one) falls back to vector:
+    /// the geometry is still drawn and no image XObject is emitted.
+    #[test]
+    fn shaded_without_raster_falls_back_to_vector() {
+        use crate::{parse, Session};
+        let mut s = Session::default();
+        s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse("sheetview s1 top 100").unwrap()).unwrap();
+        s.run(parse("sheetviewset s1 1 mode shaded").unwrap()).unwrap();
+        let sheet = s.doc.sheet("s1").unwrap().clone();
+        // No rasters passed → vector fallback.
+        let (bytes, drawn) = sheet_pdf(&s.doc, &sheet);
+        assert!(drawn > 0, "fallback draws vector geometry, got {drawn}");
+        assert!(!String::from_utf8_lossy(&bytes).contains("/Subtype /Image"),
+            "no image XObject without a raster");
+    }
+
+    /// Hidden-line mode removes edges occluded by solid faces, so a shaded box
+    /// (which fully occludes its own far edges in a top view) draws FEWER edges
+    /// than the same box in wireframe. Wireframe output is unchanged.
+    #[test]
+    fn hidden_line_removes_occluded_edges() {
+        use crate::{parse, Session};
+
+        let draw_count = |mode: &str| -> usize {
+            let mut s = Session::default();
+            // A solid box: top view sees the top face (4 edges) occluding the
+            // bottom face's 4 edges + the 4 verticals (which project onto the
+            // silhouette). Wireframe keeps all; hidden-line culls the hidden ones.
+            s.run(parse("box 0,0,0 2,2,2").unwrap()).unwrap();
+            s.run(parse("sheet s1 a3").unwrap()).unwrap();
+            s.run(parse("sheetview s1 top 50").unwrap()).unwrap();
+            s.run(parse(&format!("sheetviewset s1 1 mode {mode}")).unwrap()).unwrap();
+            let sheet = s.doc.sheet("s1").unwrap().clone();
+            sheet_pdf(&s.doc, &sheet).1
+        };
+
+        let wire = draw_count("wireframe");
+        let hidden = draw_count("hiddenline");
+        assert!(wire > 0, "wireframe draws the box edges");
+        assert!(
+            hidden < wire,
+            "hidden-line removes occluded edges (wire={wire}, hidden={hidden})"
+        );
+    }
+
+    /// Wireframe (the default) is byte-identical whether or not the display_mode
+    /// field is touched — proving the new routing adds nothing to legacy output.
+    #[test]
+    fn wireframe_output_unchanged_by_mode_field() {
+        use crate::{parse, Session};
+        let build = |set_wire: bool| -> Vec<u8> {
+            let mut s = Session::default();
+            s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+            s.run(parse("sheet s1 a3").unwrap()).unwrap();
+            s.run(parse("sheetview s1 top 100").unwrap()).unwrap();
+            if set_wire {
+                s.run(parse("sheetviewset s1 1 mode wireframe").unwrap()).unwrap();
+            }
+            let sheet = s.doc.sheet("s1").unwrap().clone();
+            sheet_pdf(&s.doc, &sheet).0
+        };
+        assert_eq!(build(false), build(true), "explicit wireframe == default");
     }
 }
