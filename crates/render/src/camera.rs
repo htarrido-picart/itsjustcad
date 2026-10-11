@@ -67,7 +67,14 @@ impl OrbitCamera {
     pub fn pan(&mut self, dx: f32, dy: f32) {
         let eye = self.eye();
         let forward = (self.target - eye).normalize();
-        let right = forward.cross(Vec3::Z).normalize();
+        // Use the SAME up-reference as `view_proj`: looking straight down/up
+        // (top/bottom view) the Z reference degenerates — `forward × Z → 0` and
+        // normalizes to a vector OPPOSITE the screen axes the projection uses,
+        // which inverted the pan. Switching to Y there (matching view_proj's
+        // `pitch.abs() > 1.55` guard) keeps pan content-follows-finger in every
+        // view; non-vertical views are unchanged (still Z).
+        let ref_up = if self.pitch.abs() > 1.55 { Vec3::Y } else { Vec3::Z };
+        let right = forward.cross(ref_up).normalize();
         let up = right.cross(forward);
         let scale = self.distance * 0.0016;
         self.target += (-right * dx + up * dy) * scale;
