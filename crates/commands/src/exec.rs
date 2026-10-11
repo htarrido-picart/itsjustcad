@@ -770,10 +770,16 @@ impl Session {
                 // full replay starts from a fresh world CPlane, so neither
                 // double-transforms.
                 let cmd = cplane_resolve(&self.doc, cmd)?;
+                // Coalescing (below) is only sound at the log tip: after an
+                // undo the entry before the cursor is NOT "what just happened",
+                // so merging across it would skip the state the user returned to.
+                let at_tip = self.cursor == self.log.len();
                 let (op, inverse, outcome) = apply_forward(&mut self.doc, cmd)?;
                 if logged {
                     self.log.truncate(self.cursor);
-                    self.log.push(AppliedOp { op, inverse });
+                    if !(at_tip && self.coalesce_lot_refresh(&op, &inverse)) {
+                        self.log.push(AppliedOp { op, inverse });
+                    }
                     self.cursor = self.log.len();
                 }
                 Ok(outcome)
@@ -790,6 +796,32 @@ impl Session {
         let out = self.run(cmd);
         self.doc.cplane = saved;
         out
+    }
+
+    /// Op-log coalescing for the W1 auto-recompute churn: when a `lotrefresh`
+    /// for source X lands directly on top of another `lotrefresh` for X (log
+    /// tip, nothing in between), merge them into ONE entry instead of
+    /// appending. A drag gesture on a source polygon fires one auto refresh
+    /// per commit; without merging each one is its own undo step and the log
+    /// bloats. The merged entry adopts the NEW forward op + created ids (so
+    /// replay reproduces the final lots) while KEEPING the first entry's
+    /// `restored`/`prev_link` inverse (so one undo restores the pre-gesture
+    /// state). Returns true when merged; the caller then skips the push.
+    fn coalesce_lot_refresh(&mut self, op: &Command, inverse: &Inverse) -> bool {
+        let Command::LotRefresh { source, .. } = op else { return false };
+        let Inverse::LotRefreshed { created, .. } = inverse else { return false };
+        let Some(prev) = self.log.last_mut() else { return false };
+        // Same-source lotrefresh only: LotSetParams reuses the LotRefreshed
+        // inverse but is a distinct user action, so it never merges.
+        if !matches!(&prev.op, Command::LotRefresh { source: s, .. } if s == source) {
+            return false;
+        }
+        let Inverse::LotRefreshed { created: prev_created, .. } = &mut prev.inverse else {
+            return false;
+        };
+        *prev_created = created.clone();
+        prev.op = op.clone();
+        true
     }
 
     fn undo(&mut self) -> Result<ApplyOutcome, ExecError> {
@@ -26427,5 +26459,148 @@ mod tests {
         run(&mut s, "undo"); // undo refresh
         run(&mut s, "undo"); // undo the unfreeze → back to frozen
         assert!(s.doc.subdivision_links.get(&source).unwrap().frozen, "undo restored frozen flag");
+    }
+
+    /// Issue #24 helper: a subdivided 40x40 square block, returning the session
+    /// and its source id. Shared by the coalescing tests below.
+    fn subdivided_square(origin_x: f64) -> (Session, ObjectId) {
+        let mut s = Session::default();
+        subdivide_square(&mut s, origin_x);
+        let source = s.doc.objects().next().expect("one block").id;
+        (s, source)
+    }
+
+    /// Append a subdivided 40x40 square block at `origin_x` to an existing
+    /// session (grid method, default params).
+    fn subdivide_square(s: &mut Session, origin_x: f64) {
+        let (a, b) = (origin_x, origin_x + 40.0);
+        run(s, &format!("polyline {a},0,0 {b},0,0 {b},40,0 {a},40,0 closed"));
+        let source = s.doc.objects().last().expect("block").id;
+        s.run(Command::LotSubdivide {
+            targets: Selector::Ids { ids: vec![source] },
+            method: "grid".into(),
+            area: None,
+            width: None,
+            irregularity: None,
+            seed: None,
+            ids: None,
+        })
+        .expect("lotsubdivide ok");
+    }
+
+    /// Issue #24: back-to-back `lotrefresh` ops on the SAME source coalesce
+    /// into ONE log entry — a multi-commit drag gesture becomes a single undo
+    /// step that restores the pre-gesture lots + link in one go.
+    #[test]
+    fn lotrefresh_coalesces_back_to_back_refreshes_into_one_undo_step() {
+        let (mut s, source) = subdivided_square(0.0);
+        let pre = s.doc.subdivision_links.get(&source).expect("link").clone();
+        let steps_before = s.history().0.len();
+
+        // Simulate the auto-recompute firing once per drag commit: nudge the
+        // source geometry (as the app's grip drag does) and refresh, thrice.
+        for i in 1..=3 {
+            let obj = s.doc.get_mut(source).expect("source");
+            obj.geometry.translate(DVec3::new(0.0, 0.5 * f64::from(i), 0.0));
+            s.run(Command::LotRefresh { source, ids: None }).expect("refresh ok");
+        }
+        let final_ids = s.doc.subdivision_links.get(&source).expect("link").produced.clone();
+        assert_ne!(final_ids, pre.produced, "refresh minted fresh ids");
+
+        // The three refreshes collapsed into a single log entry.
+        let (steps, cursor) = s.history();
+        assert_eq!(steps.len(), steps_before + 1, "3 refreshes coalesced into 1 op: {steps:?}");
+        assert_eq!(cursor, steps.len(), "cursor at the tip");
+
+        // ONE undo restores the pre-gesture lots and link.
+        run(&mut s, "undo");
+        let reverted = s.doc.subdivision_links.get(&source).expect("link after undo").clone();
+        assert_eq!(reverted.produced, pre.produced, "one undo → pre-gesture produced ids");
+        for id in &pre.produced {
+            assert!(s.doc.get(*id).is_some(), "pre-gesture lot {id:?} restored");
+        }
+        for id in &final_ids {
+            assert!(s.doc.get(*id).is_none(), "coalesced lot {id:?} removed by one undo");
+        }
+    }
+
+    /// Issue #24: refreshes for DIFFERENT sources never merge, and any
+    /// intervening logged op is a gesture boundary that blocks coalescing.
+    #[test]
+    fn lotrefresh_coalescing_stops_at_other_sources_and_intervening_ops() {
+        let (mut s, b1) = subdivided_square(0.0);
+        subdivide_square(&mut s, 100.0);
+        let b2 = s
+            .doc
+            .subdivision_links
+            .keys()
+            .copied()
+            .find(|k| *k != b1)
+            .expect("second link");
+
+        // Alternating sources: both entries stay separate.
+        let n = s.history().0.len();
+        s.run(Command::LotRefresh { source: b1, ids: None }).expect("refresh b1");
+        s.run(Command::LotRefresh { source: b2, ids: None }).expect("refresh b2");
+        assert_eq!(s.history().0.len(), n + 2, "different sources do not coalesce");
+
+        // Same source but with an unrelated op in between: no merge either.
+        run(&mut s, "box 200,0,0 2,2,2");
+        s.run(Command::LotRefresh { source: b2, ids: None }).expect("refresh b2 again");
+        assert_eq!(s.history().0.len(), n + 4, "an intervening op blocks coalescing");
+    }
+
+    /// Issue #24: an undo is a gesture boundary. A refresh issued while the
+    /// cursor is OFF the log tip must append (after truncating the redo tail),
+    /// not merge into the refresh entry before the cursor — otherwise a single
+    /// undo would skip the state the user deliberately returned to.
+    #[test]
+    fn lotrefresh_does_not_coalesce_across_an_undo_boundary() {
+        let (mut s, source) = subdivided_square(0.0);
+        s.run(Command::LotRefresh { source, ids: None }).expect("refresh A");
+        let after_a = s.doc.subdivision_links.get(&source).expect("link").produced.clone();
+
+        // Park a redo tail so the next refresh arrives off the log tip.
+        run(&mut s, "box 200,0,0 2,2,2");
+        run(&mut s, "undo");
+        let n = s.history().0.len(); // still counts the undone box op
+
+        s.run(Command::LotRefresh { source, ids: None }).expect("refresh B");
+        assert_eq!(s.history().0.len(), n, "box op truncated, refresh B appended separately");
+
+        // Undoing refresh B lands on the post-refresh-A state, not pre-A.
+        run(&mut s, "undo");
+        let reverted = s.doc.subdivision_links.get(&source).expect("link").produced.clone();
+        assert_eq!(reverted, after_a, "undo stops at the state the user had returned to");
+    }
+
+    /// Issue #24: a coalesced log stays replayable — the saved effective log
+    /// (one merged `lotrefresh` carrying the FINAL ids) reproduces the final
+    /// document byte-identically.
+    #[test]
+    fn replay_of_coalesced_lotrefresh_log_reproduces_final_document() {
+        let (mut s, source) = subdivided_square(0.0);
+        s.run(Command::LotRefresh { source, ids: None }).expect("refresh 1");
+        s.run(Command::LotRefresh { source, ids: None }).expect("refresh 2");
+
+        let log = s.save_log();
+        let replayed = Session::replay(log.clone()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a.len(), b.len(), "same object count after replay");
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x, y, "replayed object identical");
+        }
+        assert_eq!(
+            s.doc.subdivision_links.get(&source).map(|l| l.produced.clone()),
+            replayed.doc.subdivision_links.get(&source).map(|l| l.produced.clone()),
+            "replay reproduces the merged link's produced ids"
+        );
+        // The log itself is stable across replay (the merged op's written-back
+        // ids round-trip).
+        assert_eq!(
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&replayed.save_log()).unwrap()
+        );
     }
 }
