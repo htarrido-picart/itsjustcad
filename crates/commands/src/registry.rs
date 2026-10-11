@@ -726,6 +726,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Tools,
         },
         CommandSpec {
+            name: "trace",
+            usage: "trace <color> [tol <n>] [layer]",
+            summary: "Vectorize the underlay by color into pixel-accurate centerline polylines on their own layer — the precise way to trace (do NOT hand-plot points by eye). <color> is r,g,b (0..255, read it from the image) or a name (red/green/blue/black/white/cyan/magenta/yellow); optional tol is the per-channel match tolerance (default 72); remaining words name the layer (default Trace). Set an underlay first, then trace each color onto its own layer. Example: trace 237,28,36 Contours · trace blue Boundary",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "underlayopacity",
             usage: "underlayopacity <0..1>",
             summary: "Set the underlay's blend opacity. Example: underlayopacity 0.4",

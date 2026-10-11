@@ -542,6 +542,18 @@ pub enum Command {
         points: Vec<DVec3>,
         closed: bool,
     },
+    /// Vectorize the raster underlay: extract strokes matching `target` colour
+    /// (within `tol`, max per-channel distance) as centerline polylines on
+    /// `layer` (default: "Trace"). Reads the underlay image, so it is
+    /// side-effecting; it is NOT logged itself — it expands into logged
+    /// `Layer`/`Polyline`/`LayerColor` ops (the `import_geojson` precedent), so
+    /// replay reconstructs the geometry from the op-log without the image.
+    Trace {
+        target: [u8; 3],
+        tol: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layer: Option<String>,
+    },
     Rectangle {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
@@ -2380,6 +2392,9 @@ impl Command {
                 | Command::Export { .. }
                 | Command::ControlImages { .. }
                 | Command::Import { .. }
+                // trace expands into logged Layer/Polyline ops; it is not
+                // itself logged (the Import/Terrain precedent).
+                | Command::Trace { .. }
                 | Command::Terrain { .. }
                 | Command::OsmFile { .. }
                 | Command::Plant { .. }
@@ -2452,6 +2467,8 @@ impl Command {
                 // dataextract only touches the fs when writing a .csv
                 | Command::DataExtract { path: Some(_), .. }
                 | Command::Underlay { .. }
+                // trace READS the underlay image off disk to vectorize it
+                | Command::Trace { .. }
                 // hatchpat reads an external .pat file from disk
                 | Command::HatchPat { .. }
                 | Command::BlockLibLoad { .. }
@@ -2484,6 +2501,10 @@ impl Command {
             Command::PlantSchedule { path } => Some(format!("plantschedule → {path}")),
             Command::DataExtract { path: Some(p), .. } => Some(format!("dataextract → {p}")),
             Command::Underlay { path, .. } => Some(format!("underlay ← {path}")),
+            Command::Trace { target, layer, .. } => Some(format!(
+                "trace underlay [{:02x}{:02x}{:02x}] → layer {}",
+                target[0], target[1], target[2], layer.as_deref().unwrap_or("Trace")
+            )),
             Command::HatchPat { path } => Some(format!("hatchpat ← {path}")),
             Command::BlockLibLoad { name, .. } => {
                 Some(format!("blockload ← library:{name}"))
@@ -2516,6 +2537,8 @@ mod classify_tests {
             Command::OsmFile { path: "/tmp/o.json".into() },
             Command::PlantSchedule { path: "/tmp/plants.csv".into() },
             Command::Underlay { path: "/tmp/p.png".into(), corner: None, width: None, height: None },
+            // trace reads the underlay image off disk.
+            Command::Trace { target: [255, 0, 0], tol: 60, layer: None },
             // Granting a workdir (path set) is a persisted fs grant → gated.
             Command::Workdir { path: Some("/tmp/imports".into()) },
         ];

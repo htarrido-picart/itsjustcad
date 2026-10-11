@@ -961,6 +961,7 @@ pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char)
         if let PendingOp::Cmd(cmd) = &op
             && cmd.is_side_effecting()
             && !itsjustcad_commands::workdir::allows_underlay(cmd)
+            && !itsjustcad_commands::workdir::allows_trace(cmd)
         {
             eprintln!("[ijc] {}", side_effect_refusal(cmd));
             return false;
@@ -2052,6 +2053,7 @@ unsafe fn deck_send_inner(
                                     if let PendingOp::Cmd(cmd) = &op
                                         && cmd.is_side_effecting()
                                         && !itsjustcad_commands::workdir::allows_underlay(cmd)
+                                        && !itsjustcad_commands::workdir::allows_trace(cmd)
                                     {
                                         emit(cb, &ctx, CB_ERROR, &side_effect_refusal(cmd));
                                         continue;
