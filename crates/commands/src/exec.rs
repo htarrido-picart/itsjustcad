@@ -12440,6 +12440,24 @@ fn apply_forward(
             ))
         }
         Command::Underlay { path, corner, width, height } => {
+            // Workdir name resolution (mirrors `import`): when a deck workdir is
+            // granted and `path` isn't already an existing file on disk, resolve
+            // it as a bare name inside that scoped folder (path-traversal
+            // guarded — '..'/absolute/separators/symlink-escape refused). This is
+            // what lets the model emit `underlay attachment-1.jpg` and have it
+            // land on `<workdir>/attachment-1.jpg`. The SAME resolver backs the
+            // iOS gate (`workdir::allows_underlay`), so what the gate authorizes
+            // is exactly what we place here. A human's real existing path still
+            // underlays directly; no workdir → behaviour unchanged.
+            let path = if !std::path::Path::new(&path).is_file()
+                && crate::workdir::get().is_some()
+            {
+                crate::workdir::resolve_within(&path)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .map_err(ExecError::Invalid)?
+            } else {
+                path
+            };
             let prev = doc.underlay.clone();
             let corner = corner.unwrap_or(DVec3::ZERO);
             let width = width.unwrap_or(10.0);

@@ -861,8 +861,13 @@ pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char)
             return false;
         };
         // Gate side-effecting commands (fs/net) exactly as the deck path does.
+        // The ONE exception: `underlay <file>` where <file> resolves INSIDE the
+        // user-granted workdir (canonicalized, traversal- and symlink-guarded).
+        // Everything else (Import/Export/Print, or an underlay escaping the
+        // workdir) stays refused.
         if let PendingOp::Cmd(cmd) = &op
             && cmd.is_side_effecting()
+            && !itsjustcad_commands::workdir::allows_underlay(cmd)
         {
             eprintln!("[ijc] refused side-effecting host command (filesystem/network not allowed)");
             return false;
@@ -872,6 +877,62 @@ pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char)
             return true;
         }
         false
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Scoped workdir (app-initiated, TRUSTED)
+// ---------------------------------------------------------------------------
+//
+// These let the iOS app point the core's scoped workdir at its own attachments
+// sandbox directory. Granting a workdir is app-initiated and therefore TRUSTED
+// — it is NOT routed through the side-effect gate (the gate exists to stop the
+// untrusted model/host-typed path from choosing arbitrary filesystem paths; the
+// app choosing its OWN sandbox dir is the human-authorized act the whole workdir
+// mechanism is built around). Once set, the model may only `underlay` files
+// that live INSIDE this directory (see `workdir::allows_underlay`).
+
+/// Grant `path` as the core's scoped workdir (app-initiated, TRUSTED — NOT
+/// gated). `path` must name an existing directory; it is validated and the
+/// canonical form persisted. Returns `true` on success, `false` on a null/bad
+/// handle, a null/invalid path, or a path that is not an existing directory.
+///
+/// # Safety
+/// `h` must be null or a live handle; `path` must be null or a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_set_workdir(h: *mut AppHandle, path: *const c_char) -> bool {
+    guard_ffi(false, || {
+        if (unsafe { handle_ref(h) }).is_none() {
+            return false;
+        }
+        if path.is_null() {
+            return false;
+        }
+        let Ok(s) = (unsafe { CStr::from_ptr(path) }).to_str() else {
+            return false;
+        };
+        itsjustcad_commands::workdir::set(s).is_ok()
+    })
+}
+
+/// Return the currently-granted workdir as a heap-allocated C string the caller
+/// owns, or null when no workdir is set (or on a null/invalid handle). Caller
+/// must release a non-null result exactly once via [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle. The returned pointer, if non-null, must
+/// be freed exactly once via [`ijc_string_free`] and not otherwise retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_get_workdir(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        if (unsafe { handle_ref(h) }).is_none() {
+            return std::ptr::null_mut();
+        }
+        match itsjustcad_commands::workdir::get() {
+            Some(dir) => into_c_string(dir.to_string_lossy().into_owned()),
+            None => std::ptr::null_mut(),
+        }
     })
 }
 
@@ -1882,8 +1943,17 @@ unsafe fn deck_send_inner(
                                     // or write arbitrary paths. On iOS we refuse
                                     // side-effecting deck commands outright rather
                                     // than let the model choose fs paths.
+                                    // Same gate as `ijc_run_command`, with the
+                                    // same single exception: a model-emitted
+                                    // `underlay <file>` is allowed ONLY when the
+                                    // file resolves inside the user-granted
+                                    // workdir (canonicalized, traversal- and
+                                    // symlink-guarded). All other fs/net commands
+                                    // — and any underlay escaping the workdir —
+                                    // stay refused.
                                     if let PendingOp::Cmd(cmd) = &op
                                         && cmd.is_side_effecting()
+                                        && !itsjustcad_commands::workdir::allows_underlay(cmd)
                                     {
                                         emit(
                                             cb,

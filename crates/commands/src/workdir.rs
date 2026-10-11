@@ -12,6 +12,7 @@
 //! refused. This keeps the security invariant — the model gets file access only
 //! within one folder a human explicitly chose, and only for import.
 
+use crate::command::Command;
 use std::path::{Path, PathBuf};
 
 /// Extensions the substrate can import (kept in sync with the `import` dispatch
@@ -130,6 +131,43 @@ pub fn resolve_within_dir(dir: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
+/// Resolve an `underlay` target against the granted workdir, if it is a bare
+/// name inside it. Returns the canonical absolute path when `name` names a file
+/// that lives inside the granted workdir (no `..`, no separators, no absolute
+/// escape, no symlink escape — the same guard as [`resolve_within`]). Returns
+/// `None` when there is no workdir OR the name is anything other than a bare
+/// in-workdir file (an absolute path, a traversal attempt, or a miss). This is
+/// the single source of truth both the gate and exec-path resolution consult,
+/// so the thing the gate *authorizes* is exactly the thing exec *places*.
+pub fn resolve_underlay(name: &str) -> Option<PathBuf> {
+    let dir = get()?;
+    resolve_within_dir(&dir, name).ok()
+}
+
+/// SECURITY GATE: the ONLY widening of the iOS side-effect refusal. Returns
+/// `true` for exactly one case — an [`Command::Underlay`] whose `path` resolves
+/// to a file INSIDE the user-granted workdir (canonicalized, traversal- and
+/// symlink-guarded via [`resolve_within_dir`]). Every other command, a missing
+/// workdir, an absolute/`..`/separator path, or a path that canonicalizes
+/// outside the workdir returns `false`, so Import/Export/Print and any
+/// underlay-of-an-outside-file stay refused exactly as before.
+pub fn allows_underlay(cmd: &Command) -> bool {
+    match get() {
+        Some(dir) => allows_underlay_in(&dir, cmd),
+        None => false,
+    }
+}
+
+/// Pure core of [`allows_underlay`] against an explicit workdir — testable
+/// without touching the persisted config. True ONLY for an [`Command::Underlay`]
+/// whose `path` resolves to a file inside `dir` (traversal/symlink-guarded).
+pub fn allows_underlay_in(dir: &Path, cmd: &Command) -> bool {
+    match cmd {
+        Command::Underlay { path, .. } => resolve_within_dir(dir, path).is_ok(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +234,64 @@ mod tests {
         let err = resolve_within_dir(&dir, "nope.dxf").unwrap_err();
         assert!(err.contains("not a file in the workdir"), "{err}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- scoped underlay gate (allows_underlay_in) ---
+
+    use crate::command::Command;
+    use glam::DVec3;
+
+    fn underlay(path: &str) -> Command {
+        Command::Underlay { path: path.into(), corner: None, width: None, height: None }
+    }
+
+    #[test]
+    fn allows_underlay_for_file_inside_the_workdir() {
+        let dir = tmp("ul_ok");
+        fs::write(dir.join("attachment-1.jpg"), b"x").unwrap();
+        assert!(allows_underlay_in(&dir, &underlay("attachment-1.jpg")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_underlay_escaping_the_workdir() {
+        let dir = tmp("ul_escape");
+        // '..' traversal, a separator'd path, and an absolute path are all refused.
+        assert!(!allows_underlay_in(&dir, &underlay("../etc/passwd")));
+        assert!(!allows_underlay_in(&dir, &underlay("sub/../../../etc/passwd")));
+        assert!(!allows_underlay_in(&dir, &underlay("/etc/passwd")));
+        // A bare name that doesn't exist in the workdir is also refused.
+        assert!(!allows_underlay_in(&dir, &underlay("nope.jpg")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_import_and_export_even_inside_the_workdir() {
+        let dir = tmp("ul_notunderlay");
+        fs::write(dir.join("site.dxf"), b"x").unwrap();
+        // Not an Underlay → never allowed by the gate exception, even for a
+        // file that genuinely lives in the workdir.
+        assert!(!allows_underlay_in(&dir, &Command::Import { path: "site.dxf".into() }));
+        assert!(!allows_underlay_in(&dir, &Command::Export { path: "out.dxf".into() }));
+        assert!(!allows_underlay_in(
+            &dir,
+            &Command::Print { sheet: "S1".into(), path: "out.pdf".into() }
+        ));
+        // A pure geometry command is likewise not an underlay grant.
+        assert!(!allows_underlay_in(
+            &dir,
+            &Command::Box { id: None, corner: DVec3::ZERO, size: DVec3::ONE }
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn allows_underlay_is_false_when_no_workdir_set() {
+        // The global entry point: with no persisted workdir, nothing is allowed.
+        // (We don't mutate the real config here; `get()` returning None is the
+        // common CI case. If a workdir IS configured, this asserts the command
+        // is still rejected because the file won't exist in it.)
+        assert!(!allows_underlay(&underlay("definitely-not-a-real-file-xyz.jpg")));
     }
 
     #[test]
