@@ -12,6 +12,7 @@
 //! refused. This keeps the security invariant — the model gets file access only
 //! within one folder a human explicitly chose, and only for import.
 
+use crate::command::Command;
 use std::path::{Path, PathBuf};
 
 /// Extensions the substrate can import (kept in sync with the `import` dispatch
@@ -130,6 +131,78 @@ pub fn resolve_within_dir(dir: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
+/// Resolve an `underlay` target against the granted workdir, if it is a bare
+/// name inside it. Returns the canonical absolute path when `name` names a file
+/// that lives inside the granted workdir (no `..`, no separators, no absolute
+/// escape, no symlink escape — the same guard as [`resolve_within`]). Returns
+/// `None` when there is no workdir OR the name is anything other than a bare
+/// in-workdir file (an absolute path, a traversal attempt, or a miss). This is
+/// the single source of truth both the gate and the read-time open resolution
+/// ([`resolve_for_open`]) consult, so the file the gate *authorizes* is exactly
+/// the file a consumer eventually *opens*.
+pub fn resolve_underlay(name: &str) -> Option<PathBuf> {
+    let dir = get()?;
+    resolve_within_dir(&dir, name).ok()
+}
+
+/// Read-time twin of the write-time gate: map a STORED underlay path to the real
+/// file to open. A bare name (no separators, not absolute) that resolves inside
+/// the granted workdir becomes that in-workdir absolute path; anything else — an
+/// absolute/relative path the user typed, or a bare name with no workdir / no
+/// match — is returned unchanged.
+///
+/// Why this exists: the stored command and document keep the portable bare NAME
+/// (baking the device's absolute sandbox path into the op-log would leak the
+/// filesystem layout and break portability across devices). Resolution to the
+/// concrete on-device path happens only here, when a consumer actually opens the
+/// file. Best-effort and non-fatal — an unresolvable name is handed back as-is so
+/// the caller surfaces the usual "image not shown" warning rather than aborting
+/// (critical for op-log replay, which must load even when the workdir/file is
+/// gone). It reuses [`resolve_underlay`], so it authorizes exactly what the gate
+/// authorized — no CWD shadow, no symlink escape.
+pub fn resolve_for_open(path: &str) -> String {
+    match get() {
+        Some(dir) => resolve_for_open_in(&dir, path),
+        None => path.to_string(),
+    }
+}
+
+/// Pure core of [`resolve_for_open`] against an explicit workdir — testable
+/// without the persisted config. A bare name that resolves to a file inside
+/// `dir` becomes that canonical path; everything else (absolute/relative paths,
+/// or a bare name with no in-workdir match) is returned unchanged.
+pub fn resolve_for_open_in(dir: &Path, path: &str) -> String {
+    let is_bare = !Path::new(path).is_absolute() && !path.contains('/') && !path.contains('\\');
+    if is_bare && let Ok(p) = resolve_within_dir(dir, path) {
+        return p.to_string_lossy().into_owned();
+    }
+    path.to_string()
+}
+
+/// SECURITY GATE: the ONLY widening of the iOS side-effect refusal. Returns
+/// `true` for exactly one case — an [`Command::Underlay`] whose `path` resolves
+/// to a file INSIDE the user-granted workdir (canonicalized, traversal- and
+/// symlink-guarded via [`resolve_within_dir`]). Every other command, a missing
+/// workdir, an absolute/`..`/separator path, or a path that canonicalizes
+/// outside the workdir returns `false`, so Import/Export/Print and any
+/// underlay-of-an-outside-file stay refused exactly as before.
+pub fn allows_underlay(cmd: &Command) -> bool {
+    match get() {
+        Some(dir) => allows_underlay_in(&dir, cmd),
+        None => false,
+    }
+}
+
+/// Pure core of [`allows_underlay`] against an explicit workdir — testable
+/// without touching the persisted config. True ONLY for an [`Command::Underlay`]
+/// whose `path` resolves to a file inside `dir` (traversal/symlink-guarded).
+pub fn allows_underlay_in(dir: &Path, cmd: &Command) -> bool {
+    match cmd {
+        Command::Underlay { path, .. } => resolve_within_dir(dir, path).is_ok(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +269,117 @@ mod tests {
         let err = resolve_within_dir(&dir, "nope.dxf").unwrap_err();
         assert!(err.contains("not a file in the workdir"), "{err}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- scoped underlay gate (allows_underlay_in) ---
+
+    use crate::command::Command;
+    use glam::DVec3;
+
+    fn underlay(path: &str) -> Command {
+        Command::Underlay { path: path.into(), corner: None, width: None, height: None }
+    }
+
+    #[test]
+    fn allows_underlay_for_file_inside_the_workdir() {
+        let dir = tmp("ul_ok");
+        fs::write(dir.join("attachment-1.jpg"), b"x").unwrap();
+        assert!(allows_underlay_in(&dir, &underlay("attachment-1.jpg")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_underlay_escaping_the_workdir() {
+        let dir = tmp("ul_escape");
+        // '..' traversal, a separator'd path, and an absolute path are all refused.
+        assert!(!allows_underlay_in(&dir, &underlay("../etc/passwd")));
+        assert!(!allows_underlay_in(&dir, &underlay("sub/../../../etc/passwd")));
+        assert!(!allows_underlay_in(&dir, &underlay("/etc/passwd")));
+        // A bare name that doesn't exist in the workdir is also refused.
+        assert!(!allows_underlay_in(&dir, &underlay("nope.jpg")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_underlay_through_a_symlink_escaping_the_workdir() {
+        // The symlink-escape guard was described but never exercised. Plant a
+        // real symlink inside the workdir pointing at a file OUTSIDE it: the
+        // bare name exists and is a file, but its canonical path leaves the
+        // workdir, so both the resolver and the gate must refuse it.
+        let dir = tmp("ul_symlink");
+        let outside = tmp("ul_symlink_outside");
+        fs::write(outside.join("secret.jpg"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.jpg"), dir.join("link.jpg")).unwrap();
+        assert!(dir.join("link.jpg").is_file(), "symlink should resolve to a file");
+        assert!(resolve_within_dir(&dir, "link.jpg").is_err(), "symlink escape must be refused");
+        assert!(!allows_underlay_in(&dir, &underlay("link.jpg")));
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn resolve_is_anchored_to_the_workdir_not_a_same_named_sibling() {
+        // Regression for the gate/exec divergence: resolution is anchored to the
+        // workdir and never selects a same-named file living elsewhere. The gate
+        // authorizes `<workdir>/a.jpg`, so exec (which calls this resolver for a
+        // bare name) must place exactly that — not a collision reachable by some
+        // other path. Here an identically-named file exists in a sibling dir;
+        // the resolved path must be the workdir's copy.
+        let dir = tmp("ul_anchor");
+        let sibling = tmp("ul_anchor_sibling");
+        fs::write(dir.join("a.jpg"), b"in-workdir").unwrap();
+        fs::write(sibling.join("a.jpg"), b"elsewhere").unwrap();
+        let resolved = resolve_within_dir(&dir, "a.jpg").expect("in-workdir file resolves");
+        assert_eq!(resolved, dir.canonicalize().unwrap().join("a.jpg"));
+        assert!(!resolved.starts_with(sibling.canonicalize().unwrap()));
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&sibling).unwrap();
+    }
+
+    #[test]
+    fn resolve_for_open_maps_bare_name_to_workdir_but_passes_others_through() {
+        let dir = tmp("ul_open");
+        fs::write(dir.join("a.jpg"), b"x").unwrap();
+        let canon = dir.canonicalize().unwrap();
+        // A bare, in-workdir name resolves to its absolute in-workdir path.
+        assert_eq!(resolve_for_open_in(&dir, "a.jpg"), canon.join("a.jpg").to_string_lossy());
+        // Anything that isn't a bare in-workdir hit is returned verbatim, so the
+        // caller opens exactly what was stored (and surfaces the usual warning if
+        // it is missing): a bare miss, a traversal attempt, an absolute path.
+        assert_eq!(resolve_for_open_in(&dir, "missing.jpg"), "missing.jpg");
+        assert_eq!(resolve_for_open_in(&dir, "../a.jpg"), "../a.jpg");
+        assert_eq!(resolve_for_open_in(&dir, "/etc/passwd"), "/etc/passwd");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_import_and_export_even_inside_the_workdir() {
+        let dir = tmp("ul_notunderlay");
+        fs::write(dir.join("site.dxf"), b"x").unwrap();
+        // Not an Underlay → never allowed by the gate exception, even for a
+        // file that genuinely lives in the workdir.
+        assert!(!allows_underlay_in(&dir, &Command::Import { path: "site.dxf".into() }));
+        assert!(!allows_underlay_in(&dir, &Command::Export { path: "out.dxf".into() }));
+        assert!(!allows_underlay_in(
+            &dir,
+            &Command::Print { sheet: "S1".into(), path: "out.pdf".into() }
+        ));
+        // A pure geometry command is likewise not an underlay grant.
+        assert!(!allows_underlay_in(
+            &dir,
+            &Command::Box { id: None, corner: DVec3::ZERO, size: DVec3::ONE }
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn allows_underlay_is_false_when_no_workdir_set() {
+        // The global entry point: with no persisted workdir, nothing is allowed.
+        // (We don't mutate the real config here; `get()` returning None is the
+        // common CI case. If a workdir IS configured, this asserts the command
+        // is still rejected because the file won't exist in it.)
+        assert!(!allows_underlay(&underlay("definitely-not-a-real-file-xyz.jpg")));
     }
 
     #[test]

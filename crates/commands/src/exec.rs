@@ -12446,13 +12446,22 @@ fn apply_forward(
             if width <= 0.0 {
                 return Err(ExecError::Invalid("underlay width must be positive".into()));
             }
-            // height carried on a replayed op wins (the file need not exist);
-            // otherwise derive it from the image's pixel aspect ratio. A
-            // missing/unreadable file is a warning, not an error: fall back to
-            // a square so the placement still lands and replays.
+            // Workdir name resolution happens at OPEN time, not here: we store the
+            // path exactly as emitted (a bare `attachment-1.jpg` from the model, or
+            // a human's literal path) so the op-log stays portable and never bakes
+            // in the device's absolute sandbox path. `resolve_for_open` maps a bare
+            // name to its in-workdir file (traversal/symlink guarded — the SAME
+            // resolver the iOS gate consulted, so no gate/exec divergence) only
+            // when a consumer actually reads the bytes. Here that consumer is the
+            // aspect probe below; the renderer resolves identically when it decodes.
+            //
+            // height carried on a replayed op wins (the file need not exist, so a
+            // load with no workdir still replays); otherwise derive it from the
+            // image's pixel aspect ratio. A missing/unreadable file is a warning,
+            // not an error: fall back to a square so the placement still lands.
             let (height, note) = match height {
                 Some(h) => (h, ""),
-                None => match image_aspect(&path) {
+                None => match image_aspect(&crate::workdir::resolve_for_open(&path)) {
                     Some(aspect) if aspect > 0.0 => (width / aspect, ""),
                     _ => (width, " (image unreadable, assumed square)"),
                 },
@@ -19934,6 +19943,41 @@ mod tests {
         assert_eq!(u.width, 8.0);
         assert_eq!(u.height, 8.0, "unreadable image assumed square");
         assert!(out.message.contains("unreadable"), "{}", out.message);
+    }
+
+    #[test]
+    fn underlay_stores_the_bare_name_verbatim_not_an_absolute_path() {
+        // Portability + no sandbox-path leak: exec must store the path exactly as
+        // emitted (a bare name stays bare), never rewriting it to an absolute
+        // workdir path in the doc or the logged op. Resolution to the real file
+        // happens at open time via `workdir::resolve_for_open`.
+        let mut s = Session::default();
+        run(&mut s, "underlay attachment-1.jpg 0,0 8");
+        assert_eq!(s.doc.underlay.as_ref().unwrap().path, "attachment-1.jpg");
+        let log = s.save_log();
+        assert!(
+            matches!(&log[0], Command::Underlay { path, .. } if path == "attachment-1.jpg"),
+            "logged op must keep the bare name, got {:?}",
+            log[0]
+        );
+    }
+
+    #[test]
+    fn replaying_a_bare_name_underlay_without_a_workdir_is_non_fatal() {
+        // A file saved on iOS logs `underlay <bare-name>` with the height carried.
+        // Opening it on desktop (no workdir, file absent) must still load: replay
+        // keeps the bare name and uses the carried height — no hard error.
+        let log = vec![Command::Underlay {
+            path: "attachment-1.jpg".into(),
+            corner: Some(DVec3::ZERO),
+            width: Some(10.0),
+            height: Some(5.0),
+        }];
+        let s = Session::replay(log).expect("bare-name underlay replays without a workdir");
+        let u = s.doc.underlay.as_ref().expect("underlay present after replay");
+        assert_eq!(u.path, "attachment-1.jpg");
+        assert_eq!(u.width, 10.0);
+        assert_eq!(u.height, 5.0, "carried height wins; no file needed");
     }
 
     #[test]
