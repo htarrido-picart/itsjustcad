@@ -2201,12 +2201,53 @@ fn sheets_json(doc: &itsjustcad_doc::Document) -> String {
                 out.push(',');
             }
             out.push_str(&format!(
-                "{{\"direction\":\"{}\",\"scale\":{}}}",
+                "{{\"direction\":\"{}\",\"scale\":{}",
                 view.direction.label(),
                 view.scale,
             ));
+            // Custom callout title (omitted when the view uses the derived one).
+            if let Some(t) = &view.title {
+                out.push_str(&format!(",\"title\":\"{}\"", esc(t)));
+            }
+            // Explicit paper-space rect in mm (omitted when auto-grid).
+            if let Some(r) = &view.rect {
+                out.push_str(&format!(
+                    ",\"rect\":{{\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+                    r.x, r.y, r.w, r.h
+                ));
+            }
+            out.push('}');
         }
-        out.push_str("]}");
+        out.push(']');
+        // Title block / stamp (omitted when absent or all-empty).
+        if let Some(tb) = &sheet.titleblock
+            && !tb.is_empty()
+        {
+            out.push_str(",\"titleblock\":{");
+            let mut first = true;
+            let mut field = |out: &mut String, key: &str, val: &Option<String>| {
+                if let Some(v) = val.as_deref()
+                    && !v.is_empty()
+                {
+                    if !first {
+                        out.push(',');
+                    }
+                    first = false;
+                    out.push_str(&format!("\"{}\":\"{}\"", key, esc(v)));
+                }
+            };
+            field(&mut out, "project", &tb.project);
+            field(&mut out, "address", &tb.address);
+            field(&mut out, "client", &tb.client);
+            field(&mut out, "sheet_no", &tb.sheet_no);
+            field(&mut out, "sheet_title", &tb.sheet_title);
+            field(&mut out, "scale", &tb.scale);
+            field(&mut out, "date", &tb.date);
+            field(&mut out, "drawn_by", &tb.drawn_by);
+            field(&mut out, "revision", &tb.revision);
+            out.push('}');
+        }
+        out.push('}');
     }
     out.push_str("],\"sets\":[");
     for (i, set) in doc.sheet_sets.iter().enumerate() {
@@ -2274,6 +2315,213 @@ pub unsafe extern "C" fn ijc_sheet_rename(
                     *member = new.to_owned();
                 }
             }
+        }
+        doc.generation += 1;
+        true
+    })
+}
+
+/// Resolve a `sheet` name + 1-based view `index` to a mutable `&mut SheetView`,
+/// running `f` on it and bumping `doc.generation`. Returns false on null/invalid
+/// handle, a null/invalid `sheet` string, an unknown sheet, or an out-of-range
+/// index. Shared helper for the per-view setters below; index semantics match
+/// the `sheetview`/`sheetviewdelete` verbs (1-based).
+///
+/// # Safety
+/// `h` must be null or a live handle; `sheet` a valid NUL-terminated C string.
+unsafe fn with_sheet_view(
+    h: *mut AppHandle,
+    sheet: *const c_char,
+    index: usize,
+    f: impl FnOnce(&mut itsjustcad_doc::SheetView),
+) -> bool {
+    if sheet.is_null() {
+        return false;
+    }
+    let Ok(sheet) = (unsafe { CStr::from_ptr(sheet) }).to_str() else {
+        return false;
+    };
+    let Some(mut app) = (unsafe { handle_mut(h) }) else {
+        return false;
+    };
+    let doc = &mut app.session.doc;
+    let Some(s) = doc.sheet_mut(sheet) else {
+        return false;
+    };
+    if index == 0 || index > s.views.len() {
+        return false;
+    }
+    f(&mut s.views[index - 1]);
+    doc.generation += 1;
+    true
+}
+
+/// Set (or clear) the custom callout title of a view. `index` is 1-based. A null
+/// or empty `title` clears the override, so the view falls back to the derived
+/// callout (PLAN/ELEVATION/…). Returns false on null/invalid handle, unknown
+/// sheet, or out-of-range index. Bumps `doc.generation`. Mirrors
+/// [`ijc_sheet_rename`]'s direct-mutation style (no op-log/undo in v1).
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `sheet` must be a valid
+/// NUL-terminated C string; `title` must be null or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_sheet_view_set_title(
+    h: *mut AppHandle,
+    sheet: *const c_char,
+    index: usize,
+    title: *const c_char,
+) -> bool {
+    guard_ffi(false, || {
+        // A null title clears; otherwise the C string (empty also clears).
+        let title_owned: Option<String> = if title.is_null() {
+            None
+        } else {
+            match unsafe { CStr::from_ptr(title) }.to_str() {
+                Ok(s) if !s.is_empty() => Some(s.to_owned()),
+                Ok(_) => None,
+                Err(_) => return false,
+            }
+        };
+        unsafe {
+            with_sheet_view(h, sheet, index, |v| v.title = title_owned)
+        }
+    })
+}
+
+/// Set (or clear) the explicit paper-space viewport rectangle of a view, in
+/// millimeters from the sheet lower-left. `index` is 1-based. When `clear` is
+/// true the rect is removed and the view returns to the auto-grid layout; when
+/// false the `(x, y, w, h)` rect is applied. Non-positive `w`/`h` (when not
+/// clearing) are rejected. Returns false on null/invalid handle, unknown sheet,
+/// or out-of-range index. Bumps `doc.generation`.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `sheet` must be a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_sheet_view_set_rect(
+    h: *mut AppHandle,
+    sheet: *const c_char,
+    index: usize,
+    clear: bool,
+    x: f64,
+    y: f64,
+    w: f64,
+    h_mm: f64,
+) -> bool {
+    guard_ffi(false, || {
+        if !clear && (w <= 0.0 || h_mm <= 0.0) {
+            return false;
+        }
+        let rect = if clear {
+            None
+        } else {
+            Some(itsjustcad_doc::PageRect { x, y, w, h: h_mm })
+        };
+        unsafe { with_sheet_view(h, sheet, index, |v| v.rect = rect) }
+    })
+}
+
+/// Delete a view from a sheet by 1-based `index`. Returns false on null/invalid
+/// handle, a null/invalid `sheet`, an unknown sheet, or an out-of-range index.
+/// Bumps `doc.generation`. Direct mutation (no op-log/undo in v1), mirroring
+/// [`ijc_sheet_rename`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `sheet` must be a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_sheet_view_delete(
+    h: *mut AppHandle,
+    sheet: *const c_char,
+    index: usize,
+) -> bool {
+    guard_ffi(false, || {
+        if sheet.is_null() {
+            return false;
+        }
+        let Ok(sheet) = (unsafe { CStr::from_ptr(sheet) }).to_str() else {
+            return false;
+        };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let doc = &mut app.session.doc;
+        let Some(s) = doc.sheet_mut(sheet) else {
+            return false;
+        };
+        if index == 0 || index > s.views.len() {
+            return false;
+        }
+        s.views.remove(index - 1);
+        doc.generation += 1;
+        true
+    })
+}
+
+/// Set a single field of a sheet's title block / stamp by `field` key
+/// (`"project"`, `"address"`, `"client"`, `"sheet_no"`, `"sheet_title"`,
+/// `"scale"`, `"date"`, `"drawn_by"`, `"revision"`). A null or empty `value`
+/// clears that field; when all fields are empty the stamp renders nothing (the
+/// block is created lazily on first non-empty set). Returns false on null/invalid
+/// handle, a null/invalid `sheet`/`field`, an unknown sheet, or an unknown field
+/// key. Bumps `doc.generation`. Direct mutation (no op-log/undo in v1).
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `sheet` and `field` must
+/// be valid NUL-terminated C strings; `value` must be null or a valid one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_sheet_set_titleblock(
+    h: *mut AppHandle,
+    sheet: *const c_char,
+    field: *const c_char,
+    value: *const c_char,
+) -> bool {
+    guard_ffi(false, || {
+        if sheet.is_null() || field.is_null() {
+            return false;
+        }
+        let Ok(sheet) = (unsafe { CStr::from_ptr(sheet) }).to_str() else {
+            return false;
+        };
+        let Ok(field) = (unsafe { CStr::from_ptr(field) }).to_str() else {
+            return false;
+        };
+        // A null/empty value clears the field.
+        let value: Option<String> = if value.is_null() {
+            None
+        } else {
+            match unsafe { CStr::from_ptr(value) }.to_str() {
+                Ok(s) if !s.is_empty() => Some(s.to_owned()),
+                Ok(_) => None,
+                Err(_) => return false,
+            }
+        };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let doc = &mut app.session.doc;
+        let Some(s) = doc.sheet_mut(sheet) else {
+            return false;
+        };
+        let tb = s.titleblock.get_or_insert_with(itsjustcad_doc::TitleBlock::default);
+        let slot = match field {
+            "project" => &mut tb.project,
+            "address" => &mut tb.address,
+            "client" => &mut tb.client,
+            "sheet_no" => &mut tb.sheet_no,
+            "sheet_title" => &mut tb.sheet_title,
+            "scale" => &mut tb.scale,
+            "date" => &mut tb.date,
+            "drawn_by" => &mut tb.drawn_by,
+            "revision" => &mut tb.revision,
+            _ => return false,
+        };
+        *slot = value;
+        // Collapse a now-empty block back to None so readers see "no stamp".
+        if tb.is_empty() {
+            s.titleblock = None;
         }
         doc.generation += 1;
         true
@@ -2563,7 +2811,53 @@ mod tests {
             len = 123;
             assert!(ijc_sheetset_pdf(nil, name.as_ptr(), &mut len).is_null());
             assert_eq!(len, 0);
+
+            // New per-view / titleblock setters: null handle → false, no panic.
+            let field = CString::new("project").unwrap();
+            let val = CString::new("Villa").unwrap();
+            assert!(!ijc_sheet_view_set_title(nil, name.as_ptr(), 1, val.as_ptr()));
+            assert!(!ijc_sheet_view_set_rect(nil, name.as_ptr(), 1, false, 0.0, 0.0, 10.0, 10.0));
+            assert!(!ijc_sheet_view_delete(nil, name.as_ptr(), 1));
+            assert!(!ijc_sheet_set_titleblock(
+                nil,
+                name.as_ptr(),
+                field.as_ptr(),
+                val.as_ptr()
+            ));
         }
+    }
+
+    /// `sheets_json` (the pure builder behind `ijc_sheets_json`) surfaces the new
+    /// per-view `title`/`rect` and the sheet `titleblock`. Exercised on a plain
+    /// `Document` so no live GPU handle is needed.
+    #[test]
+    fn sheets_json_exposes_title_rect_titleblock() {
+        use itsjustcad_doc::{PageRect, TitleBlock};
+        let mut s = Session::default();
+        s.run(parse("sheet plan a3").unwrap()).unwrap();
+        s.run(parse("sheetview plan top 100").unwrap()).unwrap();
+
+        // Default view: no title/rect in the JSON.
+        let j0 = sheets_json(&s.doc);
+        assert!(j0.contains("\"direction\":\"top\""));
+        assert!(!j0.contains("\"title\""), "no title when None: {j0}");
+        assert!(!j0.contains("\"rect\""), "no rect when None: {j0}");
+        assert!(!j0.contains("titleblock"), "no stamp when absent");
+
+        // Fill in the new fields directly on the model.
+        {
+            let sheet = s.doc.sheet_mut("plan").unwrap();
+            sheet.views[0].title = Some("GROUND FLOOR".into());
+            sheet.views[0].rect = Some(PageRect { x: 10.0, y: 20.0, w: 100.0, h: 80.0 });
+            sheet.titleblock = Some(TitleBlock {
+                project: Some("Villa".into()),
+                ..TitleBlock::default()
+            });
+        }
+        let j1 = sheets_json(&s.doc);
+        assert!(j1.contains("\"title\":\"GROUND FLOOR\""), "{j1}");
+        assert!(j1.contains("\"rect\":{\"x\":10,\"y\":20,\"w\":100,\"h\":80}"), "{j1}");
+        assert!(j1.contains("\"titleblock\":{\"project\":\"Villa\"}"), "{j1}");
     }
 
     #[test]

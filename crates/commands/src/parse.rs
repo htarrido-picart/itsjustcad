@@ -13,6 +13,7 @@ use crate::registry::registry;
 use crate::{
     BoolKind, CPlaneOp, Command, CompassDir, DimAnchorSpec, MirrorPlane, OptionOp, PlotStyleOp,
     SheetSetOp,
+    SheetViewSet,
     Selector,
     SimilarBy,
     RegionMode,
@@ -1437,6 +1438,39 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 scale: scale_denominator(scale)?,
             })
         }
+        "sheetviewdelete" => {
+            let [sheet, index] =
+                take::<2>("sheetviewdelete", "a sheet name and a 1-based view index", &args)?;
+            Ok(Command::SheetViewDelete {
+                sheet: sheet.to_string(),
+                index: index
+                    .parse::<usize>()
+                    .map_err(|_| ParseError::BadNumber((*index).to_string()))?,
+            })
+        }
+        "sheetviewset" => match args.as_slice() {
+            [sheet, index, "title", title @ ..] => Ok(Command::SheetViewSet {
+                sheet: (*sheet).to_string(),
+                index: parse_index(index)?,
+                // Join the tail so multi-word titles work; empty resets to derived.
+                set: SheetViewSet::Title { title: title.join(" ") },
+            }),
+            [sheet, index, "scale", scale] => Ok(Command::SheetViewSet {
+                sheet: (*sheet).to_string(),
+                index: parse_index(index)?,
+                set: SheetViewSet::Scale { scale: scale_denominator(scale)? },
+            }),
+            [sheet, index, "direction", dir] => Ok(Command::SheetViewSet {
+                sheet: (*sheet).to_string(),
+                index: parse_index(index)?,
+                set: SheetViewSet::Direction { direction: view_direction(dir)? },
+            }),
+            _ => wrong(
+                "sheetviewset",
+                "<sheet> <index> <title <text>|scale <scale>|direction <top|front|right|persp>>",
+                &args,
+            ),
+        },
         "print" => {
             let [sheet, path] = take::<2>("print", "a sheet name and an output path", &args)?;
             Ok(Command::Print {
@@ -3212,6 +3246,11 @@ fn layer_name_and_value<'a>(
         Some((value, head)) if !head.is_empty() => Ok((head.join(" "), value)),
         _ => Err(wrong_err(command, expected, args)),
     }
+}
+
+/// Parse a 1-based index token into a `usize`, surfacing a `BadNumber` error.
+fn parse_index(s: &str) -> Result<usize, ParseError> {
+    s.parse::<usize>().map_err(|_| ParseError::BadNumber(s.to_string()))
 }
 
 fn wrong<T>(command: &'static str, expected: &'static str, args: &[&str]) -> Result<T, ParseError> {
@@ -6149,6 +6188,47 @@ mod tests {
         assert!(parse("sheetview plan top 1:0").unwrap_err().to_string().contains("1:100"));
         assert!(parse("sheet").unwrap_err().to_string().contains("name"));
         assert!(parse("print plan").unwrap_err().to_string().contains("path"));
+    }
+
+    #[test]
+    fn parse_sheetview_edit_commands() {
+        use itsjustcad_doc::ViewDirection;
+        assert_eq!(
+            parse("sheetviewdelete plan 2").unwrap(),
+            Command::SheetViewDelete { sheet: "plan".into(), index: 2 }
+        );
+        // Multi-word title joins; index is 1-based.
+        assert_eq!(
+            parse("sheetviewset plan 1 title GROUND FLOOR").unwrap(),
+            Command::SheetViewSet {
+                sheet: "plan".into(),
+                index: 1,
+                set: SheetViewSet::Title { title: "GROUND FLOOR".into() },
+            }
+        );
+        // Empty title (clear) parses to an empty string.
+        assert_eq!(
+            parse("sheetviewset plan 1 title").unwrap(),
+            Command::SheetViewSet {
+                sheet: "plan".into(),
+                index: 1,
+                set: SheetViewSet::Title { title: String::new() },
+            }
+        );
+        assert!(matches!(
+            parse("sheetviewset plan 3 scale 1:50").unwrap(),
+            Command::SheetViewSet { set: SheetViewSet::Scale { scale }, index: 3, .. }
+                if scale == 50.0
+        ));
+        assert!(matches!(
+            parse("sheetviewset plan 1 direction persp").unwrap(),
+            Command::SheetViewSet {
+                set: SheetViewSet::Direction { direction: ViewDirection::Iso }, ..
+            }
+        ));
+        // errors
+        assert!(parse("sheetviewdelete plan x").unwrap_err().to_string().contains('x'));
+        assert!(parse("sheetviewset plan 1 bogus v").is_err());
     }
 
     #[test]
