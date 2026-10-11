@@ -8,6 +8,12 @@ license.workspace = true
 name = "itsjustcad"
 path = "src/main.rs"
 
+# Icon generator: `test = true` so its squircle-mask unit tests run under
+# `cargo test` (examples are not tested by default).
+[[example]]
+name = "gen_icon"
+test = true
+
 [features]
 default = []
 # Opt-in exact-BREP tier: forwards to itsjustcad-commands' `kernel-occt` feature
