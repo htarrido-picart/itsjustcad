@@ -60,7 +60,10 @@ impl ChatSession {
         if self.turns.is_empty() && role == "user" {
             self.title = title_from(content);
         }
-        self.turns.push(Turn { role: role.into(), content: content.into() });
+        self.turns.push(Turn {
+            role: role.into(),
+            content: content.into(),
+        });
         self.updated = now;
     }
 
@@ -133,7 +136,10 @@ pub struct SearchHit {
 
 impl DocSessions {
     pub fn new(doc_uuid: String) -> Self {
-        Self { doc_uuid, sessions: Vec::new() }
+        Self {
+            doc_uuid,
+            sessions: Vec::new(),
+        }
     }
 
     /// Sort sessions newest-first by `updated`.
@@ -141,15 +147,55 @@ impl DocSessions {
         self.sessions.sort_by_key(|a| std::cmp::Reverse(a.updated));
     }
 
-    /// Full-text SEARCH across every turn of every session: a case-insensitive
-    /// linear substring scan. Returns one hit per matching turn (first match per
-    /// turn), so the UI can list matching sessions with a snippet and jump to the
-    /// exact turn. An empty/whitespace query returns nothing.
+    /// Full-text SEARCH across every turn of every session in THIS document.
+    ///
+    /// Prefers FTS5 over the live database (fast, scales across many sessions /
+    /// documents); falls back to a linear in-memory substring scan when the DB
+    /// is unavailable (headless/no-home) or the query isn't FTS-expressible, so
+    /// an unsaved in-memory `DocSessions` still searches. Returns one hit per
+    /// matching turn with a snippet and the turn's `ord` as `turn_index`. An
+    /// empty/whitespace query returns nothing.
     pub fn search(&self, query: &str) -> Vec<SearchHit> {
-        let needle = query.trim().to_lowercase();
+        let needle = query.trim();
         if needle.is_empty() {
             return Vec::new();
         }
+        if let Some(hits) = self.search_fts(needle) {
+            return hits;
+        }
+        self.search_linear(needle)
+    }
+
+    /// FTS5-backed search scoped to this document. `None` when the DB is
+    /// unavailable or the query produces no FTS syntax (caller falls back).
+    fn search_fts(&self, query: &str) -> Option<Vec<SearchHit>> {
+        let path = crate::chat_db::db_path()?;
+        if !path.exists() {
+            return None;
+        }
+        let conn = crate::chat_db::open_db(&path).ok()?;
+        search_fts_conn(&conn, &self.doc_uuid, query).ok().flatten()
+    }
+
+    /// FTS5 search against an explicit DB path (test seam / direct DB query).
+    /// Returns an empty vec for an empty/whitespace query.
+    #[allow(dead_code)] // hermetic test/API seam; production uses search()/search_fts.
+    pub fn search_at(
+        doc_uuid: &str,
+        query: &str,
+        db_path: &std::path::Path,
+    ) -> rusqlite::Result<Vec<SearchHit>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = crate::chat_db::open_db(db_path)?;
+        Ok(search_fts_conn(&conn, doc_uuid, query.trim())?.unwrap_or_default())
+    }
+
+    /// Case-insensitive linear substring scan over the in-memory sessions (the
+    /// pre-DB behavior; also the fallback when no DB is present).
+    fn search_linear(&self, query: &str) -> Vec<SearchHit> {
+        let needle = query.to_lowercase();
         let mut hits = Vec::new();
         for session in &self.sessions {
             for (i, turn) in session.turns.iter().enumerate() {
@@ -218,6 +264,83 @@ fn snippet_around(content: &str, pos: usize, len: usize) -> String {
     out
 }
 
+/// Build a safe FTS5 MATCH expression from a free-text query: each whitespace
+/// token becomes a double-quoted term (so punctuation / FTS operators in user
+/// text can't blow up the parser), ANDed together. Returns `None` when the
+/// query has no usable tokens (caller falls back to the linear scan).
+fn fts_match_expr(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .filter(|t| t.chars().any(|c| c.is_alphanumeric()))
+        .map(|t| {
+            // Escape embedded double quotes per FTS5 string-literal rules.
+            let escaped = t.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        })
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" AND "))
+    }
+}
+
+/// Build a snippet for an FTS hit by locating the first query term in `content`
+/// (case-insensitive) and windowing around it; falls back to a leading preview
+/// when no term is found (e.g. a stemmed FTS match). Char-boundary safe.
+fn snippet_for(content: &str, query: &str) -> String {
+    let hay = content.to_lowercase();
+    for term in query.split_whitespace() {
+        let t = term.to_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(pos) = hay.find(&t) {
+            return snippet_around(content, pos, t.len());
+        }
+    }
+    snippet_around(content, 0, 0)
+}
+
+/// Run the FTS5 query over one document using an open connection. Returns
+/// `Ok(None)` when the query has no usable FTS tokens (caller falls back).
+fn search_fts_conn(
+    conn: &rusqlite::Connection,
+    doc_uuid: &str,
+    query: &str,
+) -> rusqlite::Result<Option<Vec<SearchHit>>> {
+    let Some(match_expr) = fts_match_expr(query) else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT s.uuid, s.title, m.ord, m.content \
+         FROM messages_fts f \
+         JOIN messages m ON m.id = f.rowid \
+         JOIN sessions s ON s.id = m.session_id \
+         WHERE s.doc_uuid = ?1 AND f.content MATCH ?2 \
+         ORDER BY s.updated_at DESC, m.ord ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![doc_uuid, match_expr], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut hits = Vec::new();
+    for row in rows {
+        let (session_id, session_title, ord, content) = row?;
+        hits.push(SearchHit {
+            session_id,
+            session_title,
+            turn_index: ord.max(0) as usize,
+            snippet: snippet_for(&content, query),
+        });
+    }
+    Ok(Some(hits))
+}
+
 fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     if i >= s.len() {
         return s.len();
@@ -257,12 +380,15 @@ pub fn fmt_date(unix: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// App-local path for a document's chat store: `~/.config/itsjustcad/chats/<uuid>.json`.
+/// Legacy per-document JSON store path: `~/.config/itsjustcad/chats/<uuid>.json`.
+///
+/// The live backend is now SQLite ([`crate::chat_db`]); these JSON files are
+/// the pre-SQLite format, kept for the ONE-TIME import and left in place as a
+/// read-only backup (never written again). The uuid is validated (hex + dashes
+/// only) to guard against path traversal — a check still reused by call sites.
 pub fn store_path(doc_uuid: &str) -> Option<std::path::PathBuf> {
     // Guard against path traversal: a uuid is hex + dashes only.
-    if doc_uuid.is_empty()
-        || !doc_uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-    {
+    if doc_uuid.is_empty() || !doc_uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
         return None;
     }
     Some(
@@ -275,50 +401,256 @@ pub fn store_path(doc_uuid: &str) -> Option<std::path::PathBuf> {
 }
 
 impl DocSessions {
-    /// Load this document's sessions from the app-local store, or an empty set.
-    /// Uses the real OS-keychain-backed key store; see [`Self::load_with`].
+    /// Load this document's sessions from the SQLite store (importing legacy
+    /// JSON on first run); see [`Self::load_with`]. The `KeyStore`-generic
+    /// variant is retained for API compatibility — encryption is handled by
+    /// SQLCipher-later at the DB layer, not here, so the key store is unused in
+    /// the DB path.
     pub fn load(doc_uuid: &str) -> Self {
         Self::load_with(doc_uuid, &crate::chat_crypto::OsKeyStore)
     }
 
-    /// Persist to the app-local store; see [`Self::save_with_opts`]. Encryption
-    /// follows the user's `chat_encryption` preference (default OFF; opt in via
-    /// `chatencryption on`).
+    /// Persist to the SQLite store; see [`Self::save_with_opts`]. The `encrypt`
+    /// preference is threaded through for API compatibility but is a no-op on
+    /// the DB path (plaintext-at-rest until SQLCipher).
     pub fn save(&self) {
-        self.save_with_opts(&crate::chat_crypto::OsKeyStore, crate::app::load_chat_encryption());
+        self.save_with_opts(
+            &crate::chat_crypto::OsKeyStore,
+            crate::app::load_chat_encryption(),
+        );
     }
 
-    /// Load, transparently decrypting an encrypted store or reading a legacy
-    /// plaintext one (both distinguished by a file marker). Any read/decrypt
-    /// failure yields an empty set rather than losing the caller's day.
-    /// `store` is injectable so tests never touch the real keychain.
-    pub fn load_with<K: crate::chat_crypto::KeyStore>(doc_uuid: &str, store: &K) -> Self {
-        store_path(doc_uuid)
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|bytes| crate::chat_crypto::open(store, &bytes).ok())
-            .and_then(|json| serde_json::from_slice(&json).ok())
-            .unwrap_or_else(|| DocSessions::new(doc_uuid.to_string()))
+    /// Load this document's sessions from SQLite, newest-first.
+    ///
+    /// On first open the one-time JSON→DB import runs (see
+    /// [`crate::chat_db::import`]-equivalent logic in [`import_legacy_json`]),
+    /// after which the legacy JSON files are left as a backup. Any DB error
+    /// yields an empty set rather than losing the caller's day. The `KeyStore`
+    /// is accepted for signature compatibility and is unused (encryption moved
+    /// to the SQLCipher-ready DB seam); tests therefore never touch the real
+    /// keychain regardless.
+    pub fn load_with<K: crate::chat_crypto::KeyStore>(doc_uuid: &str, _store: &K) -> Self {
+        let Some(path) = crate::chat_db::db_path() else {
+            return DocSessions::new(doc_uuid.to_string());
+        };
+        Self::load_at(doc_uuid, &path).unwrap_or_else(|_| DocSessions::new(doc_uuid.to_string()))
     }
 
-    /// Persist to the app-local store, private (0600). `encrypt` gates at-rest
-    /// encryption: when `false` the store is written as plaintext JSON
-    /// (self-describing, so it still loads); when `true` it is sealed if a
-    /// keychain is available (plaintext fallback with a one-time warning
-    /// otherwise). Best-effort; NEVER writes into the shared document. `store`
-    /// is injectable for tests.
-    pub fn save_with_opts<K: crate::chat_crypto::KeyStore>(&self, store: &K, encrypt: bool) {
-        let Some(path) = store_path(&self.doc_uuid) else { return };
-        let Some(parent) = path.parent() else { return };
-        let _ = std::fs::create_dir_all(parent);
-        if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let blob = if encrypt {
-                crate::chat_crypto::seal_for_write(store, &json)
-            } else {
-                json
-            };
-            let _ = crate::journal::write_private(&path, &blob);
+    /// Persist to SQLite. `encrypt` is accepted for API compatibility but is a
+    /// no-op (plaintext-at-rest; see [`crate::chat_db::open_db`] for the
+    /// SQLCipher seam). Best-effort; never writes into the shared document.
+    pub fn save_with_opts<K: crate::chat_crypto::KeyStore>(&self, _store: &K, _encrypt: bool) {
+        let Some(path) = crate::chat_db::db_path() else {
+            return;
+        };
+        let _ = self.save_at(&path);
+    }
+
+    /// Hermetic load against an explicit DB path (test seam). Opens + migrates
+    /// the DB, runs the one-time legacy import from the REAL chats directory,
+    /// then reads this document's rows.
+    pub fn load_at(doc_uuid: &str, db_path: &std::path::Path) -> rusqlite::Result<Self> {
+        let legacy = store_path("00000000-0000-0000-0000-000000000000")
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        Self::load_at_with_legacy(doc_uuid, db_path, legacy.as_deref())
+    }
+
+    /// Fully hermetic load: explicit DB path AND explicit legacy chats dir
+    /// (`None` to skip import). Used by tests so the one-time JSON import is
+    /// exercised without touching `~/.config`.
+    pub fn load_at_with_legacy(
+        doc_uuid: &str,
+        db_path: &std::path::Path,
+        legacy_dir: Option<&std::path::Path>,
+    ) -> rusqlite::Result<Self> {
+        let mut conn = crate::chat_db::open_db(db_path)?;
+        crate::chat_db::run_migrations(&mut conn)?;
+        import_legacy_json(&mut conn, legacy_dir)?;
+        read_doc(&conn, doc_uuid)
+    }
+
+    /// Hermetic save against an explicit DB path (test seam). Atomically
+    /// replaces THIS document's sessions/messages in one transaction.
+    pub fn save_at(&self, db_path: &std::path::Path) -> rusqlite::Result<()> {
+        let mut conn = crate::chat_db::open_db(db_path)?;
+        crate::chat_db::run_migrations(&mut conn)?;
+        write_doc(&mut conn, self)
+    }
+}
+
+/// Read all sessions for one document from the DB, newest-first.
+fn read_doc(conn: &rusqlite::Connection, doc_uuid: &str) -> rusqlite::Result<DocSessions> {
+    let mut docs = DocSessions::new(doc_uuid.to_string());
+    let mut sstmt = conn.prepare(
+        "SELECT id, uuid, title, summary, updated_at FROM sessions \
+         WHERE doc_uuid = ?1 ORDER BY updated_at DESC, id DESC",
+    )?;
+    let sessions: Vec<(i64, String, String, String, i64)> = sstmt
+        .query_map([doc_uuid], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut mstmt = conn.prepare(
+        "SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY ord ASC, id ASC",
+    )?;
+    for (rowid, uuid, title, summary, updated) in sessions {
+        let turns: Vec<Turn> = mstmt
+            .query_map([rowid], |r| {
+                Ok(Turn {
+                    role: r.get(0)?,
+                    content: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        docs.sessions.push(ChatSession {
+            id: uuid,
+            title,
+            summary,
+            updated: updated.max(0) as u64,
+            turns,
+        });
+    }
+    Ok(docs)
+}
+
+/// Atomically replace one document's sessions. Sessions absent from `docs` are
+/// deleted (cascading their messages + FTS rows); present ones are upserted and
+/// their messages fully reinserted in order. One transaction = all-or-nothing.
+fn write_doc(conn: &mut rusqlite::Connection, docs: &DocSessions) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    // Drop sessions that no longer exist for this document.
+    {
+        let keep: Vec<String> = docs.sessions.iter().map(|s| s.id.clone()).collect();
+        let mut existing = tx.prepare("SELECT uuid FROM sessions WHERE doc_uuid = ?1")?;
+        let present: Vec<String> = existing
+            .query_map([&docs.doc_uuid], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(existing);
+        for uuid in present {
+            if !keep.contains(&uuid) {
+                tx.execute("DELETE FROM sessions WHERE uuid = ?1", [&uuid])?;
+            }
         }
     }
+    for s in &docs.sessions {
+        upsert_session(&tx, &docs.doc_uuid, s)?;
+    }
+    tx.commit()
+}
+
+/// Upsert one session (by uuid) and fully replace its ordered messages. Used by
+/// [`write_doc`] and the legacy import. `created_at` is preserved on update.
+fn upsert_session(
+    tx: &rusqlite::Transaction<'_>,
+    doc_uuid: &str,
+    s: &ChatSession,
+) -> rusqlite::Result<()> {
+    let updated = s.updated as i64;
+    // Insert or update by the unique uuid; keep the original created_at.
+    tx.execute(
+        "INSERT INTO sessions(uuid, doc_uuid, title, summary, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+         ON CONFLICT(uuid) DO UPDATE SET \
+            doc_uuid = excluded.doc_uuid, \
+            title = excluded.title, \
+            summary = excluded.summary, \
+            updated_at = excluded.updated_at",
+        rusqlite::params![s.id, doc_uuid, s.title, s.summary, updated],
+    )?;
+    let rowid: i64 = tx.query_row("SELECT id FROM sessions WHERE uuid = ?1", [&s.id], |r| {
+        r.get(0)
+    })?;
+    // Fully replace messages (cascades FTS via triggers). Simplest correct
+    // upsert for conversations that only ever append.
+    tx.execute("DELETE FROM messages WHERE session_id = ?1", [rowid])?;
+    let mut ins = tx.prepare(
+        "INSERT INTO messages(session_id, ord, role, content, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for (ord, turn) in s.turns.iter().enumerate() {
+        ins.execute(rusqlite::params![
+            rowid,
+            ord as i64,
+            turn.role,
+            turn.content,
+            updated
+        ])?;
+    }
+    Ok(())
+}
+
+/// Marker recording that the one-time legacy JSON→DB import already ran, so it
+/// never double-imports (idempotent even if the user later deletes all chats).
+const IMPORT_MARKER: &str = "json_import_v1";
+
+/// ONE-TIME import of pre-SQLite JSON chats into the DB. Runs when the
+/// `json_import_v1` marker is absent from `grdb_migrations`-sibling bookkeeping;
+/// scans `~/.config/itsjustcad/chats/*.json` (the multi-session archives) and
+/// imports any the DB doesn't already have, then records the marker. Legacy
+/// files are LEFT IN PLACE as a backup. Encrypted legacy stores are opened via
+/// `chat_crypto` using the real keychain (best-effort; undecryptable ones are
+/// skipped). Idempotent: the marker guards re-runs.
+fn import_legacy_json(
+    conn: &mut rusqlite::Connection,
+    legacy_dir: Option<&std::path::Path>,
+) -> rusqlite::Result<()> {
+    // Bookkeeping table for non-schema one-time tasks (distinct from GRDB's
+    // schema-migration table so it never confuses the shared migrator).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS app_imports (marker TEXT NOT NULL PRIMARY KEY);",
+    )?;
+    let done: bool = conn
+        .query_row(
+            "SELECT 1 FROM app_imports WHERE marker = ?1",
+            [IMPORT_MARKER],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if done {
+        return Ok(());
+    }
+    if let Some(dir) = legacy_dir
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        let tx = conn.transaction()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Only the multi-session archives `<uuid>.json` (skip `.draft.json`).
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.ends_with(".json") || name.ends_with(".draft.json") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            // Legacy files may be plaintext JSON or chat_crypto-sealed.
+            let Ok(json) = crate::chat_crypto::open(&crate::chat_crypto::OsKeyStore, &bytes) else {
+                continue;
+            };
+            let Ok(legacy) = serde_json::from_slice::<DocSessions>(&json) else {
+                continue;
+            };
+            for s in &legacy.sessions {
+                // Skip sessions already present (keeps import idempotent even
+                // if the marker were lost).
+                let exists: bool = tx
+                    .query_row("SELECT 1 FROM sessions WHERE uuid = ?1", [&s.id], |_| {
+                        Ok(true)
+                    })
+                    .unwrap_or(false);
+                if exists {
+                    continue;
+                }
+                upsert_session(&tx, &legacy.doc_uuid, s)?;
+            }
+        }
+        tx.commit()?;
+    }
+    conn.execute(
+        "INSERT INTO app_imports(marker) VALUES (?1)",
+        [IMPORT_MARKER],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -338,18 +670,47 @@ mod tests {
         docs
     }
 
+    /// Unique temp DB path per test (pid + counter): hermetic + parallel-safe,
+    /// never touches `~/.config`. Mirrors the workdir temp-dir+pid convention.
+    fn temp_db_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("ijc-chatstore-{}-{}.db", std::process::id(), n))
+    }
+
+    /// RAII temp DB: unique path, cleaned up on drop (incl. WAL/SHM sidecars).
+    struct TmpDb(std::path::PathBuf);
+    impl TmpDb {
+        fn new() -> Self {
+            let p = temp_db_path();
+            let _ = std::fs::remove_file(&p);
+            TmpDb(p)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", self.0.display()));
+            }
+        }
+    }
+
     #[test]
     fn search_returns_the_right_session_for_a_query() {
+        // Linear (in-memory) scan — the DB-less fallback semantics.
         let docs = doc_with_two_sessions();
-        // "facade" only appears in session b.
-        let hits = docs.search("facade");
+        let hits = docs.search_linear("facade");
         assert!(!hits.is_empty(), "expected a hit for 'facade'");
         assert!(
-            hits.iter().all(|h| h.session_title.contains("curtain wall")),
+            hits.iter()
+                .all(|h| h.session_title.contains("curtain wall")),
             "all facade hits must be in the curtain-wall session: {hits:?}"
         );
-        // "core" only appears in session a (in both its turns).
-        let core = docs.search("core");
+        let core = docs.search_linear("core");
         assert!(!core.is_empty());
         assert!(
             core.iter().all(|h| h.session_title.contains("office core")),
@@ -361,7 +722,7 @@ mod tests {
     #[test]
     fn search_is_case_insensitive_and_snippets_the_match() {
         let docs = doc_with_two_sessions();
-        let hits = docs.search("GLASS");
+        let hits = docs.search_linear("GLASS");
         assert_eq!(hits.len(), 1);
         assert!(
             hits[0].snippet.to_lowercase().contains("glass"),
@@ -380,7 +741,162 @@ mod tests {
     #[test]
     fn no_match_returns_empty() {
         let docs = doc_with_two_sessions();
-        assert!(docs.search("helicopter").is_empty());
+        assert!(docs.search_linear("helicopter").is_empty());
+    }
+
+    #[test]
+    fn fts_search_within_and_across_sessions_and_documents() {
+        let db = TmpDb::new();
+        // Two documents, each with sessions, saved to the same DB.
+        let mut doc_a = DocSessions::new("aaaaaaaa-0000-0000-0000-000000000001".into());
+        let mut s1 = ChatSession::new(100);
+        s1.push("user", "make a five by five office core", 100);
+        s1.push("assistant", "Drew the core.", 101);
+        let mut s2 = ChatSession::new(200);
+        s2.push("user", "add a curtain wall facade", 200);
+        s2.push("assistant", "Added a facade of glass panels.", 201);
+        doc_a.sessions.push(s1);
+        doc_a.sessions.push(s2);
+        doc_a.save_at(db.path()).unwrap();
+
+        let mut doc_b = DocSessions::new("bbbbbbbb-0000-0000-0000-000000000002".into());
+        let mut s3 = ChatSession::new(300);
+        s3.push("user", "a glass helicopter pad on the roof", 300);
+        doc_b.sessions.push(s3);
+        doc_b.save_at(db.path()).unwrap();
+
+        // Across sessions WITHIN doc_a: "facade" only in s2, "core" only in s1.
+        let facade = DocSessions::search_at(&doc_a.doc_uuid, "facade", db.path()).unwrap();
+        assert!(!facade.is_empty());
+        assert!(
+            facade
+                .iter()
+                .all(|h| h.session_title.contains("curtain wall"))
+        );
+        let core = DocSessions::search_at(&doc_a.doc_uuid, "core", db.path()).unwrap();
+        assert!(core.iter().all(|h| h.session_title.contains("office core")));
+
+        // Search is scoped PER DOCUMENT: "glass" matches in both docs, but each
+        // query only returns its own document's hits.
+        let glass_a = DocSessions::search_at(&doc_a.doc_uuid, "glass", db.path()).unwrap();
+        assert_eq!(glass_a.len(), 1, "doc_a has one 'glass' turn");
+        let glass_b = DocSessions::search_at(&doc_b.doc_uuid, "glass", db.path()).unwrap();
+        assert_eq!(glass_b.len(), 1, "doc_b has its own 'glass' turn");
+        assert_ne!(glass_a[0].session_id, glass_b[0].session_id);
+
+        // No match returns empty; empty query returns empty.
+        assert!(
+            DocSessions::search_at(&doc_a.doc_uuid, "helicopter", db.path())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            DocSessions::search_at(&doc_a.doc_uuid, "   ", db.path())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn db_round_trip_preserves_turns_meta_and_epoch_timestamps() {
+        let db = TmpDb::new();
+        let mut docs = doc_with_two_sessions();
+        docs.set_meta(&docs.sessions[0].id.clone(), "Office core", "A core.");
+        docs.save_at(db.path()).unwrap();
+        let back = DocSessions::load_at_with_legacy(&docs.doc_uuid, db.path(), None).unwrap();
+        // Newest-first ordering, turns + meta preserved, timestamps as epoch ints.
+        assert_eq!(back.sessions.len(), 2);
+        let a = back
+            .get(
+                &docs
+                    .sessions
+                    .iter()
+                    .find(|s| s.title == "Office core")
+                    .unwrap()
+                    .id,
+            )
+            .unwrap();
+        assert_eq!(a.title, "Office core");
+        assert_eq!(a.summary, "A core.");
+        assert_eq!(a.updated, 101, "updated stored/read as unix seconds");
+        assert_eq!(a.turns.len(), 2);
+        assert_eq!(a.turns[0].role, "user");
+    }
+
+    #[test]
+    fn save_at_is_atomic_upsert_and_deletes_removed_sessions() {
+        let db = TmpDb::new();
+        let docs = doc_with_two_sessions();
+        docs.save_at(db.path()).unwrap();
+        let keep_id = docs.sessions[1].id.clone();
+        // Replace one session's content (upsert) and drop the other.
+        let mut replacement = ChatSession::new(500);
+        replacement.id = keep_id.clone();
+        replacement.push("user", "the continued conversation", 500);
+        let mut next = DocSessions::new(docs.doc_uuid.clone());
+        next.sessions.push(replacement);
+        next.save_at(db.path()).unwrap();
+
+        let back = DocSessions::load_at_with_legacy(&docs.doc_uuid, db.path(), None).unwrap();
+        assert_eq!(back.sessions.len(), 1, "removed session must be deleted");
+        assert_eq!(back.sessions[0].id, keep_id);
+        assert_eq!(
+            back.sessions[0].turns[0].content,
+            "the continued conversation"
+        );
+        // Cascade: the dropped session's messages are gone (its old content).
+        let gone = DocSessions::search_at(&docs.doc_uuid, "office", db.path()).unwrap();
+        assert!(
+            gone.is_empty(),
+            "messages of deleted session must cascade out"
+        );
+    }
+
+    #[test]
+    fn json_import_is_idempotent_and_preserves_turns_and_meta() {
+        let db = TmpDb::new();
+        // Stage a legacy JSON chats dir with one plaintext store.
+        let legacy = std::env::temp_dir().join(format!(
+            "ijc-legacy-{}-{}",
+            std::process::id(),
+            db.path().file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&legacy).unwrap();
+        let mut old = doc_with_two_sessions();
+        old.set_meta(&old.sessions[0].id.clone(), "Imported", "Imported summary.");
+        let json = serde_json::to_vec_pretty(&old).unwrap();
+        std::fs::write(legacy.join(format!("{}.json", old.doc_uuid)), &json).unwrap();
+        // A `.draft.json` that MUST be skipped by the import.
+        std::fs::write(legacy.join(format!("{}.draft.json", old.doc_uuid)), b"{}").unwrap();
+
+        // First load imports.
+        let back =
+            DocSessions::load_at_with_legacy(&old.doc_uuid, db.path(), Some(&legacy)).unwrap();
+        assert_eq!(back.sessions.len(), 2);
+        let imported = back
+            .get(
+                &old.sessions
+                    .iter()
+                    .find(|s| s.title == "Imported")
+                    .unwrap()
+                    .id,
+            )
+            .unwrap();
+        assert_eq!(imported.summary, "Imported summary.");
+        assert_eq!(imported.turns.len(), 2);
+
+        // Second load must NOT double-import (idempotent via the marker).
+        let again =
+            DocSessions::load_at_with_legacy(&old.doc_uuid, db.path(), Some(&legacy)).unwrap();
+        assert_eq!(
+            again.sessions.len(),
+            2,
+            "re-import must not duplicate sessions"
+        );
+
+        // Legacy files are LEFT IN PLACE as a backup.
+        assert!(legacy.join(format!("{}.json", old.doc_uuid)).exists());
+        let _ = std::fs::remove_dir_all(&legacy);
     }
 
     #[test]
@@ -423,12 +939,28 @@ mod tests {
     fn derive_meta_builds_fallback_title_and_summary() {
         let mut s = ChatSession::new(0);
         s.push("user", "make a five by five office core with a stair", 0);
-        s.push("assistant", "Drew the core and added a stair to level 2.", 1);
+        s.push(
+            "assistant",
+            "Drew the core and added a stair to level 2.",
+            1,
+        );
         s.derive_meta();
         assert_eq!(s.title, "make a five by five office core with a stair");
-        assert!(s.summary.contains("office core"), "summary keeps the ask: {}", s.summary);
-        assert!(s.summary.contains('→'), "summary joins ask→reply: {}", s.summary);
-        assert!(s.summary.contains("stair"), "summary previews the reply: {}", s.summary);
+        assert!(
+            s.summary.contains("office core"),
+            "summary keeps the ask: {}",
+            s.summary
+        );
+        assert!(
+            s.summary.contains('→'),
+            "summary joins ask→reply: {}",
+            s.summary
+        );
+        assert!(
+            s.summary.contains("stair"),
+            "summary previews the reply: {}",
+            s.summary
+        );
     }
 
     #[test]
@@ -457,7 +989,10 @@ mod tests {
         }"#;
         let docs: DocSessions = serde_json::from_str(legacy).expect("legacy load");
         assert_eq!(docs.sessions.len(), 1);
-        assert_eq!(docs.sessions[0].summary, "", "missing summary defaults to empty");
+        assert_eq!(
+            docs.sessions[0].summary, "",
+            "missing summary defaults to empty"
+        );
         assert_eq!(docs.sessions[0].title, "old session");
     }
 
@@ -480,9 +1015,16 @@ mod tests {
         // Replaced in place (new content) and re-sorted newest-first.
         assert_eq!(docs.sessions[0].id, existing_id);
         assert_eq!(docs.sessions[0].updated, 500);
-        assert_eq!(docs.sessions[0].turns[0].content, "the continued conversation");
+        assert_eq!(
+            docs.sessions[0].turns[0].content,
+            "the continued conversation"
+        );
         // The OTHER session is preserved.
-        assert!(docs.sessions.iter().any(|s| s.title.contains("curtain wall")));
+        assert!(
+            docs.sessions
+                .iter()
+                .any(|s| s.title.contains("curtain wall"))
+        );
     }
 
     #[test]
@@ -576,9 +1118,24 @@ mod tests {
         // Non-ASCII around the match to exercise char-boundary clamping.
         s.push("user", "café — draw a façade wall then résumé the work", 0);
         docs.sessions.push(s);
-        let hits = docs.search("façade");
+        let hits = docs.search_linear("façade");
         assert_eq!(hits.len(), 1);
         // Must not panic and must contain the match.
+        assert!(hits[0].snippet.contains("façade"));
+    }
+
+    #[test]
+    fn fts_snippet_stays_on_char_boundaries() {
+        // Same multibyte content, but exercised through the DB/FTS path to prove
+        // snippet_for is char-boundary safe on an FTS hit.
+        let db = TmpDb::new();
+        let mut docs = DocSessions::new("cccc1111-2222-3333-4444-555566667777".into());
+        let mut s = ChatSession::new(7);
+        s.push("user", "café — draw a façade wall then résumé the work", 7);
+        docs.sessions.push(s);
+        docs.save_at(db.path()).unwrap();
+        let hits = DocSessions::search_at(&docs.doc_uuid, "façade", db.path()).unwrap();
+        assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.contains("façade"));
     }
 }

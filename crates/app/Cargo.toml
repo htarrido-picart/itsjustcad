@@ -50,6 +50,7 @@ serde_json.workspace = true
 uuid.workspace = true
 aes-gcm.workspace = true
 keyring.workspace = true
+rusqlite.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = "0.4"
 egui_commonmark = "0.24"
