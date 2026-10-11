@@ -121,6 +121,15 @@ impl OsKeyStore {
 
 /// One-time "encryption unavailable" warning latch so the log isn't spammed on
 /// every save when there is no keychain (headless / CI / bare Linux).
+///
+/// NOTE: since the chat store moved to SQLite (`chat_db`), the DB is
+/// plaintext-at-rest and the WRITE-side encryption chain below
+/// (`seal_for_write` → `encrypt_bytes` → `warn_plaintext_once`) is no longer on
+/// the live save path. It is kept intact — exercised by unit tests and ready to
+/// re-enable — but the write side is `dead_code` for the binary until SQLCipher
+/// lands. The READ side (`open`/`decrypt_bytes`) stays live: the one-time
+/// JSON→DB import must still open legacy encrypted stores.
+#[allow(dead_code)]
 static WARNED_PLAINTEXT: AtomicBool = AtomicBool::new(false);
 
 /// Set once the writer has actually fallen back to plaintext despite the user
@@ -136,6 +145,7 @@ pub fn take_plaintext_fallback_notice() -> bool {
     PLAINTEXT_FALLBACK.swap(false, Ordering::Relaxed)
 }
 
+#[allow(dead_code)] // write-side; see WARNED_PLAINTEXT note. Re-enabled with SQLCipher.
 fn warn_plaintext_once() {
     // Raise the user-facing notice EVERY time we fall back (the UI de-dupes via
     // its own consume-once poll), so if the user re-enables encryption later they
@@ -162,6 +172,7 @@ pub fn is_encrypted(blob: &[u8]) -> bool {
 
 /// Encrypt `plaintext` under `key` into a self-describing container.
 /// Nondeterministic: a fresh random nonce per call.
+#[allow(dead_code)] // write-side; see WARNED_PLAINTEXT note. Re-enabled with SQLCipher.
 pub fn encrypt_bytes(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Vec<u8> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -194,6 +205,7 @@ pub fn decrypt_bytes(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>, Crypto
 /// Serialize for WRITE: encrypt when the key store yields a key, otherwise fall
 /// back to the plaintext `json` bytes (with a one-time warning). The chosen
 /// format is self-describing so [`open`] always reads it back.
+#[allow(dead_code)] // write-side; see WARNED_PLAINTEXT note. Re-enabled with SQLCipher.
 pub fn seal_for_write<K: KeyStore>(store: &K, json: &[u8]) -> Vec<u8> {
     match store.get_or_create_key() {
         Ok(key) => encrypt_bytes(&key, json),

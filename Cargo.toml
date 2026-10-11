@@ -59,6 +59,12 @@ aes-gcm = { version = "0.10", features = ["std"] }
 # Secret Service). Apache-2.0 OR MIT. `apple-native`/`windows-native` avoid the
 # heavy dbus path on those OSes; `sync-secret-service` is the Linux backend.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+# Embedded SQLite for the chat/session store (shared source-of-truth with the
+# iOS GRDB app). `bundled` compiles a known-good SQLite in-tree so the file is
+# openable by stock sqlite3 / GRDB; no system libsqlite dependency. MIT.
+# NOTE (SQLCipher-ready): to encrypt at rest later, swap `bundled` for
+# `bundled-sqlcipher` (pulls OpenSSL) and add a `PRAGMA key` in `open_db`.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # internal crates
 kernel-mesh = { path = "crates/kernel-mesh" }
