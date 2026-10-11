@@ -52,22 +52,6 @@ impl Spacing {
     /// 32px — major regions.
     pub const XL: f32 = 32.0;
 
-    /// Command-history scrollback height: fill the command-line panel, leaving
-    /// `INPUT_RESERVE` for the prompt/input row below, with a small floor
-    /// so a tiny window never collapses it. Because it tracks `panel_h` with no
-    /// upper cap, dragging the panel taller actually shows MORE history (rather
-    /// than opening dead space under a fixed-height scrollback).
-    pub fn history_h_for(panel_h: f32) -> f32 {
-        const INPUT_RESERVE: f32 = 44.0;
-        // Small floor only (one line) — NOT the old ~80px floor, which made the
-        // history content exceed a dragged-small panel and forced egui to SNAP
-        // the resizable command-line panel to that content-minimum instead of
-        // honouring an in-between drag height. The ~5-line default now comes from
-        // the panel's `default_size`, and the history fills whatever height the
-        // user drags to.
-        (panel_h - INPUT_RESERVE).max(24.0)
-    }
-
     /// 28px — the min interactive height for PRIMARY chrome controls
     /// (toolbar buttons, dialog buttons, combos). HIG/SwiftUI comfortable
     /// target sits ~28–32; dense list rows may still drop to `L` (24).
@@ -1017,31 +1001,6 @@ mod tests {
             "command_line.rs must pin its input with a bottom_up layout"
         );
         assert!(app.contains("Spacing::SM"));
-    }
-
-    #[test]
-    fn history_h_for_tracks_panel_with_tiny_floor() {
-        // Small 24px floor (one line) — deliberately NOT the old ~80px floor,
-        // which forced content above a dragged-small panel and broke resize.
-        assert_eq!(Spacing::history_h_for(0.0), 24.0, "tiny floor");
-        // Content = panel - input reserve, so it NEVER exceeds the panel height
-        // (the property that keeps the resizable command line snap-free).
-        assert!((Spacing::history_h_for(100.0) - 56.0).abs() < 0.1);
-        assert!((Spacing::history_h_for(400.0) - 356.0).abs() < 0.1);
-        assert!((Spacing::history_h_for(1200.0) - 1156.0).abs() < 0.1);
-        for h in [90.0, 150.0, 300.0, 800.0] {
-            assert!(
-                Spacing::history_h_for(h) <= h,
-                "history must fit within the panel at {h}"
-            );
-        }
-        // Monotonic non-decreasing in panel height.
-        let mut prev = 0.0;
-        for h in [0.0, 100.0, 300.0, 500.0, 800.0, 1200.0] {
-            let v = Spacing::history_h_for(h);
-            assert!(v >= prev - 0.1, "must not shrink as panel grows");
-            prev = v;
-        }
     }
 
     #[test]

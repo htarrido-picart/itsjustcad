@@ -179,6 +179,117 @@ fn chat_is_empty(transcript: &[Entry], streaming: &str) -> bool {
     transcript.is_empty() && streaming.trim().is_empty()
 }
 
+/// The ghost-hint label for the slot currently being typed in `line` (which
+/// INCLUDES the verb), e.g. after `box 0,0,0 ` → `size (x,y,z)`. Optional slots
+/// are marked. `None` when there is no verb usage, or the cursor is past the
+/// last slot. Pure — looks the verb's usage up in the registry/app-verb set.
+fn active_slot_hint(line: &str) -> Option<String> {
+    let verb = crate::suggest::verb_of(line.trim_start());
+    if verb.is_empty() {
+        return None;
+    }
+    let usage = crate::palette::entries()
+        .into_iter()
+        .find(|e| e.name == verb)
+        .map(|e| e.usage)?;
+    if usage.is_empty() {
+        return None;
+    }
+    let slots = crate::usage_spec::parse_usage(&usage);
+    let idx = crate::usage_spec::active_slot(line, slots.len())?;
+    let slot = slots.get(idx)?;
+    Some(match slot.req {
+        crate::usage_spec::SlotReq::Optional => format!("{} (optional)", slot.name),
+        crate::usage_spec::SlotReq::Required => slot.name.clone(),
+    })
+}
+
+/// One row of the `/` inline palette: verb name + one-line summary.
+struct SlashMatch {
+    name: String,
+    summary: String,
+}
+
+/// Commands matching the `/` palette query `q` (the partial verb), prefix
+/// matches first then substring, capped at `limit` — the desktop equivalent of
+/// the iOS palette, driven by the same registry+app-verb set the ⌘K palette
+/// uses. Pure selection; reuses [`crate::palette`].
+fn slash_palette_matches(q: &str, limit: usize) -> Vec<SlashMatch> {
+    let entries = crate::palette::entries();
+    let ql = q.to_lowercase();
+    if ql.is_empty() {
+        return entries
+            .iter()
+            .take(limit)
+            .map(|e| SlashMatch { name: e.name.clone(), summary: e.summary.clone() })
+            .collect();
+    }
+    let mut prefix = Vec::new();
+    let mut substring = Vec::new();
+    for e in &entries {
+        let n = e.name.to_lowercase();
+        if n.starts_with(&ql) {
+            prefix.push(e);
+        } else if n.contains(&ql) {
+            substring.push(e);
+        }
+    }
+    prefix
+        .into_iter()
+        .chain(substring)
+        .take(limit)
+        .map(|e| SlashMatch { name: e.name.clone(), summary: e.summary.clone() })
+        .collect()
+}
+
+/// Render the `/` palette rows above the chat input. Returns `Some("/<name> ")`
+/// when a row is clicked. A plain non-focusable list — it never steals keyboard
+/// focus from the TextEdit (c2cfcff fast-typing guard).
+fn slash_palette_ui(
+    ui: &mut egui::Ui,
+    roles: &crate::theme::ColorRoles,
+    matches: &[SlashMatch],
+) -> Option<String> {
+    let mut pick = None;
+    egui::Frame::NONE
+        .fill(crate::theme::to_color32(roles.surface_elevated))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(
+            crate::theme::Spacing::S as i8,
+            crate::theme::Spacing::XS as i8,
+        ))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    for m in matches {
+                        let resp = ui
+                            .scope(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&m.name)
+                                            .monospace()
+                                            .color(ui.visuals().text_color()),
+                                    );
+                                    if !m.summary.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&m.summary).weak().small(),
+                                        );
+                                    }
+                                });
+                            })
+                            .response
+                            .interact(egui::Sense::click());
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.clicked() {
+                            pick = Some(format!("/{} ", m.name));
+                        }
+                    }
+                });
+        });
+    pick
+}
+
 /// The RAW text a transcript entry yields when copied — the original markdown
 /// source, not the rendered layout, so a pasted table/emphasis survives as
 /// markdown (M-chatmd). `None` = nothing sensible to copy (the Commands card
@@ -306,6 +417,74 @@ impl SavedChatRef<'_> {
             &path,
             serde_json::to_string_pretty(self).expect("serializes").as_bytes(),
         );
+    }
+}
+
+#[cfg(test)]
+mod slash_palette_tests {
+    use super::*;
+
+    #[test]
+    fn empty_query_returns_capped_prefix() {
+        let hits = slash_palette_matches("", 8);
+        assert_eq!(hits.len(), 8, "empty query shows the first few commands");
+    }
+
+    #[test]
+    fn prefix_matches_rank_before_substring() {
+        // `box` is a prefix match; `bbox` contains `box` as a substring. Prefix
+        // must come first.
+        let hits = slash_palette_matches("box", 8);
+        assert_eq!(hits.first().map(|m| m.name.as_str()), Some("box"));
+        let names: Vec<_> = hits.iter().map(|m| m.name.as_str()).collect();
+        if let (Some(bi), Some(bbi)) = (
+            names.iter().position(|n| *n == "box"),
+            names.iter().position(|n| *n == "bbox"),
+        ) {
+            assert!(bi < bbi, "prefix 'box' ranks before substring 'bbox': {names:?}");
+        }
+    }
+
+    #[test]
+    fn cap_is_respected() {
+        let hits = slash_palette_matches("e", 3);
+        assert!(hits.len() <= 3);
+    }
+
+    #[test]
+    fn includes_app_verbs() {
+        // `ze` is an app-verb (not a registry command) and should be reachable.
+        let hits = slash_palette_matches("ze", 8);
+        assert!(hits.iter().any(|m| m.name == "ze"), "app verb ze reachable via /");
+    }
+}
+
+#[cfg(test)]
+mod slot_hint_tests {
+    use super::*;
+
+    #[test]
+    fn no_hint_while_typing_verb() {
+        assert_eq!(active_slot_hint("box"), None);
+    }
+
+    #[test]
+    fn first_slot_after_verb_space() {
+        // `box ` → first slot (corner).
+        let h = active_slot_hint("box ").expect("a hint on the first slot");
+        assert!(h.contains("corner"), "{h}");
+    }
+
+    #[test]
+    fn advances_to_size_after_first_point() {
+        // `box 0,0,0 ` → the size slot.
+        let h = active_slot_hint("box 0,0,0 ").expect("a hint on slot 2");
+        assert!(h.contains("size"), "{h}");
+    }
+
+    #[test]
+    fn verb_without_usage_has_no_hint() {
+        assert_eq!(active_slot_hint("undo "), None);
     }
 }
 
@@ -2546,6 +2725,11 @@ impl DeckPane {
     }
 
     #[allow(clippy::too_many_arguments)] // fixed signature; splitting further aids nothing
+    /// Render the Chat segment. Returns `Some(line)` when the user submitted a
+    /// leading-`/` command (e.g. `/box 0,0,0 5,5,3`): the caller runs it through
+    /// `App::execute_line` and echoes it into the Commands history (issue #28) —
+    /// it is NOT sent to the LLM. Plain prose is sent to the deck as usual and
+    /// returns `None`.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -2555,7 +2739,7 @@ impl DeckPane {
         roles: &crate::theme::ColorRoles,
         _dark: bool,
         reduce_motion: bool,
-    ) {
+    ) -> Option<String> {
         self.drain(session, handle);
         if self.busy()
             && let Some(started) = self.turn_started
@@ -2828,7 +3012,7 @@ impl DeckPane {
             if back {
                 self.view = PaneView::Chat;
             }
-            return;
+            return None;
         }
         if !matches!(self.view, PaneView::Chat) {
             self.view = PaneView::Chat; // stale index — fall back
@@ -2836,6 +3020,8 @@ impl DeckPane {
 
         let mut open_detail: Option<PaneView> = None;
         let mut chip_fill: Option<String> = None;
+        // A `/`-palette row click this frame: the `/<name> ` string to install.
+        let mut slash_pick: Option<String> = None;
         let mut do_send = false;
         let mut do_stop = false;
         let empty_chat = chat_is_empty(&self.transcript, &self.streaming_chat) && !self.busy();
@@ -2864,6 +3050,20 @@ impl DeckPane {
         let has_focus = ui.memory(|m| m.has_focus(input_id));
         let enabled = (!self.busy() && self.ready()) || has_focus;
         let can_send = !self.busy() && self.ready() && !self.input.trim().is_empty();
+        // `/`-armed: the chat input is typing a command. Syntax-highlight it live
+        // and show the active-slot ghost hint (issue #28). `slash` also closes the
+        // palette once a space ends the verb (→ Command), so the hint tracks slots.
+        let slash_armed = !matches!(
+            crate::usage_spec::slash(&self.input),
+            crate::usage_spec::SlashState::Chat
+        );
+        let slot_hint = if slash_armed {
+            crate::usage_spec::strip_slash(&self.input)
+                .as_deref()
+                .and_then(active_slot_hint)
+        } else {
+            None
+        };
         let input_radius =
             egui::CornerRadius::same(crate::theme::Radii::default().medium as u8);
 
@@ -2887,6 +3087,21 @@ impl DeckPane {
             // the only visual break between the transcript and the input.
             .show_separator_line(false)
             .show(ui, |ui| {
+                // `/` INLINE PALETTE (issue #28): when the input (after leading
+                // whitespace) starts with `/` and the verb has no trailing space,
+                // show up to 8 matching commands ABOVE the input. A row click
+                // inserts `/<name> ` and re-focuses the TextEdit — the palette is a
+                // plain non-focusable list, so it NEVER steals focus mid-typing
+                // (c2cfcff fast-typing guard). It closes the instant a space ends
+                // the verb.
+                if let crate::usage_spec::SlashState::Arming(q) =
+                    crate::usage_spec::slash(&self.input)
+                {
+                    let matches = slash_palette_matches(&q, 8);
+                    if !matches.is_empty() {
+                        slash_pick = slash_palette_ui(ui, roles, &matches);
+                    }
+                }
                 // Side-effect confirmation sits directly above the input card.
                 self.side_effect_confirm_ui(ui, session, icons);
                 // Attachment chip (name + remove) above the input card.
@@ -3057,13 +3272,38 @@ impl DeckPane {
                                 crate::theme::Spacing::XS as i8,
                             ))
                             .show(ui, |ui| {
+                                let mut layouter =
+                                    |ui: &egui::Ui, text: &dyn egui::TextBuffer, _w: f32| {
+                                        let text = text.as_str();
+                                        let job = if slash_armed {
+                                            crate::syntax_layout::highlight_job(
+                                                ui,
+                                                text,
+                                                egui::TextStyle::Monospace.resolve(ui.style()),
+                                            )
+                                        } else {
+                                            let mut j = egui::text::LayoutJob::single_section(
+                                                text.to_owned(),
+                                                egui::TextFormat {
+                                                    font_id: egui::TextStyle::Body
+                                                        .resolve(ui.style()),
+                                                    color: ui.visuals().text_color(),
+                                                    ..Default::default()
+                                                },
+                                            );
+                                            j.wrap.max_width = f32::INFINITY;
+                                            j
+                                        };
+                                        ui.ctx().fonts_mut(|f| f.layout_job(job))
+                                    };
                                 let response = ui.add_enabled(
                                     enabled,
                                     egui::TextEdit::multiline(&mut self.input)
                                         .id(input_id)
                                         .desired_rows(8)
                                         .desired_width(f32::INFINITY)
-                                        .hint_text(hint),
+                                        .hint_text(hint)
+                                        .layouter(&mut layouter),
                                 );
                                 submit_on_chord!(response, ui);
                                 crate::text_context_menu::attach(
@@ -3072,6 +3312,11 @@ impl DeckPane {
                                     input_id,
                                 );
                             });
+                        if let Some(h) = &slot_hint {
+                            ui.label(
+                                egui::RichText::new(format!("↳ {h}")).weak().small(),
+                            );
+                        }
                         // Buttons: photo + send together, right-aligned, below.
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -3081,6 +3326,11 @@ impl DeckPane {
                             },
                         );
                     } else {
+                        if let Some(h) = &slot_hint {
+                            ui.label(
+                                egui::RichText::new(format!("↳ {h}")).weak().small(),
+                            );
+                        }
                         // Single-line row below the chevron: text fills; photo +
                         // send hug the right.
                         ui.with_layout(
@@ -3090,13 +3340,38 @@ impl DeckPane {
                                 photo!(ui);
                                 // Two-line field in the collapsed state (expand
                                 // with the chevron for a tall composer).
+                                let mut layouter =
+                                    |ui: &egui::Ui, text: &dyn egui::TextBuffer, _w: f32| {
+                                        let text = text.as_str();
+                                        let job = if slash_armed {
+                                            crate::syntax_layout::highlight_job(
+                                                ui,
+                                                text,
+                                                egui::TextStyle::Monospace.resolve(ui.style()),
+                                            )
+                                        } else {
+                                            let mut j = egui::text::LayoutJob::single_section(
+                                                text.to_owned(),
+                                                egui::TextFormat {
+                                                    font_id: egui::TextStyle::Body
+                                                        .resolve(ui.style()),
+                                                    color: ui.visuals().text_color(),
+                                                    ..Default::default()
+                                                },
+                                            );
+                                            j.wrap.max_width = f32::INFINITY;
+                                            j
+                                        };
+                                        ui.ctx().fonts_mut(|f| f.layout_job(job))
+                                    };
                                 let response = ui.add_enabled(
                                     enabled,
                                     egui::TextEdit::multiline(&mut self.input)
                                         .id(input_id)
                                         .desired_rows(2)
                                         .desired_width(f32::INFINITY)
-                                        .hint_text(hint),
+                                        .hint_text(hint)
+                                        .layouter(&mut layouter),
                                 );
                                 submit_on_chord!(response, ui);
                                 crate::text_context_menu::attach(
@@ -3323,14 +3598,33 @@ impl DeckPane {
             self.input = text;
             ui.memory_mut(|m| m.request_focus(input_id));
         }
+        // A `/`-palette row click installs `/<name> ` and re-focuses the input so
+        // the user types args into the SAME stable TextEdit (c2cfcff: the palette
+        // never grabs focus itself).
+        if let Some(insert) = slash_pick {
+            self.input = insert;
+            ui.memory_mut(|m| m.request_focus(input_id));
+        }
         if do_stop {
             self.stop_turn();
         }
         if do_send {
             // Strip any newline the submit chord may have inserted before sending.
             self.input = self.input.trim_end_matches('\n').to_string();
+            // A leading `/` runs the line as a COMMAND (verb + args) instead of a
+            // chat turn: return it so the app runs it via `execute_line` and echoes
+            // it into the Commands history. A compact confirmation is pushed to the
+            // transcript so the chat shows what happened (issue #28).
+            if let Some(cmd) = crate::usage_spec::strip_slash(&self.input) {
+                self.input.clear();
+                self.transcript
+                    .push(Entry::Status(format!("ran /{cmd} (see Commands)")));
+                self.persist_chat();
+                return Some(cmd);
+            }
             self.send(session, handle);
         }
+        None
     }
 }
 
