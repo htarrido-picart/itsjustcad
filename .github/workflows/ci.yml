@@ -56,6 +56,10 @@ jobs:
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: cargo test --workspace
 
+      - name: Bundle script tests (macOS)
+        if: matrix.os == 'macos-latest'
+        run: bash scripts/tests/test-bundle-macos.sh
+
       - name: Clippy (no new warnings)
         run: cargo clippy --workspace -- -D warnings
 
