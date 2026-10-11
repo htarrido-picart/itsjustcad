@@ -137,11 +137,46 @@ pub fn resolve_within_dir(dir: &Path, name: &str) -> Result<PathBuf, String> {
 /// escape, no symlink escape — the same guard as [`resolve_within`]). Returns
 /// `None` when there is no workdir OR the name is anything other than a bare
 /// in-workdir file (an absolute path, a traversal attempt, or a miss). This is
-/// the single source of truth both the gate and exec-path resolution consult,
-/// so the thing the gate *authorizes* is exactly the thing exec *places*.
+/// the single source of truth both the gate and the read-time open resolution
+/// ([`resolve_for_open`]) consult, so the file the gate *authorizes* is exactly
+/// the file a consumer eventually *opens*.
 pub fn resolve_underlay(name: &str) -> Option<PathBuf> {
     let dir = get()?;
     resolve_within_dir(&dir, name).ok()
+}
+
+/// Read-time twin of the write-time gate: map a STORED underlay path to the real
+/// file to open. A bare name (no separators, not absolute) that resolves inside
+/// the granted workdir becomes that in-workdir absolute path; anything else — an
+/// absolute/relative path the user typed, or a bare name with no workdir / no
+/// match — is returned unchanged.
+///
+/// Why this exists: the stored command and document keep the portable bare NAME
+/// (baking the device's absolute sandbox path into the op-log would leak the
+/// filesystem layout and break portability across devices). Resolution to the
+/// concrete on-device path happens only here, when a consumer actually opens the
+/// file. Best-effort and non-fatal — an unresolvable name is handed back as-is so
+/// the caller surfaces the usual "image not shown" warning rather than aborting
+/// (critical for op-log replay, which must load even when the workdir/file is
+/// gone). It reuses [`resolve_underlay`], so it authorizes exactly what the gate
+/// authorized — no CWD shadow, no symlink escape.
+pub fn resolve_for_open(path: &str) -> String {
+    match get() {
+        Some(dir) => resolve_for_open_in(&dir, path),
+        None => path.to_string(),
+    }
+}
+
+/// Pure core of [`resolve_for_open`] against an explicit workdir — testable
+/// without the persisted config. A bare name that resolves to a file inside
+/// `dir` becomes that canonical path; everything else (absolute/relative paths,
+/// or a bare name with no in-workdir match) is returned unchanged.
+pub fn resolve_for_open_in(dir: &Path, path: &str) -> String {
+    let is_bare = !Path::new(path).is_absolute() && !path.contains('/') && !path.contains('\\');
+    if is_bare && let Ok(p) = resolve_within_dir(dir, path) {
+        return p.to_string_lossy().into_owned();
+    }
+    path.to_string()
 }
 
 /// SECURITY GATE: the ONLY widening of the iOS side-effect refusal. Returns
@@ -300,6 +335,22 @@ mod tests {
         assert!(!resolved.starts_with(sibling.canonicalize().unwrap()));
         fs::remove_dir_all(&dir).unwrap();
         fs::remove_dir_all(&sibling).unwrap();
+    }
+
+    #[test]
+    fn resolve_for_open_maps_bare_name_to_workdir_but_passes_others_through() {
+        let dir = tmp("ul_open");
+        fs::write(dir.join("a.jpg"), b"x").unwrap();
+        let canon = dir.canonicalize().unwrap();
+        // A bare, in-workdir name resolves to its absolute in-workdir path.
+        assert_eq!(resolve_for_open_in(&dir, "a.jpg"), canon.join("a.jpg").to_string_lossy());
+        // Anything that isn't a bare in-workdir hit is returned verbatim, so the
+        // caller opens exactly what was stored (and surfaces the usual warning if
+        // it is missing): a bare miss, a traversal attempt, an absolute path.
+        assert_eq!(resolve_for_open_in(&dir, "missing.jpg"), "missing.jpg");
+        assert_eq!(resolve_for_open_in(&dir, "../a.jpg"), "../a.jpg");
+        assert_eq!(resolve_for_open_in(&dir, "/etc/passwd"), "/etc/passwd");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

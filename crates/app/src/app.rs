@@ -2185,10 +2185,16 @@ impl App {
     /// contract on open.
     fn decode_underlay(&mut self) -> Option<UnderlayData> {
         let u = self.session.doc.underlay.as_ref()?;
+        // Stored underlay paths keep the portable bare NAME; map it to the real
+        // file to open. A bare name resolves inside the granted workdir (same
+        // guarded resolver the command gate used); absolute/relative paths and
+        // the no-workdir case pass through unchanged. Cache keys on the ORIGINAL
+        // stored path so a workdir change re-decodes.
+        let open_path = itsjustcad_commands::workdir::resolve_for_open(&u.path);
         let cached = match &self.underlay_cache {
             Some((path, pixels)) if *path == u.path => pixels.clone(),
             _ => {
-                let img = match image::open(&u.path) {
+                let img = match image::open(&open_path) {
                     Ok(img) => img.to_rgba8(),
                     Err(e) => {
                         // Surface once per path change, then forget it so we do
