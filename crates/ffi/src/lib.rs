@@ -35,24 +35,22 @@
 //! freed, and buffer pointers must be valid for the given length.
 #![allow(clippy::missing_safety_doc)]
 
-use std::ffi::{c_char, c_void, CStr, CString};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use itsjustcad_commands::{io, parse, Command, Selector, Session};
+use itsjustcad_commands::{Command, Selector, Session, io, parse};
 use itsjustcad_deck::{
-    compact_command_catalog, digest, make_deck, system_prompt, ChatMessage, ChatRequest,
-    DeckConfig, DeckDelta, DeckKind, ExtractEvent, Extractor, LlmDeck, Role,
+    ChatMessage, ChatRequest, DeckConfig, DeckDelta, DeckKind, ExtractEvent, Extractor, ImagePart,
+    LlmDeck, Role, compact_command_catalog, digest, make_deck, system_prompt,
 };
 use itsjustcad_render::{
-    camera_uniform_with_mode, object_wireframe_world, snapshot, DisplayMode, LineEntry,
-    OrbitCamera, SceneRenderer, StandardView, Theme, DEPTH_FORMAT,
+    DEPTH_FORMAT, DisplayMode, LineEntry, OrbitCamera, SceneRenderer, StandardView, Theme,
+    camera_uniform_with_mode, object_wireframe_world, snapshot,
 };
-use raw_window_handle::{
-    RawDisplayHandle, RawWindowHandle, UiKitDisplayHandle, UiKitWindowHandle,
-};
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
 
 /// Live guard word stamped into every [`AppHandle`] by [`ijc_init`]. [`ijc_free`]
 /// overwrites it with [`GUARD_DEAD`] before dropping, so a later call on a stale
@@ -87,9 +85,18 @@ const GHOST_COLOR: [f32; 4] = [1.0, 0.82, 0.31, 0.45];
 /// every frame and the committed command resolves `Selector::Selected`.
 #[derive(Debug)]
 enum PreviewKind {
-    Move { delta: glam::DVec3 },
-    Rotate { angle_deg: f64, axis: glam::DVec3, center: glam::DVec3 },
-    Scale { factors: glam::DVec3, center: glam::DVec3 },
+    Move {
+        delta: glam::DVec3,
+    },
+    Rotate {
+        angle_deg: f64,
+        axis: glam::DVec3,
+        center: glam::DVec3,
+    },
+    Scale {
+        factors: glam::DVec3,
+        center: glam::DVec3,
+    },
 }
 
 /// A live gumball preview: a pending transform shown as an amber ghost
@@ -108,7 +115,11 @@ impl PreviewKind {
         use glam::DMat4;
         match *self {
             PreviewKind::Move { delta } => DMat4::from_translation(delta),
-            PreviewKind::Rotate { angle_deg, axis, center } => {
+            PreviewKind::Rotate {
+                angle_deg,
+                axis,
+                center,
+            } => {
                 let axis = axis.normalize_or_zero();
                 DMat4::from_translation(center)
                     * DMat4::from_axis_angle(axis, angle_deg.to_radians())
@@ -130,7 +141,11 @@ impl PreviewKind {
                 targets: Selector::Selected,
                 delta,
             },
-            PreviewKind::Rotate { angle_deg, axis, center } => Command::Rotate {
+            PreviewKind::Rotate {
+                angle_deg,
+                axis,
+                center,
+            } => Command::Rotate {
                 targets: Selector::Selected,
                 angle_deg,
                 axis,
@@ -348,7 +363,11 @@ unsafe fn handle_mut<'a>(h: *mut AppHandle) -> Option<HandleGuard<'a>> {
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("ijc_depth"),
-        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w.max(1),
+            height: h.max(1),
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -574,7 +593,10 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
         let renderer = SceneRenderer::new(&device, format);
         let depth_view = make_depth(&device, config.width, config.height);
 
-        let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -720,7 +742,9 @@ fn clamp_dim(v: u32, device: &wgpu::Device) -> u32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_resize(h: *mut AppHandle, w: u32, h_px: u32) {
     guard_ffi((), || {
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return;
+        };
         let app: &mut AppHandle = &mut app;
         app.config.width = clamp_dim(w, &app.device);
         app.config.height = clamp_dim(h_px, &app.device);
@@ -745,7 +769,9 @@ const MAX_JSON_LEN: usize = 256 * 1024 * 1024;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_open_json(h: *mut AppHandle, ptr: *const u8, len: usize) -> bool {
     guard_ffi(false, || {
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
         // Reject null / absurd length. A zero-length buffer is a valid empty doc
         // request but cannot parse as JSON, so bail early either way.
         if ptr.is_null() || len == 0 || len > MAX_JSON_LEN {
@@ -753,7 +779,9 @@ pub unsafe extern "C" fn ijc_open_json(h: *mut AppHandle, ptr: *const u8, len: u
         }
         // `u8` has alignment 1, so no alignment check is required for `ptr`.
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-        let Ok(json) = std::str::from_utf8(bytes) else { return false };
+        let Ok(json) = std::str::from_utf8(bytes) else {
+            return false;
+        };
         match io::from_json(json) {
             Ok(session) => {
                 app.session = session;
@@ -779,7 +807,9 @@ pub unsafe extern "C" fn ijc_open_json(h: *mut AppHandle, ptr: *const u8, len: u
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_new_document(h: *mut AppHandle) {
     guard_ffi((), || {
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return;
+        };
         app.session = Session::default();
         if let Ok(mut hist) = app.history.lock() {
             hist.clear();
@@ -818,12 +848,18 @@ fn frame_camera(app: &mut AppHandle) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char) -> bool {
     guard_ffi(false, || {
-        let Some(app) = (unsafe { handle_ref(h) }) else { return false };
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return false;
+        };
         if line.is_null() {
             return false;
         }
-        let Ok(s) = (unsafe { CStr::from_ptr(line) }).to_str() else { return false };
-        let Some(op) = route_line(s) else { return false };
+        let Ok(s) = (unsafe { CStr::from_ptr(line) }).to_str() else {
+            return false;
+        };
+        let Some(op) = route_line(s) else {
+            return false;
+        };
         // Gate side-effecting commands (fs/net) exactly as the deck path does.
         if let PendingOp::Cmd(cmd) = &op
             && cmd.is_side_effecting()
@@ -860,7 +896,9 @@ pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_camera_orbit(h: *mut AppHandle, dx: f32, dy: f32) {
     guard_ffi((), || {
-        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return;
+        };
         if let Ok(mut pending) = app.pending.lock() {
             pending.push(PendingOp::Camera(CamOp::Orbit(dx, dy)));
         }
@@ -876,7 +914,9 @@ pub unsafe extern "C" fn ijc_camera_orbit(h: *mut AppHandle, dx: f32, dy: f32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_camera_pan(h: *mut AppHandle, dx: f32, dy: f32) {
     guard_ffi((), || {
-        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return;
+        };
         if let Ok(mut pending) = app.pending.lock() {
             pending.push(PendingOp::Camera(CamOp::Pan(dx, dy)));
         }
@@ -894,7 +934,9 @@ pub unsafe extern "C" fn ijc_camera_pan(h: *mut AppHandle, dx: f32, dy: f32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_camera_zoom(h: *mut AppHandle, factor: f32) {
     guard_ffi((), || {
-        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return;
+        };
         // A non-finite / non-positive factor is a no-op (a pinch recognizer can
         // momentarily report 0 or NaN scale between touches).
         if !factor.is_finite() || factor <= 0.0 {
@@ -919,7 +961,9 @@ pub unsafe extern "C" fn ijc_camera_zoom(h: *mut AppHandle, factor: f32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_camera_zoom_extents(h: *mut AppHandle) {
     guard_ffi((), || {
-        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return;
+        };
         if let Ok(mut pending) = app.pending.lock() {
             pending.push(PendingOp::Camera(CamOp::Frame));
         }
@@ -981,7 +1025,12 @@ fn screen_ray(
 /// Slab ray/AABB test; returns the nearest non-negative hit distance `t` along
 /// the ray, or `None` on a miss. Compact reimplementation of the desktop
 /// `ray_aabb`.
-fn ray_aabb(origin: glam::DVec3, dir: glam::DVec3, min: glam::DVec3, max: glam::DVec3) -> Option<f64> {
+fn ray_aabb(
+    origin: glam::DVec3,
+    dir: glam::DVec3,
+    min: glam::DVec3,
+    max: glam::DVec3,
+) -> Option<f64> {
     let inv = dir.recip();
     let t1 = (min - origin) * inv;
     let t2 = (max - origin) * inv;
@@ -1008,12 +1057,16 @@ fn ray_aabb(origin: glam::DVec3, dir: glam::DVec3, min: glam::DVec3, max: glam::
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_pick(h: *mut AppHandle, x_px: f32, y_px: f32, additive: bool) -> bool {
     guard_ffi(false, || {
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
         let app: &mut AppHandle = &mut app;
 
         let vp = app.camera.view_proj(aspect_of(app));
         let (w, h) = (app.config.width as f32, app.config.height as f32);
-        let Some((origin, dir)) = screen_ray(vp, w, h, x_px, y_px) else { return false };
+        let Some((origin, dir)) = screen_ray(vp, w, h, x_px, y_px) else {
+            return false;
+        };
 
         // Broad phase: nearest visible object whose world AABB the ray hits.
         let doc = &app.session.doc;
@@ -1080,8 +1133,12 @@ pub unsafe extern "C" fn ijc_selection_bbox(
         if center.is_null() || size.is_null() {
             return false;
         }
-        let Some(app) = (unsafe { handle_ref(h) }) else { return false };
-        let Some(bb) = app.session.doc.selection_aabb() else { return false };
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return false;
+        };
+        let Some(bb) = app.session.doc.selection_aabb() else {
+            return false;
+        };
         let c = bb.center();
         let s = bb.size();
         unsafe {
@@ -1113,7 +1170,9 @@ pub unsafe extern "C" fn ijc_project_point(
         if world.is_null() || out_xy.is_null() {
             return false;
         }
-        let Some(app) = (unsafe { handle_ref(h) }) else { return false };
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return false;
+        };
         let p = unsafe { std::slice::from_raw_parts(world, 3) };
         let (w, h_px) = (app.config.width as f32, app.config.height.max(1) as f32);
         let vp = app.camera.view_proj(aspect_of(app));
@@ -1151,7 +1210,9 @@ pub unsafe extern "C" fn ijc_move_selected(h: *mut AppHandle, dx: f64, dy: f64, 
         if !dx.is_finite() || !dy.is_finite() || !dz.is_finite() {
             return false;
         }
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
         // Empty selection: nothing to move (and `Selector::Selected` would be a
         // no-op resolve). Report false so the host can skip the gesture.
         if app.session.doc.selection.is_empty() {
@@ -1193,12 +1254,16 @@ pub unsafe extern "C" fn ijc_gumball_preview_move(
         if !dx.is_finite() || !dy.is_finite() || !dz.is_finite() {
             return false;
         }
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
         if app.session.doc.selection.is_empty() {
             return false;
         }
         app.gumball_preview = Some(GumballPreview {
-            kind: PreviewKind::Move { delta: glam::DVec3::new(dx, dy, dz) },
+            kind: PreviewKind::Move {
+                delta: glam::DVec3::new(dx, dy, dz),
+            },
         });
         app.session.doc.generation += 1;
         true
@@ -1234,7 +1299,9 @@ pub unsafe extern "C" fn ijc_gumball_preview_rotate(
         if axis.length_squared() == 0.0 {
             return false;
         }
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
         if app.session.doc.selection.is_empty() {
             return false;
         }
@@ -1273,7 +1340,9 @@ pub unsafe extern "C" fn ijc_gumball_preview_scale(
         if all.iter().any(|v| !v.is_finite()) {
             return false;
         }
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
         if app.session.doc.selection.is_empty() {
             return false;
         }
@@ -1298,7 +1367,9 @@ pub unsafe extern "C" fn ijc_gumball_preview_scale(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_gumball_cancel(h: *mut AppHandle) -> bool {
     guard_ffi(false, || {
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
         app.gumball_preview = None;
         app.session.doc.generation += 1;
         true
@@ -1317,7 +1388,9 @@ pub unsafe extern "C" fn ijc_gumball_cancel(h: *mut AppHandle) -> bool {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_gumball_commit(h: *mut AppHandle) -> bool {
     guard_ffi(false, || {
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
         let Some(preview) = app.gumball_preview.take() else {
             return false;
         };
@@ -1446,7 +1519,9 @@ pub unsafe extern "C" fn ijc_bytes_free(ptr: *mut u8, len: usize) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
     guard_ffi((), || {
-        let Some(mut guard) = (unsafe { handle_mut(h) }) else { return };
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return;
+        };
         // Reborrow the inner `&mut AppHandle` once so the compiler can split
         // disjoint field borrows (device/queue/renderer/surface) below — a plain
         // `Deref` through the guard would treat every access as borrowing the
@@ -1477,7 +1552,8 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
         let doc_gen = app.session.doc.generation;
         if app.last_gen != Some(doc_gen) {
             let scene = snapshot(&app.session.doc, app.theme);
-            app.renderer.set_scene(&app.device, &app.queue, &scene, doc_gen);
+            app.renderer
+                .set_scene(&app.device, &app.queue, &scene, doc_gen);
             app.last_gen = Some(doc_gen);
         }
 
@@ -1592,13 +1668,18 @@ pub unsafe extern "C" fn ijc_deck_configure(
     api_key: *const c_char,
 ) -> bool {
     guard_ffi(false, || {
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
         // SAFETY: each pointer is null-checked and UTF-8-validated here.
         let cstr = |p: *const c_char| -> Option<String> {
             if p.is_null() {
                 None
             } else {
-                unsafe { CStr::from_ptr(p) }.to_str().ok().map(str::to_owned)
+                unsafe { CStr::from_ptr(p) }
+                    .to_str()
+                    .ok()
+                    .map(str::to_owned)
             }
         };
         let config = DeckConfig {
@@ -1641,39 +1722,133 @@ pub unsafe extern "C" fn ijc_deck_send(
     ctx: *mut c_void,
 ) {
     guard_ffi((), || {
-        let Some(app) = (unsafe { handle_mut(h) }) else { return };
-        let ctx = SendCtx { ctx, alive: app.alive.clone() };
-        if prompt.is_null() {
-            emit(cb, &ctx, CB_ERROR, "null prompt");
-            return;
-        }
-        let Ok(prompt) = (unsafe { CStr::from_ptr(prompt) }).to_str() else {
-            emit(cb, &ctx, CB_ERROR, "invalid prompt");
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
             return;
         };
+        unsafe { deck_send_inner(&mut app, prompt, Vec::new(), cb, ctx) };
+    })
+}
 
-        let (Some(deck), Some(config)) = (app.deck.clone(), app.deck_config.clone()) else {
-            emit(cb, &ctx, CB_ERROR, "deck not configured");
+/// Send a chat prompt with inline images attached to THIS user turn. Behaves
+/// exactly like [`ijc_deck_send`] (same history, streaming, callbacks,
+/// side-effect gate) except the images ride on the request's last user message
+/// so the model can see them. `images_json` is a JSON array like
+/// `[{"mime":"image/jpeg","data":"<base64>"}, …]` (base64 WITHOUT a `data:`
+/// prefix). A null, empty, or unparseable `images_json` means no images — then
+/// this is byte-for-byte equivalent to [`ijc_deck_send`]. Only the cloud deck
+/// (Anthropic / OpenAI-compatible) honours the images; history `ChatMessage`s
+/// stay text-only.
+///
+/// # Safety
+/// `h` must be null or a live handle; `prompt` and `images_json` must each be
+/// null or a valid NUL-terminated C string; `cb` must be a valid function
+/// pointer and `ctx` an opaque pointer the host keeps alive for the stream.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_deck_send_image(
+    h: *mut AppHandle,
+    prompt: *const c_char,
+    images_json: *const c_char,
+    cb: DeckCallback,
+    ctx: *mut c_void,
+) {
+    guard_ffi((), || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
             return;
         };
+        // Parse the images; null / invalid UTF-8 / parse failure / empty all
+        // degrade to "no images" so this can never fail a turn just because the
+        // attachment payload was malformed — it simply sends as text.
+        let images = unsafe { parse_images_json(images_json) };
+        unsafe { deck_send_inner(&mut app, prompt, images, cb, ctx) };
+    })
+}
 
-        let system = system_prompt(&digest(&app.session.doc), &app.session.plugins);
-        let messages = {
-            let Ok(mut history) = app.history.lock() else {
-                emit(cb, &ctx, CB_ERROR, "history unavailable");
-                return;
-            };
-            history.push(ChatMessage { role: Role::User, content: prompt.to_string() });
-            history.clone()
+/// Parse the `images_json` C string into `Vec<ImagePart>`. Null, invalid UTF-8,
+/// JSON parse failure, or an empty array all yield an empty vec (no images).
+/// The wire shape is `[{"mime": "...", "data": "<base64>"}]`; `data` maps to
+/// `ImagePart::data_base64`.
+///
+/// # Safety
+/// `images_json` must be null or a valid NUL-terminated C string.
+unsafe fn parse_images_json(images_json: *const c_char) -> Vec<ImagePart> {
+    if images_json.is_null() {
+        return Vec::new();
+    }
+    let Ok(s) = (unsafe { CStr::from_ptr(images_json) }).to_str() else {
+        return Vec::new();
+    };
+    // Parse via `Value` (serde_json, already a dep) rather than a derived
+    // struct — avoids pulling serde's derive into the ffi crate. Entries
+    // missing `mime` or `data` are skipped; any parse failure yields an empty
+    // vec (→ a plain text turn).
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(s) else {
+        return Vec::new();
+    };
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| {
+            let mime = v.get("mime")?.as_str()?.to_string();
+            let data_base64 = v.get("data")?.as_str()?.to_string();
+            Some(ImagePart { mime, data_base64 })
+        })
+        .collect()
+}
+
+/// Shared body for [`ijc_deck_send`] / [`ijc_deck_send_image`]: push the user
+/// turn to history, build the request (text + optional images on this turn),
+/// and spawn the streaming task with the full extractor / side-effect gate.
+///
+/// # Safety
+/// `app` must be an exclusively-borrowed live handle; `prompt` must be null or
+/// a valid NUL-terminated C string; `cb`/`ctx` as for [`ijc_deck_send`].
+unsafe fn deck_send_inner(
+    app: &mut AppHandle,
+    prompt: *const c_char,
+    images: Vec<ImagePart>,
+    cb: DeckCallback,
+    ctx: *mut c_void,
+) {
+    let ctx = SendCtx {
+        ctx,
+        alive: app.alive.clone(),
+    };
+    if prompt.is_null() {
+        emit(cb, &ctx, CB_ERROR, "null prompt");
+        return;
+    }
+    let Ok(prompt) = (unsafe { CStr::from_ptr(prompt) }).to_str() else {
+        emit(cb, &ctx, CB_ERROR, "invalid prompt");
+        return;
+    };
+
+    let (Some(deck), Some(config)) = (app.deck.clone(), app.deck_config.clone()) else {
+        emit(cb, &ctx, CB_ERROR, "deck not configured");
+        return;
+    };
+
+    let system = system_prompt(&digest(&app.session.doc), &app.session.plugins);
+    let messages = {
+        let Ok(mut history) = app.history.lock() else {
+            emit(cb, &ctx, CB_ERROR, "history unavailable");
+            return;
         };
+        history.push(ChatMessage {
+            role: Role::User,
+            content: prompt.to_string(),
+        });
+        history.clone()
+    };
 
-        let req = ChatRequest::text(system, messages, config.model.clone(), 4096, 0.2, None);
-        let pending = app.pending.clone();
-        let history = app.history.clone();
-        let tasks = app.tasks.clone();
-        let auto_apply = app.deck_auto_apply.clone();
+    let req = ChatRequest::text(system, messages, config.model.clone(), 4096, 0.2, None)
+        .with_images(images);
+    let pending = app.pending.clone();
+    let history = app.history.clone();
+    let tasks = app.tasks.clone();
+    let auto_apply = app.deck_auto_apply.clone();
 
-        let join = app.runtime.spawn(async move {
+    let join = app.runtime.spawn(async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DeckDelta>();
             let deck2 = deck.clone();
             tokio::spawn(async move { deck2.stream_chat(req, tx).await });
@@ -1760,14 +1935,13 @@ pub unsafe extern "C" fn ijc_deck_send(
             let _ = catch_unwind(AssertUnwindSafe(|| emit(cb, &ctx, CB_DONE, "")));
         });
 
-        // Track the task so `ijc_free` can abort it before teardown, closing the
-        // window where a detached stream fires a callback on a freed ctx / after
-        // the handle's shared state is gone (finding #2).
-        if let Ok(mut t) = tasks.lock() {
-            t.retain(|a| !a.is_finished());
-            t.push(join.abort_handle());
-        }
-    })
+    // Track the task so `ijc_free` can abort it before teardown, closing the
+    // window where a detached stream fires a callback on a freed ctx / after
+    // the handle's shared state is gone (finding #2).
+    if let Ok(mut t) = tasks.lock() {
+        t.retain(|a| !a.is_finished());
+        t.push(join.abort_handle());
+    }
 }
 
 /// Stop any in-flight deck stream: abort the streaming task(s) without tearing
@@ -1781,7 +1955,9 @@ pub unsafe extern "C" fn ijc_deck_send(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_deck_stop(h: *mut AppHandle) {
     guard_ffi((), || {
-        let Some(app) = (unsafe { handle_ref(h) }) else { return };
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return;
+        };
         if let Ok(mut tasks) = app.tasks.lock() {
             for t in tasks.drain(..) {
                 t.abort();
@@ -1834,7 +2010,9 @@ fn into_c_string(s: String) -> *mut c_char {
 /// not otherwise retained.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_command_brief() -> *mut c_char {
-    guard_ffi(std::ptr::null_mut(), || into_c_string(compact_command_catalog()))
+    guard_ffi(std::ptr::null_mut(), || {
+        into_c_string(compact_command_catalog())
+    })
 }
 
 /// The full command registry as a JSON array, for a client-side command palette:
@@ -1846,7 +2024,9 @@ pub unsafe extern "C" fn ijc_command_brief() -> *mut c_char {
 /// not otherwise retained.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_command_catalog_json() -> *mut c_char {
-    guard_ffi(std::ptr::null_mut(), || into_c_string(command_catalog_json()))
+    guard_ffi(std::ptr::null_mut(), || {
+        into_c_string(command_catalog_json())
+    })
 }
 
 /// Serialize the command registry to a compact JSON array. Built by hand (no
@@ -2066,12 +2246,18 @@ pub unsafe extern "C" fn ijc_sheet_rename(
         if old.is_null() || new.is_null() {
             return false;
         }
-        let Ok(old) = (unsafe { CStr::from_ptr(old) }).to_str() else { return false };
-        let Ok(new) = (unsafe { CStr::from_ptr(new) }).to_str() else { return false };
+        let Ok(old) = (unsafe { CStr::from_ptr(old) }).to_str() else {
+            return false;
+        };
+        let Ok(new) = (unsafe { CStr::from_ptr(new) }).to_str() else {
+            return false;
+        };
         if new.is_empty() {
             return false;
         }
-        let Some(mut app) = (unsafe { handle_mut(h) }) else { return false };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
         let doc = &mut app.session.doc;
         // A no-op rename (old == new) is a success, but a different sheet named
         // `new` is a collision.
@@ -2284,8 +2470,14 @@ mod tests {
             route_line("persp"),
             Some(PendingOp::Camera(CamOp::SetView(StandardView::Perspective)))
         ));
-        assert!(matches!(route_line("orbit 0.1 0.2"), Some(PendingOp::Camera(CamOp::Orbit(..)))));
-        assert!(matches!(route_line("zoom in"), Some(PendingOp::Camera(CamOp::Dolly(..)))));
+        assert!(matches!(
+            route_line("orbit 0.1 0.2"),
+            Some(PendingOp::Camera(CamOp::Orbit(..)))
+        ));
+        assert!(matches!(
+            route_line("zoom in"),
+            Some(PendingOp::Camera(CamOp::Dolly(..)))
+        ));
     }
 
     #[test]
@@ -2307,14 +2499,23 @@ mod tests {
         // A pinch-apart (factor > 1, zoom in) must shrink the camera distance;
         // a pinch-together (factor < 1) must grow it. Verify the scroll we feed
         // `dolly` produces the right sign and roughly divides distance by factor.
-        let mut cam = OrbitCamera { distance: 100.0, ..OrbitCamera::default() };
+        let mut cam = OrbitCamera {
+            distance: 100.0,
+            ..OrbitCamera::default()
+        };
         let factor = 2.0f32;
         let scroll = (1.0 - 1.0 / factor) / 0.002;
         cam.dolly(scroll);
         assert!(cam.distance < 100.0, "zoom-in must bring the camera closer");
-        assert!((cam.distance - 50.0).abs() < 1e-3, "factor 2 ≈ halve distance");
+        assert!(
+            (cam.distance - 50.0).abs() < 1e-3,
+            "factor 2 ≈ halve distance"
+        );
 
-        let mut cam2 = OrbitCamera { distance: 100.0, ..OrbitCamera::default() };
+        let mut cam2 = OrbitCamera {
+            distance: 100.0,
+            ..OrbitCamera::default()
+        };
         let out = 0.5f32;
         cam2.dolly((1.0 - 1.0 / out) / 0.002);
         assert!(cam2.distance > 100.0, "zoom-out must push the camera away");
@@ -2367,7 +2568,10 @@ mod tests {
 
     #[test]
     fn geometry_verbs_route_to_session() {
-        assert!(matches!(route_line("box 0,0,0 1,1,1"), Some(PendingOp::Cmd(_))));
+        assert!(matches!(
+            route_line("box 0,0,0 1,1,1"),
+            Some(PendingOp::Cmd(_))
+        ));
     }
 
     #[test]
@@ -2379,35 +2583,69 @@ mod tests {
     fn gumball_preview_matrix_composes_about_center() {
         use glam::DVec3;
         // Move is a pure translate.
-        let m = PreviewKind::Move { delta: DVec3::new(1.0, 2.0, 3.0) }.matrix();
-        assert!(m.transform_point3(DVec3::ZERO).abs_diff_eq(DVec3::new(1.0, 2.0, 3.0), 1e-9));
+        let m = PreviewKind::Move {
+            delta: DVec3::new(1.0, 2.0, 3.0),
+        }
+        .matrix();
+        assert!(
+            m.transform_point3(DVec3::ZERO)
+                .abs_diff_eq(DVec3::new(1.0, 2.0, 3.0), 1e-9)
+        );
 
         // Rotate 90° about Z through center (1,0,0): the center is fixed, and a
         // point on +X of the center swings to +Y of it.
         let center = DVec3::new(1.0, 0.0, 0.0);
-        let r = PreviewKind::Rotate { angle_deg: 90.0, axis: DVec3::Z, center }.matrix();
+        let r = PreviewKind::Rotate {
+            angle_deg: 90.0,
+            axis: DVec3::Z,
+            center,
+        }
+        .matrix();
         assert!(r.transform_point3(center).abs_diff_eq(center, 1e-9));
-        assert!(r
-            .transform_point3(DVec3::new(2.0, 0.0, 0.0))
-            .abs_diff_eq(DVec3::new(1.0, 1.0, 0.0), 1e-9));
+        assert!(
+            r.transform_point3(DVec3::new(2.0, 0.0, 0.0))
+                .abs_diff_eq(DVec3::new(1.0, 1.0, 0.0), 1e-9)
+        );
 
         // Scale 2× about center (1,1,1): center fixed, distances double.
         let c = DVec3::splat(1.0);
-        let s = PreviewKind::Scale { factors: DVec3::splat(2.0), center: c }.matrix();
+        let s = PreviewKind::Scale {
+            factors: DVec3::splat(2.0),
+            center: c,
+        }
+        .matrix();
         assert!(s.transform_point3(c).abs_diff_eq(c, 1e-9));
-        assert!(s.transform_point3(DVec3::new(2.0, 1.0, 1.0)).abs_diff_eq(DVec3::new(3.0, 1.0, 1.0), 1e-9));
+        assert!(
+            s.transform_point3(DVec3::new(2.0, 1.0, 1.0))
+                .abs_diff_eq(DVec3::new(3.0, 1.0, 1.0), 1e-9)
+        );
     }
 
     #[test]
     fn gumball_preview_to_command_sets_explicit_center() {
         use glam::DVec3;
         let center = DVec3::new(1.0, 2.0, 3.0);
-        match (PreviewKind::Rotate { angle_deg: 30.0, axis: DVec3::Z, center }).to_command() {
-            Command::Rotate { center: Some(c), .. } => assert!(c.abs_diff_eq(center, 1e-12)),
+        match (PreviewKind::Rotate {
+            angle_deg: 30.0,
+            axis: DVec3::Z,
+            center,
+        })
+        .to_command()
+        {
+            Command::Rotate {
+                center: Some(c), ..
+            } => assert!(c.abs_diff_eq(center, 1e-12)),
             other => panic!("expected Rotate with explicit center, got {other:?}"),
         }
-        match (PreviewKind::Scale { factors: DVec3::splat(2.0), center }).to_command() {
-            Command::Scale { center: Some(c), .. } => assert!(c.abs_diff_eq(center, 1e-12)),
+        match (PreviewKind::Scale {
+            factors: DVec3::splat(2.0),
+            center,
+        })
+        .to_command()
+        {
+            Command::Scale {
+                center: Some(c), ..
+            } => assert!(c.abs_diff_eq(center, 1e-12)),
             other => panic!("expected Scale with explicit center, got {other:?}"),
         }
     }
@@ -2440,25 +2678,43 @@ mod tests {
             ijc_render_frame(nil);
             assert!(!ijc_open_json(nil, b"{}".as_ptr(), 2));
             assert!(!ijc_run_command(nil, c"box 0,0,0 1,1,1".as_ptr()));
-            assert!(!ijc_deck_configure(nil, 0, std::ptr::null(), std::ptr::null(), std::ptr::null()));
+            assert!(!ijc_deck_configure(
+                nil,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null()
+            ));
             // Pick/gumball entry points: null handle → documented safe default.
             assert!(!ijc_pick(nil, 10.0, 10.0, false));
             assert!(!ijc_pick(nil, 10.0, 10.0, true));
             let mut c3 = [0.0f64; 3];
             let mut s3 = [0.0f64; 3];
             assert!(!ijc_selection_bbox(nil, c3.as_mut_ptr(), s3.as_mut_ptr()));
-            assert!(!ijc_selection_bbox(nil, std::ptr::null_mut(), std::ptr::null_mut()));
+            assert!(!ijc_selection_bbox(
+                nil,
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ));
             let w = [1.0f64, 2.0, 3.0];
             let mut xy = [0.0f32; 2];
             assert!(!ijc_project_point(nil, w.as_ptr(), xy.as_mut_ptr()));
-            assert!(!ijc_project_point(nil, std::ptr::null(), std::ptr::null_mut()));
+            assert!(!ijc_project_point(
+                nil,
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ));
             assert!(!ijc_move_selected(nil, 1.0, 0.0, 0.0));
             assert!(!ijc_move_selected(nil, f64::NAN, 0.0, 0.0));
             // Full gumball: every entry point is null-safe and returns false on
             // a null handle (including the always-true cancel path).
             assert!(!ijc_gumball_preview_move(nil, 1.0, 0.0, 0.0));
-            assert!(!ijc_gumball_preview_rotate(nil, 45.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0));
-            assert!(!ijc_gumball_preview_scale(nil, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0));
+            assert!(!ijc_gumball_preview_rotate(
+                nil, 45.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0
+            ));
+            assert!(!ijc_gumball_preview_scale(
+                nil, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0
+            ));
             assert!(!ijc_gumball_cancel(nil));
             assert!(!ijc_gumball_commit(nil));
             assert!(!ijc_gumball_has_preview(nil));
@@ -2492,7 +2748,10 @@ mod tests {
     fn emit_is_a_noop_after_ctx_marked_dead() {
         CB_HITS.store(0, Ordering::SeqCst);
         let alive = Arc::new(AtomicBool::new(true));
-        let ctx = SendCtx { ctx: std::ptr::null_mut(), alive: alive.clone() };
+        let ctx = SendCtx {
+            ctx: std::ptr::null_mut(),
+            alive: alive.clone(),
+        };
 
         // Alive: the callback fires.
         emit(counting_cb, &ctx, CB_CHAT, "hello");
@@ -2520,18 +2779,21 @@ mod tests {
         let busy = AtomicBool::new(false);
 
         // First acquirer wins.
-        assert!(busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok());
+        assert!(
+            busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        );
         // Second, concurrent acquirer is rejected (would have aliased &mut).
-        assert!(busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err());
+        assert!(
+            busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        );
         // After the first releases, a later call succeeds again.
         busy.store(false, Ordering::Release);
-        assert!(busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok());
+        assert!(
+            busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        );
     }
 
     // ---- ijc_free hardening: one-shot free latch + free/mutator serialization
@@ -2604,9 +2866,10 @@ mod tests {
         let guard = Arc::new(AtomicU64::new(GUARD_LIVE));
 
         // Mutator takes `busy` first (as `handle_mut` would).
-        assert!(busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok());
+        assert!(
+            busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        );
 
         let busy2 = busy.clone();
         let guard2 = guard.clone();
@@ -2645,10 +2908,7 @@ mod tests {
         // The drain/handle_events gate refuses any PendingOp::Cmd whose command
         // is side-effecting. Verify the exact commands a hostile model could emit
         // (import/export) route to a side-effecting Command so the gate trips.
-        for line in [
-            "import /etc/passwd",
-            "export /tmp/exfil.dxf",
-        ] {
+        for line in ["import /etc/passwd", "export /tmp/exfil.dxf"] {
             match route_line(line) {
                 Some(PendingOp::Cmd(cmd)) => assert!(
                     cmd.is_side_effecting(),
@@ -2704,10 +2964,10 @@ mod tests {
         // fail (`io::from_json` -> Err) so the existing document is untouched.
         // We exercise the parse contract directly (the assignment is gated on it).
         for bad in [
-            "",                    // empty
-            "not json at all",     // garbage bytes
-            "{",                   // truncated
-            "[1,2,3]",             // valid json, wrong shape
+            "",                // empty
+            "not json at all", // garbage bytes
+            "{",               // truncated
+            "[1,2,3]",         // valid json, wrong shape
             "{\"unexpected\":true}",
             "\u{feff}garbage",
         ] {
@@ -2739,9 +2999,19 @@ mod tests {
         // its near face (t≈4), and miss a box parked off the ray's path.
         let o = glam::DVec3::ZERO;
         let d = glam::DVec3::X;
-        let hit = ray_aabb(o, d, glam::DVec3::new(4.0, -1.0, -1.0), glam::DVec3::new(6.0, 1.0, 1.0));
+        let hit = ray_aabb(
+            o,
+            d,
+            glam::DVec3::new(4.0, -1.0, -1.0),
+            glam::DVec3::new(6.0, 1.0, 1.0),
+        );
         assert!(hit.is_some_and(|t| (t - 4.0).abs() < 1e-9));
-        let miss = ray_aabb(o, d, glam::DVec3::new(4.0, 5.0, 5.0), glam::DVec3::new(6.0, 7.0, 7.0));
+        let miss = ray_aabb(
+            o,
+            d,
+            glam::DVec3::new(4.0, 5.0, 5.0),
+            glam::DVec3::new(6.0, 7.0, 7.0),
+        );
         assert!(miss.is_none());
         // A box straddling the origin reports t=0 (we are inside it), not negative.
         let inside = ray_aabb(o, d, glam::DVec3::splat(-1.0), glam::DVec3::splat(1.0));
@@ -2757,8 +3027,14 @@ mod tests {
         let (_origin, dir) = screen_ray(vp, 100.0, 100.0, 50.0, 50.0).expect("center ray");
         let eye = cam.eye().as_dvec3();
         let to_target = (cam.target.as_dvec3() - eye).normalize();
-        assert!(dir.dot(to_target) > 0.9, "center ray should look toward the target");
-        assert!((dir.length() - 1.0).abs() < 1e-9, "direction must be unit length");
+        assert!(
+            dir.dot(to_target) > 0.9,
+            "center ray should look toward the target"
+        );
+        assert!(
+            (dir.length() - 1.0).abs() < 1e-9,
+            "direction must be unit length"
+        );
         // Degenerate viewport is rejected rather than producing NaNs.
         assert!(screen_ray(vp, 0.0, 100.0, 50.0, 50.0).is_none());
     }

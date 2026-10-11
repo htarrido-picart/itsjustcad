@@ -2756,6 +2756,7 @@ dependencies = [
  "itsjustcad-render",
  "pollster",
  "raw-window-handle",
+ "serde_json",
  "tokio",
  "wgpu",
 ]
