@@ -232,10 +232,12 @@ pub fn convert_dwg_to_dxf_with(bin: &Path, input: &str) -> Result<Converted, Str
         // a big ADT file look truncated. We decode lossily: the DXF grammar the
         // importer parses is ASCII group codes, and the only bytes replaced are
         // inside binary blobs the importer already skips.
-        let bytes = std::fs::read(&out_dxf).map_err(|_| {
-            "DWG conversion incomplete (converter too old or unsupported DWG — try a newer \
-             LibreDWG/ODA)"
-                .to_string()
+        let bytes = std::fs::read(&out_dxf).map_err(|e| {
+            format!(
+                "DWG conversion incomplete (converter too old or unsupported DWG — try a \
+                 newer LibreDWG/ODA) [cannot read '{}': {e}]",
+                out_dxf.display()
+            )
         })?;
         let dxf = String::from_utf8_lossy(&bytes).into_owned();
         validate_dxf_complete(&dxf)?;
@@ -247,14 +249,22 @@ pub fn convert_dwg_to_dxf_with(bin: &Path, input: &str) -> Result<Converted, Str
     result
 }
 
-/// A short, process-unique tag for temp paths. Uses the nanosecond clock; the
-/// enclosing dir is already namespaced by pid, so this only needs to separate
-/// two conversions within the same process.
-fn unique_tag() -> u128 {
-    std::time::SystemTime::now()
+/// A short, process-unique tag for temp paths: nanosecond clock + a
+/// process-global monotonic counter. The counter is what actually guarantees
+/// uniqueness WITHIN the process — the clock alone is too coarse (macOS ticks
+/// in ~µs), so two threads converting at once (e.g. the parallel test harness)
+/// could draw the same tag, silently share one temp dir, and one `remove_dir_all`
+/// would delete the other's output mid-conversion. The clock is kept only to
+/// de-collide a reused pid across separate runs.
+fn unique_tag() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    format!("{nanos}_{seq}")
 }
 
 #[cfg(test)]
@@ -318,7 +328,7 @@ mod tests {
             let dirs = dwg2dxf_search_dirs();
             let local = home.join(".local").join("bin");
             let local_idx = dirs.iter().position(|d| *d == local);
-            let usrlocal_idx = dirs.iter().position(|d| d.as_path() == std::path::Path::new("/usr/local/bin"));
+            let usrlocal_idx = dirs.iter().position(|d| d.as_path() == Path::new("/usr/local/bin"));
             assert!(local_idx.is_some(), "{dirs:?}");
             assert!(usrlocal_idx.is_some(), "{dirs:?}");
             assert!(local_idx < usrlocal_idx, "~/.local/bin must precede /usr/local/bin: {dirs:?}");
@@ -495,6 +505,24 @@ mod tests {
         assert!(got.dxf.contains("ENTITIES"), "{}", got.dxf);
         assert!(got.dxf.contains("EOF"), "{}", got.dxf);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression (flaky CI): tags drawn concurrently must all be distinct.
+    /// With the clock-only tag, two parallel stub tests could share a conversion
+    /// temp dir and one would delete the other's output mid-read.
+    #[test]
+    fn unique_tags_are_distinct_under_concurrency() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| (0..64).map(|_| unique_tag()).collect::<Vec<_>>()))
+            .collect();
+        let mut all: Vec<String> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let n = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), n, "unique_tag produced duplicate tags");
     }
 
     #[cfg(unix)]
