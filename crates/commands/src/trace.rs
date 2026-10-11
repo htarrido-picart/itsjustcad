@@ -39,31 +39,279 @@ pub fn trace_color(
         return Vec::new();
     }
     let mut mask = color_mask(rgba, w, h, target, tol);
+    // Bridge pixel-level gaps (anti-aliasing / JPEG noise leaves thin strokes
+    // dotted) by one dilation before thinning, so a stroke solidifies into a
+    // connected region and thins to a continuous centerline. Radius 1 keeps
+    // adjacent parallel contours from merging.
+    dilate(&mut mask, w, h, 1);
     thin_zhang_suen(&mut mask, w, h);
     let paths = walk_skeleton(&mask, w, h);
-    paths
+    // Stitch fragments whose endpoints are close AND directionally continuous —
+    // reconnects a contour broken by spurious skeleton junctions without joining
+    // a different parallel contour running alongside it.
+    let max_gap = (w.max(h) as f64 / 180.0).clamp(4.0, 12.0);
+    let bridged = bridge_endpoints(paths, max_gap, 35.0_f64.to_radians());
+    // Filter by ARC LENGTH, not point count: after simplification a long contour
+    // may be only a handful of points, while noise specks are short regardless.
+    // `min_len_px` is a minimum stroke length in pixels.
+    let min_len = min_len_px as f64;
+    bridged
         .into_iter()
-        .filter(|p| p.len() >= min_len_px.max(2))
+        .filter(|p| polyline_len(p) >= min_len)
         .map(|p| rdp(&p, epsilon_px.max(0.0)))
         .filter(|p| p.len() >= 2)
         .collect()
 }
 
-/// Build a boolean foreground mask: `true` where the pixel is within `tol` of
-/// `target` on every channel (max-channel distance ≤ `tol`). Alpha is treated
-/// as coverage — fully transparent pixels never match.
+/// Total arc length of a polyline in pixels.
+fn polyline_len(p: &[(f64, f64)]) -> f64 {
+    p.windows(2)
+        .map(|s| ((s[1].0 - s[0].0).powi(2) + (s[1].1 - s[0].1).powi(2)).sqrt())
+        .sum()
+}
+
+/// Grow the foreground by `radius` (Chebyshev) — a morphological dilation. Used
+/// to bridge small gaps in dotted/anti-aliased strokes before thinning.
+fn dilate(mask: &mut [bool], w: usize, h: usize, radius: isize) {
+    let src = mask.to_vec();
+    for y in 0..h as isize {
+        for x in 0..w as isize {
+            if at(&src, w, h, x, y) {
+                continue; // already set
+            }
+            let mut hit = false;
+            'r: for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if at(&src, w, h, x + dx, y + dy) {
+                        hit = true;
+                        break 'r;
+                    }
+                }
+            }
+            if hit {
+                mask[y as usize * w + x as usize] = true;
+            }
+        }
+    }
+}
+
+/// Tangent direction at the end of `p` (unit vector pointing OUT of the
+/// endpoint), estimated from the last/first `k` points. `at_start` picks which
+/// end. Returns `(0,0)` for a degenerate path.
+fn end_dir(p: &[(f64, f64)], at_start: bool, k: usize) -> (f64, f64) {
+    let n = p.len();
+    if n < 2 {
+        return (0.0, 0.0);
+    }
+    let (tip, base) = if at_start {
+        (p[0], p[k.min(n - 1)])
+    } else {
+        (p[n - 1], p[n - 1 - k.min(n - 1)])
+    };
+    let (dx, dy) = (tip.0 - base.0, tip.1 - base.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-9 { (0.0, 0.0) } else { (dx / len, dy / len) }
+}
+
+/// Join open polylines whose endpoints are close AND directionally continuous,
+/// reconnecting a contour broken into fragments without merging a different
+/// parallel contour (a hop to a neighbour fails the tangent test — it runs
+/// roughly perpendicular to the strokes). Single pass: score every candidate
+/// join once, apply greedily (closest + straightest first) with each endpoint
+/// used at most once and union-find preventing a polyline joining itself, then
+/// reconstruct the merged chains in one walk. O(E²) to score, O(E) to rebuild —
+/// no per-join rescans or clones.
+fn bridge_endpoints(polys: Vec<PixelPolyline>, max_gap: f64, max_turn: f64) -> Vec<PixelPolyline> {
+    let min_cos = max_turn.cos();
+    let k = 4; // points back used to estimate the endpoint tangent
+
+    // Closed loops and degenerate paths pass through untouched; the rest get two
+    // endpoints each (indices 2m, 2m+1 are siblings — same polyline, opposite
+    // ends), so `sibling = e ^ 1`.
+    struct Ep {
+        pt: (f64, f64),
+        dir: (f64, f64),
+        poly: usize,
+        start: bool,
+    }
+    let mut out: Vec<PixelPolyline> = Vec::new();
+    let mut open: Vec<&PixelPolyline> = Vec::new();
+    let mut eps: Vec<Ep> = Vec::new();
+    for p in &polys {
+        if p.len() < 2 || is_closed(p) {
+            out.push(p.clone());
+            continue;
+        }
+        let poly = open.len();
+        open.push(p);
+        eps.push(Ep { pt: p[0], dir: end_dir(p, true, k), poly, start: true });
+        eps.push(Ep { pt: *p.last().unwrap(), dir: end_dir(p, false, k), poly, start: false });
+    }
+
+    // Score candidate joins once.
+    let mut cands: Vec<(f64, usize, usize)> = Vec::new();
+    for a in 0..eps.len() {
+        for b in (a + 1)..eps.len() {
+            if eps[a].poly == eps[b].poly {
+                continue;
+            }
+            let (pa, pb) = (eps[a].pt, eps[b].pt);
+            let gap = ((pa.0 - pb.0).powi(2) + (pa.1 - pb.1).powi(2)).sqrt();
+            if gap > max_gap || gap < 1e-6 {
+                continue;
+            }
+            let cl = gap;
+            let (cx, cy) = ((pb.0 - pa.0) / cl, (pb.1 - pa.1) / cl);
+            let cont_a = eps[a].dir.0 * cx + eps[a].dir.1 * cy;
+            let cont_b = eps[b].dir.0 * (-cx) + eps[b].dir.1 * (-cy);
+            if cont_a >= min_cos && cont_b >= min_cos {
+                cands.push((gap - (cont_a + cont_b), a, b)); // prefer close + straight
+            }
+        }
+    }
+    cands.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Greedy apply: each endpoint used once; union-find stops a poly joining
+    // itself (which would otherwise orphan a loop).
+    let mut parent: Vec<usize> = (0..open.len()).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut r = x;
+        while parent[r] != r {
+            r = parent[r];
+        }
+        let mut c = x;
+        while parent[c] != r {
+            let n = parent[c];
+            parent[c] = r;
+            c = n;
+        }
+        r
+    }
+    let mut partner: Vec<Option<usize>> = vec![None; eps.len()];
+    for (_, a, b) in cands {
+        if partner[a].is_some() || partner[b].is_some() {
+            continue;
+        }
+        let (ra, rb) = (find(&mut parent, eps[a].poly), find(&mut parent, eps[b].poly));
+        if ra == rb {
+            continue;
+        }
+        partner[a] = Some(b);
+        partner[b] = Some(a);
+        parent[ra] = rb;
+    }
+
+    // Reconstruct. Each endpoint has one internal edge (to its sibling, via the
+    // polyline body) and ≤1 join edge → everything is a path or a cycle.
+    let mut visited = vec![false; eps.len()];
+    let emit = |e_start: usize, visited: &mut [bool], out: &mut Vec<PixelPolyline>| {
+        let mut path: PixelPolyline = Vec::new();
+        let mut e = e_start;
+        loop {
+            if visited[e] {
+                break;
+            }
+            visited[e] = true;
+            let sib = e ^ 1;
+            visited[sib] = true;
+            let poly = open[eps[e].poly];
+            if eps[e].start {
+                path.extend_from_slice(poly); // entered at start → forward
+            } else {
+                path.extend(poly.iter().rev().copied()); // entered at end → reversed
+            }
+            match partner[sib] {
+                Some(next) => e = next, // hop across the gap to the next fragment
+                None => break,
+            }
+        }
+        if path.len() >= 2 {
+            out.push(path);
+        }
+    };
+    // Open chains first (start only at a true free end: no join there).
+    for s in 0..eps.len() {
+        if !visited[s] && partner[s].is_none() {
+            emit(s, &mut visited, &mut out);
+        }
+    }
+    // Any remainder is a pure cycle of fragments — emit and close it.
+    for s in 0..eps.len() {
+        if !visited[s] {
+            let before = out.len();
+            emit(s, &mut visited, &mut out);
+            if let Some(last) = out.get_mut(before)
+                && last.len() >= 4
+                && last[0] != last[last.len() - 1]
+            {
+                last.push(last[0]);
+            }
+        }
+    }
+    out
+}
+
+fn is_closed(p: &[(f64, f64)]) -> bool {
+    p.len() >= 4 && {
+        let (a, b) = (p[0], p[p.len() - 1]);
+        (a.0 - b.0).abs() < 1.5 && (a.1 - b.1).abs() < 1.5
+    }
+}
+
+/// HSV-ish breakdown: hue in degrees (0..360, −1 if achromatic), chroma 0..1,
+/// value 0..1. Line-art inks are better separated by hue than by RGB distance —
+/// a faint pink and a saturated red share a hue but are far apart in RGB.
+fn hcv(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
+    let (r, g, b) = (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let c = max - min;
+    let h = if c < 1e-6 {
+        -1.0
+    } else if max == r {
+        60.0 * (((g - b) / c).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * ((b - r) / c + 2.0)
+    } else {
+        60.0 * ((r - g) / c + 4.0)
+    };
+    (h, c, max)
+}
+
+/// Smallest angular distance between two hues, in degrees (0..180).
+fn hue_dist(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs().rem_euclid(360.0);
+    d.min(360.0 - d)
+}
+
+/// Build a boolean foreground mask for the pixels matching `target`.
+///
+/// For a CHROMATIC target (coloured ink like the red/blue contours) a pixel
+/// matches when it carries enough chroma to be ink (not white/near-grey) and its
+/// HUE is within tolerance of the target's — so a faint, JPEG-muddied pink still
+/// registers as "red" while the blue boundary and black linework do not. For an
+/// ACHROMATIC target (black/white) it matches low-chroma pixels within a value
+/// band. `tol` widens both the hue window and the value band.
 fn color_mask(rgba: &[u8], w: usize, h: usize, target: [u8; 3], tol: u8) -> Vec<bool> {
-    let tol = tol as i32;
+    let (th, tc, tv) = hcv(target[0], target[1], target[2]);
+    let chromatic = tc >= 0.10;
+    let min_chroma = 0.09; // below this a pixel is treated as white/grey/black
+    let hue_tol = 20.0 + (tol as f64 / 255.0) * 70.0; // tol 72→40°, 110→50°
+    let val_tol = 0.12 + (tol as f64 / 255.0) * 0.6; // achromatic value band
+
     let mut mask = vec![false; w * h];
     for (i, m) in mask.iter_mut().enumerate() {
         let p = i * 4;
         if rgba[p + 3] < 8 {
             continue; // transparent → background
         }
-        let dr = (rgba[p] as i32 - target[0] as i32).abs();
-        let dg = (rgba[p + 1] as i32 - target[1] as i32).abs();
-        let db = (rgba[p + 2] as i32 - target[2] as i32).abs();
-        *m = dr.max(dg).max(db) <= tol;
+        let (h, c, v) = hcv(rgba[p], rgba[p + 1], rgba[p + 2]);
+        *m = if chromatic {
+            c >= min_chroma && h >= 0.0 && hue_dist(h, th) <= hue_tol
+        } else {
+            // Black/white ink: low chroma, value near the target's.
+            c < min_chroma && (v - tv).abs() <= val_tol
+        };
     }
     mask
 }

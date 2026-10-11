@@ -2044,10 +2044,10 @@ impl Session {
             .to_rgba8();
         let (w, h) = img.dimensions();
 
-        // Centerline polylines in pixel space (x→right, y→down). min length and
-        // simplify tolerance scale loosely with image size so specks drop and
-        // long runs stay smooth.
-        let min_len = 6usize;
+        // Centerline polylines in pixel space (x→right, y→down). The minimum
+        // stroke LENGTH (drops noise specks) and the simplify tolerance scale
+        // with image size so output is stable across resolutions.
+        let min_len = ((w.max(h) as f64 / 70.0).max(15.0)) as usize;
         let epsilon = (w.max(h) as f64 / 600.0).clamp(0.75, 3.0);
         let polys = crate::trace::trace_color(img.as_raw(), w, h, target, tol, min_len, epsilon);
         if polys.is_empty() {

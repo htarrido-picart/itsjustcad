@@ -728,7 +728,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "trace",
             usage: "trace <color> [tol <n>] [layer]",
-            summary: "Vectorize the underlay by color into pixel-accurate centerline polylines on their own layer — the precise way to trace (do NOT hand-plot points by eye). <color> is r,g,b (0..255, read it from the image) or a name (red/green/blue/black/white/cyan/magenta/yellow); optional tol is the per-channel match tolerance (default 72); remaining words name the layer (default Trace). Set an underlay first, then trace each color onto its own layer. Example: trace 237,28,36 Contours · trace blue Boundary",
+            summary: "Vectorize the underlay by color into pixel-accurate centerline polylines on their own layer — the precise way to trace (do NOT hand-plot points by eye). Matching is by HUE, so a faint/muddy version of a color still matches: pass the general color, not an exact pixel value. <color> is r,g,b (0..255) or a name (red/green/blue/black/white/cyan/magenta/yellow); optional tol widens the hue/shade window (default 72); remaining words name the layer (default Trace). Set an underlay first, then trace each color onto its own layer. Example: trace red Contours · trace blue Boundary · trace black Buildings",
             category: Category::Tools,
         },
         CommandSpec {
