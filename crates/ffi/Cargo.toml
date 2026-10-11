@@ -19,6 +19,9 @@ glam.workspace = true
 tokio.workspace = true
 raw-window-handle = "0.6"
 pollster = "0.4"
+# Underlay decode on the iOS render path (desktop owns this via its own `image`
+# dep). jpeg: chat photo attachments are saved as JPEG; png: typical underlays.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
