@@ -840,6 +840,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Dimension,
         },
         CommandSpec {
+            name: "sheetviewdelete",
+            usage: "sheetviewdelete <sheet> <index>",
+            summary: "Delete a view from a sheet by its 1-based index (the order views were added, as counted by 'sheetview'). Undoable. Example: sheetviewdelete plan 2",
+            category: Category::Dimension,
+        },
+        CommandSpec {
+            name: "sheetviewset",
+            usage: "sheetviewset <sheet> <index> <title <text>|scale <scale>|direction <top|front|right|persp>>",
+            summary: "Edit one property of an existing view (1-based index): 'title <text>' overrides the derived callout (PLAN/ELEVATION/…), empty text resets it; 'scale <scale>' changes the drawing scale; 'direction <dir>' changes the projection. Undoable. Example: sheetviewset plan 1 title GROUND FLOOR",
+            category: Category::Dimension,
+        },
+        CommandSpec {
             name: "plotstyle",
             usage: "plotstyle <new <name>|set <name> <layer-or-r,g,b> color <r,g,b> [weight <mm>] [screen <pct>]|list [<name>]|apply <name>|none|delete <name>>",
             summary: "Plot styles / pen tables (AutoCAD CTB/STB): a named, saved mapping from a SOURCE KEY (a layer name, or an object color token 'r,g,b') to how objects PLOT — pen color, lineweight, screening — applied only at print/export, never changing the model. 'new <name>' creates a table; 'set <name> <key> color <r,g,b> [weight <mm>] [screen <pct>]' adds/replaces a mapping (screening 0..100% lightens the pen toward white); 'apply <name>' makes a table the active print pen (looked up per object by layer then color, unmapped objects plot as today); 'none' clears it; 'list [<name>]' shows tables/entries; 'delete <name>' removes one. new/set/apply/none/delete are logged (undoable); list is a query. Example: plotstyle new mono · plotstyle set mono walls color 0,0,0 weight 0.5 · plotstyle apply mono · print plan /tmp/plan.pdf",

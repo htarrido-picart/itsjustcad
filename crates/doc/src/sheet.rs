@@ -59,13 +59,45 @@ impl ViewDirection {
     }
 }
 
+/// A viewport rectangle in paper space (millimeters from the sheet lower-left):
+/// `x`,`y` is the lower-left corner, `w`×`h` the size. When a `SheetView` carries
+/// one, the PDF layout places that view at this explicit rect instead of the
+/// auto-grid. Kept minimal (4 floats) so it serializes compactly.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PageRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
 /// One viewport on a sheet: a direction at a drawing scale. `scale` is the
 /// denominator — 100 means 1:100. Viewport rectangles are laid out at print
 /// time from the view count, so the stored state stays minimal.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+///
+/// `title` and `rect` are optional overrides (default `None`, so existing sheets
+/// are byte-identical): `title` replaces the derived callout (PLAN/ELEVATION/…)
+/// with a custom string; `rect` pins the viewport to an explicit paper-space
+/// rectangle instead of the auto-grid.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SheetView {
     pub direction: ViewDirection,
     pub scale: f64,
+    /// Custom callout title. `None` → the derived callout for the direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Explicit paper-space viewport rectangle (mm). `None` → auto-grid layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rect: Option<PageRect>,
+}
+
+impl SheetView {
+    /// A view with the default auto-layout behavior: no custom title, no pinned
+    /// rect. Construction-site helper so callers stay terse and future fields
+    /// default in one place.
+    pub fn new(direction: ViewDirection, scale: f64) -> Self {
+        Self { direction, scale, title: None, rect: None }
+    }
 }
 
 /// One row in a material/object schedule table.
@@ -181,6 +213,52 @@ pub struct SheetTag {
     pub view_index: Option<usize>,
 }
 
+/// An architect's title block / stamp for a sheet: the metadata box (bottom-
+/// right by convention) carrying project/client/sheet identity. Every field is
+/// optional — when they are all absent/empty the stamp renders nothing, so
+/// existing sheets are unchanged. Kept as plain strings (free text) because this
+/// is annotation, not model state.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct TitleBlock {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet_no: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawn_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+impl TitleBlock {
+    /// True when every field is empty/absent — the stamp should render nothing.
+    pub fn is_empty(&self) -> bool {
+        [
+            &self.project,
+            &self.address,
+            &self.client,
+            &self.sheet_no,
+            &self.sheet_title,
+            &self.scale,
+            &self.date,
+            &self.drawn_by,
+            &self.revision,
+        ]
+        .iter()
+        .all(|f| f.as_deref().map(str::is_empty).unwrap_or(true))
+    }
+}
+
 /// A named paper layout holding scaled views of the model.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Sheet {
@@ -188,6 +266,9 @@ pub struct Sheet {
     pub paper: PaperSize,
     #[serde(default)]
     pub views: Vec<SheetView>,
+    /// Architect title block / stamp. `None` → no stamp (behavior unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub titleblock: Option<TitleBlock>,
     /// Optional schedule table placed below the views.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table: Option<SheetTable>,
@@ -218,4 +299,62 @@ pub struct SheetSet {
     /// name; a name may linger here after its sheet is deleted (readers filter).
     #[serde(default)]
     pub sheets: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A view with the new optional fields round-trips through JSON, and the
+    /// defaulted (None) case omits them so output stays compact.
+    #[test]
+    fn sheet_view_serde_round_trip_with_new_fields() {
+        let v = SheetView {
+            direction: ViewDirection::Top,
+            scale: 100.0,
+            title: Some("GROUND FLOOR".into()),
+            rect: Some(PageRect { x: 10.0, y: 20.0, w: 100.0, h: 80.0 }),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(v, serde_json::from_str::<SheetView>(&json).unwrap());
+
+        // A default view omits title/rect (skip_serializing_if).
+        let plain = SheetView::new(ViewDirection::Front, 50.0);
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(!plain_json.contains("\"title\""), "title omitted when None: {plain_json}");
+        assert!(!plain_json.contains("\"rect\""), "rect omitted when None: {plain_json}");
+    }
+
+    /// OLD documents — views with only `direction`/`scale`, sheets with no
+    /// `titleblock` — still deserialize, with the new fields defaulting. This is
+    /// the critical backward-compatibility guarantee for stored checkpoints.
+    #[test]
+    fn old_json_defaults_new_fields() {
+        // Pre-feature SheetView shape.
+        let old_view = r#"{"direction":"top","scale":100.0}"#;
+        let v: SheetView = serde_json::from_str(old_view).unwrap();
+        assert!(v.title.is_none() && v.rect.is_none());
+
+        // Pre-feature Sheet shape (no titleblock key).
+        let old_sheet = r#"{"name":"s","paper":"a3","views":[]}"#;
+        let s: Sheet = serde_json::from_str(old_sheet).unwrap();
+        assert!(s.titleblock.is_none(), "titleblock defaults to None on old docs");
+    }
+
+    /// The title block round-trips and `is_empty` reflects filled vs blank.
+    #[test]
+    fn titleblock_serde_and_is_empty() {
+        assert!(TitleBlock::default().is_empty());
+        let tb = TitleBlock {
+            project: Some("Villa".into()),
+            drawn_by: Some("HTP".into()),
+            ..TitleBlock::default()
+        };
+        assert!(!tb.is_empty());
+        let json = serde_json::to_string(&tb).unwrap();
+        assert_eq!(tb, serde_json::from_str::<TitleBlock>(&json).unwrap());
+        // Blank strings count as empty.
+        let blank = TitleBlock { project: Some(String::new()), ..TitleBlock::default() };
+        assert!(blank.is_empty(), "all-blank fields → empty");
+    }
 }

@@ -221,6 +221,20 @@ enum Inverse {
     RemoveSheet(String),
     /// `sheetview`: drop the view most recently added to a sheet.
     PopSheetView(String),
+    /// `sheetviewdelete`: re-insert a deleted view at its former 0-based slot.
+    InsertSheetView {
+        sheet: String,
+        /// 0-based slot the view occupied before deletion.
+        at: usize,
+        view: itsjustcad_doc::SheetView,
+    },
+    /// `sheetviewset`: restore a view to its prior state (0-based slot).
+    RestoreSheetView {
+        sheet: String,
+        /// 0-based slot of the edited view.
+        at: usize,
+        view: itsjustcad_doc::SheetView,
+    },
     /// `sheettable`: clear the table that was placed on a sheet.
     SheetTableRemoved(String),
     /// `sheetdim`: remove the last dim appended to a sheet.
@@ -1060,6 +1074,23 @@ impl Session {
                 let sheet = sheet.clone();
                 if let Some(s) = self.doc.sheet_mut(&sheet) {
                     s.views.pop();
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::InsertSheetView { sheet, at, view } => {
+                let (sheet, at, view) = (sheet.clone(), *at, view.clone());
+                if let Some(s) = self.doc.sheet_mut(&sheet) {
+                    let at = at.min(s.views.len());
+                    s.views.insert(at, view);
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::RestoreSheetView { sheet, at, view } => {
+                let (sheet, at, view) = (sheet.clone(), *at, view.clone());
+                if let Some(s) = self.doc.sheet_mut(&sheet)
+                    && let Some(slot) = s.views.get_mut(at)
+                {
+                    *slot = view;
                 }
                 self.doc.generation += 1;
             }
@@ -12762,6 +12793,7 @@ fn apply_forward(
                 name: name.clone(),
                 paper,
                 views: Vec::new(),
+                titleblock: None,
                 table: None,
                 dims: Vec::new(),
                 texts: Vec::new(),
@@ -12789,7 +12821,7 @@ fn apply_forward(
                     known.join(", ")
                 )));
             };
-            s.views.push(itsjustcad_doc::SheetView { direction, scale });
+            s.views.push(itsjustcad_doc::SheetView::new(direction, scale));
             let count = s.views.len();
             doc.generation += 1;
             Ok((
@@ -12801,6 +12833,82 @@ fn apply_forward(
                         "added {} view @ 1:{scale} to '{sheet}' ({count} view(s))",
                         direction.label()
                     ),
+                },
+            ))
+        }
+        Command::SheetViewDelete { sheet, index } => {
+            let known: Vec<String> = doc.sheets.iter().map(|s| s.name.clone()).collect();
+            let Some(s) = doc.sheet_mut(&sheet) else {
+                return Err(ExecError::Invalid(format!(
+                    "no sheet '{sheet}' (sheets: {})",
+                    known.join(", ")
+                )));
+            };
+            // 1-based index → 0-based slot; reject out-of-range cleanly.
+            if index == 0 || index > s.views.len() {
+                return Err(ExecError::Invalid(format!(
+                    "sheet '{sheet}' has no view {index} (it has {} view(s); indices are 1-based)",
+                    s.views.len()
+                )));
+            }
+            let at = index - 1;
+            let removed = s.views.remove(at);
+            let count = s.views.len();
+            doc.generation += 1;
+            Ok((
+                Command::SheetViewDelete { sheet: sheet.clone(), index },
+                Inverse::InsertSheetView { sheet: sheet.clone(), at, view: removed },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("deleted view {index} from '{sheet}' ({count} view(s) left)"),
+                },
+            ))
+        }
+        Command::SheetViewSet { sheet, index, set } => {
+            let known: Vec<String> = doc.sheets.iter().map(|s| s.name.clone()).collect();
+            let Some(s) = doc.sheet_mut(&sheet) else {
+                return Err(ExecError::Invalid(format!(
+                    "no sheet '{sheet}' (sheets: {})",
+                    known.join(", ")
+                )));
+            };
+            if index == 0 || index > s.views.len() {
+                return Err(ExecError::Invalid(format!(
+                    "sheet '{sheet}' has no view {index} (it has {} view(s); indices are 1-based)",
+                    s.views.len()
+                )));
+            }
+            let at = index - 1;
+            let prev = s.views[at].clone();
+            let view = &mut s.views[at];
+            let what = match &set {
+                crate::SheetViewSet::Title { title } => {
+                    // Empty string clears the custom title (back to derived callout).
+                    view.title = if title.is_empty() { None } else { Some(title.clone()) };
+                    match &view.title {
+                        Some(t) => format!("title = '{t}'"),
+                        None => "title cleared".to_string(),
+                    }
+                }
+                crate::SheetViewSet::Scale { scale } => {
+                    if *scale <= 0.0 {
+                        return Err(ExecError::Invalid("view scale must be positive".into()));
+                    }
+                    view.scale = *scale;
+                    format!("scale = 1:{scale}")
+                }
+                crate::SheetViewSet::Direction { direction } => {
+                    view.direction = *direction;
+                    format!("direction = {}", direction.label())
+                }
+            };
+            doc.generation += 1;
+            Ok((
+                Command::SheetViewSet { sheet: sheet.clone(), index, set },
+                Inverse::RestoreSheetView { sheet: sheet.clone(), at, view: prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!("view {index} on '{sheet}': {what}"),
                 },
             ))
         }
@@ -15073,6 +15181,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::FaceSunHours { .. } => "facesunhours",
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
+        Command::SheetViewDelete { .. } => "sheetviewdelete",
+        Command::SheetViewSet { .. } => "sheetviewset",
         Command::Print { .. } => "print",
         Command::SheetSet(..) => "sheetset",
         Command::Export { .. } => "export",
@@ -19323,6 +19433,77 @@ mod tests {
         assert!(err.to_string().contains("already exists"), "{err}");
         let err = s.run(parse("sheetview ghost top 100").unwrap()).unwrap_err();
         assert!(err.to_string().contains("no sheet 'ghost'"), "{err}");
+    }
+
+    /// Item 2: delete a view by 1-based index; out-of-range and unknown-sheet
+    /// errors are clean; undo re-inserts at the original slot.
+    #[test]
+    fn sheetview_delete_and_errors() {
+        use itsjustcad_doc::ViewDirection;
+        let mut s = Session::default();
+        run(&mut s, "sheet plan a3");
+        run(&mut s, "sheetview plan top 100");
+        run(&mut s, "sheetview plan front 50");
+        run(&mut s, "sheetview plan right 50");
+        assert_eq!(s.doc.sheet("plan").unwrap().views.len(), 3);
+
+        // Delete the middle view (1-based index 2 = front).
+        let out = run(&mut s, "sheetviewdelete plan 2");
+        assert!(out.message.contains("deleted view 2"), "{}", out.message);
+        let views = &s.doc.sheet("plan").unwrap().views;
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].direction, ViewDirection::Top);
+        assert_eq!(views[1].direction, ViewDirection::Right, "front removed");
+
+        // Index 0 and past-end both error cleanly (no panic).
+        let e0 = s.run(parse("sheetviewdelete plan 0").unwrap()).unwrap_err();
+        assert!(e0.to_string().contains("no view 0"), "{e0}");
+        let e9 = s.run(parse("sheetviewdelete plan 9").unwrap()).unwrap_err();
+        assert!(e9.to_string().contains("no view 9"), "{e9}");
+        let eg = s.run(parse("sheetviewdelete ghost 1").unwrap()).unwrap_err();
+        assert!(eg.to_string().contains("no sheet 'ghost'"), "{eg}");
+
+        // Undo restores the deleted view at its slot.
+        run(&mut s, "undo");
+        let views = &s.doc.sheet("plan").unwrap().views;
+        assert_eq!(views.len(), 3);
+        assert_eq!(views[1].direction, ViewDirection::Front, "re-inserted at slot 1");
+    }
+
+    /// Item 1/2: `sheetviewset` edits title/scale/direction; undo restores the
+    /// prior value; replay is stable through JSON.
+    #[test]
+    fn sheetview_set_fields_and_undo() {
+        use itsjustcad_doc::ViewDirection;
+        let mut s = Session::default();
+        run(&mut s, "sheet plan a3");
+        run(&mut s, "sheetview plan top 100");
+
+        // Title.
+        run(&mut s, "sheetviewset plan 1 title GROUND FLOOR");
+        assert_eq!(
+            s.doc.sheet("plan").unwrap().views[0].title.as_deref(),
+            Some("GROUND FLOOR")
+        );
+        // Scale + direction.
+        run(&mut s, "sheetviewset plan 1 scale 1:50");
+        run(&mut s, "sheetviewset plan 1 direction front");
+        let v = &s.doc.sheet("plan").unwrap().views[0];
+        assert_eq!(v.scale, 50.0);
+        assert_eq!(v.direction, ViewDirection::Front);
+
+        // Out-of-range index errors cleanly.
+        let e = s.run(parse("sheetviewset plan 5 scale 10").unwrap()).unwrap_err();
+        assert!(e.to_string().contains("no view 5"), "{e}");
+
+        // Undo direction then title-clear round-trip.
+        run(&mut s, "undo"); // direction back to top
+        assert_eq!(s.doc.sheet("plan").unwrap().views[0].direction, ViewDirection::Top);
+
+        // Replay stability with the new fields set.
+        let json = crate::io::to_json(&s);
+        let s2 = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&s2), json, "replay-stable JSON");
     }
 
     #[test]

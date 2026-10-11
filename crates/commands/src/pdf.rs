@@ -9,7 +9,7 @@
 use glam::{DVec2, DVec3};
 use itsjustcad_doc::{
     Annotation, Document, Geometry, ScheduleRow, Sheet, SheetDim, SheetLeader, SheetTag,
-    SheetText, SheetView, ViewDirection,
+    SheetText, SheetView, TitleBlock, ViewDirection,
 };
 
 /// Chord tolerance for tessellating curves at print time (meters).
@@ -385,11 +385,16 @@ fn render_view(
 
     // Professional CAD callout in the bottom-left of the cell: a view title in a
     // larger font, a thin underline rule, and a smaller scale line beneath it.
-    let title = match view.direction {
-        ViewDirection::Top => "PLAN".to_owned(),
-        ViewDirection::Front => "FRONT ELEVATION".to_owned(),
-        ViewDirection::Right => "SIDE ELEVATION".to_owned(),
-        ViewDirection::Iso => "PERSPECTIVE".to_owned(),
+    // A custom `view.title` overrides the derived callout; `None` keeps the
+    // direction-derived label (PLAN/ELEVATION/PERSPECTIVE) unchanged.
+    let title = match &view.title {
+        Some(t) => t.clone(),
+        None => match view.direction {
+            ViewDirection::Top => "PLAN".to_owned(),
+            ViewDirection::Front => "FRONT ELEVATION".to_owned(),
+            ViewDirection::Right => "SIDE ELEVATION".to_owned(),
+            ViewDirection::Iso => "PERSPECTIVE".to_owned(),
+        },
     };
     // Scale as an integer when whole (`1:100`, not `1:100.0`).
     let scale = if view.scale.fract() == 0.0 {
@@ -709,6 +714,97 @@ fn render_table(rows: &[ScheduleRow], y_start_mm: f64, content: &mut String) -> 
     total_h
 }
 
+/// Title-block width in mm (fits the longest convention label at 7pt on A4).
+const TB_W_MM: f64 = 70.0;
+/// Title-block row height in mm.
+const TB_ROW_MM: f64 = 5.0;
+/// Title-block label font size in points.
+const TB_FONT_PT: f64 = 7.0;
+
+/// Render an architect title block / stamp in the bottom-right corner (inside
+/// the sheet frame). Only non-empty fields produce rows, stacked bottom-up, so
+/// the box grows to fit; an all-empty block renders nothing (caller gates on
+/// [`TitleBlock::is_empty`]). Vector text only, matching the callout style.
+///
+/// `paper_w` is the sheet width in mm; the block is anchored at the frame's
+/// bottom-right (half a margin in from each edge).
+fn render_titleblock(tb: &TitleBlock, paper_w: f64, content: &mut String) {
+    // (label, value) rows, top (first) to bottom (last). Skip empty fields so
+    // the stamp only lists what the drafter filled in.
+    let fields: [(&str, &Option<String>); 9] = [
+        ("PROJECT", &tb.project),
+        ("ADDRESS", &tb.address),
+        ("CLIENT", &tb.client),
+        ("SHEET TITLE", &tb.sheet_title),
+        ("SHEET NO.", &tb.sheet_no),
+        ("SCALE", &tb.scale),
+        ("DATE", &tb.date),
+        ("DRAWN BY", &tb.drawn_by),
+        ("REV", &tb.revision),
+    ];
+    let rows: Vec<(&str, &str)> = fields
+        .iter()
+        .filter_map(|(label, v)| match v.as_deref() {
+            Some(s) if !s.is_empty() => Some((*label, s)),
+            _ => None,
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+
+    let block_h = rows.len() as f64 * TB_ROW_MM;
+    // Bottom-right, inside the sheet frame (frame inset is MARGIN_MM/2).
+    let x0 = paper_w - MARGIN_MM / 2.0 - TB_W_MM;
+    let y0 = MARGIN_MM / 2.0;
+
+    // Outer border.
+    content.push_str(&format!(
+        "0.5 w {} {} {} {} re S\n",
+        mm(x0),
+        mm(y0),
+        mm(TB_W_MM),
+        mm(block_h)
+    ));
+
+    // Rows bottom-up: the first field sits at the top of the stack.
+    let label_w = 22.0; // mm reserved for the label column
+    for (i, (label, value)) in rows.iter().enumerate() {
+        let row_y = y0 + (rows.len() - 1 - i) as f64 * TB_ROW_MM;
+        // Divider above each row except the bottom-most.
+        if row_y > y0 + 1e-6 {
+            content.push_str(&format!(
+                "0.3 w {} {} m {} {} l S\n",
+                mm(x0),
+                mm(row_y),
+                mm(x0 + TB_W_MM),
+                mm(row_y)
+            ));
+        }
+        // Label column separator.
+        content.push_str(&format!(
+            "0.3 w {} {} m {} {} l S\n",
+            mm(x0 + label_w),
+            mm(row_y),
+            mm(x0 + label_w),
+            mm(row_y + TB_ROW_MM)
+        ));
+        // Label (small) then value.
+        content.push_str(&format!(
+            "BT /F1 {TB_FONT_PT} Tf {} {} Td ({}) Tj ET\n",
+            mm(x0 + 1.0),
+            mm(row_y + 1.5),
+            escape_pdf_text(label)
+        ));
+        content.push_str(&format!(
+            "BT /F1 {TB_FONT_PT} Tf {} {} Td ({}) Tj ET\n",
+            mm(x0 + label_w + 1.5),
+            mm(row_y + 1.5),
+            escape_pdf_text(value)
+        ));
+    }
+}
+
 /// Build the complete PDF for a sheet. Returns the file bytes and the number
 /// of geometry lines drawn across all viewports.
 pub fn sheet_pdf(doc: &Document, sheet: &Sheet) -> (Vec<u8>, usize) {
@@ -750,20 +846,24 @@ fn sheet_content(doc: &Document, sheet: &Sheet) -> (String, usize) {
     };
     let view_y0 = MARGIN_MM + TITLE_MM + if table_h > 0.0 { table_h + GUTTER_MM } else { 0.0 };
 
-    // Equal horizontal slices between the margins, above the title strip (and table).
+    // Equal horizontal slices between the margins, above the title strip (and
+    // table). A view carrying an explicit `rect` is placed there verbatim (paper
+    // mm from the sheet lower-left); views with `rect == None` keep their current
+    // auto-grid slot, so a sheet with no pinned rects renders byte-identically.
     let n = sheet.views.len();
     if n > 0 {
         let area_w = paper_w - 2.0 * MARGIN_MM;
         let view_w = (area_w - GUTTER_MM * (n as f64 - 1.0)) / n as f64;
         let (y0, y1) = (view_y0, paper_h - MARGIN_MM);
         for (i, view) in sheet.views.iter().enumerate() {
-            let x0 = MARGIN_MM + i as f64 * (view_w + GUTTER_MM);
-            drawn += render_view(
-                doc,
-                view,
-                (DVec2::new(x0, y0), DVec2::new(x0 + view_w, y1)),
-                &mut content,
-            );
+            let rect = match view.rect {
+                Some(r) => (DVec2::new(r.x, r.y), DVec2::new(r.x + r.w, r.y + r.h)),
+                None => {
+                    let x0 = MARGIN_MM + i as f64 * (view_w + GUTTER_MM);
+                    (DVec2::new(x0, y0), DVec2::new(x0 + view_w, y1))
+                }
+            };
+            drawn += render_view(doc, view, rect, &mut content);
         }
     }
 
@@ -783,6 +883,14 @@ fn sheet_content(doc: &Document, sheet: &Sheet) -> (String, usize) {
     }
     for t in &sheet.tags {
         render_sheet_tag(t, &mut content);
+    }
+
+    // Architect title block / stamp (bottom-right). Renders only when present
+    // and non-empty, so existing sheets are unchanged.
+    if let Some(tb) = &sheet.titleblock
+        && !tb.is_empty()
+    {
+        render_titleblock(tb, paper_w, &mut content);
     }
 
     (content, drawn)
@@ -945,6 +1053,7 @@ mod tests {
             name: "empty".into(),
             paper: itsjustcad_doc::PaperSize::A3,
             views: vec![],
+            titleblock: None,
             table: None,
             dims: vec![],
             texts: vec![],
@@ -1289,5 +1398,115 @@ mod tests {
         let content = String::from_utf8_lossy(&bytes);
         // The model distance label "5.000m" should appear in the PDF.
         assert!(content.contains("5.000m"), "PDF should contain dim label '5.000m'");
+    }
+
+    /// Item 1: `None` title renders the derived callout; `Some` overrides it.
+    #[test]
+    fn view_title_some_overrides_derived_callout() {
+        use crate::{parse, Session};
+        let mut s = Session::default();
+        s.run(parse("line 0,0,0 1,0,0").unwrap()).unwrap();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse("sheetview s1 top 100").unwrap()).unwrap();
+
+        // Default (None) → derived "PLAN".
+        let derived = String::from_utf8_lossy(&sheet_pdf(&s.doc, s.doc.sheet("s1").unwrap()).0)
+            .into_owned();
+        assert!(derived.contains("(PLAN)"), "derived callout PLAN present");
+        assert!(!derived.contains("GROUND FLOOR"), "no custom title yet");
+
+        // Set a custom title on view 1 → override.
+        s.run(parse("sheetviewset s1 1 title GROUND FLOOR").unwrap()).unwrap();
+        assert_eq!(
+            s.doc.sheet("s1").unwrap().views[0].title.as_deref(),
+            Some("GROUND FLOOR")
+        );
+        let custom =
+            String::from_utf8_lossy(&sheet_pdf(&s.doc, s.doc.sheet("s1").unwrap()).0).into_owned();
+        assert!(custom.contains("(GROUND FLOOR)"), "custom callout rendered");
+        assert!(!custom.contains("(PLAN)"), "derived callout suppressed");
+
+        // Clear it (empty title) → back to derived.
+        s.run(parse("sheetviewset s1 1 title").unwrap()).unwrap();
+        assert!(s.doc.sheet("s1").unwrap().views[0].title.is_none());
+    }
+
+    /// Item 3: a view with an explicit `rect` is placed there, not on the
+    /// auto-grid; a sheet with no rects is byte-identical to before.
+    #[test]
+    fn view_rect_honored_vs_auto_grid() {
+        use itsjustcad_doc::{PageRect, SheetView, ViewDirection};
+        let doc = Document::default();
+
+        // Auto-grid baseline.
+        let auto = Sheet {
+            name: "s".into(),
+            paper: itsjustcad_doc::PaperSize::A3,
+            views: vec![SheetView::new(ViewDirection::Top, 100.0)],
+            titleblock: None,
+            table: None,
+            dims: vec![],
+            texts: vec![],
+            leaders: vec![],
+            tags: vec![],
+        };
+        // Pinned rect at a known paper position.
+        let mut pinned = auto.clone();
+        pinned.views[0].rect = Some(PageRect { x: 50.0, y: 40.0, w: 120.0, h: 90.0 });
+
+        let auto_pdf = String::from_utf8_lossy(&sheet_pdf(&doc, &auto).0).into_owned();
+        let pinned_pdf = String::from_utf8_lossy(&sheet_pdf(&doc, &pinned).0).into_owned();
+        assert_ne!(auto_pdf, pinned_pdf, "explicit rect changes the layout");
+
+        // The callout title sits at rect lower-left + (2, 6) mm → (52, 46) mm.
+        // mm() emits points: 52mm ≈ 147.40pt, 46mm ≈ 130.39pt.
+        let x_pt = format!("{:.2}", 52.0 * (72.0 / 25.4));
+        let y_pt = format!("{:.2}", 46.0 * (72.0 / 25.4));
+        assert!(
+            pinned_pdf.contains(&format!("{x_pt} {y_pt} Td")),
+            "callout anchored at the explicit rect (looking for '{x_pt} {y_pt} Td')"
+        );
+    }
+
+    /// Item 4: a title block renders its fields when present; absent/empty → no
+    /// stamp, byte-identical to a sheet without one.
+    #[test]
+    fn titleblock_renders_when_present_absent() {
+        use itsjustcad_doc::{SheetView, TitleBlock, ViewDirection};
+        let doc = Document::default();
+        let base = Sheet {
+            name: "s".into(),
+            paper: itsjustcad_doc::PaperSize::A3,
+            views: vec![SheetView::new(ViewDirection::Top, 100.0)],
+            titleblock: None,
+            table: None,
+            dims: vec![],
+            texts: vec![],
+            leaders: vec![],
+            tags: vec![],
+        };
+
+        // Absent.
+        let absent = String::from_utf8_lossy(&sheet_pdf(&doc, &base).0).into_owned();
+        assert!(!absent.contains("PROJECT"), "no stamp when absent");
+
+        // All-empty block renders nothing either.
+        let mut empty = base.clone();
+        empty.titleblock = Some(TitleBlock::default());
+        let empty_pdf = String::from_utf8_lossy(&sheet_pdf(&doc, &empty).0).into_owned();
+        assert_eq!(empty_pdf, absent, "all-empty block renders nothing");
+
+        // Present → fields appear.
+        let mut present = base.clone();
+        present.titleblock = Some(TitleBlock {
+            project: Some("Villa".into()),
+            drawn_by: Some("HTP".into()),
+            ..TitleBlock::default()
+        });
+        let present_pdf = String::from_utf8_lossy(&sheet_pdf(&doc, &present).0).into_owned();
+        assert!(present_pdf.contains("(PROJECT)"), "project label present");
+        assert!(present_pdf.contains("(Villa)"), "project value present");
+        assert!(present_pdf.contains("(DRAWN BY)") && present_pdf.contains("(HTP)"));
+        assert!(!present_pdf.contains("(CLIENT)"), "empty fields skipped");
     }
 }

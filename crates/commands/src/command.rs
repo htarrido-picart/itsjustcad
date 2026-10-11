@@ -1351,6 +1351,20 @@ pub enum Command {
         direction: ViewDirection,
         scale: f64,
     },
+    /// Delete a view from a sheet by 1-based index (matching the "N view(s)"
+    /// count reported by `sheetview`).
+    SheetViewDelete {
+        sheet: String,
+        /// 1-based index into the sheet's views.
+        index: usize,
+    },
+    /// Edit one property of an existing view (1-based index). See [`SheetViewSet`].
+    SheetViewSet {
+        sheet: String,
+        /// 1-based index into the sheet's views.
+        index: usize,
+        set: SheetViewSet,
+    },
     /// Export a sheet as a vector PDF. Not logged: printing is I/O, not model state.
     Print {
         sheet: String,
@@ -2324,6 +2338,20 @@ pub enum SheetSetOp {
     /// Batch-render every sheet in the active set to one multi-page PDF at
     /// `path` (defaults to `<setname>.pdf`). I/O — not logged.
     Publish { path: Option<String> },
+}
+
+/// Which property of an existing `SheetView` a `sheetviewset` edits. One variant
+/// per editable field so the op-log stays explicit and the inverse is a simple
+/// restore of the prior value.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "field", rename_all = "snake_case")]
+pub enum SheetViewSet {
+    /// Replace the callout title (`clear`/empty resets to the derived callout).
+    Title { title: String },
+    /// Change the drawing scale (denominator; 1:100 -> 100).
+    Scale { scale: f64 },
+    /// Change the projection direction.
+    Direction { direction: ViewDirection },
 }
 
 fn is_zero_opt(v: &Option<f64>) -> bool {
