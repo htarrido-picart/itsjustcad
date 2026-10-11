@@ -45,8 +45,10 @@ const TCODE_COMMENTBLOCK: u32 = 0x0000_0001;
 const TCODE_ENDOFFILE: u32 = 0x0000_7FFF;
 const TCODE_ENDOFTABLE: u32 = 0xFFFF_FFFF;
 
+const TCODE_MATERIAL_TABLE: u32 = 0x1000_0010;
 const TCODE_LAYER_TABLE: u32 = 0x1000_0011;
 const TCODE_OBJECT_TABLE: u32 = 0x1000_0013;
+const TCODE_MATERIAL_RECORD: u32 = 0x2000_8040;
 const TCODE_LAYER_RECORD: u32 = 0x2000_8050;
 const TCODE_OBJECT_RECORD: u32 = 0x2000_8070;
 const TCODE_OBJECT_RECORD_TYPE: u32 = 0x8200_0071;
@@ -725,6 +727,18 @@ pub fn write_min(layers: &[&str], items: &[WriteItem]) -> Vec<u8> {
         b.push(0x00);
     });
 
+    // Material table. openNURBS reads the archive tables in a fixed order
+    // (…, material, linetype, layer, …, object, end); Rhino flags the file as
+    // having an "unreadable material table" if this chunk is absent, so we emit
+    // one default material (index 0) here — *before* the layer table — even
+    // though our geometry never references it by index.
+    write_big_chunk(&mut out, TCODE_MATERIAL_TABLE, false, |b| {
+        write_big_chunk(b, TCODE_MATERIAL_RECORD, true, |mr| {
+            write_opennurbs_class(mr, &UUID_MATERIAL, |cd| write_material(cd, 0));
+        });
+        write_short_chunk(b, TCODE_ENDOFTABLE, 0);
+    });
+
     // Layer table.
     write_big_chunk(&mut out, TCODE_LAYER_TABLE, false, |b| {
         for (i, name) in layers.iter().enumerate() {
@@ -750,6 +764,11 @@ pub fn write_min(layers: &[&str], items: &[WriteItem]) -> Vec<u8> {
 
 const UUID_LAYER: [u8; 16] =
     [0x3C, 0x36, 0x86, 0xCA, 0xF3, 0x03, 0x11, 0xD4, 0x98, 0x1B, 0x88, 0x1C, 0x2A, 0x00, 0x2A, 0x9E];
+
+/// `ON_Material` class id `60B5DBBC-E660-11d3-BFE4-0010830122F0`, on-disk
+/// mixed-endian (Data1 LE u32, Data2/Data3 LE u16, Data4 verbatim).
+const UUID_MATERIAL: [u8; 16] =
+    [0xBC, 0xDB, 0xB5, 0x60, 0x60, 0xE6, 0xD3, 0x11, 0xBF, 0xE4, 0x00, 0x10, 0x83, 0x01, 0x22, 0xF0];
 
 fn write_object_record(out: &mut Vec<u8>, item: &WriteItem) {
     let (name, layer_index) = match item {
@@ -800,6 +819,64 @@ fn write_layer(out: &mut Vec<u8>, index: i32, name: &str) {
     w_f64(out, 0.0);
     w_f64(out, 1.0);
     w_string(out, name); // m_name — reader stops here
+}
+
+/// `TCODE_ANONYMOUS_CHUNK` (`TCODE_USER | TCODE_CRC`): a length-prefixed CRC
+/// chunk whose payload opens with an int major/minor version pair. openNURBS'
+/// `BeginWrite3dmChunk(TCODE_ANONYMOUS_CHUNK, major, minor)` frames exactly this.
+const TCODE_ANONYMOUS_CHUNK: u32 = 0x4000_8000;
+
+/// `ON_Material::Write` for a V5 archive (archive version < 60 takes the V4
+/// path): a chunk-version byte of 2.0, then a nested anonymous CRC chunk at
+/// minor version 3 carrying the material fields. We emit a single neutral
+/// default material (white diffuse, no textures) at the given table index.
+/// Rhino skips/reads this so the material table parses; our own reader skips
+/// the whole table by chunk length and never inspects it.
+fn write_material(out: &mut Vec<u8>, index: i32) {
+    out.push(0x20); // Write3dmChunkVersion(2, 0) — forces the V4 read path
+    write_big_chunk(out, TCODE_ANONYMOUS_CHUNK, true, |m| {
+        w_i32(m, 1); // chunk major version
+        w_i32(m, 3); // chunk minor version (V5 archive: minor == 3)
+        write_uuid_nil(m); // material Id
+        w_i32(m, index); // Write3dmReferencedComponentIndex → material index
+        w_string(m, ""); // Name (empty)
+        write_uuid_nil(m); // m_plugin_id
+
+        w_color(m, 0, 0, 0, 0); // m_ambient
+        w_color(m, 128, 128, 128, 0); // m_diffuse (neutral grey)
+        w_color(m, 0, 0, 0, 0); // m_emission
+        w_color(m, 255, 255, 255, 0); // m_specular
+        w_color(m, 255, 255, 255, 0); // m_reflection
+        w_color(m, 255, 255, 255, 0); // m_transparent
+
+        w_f64(m, 1.0); // m_index_of_refraction
+        w_f64(m, 0.0); // m_reflectivity
+        w_f64(m, 0.0); // m_shine (0 = ON_Material::MaxShine is 255; 0 is valid)
+        w_f64(m, 0.0); // m_transparency
+
+        // Textures: a nested anonymous CRC chunk (1.0) with a zero count.
+        write_big_chunk(m, TCODE_ANONYMOUS_CHUNK, true, |tx| {
+            w_i32(tx, 1); // major
+            w_i32(tx, 0); // minor
+            w_i32(tx, 0); // texture count
+        });
+
+        w_string(m, ""); // obsolete flamingo library (1.1 field)
+        w_i32(m, 0); // m_material_channel array count (1.2 field)
+        m.push(0); // m_bShareable = false (1.3 field)
+        m.push(0); // m_bDisableLighting = false (1.3 field)
+    });
+}
+
+/// A 16-byte nil UUID.
+fn write_uuid_nil(out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0u8; 16]);
+}
+
+/// openNURBS `WriteColor`: a single little-endian u32 `0x00BBGGRR`-style COLORREF
+/// (R low byte). The fourth component is openNURBS' alpha/"not used" byte.
+fn w_color(out: &mut Vec<u8>, r: u8, g: u8, b: u8, a: u8) {
+    out.extend_from_slice(&[r, g, b, a]);
 }
 
 fn write_attributes(out: &mut Vec<u8>, name: &str, layer_index: i32) {
@@ -1098,6 +1175,49 @@ mod tests {
             }
             _ => panic!("expected polyline"),
         }
+    }
+
+    /// Scan a buffer for the byte-position of the first little-endian u32
+    /// `tcode` that appears at a plausible top-level chunk boundary. We only
+    /// need relative ordering, so a simple forward scan for the 4-byte pattern
+    /// is sufficient and robust.
+    fn find_tcode(bytes: &[u8], tcode: u32) -> Option<usize> {
+        let needle = tcode.to_le_bytes();
+        bytes.windows(4).position(|w| w == needle)
+    }
+
+    /// STRUCTURAL conformance (issue #11): the exported archive must contain a
+    /// material table (`TCODE_MATERIAL_TABLE`, 0x1000_0010) in addition to the
+    /// layer and object tables, in the openNURBS archive order
+    /// (material → layer → object). A missing material table makes Rhino report
+    /// an "unreadable material table".
+    #[test]
+    fn export_has_material_table_in_order() {
+        let items = vec![WriteItem::Line {
+            name: "edge".to_string(),
+            layer_index: 0,
+            a: DVec3::ZERO,
+            b: DVec3::X,
+        }];
+        let bytes = write_min(&["a"], &items);
+
+        let mat = find_tcode(&bytes, TCODE_MATERIAL_TABLE).expect("material table present");
+        let lay = find_tcode(&bytes, TCODE_LAYER_TABLE).expect("layer table present");
+        let obj = find_tcode(&bytes, TCODE_OBJECT_TABLE).expect("object table present");
+
+        assert!(mat < lay, "material table must come before layer table");
+        assert!(lay < obj, "layer table must come before object table");
+
+        // A material record and the end-of-table marker must sit inside the
+        // material table (between its start and the layer table).
+        let rec = find_tcode(&bytes, TCODE_MATERIAL_RECORD).expect("material record present");
+        assert!(mat < rec && rec < lay, "material record lives in the material table");
+
+        // And the geometry must still read back cleanly past the new table.
+        let imp = import(&bytes).expect("valid .3dm");
+        assert_eq!(imp.skipped, 0);
+        assert_eq!(imp.objects.len(), 1);
+        assert_eq!(imp.objects[0].name, "edge");
     }
 
     /// An object with an unknown class UUID is skipped and counted, not fatal.
