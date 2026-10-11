@@ -251,6 +251,122 @@ pub fn classify_tokens(line: &str) -> Vec<TokenSpan> {
     spans
 }
 
+/// One segment of the live labeled parse-preview (issue #28 FIX 2): a slot
+/// paired with the value the user has typed into it so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewSlot {
+    /// The slot's friendly name, e.g. `corner (x,y,z)` or `height`.
+    pub name: String,
+    /// The typed token for this slot, if any (`None` for an unfilled slot).
+    pub value: Option<String>,
+    /// True while the cursor is in this slot (the one being typed right now).
+    pub active: bool,
+    pub req: SlotReq,
+    /// A validation complaint for `value`, e.g. a malformed point. `None` when
+    /// the value is absent or well-formed for the slot's [`SlotKind`].
+    pub error: Option<String>,
+}
+
+/// Validate a typed `value` against a slot `kind`, returning a human message
+/// when it is malformed. Only the point/number cases are checked (the common
+/// mistakes); everything else is accepted. Pure.
+fn validate_value(kind: SlotKind, value: &str) -> Option<String> {
+    match kind {
+        SlotKind::Point => {
+            // A point is 2–3 comma-joined numbers (`x,y` or `x,y,z`).
+            let parts: Vec<&str> = value.split(',').collect();
+            let all_num =
+                parts.iter().all(|p| !p.is_empty() && p.parse::<f64>().is_ok());
+            if !all_num || !(2..=3).contains(&parts.len()) {
+                return Some(format!(
+                    "'{value}' is not a point; write x,y or x,y,z (example: 0,0,0)"
+                ));
+            }
+            None
+        }
+        SlotKind::Number | SlotKind::Angle => {
+            if value.parse::<f64>().is_err() {
+                return Some(format!("'{value}' is not a number (example: 3.5)"));
+            }
+            None
+        }
+        SlotKind::Selector | SlotKind::String => None,
+    }
+}
+
+/// Build the live labeled parse-preview for `input` (which INCLUDES the verb)
+/// against a command's `usage` string (issue #28 FIX 2). Each positional
+/// argument the user has typed is paired with its slot so the composer can show
+/// `corner(0,0,0) size(1,2,3)` as read-only feedback. Returns `None` when the
+/// usage has no slots (nothing to preview) or the user is still typing the verb
+/// (no slot reached yet). Pure — never mutates the executed command string.
+///
+/// - Filled slots carry their typed `value` (and a validation `error` if any).
+/// - The slot currently being typed is marked `active`.
+/// - Unfilled slots carry `value: None` (the renderer dims them; required ones
+///   stand out from optional ones via `req`).
+pub fn parse_preview(input: &str, usage: &str) -> Option<Vec<PreviewSlot>> {
+    let slots = parse_usage(usage);
+    if slots.is_empty() {
+        return None;
+    }
+    // Argument tokens after the verb (the verb is the first whitespace token).
+    let after_verb = input
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .map(|x| x.1)
+        .unwrap_or("");
+    // No args typed and no trailing space → still on the verb, nothing to show.
+    if after_verb.trim().is_empty() && !input.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let args: Vec<&str> = after_verb.split_whitespace().collect();
+    let active = active_slot(input, slots.len());
+    let out = slots
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            let value = args.get(i).map(|s| s.to_string());
+            let error = value
+                .as_deref()
+                .and_then(|v| validate_value(slot.kind, v));
+            PreviewSlot {
+                name: slot.name.clone(),
+                value,
+                active: active == Some(i),
+                req: slot.req,
+                error,
+            }
+        })
+        .collect();
+    Some(out)
+}
+
+/// Render a [`parse_preview`] result to a compact one-line string for tests and
+/// logging, e.g. `corner(0,0,0) size(1,2,3)`. Filled slots show
+/// `name(value)`; the active-but-empty slot shows `name(…)`; other unfilled
+/// slots show `name`. Pure. Used by tests and available for logging the
+/// resolved command shape; the egui renderer colours each segment itself.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn preview_line(slots: &[PreviewSlot]) -> String {
+    slots
+        .iter()
+        .map(|s| match &s.value {
+            Some(v) => format!("{}={v}", first_word(&s.name)),
+            None if s.active => format!("{}=…", first_word(&s.name)),
+            None => first_word(&s.name).to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The leading word of a slot name — `corner (x,y,z)` → `corner`, `height` →
+/// `height` — so the preview reads `corner(0,0,0)` not `corner (x,y,z)(0,0,0)`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn first_word(name: &str) -> &str {
+    name.split_whitespace().next().unwrap_or(name)
+}
+
 /// The result of classifying a chat input for the `/` inline palette.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashState {
@@ -429,6 +545,86 @@ mod tests {
     fn classify_empty_is_empty() {
         assert!(classify_tokens("").is_empty());
         assert!(classify_tokens("   ").is_empty());
+    }
+
+    // ── parse_preview / preview_line ─────────────────────────────────────────
+
+    #[test]
+    fn preview_box_two_points_filled() {
+        let p = parse_preview("box 0,0,0 1,2,3", "box <corner x,y,z> <size x,y,z>")
+            .expect("box has slots");
+        assert_eq!(preview_line(&p), "corner=0,0,0 size=1,2,3");
+        assert!(p.iter().all(|s| s.error.is_none()));
+    }
+
+    #[test]
+    fn preview_partial_marks_active_slot() {
+        // Second slot being typed: first filled, second active with a value.
+        let p = parse_preview("box 0,0,0 1,2", "box <corner x,y,z> <size x,y,z>").unwrap();
+        assert_eq!(p[0].value.as_deref(), Some("0,0,0"));
+        assert!(!p[0].active);
+        assert_eq!(p[1].value.as_deref(), Some("1,2"));
+        assert!(p[1].active);
+        assert_eq!(preview_line(&p), "corner=0,0,0 size=1,2");
+    }
+
+    #[test]
+    fn preview_trailing_space_shows_empty_active_slot() {
+        // `box 0,0,0 ` → first filled, second active-but-empty (shown as `…`).
+        let p = parse_preview("box 0,0,0 ", "box <corner x,y,z> <size x,y,z>").unwrap();
+        assert_eq!(p[0].value.as_deref(), Some("0,0,0"));
+        assert_eq!(p[1].value, None);
+        assert!(p[1].active);
+        assert_eq!(preview_line(&p), "corner=0,0,0 size=…");
+    }
+
+    #[test]
+    fn preview_still_typing_verb_is_none() {
+        assert_eq!(parse_preview("bo", "box <corner x,y,z> <size x,y,z>"), None);
+        assert_eq!(parse_preview("box", "box <corner x,y,z> <size x,y,z>"), None);
+    }
+
+    #[test]
+    fn preview_verb_with_space_shows_first_slot_dim() {
+        let p = parse_preview("box ", "box <corner x,y,z> <size x,y,z>").unwrap();
+        assert_eq!(p[0].value, None);
+        assert!(p[0].active);
+        assert_eq!(preview_line(&p), "corner=… size");
+    }
+
+    #[test]
+    fn preview_optional_slots_unfilled() {
+        let p = parse_preview(
+            "revolve last ",
+            "revolve <selector> [axis point x,y,z] [angle deg]",
+        )
+        .unwrap();
+        assert_eq!(p[0].value.as_deref(), Some("last"));
+        assert_eq!(p[1].req, SlotReq::Optional);
+        assert_eq!(p[2].req, SlotReq::Optional);
+        assert_eq!(preview_line(&p), "selector=last axis=… angle");
+    }
+
+    #[test]
+    fn preview_unknown_verb_no_slots_is_none() {
+        assert_eq!(parse_preview("undo ", "undo"), None);
+        assert_eq!(parse_preview("undo ", ""), None);
+    }
+
+    #[test]
+    fn preview_malformed_point_flags_specific_error() {
+        let p = parse_preview("box abc 1,2,3", "box <corner x,y,z> <size x,y,z>").unwrap();
+        let err = p[0].error.as_deref().expect("malformed point flagged");
+        assert!(err.contains("not a point"), "{err}");
+        assert!(err.contains("0,0,0"), "example present: {err}");
+        assert!(p[1].error.is_none(), "well-formed point not flagged");
+    }
+
+    #[test]
+    fn preview_malformed_number_flagged() {
+        let p = parse_preview("extrude last foo", "extrude <selector> <height>").unwrap();
+        assert!(p[0].error.is_none(), "selector accepts any token");
+        assert!(p[1].error.as_deref().unwrap().contains("not a number"));
     }
 
     // ── slash ─────────────────────────────────────────────────────────────────

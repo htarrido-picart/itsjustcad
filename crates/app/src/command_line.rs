@@ -37,22 +37,68 @@ fn render_history_line(ui: &mut egui::Ui, line: &str) {
     }
 }
 
-/// Live slot hint for the command being typed, e.g. after `box 0,0,0 ` →
-/// `size (x,y,z)`. `None` when typing the verb, past the last slot, or the verb
-/// has no usage. Pure — resolves the verb's usage from the registry/app verbs.
-fn active_slot_hint(input: &str) -> Option<String> {
+/// Live labeled parse-preview for the command being typed (issue #28 FIX 2),
+/// e.g. `box 0,0,0 1,2,3` → `[corner(0,0,0), size(1,2,3)]`. Each typed argument
+/// is paired with its slot so the user sees what each value fills AS THEY TYPE —
+/// read-only feedback; the executed command stays positional and untouched.
+/// `None` when typing the verb, when the verb has no usage, or the verb is
+/// unknown. Pure — resolves the verb's usage from the registry/app verbs.
+fn command_preview(input: &str) -> Option<Vec<crate::usage_spec::PreviewSlot>> {
     let verb = crate::suggest::verb_of(input.trim_start());
     if verb.is_empty() {
         return None;
     }
     let usage = crate::suggest::usage_for_verb(verb)?;
-    let slots = crate::usage_spec::parse_usage(usage);
-    let idx = crate::usage_spec::active_slot(input, slots.len())?;
-    let slot = slots.get(idx)?;
-    Some(match slot.req {
-        crate::usage_spec::SlotReq::Optional => format!("{} (optional)", slot.name),
-        crate::usage_spec::SlotReq::Required => slot.name.clone(),
-    })
+    crate::usage_spec::parse_preview(input, usage)
+}
+
+/// Render the labeled parse-preview as a compact one-line, monospace, dim strip
+/// below/above the input (issue #28 FIX 2). Filled slots read `name=value`;
+/// the slot being typed reads `name=…`; unfilled required slots are dim and
+/// unfilled optional slots are dimmer still. A malformed value (e.g. a bad
+/// point) is coloured RED and its specific guidance is shown after the strip.
+fn render_command_preview(ui: &mut egui::Ui, slots: &[crate::usage_spec::PreviewSlot]) {
+    use crate::usage_spec::SlotReq;
+    let font = egui::FontId::monospace(11.0);
+    let err_color = egui::Color32::from_rgb(0xe0, 0x4b, 0x3f);
+    let accent = crate::syntax_layout::accent_color(ui.visuals());
+    let dim = ui.visuals().weak_text_color();
+    let text = ui.visuals().text_color();
+    // First red error message (if any) shown after the strip as guidance.
+    let mut first_error: Option<String> = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for s in slots {
+            let name = s.name.split_whitespace().next().unwrap_or(&s.name);
+            let (label, color) = match &s.value {
+                Some(v) => {
+                    if let Some(e) = &s.error {
+                        if first_error.is_none() {
+                            first_error = Some(e.clone());
+                        }
+                        (format!("{name}={v}"), err_color)
+                    } else if s.active {
+                        (format!("{name}={v}"), accent)
+                    } else {
+                        (format!("{name}={v}"), text)
+                    }
+                }
+                None if s.active => (format!("{name}=…"), accent),
+                None => (
+                    name.to_string(),
+                    if s.req == SlotReq::Optional {
+                        dim.gamma_multiply(0.6)
+                    } else {
+                        dim
+                    },
+                ),
+            };
+            ui.label(egui::RichText::new(label).color(color).font(font.clone()));
+        }
+    });
+    if let Some(e) = first_error {
+        ui.label(egui::RichText::new(e).color(err_color).small());
+    }
 }
 
 /// Rhino-style command line: single input row + scrollback, up/down history,
@@ -637,13 +683,18 @@ impl CommandLine {
     ) -> Option<String> {
         let mut submitted = None;
         let show_popup = self.popup_visible();
-        // Live slot hint for the token being typed (issue #28), e.g. after
-        // `box 0,0,0 ` → `size (x,y,z)`. Shown below the input row.
-        let slot_hint = active_slot_hint(&self.input);
-        if let Some(h) = &slot_hint {
-            ui.label(egui::RichText::new(format!("↳ {h}")).weak().small());
+        // Live labeled parse-preview for the command being typed (issue #28
+        // FIX 2), e.g. `box 0,0,0 1,2,3` → `corner(0,0,0) size(1,2,3)`. This is
+        // READ-ONLY feedback drawn below the input; the executed command string
+        // (`self.input`) is never touched.
+        let preview = command_preview(&self.input);
+        if let Some(slots) = &preview {
+            render_command_preview(ui, slots);
         }
         ui.horizontal(|ui| {
+            // Vertically centre the `>` prompt with the text so the row reads as
+            // one clean, comfortably-tall field (issue #28 FIX 3).
+            ui.spacing_mut().interact_size.y = crate::theme::Spacing::L; // ~24pt
             ui.monospace(">");
             // Highlight the live input by command-token role (verb/number/
             // selector/string). A pure classifier drives the colours.
@@ -665,6 +716,14 @@ impl CommandLine {
                     .id(egui::Id::new("command_line_input"))
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
+                    // Comfortable, consistent single-line height with the text
+                    // vertically centred — the field no longer reads as cramped
+                    // or stretched now that Commands is its own view (FIX 3).
+                    .margin(egui::Margin::symmetric(
+                        crate::theme::Spacing::S as i8,
+                        crate::theme::Spacing::XS as i8,
+                    ))
+                    .vertical_align(egui::Align::Center)
                     // While the autosuggest popup is open, Tab must ACCEPT the
                     // suggestion — without lock_focus egui consumes Tab for
                     // focus traversal before our handler ever sees it, so the

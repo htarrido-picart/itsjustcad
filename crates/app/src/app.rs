@@ -54,6 +54,71 @@ pub(crate) enum DeckSegment {
     Commands,
 }
 
+/// A full-width iOS-style segmented control for the `Chat | Commands` deck
+/// switcher (issue #28 FIX 1). Fills the pane width with two equal-width
+/// segments inside a rounded track; the selected half is drawn as a raised
+/// pill. Returns `true` if the selection changed this frame.
+fn segmented_control(ui: &mut egui::Ui, seg: &mut DeckSegment) -> bool {
+    const SEGMENTS: [(DeckSegment, &str); 2] =
+        [(DeckSegment::Chat, "Chat"), (DeckSegment::Commands, "Commands")];
+    let height = crate::theme::Spacing::L; // ~24pt, a comfortable control height
+    let full_w = ui.available_width();
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(full_w, height), egui::Sense::hover());
+    let visuals = ui.visuals();
+    let radius = egui::CornerRadius::same((height / 2.0) as u8);
+    // The track: a subtle recessed background behind both segments.
+    let track_fill = if visuals.dark_mode {
+        egui::Color32::from_white_alpha(14)
+    } else {
+        egui::Color32::from_black_alpha(14)
+    };
+    ui.painter().rect_filled(rect, radius, track_fill);
+
+    let accent = visuals.selection.bg_fill;
+    let on_accent = egui::Color32::WHITE;
+    let text_color = visuals.text_color();
+    let seg_w = full_w / SEGMENTS.len() as f32;
+    let pad = 2.0_f32; // inset the pill from the track edge
+    let mut changed = false;
+    for (i, (value, label)) in SEGMENTS.iter().enumerate() {
+        let seg_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + seg_w * i as f32, rect.min.y),
+            egui::vec2(seg_w, height),
+        );
+        let id = ui.id().with(("deck_segment", i));
+        let resp = ui.interact(seg_rect, id, egui::Sense::click());
+        let selected = *seg == *value;
+        if selected {
+            let pill = seg_rect.shrink(pad);
+            ui.painter().rect_filled(
+                pill,
+                egui::CornerRadius::same(((height - 2.0 * pad) / 2.0) as u8),
+                accent,
+            );
+        } else if resp.hovered() {
+            ui.painter().rect_filled(
+                seg_rect.shrink(pad),
+                egui::CornerRadius::same(((height - 2.0 * pad) / 2.0) as u8),
+                visuals.widgets.hovered.bg_fill.gamma_multiply(0.5),
+            );
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        ui.painter().text(
+            seg_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            *label,
+            egui::FontId::proportional(13.0),
+            if selected { on_accent } else { text_color },
+        );
+        if resp.clicked() && !selected {
+            *seg = *value;
+            changed = true;
+        }
+    }
+    changed
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) enum TemplateUnits {
     Meters,
@@ -6646,12 +6711,12 @@ impl App {
     /// mirroring iOS) then the active segment. Chat = the LLM composer/transcript
     /// + `/` inline palette; Commands = the re-homed command history + input.
     fn deck_tab(&mut self, ui: &mut egui::Ui) {
-        // ── Segmented control (egui button group) ───────────────────────────
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = crate::theme::Spacing::XS;
-            ui.selectable_value(&mut self.deck_segment, DeckSegment::Chat, "Chat");
-            ui.selectable_value(&mut self.deck_segment, DeckSegment::Commands, "Commands");
-        });
+        // ── Full-width iOS-style segmented control (issue #28 FIX 1) ─────────
+        // Two equal-width segments spanning the whole pane, drawn inside a
+        // rounded "track" so the selected half reads as a raised pill — the
+        // earlier `selectable_value` pair was tiny and left-aligned so the user
+        // couldn't see it. Always rendered (not gated on a transcript existing).
+        segmented_control(ui, &mut self.deck_segment);
         ui.add_space(crate::theme::Spacing::XS);
 
         match self.deck_segment {
@@ -9815,6 +9880,16 @@ impl eframe::App for App {
         // ITSJUSTCAD_TYPE: pre-fill command input (dev hook for autosuggest screenshots).
         if let Some(text) = self.type_script.take() {
             self.command_line.prefill(text);
+        }
+        // ITSJUSTCAD_DECK=commands|chat: force the deck segment on startup so a
+        // --shot can capture the Commands segment (segmented control + labeled
+        // parse-preview + input height). Dev-only hook.
+        if self.frame_count == 0 {
+            match std::env::var("ITSJUSTCAD_DECK").ok().as_deref() {
+                Some("commands") => self.deck_segment = DeckSegment::Commands,
+                Some("chat") => self.deck_segment = DeckSegment::Chat,
+                _ => {}
+            }
         }
         // ITSJUSTCAD_DIALOG=about: open an overlay so a --shot captures elevated
         // surfaces (dialog/popover) floating above the panels. Dev-only hook.
