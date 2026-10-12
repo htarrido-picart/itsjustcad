@@ -403,82 +403,76 @@ fn degree(mask: &[bool], w: usize, h: usize, x: isize, y: isize) -> usize {
     d
 }
 
-/// Walk a 1-px skeleton into polylines. Paths run between endpoints (degree 1)
-/// and junctions (degree ≥ 3); pure loops (all degree 2) are emitted as closed
-/// polylines. Every skeleton pixel is consumed at most once per emitted segment.
+/// Walk a 1-px skeleton into polylines by DIRECTIONAL tracing: from a start
+/// pixel, step to the unused neighbour that best continues the current heading
+/// (smallest turn). Crucially this threads a stroke THROUGH a junction instead
+/// of stopping — topographic contours never truly cross, so a skeleton junction
+/// is almost always thinning noise (a tiny Y-spur or a staircase artifact), and
+/// following the straightest path keeps the contour as one continuous line. Each
+/// pixel is consumed once; branches not taken at a junction become their own
+/// (usually short) strokes that the length filter or endpoint-bridging handles.
+/// Endpoints (degree 1) seed first so open strokes trace end-to-end; remaining
+/// pixels seed loops.
 fn walk_skeleton(mask: &[bool], w: usize, h: usize) -> Vec<PixelPolyline> {
-    // Neighbour offsets, 8-connected. Order favours straight runs first.
     const N: [(isize, isize); 8] =
         [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)];
     let idx = |x: isize, y: isize| y as usize * w + x as usize;
-    let mut used = vec![false; w * h]; // an edge-visited marker per pixel
+    let mut used = vec![false; w * h];
     let mut out = Vec::new();
 
-    // Helper: trace from a node pixel along one unused neighbour until the next
-    // node (endpoint/junction) or until the path can't continue.
-    let trace_from = |sx: isize, sy: isize, used: &mut [bool]| -> Option<PixelPolyline> {
-        // Pick an unused neighbour to start the edge.
-        let mut next = None;
-        for (dx, dy) in N {
-            let (nx, ny) = (sx + dx, sy + dy);
-            if at(mask, w, h, nx, ny) && !used[idx(nx, ny)] {
-                next = Some((nx, ny));
-                break;
-            }
-        }
-        let (mut cx, mut cy) = next?;
+    // Trace a maximal directional path from (sx,sy).
+    let trace = |sx: isize, sy: isize, used: &mut [bool]| -> PixelPolyline {
         let mut path = vec![(sx as f64, sy as f64)];
+        used[idx(sx, sy)] = true;
+        let (mut cx, mut cy) = (sx, sy);
+        let mut pdir: Option<(f64, f64)> = None;
         loop {
-            path.push((cx as f64, cy as f64));
-            used[idx(cx, cy)] = true;
-            // Stop when we reach a node (not a simple degree-2 pass-through).
-            if degree(mask, w, h, cx, cy) != 2 {
-                break;
-            }
-            // Continue to the single unused neighbour (the one we didn't come
-            // from is implicitly handled by the `used` marks).
-            let mut moved = false;
+            // Among unused skeleton neighbours, pick the straightest continuation.
+            let mut best: Option<((isize, isize), f64)> = None;
             for (dx, dy) in N {
                 let (nx, ny) = (cx + dx, cy + dy);
-                if at(mask, w, h, nx, ny) && !used[idx(nx, ny)] {
-                    cx = nx;
-                    cy = ny;
-                    moved = true;
-                    break;
+                if !at(mask, w, h, nx, ny) || used[idx(nx, ny)] {
+                    continue;
+                }
+                let l = ((dx * dx + dy * dy) as f64).sqrt();
+                let v = (dx as f64 / l, dy as f64 / l);
+                // Turn cost: 1 - cos(angle) from the previous heading (0 = straight
+                // ahead, 2 = reverse). With no heading yet, any step is fine.
+                let cost = match pdir {
+                    Some(d) => 1.0 - (d.0 * v.0 + d.1 * v.1),
+                    None => 0.0,
+                };
+                if best.is_none_or(|b| cost < b.1) {
+                    best = Some(((nx, ny), cost));
                 }
             }
-            if !moved {
-                break;
-            }
+            let Some(((nx, ny), _)) = best else { break };
+            pdir = Some({
+                let (dx, dy) = ((nx - cx) as f64, (ny - cy) as f64);
+                let l = (dx * dx + dy * dy).sqrt();
+                (dx / l, dy / l)
+            });
+            used[idx(nx, ny)] = true;
+            path.push((nx as f64, ny as f64));
+            cx = nx;
+            cy = ny;
         }
-        Some(path)
+        path
     };
 
-    // 1) Trace every edge incident to a node (endpoint or junction).
+    // Endpoints first (degree 1) so open strokes trace fully.
     for y in 0..h as isize {
         for x in 0..w as isize {
-            if !at(mask, w, h, x, y) {
-                continue;
-            }
-            let d = degree(mask, w, h, x, y);
-            if d == 1 || d >= 3 {
-                while let Some(p) = trace_from(x, y, &mut used) {
-                    out.push(p);
-                }
+            if at(mask, w, h, x, y) && !used[idx(x, y)] && degree(mask, w, h, x, y) == 1 {
+                out.push(trace(x, y, &mut used));
             }
         }
     }
-
-    // 2) Pure loops (every pixel degree 2) have no node to seed from — pick any
-    //    remaining unused skeleton pixel and walk it around.
+    // Then any remaining skeleton pixel (loops, or leftovers at junctions).
     for y in 0..h as isize {
         for x in 0..w as isize {
-            if at(mask, w, h, x, y) && !used[idx(x, y)] && degree(mask, w, h, x, y) == 2 {
-                used[idx(x, y)] = true;
-                if let Some(mut p) = trace_from(x, y, &mut used) {
-                    p.push((x as f64, y as f64)); // close the loop
-                    out.push(p);
-                }
+            if at(mask, w, h, x, y) && !used[idx(x, y)] {
+                out.push(trace(x, y, &mut used));
             }
         }
     }
