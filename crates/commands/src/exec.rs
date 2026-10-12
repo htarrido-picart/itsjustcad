@@ -2044,13 +2044,14 @@ impl Session {
             .to_rgba8();
         let (w, h) = img.dimensions();
 
-        // Centerline polylines in pixel space (x→right, y→down). Minimum stroke
-        // LENGTH (drops noise specks) and simplify tolerance scale with image
-        // size; the values track the objective F1 optimum (mlen≈12, eps≈1.5 at
-        // 1280²) found by the trace_probe evaluator.
+        // Minimum stroke LENGTH (drops noise specks) and simplify tolerance.
+        // Both scale SUB-linearly (√long) with resolution — the sweep optimum
+        // was mlen≈12 at BOTH 1280² and 2576² (noise specks don't grow linearly
+        // with the image), so a linear scale would wrongly drop real short
+        // contours at high resolution.
         let long = w.max(h) as f64;
-        let min_len = ((long / 100.0).max(10.0)) as usize;
-        let epsilon = (long / 850.0).clamp(0.75, 2.0);
+        let min_len = (long.sqrt() * 0.34).clamp(9.0, 16.0) as usize;
+        let epsilon = (long.sqrt() * 0.045).clamp(0.75, 2.0);
         let polys = crate::trace::trace_color(img.as_raw(), w, h, target, tol, min_len, epsilon);
         if polys.is_empty() {
             return Ok(ApplyOutcome {

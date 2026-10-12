@@ -38,6 +38,8 @@ pub fn trace_color(
     // dil=0 and a wide (60°) stitch angle were the objective F1 optima on a real
     // 1280² contour plan (precision 0.994, recall 0.962) — see the trace_probe
     // evaluator. Dilation merged adjacent contours and always scored worse.
+    // Bridge gap scales SUB-linearly with resolution (√long): the sweep optimum
+    // was ~16px @ 1280² and ~24px @ 2576² — a 2.0× resolution but only 1.5× gap.
     let long = w.max(h) as f64;
     trace_with(
         rgba,
@@ -47,7 +49,7 @@ pub fn trace_color(
         &TraceParams {
             tol,
             dilate_radius: 0,
-            bridge_gap: (long / 80.0).clamp(10.0, 40.0),
+            bridge_gap: (long.sqrt() * 0.46).clamp(10.0, 32.0),
             bridge_angle_deg: 60.0,
             min_len: min_len_px as f64,
             epsilon: epsilon_px,

@@ -8,7 +8,7 @@
 //   color = red | blue | black | r,g,b   (default: red)
 
 use image::{Rgba, RgbaImage};
-use itsjustcad_commands::trace::{TraceParams, trace_with};
+use itsjustcad_commands::trace::{TraceParams, trace_color, trace_with};
 
 const TOL_PX: i32 = 2; // match tolerance: a trace within this many px of ink counts
 
@@ -99,10 +99,28 @@ fn main() {
         let polys = trace_with(img.as_raw(), w, h, target, &best.p);
         save_overlay_on(&img, &polys, &format!("{outdir}/best_{color}.png"));
         println!(
-            "\nBEST: F1={:.3} prec={:.3} rec={:.3}  tol={} dil={} gap={} mlen={}  → {outdir}/best_{color}.png",
+            "\nBEST:    F1={:.3} prec={:.3} rec={:.3}  tol={} dil={} gap={} mlen={}  → {outdir}/best_{color}.png",
             best.f1, best.prec, best.rec, best.p.tol, best.p.dilate_radius, best.p.bridge_gap, best.p.min_len
         );
     }
+
+    // Score the ACTUAL shipped path (trace_color + exec's resolution-scaled
+    // min_len/epsilon) so we verify what the app runs, not just the sweep's best.
+    let long = wu.max(hu) as f64;
+    let min_len = (long.sqrt() * 0.34).clamp(9.0, 16.0) as usize;
+    let epsilon = (long.sqrt() * 0.045).clamp(0.75, 2.0);
+    let polys = trace_color(img.as_raw(), w, h, target, 80, min_len, epsilon);
+    let t = rasterize(&polys, wu, hu);
+    let tc = t.iter().filter(|&&b| b).count().max(1);
+    let td = dilate(&t, wu, hu, TOL_PX);
+    let prec = (0..wu * hu).filter(|&i| t[i] && gt_d[i]).count() as f64 / tc as f64;
+    let rec = (0..wu * hu).filter(|&i| gt[i] && td[i]).count() as f64 / gt_count.max(1) as f64;
+    let f1 = if prec + rec > 0.0 { 2.0 * prec * rec / (prec + rec) } else { 0.0 };
+    save_overlay_on(&img, &polys, &format!("{outdir}/shipped_{color}.png"));
+    println!(
+        "SHIPPED: F1={f1:.3} prec={prec:.3} rec={rec:.3}  tol=80 mlen={min_len} eps={epsilon:.2}  npoly={}  → {outdir}/shipped_{color}.png",
+        polys.len()
+    );
 }
 
 fn parse_color(s: &str) -> [u8; 3] {
