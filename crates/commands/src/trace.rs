@@ -34,32 +34,85 @@ pub fn trace_color(
     min_len_px: usize,
     epsilon_px: f64,
 ) -> Vec<PixelPolyline> {
+    // Resolution-scaled stitch gap (the ink's pixel gaps scale with the image).
+    // dil=0 and a wide (60°) stitch angle were the objective F1 optima on a real
+    // 1280² contour plan (precision 0.994, recall 0.962) — see the trace_probe
+    // evaluator. Dilation merged adjacent contours and always scored worse.
+    let long = w.max(h) as f64;
+    trace_with(
+        rgba,
+        w,
+        h,
+        target,
+        &TraceParams {
+            tol,
+            dilate_radius: 0,
+            bridge_gap: (long / 80.0).clamp(10.0, 40.0),
+            bridge_angle_deg: 60.0,
+            min_len: min_len_px as f64,
+            epsilon: epsilon_px,
+        },
+    )
+}
+
+/// Tunable knobs for [`trace_with`], so the pipeline can be swept/benchmarked
+/// objectively rather than hand-tuned. The defaults are the shipping values.
+#[derive(Clone, Copy, Debug)]
+pub struct TraceParams {
+    /// Hue/shade match window (see [`color_mask`]).
+    pub tol: u8,
+    /// Pre-thinning dilation radius (Chebyshev). 0 = off; bridges pixel gaps but
+    /// larger values risk merging adjacent parallel strokes.
+    pub dilate_radius: i32,
+    /// Max endpoint gap (px) for directional stitching. 0 = off.
+    pub bridge_gap: f64,
+    /// Max turn angle (degrees) allowed across a stitch.
+    pub bridge_angle_deg: f64,
+    /// Minimum stroke arc length (px) kept — drops noise specks.
+    pub min_len: f64,
+    /// Douglas–Peucker tolerance (px).
+    pub epsilon: f64,
+}
+
+impl Default for TraceParams {
+    fn default() -> Self {
+        // The objective F1 optimum from the trace_probe sweep on a real contour
+        // plan (dil=0, gap=16, angle=60, mlen=12 at 1280²).
+        TraceParams {
+            tol: 80,
+            dilate_radius: 0,
+            bridge_gap: 16.0,
+            bridge_angle_deg: 60.0,
+            min_len: 12.0,
+            epsilon: 1.5,
+        }
+    }
+}
+
+/// The full raster→vector pipeline with explicit parameters: hue mask → optional
+/// dilation → Zhang–Suen thinning → directional skeleton walk → optional
+/// directional endpoint stitching → length filter → Douglas–Peucker.
+pub fn trace_with(rgba: &[u8], w: u32, h: u32, target: [u8; 3], p: &TraceParams) -> Vec<PixelPolyline> {
     let (w, h) = (w as usize, h as usize);
     if w == 0 || h == 0 || rgba.len() < w * h * 4 {
         return Vec::new();
     }
-    let mut mask = color_mask(rgba, w, h, target, tol);
-    // Bridge pixel-level gaps (anti-aliasing / JPEG noise leaves thin strokes
-    // dotted) by one dilation before thinning, so a stroke solidifies into a
-    // connected region and thins to a continuous centerline. Radius 1 keeps
-    // adjacent parallel contours from merging.
-    dilate(&mut mask, w, h, 1);
+    let mut mask = color_mask(rgba, w, h, target, p.tol);
+    if p.dilate_radius > 0 {
+        dilate(&mut mask, w, h, p.dilate_radius as isize);
+    }
     thin_zhang_suen(&mut mask, w, h);
     let paths = walk_skeleton(&mask, w, h);
-    // Stitch fragments whose endpoints are close AND directionally continuous —
-    // reconnects a contour broken by spurious skeleton junctions without joining
-    // a different parallel contour running alongside it.
-    let max_gap = (w.max(h) as f64 / 180.0).clamp(4.0, 12.0);
-    let bridged = bridge_endpoints(paths, max_gap, 35.0_f64.to_radians());
-    // Filter by ARC LENGTH, not point count: after simplification a long contour
-    // may be only a handful of points, while noise specks are short regardless.
-    // `min_len_px` is a minimum stroke length in pixels.
-    let min_len = min_len_px as f64;
-    bridged
+    let paths = if p.bridge_gap > 0.0 {
+        bridge_endpoints(paths, p.bridge_gap, p.bridge_angle_deg.to_radians())
+    } else {
+        paths
+    };
+    paths
         .into_iter()
-        .filter(|p| polyline_len(p) >= min_len)
-        .map(|p| rdp(&p, epsilon_px.max(0.0)))
-        .filter(|p| p.len() >= 2)
+        .filter(|pl| polyline_len(pl) >= p.min_len)
+        .map(|pl| rdp(&pl, p.epsilon.max(0.0)))
+        .filter(|pl| pl.len() >= 2)
         .collect()
 }
 

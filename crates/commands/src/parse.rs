@@ -1381,7 +1381,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 return wrong("trace", "a color (r,g,b or a name) and an optional layer", &args);
             }
             let target = trace_color(args[0])?;
-            let mut tol: u8 = 72;
+            let mut tol: u8 = 80;
             let mut rest = &args[1..];
             if rest.len() >= 2 && rest[0].eq_ignore_ascii_case("tol") {
                 tol = integer(rest[1], "trace tol")?.min(255) as u8;

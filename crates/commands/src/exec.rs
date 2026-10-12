@@ -2044,11 +2044,13 @@ impl Session {
             .to_rgba8();
         let (w, h) = img.dimensions();
 
-        // Centerline polylines in pixel space (x→right, y→down). The minimum
-        // stroke LENGTH (drops noise specks) and the simplify tolerance scale
-        // with image size so output is stable across resolutions.
-        let min_len = ((w.max(h) as f64 / 70.0).max(15.0)) as usize;
-        let epsilon = (w.max(h) as f64 / 600.0).clamp(0.75, 3.0);
+        // Centerline polylines in pixel space (x→right, y→down). Minimum stroke
+        // LENGTH (drops noise specks) and simplify tolerance scale with image
+        // size; the values track the objective F1 optimum (mlen≈12, eps≈1.5 at
+        // 1280²) found by the trace_probe evaluator.
+        let long = w.max(h) as f64;
+        let min_len = ((long / 100.0).max(10.0)) as usize;
+        let epsilon = (long / 850.0).clamp(0.75, 2.0);
         let polys = crate::trace::trace_color(img.as_raw(), w, h, target, tol, min_len, epsilon);
         if polys.is_empty() {
             return Ok(ApplyOutcome {
