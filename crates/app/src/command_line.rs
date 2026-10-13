@@ -43,7 +43,7 @@ fn render_history_line(ui: &mut egui::Ui, line: &str) {
 /// read-only feedback; the executed command stays positional and untouched.
 /// `None` when typing the verb, when the verb has no usage, or the verb is
 /// unknown. Pure — resolves the verb's usage from the registry/app verbs.
-fn command_preview(input: &str) -> Option<Vec<crate::usage_spec::PreviewSlot>> {
+pub(crate) fn command_preview(input: &str) -> Option<Vec<crate::usage_spec::PreviewSlot>> {
     let verb = crate::suggest::verb_of(input.trim_start());
     if verb.is_empty() {
         return None;
@@ -57,7 +57,7 @@ fn command_preview(input: &str) -> Option<Vec<crate::usage_spec::PreviewSlot>> {
 /// the slot being typed reads `name=…`; unfilled required slots are dim and
 /// unfilled optional slots are dimmer still. A malformed value (e.g. a bad
 /// point) is coloured RED and its specific guidance is shown after the strip.
-fn render_command_preview(ui: &mut egui::Ui, slots: &[crate::usage_spec::PreviewSlot]) {
+pub(crate) fn render_command_preview(ui: &mut egui::Ui, slots: &[crate::usage_spec::PreviewSlot]) {
     use crate::usage_spec::SlotReq;
     let font = egui::FontId::monospace(11.0);
     let err_color = egui::Color32::from_rgb(0xe0, 0x4b, 0x3f);
