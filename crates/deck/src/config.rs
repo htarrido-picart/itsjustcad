@@ -375,6 +375,17 @@ impl DecksFile {
 mod tests {
     use super::*;
 
+    // decks.json must live under `$HOME/.config/itsjustcad/` on every OS —
+    // the XDG default on Linux (dirs::home_dir() reads $HOME). Pins the layout
+    // so a macOS-only dir can never sneak in (GitHub issue #26).
+    #[test]
+    fn decks_config_path_is_under_dot_config_itsjustcad() {
+        if let Some(p) = config_path() {
+            let home = dirs::home_dir().expect("home dir");
+            assert_eq!(p, home.join(".config").join("itsjustcad").join("decks.json"));
+        }
+    }
+
     #[test]
     fn local_url_classification() {
         assert!(is_local_url(""));
