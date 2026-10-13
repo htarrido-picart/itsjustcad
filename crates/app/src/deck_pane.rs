@@ -1683,6 +1683,13 @@ impl DeckPane {
         !self.messages.is_empty() && !self.busy()
     }
 
+    /// Dev hook: pre-fill the chat composer input WITHOUT sending, so the
+    /// ITSJUSTCAD_TYPE/ITSJUSTCAD_SHOT pair can capture the `/`-slash preview and
+    /// palette (issue #50). Mirrors `CommandLine::prefill`; never auto-sends.
+    pub fn prefill(&mut self, text: String) {
+        self.input = text;
+    }
+
     /// Dev scripting entry: send a prompt as if typed in the pane.
     pub fn send_text(
         &mut self,
@@ -3106,6 +3113,19 @@ impl DeckPane {
                         slash_pick = slash_palette_ui(ui, roles, &matches);
                     }
                 }
+                // Live labeled parse-preview for a `/`-armed command (issue #50):
+                // the SAME `name=value` strip the Commands view shows, reused
+                // verbatim so `/box 0,0,0 1,1,1` reads `corner=0,0,0 size=1,1,1`
+                // directly above the input. Slash-gated and ADDITIVE — plain chat
+                // (no leading `/`) never reaches this branch, so the non-slash
+                // composer path is byte-for-byte unchanged. The strip is read-only
+                // and never touches `self.input`, so fast typing drops no keys.
+                if slash_armed
+                    && let Some(cmd) = crate::usage_spec::strip_slash(&self.input)
+                    && let Some(slots) = crate::command_line::command_preview(&cmd)
+                {
+                    crate::command_line::render_command_preview(ui, &slots);
+                }
                 // Side-effect confirmation sits directly above the input card.
                 self.side_effect_confirm_ui(ui, session, icons);
                 // Attachment chip (name + remove) above the input card.
@@ -3248,26 +3268,31 @@ impl DeckPane {
                         };
                     }
 
-                    // Chevron ALWAYS top-center, a SIMPLE frameless button (no grey
-                    // button background): up = expand, down = collapse.
-                    ui.vertical_centered(|ui| {
-                        let chev = if expanded {
-                            crate::icons::Icon::ChevronDown
-                        } else {
-                            crate::icons::Icon::ChevronUp
-                        };
-                        let btn = egui::Button::image(icons.image(
-                            ui.ctx(),
-                            chev,
-                            icon_sz,
-                            ui.visuals().weak_text_color(),
-                        ))
-                        .frame(false);
-                        let tip = if expanded { "collapse" } else { "expand input" };
-                        if ui.add(btn).on_hover_text(tip).clicked() {
-                            ui.ctx().data_mut(|d| d.insert_temp(expand_id, !expanded));
-                        }
-                    });
+                    // Chevron top-center, a SIMPLE frameless button (no grey button
+                    // background): up = expand, down = collapse. HIDDEN in `/`-armed
+                    // slash mode (issue #50) — a one-line command never expands, so
+                    // the chevron would only float uselessly. Gated on `slash_armed`
+                    // so the non-slash chevron behaviour is unchanged.
+                    if !slash_armed {
+                        ui.vertical_centered(|ui| {
+                            let chev = if expanded {
+                                crate::icons::Icon::ChevronDown
+                            } else {
+                                crate::icons::Icon::ChevronUp
+                            };
+                            let btn = egui::Button::image(icons.image(
+                                ui.ctx(),
+                                chev,
+                                icon_sz,
+                                ui.visuals().weak_text_color(),
+                            ))
+                            .frame(false);
+                            let tip = if expanded { "collapse" } else { "expand input" };
+                            if ui.add(btn).on_hover_text(tip).clicked() {
+                                ui.ctx().data_mut(|d| d.insert_temp(expand_id, !expanded));
+                            }
+                        });
+                    }
                     if expanded {
                         // Tall field (vertical padding only → full-width aligned).
                         egui::Frame::NONE

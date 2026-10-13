@@ -9877,9 +9877,16 @@ impl eframe::App for App {
             }
         }
         self.run_startup_script();
-        // ITSJUSTCAD_TYPE: pre-fill command input (dev hook for autosuggest screenshots).
+        // ITSJUSTCAD_TYPE: pre-fill command input (dev hook for autosuggest
+        // screenshots). When ITSJUSTCAD_DECK=chat forces the Chat segment, route
+        // the prefill into the chat composer instead so the slash preview/palette
+        // (issue #50) can be captured. Dev-only — no production path hits this.
         if let Some(text) = self.type_script.take() {
-            self.command_line.prefill(text);
+            if std::env::var("ITSJUSTCAD_DECK").as_deref() == Ok("chat") {
+                self.deck_pane.prefill(text);
+            } else {
+                self.command_line.prefill(text);
+            }
         }
         // ITSJUSTCAD_DECK=commands|chat: force the deck segment on startup so a
         // --shot can capture the Commands segment (segmented control + labeled
