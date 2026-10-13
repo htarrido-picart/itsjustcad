@@ -237,6 +237,17 @@ pub fn allows_underlay_in(dir: &Path, cmd: &Command) -> bool {
     }
 }
 
+/// SECURITY GATE: the second (and only other) widening of the iOS side-effect
+/// refusal. Allows [`Command::Trace`] when a workdir is granted. Trace takes NO
+/// path from the model — it re-reads the document's existing underlay, which
+/// could only have been set through the already-gated [`allows_underlay`] path
+/// (or typed by a human). So no new filesystem reach is opened: the model can
+/// vectorize the image it was already permitted to place, nothing else. Refused
+/// when no workdir is set (symmetric with `allows_underlay`).
+pub fn allows_trace(cmd: &Command) -> bool {
+    matches!(cmd, Command::Trace { .. }) && get().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

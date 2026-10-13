@@ -725,6 +725,7 @@ impl Session {
             Command::Amend { step, with } => self.amend(step, *with),
             Command::Option(op) => self.option(op),
             Command::Import { path } => self.import(path),
+            Command::Trace { target, tol, layer } => self.trace(target, tol, layer),
             Command::Terrain { path } => self.terrain(path),
             Command::OsmFile { path } => self.osmfile(path),
             Command::Plant { species, at, age_years } => self.plant(species, at, age_years),
@@ -2017,6 +2018,97 @@ impl Session {
             created,
             message: format!(
                 "imported {total} GeoJSON feature(s) from {path} (points → 0.5m marker circles)"
+            ),
+        })
+    }
+
+    /// Vectorize the raster underlay: extract strokes matching `target` colour
+    /// (within `tol`) as centerline polylines placed on `layer` (default
+    /// "Trace"), coloured to match. Like the importers, this expands into logged
+    /// `Layer`/`LayerColor`/`Polyline` ops (so replay needs only the op-log, not
+    /// the image) and is itself not logged. Requires an underlay to be set.
+    fn trace(
+        &mut self,
+        target: [u8; 3],
+        tol: u8,
+        layer: Option<String>,
+    ) -> Result<ApplyOutcome, ExecError> {
+        let under = self.doc.underlay.clone().ok_or_else(|| {
+            ExecError::Invalid("no underlay to trace — run `underlay <image>` first".into())
+        })?;
+        // Resolve the stored (portable) underlay name to the real file and decode
+        // it. The same workdir resolver the underlay command/gate used.
+        let path = crate::workdir::resolve_for_open(&under.path);
+        let img = image::open(&path)
+            .map_err(|e| ExecError::Invalid(format!("cannot read underlay '{}': {e}", under.path)))?
+            .to_rgba8();
+        let (w, h) = img.dimensions();
+
+        // Minimum stroke LENGTH (drops noise specks) and simplify tolerance.
+        // Both scale SUB-linearly (√long) with resolution — the sweep optimum
+        // was mlen≈12 at BOTH 1280² and 2576² (noise specks don't grow linearly
+        // with the image), so a linear scale would wrongly drop real short
+        // contours at high resolution.
+        let long = w.max(h) as f64;
+        let min_len = (long.sqrt() * 0.34).clamp(9.0, 16.0) as usize;
+        let epsilon = (long.sqrt() * 0.045).clamp(0.75, 2.0);
+        let polys = crate::trace::trace_color(img.as_raw(), w, h, target, tol, min_len, epsilon);
+        if polys.is_empty() {
+            return Ok(ApplyOutcome {
+                created: Vec::new(),
+                message: format!(
+                    "trace: no strokes matched color [{:02x}{:02x}{:02x}] (tol {tol}) in the underlay",
+                    target[0], target[1], target[2]
+                ),
+            });
+        }
+
+        // Pixel → world via the underlay quad. Corners are CCW from lower-left:
+        // [LL, LR, UR, UL]. Image y runs top→bottom, so v=0 is the TOP (UL/UR).
+        let q = under.quad_corners();
+        let (ll, lr, ur, ul) = (q[0], q[1], q[2], q[3]);
+        let to_world = |px: f64, py: f64| -> DVec3 {
+            let u = (px / w as f64).clamp(0.0, 1.0);
+            let v = (py / h as f64).clamp(0.0, 1.0);
+            let top = ul.lerp(ur, u);
+            let bottom = ll.lerp(lr, u);
+            let p = top.lerp(bottom, v);
+            DVec3::new(p.x, p.y, 0.0)
+        };
+
+        let layer = layer.unwrap_or_else(|| "Trace".to_string());
+        let prev_layer = self.doc.current_layer.clone();
+        self.switch_layer(&layer)?;
+        // Colour the layer to match what was traced (nice visual parity; also a
+        // logged op so replay reproduces it).
+        self.run(Command::LayerColor {
+            layer: layer.clone(),
+            color: [target[0] as f32 / 255.0, target[1] as f32 / 255.0, target[2] as f32 / 255.0],
+        })?;
+
+        let count = polys.len();
+        let mut created = Vec::new();
+        for poly in polys {
+            let points: Vec<DVec3> = poly.iter().map(|&(x, y)| to_world(x, y)).collect();
+            if points.len() < 2 {
+                continue;
+            }
+            // Closed when the trace returned a loop (first ≈ last pixel).
+            let closed = {
+                let (a, b) = (poly[0], poly[poly.len() - 1]);
+                (a.0 - b.0).abs() < 1.5 && (a.1 - b.1).abs() < 1.5 && points.len() >= 4
+            };
+            let out = self.run_world(Command::Polyline { id: None, points, closed })?;
+            created.extend(out.created);
+        }
+        self.switch_layer(&prev_layer)?;
+
+        Ok(ApplyOutcome {
+            created,
+            message: format!(
+                "traced {count} polyline(s) from the underlay onto layer '{layer}' \
+                 (color [{:02x}{:02x}{:02x}], tol {tol})",
+                target[0], target[1], target[2]
             ),
         })
     }
@@ -8741,6 +8833,11 @@ fn apply_forward(
     cmd: Command,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
     match cmd {
+        // Trace is intercepted in `run()` and expands into logged sub-ops; it is
+        // never logged itself, so it is never replayed through apply_forward.
+        Command::Trace { .. } => {
+            Err(ExecError::Invalid("internal: trace must be dispatched via run()".into()))
+        }
         Command::Box { id, corner, size } => {
             if size.min_element() <= 0.0 {
                 return Err(ExecError::Invalid(format!(
@@ -12497,10 +12594,22 @@ fn apply_forward(
                     _ => (width, " (image unreadable, assumed square)"),
                 },
             };
-            // Keep the previous opacity/rotation when swapping the image; new
-            // underlays start fully opaque and unrotated.
+            // Keep the previous opacity/rotation/layer when swapping the image;
+            // new underlays start fully opaque, unrotated, on the "Underlay"
+            // layer.
             let opacity = prev.as_ref().map_or(1.0, |u| u.opacity);
             let rotation_deg = prev.as_ref().map_or(0.0, |u| u.rotation_deg);
+            let layer = prev
+                .as_ref()
+                .map_or_else(itsjustcad_doc::default_underlay_layer, |u| u.layer.clone());
+            // Ensure the underlay's layer exists so it appears in the Layers
+            // inspector and its visibility can be toggled like any object.
+            // Idempotent; deterministic colour by creation index (replay-stable).
+            if !doc.layers.contains_key(&layer) {
+                let color = default_layer_color(doc.layers.len());
+                doc.layers
+                    .insert(layer.clone(), LayerStyle { color: Some(color), ..LayerStyle::default() });
+            }
             doc.underlay = Some(Underlay {
                 path: path.clone(),
                 corner: corner.truncate(),
@@ -12508,6 +12617,7 @@ fn apply_forward(
                 height,
                 opacity,
                 rotation_deg,
+                layer,
             });
             doc.generation += 1;
             Ok((
@@ -15053,6 +15163,7 @@ fn wall_normal(boundary: &[DVec3]) -> DVec3 {
 
 fn describe(cmd: &Command) -> &'static str {
     match cmd {
+        Command::Trace { .. } => "trace",
         Command::Constrain { .. } => "constrain",
         Command::SolveConstraints => "solveconstraints",
         Command::ConstraintsList | Command::ConstraintDelete { .. } => "constraints",

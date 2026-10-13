@@ -34,6 +34,7 @@ pub mod saf;
 pub mod sketch;
 pub mod subdiv_params;
 pub mod svg;
+pub mod trace;
 pub mod workdir;
 
 pub use command::{

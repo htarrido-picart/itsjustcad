@@ -27,6 +27,16 @@ pub struct Underlay {
     /// defaults to 0 so old save files (no rotation) load unrotated.
     #[serde(default)]
     pub rotation_deg: f64,
+    /// The layer this underlay belongs to, so it can be shown/hidden (and
+    /// listed) in the Layers inspector like any object. Serde-defaults to
+    /// "Underlay" so old save files (no layer) load onto the standard layer.
+    #[serde(default = "default_underlay_layer")]
+    pub layer: String,
+}
+
+/// Default layer name for a raster underlay.
+pub fn default_underlay_layer() -> String {
+    "Underlay".to_string()
 }
 
 impl Underlay {
@@ -138,6 +148,7 @@ mod tests {
             height: 5.0,
             opacity: 0.5,
             rotation_deg: 0.0,
+            layer: default_underlay_layer(),
         };
         assert_eq!(
             u.quad_corners(),
@@ -159,6 +170,7 @@ mod tests {
             height: 6.0,
             opacity: 0.75,
             rotation_deg: 30.0,
+            layer: "Trace Source".into(),
         };
         let json = serde_json::to_string(&u).unwrap();
         let back: Underlay = serde_json::from_str(&json).unwrap();

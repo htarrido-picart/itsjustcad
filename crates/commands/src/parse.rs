@@ -1371,6 +1371,25 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 &args,
             ),
         },
+        // trace <color> [tol <n>] [layer...] — vectorize the underlay. <color>
+        // is `r,g,b` (0..255) or a name (red/green/blue/black/white/cyan/
+        // magenta/yellow). Remaining words become the target layer name
+        // (default "Trace"). The LLM, which can see the image, is encouraged to
+        // pass the exact r,g,b it reads for a tight match.
+        "trace" => {
+            if args.is_empty() {
+                return wrong("trace", "a color (r,g,b or a name) and an optional layer", &args);
+            }
+            let target = trace_color(args[0])?;
+            let mut tol: u8 = 80;
+            let mut rest = &args[1..];
+            if rest.len() >= 2 && rest[0].eq_ignore_ascii_case("tol") {
+                tol = integer(rest[1], "trace tol")?.min(255) as u8;
+                rest = &rest[2..];
+            }
+            let layer = if rest.is_empty() { None } else { Some(rest.join(" ")) };
+            Ok(Command::Trace { target, tol, layer })
+        }
         "hatchpat" => {
             let [path] = take::<1>("hatchpat", "a .pat file path", &args)?;
             Ok(Command::HatchPat { path: (*path).to_string() })
@@ -3263,6 +3282,45 @@ fn parse_index(s: &str) -> Result<usize, ParseError> {
 
 fn wrong<T>(command: &'static str, expected: &'static str, args: &[&str]) -> Result<T, ParseError> {
     Err(wrong_err(command, expected, args))
+}
+
+/// Parse a `trace` colour: either `r,g,b` (each 0..255) or a named colour.
+/// Names are the eight print primaries the deck is most likely to reference.
+fn trace_color(s: &str) -> Result<[u8; 3], ParseError> {
+    if s.contains(',') {
+        let parts: Vec<&str> = s.split(',').collect();
+        if parts.len() == 3
+            && let (Ok(r), Ok(g), Ok(b)) = (
+                parts[0].trim().parse::<u32>(),
+                parts[1].trim().parse::<u32>(),
+                parts[2].trim().parse::<u32>(),
+            )
+            && r <= 255
+            && g <= 255
+            && b <= 255
+        {
+            return Ok([r as u8, g as u8, b as u8]);
+        }
+        return wrong("trace", "a color as r,g,b with each channel 0..255", &[s]);
+    }
+    let rgb = match s.to_ascii_lowercase().as_str() {
+        "red" => [230, 30, 38],
+        "green" => [0, 150, 70],
+        "blue" => [40, 55, 200],
+        "black" => [20, 20, 20],
+        "white" => [240, 240, 240],
+        "cyan" => [0, 174, 239],
+        "magenta" => [236, 0, 140],
+        "yellow" => [255, 222, 23],
+        _ => {
+            return wrong(
+                "trace",
+                "a color: r,g,b or red/green/blue/black/white/cyan/magenta/yellow",
+                &[s],
+            );
+        }
+    };
+    Ok(rgb)
 }
 
 fn wrong_err(command: &'static str, expected: &'static str, args: &[&str]) -> ParseError {
