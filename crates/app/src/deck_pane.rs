@@ -998,6 +998,15 @@ pub struct DeckPane {
     /// or `None` for a fresh conversation. Drives update-in-place vs fork on
     /// archive. Set in `load_stored_session`, cleared in `new_session`.
     loaded_session_id: Option<String>,
+    /// The stable Sessions-archive row id for the LIVE conversation, used so the
+    /// per-turn auto-upsert (issue #58) and the finalize `archive_active(Auto)`
+    /// converge on ONE row instead of forking a new session per turn. Assigned
+    /// on the first auto-upsert of a fresh conversation (and set equal to
+    /// `loaded_session_id` when a stored card is loaded); cleared on new/load.
+    /// Distinct from `loaded_session_id`, which stays `None` for a fresh
+    /// conversation so continuing it never spuriously trips the update-vs-new
+    /// modal (`is_ambiguous_continue`).
+    auto_session_id: Option<String>,
     /// A turn was appended AFTER a session was loaded — the loaded conversation
     /// has diverged from its stored copy, so continuing it is the ambiguous
     /// "update vs save-as-new" case. Set in `send`; cleared on load/new/archive.
@@ -1025,6 +1034,15 @@ pub struct DeckPane {
     /// [`DeckPane::take_app_verbs`] and runs them through the same app-verb-aware
     /// path as the human command line (`App::execute_line`). Never op-logged.
     pending_app_verbs: Vec<String>,
+    /// Pre-formatted Commands-history echo lines for commands the DECK ran this
+    /// frame (continuous execution + confirmed side-effects). Each entry is
+    /// already in the command-line scrollback's wire form: a `> <line>` echo
+    /// (rendered with the ✓ + syntax colours) or an `error: …` line (red). The
+    /// app drains these each frame via [`DeckPane::take_command_echoes`] and
+    /// feeds them to its `CommandLine` so deck-run commands show in the Commands
+    /// segment exactly like `/`-typed chat commands do (issue #59, mirroring the
+    /// #28 echo). NOT op-logged — the session already logged the real command.
+    pending_command_echoes: Vec<String>,
     /// Plan-execute state: the numbered plan the model announced for a
     /// prolonged task, driven step-by-step by [`finish_turn`]. Persisted in the
     /// per-doc draft so a cancelled/interrupted plan resumes. `None` = no plan.
@@ -1095,6 +1113,7 @@ impl Default for DeckPane {
             store: None,
             active_doc_uuid: None,
             loaded_session_id: None,
+            auto_session_id: None,
             dirty_since_load: false,
             pending_session_decision: None,
             summarize: None,
@@ -1102,6 +1121,7 @@ impl Default for DeckPane {
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
+            pending_command_echoes: Vec::new(),
             plan: None,
             plan_rounds: 0,
         }
@@ -1313,6 +1333,7 @@ impl DeckPane {
         self.input.clear();
         self.attached_image = None;
         self.loaded_session_id = None;
+        self.auto_session_id = None;
         self.dirty_since_load = false;
         self.view = PaneView::Chat;
         self.persist_chat();
@@ -1332,6 +1353,28 @@ impl DeckPane {
     /// person can. These never enter the op-log.
     pub fn take_app_verbs(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_app_verbs)
+    }
+
+    /// Drain the Commands-history echo lines for deck-run commands accumulated
+    /// since the last call (issue #59). Each line is already in command-line
+    /// scrollback form (`> <line>` or `error: …`); the app feeds them straight
+    /// to `CommandLine::push_line` so the Commands segment mirrors what the deck
+    /// ran, the same way `/`-typed chat commands are mirrored (issue #28).
+    pub fn take_command_echoes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_command_echoes)
+    }
+
+    /// Queue the Commands-history echo for one deck-run command: a `> <line>`
+    /// echo (✓ + syntax colours) plus, on failure, an `error: …` line (red).
+    /// Success output is intentionally NOT echoed as a body line here — the
+    /// transcript's command card already shows the result, and the `> line`
+    /// echo alone matches how iOS mirrors deck commands. `error` is `Some(msg)`
+    /// when `session.run` failed, `None` on success.
+    fn echo_command_to_history(&mut self, line: &str, error: Option<&str>) {
+        self.pending_command_echoes.push(format!("> {line}"));
+        if let Some(e) = error {
+            self.pending_command_echoes.push(format!("error: {e}"));
+        }
     }
 
     /// Point the multi-session store AND the live draft at `doc_uuid`. Called by
@@ -1427,9 +1470,13 @@ impl DeckPane {
         // mint a fresh one (fork).
         let reuse_id = match &mode {
             ArchiveMode::Update(id) => Some(id.clone()),
+            // Reuse the loaded card's id OR the id the per-turn auto-upsert
+            // already assigned to this live conversation (issue #58), so the
+            // finalize archive converges on the SAME row instead of forking.
             ArchiveMode::Auto => self
                 .loaded_session_id
                 .as_ref()
+                .or(self.auto_session_id.as_ref())
                 .filter(|id| store.get(id).is_some())
                 .cloned(),
             ArchiveMode::New => None,
@@ -1454,12 +1501,66 @@ impl DeckPane {
         // The live pane now tracks this stored session; a subsequent turn dirties
         // it again. Clear the dirty flag — the current state is archived.
         self.loaded_session_id = Some(archived_id.clone());
+        self.auto_session_id = Some(archived_id.clone());
         self.dirty_since_load = false;
         // Queue an async LLM title/summary refine; `tick` (which owns the tokio
         // handle) spawns it. The deterministic labels are already in place, so a
         // headless/offline archive is fully labeled without this ever firing.
         self.pending_summarize_id = Some(archived_id.clone());
         Some(archived_id)
+    }
+
+    /// Auto-upsert the LIVE conversation into the Sessions archive after a turn,
+    /// so it appears in the Sessions tab immediately and survives a crash —
+    /// rather than only landing on new/save/quit (issue #58). Update-in-place:
+    /// ONE row per conversation, never one per turn.
+    ///
+    /// Dedup is by a stable per-conversation id: reuse `loaded_session_id` when
+    /// it is set (this is also what [`archive_active`]'s `Auto` mode reuses, so
+    /// the per-turn upsert and the finalize archive converge on the SAME row);
+    /// otherwise mint a fresh id, REMEMBER it in `loaded_session_id`, and upsert
+    /// — so later turns in this conversation update that same row.
+    ///
+    /// Uses the deterministic `derive_meta` fallback (no async LLM title pass is
+    /// blocked on). Unlike `archive_active` this does NOT clear
+    /// `dirty_since_load` (a loaded-then-continued chat must still trip the
+    /// update-vs-new modal) and does NOT queue a summarize pass (that stays a
+    /// finalize concern). No-op until `sync_store` and when there are no
+    /// messages.
+    fn auto_upsert_active(&mut self) {
+        let Some(store) = self.store.as_mut() else { return };
+        if self.messages.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Reuse the remembered conversation id (loaded card, or an earlier
+        // auto-upsert of this conversation) for update-in-place; otherwise mint
+        // one. Prefer `loaded_session_id` so a loaded card keeps its own row.
+        let id = self
+            .loaded_session_id
+            .clone()
+            .or_else(|| self.auto_session_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mut session = crate::chat_store::ChatSession::new(now);
+        session.id = id.clone();
+        for m in &self.messages {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            };
+            session.push(role, &m.content, now);
+        }
+        session.derive_meta();
+        store.upsert(session);
+        store.save();
+        // Remember the id so the next turn (and the finalize archive) update THIS
+        // row instead of creating a duplicate. Recorded in `auto_session_id`, NOT
+        // `loaded_session_id`, so a fresh conversation doesn't start tripping the
+        // update-vs-new modal mid-flight (`is_ambiguous_continue`).
+        self.auto_session_id = Some(id);
     }
 
     /// Whether the live pane holds a loaded session that gained new turns — the
@@ -2210,6 +2311,9 @@ impl DeckPane {
         if let Err(e) = &result {
             self.errors_this_turn.push(format!("`{line}` failed: {e}"));
         }
+        // Mirror the executed command into the Commands-history scrollback
+        // (issue #59) so deck-run commands show there like `/`-chat ones.
+        self.echo_command_to_history(line, result.as_ref().err().map(String::as_str));
         self.current_commands.push(ExecutedCommand {
             line: line.to_string(),
             result: result.map(|o| o.message),
@@ -2332,6 +2436,10 @@ impl DeckPane {
             self.start_turn(session, handle);
         }
         self.persist_chat();
+        // Auto-land the live conversation in the Sessions archive each completed
+        // turn (update-in-place, one row per conversation) so it shows in the
+        // Sessions tab immediately and survives a crash (issue #58).
+        self.auto_upsert_active();
     }
 
     /// Advance or retry the live plan after a finished turn. `had_commands`
@@ -2773,6 +2881,9 @@ impl DeckPane {
     /// command — so replay reproduces the confirmed side-effect.
     fn run_confirmed_side_effect(&mut self, session: &mut Session, cmd: Command, line: String) {
         let result = session.run(cmd).map_err(|e| e.to_string());
+        // Mirror the confirmed command into the Commands-history scrollback
+        // (issue #59), the same as auto-run deck commands.
+        self.echo_command_to_history(&line, result.as_ref().err().map(String::as_str));
         self.transcript.push(Entry::Commands(vec![ExecutedCommand {
             line,
             result: result.map(|o| o.message),
@@ -2956,6 +3067,9 @@ impl DeckPane {
         self.session_id = None;
         // Track it so a continued-then-left conversation updates in place.
         self.loaded_session_id = Some(id.to_string());
+        // Keep the auto-upsert row id in sync so continuing a loaded card
+        // updates THAT row (issue #58), not a fresh duplicate.
+        self.auto_session_id = Some(id.to_string());
         self.dirty_since_load = false;
         self.session_search.clear();
         self.view = PaneView::Chat;
@@ -4189,6 +4303,7 @@ mod side_effect_gate_tests {
             store: None,
             active_doc_uuid: None,
             loaded_session_id: None,
+            auto_session_id: None,
             dirty_since_load: false,
             pending_session_decision: None,
             summarize: None,
@@ -4196,6 +4311,7 @@ mod side_effect_gate_tests {
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
+            pending_command_echoes: Vec::new(),
             plan: None,
             plan_rounds: 0,
         }
@@ -4562,6 +4678,106 @@ mod side_effect_gate_tests {
         assert_eq!(s.title, "make a five by five core");
         assert!(s.summary.contains("core"), "summary populated: {}", s.summary);
         assert!(!s.summary.is_empty());
+    }
+
+    #[test]
+    fn auto_upsert_updates_one_row_across_turns() {
+        // Issue #58: the per-turn auto-upsert must land the live conversation as
+        // ONE session row and UPDATE it across turns — never a new row per turn.
+        let mut pane = blank_pane();
+        pane.store = Some(crate::chat_store::DocSessions::new(
+            "11112222-3333-4444-5555-666677778888".into(),
+        ));
+        // Turn 1.
+        pane.messages = vec![
+            ChatMessage { role: Role::User, content: "make a slab".into() },
+            ChatMessage { role: Role::Assistant, content: "Drew a slab.".into() },
+        ];
+        pane.auto_upsert_active();
+        let first_id = pane.auto_session_id.clone().expect("id assigned");
+        assert_eq!(
+            pane.store.as_ref().unwrap().sessions.len(),
+            1,
+            "first turn creates exactly one row"
+        );
+        // Turn 2 appends to the SAME conversation.
+        pane.messages.push(ChatMessage { role: Role::User, content: "add columns".into() });
+        pane.messages.push(ChatMessage { role: Role::Assistant, content: "Added columns.".into() });
+        pane.auto_upsert_active();
+        let store = pane.store.as_ref().unwrap();
+        assert_eq!(store.sessions.len(), 1, "second turn UPDATES the row, no duplicate");
+        assert_eq!(
+            pane.auto_session_id.as_deref(),
+            Some(first_id.as_str()),
+            "the conversation keeps its stable id"
+        );
+        assert_eq!(store.sessions[0].id, first_id);
+        assert_eq!(store.sessions[0].turns.len(), 4, "row reflects all four turns");
+        // A fresh conversation stays non-ambiguous (no spurious update-vs-new
+        // modal): loaded_session_id is untouched, dirty flag stays false.
+        assert!(pane.loaded_session_id.is_none());
+        assert!(!pane.dirty_since_load);
+    }
+
+    #[test]
+    fn auto_upsert_and_finalize_archive_converge_on_one_row() {
+        // The per-turn auto-upsert and the new/save/quit archive_active(Auto)
+        // must NOT create duplicate sessions — they share the conversation id.
+        let mut pane = blank_pane();
+        pane.store = Some(crate::chat_store::DocSessions::new(
+            "11112222-3333-4444-5555-666677778888".into(),
+        ));
+        pane.messages = vec![
+            ChatMessage { role: Role::User, content: "make a slab".into() },
+            ChatMessage { role: Role::Assistant, content: "Drew a slab.".into() },
+        ];
+        pane.auto_upsert_active();
+        let auto_id = pane.auto_session_id.clone().unwrap();
+        // Finalize (as save/quit does).
+        let archived = pane.archive_active(ArchiveMode::Auto).unwrap();
+        assert_eq!(archived, auto_id, "finalize reuses the auto-upsert id");
+        assert_eq!(
+            pane.store.as_ref().unwrap().sessions.len(),
+            1,
+            "finalize updates the SAME row — no duplicate"
+        );
+    }
+
+    #[test]
+    fn echo_command_to_history_mirrors_success_and_error() {
+        // Issue #59: deck-run commands queue a `> line` echo (✓) for success and
+        // an extra `error: …` line (red) for failure — drained by the app into
+        // the Commands scrollback. No double-logging of the `> line`.
+        let mut pane = blank_pane();
+        pane.echo_command_to_history("box 0,0,0 4,4,4", None);
+        pane.echo_command_to_history("bogus", Some("unknown verb"));
+        let echoes = pane.take_command_echoes();
+        assert_eq!(
+            echoes,
+            vec![
+                "> box 0,0,0 4,4,4".to_string(),
+                "> bogus".to_string(),
+                "error: unknown verb".to_string(),
+            ],
+            "success echoes `> line` once; error echoes `> line` + `error: …`"
+        );
+        // Drained: a second take yields nothing (no double-logging across frames).
+        assert!(pane.take_command_echoes().is_empty());
+    }
+
+    #[test]
+    fn run_deck_command_echoes_once_to_history() {
+        // A deck-run command mirrors into the Commands history exactly once.
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        let cmd = parse("box 0,0,0 2,2,2").expect("parses");
+        pane.run_deck_command("box 0,0,0 2,2,2", cmd, &mut session);
+        let echoes = pane.take_command_echoes();
+        assert_eq!(
+            echoes.iter().filter(|l| l.as_str() == "> box 0,0,0 2,2,2").count(),
+            1,
+            "the deck command is echoed exactly once (no double-log)"
+        );
     }
 
     #[test]

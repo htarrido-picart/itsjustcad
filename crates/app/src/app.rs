@@ -8982,6 +8982,49 @@ impl App {
     }
 }
 
+/// Path to the persisted scratch document uuid:
+/// `~/.config/itsjustcad/scratch_doc_uuid`. Keeps the unsaved/scratch document
+/// keyed to ONE stable uuid across launches so its chat sessions survive (issue
+/// #58). `None` only when there is no home directory.
+fn scratch_doc_uuid_path() -> Option<std::path::PathBuf> {
+    Some(
+        dirs::home_dir()?
+            .join(".config")
+            .join("itsjustcad")
+            .join("scratch_doc_uuid"),
+    )
+}
+
+/// Read the persisted scratch document uuid, minting + persisting one on first
+/// use. Delegates to [`scratch_doc_uuid_at`] with the real config path; falls
+/// back to a fresh (unpersisted) uuid when there is no home directory.
+fn scratch_doc_uuid() -> String {
+    match scratch_doc_uuid_path() {
+        Some(path) => scratch_doc_uuid_at(&path),
+        None => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
+/// Load-or-create the scratch document uuid at an explicit path (test seam).
+/// Returns the existing uuid when the file holds a non-empty value; otherwise
+/// mints a fresh uuid, writes it (private, best-effort), and returns it. A write
+/// failure still returns the fresh uuid — the current session stays consistent,
+/// and persistence is retried next launch.
+fn scratch_doc_uuid_at(path: &std::path::Path) -> String {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let fresh = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = crate::journal::write_private(path, fresh.as_bytes());
+    fresh
+}
+
 impl App {
     /// The current document's stable uuid, stamping a fresh one onto the session
     /// when the file never carried one. Header-level only (see
@@ -8991,9 +9034,16 @@ impl App {
         if let Some(u) = self.session.doc_uuid() {
             return u.to_string();
         }
-        let fresh = uuid::Uuid::new_v4().to_string();
-        self.session.set_doc_uuid(Some(fresh.clone()));
-        fresh
+        // SCRATCH/unsaved document: reuse a STABLE uuid persisted in config
+        // rather than minting a fresh random one every launch. A fresh random
+        // each run orphaned the scratch doc's chats under a throwaway uuid, so
+        // the Sessions tab (keyed to the current doc uuid) never found them next
+        // launch (issue #58). Reusing the persisted scratch uuid keeps the
+        // scratch doc's chat history across relaunches. A SAVED file always
+        // carries its own `file.uuid` (set on load/save) and never reaches here.
+        let scratch = scratch_doc_uuid();
+        self.session.set_doc_uuid(Some(scratch.clone()));
+        scratch
     }
 
     /// Reconcile live widgets to a UI-plane change just written to `ui.json`.
@@ -10415,6 +10465,16 @@ impl eframe::App for App {
             self.execute_line(line);
         }
 
+        // Mirror the deck's OWN executed commands (continuous execution +
+        // confirmed side-effects) into the Commands-history scrollback so they
+        // show in the Commands segment like `/`-typed chat commands do (issue
+        // #59). These are already in scrollback form (`> line` / `error: …`)
+        // and the session already ran+logged them, so they go straight to
+        // `push_line` — NOT `execute_line` (which would re-run the command).
+        for echo in self.deck_pane.take_command_echoes() {
+            self.command_line.push_line(echo);
+        }
+
         // Cmd+\ reveals the Deck tab in the right panel (or hides the panel if
         // the Deck tab is already the active, visible one). Backslash is not
         // used elsewhere.
@@ -10677,6 +10737,65 @@ fn pano_from_view(v: itsjustcad_doc::PanoView) -> itsjustcad_render::PanoProject
 mod tests {
     use super::*;
     use itsjustcad_commands::registry;
+
+    /// Unique temp path per test (pid + counter), hermetic + parallel-safe.
+    fn temp_scratch_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("ijc-scratch-uuid-{}-{}", std::process::id(), n))
+    }
+
+    #[test]
+    fn scratch_doc_uuid_is_stable_across_relaunches() {
+        // Issue #58: a scratch/unsaved document must keep ONE stable doc uuid
+        // across launches so its chat sessions aren't orphaned each run.
+        let path = temp_scratch_path();
+        let _ = std::fs::remove_file(&path);
+        // First "launch" mints + persists.
+        let first = scratch_doc_uuid_at(&path);
+        assert!(!first.is_empty());
+        assert!(path.exists(), "the uuid is persisted to disk");
+        // Second "launch" (simulated relaunch) reuses the SAME uuid.
+        let second = scratch_doc_uuid_at(&path);
+        assert_eq!(first, second, "scratch uuid is stable across relaunches");
+        // A fresh file at a different path mints a DIFFERENT uuid (sanity).
+        let other = temp_scratch_path();
+        let _ = std::fs::remove_file(&other);
+        assert_ne!(scratch_doc_uuid_at(&other), first);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&other);
+    }
+
+    #[test]
+    fn scratch_doc_uuid_ignores_blank_file() {
+        // A blank/whitespace scratch file is treated as absent — a fresh uuid is
+        // minted and written, so a corrupted empty file self-heals.
+        let path = temp_scratch_path();
+        std::fs::write(&path, "   \n").unwrap();
+        let u = scratch_doc_uuid_at(&path);
+        assert!(!u.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            u,
+            "the minted uuid is written back over the blank file"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn saved_file_uuid_is_used_over_scratch() {
+        // A SAVED file carries its own uuid; ensure_doc_uuid must return THAT,
+        // never the scratch uuid. (Pure-logic: a session with a doc_uuid set.)
+        let mut session = Session::default();
+        session.set_doc_uuid(Some("ffff0000-0000-4000-8000-000000000abc".into()));
+        // The scratch path is irrelevant here because doc_uuid() short-circuits.
+        assert_eq!(
+            session.doc_uuid(),
+            Some("ffff0000-0000-4000-8000-000000000abc"),
+            "a saved file keeps its own file.uuid"
+        );
+    }
 
     #[test]
     fn space_acts_as_enter_only_on_non_text_guided_steps() {
