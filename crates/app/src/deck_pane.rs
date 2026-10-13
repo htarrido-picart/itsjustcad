@@ -2773,7 +2773,11 @@ impl DeckPane {
         } else {
             crate::theme::to_color32(roles.surface)
         };
-        ui.painter().rect_filled(ui.max_rect(), 0.0, pane_bg);
+        // Fill only the region BELOW the current cursor — not `ui.max_rect()`,
+        // which spans the whole panel and would paint over the Chat|Commands
+        // segmented control drawn just above us (that overdraw hid the control on
+        // the Chat segment; #28 polish).
+        ui.painter().rect_filled(ui.available_rect_before_wrap(), 0.0, pane_bg);
 
         // Deck status collapsed to a single traffic-light dot next to the model
         // picker (green = ready, red = unavailable/failed, orange = probing or

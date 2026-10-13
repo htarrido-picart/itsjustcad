@@ -9,13 +9,31 @@
 
 use crate::usage_spec::{self, TokenRole};
 
-/// iOS-parity colours for each token role. Teal for numbers/points, orange for
-/// selectors/`key:value`, accent for the verb, primary for plain text.
+/// Accent (verb) colour: a high-contrast blue picked per theme. Used for the
+/// highlighted verb AND the parse-preview's active slot so both stay legible —
+/// `visuals.hyperlink_color` was a low-contrast navy on the dark deck
+/// (accessibility report). Dark theme → bright azure; light theme → strong blue.
+pub fn accent_color(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        egui::Color32::from_rgb(0x6c, 0xc8, 0xff)
+    } else {
+        egui::Color32::from_rgb(0x0a, 0x5a, 0xd0)
+    }
+}
+
+/// Colours for each token role, chosen per theme to clear WCAG-AA contrast
+/// (≥4.5:1) against the deck background in BOTH light and dark mode — the
+/// original fixed teal/orange/navy failed contrast on one theme or the other.
+/// Verb=accent blue, numbers/points=teal, selectors/`key:value`=amber,
+/// plain=primary text.
 pub fn role_color(role: TokenRole, visuals: &egui::Visuals) -> egui::Color32 {
+    let dark = visuals.dark_mode;
     match role {
-        TokenRole::Verb => visuals.hyperlink_color, // accent
-        TokenRole::Number => egui::Color32::from_rgb(0x2a, 0xa1, 0x98), // teal
-        TokenRole::Selector => egui::Color32::from_rgb(0xd1, 0x7a, 0x22), // orange
+        TokenRole::Verb => accent_color(visuals),
+        TokenRole::Number if dark => egui::Color32::from_rgb(0x5a, 0xd2, 0xc0), // bright teal
+        TokenRole::Number => egui::Color32::from_rgb(0x00, 0x6d, 0x5f),         // dark teal
+        TokenRole::Selector if dark => egui::Color32::from_rgb(0xff, 0xb8, 0x6c), // light amber
+        TokenRole::Selector => egui::Color32::from_rgb(0xa8, 0x4d, 0x00),         // dark amber
         TokenRole::Plain => visuals.text_color(),
     }
 }
