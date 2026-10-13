@@ -3,10 +3,11 @@
 
 //! Hardware capability probe for local-model onboarding.
 //!
-//! Zero heavy deps: RAM comes from `sysctl hw.memsize` (macOS) or
-//! `/proc/meminfo` (Linux); cores from [`std::thread::available_parallelism`];
-//! GPU/Metal presence is a best-effort per-OS guess; free disk on the config
-//! volume is read from the platform stat call. The scoring policy in
+//! Zero heavy deps: RAM comes from `sysctl hw.memsize` (macOS), `/proc/meminfo`
+//! (Linux), or `GlobalMemoryStatusEx` (Windows); cores from
+//! [`std::thread::available_parallelism`]; GPU/Metal presence is a best-effort
+//! per-OS guess; free disk on the config volume is read from the platform stat
+//! call (`df` on unix, `GetDiskFreeSpaceExW` on Windows). The scoring policy in
 //! [`recommend_tier`] is a pure function so it can be unit-tested exhaustively.
 
 /// A model size class the machine can reasonably run locally.
@@ -133,7 +134,46 @@ fn detect_ram_bytes() -> Option<u64> {
     parse_meminfo_total_bytes(&meminfo)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+fn detect_ram_bytes() -> Option<u64> {
+    // `GlobalMemoryStatusEx` (kernel32) is the canonical physical-RAM query on
+    // Windows — neither `sysctl` nor `/proc/meminfo` exists there, so without
+    // this the onboarding saw "unknown RAM" on every Windows box (e.g. a 32 GB
+    // machine fell back to the smallest tier and showed "couldn't detect RAM").
+    #[repr(C)]
+    struct MemoryStatusEx {
+        dw_length: u32,
+        dw_memory_load: u32,
+        ull_total_phys: u64,
+        ull_avail_phys: u64,
+        ull_total_page_file: u64,
+        ull_avail_page_file: u64,
+        ull_total_virtual: u64,
+        ull_avail_virtual: u64,
+        ull_avail_extended_virtual: u64,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut status = MemoryStatusEx {
+        dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        dw_memory_load: 0,
+        ull_total_phys: 0,
+        ull_avail_phys: 0,
+        ull_total_page_file: 0,
+        ull_avail_page_file: 0,
+        ull_total_virtual: 0,
+        ull_avail_virtual: 0,
+        ull_avail_extended_virtual: 0,
+    };
+    // SAFETY: `status` is a correctly-sized, fully-initialised MEMORYSTATUSEX
+    // with `dw_length` set as the API requires; the call only writes into it.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0).then_some(status.ull_total_phys)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn detect_ram_bytes() -> Option<u64> {
     None
 }
@@ -159,7 +199,15 @@ fn detect_gpu() -> bool {
     true
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn detect_gpu() -> bool {
+    // Best-effort: Windows desktops effectively always expose a GPU (integrated
+    // or discrete) and wgpu drives it via DX12/Vulkan. The old `/dev/dri` check
+    // reported `false` here, hiding a present card (e.g. an RTX 3060 Ti).
+    true
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn detect_gpu() -> bool {
     // Best-effort on Linux/other: presence of a DRM render node.
     std::path::Path::new("/dev/dri").exists()
@@ -167,6 +215,7 @@ fn detect_gpu() -> bool {
 
 /// Free bytes on the config volume, in GiB. Uses `df` (portable) so we stay
 /// zero-dep; returns `None` if the command or parse fails.
+#[cfg(not(target_os = "windows"))]
 fn detect_free_disk_gb() -> Option<u64> {
     let target = dirs::home_dir()?.join(".config");
     let path = if target.exists() {
@@ -184,6 +233,35 @@ fn detect_free_disk_gb() -> Option<u64> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     parse_df_avail_gb(&text)
+}
+
+/// Free bytes on the config volume, in GiB, via `GetDiskFreeSpaceExW` (there is
+/// no `df` on Windows). Returns `None` if the call fails.
+#[cfg(target_os = "windows")]
+fn detect_free_disk_gb() -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let target = dirs::home_dir()?.join(".config");
+    let path = if target.exists() { target } else { dirs::home_dir()? };
+    // UTF-16, NUL-terminated directory path for the W API.
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory_name: *const u16,
+            free_bytes_available_to_caller: *mut u64,
+            total_number_of_bytes: *mut u64,
+            total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let mut free_to_caller: u64 = 0;
+    let mut total: u64 = 0;
+    let mut total_free: u64 = 0;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; the three out-params are
+    // valid, writable `u64` slots. The call only reads the path and writes them.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_to_caller, &mut total, &mut total_free)
+    };
+    (ok != 0).then_some(free_to_caller / (1024 * 1024 * 1024))
 }
 
 /// Parse the "Available" (4th) column, in 1K blocks, from `df -k` output → GiB.
