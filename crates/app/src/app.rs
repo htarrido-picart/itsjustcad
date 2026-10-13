@@ -8392,10 +8392,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(format!(
                                 "{} · {} · needs {} GB RAM",
-                                match entry.tier {
-                                    crate::model_catalog::TierTag::Small3B => "3B",
-                                    crate::model_catalog::TierTag::Mid7B => "7B",
-                                },
+                                entry.params,
                                 crate::download::fmt_bytes(entry.size_bytes),
                                 entry.ram_gb_min,
                             ))

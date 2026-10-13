@@ -37,6 +37,9 @@ pub struct ModelEntry {
     /// Stable slug (also the local cassette suffix: `local-<id>`).
     pub id: String,
     pub display_name: String,
+    /// The model's real parameter count (e.g. "0.6B", "4B") — shown in the UI so
+    /// the size line reflects the actual model, not the hardware tier it targets.
+    pub params: String,
     /// Which hardware tier this model targets.
     pub tier: TierTag,
     pub url: String,
@@ -228,20 +231,21 @@ mod tests {
     #[test]
     fn runnable_gate_by_ram() {
         let cat = Catalog::load();
-        // 8 GB → only the small-tier entry is runnable, not the 7B.
+        // Realistic per-model minimums: the small (0.6B) needs 4 GB, the larger
+        // (4B) needs 8 GB. Just under the larger's minimum → only the small runs.
+        let at4 = cat.runnable_at(Some(4));
+        assert!(at4.iter().any(|m| m.tier == TierTag::Small3B), "{at4:?}");
+        assert!(!at4.iter().any(|m| m.tier == TierTag::Mid7B), "{at4:?}");
+        // At/above the larger's minimum → both are runnable.
         let at8 = cat.runnable_at(Some(8));
-        assert!(at8.iter().any(|m| m.tier == TierTag::Small3B), "{at8:?}");
-        assert!(!at8.iter().any(|m| m.tier == TierTag::Mid7B), "{at8:?}");
-        // 16 GB → both are runnable.
-        let at16 = cat.runnable_at(Some(16));
-        assert_eq!(at16.len(), cat.models.len());
+        assert_eq!(at8.len(), cat.models.len(), "{at8:?}");
     }
 
     #[test]
-    fn runnable_below_all_minimums_is_empty_or_small() {
+    fn runnable_below_all_minimums_is_empty() {
         let cat = Catalog::load();
-        // 4 GB is under every entry's minimum (min is 8) → nothing runs.
-        assert!(cat.runnable_at(Some(4)).is_empty());
+        // 3 GB is under every entry's minimum (smallest is 4) → nothing runs.
+        assert!(cat.runnable_at(Some(3)).is_empty());
     }
 
     #[test]
@@ -255,6 +259,7 @@ mod tests {
         let e = ModelEntry {
             id: "x".into(),
             display_name: "X".into(),
+            params: "7B".into(),
             tier: TierTag::Mid7B,
             url: "https://h/x.gguf".into(),
             size_bytes: 1,
@@ -295,6 +300,7 @@ mod tests {
         ModelEntry {
             id: "m".into(),
             display_name: "M".into(),
+            params: "3B".into(),
             tier: TierTag::Small3B,
             url: "https://host/model.gguf".into(),
             size_bytes,
@@ -360,6 +366,7 @@ mod tests {
         let e = ModelEntry {
             id: "m".into(),
             display_name: "M".into(),
+            params: "3B".into(),
             tier: TierTag::Small3B,
             url: "https://host/a/b/model.gguf?download=true".into(),
             size_bytes: 1,
@@ -375,6 +382,7 @@ mod tests {
         let mut e = ModelEntry {
             id: "m".into(),
             display_name: "M".into(),
+            params: "3B".into(),
             tier: TierTag::Small3B,
             url: "https://host/model.gguf".into(),
             size_bytes: 1,
