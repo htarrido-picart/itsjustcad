@@ -1087,34 +1087,46 @@ fn subdivisions_to_refresh(
     to_refresh
 }
 
+/// Per-platform symbol-font candidates, lightest-with-arrow-coverage first.
+/// Each entry MUST cover the arrows `←` `→` (U+2190/U+2192) — the glyphs that
+/// otherwise tofu-box in menus and guided-command prompts. Keep at least one
+/// entry per OS or that platform regresses to boxes.
+const SYMBOL_FONT_CANDIDATES: &[&str] = &[
+    // macOS: Apple Symbols (~0.9 MB, has ← → — •); Arial Unicode as the
+    // comprehensive last resort (~22 MB, covers ✓ and much more).
+    "/System/Library/Fonts/Apple Symbols.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    // Linux (Debian/Ubuntu paths — fonts-dejavu-core / fonts-noto / fonts-freefont).
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    // Fedora/RHEL/openSUSE/Arch layouts (no `truetype/` component).
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    // Windows: Segoe UI Symbol has the arrows; Arial is the broad fallback.
+    "C:\\Windows\\Fonts\\seguisym.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+];
+
+/// First candidate font that exists and is readable on this machine, with its
+/// bytes. `None` only when no candidate is present (→ arrows may tofu-box).
+fn resolve_symbol_font() -> Option<(&'static str, Vec<u8>)> {
+    SYMBOL_FONT_CANDIDATES
+        .iter()
+        .find_map(|p| std::fs::read(p).ok().map(|b| (*p, b)))
+}
+
 /// egui 0.35's bundled fonts (Ubuntu-Light / NotoEmoji / emoji-icon-font) don't
 /// cover common symbol glyphs — in particular the arrows `←` `→`, which show up
 /// in menus, guided-command prompts and hints and render as tofu boxes without a
-/// fallback. Load the first available system font that DOES cover them and
-/// append it as the LAST entry in both font families: as a fallback it only
-/// supplies glyphs the primary font is missing, so ordinary text keeps the
-/// Ubuntu look. No-op (with a warning) when no candidate exists — same visual as
-/// before, never a crash. Order favours a light symbol font over a heavy
-/// everything-font.
+/// fallback. Load the first available system font that DOES cover them (see
+/// [`SYMBOL_FONT_CANDIDATES`]) and append it as the LAST entry in both font
+/// families: as a fallback it only supplies glyphs the primary font is missing,
+/// so ordinary text keeps the Ubuntu look. No-op (with a warning) when no
+/// candidate exists — same visual as before, never a crash.
 fn install_symbol_fallback(ctx: &egui::Context) {
-    // Per-platform candidates, lightest-with-arrow-coverage first.
-    const CANDIDATES: &[&str] = &[
-        // macOS: Apple Symbols (~0.9 MB, has ← → — •); Arial Unicode as the
-        // comprehensive last resort (~22 MB, covers ✓ and much more).
-        "/System/Library/Fonts/Apple Symbols.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        // Linux
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        // Windows: Segoe UI Symbol has the arrows; Arial is the broad fallback.
-        "C:\\Windows\\Fonts\\seguisym.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
-    ];
-    let Some((path, bytes)) = CANDIDATES
-        .iter()
-        .find_map(|p| std::fs::read(p).ok().map(|b| (*p, b)))
-    else {
+    let Some((path, bytes)) = resolve_symbol_font() else {
         tracing::warn!("no symbol-fallback font found; arrows/symbols may render as boxes");
         return;
     };
@@ -12702,5 +12714,58 @@ mod tests {
         for bad in ["notes.txt", "image.png", "noext", "archive.zip"] {
             assert!(!App::is_importable(Path::new(bad)), "{bad} must not import");
         }
+    }
+
+    // ── Cross-platform symbol-font fallback (GitHub issue #26) ──────────────
+    // The onboarding/menu/guided arrows `←` `→` render as tofu boxes unless a
+    // system font covering them is appended. These tests guard against a
+    // regression where the candidate list loses its coverage for a platform.
+
+    #[test]
+    fn symbol_font_candidates_cover_every_desktop_os() {
+        // At least one candidate path per OS family, so a stock install of each
+        // has a shot at resolving an arrow-capable font.
+        let has = |needle: &str| SYMBOL_FONT_CANDIDATES.iter().any(|p| p.contains(needle));
+        assert!(has("/System/Library/Fonts/"), "no macOS candidate");
+        assert!(has("/usr/share/fonts/"), "no Linux candidate");
+        assert!(has("C:\\Windows\\Fonts\\"), "no Windows candidate");
+        // Linux must list DejaVuSans at the canonical Debian/Ubuntu path (what
+        // the CI runner and the release Linux artifact actually ship).
+        assert!(
+            SYMBOL_FONT_CANDIDATES.contains(&"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            "Debian/Ubuntu DejaVuSans path dropped from candidates"
+        );
+    }
+
+    // On a desktop OS (macOS/Windows/Linux) a symbol font MUST actually resolve
+    // at runtime, otherwise the arrows tofu-box. On Linux this fails unless a
+    // DejaVu/Noto/FreeSans package is installed — which CI (ubuntu, with
+    // fonts-dejavu-core) and the packaged app both guarantee. Skipped on
+    // exotic targets where none of the paths apply.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    fn a_symbol_font_resolves_on_this_platform() {
+        assert!(
+            resolve_symbol_font().is_some(),
+            "no arrow-capable font found on this platform; onboarding arrows \
+             (← →) would render as tofu boxes. Candidates tried: {SYMBOL_FONT_CANDIDATES:?}"
+        );
+    }
+
+    // ── Config path resolution is XDG-correct on Linux (GitHub issue #26) ───
+    // All user config lives under `$HOME/.config/itsjustcad/…`. On Linux
+    // `dirs::home_dir()` reads `$HOME`, so this is the XDG default; this test
+    // pins the layout so a macOS-only dir (e.g. Application Support) can never
+    // sneak in.
+    #[test]
+    fn user_config_paths_live_under_dot_config_itsjustcad() {
+        let home = dirs::home_dir().expect("home dir");
+        let base = home.join(".config").join("itsjustcad");
+
+        let kb = crate::keybindings::config_path().expect("keybindings path");
+        assert_eq!(kb, base.join("keybindings.json"));
+
+        let db = crate::chat_db::db_path().expect("db path");
+        assert_eq!(db, base.join("itsjustcad.db"));
     }
 }
