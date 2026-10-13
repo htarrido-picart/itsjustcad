@@ -12,6 +12,7 @@ mod chat_store;
 mod command_line;
 mod deck_pane;
 mod diffusion;
+mod doc_paths;
 mod download;
 mod draw_tool;
 mod dyntabs;

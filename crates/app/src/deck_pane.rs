@@ -117,7 +117,10 @@ pub enum ArchiveMode {
 pub enum NextAction {
     /// File → New Session (clear the live pane for a fresh chat).
     NewSession,
-    /// Load another stored session by id.
+    /// Load another stored session by id (in-place, fork/update-guarded). Now
+    /// only exercised by the in-pane-load contract test — the production "open
+    /// this chat" flow reopens the whole document (see `App::open_session`).
+    #[cfg_attr(not(test), allow(dead_code))]
     LoadSession(String),
 }
 
@@ -643,6 +646,24 @@ const VERIFY_PROMPT: &str = "All plan steps are done. Verify the end state with 
 read-only commands (`bbox all`, `schedule`) if useful, and reply with a one-line \
 summary of what was built.";
 
+/// A one-line summary of a queued deck command for the first-run modal. Uses the
+/// command's side-effect summary when it parses to a side-effecting command (so
+/// a write/read reads "export → /path"), else the raw line trimmed to length.
+fn firstrun_summary(line: &str) -> String {
+    if let Ok(cmd) = parse(line)
+        && let Some(s) = cmd.side_effect_summary()
+    {
+        return s;
+    }
+    let line = line.trim();
+    if line.chars().count() > 72 {
+        let t: String = line.chars().take(71).collect();
+        format!("{t}…")
+    } else {
+        line.to_string()
+    }
+}
+
 /// The filesystem path a side-effecting command targets, if any.
 fn deck_command_path(cmd: &Command) -> Option<&str> {
     match cmd {
@@ -965,6 +986,25 @@ pub struct DeckPane {
     /// sandbox root, without a per-command prompt. Defaults OFF. Paths that
     /// escape the sandbox are still queued even when this is on.
     allow_deck_side_effects: bool,
+    /// Claude-Code-style OUTER first-run gate: has the user approved the deck
+    /// running ANY commands this session? Defaults OFF. While false, the whole
+    /// of a turn's emitted command batch is held in `pending_firstrun` and a
+    /// first-run modal is shown; nothing (even pure geometry) runs until the
+    /// user approves. "Approve for session" sets this (and
+    /// `allow_deck_side_effects`); "Approve once" runs the batch but leaves this
+    /// false so the next batch re-prompts. Once true, behavior is exactly as
+    /// before: geometry auto-runs, writes follow `allow_deck_side_effects` / the
+    /// write-modal, and reads ALWAYS take the manual picker carve-out.
+    deck_run_approved: bool,
+    /// The current turn's emitted command lines, held unprocessed while the
+    /// first-run gate is closed (`!deck_run_approved`). Raw lines — replayed
+    /// through the normal per-line routing (`process_command_line`) once the
+    /// user approves, so writers/readers still hit their INNER gates.
+    pending_firstrun: Vec<String>,
+    /// Full deck-pane rect captured at the top of [`DeckPane::ui`]. The approval
+    /// overlays dim + centre on THIS (the whole chat pane), not on the bottom
+    /// input panel's `max_rect` where the modal fns are actually called.
+    pane_rect: egui::Rect,
     /// Sandbox root for deck-originated fs paths — the current document's
     /// directory when known, else the ItsJustCAD documents dir. Set by the app.
     sandbox_root: Option<std::path::PathBuf>,
@@ -998,6 +1038,15 @@ pub struct DeckPane {
     /// or `None` for a fresh conversation. Drives update-in-place vs fork on
     /// archive. Set in `load_stored_session`, cleared in `new_session`.
     loaded_session_id: Option<String>,
+    /// The stable Sessions-archive row id for the LIVE conversation, used so the
+    /// per-turn auto-upsert (issue #58) and the finalize `archive_active(Auto)`
+    /// converge on ONE row instead of forking a new session per turn. Assigned
+    /// on the first auto-upsert of a fresh conversation (and set equal to
+    /// `loaded_session_id` when a stored card is loaded); cleared on new/load.
+    /// Distinct from `loaded_session_id`, which stays `None` for a fresh
+    /// conversation so continuing it never spuriously trips the update-vs-new
+    /// modal (`is_ambiguous_continue`).
+    auto_session_id: Option<String>,
     /// A turn was appended AFTER a session was loaded — the loaded conversation
     /// has diverged from its stored copy, so continuing it is the ambiguous
     /// "update vs save-as-new" case. Set in `send`; cleared on load/new/archive.
@@ -1025,6 +1074,15 @@ pub struct DeckPane {
     /// [`DeckPane::take_app_verbs`] and runs them through the same app-verb-aware
     /// path as the human command line (`App::execute_line`). Never op-logged.
     pending_app_verbs: Vec<String>,
+    /// Pre-formatted Commands-history echo lines for commands the DECK ran this
+    /// frame (continuous execution + confirmed side-effects). Each entry is
+    /// already in the command-line scrollback's wire form: a `> <line>` echo
+    /// (rendered with the ✓ + syntax colours) or an `error: …` line (red). The
+    /// app drains these each frame via [`DeckPane::take_command_echoes`] and
+    /// feeds them to its `CommandLine` so deck-run commands show in the Commands
+    /// segment exactly like `/`-typed chat commands do (issue #59, mirroring the
+    /// #28 echo). NOT op-logged — the session already logged the real command.
+    pending_command_echoes: Vec<String>,
     /// Plan-execute state: the numbered plan the model announced for a
     /// prolonged task, driven step-by-step by [`finish_turn`]. Persisted in the
     /// per-doc draft so a cancelled/interrupted plan resumes. `None` = no plan.
@@ -1087,6 +1145,9 @@ impl Default for DeckPane {
             attached_image: None,
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
+            deck_run_approved: false,
+            pending_firstrun: Vec::new(),
+            pane_rect: egui::Rect::NOTHING,
             sandbox_root: None,
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),
@@ -1095,6 +1156,7 @@ impl Default for DeckPane {
             store: None,
             active_doc_uuid: None,
             loaded_session_id: None,
+            auto_session_id: None,
             dirty_since_load: false,
             pending_session_decision: None,
             summarize: None,
@@ -1102,6 +1164,7 @@ impl Default for DeckPane {
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
+            pending_command_echoes: Vec::new(),
             plan: None,
             plan_rounds: 0,
         }
@@ -1313,6 +1376,7 @@ impl DeckPane {
         self.input.clear();
         self.attached_image = None;
         self.loaded_session_id = None;
+        self.auto_session_id = None;
         self.dirty_since_load = false;
         self.view = PaneView::Chat;
         self.persist_chat();
@@ -1332,6 +1396,28 @@ impl DeckPane {
     /// person can. These never enter the op-log.
     pub fn take_app_verbs(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_app_verbs)
+    }
+
+    /// Drain the Commands-history echo lines for deck-run commands accumulated
+    /// since the last call (issue #59). Each line is already in command-line
+    /// scrollback form (`> <line>` or `error: …`); the app feeds them straight
+    /// to `CommandLine::push_line` so the Commands segment mirrors what the deck
+    /// ran, the same way `/`-typed chat commands are mirrored (issue #28).
+    pub fn take_command_echoes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_command_echoes)
+    }
+
+    /// Queue the Commands-history echo for one deck-run command: a `> <line>`
+    /// echo (✓ + syntax colours) plus, on failure, an `error: …` line (red).
+    /// Success output is intentionally NOT echoed as a body line here — the
+    /// transcript's command card already shows the result, and the `> line`
+    /// echo alone matches how iOS mirrors deck commands. `error` is `Some(msg)`
+    /// when `session.run` failed, `None` on success.
+    fn echo_command_to_history(&mut self, line: &str, error: Option<&str>) {
+        self.pending_command_echoes.push(format!("> {line}"));
+        if let Some(e) = error {
+            self.pending_command_echoes.push(format!("error: {e}"));
+        }
     }
 
     /// Point the multi-session store AND the live draft at `doc_uuid`. Called by
@@ -1427,9 +1513,13 @@ impl DeckPane {
         // mint a fresh one (fork).
         let reuse_id = match &mode {
             ArchiveMode::Update(id) => Some(id.clone()),
+            // Reuse the loaded card's id OR the id the per-turn auto-upsert
+            // already assigned to this live conversation (issue #58), so the
+            // finalize archive converges on the SAME row instead of forking.
             ArchiveMode::Auto => self
                 .loaded_session_id
                 .as_ref()
+                .or(self.auto_session_id.as_ref())
                 .filter(|id| store.get(id).is_some())
                 .cloned(),
             ArchiveMode::New => None,
@@ -1454,12 +1544,66 @@ impl DeckPane {
         // The live pane now tracks this stored session; a subsequent turn dirties
         // it again. Clear the dirty flag — the current state is archived.
         self.loaded_session_id = Some(archived_id.clone());
+        self.auto_session_id = Some(archived_id.clone());
         self.dirty_since_load = false;
         // Queue an async LLM title/summary refine; `tick` (which owns the tokio
         // handle) spawns it. The deterministic labels are already in place, so a
         // headless/offline archive is fully labeled without this ever firing.
         self.pending_summarize_id = Some(archived_id.clone());
         Some(archived_id)
+    }
+
+    /// Auto-upsert the LIVE conversation into the Sessions archive after a turn,
+    /// so it appears in the Sessions tab immediately and survives a crash —
+    /// rather than only landing on new/save/quit (issue #58). Update-in-place:
+    /// ONE row per conversation, never one per turn.
+    ///
+    /// Dedup is by a stable per-conversation id: reuse `loaded_session_id` when
+    /// it is set (this is also what [`archive_active`]'s `Auto` mode reuses, so
+    /// the per-turn upsert and the finalize archive converge on the SAME row);
+    /// otherwise mint a fresh id, REMEMBER it in `loaded_session_id`, and upsert
+    /// — so later turns in this conversation update that same row.
+    ///
+    /// Uses the deterministic `derive_meta` fallback (no async LLM title pass is
+    /// blocked on). Unlike `archive_active` this does NOT clear
+    /// `dirty_since_load` (a loaded-then-continued chat must still trip the
+    /// update-vs-new modal) and does NOT queue a summarize pass (that stays a
+    /// finalize concern). No-op until `sync_store` and when there are no
+    /// messages.
+    fn auto_upsert_active(&mut self) {
+        let Some(store) = self.store.as_mut() else { return };
+        if self.messages.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Reuse the remembered conversation id (loaded card, or an earlier
+        // auto-upsert of this conversation) for update-in-place; otherwise mint
+        // one. Prefer `loaded_session_id` so a loaded card keeps its own row.
+        let id = self
+            .loaded_session_id
+            .clone()
+            .or_else(|| self.auto_session_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mut session = crate::chat_store::ChatSession::new(now);
+        session.id = id.clone();
+        for m in &self.messages {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            };
+            session.push(role, &m.content, now);
+        }
+        session.derive_meta();
+        store.upsert(session);
+        store.save();
+        // Remember the id so the next turn (and the finalize archive) update THIS
+        // row instead of creating a duplicate. Recorded in `auto_session_id`, NOT
+        // `loaded_session_id`, so a fresh conversation doesn't start tripping the
+        // update-vs-new modal mid-flight (`is_ambiguous_continue`).
+        self.auto_session_id = Some(id);
     }
 
     /// Whether the live pane holds a loaded session that gained new turns — the
@@ -2030,6 +2174,33 @@ impl DeckPane {
                     self.streaming_chat.push_str("\n```\n");
                 }
                 ExtractEvent::Command(line) => {
+                    // OUTER first-run gate (Claude-Code style): until the user
+                    // has approved the deck running ANY commands this session,
+                    // hold the WHOLE turn's batch unprocessed and show the
+                    // first-run modal. Nothing — not even pure geometry — runs
+                    // until the user approves. Once approved (for-session), this
+                    // branch is skipped and commands route normally; "approve
+                    // once" replays `pending_firstrun` through this same arm with
+                    // the gate temporarily open, then re-closes it.
+                    if !self.deck_run_approved {
+                        self.pending_firstrun.push(line);
+                        continue;
+                    }
+                    self.process_command_line(line, session);
+                }
+            }
+        }
+    }
+
+    /// Route a single deck-emitted command line through its plane (ui / app-verb
+    /// / substrate command) and the INNER side-effect gates. Called once the
+    /// OUTER first-run gate is open (either because the session is approved, or
+    /// while replaying an approved-once batch). Writers still hit the write-modal
+    /// via `pending_side_effects`; readers still take the manual picker carve-out.
+    fn process_command_line(&mut self, line: String, session: &mut Session) {
+        {
+            {
+                {
                     // UI/SESSION TOOL PLANE (distinct from document commands):
                     // a layout verb changes window state via ui.json, NOT the
                     // op-log. Try it first — the two tool groups are disjoint, so
@@ -2042,7 +2213,7 @@ impl DeckPane {
                             result: Ok(action.summary()),
                         });
                         self.pending_ui_actions.push(action);
-                        continue;
+                        return;
                     }
                     // USER-HOTKEY TOOL (W4): the assistant may bind/unbind
                     // hotkeys ONLY when the user opted in (LLM ▸ Keybindings →
@@ -2068,14 +2239,14 @@ impl DeckPane {
                                     result: Err("assistant hotkey changes are off — enable “Let the assistant set hotkeys” in LLM ▸ Keybindings".to_string()),
                                 });
                             }
-                            continue;
+                            return;
                         }
                         if matches!(verb0, "hotkeys" | "keybindings") {
                             self.current_commands.push(ExecutedCommand {
                                 line: line.clone(),
                                 result: Err("open LLM ▸ Keybindings to edit hotkeys".to_string()),
                             });
-                            continue;
+                            return;
                         }
                     }
                     // APP-VERB PLANE (distinct from document commands and ui
@@ -2107,7 +2278,7 @@ impl DeckPane {
                             });
                             self.help_output_this_turn
                                 .push(format!("help {label}:\n{body}"));
-                            continue;
+                            return;
                         }
                         // SECURITY: app-verbs bypass the fs side-effect gate
                         // because they carry no `Command`. Almost all are pure
@@ -2126,7 +2297,7 @@ impl DeckPane {
                                     "basemap fetch reaches the network — run it yourself from the command line".to_string(),
                                 ),
                             });
-                            continue;
+                            return;
                         }
                         // SECURITY: `save <path>` is an app-verb, NOT a substrate
                         // `Command`, so it bypasses the fs side-effect gate that
@@ -2142,14 +2313,14 @@ impl DeckPane {
                                     "save writes to the filesystem — run it yourself from the command line".to_string(),
                                 ),
                             });
-                            continue;
+                            return;
                         }
                         self.current_commands.push(ExecutedCommand {
                             line: line.clone(),
                             result: Ok("applied (view/camera)".to_string()),
                         });
                         self.pending_app_verbs.push(line);
-                        continue;
+                        return;
                     }
                     // Parse first so we can classify. A parse error is reported
                     // exactly as before (no execution attempted).
@@ -2162,7 +2333,7 @@ impl DeckPane {
                                 line,
                                 result: Err(e),
                             });
-                            continue;
+                            return;
                         }
                     };
                     // SECURITY (C-2/H-7): a side-effecting command *emitted by
@@ -2195,7 +2366,7 @@ impl DeckPane {
                                 reader,
                             });
                         }
-                        continue;
+                        return;
                     }
                     self.run_deck_command(&line, cmd, session);
                 }
@@ -2210,6 +2381,9 @@ impl DeckPane {
         if let Err(e) = &result {
             self.errors_this_turn.push(format!("`{line}` failed: {e}"));
         }
+        // Mirror the executed command into the Commands-history scrollback
+        // (issue #59) so deck-run commands show there like `/`-chat ones.
+        self.echo_command_to_history(line, result.as_ref().err().map(String::as_str));
         self.current_commands.push(ExecutedCommand {
             line: line.to_string(),
             result: result.map(|o| o.message),
@@ -2332,6 +2506,10 @@ impl DeckPane {
             self.start_turn(session, handle);
         }
         self.persist_chat();
+        // Auto-land the live conversation in the Sessions archive each completed
+        // turn (update-in-place, one row per conversation) so it shows in the
+        // Sessions tab immediately and survives a crash (issue #58).
+        self.auto_upsert_active();
     }
 
     /// Advance or retry the live plan after a finished turn. `had_commands`
@@ -2568,6 +2746,211 @@ impl DeckPane {
         }
     }
 
+    /// Render the OUTER first-run gate modal (Claude-Code style). Shown while
+    /// `!deck_run_approved` and the current turn produced commands: it lists the
+    /// whole batch and offers Approve once / Approve for session / Decline.
+    ///
+    /// * Approve for session → `deck_run_approved = true` AND
+    ///   `allow_deck_side_effects = true` (geometry + in-sandbox writes then flow
+    ///   with no further first-run prompt); the batch is replayed normally.
+    /// * Approve once → replay the batch for THIS turn only; the flags stay off
+    ///   so the next turn's batch re-prompts.
+    /// * Decline → discard the batch unrun; record "declined N command(s)".
+    ///
+    /// The batch is replayed through `process_command_line`, so any WRITE in it
+    /// still pops the INNER write-modal and any READ still takes the manual
+    /// picker carve-out — the first-run gate never bypasses those. This is the
+    /// OUTER gate: it is rendered BEFORE `side_effect_confirm_ui`, and because it
+    /// only replays once dismissed, the two modals never show at once (no
+    /// deadlock — first-run resolves, then per-command side-effect modals run as
+    /// the replayed batch queues them).
+    /// Shared in-pane approval overlay. Dims ONLY the deck pane (not the whole
+    /// window / 3D viewport) and floats the approval CARD within that rect:
+    ///
+    /// * `pane = ui.max_rect()` is the deck-pane rect at the call site.
+    /// * A semi-transparent fill is painted over `pane` on a FOREGROUND layer so
+    ///   it sits above the chat, and an invisible full-pane `Sense::click` button
+    ///   is placed on that layer so backdrop clicks are CONSUMED (no fall-through
+    ///   to the chat behind) and detectable.
+    /// * The card is an `Area` (Foreground, constrained to `pane`), width = the
+    ///   pane width minus a symmetric margin, clamped to a sane min/max, so it
+    ///   spans ~the chat width instead of a fixed 380px. `add` draws its body.
+    /// * Returns `true` for a DISMISS gesture: Esc, or a click on the dimmed
+    ///   backdrop OUTSIDE the card. Callers map that to their Decline action,
+    ///   preserving the old `Modal::should_close()` semantics.
+    fn approval_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        id: &str,
+        add: impl FnOnce(&mut egui::Ui),
+    ) -> bool {
+        // The FULL deck-pane rect (captured at the top of `ui()`), NOT the bottom
+        // input panel's `max_rect` where the modal fns run.
+        let pane = self.pane_rect;
+        let ctx = ui.ctx().clone();
+
+        // Dim just the pane, on a foreground layer above the chat.
+        let backdrop_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new(id));
+        let dim = if ui.visuals().dark_mode {
+            egui::Color32::from_black_alpha(160)
+        } else {
+            egui::Color32::from_black_alpha(96)
+        };
+        ctx.layer_painter(backdrop_layer)
+            .with_clip_rect(pane)
+            .rect_filled(pane, 0.0, dim);
+
+        // A full-pane click sink on the same layer: consumes pointer input over
+        // the pane so clicks never fall through to the chat behind the dim.
+        let backdrop = ui.interact(
+            pane,
+            egui::Id::new(id).with("backdrop"),
+            egui::Sense::click(),
+        );
+
+        // Card: span the pane width minus a symmetric margin, clamped.
+        let margin = 14.0;
+        let card_w = (pane.width() - 2.0 * margin).clamp(260.0, 460.0);
+        // Position in the upper third of the pane (falls back to centred if the
+        // pane is short), horizontally centred.
+        let card_x = pane.center().x - card_w / 2.0;
+        let card_y = pane.top() + (pane.height() * 0.22).min(pane.height() * 0.5);
+
+        let resp = egui::Area::new(egui::Id::new(id).with("card"))
+            .order(egui::Order::Foreground)
+            .constrain_to(pane)
+            .fixed_pos(egui::pos2(card_x, card_y))
+            .show(&ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::same(crate::theme::Spacing::M as i8))
+                    .show(ui, |ui| {
+                        ui.set_width(card_w);
+                        add(ui);
+                    });
+            });
+
+        // Dismiss = Esc, or a click on the backdrop OUTSIDE the card rect.
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let card_rect = resp.response.rect;
+        let backdrop_click = backdrop.clicked()
+            && backdrop
+                .interact_pointer_pos()
+                .map(|p| !card_rect.contains(p))
+                .unwrap_or(false);
+        esc || backdrop_click
+    }
+
+    fn firstrun_confirm_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &mut Session,
+        roles: &crate::theme::ColorRoles,
+    ) {
+        if self.deck_run_approved || self.pending_firstrun.is_empty() {
+            return;
+        }
+        enum Decision {
+            ApproveOnce,
+            ApproveSession,
+            Decline,
+        }
+        let mut decision: Option<Decision> = None;
+        let batch = self.pending_firstrun.clone();
+        let n = batch.len();
+
+        let dismissed = self.approval_overlay(ui, "deck_firstrun_modal", |ui| {
+            ui.heading("The deck wants to run commands.");
+            ui.add_space(crate::theme::Spacing::XS);
+            ui.label(format!(
+                "The assistant proposed {n} command{} this turn. Nothing runs \
+                 until you approve. Opens/imports always ask again regardless.",
+                if n == 1 { "" } else { "s" }
+            ));
+            ui.add_space(crate::theme::Spacing::S);
+            egui::Frame::group(ui.style())
+                .fill(ui.visuals().extreme_bg_color)
+                .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
+                .show(ui, |ui| {
+                    for line in batch.iter().take(8) {
+                        let summary = firstrun_summary(line);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            crate::syntax_layout::highlighted_command_inline(ui, &summary);
+                        });
+                    }
+                    if n > 8 {
+                        ui.label(
+                            egui::RichText::new(format!("… and {} more", n - 8))
+                                .weak()
+                                .small(),
+                        );
+                    }
+                });
+            ui.add_space(crate::theme::Spacing::M);
+            ui.horizontal_wrapped(|ui| {
+                let dark = ui.visuals().dark_mode;
+                use crate::widgets::{role_button, ButtonRole};
+                // Hierarchy: Approve once = prominent (filled accent), Approve for
+                // session = normal (outlined), Decline = destructive (red).
+                if role_button(ui, roles, dark, ButtonRole::Prominent, "Approve once")
+                    .on_hover_text("run this turn's commands only; ask again next turn")
+                    .clicked()
+                {
+                    decision = Some(Decision::ApproveOnce);
+                }
+                if role_button(ui, roles, dark, ButtonRole::Normal, "Approve for session")
+                    .on_hover_text(
+                        "let the deck run commands (and in-folder writes) this \
+                         session without asking; opens/imports still ask",
+                    )
+                    .clicked()
+                {
+                    decision = Some(Decision::ApproveSession);
+                }
+                if role_button(ui, roles, dark, ButtonRole::Destructive, "Decline").clicked() {
+                    decision = Some(Decision::Decline);
+                }
+            });
+        });
+        if dismissed && decision.is_none() {
+            // Esc / backdrop dismiss = Decline the batch.
+            decision = Some(Decision::Decline);
+        }
+
+        match decision {
+            None => {}
+            Some(Decision::ApproveSession) => self.firstrun_approve(session, true),
+            Some(Decision::ApproveOnce) => self.firstrun_approve(session, false),
+            Some(Decision::Decline) => self.firstrun_decline(),
+        }
+    }
+
+    /// Open the OUTER gate and run the held batch. `for_session` → latch
+    /// `deck_run_approved` + `allow_deck_side_effects` so future turns and
+    /// in-sandbox writes flow without re-prompting; otherwise run THIS batch only
+    /// (gate stays closed, next turn re-prompts). Either way the batch replays
+    /// through `process_command_line`, so each writer still hits the write-modal
+    /// and each reader still takes the manual picker carve-out.
+    fn firstrun_approve(&mut self, session: &mut Session, for_session: bool) {
+        if for_session {
+            self.deck_run_approved = true;
+            self.allow_deck_side_effects = true;
+        }
+        let batch = std::mem::take(&mut self.pending_firstrun);
+        for line in batch {
+            self.process_command_line(line, session);
+        }
+    }
+
+    /// Discard the held batch unrun and record a status line.
+    fn firstrun_decline(&mut self) {
+        let n = self.pending_firstrun.len();
+        self.pending_firstrun.clear();
+        self.transcript
+            .push(Entry::Status(format!("declined {n} command(s)")));
+        self.persist_chat();
+    }
+
     /// Render the permission MODAL for deck-emitted side-effecting commands.
     /// Styled like Claude Code's permission prompt / the iOS ApprovalSheet: a
     /// dimmed backdrop + centered window showing the FIRST pending command and
@@ -2586,6 +2969,7 @@ impl DeckPane {
         ui: &mut egui::Ui,
         session: &mut Session,
         _icons: &crate::icons::Icons,
+        roles: &crate::theme::ColorRoles,
     ) {
         if self.pending_side_effects.is_empty() {
             return;
@@ -2604,103 +2988,106 @@ impl DeckPane {
         let summary = pending.summary.clone();
         let remaining = self.pending_side_effects.len();
 
-        // Dimmed backdrop over the whole pane, then a centered modal window.
-        let modal = egui::Modal::new(egui::Id::new("deck_side_effect_modal")).show(
-            ui.ctx(),
-            |ui| {
-                ui.set_width(380.0);
-                ui.heading(if reader {
-                    "Open a file?"
-                } else {
-                    "Allow this action?"
-                });
-                ui.add_space(crate::theme::Spacing::XS);
-                ui.label(if reader {
-                    "The deck wants to READ an external file into the document. \
-                     Opens and imports (images included) are always manual — \
-                     you choose the file, not the model."
-                } else {
-                    "The deck wants to run a command that writes to disk."
-                });
-                ui.add_space(crate::theme::Spacing::S);
-                egui::Frame::group(ui.style())
-                    .fill(ui.visuals().extreme_bg_color)
-                    .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new(&summary).monospace());
+        // In-pane dimmed overlay + card (dims only the deck pane, not the
+        // viewport). Card spans ~the pane width.
+        let picker_applies =
+            reader_with_user_path(&self.pending_side_effects[0].cmd, "x").is_some();
+        let dismissed = self.approval_overlay(ui, "deck_side_effect_modal", |ui| {
+            ui.heading(if reader {
+                "Open a file?"
+            } else {
+                "Allow this action?"
+            });
+            ui.add_space(crate::theme::Spacing::XS);
+            ui.label(if reader {
+                "The deck wants to READ an external file into the document. \
+                 Opens and imports (images included) are always manual — \
+                 you choose the file, not the model."
+            } else {
+                "The deck wants to run a command that writes to disk."
+            });
+            ui.add_space(crate::theme::Spacing::S);
+            egui::Frame::group(ui.style())
+                .fill(ui.visuals().extreme_bg_color)
+                .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
+                .show(ui, |ui| {
+                    // Summary may be a bare command or the `verb → /path` form;
+                    // the tokenizer colours the leading verb either way.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        crate::syntax_layout::highlighted_command_inline(ui, &summary);
                     });
-                if outside {
-                    ui.add_space(crate::theme::Spacing::XS);
-                    ui.label(
-                        egui::RichText::new("⚠ path is OUTSIDE the document folder")
-                            .color(ERR_COLOR)
-                            .small(),
-                    );
-                }
-                if remaining > 1 {
-                    ui.label(
-                        egui::RichText::new(format!("{} more queued", remaining - 1))
-                            .weak()
-                            .small(),
-                    );
-                }
-                ui.add_space(crate::theme::Spacing::M);
-                ui.horizontal(|ui| {
-                    if reader {
-                        // Readers: NO session approval, NO auto-run. Only a user
-                        // file pick (if a picker applies) or Decline.
-                        let picker_applies =
-                            reader_with_user_path(&self.pending_side_effects[0].cmd, "x")
-                                .is_some();
-                        if picker_applies {
-                            if ui
-                                .button("Open file picker…")
-                                .on_hover_text(
-                                    "pick the file yourself — the model's proposed path is ignored",
-                                )
-                                .clicked()
-                            {
-                                decision = Some(Decision::Pick);
-                            }
-                        } else {
-                            ui.label(
-                                egui::RichText::new("opens/imports are manual")
-                                    .weak()
-                                    .small(),
-                            );
-                        }
-                        if ui.button("Decline").clicked() {
-                            decision = Some(Decision::Decline);
-                        }
-                    } else {
-                        if ui
-                            .button("Approve once")
-                            .on_hover_text("run this one command")
+                });
+            if outside {
+                ui.add_space(crate::theme::Spacing::XS);
+                ui.label(
+                    egui::RichText::new("⚠ path is OUTSIDE the document folder")
+                        .color(ERR_COLOR)
+                        .small(),
+                );
+            }
+            if remaining > 1 {
+                ui.label(
+                    egui::RichText::new(format!("{} more queued", remaining - 1))
+                        .weak()
+                        .small(),
+                );
+            }
+            ui.add_space(crate::theme::Spacing::M);
+            ui.horizontal_wrapped(|ui| {
+                let dark = ui.visuals().dark_mode;
+                use crate::widgets::{role_button, ButtonRole};
+                if reader {
+                    // Readers: NO session approval, NO auto-run. Only a user
+                    // file pick (if a picker applies) or Decline. The picker is
+                    // the prominent action; Decline is destructive (red).
+                    if picker_applies {
+                        if role_button(ui, roles, dark, ButtonRole::Prominent, "Open file picker…")
+                            .on_hover_text(
+                                "pick the file yourself — the model's proposed path is ignored",
+                            )
                             .clicked()
                         {
-                            decision = Some(Decision::ApproveOnce);
+                            decision = Some(Decision::Pick);
                         }
-                        // "Approve for session" only makes sense for in-sandbox
-                        // writes; an outside-sandbox path always asks again.
-                        if !outside
-                            && ui
-                                .button("Approve for session")
-                                .on_hover_text(
-                                    "run this, and let in-folder writes run this session without asking",
-                                )
-                                .clicked()
-                        {
-                            decision = Some(Decision::ApproveSession);
-                        }
-                        if ui.button("Decline").clicked() {
-                            decision = Some(Decision::Decline);
-                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("opens/imports are manual")
+                                .weak()
+                                .small(),
+                        );
                     }
-                });
-            },
-        );
-        if modal.should_close() && decision.is_none() {
-            // Dismissing the modal (Esc / backdrop click) = Decline the head.
+                    if role_button(ui, roles, dark, ButtonRole::Destructive, "Decline").clicked() {
+                        decision = Some(Decision::Decline);
+                    }
+                } else {
+                    // Approve once = prominent, Approve for session = normal,
+                    // Decline = destructive.
+                    if role_button(ui, roles, dark, ButtonRole::Prominent, "Approve once")
+                        .on_hover_text("run this one command")
+                        .clicked()
+                    {
+                        decision = Some(Decision::ApproveOnce);
+                    }
+                    // "Approve for session" only makes sense for in-sandbox
+                    // writes; an outside-sandbox path always asks again.
+                    if !outside
+                        && role_button(ui, roles, dark, ButtonRole::Normal, "Approve for session")
+                            .on_hover_text(
+                                "run this, and let in-folder writes run this session without asking",
+                            )
+                            .clicked()
+                    {
+                        decision = Some(Decision::ApproveSession);
+                    }
+                    if role_button(ui, roles, dark, ButtonRole::Destructive, "Decline").clicked() {
+                        decision = Some(Decision::Decline);
+                    }
+                }
+            });
+        });
+        if dismissed && decision.is_none() {
+            // Dismissing the overlay (Esc / backdrop click) = Decline the head.
             decision = Some(Decision::Decline);
         }
 
@@ -2773,6 +3160,9 @@ impl DeckPane {
     /// command — so replay reproduces the confirmed side-effect.
     fn run_confirmed_side_effect(&mut self, session: &mut Session, cmd: Command, line: String) {
         let result = session.run(cmd).map_err(|e| e.to_string());
+        // Mirror the confirmed command into the Commands-history scrollback
+        // (issue #59), the same as auto-run deck commands.
+        self.echo_command_to_history(&line, result.as_ref().err().map(String::as_str));
         self.transcript.push(Entry::Commands(vec![ExecutedCommand {
             line,
             result: result.map(|o| o.message),
@@ -2810,6 +3200,18 @@ impl DeckPane {
         });
     }
 
+    /// Dev hook (`ITSJUSTCAD_DECK_FIRSTRUN=1`): seed a sample unprocessed command
+    /// batch with the OUTER first-run gate closed, so an ITSJUSTCAD_SHOT frame can
+    /// capture the "The deck wants to run commands." modal without a live model.
+    pub fn seed_pending_firstrun(&mut self) {
+        self.deck_run_approved = false;
+        self.pending_firstrun = vec![
+            "box 0,0,0 10,10,3".to_string(),
+            "circle 5,5,3 2".to_string(),
+            "export /Users/you/project/plan.dxf".to_string(),
+        ];
+    }
+
     /// Seed a couple of demo chat sessions into the current store — a dev hook
     /// (`ITSJUSTCAD_DECK_PANE`) so a screenshot can show the switcher + search
     /// populated without a live model. No-op if the store already has sessions.
@@ -2837,16 +3239,18 @@ impl DeckPane {
     /// caller switches the active tab to Chat when this returns `true`.
     ///
     /// This was promoted OUT of the Chat pane (`session_browser_ui`) into its own
-    /// tab. Returns `true` iff a session was loaded this frame.
+    /// tab. Returns `Some(session_id)` when a card was clicked this frame; the
+    /// caller confirms, then opens that chat's document AND transcript (replacing
+    /// the current document in place, routed through the unsaved-changes guard).
     #[must_use]
     pub fn sessions_tab_ui(
         &mut self,
         ui: &mut egui::Ui,
         roles: &crate::theme::ColorRoles,
-    ) -> bool {
+    ) -> Option<String> {
         if self.store.is_none() {
             ui.label(egui::RichText::new("no chats yet for this document").weak().italics());
-            return false;
+            return None;
         }
         // Ensure newest-first ordering for the card list.
         if let Some(store) = self.store.as_mut() {
@@ -2910,18 +3314,19 @@ impl DeckPane {
             }
         });
 
-        if let Some(id) = load_session {
-            self.load_stored_session(&id);
-            true
-        } else {
-            false
-        }
+        // Surface the clicked id to the caller (App), which pops the
+        // confirmation then opens the chat's document + transcript. We no longer
+        // load into the pane directly here — opening replaces the whole document.
+        load_session
     }
 
     /// Load a stored session's turns into the live transcript for viewing /
-    /// continuation. Archives the current conversation first so nothing is lost.
-    /// When the current pane is an ambiguously-continued loaded session, this
-    /// parks behind the Update/Save-as-new modal; the load runs once resolved.
+    /// continuation IN PLACE (archiving the current conversation first). This is
+    /// the fork/update-guarded load used when the document is NOT changing. Since
+    /// "open this chat" now reopens the chat's document too (replacing it
+    /// wholesale, guarded at the App level), the production path uses
+    /// [`open_stored_session`]; this remains for the in-pane-load contract test.
+    #[cfg(test)]
     fn load_stored_session(&mut self, id: &str) {
         self.guarded_next_action(NextAction::LoadSession(id.to_string()));
     }
@@ -2956,10 +3361,60 @@ impl DeckPane {
         self.session_id = None;
         // Track it so a continued-then-left conversation updates in place.
         self.loaded_session_id = Some(id.to_string());
+        // Keep the auto-upsert row id in sync so continuing a loaded card
+        // updates THAT row (issue #58), not a fresh duplicate.
+        self.auto_session_id = Some(id.to_string());
         self.dirty_since_load = false;
         self.session_search.clear();
         self.view = PaneView::Chat;
         self.persist_chat();
+    }
+
+    /// The document uuid this pane's chat store is currently keyed to, or `None`
+    /// before the first `sync_store`.
+    pub fn active_doc_uuid(&self) -> Option<&str> {
+        self.active_doc_uuid.as_deref()
+    }
+
+    /// Open a stored session's transcript into the live pane DIRECTLY (no
+    /// fork/update modal). Used by the App's "open this chat" flow, where the
+    /// unsaved-changes guard already ran and the document has just been
+    /// reopened/replayed — so there is nothing to fork and the session simply
+    /// becomes the live conversation.
+    pub fn open_stored_session(&mut self, id: &str) {
+        self.replace_live_with_stored(id);
+    }
+
+    /// Extract, in order, the command lines a stored session executed — the
+    /// contents of its assistant turns' ```draft fences — using the SAME
+    /// [`Extractor`] the live deck uses to run LLM output. Returns `None` when
+    /// the session id is unknown. Powers the replay fallback when a chat has no
+    /// (or a missing) saved file: replaying these lines rebuilds the geometry.
+    pub fn session_command_lines(&self, id: &str) -> Option<Vec<String>> {
+        let store = self.store.as_ref()?;
+        let session = store.get(id)?;
+        Some(Self::command_lines_from_turns(&session.turns))
+    }
+
+    /// Pure helper: pull every ```draft-fenced command line out of a session's
+    /// assistant turns, in order. Reuses the deck's [`Extractor`] so the fence
+    /// grammar matches exactly how the commands were executed live.
+    fn command_lines_from_turns(turns: &[crate::chat_store::Turn]) -> Vec<String> {
+        let mut out = Vec::new();
+        for turn in turns {
+            if turn.role != "assistant" {
+                continue;
+            }
+            let mut ex = Extractor::default();
+            let mut events = ex.push(&turn.content);
+            events.extend(ex.finish());
+            for ev in events {
+                if let ExtractEvent::Command(line) = ev {
+                    out.push(line);
+                }
+            }
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)] // fixed signature; splitting further aids nothing
@@ -2978,6 +3433,10 @@ impl DeckPane {
         _dark: bool,
         reduce_motion: bool,
     ) -> Option<String> {
+        // Capture the FULL deck-pane rect up front: the approval overlays are
+        // invoked inside the bottom input `Panel`, whose `max_rect` is only the
+        // composer strip — we want to dim + centre over the whole chat pane.
+        self.pane_rect = ui.max_rect();
         self.drain(session, handle);
         if self.busy()
             && let Some(started) = self.turn_started
@@ -3357,8 +3816,13 @@ impl DeckPane {
                 {
                     crate::command_line::render_command_preview(ui, &slots);
                 }
+                // OUTER first-run gate renders first; while it's up the batch is
+                // held unprocessed, so no per-command side-effect modal can show
+                // simultaneously (no deadlock). Once it resolves (approve/replay)
+                // the inner side-effect modal below handles any writes/reads.
+                self.firstrun_confirm_ui(ui, session, roles);
                 // Side-effect confirmation sits directly above the input card.
-                self.side_effect_confirm_ui(ui, session, icons);
+                self.side_effect_confirm_ui(ui, session, icons, roles);
                 // Attachment chip (name + remove) above the input card.
                 if let Some(img) = self.attached_image.clone() {
                     ui.horizontal(|ui| {
@@ -4181,6 +4645,12 @@ mod side_effect_gate_tests {
             attached_image: None,
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
+            // Test helper = an already-running session: the OUTER first-run gate
+            // is already open, so existing #56 behavior tests drive commands past
+            // it. The first-run gate is tested explicitly by flipping to false.
+            deck_run_approved: true,
+            pending_firstrun: Vec::new(),
+            pane_rect: egui::Rect::NOTHING,
             sandbox_root: None,
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),
@@ -4189,6 +4659,7 @@ mod side_effect_gate_tests {
             store: None,
             active_doc_uuid: None,
             loaded_session_id: None,
+            auto_session_id: None,
             dirty_since_load: false,
             pending_session_decision: None,
             summarize: None,
@@ -4196,6 +4667,7 @@ mod side_effect_gate_tests {
             session_search: String::new(),
             pending_ui_actions: Vec::new(),
             pending_app_verbs: Vec::new(),
+            pending_command_echoes: Vec::new(),
             plan: None,
             plan_rounds: 0,
         }
@@ -4565,6 +5037,106 @@ mod side_effect_gate_tests {
     }
 
     #[test]
+    fn auto_upsert_updates_one_row_across_turns() {
+        // Issue #58: the per-turn auto-upsert must land the live conversation as
+        // ONE session row and UPDATE it across turns — never a new row per turn.
+        let mut pane = blank_pane();
+        pane.store = Some(crate::chat_store::DocSessions::new(
+            "11112222-3333-4444-5555-666677778888".into(),
+        ));
+        // Turn 1.
+        pane.messages = vec![
+            ChatMessage { role: Role::User, content: "make a slab".into() },
+            ChatMessage { role: Role::Assistant, content: "Drew a slab.".into() },
+        ];
+        pane.auto_upsert_active();
+        let first_id = pane.auto_session_id.clone().expect("id assigned");
+        assert_eq!(
+            pane.store.as_ref().unwrap().sessions.len(),
+            1,
+            "first turn creates exactly one row"
+        );
+        // Turn 2 appends to the SAME conversation.
+        pane.messages.push(ChatMessage { role: Role::User, content: "add columns".into() });
+        pane.messages.push(ChatMessage { role: Role::Assistant, content: "Added columns.".into() });
+        pane.auto_upsert_active();
+        let store = pane.store.as_ref().unwrap();
+        assert_eq!(store.sessions.len(), 1, "second turn UPDATES the row, no duplicate");
+        assert_eq!(
+            pane.auto_session_id.as_deref(),
+            Some(first_id.as_str()),
+            "the conversation keeps its stable id"
+        );
+        assert_eq!(store.sessions[0].id, first_id);
+        assert_eq!(store.sessions[0].turns.len(), 4, "row reflects all four turns");
+        // A fresh conversation stays non-ambiguous (no spurious update-vs-new
+        // modal): loaded_session_id is untouched, dirty flag stays false.
+        assert!(pane.loaded_session_id.is_none());
+        assert!(!pane.dirty_since_load);
+    }
+
+    #[test]
+    fn auto_upsert_and_finalize_archive_converge_on_one_row() {
+        // The per-turn auto-upsert and the new/save/quit archive_active(Auto)
+        // must NOT create duplicate sessions — they share the conversation id.
+        let mut pane = blank_pane();
+        pane.store = Some(crate::chat_store::DocSessions::new(
+            "11112222-3333-4444-5555-666677778888".into(),
+        ));
+        pane.messages = vec![
+            ChatMessage { role: Role::User, content: "make a slab".into() },
+            ChatMessage { role: Role::Assistant, content: "Drew a slab.".into() },
+        ];
+        pane.auto_upsert_active();
+        let auto_id = pane.auto_session_id.clone().unwrap();
+        // Finalize (as save/quit does).
+        let archived = pane.archive_active(ArchiveMode::Auto).unwrap();
+        assert_eq!(archived, auto_id, "finalize reuses the auto-upsert id");
+        assert_eq!(
+            pane.store.as_ref().unwrap().sessions.len(),
+            1,
+            "finalize updates the SAME row — no duplicate"
+        );
+    }
+
+    #[test]
+    fn echo_command_to_history_mirrors_success_and_error() {
+        // Issue #59: deck-run commands queue a `> line` echo (✓) for success and
+        // an extra `error: …` line (red) for failure — drained by the app into
+        // the Commands scrollback. No double-logging of the `> line`.
+        let mut pane = blank_pane();
+        pane.echo_command_to_history("box 0,0,0 4,4,4", None);
+        pane.echo_command_to_history("bogus", Some("unknown verb"));
+        let echoes = pane.take_command_echoes();
+        assert_eq!(
+            echoes,
+            vec![
+                "> box 0,0,0 4,4,4".to_string(),
+                "> bogus".to_string(),
+                "error: unknown verb".to_string(),
+            ],
+            "success echoes `> line` once; error echoes `> line` + `error: …`"
+        );
+        // Drained: a second take yields nothing (no double-logging across frames).
+        assert!(pane.take_command_echoes().is_empty());
+    }
+
+    #[test]
+    fn run_deck_command_echoes_once_to_history() {
+        // A deck-run command mirrors into the Commands history exactly once.
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        let cmd = parse("box 0,0,0 2,2,2").expect("parses");
+        pane.run_deck_command("box 0,0,0 2,2,2", cmd, &mut session);
+        let echoes = pane.take_command_echoes();
+        assert_eq!(
+            echoes.iter().filter(|l| l.as_str() == "> box 0,0,0 2,2,2").count(),
+            1,
+            "the deck command is echoed exactly once (no double-log)"
+        );
+    }
+
+    #[test]
     fn load_stored_session_replaces_live_transcript() {
         // Clicking a session card loads that session's turns into the live Chat
         // (state change), archiving whatever was live first so nothing is lost.
@@ -4630,6 +5202,43 @@ mod side_effect_gate_tests {
         assert_eq!(pane.messages[0].content, "revive me");
         assert!(pane.loaded_session_id.is_none());
         assert!(!pane.dirty_since_load);
+    }
+
+    #[test]
+    fn session_command_lines_extracts_draft_blocks_in_order() {
+        // The replay fallback rebuilds the drawing from the chat's ```draft
+        // command lines. Prove the extraction pulls exactly those lines, in
+        // order, from the assistant turns — reusing the live Extractor's fence
+        // grammar — and ignores prose and user turns.
+        let turns = vec![
+            crate::chat_store::Turn { role: "user".into(), content: "draw a box and a rect".into() },
+            crate::chat_store::Turn {
+                role: "assistant".into(),
+                content: "Sure, here you go:\n```draft\nbox 0,0,0 2,2,2\n```\nDone.".into(),
+            },
+            crate::chat_store::Turn {
+                role: "assistant".into(),
+                content: "And the rectangle:\n```draft\nrect 4,0,0 3 2\n```".into(),
+            },
+        ];
+        let lines = DeckPane::command_lines_from_turns(&turns);
+        assert_eq!(lines, vec!["box 0,0,0 2,2,2".to_string(), "rect 4,0,0 3 2".to_string()]);
+
+        // And the same via the store-backed public API (unknown id → None).
+        let mut store = crate::chat_store::DocSessions::new(
+            "aaaa1111-2222-3333-4444-555566667777".into(),
+        );
+        let mut s = crate::chat_store::ChatSession::new(10);
+        s.turns = turns;
+        let id = s.id.clone();
+        store.sessions.push(s);
+        let mut pane = blank_pane();
+        pane.store = Some(store);
+        assert_eq!(
+            pane.session_command_lines(&id),
+            Some(vec!["box 0,0,0 2,2,2".to_string(), "rect 4,0,0 3 2".to_string()])
+        );
+        assert_eq!(pane.session_command_lines("nope"), None, "unknown id → None");
     }
 
     #[test]
@@ -5437,6 +6046,164 @@ mod side_effect_gate_tests {
     fn header_caption_absent_for_blank_model() {
         assert_eq!(header_model_caption(&[], ""), None);
         assert_eq!(header_model_caption(&[], "   "), None);
+    }
+
+    // ── OUTER first-run gate (Claude-Code model) ────────────────────────────
+
+    #[test]
+    fn firstrun_geometry_does_not_auto_run_and_queues() {
+        // Gate closed: even a pure geometry command is HELD unprocessed and the
+        // first-run modal is pending (pending_firstrun non-empty). Nothing runs.
+        let mut pane = blank_pane();
+        pane.deck_run_approved = false;
+        let mut session = Session::default();
+        let before = session.doc.len();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 1,1,1".into())],
+            &mut session,
+        );
+        assert_eq!(
+            pane.pending_firstrun.len(),
+            1,
+            "command must be held for the first-run gate"
+        );
+        assert!(pane.current_commands.is_empty(), "nothing may run yet");
+        assert_eq!(session.doc.len(), before, "no geometry op may have run");
+        assert!(!pane.deck_run_approved, "the gate stays closed until approval");
+    }
+
+    #[test]
+    fn firstrun_approve_for_session_runs_batch_and_latches_flags() {
+        let mut pane = blank_pane();
+        pane.deck_run_approved = false;
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 1,1,1".into())],
+            &mut session,
+        );
+        let before = session.doc.len();
+        pane.firstrun_approve(&mut session, /* for_session */ true);
+        assert!(pane.deck_run_approved, "for-session latches the gate open");
+        assert!(
+            pane.allow_deck_side_effects,
+            "for-session also lets in-sandbox writes flow"
+        );
+        assert!(pane.pending_firstrun.is_empty(), "batch is drained");
+        assert!(session.doc.len() > before, "geometry ran after approval");
+        // And future geometry now auto-runs with no gate.
+        let mid = session.doc.len();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 2,2,2".into())],
+            &mut session,
+        );
+        assert!(
+            pane.pending_firstrun.is_empty(),
+            "gate open → no more queuing"
+        );
+        assert!(session.doc.len() > mid, "subsequent geometry auto-ran");
+    }
+
+    #[test]
+    fn firstrun_approve_once_runs_batch_but_leaves_gate_closed() {
+        let mut pane = blank_pane();
+        pane.deck_run_approved = false;
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 1,1,1".into())],
+            &mut session,
+        );
+        let before = session.doc.len();
+        pane.firstrun_approve(&mut session, /* for_session */ false);
+        assert!(session.doc.len() > before, "the one batch ran");
+        assert!(
+            !pane.deck_run_approved,
+            "approve-once must NOT latch the gate"
+        );
+        assert!(
+            !pane.allow_deck_side_effects,
+            "approve-once must NOT enable session writes"
+        );
+        // Next turn's batch re-prompts (held again).
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 2,2,2".into())],
+            &mut session,
+        );
+        assert_eq!(
+            pane.pending_firstrun.len(),
+            1,
+            "next batch re-prompts the first-run gate"
+        );
+    }
+
+    #[test]
+    fn firstrun_decline_discards_batch_unrun() {
+        let mut pane = blank_pane();
+        pane.deck_run_approved = false;
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![
+                ExtractEvent::Command("box 0,0,0 1,1,1".into()),
+                ExtractEvent::Command("circle 0,0,0 2".into()),
+            ],
+            &mut session,
+        );
+        assert_eq!(pane.pending_firstrun.len(), 2);
+        pane.firstrun_decline();
+        assert!(pane.pending_firstrun.is_empty(), "batch discarded");
+        assert_eq!(session.doc.len(), 0, "nothing ran");
+        assert!(
+            pane.transcript.iter().any(|e| matches!(
+                e,
+                Entry::Status(s) if s.contains("declined 2 command")
+            )),
+            "a declined-N status line is recorded"
+        );
+    }
+
+    #[test]
+    fn firstrun_approve_session_replays_reader_through_manual_carveout() {
+        // HARD carve-out: even with the gate open AND allow_deck_side_effects on,
+        // a READER (import) in the approved batch is NEVER auto-run — it is routed
+        // to the manual side-effect modal (queued as a reader), not executed.
+        let mut pane = blank_pane();
+        pane.deck_run_approved = false;
+        pane.set_sandbox_root(Some(PathBuf::from("/home/u/proj")));
+        let mut session = Session::default();
+        let sentinel = std::env::temp_dir()
+            .join(format!("itsjustcad_fr_import_{}.dxf", std::process::id()));
+        let _ = std::fs::remove_file(&sentinel);
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command(format!("import {}", sentinel.display()))],
+            &mut session,
+        );
+        pane.firstrun_approve(&mut session, /* for_session */ true);
+        assert_eq!(
+            pane.pending_side_effects.len(),
+            1,
+            "reader routed to the manual INNER modal, not auto-run"
+        );
+        assert!(
+            pane.pending_side_effects[0].reader,
+            "the queued side-effect is a reader (manual picker only)"
+        );
+        assert!(!sentinel.exists(), "no read/write hit disk without a picker");
+    }
+
+    #[test]
+    fn firstrun_approved_reader_still_never_auto_runs() {
+        // Gate already open (session approved): a reader command still NEVER
+        // auto-runs — it is queued for the manual picker (the #56 carve-out is
+        // untouched by the outer gate).
+        let mut pane = blank_pane(); // deck_run_approved = true
+        pane.allow_deck_side_effects = true; // even with writes allowed…
+        pane.set_sandbox_root(Some(PathBuf::from("/home/u/proj")));
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("import /home/u/proj/site.dxf".into())],
+            &mut session,
+        );
+        assert_eq!(pane.pending_side_effects.len(), 1, "reader queued, not run");
+        assert!(pane.pending_side_effects[0].reader);
     }
 }
 
