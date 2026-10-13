@@ -2687,6 +2687,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "arboard",
+ "base64",
  "dirs",
  "eframe",
  "egui",

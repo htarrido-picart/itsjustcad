@@ -59,6 +59,111 @@ fn is_spawnable_local(
         && catalog.get(&config.model).is_some()
 }
 
+/// Whether a vision turn should INLINE the image as a request content part
+/// (HTTP multimodal cassettes: local Qwen2.5-VL, Anthropic, OpenAI) rather than
+/// hand a scoped file path to the claude-code adapter. True only for a
+/// non-claude-code cassette that `supports_vision()`; a blind cassette gets no
+/// image at all (we never send an image to a model that can't see). Pure.
+fn inline_vision_image(config: &itsjustcad_deck::DeckConfig) -> bool {
+    !matches!(config.kind, itsjustcad_deck::DeckKind::ClaudeCode) && config.supports_vision()
+}
+
+/// Media type for an image path by extension; defaults to PNG (the critique
+/// screenshot is always a PNG) for unknown/missing extensions. Pure.
+fn image_mime_for(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "image/png",
+    }
+}
+
+/// Read one image file and wrap it as an inline [`itsjustcad_deck::ImagePart`]
+/// (mime from the extension, payload base64-encoded). `None` when the file can't
+/// be read — the caller then sends a plain text turn rather than a broken image.
+/// The read is scoped to exactly the single path the vision turn pinned (H-1).
+fn read_vision_image(path: &std::path::Path) -> Option<itsjustcad_deck::ImagePart> {
+    use base64::Engine as _;
+    let bytes = std::fs::read(path).ok()?;
+    Some(itsjustcad_deck::ImagePart {
+        mime: image_mime_for(path).to_string(),
+        data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    })
+}
+
+#[cfg(test)]
+mod vision_image_tests {
+    use super::*;
+    use itsjustcad_deck::{DeckConfig, DeckKind};
+
+    fn cfg(kind: DeckKind, model: &str, grammar: bool) -> DeckConfig {
+        DeckConfig {
+            name: "x".into(),
+            kind,
+            base_url: if matches!(kind, DeckKind::ClaudeCode) {
+                String::new()
+            } else {
+                "http://127.0.0.1:8080/v1".into()
+            },
+            model: model.into(),
+            api_key: None,
+            grammar,
+            terse: None,
+        }
+    }
+
+    #[test]
+    fn inline_only_for_http_vision_cassettes() {
+        // Local Qwen2.5-VL: grammar-constrained yet multimodal → inline.
+        assert!(inline_vision_image(&cfg(
+            DeckKind::OpenaiCompat,
+            "qwen2.5-vl-3b",
+            true
+        )));
+        // Local text model → no image inlined (blind).
+        assert!(!inline_vision_image(&cfg(DeckKind::OpenaiCompat, "qwen3", true)));
+        // claude-code uses the scoped-Read path instead, never inlining.
+        assert!(!inline_vision_image(&cfg(DeckKind::ClaudeCode, "sonnet", false)));
+    }
+
+    #[test]
+    fn mime_from_extension_defaults_png() {
+        use std::path::Path;
+        assert_eq!(image_mime_for(Path::new("a/b/critique.png")), "image/png");
+        assert_eq!(image_mime_for(Path::new("x.JPG")), "image/jpeg");
+        assert_eq!(image_mime_for(Path::new("x.jpeg")), "image/jpeg");
+        assert_eq!(image_mime_for(Path::new("x.webp")), "image/webp");
+        // No/unknown extension → PNG (the critique screenshot).
+        assert_eq!(image_mime_for(Path::new("noext")), "image/png");
+    }
+
+    #[test]
+    fn read_vision_image_encodes_bytes_and_errors_softly() {
+        use base64::Engine as _;
+        let dir = std::env::temp_dir().join("ijc_vision_read");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("shot.png");
+        let payload = b"\x89PNG\r\n\x1a\nfake-bytes";
+        std::fs::write(&p, payload).unwrap();
+        let img = read_vision_image(&p).expect("readable image → Some");
+        assert_eq!(img.mime, "image/png");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(img.data_base64.as_bytes())
+            .unwrap();
+        assert_eq!(decoded, payload, "round-trips the exact file bytes");
+        // A missing file degrades to None (caller falls back to a text turn).
+        assert!(read_vision_image(&dir.join("absent.png")).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 /// Human label for a cassette in the deck dropdown. Installed local models are
 /// keyed `local-<catalog-id>` (a stable lookup key, ugly to show). Resolve that
 /// key to the catalog's `display_name` so the dropdown reads "JustCadModel
@@ -2077,20 +2182,32 @@ impl DeckPane {
         // request-level guarantee, independent of the UI disabling the toggle.
         req.web_search = self.allow_web_search && !self.decks.local_only;
         if self.vision_turn {
-            // SECURITY (H-1): grant NO unscoped Read. Instead point the adapter
-            // at a SINGLE fixed image — either the user-attached image or the
-            // critique screenshot — and it derives a Read scoped to exactly that
-            // file (no arbitrary read, no `decks.json` key exfiltration via an
-            // attacker-controlled scene name). A 2nd agentic step lets the model
-            // open the shot then answer. Claude-code cassette only; HTTP adapters
-            // ignore these fields (vision there is a cut).
+            // SECURITY (H-1): a vision turn is pinned to a SINGLE fixed image —
+            // the user-attached image or the critique screenshot — never an
+            // arbitrary read (no `decks.json` key exfiltration via an
+            // attacker-controlled scene name). HOW that one image reaches the
+            // model depends on the cassette.
             let shot = self
                 .attached_image
                 .take()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| crate::app::critique_shot_path().display().to_string());
-            req.vision_shot_path = Some(shot);
-            req.max_turns = 2;
+                .unwrap_or_else(crate::app::critique_shot_path);
+            if matches!(config.kind, itsjustcad_deck::DeckKind::ClaudeCode) {
+                // claude-code: grant no unscoped Read — hand the adapter the one
+                // path, from which it derives a Read scoped to exactly that file,
+                // and give it a 2nd agentic step to open the shot then answer.
+                req.vision_shot_path = Some(shot.display().to_string());
+                req.max_turns = 2;
+            } else if inline_vision_image(&config) {
+                // HTTP multimodal cassette (local Qwen2.5-VL served with
+                // --mmproj, or a cloud vision model): inline the image as a
+                // base64 content part on the last user message — which
+                // `openai_compat`/`anthropic` turn into a provider-native image
+                // block. A read failure degrades to a plain text turn rather than
+                // blocking the message; we never attach to a blind model.
+                if let Some(img) = read_vision_image(&shot) {
+                    req.images.push(img);
+                }
+            }
         }
         let (tx, rx) = unbounded_channel();
         self.rx = Some(rx);

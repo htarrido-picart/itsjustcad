@@ -73,6 +73,10 @@ pub struct RuntimePlan {
     pub runtime: Runtime,
     /// Absolute path to the downloaded model file.
     pub file: PathBuf,
+    /// Vision models only: absolute path to the multimodal projector (`mmproj`)
+    /// file, passed to the server as `--mmproj`. `None` for text models (the
+    /// command is then byte-identical to the pre-vision shape).
+    pub projector: Option<PathBuf>,
 }
 
 /// Resolve the cassette's `model` (a catalog id) into a concrete file + runtime.
@@ -94,9 +98,27 @@ pub fn resolve_runtime(
             file.display()
         ));
     }
+    // A vision model needs its projector on disk too; a half-installed pair
+    // (weights present, mmproj missing) would make the server fail to load the
+    // CLIP model with an opaque error — catch it here with an actionable one.
+    let projector = match entry.mmproj_file_name() {
+        Some(name) => {
+            let p = models_dir.join(name);
+            if !p.exists() {
+                return Err(format!(
+                    "vision projector (mmproj) not found: {} — reinstall this \
+                     model from Model Setup to fetch both files",
+                    p.display()
+                ));
+            }
+            Some(p)
+        }
+        None => None,
+    };
     Ok(RuntimePlan {
         runtime: entry.runtime,
         file,
+        projector,
     })
 }
 
@@ -121,9 +143,8 @@ pub fn build_command(
 ) -> Result<(PathBuf, Vec<String>), String> {
     let port = port.to_string();
     match plan.runtime {
-        Runtime::Llamafile => Ok((
-            plan.file.clone(),
-            vec![
+        Runtime::Llamafile => {
+            let mut args = vec![
                 "--server".into(),
                 "--port".into(),
                 port,
@@ -134,8 +155,13 @@ pub fn build_command(
                 // unconditionally is safe.
                 "-ngl".into(),
                 "999".into(),
-            ],
-        )),
+            ];
+            // Future-proof: a vision llamafile (recent builds are llama.cpp-based
+            // and accept --mmproj in server mode) gets its projector too. No
+            // shipped llamafile entry is vision today, so this is normally a no-op.
+            push_mmproj(&mut args, plan);
+            Ok((plan.file.clone(), args))
+        }
         Runtime::Gguf => {
             // llama.cpp renamed `server` → `llama-server`; accept either.
             let bin = find_on_path("llama-server")
@@ -146,21 +172,32 @@ pub fn build_command(
                      Model Setup, which needs no extra install."
                         .to_string()
                 })?;
-            Ok((
-                bin,
-                vec![
-                    "-m".into(),
-                    plan.file.display().to_string(),
-                    "--host".into(),
-                    "127.0.0.1".into(),
-                    "--port".into(),
-                    port,
-                    // Full GPU offload; falls back to CPU where unsupported.
-                    "-ngl".into(),
-                    "999".into(),
-                ],
-            ))
+            let mut args = vec![
+                "-m".into(),
+                plan.file.display().to_string(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                port,
+                // Full GPU offload; falls back to CPU where unsupported.
+                "-ngl".into(),
+                "999".into(),
+            ];
+            // Vision model: hand llama-server the CLIP projector. `--mmproj` makes
+            // the OpenAI-compatible endpoint accept `image_url` content parts
+            // (libmtmd); without it the same weights serve text-only.
+            push_mmproj(&mut args, plan);
+            Ok((bin, args))
         }
+    }
+}
+
+/// Append `--mmproj <projector>` to `args` when the plan carries a projector.
+/// Factored out so both runtime arms stay in sync and the rule is unit-tested.
+fn push_mmproj(args: &mut Vec<String>, plan: &RuntimePlan) {
+    if let Some(proj) = &plan.projector {
+        args.push("--mmproj".into());
+        args.push(proj.display().to_string());
     }
 }
 
@@ -364,6 +401,7 @@ mod tests {
         RuntimePlan {
             runtime: Runtime::Gguf,
             file: PathBuf::from("/models/qwen.gguf"),
+            projector: None,
         }
     }
 
@@ -371,6 +409,15 @@ mod tests {
         RuntimePlan {
             runtime: Runtime::Llamafile,
             file: PathBuf::from("/models/qwen.llamafile"),
+            projector: None,
+        }
+    }
+
+    fn vision_gguf_plan() -> RuntimePlan {
+        RuntimePlan {
+            runtime: Runtime::Gguf,
+            file: PathBuf::from("/models/vl.gguf"),
+            projector: Some(PathBuf::from("/models/mmproj-vl.gguf")),
         }
     }
 
@@ -444,6 +491,33 @@ mod tests {
         assert_eq!(args[p + 1], "8080");
         let g = args.iter().position(|a| a == "-ngl").expect("-ngl present");
         assert_eq!(args[g + 1], "999");
+    }
+
+    #[test]
+    fn gguf_vision_plan_appends_mmproj() {
+        let (prog, args) = build_command(&vision_gguf_plan(), 8080, |name| {
+            (name == "llama-server").then(|| PathBuf::from("/usr/bin/llama-server"))
+        })
+        .unwrap();
+        assert_eq!(prog, PathBuf::from("/usr/bin/llama-server"));
+        // Weights via -m, projector via --mmproj (the value directly follows).
+        let m = args.iter().position(|a| a == "-m").unwrap();
+        assert_eq!(args[m + 1], "/models/vl.gguf");
+        let mm = args.iter().position(|a| a == "--mmproj").expect("--mmproj present");
+        assert_eq!(args[mm + 1], "/models/mmproj-vl.gguf");
+    }
+
+    #[test]
+    fn non_vision_plan_omits_mmproj() {
+        // A text model's command must be byte-identical to the pre-vision shape.
+        let (_, args) = build_command(&gguf_plan(), 8080, |name| {
+            (name == "llama-server").then(|| PathBuf::from("/usr/bin/llama-server"))
+        })
+        .unwrap();
+        assert!(!args.iter().any(|a| a == "--mmproj"));
+        // llamafile too.
+        let (_, largs) = build_command(&llamafile_plan(), 8080, |_| None).unwrap();
+        assert!(!largs.iter().any(|a| a == "--mmproj"));
     }
 
     #[test]
@@ -596,6 +670,32 @@ mod tests {
         let plan = resolve_runtime(&cat, &dir, &entry.id).unwrap();
         assert_eq!(plan.runtime, entry.runtime);
         assert_eq!(plan.file, file);
+        assert_eq!(plan.projector, None, "text model has no projector");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_vision_requires_projector_then_sets_it() {
+        let cat = Catalog::load();
+        let entry = cat
+            .models
+            .iter()
+            .find(|m| m.is_vision())
+            .expect("catalog ships a vision model")
+            .clone();
+        let dir = std::env::temp_dir().join("ijc_resolve_vision");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Weights present but projector missing → a half-install error naming mmproj.
+        let weights = dir.join(entry.file_name());
+        std::fs::write(&weights, b"").unwrap();
+        let err = resolve_runtime(&cat, &dir, &entry.id).unwrap_err();
+        assert!(err.to_lowercase().contains("mmproj"), "{err}");
+        // Add the projector → resolves with the projector path set.
+        let proj = dir.join(entry.mmproj_file_name().unwrap());
+        std::fs::write(&proj, b"").unwrap();
+        let plan = resolve_runtime(&cat, &dir, &entry.id).unwrap();
+        assert_eq!(plan.projector, Some(proj));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
