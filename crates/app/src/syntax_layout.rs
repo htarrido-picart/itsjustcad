@@ -89,7 +89,6 @@ fn append(
 /// per-token syntax colours. Errors are rendered by the caller in RED instead.
 pub fn highlighted_command_label(ui: &mut egui::Ui, line: &str) {
     let font = egui::FontId::monospace(12.0);
-    let visuals = ui.visuals().clone();
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.label(
@@ -97,23 +96,33 @@ pub fn highlighted_command_label(ui: &mut egui::Ui, line: &str) {
                 .color(egui::Color32::from_rgb(0x3f, 0xb9, 0x50))
                 .font(font.clone()),
         );
-        let spans = usage_spec::classify_tokens(line);
-        let mut cursor = 0usize;
-        for span in &spans {
-            if span.start > cursor {
-                ui.label(egui::RichText::new(&line[cursor..span.start]).font(font.clone()));
-            }
-            let mut rt = egui::RichText::new(&line[span.start..span.end])
-                .color(role_color(span.role, &visuals))
-                .font(font.clone());
-            if span.role == TokenRole::Verb {
-                rt = rt.strong();
-            }
-            ui.label(rt);
-            cursor = span.end;
-        }
-        if cursor < line.len() {
-            ui.label(egui::RichText::new(&line[cursor..]).font(font.clone()));
-        }
+        highlighted_command_inline(ui, line);
     });
+}
+
+/// Render the per-token syntax-coloured spans for `line` (monospace) WITHOUT the
+/// `✓` history-echo prefix and WITHOUT its own wrapping layout — meant to run
+/// inside a caller-provided `horizontal_wrapped`. Used by the approval modals
+/// (no `✓`) and by [`highlighted_command_label`] (which draws the `✓` first).
+pub fn highlighted_command_inline(ui: &mut egui::Ui, line: &str) {
+    let font = egui::FontId::monospace(12.0);
+    let visuals = ui.visuals().clone();
+    let spans = usage_spec::classify_tokens(line);
+    let mut cursor = 0usize;
+    for span in &spans {
+        if span.start > cursor {
+            ui.label(egui::RichText::new(&line[cursor..span.start]).font(font.clone()));
+        }
+        let mut rt = egui::RichText::new(&line[span.start..span.end])
+            .color(role_color(span.role, &visuals))
+            .font(font.clone());
+        if span.role == TokenRole::Verb {
+            rt = rt.strong();
+        }
+        ui.label(rt);
+        cursor = span.end;
+    }
+    if cursor < line.len() {
+        ui.label(egui::RichText::new(&line[cursor..]).font(font.clone()));
+    }
 }

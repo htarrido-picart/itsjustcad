@@ -1001,6 +1001,10 @@ pub struct DeckPane {
     /// through the normal per-line routing (`process_command_line`) once the
     /// user approves, so writers/readers still hit their INNER gates.
     pending_firstrun: Vec<String>,
+    /// Full deck-pane rect captured at the top of [`DeckPane::ui`]. The approval
+    /// overlays dim + centre on THIS (the whole chat pane), not on the bottom
+    /// input panel's `max_rect` where the modal fns are actually called.
+    pane_rect: egui::Rect,
     /// Sandbox root for deck-originated fs paths — the current document's
     /// directory when known, else the ItsJustCAD documents dir. Set by the app.
     sandbox_root: Option<std::path::PathBuf>,
@@ -1143,6 +1147,7 @@ impl Default for DeckPane {
             allow_deck_side_effects: false,
             deck_run_approved: false,
             pending_firstrun: Vec::new(),
+            pane_rect: egui::Rect::NOTHING,
             sandbox_root: None,
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),
@@ -2759,6 +2764,82 @@ impl DeckPane {
     /// only replays once dismissed, the two modals never show at once (no
     /// deadlock — first-run resolves, then per-command side-effect modals run as
     /// the replayed batch queues them).
+    /// Shared in-pane approval overlay. Dims ONLY the deck pane (not the whole
+    /// window / 3D viewport) and floats the approval CARD within that rect:
+    ///
+    /// * `pane = ui.max_rect()` is the deck-pane rect at the call site.
+    /// * A semi-transparent fill is painted over `pane` on a FOREGROUND layer so
+    ///   it sits above the chat, and an invisible full-pane `Sense::click` button
+    ///   is placed on that layer so backdrop clicks are CONSUMED (no fall-through
+    ///   to the chat behind) and detectable.
+    /// * The card is an `Area` (Foreground, constrained to `pane`), width = the
+    ///   pane width minus a symmetric margin, clamped to a sane min/max, so it
+    ///   spans ~the chat width instead of a fixed 380px. `add` draws its body.
+    /// * Returns `true` for a DISMISS gesture: Esc, or a click on the dimmed
+    ///   backdrop OUTSIDE the card. Callers map that to their Decline action,
+    ///   preserving the old `Modal::should_close()` semantics.
+    fn approval_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        id: &str,
+        add: impl FnOnce(&mut egui::Ui),
+    ) -> bool {
+        // The FULL deck-pane rect (captured at the top of `ui()`), NOT the bottom
+        // input panel's `max_rect` where the modal fns run.
+        let pane = self.pane_rect;
+        let ctx = ui.ctx().clone();
+
+        // Dim just the pane, on a foreground layer above the chat.
+        let backdrop_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new(id));
+        let dim = if ui.visuals().dark_mode {
+            egui::Color32::from_black_alpha(160)
+        } else {
+            egui::Color32::from_black_alpha(96)
+        };
+        ctx.layer_painter(backdrop_layer)
+            .with_clip_rect(pane)
+            .rect_filled(pane, 0.0, dim);
+
+        // A full-pane click sink on the same layer: consumes pointer input over
+        // the pane so clicks never fall through to the chat behind the dim.
+        let backdrop = ui.interact(
+            pane,
+            egui::Id::new(id).with("backdrop"),
+            egui::Sense::click(),
+        );
+
+        // Card: span the pane width minus a symmetric margin, clamped.
+        let margin = 14.0;
+        let card_w = (pane.width() - 2.0 * margin).clamp(260.0, 460.0);
+        // Position in the upper third of the pane (falls back to centred if the
+        // pane is short), horizontally centred.
+        let card_x = pane.center().x - card_w / 2.0;
+        let card_y = pane.top() + (pane.height() * 0.22).min(pane.height() * 0.5);
+
+        let resp = egui::Area::new(egui::Id::new(id).with("card"))
+            .order(egui::Order::Foreground)
+            .constrain_to(pane)
+            .fixed_pos(egui::pos2(card_x, card_y))
+            .show(&ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::same(crate::theme::Spacing::M as i8))
+                    .show(ui, |ui| {
+                        ui.set_width(card_w);
+                        add(ui);
+                    });
+            });
+
+        // Dismiss = Esc, or a click on the backdrop OUTSIDE the card rect.
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let card_rect = resp.response.rect;
+        let backdrop_click = backdrop.clicked()
+            && backdrop
+                .interact_pointer_pos()
+                .map(|p| !card_rect.contains(p))
+                .unwrap_or(false);
+        esc || backdrop_click
+    }
+
     fn firstrun_confirm_ui(&mut self, ui: &mut egui::Ui, session: &mut Session) {
         if self.deck_run_approved || self.pending_firstrun.is_empty() {
             return;
@@ -2772,8 +2853,7 @@ impl DeckPane {
         let batch = self.pending_firstrun.clone();
         let n = batch.len();
 
-        let modal = egui::Modal::new(egui::Id::new("deck_firstrun_modal")).show(ui.ctx(), |ui| {
-            ui.set_width(380.0);
+        let dismissed = self.approval_overlay(ui, "deck_firstrun_modal", |ui| {
             ui.heading("The deck wants to run commands.");
             ui.add_space(crate::theme::Spacing::XS);
             ui.label(format!(
@@ -2787,7 +2867,11 @@ impl DeckPane {
                 .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
                 .show(ui, |ui| {
                     for line in batch.iter().take(8) {
-                        ui.label(egui::RichText::new(firstrun_summary(line)).monospace());
+                        let summary = firstrun_summary(line);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            crate::syntax_layout::highlighted_command_inline(ui, &summary);
+                        });
                     }
                     if n > 8 {
                         ui.label(
@@ -2798,7 +2882,7 @@ impl DeckPane {
                     }
                 });
             ui.add_space(crate::theme::Spacing::M);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .button("Approve once")
                     .on_hover_text("run this turn's commands only; ask again next turn")
@@ -2821,7 +2905,7 @@ impl DeckPane {
                 }
             });
         });
-        if modal.should_close() && decision.is_none() {
+        if dismissed && decision.is_none() {
             // Esc / backdrop dismiss = Decline the batch.
             decision = Some(Decision::Decline);
         }
@@ -2896,103 +2980,104 @@ impl DeckPane {
         let summary = pending.summary.clone();
         let remaining = self.pending_side_effects.len();
 
-        // Dimmed backdrop over the whole pane, then a centered modal window.
-        let modal = egui::Modal::new(egui::Id::new("deck_side_effect_modal")).show(
-            ui.ctx(),
-            |ui| {
-                ui.set_width(380.0);
-                ui.heading(if reader {
-                    "Open a file?"
-                } else {
-                    "Allow this action?"
-                });
-                ui.add_space(crate::theme::Spacing::XS);
-                ui.label(if reader {
-                    "The deck wants to READ an external file into the document. \
-                     Opens and imports (images included) are always manual — \
-                     you choose the file, not the model."
-                } else {
-                    "The deck wants to run a command that writes to disk."
-                });
-                ui.add_space(crate::theme::Spacing::S);
-                egui::Frame::group(ui.style())
-                    .fill(ui.visuals().extreme_bg_color)
-                    .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new(&summary).monospace());
+        // In-pane dimmed overlay + card (dims only the deck pane, not the
+        // viewport). Card spans ~the pane width.
+        let picker_applies =
+            reader_with_user_path(&self.pending_side_effects[0].cmd, "x").is_some();
+        let dismissed = self.approval_overlay(ui, "deck_side_effect_modal", |ui| {
+            ui.heading(if reader {
+                "Open a file?"
+            } else {
+                "Allow this action?"
+            });
+            ui.add_space(crate::theme::Spacing::XS);
+            ui.label(if reader {
+                "The deck wants to READ an external file into the document. \
+                 Opens and imports (images included) are always manual — \
+                 you choose the file, not the model."
+            } else {
+                "The deck wants to run a command that writes to disk."
+            });
+            ui.add_space(crate::theme::Spacing::S);
+            egui::Frame::group(ui.style())
+                .fill(ui.visuals().extreme_bg_color)
+                .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
+                .show(ui, |ui| {
+                    // Summary may be a bare command or the `verb → /path` form;
+                    // the tokenizer colours the leading verb either way.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        crate::syntax_layout::highlighted_command_inline(ui, &summary);
                     });
-                if outside {
-                    ui.add_space(crate::theme::Spacing::XS);
-                    ui.label(
-                        egui::RichText::new("⚠ path is OUTSIDE the document folder")
-                            .color(ERR_COLOR)
-                            .small(),
-                    );
-                }
-                if remaining > 1 {
-                    ui.label(
-                        egui::RichText::new(format!("{} more queued", remaining - 1))
-                            .weak()
-                            .small(),
-                    );
-                }
-                ui.add_space(crate::theme::Spacing::M);
-                ui.horizontal(|ui| {
-                    if reader {
-                        // Readers: NO session approval, NO auto-run. Only a user
-                        // file pick (if a picker applies) or Decline.
-                        let picker_applies =
-                            reader_with_user_path(&self.pending_side_effects[0].cmd, "x")
-                                .is_some();
-                        if picker_applies {
-                            if ui
-                                .button("Open file picker…")
-                                .on_hover_text(
-                                    "pick the file yourself — the model's proposed path is ignored",
-                                )
-                                .clicked()
-                            {
-                                decision = Some(Decision::Pick);
-                            }
-                        } else {
-                            ui.label(
-                                egui::RichText::new("opens/imports are manual")
-                                    .weak()
-                                    .small(),
-                            );
-                        }
-                        if ui.button("Decline").clicked() {
-                            decision = Some(Decision::Decline);
-                        }
-                    } else {
+                });
+            if outside {
+                ui.add_space(crate::theme::Spacing::XS);
+                ui.label(
+                    egui::RichText::new("⚠ path is OUTSIDE the document folder")
+                        .color(ERR_COLOR)
+                        .small(),
+                );
+            }
+            if remaining > 1 {
+                ui.label(
+                    egui::RichText::new(format!("{} more queued", remaining - 1))
+                        .weak()
+                        .small(),
+                );
+            }
+            ui.add_space(crate::theme::Spacing::M);
+            ui.horizontal_wrapped(|ui| {
+                if reader {
+                    // Readers: NO session approval, NO auto-run. Only a user
+                    // file pick (if a picker applies) or Decline.
+                    if picker_applies {
                         if ui
-                            .button("Approve once")
-                            .on_hover_text("run this one command")
+                            .button("Open file picker…")
+                            .on_hover_text(
+                                "pick the file yourself — the model's proposed path is ignored",
+                            )
                             .clicked()
                         {
-                            decision = Some(Decision::ApproveOnce);
+                            decision = Some(Decision::Pick);
                         }
-                        // "Approve for session" only makes sense for in-sandbox
-                        // writes; an outside-sandbox path always asks again.
-                        if !outside
-                            && ui
-                                .button("Approve for session")
-                                .on_hover_text(
-                                    "run this, and let in-folder writes run this session without asking",
-                                )
-                                .clicked()
-                        {
-                            decision = Some(Decision::ApproveSession);
-                        }
-                        if ui.button("Decline").clicked() {
-                            decision = Some(Decision::Decline);
-                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("opens/imports are manual")
+                                .weak()
+                                .small(),
+                        );
                     }
-                });
-            },
-        );
-        if modal.should_close() && decision.is_none() {
-            // Dismissing the modal (Esc / backdrop click) = Decline the head.
+                    if ui.button("Decline").clicked() {
+                        decision = Some(Decision::Decline);
+                    }
+                } else {
+                    if ui
+                        .button("Approve once")
+                        .on_hover_text("run this one command")
+                        .clicked()
+                    {
+                        decision = Some(Decision::ApproveOnce);
+                    }
+                    // "Approve for session" only makes sense for in-sandbox
+                    // writes; an outside-sandbox path always asks again.
+                    if !outside
+                        && ui
+                            .button("Approve for session")
+                            .on_hover_text(
+                                "run this, and let in-folder writes run this session without asking",
+                            )
+                            .clicked()
+                    {
+                        decision = Some(Decision::ApproveSession);
+                    }
+                    if ui.button("Decline").clicked() {
+                        decision = Some(Decision::Decline);
+                    }
+                }
+            });
+        });
+        if dismissed && decision.is_none() {
+            // Dismissing the overlay (Esc / backdrop click) = Decline the head.
             decision = Some(Decision::Decline);
         }
 
@@ -3338,6 +3423,10 @@ impl DeckPane {
         _dark: bool,
         reduce_motion: bool,
     ) -> Option<String> {
+        // Capture the FULL deck-pane rect up front: the approval overlays are
+        // invoked inside the bottom input `Panel`, whose `max_rect` is only the
+        // composer strip — we want to dim + centre over the whole chat pane.
+        self.pane_rect = ui.max_rect();
         self.drain(session, handle);
         if self.busy()
             && let Some(started) = self.turn_started
@@ -4551,6 +4640,7 @@ mod side_effect_gate_tests {
             // it. The first-run gate is tested explicitly by flipping to false.
             deck_run_approved: true,
             pending_firstrun: Vec::new(),
+            pane_rect: egui::Rect::NOTHING,
             sandbox_root: None,
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),
