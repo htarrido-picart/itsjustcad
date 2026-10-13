@@ -173,18 +173,21 @@ QUESTION: <one short clarifying question>
 The user's next message answers it; then proceed. Never mix commands and a QUESTION in the same turn, ask at most one question per turn, and only as a last resort — a clear command must never produce a question.
 ";
 
-/// The "Multi-step plans" section: for prolonged tasks the model first emits
-/// the explicit `PLAN:` message form (`crate::agent::parse_plan`), which the
-/// app renders as a checklist and then drives step by step — each step's
-/// commands run, errors are fed back for a bounded retry, and the run ends
-/// with a verification + summary turn. Injected into the full system prompt.
+/// The "Multi-step work" section. The DEFAULT is now continuous: for a
+/// multi-step task the model emits ALL the task's commands in one ```draft
+/// block and they run in order — no plan ceremony. The explicit `PLAN:` message
+/// form (`crate::agent::parse_plan`) stays documented and the step-by-step
+/// harness (checklist, per-step error feedback, verify+summary) remains intact,
+/// but it is now a RARE fallback for long/uncertain multi-stage work rather than
+/// the default path. Injected into the full system prompt.
 pub const PLAN_HELP: &str = "\
-## Multi-step plans (prolonged tasks)
-For a prolonged task with several distinct stages (e.g. model a small building: slab, cores, envelope, roof), FIRST reply with only a plan — numbered steps, nothing else:
+## Multi-step work
+DEFAULT — run it all at once: for a multi-step task (e.g. model a small building: slab, cores, envelope, roof) emit ALL the commands the task needs in ONE ```draft block, in order; they execute continuously as you stream. Do NOT stop after a step to wait for the next turn, and do NOT announce a plan first. Just build it, then (optionally) verify with read-only commands (`bbox all`, `schedule`, `report`) and give a one-line summary.
+RARE fallback — an explicit plan: ONLY for long or uncertain multi-stage work where you genuinely need each step's results/errors fed back before committing to the next, reply with just a numbered plan and nothing else:
 PLAN:
 1. <first step>
 2. <second step>
-Then execute it one step per turn: emit ONLY the current step's commands in a ```draft block, read the results/errors fed back, fix failures, and move on when the step succeeds. After the last step, verify the end state with read-only commands (`bbox all`, `schedule`, `report`) and reply with a one-line summary. Simple one-shot requests need NO plan — just draw.
+Then execute it one step per turn: emit ONLY the current step's commands in a ```draft block, read the results/errors fed back, fix failures, move on when a step succeeds, and after the last step verify + summarize. This is the exception, not the norm — when in doubt, run the commands continuously instead.
 ";
 
 /// The "Presenting data" section: nudges the model to answer tabular questions
@@ -393,7 +396,7 @@ pub fn compact_system_prompt(scene_digest: &str, plugins: &PluginRegistry) -> St
         r#"You are the drafting companion inside ItsJustCAD, a CAD program for architects. You model by emitting commands — the same commands the human types. Coordinates are meters, Z is up, the ground plane is z=0.
 
 ## How to draw
-Emit commands inside a ```draft fenced block, ONE command per line. Commands execute live as you stream them. Text outside the block is chat shown to the architect. Keep chat brief.
+Translate the request into ItsJustCAD commands and run them. Answer with one short sentence of chat plus a ```draft fenced block, ONE command per line — emit ALL the commands the task needs in that one block and they run in order, live, as you stream them. A multi-step task is still one block: don't stop after one command to wait for a turn. Text outside the block is chat shown to the architect. Keep chat brief; prefer commands over prose. Use only verbs from the catalog below.
 
 ## Command catalog (name — one-line summary, grouped by category)
 This is the COMPLETE command set: every verb ItsJustCAD supports. You see each command's NAME and a terse summary. Before using a verb whose exact arguments you are unsure of, emit `help <verb>` (e.g. `help geodesic`) in a ```draft block on its OWN — the app replies with that verb's full syntax, arguments, and worked examples, threaded back to you so you can then call it correctly. Never tell the user a capability "doesn't exist" without checking this list first: if it is named here, it exists.
@@ -514,7 +517,7 @@ pub fn system_prompt(scene_digest: &str, plugins: &PluginRegistry) -> String {
         r#"You are the drafting companion inside ItsJustCAD, a CAD program for architects. You model by emitting commands — the same commands the human types. Coordinates are meters, Z is up, the ground plane is z=0.
 
 ## How to draw
-Emit commands inside a ```draft fenced block, ONE command per line. Commands execute live as you stream them. Text outside the block is chat shown to the architect. Keep chat brief.
+Translate the request into ItsJustCAD commands and run them. Answer with one short sentence of chat plus a ```draft fenced block, ONE command per line — emit ALL the commands the task needs in that one block and they run in order, live, as you stream them. A multi-step task is still one block: don't stop after one command to wait for a turn. Text outside the block is chat shown to the architect. Keep chat brief; prefer commands over prose. Use only verbs from the catalog below.
 
 ## Commands
 {commands}
@@ -853,7 +856,14 @@ mod tests {
             compact_system_prompt("", &PluginRegistry::new()),
         ] {
             assert!(p.contains(PLAN_HELP), "PLAN_HELP not injected");
-            assert!(p.contains("## Multi-step plans"));
+            assert!(p.contains("## Multi-step work"));
+            // Continuous-first is the DEFAULT; the PLAN: form is now the rare
+            // fallback. Both must still be taught so the parser/harness stay
+            // reachable, but the wording leads with "run it all at once".
+            assert!(
+                p.contains("DEFAULT") && p.contains("run it all at once"),
+                "the continuous default must be advertised first"
+            );
             assert!(p.contains("PLAN:\n1. <first step>"));
             assert!(p.contains("`bbox all`, `schedule`, `report`"));
         }

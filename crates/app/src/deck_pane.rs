@@ -656,6 +656,64 @@ fn deck_command_path(cmd: &Command) -> Option<&str> {
     }
 }
 
+/// Return a copy of a FILE-READER command with its source path replaced by
+/// `chosen` — the path the USER picked in the OS dialog. The deck's proposed
+/// path is discarded (security Part C): opens/imports/images never auto-use the
+/// LLM's path. `None` when no native picker applies to this reader (e.g. `Trace`
+/// reads the current underlay, `XrefReload`/`BlockLibLoad` take a name, not an
+/// external path) — the modal then offers Decline only.
+fn reader_with_user_path(cmd: &Command, chosen: &str) -> Option<Command> {
+    let c = chosen.to_string();
+    match cmd {
+        Command::Import { .. } => Some(Command::Import { path: c }),
+        Command::Terrain { .. } => Some(Command::Terrain { path: c }),
+        Command::OsmFile { .. } => Some(Command::OsmFile { path: c }),
+        Command::CheckRulesLoad { .. } => Some(Command::CheckRulesLoad { path: c }),
+        Command::HatchPat { .. } => Some(Command::HatchPat { path: c }),
+        Command::Underlay { corner, width, height, .. } => Some(Command::Underlay {
+            path: c,
+            corner: *corner,
+            width: *width,
+            height: *height,
+        }),
+        Command::XrefAttach {
+            at,
+            scale,
+            rotation_deg,
+            name,
+            ..
+        } => Some(Command::XrefAttach {
+            path: c,
+            at: *at,
+            scale: *scale,
+            rotation_deg: *rotation_deg,
+            id: None,
+            name: name.clone(),
+            geometries: None,
+        }),
+        // Readers with no swappable external path → no picker, Decline only.
+        _ => None,
+    }
+}
+
+/// The rfd file filter (label, extensions) appropriate for a reader command's
+/// native "Open file picker…" button, so the user only sees relevant files.
+fn reader_file_filter(cmd: &Command) -> (&'static str, &'static [&'static str]) {
+    match cmd {
+        Command::Import { .. } => (
+            "All supported",
+            &["dxf", "dwg", "ifc", "obj", "stl", "gltf", "glb", "dae", "las", "laz", "e57", "3dm"],
+        ),
+        Command::Underlay { .. } => ("Image", &["png", "jpg", "jpeg", "bmp", "tif", "tiff"]),
+        Command::Terrain { .. } => ("Terrain", &["csv", "txt", "geojson", "json"]),
+        Command::OsmFile { .. } => ("OSM", &["json", "geojson", "osm"]),
+        Command::XrefAttach { .. } => ("Drawing", &["dxf", "dwg", "json"]),
+        Command::CheckRulesLoad { .. } => ("Rules", &["json"]),
+        Command::HatchPat { .. } => ("Hatch pattern", &["pat"]),
+        _ => ("All files", &["*"]),
+    }
+}
+
 /// Whether `candidate` resolves inside `root`. Purely lexical (no fs access, so
 /// it works for not-yet-created export targets): both are normalized by folding
 /// out `.`/`..` segments, then we check the prefix. A candidate that climbs
@@ -703,6 +761,11 @@ struct PendingSideEffect {
     /// True when the target path escaped the sandbox root — surfaced in the
     /// affordance so the user knows the deck is writing/reading outside the doc.
     outside_sandbox: bool,
+    /// True when this command READS an external file into the app (import / open
+    /// / underlay-image / xref / data-load). Readers get the manual-only modal
+    /// (Decline + "Open file picker…"); they are NEVER auto-run and NEVER
+    /// eligible for "approve for session". Writers get approve-once/for-session.
+    reader: bool,
 }
 
 /// Deck pane navigation: chat, or a full-pane command detail with a back button.
@@ -2107,10 +2170,18 @@ impl DeckPane {
                     // human OK. Pure geometry ops auto-run as before.
                     if cmd.is_side_effecting() {
                         let outside = self.path_outside_sandbox(&cmd);
-                        // Opt-in fast path: user allowed deck side-effects AND
-                        // the path stays inside the sandbox → run without a
-                        // per-command prompt. Escaping paths are always queued.
-                        if self.allow_deck_side_effects && !outside {
+                        // HARD security carve-out (Part C): a command that READS
+                        // an external file into the app (open/import/underlay-
+                        // image/xref/data-load) is NEVER auto-run and NEVER
+                        // eligible for the session fast-path — even with the
+                        // opt-in on. The user must pick the file via the OS
+                        // dialog; the LLM's proposed path is never auto-used.
+                        let reader = cmd.reads_external_file();
+                        // Opt-in fast path (WRITERS only): user allowed deck
+                        // side-effects AND the path stays inside the sandbox →
+                        // run without a prompt. Escaping paths and readers are
+                        // always queued.
+                        if !reader && self.allow_deck_side_effects && !outside {
                             self.run_deck_command(&line, cmd, session);
                         } else {
                             let summary = cmd
@@ -2121,6 +2192,7 @@ impl DeckPane {
                                 cmd,
                                 summary,
                                 outside_sandbox: outside,
+                                reader,
                             });
                         }
                         continue;
@@ -2496,87 +2568,246 @@ impl DeckPane {
         }
     }
 
-    /// Render the confirm affordances for deck-emitted side-effecting commands.
-    /// Each queued command shows "deck wants to: export → /path  [run] [skip]".
-    /// A path that escaped the sandbox is flagged so the user knows the deck is
-    /// touching a file outside the document's directory (security C-2/H-7).
+    /// Render the permission MODAL for deck-emitted side-effecting commands.
+    /// Styled like Claude Code's permission prompt / the iOS ApprovalSheet: a
+    /// dimmed backdrop + centered window showing the FIRST pending command and
+    /// the choices appropriate to its class (security C-2/H-7, Part B/C):
+    ///
+    /// * WRITE side-effect (export/print/save/publish/grant): Approve once,
+    ///   Approve for session (sets `allow_deck_side_effects`), Decline.
+    /// * FILE READ (import/open/underlay-image/xref/data-load): NEVER auto-run
+    ///   and NEVER session-approvable. Decline, and — where a native picker
+    ///   applies — "Open file picker…" so the USER chooses the file (the LLM's
+    ///   proposed path is discarded).
+    ///
+    /// Applies at most one decision per frame so queue indices stay valid.
     fn side_effect_confirm_ui(
         &mut self,
         ui: &mut egui::Ui,
         session: &mut Session,
-        icons: &crate::icons::Icons,
+        _icons: &crate::icons::Icons,
     ) {
         if self.pending_side_effects.is_empty() {
             return;
         }
-        ui.separator();
-        // Global opt-in: run in-sandbox side-effects without a prompt. Escaping
-        // paths still require the explicit [run] below even when this is on.
-        ui.checkbox(
-            &mut self.allow_deck_side_effects,
-            "allow deck file side-effects inside the document folder",
-        )
-        .on_hover_text(
-            "when on, deck-emitted export/import inside the document directory run without asking; paths outside always ask",
-        );
+        // One decision per frame. Index 0 is the head of the queue.
+        enum Decision {
+            ApproveOnce,
+            ApproveSession,
+            Decline,
+            Pick,
+        }
+        let mut decision: Option<Decision> = None;
+        let pending = &self.pending_side_effects[0];
+        let reader = pending.reader;
+        let outside = pending.outside_sandbox;
+        let summary = pending.summary.clone();
+        let remaining = self.pending_side_effects.len();
 
-        let mut run_idx: Option<usize> = None;
-        let mut skip_idx: Option<usize> = None;
-        for (i, pending) in self.pending_side_effects.iter().enumerate() {
-            egui::Frame::group(ui.style())
-                .fill(ui.visuals().extreme_bg_color)
-                .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            egui::RichText::new("deck wants to:").strong().color(ACCENT),
-                        );
-                        ui.label(egui::RichText::new(&pending.summary).monospace());
+        // Dimmed backdrop over the whole pane, then a centered modal window.
+        let modal = egui::Modal::new(egui::Id::new("deck_side_effect_modal")).show(
+            ui.ctx(),
+            |ui| {
+                ui.set_width(380.0);
+                ui.heading(if reader {
+                    "Open a file?"
+                } else {
+                    "Allow this action?"
+                });
+                ui.add_space(crate::theme::Spacing::XS);
+                ui.label(if reader {
+                    "The deck wants to READ an external file into the document. \
+                     Opens and imports (images included) are always manual — \
+                     you choose the file, not the model."
+                } else {
+                    "The deck wants to run a command that writes to disk."
+                });
+                ui.add_space(crate::theme::Spacing::S);
+                egui::Frame::group(ui.style())
+                    .fill(ui.visuals().extreme_bg_color)
+                    .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(&summary).monospace());
                     });
-                    if pending.outside_sandbox {
-                        ui.label(
-                            egui::RichText::new(
-                                "⚠ path is OUTSIDE the document folder",
-                            )
+                if outside {
+                    ui.add_space(crate::theme::Spacing::XS);
+                    ui.label(
+                        egui::RichText::new("⚠ path is OUTSIDE the document folder")
                             .color(ERR_COLOR)
                             .small(),
-                        );
+                    );
+                }
+                if remaining > 1 {
+                    ui.label(
+                        egui::RichText::new(format!("{} more queued", remaining - 1))
+                            .weak()
+                            .small(),
+                    );
+                }
+                ui.add_space(crate::theme::Spacing::M);
+                ui.horizontal(|ui| {
+                    if reader {
+                        // Readers: NO session approval, NO auto-run. Only a user
+                        // file pick (if a picker applies) or Decline.
+                        let picker_applies =
+                            reader_with_user_path(&self.pending_side_effects[0].cmd, "x")
+                                .is_some();
+                        if picker_applies {
+                            if ui
+                                .button("Open file picker…")
+                                .on_hover_text(
+                                    "pick the file yourself — the model's proposed path is ignored",
+                                )
+                                .clicked()
+                            {
+                                decision = Some(Decision::Pick);
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new("opens/imports are manual")
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+                        if ui.button("Decline").clicked() {
+                            decision = Some(Decision::Decline);
+                        }
+                    } else {
+                        if ui
+                            .button("Approve once")
+                            .on_hover_text("run this one command")
+                            .clicked()
+                        {
+                            decision = Some(Decision::ApproveOnce);
+                        }
+                        // "Approve for session" only makes sense for in-sandbox
+                        // writes; an outside-sandbox path always asks again.
+                        if !outside
+                            && ui
+                                .button("Approve for session")
+                                .on_hover_text(
+                                    "run this, and let in-folder writes run this session without asking",
+                                )
+                                .clicked()
+                        {
+                            decision = Some(Decision::ApproveSession);
+                        }
+                        if ui.button("Decline").clicked() {
+                            decision = Some(Decision::Decline);
+                        }
                     }
-                    ui.horizontal(|ui| {
-                        if icons
-                            .icon_button(ui, crate::icons::Icon::Run, "run this action")
-                            .clicked()
-                        {
-                            run_idx = Some(i);
-                        }
-                        if icons
-                            .icon_button(ui, crate::icons::Icon::Skip, "skip this action")
-                            .clicked()
-                        {
-                            skip_idx = Some(i);
-                        }
-                    });
                 });
+            },
+        );
+        if modal.should_close() && decision.is_none() {
+            // Dismissing the modal (Esc / backdrop click) = Decline the head.
+            decision = Some(Decision::Decline);
         }
-        // Apply at most one action per frame (indices stay valid).
-        if let Some(i) = run_idx {
-            let p = self.pending_side_effects.remove(i);
-            // The originating turn is already finished, so run it directly and
-            // record it as its own transcript entry (current_commands has been
-            // drained). This goes through session.run — logged/replayed like any
-            // command, so replay reproduces the confirmed side-effect.
-            let result = session.run(p.cmd).map_err(|e| e.to_string());
-            self.transcript.push(Entry::Commands(vec![ExecutedCommand {
-                line: p.line,
-                result: result.map(|o| o.message),
-            }]));
-            self.persist_chat();
-        } else if let Some(i) = skip_idx {
-            let p = self.pending_side_effects.remove(i);
-            self.transcript
-                .push(Entry::Status(format!("skipped deck side-effect: {}", p.summary)));
-            self.persist_chat();
+
+        match decision {
+            None => {}
+            Some(Decision::ApproveSession) => {
+                self.allow_deck_side_effects = true;
+                let p = self.pending_side_effects.remove(0);
+                self.run_confirmed_side_effect(session, p.cmd, p.line);
+            }
+            Some(Decision::ApproveOnce) => {
+                let p = self.pending_side_effects.remove(0);
+                self.run_confirmed_side_effect(session, p.cmd, p.line);
+            }
+            Some(Decision::Decline) => {
+                let p = self.pending_side_effects.remove(0);
+                self.transcript.push(Entry::Status(format!(
+                    "declined deck side-effect: {}",
+                    p.summary
+                )));
+                self.persist_chat();
+            }
+            Some(Decision::Pick) => {
+                // SECURITY (Part C): the user picks the file via the OS dialog;
+                // the LLM's proposed path is discarded. Guarded against headless
+                // / screenshot frames so they never block on a dialog.
+                let headless = std::env::var("ITSJUSTCAD_SHOT").is_ok()
+                    || std::env::var("ITSJUSTCAD_DECK_RUN").is_ok();
+                let p = &self.pending_side_effects[0];
+                let (label, exts) = reader_file_filter(&p.cmd);
+                let chosen = if headless {
+                    None
+                } else {
+                    rfd::FileDialog::new()
+                        .add_filter(label, exts)
+                        .pick_file()
+                };
+                match chosen {
+                    Some(path) => {
+                        let p = self.pending_side_effects.remove(0);
+                        let display = path.display().to_string();
+                        match reader_with_user_path(&p.cmd, &display) {
+                            Some(cmd) => {
+                                // Label the transcript with the command's real
+                                // verb (import/underlay/terrain/…) + the chosen
+                                // path, not a hardcoded "import".
+                                let line = cmd
+                                    .side_effect_summary()
+                                    .unwrap_or_else(|| format!("import {display}"));
+                                self.run_confirmed_side_effect(session, cmd, line);
+                            }
+                            None => {
+                                self.transcript.push(Entry::Status(
+                                    "no file picker for this command".into(),
+                                ));
+                                self.persist_chat();
+                            }
+                        }
+                    }
+                    None => {
+                        // Cancelled the dialog (or headless): leave it queued.
+                    }
+                }
+            }
         }
+    }
+
+    /// Run a human-confirmed side-effecting command and record it as its own
+    /// transcript entry. Goes through `session.run` — logged/replayed like any
+    /// command — so replay reproduces the confirmed side-effect.
+    fn run_confirmed_side_effect(&mut self, session: &mut Session, cmd: Command, line: String) {
+        let result = session.run(cmd).map_err(|e| e.to_string());
+        self.transcript.push(Entry::Commands(vec![ExecutedCommand {
+            line,
+            result: result.map(|o| o.message),
+        }]));
+        self.persist_chat();
+    }
+
+    /// Dev hook (`ITSJUSTCAD_DECK_APPROVAL=reader|writer`): seed a pending
+    /// deck-emitted side-effect so an ITSJUSTCAD_SHOT frame can capture the
+    /// permission modal without a live model. `writer` → an export (approve
+    /// once/for-session/decline); anything else → an import (picker/decline,
+    /// never session-approvable).
+    pub fn seed_pending_side_effect(&mut self, kind: &str) {
+        let (line, cmd, reader) = if kind.eq_ignore_ascii_case("writer") {
+            (
+                "export /Users/you/project/out.dxf".to_string(),
+                Command::Export { path: "/Users/you/project/out.dxf".into() },
+                false,
+            )
+        } else {
+            (
+                "import /Users/you/Downloads/site-survey.dxf".to_string(),
+                Command::Import { path: "/Users/you/Downloads/site-survey.dxf".into() },
+                true,
+            )
+        };
+        let summary = cmd.side_effect_summary().unwrap_or_else(|| line.clone());
+        let outside_sandbox = self.path_outside_sandbox(&cmd);
+        self.pending_side_effects.push(PendingSideEffect {
+            line,
+            cmd,
+            summary,
+            outside_sandbox,
+            reader,
+        });
     }
 
     /// Seed a couple of demo chat sessions into the current store — a dev hook
@@ -5042,6 +5273,96 @@ mod side_effect_gate_tests {
             "outside export must still be queued despite the toggle"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reader_import_never_auto_runs_even_with_allow_flag_and_in_sandbox() {
+        // HARD carve-out (Part C): an import/open/image READ from the deck is
+        // NEVER auto-run — not even with the session opt-in on AND the path
+        // inside the sandbox. It must always queue as a manual-only pending.
+        let dir = std::env::temp_dir().join(format!("itsjustcad_rd_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut pane = blank_pane();
+        pane.allow_deck_side_effects = true; // opt-in ON
+        pane.set_sandbox_root(Some(dir.clone()));
+        let mut session = Session::default();
+        let inside = dir.join("model.dxf");
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command(format!("import {}", inside.display()))],
+            &mut session,
+        );
+        assert_eq!(
+            pane.pending_side_effects.len(),
+            1,
+            "a reader import must ALWAYS queue, never auto-run"
+        );
+        assert!(
+            pane.pending_side_effects[0].reader,
+            "import must be flagged as a file reader"
+        );
+        assert!(
+            pane.current_commands.is_empty(),
+            "the reader must NOT have executed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reader_underlay_image_is_a_queued_reader() {
+        // Images (underlay) are readers too — manual-only, never session-approved.
+        let mut pane = blank_pane();
+        pane.allow_deck_side_effects = true;
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("underlay /tmp/site.png".into())],
+            &mut session,
+        );
+        assert_eq!(pane.pending_side_effects.len(), 1);
+        assert!(
+            pane.pending_side_effects[0].reader,
+            "an underlay image must be flagged as a reader"
+        );
+    }
+
+    #[test]
+    fn writer_export_auto_runs_with_allow_flag_in_sandbox() {
+        // Contrast with readers: a WRITER (export) WITH the opt-in and in-sandbox
+        // DOES auto-run — writers remain eligible for the fast path.
+        let dir = std::env::temp_dir().join(format!("itsjustcad_wr_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut pane = blank_pane();
+        pane.allow_deck_side_effects = true;
+        pane.set_sandbox_root(Some(dir.clone()));
+        let mut session = Session::default();
+        session.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        let inside = dir.join("out.csv");
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command(format!("export {}", inside.display()))],
+            &mut session,
+        );
+        assert!(
+            pane.pending_side_effects.is_empty(),
+            "an in-sandbox export with the opt-in on must auto-run"
+        );
+        assert_eq!(pane.current_commands.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queued_export_carries_writer_flag_not_reader() {
+        // A deck export queues with reader=false so the modal shows the
+        // approve-once/for-session choices, not the picker/decline pair.
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("export /tmp/elsewhere.csv".into())],
+            &mut session,
+        );
+        assert_eq!(pane.pending_side_effects.len(), 1);
+        assert!(
+            !pane.pending_side_effects[0].reader,
+            "export is a writer, not a reader"
+        );
     }
 
     #[test]

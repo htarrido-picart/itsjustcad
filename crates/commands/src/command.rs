@@ -2480,6 +2480,46 @@ impl Command {
         )
     }
 
+    /// SECURITY carve-out: does this command READ an external file INTO the app
+    /// (open / import / underlay-image / xref / data load)? These are the hard
+    /// exception to continuous deck execution: a file read chosen by the LLM can
+    /// exfiltrate or DoS, and — per product rule — opening/importing files
+    /// (images included) must ALWAYS be a manual, human-chosen action. The deck
+    /// gate uses this to force such commands onto a manual-only path: they are
+    /// NEVER auto-run and NEVER eligible for "approve for session", even when the
+    /// `allow_deck_side_effects` opt-in is on. The user picks the file via the OS
+    /// dialog; the LLM's proposed path is never auto-used.
+    ///
+    /// This is a strict SUBSET of [`is_side_effecting`]: every reader here is
+    /// side-effecting, but writers (export/print/save/publish/grant) are not
+    /// readers and stay on the approve-once/for-session path.
+    ///
+    /// The default is `false` (a writer), but the unit tests below pin the full
+    /// reader set, so adding a new fs-reading variant without classifying it
+    /// trips a test rather than silently treating a reader as a writer.
+    pub fn reads_external_file(&self) -> bool {
+        matches!(
+            self,
+            // Imports a drawing / mesh / data file into the document.
+            Command::Import { .. }
+                // Reads an external image off disk as a tracing underlay (images).
+                | Command::Underlay { .. }
+                // Trace READS the underlay image off disk to vectorize it.
+                | Command::Trace { .. }
+                // Xref attach/reload read an external drawing file.
+                | Command::XrefAttach { .. }
+                | Command::XrefReload { .. }
+                // Reads an external terrain / OSM source file into the model.
+                // (PlantSchedule is NOT here — it WRITES a tally CSV; see below.)
+                | Command::Terrain { .. }
+                | Command::OsmFile { .. }
+                // Loads a block library / check-rules pack / hatch pattern file.
+                | Command::BlockLibLoad { .. }
+                | Command::CheckRulesLoad { .. }
+                | Command::HatchPat { .. }
+        )
+    }
+
     /// A short human-readable path/target for the confirm affordance, when the
     /// command touches the filesystem. `None` for pure ops.
     pub fn side_effect_summary(&self) -> Option<String> {
@@ -2558,6 +2598,85 @@ mod classify_tests {
         for c in [Command::Workdir { path: None }, Command::WorkdirFiles] {
             assert!(!c.is_side_effecting(), "{c:?} must be a pure query");
             assert!(c.side_effect_summary().is_none(), "{c:?} has no fs path");
+        }
+    }
+
+    /// The security carve-out: these variants READ an external file into the
+    /// app (open/import/underlay-image/xref/data-load). Each must report as a
+    /// reader AND as side-effecting (readers are a subset of side-effecting).
+    #[test]
+    fn external_file_readers_are_classified_as_readers() {
+        let readers: Vec<Command> = vec![
+            Command::Import { path: "/etc/passwd".into() },
+            Command::Underlay {
+                path: "/tmp/secret.png".into(),
+                corner: None,
+                width: None,
+                height: None,
+            },
+            Command::Trace { target: [255, 0, 0], tol: 60, layer: None },
+            Command::XrefAttach {
+                path: "/tmp/ref.dxf".into(),
+                at: None,
+                scale: None,
+                rotation_deg: None,
+                id: None,
+                name: None,
+                geometries: None,
+            },
+            Command::XrefReload { name: "ref".into(), geometries: None },
+            Command::Terrain { path: "/tmp/t.csv".into() },
+            Command::OsmFile { path: "/tmp/o.json".into() },
+            Command::BlockLibLoad { name: "lib".into(), geometries: None },
+            Command::CheckRulesLoad { path: "/tmp/rules.json".into() },
+            Command::HatchPat { path: "/tmp/p.pat".into() },
+        ];
+        for c in &readers {
+            assert!(c.reads_external_file(), "{c:?} must be a reader");
+            assert!(
+                c.is_side_effecting(),
+                "{c:?} reader must also be side-effecting"
+            );
+        }
+    }
+
+    /// WRITE side-effects export/print/save/publish/grant to disk — they do NOT
+    /// read an external file in, so they are NOT readers (they stay eligible for
+    /// the approve-once / approve-for-session modal). PlantSchedule and the
+    /// write form of DataExtract WRITE a CSV, so they are writers too.
+    #[test]
+    fn write_side_effects_are_not_external_file_readers() {
+        let writers: Vec<Command> = vec![
+            Command::Export { path: "/tmp/x.dxf".into() },
+            Command::Print { sheet: "S1".into(), path: "/tmp/x.pdf".into() },
+            Command::ControlImages { prefix: "/tmp/ctrl".into() },
+            Command::SheetSet(SheetSetOp::Publish { path: Some("/tmp/set.pdf".into()) }),
+            Command::BlockLibSave { name: "lib".into(), description: String::new() },
+            Command::DataExtract { path: Some("/tmp/d.csv".into()), by_instance: false },
+            Command::PlantSchedule { path: "/tmp/plants.csv".into() },
+            Command::Workdir { path: Some("/tmp/imports".into()) },
+        ];
+        for c in &writers {
+            assert!(
+                !c.reads_external_file(),
+                "{c:?} is a writer, not an external-file reader"
+            );
+            assert!(
+                c.is_side_effecting(),
+                "{c:?} writer must still be side-effecting"
+            );
+        }
+    }
+
+    /// Pure geometry ops are neither side-effecting nor readers.
+    #[test]
+    fn pure_ops_are_not_readers() {
+        for c in [
+            Command::Box { id: None, corner: DVec3::ZERO, size: DVec3::ONE },
+            Command::Undo,
+            Command::Workdir { path: None },
+        ] {
+            assert!(!c.reads_external_file(), "{c:?} must not be a reader");
         }
     }
 
