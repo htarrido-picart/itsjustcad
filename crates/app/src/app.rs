@@ -1618,6 +1618,14 @@ impl App {
             // newest-first session CARDS (title/summary/date) — without a model.
             self.panel_tabs.show(crate::tabstrip::PanelTab::Sessions);
         }
+        // Dev hook: seed a pending deck side-effect so ITSJUSTCAD_SHOT frames can
+        // capture the permission modal without a live model. `writer` seeds an
+        // export (Approve once / for session / Decline); `reader` seeds an import
+        // (Open file picker… / Decline — never session-approvable).
+        if let Ok(kind) = std::env::var("ITSJUSTCAD_DECK_APPROVAL") {
+            self.panel_tabs.show(crate::tabstrip::PanelTab::Deck);
+            self.deck_pane.seed_pending_side_effect(&kind);
+        }
         // Dev/screenshot hook: force a specific right-dock tab so each tab can be
         // shot at the (constant) dock width. chat|sessions|layers|blocks|plugins.
         if let Ok(tab) = std::env::var("ITSJUSTCAD_PANEL_TAB") {
