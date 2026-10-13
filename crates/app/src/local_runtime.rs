@@ -236,10 +236,49 @@ fn spawn_server_process(
         .map_err(|e| format!("cannot launch {}: {e}", program.display()))
 }
 
-/// Look up an executable on `PATH` (the real injector for [`build_command`]).
+/// Directories to search for a program, in order: every entry of `$PATH`, then
+/// the well-known install locations a macOS GUI app would otherwise miss.
+///
+/// A bundle launched from Finder/`open` inherits launchd's minimal `PATH`
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`) — NOT the user's shell PATH — so a
+/// Homebrew-installed `llama-server` (`/usr/local/bin` on Intel,
+/// `/opt/homebrew/bin` on Apple Silicon) is invisible via `$PATH` alone and the
+/// gguf runtime fails with "no llama.cpp server on PATH" even though it IS
+/// installed. Appending the standard prefixes (deduped, never ahead of PATH)
+/// fixes that without changing behaviour when PATH already covers them. The
+/// extra dirs simply don't exist on other platforms, so the probe is harmless.
+/// Pure over its injected inputs so the ordering/dedup rule is unit-tested.
+pub fn program_search_dirs(path_var: Option<std::ffi::OsString>, home: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path_var
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let mut push_unique = |dirs: &mut Vec<PathBuf>, p: PathBuf| {
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+    for d in [
+        "/opt/homebrew/bin", // Apple-silicon Homebrew
+        "/opt/homebrew/sbin",
+        "/usr/local/bin", // Intel Homebrew / manual installs
+        "/usr/local/sbin",
+    ] {
+        push_unique(&mut dirs, PathBuf::from(d));
+    }
+    if let Some(home) = home {
+        for sub in [".local/bin", "bin"] {
+            push_unique(&mut dirs, home.join(sub));
+        }
+    }
+    dirs
+}
+
+/// Look up an executable for [`build_command`]: `$PATH` first, then the
+/// well-known prefixes (see [`program_search_dirs`]) so a GUI-launched bundle
+/// still finds a Homebrew `llama-server`.
 pub fn which(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    program_search_dirs(std::env::var_os("PATH"), dirs::home_dir())
+        .into_iter()
         .map(|dir| dir.join(program))
         .find(|cand| cand.is_file())
 }
@@ -537,6 +576,45 @@ mod tests {
         assert!(err.contains("llama-server"), "{err}");
         // Points the user at the no-install alternative.
         assert!(err.to_lowercase().contains("llamafile"), "{err}");
+    }
+
+    // ── program search dirs (macOS GUI PATH gap) ───────────────────────────
+
+    #[test]
+    fn search_dirs_append_homebrew_prefixes_after_path() {
+        // A minimal launchd-style PATH (what a Finder/`open`-launched bundle
+        // sees) must still be augmented with the Homebrew/common prefixes so a
+        // brew-installed llama-server is found.
+        let path = std::env::join_paths(["/usr/bin", "/bin"]).unwrap();
+        let dirs = program_search_dirs(Some(path), Some(PathBuf::from("/Users/x")));
+        // PATH entries come first, in order.
+        assert_eq!(dirs[0], PathBuf::from("/usr/bin"));
+        assert_eq!(dirs[1], PathBuf::from("/bin"));
+        // Both Homebrew bin dirs are present (Apple-silicon + Intel).
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")), "{dirs:?}");
+        assert!(dirs.contains(&PathBuf::from("/usr/local/bin")), "{dirs:?}");
+        // Home-relative user bin dirs are included.
+        assert!(dirs.contains(&PathBuf::from("/Users/x/.local/bin")), "{dirs:?}");
+        assert!(dirs.contains(&PathBuf::from("/Users/x/bin")), "{dirs:?}");
+    }
+
+    #[test]
+    fn search_dirs_dedupe_prefix_already_in_path() {
+        // If PATH already lists a prefix, it must not be appended a second time.
+        let path = std::env::join_paths(["/usr/local/bin", "/usr/bin"]).unwrap();
+        let dirs = program_search_dirs(Some(path), None);
+        let hits = dirs.iter().filter(|d| **d == PathBuf::from("/usr/local/bin")).count();
+        assert_eq!(hits, 1, "prefix duplicated: {dirs:?}");
+        // No home ⇒ no home-relative dirs.
+        assert!(!dirs.iter().any(|d| d.ends_with(".local/bin")), "{dirs:?}");
+    }
+
+    #[test]
+    fn search_dirs_empty_path_still_probes_prefixes() {
+        // Even with no PATH at all, the fallback prefixes are searched.
+        let dirs = program_search_dirs(None, None);
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")), "{dirs:?}");
+        assert!(dirs.contains(&PathBuf::from("/usr/local/bin")), "{dirs:?}");
     }
 
     // ── free port selection ────────────────────────────────────────────────
