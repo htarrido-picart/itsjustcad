@@ -827,6 +827,11 @@ pub struct App {
     /// unsaved-changes alert. `Some` while the alert is up; taken when the user
     /// picks Discard.
     pending_nav: Option<PendingNav>,
+    /// A chat session id the user clicked in the Sessions tab, awaiting the
+    /// "Open this chat? — this replaces the current document" confirmation.
+    /// `Some` while that confirm dialog is up; cleared on Open (which parks an
+    /// `OpenSession` nav behind the unsaved guard) or Cancel.
+    pending_open_session: Option<String>,
     /// Set true when a confirmed Discard-quit sends `ViewportCommand::Close`, so
     /// the close-request handler lets that close through instead of re-parking a
     /// fresh Quit (the doc is still dirty). Without it, Discard loops forever and
@@ -854,11 +859,14 @@ pub struct App {
 }
 
 /// A navigation intent deferred behind the unsaved-changes guard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingNav {
     New,
     Open,
     Quit,
+    /// Open a stored chat session by id: reopen its document (reconstructing the
+    /// drawing) and load the chat, replacing the current doc/chat in place.
+    OpenSession(String),
 }
 
 /// A DXF import in progress, applied in time-boxed batches across frames so a
@@ -966,6 +974,14 @@ pub(crate) struct NavAction {
 /// Map an alert choice to the guard's action. This is the exact logic
 /// `unsaved_guard_ui` applies; extracted so the Discard-performs / Cancel-drops
 /// contract is provable in a headless test.
+/// Whether a guarded navigation (New/Open/Quit/OpenSession) must PARK behind the
+/// unsaved-changes alert rather than run immediately: park iff the document is
+/// dirty. Pure so the "dirty parks / clean proceeds" contract is provable in a
+/// headless test for every nav intent, including `OpenSession`.
+pub(crate) fn guard_parks(is_dirty: bool) -> bool {
+    is_dirty
+}
+
 pub(crate) fn nav_action_for(choice: Option<crate::widgets::AlertChoice>) -> NavAction {
     match choice {
         Some(crate::widgets::AlertChoice::Confirm) => NavAction { clear_pending: true, perform: true },
@@ -1414,6 +1430,7 @@ impl App {
             pending_nav: std::env::var("ITSJUSTCAD_UNSAVED_ALERT")
                 .is_ok()
                 .then_some(PendingNav::New),
+            pending_open_session: None,
             force_close: false,
             file_watch: None,
             external_change: None,
@@ -1440,7 +1457,7 @@ impl App {
     /// guard: if the doc is dirty, park the intent and raise the alert; otherwise
     /// perform it immediately.
     fn guarded_nav(&mut self, ctx: &egui::Context, nav: PendingNav) {
-        if self.is_dirty() {
+        if guard_parks(self.is_dirty()) {
             self.pending_nav = Some(nav);
         } else {
             self.perform_nav(ctx, nav);
@@ -1455,6 +1472,7 @@ impl App {
                 self.mark_saved();
             }
             PendingNav::Open => self.open(None),
+            PendingNav::OpenSession(id) => self.open_session(&id),
             PendingNav::Quit => {
                 // Mark the close as intentional so the close-request handler does
                 // not re-park a fresh Quit (the doc is still dirty after Discard).
@@ -1469,7 +1487,7 @@ impl App {
     /// drops it. Returns `true` while the alert is up (so a close-request can be
     /// held off until the user decides).
     fn unsaved_guard_ui(&mut self, ctx: &egui::Context) -> bool {
-        let Some(nav) = self.pending_nav else {
+        let Some(nav) = self.pending_nav.clone() else {
             return false;
         };
         let dark = ctx.theme() == egui::Theme::Dark;
@@ -1477,6 +1495,7 @@ impl App {
         let verb = match nav {
             PendingNav::New => "start a new document",
             PendingNav::Open => "open another document",
+            PendingNav::OpenSession(_) => "open this chat (replacing the current document)",
             PendingNav::Quit => "quit",
         };
         let choice = crate::widgets::alert(
@@ -1573,6 +1592,71 @@ impl App {
         !resolved && self.deck_pane.needs_session_decision().is_some()
     }
 
+    /// Confirmation modal for opening a clicked Sessions card. Opening a chat
+    /// reopens its document (reconstructing the drawing) and loads its
+    /// transcript, REPLACING the current document in place — so we ask first.
+    /// **Open** parks an `OpenSession` nav behind the unsaved-changes guard (a
+    /// dirty doc then prompts to save/discard before proceeding); **Cancel**
+    /// drops the pending id. Returns `true` while the dialog is up.
+    fn open_session_confirm_ui(&mut self, ctx: &egui::Context) -> bool {
+        let Some(id) = self.pending_open_session.clone() else {
+            return false;
+        };
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let roles = self.live_roles(dark);
+        let mut resolved = false;
+        egui::Modal::new(egui::Id::new("itsjustcad_open_session_confirm"))
+            .frame(crate::widgets::dialog_modal_frame(&roles))
+            .show(ctx, |ui| {
+                crate::widgets::dialog_body(ui, &roles, 400.0, |ui| {
+                    crate::widgets::dialog_title(ui, &roles, "Open this chat?");
+                    ui.add_space(crate::theme::Spacing::SM);
+                    crate::widgets::dialog_text(
+                        ui,
+                        &roles,
+                        "This opens its drawing and replaces the current document.",
+                    );
+                    ui.add_space(crate::theme::Spacing::L);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = crate::theme::Spacing::SM;
+                        if crate::widgets::role_button(
+                            ui,
+                            &roles,
+                            dark,
+                            crate::widgets::ButtonRole::Prominent,
+                            "Open",
+                        )
+                        .clicked()
+                        {
+                            // Route through the unsaved-changes guard: a dirty
+                            // doc warns/saves first, then the open proceeds.
+                            self.guarded_nav(ctx, PendingNav::OpenSession(id.clone()));
+                            resolved = true;
+                        }
+                        if crate::widgets::role_button(
+                            ui,
+                            &roles,
+                            dark,
+                            crate::widgets::ButtonRole::Normal,
+                            "Cancel",
+                        )
+                        .clicked()
+                        {
+                            resolved = true;
+                        }
+                    });
+                });
+            });
+        // Esc = Cancel (safe path).
+        if !resolved && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            resolved = true;
+        }
+        if resolved {
+            self.pending_open_session = None;
+        }
+        self.pending_open_session.is_some()
+    }
+
     /// Lazily attach the true native OS menu bar (muda) the first interactive
     /// frame, then never retry. Only runs when eframe hands us a live winit
     /// window (`frame.window_handle()` succeeds) — headless/`--shot` has no
@@ -1625,6 +1709,14 @@ impl App {
         if let Ok(kind) = std::env::var("ITSJUSTCAD_DECK_APPROVAL") {
             self.panel_tabs.show(crate::tabstrip::PanelTab::Deck);
             self.deck_pane.seed_pending_side_effect(&kind);
+        }
+        // Dev hook: ITSJUSTCAD_OPEN_SESSION_CONFIRM=1 seeds the "Open this chat?"
+        // confirmation on startup (after seeding demo sessions) so ITSJUSTCAD_SHOT
+        // frames can capture the dialog without a card click.
+        if std::env::var("ITSJUSTCAD_OPEN_SESSION_CONFIRM").is_ok() {
+            self.panel_tabs.show(crate::tabstrip::PanelTab::Sessions);
+            self.deck_pane.seed_demo_sessions();
+            self.pending_open_session = Some("demo".to_string());
         }
         // Dev/screenshot hook: force a specific right-dock tab so each tab can be
         // shot at the (constant) dock width. chat|sessions|layers|blocks|plugins.
@@ -3688,6 +3780,10 @@ impl App {
                 self.journaled_generation = Some(self.session.doc.generation);
                 // The document is now clean at the current op-log cursor.
                 self.mark_saved();
+                // Record doc_uuid → file path so "open this chat" can reopen the
+                // saved drawing later (app-local metadata, not in the file).
+                let uuid = self.ensure_doc_uuid();
+                crate::doc_paths::record(&uuid, &path);
                 // Archive the live conversation into per-document history on save
                 // (Auto: update-in-place or fresh; no-op when empty) so saving the
                 // document also durably lands the current chat.
@@ -3855,6 +3951,11 @@ impl App {
                 self.uploaded_generation = None;
                 // A freshly-opened document is clean at its loaded op-log cursor.
                 self.mark_saved();
+                // Record doc_uuid → file path so "open this chat" can reopen the
+                // saved drawing later (app-local metadata, not in the file).
+                if let Some(uuid) = self.session.doc_uuid().map(str::to_string) {
+                    crate::doc_paths::record(&uuid, &path);
+                }
                 // Confine deck-originated fs paths to this document's directory.
                 self.deck_pane
                     .set_sandbox_root(path.parent().map(|p| p.to_path_buf()));
@@ -3866,6 +3967,84 @@ impl App {
             }
             Err(e) => self.command_line.push_line(format!("error: {e}")),
         }
+    }
+
+    /// Open a stored chat session: reconstruct its drawing and load its
+    /// transcript, replacing the current document/chat in place. The guard has
+    /// already run (routed via [`PendingNav::OpenSession`]).
+    ///
+    /// Reconstruction prefers REOPENING THE SAVED FILE recorded for the chat's
+    /// document uuid (its op-log replays the geometry), falling back to REPLAYING
+    /// the chat's own ```draft commands into a fresh document when the chat was
+    /// never saved (scratch) or the file is missing/moved.
+    fn open_session(&mut self, session_id: &str) {
+        // Sessions are keyed to the ACTIVE document's uuid (the Sessions tab
+        // shows the current doc's chats), so that is the uuid to reconstruct.
+        let Some(doc_uuid) = self.deck_pane.active_doc_uuid().map(str::to_string) else {
+            self.command_line
+                .push_line("error: no active document for session");
+            return;
+        };
+        // Resolve the chat's document uuid → last-known file path.
+        let path = crate::doc_paths::load().get(&doc_uuid);
+        let opened_from_file = match &path {
+            Some(p) if p.exists() => match itsjustcad_commands::io::load_file(p) {
+                Ok(session) => {
+                    self.session = session;
+                    self.uploaded_generation = None;
+                    self.mark_saved();
+                    self.deck_pane
+                        .set_sandbox_root(p.parent().map(|d| d.to_path_buf()));
+                    self.file_watch = Some(crate::filewatch::FileWatch::new(p));
+                    self.external_change = None;
+                    self.command_line.push_line(format!(
+                        "opened chat drawing {} ({} objects)",
+                        p.display(),
+                        self.session.doc.len()
+                    ));
+                    true
+                }
+                Err(e) => {
+                    self.command_line
+                        .push_line(format!("error opening {}: {e}", p.display()));
+                    false
+                }
+            },
+            _ => false,
+        };
+
+        if !opened_from_file {
+            // Scratch chat or a missing/moved file: rebuild from the chat itself.
+            if path.is_some() {
+                self.command_line.push_line(
+                    "saved drawing missing — replaying the chat's commands instead",
+                );
+            }
+            let lines = self
+                .deck_pane
+                .session_command_lines(session_id)
+                .unwrap_or_default();
+            // Fresh, clean document keyed to the SAME uuid so its chat store and
+            // sessions stay attached after the replay.
+            self.new_document();
+            self.session.set_doc_uuid(Some(doc_uuid.clone()));
+            for line in lines {
+                self.execute_line(line);
+            }
+            // The replayed drawing is the chat's end state; treat it as clean.
+            self.mark_saved();
+            self.command_line
+                .push_line("reconstructed drawing from chat commands");
+        }
+
+        // Make the chat's document uuid active and load THAT session's transcript
+        // into the deck pane. `sync_store` rekeys the store; `open_stored_session`
+        // swaps the live transcript to the chosen session.
+        self.deck_pane.sync_store(&doc_uuid);
+        self.deck_pane.open_stored_session(session_id);
+        // Surface the opened chat: reveal the Deck tab.
+        self.panel_tabs.show(crate::tabstrip::PanelTab::Deck);
+        self.deck_visible = true;
     }
 
     /// Import a model file THROUGH THE SUBSTRATE. With no path (menu click or a
@@ -7003,13 +7182,15 @@ impl App {
                     }
                     PanelTab::Sessions => {
                         // Promoted session browser: search + newest-first cards.
-                        // A card click loads that session into the live Chat and
-                        // switches the active tab to Chat.
+                        // A card click asks to OPEN that chat — opening its
+                        // document (reconstructing the drawing) and loading the
+                        // transcript, replacing the current document in place. We
+                        // only stash the clicked id here; the confirm dialog +
+                        // unsaved guard run in the overlay pass.
                         let roles = self.live_roles(ui.visuals().dark_mode);
                         // No redundant "Sessions" title — the active tab names it.
-                        if self.deck_pane.sessions_tab_ui(ui, &roles) {
-                            self.panel_tabs.show(PanelTab::Deck);
-                            self.deck_visible = true;
+                        if let Some(id) = self.deck_pane.sessions_tab_ui(ui, &roles) {
+                            self.pending_open_session = Some(id);
                         }
                     }
                     PanelTab::Deck => {
@@ -10639,6 +10820,9 @@ impl eframe::App for App {
         // Ask-on-continue: modal when continuing a loaded chat that diverged and
         // the user then triggered New Session / load-another.
         self.session_conflict_ui(&ctx);
+        // Open-this-chat confirmation: a clicked Sessions card asks before it
+        // opens the chat's document (reconstructing the drawing) in place.
+        self.open_session_confirm_ui(&ctx);
 
         // COMMAND LINE ALWAYS LISTENS (Rhino-style): whenever nothing else owns
         // the keyboard — e.g. after clicking the viewport, which leaves focus on
@@ -12279,6 +12463,30 @@ mod tests {
         let a = nav_action_for(None);
         assert!(!a.clear_pending);
         assert!(!a.perform);
+    }
+
+    #[test]
+    fn open_session_parks_when_dirty_and_proceeds_when_clean() {
+        // "Open this chat" routes an OpenSession nav through the SAME guard as
+        // New/Open: a dirty document must park it behind the save/discard alert;
+        // a clean document proceeds immediately.
+        assert!(guard_parks(true), "dirty doc parks the OpenSession behind the alert");
+        assert!(!guard_parks(false), "clean doc opens the chat straight away");
+        // And the parked OpenSession performs on Discard, drops on Cancel — the
+        // generic choice→action contract applies to it unchanged.
+        assert!(nav_action_for(Some(crate::widgets::AlertChoice::Confirm)).perform);
+        assert!(!nav_action_for(Some(crate::widgets::AlertChoice::Cancel)).perform);
+    }
+
+    #[test]
+    fn open_session_nav_variant_carries_the_id() {
+        // The id travels with the parked intent so the guard can open the right
+        // chat after the user resolves the alert.
+        let nav = PendingNav::OpenSession("sess-42".to_string());
+        match nav {
+            PendingNav::OpenSession(id) => assert_eq!(id, "sess-42"),
+            _ => panic!("expected OpenSession"),
+        }
     }
 
     #[test]

@@ -117,7 +117,10 @@ pub enum ArchiveMode {
 pub enum NextAction {
     /// File → New Session (clear the live pane for a fresh chat).
     NewSession,
-    /// Load another stored session by id.
+    /// Load another stored session by id (in-place, fork/update-guarded). Now
+    /// only exercised by the in-pane-load contract test — the production "open
+    /// this chat" flow reopens the whole document (see `App::open_session`).
+    #[cfg_attr(not(test), allow(dead_code))]
     LoadSession(String),
 }
 
@@ -2948,16 +2951,18 @@ impl DeckPane {
     /// caller switches the active tab to Chat when this returns `true`.
     ///
     /// This was promoted OUT of the Chat pane (`session_browser_ui`) into its own
-    /// tab. Returns `true` iff a session was loaded this frame.
+    /// tab. Returns `Some(session_id)` when a card was clicked this frame; the
+    /// caller confirms, then opens that chat's document AND transcript (replacing
+    /// the current document in place, routed through the unsaved-changes guard).
     #[must_use]
     pub fn sessions_tab_ui(
         &mut self,
         ui: &mut egui::Ui,
         roles: &crate::theme::ColorRoles,
-    ) -> bool {
+    ) -> Option<String> {
         if self.store.is_none() {
             ui.label(egui::RichText::new("no chats yet for this document").weak().italics());
-            return false;
+            return None;
         }
         // Ensure newest-first ordering for the card list.
         if let Some(store) = self.store.as_mut() {
@@ -3021,18 +3026,19 @@ impl DeckPane {
             }
         });
 
-        if let Some(id) = load_session {
-            self.load_stored_session(&id);
-            true
-        } else {
-            false
-        }
+        // Surface the clicked id to the caller (App), which pops the
+        // confirmation then opens the chat's document + transcript. We no longer
+        // load into the pane directly here — opening replaces the whole document.
+        load_session
     }
 
     /// Load a stored session's turns into the live transcript for viewing /
-    /// continuation. Archives the current conversation first so nothing is lost.
-    /// When the current pane is an ambiguously-continued loaded session, this
-    /// parks behind the Update/Save-as-new modal; the load runs once resolved.
+    /// continuation IN PLACE (archiving the current conversation first). This is
+    /// the fork/update-guarded load used when the document is NOT changing. Since
+    /// "open this chat" now reopens the chat's document too (replacing it
+    /// wholesale, guarded at the App level), the production path uses
+    /// [`open_stored_session`]; this remains for the in-pane-load contract test.
+    #[cfg(test)]
     fn load_stored_session(&mut self, id: &str) {
         self.guarded_next_action(NextAction::LoadSession(id.to_string()));
     }
@@ -3074,6 +3080,53 @@ impl DeckPane {
         self.session_search.clear();
         self.view = PaneView::Chat;
         self.persist_chat();
+    }
+
+    /// The document uuid this pane's chat store is currently keyed to, or `None`
+    /// before the first `sync_store`.
+    pub fn active_doc_uuid(&self) -> Option<&str> {
+        self.active_doc_uuid.as_deref()
+    }
+
+    /// Open a stored session's transcript into the live pane DIRECTLY (no
+    /// fork/update modal). Used by the App's "open this chat" flow, where the
+    /// unsaved-changes guard already ran and the document has just been
+    /// reopened/replayed — so there is nothing to fork and the session simply
+    /// becomes the live conversation.
+    pub fn open_stored_session(&mut self, id: &str) {
+        self.replace_live_with_stored(id);
+    }
+
+    /// Extract, in order, the command lines a stored session executed — the
+    /// contents of its assistant turns' ```draft fences — using the SAME
+    /// [`Extractor`] the live deck uses to run LLM output. Returns `None` when
+    /// the session id is unknown. Powers the replay fallback when a chat has no
+    /// (or a missing) saved file: replaying these lines rebuilds the geometry.
+    pub fn session_command_lines(&self, id: &str) -> Option<Vec<String>> {
+        let store = self.store.as_ref()?;
+        let session = store.get(id)?;
+        Some(Self::command_lines_from_turns(&session.turns))
+    }
+
+    /// Pure helper: pull every ```draft-fenced command line out of a session's
+    /// assistant turns, in order. Reuses the deck's [`Extractor`] so the fence
+    /// grammar matches exactly how the commands were executed live.
+    fn command_lines_from_turns(turns: &[crate::chat_store::Turn]) -> Vec<String> {
+        let mut out = Vec::new();
+        for turn in turns {
+            if turn.role != "assistant" {
+                continue;
+            }
+            let mut ex = Extractor::default();
+            let mut events = ex.push(&turn.content);
+            events.extend(ex.finish());
+            for ev in events {
+                if let ExtractEvent::Command(line) = ev {
+                    out.push(line);
+                }
+            }
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)] // fixed signature; splitting further aids nothing
@@ -4846,6 +4899,43 @@ mod side_effect_gate_tests {
         assert_eq!(pane.messages[0].content, "revive me");
         assert!(pane.loaded_session_id.is_none());
         assert!(!pane.dirty_since_load);
+    }
+
+    #[test]
+    fn session_command_lines_extracts_draft_blocks_in_order() {
+        // The replay fallback rebuilds the drawing from the chat's ```draft
+        // command lines. Prove the extraction pulls exactly those lines, in
+        // order, from the assistant turns — reusing the live Extractor's fence
+        // grammar — and ignores prose and user turns.
+        let turns = vec![
+            crate::chat_store::Turn { role: "user".into(), content: "draw a box and a rect".into() },
+            crate::chat_store::Turn {
+                role: "assistant".into(),
+                content: "Sure, here you go:\n```draft\nbox 0,0,0 2,2,2\n```\nDone.".into(),
+            },
+            crate::chat_store::Turn {
+                role: "assistant".into(),
+                content: "And the rectangle:\n```draft\nrect 4,0,0 3 2\n```".into(),
+            },
+        ];
+        let lines = DeckPane::command_lines_from_turns(&turns);
+        assert_eq!(lines, vec!["box 0,0,0 2,2,2".to_string(), "rect 4,0,0 3 2".to_string()]);
+
+        // And the same via the store-backed public API (unknown id → None).
+        let mut store = crate::chat_store::DocSessions::new(
+            "aaaa1111-2222-3333-4444-555566667777".into(),
+        );
+        let mut s = crate::chat_store::ChatSession::new(10);
+        s.turns = turns;
+        let id = s.id.clone();
+        store.sessions.push(s);
+        let mut pane = blank_pane();
+        pane.store = Some(store);
+        assert_eq!(
+            pane.session_command_lines(&id),
+            Some(vec!["box 0,0,0 2,2,2".to_string(), "rect 4,0,0 3 2".to_string()])
+        );
+        assert_eq!(pane.session_command_lines("nope"), None, "unknown id → None");
     }
 
     #[test]
