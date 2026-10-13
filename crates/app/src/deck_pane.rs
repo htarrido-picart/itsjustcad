@@ -398,6 +398,28 @@ fn slash_palette_ui(
     pick
 }
 
+/// Extensions the chat accepts as an attachable image — the SAME set the attach
+/// file-dialog filters on (`deck_pane` input bar), so drag-and-drop and the
+/// picker agree on what counts as an image. Lower-case, no leading dot.
+const IMAGE_DROP_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+
+/// True when `path` has a known image extension (case-insensitive). Pure.
+fn is_image_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| IMAGE_DROP_EXTS.contains(&e.as_str()))
+}
+
+/// The first attachable image among a set of dropped file paths, or `None` when
+/// none qualify. Pure so the extension filter is unit-tested without an egui
+/// context. (We take ONE image; multi-attach is a later item in issue #68.)
+/// Path-less drops — e.g. a selection dragged from a browser on some platforms —
+/// are simply skipped (`DroppedFile::path` is `None` there).
+fn first_dropped_image(paths: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    paths.iter().find(|p| is_image_path(p)).cloned()
+}
+
 /// The RAW text a transcript entry yields when copied — the original markdown
 /// source, not the rendered layout, so a pasted table/emphasis survives as
 /// markdown (M-chatmd). `None` = nothing sensible to copy (the Commands card
@@ -564,6 +586,44 @@ mod slash_palette_tests {
         // `ze` is an app-verb (not a registry command) and should be reachable.
         let hits = slash_palette_matches("ze", 8);
         assert!(hits.iter().any(|m| m.name == "ze"), "app verb ze reachable via /");
+    }
+}
+
+#[cfg(test)]
+mod image_drop_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn known_image_extensions_are_case_insensitive() {
+        for ok in ["a.png", "b.JPG", "c.jpeg", "d.WebP", "e.gif", "/x/y/z.PNG"] {
+            assert!(is_image_path(std::path::Path::new(ok)), "{ok} should be an image");
+        }
+    }
+
+    #[test]
+    fn non_images_and_extensionless_are_rejected() {
+        for no in ["a.txt", "b.pdf", "c.dxf", "d.", "noext", "e.gguf", "f.svg"] {
+            assert!(!is_image_path(std::path::Path::new(no)), "{no} is not an image");
+        }
+    }
+
+    #[test]
+    fn first_dropped_image_picks_first_image_and_skips_others() {
+        let paths = [
+            PathBuf::from("/tmp/readme.txt"),
+            PathBuf::from("/tmp/plan.png"),
+            PathBuf::from("/tmp/section.jpg"),
+        ];
+        assert_eq!(first_dropped_image(&paths), Some(PathBuf::from("/tmp/plan.png")));
+    }
+
+    #[test]
+    fn first_dropped_image_none_when_no_images() {
+        let paths = [PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.dwg")];
+        assert_eq!(first_dropped_image(&paths), None);
+        // Empty drop (e.g. a path-less browser drag filtered upstream) → None.
+        assert_eq!(first_dropped_image(&[]), None);
     }
 }
 
@@ -3534,6 +3594,83 @@ impl DeckPane {
         out
     }
 
+    /// Whether the active cassette can accept an image — the SAME gate as the
+    /// attach button (`DeckConfig::supports_vision`). Drag-and-drop honours it so
+    /// we never attach an image to a blind model.
+    fn active_supports_vision(&self) -> bool {
+        self.decks
+            .decks
+            .get(self.decks.active)
+            .map(|c| c.supports_vision())
+            .unwrap_or(false)
+    }
+
+    /// Accept an image dragged from the OS onto the chat pane. On a completed
+    /// drop of a known image file — scoped to this pane via the pointer position
+    /// so a drop over the viewport/another panel is ignored — set it as the
+    /// attachment (exactly as the attach dialog would). While files hover the
+    /// pane, paint a drop-target hint. Gated on `active_supports_vision`: a blind
+    /// model shows a "can't see images" hint instead of accepting the drop.
+    fn handle_image_drop(&mut self, ui: &egui::Ui, roles: &crate::theme::ColorRoles) {
+        let ctx = ui.ctx();
+        // Pointer position scopes both the drop and the hint to THIS pane.
+        let over_pane = ctx
+            .input(|i| i.pointer.latest_pos())
+            .is_some_and(|p| self.pane_rect.contains(p));
+        if !over_pane {
+            return;
+        }
+        let vision = self.active_supports_vision();
+
+        // Completed drop → attach the first image file (path-less drops skipped).
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if vision && let Some(img) = first_dropped_image(&dropped) {
+            self.attached_image = Some(img);
+        }
+
+        // Hover hint while an OS file drag is in progress over the pane.
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            self.paint_drop_hint(ui, roles, vision);
+        }
+    }
+
+    /// Paint a rounded drop-target border + centred label over the pane while an
+    /// OS file drag hovers it. `vision` selects accept vs "can't see" messaging.
+    fn paint_drop_hint(&self, ui: &egui::Ui, roles: &crate::theme::ColorRoles, vision: bool) {
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("deck_image_drop_hint"),
+        ));
+        let rect = self.pane_rect.shrink(8.0);
+        let (color, label) = if vision {
+            (crate::theme::to_color32(roles.primary), "Drop image to attach")
+        } else {
+            (
+                crate::theme::to_color32(roles.on_surface_tertiary),
+                "This model can't see images — pick a vision-capable model",
+            )
+        };
+        painter.rect_stroke(
+            rect,
+            12.0,
+            egui::Stroke::new(2.0, color),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(16.0),
+            color,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)] // fixed signature; splitting further aids nothing
     /// Render the Chat segment. Returns `Some(line)` when the user submitted a
     /// leading-`/` command (e.g. `/box 0,0,0 5,5,3`): the caller runs it through
@@ -3554,6 +3691,7 @@ impl DeckPane {
         // invoked inside the bottom input `Panel`, whose `max_rect` is only the
         // composer strip — we want to dim + centre over the whole chat pane.
         self.pane_rect = ui.max_rect();
+        self.handle_image_drop(ui, roles);
         self.drain(session, handle);
         if self.busy()
             && let Some(started) = self.turn_started
