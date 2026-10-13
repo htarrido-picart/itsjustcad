@@ -1710,6 +1710,13 @@ impl App {
             self.panel_tabs.show(crate::tabstrip::PanelTab::Deck);
             self.deck_pane.seed_pending_side_effect(&kind);
         }
+        // Dev hook: ITSJUSTCAD_DECK_FIRSTRUN=1 seeds the OUTER first-run gate
+        // modal with a sample command batch (deck_run_approved stays false) so
+        // an ITSJUSTCAD_SHOT frame can capture it without a live model.
+        if std::env::var("ITSJUSTCAD_DECK_FIRSTRUN").is_ok() {
+            self.panel_tabs.show(crate::tabstrip::PanelTab::Deck);
+            self.deck_pane.seed_pending_firstrun();
+        }
         // Dev hook: ITSJUSTCAD_OPEN_SESSION_CONFIRM=1 seeds the "Open this chat?"
         // confirmation on startup (after seeding demo sessions) so ITSJUSTCAD_SHOT
         // frames can capture the dialog without a card click.

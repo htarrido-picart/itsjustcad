@@ -646,6 +646,24 @@ const VERIFY_PROMPT: &str = "All plan steps are done. Verify the end state with 
 read-only commands (`bbox all`, `schedule`) if useful, and reply with a one-line \
 summary of what was built.";
 
+/// A one-line summary of a queued deck command for the first-run modal. Uses the
+/// command's side-effect summary when it parses to a side-effecting command (so
+/// a write/read reads "export → /path"), else the raw line trimmed to length.
+fn firstrun_summary(line: &str) -> String {
+    if let Ok(cmd) = parse(line)
+        && let Some(s) = cmd.side_effect_summary()
+    {
+        return s;
+    }
+    let line = line.trim();
+    if line.chars().count() > 72 {
+        let t: String = line.chars().take(71).collect();
+        format!("{t}…")
+    } else {
+        line.to_string()
+    }
+}
+
 /// The filesystem path a side-effecting command targets, if any.
 fn deck_command_path(cmd: &Command) -> Option<&str> {
     match cmd {
@@ -968,6 +986,21 @@ pub struct DeckPane {
     /// sandbox root, without a per-command prompt. Defaults OFF. Paths that
     /// escape the sandbox are still queued even when this is on.
     allow_deck_side_effects: bool,
+    /// Claude-Code-style OUTER first-run gate: has the user approved the deck
+    /// running ANY commands this session? Defaults OFF. While false, the whole
+    /// of a turn's emitted command batch is held in `pending_firstrun` and a
+    /// first-run modal is shown; nothing (even pure geometry) runs until the
+    /// user approves. "Approve for session" sets this (and
+    /// `allow_deck_side_effects`); "Approve once" runs the batch but leaves this
+    /// false so the next batch re-prompts. Once true, behavior is exactly as
+    /// before: geometry auto-runs, writes follow `allow_deck_side_effects` / the
+    /// write-modal, and reads ALWAYS take the manual picker carve-out.
+    deck_run_approved: bool,
+    /// The current turn's emitted command lines, held unprocessed while the
+    /// first-run gate is closed (`!deck_run_approved`). Raw lines — replayed
+    /// through the normal per-line routing (`process_command_line`) once the
+    /// user approves, so writers/readers still hit their INNER gates.
+    pending_firstrun: Vec<String>,
     /// Sandbox root for deck-originated fs paths — the current document's
     /// directory when known, else the ItsJustCAD documents dir. Set by the app.
     sandbox_root: Option<std::path::PathBuf>,
@@ -1108,6 +1141,8 @@ impl Default for DeckPane {
             attached_image: None,
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
+            deck_run_approved: false,
+            pending_firstrun: Vec::new(),
             sandbox_root: None,
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),
@@ -2134,6 +2169,33 @@ impl DeckPane {
                     self.streaming_chat.push_str("\n```\n");
                 }
                 ExtractEvent::Command(line) => {
+                    // OUTER first-run gate (Claude-Code style): until the user
+                    // has approved the deck running ANY commands this session,
+                    // hold the WHOLE turn's batch unprocessed and show the
+                    // first-run modal. Nothing — not even pure geometry — runs
+                    // until the user approves. Once approved (for-session), this
+                    // branch is skipped and commands route normally; "approve
+                    // once" replays `pending_firstrun` through this same arm with
+                    // the gate temporarily open, then re-closes it.
+                    if !self.deck_run_approved {
+                        self.pending_firstrun.push(line);
+                        continue;
+                    }
+                    self.process_command_line(line, session);
+                }
+            }
+        }
+    }
+
+    /// Route a single deck-emitted command line through its plane (ui / app-verb
+    /// / substrate command) and the INNER side-effect gates. Called once the
+    /// OUTER first-run gate is open (either because the session is approved, or
+    /// while replaying an approved-once batch). Writers still hit the write-modal
+    /// via `pending_side_effects`; readers still take the manual picker carve-out.
+    fn process_command_line(&mut self, line: String, session: &mut Session) {
+        {
+            {
+                {
                     // UI/SESSION TOOL PLANE (distinct from document commands):
                     // a layout verb changes window state via ui.json, NOT the
                     // op-log. Try it first — the two tool groups are disjoint, so
@@ -2146,7 +2208,7 @@ impl DeckPane {
                             result: Ok(action.summary()),
                         });
                         self.pending_ui_actions.push(action);
-                        continue;
+                        return;
                     }
                     // USER-HOTKEY TOOL (W4): the assistant may bind/unbind
                     // hotkeys ONLY when the user opted in (LLM ▸ Keybindings →
@@ -2172,14 +2234,14 @@ impl DeckPane {
                                     result: Err("assistant hotkey changes are off — enable “Let the assistant set hotkeys” in LLM ▸ Keybindings".to_string()),
                                 });
                             }
-                            continue;
+                            return;
                         }
                         if matches!(verb0, "hotkeys" | "keybindings") {
                             self.current_commands.push(ExecutedCommand {
                                 line: line.clone(),
                                 result: Err("open LLM ▸ Keybindings to edit hotkeys".to_string()),
                             });
-                            continue;
+                            return;
                         }
                     }
                     // APP-VERB PLANE (distinct from document commands and ui
@@ -2211,7 +2273,7 @@ impl DeckPane {
                             });
                             self.help_output_this_turn
                                 .push(format!("help {label}:\n{body}"));
-                            continue;
+                            return;
                         }
                         // SECURITY: app-verbs bypass the fs side-effect gate
                         // because they carry no `Command`. Almost all are pure
@@ -2230,7 +2292,7 @@ impl DeckPane {
                                     "basemap fetch reaches the network — run it yourself from the command line".to_string(),
                                 ),
                             });
-                            continue;
+                            return;
                         }
                         // SECURITY: `save <path>` is an app-verb, NOT a substrate
                         // `Command`, so it bypasses the fs side-effect gate that
@@ -2246,14 +2308,14 @@ impl DeckPane {
                                     "save writes to the filesystem — run it yourself from the command line".to_string(),
                                 ),
                             });
-                            continue;
+                            return;
                         }
                         self.current_commands.push(ExecutedCommand {
                             line: line.clone(),
                             result: Ok("applied (view/camera)".to_string()),
                         });
                         self.pending_app_verbs.push(line);
-                        continue;
+                        return;
                     }
                     // Parse first so we can classify. A parse error is reported
                     // exactly as before (no execution attempted).
@@ -2266,7 +2328,7 @@ impl DeckPane {
                                 line,
                                 result: Err(e),
                             });
-                            continue;
+                            return;
                         }
                     };
                     // SECURITY (C-2/H-7): a side-effecting command *emitted by
@@ -2299,7 +2361,7 @@ impl DeckPane {
                                 reader,
                             });
                         }
-                        continue;
+                        return;
                     }
                     self.run_deck_command(&line, cmd, session);
                 }
@@ -2679,6 +2741,125 @@ impl DeckPane {
         }
     }
 
+    /// Render the OUTER first-run gate modal (Claude-Code style). Shown while
+    /// `!deck_run_approved` and the current turn produced commands: it lists the
+    /// whole batch and offers Approve once / Approve for session / Decline.
+    ///
+    /// * Approve for session → `deck_run_approved = true` AND
+    ///   `allow_deck_side_effects = true` (geometry + in-sandbox writes then flow
+    ///   with no further first-run prompt); the batch is replayed normally.
+    /// * Approve once → replay the batch for THIS turn only; the flags stay off
+    ///   so the next turn's batch re-prompts.
+    /// * Decline → discard the batch unrun; record "declined N command(s)".
+    ///
+    /// The batch is replayed through `process_command_line`, so any WRITE in it
+    /// still pops the INNER write-modal and any READ still takes the manual
+    /// picker carve-out — the first-run gate never bypasses those. This is the
+    /// OUTER gate: it is rendered BEFORE `side_effect_confirm_ui`, and because it
+    /// only replays once dismissed, the two modals never show at once (no
+    /// deadlock — first-run resolves, then per-command side-effect modals run as
+    /// the replayed batch queues them).
+    fn firstrun_confirm_ui(&mut self, ui: &mut egui::Ui, session: &mut Session) {
+        if self.deck_run_approved || self.pending_firstrun.is_empty() {
+            return;
+        }
+        enum Decision {
+            ApproveOnce,
+            ApproveSession,
+            Decline,
+        }
+        let mut decision: Option<Decision> = None;
+        let batch = self.pending_firstrun.clone();
+        let n = batch.len();
+
+        let modal = egui::Modal::new(egui::Id::new("deck_firstrun_modal")).show(ui.ctx(), |ui| {
+            ui.set_width(380.0);
+            ui.heading("The deck wants to run commands.");
+            ui.add_space(crate::theme::Spacing::XS);
+            ui.label(format!(
+                "The assistant proposed {n} command{} this turn. Nothing runs \
+                 until you approve. Opens/imports always ask again regardless.",
+                if n == 1 { "" } else { "s" }
+            ));
+            ui.add_space(crate::theme::Spacing::S);
+            egui::Frame::group(ui.style())
+                .fill(ui.visuals().extreme_bg_color)
+                .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
+                .show(ui, |ui| {
+                    for line in batch.iter().take(8) {
+                        ui.label(egui::RichText::new(firstrun_summary(line)).monospace());
+                    }
+                    if n > 8 {
+                        ui.label(
+                            egui::RichText::new(format!("… and {} more", n - 8))
+                                .weak()
+                                .small(),
+                        );
+                    }
+                });
+            ui.add_space(crate::theme::Spacing::M);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Approve once")
+                    .on_hover_text("run this turn's commands only; ask again next turn")
+                    .clicked()
+                {
+                    decision = Some(Decision::ApproveOnce);
+                }
+                if ui
+                    .button("Approve for session")
+                    .on_hover_text(
+                        "let the deck run commands (and in-folder writes) this \
+                         session without asking; opens/imports still ask",
+                    )
+                    .clicked()
+                {
+                    decision = Some(Decision::ApproveSession);
+                }
+                if ui.button("Decline").clicked() {
+                    decision = Some(Decision::Decline);
+                }
+            });
+        });
+        if modal.should_close() && decision.is_none() {
+            // Esc / backdrop dismiss = Decline the batch.
+            decision = Some(Decision::Decline);
+        }
+
+        match decision {
+            None => {}
+            Some(Decision::ApproveSession) => self.firstrun_approve(session, true),
+            Some(Decision::ApproveOnce) => self.firstrun_approve(session, false),
+            Some(Decision::Decline) => self.firstrun_decline(),
+        }
+    }
+
+    /// Open the OUTER gate and run the held batch. `for_session` → latch
+    /// `deck_run_approved` + `allow_deck_side_effects` so future turns and
+    /// in-sandbox writes flow without re-prompting; otherwise run THIS batch only
+    /// (gate stays closed, next turn re-prompts). Either way the batch replays
+    /// through `process_command_line`, so each writer still hits the write-modal
+    /// and each reader still takes the manual picker carve-out.
+    fn firstrun_approve(&mut self, session: &mut Session, for_session: bool) {
+        if for_session {
+            self.deck_run_approved = true;
+            self.allow_deck_side_effects = true;
+        }
+        let batch = std::mem::take(&mut self.pending_firstrun);
+        for line in batch {
+            self.process_command_line(line, session);
+        }
+    }
+
+    /// Discard the held batch unrun and record a status line.
+    fn firstrun_decline(&mut self) {
+        let n = self.pending_firstrun.len();
+        self.pending_firstrun.clear();
+        self.transcript
+            .push(Entry::Status(format!("declined {n} command(s)")));
+        self.persist_chat();
+    }
+
     /// Render the permission MODAL for deck-emitted side-effecting commands.
     /// Styled like Claude Code's permission prompt / the iOS ApprovalSheet: a
     /// dimmed backdrop + centered window showing the FIRST pending command and
@@ -2922,6 +3103,18 @@ impl DeckPane {
             outside_sandbox,
             reader,
         });
+    }
+
+    /// Dev hook (`ITSJUSTCAD_DECK_FIRSTRUN=1`): seed a sample unprocessed command
+    /// batch with the OUTER first-run gate closed, so an ITSJUSTCAD_SHOT frame can
+    /// capture the "The deck wants to run commands." modal without a live model.
+    pub fn seed_pending_firstrun(&mut self) {
+        self.deck_run_approved = false;
+        self.pending_firstrun = vec![
+            "box 0,0,0 10,10,3".to_string(),
+            "circle 5,5,3 2".to_string(),
+            "export /Users/you/project/plan.dxf".to_string(),
+        ];
     }
 
     /// Seed a couple of demo chat sessions into the current store — a dev hook
@@ -3524,6 +3717,11 @@ impl DeckPane {
                 {
                     crate::command_line::render_command_preview(ui, &slots);
                 }
+                // OUTER first-run gate renders first; while it's up the batch is
+                // held unprocessed, so no per-command side-effect modal can show
+                // simultaneously (no deadlock). Once it resolves (approve/replay)
+                // the inner side-effect modal below handles any writes/reads.
+                self.firstrun_confirm_ui(ui, session);
                 // Side-effect confirmation sits directly above the input card.
                 self.side_effect_confirm_ui(ui, session, icons);
                 // Attachment chip (name + remove) above the input card.
@@ -4348,6 +4546,11 @@ mod side_effect_gate_tests {
             attached_image: None,
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
+            // Test helper = an already-running session: the OUTER first-run gate
+            // is already open, so existing #56 behavior tests drive commands past
+            // it. The first-run gate is tested explicitly by flipping to false.
+            deck_run_approved: true,
+            pending_firstrun: Vec::new(),
             sandbox_root: None,
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),
@@ -5743,6 +5946,164 @@ mod side_effect_gate_tests {
     fn header_caption_absent_for_blank_model() {
         assert_eq!(header_model_caption(&[], ""), None);
         assert_eq!(header_model_caption(&[], "   "), None);
+    }
+
+    // ── OUTER first-run gate (Claude-Code model) ────────────────────────────
+
+    #[test]
+    fn firstrun_geometry_does_not_auto_run_and_queues() {
+        // Gate closed: even a pure geometry command is HELD unprocessed and the
+        // first-run modal is pending (pending_firstrun non-empty). Nothing runs.
+        let mut pane = blank_pane();
+        pane.deck_run_approved = false;
+        let mut session = Session::default();
+        let before = session.doc.len();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 1,1,1".into())],
+            &mut session,
+        );
+        assert_eq!(
+            pane.pending_firstrun.len(),
+            1,
+            "command must be held for the first-run gate"
+        );
+        assert!(pane.current_commands.is_empty(), "nothing may run yet");
+        assert_eq!(session.doc.len(), before, "no geometry op may have run");
+        assert!(!pane.deck_run_approved, "the gate stays closed until approval");
+    }
+
+    #[test]
+    fn firstrun_approve_for_session_runs_batch_and_latches_flags() {
+        let mut pane = blank_pane();
+        pane.deck_run_approved = false;
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 1,1,1".into())],
+            &mut session,
+        );
+        let before = session.doc.len();
+        pane.firstrun_approve(&mut session, /* for_session */ true);
+        assert!(pane.deck_run_approved, "for-session latches the gate open");
+        assert!(
+            pane.allow_deck_side_effects,
+            "for-session also lets in-sandbox writes flow"
+        );
+        assert!(pane.pending_firstrun.is_empty(), "batch is drained");
+        assert!(session.doc.len() > before, "geometry ran after approval");
+        // And future geometry now auto-runs with no gate.
+        let mid = session.doc.len();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 2,2,2".into())],
+            &mut session,
+        );
+        assert!(
+            pane.pending_firstrun.is_empty(),
+            "gate open → no more queuing"
+        );
+        assert!(session.doc.len() > mid, "subsequent geometry auto-ran");
+    }
+
+    #[test]
+    fn firstrun_approve_once_runs_batch_but_leaves_gate_closed() {
+        let mut pane = blank_pane();
+        pane.deck_run_approved = false;
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 1,1,1".into())],
+            &mut session,
+        );
+        let before = session.doc.len();
+        pane.firstrun_approve(&mut session, /* for_session */ false);
+        assert!(session.doc.len() > before, "the one batch ran");
+        assert!(
+            !pane.deck_run_approved,
+            "approve-once must NOT latch the gate"
+        );
+        assert!(
+            !pane.allow_deck_side_effects,
+            "approve-once must NOT enable session writes"
+        );
+        // Next turn's batch re-prompts (held again).
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 2,2,2".into())],
+            &mut session,
+        );
+        assert_eq!(
+            pane.pending_firstrun.len(),
+            1,
+            "next batch re-prompts the first-run gate"
+        );
+    }
+
+    #[test]
+    fn firstrun_decline_discards_batch_unrun() {
+        let mut pane = blank_pane();
+        pane.deck_run_approved = false;
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![
+                ExtractEvent::Command("box 0,0,0 1,1,1".into()),
+                ExtractEvent::Command("circle 0,0,0 2".into()),
+            ],
+            &mut session,
+        );
+        assert_eq!(pane.pending_firstrun.len(), 2);
+        pane.firstrun_decline();
+        assert!(pane.pending_firstrun.is_empty(), "batch discarded");
+        assert_eq!(session.doc.len(), 0, "nothing ran");
+        assert!(
+            pane.transcript.iter().any(|e| matches!(
+                e,
+                Entry::Status(s) if s.contains("declined 2 command")
+            )),
+            "a declined-N status line is recorded"
+        );
+    }
+
+    #[test]
+    fn firstrun_approve_session_replays_reader_through_manual_carveout() {
+        // HARD carve-out: even with the gate open AND allow_deck_side_effects on,
+        // a READER (import) in the approved batch is NEVER auto-run — it is routed
+        // to the manual side-effect modal (queued as a reader), not executed.
+        let mut pane = blank_pane();
+        pane.deck_run_approved = false;
+        pane.set_sandbox_root(Some(PathBuf::from("/home/u/proj")));
+        let mut session = Session::default();
+        let sentinel = std::env::temp_dir()
+            .join(format!("itsjustcad_fr_import_{}.dxf", std::process::id()));
+        let _ = std::fs::remove_file(&sentinel);
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command(format!("import {}", sentinel.display()))],
+            &mut session,
+        );
+        pane.firstrun_approve(&mut session, /* for_session */ true);
+        assert_eq!(
+            pane.pending_side_effects.len(),
+            1,
+            "reader routed to the manual INNER modal, not auto-run"
+        );
+        assert!(
+            pane.pending_side_effects[0].reader,
+            "the queued side-effect is a reader (manual picker only)"
+        );
+        assert!(!sentinel.exists(), "no read/write hit disk without a picker");
+    }
+
+    #[test]
+    fn firstrun_approved_reader_still_never_auto_runs() {
+        // Gate already open (session approved): a reader command still NEVER
+        // auto-runs — it is queued for the manual picker (the #56 carve-out is
+        // untouched by the outer gate).
+        let mut pane = blank_pane(); // deck_run_approved = true
+        pane.allow_deck_side_effects = true; // even with writes allowed…
+        pane.set_sandbox_root(Some(PathBuf::from("/home/u/proj")));
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("import /home/u/proj/site.dxf".into())],
+            &mut session,
+        );
+        assert_eq!(pane.pending_side_effects.len(), 1, "reader queued, not run");
+        assert!(pane.pending_side_effects[0].reader);
     }
 }
 
