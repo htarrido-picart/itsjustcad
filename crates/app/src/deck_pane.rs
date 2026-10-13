@@ -2840,7 +2840,12 @@ impl DeckPane {
         esc || backdrop_click
     }
 
-    fn firstrun_confirm_ui(&mut self, ui: &mut egui::Ui, session: &mut Session) {
+    fn firstrun_confirm_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &mut Session,
+        roles: &crate::theme::ColorRoles,
+    ) {
         if self.deck_run_approved || self.pending_firstrun.is_empty() {
             return;
         }
@@ -2883,15 +2888,17 @@ impl DeckPane {
                 });
             ui.add_space(crate::theme::Spacing::M);
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .button("Approve once")
+                let dark = ui.visuals().dark_mode;
+                use crate::widgets::{role_button, ButtonRole};
+                // Hierarchy: Approve once = prominent (filled accent), Approve for
+                // session = normal (outlined), Decline = destructive (red).
+                if role_button(ui, roles, dark, ButtonRole::Prominent, "Approve once")
                     .on_hover_text("run this turn's commands only; ask again next turn")
                     .clicked()
                 {
                     decision = Some(Decision::ApproveOnce);
                 }
-                if ui
-                    .button("Approve for session")
+                if role_button(ui, roles, dark, ButtonRole::Normal, "Approve for session")
                     .on_hover_text(
                         "let the deck run commands (and in-folder writes) this \
                          session without asking; opens/imports still ask",
@@ -2900,7 +2907,7 @@ impl DeckPane {
                 {
                     decision = Some(Decision::ApproveSession);
                 }
-                if ui.button("Decline").clicked() {
+                if role_button(ui, roles, dark, ButtonRole::Destructive, "Decline").clicked() {
                     decision = Some(Decision::Decline);
                 }
             });
@@ -2962,6 +2969,7 @@ impl DeckPane {
         ui: &mut egui::Ui,
         session: &mut Session,
         _icons: &crate::icons::Icons,
+        roles: &crate::theme::ColorRoles,
     ) {
         if self.pending_side_effects.is_empty() {
             return;
@@ -3027,12 +3035,14 @@ impl DeckPane {
             }
             ui.add_space(crate::theme::Spacing::M);
             ui.horizontal_wrapped(|ui| {
+                let dark = ui.visuals().dark_mode;
+                use crate::widgets::{role_button, ButtonRole};
                 if reader {
                     // Readers: NO session approval, NO auto-run. Only a user
-                    // file pick (if a picker applies) or Decline.
+                    // file pick (if a picker applies) or Decline. The picker is
+                    // the prominent action; Decline is destructive (red).
                     if picker_applies {
-                        if ui
-                            .button("Open file picker…")
+                        if role_button(ui, roles, dark, ButtonRole::Prominent, "Open file picker…")
                             .on_hover_text(
                                 "pick the file yourself — the model's proposed path is ignored",
                             )
@@ -3047,12 +3057,13 @@ impl DeckPane {
                                 .small(),
                         );
                     }
-                    if ui.button("Decline").clicked() {
+                    if role_button(ui, roles, dark, ButtonRole::Destructive, "Decline").clicked() {
                         decision = Some(Decision::Decline);
                     }
                 } else {
-                    if ui
-                        .button("Approve once")
+                    // Approve once = prominent, Approve for session = normal,
+                    // Decline = destructive.
+                    if role_button(ui, roles, dark, ButtonRole::Prominent, "Approve once")
                         .on_hover_text("run this one command")
                         .clicked()
                     {
@@ -3061,8 +3072,7 @@ impl DeckPane {
                     // "Approve for session" only makes sense for in-sandbox
                     // writes; an outside-sandbox path always asks again.
                     if !outside
-                        && ui
-                            .button("Approve for session")
+                        && role_button(ui, roles, dark, ButtonRole::Normal, "Approve for session")
                             .on_hover_text(
                                 "run this, and let in-folder writes run this session without asking",
                             )
@@ -3070,7 +3080,7 @@ impl DeckPane {
                     {
                         decision = Some(Decision::ApproveSession);
                     }
-                    if ui.button("Decline").clicked() {
+                    if role_button(ui, roles, dark, ButtonRole::Destructive, "Decline").clicked() {
                         decision = Some(Decision::Decline);
                     }
                 }
@@ -3810,9 +3820,9 @@ impl DeckPane {
                 // held unprocessed, so no per-command side-effect modal can show
                 // simultaneously (no deadlock). Once it resolves (approve/replay)
                 // the inner side-effect modal below handles any writes/reads.
-                self.firstrun_confirm_ui(ui, session);
+                self.firstrun_confirm_ui(ui, session, roles);
                 // Side-effect confirmation sits directly above the input card.
-                self.side_effect_confirm_ui(ui, session, icons);
+                self.side_effect_confirm_ui(ui, session, icons, roles);
                 // Attachment chip (name + remove) above the input card.
                 if let Some(img) = self.attached_image.clone() {
                     ui.horizontal(|ui| {
