@@ -1013,6 +1013,12 @@ struct ActiveDownload {
     /// Set once the terminal state (Done/Failed) has been handled — the Done
     /// cassette persisted, or the failure announced — so it happens only once.
     persisted: bool,
+    /// A SECOND artifact to fetch once `handle` finishes, for vision models that
+    /// install two files (weights then mmproj projector). While `Some`, a
+    /// completed `handle` kicks off this download under the SAME `model_id`
+    /// instead of registering the cassette — the cassette is only installed once
+    /// the final file lands (`pending == None`). `None` for single-file models.
+    pending: Option<crate::download::DownloadSpec>,
 }
 
 /// A downloading Stable Diffusion weight file (base model or ControlNet) from
@@ -8460,6 +8466,22 @@ impl App {
             });
         match outcome {
             Some((model_id, DownloadOutcome::Completed)) => {
+                // Vision models install in two steps: when the FIRST file
+                // (weights) completes there is a `pending` projector spec — start
+                // it under the same model_id and defer the cassette until it too
+                // lands. Only a completion with no pending step installs the deck.
+                if let Some(next) = self
+                    .active_download
+                    .as_mut()
+                    .and_then(|a| a.pending.take())
+                {
+                    let handle = crate::download::start(&self.tokio, next);
+                    if let Some(active) = self.active_download.as_mut() {
+                        active.handle = handle;
+                        active.persisted = false;
+                    }
+                    return;
+                }
                 if let Some(entry) = self.catalog.get(&model_id).cloned() {
                     let mut decks = itsjustcad_deck::DecksFile::load_or_default();
                     install_catalog_deck(&mut decks, &entry); // sets active in-file
@@ -8774,6 +8796,11 @@ impl App {
                 && let Some(dir) = crate::download::models_dir()
             {
                 let _ = std::fs::remove_file(dir.join(entry.file_name()));
+                // Vision models also dropped a projector file — remove it too so
+                // no multi-GB orphan is left behind.
+                if let Some(mmproj) = entry.mmproj_file_name() {
+                    let _ = std::fs::remove_file(dir.join(mmproj));
+                }
             }
             let mut decks = itsjustcad_deck::DecksFile::load_or_default();
             if remove_catalog_deck(&mut decks, &id) {
@@ -8878,14 +8905,18 @@ impl App {
         }
         let entry = self.catalog.recommended_for(self.hardware.tier())?;
         let dir = crate::download::models_dir()?;
-        // Already downloaded → don't offer it.
-        if dir.join(entry.file_name()).exists() {
+        // Already downloaded → don't offer it. A vision model counts as present
+        // only when BOTH its files are on disk.
+        if model_artifacts_present(entry, &dir) {
             return None;
         }
         Some((entry.id.clone(), entry.display_name.clone()))
     }
 
     /// Kick off a background download for catalog model `id` into the models dir.
+    /// Vision models install TWO files: the weights download starts now and the
+    /// projector (`mmproj`) is queued as `pending`, fetched when the weights
+    /// finish (see [`poll_model_download`](Self::poll_model_download)).
     fn start_model_install(&mut self, id: &str) {
         let Some(entry) = self.catalog.get(id).cloned() else {
             return;
@@ -8894,17 +8925,13 @@ impl App {
             tracing::error!("no home dir — cannot resolve models directory");
             return;
         };
-        let spec = crate::download::DownloadSpec {
-            url: entry.url.clone(),
-            dir,
-            file_name: entry.file_name(),
-            expected_sha256: entry.expected_sha().map(|s| s.to_string()),
-        };
-        let handle = crate::download::start(&self.tokio, spec);
+        let (weights, pending) = install_specs(&entry, dir);
+        let handle = crate::download::start(&self.tokio, weights);
         self.active_download = Some(ActiveDownload {
             model_id: entry.id,
             handle,
             persisted: false,
+            pending,
         });
     }
 
@@ -9652,6 +9679,48 @@ fn cassette_name_for(model_id: &str) -> String {
 fn installed_model_file(entry: &crate::model_catalog::ModelEntry) -> Option<std::path::PathBuf> {
     let p = crate::download::models_dir()?.join(entry.file_name());
     p.exists().then_some(p)
+}
+
+/// The download specs for a catalog entry: the weights (always) plus an optional
+/// projector (`mmproj`) for vision models, each sha-verified. Pure so the
+/// single-vs-two-file split is unit-tested without touching the network.
+fn install_specs(
+    entry: &crate::model_catalog::ModelEntry,
+    dir: std::path::PathBuf,
+) -> (
+    crate::download::DownloadSpec,
+    Option<crate::download::DownloadSpec>,
+) {
+    let weights = crate::download::DownloadSpec {
+        url: entry.url.clone(),
+        dir: dir.clone(),
+        file_name: entry.file_name(),
+        expected_sha256: entry.expected_sha().map(|s| s.to_string()),
+    };
+    let projector = entry.mmproj_url.as_ref().map(|url| crate::download::DownloadSpec {
+        url: url.clone(),
+        dir,
+        file_name: entry.mmproj_file_name().unwrap_or_else(|| entry.file_name()),
+        expected_sha256: entry.mmproj_expected_sha().map(|s| s.to_string()),
+    });
+    (weights, projector)
+}
+
+/// True when every artifact a catalog entry needs is already on disk in `dir`:
+/// the weights, plus the projector for a vision model. Used to decide whether to
+/// OFFER a download; a half-installed vision pair is treated as not-present so
+/// the user can complete it. Pure — unit-tested with temp files.
+fn model_artifacts_present(
+    entry: &crate::model_catalog::ModelEntry,
+    dir: &std::path::Path,
+) -> bool {
+    if !dir.join(entry.file_name()).exists() {
+        return false;
+    }
+    match entry.mmproj_file_name() {
+        Some(name) => dir.join(name).exists(),
+        None => true,
+    }
 }
 
 /// Reveal a file in the OS file manager, selecting it. Best-effort — a failure
@@ -12669,6 +12738,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn install_specs_single_file_for_text_model() {
+        let cat = crate::model_catalog::Catalog::load();
+        let text = cat.models.iter().find(|m| !m.is_vision()).unwrap();
+        let (weights, projector) = install_specs(text, std::path::PathBuf::from("/models"));
+        assert_eq!(weights.file_name, text.file_name());
+        assert!(projector.is_none(), "text model has no second artifact");
+    }
+
+    #[test]
+    fn install_specs_two_files_for_vision_model() {
+        let cat = crate::model_catalog::Catalog::load();
+        let vision = cat.models.iter().find(|m| m.is_vision()).unwrap();
+        let (weights, projector) = install_specs(vision, std::path::PathBuf::from("/models"));
+        assert_eq!(weights.url, vision.url);
+        assert_eq!(weights.expected_sha256, vision.expected_sha().map(String::from));
+        let p = projector.expect("vision model queues a projector download");
+        assert_eq!(p.file_name, vision.mmproj_file_name().unwrap());
+        assert_eq!(p.url, vision.mmproj_url.clone().unwrap());
+        assert_eq!(p.expected_sha256, vision.mmproj_expected_sha().map(String::from));
+    }
+
+    #[test]
+    fn model_artifacts_present_requires_both_files_for_vision() {
+        let cat = crate::model_catalog::Catalog::load();
+        let vision = cat.models.iter().find(|m| m.is_vision()).unwrap().clone();
+        let dir = std::env::temp_dir().join("ijc_artifacts_present");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Neither file → absent.
+        assert!(!model_artifacts_present(&vision, &dir));
+        // Weights only (half install) → still absent.
+        std::fs::write(dir.join(vision.file_name()), b"").unwrap();
+        assert!(!model_artifacts_present(&vision, &dir));
+        // Both files → present.
+        std::fs::write(dir.join(vision.mmproj_file_name().unwrap()), b"").unwrap();
+        assert!(model_artifacts_present(&vision, &dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Closing the Model Setup panel must NOT cancel an active download: the
     /// background task stays alive and keeps advancing. We model the close path
     /// (`close_model_setup` only flips `show_model_setup`) against a fake
@@ -12688,6 +12797,7 @@ mod tests {
             model_id: "m".into(),
             handle,
             persisted: false,
+            pending: None,
         };
 
         // The close path (see `close_model_setup`) touches only the panel flag,

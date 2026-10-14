@@ -52,6 +52,10 @@ aes-gcm.workspace = true
 keyring.workspace = true
 rusqlite.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Base64-encode a screenshot/attached image for the local vision (mmproj) path:
+# ChatRequest carries images as raw base64, which the OpenAI-compat cassette
+# wraps into a `data:` image_url. Version matches the workspace lock (transitive).
+base64 = "0.22"
 pollster = "0.4"
 egui_commonmark = "0.24"
 raw-window-handle = "0.6"

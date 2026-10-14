@@ -134,17 +134,20 @@ impl DeckConfig {
 
     /// Whether this cassette can analyze an attached image. Claude (subscription
     /// CLI) and Anthropic API are multimodal; OpenAI-compatible endpoints only
-    /// when the selected model is a known vision model. Local grammar cassettes
-    /// (llama.cpp text models) are treated as text-only. The image-attach button
+    /// when the selected model is a known vision model. The image-attach button
     /// in the chat is gated on this so we never send an image to a blind model.
+    ///
+    /// NOTE on `grammar`: a grammar-constrained LOCAL model can still be
+    /// multimodal — the GBNF grammar constrains the model's OUTPUT text (so it
+    /// can only emit real verbs), while vision is an INPUT capability. A local
+    /// Qwen2.5-VL served with `--mmproj` is both grammar-constrained AND able to
+    /// see images. So we decide vision from the model identity (name / endpoint),
+    /// NOT from the grammar flag: a known vision name wins even with grammar on;
+    /// an unknown text model is blind whether or not grammar is set.
     pub fn supports_vision(&self) -> bool {
         match self.kind {
             DeckKind::ClaudeCode | DeckKind::Anthropic => true,
             DeckKind::OpenaiCompat => {
-                // Grammar-constrained local text models can't see images.
-                if self.grammar {
-                    return false;
-                }
                 // The real OpenAI cloud only serves frontier models, which are
                 // all multimodal (gpt-4o, gpt-4.1, gpt-5.x "Sol", "astra", …).
                 // Trust the endpoint rather than chasing each new codename in a
@@ -153,8 +156,10 @@ impl DeckConfig {
                 if self.base_url.starts_with("https://api.openai.com") {
                     return true;
                 }
-                // Other OpenAI-compatible endpoints (local servers, gateways)
-                // host arbitrary models, so keep allow-listing known vision names.
+                // Other OpenAI-compatible endpoints (local llama.cpp, gateways)
+                // host arbitrary models, so allow-list known vision names. This
+                // runs BEFORE any grammar consideration: our local vision model
+                // ("qwen2.5-vl-3b…") carries grammar=true yet is fully multimodal.
                 let m = self.model.to_ascii_lowercase();
                 m.contains("vl")
                     || m.contains("vision")
@@ -440,6 +445,11 @@ mod tests {
         assert!(mk(DeckKind::OpenaiCompat, "qwen2.5-vl-7b", false).supports_vision());
         assert!(!mk(DeckKind::OpenaiCompat, "qwen3", true).supports_vision());
         assert!(!mk(DeckKind::OpenaiCompat, "llama3", false).supports_vision());
+        // A LOCAL vision model carries grammar=true (constrains OUTPUT) yet is
+        // multimodal (INPUT): the vision name must win over the grammar flag.
+        assert!(mk(DeckKind::OpenaiCompat, "qwen2.5-vl-3b", true).supports_vision());
+        // …while a grammar-constrained TEXT model stays blind.
+        assert!(!mk(DeckKind::OpenaiCompat, "qwen3", true).supports_vision());
     }
 
     #[test]

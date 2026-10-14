@@ -73,6 +73,10 @@ pub struct RuntimePlan {
     pub runtime: Runtime,
     /// Absolute path to the downloaded model file.
     pub file: PathBuf,
+    /// Vision models only: absolute path to the multimodal projector (`mmproj`)
+    /// file, passed to the server as `--mmproj`. `None` for text models (the
+    /// command is then byte-identical to the pre-vision shape).
+    pub projector: Option<PathBuf>,
 }
 
 /// Resolve the cassette's `model` (a catalog id) into a concrete file + runtime.
@@ -94,9 +98,29 @@ pub fn resolve_runtime(
             file.display()
         ));
     }
+    // A vision model needs its projector on disk too; a half-installed pair
+    // (weights present, mmproj missing) would make the server fail to load the
+    // CLIP model with an opaque error — catch it here with an actionable one.
+    let projector = if entry.is_vision() {
+        let name = entry
+            .mmproj_file_name()
+            .expect("is_vision() ⇒ mmproj_url ⇒ mmproj_file_name is Some");
+        let p = models_dir.join(name);
+        if !p.exists() {
+            return Err(format!(
+                "vision projector (mmproj) not found: {} — reinstall this \
+                 model from Model Setup to fetch both files",
+                p.display()
+            ));
+        }
+        Some(p)
+    } else {
+        None
+    };
     Ok(RuntimePlan {
         runtime: entry.runtime,
         file,
+        projector,
     })
 }
 
@@ -121,9 +145,8 @@ pub fn build_command(
 ) -> Result<(PathBuf, Vec<String>), String> {
     let port = port.to_string();
     match plan.runtime {
-        Runtime::Llamafile => Ok((
-            plan.file.clone(),
-            vec![
+        Runtime::Llamafile => {
+            let mut args = vec![
                 "--server".into(),
                 "--port".into(),
                 port,
@@ -134,8 +157,13 @@ pub fn build_command(
                 // unconditionally is safe.
                 "-ngl".into(),
                 "999".into(),
-            ],
-        )),
+            ];
+            // Future-proof: a vision llamafile (recent builds are llama.cpp-based
+            // and accept --mmproj in server mode) gets its projector too. No
+            // shipped llamafile entry is vision today, so this is normally a no-op.
+            push_mmproj(&mut args, plan);
+            Ok((plan.file.clone(), args))
+        }
         Runtime::Gguf => {
             // llama.cpp renamed `server` → `llama-server`; accept either.
             let bin = find_on_path("llama-server")
@@ -146,21 +174,32 @@ pub fn build_command(
                      Model Setup, which needs no extra install."
                         .to_string()
                 })?;
-            Ok((
-                bin,
-                vec![
-                    "-m".into(),
-                    plan.file.display().to_string(),
-                    "--host".into(),
-                    "127.0.0.1".into(),
-                    "--port".into(),
-                    port,
-                    // Full GPU offload; falls back to CPU where unsupported.
-                    "-ngl".into(),
-                    "999".into(),
-                ],
-            ))
+            let mut args = vec![
+                "-m".into(),
+                plan.file.display().to_string(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                port,
+                // Full GPU offload; falls back to CPU where unsupported.
+                "-ngl".into(),
+                "999".into(),
+            ];
+            // Vision model: hand llama-server the CLIP projector. `--mmproj` makes
+            // the OpenAI-compatible endpoint accept `image_url` content parts
+            // (libmtmd); without it the same weights serve text-only.
+            push_mmproj(&mut args, plan);
+            Ok((bin, args))
         }
+    }
+}
+
+/// Append `--mmproj <projector>` to `args` when the plan carries a projector.
+/// Factored out so both runtime arms stay in sync and the rule is unit-tested.
+fn push_mmproj(args: &mut Vec<String>, plan: &RuntimePlan) {
+    if let Some(proj) = &plan.projector {
+        args.push("--mmproj".into());
+        args.push(proj.display().to_string());
     }
 }
 
@@ -199,10 +238,49 @@ fn spawn_server_process(
         .map_err(|e| format!("cannot launch {}: {e}", program.display()))
 }
 
-/// Look up an executable on `PATH` (the real injector for [`build_command`]).
+/// Directories to search for a program, in order: every entry of `$PATH`, then
+/// the well-known install locations a macOS GUI app would otherwise miss.
+///
+/// A bundle launched from Finder/`open` inherits launchd's minimal `PATH`
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`) — NOT the user's shell PATH — so a
+/// Homebrew-installed `llama-server` (`/usr/local/bin` on Intel,
+/// `/opt/homebrew/bin` on Apple Silicon) is invisible via `$PATH` alone and the
+/// gguf runtime fails with "no llama.cpp server on PATH" even though it IS
+/// installed. Appending the standard prefixes (deduped, never ahead of PATH)
+/// fixes that without changing behaviour when PATH already covers them. The
+/// extra dirs simply don't exist on other platforms, so the probe is harmless.
+/// Pure over its injected inputs so the ordering/dedup rule is unit-tested.
+pub fn program_search_dirs(path_var: Option<std::ffi::OsString>, home: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path_var
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let push_unique = |dirs: &mut Vec<PathBuf>, p: PathBuf| {
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+    for d in [
+        "/opt/homebrew/bin", // Apple-silicon Homebrew
+        "/opt/homebrew/sbin",
+        "/usr/local/bin", // Intel Homebrew / manual installs
+        "/usr/local/sbin",
+    ] {
+        push_unique(&mut dirs, PathBuf::from(d));
+    }
+    if let Some(home) = home {
+        for sub in [".local/bin", "bin"] {
+            push_unique(&mut dirs, home.join(sub));
+        }
+    }
+    dirs
+}
+
+/// Look up an executable for [`build_command`]: `$PATH` first, then the
+/// well-known prefixes (see [`program_search_dirs`]) so a GUI-launched bundle
+/// still finds a Homebrew `llama-server`.
 pub fn which(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    program_search_dirs(std::env::var_os("PATH"), dirs::home_dir())
+        .into_iter()
         .map(|dir| dir.join(program))
         .find(|cand| cand.is_file())
 }
@@ -364,6 +442,7 @@ mod tests {
         RuntimePlan {
             runtime: Runtime::Gguf,
             file: PathBuf::from("/models/qwen.gguf"),
+            projector: None,
         }
     }
 
@@ -371,6 +450,15 @@ mod tests {
         RuntimePlan {
             runtime: Runtime::Llamafile,
             file: PathBuf::from("/models/qwen.llamafile"),
+            projector: None,
+        }
+    }
+
+    fn vision_gguf_plan() -> RuntimePlan {
+        RuntimePlan {
+            runtime: Runtime::Gguf,
+            file: PathBuf::from("/models/vl.gguf"),
+            projector: Some(PathBuf::from("/models/mmproj-vl.gguf")),
         }
     }
 
@@ -447,6 +535,33 @@ mod tests {
     }
 
     #[test]
+    fn gguf_vision_plan_appends_mmproj() {
+        let (prog, args) = build_command(&vision_gguf_plan(), 8080, |name| {
+            (name == "llama-server").then(|| PathBuf::from("/usr/bin/llama-server"))
+        })
+        .unwrap();
+        assert_eq!(prog, PathBuf::from("/usr/bin/llama-server"));
+        // Weights via -m, projector via --mmproj (the value directly follows).
+        let m = args.iter().position(|a| a == "-m").unwrap();
+        assert_eq!(args[m + 1], "/models/vl.gguf");
+        let mm = args.iter().position(|a| a == "--mmproj").expect("--mmproj present");
+        assert_eq!(args[mm + 1], "/models/mmproj-vl.gguf");
+    }
+
+    #[test]
+    fn non_vision_plan_omits_mmproj() {
+        // A text model's command must be byte-identical to the pre-vision shape.
+        let (_, args) = build_command(&gguf_plan(), 8080, |name| {
+            (name == "llama-server").then(|| PathBuf::from("/usr/bin/llama-server"))
+        })
+        .unwrap();
+        assert!(!args.iter().any(|a| a == "--mmproj"));
+        // llamafile too.
+        let (_, largs) = build_command(&llamafile_plan(), 8080, |_| None).unwrap();
+        assert!(!largs.iter().any(|a| a == "--mmproj"));
+    }
+
+    #[test]
     fn gguf_falls_back_to_legacy_server_binary() {
         // Only the old `server` name is present → still resolves.
         let (prog, _) = build_command(&gguf_plan(), 8080, |name| {
@@ -463,6 +578,45 @@ mod tests {
         assert!(err.contains("llama-server"), "{err}");
         // Points the user at the no-install alternative.
         assert!(err.to_lowercase().contains("llamafile"), "{err}");
+    }
+
+    // ── program search dirs (macOS GUI PATH gap) ───────────────────────────
+
+    #[test]
+    fn search_dirs_append_homebrew_prefixes_after_path() {
+        // A minimal launchd-style PATH (what a Finder/`open`-launched bundle
+        // sees) must still be augmented with the Homebrew/common prefixes so a
+        // brew-installed llama-server is found.
+        let path = std::env::join_paths(["/usr/bin", "/bin"]).unwrap();
+        let dirs = program_search_dirs(Some(path), Some(PathBuf::from("/Users/x")));
+        // PATH entries come first, in order.
+        assert_eq!(dirs[0], PathBuf::from("/usr/bin"));
+        assert_eq!(dirs[1], PathBuf::from("/bin"));
+        // Both Homebrew bin dirs are present (Apple-silicon + Intel).
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")), "{dirs:?}");
+        assert!(dirs.contains(&PathBuf::from("/usr/local/bin")), "{dirs:?}");
+        // Home-relative user bin dirs are included.
+        assert!(dirs.contains(&PathBuf::from("/Users/x/.local/bin")), "{dirs:?}");
+        assert!(dirs.contains(&PathBuf::from("/Users/x/bin")), "{dirs:?}");
+    }
+
+    #[test]
+    fn search_dirs_dedupe_prefix_already_in_path() {
+        // If PATH already lists a prefix, it must not be appended a second time.
+        let path = std::env::join_paths(["/usr/local/bin", "/usr/bin"]).unwrap();
+        let dirs = program_search_dirs(Some(path), None);
+        let hits = dirs.iter().filter(|d| **d == PathBuf::from("/usr/local/bin")).count();
+        assert_eq!(hits, 1, "prefix duplicated: {dirs:?}");
+        // No home ⇒ no home-relative dirs.
+        assert!(!dirs.iter().any(|d| d.ends_with(".local/bin")), "{dirs:?}");
+    }
+
+    #[test]
+    fn search_dirs_empty_path_still_probes_prefixes() {
+        // Even with no PATH at all, the fallback prefixes are searched.
+        let dirs = program_search_dirs(None, None);
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")), "{dirs:?}");
+        assert!(dirs.contains(&PathBuf::from("/usr/local/bin")), "{dirs:?}");
     }
 
     // ── free port selection ────────────────────────────────────────────────
@@ -596,6 +750,32 @@ mod tests {
         let plan = resolve_runtime(&cat, &dir, &entry.id).unwrap();
         assert_eq!(plan.runtime, entry.runtime);
         assert_eq!(plan.file, file);
+        assert_eq!(plan.projector, None, "text model has no projector");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_vision_requires_projector_then_sets_it() {
+        let cat = Catalog::load();
+        let entry = cat
+            .models
+            .iter()
+            .find(|m| m.is_vision())
+            .expect("catalog ships a vision model")
+            .clone();
+        let dir = std::env::temp_dir().join("ijc_resolve_vision");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Weights present but projector missing → a half-install error naming mmproj.
+        let weights = dir.join(entry.file_name());
+        std::fs::write(&weights, b"").unwrap();
+        let err = resolve_runtime(&cat, &dir, &entry.id).unwrap_err();
+        assert!(err.to_lowercase().contains("mmproj"), "{err}");
+        // Add the projector → resolves with the projector path set.
+        let proj = dir.join(entry.mmproj_file_name().unwrap());
+        std::fs::write(&proj, b"").unwrap();
+        let plan = resolve_runtime(&cat, &dir, &entry.id).unwrap();
+        assert_eq!(plan.projector, Some(proj));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

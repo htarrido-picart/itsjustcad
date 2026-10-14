@@ -52,6 +52,21 @@ pub struct ModelEntry {
     pub runtime: Runtime,
     /// Minimum system RAM (GiB) to run comfortably; the Install gate.
     pub ram_gb_min: u64,
+    /// Vision models only: URL of the multimodal CLIP projector (`mmproj`) that
+    /// rides alongside the weights. `Some` ⇒ this is a vision entry served with
+    /// `llama-server -m <weights> --mmproj <projector>`. Absent (the default, via
+    /// `#[serde(default)]`) for every text model, so existing entries and old
+    /// on-disk catalogs parse byte-identically.
+    #[serde(default)]
+    pub mmproj_url: Option<String>,
+    /// Expected SHA-256 of the projector (lower-case hex). `None` for text
+    /// models; a placeholder-style empty string is treated as "unverified".
+    #[serde(default)]
+    pub mmproj_sha256: Option<String>,
+    /// Projector size in bytes — folded into the disk gate so Install refuses
+    /// when the volume can't hold BOTH files plus the margin.
+    #[serde(default)]
+    pub mmproj_size_bytes: Option<u64>,
 }
 
 /// Serde-friendly mirror of [`ModelTier`] (that enum has no `None` in the JSON
@@ -88,6 +103,37 @@ impl ModelEntry {
             .to_string()
     }
 
+    /// True when this is a vision (multimodal) model: it carries a projector
+    /// artifact that must be downloaded and passed to the runtime as `--mmproj`.
+    pub fn is_vision(&self) -> bool {
+        self.mmproj_url.is_some()
+    }
+
+    /// On-disk file name for the projector (last path segment of `mmproj_url`,
+    /// query stripped) — the mmproj mirror of [`file_name`](Self::file_name).
+    /// `None` for text models.
+    pub fn mmproj_file_name(&self) -> Option<String> {
+        let url = self.mmproj_url.as_deref()?;
+        Some(
+            url.rsplit('/')
+                .next()
+                .unwrap_or(&self.id)
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(&self.id)
+                .to_string(),
+        )
+    }
+
+    /// Expected SHA-256 for the projector download, or `None` when absent or an
+    /// empty/placeholder string (mirrors [`expected_sha`](Self::expected_sha)).
+    pub fn mmproj_expected_sha(&self) -> Option<&str> {
+        match self.mmproj_sha256.as_deref() {
+            Some(s) if !s.trim().is_empty() => Some(s),
+            _ => None,
+        }
+    }
+
     /// True when this machine (with `ram_gb` GiB) can run the model per the
     /// catalog's `ram_gb_min` gate. Unknown RAM (`None`) is treated permissively
     /// as "allow, but warn" — the caller decides how to surface that.
@@ -109,13 +155,18 @@ impl ModelEntry {
     pub fn disk_shortfall(&self, free_disk_gb: Option<u64>) -> Option<String> {
         const GIB: u64 = 1024 * 1024 * 1024;
         let free = free_disk_gb?;
-        let needed = self.size_bytes.saturating_add(GIB);
+        // A vision model installs TWO files (weights + projector); the gate must
+        // account for both so Install doesn't start a pair that can't fit.
+        let payload = self
+            .size_bytes
+            .saturating_add(self.mmproj_size_bytes.unwrap_or(0));
+        let needed = payload.saturating_add(GIB);
         if free.saturating_mul(GIB) >= needed {
             return None;
         }
         Some(format!(
             "Not enough free disk space: needs {} (+1 GB margin), only {} GB free.",
-            crate::download::fmt_bytes(self.size_bytes),
+            crate::download::fmt_bytes(payload),
             free
         ))
     }
@@ -266,6 +317,9 @@ mod tests {
             sha256: "".into(),
             runtime: Runtime::Gguf,
             ram_gb_min: 16,
+            mmproj_url: None,
+            mmproj_sha256: None,
+            mmproj_size_bytes: None,
         };
         assert!(!e.runnable_at(Some(15)));
         assert!(e.runnable_at(Some(16)));
@@ -294,6 +348,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recommended_default_is_zero_install_text_not_vision() {
+        // Product decision: the auto-recommended local model stays a
+        // self-contained llamafile (no llama.cpp install), NOT the vision GGUF
+        // (which needs `llama-server` on PATH). Vision is offered as an explicit
+        // opt-in. This guards against a catalog reorder silently promoting the
+        // GGUF vision model to the default and regressing zero-install onboarding.
+        let cat = Catalog::load();
+        for tier in [ModelTier::None, ModelTier::Small3B, ModelTier::Mid7B] {
+            let rec = cat.recommended_for(tier).unwrap();
+            assert_eq!(rec.runtime, Runtime::Llamafile, "{tier:?} rec {}", rec.id);
+            assert!(!rec.is_vision(), "{tier:?} recommended a vision model: {}", rec.id);
+        }
+    }
+
     // ── disk gate + unknown-RAM warning ────────────────────────────────────
 
     fn entry_of_size(size_bytes: u64) -> ModelEntry {
@@ -307,6 +376,9 @@ mod tests {
             sha256: "".into(),
             runtime: Runtime::Gguf,
             ram_gb_min: 8,
+            mmproj_url: None,
+            mmproj_sha256: None,
+            mmproj_size_bytes: None,
         }
     }
 
@@ -373,6 +445,9 @@ mod tests {
             sha256: "".into(),
             runtime: Runtime::Gguf,
             ram_gb_min: 8,
+            mmproj_url: None,
+            mmproj_sha256: None,
+            mmproj_size_bytes: None,
         };
         assert_eq!(e.file_name(), "model.gguf");
     }
@@ -389,12 +464,86 @@ mod tests {
             sha256: "".into(),
             runtime: Runtime::Gguf,
             ram_gb_min: 8,
+            mmproj_url: None,
+            mmproj_sha256: None,
+            mmproj_size_bytes: None,
         };
         assert!(e.is_placeholder());
         assert_eq!(e.expected_sha(), None);
         e.sha256 = "abc123".into();
         assert!(!e.is_placeholder());
         assert_eq!(e.expected_sha(), Some("abc123"));
+    }
+
+    // ── vision (mmproj) entries ────────────────────────────────────────────
+
+    #[test]
+    fn bundled_catalog_has_a_vision_entry_with_a_verified_projector() {
+        let cat = Catalog::load();
+        let v = cat
+            .models
+            .iter()
+            .find(|m| m.is_vision())
+            .expect("catalog ships a vision model");
+        // A vision entry is a gguf served with a projector; both artifacts must
+        // carry a 64-hex sha and the projector file name derives from its url.
+        assert_eq!(v.runtime, Runtime::Gguf, "{}", v.id);
+        assert_eq!(v.mmproj_file_name().as_deref(), Some("mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf"));
+        let sha = v.mmproj_expected_sha().expect("projector sha present");
+        assert_eq!(sha.len(), 64, "{}", v.id);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()), "{}", v.id);
+        assert!(v.mmproj_size_bytes.is_some_and(|n| n > 0));
+    }
+
+    #[test]
+    fn text_entry_is_not_vision_and_has_no_projector() {
+        let e = entry_of_size(1);
+        assert!(!e.is_vision());
+        assert_eq!(e.mmproj_file_name(), None);
+        assert_eq!(e.mmproj_expected_sha(), None);
+    }
+
+    #[test]
+    fn empty_mmproj_sha_is_treated_as_unverified() {
+        let mut e = entry_of_size(1);
+        e.mmproj_url = Some("https://h/mmproj.gguf".into());
+        e.mmproj_sha256 = Some("  ".into());
+        assert!(e.is_vision());
+        assert_eq!(e.mmproj_expected_sha(), None, "blank sha ⇒ no expectation");
+        e.mmproj_sha256 = Some("abc123".into());
+        assert_eq!(e.mmproj_expected_sha(), Some("abc123"));
+    }
+
+    #[test]
+    fn disk_gate_sums_weights_and_projector() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // 3 GiB weights + 2 GiB projector = 5 GiB payload, +1 GiB margin = 6 GiB.
+        let mut e = entry_of_size(3 * GIB);
+        e.mmproj_url = Some("https://h/mmproj.gguf".into());
+        e.mmproj_size_bytes = Some(2 * GIB);
+        // 6 GB free is exactly payload+margin → OK; 5 GB is short → blocked.
+        assert_eq!(e.disk_shortfall(Some(6)), None);
+        let msg = e.disk_shortfall(Some(5)).expect("must block");
+        assert!(msg.contains("5.0 GB"), "payload size shown: {msg}");
+    }
+
+    #[test]
+    fn vision_entry_serde_roundtrips_and_old_json_omits_fields() {
+        // Old text-only JSON (no mmproj keys) must parse with the fields None.
+        let text = r#"{"id":"t","display_name":"T","params":"4B","tier":"Mid7B",
+            "url":"https://h/t.llamafile","size_bytes":10,"sha256":"",
+            "runtime":"llamafile","ram_gb_min":8}"#;
+        let e: ModelEntry = serde_json::from_str(text).unwrap();
+        assert!(!e.is_vision());
+        // A vision entry round-trips through serde intact.
+        let vision = r#"{"id":"v","display_name":"V","params":"3B","tier":"Small3B",
+            "url":"https://h/v.gguf","size_bytes":10,"sha256":"","runtime":"gguf",
+            "ram_gb_min":8,"mmproj_url":"https://h/mmproj.gguf",
+            "mmproj_sha256":"deadbeef","mmproj_size_bytes":5}"#;
+        let v: ModelEntry = serde_json::from_str(vision).unwrap();
+        assert!(v.is_vision());
+        assert_eq!(v.mmproj_file_name().as_deref(), Some("mmproj.gguf"));
+        assert_eq!(v.mmproj_size_bytes, Some(5));
     }
 
     #[test]
