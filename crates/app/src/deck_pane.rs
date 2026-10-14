@@ -3793,16 +3793,16 @@ impl DeckPane {
     /// blind model shows a "can't see images" hint rather than accepting.
     fn handle_image_drop(&mut self, ui: &egui::Ui, roles: &crate::theme::ColorRoles) {
         let ctx = ui.ctx();
-        // Scope to the message area via the pointer: a drop (or hover) over the
-        // composer, the segment control, or outside the chat is ignored here.
-        let over_messages = ctx
-            .input(|i| i.pointer.latest_pos())
-            .is_some_and(|p| self.message_area_rect.contains(p));
-        if !over_messages {
-            return;
-        }
         let vision = self.active_supports_vision();
 
+        // Accept the drop regardless of position. macOS does NOT reliably feed
+        // egui the cursor position during an external file drag, so a
+        // rect/`latest_pos` test silently rejects every drop (the bug the user
+        // hit). We can't geometrically scope WHERE the file lands — but an image
+        // is only ever a chat attachment, and this runs only while the Chat pane
+        // is visible, so a position-free accept is correct. The VISUAL hint below
+        // is still confined to the message area, so no drop feedback ever shows
+        // over the composer input or the `Chat | Commands` segment control.
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -3814,7 +3814,8 @@ impl DeckPane {
             self.attached_image = Some(img);
         }
 
-        // Drop-target hint over the message area while a file is dragged over it.
+        // Drop-target hint painted over the MESSAGE AREA only (see
+        // `paint_drop_hint`) while an OS file drag is in progress.
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             self.paint_drop_hint(ui, roles, vision);
         }
@@ -3844,6 +3845,41 @@ impl DeckPane {
         if let Some(img) = clipboard_image_to_file(&std::env::temp_dir()) {
             self.attached_image = Some(img);
         }
+    }
+
+    /// Draw a small circular "×" remove badge on the TOP-RIGHT corner of an
+    /// attachment thumbnail (`img_rect`) and return whether it was clicked. The
+    /// photo-attachment convention: the remove control sits on the image itself,
+    /// not as a separate button beside it.
+    fn remove_attachment_badge(ui: &egui::Ui, img_rect: egui::Rect) -> bool {
+        let r = 8.5;
+        // Nudge the badge slightly inward from the corner so it overlaps the
+        // image edge rather than floating off it.
+        let center = egui::pos2(img_rect.right() - r + 1.0, img_rect.top() + r - 1.0);
+        let hit = egui::Rect::from_center_size(center, egui::vec2(2.0 * r, 2.0 * r));
+        let resp = ui
+            .interact(hit, ui.id().with("remove_attachment_badge"), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("remove attachment");
+        let painter = ui.painter();
+        let bg = if resp.hovered() {
+            egui::Color32::from_rgb(220, 60, 60)
+        } else {
+            egui::Color32::from_black_alpha(170)
+        };
+        painter.circle_filled(center, r, bg);
+        // The × glyph: two diagonal strokes.
+        let d = r * 0.42;
+        let stroke = egui::Stroke::new(1.6, egui::Color32::WHITE);
+        painter.line_segment(
+            [center + egui::vec2(-d, -d), center + egui::vec2(d, d)],
+            stroke,
+        );
+        painter.line_segment(
+            [center + egui::vec2(-d, d), center + egui::vec2(d, -d)],
+            stroke,
+        );
+        resp.clicked()
     }
 
     /// Paint a rounded drop-target border + centred label over the MESSAGE area
@@ -4294,14 +4330,20 @@ impl DeckPane {
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        // Thumbnail preview; fall back to a paperclip + filename
-                        // if the image can't be decoded.
+                        // Thumbnail preview with a circular × overlaid on its
+                        // top-right corner (photo-attachment convention); fall
+                        // back to a paperclip + filename + a plain × if the image
+                        // can't be decoded.
                         match self.image_texture(ui.ctx(), &img) {
                             Some(tex) => {
                                 let size =
                                     thumb_fit(tex.size().map(|d| d as u32), egui::vec2(0.0, 44.0));
-                                ui.image(egui::load::SizedTexture::new(tex.id(), size))
+                                let resp = ui
+                                    .image(egui::load::SizedTexture::new(tex.id(), size))
                                     .on_hover_text(&name);
+                                if Self::remove_attachment_badge(ui, resp.rect) {
+                                    self.attached_image = None;
+                                }
                             }
                             None => {
                                 let fg = ui.visuals().weak_text_color();
@@ -4314,13 +4356,13 @@ impl DeckPane {
                                 ))
                                 .on_hover_text("attached image");
                                 ui.label(egui::RichText::new(&name).weak());
+                                if icons
+                                    .icon_button(ui, crate::icons::Icon::Close, "remove attachment")
+                                    .clicked()
+                                {
+                                    self.attached_image = None;
+                                }
                             }
-                        }
-                        if icons
-                            .icon_button(ui, crate::icons::Icon::Close, "remove attachment")
-                            .clicked()
-                        {
-                            self.attached_image = None;
                         }
                     });
                 }

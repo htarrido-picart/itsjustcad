@@ -8940,6 +8940,24 @@ impl App {
             tracing::error!("no home dir — cannot resolve models directory");
             return;
         };
+        // Already on disk (a prior download, or files placed manually)? Skip the
+        // multi-GB re-download and just register + activate the cassette.
+        // Installed-state is cassette-based (`catalog_deck_installed`), so a model
+        // whose files were present but whose cassette was missing showed as "not
+        // installed" and re-downloaded; creating the cassette here fixes that.
+        if model_artifacts_present(&entry, &dir) {
+            let mut decks = itsjustcad_deck::DecksFile::load_or_default();
+            install_catalog_deck(&mut decks, &entry);
+            decks.save();
+            let cassette = cassette_name_for(&entry.id);
+            self.deck_pane.activate_installed_model(&cassette, &self.tokio);
+            tracing::info!(
+                "{} already on disk — registered cassette '{}', no re-download.",
+                entry.display_name,
+                cassette
+            );
+            return;
+        }
         let (weights, pending) = install_specs(&entry, dir);
         let handle = crate::download::start(&self.tokio, weights);
         self.active_download = Some(ActiveDownload {
