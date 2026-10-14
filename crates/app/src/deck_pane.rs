@@ -423,6 +423,21 @@ fn first_dropped_image(paths: &[std::path::PathBuf]) -> Option<std::path::PathBu
     paths.iter().find(|p| is_image_path(p)).cloned()
 }
 
+/// Directive appended to a claude-code vision turn's system prompt for a
+/// USER-attached image. The claude-code CLI receives only a path-scoped `Read`
+/// (not an inline image block), so granting the Read is not enough — the model
+/// must be told the image exists at that exact path or it answers from the
+/// user's prose alone. (The viewport-critique turn already carries this in its
+/// own message; only user attachments need it added.) Pure so the wording is
+/// unit-tested.
+fn claude_code_vision_directive(image_path: &std::path::Path) -> String {
+    format!(
+        "\n\n[A user-attached image is available at {}. Use the Read tool on that \
+         exact path to view the image, then answer the user's message about it.]",
+        image_path.display()
+    )
+}
+
 /// Display size for a `src`-pixel image fitted within `max`, preserving aspect
 /// and NEVER upscaling beyond native size. A `max` component of `0.0` means
 /// "unconstrained on that axis" (the height-bounded composer chip passes
@@ -720,6 +735,16 @@ mod image_drop_tests {
         approx(thumb_fit([400, 100], egui::vec2(0.0, 44.0)), egui::vec2(176.0, 44.0));
         // And still never upscales a tiny source past native.
         approx(thumb_fit([20, 10], egui::vec2(0.0, 44.0)), egui::vec2(20.0, 10.0));
+    }
+
+    #[test]
+    fn claude_code_vision_directive_names_the_path_and_read_tool() {
+        let d = claude_code_vision_directive(std::path::Path::new("/tmp/plan.png"));
+        // Must name the exact path and instruct a Read — the whole point is the
+        // CLI opens the file instead of answering from the user's prose alone.
+        assert!(d.contains("/tmp/plan.png"), "{d}");
+        assert!(d.contains("Read"), "{d}");
+        assert!(d.to_lowercase().contains("image"), "{d}");
     }
 }
 
@@ -1270,6 +1295,11 @@ pub struct DeckPane {
     /// overlays dim + centre on THIS (the whole chat pane), not on the bottom
     /// input panel's `max_rect` where the modal fns are actually called.
     pane_rect: egui::Rect,
+    /// The transcript (message) region, captured each frame. Drag-and-drop and
+    /// its hover hint are scoped to THIS rect so the composer input and the
+    /// `Chat | Commands` segment control stay clear of image drops. Read one
+    /// frame late by `handle_image_drop` (which runs before layout); negligible.
+    message_area_rect: egui::Rect,
     /// Sandbox root for deck-originated fs paths — the current document's
     /// directory when known, else the ItsJustCAD documents dir. Set by the app.
     sandbox_root: Option<std::path::PathBuf>,
@@ -1414,6 +1444,7 @@ impl Default for DeckPane {
             deck_run_approved: false,
             pending_firstrun: Vec::new(),
             pane_rect: egui::Rect::NOTHING,
+            message_area_rect: egui::Rect::NOTHING,
             sandbox_root: None,
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),
@@ -2348,6 +2379,10 @@ impl DeckPane {
             // arbitrary read (no `decks.json` key exfiltration via an
             // attacker-controlled scene name). HOW that one image reaches the
             // model depends on the cassette.
+            // Whether this image came from a USER attachment (drag/paste/picker)
+            // vs the viewport critique. The critique's own message already says
+            // "Read {path} …"; a user attachment carries only the user's prose.
+            let user_attached = self.attached_image.is_some();
             let shot = self
                 .attached_image
                 .take()
@@ -2358,6 +2393,16 @@ impl DeckPane {
                 // and give it a 2nd agentic step to open the shot then answer.
                 req.vision_shot_path = Some(shot.display().to_string());
                 req.max_turns = 2;
+                // Unlike the HTTP cassettes (which inline the image bytes), the
+                // claude-code CLI only gets a scoped Read of the path — not an
+                // image block. Granting the Read isn't enough: the model must be
+                // TOLD the image exists, or it answers from the user's text alone
+                // (the exact bug where "what is this?" got a generic reply). The
+                // critique turn already instructs this in its message, so only the
+                // user-attached path needs the directive added here.
+                if user_attached {
+                    req.system.push_str(&claude_code_vision_directive(&shot));
+                }
             } else if inline_vision_image(&config) {
                 // HTTP multimodal cassette (local Qwen2.5-VL served with
                 // --mmproj, or a cloud vision model): inline the image as a
@@ -3739,24 +3784,25 @@ impl DeckPane {
         Some(tex)
     }
 
-    /// Accept an image dragged from the OS onto the chat pane. On a completed
-    /// drop of a known image file — scoped to this pane via the pointer position
-    /// so a drop over the viewport/another panel is ignored — set it as the
-    /// attachment (exactly as the attach dialog would). While files hover the
-    /// pane, paint a drop-target hint. Gated on `active_supports_vision`: a blind
-    /// model shows a "can't see images" hint instead of accepting the drop.
+    /// Accept an image dragged from the OS onto the chat — restricted to the
+    /// MESSAGE (transcript) area only: never the composer input, nor the
+    /// `Chat | Commands` segment control above it. Both the drop and its hover
+    /// hint are scoped to `message_area_rect` (the transcript region captured on
+    /// the previous frame — this runs before this frame lays it out, and the
+    /// rect barely moves between frames). Gated on `active_supports_vision`: a
+    /// blind model shows a "can't see images" hint rather than accepting.
     fn handle_image_drop(&mut self, ui: &egui::Ui, roles: &crate::theme::ColorRoles) {
         let ctx = ui.ctx();
+        // Scope to the message area via the pointer: a drop (or hover) over the
+        // composer, the segment control, or outside the chat is ignored here.
+        let over_messages = ctx
+            .input(|i| i.pointer.latest_pos())
+            .is_some_and(|p| self.message_area_rect.contains(p));
+        if !over_messages {
+            return;
+        }
         let vision = self.active_supports_vision();
 
-        // Accept an image dropped ANYWHERE over the chat — the whole pane, not
-        // just the composer. We deliberately do NOT gate on pointer position:
-        // during an OS file drag the pointer is often not reported (so a
-        // rect/`latest_pos` test would only catch drops over the last-tracked
-        // spot, typically the input), and an image is only ever meaningful as a
-        // chat attachment — the viewport imports CAD files, never images, and the
-        // app-wide handler already ignores images. This fn runs only while the
-        // Chat pane is on screen, so "window-wide" effectively means "the chat".
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -3768,7 +3814,7 @@ impl DeckPane {
             self.attached_image = Some(img);
         }
 
-        // Drop-target hint across the whole pane while a file is dragged over it.
+        // Drop-target hint over the message area while a file is dragged over it.
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             self.paint_drop_hint(ui, roles, vision);
         }
@@ -3800,14 +3846,16 @@ impl DeckPane {
         }
     }
 
-    /// Paint a rounded drop-target border + centred label over the pane while an
-    /// OS file drag hovers it. `vision` selects accept vs "can't see" messaging.
+    /// Paint a rounded drop-target border + centred label over the MESSAGE area
+    /// while an OS file drag hovers it. `vision` selects accept vs "can't see"
+    /// messaging. Uses `message_area_rect` so the hint never covers the composer
+    /// or the segment control.
     fn paint_drop_hint(&self, ui: &egui::Ui, roles: &crate::theme::ColorRoles, vision: bool) {
         let painter = ui.ctx().layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("deck_image_drop_hint"),
         ));
-        let rect = self.pane_rect.shrink(8.0);
+        let rect = self.message_area_rect.shrink(8.0);
         let (color, label) = if vision {
             (crate::theme::to_color32(roles.primary), "Drop image to attach")
         } else {
@@ -4555,6 +4603,10 @@ impl DeckPane {
         let (user_bg, user_txt) = crate::theme::viewport_active_tag(ui.visuals().dark_mode);
         let deck_bg = crate::theme::to_color32(roles.surface_elevated);
         let bubble_radius = egui::CornerRadius::same(10);
+        // The transcript fills the remaining central space — the bottom composer
+        // `Panel` and the top toolbar/segment control are already reserved — so
+        // this is exactly the message area the next frame's drag-drop scopes to.
+        self.message_area_rect = ui.available_rect_before_wrap();
         egui::Frame::NONE
             .fill(transcript_bg)
             // Horizontal inner margin so bubbles/rows don't clip against the
@@ -5129,6 +5181,7 @@ mod side_effect_gate_tests {
             deck_run_approved: true,
             pending_firstrun: Vec::new(),
             pane_rect: egui::Rect::NOTHING,
+            message_area_rect: egui::Rect::NOTHING,
             sandbox_root: None,
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),

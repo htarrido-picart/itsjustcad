@@ -1396,7 +1396,10 @@ impl App {
                 Some("ollama") => DeckBrain::Ollama,
                 Some("cloud") => DeckBrain::Cloud,
                 Some("openai") => DeckBrain::OpenAi,
-                _ => DeckBrain::Skip,
+                Some("skip") => DeckBrain::Skip,
+                // Default the first-run pick to a LOCAL model download (private,
+                // no API key) rather than Skip — a local-first onboarding default.
+                _ => DeckBrain::Download,
             },
             hardware: crate::hardware::detect(),
             // Dev hook: ITSJUSTCAD_MODEL_SETUP=1 opens the Model Setup panel on
