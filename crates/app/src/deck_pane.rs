@@ -473,7 +473,9 @@ fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> 
 /// Not pure (clipboard + disk); the encode core is [`encode_rgba_png`].
 fn clipboard_image_to_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut cb = arboard::Clipboard::new().ok()?;
-    let img = cb.get_image().ok()?; // RGBA8; Err when the clipboard isn't an image
+    // `get_image` errors when the clipboard holds text / no bitmap — the common
+    // case on a ⌘V meant for text, so this stays quiet and the caller no-ops.
+    let img = cb.get_image().ok()?; // RGBA8
     let png = encode_rgba_png(img.width, img.height, &img.bytes)?;
     let path = dir.join("itsjustcad-pasted.png");
     std::fs::write(&path, png).ok()?;
@@ -3833,22 +3835,30 @@ impl DeckPane {
     /// and we no-op: normal text paste into the input is untouched, and a copied
     /// file is handled by dragging it in instead.
     fn handle_image_paste(&mut self, ui: &egui::Ui) {
-        if !self.active_supports_vision() {
-            return;
-        }
-        // Detect a paste by EITHER signal. On macOS, eframe routes ⌘V as an
-        // `Event::Paste` and frequently does NOT surface the raw `V` keypress, so
-        // the chord alone silently misses every paste (the bug the user hit); on
-        // other setups the reverse can be true. Catching both is robust. A text
-        // paste also fires `Event::Paste`, but `clipboard_image_to_file` then
-        // finds no image and no-ops, leaving the input's own text paste untouched.
+        // Detect ⌘V for an IMAGE paste. Two macOS facts (confirmed by tracing)
+        // break the obvious detections:
+        //   1. macOS consumes the Cmd+V key-DOWN for its paste shortcut, so egui
+        //      only ever sees the key-UP — `key_pressed(V)` is never true.
+        //   2. eframe emits `Event::Paste` only for non-empty clipboard TEXT, so
+        //      an image-only clipboard produces no Paste event.
+        // So we scan for ANY `V` key event (down or up) with Cmd held — the key-UP
+        // reliably arrives — plus `Event::Paste` for text-bearing clipboards and
+        // other platforms. Firing on key-UP just means the attach lands on release.
         let paste = ui.ctx().input(|i| {
-            i.events
-                .iter()
-                .any(|e| matches!(e, egui::Event::Paste(_)))
-                || (i.key_pressed(egui::Key::V) && i.modifiers.command)
+            i.events.iter().any(|e| match e {
+                egui::Event::Paste(_) => true,
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    modifiers,
+                    ..
+                } => modifiers.command,
+                _ => false,
+            })
         });
         if !paste {
+            return;
+        }
+        if !self.active_supports_vision() {
             return;
         }
         if let Some(img) = clipboard_image_to_file(&std::env::temp_dir()) {
