@@ -1132,12 +1132,48 @@ fn commands_card(ui: &mut egui::Ui, commands: &[ExecutedCommand]) -> bool {
     .clicked()
 }
 
+/// Green used for the compact "current" session badge — the same tasteful
+/// positive green as the deck's `OK_COLOR` check-marks (no `success` role exists
+/// in [`crate::theme::ColorRoles`] yet, so this mirrors the established token).
+const CURRENT_BADGE_GREEN: egui::Color32 = OK_COLOR;
+
+/// Predicate for the Sessions tab's "current" highlight: a stored card is the
+/// CURRENT one when its id equals the pane's `loaded_session_id`. A `None`
+/// loaded id (fresh, never-loaded conversation) matches nothing. Pure so it is
+/// unit-testable without egui.
+fn is_current_session(session_id: &str, loaded_session_id: Option<&str>) -> bool {
+    loaded_session_id == Some(session_id)
+}
+
+/// Draw a COMPACT green "current" pill inline (used on the active card's title
+/// row so it adds NO vertical height). Theme-token green, rounded, small caps.
+fn current_badge(ui: &mut egui::Ui) {
+    egui::Frame::new()
+        .fill(CURRENT_BADGE_GREEN.gamma_multiply(0.22))
+        .stroke(egui::Stroke::new(1.0, CURRENT_BADGE_GREEN))
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("current")
+                    .color(CURRENT_BADGE_GREEN)
+                    .size(10.0)
+                    .strong(),
+            );
+        });
+}
+
 /// One clickable SESSION card for the Sessions tab: TITLE (panel-title weight)
 /// over a 1-2 line SUMMARY (secondary color) with a trailing DATE (tertiary).
 /// The whole card is a click target; returns `true` when clicked (→ load it).
+///
+/// When `current` is true the card carries a compact green "current" pill on the
+/// TITLE row (inline, right-aligned) — it marks the active session without
+/// changing the card's height, so the active and non-active cards line up.
 fn session_card(
     ui: &mut egui::Ui,
     session: &crate::chat_store::ChatSession,
+    current: bool,
     secondary: egui::Color32,
     tertiary: egui::Color32,
     outline: egui::Color32,
@@ -1156,12 +1192,24 @@ fn session_card(
     let date = crate::chat_store::fmt_date(session.updated);
 
     let resp = egui::Frame::group(ui.style())
-        .stroke(egui::Stroke::new(1.0, outline))
+        .stroke(egui::Stroke::new(
+            1.0,
+            if current { CURRENT_BADGE_GREEN } else { outline },
+        ))
         .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            // Title — panel-title weight (semibold-ish via .strong()).
-            ui.label(egui::RichText::new(&session.title).strong().size(15.0));
+            // Title row — panel-title weight (semibold-ish via .strong()) with
+            // the optional "current" pill pinned to the right. Keeping the pill
+            // on THIS row means the current card is exactly as tall as the rest.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&session.title).strong().size(15.0));
+                if current {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        current_badge(ui);
+                    });
+                }
+            });
             // Summary — secondary color, wraps to 1-2 lines.
             ui.label(egui::RichText::new(summary).color(secondary).size(12.0));
             // Date — tertiary, right-aligned metadata.
@@ -1176,6 +1224,24 @@ fn session_card(
     }
     ui.add_space(4.0);
     resp.clicked()
+}
+
+#[cfg(test)]
+mod current_session_tests {
+    use super::is_current_session;
+
+    #[test]
+    fn current_matches_only_the_loaded_id() {
+        // The loaded id is the current card; others are not.
+        assert!(is_current_session("abc", Some("abc")));
+        assert!(!is_current_session("abc", Some("xyz")));
+    }
+
+    #[test]
+    fn nothing_is_current_when_no_session_loaded() {
+        // A fresh, never-loaded conversation has no current card.
+        assert!(!is_current_session("abc", None));
+    }
 }
 
 /// Full formatted code view for the detail pane.
@@ -3627,6 +3693,9 @@ impl DeckPane {
         ui.add_space(4.0);
 
         let mut load_session: Option<String> = None;
+        // Snapshot the current (loaded) session id so the render closure can
+        // flag the active card WITHOUT re-borrowing `self` while `store` is held.
+        let current_id = self.loaded_session_id.clone();
         let store = self.store.as_ref().expect("store present");
         let query = self.session_search.trim().to_string();
 
@@ -3648,7 +3717,8 @@ impl DeckPane {
                     ui.label(egui::RichText::new("no matches").weak().italics());
                 }
                 for s in matched {
-                    if session_card(ui, s, secondary, tertiary, outline) {
+                    let current = is_current_session(&s.id, current_id.as_deref());
+                    if session_card(ui, s, current, secondary, tertiary, outline) {
                         load_session = Some(s.id.clone());
                     }
                 }
@@ -3660,7 +3730,8 @@ impl DeckPane {
                 );
             } else {
                 for s in store.sessions.iter() {
-                    if session_card(ui, s, secondary, tertiary, outline) {
+                    let current = is_current_session(&s.id, current_id.as_deref());
+                    if session_card(ui, s, current, secondary, tertiary, outline) {
                         load_session = Some(s.id.clone());
                     }
                 }
