@@ -823,7 +823,7 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "codecheck",
-            usage: "codecheck <pack> [story]",
+            usage: "codecheck <pack-name (e.g. demo, or one loaded via `checkrules load <path>`; `checkrules list` to see them)> [story]",
             summary: "Evaluate a compliance-check pack (declarative JSON rules) against the model: ramp/path slope, door clear width, stair risers, headroom, route clear width, turning circles, counts per story, guard drops. Verdicts land in `report codecheck` (rule id, pass/fail/warn, measured vs required, object ids); failures get colored markers on the 'compliance' layer. The embedded 'demo' pack is always available; load more with `checkrules load`. ADVISORY pre-check only, never a code review — verify with a licensed professional / AHJ. Example: codecheck demo · codecheck demo L1",
             category: Category::Analyze,
         },
@@ -919,7 +919,7 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "lotsubdivide",
-            usage: "lotsubdivide [selector] <method> [area=<> width=<> irregularity=<> seed=<>]",
+            usage: "lotsubdivide [selector] <method: grid|perimeter|streetfollowing> [area=<> width=<> irregularity=<> seed=<>]",
             summary: "Subdivide the selected closed block curve(s) into lots on layer 'lots' (M-intemfit site planning). method=grid is recursive minimum-area OBB subdivision (splits along the block's short axis, pivoted on the long-axis midpoint, recursing while lot area > area). method=perimeter inward-offsets the block by offset_width, cuts the perimeter strip into lots with lines orthogonal to the boundary, and (when subdivide_core is on) grids the interior core — it falls back to grid when the offset collapses. method=streetfollowing (Phase 7) runs a straight-skeleton spine down the block and slices depth-limited lots off its street frontages so each lot follows the fronting street (skeleton backend selectable via lotsettings skeleton=offset|felkel; falls back to grid when the skeleton is degenerate). area = min lot area (recursion stop), width = min lot side length, irregularity 0..0.4 jitters the split pivot / perimeter samples (needs a seed to matter), seed makes the layout deterministic (replay-stable). Every lot keeps a block-boundary (street) edge. Phase-6 lot rules apply as a post-pass from the sticky settings: a width mix (lotsettings widthmix=6:0.25,8:0.5,10:0.25) re-slices the frontage by packing (hits target proportions within 5%); acute corner lots are widened (corner bonus) and clamped; slivers below sliver_frac×area are merged into their largest-shared-edge neighbour; alley loading gives two-frontage depth. When the euro_latam default profile supplies a rule value (no override), the run notes 'using euro_latam defaults (placeholder — confirm with Manuel)'. Sticky defaults come from `lotsettings`. Example: lotsubdivide last grid area=6500 width=50 · lotsubdivide grid width=40 irregularity=0.2 seed=7 · lotsubdivide perimeter area=6500 width=40",
             category: Category::Tools,
         },
@@ -931,7 +931,7 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "lotgeneratesite",
-            usage: "lotgeneratesite [selector] <pattern> [roadwidth=<> blockdepth=<> alleys=on|off seed=<>]",
+            usage: "lotgeneratesite [selector] <pattern: orthogonal|skewed|organic|culdesac|radial|hexagonal|voronoi> [roadwidth=<> blockdepth=<> alleys=on|off seed=<>]",
             summary: "Generate a road network and blocks from the selected closed site boundary curve (M-intemfit site planning, Phase 5). pattern picks a generator — four rectilinear: orthogonal (recursive minimum-area-OBB split of the site into a grid; a spine road along each split), skewed (the same grid rotated 22.5° into a diagonal layout), organic (a gently sinusoidal spine down the site long axis plus perpendicular connectors), culdesac (a spine with perpendicular stubs ending in turnaround bulbs, spaced by block depth); plus three non-rectilinear (Phase 5b): radial (concentric ring roads + radial spokes → annular-sector blocks), hexagonal (hex lattice → hex-cell blocks), voronoi (jittered seeds, diagram as the dual of the Delaunay triangulation → irregular cell blocks). Roads bake as centerlines onto the 'roads' layer; blocks bake as outlines onto the 'blocks' layer, every block edge tagged with the street it fronts (id/width/length) so a later `lotsubdivide` on a block honours force_street_access. roadwidth = road right-of-way width (curb to curb), blockdepth = block-depth road spacing, alleys=on inserts a narrower rear-lane tier bisecting each block along its long axis, seed makes the layout deterministic (replay-stable). Sticky defaults come from `lotsettings`. Example: lotgeneratesite last orthogonal roadwidth=12 blockdepth=60 · lotgeneratesite voronoi blockdepth=70 seed=3 · lotgeneratesite culdesac blockdepth=50 alleys=on seed=7",
             category: Category::Tools,
         },
@@ -979,13 +979,13 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "plant",
-            usage: "plant <species> <x,y[,z]> [age-years]",
+            usage: "plant <species-id (from the catalog, e.g. oak/royal-palm; `plantcatalog` to browse)> <x,y[,z]> [age-years]",
             summary: "Place one plant from the embedded 33-species catalog: temperate ornamentals (quercus-robur, acer-rubrum, betula-pendula, pinus-sylvestris, tilia-cordata) plus tropical/subtropical packs — Caribbean (royal/coconut palm, ceiba, flamboyan, mango), Valle del Cauca (saman, guadua bamboo, gualanday), Guayaquil (guayacan amarillo, algarrobo, palo santo, ceibo). Common-name substrings like 'oak' or 'palm' work too. Renders a trunk + canopy mesh named 'plant:<id>' on layer 'planting', draped onto the terrain when one exists; palms render as crown-on-trunk for low-sun shadow accuracy. [age-years] scales height and canopy along the species growth rate (default mature). If the doc has a `location`, planting outside the species' climate band prints an advisory. Use `plantcatalog [region|zone]` to browse. Planted canopies occlude sun like any mesh. Example: plant royal-palm 10,5 · plant oak 10,5 25",
             category: Category::Tools,
         },
         CommandSpec {
             name: "plantrow",
-            usage: "plantrow <species> <a x,y> <b x,y> <spacing>",
+            usage: "plantrow <species-id (from the catalog, e.g. tilia; `plantcatalog` to browse)> <a x,y> <b x,y> <spacing>",
             summary: "A row of plants from a to b, one every <spacing> meters (b included when the length is an exact multiple). Same catalog, draping and layer as `plant`. Example: plantrow tilia 0,0 30,0 6",
             category: Category::Tools,
         },
@@ -1273,7 +1273,7 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "room",
-            usage: "room <closed-curve> <occupancy> [name]",
+            usage: "room <closed-curve> <occupancy: assembly|business|residential|mercantile|educational|storage|institutional> [name]",
             summary: "Tag a closed-curve region with an IBC use group (assembly|business|residential|mercantile|educational|storage|institutional) and its computed plan area. Rooms feed the IBC occupant-load / exit-count / travel-distance compliance checks (codecheck ibc2021). Example: room sel business · room #suite assembly Lobby",
             category: Category::Structure,
         },
@@ -1285,13 +1285,13 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "beam",
-            usage: "beam <a x,y,z> <b x,y,z> <section> [material <m>] [rot <deg>]",
+            usage: "beam <a x,y,z> <b x,y,z> <section-name (built-in e.g. IPE300/W12, or define via `section <name> rect <w> <h>`)> [material <m>] [rot <deg>]",
             summary: "Frame member (horizontal): sweep a named section along the line a→b into a solid. Optional material and roll angle (deg). Example: beam 0,0,3 6,0,3 W12 material steel · beam 0,0,3 6,0,3 col rot 90",
             category: Category::Structure,
         },
         CommandSpec {
             name: "column",
-            usage: "column <a x,y,z> <b x,y,z> <section> [material <m>] [rot <deg>]",
+            usage: "column <a x,y,z> <b x,y,z> <section-name (built-in e.g. IPE300/W12, or define via `section <name> rect <w> <h>`)> [material <m>] [rot <deg>]",
             summary: "Frame member (vertical): sweep a named section along the line a→b into a solid. Same as beam, distinct for scheduling/ergonomics. Example: column 0,0,0 0,0,3.5 col material concrete",
             category: Category::Structure,
         },
@@ -1325,3 +1325,54 @@ pub fn registry() -> &'static [CommandSpec] {
 /// Selector grammar shared by help and the LLM prompt.
 pub const SELECTOR_HELP: &str =
     "Selectors: 'last' (most recent object), 'last N' (N most recent), 'all', 'sel' (current selection), or an object name.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guard against "trap verbs": commands whose exec resolves an argument
+    /// against a NAMED/ENUMERATED table (section catalog, occupancy codes,
+    /// subdivision methods, check packs, plant species, …) but whose `usage`
+    /// shows the token like a free value/number so the model passes the wrong
+    /// thing and the command errors first try (issue #57).
+    ///
+    /// Each entry pins a verb to a substring its usage MUST contain to signal
+    /// the required-token nature. When you add a verb that looks up an arg in a
+    /// named table, add it here (and make the usage self-describing) so the
+    /// hint can never silently regress.
+    #[test]
+    fn named_table_args_are_signalled_in_usage() {
+        // verb -> a substring the usage must carry so the arg reads as a
+        // name/enum rather than a free value.
+        let require: &[(&str, &[&str])] = &[
+            // Named section catalog / user-defined sections.
+            ("beam", &["section-name"]),
+            ("column", &["section-name"]),
+            // IBC occupancy enum.
+            ("room", &["assembly|business|"]),
+            // Fixed subdivision / site-generation enums.
+            ("lotsubdivide", &["grid|perimeter|streetfollowing"]),
+            ("lotgeneratesite", &["orthogonal|skewed|"]),
+            // Named compliance-check pack.
+            ("codecheck", &["pack-name"]),
+            // Species catalog.
+            ("plant", &["species-id"]),
+            ("plantrow", &["species-id"]),
+        ];
+        let specs = registry();
+        for (verb, needles) in require {
+            let spec = specs
+                .iter()
+                .find(|s| s.name == *verb)
+                .unwrap_or_else(|| panic!("registry missing trap-verb '{verb}'"));
+            for needle in *needles {
+                assert!(
+                    spec.usage.contains(needle),
+                    "trap-verb '{verb}' usage must signal its named/enumerated arg \
+                     (expected substring {needle:?}); usage was: {}",
+                    spec.usage
+                );
+            }
+        }
+    }
+}
