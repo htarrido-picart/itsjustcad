@@ -420,6 +420,30 @@ fn first_dropped_image(paths: &[std::path::PathBuf]) -> Option<std::path::PathBu
     paths.iter().find(|p| is_image_path(p)).cloned()
 }
 
+/// Encode raw RGBA8 pixels (as `arboard` hands back a pasted clipboard image)
+/// to PNG bytes. Pure so the encode is unit-tested without touching the
+/// clipboard or disk. `None` when the buffer length doesn't match
+/// `width * height * 4` (a corrupt/partial clipboard payload).
+fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
+    let img = image::RgbaImage::from_raw(width as u32, height as u32, rgba.to_vec())?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some(buf.into_inner())
+}
+
+/// Read an image off the system clipboard and write it to `dir/itsjustcad-pasted.png`,
+/// returning that path. `None` when the clipboard holds no image (e.g. text —
+/// in which case normal text paste proceeds untouched) or the write fails.
+/// Not pure (clipboard + disk); the encode core is [`encode_rgba_png`].
+fn clipboard_image_to_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    let img = cb.get_image().ok()?; // RGBA8; Err when the clipboard isn't an image
+    let png = encode_rgba_png(img.width, img.height, &img.bytes)?;
+    let path = dir.join("itsjustcad-pasted.png");
+    std::fs::write(&path, png).ok()?;
+    Some(path)
+}
+
 /// The RAW text a transcript entry yields when copied — the original markdown
 /// source, not the rendered layout, so a pasted table/emphasis survives as
 /// markdown (M-chatmd). `None` = nothing sensible to copy (the Commands card
@@ -624,6 +648,21 @@ mod image_drop_tests {
         assert_eq!(first_dropped_image(&paths), None);
         // Empty drop (e.g. a path-less browser drag filtered upstream) → None.
         assert_eq!(first_dropped_image(&[]), None);
+    }
+
+    #[test]
+    fn encode_rgba_png_writes_valid_png_header() {
+        // 2x2 opaque-red RGBA → valid PNG bytes with the 8-byte PNG signature.
+        let rgba = [255u8, 0, 0, 255].repeat(4); // 4 px * RGBA
+        let png = encode_rgba_png(2, 2, &rgba).expect("valid buffer encodes");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+    }
+
+    #[test]
+    fn encode_rgba_png_rejects_mismatched_buffer() {
+        // Length must be width*height*4; a short buffer yields None (not a panic).
+        assert_eq!(encode_rgba_png(2, 2, &[0u8; 3]), None);
+        assert_eq!(encode_rgba_png(1, 1, &[]), None);
     }
 }
 
@@ -3640,6 +3679,34 @@ impl DeckPane {
         }
     }
 
+    /// Attach an image pasted from the clipboard (⌘V / Ctrl+V) — the paste
+    /// sibling of drag-and-drop, e.g. after a screenshot or copying an image
+    /// from a browser. Only fires on the paste chord while the chat is the
+    /// focus (input focused or pointer over the pane) and the active cassette
+    /// can see images. If the clipboard holds TEXT rather than an image,
+    /// `clipboard_image_to_file` returns `None` and normal text paste into the
+    /// input proceeds untouched (we never consume the event).
+    fn handle_image_paste(&mut self, ui: &egui::Ui) {
+        if !self.active_supports_vision() {
+            return;
+        }
+        let ctx = ui.ctx();
+        let paste_chord = ctx.input(|i| i.key_pressed(egui::Key::V) && i.modifiers.command);
+        if !paste_chord {
+            return;
+        }
+        let focused = ctx.memory(|m| m.has_focus(egui::Id::new("deck_chat_input")));
+        let over_pane = ctx
+            .input(|i| i.pointer.latest_pos())
+            .is_some_and(|p| self.pane_rect.contains(p));
+        if !focused && !over_pane {
+            return;
+        }
+        if let Some(img) = clipboard_image_to_file(&std::env::temp_dir()) {
+            self.attached_image = Some(img);
+        }
+    }
+
     /// Paint a rounded drop-target border + centred label over the pane while an
     /// OS file drag hovers it. `vision` selects accept vs "can't see" messaging.
     fn paint_drop_hint(&self, ui: &egui::Ui, roles: &crate::theme::ColorRoles, vision: bool) {
@@ -3692,6 +3759,7 @@ impl DeckPane {
         // composer strip — we want to dim + centre over the whole chat pane.
         self.pane_rect = ui.max_rect();
         self.handle_image_drop(ui, roles);
+        self.handle_image_paste(ui);
         self.drain(session, handle);
         if self.busy()
             && let Some(started) = self.turn_started
