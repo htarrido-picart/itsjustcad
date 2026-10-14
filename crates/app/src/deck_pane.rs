@@ -3117,8 +3117,12 @@ impl DeckPane {
         let pane = self.pane_rect;
         let ctx = ui.ctx().clone();
 
-        // Dim just the pane, on a foreground layer above the chat.
-        let backdrop_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new(id));
+        // Dim just the pane, on the MIDDLE layer: above the chat (Background) but
+        // strictly BELOW the Foreground card. Painting the dim on the SAME order
+        // as the card let egui composite it OVER the card — greying out the modal
+        // and making it hard to read. Middle < Foreground guarantees the card is
+        // on top of the dim.
+        let backdrop_layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new(id));
         let dim = if ui.visuals().dark_mode {
             egui::Color32::from_black_alpha(160)
         } else {

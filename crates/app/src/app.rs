@@ -10894,6 +10894,9 @@ impl eframe::App for App {
         // 3. Status bar — full-width bottom of the LEFT column.
         egui::Panel::bottom("statusbar")
             .resizable(false)
+            // No default top hairline: it sits flush against the deck's left edge
+            // and reads as a stray line crossing the chat input next to it.
+            .show_separator_line(false)
             .show(ui, |ui| self.status_bar(ui));
 
         // A `view <name>` restore (command line, deck or script) parks the
@@ -10908,6 +10911,9 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 egui::Panel::bottom("viewport_tabs")
                     .resizable(false)
+                    // Drop the default top hairline (see statusbar above): it
+                    // bleeds to the deck edge and overlaps the chat input.
+                    .show_separator_line(false)
                     .show(ui, |ui| self.viewport_tab_bar(ui));
                 self.viewport(ui);
             });
