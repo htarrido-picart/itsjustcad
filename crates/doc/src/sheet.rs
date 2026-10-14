@@ -344,6 +344,61 @@ pub struct Sheet {
     pub tags: Vec<SheetTag>,
 }
 
+/// Sheet layout constants, shared between the PDF renderer and
+/// [`Sheet::view_layout_rects`] so the computed rects always match the drawn
+/// page. Paper millimeters.
+pub const SHEET_MARGIN_MM: f64 = 10.0;
+/// Height of the bottom title strip (sheet name + paper size).
+pub const SHEET_TITLE_MM: f64 = 12.0;
+/// Gap between adjacent auto-grid viewports (and between the table and views).
+pub const SHEET_GUTTER_MM: f64 = 5.0;
+/// Height of one schedule-table row (header + each data row).
+pub const SHEET_TABLE_ROW_MM: f64 = 4.5;
+
+impl Sheet {
+    /// The COMPUTED paper-space rectangle for every view, in the SAME order as
+    /// `views` — a pinned view uses its explicit `rect`; an auto-grid view uses
+    /// the equal-horizontal-slice layout the PDF renderer draws. This is the one
+    /// source of truth for "where does this viewport actually sit on the page",
+    /// used both by the PDF content builder and by the FFI JSON (so an editor can
+    /// draw boxes that line up with the exported sheet).
+    ///
+    /// Must stay in lockstep with `pdf::sheet_content`'s layout block.
+    pub fn view_layout_rects(&self) -> Vec<PageRect> {
+        let (paper_w, paper_h) = self.paper.landscape_mm();
+        let n = self.views.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Vertical start of the viewport band: above the title strip, and above
+        // the schedule table when one is present (header + one row per entry).
+        let table_h = match &self.table {
+            Some(t) if !t.rows.is_empty() => (1 + t.rows.len()) as f64 * SHEET_TABLE_ROW_MM,
+            _ => 0.0,
+        };
+        let y0 = SHEET_MARGIN_MM
+            + SHEET_TITLE_MM
+            + if table_h > 0.0 { table_h + SHEET_GUTTER_MM } else { 0.0 };
+        let y1 = paper_h - SHEET_MARGIN_MM;
+
+        let area_w = paper_w - 2.0 * SHEET_MARGIN_MM;
+        let view_w = (area_w - SHEET_GUTTER_MM * (n as f64 - 1.0)) / n as f64;
+
+        self.views
+            .iter()
+            .enumerate()
+            .map(|(i, view)| match view.rect {
+                Some(r) => r,
+                None => {
+                    let x0 = SHEET_MARGIN_MM + i as f64 * (view_w + SHEET_GUTTER_MM);
+                    PageRect { x: x0, y: y0, w: view_w, h: y1 - y0 }
+                }
+            })
+            .collect()
+    }
+}
+
 /// A named, ordered collection of existing sheets — the AutoCAD Sheet Set
 /// Manager / InDesign document analogue. A set is a lightweight *index*: it
 /// stores only sheet names, never a copy of their content, so the referenced

@@ -2373,6 +2373,10 @@ fn sheets_json(doc: &itsjustcad_doc::Document) -> String {
             esc(&sheet.name),
             sheet.paper.label(),
         ));
+        // Computed paper-space rect for EVERY view (auto-grid or pinned), in view
+        // order — the same layout the PDF draws, so an editor can overlay boxes
+        // that line up with the exported sheet.
+        let computed = sheet.view_layout_rects();
         for (j, view) in sheet.views.iter().enumerate() {
             if j > 0 {
                 out.push(',');
@@ -2387,11 +2391,20 @@ fn sheets_json(doc: &itsjustcad_doc::Document) -> String {
             if let Some(t) = &view.title {
                 out.push_str(&format!(",\"title\":\"{}\"", esc(t)));
             }
-            // Explicit paper-space rect in mm (omitted when auto-grid).
+            // Explicit paper-space rect in mm — present ONLY when pinned, so the
+            // editor can tell pinned from auto-grid.
             if let Some(r) = &view.rect {
                 out.push_str(&format!(
                     ",\"rect\":{{\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
                     r.x, r.y, r.w, r.h
+                ));
+            }
+            // Computed rect — ALWAYS present: where the viewport actually sits on
+            // the page (the pinned rect, or the auto-grid slot).
+            if let Some(cr) = computed.get(j) {
+                out.push_str(&format!(
+                    ",\"computedRect\":{{\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+                    cr.x, cr.y, cr.w, cr.h
                 ));
             }
             out.push('}');
@@ -3250,13 +3263,21 @@ mod tests {
         s.run(parse("sheet plan a3").unwrap()).unwrap();
         s.run(parse("sheetview plan top 100").unwrap()).unwrap();
 
-        // Default view: no title/rect in the JSON; displayMode defaults wireframe.
+        // Default view: no title/pinned-rect in the JSON; displayMode defaults
+        // wireframe. But `computedRect` is ALWAYS present — the auto-grid slot.
         let j0 = sheets_json(&s.doc);
         assert!(j0.contains("\"direction\":\"top\""));
         assert!(j0.contains("\"displayMode\":\"wireframe\""), "default mode: {j0}");
         assert!(!j0.contains("\"title\""), "no title when None: {j0}");
-        assert!(!j0.contains("\"rect\""), "no rect when None: {j0}");
+        assert!(!j0.contains("\"rect\":"), "no pinned rect when None: {j0}");
+        assert!(j0.contains("\"computedRect\":"), "computedRect always present: {j0}");
         assert!(!j0.contains("titleblock"), "no stamp when absent");
+        // One view on A3 (420×297): full-width slot inside the margins, above the
+        // 12mm title strip. x=10, y=22, w=400, h=265.
+        assert!(
+            j0.contains("\"computedRect\":{\"x\":10,\"y\":22,\"w\":400,\"h\":265}"),
+            "auto-grid computed rect: {j0}"
+        );
 
         // Fill in the new fields directly on the model.
         {
@@ -3273,7 +3294,38 @@ mod tests {
         assert!(j1.contains("\"displayMode\":\"shaded\""), "{j1}");
         assert!(j1.contains("\"title\":\"GROUND FLOOR\""), "{j1}");
         assert!(j1.contains("\"rect\":{\"x\":10,\"y\":20,\"w\":100,\"h\":80}"), "{j1}");
+        // Once pinned, computedRect equals the pinned rect.
+        assert!(
+            j1.contains("\"computedRect\":{\"x\":10,\"y\":20,\"w\":100,\"h\":80}"),
+            "computedRect == pinned rect: {j1}"
+        );
         assert!(j1.contains("\"titleblock\":{\"project\":\"Villa\"}"), "{j1}");
+    }
+
+    /// `Sheet::view_layout_rects` splits the usable width into equal columns and
+    /// matches a pinned rect verbatim.
+    #[test]
+    fn view_layout_rects_auto_grid_and_pinned() {
+        use itsjustcad_doc::PageRect;
+        let mut s = Session::default();
+        s.run(parse("sheet p a3").unwrap()).unwrap(); // 420 × 297
+        s.run(parse("sheetview p top 100").unwrap()).unwrap();
+        s.run(parse("sheetview p front 100").unwrap()).unwrap();
+
+        // Two auto-grid views: area_w = 400, gutter 5 → each 197.5 wide.
+        // y0 = 10 + 12 = 22, y1 = 287 → h = 265.
+        let r = s.doc.sheet("p").unwrap().view_layout_rects();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0], PageRect { x: 10.0, y: 22.0, w: 197.5, h: 265.0 });
+        assert_eq!(r[1], PageRect { x: 212.5, y: 22.0, w: 197.5, h: 265.0 });
+
+        // Pin view 0 → it is returned verbatim; view 1 still auto-grids as the
+        // only remaining "column 1" slot layout is recomputed for n=2.
+        s.doc.sheet_mut("p").unwrap().views[0].rect =
+            Some(PageRect { x: 5.0, y: 5.0, w: 50.0, h: 40.0 });
+        let r2 = s.doc.sheet("p").unwrap().view_layout_rects();
+        assert_eq!(r2[0], PageRect { x: 5.0, y: 5.0, w: 50.0, h: 40.0 });
+        assert_eq!(r2[1], PageRect { x: 212.5, y: 22.0, w: 197.5, h: 265.0 });
     }
 
     /// End-to-end shaded sheet: render a box to an offscreen RGBA raster via the

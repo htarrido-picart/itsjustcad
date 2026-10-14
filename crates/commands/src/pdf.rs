@@ -1104,23 +1104,18 @@ fn sheet_content(
     };
     let view_y0 = MARGIN_MM + TITLE_MM + if table_h > 0.0 { table_h + GUTTER_MM } else { 0.0 };
 
-    // Equal horizontal slices between the margins, above the title strip (and
-    // table). A view carrying an explicit `rect` is placed there verbatim (paper
-    // mm from the sheet lower-left); views with `rect == None` keep their current
-    // auto-grid slot, so a sheet with no pinned rects renders byte-identically.
+    // Viewport rects come from the shared layout in the doc crate
+    // (`Sheet::view_layout_rects`) so the drawn page and any editor overlay
+    // agree: a pinned `rect` is placed verbatim; an auto-grid view gets its
+    // equal-horizontal-slice slot above the title strip (and table). The loop
+    // below must stay in lockstep with that function — see its doc comment.
+    let _ = view_y0; // y0/y1 now derived inside view_layout_rects
     let n = sheet.views.len();
     if n > 0 {
-        let area_w = paper_w - 2.0 * MARGIN_MM;
-        let view_w = (area_w - GUTTER_MM * (n as f64 - 1.0)) / n as f64;
-        let (y0, y1) = (view_y0, paper_h - MARGIN_MM);
+        let rects = sheet.view_layout_rects();
         for (i, view) in sheet.views.iter().enumerate() {
-            let rect = match view.rect {
-                Some(r) => (DVec2::new(r.x, r.y), DVec2::new(r.x + r.w, r.y + r.h)),
-                None => {
-                    let x0 = MARGIN_MM + i as f64 * (view_w + GUTTER_MM);
-                    (DVec2::new(x0, y0), DVec2::new(x0 + view_w, y1))
-                }
-            };
+            let r = rects[i];
+            let rect = (DVec2::new(r.x, r.y), DVec2::new(r.x + r.w, r.y + r.h));
             // Shaded viewport with a matching, valid raster → embed it as an
             // image XObject and paint it into the rect. Anything else (wrong
             // mode, no raster, bad buffer) renders as vector line art.
