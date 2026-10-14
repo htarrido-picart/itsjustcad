@@ -1396,7 +1396,10 @@ impl App {
                 Some("ollama") => DeckBrain::Ollama,
                 Some("cloud") => DeckBrain::Cloud,
                 Some("openai") => DeckBrain::OpenAi,
-                _ => DeckBrain::Skip,
+                Some("skip") => DeckBrain::Skip,
+                // Default the first-run pick to a LOCAL model download (private,
+                // no API key) rather than Skip — a local-first onboarding default.
+                _ => DeckBrain::Download,
             },
             hardware: crate::hardware::detect(),
             // Dev hook: ITSJUSTCAD_MODEL_SETUP=1 opens the Model Setup panel on
@@ -3463,14 +3466,26 @@ impl App {
         if dropped.is_empty() {
             return;
         }
-        let paths: Vec<std::path::PathBuf> = dropped
+        let all_paths: Vec<std::path::PathBuf> =
+            dropped.into_iter().filter_map(|f| f.path).collect();
+        // Images are the chat deck's job (dropped onto the chat → vision
+        // attachment, handled in `deck_pane`); don't claim them here or warn.
+        let has_image = all_paths.iter().any(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .is_some_and(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif"))
+        });
+        let paths: Vec<std::path::PathBuf> = all_paths
             .into_iter()
-            .filter_map(|f| f.path)
             .filter(|p| Self::is_importable(p))
             .collect();
         let Some(first) = paths.first().cloned() else {
-            self.command_line
-                .push_line("drop ignored: not an importable file (dxf/dwg/ifc/obj/stl/…)");
+            // Stay silent for an image-only drop — the chat deck attaches it.
+            if !has_image {
+                self.command_line
+                    .push_line("drop ignored: not an importable file (dxf/dwg/ifc/obj/stl/…)");
+            }
             return;
         };
         if self.import_job.is_some() {
@@ -8925,6 +8940,24 @@ impl App {
             tracing::error!("no home dir — cannot resolve models directory");
             return;
         };
+        // Already on disk (a prior download, or files placed manually)? Skip the
+        // multi-GB re-download and just register + activate the cassette.
+        // Installed-state is cassette-based (`catalog_deck_installed`), so a model
+        // whose files were present but whose cassette was missing showed as "not
+        // installed" and re-downloaded; creating the cassette here fixes that.
+        if model_artifacts_present(&entry, &dir) {
+            let mut decks = itsjustcad_deck::DecksFile::load_or_default();
+            install_catalog_deck(&mut decks, &entry);
+            decks.save();
+            let cassette = cassette_name_for(&entry.id);
+            self.deck_pane.activate_installed_model(&cassette, &self.tokio);
+            tracing::info!(
+                "{} already on disk — registered cassette '{}', no re-download.",
+                entry.display_name,
+                cassette
+            );
+            return;
+        }
         let (weights, pending) = install_specs(&entry, dir);
         let handle = crate::download::start(&self.tokio, weights);
         self.active_download = Some(ActiveDownload {
@@ -10442,12 +10475,17 @@ impl eframe::App for App {
                             "It's just CAD — a command-first, FOSS CAD workspace.",
                         );
                         ui.add_space(crate::theme::Spacing::S);
-                        // Attribution required under AGPLv3 §7(b) — do not remove.
-                        crate::widgets::dialog_text(ui, roles, "© 2026 Hector Tarrido-Picart");
                         crate::widgets::dialog_text(
                             ui,
                             roles,
-                            "Desktop: AGPLv3. Commercial & mobile licensing from the author.",
+                            &format!("Version {}", crate::update::APP_VERSION),
+                        );
+                        crate::widgets::dialog_text(ui, roles, "License: AGPLv3 (AGPL-3.0-only)");
+                        // Attribution required under AGPLv3 §7(b) — do not remove.
+                        crate::widgets::dialog_text(ui, roles, "© 2026 Hector Tarrido-Picart");
+                        ui.hyperlink_to(
+                            "Source code",
+                            "https://github.com/htarrido-picart/itsjustcad",
                         );
                         crate::widgets::dialog_text(
                             ui,
@@ -10861,6 +10899,9 @@ impl eframe::App for App {
         // 3. Status bar — full-width bottom of the LEFT column.
         egui::Panel::bottom("statusbar")
             .resizable(false)
+            // No default top hairline: it sits flush against the deck's left edge
+            // and reads as a stray line crossing the chat input next to it.
+            .show_separator_line(false)
             .show(ui, |ui| self.status_bar(ui));
 
         // A `view <name>` restore (command line, deck or script) parks the
@@ -10875,6 +10916,9 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 egui::Panel::bottom("viewport_tabs")
                     .resizable(false)
+                    // Drop the default top hairline (see statusbar above): it
+                    // bleeds to the deck edge and overlaps the chat input.
+                    .show_separator_line(false)
                     .show(ui, |ui| self.viewport_tab_bar(ui));
                 self.viewport(ui);
             });

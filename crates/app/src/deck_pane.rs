@@ -166,8 +166,8 @@ mod vision_image_tests {
 
 /// Human label for a cassette in the deck dropdown. Installed local models are
 /// keyed `local-<catalog-id>` (a stable lookup key, ugly to show). Resolve that
-/// key to the catalog's `display_name` so the dropdown reads "JustCadModel
-/// (Qwen 4B)". Non-local decks (and unknown ids) render their raw name.
+/// key to the catalog's `display_name` so the dropdown reads "Qwen3 4B".
+/// Non-local decks (and unknown ids) render their raw name.
 /// Mirrors crates/app/assets/models.json — kept a plain lookup so it stays in
 /// sync with the shipped catalog without threading `&Catalog` through the UI.
 fn deck_display_name(name: &str) -> String {
@@ -269,6 +269,9 @@ enum Entry {
     /// A numbered plan the model emitted for a prolonged task, snapshotted at
     /// the moment it advanced — shown as a checklist.
     Plan(itsjustcad_deck::Plan),
+    /// An image attached to the user's turn — rendered as a thumbnail in the
+    /// transcript (pushed just above the `User` text for a vision turn).
+    Image(std::path::PathBuf),
 }
 
 /// Starter prompts shown as tappable chips over an empty chat transcript. Kept
@@ -398,6 +401,87 @@ fn slash_palette_ui(
     pick
 }
 
+/// Extensions the chat accepts as an attachable image — the SAME set the attach
+/// file-dialog filters on (`deck_pane` input bar), so drag-and-drop and the
+/// picker agree on what counts as an image. Lower-case, no leading dot.
+const IMAGE_DROP_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+
+/// True when `path` has a known image extension (case-insensitive). Pure.
+fn is_image_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| IMAGE_DROP_EXTS.contains(&e.as_str()))
+}
+
+/// The first attachable image among a set of dropped file paths, or `None` when
+/// none qualify. Pure so the extension filter is unit-tested without an egui
+/// context. (We take ONE image; multi-attach is a later item in issue #68.)
+/// Path-less drops — e.g. a selection dragged from a browser on some platforms —
+/// are simply skipped (`DroppedFile::path` is `None` there).
+fn first_dropped_image(paths: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    paths.iter().find(|p| is_image_path(p)).cloned()
+}
+
+/// Directive appended to a claude-code vision turn's system prompt for a
+/// USER-attached image. The claude-code CLI receives only a path-scoped `Read`
+/// (not an inline image block), so granting the Read is not enough — the model
+/// must be told the image exists at that exact path or it answers from the
+/// user's prose alone. (The viewport-critique turn already carries this in its
+/// own message; only user attachments need it added.) Pure so the wording is
+/// unit-tested.
+fn claude_code_vision_directive(image_path: &std::path::Path) -> String {
+    format!(
+        "\n\n[A user-attached image is available at {}. Use the Read tool on that \
+         exact path to view the image, then answer the user's message about it.]",
+        image_path.display()
+    )
+}
+
+/// Display size for a `src`-pixel image fitted within `max`, preserving aspect
+/// and NEVER upscaling beyond native size. A `max` component of `0.0` means
+/// "unconstrained on that axis" (the height-bounded composer chip passes
+/// `[0.0, 44.0]`). Pure — unit-tested; the texture upload lives in
+/// [`DeckPane::image_texture`].
+fn thumb_fit(src: [u32; 2], max: egui::Vec2) -> egui::Vec2 {
+    let (w, h) = (src[0] as f32, src[1] as f32);
+    if w <= 0.0 || h <= 0.0 {
+        return egui::Vec2::ZERO;
+    }
+    // Per-axis scale to fit; an unconstrained (≤0) bound imposes no limit.
+    let sx = if max.x > 0.0 { max.x / w } else { f32::INFINITY };
+    let sy = if max.y > 0.0 { max.y / h } else { f32::INFINITY };
+    // Fit within the box AND cap at 1.0 so a small source renders at native px.
+    let s = sx.min(sy).min(1.0);
+    egui::vec2(w * s, h * s)
+}
+
+/// Encode raw RGBA8 pixels (as `arboard` hands back a pasted clipboard image)
+/// to PNG bytes. Pure so the encode is unit-tested without touching the
+/// clipboard or disk. `None` when the buffer length doesn't match
+/// `width * height * 4` (a corrupt/partial clipboard payload).
+fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
+    let img = image::RgbaImage::from_raw(width as u32, height as u32, rgba.to_vec())?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some(buf.into_inner())
+}
+
+/// Read an image off the system clipboard and write it to `dir/itsjustcad-pasted.png`,
+/// returning that path. `None` when the clipboard holds no image (e.g. text —
+/// in which case normal text paste proceeds untouched) or the write fails.
+/// Not pure (clipboard + disk); the encode core is [`encode_rgba_png`].
+fn clipboard_image_to_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    // `get_image` errors when the clipboard holds text / no bitmap — the common
+    // case on a ⌘V meant for text, so this stays quiet and the caller no-ops.
+    let img = cb.get_image().ok()?; // RGBA8
+    let png = encode_rgba_png(img.width, img.height, &img.bytes)?;
+    let path = dir.join("itsjustcad-pasted.png");
+    std::fs::write(&path, png).ok()?;
+    Some(path)
+}
+
 /// The RAW text a transcript entry yields when copied — the original markdown
 /// source, not the rendered layout, so a pasted table/emphasis survives as
 /// markdown (M-chatmd). `None` = nothing sensible to copy (the Commands card
@@ -408,6 +492,8 @@ fn entry_copy_text(entry: &Entry) -> Option<String> {
         Entry::Question(q) => Some(q.clone()),
         Entry::Plan(p) => Some(p.checklist()),
         Entry::Commands(_) => None,
+        // Nothing textual to copy from a thumbnail.
+        Entry::Image(_) => None,
     }
 }
 
@@ -568,6 +654,103 @@ mod slash_palette_tests {
 }
 
 #[cfg(test)]
+mod image_drop_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn known_image_extensions_are_case_insensitive() {
+        for ok in ["a.png", "b.JPG", "c.jpeg", "d.WebP", "e.gif", "/x/y/z.PNG"] {
+            assert!(is_image_path(std::path::Path::new(ok)), "{ok} should be an image");
+        }
+    }
+
+    #[test]
+    fn non_images_and_extensionless_are_rejected() {
+        for no in ["a.txt", "b.pdf", "c.dxf", "d.", "noext", "e.gguf", "f.svg"] {
+            assert!(!is_image_path(std::path::Path::new(no)), "{no} is not an image");
+        }
+    }
+
+    #[test]
+    fn first_dropped_image_picks_first_image_and_skips_others() {
+        let paths = [
+            PathBuf::from("/tmp/readme.txt"),
+            PathBuf::from("/tmp/plan.png"),
+            PathBuf::from("/tmp/section.jpg"),
+        ];
+        assert_eq!(first_dropped_image(&paths), Some(PathBuf::from("/tmp/plan.png")));
+    }
+
+    #[test]
+    fn first_dropped_image_none_when_no_images() {
+        let paths = [PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.dwg")];
+        assert_eq!(first_dropped_image(&paths), None);
+        // Empty drop (e.g. a path-less browser drag filtered upstream) → None.
+        assert_eq!(first_dropped_image(&[]), None);
+    }
+
+    #[test]
+    fn encode_rgba_png_writes_valid_png_header() {
+        // 2x2 opaque-red RGBA → valid PNG bytes with the 8-byte PNG signature.
+        let rgba = [255u8, 0, 0, 255].repeat(4); // 4 px * RGBA
+        let png = encode_rgba_png(2, 2, &rgba).expect("valid buffer encodes");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+    }
+
+    #[test]
+    fn encode_rgba_png_rejects_mismatched_buffer() {
+        // Length must be width*height*4; a short buffer yields None (not a panic).
+        assert_eq!(encode_rgba_png(2, 2, &[0u8; 3]), None);
+        assert_eq!(encode_rgba_png(1, 1, &[]), None);
+    }
+
+    // ── thumbnail sizing (pure) ────────────────────────────────────────────
+    // The decode + GPU upload (`DeckPane::image_texture`) needs a live egui
+    // context, so only the sizing math is unit-tested here.
+
+    fn approx(a: egui::Vec2, b: egui::Vec2) {
+        assert!((a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() < 0.01, "{a:?} ≉ {b:?}");
+    }
+
+    #[test]
+    fn thumb_fit_wide_clamps_on_width() {
+        // 400×100 into a 240×220 box → width is the binding axis (aspect kept).
+        approx(thumb_fit([400, 100], egui::vec2(240.0, 220.0)), egui::vec2(240.0, 60.0));
+    }
+
+    #[test]
+    fn thumb_fit_tall_clamps_on_height() {
+        // 100×400 into a 240×220 box → height binds.
+        approx(thumb_fit([100, 400], egui::vec2(240.0, 220.0)), egui::vec2(55.0, 220.0));
+    }
+
+    #[test]
+    fn thumb_fit_small_source_is_not_upscaled() {
+        // A source smaller than the box renders at native pixels (cap at 1.0).
+        approx(thumb_fit([50, 50], egui::vec2(240.0, 220.0)), egui::vec2(50.0, 50.0));
+    }
+
+    #[test]
+    fn thumb_fit_zero_width_bound_constrains_only_by_height() {
+        // The composer chip passes [0.0, 44.0]: height-bounded, width free.
+        approx(thumb_fit([400, 100], egui::vec2(0.0, 44.0)), egui::vec2(176.0, 44.0));
+        // And still never upscales a tiny source past native.
+        approx(thumb_fit([20, 10], egui::vec2(0.0, 44.0)), egui::vec2(20.0, 10.0));
+    }
+
+    #[test]
+    fn claude_code_vision_directive_names_the_path_and_read_tool() {
+        let d = claude_code_vision_directive(std::path::Path::new("/tmp/plan.png"));
+        // Must name the exact path and instruct a Read — the whole point is the
+        // CLI opens the file instead of answering from the user's prose alone.
+        assert!(d.contains("/tmp/plan.png"), "{d}");
+        assert!(d.contains("Read"), "{d}");
+        assert!(d.to_lowercase().contains("image"), "{d}");
+    }
+}
+
+#[cfg(test)]
 mod slot_hint_tests {
     use super::*;
 
@@ -640,14 +823,14 @@ mod saved_chat_tests {
 
     #[test]
     fn deck_display_name_resolves_local_cassettes() {
-        // A `local-<catalog-id>` key renders as the catalog's brand display name.
+        // A `local-<catalog-id>` key renders as the catalog's display name.
         assert_eq!(
             deck_display_name("local-qwen3-4b-q4km-llamafile"),
-            "JustCadModel (Qwen 4B)"
+            "Qwen3 4B"
         );
         assert_eq!(
             deck_display_name("local-qwen3-0.6b-q6k-llamafile"),
-            "JustCadModel Mini (Qwen 0.6B)"
+            "Qwen3 0.6B"
         );
         // Unknown local id falls back to the bare id (prefix stripped, no crash).
         assert_eq!(deck_display_name("local-mystery"), "mystery");
@@ -1083,6 +1266,10 @@ pub struct DeckPane {
     /// vision critique). Only offered for vision-capable cassettes. Cleared once
     /// the turn is sent.
     attached_image: Option<std::path::PathBuf>,
+    /// Decoded-image texture cache for thumbnails (composer chip + transcript),
+    /// keyed by path → (file mtime, handle). The mtime busts a stale texture
+    /// when a re-paste overwrites the same temp path. Not persisted.
+    image_cache: std::collections::HashMap<std::path::PathBuf, (std::time::SystemTime, egui::TextureHandle)>,
     /// Deck-emitted side-effecting commands (export/print/import/…) awaiting an
     /// explicit human [run]/[skip]. They never touch the filesystem until the
     /// user confirms (security C-2 / H-7).
@@ -1110,6 +1297,11 @@ pub struct DeckPane {
     /// overlays dim + centre on THIS (the whole chat pane), not on the bottom
     /// input panel's `max_rect` where the modal fns are actually called.
     pane_rect: egui::Rect,
+    /// The transcript (message) region, captured each frame. Drag-and-drop and
+    /// its hover hint are scoped to THIS rect so the composer input and the
+    /// `Chat | Commands` segment control stay clear of image drops. Read one
+    /// frame late by `handle_image_drop` (which runs before layout); negligible.
+    message_area_rect: egui::Rect,
     /// Sandbox root for deck-originated fs paths — the current document's
     /// directory when known, else the ItsJustCAD documents dir. Set by the app.
     sandbox_root: Option<std::path::PathBuf>,
@@ -1248,11 +1440,13 @@ impl Default for DeckPane {
             vision_turn: false,
             critique_requested: false,
             attached_image: None,
+            image_cache: std::collections::HashMap::new(),
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
             deck_run_approved: false,
             pending_firstrun: Vec::new(),
             pane_rect: egui::Rect::NOTHING,
+            message_area_rect: egui::Rect::NOTHING,
             sandbox_root: None,
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),
@@ -2187,6 +2381,10 @@ impl DeckPane {
             // arbitrary read (no `decks.json` key exfiltration via an
             // attacker-controlled scene name). HOW that one image reaches the
             // model depends on the cassette.
+            // Whether this image came from a USER attachment (drag/paste/picker)
+            // vs the viewport critique. The critique's own message already says
+            // "Read {path} …"; a user attachment carries only the user's prose.
+            let user_attached = self.attached_image.is_some();
             let shot = self
                 .attached_image
                 .take()
@@ -2197,6 +2395,16 @@ impl DeckPane {
                 // and give it a 2nd agentic step to open the shot then answer.
                 req.vision_shot_path = Some(shot.display().to_string());
                 req.max_turns = 2;
+                // Unlike the HTTP cassettes (which inline the image bytes), the
+                // claude-code CLI only gets a scoped Read of the path — not an
+                // image block. Granting the Read isn't enough: the model must be
+                // TOLD the image exists, or it answers from the user's text alone
+                // (the exact bug where "what is this?" got a generic reply). The
+                // critique turn already instructs this in its message, so only the
+                // user-attached path needs the directive added here.
+                if user_attached {
+                    req.system.push_str(&claude_code_vision_directive(&shot));
+                }
             } else if inline_vision_image(&config) {
                 // HTTP multimodal cassette (local Qwen2.5-VL served with
                 // --mmproj, or a cloud vision model): inline the image as a
@@ -2258,8 +2466,11 @@ impl DeckPane {
         self.retries = 0;
         // A user-attached image makes this a vision turn (scoped Read of that
         // one file, prose-only reply — same security envelope as a critique).
-        if self.attached_image.is_some() {
+        if let Some(img) = self.attached_image.clone() {
             self.vision_turn = true;
+            // Show the attachment in the conversation, just above the message
+            // (the path is consumed later when the request is built).
+            self.transcript.push(Entry::Image(img));
         }
         self.transcript.push(Entry::User(text.to_string()));
         self.messages.push(ChatMessage {
@@ -2906,8 +3117,12 @@ impl DeckPane {
         let pane = self.pane_rect;
         let ctx = ui.ctx().clone();
 
-        // Dim just the pane, on a foreground layer above the chat.
-        let backdrop_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new(id));
+        // Dim just the pane, on the MIDDLE layer: above the chat (Background) but
+        // strictly BELOW the Foreground card. Painting the dim on the SAME order
+        // as the card let egui composite it OVER the card — greying out the modal
+        // and making it hard to read. Middle < Foreground guarantees the card is
+        // on top of the dim.
+        let backdrop_layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new(id));
         let dim = if ui.visuals().dark_mode {
             egui::Color32::from_black_alpha(160)
         } else {
@@ -2974,6 +3189,11 @@ impl DeckPane {
         let mut decision: Option<Decision> = None;
         let batch = self.pending_firstrun.clone();
         let n = batch.len();
+        // Commands land in `pending_firstrun` incrementally WHILE the turn streams
+        // (see the ExtractEvent::Command push), so the list shown here is still
+        // growing until the turn finishes. Keep Approve disabled until then so a
+        // partial batch can't be approved; Decline stays available throughout.
+        let streaming = self.busy();
 
         let dismissed = self.approval_overlay(ui, "deck_firstrun_modal", |ui| {
             ui.heading("The deck wants to run commands.");
@@ -3003,27 +3223,43 @@ impl DeckPane {
                         );
                     }
                 });
+            // While the turn is still streaming, the list above is incomplete —
+            // tell the user and keep Approve disabled below.
+            if streaming {
+                ui.add_space(crate::theme::Spacing::XS);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("waiting for all commands to arrive…")
+                            .weak()
+                            .small(),
+                    );
+                });
+            }
             ui.add_space(crate::theme::Spacing::M);
             ui.horizontal_wrapped(|ui| {
                 let dark = ui.visuals().dark_mode;
                 use crate::widgets::{role_button, ButtonRole};
                 // Hierarchy: Approve once = prominent (filled accent), Approve for
-                // session = normal (outlined), Decline = destructive (red).
-                if role_button(ui, roles, dark, ButtonRole::Prominent, "Approve once")
-                    .on_hover_text("run this turn's commands only; ask again next turn")
-                    .clicked()
-                {
-                    decision = Some(Decision::ApproveOnce);
-                }
-                if role_button(ui, roles, dark, ButtonRole::Normal, "Approve for session")
-                    .on_hover_text(
-                        "let the deck run commands (and in-folder writes) this \
-                         session without asking; opens/imports still ask",
-                    )
-                    .clicked()
-                {
-                    decision = Some(Decision::ApproveSession);
-                }
+                // session = normal (outlined), Decline = destructive (red). Approve
+                // is DISABLED until the full batch has landed (`!streaming`).
+                ui.add_enabled_ui(!streaming, |ui| {
+                    if role_button(ui, roles, dark, ButtonRole::Prominent, "Approve once")
+                        .on_hover_text("run this turn's commands only; ask again next turn")
+                        .clicked()
+                    {
+                        decision = Some(Decision::ApproveOnce);
+                    }
+                    if role_button(ui, roles, dark, ButtonRole::Normal, "Approve for session")
+                        .on_hover_text(
+                            "let the deck run commands (and in-folder writes) this \
+                             session without asking; opens/imports still ask",
+                        )
+                        .clicked()
+                    {
+                        decision = Some(Decision::ApproveSession);
+                    }
+                });
                 if role_button(ui, roles, dark, ButtonRole::Destructive, "Decline").clicked() {
                     decision = Some(Decision::Decline);
                 }
@@ -3534,6 +3770,195 @@ impl DeckPane {
         out
     }
 
+    /// Whether the active cassette can accept an image — the SAME gate as the
+    /// attach button (`DeckConfig::supports_vision`). Drag-and-drop honours it so
+    /// we never attach an image to a blind model.
+    fn active_supports_vision(&self) -> bool {
+        self.decks
+            .decks
+            .get(self.decks.active)
+            .map(|c| c.supports_vision())
+            .unwrap_or(false)
+    }
+
+    /// Decode `path` into a cached egui texture for thumbnail display (composer
+    /// chip + transcript). Keyed by path AND file mtime so overwriting the same
+    /// temp path (a re-paste into `itsjustcad-pasted.png`) busts the stale
+    /// texture. Returns an owned handle (a cheap Arc clone); `None` on a
+    /// missing/undecodable file. Not pure (disk read + GPU upload); the sizing
+    /// math is the pure [`thumb_fit`].
+    fn image_texture(
+        &mut self,
+        ctx: &egui::Context,
+        path: &std::path::Path,
+    ) -> Option<egui::TextureHandle> {
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+        if let Some((cached, tex)) = self.image_cache.get(path)
+            && *cached == mtime
+        {
+            return Some(tex.clone());
+        }
+        let img = image::open(path).ok()?.to_rgba8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], img.as_raw());
+        let tex = ctx.load_texture(
+            format!("deck_attach:{}", path.display()),
+            ci,
+            egui::TextureOptions::LINEAR,
+        );
+        self.image_cache
+            .insert(path.to_path_buf(), (mtime, tex.clone()));
+        Some(tex)
+    }
+
+    /// Accept an image dragged from the OS onto the chat — restricted to the
+    /// MESSAGE (transcript) area only: never the composer input, nor the
+    /// `Chat | Commands` segment control above it. Both the drop and its hover
+    /// hint are scoped to `message_area_rect` (the transcript region captured on
+    /// the previous frame — this runs before this frame lays it out, and the
+    /// rect barely moves between frames). Gated on `active_supports_vision`: a
+    /// blind model shows a "can't see images" hint rather than accepting.
+    fn handle_image_drop(&mut self, ui: &egui::Ui, roles: &crate::theme::ColorRoles) {
+        let ctx = ui.ctx();
+        let vision = self.active_supports_vision();
+
+        // Accept the drop regardless of position. macOS does NOT reliably feed
+        // egui the cursor position during an external file drag, so a
+        // rect/`latest_pos` test silently rejects every drop (the bug the user
+        // hit). We can't geometrically scope WHERE the file lands — but an image
+        // is only ever a chat attachment, and this runs only while the Chat pane
+        // is visible, so a position-free accept is correct. The VISUAL hint below
+        // is still confined to the message area, so no drop feedback ever shows
+        // over the composer input or the `Chat | Commands` segment control.
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if vision && let Some(img) = first_dropped_image(&dropped) {
+            self.attached_image = Some(img);
+        }
+
+        // Drop-target hint painted over the MESSAGE AREA only (see
+        // `paint_drop_hint`) while an OS file drag is in progress.
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            self.paint_drop_hint(ui, roles, vision);
+        }
+    }
+
+    /// Attach an image pasted from the clipboard (⌘V / Ctrl+V) — the paste
+    /// sibling of drag-and-drop, e.g. after a screenshot or "copy image" from a
+    /// browser/Preview. Fires on the paste chord while the Chat pane is on
+    /// screen and the active cassette can see images; no focus/pointer gate, so
+    /// ⌘V works anywhere over the chat, not only inside the composer.
+    ///
+    /// Reads only clipboard IMAGE BITMAP data (what a screenshot or "copy image"
+    /// puts there). A clipboard holding TEXT — or a FILE reference copied in
+    /// Finder — yields no bitmap, so `clipboard_image_to_file` returns `None`
+    /// and we no-op: normal text paste into the input is untouched, and a copied
+    /// file is handled by dragging it in instead.
+    fn handle_image_paste(&mut self, ui: &egui::Ui) {
+        // Detect ⌘V for an IMAGE paste. Two macOS facts (confirmed by tracing)
+        // break the obvious detections:
+        //   1. macOS consumes the Cmd+V key-DOWN for its paste shortcut, so egui
+        //      only ever sees the key-UP — `key_pressed(V)` is never true.
+        //   2. eframe emits `Event::Paste` only for non-empty clipboard TEXT, so
+        //      an image-only clipboard produces no Paste event.
+        // So we scan for ANY `V` key event (down or up) with Cmd held — the key-UP
+        // reliably arrives — plus `Event::Paste` for text-bearing clipboards and
+        // other platforms. Firing on key-UP just means the attach lands on release.
+        let paste = ui.ctx().input(|i| {
+            i.events.iter().any(|e| match e {
+                egui::Event::Paste(_) => true,
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    modifiers,
+                    ..
+                } => modifiers.command,
+                _ => false,
+            })
+        });
+        if !paste {
+            return;
+        }
+        if !self.active_supports_vision() {
+            return;
+        }
+        if let Some(img) = clipboard_image_to_file(&std::env::temp_dir()) {
+            self.attached_image = Some(img);
+        }
+    }
+
+    /// Draw a small circular "×" remove badge on the TOP-RIGHT corner of an
+    /// attachment thumbnail (`img_rect`) and return whether it was clicked. The
+    /// photo-attachment convention: the remove control sits on the image itself,
+    /// not as a separate button beside it.
+    fn remove_attachment_badge(ui: &egui::Ui, img_rect: egui::Rect) -> bool {
+        let r = 8.5;
+        // Nudge the badge slightly inward from the corner so it overlaps the
+        // image edge rather than floating off it.
+        let center = egui::pos2(img_rect.right() - r + 1.0, img_rect.top() + r - 1.0);
+        let hit = egui::Rect::from_center_size(center, egui::vec2(2.0 * r, 2.0 * r));
+        let resp = ui
+            .interact(hit, ui.id().with("remove_attachment_badge"), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("remove attachment");
+        let painter = ui.painter();
+        let bg = if resp.hovered() {
+            egui::Color32::from_rgb(220, 60, 60)
+        } else {
+            egui::Color32::from_black_alpha(170)
+        };
+        painter.circle_filled(center, r, bg);
+        // The × glyph: two diagonal strokes.
+        let d = r * 0.42;
+        let stroke = egui::Stroke::new(1.6, egui::Color32::WHITE);
+        painter.line_segment(
+            [center + egui::vec2(-d, -d), center + egui::vec2(d, d)],
+            stroke,
+        );
+        painter.line_segment(
+            [center + egui::vec2(-d, d), center + egui::vec2(d, -d)],
+            stroke,
+        );
+        resp.clicked()
+    }
+
+    /// Paint a rounded drop-target border + centred label over the MESSAGE area
+    /// while an OS file drag hovers it. `vision` selects accept vs "can't see"
+    /// messaging. Uses `message_area_rect` so the hint never covers the composer
+    /// or the segment control.
+    fn paint_drop_hint(&self, ui: &egui::Ui, roles: &crate::theme::ColorRoles, vision: bool) {
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("deck_image_drop_hint"),
+        ));
+        let rect = self.message_area_rect.shrink(8.0);
+        let (color, label) = if vision {
+            (crate::theme::to_color32(roles.primary), "Drop image to attach")
+        } else {
+            (
+                crate::theme::to_color32(roles.on_surface_tertiary),
+                "This model can't see images — pick a vision-capable model",
+            )
+        };
+        painter.rect_stroke(
+            rect,
+            12.0,
+            egui::Stroke::new(2.0, color),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(16.0),
+            color,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)] // fixed signature; splitting further aids nothing
     /// Render the Chat segment. Returns `Some(line)` when the user submitted a
     /// leading-`/` command (e.g. `/box 0,0,0 5,5,3`): the caller runs it through
@@ -3554,6 +3979,8 @@ impl DeckPane {
         // invoked inside the bottom input `Panel`, whose `max_rect` is only the
         // composer strip — we want to dim + centre over the whole chat pane.
         self.pane_rect = ui.max_rect();
+        self.handle_image_drop(ui, roles);
+        self.handle_image_paste(ui);
         self.drain(session, handle);
         if self.busy()
             && let Some(started) = self.turn_started
@@ -3940,23 +4367,46 @@ impl DeckPane {
                 self.firstrun_confirm_ui(ui, session, roles);
                 // Side-effect confirmation sits directly above the input card.
                 self.side_effect_confirm_ui(ui, session, icons, roles);
-                // Attachment chip (name + remove) above the input card.
+                // Attachment chip (thumbnail + remove) above the input card.
                 if let Some(img) = self.attached_image.clone() {
                     ui.horizontal(|ui| {
                         let name = img
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        let fg = ui.visuals().weak_text_color();
-                        let sz = ui.text_style_height(&egui::TextStyle::Body);
-                        ui.add(icons.image(ui.ctx(), crate::icons::Icon::Paperclip, sz, fg))
-                            .on_hover_text("attached image");
-                        ui.label(egui::RichText::new(name).weak());
-                        if icons
-                            .icon_button(ui, crate::icons::Icon::Close, "remove attachment")
-                            .clicked()
-                        {
-                            self.attached_image = None;
+                        // Thumbnail preview with a circular × overlaid on its
+                        // top-right corner (photo-attachment convention); fall
+                        // back to a paperclip + filename + a plain × if the image
+                        // can't be decoded.
+                        match self.image_texture(ui.ctx(), &img) {
+                            Some(tex) => {
+                                let size =
+                                    thumb_fit(tex.size().map(|d| d as u32), egui::vec2(0.0, 44.0));
+                                let resp = ui
+                                    .image(egui::load::SizedTexture::new(tex.id(), size))
+                                    .on_hover_text(&name);
+                                if Self::remove_attachment_badge(ui, resp.rect) {
+                                    self.attached_image = None;
+                                }
+                            }
+                            None => {
+                                let fg = ui.visuals().weak_text_color();
+                                let sz = ui.text_style_height(&egui::TextStyle::Body);
+                                ui.add(icons.image(
+                                    ui.ctx(),
+                                    crate::icons::Icon::Paperclip,
+                                    sz,
+                                    fg,
+                                ))
+                                .on_hover_text("attached image");
+                                ui.label(egui::RichText::new(&name).weak());
+                                if icons
+                                    .icon_button(ui, crate::icons::Icon::Close, "remove attachment")
+                                    .clicked()
+                                {
+                                    self.attached_image = None;
+                                }
+                            }
                         }
                     });
                 }
@@ -4239,6 +4689,10 @@ impl DeckPane {
         let (user_bg, user_txt) = crate::theme::viewport_active_tag(ui.visuals().dark_mode);
         let deck_bg = crate::theme::to_color32(roles.surface_elevated);
         let bubble_radius = egui::CornerRadius::same(10);
+        // The transcript fills the remaining central space — the bottom composer
+        // `Panel` and the top toolbar/segment control are already reserved — so
+        // this is exactly the message area the next frame's drag-drop scopes to.
+        self.message_area_rect = ui.available_rect_before_wrap();
         egui::Frame::NONE
             .fill(transcript_bg)
             // Horizontal inner margin so bubbles/rows don't clip against the
@@ -4267,6 +4721,21 @@ impl DeckPane {
                                 ui.add_space(crate::theme::Spacing::XS);
                             }
                         }
+                        // Pre-load thumbnails into the cache BEFORE the immutable
+                        // transcript borrow below (texture build needs &mut self);
+                        // the render arm then reads the cached handle.
+                        let thumb_paths: Vec<std::path::PathBuf> = self
+                            .transcript
+                            .iter()
+                            .filter_map(|e| match e {
+                                Entry::Image(p) => Some(p.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let thumb_ctx = ui.ctx().clone();
+                        for p in &thumb_paths {
+                            let _ = self.image_texture(&thumb_ctx, p);
+                        }
                         for (i, entry) in self.transcript.iter().enumerate() {
                             match entry {
                                 Entry::User(t) => {
@@ -4293,6 +4762,35 @@ impl DeckPane {
                                                     );
                                                 });
                                             attach_copy_menu(&r.response, entry_copy_text(entry));
+                                        },
+                                    );
+                                }
+                                Entry::Image(path) => {
+                                    // Right-aligned thumbnail accompanying the
+                                    // user's message (pre-loaded into the cache
+                                    // above). A missing/undecodable file degrades
+                                    // to a muted placeholder rather than vanishing.
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Min),
+                                        |ui| match self.image_cache.get(path) {
+                                            Some((_, tex)) => {
+                                                let size = thumb_fit(
+                                                    tex.size().map(|d| d as u32),
+                                                    egui::vec2(240.0, 220.0),
+                                                );
+                                                ui.image(egui::load::SizedTexture::new(
+                                                    tex.id(),
+                                                    size,
+                                                ));
+                                            }
+                                            None => {
+                                                ui.label(
+                                                    egui::RichText::new("[image unavailable]")
+                                                        .weak()
+                                                        .italics()
+                                                        .small(),
+                                                );
+                                            }
                                         },
                                     );
                                 }
@@ -4760,6 +5258,7 @@ mod side_effect_gate_tests {
             vision_turn: false,
             critique_requested: false,
             attached_image: None,
+            image_cache: std::collections::HashMap::new(),
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
             // Test helper = an already-running session: the OUTER first-run gate
@@ -4768,6 +5267,7 @@ mod side_effect_gate_tests {
             deck_run_approved: true,
             pending_firstrun: Vec::new(),
             pane_rect: egui::Rect::NOTHING,
+            message_area_rect: egui::Rect::NOTHING,
             sandbox_root: None,
             local_runtime: None,
             catalog: crate::model_catalog::Catalog::load(),

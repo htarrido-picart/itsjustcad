@@ -605,7 +605,7 @@ mod tests {
         // If PATH already lists a prefix, it must not be appended a second time.
         let path = std::env::join_paths(["/usr/local/bin", "/usr/bin"]).unwrap();
         let dirs = program_search_dirs(Some(path), None);
-        let hits = dirs.iter().filter(|d| **d == PathBuf::from("/usr/local/bin")).count();
+        let hits = dirs.iter().filter(|d| d.as_path() == Path::new("/usr/local/bin")).count();
         assert_eq!(hits, 1, "prefix duplicated: {dirs:?}");
         // No home ⇒ no home-relative dirs.
         assert!(!dirs.iter().any(|d| d.ends_with(".local/bin")), "{dirs:?}");
