@@ -101,19 +101,21 @@ pub fn resolve_runtime(
     // A vision model needs its projector on disk too; a half-installed pair
     // (weights present, mmproj missing) would make the server fail to load the
     // CLIP model with an opaque error — catch it here with an actionable one.
-    let projector = match entry.mmproj_file_name() {
-        Some(name) => {
-            let p = models_dir.join(name);
-            if !p.exists() {
-                return Err(format!(
-                    "vision projector (mmproj) not found: {} — reinstall this \
-                     model from Model Setup to fetch both files",
-                    p.display()
-                ));
-            }
-            Some(p)
+    let projector = if entry.is_vision() {
+        let name = entry
+            .mmproj_file_name()
+            .expect("is_vision() ⇒ mmproj_url ⇒ mmproj_file_name is Some");
+        let p = models_dir.join(name);
+        if !p.exists() {
+            return Err(format!(
+                "vision projector (mmproj) not found: {} — reinstall this \
+                 model from Model Setup to fetch both files",
+                p.display()
+            ));
         }
-        None => None,
+        Some(p)
+    } else {
+        None
     };
     Ok(RuntimePlan {
         runtime: entry.runtime,
@@ -252,7 +254,7 @@ pub fn program_search_dirs(path_var: Option<std::ffi::OsString>, home: Option<Pa
     let mut dirs: Vec<PathBuf> = path_var
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    let mut push_unique = |dirs: &mut Vec<PathBuf>, p: PathBuf| {
+    let push_unique = |dirs: &mut Vec<PathBuf>, p: PathBuf| {
         if !dirs.contains(&p) {
             dirs.push(p);
         }
