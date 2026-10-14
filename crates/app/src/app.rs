@@ -10475,12 +10475,17 @@ impl eframe::App for App {
                             "It's just CAD — a command-first, FOSS CAD workspace.",
                         );
                         ui.add_space(crate::theme::Spacing::S);
-                        // Attribution required under AGPLv3 §7(b) — do not remove.
-                        crate::widgets::dialog_text(ui, roles, "© 2026 Hector Tarrido-Picart");
                         crate::widgets::dialog_text(
                             ui,
                             roles,
-                            "Desktop: AGPLv3. Commercial & mobile licensing from the author.",
+                            &format!("Version {}", crate::update::APP_VERSION),
+                        );
+                        crate::widgets::dialog_text(ui, roles, "License: AGPLv3 (AGPL-3.0-only)");
+                        // Attribution required under AGPLv3 §7(b) — do not remove.
+                        crate::widgets::dialog_text(ui, roles, "© 2026 Hector Tarrido-Picart");
+                        ui.hyperlink_to(
+                            "Source code",
+                            "https://github.com/htarrido-picart/itsjustcad",
                         );
                         crate::widgets::dialog_text(
                             ui,
