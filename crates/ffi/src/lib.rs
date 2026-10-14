@@ -2649,6 +2649,55 @@ pub unsafe extern "C" fn ijc_sheet_view_set_mode(
     })
 }
 
+/// Set the live viewport's render style. `mode` ∈
+/// {"shaded","wireframe","pencil","xray","ghosted"} (plus the aliases
+/// [`DisplayMode::parse`] accepts). Returns false on a null/invalid handle or a
+/// null/unparseable `mode`. The change takes effect on the next
+/// [`ijc_render_frame`] (which reads `app.mode`). Mirrors
+/// [`ijc_sheet_view_set_mode`] but targets the on-screen view, not a sheet view.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `mode` must be a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_set_render_mode(h: *mut AppHandle, mode: *const c_char) -> bool {
+    guard_ffi(false, || {
+        if mode.is_null() {
+            return false;
+        }
+        let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
+            return false;
+        };
+        let Some(parsed) = DisplayMode::parse(mode_str) else {
+            return false;
+        };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        app.mode = parsed;
+        true
+    })
+}
+
+/// Return the live viewport's current render style as its label
+/// (e.g. "Shaded", "Wireframe", "X-Ray", "Ghosted", "Pencil") in a
+/// heap-allocated C string the caller owns, or null on a null/invalid handle.
+/// Caller must release a non-null result exactly once via [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer, if
+/// non-null, must be freed exactly once via [`ijc_string_free`] and not
+/// otherwise retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_get_render_mode(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return std::ptr::null_mut();
+        };
+        into_c_string(app.mode.label().to_owned())
+    })
+}
+
 /// Delete a view from a sheet by 1-based `index`. Returns false on null/invalid
 /// handle, a null/invalid `sheet`, an unknown sheet, or an out-of-range index.
 /// Bumps `doc.generation`. Direct mutation (no op-log/undo in v1), mirroring
