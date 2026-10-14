@@ -33,7 +33,7 @@ allow = [
     "Ubuntu-font-1.0",
     "CDLA-Permissive-2.0",
     # our own crates
-    "AGPL-3.0-or-later",
+    "AGPL-3.0-only",
 ]
 
 [licenses.private]

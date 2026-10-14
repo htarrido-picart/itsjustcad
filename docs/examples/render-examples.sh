@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 # Copyright © 2026 Hector Tarrido-Picart
 #
 # render-examples.sh — regenerate the inline showcase images used in the README.

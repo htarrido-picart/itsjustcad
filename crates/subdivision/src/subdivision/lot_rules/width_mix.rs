@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
 //! `WidthMixSolver` (plan §7.4, Phase 6) — the width-mix **packing** problem.

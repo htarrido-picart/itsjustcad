@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: AGPL-3.0-or-later
+-- SPDX-License-Identifier: AGPL-3.0-only
 -- Copyright © 2026 Hector Tarrido-Picart
 --
 -- SHARED SOURCE-OF-TRUTH chat/session schema for the embedded SQLite store.
