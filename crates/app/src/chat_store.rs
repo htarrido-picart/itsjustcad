@@ -195,17 +195,16 @@ impl DocSessions {
     /// Case-insensitive linear substring scan over the in-memory sessions (the
     /// pre-DB behavior; also the fallback when no DB is present).
     fn search_linear(&self, query: &str) -> Vec<SearchHit> {
-        let needle = query.to_lowercase();
+        let needle = query.trim();
         let mut hits = Vec::new();
         for session in &self.sessions {
             for (i, turn) in session.turns.iter().enumerate() {
-                let hay = turn.content.to_lowercase();
-                if let Some(pos) = hay.find(&needle) {
+                if let Some(snippet) = find_snippet(&turn.content, needle) {
                     hits.push(SearchHit {
                         session_id: session.id.clone(),
                         session_title: session.title.clone(),
                         turn_index: i,
-                        snippet: snippet_around(&turn.content, pos, needle.len()),
+                        snippet,
                     });
                 }
             }
@@ -245,10 +244,61 @@ impl DocSessions {
     }
 }
 
+/// Case-insensitive substring search that returns the `(start, end)` **byte
+/// range in `content`** of the first match of `needle`, or `None`.
+///
+/// Unlike `content.to_lowercase().find(&needle.to_lowercase())`, this never
+/// mixes byte offsets from a lowercased copy (whose length can differ from the
+/// original for case-folding chars like `İ`, `ẞ`, `ﬀ`) back into the original
+/// string. The returned range is always on `content`'s char boundaries, so it
+/// is safe to slice. An empty needle yields `Some((0, 0))` (matches the start).
+fn find_ci(content: &str, needle: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return Some((0, 0));
+    }
+    let nlow = needle.to_lowercase();
+    // Try each char boundary of `content` as a candidate start, comparing the
+    // lowercased suffix prefix-wise. O(n·m) but these are short chat turns and
+    // this only runs for the DB-less fallback / snippet windowing.
+    for (start, _) in content.char_indices() {
+        let tail = &content[start..];
+        let tail_low = tail.to_lowercase();
+        if tail_low.starts_with(&nlow) {
+            // Walk `content` chars until their lowercase covers `nlow`, so the
+            // end lands on an original char boundary.
+            let mut acc = String::new();
+            let mut end = start;
+            for (off, ch) in tail.char_indices() {
+                acc.push_str(&ch.to_lowercase().to_string());
+                end = start + off + ch.len_utf8();
+                if acc.len() >= nlow.len() {
+                    break;
+                }
+            }
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+/// Char-safe case-insensitive snippet: find `query` in `content` and window a
+/// ±30-char context around the match (ellipses when clipped). `None` when
+/// `query` doesn't occur. Pure and panic-free for ANY input (empty, no-match,
+/// longer-than-content, Unicode/emoji, regex-special chars — all treated
+/// literally). This is the single filter+snippet helper the Sessions search and
+/// the DB-less linear scan share.
+fn find_snippet(content: &str, query: &str) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    let (start, end) = find_ci(content, query)?;
+    Some(snippet_around(content, start, end.saturating_sub(start)))
+}
+
 /// A ±30-char context window around a byte match, on char boundaries, with
-/// ellipses when clipped. `pos`/`len` are byte offsets into the lowercased
-/// haystack, which shares byte offsets with `content` for the ASCII case and is
-/// clamped to char boundaries for safety.
+/// ellipses when clipped. `pos`/`len` are byte offsets into `content` itself
+/// (see [`find_ci`]); both ends are additionally clamped to char boundaries so
+/// the slice can never panic even if a caller passes stale offsets.
 fn snippet_around(content: &str, pos: usize, len: usize) -> String {
     const CTX: usize = 30;
     let start = floor_char_boundary(content, pos.saturating_sub(CTX));
@@ -289,14 +339,12 @@ fn fts_match_expr(query: &str) -> Option<String> {
 /// (case-insensitive) and windowing around it; falls back to a leading preview
 /// when no term is found (e.g. a stemmed FTS match). Char-boundary safe.
 fn snippet_for(content: &str, query: &str) -> String {
-    let hay = content.to_lowercase();
     for term in query.split_whitespace() {
-        let t = term.to_lowercase();
-        if t.is_empty() {
+        if term.is_empty() {
             continue;
         }
-        if let Some(pos) = hay.find(&t) {
-            return snippet_around(content, pos, t.len());
+        if let Some((start, end)) = find_ci(content, term) {
+            return snippet_around(content, start, end.saturating_sub(start));
         }
     }
     snippet_around(content, 0, 0)
@@ -742,6 +790,75 @@ mod tests {
     fn no_match_returns_empty() {
         let docs = doc_with_two_sessions();
         assert!(docs.search_linear("helicopter").is_empty());
+    }
+
+    // --- Regression tests for the Sessions-search crash (issue #73). ---
+    // These exercise the pure filter/snippet helper that the search field feeds.
+    // Each is written so it would panic (or mis-match) on the pre-fix code path
+    // that sliced the ORIGINAL content with byte offsets taken from a LOWERCASED
+    // copy (whose length differs for case-folding chars like `İ`/`ẞ`).
+
+    #[test]
+    fn find_snippet_empty_query_is_none() {
+        // An empty query matches nothing (the field is treated as "no filter").
+        assert_eq!(find_snippet("anything at all", ""), None);
+    }
+
+    #[test]
+    fn find_snippet_no_match_is_none() {
+        assert_eq!(find_snippet("a glass facade", "helicopter"), None);
+    }
+
+    #[test]
+    fn find_snippet_is_case_insensitive() {
+        let s = find_snippet("A GLASS Facade", "glass").expect("case-insensitive hit");
+        assert!(s.to_lowercase().contains("glass"), "snippet was {s:?}");
+    }
+
+    #[test]
+    fn find_snippet_multibyte_title_does_not_misslice_or_panic() {
+        // `İ` (U+0130) lowercases to "i̇" (THREE bytes vs two in the original),
+        // so an offset taken from a lowercased copy DRIFTS past the real match
+        // in the original string. With enough such chars before the match the
+        // drift exceeds the ±30-char window and the OLD code windowed the WRONG
+        // region, clipping the match entirely (fail-before). `find_ci` locates
+        // the match in the ORIGINAL, so the snippet always contains it.
+        let content = format!("{}glasstoken zzz", "İ".repeat(40));
+        let s = find_snippet(&content, "glasstoken").expect("must find the match");
+        assert!(
+            s.to_lowercase().contains("glasstoken"),
+            "snippet lost the match (byte-offset drift): {s:?}"
+        );
+        // Emoji (4-byte) haystack with a case-insensitive query after it.
+        let emoji = "🏛️🏛️🏛️ curtain WALL facade";
+        let s2 = find_snippet(emoji, "wall").expect("case-insensitive emoji hit");
+        assert!(s2.to_lowercase().contains("wall"), "snippet was {s2:?}");
+    }
+
+    #[test]
+    fn find_snippet_query_longer_than_content_is_none_not_panic() {
+        // A query longer than the whole haystack must simply not match.
+        assert_eq!(find_snippet("tiny", "a query far longer than the content"), None);
+        // And an empty haystack with any query is fine.
+        assert_eq!(find_snippet("", "anything"), None);
+    }
+
+    #[test]
+    fn search_linear_handles_multibyte_turns_without_panicking() {
+        let mut docs = DocSessions::new("dddddddd-0000-0000-0000-000000000004".into());
+        let mut s = ChatSession::new(100);
+        s.push("user", "İstanbul ẞtrasse café — add a GLASS façade 🏛️", 100);
+        docs.sessions.push(s);
+        // Queries that would mis-slice the original with lowercased offsets.
+        let hits = docs.search_linear("glass");
+        assert_eq!(hits.len(), 1, "finds the glass turn: {hits:?}");
+        assert!(hits[0].snippet.to_lowercase().contains("glass"));
+        assert!(docs.search_linear("helicopter").is_empty());
+        // Query longer than the turn → no match, no panic.
+        assert!(
+            docs.search_linear("a query that is strictly longer than the entire stored turn text")
+                .is_empty()
+        );
     }
 
     #[test]
