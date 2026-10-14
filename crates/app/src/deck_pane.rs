@@ -269,6 +269,9 @@ enum Entry {
     /// A numbered plan the model emitted for a prolonged task, snapshotted at
     /// the moment it advanced — shown as a checklist.
     Plan(itsjustcad_deck::Plan),
+    /// An image attached to the user's turn — rendered as a thumbnail in the
+    /// transcript (pushed just above the `User` text for a vision turn).
+    Image(std::path::PathBuf),
 }
 
 /// Starter prompts shown as tappable chips over an empty chat transcript. Kept
@@ -420,6 +423,24 @@ fn first_dropped_image(paths: &[std::path::PathBuf]) -> Option<std::path::PathBu
     paths.iter().find(|p| is_image_path(p)).cloned()
 }
 
+/// Display size for a `src`-pixel image fitted within `max`, preserving aspect
+/// and NEVER upscaling beyond native size. A `max` component of `0.0` means
+/// "unconstrained on that axis" (the height-bounded composer chip passes
+/// `[0.0, 44.0]`). Pure — unit-tested; the texture upload lives in
+/// [`DeckPane::image_texture`].
+fn thumb_fit(src: [u32; 2], max: egui::Vec2) -> egui::Vec2 {
+    let (w, h) = (src[0] as f32, src[1] as f32);
+    if w <= 0.0 || h <= 0.0 {
+        return egui::Vec2::ZERO;
+    }
+    // Per-axis scale to fit; an unconstrained (≤0) bound imposes no limit.
+    let sx = if max.x > 0.0 { max.x / w } else { f32::INFINITY };
+    let sy = if max.y > 0.0 { max.y / h } else { f32::INFINITY };
+    // Fit within the box AND cap at 1.0 so a small source renders at native px.
+    let s = sx.min(sy).min(1.0);
+    egui::vec2(w * s, h * s)
+}
+
 /// Encode raw RGBA8 pixels (as `arboard` hands back a pasted clipboard image)
 /// to PNG bytes. Pure so the encode is unit-tested without touching the
 /// clipboard or disk. `None` when the buffer length doesn't match
@@ -454,6 +475,8 @@ fn entry_copy_text(entry: &Entry) -> Option<String> {
         Entry::Question(q) => Some(q.clone()),
         Entry::Plan(p) => Some(p.checklist()),
         Entry::Commands(_) => None,
+        // Nothing textual to copy from a thumbnail.
+        Entry::Image(_) => None,
     }
 }
 
@@ -663,6 +686,40 @@ mod image_drop_tests {
         // Length must be width*height*4; a short buffer yields None (not a panic).
         assert_eq!(encode_rgba_png(2, 2, &[0u8; 3]), None);
         assert_eq!(encode_rgba_png(1, 1, &[]), None);
+    }
+
+    // ── thumbnail sizing (pure) ────────────────────────────────────────────
+    // The decode + GPU upload (`DeckPane::image_texture`) needs a live egui
+    // context, so only the sizing math is unit-tested here.
+
+    fn approx(a: egui::Vec2, b: egui::Vec2) {
+        assert!((a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() < 0.01, "{a:?} ≉ {b:?}");
+    }
+
+    #[test]
+    fn thumb_fit_wide_clamps_on_width() {
+        // 400×100 into a 240×220 box → width is the binding axis (aspect kept).
+        approx(thumb_fit([400, 100], egui::vec2(240.0, 220.0)), egui::vec2(240.0, 60.0));
+    }
+
+    #[test]
+    fn thumb_fit_tall_clamps_on_height() {
+        // 100×400 into a 240×220 box → height binds.
+        approx(thumb_fit([100, 400], egui::vec2(240.0, 220.0)), egui::vec2(55.0, 220.0));
+    }
+
+    #[test]
+    fn thumb_fit_small_source_is_not_upscaled() {
+        // A source smaller than the box renders at native pixels (cap at 1.0).
+        approx(thumb_fit([50, 50], egui::vec2(240.0, 220.0)), egui::vec2(50.0, 50.0));
+    }
+
+    #[test]
+    fn thumb_fit_zero_width_bound_constrains_only_by_height() {
+        // The composer chip passes [0.0, 44.0]: height-bounded, width free.
+        approx(thumb_fit([400, 100], egui::vec2(0.0, 44.0)), egui::vec2(176.0, 44.0));
+        // And still never upscales a tiny source past native.
+        approx(thumb_fit([20, 10], egui::vec2(0.0, 44.0)), egui::vec2(20.0, 10.0));
     }
 }
 
@@ -1182,6 +1239,10 @@ pub struct DeckPane {
     /// vision critique). Only offered for vision-capable cassettes. Cleared once
     /// the turn is sent.
     attached_image: Option<std::path::PathBuf>,
+    /// Decoded-image texture cache for thumbnails (composer chip + transcript),
+    /// keyed by path → (file mtime, handle). The mtime busts a stale texture
+    /// when a re-paste overwrites the same temp path. Not persisted.
+    image_cache: std::collections::HashMap<std::path::PathBuf, (std::time::SystemTime, egui::TextureHandle)>,
     /// Deck-emitted side-effecting commands (export/print/import/…) awaiting an
     /// explicit human [run]/[skip]. They never touch the filesystem until the
     /// user confirms (security C-2 / H-7).
@@ -1347,6 +1408,7 @@ impl Default for DeckPane {
             vision_turn: false,
             critique_requested: false,
             attached_image: None,
+            image_cache: std::collections::HashMap::new(),
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
             deck_run_approved: false,
@@ -2357,8 +2419,11 @@ impl DeckPane {
         self.retries = 0;
         // A user-attached image makes this a vision turn (scoped Read of that
         // one file, prose-only reply — same security envelope as a critique).
-        if self.attached_image.is_some() {
+        if let Some(img) = self.attached_image.clone() {
             self.vision_turn = true;
+            // Show the attachment in the conversation, just above the message
+            // (the path is consumed later when the request is built).
+            self.transcript.push(Entry::Image(img));
         }
         self.transcript.push(Entry::User(text.to_string()));
         self.messages.push(ChatMessage {
@@ -3644,6 +3709,36 @@ impl DeckPane {
             .unwrap_or(false)
     }
 
+    /// Decode `path` into a cached egui texture for thumbnail display (composer
+    /// chip + transcript). Keyed by path AND file mtime so overwriting the same
+    /// temp path (a re-paste into `itsjustcad-pasted.png`) busts the stale
+    /// texture. Returns an owned handle (a cheap Arc clone); `None` on a
+    /// missing/undecodable file. Not pure (disk read + GPU upload); the sizing
+    /// math is the pure [`thumb_fit`].
+    fn image_texture(
+        &mut self,
+        ctx: &egui::Context,
+        path: &std::path::Path,
+    ) -> Option<egui::TextureHandle> {
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+        if let Some((cached, tex)) = self.image_cache.get(path)
+            && *cached == mtime
+        {
+            return Some(tex.clone());
+        }
+        let img = image::open(path).ok()?.to_rgba8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], img.as_raw());
+        let tex = ctx.load_texture(
+            format!("deck_attach:{}", path.display()),
+            ci,
+            egui::TextureOptions::LINEAR,
+        );
+        self.image_cache
+            .insert(path.to_path_buf(), (mtime, tex.clone()));
+        Some(tex)
+    }
+
     /// Accept an image dragged from the OS onto the chat pane. On a completed
     /// drop of a known image file — scoped to this pane via the pointer position
     /// so a drop over the viewport/another panel is ignored — set it as the
@@ -4144,18 +4239,35 @@ impl DeckPane {
                 self.firstrun_confirm_ui(ui, session, roles);
                 // Side-effect confirmation sits directly above the input card.
                 self.side_effect_confirm_ui(ui, session, icons, roles);
-                // Attachment chip (name + remove) above the input card.
+                // Attachment chip (thumbnail + remove) above the input card.
                 if let Some(img) = self.attached_image.clone() {
                     ui.horizontal(|ui| {
                         let name = img
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        let fg = ui.visuals().weak_text_color();
-                        let sz = ui.text_style_height(&egui::TextStyle::Body);
-                        ui.add(icons.image(ui.ctx(), crate::icons::Icon::Paperclip, sz, fg))
-                            .on_hover_text("attached image");
-                        ui.label(egui::RichText::new(name).weak());
+                        // Thumbnail preview; fall back to a paperclip + filename
+                        // if the image can't be decoded.
+                        match self.image_texture(ui.ctx(), &img) {
+                            Some(tex) => {
+                                let size =
+                                    thumb_fit(tex.size().map(|d| d as u32), egui::vec2(0.0, 44.0));
+                                ui.image(egui::load::SizedTexture::new(tex.id(), size))
+                                    .on_hover_text(&name);
+                            }
+                            None => {
+                                let fg = ui.visuals().weak_text_color();
+                                let sz = ui.text_style_height(&egui::TextStyle::Body);
+                                ui.add(icons.image(
+                                    ui.ctx(),
+                                    crate::icons::Icon::Paperclip,
+                                    sz,
+                                    fg,
+                                ))
+                                .on_hover_text("attached image");
+                                ui.label(egui::RichText::new(&name).weak());
+                            }
+                        }
                         if icons
                             .icon_button(ui, crate::icons::Icon::Close, "remove attachment")
                             .clicked()
@@ -4471,6 +4583,21 @@ impl DeckPane {
                                 ui.add_space(crate::theme::Spacing::XS);
                             }
                         }
+                        // Pre-load thumbnails into the cache BEFORE the immutable
+                        // transcript borrow below (texture build needs &mut self);
+                        // the render arm then reads the cached handle.
+                        let thumb_paths: Vec<std::path::PathBuf> = self
+                            .transcript
+                            .iter()
+                            .filter_map(|e| match e {
+                                Entry::Image(p) => Some(p.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let thumb_ctx = ui.ctx().clone();
+                        for p in &thumb_paths {
+                            let _ = self.image_texture(&thumb_ctx, p);
+                        }
                         for (i, entry) in self.transcript.iter().enumerate() {
                             match entry {
                                 Entry::User(t) => {
@@ -4497,6 +4624,35 @@ impl DeckPane {
                                                     );
                                                 });
                                             attach_copy_menu(&r.response, entry_copy_text(entry));
+                                        },
+                                    );
+                                }
+                                Entry::Image(path) => {
+                                    // Right-aligned thumbnail accompanying the
+                                    // user's message (pre-loaded into the cache
+                                    // above). A missing/undecodable file degrades
+                                    // to a muted placeholder rather than vanishing.
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Min),
+                                        |ui| match self.image_cache.get(path) {
+                                            Some((_, tex)) => {
+                                                let size = thumb_fit(
+                                                    tex.size().map(|d| d as u32),
+                                                    egui::vec2(240.0, 220.0),
+                                                );
+                                                ui.image(egui::load::SizedTexture::new(
+                                                    tex.id(),
+                                                    size,
+                                                ));
+                                            }
+                                            None => {
+                                                ui.label(
+                                                    egui::RichText::new("[image unavailable]")
+                                                        .weak()
+                                                        .italics()
+                                                        .small(),
+                                                );
+                                            }
                                         },
                                     );
                                 }
@@ -4964,6 +5120,7 @@ mod side_effect_gate_tests {
             vision_turn: false,
             critique_requested: false,
             attached_image: None,
+            image_cache: std::collections::HashMap::new(),
             pending_side_effects: Vec::new(),
             allow_deck_side_effects: false,
             // Test helper = an already-running session: the OUTER first-run gate
