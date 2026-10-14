@@ -2373,6 +2373,8 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "column" => parse_frame(FrameKind::Column, &args),
         "slab" => parse_area(AreaKind::Slab, &args),
         "wall" => parse_area(AreaKind::Wall, &args),
+        "ramp" => parse_ramp(&args),
+        "stair" => parse_stair(&args),
         "load" => parse_load(&args),
         "support" => parse_support(&args),
         "undo" => Ok(Command::Undo),
@@ -3162,6 +3164,79 @@ fn parse_area(kind: AreaKind, args: &[&str]) -> Result<Command, ParseError> {
     let (material, _rot) = member_options(rest, command, args)?;
     let boundary = pts.iter().map(|p| point(p)).collect::<Result<_, _>>()?;
     Ok(Command::AreaMember { id: None, kind, boundary, thickness, material })
+}
+
+/// `ramp rise <m> slope <a:b> | run <m> width <m>` (issue #18).
+///
+/// Keyword-driven: `rise`, `width` are required; exactly one of `slope` (a
+/// rise:run ratio like `1:12`) or `run` (a total plan length) gives the slope.
+fn parse_ramp(args: &[&str]) -> Result<Command, ParseError> {
+    let mut rise: Option<f64> = None;
+    let mut slope: Option<f64> = None;
+    let mut run: Option<f64> = None;
+    let mut width: Option<f64> = None;
+    let mut it = args.iter();
+    while let Some(&kw) = it.next() {
+        let v = *it
+            .next()
+            .ok_or_else(|| wrong_err("ramp", "a value after each keyword", args))?;
+        match kw {
+            "rise" => rise = Some(number(v)?),
+            "width" => width = Some(number(v)?),
+            "run" => run = Some(number(v)?),
+            "slope" => slope = Some(parse_slope_ratio(v)?),
+            _ => return wrong("ramp", "keywords rise/slope/run/width", args),
+        }
+    }
+    let (Some(rise), Some(width)) = (rise, width) else {
+        return wrong("ramp", "rise <m> and width <m>", args);
+    };
+    if slope.is_none() && run.is_none() {
+        return wrong("ramp", "a slope <a:b> or a run <m>", args);
+    }
+    if slope.is_some() && run.is_some() {
+        return wrong("ramp", "only one of slope or run", args);
+    }
+    Ok(Command::Ramp { rise, slope, run, width, ids: Vec::new() })
+}
+
+/// Parse a rise:run ratio token (`1:12`, `1:8`) into a slope fraction. Also
+/// accepts a bare decimal (`0.0833`) for flexibility.
+fn parse_slope_ratio(s: &str) -> Result<f64, ParseError> {
+    if let Some((a, b)) = s.split_once(':') {
+        let a: f64 = a.parse().map_err(|_| ParseError::BadNumber(s.to_string()))?;
+        let b: f64 = b.parse().map_err(|_| ParseError::BadNumber(s.to_string()))?;
+        if b == 0.0 {
+            return Err(ParseError::BadNumber(s.to_string()));
+        }
+        return Ok(a / b);
+    }
+    s.parse::<f64>().map_err(|_| ParseError::BadNumber(s.to_string()))
+}
+
+/// `stair rise <m> width <m> [riser <m>] [tread <m>]` (issue #18).
+fn parse_stair(args: &[&str]) -> Result<Command, ParseError> {
+    let mut rise: Option<f64> = None;
+    let mut width: Option<f64> = None;
+    let mut riser: Option<f64> = None;
+    let mut tread: Option<f64> = None;
+    let mut it = args.iter();
+    while let Some(&kw) = it.next() {
+        let v = *it
+            .next()
+            .ok_or_else(|| wrong_err("stair", "a value after each keyword", args))?;
+        match kw {
+            "rise" => rise = Some(number(v)?),
+            "width" => width = Some(number(v)?),
+            "riser" => riser = Some(number(v)?),
+            "tread" => tread = Some(number(v)?),
+            _ => return wrong("stair", "keywords rise/width/riser/tread", args),
+        }
+    }
+    let (Some(rise), Some(width)) = (rise, width) else {
+        return wrong("stair", "rise <m> and width <m>", args);
+    };
+    Ok(Command::Stair { rise, width, riser, tread, ids: Vec::new() })
 }
 
 /// `fromlayer <layer> wall thick <t> [height <h> | level <name>]`

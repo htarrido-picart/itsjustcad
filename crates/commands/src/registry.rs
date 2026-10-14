@@ -1308,6 +1308,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Structure,
         },
         CommandSpec {
+            name: "ramp",
+            usage: "ramp rise <m> slope <a:b> | run <m> width <m>",
+            summary: "Parametric accessible ramp: lay out a code-compliant ramp from a total RISE (m) and EITHER a running slope as a ratio 'slope <a:b>' (e.g. 1:12, the ADA max — steeper is clamped to it) OR a total 'run <m>' (slope = rise/run, also clamped to 1:12), WIDTH (m). Inserts a level landing (≥60 in long, ≥ ramp width) whenever a single run would rise more than 30 in (ADA 405.7). Bakes a continuous ramp surface plus a named 'ramp' centerline so `codecheck ada2010` grades slope and landings. Defaults, not legal advice — verify with the AHJ. Example: ramp rise 0.9 slope 1:12 width 1.2 · ramp rise 1.5 run 20 width 1.5",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "stair",
+            usage: "stair rise <m> width <m> [riser <m>] [tread <m>]",
+            summary: "Parametric stair: lay out a code-compliant straight flight from a total floor-to-floor RISE (m) and WIDTH (m), optional target 'riser <m>' and 'tread <m>'. Riser count = ceil(rise / 7in) so each riser ≤ 7 in; the height is EQUALIZED (rise/count, consistent, variation ≤ 3/8 in, ≥ 4 in); tread ≥ 11 in, honoring 2R+T≈24–25 in when no tread is given. Flags a landing past 12 ft of rise. Bakes a stepped mesh named 'stair' so `codecheck ibc2021` grades risers and treads. Defaults, not legal advice — verify with the AHJ. Example: stair rise 3 width 1.2 · stair rise 3.6 width 1.5 tread 0.3",
+            category: Category::Structure,
+        },
+        CommandSpec {
             name: "load",
             usage: "load <point|line|area> [name] <target/point(s)> <magnitude> <dx,dy,dz>",
             summary: "Record a structural load (data + overlay arrow; no analysis). point = concentrated force at a node (N); line = distributed along a member (N/m); area = pressure on a surface (Pa). Direction is a world-space vector. Example: load point dead 0,0,3 10000 0,0,-1 · load line live 0,0,3 6,0,3 5000 0,0,-1 · load area wind 0,0,0 6,0,0 6,4,0 0,4,0 end 2000 1,0,0",
