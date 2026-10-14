@@ -13,7 +13,7 @@
 **A complete architect's CAD in a single ~10 MB binary — with an LLM drafting
 partner built into the app.**
 
-FOSS, AGPL-3.0-or-later. Pure Rust (egui + wgpu + glam). Linux / macOS / Windows.
+FOSS, AGPL-3.0-only. Pure Rust (egui + wgpu + glam). Linux / macOS / Windows.
 
 Model buildings, cut plans and sections, lay out dimensioned sheets, print
 vector PDFs, exchange DXF/IFC/glTF with every major CAD — and talk to an LLM
@@ -976,7 +976,7 @@ courtyard sheet, and a full intemfit site.
 
 Copyright © 2026 Hector Tarrido-Picart.
 
-**The desktop app is free and open source under AGPL-3.0-or-later** (see
+**The desktop app is free and open source under AGPL-3.0-only** (see
 [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)) — use it, fork it, build on it. The
 AGPL's copyleft means any modified or network-served version must also be open.
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
 //! `LoadingStrategy` (plan §7.4, Phase 6) — FrontLoaded (euro_latam default) vs
