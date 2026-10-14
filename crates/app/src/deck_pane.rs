@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -3189,6 +3189,11 @@ impl DeckPane {
         let mut decision: Option<Decision> = None;
         let batch = self.pending_firstrun.clone();
         let n = batch.len();
+        // Commands land in `pending_firstrun` incrementally WHILE the turn streams
+        // (see the ExtractEvent::Command push), so the list shown here is still
+        // growing until the turn finishes. Keep Approve disabled until then so a
+        // partial batch can't be approved; Decline stays available throughout.
+        let streaming = self.busy();
 
         let dismissed = self.approval_overlay(ui, "deck_firstrun_modal", |ui| {
             ui.heading("The deck wants to run commands.");
@@ -3218,27 +3223,43 @@ impl DeckPane {
                         );
                     }
                 });
+            // While the turn is still streaming, the list above is incomplete —
+            // tell the user and keep Approve disabled below.
+            if streaming {
+                ui.add_space(crate::theme::Spacing::XS);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("waiting for all commands to arrive…")
+                            .weak()
+                            .small(),
+                    );
+                });
+            }
             ui.add_space(crate::theme::Spacing::M);
             ui.horizontal_wrapped(|ui| {
                 let dark = ui.visuals().dark_mode;
                 use crate::widgets::{role_button, ButtonRole};
                 // Hierarchy: Approve once = prominent (filled accent), Approve for
-                // session = normal (outlined), Decline = destructive (red).
-                if role_button(ui, roles, dark, ButtonRole::Prominent, "Approve once")
-                    .on_hover_text("run this turn's commands only; ask again next turn")
-                    .clicked()
-                {
-                    decision = Some(Decision::ApproveOnce);
-                }
-                if role_button(ui, roles, dark, ButtonRole::Normal, "Approve for session")
-                    .on_hover_text(
-                        "let the deck run commands (and in-folder writes) this \
-                         session without asking; opens/imports still ask",
-                    )
-                    .clicked()
-                {
-                    decision = Some(Decision::ApproveSession);
-                }
+                // session = normal (outlined), Decline = destructive (red). Approve
+                // is DISABLED until the full batch has landed (`!streaming`).
+                ui.add_enabled_ui(!streaming, |ui| {
+                    if role_button(ui, roles, dark, ButtonRole::Prominent, "Approve once")
+                        .on_hover_text("run this turn's commands only; ask again next turn")
+                        .clicked()
+                    {
+                        decision = Some(Decision::ApproveOnce);
+                    }
+                    if role_button(ui, roles, dark, ButtonRole::Normal, "Approve for session")
+                        .on_hover_text(
+                            "let the deck run commands (and in-folder writes) this \
+                             session without asking; opens/imports still ask",
+                        )
+                        .clicked()
+                    {
+                        decision = Some(Decision::ApproveSession);
+                    }
+                });
                 if role_button(ui, roles, dark, ButtonRole::Destructive, "Decline").clicked() {
                     decision = Some(Decision::Decline);
                 }
