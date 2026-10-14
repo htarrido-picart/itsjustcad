@@ -3,7 +3,7 @@
   "models": [
     {
       "id": "qwen3-0.6b-q6k-llamafile",
-      "display_name": "JustCadModel Mini (Qwen 0.6B)",
+      "display_name": "Qwen3 0.6B",
       "params": "0.6B",
       "tier": "Small3B",
       "url": "https://huggingface.co/mozilla-ai/Qwen3-0.6B-llamafile/resolve/main/Qwen_Qwen3-0.6B-Q6_K.llamafile",
@@ -14,7 +14,7 @@
     },
     {
       "id": "qwen3-4b-q4km-llamafile",
-      "display_name": "JustCadModel (Qwen 4B)",
+      "display_name": "Qwen3 4B",
       "params": "4B",
       "tier": "Mid7B",
       "url": "https://huggingface.co/mozilla-ai/Qwen3-4B-llamafile/resolve/main/Qwen_Qwen3-4B-Q4_K_M.llamafile",
@@ -25,7 +25,7 @@
     },
     {
       "id": "qwen2.5-vl-3b-q4km-gguf",
-      "display_name": "JustCadModel Vision (Qwen2.5-VL 3B)",
+      "display_name": "Qwen2.5-VL 3B",
       "params": "3B",
       "tier": "Small3B",
       "url": "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",

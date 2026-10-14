@@ -166,8 +166,8 @@ mod vision_image_tests {
 
 /// Human label for a cassette in the deck dropdown. Installed local models are
 /// keyed `local-<catalog-id>` (a stable lookup key, ugly to show). Resolve that
-/// key to the catalog's `display_name` so the dropdown reads "JustCadModel
-/// (Qwen 4B)". Non-local decks (and unknown ids) render their raw name.
+/// key to the catalog's `display_name` so the dropdown reads "Qwen3 4B".
+/// Non-local decks (and unknown ids) render their raw name.
 /// Mirrors crates/app/assets/models.json — kept a plain lookup so it stays in
 /// sync with the shipped catalog without threading `&Catalog` through the UI.
 fn deck_display_name(name: &str) -> String {
@@ -821,14 +821,14 @@ mod saved_chat_tests {
 
     #[test]
     fn deck_display_name_resolves_local_cassettes() {
-        // A `local-<catalog-id>` key renders as the catalog's brand display name.
+        // A `local-<catalog-id>` key renders as the catalog's display name.
         assert_eq!(
             deck_display_name("local-qwen3-4b-q4km-llamafile"),
-            "JustCadModel (Qwen 4B)"
+            "Qwen3 4B"
         );
         assert_eq!(
             deck_display_name("local-qwen3-0.6b-q6k-llamafile"),
-            "JustCadModel Mini (Qwen 0.6B)"
+            "Qwen3 0.6B"
         );
         // Unknown local id falls back to the bare id (prefix stripped, no crash).
         assert_eq!(deck_display_name("local-mystery"), "mystery");
