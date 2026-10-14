@@ -3463,14 +3463,26 @@ impl App {
         if dropped.is_empty() {
             return;
         }
-        let paths: Vec<std::path::PathBuf> = dropped
+        let all_paths: Vec<std::path::PathBuf> =
+            dropped.into_iter().filter_map(|f| f.path).collect();
+        // Images are the chat deck's job (dropped onto the chat → vision
+        // attachment, handled in `deck_pane`); don't claim them here or warn.
+        let has_image = all_paths.iter().any(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .is_some_and(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif"))
+        });
+        let paths: Vec<std::path::PathBuf> = all_paths
             .into_iter()
-            .filter_map(|f| f.path)
             .filter(|p| Self::is_importable(p))
             .collect();
         let Some(first) = paths.first().cloned() else {
-            self.command_line
-                .push_line("drop ignored: not an importable file (dxf/dwg/ifc/obj/stl/…)");
+            // Stay silent for an image-only drop — the chat deck attaches it.
+            if !has_image {
+                self.command_line
+                    .push_line("drop ignored: not an importable file (dxf/dwg/ifc/obj/stl/…)");
+            }
             return;
         };
         if self.import_job.is_some() {

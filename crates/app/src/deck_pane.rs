@@ -3652,16 +3652,16 @@ impl DeckPane {
     /// model shows a "can't see images" hint instead of accepting the drop.
     fn handle_image_drop(&mut self, ui: &egui::Ui, roles: &crate::theme::ColorRoles) {
         let ctx = ui.ctx();
-        // Pointer position scopes both the drop and the hint to THIS pane.
-        let over_pane = ctx
-            .input(|i| i.pointer.latest_pos())
-            .is_some_and(|p| self.pane_rect.contains(p));
-        if !over_pane {
-            return;
-        }
         let vision = self.active_supports_vision();
 
-        // Completed drop → attach the first image file (path-less drops skipped).
+        // Accept an image dropped ANYWHERE over the chat — the whole pane, not
+        // just the composer. We deliberately do NOT gate on pointer position:
+        // during an OS file drag the pointer is often not reported (so a
+        // rect/`latest_pos` test would only catch drops over the last-tracked
+        // spot, typically the input), and an image is only ever meaningful as a
+        // chat attachment — the viewport imports CAD files, never images, and the
+        // app-wide handler already ignores images. This fn runs only while the
+        // Chat pane is on screen, so "window-wide" effectively means "the chat".
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -3673,33 +3673,31 @@ impl DeckPane {
             self.attached_image = Some(img);
         }
 
-        // Hover hint while an OS file drag is in progress over the pane.
+        // Drop-target hint across the whole pane while a file is dragged over it.
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             self.paint_drop_hint(ui, roles, vision);
         }
     }
 
     /// Attach an image pasted from the clipboard (⌘V / Ctrl+V) — the paste
-    /// sibling of drag-and-drop, e.g. after a screenshot or copying an image
-    /// from a browser. Only fires on the paste chord while the chat is the
-    /// focus (input focused or pointer over the pane) and the active cassette
-    /// can see images. If the clipboard holds TEXT rather than an image,
-    /// `clipboard_image_to_file` returns `None` and normal text paste into the
-    /// input proceeds untouched (we never consume the event).
+    /// sibling of drag-and-drop, e.g. after a screenshot or "copy image" from a
+    /// browser/Preview. Fires on the paste chord while the Chat pane is on
+    /// screen and the active cassette can see images; no focus/pointer gate, so
+    /// ⌘V works anywhere over the chat, not only inside the composer.
+    ///
+    /// Reads only clipboard IMAGE BITMAP data (what a screenshot or "copy image"
+    /// puts there). A clipboard holding TEXT — or a FILE reference copied in
+    /// Finder — yields no bitmap, so `clipboard_image_to_file` returns `None`
+    /// and we no-op: normal text paste into the input is untouched, and a copied
+    /// file is handled by dragging it in instead.
     fn handle_image_paste(&mut self, ui: &egui::Ui) {
         if !self.active_supports_vision() {
             return;
         }
-        let ctx = ui.ctx();
-        let paste_chord = ctx.input(|i| i.key_pressed(egui::Key::V) && i.modifiers.command);
+        let paste_chord = ui
+            .ctx()
+            .input(|i| i.key_pressed(egui::Key::V) && i.modifiers.command);
         if !paste_chord {
-            return;
-        }
-        let focused = ctx.memory(|m| m.has_focus(egui::Id::new("deck_chat_input")));
-        let over_pane = ctx
-            .input(|i| i.pointer.latest_pos())
-            .is_some_and(|p| self.pane_rect.contains(p));
-        if !focused && !over_pane {
             return;
         }
         if let Some(img) = clipboard_image_to_file(&std::env::temp_dir()) {
