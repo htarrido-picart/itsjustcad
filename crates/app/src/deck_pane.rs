@@ -3836,10 +3836,19 @@ impl DeckPane {
         if !self.active_supports_vision() {
             return;
         }
-        let paste_chord = ui
-            .ctx()
-            .input(|i| i.key_pressed(egui::Key::V) && i.modifiers.command);
-        if !paste_chord {
+        // Detect a paste by EITHER signal. On macOS, eframe routes ⌘V as an
+        // `Event::Paste` and frequently does NOT surface the raw `V` keypress, so
+        // the chord alone silently misses every paste (the bug the user hit); on
+        // other setups the reverse can be true. Catching both is robust. A text
+        // paste also fires `Event::Paste`, but `clipboard_image_to_file` then
+        // finds no image and no-ops, leaving the input's own text paste untouched.
+        let paste = ui.ctx().input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Paste(_)))
+                || (i.key_pressed(egui::Key::V) && i.modifiers.command)
+        });
+        if !paste {
             return;
         }
         if let Some(img) = clipboard_image_to_file(&std::env::temp_dir()) {
