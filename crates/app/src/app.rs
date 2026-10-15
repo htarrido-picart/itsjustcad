@@ -7661,6 +7661,9 @@ impl App {
                     .fill(bg)
                     .inner_margin(egui::Margin::symmetric(4, 6))
                     .show(ui, |ui| {
+                        // Span the full dock width so the stripe + selection ring
+                        // read as a real list row, not a box hugging the content.
+                        ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             // Mini-preview thumbnail on the left.
                             self.paint_sheet_thumbnail(ui, &row.preview);
