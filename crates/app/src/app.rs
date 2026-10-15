@@ -8184,8 +8184,7 @@ impl App {
         if resp.clicked()
             && let Some(p) = resp.interact_pointer_pos()
         {
-            for i in 0..sheet.views.len() {
-                let place = rects[i];
+            for (i, place) in rects.iter().enumerate() {
                 let r = egui::Rect::from_min_max(
                     to_pos(fit.to_px(place.x, place.y + place.h)),
                     to_pos(fit.to_px(place.x + place.w, place.y)),
