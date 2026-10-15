@@ -291,12 +291,16 @@ pub fn ramp_surface(layout: &RampLayout, start: DVec3) -> MeshBuild {
         };
         let a = cur;
         let b = cur + DVec3::new(dx, 0.0, dz);
-        // Quad: near-left, near-right, far-right, far-left (CCW from above).
+        // Wind CCW as seen from ABOVE so the surface normal points +Z (up). The
+        // previous order (near-left, near-right, far-right, far-left) produced a
+        // DOWNWARD normal — the ramp drew as wireframe from the top (back-face
+        // culled) and solid only from below. Order: near-left, far-left,
+        // far-right, near-right.
         mb.quad(
             a,
-            a + DVec3::new(0.0, w, 0.0),
-            b + DVec3::new(0.0, w, 0.0),
             b,
+            b + DVec3::new(0.0, w, 0.0),
+            a + DVec3::new(0.0, w, 0.0),
         );
         cur = b;
     }
@@ -344,6 +348,23 @@ pub fn stair_mesh(layout: &StairLayout, start: DVec3) -> MeshBuild {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ramp_surface_normal_points_up() {
+        // Regression: the surface quads were wound so the normal pointed DOWN,
+        // so the ramp drew as wireframe from the top (back-face culled) and solid
+        // only from below. Every triangle's normal must have a positive Z.
+        let layout = ramp_layout(0.9, RampSlope::Ratio(1.0 / 12.0), 1.2).unwrap();
+        let mb = ramp_surface(&layout, DVec3::ZERO);
+        assert!(!mb.faces.is_empty());
+        for f in &mb.faces {
+            let p0 = mb.positions[f[0] as usize];
+            let p1 = mb.positions[f[1] as usize];
+            let p2 = mb.positions[f[2] as usize];
+            let n = (p1 - p0).cross(p2 - p0);
+            assert!(n.z > 0.0, "ramp face normal must point up, got {n:?}");
+        }
+    }
 
     // ── Ramp ──────────────────────────────────────────────────────────────
 
