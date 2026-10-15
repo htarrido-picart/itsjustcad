@@ -7889,15 +7889,17 @@ impl App {
                         })
                         .inner_margin(egui::Margin::same(6))
                         .corner_radius(crate::theme::Radii::default().small as u8);
+                    // NOTE: do NOT put a click-sense over the whole card — it
+                    // sits on top of the combos/fields and steals their clicks
+                    // (the row would select/deselect and the controls wouldn't
+                    // open or accept text). Selection comes from the row's own
+                    // clickable header (inside `sheet_view_row`) and from clicking
+                    // the viewport on the paper.
                     let resp = frame
                         .show(ui, |ui| {
                             self.sheet_view_row(ui, name, idx1, view, pending);
                         })
-                        .response
-                        .interact(egui::Sense::click());
-                    if resp.clicked() {
-                        self.sheet_view_selected = i;
-                    }
+                        .response;
                     if selected {
                         ui.painter().rect_stroke(
                             resp.rect,
@@ -7924,6 +7926,20 @@ impl App {
     ) {
         use crate::i18n::t;
         use itsjustcad_doc::ViewDirection;
+
+        // Clickable header selects this row (the card itself is NOT clickable so
+        // the controls below keep their clicks). Shows the view's callout.
+        let i = idx1 - 1;
+        let header = view
+            .title
+            .clone()
+            .unwrap_or_else(|| default_callout(view.direction).to_string());
+        if ui
+            .selectable_label(self.sheet_view_selected == i, egui::RichText::new(header).strong())
+            .clicked()
+        {
+            self.sheet_view_selected = i;
+        }
 
         // Direction picker.
         ui.horizontal(|ui| {
@@ -7988,11 +8004,14 @@ impl App {
             if edit.changed() {
                 ui.data_mut(|d| d.insert_temp(buf_id, buf.clone()));
             }
-            if (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                && let Some(v) = parse_scale_input(&buf)
-                && (v - cur).abs() >= 1e-9
-            {
-                pending.push(format!("sheetviewset {name} {idx1} scale {v}"));
+            // Commit on focus loss (Enter or clicking away).
+            if edit.lost_focus() {
+                if let Some(v) = parse_scale_input(&buf)
+                    && (v - cur).abs() >= 1e-9
+                {
+                    pending.push(format!("sheetviewset {name} {idx1} scale {v}"));
+                }
+                ui.data_mut(|d| d.remove::<String>(buf_id));
             }
         });
 
@@ -8011,13 +8030,18 @@ impl App {
             if edit.changed() {
                 ui.data_mut(|d| d.insert_temp(buf_id, buf.clone()));
             }
-            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            // Commit on focus loss (covers Enter AND clicking away) — matching
+            // the click-to-apply feel of the Scale/Direction pickers.
+            if edit.lost_focus() {
                 let want = buf.trim().to_string();
                 let had = view.title.clone().unwrap_or_default();
                 if want != had {
                     // Empty text resets to the derived callout.
                     pending.push(format!("sheetviewset {name} {idx1} title {want}"));
                 }
+                // Drop the scratch buffer so the field re-reads the committed
+                // title from the document next frame.
+                ui.data_mut(|d| d.remove::<String>(buf_id));
             }
         });
 
@@ -8151,6 +8175,24 @@ impl App {
                         1.0,
                         accent,
                     );
+                }
+            }
+        }
+
+        // Click a viewport (a plain click, not a drag) selects it so its editor
+        // row highlights and its corner handles appear.
+        if resp.clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            for i in 0..sheet.views.len() {
+                let place = rects[i];
+                let r = egui::Rect::from_min_max(
+                    to_pos(fit.to_px(place.x, place.y + place.h)),
+                    to_pos(fit.to_px(place.x + place.w, place.y)),
+                );
+                if r.contains(p) {
+                    self.sheet_view_selected = i;
+                    break;
                 }
             }
         }
