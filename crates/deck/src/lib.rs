@@ -22,7 +22,8 @@ mod tool_loop;
 mod which;
 
 pub use agent::{
-    parse_plan, parse_question, Plan, PlanStep, StepStatus, MAX_STEP_ATTEMPTS,
+    looks_like_draw_request, parse_plan, parse_question, should_force_draft_retry, Plan,
+    PlanStep, StepStatus, MAX_STEP_ATTEMPTS,
 };
 pub use claude_code::{scoped_allowed_tools, turn_allowed_tools};
 pub use config::{is_local_url, CloudProvider, DeckConfig, DeckKind, DecksFile};

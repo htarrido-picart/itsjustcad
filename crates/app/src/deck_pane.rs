@@ -1572,6 +1572,15 @@ pub struct DeckPane {
     /// Auto-driven rounds consumed by the current plan run (steps + retries +
     /// the verify turn), bounded by [`MAX_PLAN_ROUNDS`].
     plan_rounds: u32,
+    /// The user's most recent message this conversation turn, kept so a
+    /// forcing-retry can judge whether the turn was an imperative draw request.
+    /// Set in `send`; untouched by auto-continuations so the original intent
+    /// drives the gate.
+    last_user_message: String,
+    /// A corrective "you replied without ```draft commands" follow-up has
+    /// already been forced for the current user turn. Caps the forcing retry at
+    /// ONE (no loops); reset to false on every real `send`.
+    forced_draft_retry: bool,
 }
 
 impl Default for DeckPane {
@@ -1651,6 +1660,8 @@ impl Default for DeckPane {
             pending_command_echoes: Vec::new(),
             plan: None,
             plan_rounds: 0,
+            last_user_message: String::new(),
+            forced_draft_retry: false,
         }
     }
 }
@@ -2658,6 +2669,10 @@ impl DeckPane {
             self.transcript.push(Entry::Image(img));
         }
         self.transcript.push(Entry::User(text.to_string()));
+        // Remember the user's intent for this turn, and reset the forcing-retry
+        // cap so a fresh request gets its own single corrective follow-up.
+        self.last_user_message = text.to_string();
+        self.forced_draft_retry = false;
         self.messages.push(ChatMessage {
             role: Role::User,
             content: text.to_string(),
@@ -2919,6 +2934,14 @@ impl DeckPane {
 
     fn finish_turn(&mut self, session: &Session, handle: &tokio::runtime::Handle) {
         let had_commands = !self.current_commands.is_empty();
+        // Snapshot the raw reply text BEFORE `current_response` is moved into the
+        // transcript below — the forcing-retry gate needs it to tell a genuine
+        // Q&A/question/plan turn from a prose "I did it" that drew nothing.
+        let reply_text = self.current_response.clone();
+        // `vision_turn` is cleared mid-function before the retry chain; snapshot
+        // it so the forcing-retry gate still knows this was a prose-only vision
+        // turn (which must never be nudged to draw, H-2).
+        let was_vision_turn = self.vision_turn;
         // A turn that ends awaiting the USER (clarifying question) must not be
         // auto-continued by the plan driver below.
         let mut question_turn = false;
@@ -3017,12 +3040,73 @@ impl DeckPane {
                 content: feedback,
             });
             self.start_turn(session, handle);
+        } else if self.should_force_draft_retry_now(had_commands, &reply_text, was_vision_turn) {
+            // FORMAT NON-COMPLIANCE (claude-code/sonnet): the model answered in
+            // prose and drew NOTHING for a clear draw request — e.g. "Sheet
+            // created with four views" with no ```draft block, so no geometry
+            // exists. Re-issue ONE hard corrective follow-up demanding the draft
+            // commands. Capped at a single retry (never a loop) via
+            // `forced_draft_retry`; scoped to the claude-code backend (see
+            // `should_force_draft_retry_now`). Genuine Q&A / QUESTION: / PLAN:
+            // turns are excluded by the gate, so this never stomps a real answer.
+            self.forced_draft_retry = true;
+            self.transcript.push(Entry::Status(
+                "no draft commands emitted — asking the model to output them".into(),
+            ));
+            self.messages.push(ChatMessage {
+                role: Role::User,
+                content: "You replied without any ```draft commands, so nothing was \
+drawn or changed. If this request requires drawing or modifying the model, output \
+ONLY a ```draft fenced block with the exact commands that carry it out now — no \
+prose. If it was genuinely a question or needs clarification, answer normally (or \
+use QUESTION:)."
+                    .to_string(),
+            });
+            self.start_turn(session, handle);
         }
         self.persist_chat();
         // Auto-land the live conversation in the Sessions archive each completed
         // turn (update-in-place, one row per conversation) so it shows in the
         // Sessions tab immediately and survives a crash (issue #58).
         self.auto_upsert_active();
+    }
+
+    /// Whether to force a single corrective "emit the draft commands" follow-up
+    /// for the turn that just finished. Applies the app-side scoping the pure
+    /// [`itsjustcad_deck::should_force_draft_retry`] gate can't know about:
+    ///
+    /// - BACKEND SCOPE: only the claude-code backend. Sonnet under Claude Code's
+    ///   agentic framing is the one that "answers" instead of emitting the draft
+    ///   contract; the HTTP/local cassettes comply reliably and keeping them
+    ///   untouched avoids regressing their behavior (and their own retry budgets).
+    /// - A vision turn is prose-only by design (H-2) and must never be nudged to
+    ///   draw, so it is excluded here regardless of backend.
+    ///
+    /// The pure gate handles the rest: zero commands, not a QUESTION:/PLAN:, the
+    /// single-retry cap, and the imperative-draw-request heuristic.
+    fn should_force_draft_retry_now(
+        &self,
+        had_commands: bool,
+        reply_text: &str,
+        was_vision_turn: bool,
+    ) -> bool {
+        if was_vision_turn {
+            return false;
+        }
+        let is_claude_code = self
+            .decks
+            .decks
+            .get(self.decks.active)
+            .is_some_and(|c| matches!(c.kind, itsjustcad_deck::DeckKind::ClaudeCode));
+        if !is_claude_code {
+            return false;
+        }
+        itsjustcad_deck::should_force_draft_retry(
+            &self.last_user_message,
+            reply_text,
+            had_commands,
+            self.forced_draft_retry,
+        )
     }
 
     /// Advance or retry the live plan after a finished turn. `had_commands`
@@ -5244,6 +5328,87 @@ mod plan_tests {
         itsjustcad_deck::Plan::new(vec!["model the slab".into(), "extrude the core".into()])
     }
 
+    /// A pane whose active cassette is the claude-code backend — the one the
+    /// forcing-retry is scoped to.
+    fn claude_code_pane() -> DeckPane {
+        let mut pane = side_effect_gate_tests::blank_pane();
+        pane.decks = DecksFile {
+            decks: vec![itsjustcad_deck::DeckConfig {
+                name: "claude-code".into(),
+                kind: DeckKind::ClaudeCode,
+                base_url: String::new(),
+                model: "sonnet".into(),
+                api_key: None,
+                grammar: false,
+                terse: None,
+            }],
+            active: 0,
+            local_only: false,
+        };
+        pane
+    }
+
+    #[test]
+    fn force_retry_fires_for_prose_draw_turn_on_claude_code() {
+        // THE bug: claude-code/sonnet replies in prose, draws nothing, for a
+        // clear draw request → the gate must force one corrective retry.
+        let mut pane = claude_code_pane();
+        pane.last_user_message = "make a sheet with four views of a cube".into();
+        assert!(pane.should_force_draft_retry_now(
+            /*had_commands*/ false,
+            "Sheet created with top, front, right, and perspective views of a 5×5×5 cube.",
+            /*was_vision_turn*/ false,
+        ));
+        // Capped at one: once forced, never again this turn.
+        pane.forced_draft_retry = true;
+        assert!(!pane.should_force_draft_retry_now(false, "Created the sheet.", false));
+    }
+
+    #[test]
+    fn force_retry_skips_commands_question_and_vision_turns() {
+        let mut pane = claude_code_pane();
+        pane.last_user_message = "make a box".into();
+        // A turn that ran commands is fine.
+        assert!(!pane.should_force_draft_retry_now(true, "Done.", false));
+        // A clarifying question is a legitimate commands-free outcome.
+        assert!(!pane.should_force_draft_retry_now(false, "QUESTION: how big?", false));
+        // A prose-only vision turn (H-2) must never be nudged to draw.
+        assert!(!pane.should_force_draft_retry_now(false, "It's a cube.", true));
+    }
+
+    #[test]
+    fn force_retry_is_scoped_to_claude_code_backend() {
+        // The HTTP/local cassettes comply reliably — never force them, even on a
+        // prose draw turn with zero commands.
+        let mut pane = plan_pane(); // OpenaiCompat
+        pane.last_user_message = "make a sheet with four views of a cube".into();
+        assert!(!pane.should_force_draft_retry_now(false, "Created the sheet.", false));
+    }
+
+    #[test]
+    fn force_retry_queues_one_corrective_followup_then_caps() {
+        // End-to-end through finish_turn on the claude-code pane: a prose draw
+        // turn with no commands queues exactly one corrective user message and
+        // flips the cap. (start_turn spawns the claude CLI async; we abort it
+        // immediately — we only assert the queued follow-up + cap state.)
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session = Session::default();
+        let mut pane = claude_code_pane();
+        pane.last_user_message = "make a sheet with four views of a cube".into();
+        pane.streaming_chat = "Sheet created with four views of a cube.".into();
+        pane.current_response = pane.streaming_chat.clone();
+        pane.finish_turn(&session, rt.handle());
+        assert!(pane.forced_draft_retry, "cap flag set after forcing once");
+        let last = pane.messages.last().expect("corrective follow-up queued");
+        assert!(matches!(last.role, Role::User));
+        assert!(last.content.contains("```draft"), "{}", last.content);
+        assert!(last.content.contains("without any"), "{}", last.content);
+        assert!(pane.transcript.iter().any(
+            |e| matches!(e, Entry::Status(s) if s.contains("no draft commands emitted"))
+        ));
+        pane.stop_turn();
+    }
+
     #[test]
     fn step_prompt_names_step_and_contract() {
         let mut p = two_step_plan();
@@ -5487,6 +5652,8 @@ mod side_effect_gate_tests {
             pending_command_echoes: Vec::new(),
             plan: None,
             plan_rounds: 0,
+            last_user_message: String::new(),
+            forced_draft_retry: false,
         }
     }
 

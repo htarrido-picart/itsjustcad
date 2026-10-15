@@ -164,6 +164,88 @@ fn strip_step_number(line: &str) -> Option<&str> {
     (!rest.is_empty()).then_some(rest)
 }
 
+/// Decide whether a just-finished chat turn should be given ONE corrective
+/// follow-up because the model answered in prose without emitting any `draft`
+/// commands for a request that clearly needed drawing/modifying the model.
+///
+/// This is the fix for the claude-code/sonnet format-non-compliance bug: the
+/// model replies "Sheet created with top, front, right, and perspective views…"
+/// but never emits the ```draft block, so nothing is drawn. We re-issue a hard
+/// instruction to output ONLY the draft commands. Pure + line-oriented so the
+/// gating is unit-testable; the caller owns the single-retry cap and the
+/// backend scoping.
+///
+/// Conservative by design — ALL must hold to force a retry:
+/// - `had_commands` is false (the turn drew nothing);
+/// - the turn was not a clarifying `QUESTION:` and not a `PLAN:` announcement
+///   (those are legitimate non-drawing outcomes with their own flows);
+/// - no retry has been forced yet this turn (`already_forced` is false);
+/// - the user's message reads as an imperative/draw request (see
+///   [`looks_like_draw_request`]) rather than genuine Q&A.
+pub fn should_force_draft_retry(
+    user_message: &str,
+    reply: &str,
+    had_commands: bool,
+    already_forced: bool,
+) -> bool {
+    if had_commands || already_forced {
+        return false;
+    }
+    // A question or a plan is a legitimate commands-free outcome — never force.
+    if parse_question(reply).is_some() || parse_plan(reply).is_some() {
+        return false;
+    }
+    looks_like_draw_request(user_message)
+}
+
+/// Heuristic: does the user's message ask to draw or modify the model (as
+/// opposed to asking a question / making small talk)? Kept deliberately simple
+/// and recall-biased for imperative CAD phrasing, but it still bails on obvious
+/// interrogatives so a genuine Q&A turn ("what is a hypar?") is never forced
+/// into emitting commands.
+pub fn looks_like_draw_request(user_message: &str) -> bool {
+    let msg = user_message.trim();
+    if msg.is_empty() {
+        return false;
+    }
+    let lower = msg.to_lowercase();
+
+    // Clear interrogatives / help / chit-chat → NOT a draw request. Checked
+    // first so "what should I draw?" or "can you explain extrude?" don't force.
+    if msg.ends_with('?') {
+        return false;
+    }
+    const QA_PREFIXES: &[&str] = &[
+        "what", "why", "how", "who", "when", "where", "which", "explain",
+        "describe", "tell me", "is ", "are ", "do ", "does ", "can you explain",
+        "could you explain", "help", "list ", "show me the",
+    ];
+    if QA_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return false;
+    }
+
+    // Imperative CAD verbs / action words anywhere in the message → draw request.
+    // These are the words a human uses when they want geometry or view changes.
+    const DRAW_WORDS: &[&str] = &[
+        "make", "draw", "create", "add", "build", "model", "place", "put",
+        "generate", "construct", "extrude", "box", "sphere", "cylinder", "cone",
+        "circle", "rect", "polygon", "line", "wall", "slab", "column", "beam",
+        "roof", "floor", "stair", "ramp", "sheet", "view", "move", "copy",
+        "rotate", "scale", "mirror", "array", "union", "difference", "offset",
+        "fillet", "trim", "delete", "erase", "cut", "join", "loft", "sweep",
+        "revolve", "pipe", "give me", "set up", "lay out", "sketch",
+    ];
+    DRAW_WORDS.iter().any(|w| {
+        // Word-ish match: allow it at a word boundary so "remake" doesn't count
+        // but "make a box" does. Multi-word phrases ("give me") match as-is.
+        if w.contains(' ') {
+            lower.contains(w)
+        } else {
+            lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| t == *w)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +335,100 @@ mod tests {
         assert!(c.contains("[ ] 3. roof"), "{c}");
         p.mark_step_failed();
         assert!(p.checklist().contains("[!] 2. cores"), "{}", p.checklist());
+    }
+
+    // ── Forcing-retry gating (claude-code prose-without-commands fix) ────────
+
+    #[test]
+    fn prose_turn_on_a_draw_request_forces_one_retry() {
+        // THE bug: model said it created the sheet but ran no commands.
+        assert!(should_force_draft_retry(
+            "make a sheet with four views of a cube",
+            "Sheet created with top, front, right, and perspective views of a 5×5×5 cube.",
+            /*had_commands*/ false,
+            /*already_forced*/ false,
+        ));
+        // Works for arbitrary draw requests, not just sheets.
+        assert!(should_force_draft_retry(
+            "draw a 4x4x3 tower",
+            "Done — a 4×4×3 tower.",
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn a_turn_that_ran_commands_is_not_retried() {
+        assert!(!should_force_draft_retry(
+            "make a box",
+            "Here you go.",
+            /*had_commands*/ true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn a_clarifying_question_turn_is_not_retried() {
+        // The clarify flow owns this; forcing would stomp a legitimate question.
+        assert!(!should_force_draft_retry(
+            "make a tower",
+            "QUESTION: How tall should the tower be?",
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn a_plan_announcement_turn_is_not_retried() {
+        assert!(!should_force_draft_retry(
+            "model a small office building",
+            "PLAN:\n1. Model the slab\n2. Extrude the core",
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn the_retry_is_capped_at_one() {
+        // Once we've already forced a retry this turn, never force again.
+        assert!(!should_force_draft_retry(
+            "make a sheet of a cube",
+            "Created the sheet.",
+            false,
+            /*already_forced*/ true,
+        ));
+    }
+
+    #[test]
+    fn genuine_qa_turns_are_not_forced() {
+        // A plain question with no commands is a normal answer, not a failure.
+        for (user, reply) in [
+            ("what is a hypar?", "A hyperbolic paraboloid is a doubly-ruled surface."),
+            ("how do I extrude a profile?", "Draw a closed profile, then extrude it."),
+            ("can you explain the difference command?", "It subtracts one solid from another."),
+            ("is Z up in this app?", "Yes, Z is up and the ground plane is z=0."),
+        ] {
+            assert!(
+                !should_force_draft_retry(user, reply, false, false),
+                "Q&A turn should not force a retry: {user:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn draw_request_detection_is_conservative() {
+        // Imperative draw phrasing → yes.
+        assert!(looks_like_draw_request("make a sheet with four views of a cube"));
+        assert!(looks_like_draw_request("give me two towers 10m apart"));
+        assert!(looks_like_draw_request("add a column at the origin"));
+        assert!(looks_like_draw_request("top view please")); // "view" is an action word
+        // Questions / chit-chat → no.
+        assert!(!looks_like_draw_request("what can you do?"));
+        assert!(!looks_like_draw_request("how does extrude work"));
+        assert!(!looks_like_draw_request("thanks!"));
+        assert!(!looks_like_draw_request(""));
+        // "remake" must not match on the "make" substring (word-boundary check).
+        assert!(!looks_like_draw_request("remake? no"));
     }
 
     #[test]
