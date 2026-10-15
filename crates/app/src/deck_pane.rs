@@ -45,6 +45,27 @@ const TURN_TIMEOUT_SECS: u64 = 600;
 /// weights, warm the first token) can take tens of seconds on a big model.
 const LOCAL_RUNTIME_TIMEOUT_SECS: u64 = 120;
 
+/// Minimum height (px) the transcript must keep above the bottom-docked input,
+/// so the input panel (especially EXPANDED, an 8-row field) can never claim the
+/// whole pane and overspill over the segmented control / transcript. The bottom
+/// input panel's `max_size` is derived from this: `pane_height - this`.
+const TRANSCRIPT_MIN_H: f32 = 72.0;
+
+/// The tallest the bottom-docked input panel may grow, given the deck pane's
+/// available height. A non-resizable `Panel::bottom` otherwise sizes purely to
+/// its content and, when that content (expanded composer + palette + preview)
+/// exceeds the pane, egui clamps it to the full pane height and CLIPS it — the
+/// transcript collapses to nothing and the input visually overspills the pane.
+///
+/// Capping the panel at `pane_height - TRANSCRIPT_MIN_H` guarantees the
+/// transcript always keeps `TRANSCRIPT_MIN_H` and the input stays inside the
+/// pane in every state. The cap is floored at `TRANSCRIPT_MIN_H` so a very short
+/// pane still yields a positive, usable height (never zero/negative). Pure math,
+/// unit-tested in `input_panel_max_height_*`.
+fn input_panel_max_height(pane_height: f32) -> f32 {
+    (pane_height - TRANSCRIPT_MIN_H).max(TRANSCRIPT_MIN_H)
+}
+
 /// Whether `config` is a catalog-installed local cassette that ItsJustCAD serves
 /// by spawning a subprocess: an `openai_compat` cassette with grammar on whose
 /// `model` names a known catalog id. This deliberately excludes user-managed
@@ -4494,8 +4515,18 @@ impl DeckPane {
             "deck_input_collapsed_panel"
         };
 
+        // Cap the input panel so it can never eat the whole pane (overspill fix,
+        // issue #75): a non-resizable bottom panel sizes to its content, and an
+        // expanded 8-row composer is taller than a short pane — egui would then
+        // clamp it to the full pane and clip it, collapsing the transcript and
+        // spilling over the segment control above. `max_size` reserves
+        // `TRANSCRIPT_MIN_H` for the transcript in every state. `available` here
+        // is the space left after the toolbar/segment control, i.e. exactly what
+        // the transcript + input must share.
+        let input_panel_max = input_panel_max_height(ui.available_height());
         egui::Panel::bottom(deck_input_id)
             .resizable(false)
+            .max_size(input_panel_max)
             .frame(egui::Frame::NONE)
             // No separator line — the soft top shadow (painted below the card) is
             // the only visual break between the transcript and the input.
@@ -7007,5 +7038,45 @@ mod notify_status_tests {
             e,
             Entry::Status(s) if s.contains("failed") && s.contains("404")
         )));
+    }
+}
+
+#[cfg(test)]
+mod input_panel_sizing_tests {
+    use super::{input_panel_max_height, TRANSCRIPT_MIN_H};
+
+    #[test]
+    fn input_panel_max_height_reserves_the_transcript_minimum() {
+        // Tall pane → the input may grow to everything except the reserved
+        // transcript minimum, so the transcript never collapses to zero.
+        let pane = 600.0;
+        let cap = input_panel_max_height(pane);
+        assert_eq!(cap, pane - TRANSCRIPT_MIN_H);
+        // The leftover for the transcript is exactly the reserved minimum.
+        assert_eq!(pane - cap, TRANSCRIPT_MIN_H);
+    }
+
+    #[test]
+    fn input_panel_max_height_stays_positive_in_a_short_pane() {
+        // When the pane is SHORTER than the reserved minimum, naive subtraction
+        // would go zero/negative (an invalid panel cap, which egui would ignore —
+        // reintroducing the overspill). The floor keeps it positive and usable.
+        for pane in [0.0_f32, 40.0, TRANSCRIPT_MIN_H, TRANSCRIPT_MIN_H + 1.0] {
+            let cap = input_panel_max_height(pane);
+            assert!(cap >= TRANSCRIPT_MIN_H, "cap {cap} must stay >= floor for pane {pane}");
+            assert!(cap > 0.0);
+        }
+    }
+
+    #[test]
+    fn input_panel_max_height_is_monotonic_in_pane_height() {
+        // A taller pane never yields a smaller input cap — resizing the dock
+        // taller only ever gives the composer more room, never less.
+        let mut prev = input_panel_max_height(0.0);
+        for pane in [100.0_f32, 200.0, 400.0, 800.0, 1600.0] {
+            let cap = input_panel_max_height(pane);
+            assert!(cap >= prev, "cap should be non-decreasing: {cap} < {prev}");
+            prev = cap;
+        }
     }
 }

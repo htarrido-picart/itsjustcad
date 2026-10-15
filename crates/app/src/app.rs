@@ -7029,32 +7029,56 @@ impl App {
         if !self.panel_visible {
             // Deck hidden — the commands history + chat now live inside the deck's
             // Chat|Commands segments (issue #28), so there is no always-visible
-            // command line to keep here. Draw only a slim reveal strip with a ▸
-            // handle to show the deck again (Cmd+\ also toggles it).
+            // command line to keep here. The panel disappears ENTIRELY and the
+            // viewport reclaims the full width (issue #75): instead of reserving a
+            // column, float a single reveal button in the top-right corner. Cmd+\
+            // also toggles it.
+            let screen_top = ui
+                .ctx()
+                .input(|i| i.raw.screen_rect)
+                .map(|r| r.top())
+                .unwrap_or(0.0);
+            // Line the floating button up with the collapse (▸) button it replaced
+            // so it doesn't jump vertically on toggle; fall back to a small inset
+            // from the top when no prior position was recorded.
+            let y = ui
+                .ctx()
+                .data_mut(|d| d.get_temp::<f32>(egui::Id::new("panel_toggle_y")))
+                .unwrap_or(screen_top + crate::theme::Spacing::S);
             let cmd_fill = self.command_line_fill(ui);
-            let panel_resp = egui::Panel::right("right_panel")
-                .resizable(false)
-                .exact_size(crate::theme::Spacing::XL + crate::theme::Spacing::M)
-                .frame(
-                    egui::Frame::side_top_panel(ui.style())
-                        .fill(cmd_fill)
-                        .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::S as i8, 4)),
+            let mut reveal = false;
+            egui::Area::new(egui::Id::new("right_panel_reveal"))
+                .order(egui::Order::Foreground)
+                .anchor(
+                    egui::Align2::RIGHT_TOP,
+                    egui::vec2(-crate::theme::Spacing::S, y - screen_top),
                 )
-                .show(ui, |ui| {
-                    // ▸ reveal handle at the top of the column, at the SAME height
-                    // the collapse button had so it doesn't jump on toggle.
-                    ui.horizontal(|ui| {
-                        if self
-                            .icons
-                            .icon_button(ui, crate::icons::Icon::PanelOpen, "show panel (Cmd+\\)")
-                            .clicked()
-                        {
-                            self.panel_visible = true;
-                        }
-                    });
+                .show(ui.ctx(), |ui| {
+                    // A soft pill behind the button so it reads against the 3D
+                    // viewport it now floats over.
+                    egui::Frame::NONE
+                        .fill(cmd_fill)
+                        .corner_radius(egui::CornerRadius::same(
+                            crate::theme::Radii::default().medium as u8,
+                        ))
+                        .inner_margin(egui::Margin::same(crate::theme::Spacing::XS as i8))
+                        .show(ui, |ui| {
+                            reveal = self
+                                .icons
+                                .icon_button(
+                                    ui,
+                                    crate::icons::Icon::PanelOpen,
+                                    "show panel (Cmd+\\)",
+                                )
+                                .clicked();
+                        });
                 });
-            // The viewport still clamps to the right column's left edge.
-            self.dock_left = Some(panel_resp.response.rect.left());
+            if reveal {
+                self.panel_visible = true;
+            }
+            // No dock is drawn — the viewport spans the full width (no edge to
+            // clamp against).
+            self.dock_left = None;
             return;
         }
 
