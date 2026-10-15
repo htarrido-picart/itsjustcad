@@ -847,8 +847,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "fourviews",
-            usage: "fourviews <name> [a4|a3|a2|a1|a0] [scale]",
-            summary: "Create a sheet AND add the four standard views (top, front, right, iso) in one command — the shortcut for 'make a sheet with four views'. Paper defaults a3, scale 1:100. Undoable. Example: fourviews plan a3 1:100",
+            usage: "fourviews [name] [a4|a3|a2|a1|a0] [scale]",
+            summary: "Create a sheet AND add the four standard views (top, front, right, iso) in one command — the shortcut for 'make a sheet with four views'. Name is optional (auto-named 'Sheet N' if omitted); paper defaults a3, scale 1:100. Undoable. Example: fourviews plan a3 1:100",
             category: Category::Dimension,
         },
         CommandSpec {
