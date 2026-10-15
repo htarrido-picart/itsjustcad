@@ -1170,6 +1170,19 @@ fn current_badge(ui: &mut egui::Ui) {
 /// When `current` is true the card carries a compact green "current" pill on the
 /// TITLE row (inline, right-aligned) — it marks the active session without
 /// changing the card's height, so the active and non-active cards line up.
+/// Collapse a summary to a single whitespace-normalized line capped at `max`
+/// chars (ellipsis if truncated) so a session card can never grow tall from a
+/// long/multi-line fallback summary. Pure — unit-tested.
+fn clamp_summary(raw: &str, max: usize) -> String {
+    let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > max {
+        let head: String = one_line.chars().take(max).collect();
+        format!("{}…", head.trim_end())
+    } else {
+        one_line
+    }
+}
+
 fn session_card(
     ui: &mut egui::Ui,
     session: &crate::chat_store::ChatSession,
@@ -1179,7 +1192,7 @@ fn session_card(
     outline: egui::Color32,
 ) -> bool {
     // A short fallback summary if none was derived/generated yet.
-    let summary = if session.summary.trim().is_empty() {
+    let summary_raw = if session.summary.trim().is_empty() {
         session
             .turns
             .iter()
@@ -1189,6 +1202,11 @@ fn session_card(
     } else {
         session.summary.clone()
     };
+    // Clamp to ONE length-bounded line so no card can balloon. The live/current
+    // session usually has no generated summary yet and falls back to the FULL
+    // first user turn — which is multi-line/long and made that card giant.
+    // Collapse whitespace (kills embedded newlines) and cap the length.
+    let summary = clamp_summary(&summary_raw, 120);
     let date = crate::chat_store::fmt_date(session.updated);
 
     let resp = egui::Frame::group(ui.style())
@@ -1210,11 +1228,22 @@ fn session_card(
                     });
                 }
             });
-            // Summary — secondary color, wraps to 1-2 lines.
-            ui.label(egui::RichText::new(summary).color(secondary).size(12.0));
-            // Date — tertiary, right-aligned metadata.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(date).color(tertiary).size(11.0));
+            // Summary — secondary color, a SINGLE truncated line (ellipsis) so
+            // every card is the same height regardless of content length.
+            ui.add(
+                egui::Label::new(egui::RichText::new(summary).color(secondary).size(12.0))
+                    .truncate(),
+            );
+            // Date — tertiary, right-aligned metadata. MUST be wrapped in a
+            // `horizontal` so the right-to-left layout is height-bounded to ONE
+            // row. Without it the layout claimed the frame's FULL available
+            // height — and the first card gets the whole scroll area — which
+            // vertically-centered the date and ballooned that card (the "first
+            // card is taller" bug).
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(date).color(tertiary).size(11.0));
+                });
             });
         })
         .response;
@@ -1235,6 +1264,75 @@ mod current_session_tests {
         // The loaded id is the current card; others are not.
         assert!(is_current_session("abc", Some("abc")));
         assert!(!is_current_session("abc", Some("xyz")));
+    }
+
+    #[test]
+    fn session_card_height_bounded_and_uniform() {
+        use super::session_card;
+        use crate::chat_store::{ChatSession, Turn};
+        // The live/current session: no title, no summary → falls back to a long
+        // multi-line first user turn (what ballooned the first card).
+        let live = ChatSession {
+            id: "live".into(),
+            title: String::new(),
+            summary: String::new(),
+            updated: 0,
+            turns: vec![Turn {
+                role: "user".into(),
+                content: "draft polyline 0,0\n8,0 8,5\n5,5 5,10 0,10 closed\n".repeat(20),
+            }],
+        };
+        let plain = ChatSession {
+            id: "plain".into(),
+            title: "Make a simple L-shaped floor plan".into(),
+            summary: "L-shape: 8x5 base + 5x5 wing".into(),
+            updated: 0,
+            turns: vec![],
+        };
+        let c = egui::Color32::GRAY;
+        let (mut h_current, mut h_plain) = (0.0f32, 0.0f32);
+        let ctx = egui::Context::default();
+        // A DELIBERATELY TALL panel (2000px) — the ballooning bug made the first
+        // card consume all of it.
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(320.0, 2000.0),
+            )),
+            ..Default::default()
+        };
+        ctx.begin_pass(input);
+        egui::Area::new(egui::Id::new("card_height_test")).show(&ctx, |ui| {
+            ui.set_width(320.0);
+            let y0 = ui.cursor().top();
+            let _ = session_card(ui, &live, true, c, c, c);
+            let y1 = ui.cursor().top();
+            let _ = session_card(ui, &plain, false, c, c, c);
+            let y2 = ui.cursor().top();
+            h_current = y1 - y0;
+            h_plain = y2 - y1;
+        });
+        let _ = ctx.end_pass();
+        // Not ballooned anywhere near the 2000px panel, and uniform with the
+        // plain card (both single-line title/summary/date now).
+        assert!(h_current < 160.0, "current card ballooned: {h_current}px");
+        assert!(
+            (h_current - h_plain).abs() < 12.0,
+            "card heights differ: current={h_current} plain={h_plain}"
+        );
+    }
+
+    #[test]
+    fn clamp_summary_collapses_newlines_and_caps_length() {
+        use super::clamp_summary;
+        // Multi-line / long fallback (what made the live card giant) → one short line.
+        let multi = "draft polyline 0,0\n8,0 8,5\n\n5,5 5,10 0,10 closed\nL-shape base";
+        let out = clamp_summary(multi, 20);
+        assert!(!out.contains('\n'), "no newlines: {out:?}");
+        assert!(out.chars().count() <= 21, "capped (+ellipsis): {out:?}");
+        assert!(out.ends_with('…'), "truncated marker: {out:?}");
+        // Short input passes through, whitespace-normalized.
+        assert_eq!(clamp_summary("  a   b ", 50), "a b");
     }
 
     #[test]

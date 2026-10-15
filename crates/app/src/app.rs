@@ -3268,6 +3268,12 @@ impl App {
             || self.guided.active()
             || chat_composing
             || !self.command_line.is_empty()
+            // Any text field actively owning the keyboard (Sessions search, a
+            // rename field, …) must get Backspace/Delete/Esc itself — otherwise
+            // the global shortcut consumes the key and the user can't edit the
+            // text. `egui_wants_keyboard_input()` is TRUE only for text-entry
+            // widgets, NOT the gizmo/viewport, so selection-delete still fires.
+            || ctx.egui_wants_keyboard_input()
         {
             return;
         }
