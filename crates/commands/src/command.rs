@@ -1363,6 +1363,14 @@ pub enum Command {
         direction: ViewDirection,
         scale: f64,
     },
+    /// Convenience: create a sheet AND add the four standard views (top, front,
+    /// right, iso) in one command — the "make a sheet with four views" shortcut.
+    /// `scale` is the denominator applied to all four views.
+    FourViews {
+        name: String,
+        paper: PaperSize,
+        scale: f64,
+    },
     /// Delete a view from a sheet by 1-based index (matching the "N view(s)"
     /// count reported by `sheetview`).
     SheetViewDelete {

@@ -1457,6 +1457,16 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 scale: scale_denominator(scale)?,
             })
         }
+        "fourviews" => {
+            // fourviews <name> [paper] [scale] — paper defaults A3, scale 1:100.
+            let (name, paper, scale) = match args.as_slice() {
+                [name] => (*name, PaperSize::A3, 100.0),
+                [name, paper] => (*name, paper_size(paper)?, 100.0),
+                [name, paper, scale] => (*name, paper_size(paper)?, scale_denominator(scale)?),
+                _ => return wrong("fourviews", "a name and optional paper size and scale", &args),
+            };
+            Ok(Command::FourViews { name: name.to_string(), paper, scale })
+        }
         "sheetviewdelete" => {
             let [sheet, index] =
                 take::<2>("sheetviewdelete", "a sheet name and a 1-based view index", &args)?;
@@ -6342,6 +6352,20 @@ mod tests {
             parse("print plan /tmp/plan.pdf").unwrap(),
             Command::Print { sheet: "plan".into(), path: "/tmp/plan.pdf".into() }
         );
+        // fourviews: name only (defaults), name+paper, name+paper+scale.
+        assert_eq!(
+            parse("fourviews plan").unwrap(),
+            Command::FourViews { name: "plan".into(), paper: PaperSize::A3, scale: 100.0 }
+        );
+        assert_eq!(
+            parse("fourviews plan a1").unwrap(),
+            Command::FourViews { name: "plan".into(), paper: PaperSize::A1, scale: 100.0 }
+        );
+        assert!(matches!(
+            parse("fourviews plan a3 1:50").unwrap(),
+            Command::FourViews { paper: PaperSize::A3, scale, .. } if scale == 50.0
+        ));
+        assert!(parse("fourviews").unwrap_err().to_string().contains("name"));
         // errors carry hints
         assert!(parse("sheet plan b5").unwrap_err().to_string().contains("a4"));
         assert!(parse("sheetview plan back 100").unwrap_err().to_string().contains("top"));
