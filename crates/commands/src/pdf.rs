@@ -519,6 +519,163 @@ fn mm(v: f64) -> String {
     format!("{:.2}", v * PT_PER_MM)
 }
 
+/// The geometry fit for a viewport: the world→paper centering offset plus the
+/// (padded) viewport clip box, in paper millimeters. Computed once from the
+/// collected segments so the PDF emit pass, the PDF dim-label pass and the live
+/// egui viewer all position line art identically.
+struct ViewFit {
+    /// Added to every projected+scaled paper-mm point to center the drawing in
+    /// the viewport rect.
+    offset: DVec2,
+    /// Lower-left of the padded clip box (paper mm).
+    cmin: DVec2,
+    /// Upper-right of the padded clip box (paper mm).
+    cmax: DVec2,
+    /// Visible objects' projected+scaled world segments, carrying their plot pen
+    /// weight (mm) and color. NOT yet offset/clipped.
+    weighted: Vec<(f64, [f32; 3], DVec3, DVec3)>,
+    /// Hidden-line occluder triangles (empty unless `HiddenLine` mode).
+    occ: Vec<OccTri>,
+}
+
+/// Collect the visible geometry for a viewport and compute its centering fit.
+/// Pure (no PDF strings); shared by [`view_weighted_segments`], the PDF dim
+/// pass, and — via [`view_segments`] — the live egui sheet viewer, so all three
+/// agree on where each edge lands. Returns `None` when there is no geometry
+/// (mirrors the historical `render_view` early-return for an empty viewport).
+fn collect_view_fit(doc: &Document, view: &SheetView, rect: (DVec2, DVec2)) -> Option<ViewFit> {
+    let (rmin, rmax) = rect;
+    // Hidden-line mode: precompute the projected occluder triangles once so the
+    // per-edge midpoint test can cull edges buried behind solid faces. Wireframe
+    // (and shaded-without-raster) leaves `occ` empty so no edges are removed —
+    // byte-identical to the historical output.
+    let occ: Vec<OccTri> = if view.display_mode == itsjustcad_doc::SheetDisplayMode::HiddenLine {
+        gather_occluders(doc, view.direction)
+    } else {
+        Vec::new()
+    };
+
+    // Collect (lineweight_mm, plot_color, world-segment) tuples.
+    // Per-object lineweight beats layer lineweight (mirror the color override
+    // pattern). The plot pen (color + weight) is resolved through the active
+    // plot style, if any: `doc.plot_pen` returns the base pen (default black)
+    // for unmapped objects, so the drawing is unchanged without a plot style.
+    let mut weighted: Vec<(f64, [f32; 3], DVec3, DVec3)> = Vec::new();
+    for obj in doc.objects() {
+        if obj.visible && doc.layer_visible(&obj.layer) {
+            let pen = doc.plot_pen(obj, [0.0, 0.0, 0.0]);
+            let w = pen.weight_mm;
+            let mut tmp = Vec::new();
+            geometry_segments(doc, &obj.geometry, &mut tmp);
+            // Planting plan: in a Top (plan) view, a mesh named `plant:<id>`
+            // also draws its 2D drafting symbol atop the 3D feature edges. Plan
+            // glyphs are meaningless in elevation/iso, so gate on direction.
+            if view.direction == ViewDirection::Top
+                && let (Some(name), Geometry::Mesh(mesh)) = (obj.name.as_deref(), &obj.geometry)
+                && let Some(sym) = crate::landscape::plant_object_symbol(name, mesh.positions())
+            {
+                tmp.extend(sym);
+            }
+            for (a, b) in tmp {
+                weighted.push((w, pen.color, a, b));
+            }
+        }
+    }
+    if weighted.is_empty() {
+        return None;
+    }
+
+    // Compute bounds for centering (weight-independent).
+    let (mut lo, mut hi) = (DVec2::MAX, DVec2::MIN);
+    for &(_, _, a, b) in &weighted {
+        let pa = {
+            let p = project(view.direction, a);
+            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
+        };
+        let pb = {
+            let p = project(view.direction, b);
+            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
+        };
+        lo = lo.min(pa.min(pb));
+        hi = hi.max(pa.max(pb));
+    }
+    let offset = (rmin + rmax) / 2.0 - (lo + hi) / 2.0;
+    let pad = 1.0;
+    let (cmin, cmax) = (rmin + DVec2::splat(pad), rmax - DVec2::splat(pad));
+
+    // Sort by (lineweight, color) so the PDF pass can batch `w`/`RG` operators.
+    weighted.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    Some(ViewFit { offset, cmin, cmax, weighted, occ })
+}
+
+/// The viewport's line art as weighted, already-offset-and-clipped paper-mm
+/// segments: `(lineweight_mm, rgb, a, b)`, ordered by pen so the PDF emitter can
+/// batch width/color operators. Hidden-line culling is applied per the view's
+/// display mode. This is the single projection+fit+clip pipeline the PDF path
+/// and (via [`view_segments`]) the live egui viewer both consume.
+fn view_weighted_segments(
+    doc: &Document,
+    view: &SheetView,
+    rect: (DVec2, DVec2),
+) -> Vec<(f64, [f32; 3], DVec2, DVec2)> {
+    let Some(fit) = collect_view_fit(doc, view, rect) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (w, color, wa, wb) in fit.weighted {
+        // Hidden-line cull: drop edges whose midpoint is behind a solid face.
+        // `occ` is empty in wireframe mode, so this is a no-op there.
+        if !fit.occ.is_empty() && edge_occluded(&fit.occ, view.direction, wa, wb) {
+            continue;
+        }
+        let pa = {
+            let p = project(view.direction, wa);
+            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
+        };
+        let pb = {
+            let p = project(view.direction, wb);
+            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
+        };
+        if let Some((a, b)) = clip(pa + fit.offset, pb + fit.offset, fit.cmin, fit.cmax) {
+            if (b - a).length() < 1e-6 {
+                continue;
+            }
+            out.push((w, color, a, b));
+        }
+    }
+    out
+}
+
+/// The viewport's projected line art as plain 2D segments in PAPER-MM space,
+/// positioned/scaled/centered inside `placement` EXACTLY as the PDF renderer
+/// places them (lower-left origin, same projection, fit and hidden-line cull).
+/// The live egui sheet viewer calls this so the on-screen drawing matches the
+/// exported PDF. `placement` is the viewport rect in paper mm — pass the rect
+/// from [`Sheet::view_layout_rects`](itsjustcad_doc::Sheet::view_layout_rects).
+///
+/// Wireframe draws every feature edge; HiddenLine applies the conservative
+/// sampled occlusion cull; Shaded has no raster here and falls back to the same
+/// wireframe edges (the live viewer shows wireframe, the PDF embeds the raster).
+pub fn view_segments(
+    doc: &Document,
+    view: &SheetView,
+    placement: itsjustcad_doc::PageRect,
+) -> Vec<(DVec2, DVec2)> {
+    let rect = (
+        DVec2::new(placement.x, placement.y),
+        DVec2::new(placement.x + placement.w, placement.y + placement.h),
+    );
+    view_weighted_segments(doc, view, rect)
+        .into_iter()
+        .map(|(_, _, a, b)| (a, b))
+        .collect()
+}
+
 /// Render one viewport's content (border + clipped scaled line art + label
 /// + model-space dim text) into `content`.
 ///
@@ -607,83 +764,24 @@ fn render_view(
         return 0;
     }
 
-    // Hidden-line mode: precompute the projected occluder triangles once so the
-    // per-edge midpoint test can cull edges buried behind solid faces. Wireframe
-    // (and shaded-without-raster falls through to this) leaves `occ` empty so no
-    // edges are removed — byte-identical to the historical output.
-    let occ: Vec<OccTri> = if view.display_mode == itsjustcad_doc::SheetDisplayMode::HiddenLine {
-        gather_occluders(doc, view.direction)
-    } else {
-        Vec::new()
-    };
-
-    // Collect (lineweight_mm, plot_color, world-segment) tuples.
-    // Per-object lineweight beats layer lineweight (mirror the color override
-    // pattern). The plot pen (color + weight) is resolved through the active
-    // plot style, if any: `doc.plot_pen` returns the base pen (default black)
-    // for unmapped objects, so the drawing is unchanged without a plot style.
-    let mut weighted_segs: Vec<(f64, [f32; 3], DVec3, DVec3)> = Vec::new();
-    for obj in doc.objects() {
-        if obj.visible && doc.layer_visible(&obj.layer) {
-            let pen = doc.plot_pen(obj, [0.0, 0.0, 0.0]);
-            let w = pen.weight_mm;
-            let mut tmp = Vec::new();
-            geometry_segments(doc, &obj.geometry, &mut tmp);
-            // Planting plan: in a Top (plan) view, a mesh named `plant:<id>`
-            // also draws its 2D drafting symbol atop the 3D feature edges. Plan
-            // glyphs are meaningless in elevation/iso, so gate on direction.
-            if view.direction == ViewDirection::Top
-                && let (Some(name), Geometry::Mesh(mesh)) =
-                    (obj.name.as_deref(), &obj.geometry)
-                && let Some(sym) =
-                    crate::landscape::plant_object_symbol(name, mesh.positions())
-            {
-                tmp.extend(sym);
-            }
-            for (a, b) in tmp {
-                weighted_segs.push((w, pen.color, a, b));
-            }
-        }
-    }
-    if weighted_segs.is_empty() {
+    // The vector geometry pass — projection, scale, centering, hidden-line cull
+    // and viewport clip — is factored into `collect_view_fit` so the live egui
+    // sheet viewer can paint the SAME line art (via the public `view_segments`
+    // wrapper) that this PDF path emits. Compute the fit once: an empty viewport
+    // returns early exactly as before (no geometry, no dim labels). We then emit
+    // PDF operators from the fit, batching `w`/`RG` so the output is unchanged.
+    let Some(fit) = collect_view_fit(doc, view, rect) else {
         return 0;
-    }
-
-    // Compute bounds for centering (weight-independent).
-    let (mut lo, mut hi) = (DVec2::MAX, DVec2::MIN);
-    for &(_, _, a, b) in &weighted_segs {
-        let pa = {
-            let p = project(view.direction, a);
-            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
-        };
-        let pb = {
-            let p = project(view.direction, b);
-            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
-        };
-        lo = lo.min(pa.min(pb));
-        hi = hi.max(pa.max(pb));
-    }
-    let offset = (rmin + rmax) / 2.0 - (lo + hi) / 2.0;
-    let pad = 1.0;
-    let (cmin, cmax) = (rmin + DVec2::splat(pad), rmax - DVec2::splat(pad));
-
-    // Sort by (lineweight, color) so we can batch `w` and `RG` operators.
-    weighted_segs.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
-
+    };
+    let (offset, cmin, cmax) = (fit.offset, fit.cmin, fit.cmax);
     let mut drawn = 0usize;
     // Use sentinels that guarantee the first segment always emits `w`/`RG` ops.
     let mut cur_w = -1.0_f64;
     let mut cur_c = [-1.0_f32; 3];
-    for (w, color, wa, wb) in weighted_segs {
+    for (w, color, wa, wb) in fit.weighted {
         // Hidden-line cull: drop edges whose midpoint is behind a solid face.
         // `occ` is empty in wireframe mode, so this is a no-op there.
-        if !occ.is_empty() && edge_occluded(&occ, view.direction, wa, wb) {
+        if !fit.occ.is_empty() && edge_occluded(&fit.occ, view.direction, wa, wb) {
             continue;
         }
         let pa = {
@@ -694,38 +792,39 @@ fn render_view(
             let p = project(view.direction, wb);
             DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
         };
-        if let Some((a, b)) = clip(pa + offset, pb + offset, cmin, cmax) {
-            if (b - a).length() < 1e-6 {
-                continue;
-            }
-            // Emit a `w` (line width) operator only on weight change.
-            // PDF line width is in points; 1 mm = PT_PER_MM pt.
-            if (w - cur_w).abs() > 1e-6 {
-                content.push_str(&format!("{:.4} w\n", w * PT_PER_MM));
-                cur_w = w;
-            }
-            // Emit an `RG` (stroke color) operator only on color change. Black
-            // (the default pen) still emits `0 0 0 RG`, harmless for legacy
-            // drawings; plot styles override the color here.
-            if (color[0] - cur_c[0]).abs() > 1e-6
-                || (color[1] - cur_c[1]).abs() > 1e-6
-                || (color[2] - cur_c[2]).abs() > 1e-6
-            {
-                content.push_str(&format!(
-                    "{:.4} {:.4} {:.4} RG\n",
-                    color[0], color[1], color[2]
-                ));
-                cur_c = color;
-            }
-            content.push_str(&format!(
-                "{} {} m {} {} l S\n",
-                mm(a.x),
-                mm(a.y),
-                mm(b.x),
-                mm(b.y)
-            ));
-            drawn += 1;
+        let Some((a, b)) = clip(pa + offset, pb + offset, cmin, cmax) else {
+            continue;
+        };
+        if (b - a).length() < 1e-6 {
+            continue;
         }
+        // Emit a `w` (line width) operator only on weight change.
+        // PDF line width is in points; 1 mm = PT_PER_MM pt.
+        if (w - cur_w).abs() > 1e-6 {
+            content.push_str(&format!("{:.4} w\n", w * PT_PER_MM));
+            cur_w = w;
+        }
+        // Emit an `RG` (stroke color) operator only on color change. Black
+        // (the default pen) still emits `0 0 0 RG`, harmless for legacy
+        // drawings; plot styles override the color here.
+        if (color[0] - cur_c[0]).abs() > 1e-6
+            || (color[1] - cur_c[1]).abs() > 1e-6
+            || (color[2] - cur_c[2]).abs() > 1e-6
+        {
+            content.push_str(&format!(
+                "{:.4} {:.4} {:.4} RG\n",
+                color[0], color[1], color[2]
+            ));
+            cur_c = color;
+        }
+        content.push_str(&format!(
+            "{} {} m {} {} l S\n",
+            mm(a.x),
+            mm(a.y),
+            mm(b.x),
+            mm(b.y)
+        ));
+        drawn += 1;
     }
 
     // Second pass: emit dim text labels for LinearDim annotations.
@@ -1709,6 +1808,46 @@ mod tests {
         let content = String::from_utf8_lossy(&bytes);
         // The model distance label "5.000m" should appear in the PDF.
         assert!(content.contains("5.000m"), "PDF should contain dim label '5.000m'");
+    }
+
+    /// The extracted `view_segments` returns the SAME line art the PDF path
+    /// emits: its segment count equals the `drawn` count from `sheet_pdf` for a
+    /// single-view wireframe sheet, and every segment lies inside the placement
+    /// rect. This guards the refactor — the live viewer and the PDF agree.
+    #[test]
+    fn view_segments_matches_pdf_drawn_count() {
+        use crate::{parse, Session};
+        let mut s = Session::default();
+        // A few edges so there is real geometry to project.
+        s.run(parse("line 0,0,0 1,0,0").unwrap()).unwrap();
+        s.run(parse("line 1,0,0 1,1,0").unwrap()).unwrap();
+        s.run(parse("line 1,1,0 0,1,0").unwrap()).unwrap();
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse("sheetview s1 top 100").unwrap()).unwrap();
+
+        let sheet = s.doc.sheet("s1").unwrap();
+        let (_, drawn) = sheet_pdf(&s.doc, sheet);
+        let rects = sheet.view_layout_rects();
+        let segs = view_segments(&s.doc, &sheet.views[0], rects[0]);
+        assert_eq!(
+            segs.len(),
+            drawn,
+            "view_segments count == PDF drawn line count"
+        );
+        // Every returned segment sits within the (padded) placement rect.
+        let r = rects[0];
+        for (a, b) in &segs {
+            for p in [a, b] {
+                assert!(
+                    p.x >= r.x - 1.5 && p.x <= r.x + r.w + 1.5,
+                    "segment x within placement"
+                );
+                assert!(
+                    p.y >= r.y - 1.5 && p.y <= r.y + r.h + 1.5,
+                    "segment y within placement"
+                );
+            }
+        }
     }
 
     /// Item 1: `None` title renders the derived callout; `Some` overrides it.

@@ -13015,6 +13015,16 @@ fn apply_forward(
                     view.display_mode = *mode;
                     format!("mode = {}", mode.label())
                 }
+                crate::SheetViewSet::Rect { rect } => {
+                    view.rect = *rect;
+                    match rect {
+                        Some(r) => format!(
+                            "rect = {:.1} {:.1} {:.1} {:.1} mm",
+                            r.x, r.y, r.w, r.h
+                        ),
+                        None => "rect = auto".to_string(),
+                    }
+                }
             };
             doc.generation += 1;
             Ok((
@@ -19821,6 +19831,41 @@ mod tests {
         assert_eq!(s.doc.sheet("plan").unwrap().views[0].direction, ViewDirection::Top);
 
         // Replay stability with the new fields set.
+        let json = crate::io::to_json(&s);
+        let s2 = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&s2), json, "replay-stable JSON");
+    }
+
+    /// `sheetviewset … rect x y w h` pins the viewport; `rect auto` resets it to
+    /// the auto-grid; undo restores the prior rect; replay is stable through JSON.
+    #[test]
+    fn sheetview_set_rect_and_undo() {
+        use itsjustcad_doc::PageRect;
+        let mut s = Session::default();
+        run(&mut s, "sheet plan a3");
+        run(&mut s, "sheetview plan top 100");
+        assert!(s.doc.sheet("plan").unwrap().views[0].rect.is_none(), "auto by default");
+
+        // Pin to an explicit paper-space rect.
+        run(&mut s, "sheetviewset plan 1 rect 50 40 120 90");
+        assert_eq!(
+            s.doc.sheet("plan").unwrap().views[0].rect,
+            Some(PageRect { x: 50.0, y: 40.0, w: 120.0, h: 90.0 })
+        );
+
+        // Reset to auto.
+        run(&mut s, "sheetviewset plan 1 rect auto");
+        assert!(s.doc.sheet("plan").unwrap().views[0].rect.is_none(), "reset to auto");
+
+        // Undo the reset → the pinned rect comes back.
+        run(&mut s, "undo");
+        assert_eq!(
+            s.doc.sheet("plan").unwrap().views[0].rect,
+            Some(PageRect { x: 50.0, y: 40.0, w: 120.0, h: 90.0 }),
+            "undo restores the pinned rect"
+        );
+
+        // Replay stability with a pinned rect set.
         let json = crate::io::to_json(&s);
         let s2 = crate::io::from_json(&json).unwrap();
         assert_eq!(crate::io::to_json(&s2), json, "replay-stable JSON");

@@ -456,6 +456,174 @@ fn next_last_verb(prev: Option<String>, line: &str) -> Option<String> {
     }
 }
 
+/// An in-progress viewport drag on the sheet viewer page. The live paper-mm
+/// rect (`rect`) is updated every frame so the frame tracks the pointer; the
+/// `sheetviewset … rect` command is committed ONCE on pointer release.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SheetDrag {
+    /// 0-based index of the viewport being dragged.
+    index: usize,
+    /// Which handle is grabbed: `None` = body (move), else a corner.
+    corner: Option<SheetCorner>,
+    /// The viewport rect at grab time, in paper mm (lower-left origin).
+    start_rect: itsjustcad_doc::PageRect,
+    /// The pointer position at grab time, in paper mm.
+    start_ptr_mm: glam::DVec2,
+    /// The current (live) rect in paper mm, clamped to the page margins.
+    rect: itsjustcad_doc::PageRect,
+}
+
+/// The four resize handles of a viewport frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SheetCorner {
+    BottomLeft,
+    BottomRight,
+    TopLeft,
+    TopRight,
+}
+
+/// The scale-denominator presets offered in the viewport Scale combo, mirroring
+/// the iOS picker. The trailing "Custom…" option lets the user type any value.
+const SHEET_SCALE_PRESETS: [f64; 10] = [1.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
+
+/// Pure fit-to-width mapping between paper millimeters (lower-left origin) and
+/// screen pixels (egui's top-left origin). The paper spans the FULL available
+/// width; height follows from the paper aspect ratio. Kept free of egui types
+/// (plain f64 pairs) so the round-trip is unit-testable headlessly.
+#[derive(Clone, Copy, Debug)]
+struct PaperFit {
+    /// Paper size in mm: (width, height), landscape.
+    paper_mm: (f64, f64),
+    /// Screen-space top-left of the paper, in px.
+    origin_px: (f32, f32),
+    /// Pixels per paper millimeter (uniform; aspect preserved).
+    px_per_mm: f64,
+}
+
+impl PaperFit {
+    /// Fit `paper_mm` into `avail_w` pixels of width (full width), placing the
+    /// paper's top-left at `origin_px`. The drawn height is `avail_w * aspect`.
+    fn fit_to_width(paper_mm: (f64, f64), avail_w: f32, origin_px: (f32, f32)) -> Self {
+        let px_per_mm = if paper_mm.0 > 0.0 { avail_w as f64 / paper_mm.0 } else { 1.0 };
+        Self { paper_mm, origin_px, px_per_mm }
+    }
+
+    /// The drawn paper size in pixels (width, height).
+    fn size_px(&self) -> (f32, f32) {
+        (
+            (self.paper_mm.0 * self.px_per_mm) as f32,
+            (self.paper_mm.1 * self.px_per_mm) as f32,
+        )
+    }
+
+    /// Paper mm (x,y; lower-left origin) → screen px (x,y; top-left origin, Y
+    /// flipped).
+    fn to_px(self, x_mm: f64, y_mm: f64) -> (f32, f32) {
+        let h_px = self.paper_mm.1 * self.px_per_mm;
+        (
+            self.origin_px.0 + (x_mm * self.px_per_mm) as f32,
+            self.origin_px.1 + (h_px - y_mm * self.px_per_mm) as f32,
+        )
+    }
+
+    /// Screen px → paper mm (inverse of `to_px`).
+    fn to_mm(self, x_px: f32, y_px: f32) -> (f64, f64) {
+        let h_px = self.paper_mm.1 * self.px_per_mm;
+        let dx = (x_px - self.origin_px.0) as f64;
+        let dy = (y_px - self.origin_px.1) as f64;
+        (dx / self.px_per_mm, (h_px - dy) / self.px_per_mm)
+    }
+}
+
+/// Clamp a viewport rect to the drawable page area (inside the uniform margin),
+/// shrinking it if it would overflow and keeping a sane minimum size. Pure so
+/// the drag/resize bounds logic is unit-testable. `paper_mm` is (w,h) mm.
+fn clamp_rect_to_page(
+    rect: itsjustcad_doc::PageRect,
+    paper_mm: (f64, f64),
+    margin: f64,
+) -> itsjustcad_doc::PageRect {
+    const MIN_WH: f64 = 5.0;
+    let (pw, ph) = paper_mm;
+    let max_w = (pw - 2.0 * margin).max(MIN_WH);
+    let max_h = (ph - 2.0 * margin).max(MIN_WH);
+    let w = rect.w.clamp(MIN_WH, max_w);
+    let h = rect.h.clamp(MIN_WH, max_h);
+    let x = rect.x.clamp(margin, (pw - margin - w).max(margin));
+    let y = rect.y.clamp(margin, (ph - margin - h).max(margin));
+    itsjustcad_doc::PageRect { x, y, w, h }
+}
+
+/// Apply a corner-resize to `start`, moving the grabbed `corner` by the pointer
+/// delta (paper mm) while keeping the opposite corner anchored. Returns the new
+/// rect BEFORE clamping (the caller clamps). Pure, unit-testable.
+fn resize_rect_corner(
+    start: itsjustcad_doc::PageRect,
+    corner: SheetCorner,
+    d_mm: glam::DVec2,
+) -> itsjustcad_doc::PageRect {
+    let (mut x0, mut y0) = (start.x, start.y);
+    let (mut x1, mut y1) = (start.x + start.w, start.y + start.h);
+    match corner {
+        SheetCorner::BottomLeft => {
+            x0 += d_mm.x;
+            y0 += d_mm.y;
+        }
+        SheetCorner::BottomRight => {
+            x1 += d_mm.x;
+            y0 += d_mm.y;
+        }
+        SheetCorner::TopLeft => {
+            x0 += d_mm.x;
+            y1 += d_mm.y;
+        }
+        SheetCorner::TopRight => {
+            x1 += d_mm.x;
+            y1 += d_mm.y;
+        }
+    }
+    // Normalize so w/h stay positive even if the user drags past the anchor.
+    let (lo_x, hi_x) = (x0.min(x1), x0.max(x1));
+    let (lo_y, hi_y) = (y0.min(y1), y0.max(y1));
+    itsjustcad_doc::PageRect { x: lo_x, y: lo_y, w: hi_x - lo_x, h: hi_y - lo_y }
+}
+
+/// Parse a viewport Scale combo entry into a positive denominator. Accepts a
+/// bare number ("50"), a `1:50` / `1/50` ratio, surrounding whitespace, and
+/// rejects non-positive / non-numeric input. Pure, unit-testable; mirrors the
+/// command-line `scale` grammar so the UI and command agree.
+fn parse_scale_input(s: &str) -> Option<f64> {
+    let t = s.trim();
+    let t = t.strip_prefix("1:").or_else(|| t.strip_prefix("1/")).unwrap_or(t);
+    let v: f64 = t.trim().parse().ok()?;
+    if v.is_finite() && v > 0.0 { Some(v) } else { None }
+}
+
+/// The derived callout label for a view direction, matching the PDF renderer's
+/// `render_view` defaults so the on-screen label equals the exported one.
+fn default_callout(dir: itsjustcad_doc::ViewDirection) -> &'static str {
+    use itsjustcad_doc::ViewDirection;
+    match dir {
+        ViewDirection::Top => "PLAN",
+        ViewDirection::Front => "FRONT ELEVATION",
+        ViewDirection::Right => "SIDE ELEVATION",
+        ViewDirection::Iso => "PERSPECTIVE",
+    }
+}
+
+/// Pure state transition for a sheet-row click: returns the new `sheet_open`
+/// value. Clicking the already-open sheet toggles it CLOSED; clicking any other
+/// (or clicking when none is open) OPENS that sheet. This is the behavior the
+/// click handler drives, split out so the open/close transition is unit-tested
+/// without egui. `current` is the prior `sheet_open`, `clicked` the row's name.
+fn sheet_open_after_click(current: Option<&str>, clicked: &str) -> Option<String> {
+    if current == Some(clicked) {
+        None
+    } else {
+        Some(clicked.to_string())
+    }
+}
+
 pub struct App {
     session: Session,
     command_line: CommandLine,
@@ -683,6 +851,19 @@ pub struct App {
     /// Sheets tab: the name of the currently-selected sheet (the last row the
     /// user clicked), highlighted in the list and used as the `print` target.
     sheet_selected: Option<String>,
+    /// Sheets tab: the sheet whose full-size viewer/editor window is OPEN (set
+    /// by clicking a row, cleared by Esc / the window's close button). `None`
+    /// means no viewer is shown. Mirrors the iOS "tap a sheet → see the sheet"
+    /// interaction. See [`sheet_open_after_click`].
+    sheet_open: Option<String>,
+    /// Sheets viewer: the 0-based index of the selected viewport (the row whose
+    /// editor is focused and whose frame shows drag/resize handles on the page).
+    sheet_view_selected: usize,
+    /// Sheets viewer: in-progress drag of a viewport (move or corner-resize).
+    /// `None` when idle. Holds the live paper-mm rect so the frame tracks the
+    /// pointer every frame; the `sheetviewset … rect` command is committed ONCE
+    /// on pointer release (keeping the op-log clean).
+    sheet_drag: Option<SheetDrag>,
     /// Parameters tab: the id of the parametric object being edited (the last
     /// card the user clicked). Its schema-driven editor renders below the cards.
     parametric_selected: Option<itsjustcad_doc::ObjectId>,
@@ -1347,6 +1528,9 @@ impl App {
             blocklib_search: String::new(),
             blocks_reveal: None,
             sheet_selected: None,
+            sheet_open: None,
+            sheet_view_selected: 0,
+            sheet_drag: None,
             parametric_selected: None,
             param_pending: None,
             subdiv_pending: None,
@@ -3254,6 +3438,7 @@ impl App {
             || self.show_template_picker
             || self.import_job.is_some()
             || self.import_result.is_some()
+            || self.sheet_open.is_some()
             || self.pending_nav.is_some();
         // Block ONLY when a real text field is actively composing: the command
         // line with content, or the deck chat input. When focus is on the
@@ -7448,14 +7633,14 @@ impl App {
     /// Sheets tab (DYNAMIC, appears when the document has ≥1 sheet): a striped
     /// LIST, one row per sheet. Each row shows the sheet name, a paper/view
     /// descriptor, and a small live mini-preview of the paper + its viewport
-    /// frames (`dyntabs::sheet_preview`). Clicking a row selects that sheet and
-    /// prefills the `print` verb on the command line (the sheet name is the key
-    /// the print/PDF path uses) — the single substrate path, never a second
-    /// mutation. Read-only VIEW surface, consistent with the Blocks tab.
+    /// frames (`dyntabs::sheet_preview`). Clicking a row OPENS that sheet in the
+    /// full-size viewer/editor window (clicking the open sheet again closes it)
+    /// — mirroring the iOS "tap a sheet → see the sheet" interaction. The viewer
+    /// renders real projected geometry and edits go through `sheetviewset` on the
+    /// substrate path (never a second mutation). See [`sheet_view_popup`].
     fn sheets_tab(&mut self, ui: &mut egui::Ui) {
         use crate::i18n::t;
         let rows = crate::dyntabs::sheet_rows(&self.session.doc);
-        let mut prefill: Option<String> = None;
 
         egui::ScrollArea::vertical().id_salt("sheets_scroll").show(ui, |ui| {
             if rows.is_empty() {
@@ -7470,7 +7655,8 @@ impl App {
                 } else {
                     egui::Color32::TRANSPARENT
                 };
-                let selected = self.sheet_selected.as_deref() == Some(row.name.as_str());
+                let selected = self.sheet_open.as_deref() == Some(row.name.as_str())
+                    || self.sheet_selected.as_deref() == Some(row.name.as_str());
                 let resp = egui::Frame::NONE
                     .fill(bg)
                     .inner_margin(egui::Margin::symmetric(4, 6))
@@ -7499,19 +7685,17 @@ impl App {
                     .on_hover_text(t("sheets.row.tooltip"))
                     .clicked()
                 {
-                    // Select this sheet and prefill `print <name> ` so the user
-                    // adds an output path and presses Enter (the print/PDF path
-                    // keys off the sheet name).
-                    self.sheet_selected = Some(row.name.clone());
-                    prefill = Some(format!("print {} ", row.name));
+                    // Open this sheet in the viewer (toggle closed if it is the
+                    // one already open). The viewer renders the real geometry
+                    // and hosts the per-view editing — no command-line prefill.
+                    self.sheet_open =
+                        sheet_open_after_click(self.sheet_open.as_deref(), &row.name);
+                    self.sheet_selected = self.sheet_open.clone();
+                    self.sheet_view_selected = 0;
+                    self.sheet_drag = None;
                 }
             }
         });
-
-        if let Some(text) = prefill {
-            self.command_line.prefill(text);
-            self.command_line.focus();
-        }
     }
 
     /// Paint a small paper-space thumbnail of a sheet from its pure preview
@@ -7578,6 +7762,500 @@ impl App {
         // Title strip along the bottom margin.
         let strip = egui::Rect::from_min_max(map(0.0, 12.0), map(pw, 0.0));
         painter.rect_stroke(strip, 0.0, vp_stroke, egui::StrokeKind::Inside);
+    }
+
+    /// The full-size sheet viewer/editor window (opened by clicking a Sheets-tab
+    /// row). A large resizable `egui::Window`: the paper card spans the window
+    /// width and renders the REAL projected line art (via `pdf::view_segments`)
+    /// so the on-screen drawing matches the exported PDF; a side column lists
+    /// one editor row per viewport (Direction / Scale / Callout, like iOS) and a
+    /// Print button. Selected viewports show corner handles; dragging the body
+    /// moves and dragging a corner resizes, committed once on pointer release via
+    /// `sheetviewset … rect`. Esc or the Close button clears `sheet_open`.
+    fn sheet_view_popup(&mut self, ctx: &egui::Context) {
+        use crate::i18n::t;
+        let Some(name) = self.sheet_open.clone() else {
+            return;
+        };
+        // The sheet may have been deleted/renamed under us — bail cleanly.
+        if !self.session.doc.sheets.iter().any(|s| s.name == name) {
+            self.sheet_open = None;
+            return;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.sheet_open = None;
+            self.sheet_drag = None;
+            return;
+        }
+
+        // Commands collected during the UI pass, run AFTER the closures release
+        // the borrow on `self` (the single substrate path).
+        let mut pending: Vec<String> = Vec::new();
+        let mut close = false;
+
+        let mut open = true;
+        egui::Window::new(format!("{}: {name}", t("sheets.open.title")))
+            .id(egui::Id::new("sheet_view_popup"))
+            .collapsible(false)
+            .resizable(true)
+            .default_size([1100.0, 760.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    // Right side column: per-view editors + Print. Fixed width so
+                    // the paper gets the remaining (full) width on the left.
+                    let col_w = 300.0;
+                    let avail = ui.available_size();
+                    // LEFT: the paper card, spanning the remaining width.
+                    ui.vertical(|ui| {
+                        ui.set_width((avail.x - col_w - crate::theme::Spacing::M).max(200.0));
+                        self.paint_sheet_page(ui, &name, &mut pending);
+                    });
+                    ui.separator();
+                    // RIGHT: the editing column.
+                    ui.vertical(|ui| {
+                        ui.set_width(col_w);
+                        self.sheet_editor_column(ui, &name, &mut pending, &mut close);
+                    });
+                });
+            });
+
+        if !open || close {
+            self.sheet_open = None;
+            self.sheet_drag = None;
+        }
+        for line in pending {
+            self.execute_line(line);
+        }
+    }
+
+    /// The right-hand editing column of the sheet viewer: a Print button, the
+    /// "Views" header, and one row per `SheetView` (Direction picker, Scale combo
+    /// with presets + custom, Callout field, and a Reset-to-auto button). All
+    /// edits are pushed as `sheetviewset …` command strings onto `pending` (run
+    /// on the substrate path by the caller). Selecting a row sets
+    /// `sheet_view_selected` so its viewport frame shows handles on the page.
+    fn sheet_editor_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        name: &str,
+        pending: &mut Vec<String>,
+        close: &mut bool,
+    ) {
+        use crate::i18n::t;
+        ui.horizontal(|ui| {
+            if ui.button(t("sheets.print")).clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_file_name(format!("{name}.pdf"))
+                    .add_filter("PDF", &["pdf"])
+                    .save_file()
+            {
+                // Run the real print path (writes the PDF). `print` tokenizes on
+                // whitespace, so a path is passed verbatim as the 2nd token.
+                pending.push(format!("print {name} {}", path.display()));
+            }
+            if ui.button(t("sheets.open.close")).clicked() {
+                *close = true;
+            }
+        });
+        ui.add_space(crate::theme::Spacing::S);
+        ui.strong(t("sheets.views.header"));
+        ui.add_space(crate::theme::Spacing::XS);
+
+        // Snapshot the views so the UI pass does not borrow the doc while we
+        // push command strings.
+        let views: Vec<itsjustcad_doc::SheetView> = self
+            .session
+            .doc
+            .sheets
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.views.clone())
+            .unwrap_or_default();
+        if views.is_empty() {
+            ui.weak(t("sheets.views.empty"));
+            return;
+        }
+
+        egui::ScrollArea::vertical()
+            .id_salt("sheet_view_editor_rows")
+            .show(ui, |ui| {
+                for (i, view) in views.iter().enumerate() {
+                    let idx1 = i + 1; // commands are 1-based
+                    let selected = self.sheet_view_selected == i;
+                    let frame = egui::Frame::NONE
+                        .fill(if selected {
+                            ui.visuals().faint_bg_color
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .inner_margin(egui::Margin::same(6))
+                        .corner_radius(crate::theme::Radii::default().small as u8);
+                    let resp = frame
+                        .show(ui, |ui| {
+                            self.sheet_view_row(ui, name, idx1, view, pending);
+                        })
+                        .response
+                        .interact(egui::Sense::click());
+                    if resp.clicked() {
+                        self.sheet_view_selected = i;
+                    }
+                    if selected {
+                        ui.painter().rect_stroke(
+                            resp.rect,
+                            crate::theme::Radii::default().small,
+                            egui::Stroke::new(1.0, ui.visuals().selection.stroke.color),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    ui.add_space(crate::theme::Spacing::XS);
+                }
+            });
+    }
+
+    /// One editor row: Direction picker, Scale combo (presets + custom text),
+    /// Callout field, and a Reset-to-auto button. Pushes `sheetviewset` strings
+    /// onto `pending` when a control changes.
+    fn sheet_view_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        name: &str,
+        idx1: usize,
+        view: &itsjustcad_doc::SheetView,
+        pending: &mut Vec<String>,
+    ) {
+        use crate::i18n::t;
+        use itsjustcad_doc::ViewDirection;
+
+        // Direction picker.
+        ui.horizontal(|ui| {
+            ui.label(t("sheets.view.direction"));
+            let cur = view.direction;
+            egui::ComboBox::from_id_salt(("sheet_dir", idx1))
+                .selected_text(cur.label())
+                .show_ui(ui, |ui| {
+                    for d in [
+                        ViewDirection::Top,
+                        ViewDirection::Front,
+                        ViewDirection::Right,
+                        ViewDirection::Iso,
+                    ] {
+                        if ui.selectable_label(cur == d, d.label()).clicked() && cur != d {
+                            pending.push(format!(
+                                "sheetviewset {name} {idx1} direction {}",
+                                d.label()
+                            ));
+                        }
+                    }
+                });
+        });
+
+        // Scale combo: presets + "Custom…" opening an inline text field.
+        ui.horizontal(|ui| {
+            ui.label(t("sheets.view.scale"));
+            let cur = view.scale;
+            let cur_label = if cur.fract() == 0.0 {
+                format!("1:{}", cur as i64)
+            } else {
+                format!("1:{cur}")
+            };
+            let is_preset = SHEET_SCALE_PRESETS.iter().any(|p| (p - cur).abs() < 1e-9);
+            egui::ComboBox::from_id_salt(("sheet_scale", idx1))
+                .selected_text(&cur_label)
+                .show_ui(ui, |ui| {
+                    for p in SHEET_SCALE_PRESETS {
+                        let lab = format!("1:{}", p as i64);
+                        if ui.selectable_label((p - cur).abs() < 1e-9, lab).clicked()
+                            && (p - cur).abs() >= 1e-9
+                        {
+                            pending.push(format!("sheetviewset {name} {idx1} scale {p}"));
+                        }
+                    }
+                    ui.separator();
+                    // A non-preset current value is itself the "custom" entry;
+                    // the inline field below is the actual custom-entry control.
+                    let _ = ui.selectable_label(!is_preset, t("sheets.view.scale.custom"));
+                });
+            // Inline custom entry: a small text field committing on focus loss /
+            // Enter when it parses to a positive denominator.
+            let buf_id = egui::Id::new(("sheet_scale_custom", idx1));
+            let mut buf: String = ui
+                .data(|d| d.get_temp::<String>(buf_id))
+                .unwrap_or_else(|| cur_label.trim_start_matches("1:").to_string());
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut buf)
+                    .desired_width(56.0)
+                    .hint_text("1:n"),
+            );
+            if edit.changed() {
+                ui.data_mut(|d| d.insert_temp(buf_id, buf.clone()));
+            }
+            if (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                && let Some(v) = parse_scale_input(&buf)
+                && (v - cur).abs() >= 1e-9
+            {
+                pending.push(format!("sheetviewset {name} {idx1} scale {v}"));
+            }
+        });
+
+        // Callout field (the view title override). Commit on focus loss / Enter.
+        ui.horizontal(|ui| {
+            ui.label(t("sheets.view.callout"));
+            let buf_id = egui::Id::new(("sheet_callout", idx1));
+            let mut buf: String = ui
+                .data(|d| d.get_temp::<String>(buf_id))
+                .unwrap_or_else(|| view.title.clone().unwrap_or_default());
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut buf)
+                    .desired_width(160.0)
+                    .hint_text(default_callout(view.direction)),
+            );
+            if edit.changed() {
+                ui.data_mut(|d| d.insert_temp(buf_id, buf.clone()));
+            }
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let want = buf.trim().to_string();
+                let had = view.title.clone().unwrap_or_default();
+                if want != had {
+                    // Empty text resets to the derived callout.
+                    pending.push(format!("sheetviewset {name} {idx1} title {want}"));
+                }
+            }
+        });
+
+        // Shaded-mode hint: the live viewer draws wireframe; shading is in export.
+        if view.display_mode == itsjustcad_doc::SheetDisplayMode::Shaded {
+            ui.weak(t("sheets.shaded.hint"));
+        }
+
+        // Reset a pinned viewport back to the auto-grid layout.
+        if view.rect.is_some() && ui.button(t("sheets.view.reset")).clicked() {
+            pending.push(format!("sheetviewset {name} {idx1} rect auto"));
+        }
+    }
+
+    /// Paint the sheet page (paper card + viewport frames + real projected line
+    /// art + callouts + title strip) at full window width, and handle drag/resize
+    /// of the selected viewport. Edits are pushed to `pending` (committed by the
+    /// caller on the substrate path). Drag/resize commits ONCE on pointer release.
+    fn paint_sheet_page(&mut self, ui: &mut egui::Ui, name: &str, pending: &mut Vec<String>) {
+        // Resolve the sheet (clone the bits we need to avoid holding a borrow on
+        // `self` during painting, since we also mutate `self.sheet_drag`).
+        let Some(sheet) = self.session.doc.sheets.iter().find(|s| s.name == name).cloned() else {
+            return;
+        };
+        let (pw, ph) = sheet.paper.landscape_mm();
+        if pw <= 0.0 || ph <= 0.0 {
+            return;
+        }
+        let margin = itsjustcad_doc::SHEET_MARGIN_MM;
+
+        // Fit the paper to the FULL available width; height follows the aspect.
+        let avail_w = ui.available_width().max(100.0);
+        let fit = PaperFit::fit_to_width((pw, ph), avail_w, (0.0, 0.0));
+        let (draw_w, draw_h) = fit.size_px();
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(draw_w, draw_h), egui::Sense::click_and_drag());
+        // Re-anchor the fit to the allocated rect's top-left.
+        let fit = PaperFit::fit_to_width((pw, ph), draw_w, (rect.min.x, rect.min.y));
+        let painter = ui.painter_at(rect);
+
+        // Theme-correct paper + strokes.
+        let dark = ui.visuals().dark_mode;
+        let paper_fill = if dark {
+            egui::Color32::from_gray(236)
+        } else {
+            egui::Color32::WHITE
+        };
+        let ink = egui::Color32::from_gray(40);
+        let frame_stroke = egui::Stroke::new(1.0, ui.visuals().weak_text_color());
+        let geom_stroke = egui::Stroke::new(1.0, ink);
+        let accent = ui.visuals().selection.stroke.color;
+
+        // Paper card.
+        let to_pos = |p: (f32, f32)| egui::pos2(p.0, p.1);
+        let paper_rect =
+            egui::Rect::from_min_max(to_pos(fit.to_px(0.0, ph)), to_pos(fit.to_px(pw, 0.0)));
+        painter.rect_filled(paper_rect, 2.0, paper_fill);
+        painter.rect_stroke(paper_rect, 2.0, frame_stroke, egui::StrokeKind::Inside);
+
+        // Title strip along the bottom margin + the sheet name/paper label.
+        let strip = egui::Rect::from_min_max(
+            to_pos(fit.to_px(0.0, itsjustcad_doc::SHEET_TITLE_MM + margin)),
+            to_pos(fit.to_px(pw, margin)),
+        );
+        painter.rect_stroke(strip, 0.0, frame_stroke, egui::StrokeKind::Inside);
+        painter.text(
+            strip.left_center() + egui::vec2(6.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            format!("{name}  ·  {}", sheet.paper.label().to_uppercase()),
+            egui::FontId::proportional(12.0),
+            ink,
+        );
+
+        // The authoritative per-view placement (respects pinned rects).
+        let rects = sheet.view_layout_rects();
+
+        // Paint each viewport: real projected geometry, frame, and callout.
+        for (i, view) in sheet.views.iter().enumerate() {
+            // Use the live drag rect for the viewport being dragged so the frame
+            // + geometry track the pointer this frame.
+            let place = match self.sheet_drag {
+                Some(d) if d.index == i => d.rect,
+                _ => rects[i],
+            };
+            let vp_rect = egui::Rect::from_min_max(
+                to_pos(fit.to_px(place.x, place.y + place.h)),
+                to_pos(fit.to_px(place.x + place.w, place.y)),
+            );
+            let selected = self.sheet_view_selected == i;
+            painter.rect_stroke(
+                vp_rect,
+                0.0,
+                egui::Stroke::new(if selected { 1.5 } else { 0.8 }, if selected { accent } else { frame_stroke.color }),
+                egui::StrokeKind::Inside,
+            );
+
+            // Real projected line art (wireframe / hidden-line; shaded → wire).
+            let segs = itsjustcad_commands::pdf::view_segments(&self.session.doc, view, place);
+            let clip = painter.with_clip_rect(vp_rect);
+            for (a, b) in segs {
+                clip.line_segment(
+                    [to_pos(fit.to_px(a.x, a.y)), to_pos(fit.to_px(b.x, b.y))],
+                    geom_stroke,
+                );
+            }
+
+            // Callout label (custom title or the derived default).
+            let callout = view
+                .title
+                .clone()
+                .unwrap_or_else(|| default_callout(view.direction).to_string());
+            painter.text(
+                vp_rect.left_bottom() + egui::vec2(3.0, -3.0),
+                egui::Align2::LEFT_BOTTOM,
+                callout,
+                egui::FontId::proportional(11.0),
+                ink,
+            );
+
+            // Corner handles on the selected viewport (drag targets).
+            if selected {
+                for (corner, pos) in [
+                    (SheetCorner::BottomLeft, vp_rect.left_bottom()),
+                    (SheetCorner::BottomRight, vp_rect.right_bottom()),
+                    (SheetCorner::TopLeft, vp_rect.left_top()),
+                    (SheetCorner::TopRight, vp_rect.right_top()),
+                ] {
+                    let _ = corner;
+                    painter.rect_filled(
+                        egui::Rect::from_center_size(pos, egui::vec2(8.0, 8.0)),
+                        1.0,
+                        accent,
+                    );
+                }
+            }
+        }
+
+        // ── Drag-to-place + corner-resize of the selected viewport ──
+        self.handle_sheet_drag(name, &resp, &fit, (pw, ph), margin, &rects, pending);
+    }
+
+    /// Pointer handling for the sheet page: begin a move (body) or resize (corner)
+    /// drag on the selected viewport, track it live in `self.sheet_drag`, and
+    /// commit the new rect ONCE on release via `sheetviewset … rect`. Pure math
+    /// lives in [`clamp_rect_to_page`] / [`resize_rect_corner`]; this only wires
+    /// egui pointer state to it.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_sheet_drag(
+        &mut self,
+        name: &str,
+        resp: &egui::Response,
+        fit: &PaperFit,
+        paper_mm: (f64, f64),
+        margin: f64,
+        rects: &[itsjustcad_doc::PageRect],
+        pending: &mut Vec<String>,
+    ) {
+        let i = self.sheet_view_selected;
+        let Some(place) = rects.get(i).copied() else {
+            return;
+        };
+
+        // Where is the pointer, in paper mm?
+        let ptr_mm = resp.hover_pos().or(resp.interact_pointer_pos()).map(|p| {
+            let (x, y) = fit.to_mm(p.x, p.y);
+            glam::DVec2::new(x, y)
+        });
+
+        if resp.drag_started()
+            && let Some(ptr) = ptr_mm
+        {
+            // Grab: prefer a corner (within tolerance of a handle), else the body
+            // if the pointer is inside the current rect.
+            let start = match self.sheet_drag {
+                Some(d) if d.index == i => d.rect,
+                _ => place,
+            };
+            const CORNER_TOL_MM: f64 = 4.0;
+            let corners = [
+                (SheetCorner::BottomLeft, glam::DVec2::new(start.x, start.y)),
+                (SheetCorner::BottomRight, glam::DVec2::new(start.x + start.w, start.y)),
+                (SheetCorner::TopLeft, glam::DVec2::new(start.x, start.y + start.h)),
+                (SheetCorner::TopRight, glam::DVec2::new(start.x + start.w, start.y + start.h)),
+            ];
+            let near_corner = corners
+                .iter()
+                .find(|(_, c)| (*c - ptr).length() <= CORNER_TOL_MM)
+                .map(|(k, _)| *k);
+            let inside = ptr.x >= start.x
+                && ptr.x <= start.x + start.w
+                && ptr.y >= start.y
+                && ptr.y <= start.y + start.h;
+            if near_corner.is_some() || inside {
+                self.sheet_drag = Some(SheetDrag {
+                    index: i,
+                    corner: near_corner,
+                    start_rect: start,
+                    start_ptr_mm: ptr,
+                    rect: start,
+                });
+            }
+        }
+
+        if resp.dragged()
+            && let (Some(ptr), Some(mut drag)) = (ptr_mm, self.sheet_drag)
+            && drag.index == i
+        {
+            let d = ptr - drag.start_ptr_mm;
+            let raw = match drag.corner {
+                None => itsjustcad_doc::PageRect {
+                    x: drag.start_rect.x + d.x,
+                    y: drag.start_rect.y + d.y,
+                    w: drag.start_rect.w,
+                    h: drag.start_rect.h,
+                },
+                Some(corner) => resize_rect_corner(drag.start_rect, corner, d),
+            };
+            drag.rect = clamp_rect_to_page(raw, paper_mm, margin);
+            self.sheet_drag = Some(drag);
+        }
+
+        if resp.drag_stopped()
+            && let Some(drag) = self.sheet_drag.take()
+            && drag.index == i
+        {
+            let r = drag.rect;
+            pending.push(format!(
+                "sheetviewset {name} {} rect {} {} {} {}",
+                i + 1,
+                r.x,
+                r.y,
+                r.w,
+                r.h
+            ));
+        }
     }
 
     /// The Parameters tab (M-parametric): a card per live parametric object
@@ -10697,6 +11375,10 @@ impl eframe::App for App {
         self.step_import(ui.ctx());
         self.import_ui(ui.ctx());
 
+        // The full-size sheet viewer/editor window (opened by a Sheets-tab row
+        // click). Renders real projected geometry + per-view editing.
+        self.sheet_view_popup(ui.ctx());
+
         // Associative subdivision auto-recompute: after any op edits a source
         // block, fire `lotrefresh` for non-frozen links so the division tracks
         // the boundary. Runs before the journal sync so the refresh ops are
@@ -10990,6 +11672,7 @@ impl eframe::App for App {
             || self.show_template_picker
             || self.import_job.is_some()
             || self.import_result.is_some()
+            || self.sheet_open.is_some()
             || self.pending_nav.is_some();
         if !modal_open
             && !self.draw_tool.active()
@@ -13290,5 +13973,124 @@ mod tests {
 
         let db = crate::chat_db::db_path().expect("db path");
         assert_eq!(db, base.join("itsjustcad.db"));
+    }
+
+    // ───────────────────────── Sheet viewer pure logic ─────────────────────
+
+    /// Clicking a sheet row OPENS it; clicking the open one again CLOSES it.
+    /// This is the state transition issue #77's acceptance checklist requires.
+    #[test]
+    fn sheet_open_after_click_toggles() {
+        // Nothing open → open the clicked sheet.
+        assert_eq!(sheet_open_after_click(None, "plan"), Some("plan".to_string()));
+        // A different sheet open → switch to the clicked one.
+        assert_eq!(sheet_open_after_click(Some("plan"), "sections"), Some("sections".to_string()));
+        // Clicking the already-open sheet → close it.
+        assert_eq!(sheet_open_after_click(Some("plan"), "plan"), None);
+    }
+
+    /// The fit-to-width paper↔screen mapping round-trips (px→mm→px) and honors
+    /// the Y-flip: paper-mm lower-left maps to screen bottom-left (max Y px).
+    #[test]
+    fn paper_fit_round_trip_and_y_flip() {
+        // A3 landscape fit into 840 px of width at the origin.
+        let fit = PaperFit::fit_to_width((420.0, 297.0), 840.0, (0.0, 0.0));
+        assert!((fit.px_per_mm - 2.0).abs() < 1e-9, "840px / 420mm = 2 px/mm");
+        let (dw, dh) = fit.size_px();
+        assert!((dw - 840.0).abs() < 1e-3 && (dh - 594.0).abs() < 1e-3);
+
+        // Round-trip several paper points through px and back. Screen coords are
+        // f32, so allow a sub-mm tolerance (well under the 2 px/mm resolution).
+        for (x, y) in [(0.0_f64, 0.0_f64), (420.0, 297.0), (123.4, 56.7), (200.0, 150.0)] {
+            let (px, py) = fit.to_px(x, y);
+            let (rx, ry) = fit.to_mm(px, py);
+            assert!((rx - x).abs() < 1e-2 && (ry - y).abs() < 1e-2, "round-trip ({x},{y})");
+        }
+
+        // Y-flip: paper origin (0,0) is the BOTTOM of the page in screen px,
+        // and the top paper edge (y = ph) is the TOP (smaller py).
+        let (_, py_bottom) = fit.to_px(0.0, 0.0);
+        let (_, py_top) = fit.to_px(0.0, 297.0);
+        assert!(py_bottom > py_top, "lower-left paper origin is lower on screen");
+        assert!((py_top - 0.0).abs() < 1e-3, "top edge at origin y");
+        assert!((py_bottom - 594.0).abs() < 1e-3, "bottom edge at full height");
+    }
+
+    /// Drag/resize rects clamp to the page: stay inside the margin, never exceed
+    /// the drawable area, and keep a positive minimum size.
+    #[test]
+    fn clamp_rect_keeps_viewport_on_page() {
+        use itsjustcad_doc::PageRect;
+        let paper = (420.0, 297.0);
+        let m = 10.0;
+
+        // A rect pushed past the top-right corner is pulled back inside.
+        let r = clamp_rect_to_page(PageRect { x: 400.0, y: 290.0, w: 100.0, h: 100.0 }, paper, m);
+        assert!(r.x >= m && r.y >= m);
+        assert!(r.x + r.w <= paper.0 - m + 1e-6, "right edge inside margin");
+        assert!(r.y + r.h <= paper.1 - m + 1e-6, "top edge inside margin");
+
+        // A negative origin is clamped to the margin.
+        let r = clamp_rect_to_page(PageRect { x: -50.0, y: -50.0, w: 80.0, h: 60.0 }, paper, m);
+        assert!(r.x >= m - 1e-9 && r.y >= m - 1e-9);
+
+        // A degenerate (tiny) rect keeps a sane minimum size.
+        let r = clamp_rect_to_page(PageRect { x: 20.0, y: 20.0, w: 0.1, h: 0.1 }, paper, m);
+        assert!(r.w >= 5.0 && r.h >= 5.0, "minimum size enforced");
+
+        // A rect wider than the page shrinks to the drawable width.
+        let r = clamp_rect_to_page(PageRect { x: 0.0, y: 50.0, w: 9999.0, h: 50.0 }, paper, m);
+        assert!(r.w <= paper.0 - 2.0 * m + 1e-6);
+    }
+
+    /// Corner-resize moves the grabbed corner while anchoring the opposite one,
+    /// and normalizes so w/h stay positive even when dragged past the anchor.
+    #[test]
+    fn resize_rect_corner_anchors_opposite() {
+        use itsjustcad_doc::PageRect;
+        let start = PageRect { x: 10.0, y: 20.0, w: 100.0, h: 80.0 };
+
+        // Drag the top-right corner out: origin unchanged, size grows.
+        let r = resize_rect_corner(start, SheetCorner::TopRight, glam::DVec2::new(20.0, 10.0));
+        assert!((r.x - 10.0).abs() < 1e-9 && (r.y - 20.0).abs() < 1e-9);
+        assert!((r.w - 120.0).abs() < 1e-9 && (r.h - 90.0).abs() < 1e-9);
+
+        // Drag the bottom-left corner: moves origin, shrinks size, far corner
+        // (x+ w = 110, y + h = 100) stays put.
+        let r = resize_rect_corner(start, SheetCorner::BottomLeft, glam::DVec2::new(10.0, 5.0));
+        assert!((r.x - 20.0).abs() < 1e-9 && (r.y - 25.0).abs() < 1e-9);
+        assert!(((r.x + r.w) - 110.0).abs() < 1e-9 && ((r.y + r.h) - 100.0).abs() < 1e-9);
+
+        // Drag a corner PAST the opposite one → normalized to positive w/h.
+        let r = resize_rect_corner(start, SheetCorner::TopRight, glam::DVec2::new(-200.0, -200.0));
+        assert!(r.w >= 0.0 && r.h >= 0.0, "normalized positive dimensions");
+    }
+
+    /// The Scale combo input parser mirrors the command-line `scale` grammar:
+    /// bare numbers, `1:n` / `1/n` ratios, whitespace; rejects non-positive and
+    /// garbage.
+    #[test]
+    fn parse_scale_input_presets_and_custom() {
+        assert_eq!(parse_scale_input("50"), Some(50.0));
+        assert_eq!(parse_scale_input(" 100 "), Some(100.0));
+        assert_eq!(parse_scale_input("1:200"), Some(200.0));
+        assert_eq!(parse_scale_input("1/25"), Some(25.0));
+        assert_eq!(parse_scale_input("12.5"), Some(12.5));
+        // rejections
+        assert_eq!(parse_scale_input("0"), None);
+        assert_eq!(parse_scale_input("-5"), None);
+        assert_eq!(parse_scale_input("abc"), None);
+        assert_eq!(parse_scale_input(""), None);
+    }
+
+    /// The derived callout labels match the PDF renderer's `render_view`
+    /// defaults, so the on-screen label equals the exported one.
+    #[test]
+    fn default_callout_matches_pdf_defaults() {
+        use itsjustcad_doc::ViewDirection::*;
+        assert_eq!(default_callout(Top), "PLAN");
+        assert_eq!(default_callout(Front), "FRONT ELEVATION");
+        assert_eq!(default_callout(Right), "SIDE ELEVATION");
+        assert_eq!(default_callout(Iso), "PERSPECTIVE");
     }
 }

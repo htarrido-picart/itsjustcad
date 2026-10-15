@@ -3,8 +3,8 @@
 
 use glam::DVec3;
 use itsjustcad_doc::{
-    AreaKind, EndpointRef, FieldExpr, FrameKind, HatchPattern, NamedView, ObjectId, PaperSize,
-    RestraintKind, Section as StructSection, SheetDisplayMode, Units, ViewDirection,
+    AreaKind, EndpointRef, FieldExpr, FrameKind, HatchPattern, NamedView, ObjectId, PageRect,
+    PaperSize, RestraintKind, Section as StructSection, SheetDisplayMode, Units, ViewDirection,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2413,6 +2413,10 @@ pub enum SheetViewSet {
     Direction { direction: ViewDirection },
     /// Change the render style (wireframe / hidden-line / shaded).
     Mode { mode: SheetDisplayMode },
+    /// Pin the viewport to an explicit paper-space rectangle (mm, lower-left
+    /// origin), or `None` to reset to the auto-grid layout. Drives the desktop
+    /// drag-to-place / corner-resize of viewports.
+    Rect { rect: Option<PageRect> },
 }
 
 fn is_zero_opt(v: &Option<f64>) -> bool {
