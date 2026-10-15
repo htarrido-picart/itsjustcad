@@ -3,8 +3,8 @@
 
 use glam::DVec3;
 use itsjustcad_doc::{
-    AreaKind, EndpointRef, FieldExpr, FrameKind, HatchPattern, NamedView, ObjectId, PaperSize,
-    RestraintKind, Section as StructSection, SheetDisplayMode, Units, ViewDirection,
+    AreaKind, EndpointRef, FieldExpr, FrameKind, HatchPattern, NamedView, ObjectId, PageRect,
+    PaperSize, RestraintKind, Section as StructSection, SheetDisplayMode, Units, ViewDirection,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1363,6 +1363,14 @@ pub enum Command {
         direction: ViewDirection,
         scale: f64,
     },
+    /// Convenience: create a sheet AND add the four standard views (top, front,
+    /// right, iso) in one command — the "make a sheet with four views" shortcut.
+    /// `scale` is the denominator applied to all four views.
+    FourViews {
+        name: String,
+        paper: PaperSize,
+        scale: f64,
+    },
     /// Delete a view from a sheet by 1-based index (matching the "N view(s)"
     /// count reported by `sheetview`).
     SheetViewDelete {
@@ -2413,6 +2421,10 @@ pub enum SheetViewSet {
     Direction { direction: ViewDirection },
     /// Change the render style (wireframe / hidden-line / shaded).
     Mode { mode: SheetDisplayMode },
+    /// Pin the viewport to an explicit paper-space rectangle (mm, lower-left
+    /// origin), or `None` to reset to the auto-grid layout. Drives the desktop
+    /// drag-to-place / corner-resize of viewports.
+    Rect { rect: Option<PageRect> },
 }
 
 fn is_zero_opt(v: &Option<f64>) -> bool {

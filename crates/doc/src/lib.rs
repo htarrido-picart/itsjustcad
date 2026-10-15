@@ -43,6 +43,7 @@ pub use plotstyle::{PlotStyleEntry, PlotStyleTable, ResolvedPen};
 pub use sheet::{
     PageRect, PaperSize, ScheduleRow, Sheet, SheetDim, SheetDisplayMode, SheetLeader, SheetSet,
     SheetTable, SheetTag, SheetText, SheetView, TagShape, TitleBlock, ViewDirection,
+    SHEET_MARGIN_MM, SHEET_TITLE_MM,
 };
 pub use structure::{Grid, Material, Room, Section, Story};
 pub use underlay::{Basemap, Underlay, default_underlay_layer};

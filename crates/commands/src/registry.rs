@@ -846,6 +846,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Dimension,
         },
         CommandSpec {
+            name: "fourviews",
+            usage: "fourviews <name> [a4|a3|a2|a1|a0] [scale]",
+            summary: "Create a sheet AND add the four standard views (top, front, right, iso) in one command — the shortcut for 'make a sheet with four views'. Paper defaults a3, scale 1:100. Undoable. Example: fourviews plan a3 1:100",
+            category: Category::Dimension,
+        },
+        CommandSpec {
             name: "sheetviewdelete",
             usage: "sheetviewdelete <sheet> <index>",
             summary: "Delete a view from a sheet by its 1-based index (the order views were added, as counted by 'sheetview'). Undoable. Example: sheetviewdelete plan 2",
@@ -853,8 +859,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "sheetviewset",
-            usage: "sheetviewset <sheet> <index> <title <text>|scale <scale>|direction <top|front|right|persp>|mode <wireframe|hiddenline|shaded>>",
-            summary: "Edit one property of an existing view (1-based index): 'title <text>' overrides the derived callout (PLAN/ELEVATION/…), empty text resets it; 'scale <scale>' changes the drawing scale; 'direction <dir>' changes the projection; 'mode <wireframe|hiddenline|shaded>' sets the render style (hidden-line removes occluded edges, shaded embeds a rendered raster). Undoable. Example: sheetviewset plan 1 mode shaded",
+            usage: "sheetviewset <sheet> <index> <title <text>|scale <scale>|direction <top|front|right|persp>|mode <wireframe|hiddenline|shaded>|rect <x> <y> <w> <h>|rect auto>",
+            summary: "Edit one property of an existing view (1-based index): 'title <text>' overrides the derived callout (PLAN/ELEVATION/…), empty text resets it; 'scale <scale>' changes the drawing scale; 'direction <dir>' changes the projection; 'mode <wireframe|hiddenline|shaded>' sets the render style (hidden-line removes occluded edges, shaded embeds a rendered raster); 'rect <x> <y> <w> <h>' pins the viewport to a paper-space rectangle in mm (lower-left origin), 'rect auto' resets to the auto-grid layout. Undoable. Example: sheetviewset plan 1 mode shaded",
             category: Category::Dimension,
         },
         CommandSpec {

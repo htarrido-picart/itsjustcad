@@ -12946,6 +12946,46 @@ fn apply_forward(
                 },
             ))
         }
+        Command::FourViews { name, paper, scale } => {
+            if scale <= 0.0 {
+                return Err(ExecError::Invalid("view scale must be positive".into()));
+            }
+            if doc.sheet(&name).is_some() {
+                return Err(ExecError::Invalid(format!(
+                    "sheet '{name}' already exists (add views with: sheetview {name} top 1:100)"
+                )));
+            }
+            let (w, h) = paper.landscape_mm();
+            use itsjustcad_doc::ViewDirection::{Front, Iso, Right, Top};
+            let views = [Top, Front, Right, Iso]
+                .into_iter()
+                .map(|d| itsjustcad_doc::SheetView::new(d, scale))
+                .collect();
+            doc.sheets.push(itsjustcad_doc::Sheet {
+                name: name.clone(),
+                paper,
+                views,
+                titleblock: None,
+                table: None,
+                dims: Vec::new(),
+                texts: Vec::new(),
+                leaders: Vec::new(),
+                tags: Vec::new(),
+            });
+            doc.generation += 1;
+            Ok((
+                Command::FourViews { name: name.clone(), paper, scale },
+                Inverse::RemoveSheet(name.clone()),
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "sheet '{name}' ({} landscape, {w}x{h}mm) with 4 views \
+                         (top/front/right/iso @ 1:{scale})",
+                        paper.label()
+                    ),
+                },
+            ))
+        }
         Command::SheetViewDelete { sheet, index } => {
             let known: Vec<String> = doc.sheets.iter().map(|s| s.name.clone()).collect();
             let Some(s) = doc.sheet_mut(&sheet) else {
@@ -13014,6 +13054,16 @@ fn apply_forward(
                 crate::SheetViewSet::Mode { mode } => {
                     view.display_mode = *mode;
                     format!("mode = {}", mode.label())
+                }
+                crate::SheetViewSet::Rect { rect } => {
+                    view.rect = *rect;
+                    match rect {
+                        Some(r) => format!(
+                            "rect = {:.1} {:.1} {:.1} {:.1} mm",
+                            r.x, r.y, r.w, r.h
+                        ),
+                        None => "rect = auto".to_string(),
+                    }
                 }
             };
             doc.generation += 1;
@@ -15398,6 +15448,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::FaceSunHours { .. } => "facesunhours",
         Command::Sheet { .. } => "sheet",
         Command::SheetView { .. } => "sheetview",
+        Command::FourViews { .. } => "fourviews",
         Command::SheetViewDelete { .. } => "sheetviewdelete",
         Command::SheetViewSet { .. } => "sheetviewset",
         Command::Print { .. } => "print",
@@ -19755,6 +19806,38 @@ mod tests {
         assert!(err.to_string().contains("no sheet 'ghost'"), "{err}");
     }
 
+    /// `fourviews` creates the sheet + the four standard views (top/front/right/
+    /// iso) in one undoable step; a duplicate name errors.
+    #[test]
+    fn fourviews_creates_sheet_with_four_views_and_undo() {
+        use itsjustcad_doc::{PaperSize, ViewDirection};
+        let mut s = Session::default();
+        let out = run(&mut s, "fourviews plan a3 1:100");
+        assert!(out.message.contains("4 views"), "{}", out.message);
+        let sheet = s.doc.sheet("plan").unwrap();
+        assert_eq!(sheet.paper, PaperSize::A3);
+        assert_eq!(
+            sheet.views.iter().map(|v| v.direction).collect::<Vec<_>>(),
+            vec![
+                ViewDirection::Top,
+                ViewDirection::Front,
+                ViewDirection::Right,
+                ViewDirection::Iso
+            ]
+        );
+        assert!(sheet.views.iter().all(|v| v.scale == 100.0));
+
+        // Undo removes the whole sheet in one step; redo restores it.
+        run(&mut s, "undo");
+        assert!(s.doc.sheets.is_empty());
+        run(&mut s, "redo");
+        assert_eq!(s.doc.sheet("plan").unwrap().views.len(), 4);
+
+        // Duplicate name errors with a hint.
+        let err = s.run(parse("fourviews plan").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
     /// Item 2: delete a view by 1-based index; out-of-range and unknown-sheet
     /// errors are clean; undo re-inserts at the original slot.
     #[test]
@@ -19821,6 +19904,41 @@ mod tests {
         assert_eq!(s.doc.sheet("plan").unwrap().views[0].direction, ViewDirection::Top);
 
         // Replay stability with the new fields set.
+        let json = crate::io::to_json(&s);
+        let s2 = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&s2), json, "replay-stable JSON");
+    }
+
+    /// `sheetviewset … rect x y w h` pins the viewport; `rect auto` resets it to
+    /// the auto-grid; undo restores the prior rect; replay is stable through JSON.
+    #[test]
+    fn sheetview_set_rect_and_undo() {
+        use itsjustcad_doc::PageRect;
+        let mut s = Session::default();
+        run(&mut s, "sheet plan a3");
+        run(&mut s, "sheetview plan top 100");
+        assert!(s.doc.sheet("plan").unwrap().views[0].rect.is_none(), "auto by default");
+
+        // Pin to an explicit paper-space rect.
+        run(&mut s, "sheetviewset plan 1 rect 50 40 120 90");
+        assert_eq!(
+            s.doc.sheet("plan").unwrap().views[0].rect,
+            Some(PageRect { x: 50.0, y: 40.0, w: 120.0, h: 90.0 })
+        );
+
+        // Reset to auto.
+        run(&mut s, "sheetviewset plan 1 rect auto");
+        assert!(s.doc.sheet("plan").unwrap().views[0].rect.is_none(), "reset to auto");
+
+        // Undo the reset → the pinned rect comes back.
+        run(&mut s, "undo");
+        assert_eq!(
+            s.doc.sheet("plan").unwrap().views[0].rect,
+            Some(PageRect { x: 50.0, y: 40.0, w: 120.0, h: 90.0 }),
+            "undo restores the pinned rect"
+        );
+
+        // Replay stability with a pinned rect set.
         let json = crate::io::to_json(&s);
         let s2 = crate::io::from_json(&json).unwrap();
         assert_eq!(crate::io::to_json(&s2), json, "replay-stable JSON");

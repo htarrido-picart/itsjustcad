@@ -1457,6 +1457,16 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 scale: scale_denominator(scale)?,
             })
         }
+        "fourviews" => {
+            // fourviews <name> [paper] [scale] — paper defaults A3, scale 1:100.
+            let (name, paper, scale) = match args.as_slice() {
+                [name] => (*name, PaperSize::A3, 100.0),
+                [name, paper] => (*name, paper_size(paper)?, 100.0),
+                [name, paper, scale] => (*name, paper_size(paper)?, scale_denominator(scale)?),
+                _ => return wrong("fourviews", "a name and optional paper size and scale", &args),
+            };
+            Ok(Command::FourViews { name: name.to_string(), paper, scale })
+        }
         "sheetviewdelete" => {
             let [sheet, index] =
                 take::<2>("sheetviewdelete", "a sheet name and a 1-based view index", &args)?;
@@ -1492,9 +1502,28 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                         .ok_or_else(|| ParseError::BadViewMode((*mode).to_string()))?,
                 },
             }),
+            // Reset a pinned viewport back to the auto-grid layout.
+            [sheet, index, "rect", "auto"] => Ok(Command::SheetViewSet {
+                sheet: (*sheet).to_string(),
+                index: parse_index(index)?,
+                set: SheetViewSet::Rect { rect: None },
+            }),
+            // Pin the viewport to an explicit paper-space rect (mm): x y w h.
+            [sheet, index, "rect", x, y, w, h] => Ok(Command::SheetViewSet {
+                sheet: (*sheet).to_string(),
+                index: parse_index(index)?,
+                set: SheetViewSet::Rect {
+                    rect: Some(itsjustcad_doc::PageRect {
+                        x: number(x)?,
+                        y: number(y)?,
+                        w: number(w)?,
+                        h: number(h)?,
+                    }),
+                },
+            }),
             _ => wrong(
                 "sheetviewset",
-                "<sheet> <index> <title <text>|scale <scale>|direction <top|front|right|persp>|mode <wireframe|hiddenline|shaded>>",
+                "<sheet> <index> <title <text>|scale <scale>|direction <top|front|right|persp>|mode <wireframe|hiddenline|shaded>|rect <x> <y> <w> <h>|rect auto>",
                 &args,
             ),
         },
@@ -6323,6 +6352,20 @@ mod tests {
             parse("print plan /tmp/plan.pdf").unwrap(),
             Command::Print { sheet: "plan".into(), path: "/tmp/plan.pdf".into() }
         );
+        // fourviews: name only (defaults), name+paper, name+paper+scale.
+        assert_eq!(
+            parse("fourviews plan").unwrap(),
+            Command::FourViews { name: "plan".into(), paper: PaperSize::A3, scale: 100.0 }
+        );
+        assert_eq!(
+            parse("fourviews plan a1").unwrap(),
+            Command::FourViews { name: "plan".into(), paper: PaperSize::A1, scale: 100.0 }
+        );
+        assert!(matches!(
+            parse("fourviews plan a3 1:50").unwrap(),
+            Command::FourViews { paper: PaperSize::A3, scale, .. } if scale == 50.0
+        ));
+        assert!(parse("fourviews").unwrap_err().to_string().contains("name"));
         // errors carry hints
         assert!(parse("sheet plan b5").unwrap_err().to_string().contains("a4"));
         assert!(parse("sheetview plan back 100").unwrap_err().to_string().contains("top"));
@@ -6386,6 +6429,31 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("render mode"));
+
+        // Rect: pin to an explicit paper-space rectangle (x y w h, mm).
+        assert_eq!(
+            parse("sheetviewset plan 2 rect 10 20 100 80").unwrap(),
+            Command::SheetViewSet {
+                sheet: "plan".into(),
+                index: 2,
+                set: SheetViewSet::Rect {
+                    rect: Some(itsjustcad_doc::PageRect { x: 10.0, y: 20.0, w: 100.0, h: 80.0 }),
+                },
+            }
+        );
+        // Rect auto resets to the auto-grid layout (None).
+        assert_eq!(
+            parse("sheetviewset plan 1 rect auto").unwrap(),
+            Command::SheetViewSet {
+                sheet: "plan".into(),
+                index: 1,
+                set: SheetViewSet::Rect { rect: None },
+            }
+        );
+        // A non-numeric rect coordinate is rejected.
+        assert!(parse("sheetviewset plan 1 rect 10 20 x 80").is_err());
+        // Wrong arity (3 numbers, not 4) falls through to the usage error.
+        assert!(parse("sheetviewset plan 1 rect 10 20 30").is_err());
     }
 
     #[test]
