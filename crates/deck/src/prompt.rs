@@ -146,6 +146,20 @@ Rule packs are data, not code: a pack is JSON ({\"name\":..,\"rules\":[{\"id\",\
 ALWAYS state the disclaimer when presenting results: this is an advisory pre-check, not a code review — verify with a licensed professional / AHJ. Guard height, habitable-space, and handrail checks are name-matched only; travel distance is straight-line, not the routed path; ramp cross slope infers the run axis from the mesh AABB; door threshold/reach/maneuvering clearance are param-only or omitted. Never claim a design \"complies\" with any code.
 ";
 
+/// The "Ramp & stair layout" section (issue #18): teaches the model to reach
+/// for the parametric `ramp` / `stair` verbs — which bake code-compliant
+/// geometry — instead of free-handing sloped boxes, and to respect the slope /
+/// landing / riser / tread rules if it ever hand-builds one. The verbs are
+/// advertised through the registry; this is interpretation guidance. Token-frugal.
+pub const RAMP_STAIR_HELP: &str = "\
+## Ramp & stair layout (prefer the parametric verbs)
+For ANY ramp or stair, CALL THE VERB — it computes a compliant layout and bakes geometry that passes `codecheck`, so you never free-hand sloped boxes:
+  ramp rise <m> slope 1:12 | run <m> width <m>   accessible ramp: splits the rise into runs, inserts level landings, names a 'ramp' centerline for `codecheck ada2010`. e.g. ramp rise 0.9 slope 1:12 width 1.2
+  stair rise <m> width <m> [riser <m>] [tread <m>]   straight flight: equalized risers ≤7 in, tread ≥11 in, names a 'stair' mesh for `codecheck ibc2021`. e.g. stair rise 3 width 1.2
+Then verify: `codecheck ada2010` (ramps) / `codecheck ibc2021` (stairs) → `report codecheck`.
+If you MUST hand-build from primitives, honor the defaults (not legal advice — verify with the AHJ): ramp running slope ≤ 1:12; a level landing ≥ 60 in long (and ≥ ramp width) wherever a run would rise > 30 in, plus at top/bottom and every turn. Stair riser 4–7 in and CONSISTENT (equalize = rise / ceil(rise/7in), variation ≤ 3/8 in); tread ≥ 11 in with 2R+T ≈ 24–25 in; add a landing every ≤ 12 ft of rise.
+";
+
 /// The "Yield critique" section: teaches the intemfit yield workflow
 /// (M-intemfit Phase 11). Like [`ENVIRO_CRITIQUE_HELP`] this is interpretation
 /// guidance — the `lotreport`/`report` verbs are advertised through the
@@ -412,6 +426,7 @@ You are NOT geometry-only. Besides drawing, you can reframe the viewport, orbit 
 {ui_verbs}
 {enviro}
 {codecheck}
+{ramp_stair}
 {yield_critique}
 {clarify}
 {plan}
@@ -441,6 +456,7 @@ box 10,0,0 4,4,3
         ui_verbs = UI_VERB_HELP,
         enviro = ENVIRO_CRITIQUE_HELP,
         codecheck = CODECHECK_HELP,
+        ramp_stair = RAMP_STAIR_HELP,
         yield_critique = YIELD_CRITIQUE_HELP,
         clarify = CLARIFY_HELP,
         plan = PLAN_HELP,
@@ -547,6 +563,7 @@ Examples:
 {ui_verbs}
 {enviro}
 {codecheck}
+{ramp_stair}
 {yield_critique}
 {clarify}
 {plan}
@@ -583,6 +600,7 @@ box 10,0,0 4,4,3
         ui_verbs = UI_VERB_HELP,
         enviro = ENVIRO_CRITIQUE_HELP,
         codecheck = CODECHECK_HELP,
+        ramp_stair = RAMP_STAIR_HELP,
         yield_critique = YIELD_CRITIQUE_HELP,
         clarify = CLARIFY_HELP,
         plan = PLAN_HELP,
@@ -829,6 +847,31 @@ mod tests {
     }
 
     #[test]
+    fn both_prompts_teach_ramp_and_stair_layout() {
+        // Issue #18 Part A: both prompts carry the ramp/stair layout guidance so
+        // the model prefers the parametric verbs and, if hand-building, respects
+        // the slope/landing/riser/tread rules.
+        for p in [
+            system_prompt("", &PluginRegistry::new()),
+            compact_system_prompt("", &PluginRegistry::new()),
+        ] {
+            assert!(p.contains(RAMP_STAIR_HELP), "RAMP_STAIR_HELP not injected");
+            assert!(p.contains("## Ramp & stair layout"));
+        }
+        // It points at the parametric verbs and the matching codecheck packs.
+        for needle in ["ramp rise", "stair rise", "codecheck ada2010", "codecheck ibc2021"] {
+            assert!(RAMP_STAIR_HELP.contains(needle), "ramp/stair section missing '{needle}'");
+        }
+        // The hand-build fallback carries the key numbers.
+        assert!(RAMP_STAIR_HELP.contains("1:12"));
+        assert!(RAMP_STAIR_HELP.contains("60 in"));
+        assert!(RAMP_STAIR_HELP.contains("30 in"));
+        assert!(RAMP_STAIR_HELP.contains("4–7 in") || RAMP_STAIR_HELP.contains("4-7 in"));
+        assert!(RAMP_STAIR_HELP.contains("11 in"));
+        assert!(RAMP_STAIR_HELP.contains("12 ft"));
+    }
+
+    #[test]
     fn both_prompts_advertise_clarify_before_act() {
         // Both the full and the compact prompt embed the clarify section whole,
         // teaching the exact `QUESTION:` form the parser recognizes.
@@ -917,13 +960,14 @@ mod tests {
             compact.len(),
             full.len()
         );
-        // The command CATALOG itself is the compact-by-design part: ~10–14 KB for
+        // The command CATALOG itself is the compact-by-design part: ~10–15 KB for
         // ~190 verbs vs the full prompt's ~45 KB command table. The cap tracks the
-        // growing verb count (CAD-parity batch added ~28 verbs); it stays well
-        // under the full table so the compact prompt keeps its size advantage.
+        // growing verb count (CAD-parity batch added ~28 verbs; ramp/stair added 2);
+        // it stays well under the full table so the compact prompt keeps its size
+        // advantage.
         let catalog = compact_command_catalog();
         assert!(
-            catalog.len() < 15_000,
+            catalog.len() < 15_500,
             "compact catalog bloated to {} bytes",
             catalog.len()
         );

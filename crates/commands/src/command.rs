@@ -1919,6 +1919,53 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         material: Option<String>,
     },
+    /// Parametric accessible ramp (issue #18). Lays out a code-compliant ramp
+    /// from a total `rise`, a slope spec (a rise:run `ratio` OR a total plan
+    /// `run`), and a `width`, inserting level landings so no single run rises
+    /// more than 30 in (ADA 405.7). Bakes a continuous ramp surface mesh AND a
+    /// named "ramp" centerline curve so `codecheck ada2010` can grade slope and
+    /// landings. `ids` is filled on apply, written back for replay stability.
+    Ramp {
+        /// Total rise, metres.
+        rise: f64,
+        /// Running slope as a rise:run ratio (e.g. 1/12). Clamped to the 1:12
+        /// code max. `None` when a `run` is given instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slope: Option<f64>,
+        /// Total plan run, metres (slope = rise/run, clamped to 1:12). `None`
+        /// when a `slope` ratio is given instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<f64>,
+        /// Ramp width, metres.
+        width: f64,
+        /// Object ids created on apply (surface mesh + centerline curve),
+        /// written back so undo removes the exact same set.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ids: Vec<ObjectId>,
+    },
+    /// Parametric stair (issue #18). Lays out a code-compliant straight flight
+    /// from a total floor-to-floor `rise` and a `width`, optionally honoring a
+    /// target riser/tread. Equalizes the riser height (consistent, ≤ 7 in) and
+    /// proportions the tread (≥ 11 in, honoring 2R+T≈24–25 in). Bakes a stepped
+    /// mesh named "stair" so `codecheck ibc2021` can grade risers and treads.
+    /// `ids` is filled on apply, written back for replay stability.
+    Stair {
+        /// Total floor-to-floor rise, metres.
+        rise: f64,
+        /// Stair width, metres.
+        width: f64,
+        /// Target riser height, metres (clamped to the 4–7 in band). `None` =
+        /// derive from the max-riser rule.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        riser: Option<f64>,
+        /// Target tread depth, metres (clamped to the 11 in min). `None` =
+        /// derive from 2R+T.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tread: Option<f64>,
+        /// Object ids created on apply (stepped mesh), written back for replay.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ids: Vec<ObjectId>,
+    },
     /// Drawings→BIM: consume the 2D curve objects on a layer and emit typed BIM
     /// elements extruded to storey height. Each open/closed curve on `layer`
     /// becomes one `wall` (the only element kind for now) built as a vertical

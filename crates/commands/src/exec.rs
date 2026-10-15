@@ -14805,6 +14805,98 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Ramp { rise, slope, run, width, ids } => {
+            use crate::stairs::{ramp_centerline, ramp_layout, ramp_surface, RampSlope};
+            let slope_spec = match (slope, run) {
+                (Some(s), None) => RampSlope::Ratio(s),
+                (None, Some(r)) => RampSlope::Run(r),
+                _ => {
+                    return Err(ExecError::Invalid(
+                        "ramp needs exactly one of a slope ratio or a run".into(),
+                    ))
+                }
+            };
+            let layout = ramp_layout(rise, slope_spec, width).map_err(ExecError::Invalid)?;
+            // Two objects: the continuous surface mesh (for display + the
+            // cross-slope mesh probe) and the named "ramp" centerline curve that
+            // the ADA running-slope / landing checks read.
+            let ids = ensure_ids(ids, 2);
+            let (surf_id, line_id) = (ids[0], ids[1]);
+            let mb = ramp_surface(&layout, DVec3::ZERO);
+            let mesh = kernel_mesh::Mesh::new(mb.positions, mb.faces);
+            doc.insert(SceneObject {
+                visible: true,
+                id: surf_id,
+                name: Some("ramp-surface".to_string()),
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Mesh(mesh),
+            });
+            let centerline = ramp_centerline(&layout, DVec3::new(0.0, width * 0.5, 0.0));
+            doc.insert(SceneObject {
+                visible: true,
+                id: line_id,
+                name: Some("ramp".to_string()),
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Curve(Curve::Polyline { points: centerline, closed: false }),
+            });
+            let runs = layout
+                .segments
+                .iter()
+                .filter(|s| matches!(s, crate::stairs::RampSegment::Run { .. }))
+                .count();
+            let landings = layout.segments.len() - runs;
+            Ok((
+                Command::Ramp { rise, slope, run, width, ids: ids.clone() },
+                Inverse::DeleteCreated(ids),
+                ApplyOutcome {
+                    created: vec![surf_id, line_id],
+                    message: format!(
+                        "ramp {surf_id} (rise {rise:.2} m, slope 1:{:.0}, {runs} run(s), \
+                         {landings} landing(s))",
+                        1.0 / layout.slope
+                    ),
+                },
+            ))
+        }
+        Command::Stair { rise, width, riser, tread, ids } => {
+            use crate::stairs::{stair_layout, stair_mesh};
+            let layout =
+                stair_layout(rise, width, riser, tread).map_err(ExecError::Invalid)?;
+            let ids = ensure_ids(ids, 1);
+            let id = ids[0];
+            let mb = stair_mesh(&layout, DVec3::ZERO);
+            let mesh = kernel_mesh::Mesh::new(mb.positions, mb.faces);
+            doc.insert(SceneObject {
+                visible: true,
+                id,
+                name: Some("stair".to_string()),
+                layer: doc.current_layer.clone(),
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                geometry: Geometry::Mesh(mesh),
+            });
+            Ok((
+                Command::Stair { rise, width, riser, tread, ids: ids.clone() },
+                Inverse::DeleteCreated(ids),
+                ApplyOutcome {
+                    created: vec![id],
+                    message: format!(
+                        "stair {id} ({} risers @ {:.3} m, tread {:.3} m{})",
+                        layout.risers,
+                        layout.riser_height,
+                        layout.tread_depth,
+                        if layout.landing { ", needs a landing (>12 ft)" } else { "" }
+                    ),
+                },
+            ))
+        }
         Command::FromLayer { layer, element, thickness, height, level, created } => {
             use itsjustcad_doc::AreaKind;
             // Only walls are built today; parse rejects anything else, but guard
@@ -15140,6 +15232,16 @@ fn apply_forward(
     }
 }
 
+/// Resolve the created-id list for a multi-object command: reuse the stored ids
+/// on replay (so undo removes the exact same set), else mint `n` fresh ones.
+fn ensure_ids(ids: Vec<ObjectId>, n: usize) -> Vec<ObjectId> {
+    if ids.len() == n {
+        ids
+    } else {
+        (0..n).map(|_| ObjectId::default()).collect()
+    }
+}
+
 /// Extrusion direction for a wall: the boundary's plane normal. A footprint
 /// drawn flat in XY has a +Z normal, which would make it a slab; so for walls
 /// we prefer the horizontal normal of the footprint's dominant edge. Falls back
@@ -15379,6 +15481,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::RoomList => "rooms",
         Command::FrameMember { kind, .. } => kind.label(),
         Command::AreaMember { kind, .. } => kind.label(),
+        Command::Ramp { .. } => "ramp",
+        Command::Stair { .. } => "stair",
         Command::AddLoad { .. } => "load",
         Command::AddSupport { .. } => "support",
         Command::Undo => "undo",
@@ -15395,6 +15499,107 @@ mod tests {
 
     fn run(s: &mut Session, line: &str) -> ApplyOutcome {
         s.run(parse(line).unwrap()).unwrap()
+    }
+
+    // ── ramp / stair primitives (issue #18) ───────────────────────────────
+
+    /// Verdict for one rule id in a stored compliance report (panics if absent).
+    fn verdict_of(s: &Session, pack: &str, rule_id: &str) -> String {
+        s.doc
+            .compliance_reports
+            .get(pack)
+            .unwrap_or_else(|| panic!("no {pack} report"))
+            .rules
+            .iter()
+            .find(|r| r.rule_id == rule_id)
+            .unwrap_or_else(|| panic!("no rule {rule_id} in {pack}"))
+            .verdict
+            .clone()
+    }
+
+    #[test]
+    fn ramp_900mm_passes_ada_slope_and_landing() {
+        // Acceptance (issue #18): "accessible ramp rising 900 mm" → a 1:12 ramp
+        // (~10.8 m run) WITH a mid landing, passing codecheck ada2010 for the
+        // running-slope and landing rules (generate → codecheck → assert pass).
+        let mut s = Session::default();
+        let out = run(&mut s, "ramp rise 0.9 slope 1:12 width 1.2");
+        assert!(out.message.contains("slope 1:12"), "{}", out.message);
+        assert!(out.message.contains("2 run"), "two runs: {}", out.message);
+        assert!(out.message.contains("1 landing"), "one landing: {}", out.message);
+        // The named "ramp" centerline curve the ADA checks read must exist.
+        assert_eq!(s.doc.find_named("ramp").len(), 1, "ramp centerline curve");
+        assert_eq!(s.doc.find_named("ramp-surface").len(), 1, "ramp surface mesh");
+
+        run(&mut s, "codecheck ada2010");
+        assert_eq!(
+            verdict_of(&s, "ada2010", "ramp-running-slope"),
+            "pass",
+            "1:12 ramp must pass the running-slope check"
+        );
+        assert_eq!(
+            verdict_of(&s, "ada2010", "ramp-landings"),
+            "pass",
+            "mid landing must satisfy the 30 in / 60 in landing rule"
+        );
+    }
+
+    #[test]
+    fn stair_3m_passes_ibc_riser_and_tread() {
+        // Acceptance (issue #18): "stairs for a 3 m floor-to-floor" → consistent
+        // risers (~17 ≈ 176 mm) and treads ≥ 279 mm, passing codecheck ibc2021
+        // for the riser and tread rules.
+        let mut s = Session::default();
+        let out = run(&mut s, "stair rise 3 width 1.2");
+        assert!(out.message.contains("17 risers"), "17 risers: {}", out.message);
+        assert_eq!(s.doc.find_named("stair").len(), 1, "stair mesh named 'stair'");
+
+        run(&mut s, "codecheck ibc2021");
+        assert_eq!(
+            verdict_of(&s, "ibc2021", "stair-riser"),
+            "pass",
+            "equalized 176 mm risers must pass the 7 in max"
+        );
+        assert_eq!(
+            verdict_of(&s, "ibc2021", "stair-tread"),
+            "pass",
+            "tread must pass the 11 in min"
+        );
+    }
+
+    #[test]
+    fn ramp_run_spec_and_imperial_units_parse_and_build() {
+        // The 'run' slope spec and imperial inputs both work end to end.
+        let mut s = Session::default();
+        run(&mut s, "ramp rise 1.5 run 20 width 1.5");
+        assert_eq!(s.doc.find_named("ramp").len(), 1);
+        // Imperial: a 30 in rise is one run, no landing (= the single-run max).
+        let mut s2 = Session::default();
+        let out = run(&mut s2, "stair rise 36in width 44in");
+        assert!(out.message.contains("risers"), "{}", out.message);
+    }
+
+    #[test]
+    fn stair_honors_tread_target() {
+        let mut s = Session::default();
+        let out = run(&mut s, "stair rise 3.6 width 1.5 tread 0.3");
+        assert!(out.message.contains("tread 0.300"), "{}", out.message);
+    }
+
+    #[test]
+    fn ramp_and_stair_undo_removes_all_created_objects() {
+        let mut s = Session::default();
+        run(&mut s, "ramp rise 0.9 slope 1:12 width 1.2");
+        assert_eq!(s.doc.len(), 2, "surface + centerline");
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 0, "undo removes both ramp objects");
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 2, "redo restores both");
+
+        run(&mut s, "stair rise 3 width 1.2");
+        assert_eq!(s.doc.len(), 3);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 2, "undo removes the stair mesh");
     }
 
     #[test]
