@@ -382,8 +382,17 @@ impl Sheet {
             + if table_h > 0.0 { table_h + SHEET_GUTTER_MM } else { 0.0 };
         let y1 = paper_h - SHEET_MARGIN_MM;
 
+        // Auto-grid: lay the viewports out in a near-square grid rather than a
+        // single row, so e.g. four views read as 2×2 (not 1×4). Columns is the
+        // ceiling of √n (1→1, 2→2, 3→2, 4→2, 5→3, …); rows follows from n. Row 0
+        // sits at the TOP of the band (paper mm are lower-left origin, so higher
+        // y = higher on the page).
+        let cols = (n as f64).sqrt().ceil().max(1.0) as usize;
+        let rows = n.div_ceil(cols);
         let area_w = paper_w - 2.0 * SHEET_MARGIN_MM;
-        let view_w = (area_w - SHEET_GUTTER_MM * (n as f64 - 1.0)) / n as f64;
+        let band_h = y1 - y0;
+        let cell_w = (area_w - SHEET_GUTTER_MM * (cols as f64 - 1.0)) / cols as f64;
+        let cell_h = (band_h - SHEET_GUTTER_MM * (rows as f64 - 1.0)) / rows as f64;
 
         self.views
             .iter()
@@ -391,8 +400,12 @@ impl Sheet {
             .map(|(i, view)| match view.rect {
                 Some(r) => r,
                 None => {
-                    let x0 = SHEET_MARGIN_MM + i as f64 * (view_w + SHEET_GUTTER_MM);
-                    PageRect { x: x0, y: y0, w: view_w, h: y1 - y0 }
+                    let col = i % cols;
+                    let row = i / cols;
+                    let x0 = SHEET_MARGIN_MM + col as f64 * (cell_w + SHEET_GUTTER_MM);
+                    // Row 0 at the top: its lower edge is cell_h below the band top.
+                    let y_cell = y1 - cell_h - row as f64 * (cell_h + SHEET_GUTTER_MM);
+                    PageRect { x: x0, y: y_cell, w: cell_w, h: cell_h }
                 }
             })
             .collect()

@@ -7665,8 +7665,8 @@ impl App {
                         // read as a real list row, not a box hugging the content.
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            // Mini-preview thumbnail on the left.
-                            self.paint_sheet_thumbnail(ui, &row.preview);
+                            // Mini-preview thumbnail on the left (real geometry).
+                            self.paint_sheet_thumbnail(ui, &row.name);
                             ui.vertical(|ui| {
                                 ui.strong(&row.name);
                                 ui.weak(&row.descriptor);
@@ -7701,65 +7701,59 @@ impl App {
         });
     }
 
-    /// Paint a small paper-space thumbnail of a sheet from its pure preview
-    /// layout: the paper outline, a hint of the bottom title strip, and each
-    /// viewport frame. Paper mm are mapped into a fixed-size egui rect (Y is
-    /// flipped, since egui's origin is top-left and paper mm are lower-left). The
-    /// layout itself is computed purely in `dyntabs::sheet_preview` (tested); this
-    /// only rasterizes it, so it always reads as "what's on the sheet" — never a
-    /// blank rectangle.
-    fn paint_sheet_thumbnail(&self, ui: &mut egui::Ui, preview: &crate::dyntabs::SheetPreview) {
-        // Fit the paper into a fixed thumbnail box, preserving aspect ratio.
+    /// Paint a small paper-space thumbnail of a sheet, rendering the REAL
+    /// projected geometry of each viewport (mini version of the full viewer) so
+    /// the row previews what's actually on the sheet. Paper mm (lower-left
+    /// origin) are mapped into a fixed-size egui box with Y flipped; placement
+    /// comes from [`Sheet::view_layout_rects`] (the same 2×2-style grid the
+    /// viewer + PDF use) and the line art from `pdf::view_segments`.
+    fn paint_sheet_thumbnail(&self, ui: &mut egui::Ui, sheet_name: &str) {
         const THUMB_W: f32 = 56.0;
         const THUMB_H: f32 = 40.0;
         let (rect, _resp) =
             ui.allocate_exact_size(egui::vec2(THUMB_W, THUMB_H), egui::Sense::hover());
         let painter = ui.painter_at(rect);
 
-        let [pw, ph] = preview.paper_mm;
+        let Some(sheet) = self.session.doc.sheets.iter().find(|s| s.name == sheet_name) else {
+            return;
+        };
+        let (pw, ph) = sheet.paper.landscape_mm();
         if pw <= 0.0 || ph <= 0.0 {
             return;
         }
         let scale = (THUMB_W as f64 / pw).min(THUMB_H as f64 / ph);
         let draw_w = (pw * scale) as f32;
         let draw_h = (ph * scale) as f32;
-        // Center the paper inside the thumbnail box.
-        let origin = egui::pos2(
-            rect.center().x - draw_w / 2.0,
-            rect.center().y - draw_h / 2.0,
-        );
+        let origin = egui::pos2(rect.center().x - draw_w / 2.0, rect.center().y - draw_h / 2.0);
         // Map a paper-mm point (lower-left origin) to a screen pos (Y flipped).
         let map = |x: f64, y: f64| -> egui::Pos2 {
-            egui::pos2(
-                origin.x + (x * scale) as f32,
-                origin.y + draw_h - (y * scale) as f32,
-            )
+            egui::pos2(origin.x + (x * scale) as f32, origin.y + draw_h - (y * scale) as f32)
         };
 
         let dark = ui.visuals().dark_mode;
-        let paper_fill = if dark {
-            egui::Color32::from_gray(230)
-        } else {
-            egui::Color32::WHITE
-        };
+        let paper_fill = if dark { egui::Color32::from_gray(230) } else { egui::Color32::WHITE };
         let frame_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(120));
-        let vp_stroke = egui::Stroke::new(0.8, egui::Color32::from_gray(90));
+        let vp_stroke = egui::Stroke::new(0.6, egui::Color32::from_gray(150));
+        let geom_stroke = egui::Stroke::new(0.6, egui::Color32::from_gray(60));
 
         // Paper sheet.
         let paper_rect = egui::Rect::from_min_max(map(0.0, ph), map(pw, 0.0));
         painter.rect_filled(paper_rect, 1.0, paper_fill);
         painter.rect_stroke(paper_rect, 1.0, frame_stroke, egui::StrokeKind::Inside);
 
-        // Each viewport frame — the "hint of the drawing" that makes the
-        // thumbnail read as a sheet, not a blank page. A faint diagonal inside
-        // each frame stands in for the projected geometry.
-        for vp in &preview.viewports {
+        // Each viewport frame + its real projected line art, clipped to the box.
+        let rects = sheet.view_layout_rects();
+        for (i, view) in sheet.views.iter().enumerate() {
+            let place = rects[i];
             let r = egui::Rect::from_min_max(
-                map(vp.min[0], vp.max[1]),
-                map(vp.max[0], vp.min[1]),
+                map(place.x, place.y + place.h),
+                map(place.x + place.w, place.y),
             );
             painter.rect_stroke(r, 0.0, vp_stroke, egui::StrokeKind::Inside);
-            painter.line_segment([r.left_bottom(), r.right_top()], vp_stroke);
+            let clip = painter.with_clip_rect(r);
+            for (a, b) in itsjustcad_commands::pdf::view_segments(&self.session.doc, view, place) {
+                clip.line_segment([map(a.x, a.y), map(b.x, b.y)], geom_stroke);
+            }
         }
 
         // Title strip along the bottom margin.
