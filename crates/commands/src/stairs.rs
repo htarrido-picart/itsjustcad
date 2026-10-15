@@ -64,6 +64,13 @@ pub const STAIR_2R_PLUS_T_TARGET: f64 = 0.630; // ≈ 24.8 in (within the 24–2
 /// 3658 mm (12 ft, IBC 1011.8). A flight taller than this gets a mid landing.
 pub const STAIR_MAX_RISE_PER_FLIGHT: f64 = 3.658; // 12 ft
 
+/// A usable positive dimension — also rejects NaN/∞. Factored out so the input
+/// guards avoid a negated float comparison (`!(x > 0.0)`), which clippy's
+/// `neg_cmp_op_on_partial_ord` lint flags on partially-ordered types.
+fn positive(x: f64) -> bool {
+    x.is_finite() && x > 0.0
+}
+
 // ── Ramp layout ─────────────────────────────────────────────────────────────
 
 /// One segment of a ramp centerline: either a sloped run or a level landing.
@@ -106,21 +113,21 @@ pub enum RampSlope {
 ///
 /// Returns an error string for non-positive rise/width or a non-positive slope.
 pub fn ramp_layout(rise: f64, slope: RampSlope, width: f64) -> Result<RampLayout, String> {
-    if !(rise > 0.0) {
+    if !positive(rise) {
         return Err("ramp rise must be positive".into());
     }
-    if !(width > 0.0) {
+    if !positive(width) {
         return Err("ramp width must be positive".into());
     }
     let slope = match slope {
         RampSlope::Ratio(r) => {
-            if !(r > 0.0) {
+            if !positive(r) {
                 return Err("ramp slope must be positive".into());
             }
             r.min(RAMP_MAX_SLOPE)
         }
         RampSlope::Run(run) => {
-            if !(run > 0.0) {
+            if !positive(run) {
                 return Err("ramp run must be positive".into());
             }
             (rise / run).min(RAMP_MAX_SLOPE)
@@ -208,10 +215,10 @@ pub fn stair_layout(
     target_riser: Option<f64>,
     target_tread: Option<f64>,
 ) -> Result<StairLayout, String> {
-    if !(rise > 0.0) {
+    if !positive(rise) {
         return Err("stair rise must be positive".into());
     }
-    if !(width > 0.0) {
+    if !positive(width) {
         return Err("stair width must be positive".into());
     }
 
