@@ -62,6 +62,7 @@ fn cli_help_text() -> String {
          \n\
          Options:\n\
          \x20 --help, -h                  Show this help\n\
+         \x20 --open <file.itsjustcad.json>  Load + replay a saved document op-log (combine with --shot to render it)\n\
          \x20 --run <script.txt | ->      Execute commands from file or stdin (one per line, # comments)\n\
          \x20 --out <file>                Save document after running script\n\
          \x20 --shot <path.png>           Render offscreen screenshot after running script\n\
@@ -96,6 +97,7 @@ fn cli_help_text() -> String {
 
 /// Parsed CLI arguments for the headless / script path.
 struct CliArgs {
+    open_path: Option<String>, // "--open <file.itsjustcad.json>"
     run_path: Option<String>, // "--run <path | ->"
     out_path: Option<String>, // "--out <file>"
     shot_path: Option<String>, // "--shot <path.png>"
@@ -103,7 +105,13 @@ struct CliArgs {
 }
 
 fn parse_cli_args() -> CliArgs {
-    let args: Vec<String> = std::env::args().collect();
+    parse_cli_args_from(&std::env::args().collect::<Vec<_>>())
+}
+
+/// Pure parse of an argv-style slice (first element is the program name).
+/// Factored out of [`parse_cli_args`] so the flag handling is unit-testable.
+fn parse_cli_args_from(args: &[String]) -> CliArgs {
+    let mut open_path = None;
     let mut run_path = None;
     let mut out_path = None;
     let mut shot_path = None;
@@ -111,6 +119,10 @@ fn parse_cli_args() -> CliArgs {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--open" => {
+                i += 1;
+                open_path = args.get(i).cloned();
+            }
             "--run" => {
                 i += 1;
                 run_path = args.get(i).cloned();
@@ -129,7 +141,24 @@ fn parse_cli_args() -> CliArgs {
         }
         i += 1;
     }
-    CliArgs { run_path, out_path, shot_path, headless }
+    CliArgs { open_path, run_path, out_path, shot_path, headless }
+}
+
+/// Seed a headless session from an optional `--open <file.itsjustcad.json>`.
+///
+/// `None` yields an empty [`Session`]. `Some(path)` replays the saved op-log via
+/// [`itsjustcad_commands::io::load_file`] (checkpoint fast-path or full replay).
+/// On a missing / unreadable / malformed / wrong-version file it prints a clear
+/// stderr message and returns `Err(2)` so the caller exits with the IO code.
+fn load_open_session(open_path: Option<&str>) -> Result<itsjustcad_commands::Session, i32> {
+    match open_path {
+        None => Ok(itsjustcad_commands::Session::default()),
+        Some(path) => itsjustcad_commands::io::load_file(std::path::Path::new(path))
+            .map_err(|e| {
+                eprintln!("error: could not open '{}': {e}", path);
+                2
+            }),
+    }
 }
 
 /// Entry point for `--run` (headless or not). Returns an OS exit code.
@@ -155,8 +184,15 @@ fn run_headless_mode(args: &CliArgs) -> i32 {
         None => String::new(),
     };
 
+    // Seed the session: either a saved op-log (`--open`, replayed via
+    // `io::load_file`) or an empty document. Any `--run` script then executes on
+    // top of it (e.g. framing / style app-verbs over a loaded massing).
+    let session = match load_open_session(args.open_path.as_deref()) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
     let lines = headless::parse_script(&src);
-    let session = itsjustcad_commands::Session::default();
     let (session, view) = match headless::run_script_lines(session, &lines) {
         Ok(s) => s,
         Err((line, msg)) => {
@@ -291,9 +327,9 @@ fn main() -> eframe::Result<()> {
         }
     }
 
-    // Explicit --run without --headless: run with a window but execute script
-    // first (honours --out / --shot via headless path if --headless is set).
-    if cli.run_path.is_some() && !cli.headless {
+    // Explicit --run or --open without --headless: run the batch path (load the
+    // doc / execute the script, then honour --out / --shot).
+    if (cli.run_path.is_some() || cli.open_path.is_some()) && !cli.headless {
         tracing_subscriber::fmt::init();
         let code = run_headless_mode(&cli);
         std::process::exit(code);
@@ -403,10 +439,89 @@ mod tests {
     #[test]
     fn cli_help_contains_run_flag() {
         let text = cli_help_text();
+        assert!(text.contains("--open"));
         assert!(text.contains("--run"));
         assert!(text.contains("--headless"));
         assert!(text.contains("--out"));
         assert!(text.contains("--shot"));
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        std::iter::once("itsjustcad")
+            .chain(parts.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn parse_open_flag_populates_path() {
+        let cli = parse_cli_args_from(&argv(&["--open", "plan.itsjustcad.json"]));
+        assert_eq!(cli.open_path.as_deref(), Some("plan.itsjustcad.json"));
+        assert!(cli.run_path.is_none());
+    }
+
+    #[test]
+    fn parse_open_with_headless_and_shot() {
+        let cli = parse_cli_args_from(&argv(&[
+            "--headless",
+            "--open",
+            "doc.itsjustcad.json",
+            "--shot",
+            "doc.png",
+        ]));
+        assert_eq!(cli.open_path.as_deref(), Some("doc.itsjustcad.json"));
+        assert_eq!(cli.shot_path.as_deref(), Some("doc.png"));
+        assert!(cli.headless);
+    }
+
+    #[test]
+    fn load_open_none_is_empty_session() {
+        let s = load_open_session(None).expect("empty session");
+        assert_eq!(s.doc.objects().count(), 0);
+    }
+
+    #[test]
+    fn load_open_missing_file_maps_to_exit_2() {
+        let missing = std::env::temp_dir().join("ijc_no_such_doc.itsjustcad.json");
+        let _ = std::fs::remove_file(&missing);
+        match load_open_session(Some(missing.to_str().unwrap())) {
+            Ok(_) => panic!("missing file should not load"),
+            Err(code) => assert_eq!(code, 2, "missing --open file must exit 2"),
+        }
+    }
+
+    #[test]
+    fn load_open_invalid_file_maps_to_exit_2() {
+        let dir = std::env::temp_dir().join(format!("ijc_open_bad_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("garbage.itsjustcad.json");
+        std::fs::write(&bad, b"not valid json {{{").unwrap();
+        match load_open_session(Some(bad.to_str().unwrap())) {
+            Ok(_) => panic!("malformed file should not load"),
+            Err(code) => assert_eq!(code, 2),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_round_trip_restores_object_count() {
+        // Save a tiny doc (one box) via the same io path the GUI uses, then
+        // reload it through `load_open_session` and assert the geometry replayed.
+        let dir = std::env::temp_dir().join(format!("ijc_open_rt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("one_box.itsjustcad.json");
+
+        let lines = vec!["box 0,0,0 1,1,1".to_owned()];
+        let (session, _view) =
+            headless::run_script_lines(itsjustcad_commands::Session::default(), &lines)
+                .expect("build doc");
+        let before = session.doc.objects().count();
+        assert_eq!(before, 1, "one box");
+        itsjustcad_commands::io::save_file(&session, &path).expect("save");
+
+        let reloaded = load_open_session(Some(path.to_str().unwrap())).expect("reload");
+        assert_eq!(reloaded.doc.objects().count(), before, "op-log replayed on open");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// On Unix, crash.log must be created with 0600 permissions.
