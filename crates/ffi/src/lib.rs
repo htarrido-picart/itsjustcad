@@ -189,6 +189,11 @@ unsafe impl Sync for SendCtx {}
 /// (and to satisfy clippy's `type_complexity`).
 type UnderlayCache = Option<(String, Arc<(Vec<u8>, u32, u32)>)>;
 
+/// A live deck stream: its task abort handle paired with the per-stream "alive"
+/// flag that `ijc_deck_stop`/`ijc_free` clear before aborting (a type alias to
+/// satisfy clippy's `type_complexity`).
+type DeckStreamTask = (tokio::task::AbortHandle, Arc<AtomicBool>);
+
 pub struct AppHandle {
     /// Liveness guard; must equal [`GUARD_LIVE`]. Poisoned on free.
     guard: u64,
@@ -231,7 +236,7 @@ pub struct AppHandle {
     /// callback already executing (the `handle_events` closure has no `.await`)
     /// cannot fire after the stop/free call returns — `abort()` alone is not a
     /// synchronous barrier.
-    tasks: Arc<Mutex<Vec<(tokio::task::AbortHandle, Arc<AtomicBool>)>>>,
+    tasks: Arc<Mutex<Vec<DeckStreamTask>>>,
 
     /// When true (the default), deck-emitted commands are applied automatically
     /// as they stream. When false, they are only emitted to the callback (for
