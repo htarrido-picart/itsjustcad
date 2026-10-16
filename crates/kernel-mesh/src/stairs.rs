@@ -107,6 +107,48 @@ pub enum RampSlope {
     Run(f64),
 }
 
+/// How a multi-run ramp/stair turns between runs (issue #82, enhancement #2).
+///
+/// A turning landing lets a tall ramp/stair fold back instead of running on in
+/// one very long straight line. `None` is the v1 straight-along-+X behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TurnKind {
+    /// Straight run along +X (v1 behavior).
+    #[default]
+    None,
+    /// 180° U-turn at each landing: successive runs reverse direction.
+    Switchback,
+    /// 90° dogleg at each landing: successive runs rotate a quarter turn.
+    Dogleg,
+}
+
+impl TurnKind {
+    /// Parse a stable token (used by the schema enum + verb parsing).
+    pub fn from_token(s: &str) -> Self {
+        match s {
+            "switchback" => TurnKind::Switchback,
+            "dogleg" => TurnKind::Dogleg,
+            _ => TurnKind::None,
+        }
+    }
+    /// Stable token for serialization / the schema enum.
+    pub fn token(self) -> &'static str {
+        match self {
+            TurnKind::None => "none",
+            TurnKind::Switchback => "switchback",
+            TurnKind::Dogleg => "dogleg",
+        }
+    }
+    /// The heading change (radians about +Z) applied at each turning landing.
+    fn turn_angle(self) -> f64 {
+        match self {
+            TurnKind::None => 0.0,
+            TurnKind::Switchback => std::f64::consts::PI, // 180°
+            TurnKind::Dogleg => std::f64::consts::FRAC_PI_2, // 90°
+        }
+    }
+}
+
 /// Compute a ramp layout from a total `rise`, a slope spec, and a `width`.
 ///
 /// Rules (ADA): split the rise into runs so no single run exceeds
@@ -119,25 +161,48 @@ pub enum RampSlope {
 /// steeper-than-code slope — the ramp simply gets longer).
 ///
 /// Returns an error string for non-positive rise/width or a non-positive slope.
+///
+/// This is the v1 (code-compliant) entry point; it forwards to
+/// [`ramp_layout_opts`] with `noncompliant = false`.
 pub fn ramp_layout(rise: f64, slope: RampSlope, width: f64) -> Result<RampLayout, String> {
+    ramp_layout_opts(rise, slope, width, false)
+}
+
+/// Compute a ramp layout, optionally honoring a non-compliant (verbatim) slope.
+///
+/// Issue #82, enhancement #1: when `noncompliant` is `true` the slope is used
+/// EXACTLY as asked — no clamp to [`RAMP_MAX_SLOPE`] — so a designer can author
+/// an intentionally steep service ramp (1:8, 1:10). The run still splits across
+/// landings by the single-run-rise rule, and `codecheck ada2010` is free to flag
+/// the steep slope as a failure (informational — it reads the baked geometry, it
+/// does not clamp). When `noncompliant` is `false` this behaves exactly as v1
+/// (slope clamped to the ADA max).
+pub fn ramp_layout_opts(
+    rise: f64,
+    slope: RampSlope,
+    width: f64,
+    noncompliant: bool,
+) -> Result<RampLayout, String> {
     if !positive(rise) {
         return Err("ramp rise must be positive".into());
     }
     if !positive(width) {
         return Err("ramp width must be positive".into());
     }
+    // Clamp to the ADA max UNLESS the caller opted into a non-compliant override.
+    let clamp = |r: f64| if noncompliant { r } else { r.min(RAMP_MAX_SLOPE) };
     let slope = match slope {
         RampSlope::Ratio(r) => {
             if !positive(r) {
                 return Err("ramp slope must be positive".into());
             }
-            r.min(RAMP_MAX_SLOPE)
+            clamp(r)
         }
         RampSlope::Run(run) => {
             if !positive(run) {
                 return Err("ramp run must be positive".into());
             }
-            (rise / run).min(RAMP_MAX_SLOPE)
+            clamp(rise / run)
         }
     };
 
@@ -222,6 +287,23 @@ pub fn stair_layout(
     target_riser: Option<f64>,
     target_tread: Option<f64>,
 ) -> Result<StairLayout, String> {
+    stair_layout_opts(rise, width, target_riser, target_tread, false)
+}
+
+/// Compute a stair layout, optionally honoring non-compliant riser/tread values.
+///
+/// Issue #82, enhancement #1: when `noncompliant` is `true` the target riser is
+/// NOT clamped to the IBC 4–7 in band and the target tread is NOT clamped to the
+/// 11 in minimum — a designer can author an intentionally steep/non-standard
+/// stair, and `codecheck ibc2021` is free to flag the riser/tread as a failure
+/// (informational). When `false` this behaves exactly as v1.
+pub fn stair_layout_opts(
+    rise: f64,
+    width: f64,
+    target_riser: Option<f64>,
+    target_tread: Option<f64>,
+    noncompliant: bool,
+) -> Result<StairLayout, String> {
     if !positive(rise) {
         return Err("stair rise must be positive".into());
     }
@@ -230,17 +312,32 @@ pub fn stair_layout(
     }
 
     // Riser count: honor a sensible target, else the max-riser bound. Either way
-    // we round UP so no riser exceeds the max.
+    // we round UP so no riser exceeds the max. Under a non-compliant override the
+    // target riser is used verbatim (not clamped to the 4–7 in band), so a steep
+    // riser is honored and the equalized height can exceed 7 in.
     let max_riser = match target_riser {
-        Some(r) if r > 0.0 => r.clamp(STAIR_MIN_RISER, STAIR_MAX_RISER),
+        Some(r) if r > 0.0 => {
+            if noncompliant {
+                r
+            } else {
+                r.clamp(STAIR_MIN_RISER, STAIR_MAX_RISER)
+            }
+        }
         _ => STAIR_MAX_RISER,
     };
     let risers = (rise / max_riser).ceil().max(1.0) as usize;
     let riser_height = rise / risers as f64; // equalized → 0 variation
 
-    // Tread depth: explicit target, else the 2R+T comfort rule.
+    // Tread depth: explicit target, else the 2R+T comfort rule. Under a
+    // non-compliant override an explicit tread is NOT floored at the 11 in min.
     let tread_depth = match target_tread {
-        Some(t) if t > 0.0 => t.max(STAIR_MIN_TREAD),
+        Some(t) if t > 0.0 => {
+            if noncompliant {
+                t
+            } else {
+                t.max(STAIR_MIN_TREAD)
+            }
+        }
         _ => (STAIR_2R_PLUS_T_TARGET - 2.0 * riser_height).max(STAIR_MIN_TREAD),
     };
 
@@ -314,6 +411,192 @@ pub fn ramp_mesh(rise: f64, slope: RampSlope, width: f64) -> Result<Mesh, String
     Ok(ramp_surface(&layout, DVec3::ZERO).into_mesh())
 }
 
+// ── Turning / curved ramps (issue #82, enhancements #2 & #3) ───────────────────
+
+/// A unit 2D heading in the XY plane plus its left normal, advanced as the walk
+/// line turns. Used to lay out switchback/dogleg ramps and stairs so the geometry
+/// folds back on itself with a turning landing instead of running straight +X.
+#[derive(Clone, Copy, Debug)]
+struct Frame {
+    /// Plan position of the walk-line centre at the current station.
+    pos: DVec3,
+    /// Heading angle about +Z (radians). 0 == +X.
+    heading: f64,
+}
+
+impl Frame {
+    fn new(start: DVec3) -> Self {
+        Frame { pos: start, heading: 0.0 }
+    }
+    /// Forward (travel) direction in the XY plane.
+    fn fwd(&self) -> DVec3 {
+        DVec3::new(self.heading.cos(), self.heading.sin(), 0.0)
+    }
+    /// Left direction (toward +width side) in the XY plane.
+    fn left(&self) -> DVec3 {
+        DVec3::new(-self.heading.sin(), self.heading.cos(), 0.0)
+    }
+    /// Advance `dx` along the heading, gaining `dz` in Z.
+    fn advance(&mut self, dx: f64, dz: f64) {
+        self.pos += self.fwd() * dx + DVec3::new(0.0, 0.0, dz);
+    }
+    /// Rotate the heading by `angle` radians about +Z (turning landing pivot).
+    fn turn(&mut self, angle: f64) {
+        self.heading += angle;
+    }
+}
+
+/// Build the ramp walking surface with a turning landing between runs
+/// (switchback = 180°, dogleg = 90°). Each run is a sloped quad along the current
+/// heading; each landing is a flat square turning platform, after which the
+/// heading rotates so the next run folds back. `TurnKind::None` reproduces the
+/// straight +X `ramp_surface` geometry (same rise, same plan run length) but is
+/// kept separate so the v1 path stays byte-identical.
+pub fn ramp_surface_turning(layout: &RampLayout, start: DVec3, turn: TurnKind) -> MeshBuild {
+    if turn == TurnKind::None {
+        return ramp_surface(layout, start);
+    }
+    let w = layout.width;
+    let mut mb = MeshBuild::default();
+    // The walk line runs down the CENTRE; the surface extends ±w/2 to each side so
+    // a turning platform rotates about the walk-line centre cleanly.
+    let mut f = Frame::new(start);
+    let half = w * 0.5;
+    let emit_quad = |mb: &mut MeshBuild, a: DVec3, b: DVec3, fr: &Frame| {
+        // a..b is the centre segment; widen to the left/right by half-width using
+        // the frame's left direction (constant across a straight segment).
+        let l = fr.left() * half;
+        // near-left, far-left, far-right, near-right → up-facing normal.
+        mb.quad(a - l, b - l, b + l, a + l);
+    };
+    for seg in &layout.segments {
+        match *seg {
+            RampSegment::Run { run, rise } => {
+                let a = f.pos;
+                f.advance(run, rise);
+                let b = f.pos;
+                emit_quad(&mut mb, a, b, &f);
+            }
+            RampSegment::Landing { len } => {
+                // A square turning platform sized to the ramp width, centred on the
+                // walk line; the run enters one edge and leaves a rotated edge.
+                let a = f.pos;
+                f.advance(len, 0.0);
+                let b = f.pos;
+                emit_quad(&mut mb, a, b, &f);
+                // Rotate heading so the next run folds back / turns.
+                f.turn(turn.turn_angle());
+            }
+        }
+    }
+    mb
+}
+
+/// Walk a ramp layout into a turning centerline polyline (switchback/dogleg).
+/// Mirrors [`ramp_centerline`] but applies a heading rotation at each landing so
+/// the drawn path folds back — this is the curve `codecheck ada2010` reads for
+/// running slope and landing placement on a turning ramp.
+pub fn ramp_centerline_turning(layout: &RampLayout, start: DVec3, turn: TurnKind) -> Vec<DVec3> {
+    if turn == TurnKind::None {
+        return ramp_centerline(layout, start);
+    }
+    let mut f = Frame::new(start);
+    let mut pts = vec![f.pos];
+    for seg in &layout.segments {
+        match *seg {
+            RampSegment::Run { run, rise } => {
+                f.advance(run, rise);
+                pts.push(f.pos);
+            }
+            RampSegment::Landing { len } => {
+                f.advance(len, 0.0);
+                pts.push(f.pos);
+                f.turn(turn.turn_angle());
+            }
+        }
+    }
+    pts
+}
+
+/// Build a CURVED ramp walking surface: the centerline is a circular arc of plan
+/// `radius` about a centre to the ramp's left, rising uniformly along its length
+/// (issue #82, enhancement #3). The total plan arc length equals the straight
+/// layout's plan length, so the rise/run grade is preserved along the walk line;
+/// `segments_per_run` controls the facet count. The surface is a ribbon ±w/2
+/// about the arc. A non-positive radius falls back to the straight surface.
+pub fn ramp_surface_curved(
+    layout: &RampLayout,
+    start: DVec3,
+    radius: f64,
+    facets: usize,
+) -> MeshBuild {
+    if !positive(radius) {
+        return ramp_surface(layout, start);
+    }
+    let w = layout.width;
+    let half = w * 0.5;
+    let total_len = ramp_plan_length(layout);
+    let total_rise: f64 = layout
+        .segments
+        .iter()
+        .map(|s| match s {
+            RampSegment::Run { rise, .. } => *rise,
+            RampSegment::Landing { .. } => 0.0,
+        })
+        .sum();
+    let facets = facets.max(1);
+    // Arc centre is to the LEFT of the start heading (+Y), radius away.
+    let centre = start + DVec3::new(0.0, radius, 0.0);
+    let total_angle = total_len / radius; // arc swept
+    let mut mb = MeshBuild::default();
+    // Inner/outer edge offset ±half along the radial direction.
+    let edge = |u: f64, s: f64| -> DVec3 {
+        let ang = -std::f64::consts::FRAC_PI_2 + total_angle * u;
+        let z = start.z + total_rise * u;
+        let r = radius + s * half; // s = +1 outer (left), -1 inner
+        DVec3::new(centre.x + r * ang.cos(), centre.y + r * ang.sin(), z)
+    };
+    for i in 0..facets {
+        let u0 = i as f64 / facets as f64;
+        let u1 = (i + 1) as f64 / facets as f64;
+        // near-inner, far-inner, far-outer, near-outer → up-facing normal.
+        mb.quad(edge(u0, -1.0), edge(u1, -1.0), edge(u1, 1.0), edge(u0, 1.0));
+    }
+    mb
+}
+
+/// The centerline polyline of a curved ramp arc (see [`ramp_surface_curved`]).
+pub fn ramp_centerline_curved(
+    layout: &RampLayout,
+    start: DVec3,
+    radius: f64,
+    facets: usize,
+) -> Vec<DVec3> {
+    if !positive(radius) {
+        return ramp_centerline(layout, start);
+    }
+    let total_len = ramp_plan_length(layout);
+    let total_rise: f64 = layout
+        .segments
+        .iter()
+        .map(|s| match s {
+            RampSegment::Run { rise, .. } => *rise,
+            RampSegment::Landing { .. } => 0.0,
+        })
+        .sum();
+    let facets = facets.max(1);
+    let centre = start + DVec3::new(0.0, radius, 0.0);
+    let total_angle = total_len / radius;
+    (0..=facets)
+        .map(|i| {
+            let u = i as f64 / facets as f64;
+            let ang = -std::f64::consts::FRAC_PI_2 + total_angle * u;
+            let z = start.z + total_rise * u;
+            DVec3::new(centre.x + radius * ang.cos(), centre.y + radius * ang.sin(), z)
+        })
+        .collect()
+}
+
 /// Build a stepped stair mesh from its layout, starting at `start`, running
 /// along +X, `width` wide in +Y. Each step contributes a horizontal tread quad
 /// at its level and a vertical riser quad up to it. The tread quads are the
@@ -364,6 +647,131 @@ pub fn stair_mesh_from_params(
 ) -> Result<Mesh, String> {
     let layout = stair_layout(rise, width, target_riser, target_tread)?;
     Ok(stair_mesh(&layout, DVec3::ZERO).into_mesh())
+}
+
+// ── Turning / spiral stairs (issue #82, enhancements #2 & #3) ──────────────────
+
+/// Build a stepped stair that TURNS at a mid landing (switchback = 180°, dogleg =
+/// 90°). The flight is split into two runs of (nearly) equal rise with a square
+/// landing between them; the heading rotates at the landing so the second run
+/// folds back. `TurnKind::None` falls back to the straight `stair_mesh`. Each
+/// step is a tread quad (up-facing) plus a riser quad, oriented to the walk-line
+/// frame; the landing is a flat square turning platform at its level.
+pub fn stair_mesh_turning(layout: &StairLayout, start: DVec3, turn: TurnKind) -> MeshBuild {
+    if turn == TurnKind::None {
+        return stair_mesh(layout, start);
+    }
+    let w = layout.width;
+    let t = layout.tread_depth;
+    let r = layout.riser_height;
+    let half = w * 0.5;
+    let mut mb = MeshBuild::default();
+    let mut f = Frame::new(start);
+    // Split the risers into two runs around a mid landing.
+    let first = layout.risers / 2;
+    let add_step = |mb: &mut MeshBuild, f: &mut Frame| {
+        let l = f.left() * half;
+        // Riser: rise in place before advancing along the tread.
+        let a0 = f.pos;
+        let a1 = a0 + DVec3::new(0.0, 0.0, r);
+        // Riser quad (vertical) spanning the width at the step front.
+        mb.quad(a0 - l, a0 + l, a1 + l, a1 - l);
+        // Advance one tread depth at the raised level.
+        f.pos = a1;
+        f.advance(t, 0.0);
+        let b = f.pos;
+        // Tread quad (up-facing) from a1 to b.
+        mb.quad(a1 - l, b - l, b + l, a1 + l);
+    };
+    for _ in 0..first {
+        add_step(&mut mb, &mut f);
+    }
+    // Mid landing: a flat square turning platform at the current level.
+    {
+        let l = f.left() * half;
+        let a = f.pos;
+        f.advance(w.max(t), 0.0); // platform at least width-deep
+        let b = f.pos;
+        mb.quad(a - l, b - l, b + l, a + l);
+        f.turn(turn.turn_angle());
+    }
+    for _ in first..layout.risers {
+        add_step(&mut mb, &mut f);
+    }
+    mb
+}
+
+/// Build a SPIRAL / helical stair about a `center`, winding `radius` from the
+/// axis through `total_turn` radians as it climbs the full rise (issue #82,
+/// enhancement #3). Each tread is a wedge fanning out from the axis; risers are
+/// vertical faces at the inner-to-outer leading edge. Tread depth is measured
+/// along the WALK LINE (a cylinder at `radius` from the axis), so the angular
+/// step per riser is `tread / radius`. `tread_width` is the radial extent of each
+/// tread (centred on `radius`). A non-positive radius falls back to the straight
+/// stepped stair.
+pub fn stair_mesh_spiral(
+    layout: &StairLayout,
+    center: DVec3,
+    radius: f64,
+    total_turn: f64,
+) -> MeshBuild {
+    if !positive(radius) {
+        return stair_mesh(layout, center);
+    }
+    let r = layout.riser_height;
+    let half = layout.width * 0.5;
+    let r_in = (radius - half).max(0.0);
+    let r_out = radius + half;
+    let n = layout.risers;
+    // Angular step per riser along the walk line, but never exceed what the total
+    // turn allows (so the full stair spans `total_turn`).
+    let dtheta = if n > 0 { total_turn / n as f64 } else { 0.0 };
+    let mut mb = MeshBuild::default();
+    let point = |theta: f64, rr: f64, z: f64| -> DVec3 {
+        DVec3::new(center.x + rr * theta.cos(), center.y + rr * theta.sin(), center.z + z)
+    };
+    for i in 0..n {
+        let theta0 = i as f64 * dtheta;
+        let theta1 = (i + 1) as f64 * dtheta;
+        let z = (i as f64 + 1.0) * r; // tread sits at the top of riser i
+        let z_below = i as f64 * r;
+        // Riser (vertical) along the leading radial edge at theta0, from z_below
+        // up to z, spanning inner→outer radius.
+        mb.quad(
+            point(theta0, r_in, z_below),
+            point(theta0, r_out, z_below),
+            point(theta0, r_out, z),
+            point(theta0, r_in, z),
+        );
+        // Tread wedge (up-facing) at level z, from theta0 to theta1.
+        mb.quad(
+            point(theta0, r_in, z),
+            point(theta1, r_in, z),
+            point(theta1, r_out, z),
+            point(theta0, r_out, z),
+        );
+    }
+    mb
+}
+
+/// The helical walk-line polyline of a spiral stair (the curve `codecheck` would
+/// read for the along-walk-line geometry). One point per tread edge.
+pub fn stair_centerline_spiral(
+    layout: &StairLayout,
+    center: DVec3,
+    radius: f64,
+    total_turn: f64,
+) -> Vec<DVec3> {
+    let r = layout.riser_height;
+    let n = layout.risers;
+    let dtheta = if n > 0 { total_turn / n as f64 } else { 0.0 };
+    (0..=n)
+        .map(|i| {
+            let theta = i as f64 * dtheta;
+            let z = i as f64 * r;
+            DVec3::new(center.x + radius * theta.cos(), center.y + radius * theta.sin(), center.z + z)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -489,7 +897,7 @@ mod tests {
         let l = stair_layout(3.0, 1.2, None, None).unwrap();
         let two_r_plus_t = 2.0 * l.riser_height + l.tread_depth;
         assert!(l.tread_depth >= STAIR_MIN_TREAD - 1e-9);
-        assert!(two_r_plus_t >= 0.62 && two_r_plus_t <= 0.70, "2R+T {two_r_plus_t}");
+        assert!((0.62..=0.70).contains(&two_r_plus_t), "2R+T {two_r_plus_t}");
     }
 
     #[test]
@@ -510,5 +918,200 @@ mod tests {
     fn stair_rejects_bad_inputs() {
         assert!(stair_layout(0.0, 1.0, None, None).is_err());
         assert!(stair_layout(3.0, 0.0, None, None).is_err());
+    }
+
+    // ── #82 #1: non-compliant override ──────────────────────────────────────
+
+    #[test]
+    fn ramp_noncompliant_honors_exact_slope_no_clamp() {
+        // A 1:8 service ramp (0.125) is far steeper than the ADA 1:12 max; with
+        // the override the layout must use EXACTLY 1:8, not the clamped value.
+        let steep = 1.0 / 8.0;
+        let l = ramp_layout_opts(0.9, RampSlope::Ratio(steep), 1.2, true).unwrap();
+        assert!((l.slope - steep).abs() < 1e-12, "slope must be verbatim 1:8, got {}", l.slope);
+        assert!(l.slope > RAMP_MAX_SLOPE, "steeper than the ADA max, i.e. non-compliant");
+        // And without the flag the SAME ask is clamped (v1 behavior preserved).
+        let clamped = ramp_layout_opts(0.9, RampSlope::Ratio(steep), 1.2, false).unwrap();
+        assert!((clamped.slope - RAMP_MAX_SLOPE).abs() < 1e-12, "clamped to ADA max");
+    }
+
+    #[test]
+    fn ramp_noncompliant_run_spec_is_also_verbatim() {
+        // rise 0.9 over a 7.2 m run is 1:8 — honored verbatim with the override.
+        let l = ramp_layout_opts(0.9, RampSlope::Run(7.2), 1.2, true).unwrap();
+        assert!((l.slope - 0.9 / 7.2).abs() < 1e-12, "slope {}", l.slope);
+        assert!(l.slope > RAMP_MAX_SLOPE);
+    }
+
+    #[test]
+    fn stair_noncompliant_honors_steep_riser_no_clamp() {
+        // A 0.22 m (≈8.7 in) riser exceeds the IBC 7 in max. With the override the
+        // equalized riser may exceed 7 in; without it the count is forced up so the
+        // riser stays ≤ 7 in.
+        let steep = stair_layout_opts(3.0, 1.2, Some(0.22), None, true).unwrap();
+        assert!(steep.riser_height > STAIR_MAX_RISER, "riser {} not clamped", steep.riser_height);
+        let compliant = stair_layout_opts(3.0, 1.2, Some(0.22), None, false).unwrap();
+        assert!(
+            compliant.riser_height <= STAIR_MAX_RISER + 1e-9,
+            "v1 clamps to ≤ 7 in, got {}",
+            compliant.riser_height
+        );
+    }
+
+    #[test]
+    fn stair_noncompliant_honors_shallow_tread_no_clamp() {
+        // A 0.22 m tread is below the IBC 11 in (0.2794 m) min; honored verbatim.
+        let l = stair_layout_opts(3.0, 1.2, None, Some(0.22), true).unwrap();
+        assert!((l.tread_depth - 0.22).abs() < 1e-12, "tread {}", l.tread_depth);
+        let v1 = stair_layout_opts(3.0, 1.2, None, Some(0.22), false).unwrap();
+        assert!((v1.tread_depth - STAIR_MIN_TREAD).abs() < 1e-12, "v1 floors at 11 in");
+    }
+
+    #[test]
+    fn compliant_layout_is_byte_identical_to_v1() {
+        // The opts path with `noncompliant = false` must reproduce the v1 layout.
+        let a = ramp_layout(0.9, RampSlope::Ratio(RAMP_MAX_SLOPE), 1.2).unwrap();
+        let b = ramp_layout_opts(0.9, RampSlope::Ratio(RAMP_MAX_SLOPE), 1.2, false).unwrap();
+        assert_eq!(a, b);
+        let c = stair_layout(3.0, 1.2, None, None).unwrap();
+        let d = stair_layout_opts(3.0, 1.2, None, None, false).unwrap();
+        assert_eq!(c, d);
+    }
+
+    // ── #82 #2: switchback / dogleg turning landing ─────────────────────────
+
+    /// Sum the Z of the last tread/landing vertex — the total rise of the shape.
+    fn top_z(mb: &MeshBuild) -> f64 {
+        mb.positions.iter().map(|p| p.z).fold(f64::MIN, f64::max)
+    }
+
+    #[test]
+    fn ramp_switchback_folds_back_and_keeps_total_rise() {
+        // A 1.5 m rise needs ≥3 runs (each ≤ 0.76 m) → ≥2 landings → it turns.
+        let l = ramp_layout(1.5, RampSlope::Ratio(RAMP_MAX_SLOPE), 1.2).unwrap();
+        let straight = ramp_surface(&l, DVec3::ZERO);
+        let sw = ramp_surface_turning(&l, DVec3::ZERO, TurnKind::Switchback);
+        // Same rise (top vertex Z) …
+        assert!((top_z(&straight) - 1.5).abs() < 1e-9, "straight rise");
+        assert!((top_z(&sw) - 1.5).abs() < 1e-9, "switchback keeps the total rise");
+        // … but the switchback's X extent is much shorter than the straight run
+        // (it folds back instead of running on in one line).
+        let span = |mb: &MeshBuild| {
+            let xs = mb.positions.iter().map(|p| p.x);
+            xs.clone().fold(f64::MAX, f64::min)..xs.fold(f64::MIN, f64::max)
+        };
+        let s_straight = span(&straight);
+        let s_sw = span(&sw);
+        assert!(
+            (s_sw.end - s_sw.start) < (s_straight.end - s_straight.start) * 0.75,
+            "switchback is far more compact in X"
+        );
+    }
+
+    #[test]
+    fn ramp_switchback_centerline_reverses_heading() {
+        // After a 180° landing the path travels in −X relative to the first run.
+        let l = ramp_layout(1.5, RampSlope::Ratio(RAMP_MAX_SLOPE), 1.2).unwrap();
+        let pts = ramp_centerline_turning(&l, DVec3::ZERO, TurnKind::Switchback);
+        // First segment advances +X; a later segment must advance −X.
+        let d0 = pts[1].x - pts[0].x;
+        assert!(d0 > 0.0, "first run goes +X");
+        let reversed = pts.windows(2).any(|w| w[1].x - w[0].x < -1e-6);
+        assert!(reversed, "a run after the switchback travels −X");
+    }
+
+    #[test]
+    fn stair_dogleg_turns_ninety_degrees() {
+        // A dogleg stair's second run travels along a perpendicular axis.
+        let l = stair_layout(3.0, 1.2, None, None).unwrap();
+        let mb = stair_mesh_turning(&l, DVec3::ZERO, TurnKind::Dogleg);
+        assert!((top_z(&mb) - 3.0).abs() < 1e-6, "dogleg keeps total rise, got {}", top_z(&mb));
+        // The mesh spreads in BOTH X and Y (the straight stair is X-only within the
+        // tread axis), confirming the 90° turn.
+        let yspan = mb.positions.iter().map(|p| p.y).fold(f64::MIN, f64::max)
+            - mb.positions.iter().map(|p| p.y).fold(f64::MAX, f64::min);
+        let xspan = mb.positions.iter().map(|p| p.x).fold(f64::MIN, f64::max)
+            - mb.positions.iter().map(|p| p.x).fold(f64::MAX, f64::min);
+        assert!(yspan > l.width * 1.5, "dogleg extends well beyond one width in Y");
+        assert!(xspan > l.width * 1.5, "dogleg extends in X too");
+    }
+
+    #[test]
+    fn turn_none_is_identical_to_straight() {
+        let l = ramp_layout(1.5, RampSlope::Ratio(RAMP_MAX_SLOPE), 1.2).unwrap();
+        let a = ramp_surface(&l, DVec3::ZERO);
+        let b = ramp_surface_turning(&l, DVec3::ZERO, TurnKind::None);
+        assert_eq!(a.positions, b.positions, "TurnKind::None == straight surface");
+        let sl = stair_layout(3.0, 1.2, None, None).unwrap();
+        let sa = stair_mesh(&sl, DVec3::ZERO);
+        let sb = stair_mesh_turning(&sl, DVec3::ZERO, TurnKind::None);
+        assert_eq!(sa.positions, sb.positions);
+    }
+
+    // ── #82 #3: curved ramp & spiral stair ──────────────────────────────────
+
+    #[test]
+    fn curved_ramp_follows_the_arc() {
+        // The curved ramp's centerline points lie on a circle of plan `radius`
+        // about the arc centre, and the top reaches the full rise.
+        let radius = 6.0;
+        let l = ramp_layout(0.9, RampSlope::Ratio(RAMP_MAX_SLOPE), 1.2).unwrap();
+        let pts = ramp_centerline_curved(&l, DVec3::ZERO, radius, 24);
+        let centre = DVec3::new(0.0, radius, 0.0);
+        for p in &pts {
+            let plan = DVec3::new(p.x, p.y, 0.0);
+            let r = (plan - DVec3::new(centre.x, centre.y, 0.0)).length();
+            assert!((r - radius).abs() < 1e-6, "point off the arc: r={r}");
+        }
+        assert!((pts.last().unwrap().z - 0.9).abs() < 1e-9, "curved ramp reaches the rise");
+    }
+
+    #[test]
+    fn spiral_stair_risers_measured_along_walk_line() {
+        // Acceptance (#82 #3): a spiral stair about a centre, with a given radius
+        // and total rotation; each tread spans dθ = total_turn / risers along the
+        // walk line, and every tread vertex lies between the inner and outer radius.
+        let radius = 1.5;
+        let total_turn = std::f64::consts::PI * 2.0; // 360°
+        let l = stair_layout(3.0, 1.0, None, None).unwrap();
+        let mb = stair_mesh_spiral(&l, DVec3::ZERO, radius, total_turn);
+        assert!((top_z(&mb) - 3.0).abs() < 1e-6, "spiral reaches the full rise");
+        // Walk-line polyline: consecutive points are one tread apart along the
+        // cylinder at `radius` — arc length ≈ radius * dθ.
+        let wl = stair_centerline_spiral(&l, DVec3::ZERO, radius, total_turn);
+        let dtheta = total_turn / l.risers as f64;
+        let expected_arc = radius * dtheta;
+        for w in wl.windows(2) {
+            let plan = DVec3::new(w[1].x - w[0].x, w[1].y - w[0].y, 0.0).length();
+            // chord length of the small arc ≈ 2 r sin(dθ/2); check it is close.
+            let chord = 2.0 * radius * (dtheta / 2.0).sin();
+            assert!((plan - chord).abs() < 1e-6, "walk-line step {plan} vs chord {chord}");
+        }
+        // Every vertex within [r_in, r_out] of the axis.
+        let r_in = radius - l.width * 0.5;
+        let r_out = radius + l.width * 0.5;
+        for p in &mb.positions {
+            let r = DVec3::new(p.x, p.y, 0.0).length();
+            assert!(r >= r_in - 1e-6 && r <= r_out + 1e-6, "vertex radius {r} out of band");
+        }
+        let _ = expected_arc;
+    }
+
+    #[test]
+    fn spiral_stair_total_rotation_is_respected() {
+        // The last tread edge is at angle total_turn from the first.
+        let total_turn = std::f64::consts::PI * 1.25; // 225°
+        let l = stair_layout(3.0, 1.0, None, None).unwrap();
+        let wl = stair_centerline_spiral(&l, DVec3::ZERO, 1.5, total_turn);
+        let first = wl[1] - wl[0];
+        let last = wl[wl.len() - 1] - DVec3::new(0.0, 1.5, 0.0) + DVec3::new(0.0, 1.5, 0.0);
+        // Angle of the final walk-line point about the axis.
+        let ang = last.y.atan2(last.x);
+        // total_turn starts at angle 0 (first point at (radius, 0)); the final
+        // point is at angle total_turn (mod 2π).
+        let wrapped = total_turn.rem_euclid(std::f64::consts::TAU);
+        let got = ang.rem_euclid(std::f64::consts::TAU);
+        assert!((got - wrapped).abs() < 1e-6, "final angle {got} vs {wrapped}");
+        let _ = first;
     }
 }

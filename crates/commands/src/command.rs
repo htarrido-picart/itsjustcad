@@ -1946,6 +1946,19 @@ pub enum Command {
         run: Option<f64>,
         /// Ramp width, metres.
         width: f64,
+        /// Issue #82: honor the slope verbatim, bypassing the ADA 1:12 clamp.
+        /// `codecheck ada2010` is then free to flag the steep slope. Default
+        /// false → v1 behavior.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        noncompliant: bool,
+        /// Issue #82: fold the ramp back at its landings — `none` (straight, v1),
+        /// `switchback` (180°) or `dogleg` (90°).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<String>,
+        /// Issue #82: curve the centerline along an arc of this plan radius
+        /// (metres). `None`/0 → straight (v1).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        radius: Option<f64>,
         /// Object ids created on apply (surface mesh + centerline curve),
         /// written back so undo removes the exact same set.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1970,6 +1983,25 @@ pub enum Command {
         /// derive from 2R+T.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tread: Option<f64>,
+        /// Issue #82: honor riser/tread verbatim, bypassing the IBC 4–7 in riser
+        /// band and 11 in tread min. Default false → v1 behavior.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        noncompliant: bool,
+        /// Issue #82: turn at a mid landing — `none` (straight, v1), `switchback`
+        /// (180°) or `dogleg` (90°).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<String>,
+        /// Issue #82: a spiral/helical stair winding `spiral_radius` metres from a
+        /// center axis through `spiral_turn` degrees. `None`/false → straight.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        spiral: bool,
+        /// Spiral radius, metres (walk-line distance from the axis). Used when
+        /// `spiral` is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spiral_radius: Option<f64>,
+        /// Spiral total turn, degrees. Used when `spiral` is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spiral_turn: Option<f64>,
         /// Object ids created on apply (stepped mesh), written back for replay.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ids: Vec<ObjectId>,

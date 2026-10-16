@@ -2404,6 +2404,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "wall" => parse_area(AreaKind::Wall, &args),
         "ramp" => parse_ramp(&args),
         "stair" => parse_stair(&args),
+        "spiral" => parse_spiral(&args),
         "load" => parse_load(&args),
         "support" => parse_support(&args),
         "undo" => Ok(Command::Undo),
@@ -3204,8 +3205,29 @@ fn parse_ramp(args: &[&str]) -> Result<Command, ParseError> {
     let mut slope: Option<f64> = None;
     let mut run: Option<f64> = None;
     let mut width: Option<f64> = None;
+    // Issue #82 additive options.
+    let mut noncompliant = false;
+    let mut turn: Option<String> = None;
+    let mut radius: Option<f64> = None;
     let mut it = args.iter();
     while let Some(&kw) = it.next() {
+        // `noncompliant`, `switchback` and `dogleg` are FLAG keywords (no value);
+        // everything else consumes the next token as its value.
+        match kw {
+            "noncompliant" => {
+                noncompliant = true;
+                continue;
+            }
+            "switchback" => {
+                turn = Some("switchback".to_string());
+                continue;
+            }
+            "dogleg" => {
+                turn = Some("dogleg".to_string());
+                continue;
+            }
+            _ => {}
+        }
         let v = *it
             .next()
             .ok_or_else(|| wrong_err("ramp", "a value after each keyword", args))?;
@@ -3214,7 +3236,15 @@ fn parse_ramp(args: &[&str]) -> Result<Command, ParseError> {
             "width" => width = Some(number(v)?),
             "run" => run = Some(number(v)?),
             "slope" => slope = Some(parse_slope_ratio(v)?),
-            _ => return wrong("ramp", "keywords rise/slope/run/width", args),
+            "turn" => turn = Some(parse_turn_token(v, args)?),
+            "radius" | "curve" => radius = Some(number(v)?),
+            _ => {
+                return wrong(
+                    "ramp",
+                    "keywords rise/slope/run/width/turn/radius or flags noncompliant/switchback/dogleg",
+                    args,
+                )
+            }
         }
     }
     let (Some(rise), Some(width)) = (rise, width) else {
@@ -3226,7 +3256,15 @@ fn parse_ramp(args: &[&str]) -> Result<Command, ParseError> {
     if slope.is_some() && run.is_some() {
         return wrong("ramp", "only one of slope or run", args);
     }
-    Ok(Command::Ramp { rise, slope, run, width, ids: Vec::new() })
+    Ok(Command::Ramp { rise, slope, run, width, noncompliant, turn, radius, ids: Vec::new() })
+}
+
+/// Parse a turn token (`none` / `switchback` / `dogleg`) for ramp/stair.
+fn parse_turn_token(v: &str, args: &[&str]) -> Result<String, ParseError> {
+    match v {
+        "none" | "switchback" | "dogleg" => Ok(v.to_string()),
+        _ => Err(wrong_err("turn", "none, switchback or dogleg", args)),
+    }
 }
 
 /// Parse a rise:run ratio token (`1:12`, `1:8`) into a slope fraction. Also
@@ -3243,14 +3281,58 @@ fn parse_slope_ratio(s: &str) -> Result<f64, ParseError> {
     s.parse::<f64>().map_err(|_| ParseError::BadNumber(s.to_string()))
 }
 
-/// `stair rise <m> width <m> [riser <m>] [tread <m>]` (issue #18).
+/// `stair rise <m> width <m> [riser <m>] [tread <m>]` (issue #18), plus the
+/// issue #82 options: flag `noncompliant`; `turn none|switchback|dogleg` (or the
+/// bare `switchback`/`dogleg` flags); and `spiral [radius <m>] [turn <deg>]`
+/// (or the `spiral` verb, which pre-sets the flag).
 fn parse_stair(args: &[&str]) -> Result<Command, ParseError> {
+    parse_stair_inner(args, false)
+}
+
+/// `spiral stair …` / `spiral rise <m> …`: a stair with the spiral flag pre-set.
+/// Accepts an optional leading `stair` word so both `spiral stair …` and
+/// `spiral …` read naturally.
+fn parse_spiral(args: &[&str]) -> Result<Command, ParseError> {
+    let args: &[&str] = match args.first() {
+        Some(&"stair") => &args[1..],
+        _ => args,
+    };
+    parse_stair_inner(args, true)
+}
+
+fn parse_stair_inner(args: &[&str], spiral_default: bool) -> Result<Command, ParseError> {
     let mut rise: Option<f64> = None;
     let mut width: Option<f64> = None;
     let mut riser: Option<f64> = None;
     let mut tread: Option<f64> = None;
+    // Issue #82 additive options.
+    let mut noncompliant = false;
+    let mut turn: Option<String> = None;
+    let mut spiral = spiral_default;
+    let mut spiral_radius: Option<f64> = None;
+    let mut spiral_turn: Option<f64> = None;
     let mut it = args.iter();
     while let Some(&kw) = it.next() {
+        // Flag keywords (no value).
+        match kw {
+            "noncompliant" => {
+                noncompliant = true;
+                continue;
+            }
+            "switchback" => {
+                turn = Some("switchback".to_string());
+                continue;
+            }
+            "dogleg" => {
+                turn = Some("dogleg".to_string());
+                continue;
+            }
+            "spiral" => {
+                spiral = true;
+                continue;
+            }
+            _ => {}
+        }
         let v = *it
             .next()
             .ok_or_else(|| wrong_err("stair", "a value after each keyword", args))?;
@@ -3259,13 +3341,33 @@ fn parse_stair(args: &[&str]) -> Result<Command, ParseError> {
             "width" => width = Some(number(v)?),
             "riser" => riser = Some(number(v)?),
             "tread" => tread = Some(number(v)?),
-            _ => return wrong("stair", "keywords rise/width/riser/tread", args),
+            "turn" => turn = Some(parse_turn_token(v, args)?),
+            "radius" => spiral_radius = Some(number(v)?),
+            "rotate" | "sweep" => spiral_turn = Some(number(v)?),
+            _ => {
+                return wrong(
+                    "stair",
+                    "keywords rise/width/riser/tread/turn/radius/rotate or flags noncompliant/switchback/dogleg/spiral",
+                    args,
+                )
+            }
         }
     }
     let (Some(rise), Some(width)) = (rise, width) else {
         return wrong("stair", "rise <m> and width <m>", args);
     };
-    Ok(Command::Stair { rise, width, riser, tread, ids: Vec::new() })
+    Ok(Command::Stair {
+        rise,
+        width,
+        riser,
+        tread,
+        noncompliant,
+        turn,
+        spiral,
+        spiral_radius,
+        spiral_turn,
+        ids: Vec::new(),
+    })
 }
 
 /// `fromlayer <layer> wall thick <t> [height <h> | level <name>]`
