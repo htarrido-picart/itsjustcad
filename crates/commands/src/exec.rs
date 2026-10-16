@@ -14856,7 +14856,8 @@ fn apply_forward(
             ))
         }
         Command::Ramp { rise, slope, run, width, ids } => {
-            use crate::stairs::{ramp_centerline, ramp_layout, ramp_surface, RampSlope};
+            use crate::stairs::{ramp_centerline, ramp_layout, RampSlope};
+            use itsjustcad_doc::{GeneratorKind, ParamMap, ParamValue};
             let slope_spec = match (slope, run) {
                 (Some(s), None) => RampSlope::Ratio(s),
                 (None, Some(r)) => RampSlope::Run(r),
@@ -14866,24 +14867,24 @@ fn apply_forward(
                     ))
                 }
             };
+            // Resolve the layout once so we can store the RESOLVED (clamped) slope
+            // as the parametric param — re-deriving with that ratio is idempotent.
             let layout = ramp_layout(rise, slope_spec, width).map_err(ExecError::Invalid)?;
-            // Two objects: the continuous surface mesh (for display + the
-            // cross-slope mesh probe) and the named "ramp" centerline curve that
-            // the ADA running-slope / landing checks read.
+            // Two objects: the LIVE PARAMETRIC surface (named "ramp-surface", its
+            // mesh re-baked by `paramset` from rise/slope/width — issue #83) and
+            // the named "ramp" centerline curve the ADA running-slope / landing
+            // checks read. The surface is the editable parametric object; the
+            // centerline is a static companion emitted at creation for codecheck.
             let ids = ensure_ids(ids, 2);
             let (surf_id, line_id) = (ids[0], ids[1]);
-            let mb = ramp_surface(&layout, DVec3::ZERO);
-            let mesh = kernel_mesh::Mesh::new(mb.positions, mb.faces);
-            doc.insert(SceneObject {
-                visible: true,
-                id: surf_id,
-                name: Some("ramp-surface".to_string()),
-                layer: doc.current_layer.clone(),
-                color: None,
-                material: None,
-                lineweight_mm: None,
-                geometry: Geometry::Mesh(mesh),
-            });
+            let mut params = ParamMap::new();
+            params.insert("rise".into(), ParamValue::Float(rise));
+            params.insert("slope".into(), ParamValue::Float(layout.slope));
+            params.insert("width".into(), ParamValue::Float(width));
+            parametric_object(doc, Some(surf_id), GeneratorKind::Ramp, params)?;
+            if let Some(o) = doc.get_mut(surf_id) {
+                o.name = Some("ramp-surface".to_string());
+            }
             let centerline = ramp_centerline(&layout, DVec3::new(0.0, width * 0.5, 0.0));
             doc.insert(SceneObject {
                 visible: true,
@@ -14915,23 +14916,27 @@ fn apply_forward(
             ))
         }
         Command::Stair { rise, width, riser, tread, ids } => {
-            use crate::stairs::{stair_layout, stair_mesh};
+            use crate::stairs::stair_layout;
+            use itsjustcad_doc::{GeneratorKind, ParamMap, ParamValue};
+            // Resolve the layout once so we store the RESOLVED riser/tread as the
+            // parametric params — re-deriving with those explicit targets is
+            // idempotent and reproduces the same count/landing (issue #83).
             let layout =
                 stair_layout(rise, width, riser, tread).map_err(ExecError::Invalid)?;
             let ids = ensure_ids(ids, 1);
             let id = ids[0];
-            let mb = stair_mesh(&layout, DVec3::ZERO);
-            let mesh = kernel_mesh::Mesh::new(mb.positions, mb.faces);
-            doc.insert(SceneObject {
-                visible: true,
-                id,
-                name: Some("stair".to_string()),
-                layer: doc.current_layer.clone(),
-                color: None,
-                material: None,
-                lineweight_mm: None,
-                geometry: Geometry::Mesh(mesh),
-            });
+            // The stair is a LIVE PARAMETRIC object: its mesh is re-baked by
+            // `paramset` from rise/width/riser/tread (count + tread + landing all
+            // recomputed by the same IBC layout math).
+            let mut params = ParamMap::new();
+            params.insert("rise".into(), ParamValue::Float(rise));
+            params.insert("width".into(), ParamValue::Float(width));
+            params.insert("riser".into(), ParamValue::Float(layout.riser_height));
+            params.insert("tread".into(), ParamValue::Float(layout.tread_depth));
+            parametric_object(doc, Some(id), GeneratorKind::Stair, params)?;
+            if let Some(o) = doc.get_mut(id) {
+                o.name = Some("stair".to_string());
+            }
             Ok((
                 Command::Stair { rise, width, riser, tread, ids: ids.clone() },
                 Inverse::DeleteCreated(ids),
@@ -15635,6 +15640,137 @@ mod tests {
         let mut s = Session::default();
         let out = run(&mut s, "stair rise 3.6 width 1.5 tread 0.3");
         assert!(out.message.contains("tread 0.300"), "{}", out.message);
+    }
+
+    // ── issue #83: ramp/stair are live parametric objects ────────────────────
+
+    #[test]
+    fn ramp_is_a_parametric_object_with_editable_params() {
+        // Acceptance (issue #83): `ramp rise 0.9 slope 1:12 width 1.2` makes the
+        // surface a LIVE parametric object carrying editable rise/slope/width.
+        let mut s = Session::default();
+        let surf = run(&mut s, "ramp rise 0.9 slope 1:12 width 1.2").created[0];
+        match &s.doc.get(surf).unwrap().geometry {
+            Geometry::Parametric { generator, params, .. } => {
+                assert_eq!(*generator, itsjustcad_doc::GeneratorKind::Ramp);
+                assert!((params.get("rise").unwrap().as_f64().unwrap() - 0.9).abs() < 1e-9);
+                assert!((params.get("width").unwrap().as_f64().unwrap() - 1.2).abs() < 1e-9);
+                // Slope stored as the resolved (clamped ≤ ADA max) ratio.
+                let slope = params.get("slope").unwrap().as_f64().unwrap();
+                assert!(slope <= crate::stairs::RAMP_MAX_SLOPE + 1e-9, "slope {slope}");
+            }
+            g => panic!("ramp surface must be parametric, got {g:?}"),
+        }
+        // The named "ramp" centerline companion still exists for codecheck.
+        assert_eq!(s.doc.find_named("ramp").len(), 1, "ramp centerline curve");
+        assert_eq!(s.doc.find_named("ramp-surface").len(), 1, "parametric surface");
+        // The Parameters tab reveals (predicate used by the app's right panel).
+        assert!(
+            s.doc.objects().any(|o| matches!(o.geometry, Geometry::Parametric { .. })),
+            "a ramp doc must have a parametric object (reveals the Parameters tab)"
+        );
+    }
+
+    #[test]
+    fn paramset_ramp_rise_regenerates_and_adds_a_landing_undo_redo_replay() {
+        // Editing the ramp rise re-runs the ADA layout: a bigger rise crosses the
+        // 30 in single-run limit and gains a mid landing → MORE surface quads.
+        let mut s = Session::default();
+        // 0.3 m rise is a single run (< 760 mm), no landing.
+        let surf = run(&mut s, "ramp rise 0.3 slope 1:12 width 1.2").created[0];
+        let before = mesh_of(&s, surf).positions().len();
+        // `last` resolves to the centerline curve (created after the surface), so
+        // target the parametric surface by id.
+        let out = run(&mut s, "paramset name:ramp-surface rise=0.9");
+        assert!(out.created.is_empty(), "paramset creates nothing");
+        let after = mesh_of(&s, surf).positions().len();
+        assert!(
+            after > before,
+            "rise 0.9 spans 2 runs + a landing → more quads: {before} -> {after}"
+        );
+        match &s.doc.get(surf).unwrap().geometry {
+            Geometry::Parametric { params, .. } => {
+                assert!((params.get("rise").unwrap().as_f64().unwrap() - 0.9).abs() < 1e-9);
+            }
+            g => panic!("expected parametric, got {g:?}"),
+        }
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert_eq!(mesh_of(&s, surf).positions().len(), before, "undo restores mesh");
+        run(&mut s, "redo");
+        assert_eq!(mesh_of(&s, surf).positions().len(), after, "redo re-applies");
+    }
+
+    #[test]
+    fn paramset_ramp_slope_is_reclamped_to_code() {
+        // Asking paramset for a steeper-than-ADA slope is clamped by the layout
+        // (not the schema), so the stored/derived slope stays ≤ the 1:12 max.
+        let mut s = Session::default();
+        let surf = run(&mut s, "ramp rise 0.6 slope 1:20 width 1.0").created[0];
+        run(&mut s, "paramset name:ramp-surface slope=0.5"); // 1:2, far too steep
+        // The derive re-clamps: the ramp lengthens rather than steepening. The
+        // stored param is the *requested* value (schema has no max on slope), but
+        // the DERIVED geometry respects the cap — assert via the mesh run length.
+        let m = mesh_of(&s, surf);
+        // Plan length (max X) must be at least rise/max_slope (the clamped run).
+        let max_x = m.positions().iter().map(|p| p.x).fold(0.0_f64, f64::max);
+        assert!(
+            max_x >= 0.6 / crate::stairs::RAMP_MAX_SLOPE - 1e-3,
+            "clamped ramp must stay long (max_x {max_x})"
+        );
+    }
+
+    #[test]
+    fn stair_is_a_parametric_object_with_editable_params() {
+        let mut s = Session::default();
+        let id = run(&mut s, "stair rise 3 width 1.2").created[0];
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { generator, params, .. } => {
+                assert_eq!(*generator, itsjustcad_doc::GeneratorKind::Stair);
+                assert!((params.get("rise").unwrap().as_f64().unwrap() - 3.0).abs() < 1e-9);
+                assert!((params.get("width").unwrap().as_f64().unwrap() - 1.2).abs() < 1e-9);
+                // riser/tread stored as the resolved IBC values.
+                let riser = params.get("riser").unwrap().as_f64().unwrap();
+                assert!((riser - 3.0 / 17.0).abs() < 1e-6, "equalized riser {riser}");
+                assert!(params.get("tread").unwrap().as_f64().unwrap() >= crate::stairs::STAIR_MIN_TREAD - 1e-9);
+            }
+            g => panic!("stair must be parametric, got {g:?}"),
+        }
+        assert_eq!(s.doc.find_named("stair").len(), 1, "named 'stair'");
+    }
+
+    #[test]
+    fn paramset_stair_rise_recomputes_risers_undo_redo_replay() {
+        // A taller rise needs more risers → more step quads.
+        let mut s = Session::default();
+        let id = run(&mut s, "stair rise 3 width 1.2").created[0];
+        let before = mesh_of(&s, id).positions().len();
+        let out = run(&mut s, "paramset last rise=6");
+        assert!(out.created.is_empty());
+        let after = mesh_of(&s, id).positions().len();
+        assert!(after > before, "6 m rise needs more risers: {before} -> {after}");
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { params, .. } => {
+                assert!((params.get("rise").unwrap().as_f64().unwrap() - 6.0).abs() < 1e-9);
+            }
+            g => panic!("expected parametric, got {g:?}"),
+        }
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert_eq!(mesh_of(&s, id).positions().len(), before, "undo restores");
+        run(&mut s, "redo");
+        assert_eq!(mesh_of(&s, id).positions().len(), after, "redo re-applies");
+    }
+
+    #[test]
+    fn stair_param_edit_still_passes_ibc_codecheck() {
+        // After editing the tread, the regenerated stair mesh still grades.
+        let mut s = Session::default();
+        run(&mut s, "stair rise 3 width 1.2");
+        run(&mut s, "paramset last tread=0.3");
+        run(&mut s, "codecheck ibc2021");
+        assert_eq!(verdict_of(&s, "ibc2021", "stair-tread"), "pass", "edited tread grades");
+        assert_eq!(verdict_of(&s, "ibc2021", "stair-riser"), "pass", "riser still grades");
     }
 
     #[test]
