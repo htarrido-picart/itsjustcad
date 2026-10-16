@@ -626,8 +626,11 @@ pub fn ramp_surface_curved(
     for i in 0..facets {
         let u0 = i as f64 / facets as f64;
         let u1 = (i + 1) as f64 / facets as f64;
-        // near-inner, far-inner, far-outer, near-outer → up-facing normal.
-        mb.quad(edge(u0, -1.0), edge(u1, -1.0), edge(u1, 1.0), edge(u0, 1.0));
+        // Wind CCW as seen from ABOVE (near-inner → near-outer → far-outer →
+        // far-inner) so the surface normal points +Z (up). The near/far-inner/outer
+        // order used before was CW, giving a DOWNWARD normal — the curved ramp
+        // back-faced (no shaded fill) when viewed from above.
+        mb.quad(edge(u0, -1.0), edge(u0, 1.0), edge(u1, 1.0), edge(u1, -1.0));
     }
     mb
 }
@@ -1330,3 +1333,19 @@ mod tests {
 
 
 
+
+#[cfg(test)]
+mod curved_norm {
+    use super::*;
+    #[test]
+    fn curved_ramp_surface_faces_up() {
+        let l = ramp_layout(1.5, RampSlope::Ratio(RAMP_MAX_SLOPE), 1.2).unwrap();
+        let mb = ramp_surface_curved(&l, DVec3::ZERO, 4.0, 12);
+        // Every face normal must have a positive Z (up-facing walking surface).
+        for f in &mb.faces {
+            let p0 = mb.positions[f[0] as usize];
+            let n = (mb.positions[f[1] as usize] - p0).cross(mb.positions[f[2] as usize] - p0);
+            assert!(n.z > 0.0, "curved ramp face normal points down: z={}", n.z);
+        }
+    }
+}
