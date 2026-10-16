@@ -45,6 +45,12 @@ pub enum GeneratorKind {
     VoronoiShell,
     Schwedler,
     CatenaryVault,
+    /// Accessible ramp (issue #83): a code-compliant walking surface laid out
+    /// from rise / slope / width. Renders as a normal surface mesh.
+    Ramp,
+    /// Straight-flight stair (issue #83): stepped tread/riser geometry laid out
+    /// from rise / width / riser / tread. Renders as a normal surface mesh.
+    Stair,
 }
 
 impl GeneratorKind {
@@ -64,6 +70,8 @@ impl GeneratorKind {
         GeneratorKind::VoronoiShell,
         GeneratorKind::Schwedler,
         GeneratorKind::CatenaryVault,
+        GeneratorKind::Ramp,
+        GeneratorKind::Stair,
     ];
 
     /// Stable token (matches the creating verb): `geodesic`, `hypar`, …
@@ -83,6 +91,8 @@ impl GeneratorKind {
             GeneratorKind::VoronoiShell => "voronoishell",
             GeneratorKind::Schwedler => "schwedler",
             GeneratorKind::CatenaryVault => "catenaryvault",
+            GeneratorKind::Ramp => "ramp",
+            GeneratorKind::Stair => "stair",
         }
     }
 
@@ -103,6 +113,8 @@ impl GeneratorKind {
             GeneratorKind::VoronoiShell => "param.gen.voronoishell",
             GeneratorKind::Schwedler => "param.gen.schwedler",
             GeneratorKind::CatenaryVault => "param.gen.catenaryvault",
+            GeneratorKind::Ramp => "param.gen.ramp",
+            GeneratorKind::Stair => "param.gen.stair",
         }
     }
 
@@ -253,6 +265,36 @@ impl GeneratorKind {
                     ParamField::float("rise", "param.catenaryvault.rise", 4.0, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
                     ParamField::int("nu", "param.catenaryvault.nu", 16, 2, 256, 1, Widget::Slider),
                     ParamField::int("nv", "param.catenaryvault.nv", 16, 2, 256, 1, Widget::Slider),
+                ],
+            },
+            // Ramp (issue #83): a code-compliant accessible ramp surface laid out
+            // from a total rise, a running slope (rise:run ratio), and a width.
+            // `slope` is stored as the RESOLVED ratio (already clamped ≤ the ADA
+            // 1:12 max); `derive_mesh` re-runs `ramp_layout` which re-clamps, so a
+            // later edit stays code-safe and replay-stable. `min` on slope is the
+            // ADA max (shallower is allowed); `max` is the ADA max cap — a steeper
+            // ask is clamped by the layout, not the schema, so no `max` here.
+            GeneratorKind::Ramp => ParamSchema {
+                kind: self,
+                fields: vec![
+                    ParamField::float("rise", "param.ramp.rise", 0.9, Some(0.001), None, 0.05, Widget::Numeric, Unit::Meter),
+                    ParamField::float("slope", "param.ramp.slope", 1.0 / 12.0, Some(0.001), None, 0.005, Widget::Numeric, Unit::None),
+                    ParamField::float("width", "param.ramp.width", 1.2, Some(0.1), None, 0.05, Widget::Numeric, Unit::Meter),
+                ],
+            },
+            // Stair (issue #83): a straight-flight stair laid out from a total
+            // floor-to-floor rise, a width, and target riser/tread depths. The
+            // stored riser/tread are the RESOLVED values (riser equalized to
+            // rise/count ≤ 7 in; tread ≥ 11 in), so `derive_mesh` passing them as
+            // explicit targets reproduces the same layout (replay-stable) and a
+            // later edit re-runs `stair_layout` to recompute count/landing.
+            GeneratorKind::Stair => ParamSchema {
+                kind: self,
+                fields: vec![
+                    ParamField::float("rise", "param.stair.rise", 3.0, Some(0.001), None, 0.05, Widget::Numeric, Unit::Meter),
+                    ParamField::float("width", "param.stair.width", 1.2, Some(0.1), None, 0.05, Widget::Numeric, Unit::Meter),
+                    ParamField::float("riser", "param.stair.riser", 0.1765, Some(0.0254), Some(0.3), 0.005, Widget::Numeric, Unit::Meter),
+                    ParamField::float("tread", "param.stair.tread", 0.2794, Some(0.1), None, 0.005, Widget::Numeric, Unit::Meter),
                 ],
             },
         }
@@ -785,6 +827,28 @@ pub fn derive_mesh(kind: GeneratorKind, params: &ParamMap) -> Result<Mesh, Deriv
             let nv = get_i(&p, "nv").max(2) as u32;
             Ok(kernel_mesh::catenary_vault_surface(span, length, rise, nu, nv))
         }
+        GeneratorKind::Ramp => {
+            let rise = get_f(&p, "rise");
+            let slope = get_f(&p, "slope");
+            let width = get_f(&p, "width");
+            // The stored slope is already the resolved ratio; `ramp_mesh` re-runs
+            // the ADA layout (re-clamping slope, re-placing landings), so editing
+            // any param regenerates a code-compliant ramp. Reuses the SAME pure
+            // layout math as the creating verb (`kernel_mesh::stairs`).
+            kernel_mesh::ramp_mesh(rise, kernel_mesh::RampSlope::Ratio(slope), width)
+                .map_err(DeriveError::Invalid)
+        }
+        GeneratorKind::Stair => {
+            let rise = get_f(&p, "rise");
+            let width = get_f(&p, "width");
+            let riser = get_f(&p, "riser");
+            let tread = get_f(&p, "tread");
+            // Riser/tread are the resolved targets; `stair_mesh_from_params`
+            // re-runs the IBC layout (recomputing riser count + tread, flagging a
+            // landing), reusing the SAME pure math as the creating verb.
+            kernel_mesh::stair_mesh_from_params(rise, width, Some(riser), Some(tread))
+                .map_err(DeriveError::Invalid)
+        }
     }
 }
 
@@ -891,7 +955,9 @@ pub fn derive_segments(
         GeneratorKind::Hypar
         | GeneratorKind::GaussVault
         | GeneratorKind::Cablenet
-        | GeneratorKind::CatenaryVault => Vec::new(),
+        | GeneratorKind::CatenaryVault
+        | GeneratorKind::Ramp
+        | GeneratorKind::Stair => Vec::new(),
     };
     Ok(pairs.into_iter().map(|(a, b)| [a, b]).collect())
 }
@@ -1046,6 +1112,75 @@ mod tests {
         assert_eq!(m.faces().len(), 512);
         // No member segments (it's a surface).
         assert!(derive_segments(GeneratorKind::CatenaryVault, &d).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ramp_rise_change_adds_a_landing_and_more_geometry() {
+        // Issue #83: a bigger rise crosses the 30 in single-run limit → a mid
+        // landing → more surface quads. Re-derive reuses the ADA layout math.
+        let mut p = GeneratorKind::Ramp.default_params();
+        p.insert("rise".into(), ParamValue::Float(0.3)); // single run, no landing
+        let small = derive_mesh(GeneratorKind::Ramp, &p).unwrap();
+        p.insert("rise".into(), ParamValue::Float(0.9)); // two runs + landing
+        let big = derive_mesh(GeneratorKind::Ramp, &p).unwrap();
+        assert!(
+            big.positions().len() > small.positions().len(),
+            "rise 0.9 adds a landing quad: {} -> {}",
+            small.positions().len(),
+            big.positions().len()
+        );
+    }
+
+    #[test]
+    fn ramp_slope_is_reclamped_to_ada_max_on_derive() {
+        // A steeper-than-ADA slope param is re-clamped by the layout: the ramp
+        // lengthens rather than steepening, so plan length stays ≥ rise/max_slope.
+        let mut p = GeneratorKind::Ramp.default_params();
+        p.insert("rise".into(), ParamValue::Float(0.6));
+        p.insert("slope".into(), ParamValue::Float(0.5)); // 1:2, far too steep
+        let m = derive_mesh(GeneratorKind::Ramp, &p).unwrap();
+        let max_x = m.positions().iter().map(|v| v.x).fold(0.0_f64, f64::max);
+        assert!(
+            max_x >= 0.6 / kernel_mesh::RAMP_MAX_SLOPE - 1e-6,
+            "clamped ramp stays long (max_x {max_x})"
+        );
+    }
+
+    #[test]
+    fn stair_rise_change_recomputes_riser_count() {
+        // Doubling the rise needs more risers → more step geometry.
+        let mut p = GeneratorKind::Stair.default_params();
+        p.insert("rise".into(), ParamValue::Float(3.0));
+        let a = derive_mesh(GeneratorKind::Stair, &p).unwrap();
+        p.insert("rise".into(), ParamValue::Float(6.0));
+        let b = derive_mesh(GeneratorKind::Stair, &p).unwrap();
+        assert!(
+            b.positions().len() > a.positions().len(),
+            "6 m rise has more risers: {} -> {}",
+            a.positions().len(),
+            b.positions().len()
+        );
+    }
+
+    #[test]
+    fn stair_resolved_params_are_replay_idempotent() {
+        // Storing the RESOLVED riser/tread (the creating verb's choice) and
+        // re-deriving with them as explicit targets must reproduce the same mesh
+        // byte-for-byte — the invariant that keeps a stair replay-stable.
+        let p = GeneratorKind::Stair.default_params();
+        let a = derive_mesh(GeneratorKind::Stair, &p).unwrap();
+        let b = derive_mesh(GeneratorKind::Stair, &p).unwrap();
+        assert_eq!(a.positions(), b.positions(), "stair derive is deterministic");
+        // And a round-trip through the kernel layout agrees on the count.
+        let layout = kernel_mesh::stair_layout(3.0, 1.2, None, None).unwrap();
+        let direct = kernel_mesh::stair_mesh_from_params(
+            3.0,
+            1.2,
+            Some(layout.riser_height),
+            Some(layout.tread_depth),
+        )
+        .unwrap();
+        assert_eq!(direct.positions().len(), a.positions().len(), "same step count");
     }
 
     #[test]

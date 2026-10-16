@@ -835,7 +835,11 @@ fn matches_kind(obj: &SceneObject, kind: &str) -> bool {
     };
     match kind {
         "curve" | "path" => matches!(obj.geometry, Geometry::Curve(_)),
-        "mesh" => matches!(obj.geometry, Geometry::Mesh(_)),
+        // A plain mesh OR a parametric object whose derived cache is a surface
+        // mesh (e.g. the live-parametric ramp surface, issue #83). Both expose a
+        // triangle mesh via `geometry.mesh()`, which the mesh-probe checks read.
+        "mesh" => matches!(obj.geometry, Geometry::Mesh(_))
+            || matches!(&obj.geometry, Geometry::Parametric { mesh, .. } if !mesh.positions().is_empty()),
         "block" => matches!(obj.geometry, Geometry::Instance { .. }),
         "door" => match &obj.geometry {
             Geometry::Instance { block, source, .. } => {
