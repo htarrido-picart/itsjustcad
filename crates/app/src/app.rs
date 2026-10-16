@@ -3446,19 +3446,24 @@ impl App {
         // (that focus is not text entry) — this is why Esc/Delete kept failing
         // right after a selection, which hands focus to the gizmo.
         let chat_id = egui::Id::new("deck_chat_input");
+        let cmd_input_id = egui::Id::new("command_line_input");
         let focused = ctx.memory(|m| m.focused());
         let chat_composing = focused == Some(chat_id);
+        // The command line is focused-by-default (Rhino-style), so it owns the
+        // keyboard even in the Commands segment. That must NOT block the
+        // selection-delete shortcut when the line is EMPTY — otherwise Delete in
+        // the viewport silently edits the empty input instead of deleting the
+        // selection. (`!self.command_line.is_empty()` below already blocks once
+        // the user starts typing a command.) Any OTHER text field (Sessions
+        // search, a rename field, …) still gets Backspace/Delete/Esc itself.
+        let other_text_field_focused =
+            ctx.egui_wants_keyboard_input() && focused != Some(cmd_input_id);
         if modal
             || self.draw_tool.active()
             || self.guided.active()
             || chat_composing
             || !self.command_line.is_empty()
-            // Any text field actively owning the keyboard (Sessions search, a
-            // rename field, …) must get Backspace/Delete/Esc itself — otherwise
-            // the global shortcut consumes the key and the user can't edit the
-            // text. `egui_wants_keyboard_input()` is TRUE only for text-entry
-            // widgets, NOT the gizmo/viewport, so selection-delete still fires.
-            || ctx.egui_wants_keyboard_input()
+            || other_text_field_focused
         {
             return;
         }

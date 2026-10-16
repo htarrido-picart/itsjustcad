@@ -280,6 +280,15 @@ impl GeneratorKind {
                     ParamField::float("rise", "param.ramp.rise", 0.9, Some(0.001), None, 0.05, Widget::Numeric, Unit::Meter),
                     ParamField::float("slope", "param.ramp.slope", 1.0 / 12.0, Some(0.001), None, 0.005, Widget::Numeric, Unit::None),
                     ParamField::float("width", "param.ramp.width", 1.2, Some(0.1), None, 0.05, Widget::Numeric, Unit::Meter),
+                    // Issue #82 enhancement #1: honor the slope verbatim (no ADA
+                    // clamp). Default false → byte-identical v1 ramp.
+                    ParamField::bool("noncompliant", "param.ramp.noncompliant", false),
+                    // Issue #82 enhancement #2: fold the ramp back at its landings.
+                    // Default "none" → straight +X (v1).
+                    ParamField::enum_("turn", "param.ramp.turn", "none", &["none", "switchback", "dogleg"]),
+                    // Issue #82 enhancement #3: a curved (arc) centerline of this
+                    // plan radius. 0 (default) → straight (v1).
+                    ParamField::float("radius", "param.ramp.radius", 0.0, Some(0.0), None, 0.1, Widget::Numeric, Unit::Meter),
                 ],
             },
             // Stair (issue #83): a straight-flight stair laid out from a total
@@ -295,6 +304,19 @@ impl GeneratorKind {
                     ParamField::float("width", "param.stair.width", 1.2, Some(0.1), None, 0.05, Widget::Numeric, Unit::Meter),
                     ParamField::float("riser", "param.stair.riser", 0.1765, Some(0.0254), Some(0.3), 0.005, Widget::Numeric, Unit::Meter),
                     ParamField::float("tread", "param.stair.tread", 0.2794, Some(0.1), None, 0.005, Widget::Numeric, Unit::Meter),
+                    // Issue #82 enhancement #1: honor riser/tread verbatim (no IBC
+                    // clamp). Default false → byte-identical v1 stair.
+                    ParamField::bool("noncompliant", "param.stair.noncompliant", false),
+                    // Issue #82 enhancement #2: turn at a mid landing. Default
+                    // "none" → straight +X (v1).
+                    ParamField::enum_("turn", "param.stair.turn", "none", &["none", "switchback", "dogleg"]),
+                    // Issue #82 enhancement #3: a spiral/helical stair about a
+                    // center. Off (default) → straight (v1). When on, the flight
+                    // winds `spiral_radius` from the axis through `spiral_turn`
+                    // degrees as it climbs.
+                    ParamField::bool("spiral", "param.stair.spiral", false),
+                    ParamField::float("spiral_radius", "param.stair.spiral_radius", 1.5, Some(0.1), None, 0.1, Widget::Numeric, Unit::Meter),
+                    ParamField::float("spiral_turn", "param.stair.spiral_turn", 360.0, Some(1.0), None, 5.0, Widget::Numeric, Unit::Degree),
                 ],
             },
         }
@@ -831,23 +853,55 @@ pub fn derive_mesh(kind: GeneratorKind, params: &ParamMap) -> Result<Mesh, Deriv
             let rise = get_f(&p, "rise");
             let slope = get_f(&p, "slope");
             let width = get_f(&p, "width");
-            // The stored slope is already the resolved ratio; `ramp_mesh` re-runs
-            // the ADA layout (re-clamping slope, re-placing landings), so editing
-            // any param regenerates a code-compliant ramp. Reuses the SAME pure
-            // layout math as the creating verb (`kernel_mesh::stairs`).
-            kernel_mesh::ramp_mesh(rise, kernel_mesh::RampSlope::Ratio(slope), width)
-                .map_err(DeriveError::Invalid)
+            let noncompliant = get_b(&p, "noncompliant");
+            let turn = kernel_mesh::TurnKind::from_token(
+                p.get("turn").and_then(|v| v.as_enum()).unwrap_or("none"),
+            );
+            let radius = get_f(&p, "radius");
+            // The stored slope is the resolved ratio; `ramp_layout_opts` re-runs
+            // the ADA layout (re-placing landings; re-clamping slope UNLESS
+            // `noncompliant`). Reuses the SAME pure math as the creating verb.
+            let layout =
+                kernel_mesh::ramp_layout_opts(rise, kernel_mesh::RampSlope::Ratio(slope), width, noncompliant)
+                    .map_err(DeriveError::Invalid)?;
+            // Curved (arc) takes priority, then a turning (switchback/dogleg)
+            // fold, else the straight v1 surface.
+            let mb = if radius > 0.0 {
+                kernel_mesh::ramp_surface_curved(&layout, DVec3::ZERO, radius, 24)
+            } else if turn != kernel_mesh::TurnKind::None {
+                kernel_mesh::ramp_surface_turning(&layout, DVec3::ZERO, turn)
+            } else {
+                kernel_mesh::ramp_surface(&layout, DVec3::ZERO)
+            };
+            Ok(mb.into_mesh())
         }
         GeneratorKind::Stair => {
             let rise = get_f(&p, "rise");
             let width = get_f(&p, "width");
             let riser = get_f(&p, "riser");
             let tread = get_f(&p, "tread");
-            // Riser/tread are the resolved targets; `stair_mesh_from_params`
-            // re-runs the IBC layout (recomputing riser count + tread, flagging a
-            // landing), reusing the SAME pure math as the creating verb.
-            kernel_mesh::stair_mesh_from_params(rise, width, Some(riser), Some(tread))
-                .map_err(DeriveError::Invalid)
+            let noncompliant = get_b(&p, "noncompliant");
+            let turn = kernel_mesh::TurnKind::from_token(
+                p.get("turn").and_then(|v| v.as_enum()).unwrap_or("none"),
+            );
+            let spiral = get_b(&p, "spiral");
+            let spiral_radius = get_f(&p, "spiral_radius");
+            let spiral_turn = get_f(&p, "spiral_turn").to_radians();
+            // Riser/tread are the resolved targets; `stair_layout_opts` re-runs the
+            // IBC layout (recomputing riser count + tread, flagging a landing;
+            // re-clamping riser/tread UNLESS `noncompliant`).
+            let layout =
+                kernel_mesh::stair_layout_opts(rise, width, Some(riser), Some(tread), noncompliant)
+                    .map_err(DeriveError::Invalid)?;
+            // Spiral takes priority, then a turning fold, else the straight flight.
+            let mb = if spiral {
+                kernel_mesh::stair_mesh_spiral(&layout, DVec3::ZERO, spiral_radius, spiral_turn)
+            } else if turn != kernel_mesh::TurnKind::None {
+                kernel_mesh::stair_mesh_turning(&layout, DVec3::ZERO, turn)
+            } else {
+                kernel_mesh::stair_mesh(&layout, DVec3::ZERO)
+            };
+            Ok(mb.into_mesh())
         }
     }
 }
@@ -1181,6 +1235,103 @@ mod tests {
         )
         .unwrap();
         assert_eq!(direct.positions().len(), a.positions().len(), "same step count");
+    }
+
+    // ── #82: new ramp/stair shape params on the parametric path ─────────────
+
+    #[test]
+    fn ramp_defaults_are_unchanged_by_new_params() {
+        // The additive #82 fields default to the v1 shape, so a default ramp mesh
+        // is byte-identical to one derived from only the original three params.
+        let full = GeneratorKind::Ramp.default_params();
+        let mesh_full = derive_mesh(GeneratorKind::Ramp, &full).unwrap();
+        let mut legacy = ParamMap::new();
+        legacy.insert("rise".into(), ParamValue::Float(0.9));
+        legacy.insert("slope".into(), ParamValue::Float(1.0 / 12.0));
+        legacy.insert("width".into(), ParamValue::Float(1.2));
+        // sanitize fills the new fields with defaults → same mesh.
+        let mesh_legacy = derive_mesh(GeneratorKind::Ramp, &legacy).unwrap();
+        assert_eq!(mesh_full.positions(), mesh_legacy.positions(), "defaults match v1");
+    }
+
+    #[test]
+    fn ramp_noncompliant_param_produces_steep_mesh() {
+        // #82 #1: with `noncompliant` the stored 1:8 slope is honored (not
+        // re-clamped), so the ramp is shorter in X than the clamped version.
+        let mut steep = GeneratorKind::Ramp.default_params();
+        steep.insert("rise".into(), ParamValue::Float(0.6));
+        steep.insert("slope".into(), ParamValue::Float(1.0 / 8.0));
+        steep.insert("noncompliant".into(), ParamValue::Bool(true));
+        let m_steep = derive_mesh(GeneratorKind::Ramp, &steep).unwrap();
+        let mut clamped = steep.clone();
+        clamped.insert("noncompliant".into(), ParamValue::Bool(false));
+        let m_clamped = derive_mesh(GeneratorKind::Ramp, &clamped).unwrap();
+        let max_x = |m: &kernel_mesh::Mesh| m.positions().iter().map(|v| v.x).fold(0.0f64, f64::max);
+        assert!(
+            max_x(&m_steep) < max_x(&m_clamped) - 1e-6,
+            "non-compliant 1:8 ramp is shorter ({} < {})",
+            max_x(&m_steep),
+            max_x(&m_clamped)
+        );
+    }
+
+    #[test]
+    fn ramp_switchback_param_regen_is_deterministic() {
+        // #82 #2 + replay determinism: toggling `turn` regenerates a valid mesh,
+        // and re-deriving the same params twice is byte-identical.
+        let mut p = GeneratorKind::Ramp.default_params();
+        p.insert("rise".into(), ParamValue::Float(1.5));
+        p.insert("turn".into(), ParamValue::Enum("switchback".into()));
+        let a = derive_mesh(GeneratorKind::Ramp, &p).unwrap();
+        let b = derive_mesh(GeneratorKind::Ramp, &p).unwrap();
+        assert_eq!(a.positions(), b.positions(), "switchback derive is deterministic");
+        // The switchback folds back → its X extent is smaller than the straight.
+        let mut straight = p.clone();
+        straight.insert("turn".into(), ParamValue::Enum("none".into()));
+        let s = derive_mesh(GeneratorKind::Ramp, &straight).unwrap();
+        let span_x =
+            |m: &kernel_mesh::Mesh| {
+                let xs = m.positions().iter().map(|v| v.x);
+                xs.clone().fold(f64::MIN, f64::max) - xs.fold(f64::MAX, f64::min)
+            };
+        assert!(span_x(&a) < span_x(&s) * 0.75, "switchback is more compact");
+    }
+
+    #[test]
+    fn stair_spiral_param_regen_is_deterministic_and_helical() {
+        // #82 #3: a spiral stair param set regenerates a helical mesh, and the
+        // re-derive is byte-stable (op-log replay determinism).
+        let mut p = GeneratorKind::Stair.default_params();
+        p.insert("rise".into(), ParamValue::Float(3.0));
+        p.insert("spiral".into(), ParamValue::Bool(true));
+        p.insert("spiral_radius".into(), ParamValue::Float(1.5));
+        p.insert("spiral_turn".into(), ParamValue::Float(360.0));
+        let a = derive_mesh(GeneratorKind::Stair, &p).unwrap();
+        let b = derive_mesh(GeneratorKind::Stair, &p).unwrap();
+        assert_eq!(a.positions(), b.positions(), "spiral derive is deterministic");
+        // Vertices wind around the Z axis: both +X and −X appear (a full turn).
+        let has_pos_x = a.positions().iter().any(|v| v.x > 0.5);
+        let has_neg_x = a.positions().iter().any(|v| v.x < -0.5);
+        assert!(has_pos_x && has_neg_x, "spiral winds around the axis");
+    }
+
+    #[test]
+    fn stair_noncompliant_param_allows_steep_riser() {
+        // #82 #1 on the stair parametric path: a stored steep riser is honored.
+        let mut p = GeneratorKind::Stair.default_params();
+        p.insert("rise".into(), ParamValue::Float(3.0));
+        p.insert("riser".into(), ParamValue::Float(0.22));
+        p.insert("noncompliant".into(), ParamValue::Bool(true));
+        let steep = derive_mesh(GeneratorKind::Stair, &p).unwrap();
+        p.insert("noncompliant".into(), ParamValue::Bool(false));
+        let compliant = derive_mesh(GeneratorKind::Stair, &p).unwrap();
+        // Fewer risers (taller each) when non-compliant → fewer vertices.
+        assert!(
+            steep.positions().len() < compliant.positions().len(),
+            "non-compliant steep stair has fewer, taller risers ({} < {})",
+            steep.positions().len(),
+            compliant.positions().len()
+        );
     }
 
     #[test]

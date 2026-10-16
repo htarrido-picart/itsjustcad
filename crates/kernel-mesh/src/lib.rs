@@ -43,11 +43,13 @@ pub use mesh::{Mesh, RenderMesh};
 pub use primitives::{extrude_profile, make_box};
 pub use section::slice;
 pub use stairs::{
-    ramp_centerline, ramp_layout, ramp_mesh, ramp_plan_length, ramp_surface, stair_layout,
-    stair_mesh, stair_mesh_from_params, MeshBuild, RampLayout, RampSegment, RampSlope, StairLayout,
-    RAMP_MAX_RUN_RISE, RAMP_MAX_SLOPE, RAMP_MIN_LANDING_LEN, STAIR_2R_PLUS_T_TARGET,
-    STAIR_MAX_RISER, STAIR_MAX_RISER_VARIATION, STAIR_MAX_RISE_PER_FLIGHT, STAIR_MIN_RISER,
-    STAIR_MIN_TREAD,
+    ramp_centerline, ramp_centerline_curved, ramp_centerline_turning, ramp_layout,
+    ramp_layout_opts, ramp_mesh, ramp_plan_length, ramp_surface, ramp_surface_curved,
+    ramp_surface_turning, stair_centerline_spiral, stair_layout, stair_layout_opts, stair_mesh,
+    stair_mesh_from_params, stair_mesh_spiral, stair_mesh_turning, MeshBuild, RampLayout,
+    RampSegment, RampSlope, StairLayout, TurnKind, RAMP_MAX_RUN_RISE, RAMP_MAX_SLOPE,
+    RAMP_MIN_LANDING_LEN, STAIR_2R_PLUS_T_TARGET, STAIR_MAX_RISER, STAIR_MAX_RISER_VARIATION,
+    STAIR_MAX_RISE_PER_FLIGHT, STAIR_MIN_RISER, STAIR_MIN_TREAD,
 };
 pub use catalog::{builtin_section, builtin_section_names};
 pub use structsection::Section as StructSection;

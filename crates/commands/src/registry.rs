@@ -1315,14 +1315,20 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "ramp",
-            usage: "ramp rise <m> slope <a:b> | run <m> width <m>",
-            summary: "Parametric accessible ramp: lay out a code-compliant ramp from a total RISE (m) and EITHER a running slope as a ratio 'slope <a:b>' (e.g. 1:12, the ADA max — steeper is clamped to it) OR a total 'run <m>' (slope = rise/run, also clamped to 1:12), WIDTH (m). Inserts a level landing (≥60 in long, ≥ ramp width) whenever a single run would rise more than 30 in (ADA 405.7). Bakes a continuous ramp surface plus a named 'ramp' centerline so `codecheck ada2010` grades slope and landings. Defaults, not legal advice — verify with the AHJ. Example: ramp rise 0.9 slope 1:12 width 1.2 · ramp rise 1.5 run 20 width 1.5",
+            usage: "ramp rise <m> slope <a:b> | run <m> width <m> [noncompliant] [switchback|dogleg|turn <k>] [radius <m>]",
+            summary: "Parametric accessible ramp: lay out a code-compliant ramp from a total RISE (m) and EITHER a running slope as a ratio 'slope <a:b>' (e.g. 1:12, the ADA max — steeper is clamped to it) OR a total 'run <m>' (slope = rise/run, also clamped to 1:12), WIDTH (m). Inserts a level landing (≥60 in long, ≥ ramp width) whenever a single run would rise more than 30 in (ADA 405.7). Add 'noncompliant' to honor the slope VERBATIM (no clamp) for an intentionally steep service ramp — `codecheck ada2010` then flags the slope informationally. Add 'switchback' (180°) or 'dogleg' (90°) to fold the ramp back at its landings, or 'radius <m>' for a curved (arc) ramp. Bakes a continuous ramp surface plus a named 'ramp' centerline so `codecheck ada2010` grades slope and landings. Defaults, not legal advice — verify with the AHJ. Example: ramp rise 0.9 slope 1:12 width 1.2 · ramp rise 1.5 run 20 width 1.5 · ramp rise 0.9 slope 1:8 width 1.2 noncompliant · ramp rise 1.5 slope 1:12 width 1.2 switchback",
             category: Category::Structure,
         },
         CommandSpec {
             name: "stair",
-            usage: "stair rise <m> width <m> [riser <m>] [tread <m>]",
-            summary: "Parametric stair: lay out a code-compliant straight flight from a total floor-to-floor RISE (m) and WIDTH (m), optional target 'riser <m>' and 'tread <m>'. Riser count = ceil(rise / 7in) so each riser ≤ 7 in; the height is EQUALIZED (rise/count, consistent, variation ≤ 3/8 in, ≥ 4 in); tread ≥ 11 in, honoring 2R+T≈24–25 in when no tread is given. Flags a landing past 12 ft of rise. Bakes a stepped mesh named 'stair' so `codecheck ibc2021` grades risers and treads. Defaults, not legal advice — verify with the AHJ. Example: stair rise 3 width 1.2 · stair rise 3.6 width 1.5 tread 0.3",
+            usage: "stair rise <m> width <m> [riser <m>] [tread <m>] [noncompliant] [switchback|dogleg|turn <k>] [spiral radius <m> rotate <deg>]",
+            summary: "Parametric stair: lay out a code-compliant straight flight from a total floor-to-floor RISE (m) and WIDTH (m), optional target 'riser <m>' and 'tread <m>'. Riser count = ceil(rise / 7in) so each riser ≤ 7 in; the height is EQUALIZED (rise/count, consistent, variation ≤ 3/8 in, ≥ 4 in); tread ≥ 11 in, honoring 2R+T≈24–25 in when no tread is given. Flags a landing past 12 ft of rise. Add 'noncompliant' to honor riser/tread VERBATIM (no clamp) — `codecheck ibc2021` then flags them informationally. Add 'switchback'/'dogleg' to turn at a mid landing, or 'spiral radius <m> rotate <deg>' (or the `spiral` verb) for a helical stair whose risers/treads are measured along the walk line. Bakes a stepped mesh named 'stair' so `codecheck ibc2021` grades risers and treads. Defaults, not legal advice — verify with the AHJ. Example: stair rise 3 width 1.2 · stair rise 3.6 width 1.5 tread 0.3 · stair rise 3 width 1.2 switchback · stair rise 3 width 1 spiral radius 1.5 rotate 450",
+            category: Category::Structure,
+        },
+        CommandSpec {
+            name: "spiral",
+            usage: "spiral [stair] rise <m> width <m> [radius <m>] [rotate <deg>] [riser <m>] [tread <m>]  |  spiral ramp rise <m> width <m> radius <m> [slope <a:b>]",
+            summary: "Spiral/helical stair OR ramp (issue #82). STAIR (default): wound 'radius <m>' from a center axis through 'rotate <deg>' (default 360°) as it climbs the total RISE (m); risers/treads measured along the WALK LINE (angular step per riser = tread/radius); same IBC proportioning as `stair`; shorthand for `stair … spiral`. RAMP ('spiral ramp'): a curved/helical ramp of the given 'radius <m>' (shorthand for `ramp … radius <m>`); slope defaults to 1:12 (ADA) if omitted. Example: spiral rise 3 width 1 radius 1.5 rotate 450 · spiral ramp rise 3 width 1.5 radius 5",
             category: Category::Structure,
         },
         CommandSpec {
