@@ -107,6 +107,12 @@ struct AppliedOp {
 
 enum Inverse {
     DeleteCreated(Vec<ObjectId>),
+    /// Like `DeleteCreated` but also drops a group the command created (e.g. the
+    /// `ramp` surface+centerline companion group), so undo leaves no orphan group.
+    CreatedAndGroup {
+        created: Vec<ObjectId>,
+        group: String,
+    },
     MoveBack { ids: Vec<ObjectId>, delta: DVec3 },
     Restore(Vec<(SceneObject, usize)>),
     /// `delete` of a subdivision SOURCE: restore the removed objects (source +
@@ -899,6 +905,13 @@ impl Session {
                         obj.geometry = geometry;
                     }
                 }
+            }
+            Inverse::CreatedAndGroup { created, group } => {
+                for id in created.clone() {
+                    self.doc.remove(id);
+                }
+                self.doc.groups.remove(group);
+                self.doc.generation += 1;
             }
             Inverse::CreatedOnLayer { created, layers_created } => {
                 for id in created.clone() {
@@ -14928,9 +14941,17 @@ fn apply_forward(
                 String::new()
             };
             let flag = if noncompliant { ", NON-COMPLIANT" } else { "" };
+            // Group the parametric surface + its centerline companion so a
+            // viewport pick selects (and Delete removes) the ramp as ONE object
+            // — otherwise the thin centerline curve wins the pick and deleting it
+            // leaves the surface behind. Deterministic name (keyed on the surface
+            // id) so replay/redo reuse it; the inverse drops it on undo.
+            let group = format!("ramp#{surf_id}");
+            doc.groups.insert(group.clone(), ids.iter().copied().collect());
+            doc.generation += 1;
             Ok((
                 Command::Ramp { rise, slope, run, width, noncompliant, turn, radius, ids: ids.clone() },
-                Inverse::DeleteCreated(ids),
+                Inverse::CreatedAndGroup { created: ids, group },
                 ApplyOutcome {
                     created: vec![surf_id, line_id],
                     message: format!(
@@ -16013,6 +16034,35 @@ mod tests {
             }
             g => panic!("expected parametric ramp, got {g:?}"),
         }
+    }
+
+    #[test]
+    fn ramp_surface_and_centerline_are_grouped_for_pick_and_delete() {
+        // A viewport pick selects (and Delete removes) the ramp as ONE object: the
+        // parametric surface + its centerline companion are grouped, so
+        // `expand_pick` on either returns both. Undo drops the group cleanly.
+        let mut s = Session::default();
+        let out = run(&mut s, "ramp rise 1 slope 1:12 width 1.5");
+        let (surf, line) = (out.created[0], out.created[1]);
+        // A group was created containing both objects.
+        let (_name, members) = s
+            .doc
+            .groups
+            .iter()
+            .find(|(_, m)| m.contains(&surf) && m.contains(&line))
+            .expect("ramp surface + centerline are grouped");
+        assert_eq!(members.len(), 2);
+        // A pick on EITHER object expands to both (what the viewport does).
+        assert_eq!(s.doc.expand_pick(line).len(), 2, "picking the centerline selects both");
+        assert_eq!(s.doc.expand_pick(surf).len(), 2, "picking the surface selects both");
+        // Undo removes both objects AND the group (no orphan).
+        run(&mut s, "undo");
+        assert!(s.doc.objects().next().is_none(), "undo removes both objects");
+        assert!(s.doc.groups.is_empty(), "undo removes the group");
+        // Redo restores both + the group.
+        run(&mut s, "redo");
+        assert_eq!(s.doc.objects().count(), 2);
+        assert_eq!(s.doc.groups.len(), 1);
     }
 
     #[test]
