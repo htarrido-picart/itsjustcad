@@ -107,6 +107,12 @@ struct AppliedOp {
 
 enum Inverse {
     DeleteCreated(Vec<ObjectId>),
+    /// Like `DeleteCreated` but also drops a group the command created (e.g. the
+    /// `ramp` surface+centerline companion group), so undo leaves no orphan group.
+    CreatedAndGroup {
+        created: Vec<ObjectId>,
+        group: String,
+    },
     MoveBack { ids: Vec<ObjectId>, delta: DVec3 },
     Restore(Vec<(SceneObject, usize)>),
     /// `delete` of a subdivision SOURCE: restore the removed objects (source +
@@ -899,6 +905,13 @@ impl Session {
                         obj.geometry = geometry;
                     }
                 }
+            }
+            Inverse::CreatedAndGroup { created, group } => {
+                for id in created.clone() {
+                    self.doc.remove(id);
+                }
+                self.doc.groups.remove(group);
+                self.doc.generation += 1;
             }
             Inverse::CreatedOnLayer { created, layers_created } => {
                 for id in created.clone() {
@@ -14867,8 +14880,12 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Ramp { rise, slope, run, width, ids } => {
-            use crate::stairs::{ramp_centerline, ramp_layout, ramp_surface, RampSlope};
+        Command::Ramp { rise, slope, run, width, noncompliant, turn, radius, ids } => {
+            use crate::stairs::{
+                ramp_centerline, ramp_centerline_curved, ramp_centerline_turning, ramp_layout_opts,
+                RampSlope, TurnKind,
+            };
+            use itsjustcad_doc::{GeneratorKind, ParamMap, ParamValue};
             let slope_spec = match (slope, run) {
                 (Some(s), None) => RampSlope::Ratio(s),
                 (None, Some(r)) => RampSlope::Run(r),
@@ -14878,25 +14895,40 @@ fn apply_forward(
                     ))
                 }
             };
-            let layout = ramp_layout(rise, slope_spec, width).map_err(ExecError::Invalid)?;
-            // Two objects: the continuous surface mesh (for display + the
-            // cross-slope mesh probe) and the named "ramp" centerline curve that
-            // the ADA running-slope / landing checks read.
+            let turn_kind = TurnKind::from_token(turn.as_deref().unwrap_or("none"));
+            let arc_radius = radius.unwrap_or(0.0).max(0.0);
+            // Resolve the layout once so we can store the RESOLVED slope as the
+            // parametric param — re-deriving with that ratio is idempotent. Under
+            // `noncompliant` the slope is NOT clamped (issue #82 #1), so a steep
+            // ramp is honored and `codecheck ada2010` is free to flag it.
+            let layout = ramp_layout_opts(rise, slope_spec, width, noncompliant)
+                .map_err(ExecError::Invalid)?;
+            // Two objects: the LIVE PARAMETRIC surface (named "ramp-surface", its
+            // mesh re-baked by `paramset` — issues #83/#82) and the named "ramp"
+            // centerline curve the ADA running-slope / landing checks read.
             let ids = ensure_ids(ids, 2);
             let (surf_id, line_id) = (ids[0], ids[1]);
-            let mb = ramp_surface(&layout, DVec3::ZERO);
-            let mesh = kernel_mesh::Mesh::new(mb.positions, mb.faces);
-            doc.insert(SceneObject {
-                visible: true,
-                id: surf_id,
-                name: Some("ramp-surface".to_string()),
-                layer: doc.current_layer.clone(),
-                color: None,
-                material: None,
-                lineweight_mm: None,
-                geometry: Geometry::Mesh(mesh),
-            });
-            let centerline = ramp_centerline(&layout, DVec3::new(0.0, width * 0.5, 0.0));
+            let mut params = ParamMap::new();
+            params.insert("rise".into(), ParamValue::Float(rise));
+            params.insert("slope".into(), ParamValue::Float(layout.slope));
+            params.insert("width".into(), ParamValue::Float(width));
+            params.insert("noncompliant".into(), ParamValue::Bool(noncompliant));
+            params.insert("turn".into(), ParamValue::Enum(turn_kind.token().to_string()));
+            params.insert("radius".into(), ParamValue::Float(arc_radius));
+            parametric_object(doc, Some(surf_id), GeneratorKind::Ramp, params)?;
+            if let Some(o) = doc.get_mut(surf_id) {
+                o.name = Some("ramp-surface".to_string());
+            }
+            // Centerline follows the same shape (curved > turning > straight) so
+            // codecheck grades the actual walk line.
+            let start = DVec3::new(0.0, width * 0.5, 0.0);
+            let centerline = if arc_radius > 0.0 {
+                ramp_centerline_curved(&layout, start, arc_radius, 24)
+            } else if turn_kind != TurnKind::None {
+                ramp_centerline_turning(&layout, start, turn_kind)
+            } else {
+                ramp_centerline(&layout, start)
+            };
             doc.insert(SceneObject {
                 visible: true,
                 id: line_id,
@@ -14913,44 +14945,100 @@ fn apply_forward(
                 .filter(|s| matches!(s, crate::stairs::RampSegment::Run { .. }))
                 .count();
             let landings = layout.segments.len() - runs;
+            let shape = if arc_radius > 0.0 {
+                format!(", curved r{arc_radius:.1} m")
+            } else if turn_kind != TurnKind::None {
+                format!(", {}", turn_kind.token())
+            } else {
+                String::new()
+            };
+            let flag = if noncompliant { ", NON-COMPLIANT" } else { "" };
+            // Group the parametric surface + its centerline companion so a
+            // viewport pick selects (and Delete removes) the ramp as ONE object
+            // — otherwise the thin centerline curve wins the pick and deleting it
+            // leaves the surface behind. Deterministic name (keyed on the surface
+            // id) so replay/redo reuse it; the inverse drops it on undo.
+            let group = format!("ramp#{surf_id}");
+            doc.groups.insert(group.clone(), ids.iter().copied().collect());
+            doc.generation += 1;
             Ok((
-                Command::Ramp { rise, slope, run, width, ids: ids.clone() },
-                Inverse::DeleteCreated(ids),
+                Command::Ramp { rise, slope, run, width, noncompliant, turn, radius, ids: ids.clone() },
+                Inverse::CreatedAndGroup { created: ids, group },
                 ApplyOutcome {
                     created: vec![surf_id, line_id],
                     message: format!(
                         "ramp {surf_id} (rise {rise:.2} m, slope 1:{:.0}, {runs} run(s), \
-                         {landings} landing(s))",
+                         {landings} landing(s){shape}{flag})",
                         1.0 / layout.slope
                     ),
                 },
             ))
         }
-        Command::Stair { rise, width, riser, tread, ids } => {
-            use crate::stairs::{stair_layout, stair_mesh};
-            let layout =
-                stair_layout(rise, width, riser, tread).map_err(ExecError::Invalid)?;
+        Command::Stair {
+            rise,
+            width,
+            riser,
+            tread,
+            noncompliant,
+            turn,
+            spiral,
+            spiral_radius,
+            spiral_turn,
+            ids,
+        } => {
+            use crate::stairs::{stair_layout_opts, TurnKind};
+            use itsjustcad_doc::{GeneratorKind, ParamMap, ParamValue};
+            let turn_kind = TurnKind::from_token(turn.as_deref().unwrap_or("none"));
+            let s_radius = spiral_radius.unwrap_or(1.5).max(0.1);
+            let s_turn = spiral_turn.unwrap_or(360.0);
+            // Resolve the layout once so we store the RESOLVED riser/tread as the
+            // parametric params. Under `noncompliant` riser/tread are NOT clamped
+            // to the IBC bands (issue #82 #1) so a steep stair is honored and
+            // `codecheck ibc2021` is free to flag it.
+            let layout = stair_layout_opts(rise, width, riser, tread, noncompliant)
+                .map_err(ExecError::Invalid)?;
             let ids = ensure_ids(ids, 1);
             let id = ids[0];
-            let mb = stair_mesh(&layout, DVec3::ZERO);
-            let mesh = kernel_mesh::Mesh::new(mb.positions, mb.faces);
-            doc.insert(SceneObject {
-                visible: true,
-                id,
-                name: Some("stair".to_string()),
-                layer: doc.current_layer.clone(),
-                color: None,
-                material: None,
-                lineweight_mm: None,
-                geometry: Geometry::Mesh(mesh),
-            });
+            let mut params = ParamMap::new();
+            params.insert("rise".into(), ParamValue::Float(rise));
+            params.insert("width".into(), ParamValue::Float(width));
+            params.insert("riser".into(), ParamValue::Float(layout.riser_height));
+            params.insert("tread".into(), ParamValue::Float(layout.tread_depth));
+            params.insert("noncompliant".into(), ParamValue::Bool(noncompliant));
+            params.insert("turn".into(), ParamValue::Enum(turn_kind.token().to_string()));
+            params.insert("spiral".into(), ParamValue::Bool(spiral));
+            params.insert("spiral_radius".into(), ParamValue::Float(s_radius));
+            params.insert("spiral_turn".into(), ParamValue::Float(s_turn));
+            parametric_object(doc, Some(id), GeneratorKind::Stair, params)?;
+            if let Some(o) = doc.get_mut(id) {
+                o.name = Some("stair".to_string());
+            }
+            let shape = if spiral {
+                format!(", spiral r{s_radius:.1} m {s_turn:.0}°")
+            } else if turn_kind != TurnKind::None {
+                format!(", {}", turn_kind.token())
+            } else {
+                String::new()
+            };
+            let flag = if noncompliant { ", NON-COMPLIANT" } else { "" };
             Ok((
-                Command::Stair { rise, width, riser, tread, ids: ids.clone() },
+                Command::Stair {
+                    rise,
+                    width,
+                    riser,
+                    tread,
+                    noncompliant,
+                    turn,
+                    spiral,
+                    spiral_radius,
+                    spiral_turn,
+                    ids: ids.clone(),
+                },
                 Inverse::DeleteCreated(ids),
                 ApplyOutcome {
                     created: vec![id],
                     message: format!(
-                        "stair {id} ({} risers @ {:.3} m, tread {:.3} m{})",
+                        "stair {id} ({} risers @ {:.3} m, tread {:.3} m{}{shape}{flag})",
                         layout.risers,
                         layout.riser_height,
                         layout.tread_depth,
@@ -15649,6 +15737,137 @@ mod tests {
         assert!(out.message.contains("tread 0.300"), "{}", out.message);
     }
 
+    // ── issue #83: ramp/stair are live parametric objects ────────────────────
+
+    #[test]
+    fn ramp_is_a_parametric_object_with_editable_params() {
+        // Acceptance (issue #83): `ramp rise 0.9 slope 1:12 width 1.2` makes the
+        // surface a LIVE parametric object carrying editable rise/slope/width.
+        let mut s = Session::default();
+        let surf = run(&mut s, "ramp rise 0.9 slope 1:12 width 1.2").created[0];
+        match &s.doc.get(surf).unwrap().geometry {
+            Geometry::Parametric { generator, params, .. } => {
+                assert_eq!(*generator, itsjustcad_doc::GeneratorKind::Ramp);
+                assert!((params.get("rise").unwrap().as_f64().unwrap() - 0.9).abs() < 1e-9);
+                assert!((params.get("width").unwrap().as_f64().unwrap() - 1.2).abs() < 1e-9);
+                // Slope stored as the resolved (clamped ≤ ADA max) ratio.
+                let slope = params.get("slope").unwrap().as_f64().unwrap();
+                assert!(slope <= crate::stairs::RAMP_MAX_SLOPE + 1e-9, "slope {slope}");
+            }
+            g => panic!("ramp surface must be parametric, got {g:?}"),
+        }
+        // The named "ramp" centerline companion still exists for codecheck.
+        assert_eq!(s.doc.find_named("ramp").len(), 1, "ramp centerline curve");
+        assert_eq!(s.doc.find_named("ramp-surface").len(), 1, "parametric surface");
+        // The Parameters tab reveals (predicate used by the app's right panel).
+        assert!(
+            s.doc.objects().any(|o| matches!(o.geometry, Geometry::Parametric { .. })),
+            "a ramp doc must have a parametric object (reveals the Parameters tab)"
+        );
+    }
+
+    #[test]
+    fn paramset_ramp_rise_regenerates_and_adds_a_landing_undo_redo_replay() {
+        // Editing the ramp rise re-runs the ADA layout: a bigger rise crosses the
+        // 30 in single-run limit and gains a mid landing → MORE surface quads.
+        let mut s = Session::default();
+        // 0.3 m rise is a single run (< 760 mm), no landing.
+        let surf = run(&mut s, "ramp rise 0.3 slope 1:12 width 1.2").created[0];
+        let before = mesh_of(&s, surf).positions().len();
+        // `last` resolves to the centerline curve (created after the surface), so
+        // target the parametric surface by id.
+        let out = run(&mut s, "paramset name:ramp-surface rise=0.9");
+        assert!(out.created.is_empty(), "paramset creates nothing");
+        let after = mesh_of(&s, surf).positions().len();
+        assert!(
+            after > before,
+            "rise 0.9 spans 2 runs + a landing → more quads: {before} -> {after}"
+        );
+        match &s.doc.get(surf).unwrap().geometry {
+            Geometry::Parametric { params, .. } => {
+                assert!((params.get("rise").unwrap().as_f64().unwrap() - 0.9).abs() < 1e-9);
+            }
+            g => panic!("expected parametric, got {g:?}"),
+        }
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert_eq!(mesh_of(&s, surf).positions().len(), before, "undo restores mesh");
+        run(&mut s, "redo");
+        assert_eq!(mesh_of(&s, surf).positions().len(), after, "redo re-applies");
+    }
+
+    #[test]
+    fn paramset_ramp_slope_is_reclamped_to_code() {
+        // Asking paramset for a steeper-than-ADA slope is clamped by the layout
+        // (not the schema), so the stored/derived slope stays ≤ the 1:12 max.
+        let mut s = Session::default();
+        let surf = run(&mut s, "ramp rise 0.6 slope 1:20 width 1.0").created[0];
+        run(&mut s, "paramset name:ramp-surface slope=0.5"); // 1:2, far too steep
+        // The derive re-clamps: the ramp lengthens rather than steepening. The
+        // stored param is the *requested* value (schema has no max on slope), but
+        // the DERIVED geometry respects the cap — assert via the mesh run length.
+        let m = mesh_of(&s, surf);
+        // Plan length (max X) must be at least rise/max_slope (the clamped run).
+        let max_x = m.positions().iter().map(|p| p.x).fold(0.0_f64, f64::max);
+        assert!(
+            max_x >= 0.6 / crate::stairs::RAMP_MAX_SLOPE - 1e-3,
+            "clamped ramp must stay long (max_x {max_x})"
+        );
+    }
+
+    #[test]
+    fn stair_is_a_parametric_object_with_editable_params() {
+        let mut s = Session::default();
+        let id = run(&mut s, "stair rise 3 width 1.2").created[0];
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { generator, params, .. } => {
+                assert_eq!(*generator, itsjustcad_doc::GeneratorKind::Stair);
+                assert!((params.get("rise").unwrap().as_f64().unwrap() - 3.0).abs() < 1e-9);
+                assert!((params.get("width").unwrap().as_f64().unwrap() - 1.2).abs() < 1e-9);
+                // riser/tread stored as the resolved IBC values.
+                let riser = params.get("riser").unwrap().as_f64().unwrap();
+                assert!((riser - 3.0 / 17.0).abs() < 1e-6, "equalized riser {riser}");
+                assert!(params.get("tread").unwrap().as_f64().unwrap() >= crate::stairs::STAIR_MIN_TREAD - 1e-9);
+            }
+            g => panic!("stair must be parametric, got {g:?}"),
+        }
+        assert_eq!(s.doc.find_named("stair").len(), 1, "named 'stair'");
+    }
+
+    #[test]
+    fn paramset_stair_rise_recomputes_risers_undo_redo_replay() {
+        // A taller rise needs more risers → more step quads.
+        let mut s = Session::default();
+        let id = run(&mut s, "stair rise 3 width 1.2").created[0];
+        let before = mesh_of(&s, id).positions().len();
+        let out = run(&mut s, "paramset last rise=6");
+        assert!(out.created.is_empty());
+        let after = mesh_of(&s, id).positions().len();
+        assert!(after > before, "6 m rise needs more risers: {before} -> {after}");
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { params, .. } => {
+                assert!((params.get("rise").unwrap().as_f64().unwrap() - 6.0).abs() < 1e-9);
+            }
+            g => panic!("expected parametric, got {g:?}"),
+        }
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert_eq!(mesh_of(&s, id).positions().len(), before, "undo restores");
+        run(&mut s, "redo");
+        assert_eq!(mesh_of(&s, id).positions().len(), after, "redo re-applies");
+    }
+
+    #[test]
+    fn stair_param_edit_still_passes_ibc_codecheck() {
+        // After editing the tread, the regenerated stair mesh still grades.
+        let mut s = Session::default();
+        run(&mut s, "stair rise 3 width 1.2");
+        run(&mut s, "paramset last tread=0.3");
+        run(&mut s, "codecheck ibc2021");
+        assert_eq!(verdict_of(&s, "ibc2021", "stair-tread"), "pass", "edited tread grades");
+        assert_eq!(verdict_of(&s, "ibc2021", "stair-riser"), "pass", "riser still grades");
+    }
+
     #[test]
     fn ramp_and_stair_undo_removes_all_created_objects() {
         let mut s = Session::default();
@@ -15663,6 +15882,223 @@ mod tests {
         assert_eq!(s.doc.len(), 3);
         run(&mut s, "undo");
         assert_eq!(s.doc.len(), 2, "undo removes the stair mesh");
+    }
+
+    // ── issue #82: non-compliant override, switchback/dogleg, curved & spiral ──
+
+    #[test]
+    fn noncompliant_ramp_is_true_1_to_8_and_codecheck_flags_it() {
+        // Acceptance (#82 #1): `ramp … slope 1:8 … noncompliant` builds a TRUE 1:8
+        // ramp (no clamp), and `codecheck ada2010` reports the slope FAILURE
+        // informationally — it is reported, not blocked, not silently clamped.
+        let mut s = Session::default();
+        let out = run(&mut s, "ramp rise 0.9 slope 1:8 width 1.2 noncompliant");
+        assert!(out.message.contains("slope 1:8"), "true 1:8 ramp: {}", out.message);
+        assert!(out.message.contains("NON-COMPLIANT"), "flagged: {}", out.message);
+        let surf = out.created[0];
+        match &s.doc.get(surf).unwrap().geometry {
+            Geometry::Parametric { params, .. } => {
+                let slope = params.get("slope").unwrap().as_f64().unwrap();
+                assert!((slope - 1.0 / 8.0).abs() < 1e-9, "stored slope is verbatim 1:8: {slope}");
+                assert!(params.get("noncompliant").unwrap().as_bool().unwrap());
+            }
+            g => panic!("expected parametric ramp, got {g:?}"),
+        }
+        // codecheck runs and REPORTS the slope failure (not blocked).
+        run(&mut s, "codecheck ada2010");
+        assert_eq!(
+            verdict_of(&s, "ada2010", "ramp-running-slope"),
+            "fail",
+            "a 1:8 ramp must FAIL the ADA running-slope check, informationally"
+        );
+    }
+
+    #[test]
+    fn noncompliant_stair_honors_steep_riser_and_codecheck_flags_it() {
+        // #82 #1 for stairs: a steep riser is honored verbatim; codecheck reports.
+        let mut s = Session::default();
+        let out = run(&mut s, "stair rise 3 width 1.2 riser 0.22 noncompliant");
+        assert!(out.message.contains("NON-COMPLIANT"), "{}", out.message);
+        run(&mut s, "codecheck ibc2021");
+        assert_eq!(
+            verdict_of(&s, "ibc2021", "stair-riser"),
+            "fail",
+            "a >7 in riser must FAIL the IBC riser check, informationally"
+        );
+    }
+
+    #[test]
+    fn switchback_ramp_folds_back_with_a_turning_landing() {
+        // Acceptance (#82 #2): a tall ramp that would be very long straight folds
+        // back with a turning landing. Verify via a much smaller X footprint.
+        let mut s = Session::default();
+        let straight = run(&mut s, "ramp rise 1.5 slope 1:12 width 1.2").created[0];
+        let mut s2 = Session::default();
+        let folded = run(&mut s2, "ramp rise 1.5 slope 1:12 width 1.2 switchback").created[0];
+        let xspan = |sess: &Session, id| {
+            let m = mesh_of(sess, id);
+            let xs = m.positions().iter().map(|p| p.x);
+            xs.clone().fold(f64::MIN, f64::max) - xs.fold(f64::MAX, f64::min)
+        };
+        assert!(
+            xspan(&s2, folded) < xspan(&s, straight) * 0.75,
+            "switchback ramp is far more compact in X"
+        );
+        // Stored as an editable param.
+        match &s2.doc.get(folded).unwrap().geometry {
+            Geometry::Parametric { params, .. } => {
+                assert_eq!(params.get("turn").unwrap().as_enum().unwrap(), "switchback");
+            }
+            g => panic!("expected parametric, got {g:?}"),
+        }
+    }
+
+    #[test]
+    fn ramp_turn_reverts_to_straight_via_paramset() {
+        // Bug 1 (#82): editing `turn` switchback → none must re-derive the plain
+        // straight +X ramp, byte-identical to a ramp that never turned. Also
+        // dogleg → none. Regression for a stale/non-reverting enum regen.
+        let straight = {
+            let mut s = Session::default();
+            let id = run(&mut s, "ramp rise 1.5 slope 1:12 width 1.2").created[0];
+            mesh_of(&s, id).clone()
+        };
+        for first in ["switchback", "dogleg"] {
+            let mut s = Session::default();
+            let id = run(&mut s, "ramp rise 1.5 slope 1:12 width 1.2").created[0];
+            run(&mut s, &format!("paramset name:ramp-surface turn={first}"));
+            // Turned geometry differs from straight (sanity: the edit took).
+            assert_ne!(
+                mesh_of(&s, id).positions(),
+                straight.positions(),
+                "turn={first} must change the mesh"
+            );
+            run(&mut s, "paramset name:ramp-surface turn=none");
+            let reverted = mesh_of(&s, id);
+            assert_eq!(
+                reverted.positions().len(),
+                straight.positions().len(),
+                "turn=none after {first} must restore the straight vert count"
+            );
+            assert_eq!(
+                reverted.faces().len(),
+                straight.faces().len(),
+                "turn=none after {first} must restore the straight quad count"
+            );
+            assert_eq!(
+                reverted.positions(),
+                straight.positions(),
+                "turn=none after {first} must be byte-identical to the straight ramp"
+            );
+        }
+    }
+
+    #[test]
+    fn dogleg_stair_turns_and_replays_stably() {
+        let mut s = Session::default();
+        let out = run(&mut s, "stair rise 3 width 1.2 dogleg");
+        assert!(out.message.contains("dogleg"), "{}", out.message);
+        assert_replay_stable(&s);
+    }
+
+    #[test]
+    fn spiral_stair_verb_builds_a_helix_measured_along_walk_line() {
+        // Acceptance (#82 #3): a spiral stair around a center with a radius + total
+        // rotation; risers/treads measured along the walk line.
+        let mut s = Session::default();
+        let out = run(&mut s, "spiral rise 3 width 1 radius 1.5 rotate 450");
+        assert!(out.message.contains("spiral"), "{}", out.message);
+        let id = out.created[0];
+        let m = mesh_of(&s, id);
+        // Winds around the axis: both +X and −X vertices appear (>360°).
+        assert!(m.positions().iter().any(|p| p.x > 0.5), "winds +X");
+        assert!(m.positions().iter().any(|p| p.x < -0.5), "winds −X");
+        // Reaches the full rise.
+        let top = m.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        assert!((top - 3.0).abs() < 1e-6, "spiral reaches 3 m, got {top}");
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Parametric { params, .. } => {
+                assert!(params.get("spiral").unwrap().as_bool().unwrap());
+                assert!((params.get("spiral_radius").unwrap().as_f64().unwrap() - 1.5).abs() < 1e-9);
+                assert!((params.get("spiral_turn").unwrap().as_f64().unwrap() - 450.0).abs() < 1e-9);
+            }
+            g => panic!("expected parametric, got {g:?}"),
+        }
+    }
+
+    #[test]
+    fn spiral_ramp_alias_builds_a_curved_ramp() {
+        // `spiral ramp …` is the ramp equivalent of the spiral-stair alias: it
+        // creates a curved ramp of the given radius, defaulting slope to 1:12.
+        let mut s = Session::default();
+        run(&mut s, "spiral ramp rise 3 width 1.5 radius 5");
+        // The parametric ramp surface carries the radius param.
+        let surf = s
+            .doc
+            .objects()
+            .find(|o| matches!(&o.geometry,
+                itsjustcad_doc::Geometry::Parametric { generator, .. }
+                    if *generator == itsjustcad_doc::GeneratorKind::Ramp))
+            .expect("a parametric ramp surface");
+        match &surf.geometry {
+            itsjustcad_doc::Geometry::Parametric { params, .. } => {
+                assert!((params.get("radius").unwrap().as_f64().unwrap() - 5.0).abs() < 1e-9);
+            }
+            g => panic!("expected parametric ramp, got {g:?}"),
+        }
+    }
+
+    #[test]
+    fn ramp_surface_and_centerline_are_grouped_for_pick_and_delete() {
+        // A viewport pick selects (and Delete removes) the ramp as ONE object: the
+        // parametric surface + its centerline companion are grouped, so
+        // `expand_pick` on either returns both. Undo drops the group cleanly.
+        let mut s = Session::default();
+        let out = run(&mut s, "ramp rise 1 slope 1:12 width 1.5");
+        let (surf, line) = (out.created[0], out.created[1]);
+        // A group was created containing both objects.
+        let (_name, members) = s
+            .doc
+            .groups
+            .iter()
+            .find(|(_, m)| m.contains(&surf) && m.contains(&line))
+            .expect("ramp surface + centerline are grouped");
+        assert_eq!(members.len(), 2);
+        // A pick on EITHER object expands to both (what the viewport does).
+        assert_eq!(s.doc.expand_pick(line).len(), 2, "picking the centerline selects both");
+        assert_eq!(s.doc.expand_pick(surf).len(), 2, "picking the surface selects both");
+        // Undo removes both objects AND the group (no orphan).
+        run(&mut s, "undo");
+        assert!(s.doc.objects().next().is_none(), "undo removes both objects");
+        assert!(s.doc.groups.is_empty(), "undo removes the group");
+        // Redo restores both + the group.
+        run(&mut s, "redo");
+        assert_eq!(s.doc.objects().count(), 2);
+        assert_eq!(s.doc.groups.len(), 1);
+    }
+
+    #[test]
+    fn curved_ramp_param_edit_regenerates_and_replays() {
+        let mut s = Session::default();
+        run(&mut s, "ramp rise 0.9 slope 1:12 width 1.2 radius 6");
+        // Toggle the curve off via paramset and back — regen must be stable.
+        run(&mut s, "paramset name:ramp-surface radius=0");
+        assert_replay_stable(&s);
+        run(&mut s, "paramset name:ramp-surface radius=8");
+        assert_replay_stable(&s);
+    }
+
+    #[test]
+    fn default_ramp_stair_byte_identical_after_82() {
+        // Regression: the #82 additive params must not change the default shapes.
+        let mut s = Session::default();
+        let surf = run(&mut s, "ramp rise 0.9 slope 1:12 width 1.2").created[0];
+        let ramp_verts = mesh_of(&s, surf).positions().len();
+        // The v1 acceptance count: 2 runs + 1 landing = 3 quads = 12 verts.
+        assert_eq!(ramp_verts, 12, "default ramp surface unchanged");
+        let id = run(&mut s, "stair rise 3 width 1.2").created[0];
+        // 17 risers × 2 quads × 4 verts = 136.
+        assert_eq!(mesh_of(&s, id).positions().len(), 136, "default stair unchanged");
     }
 
     #[test]

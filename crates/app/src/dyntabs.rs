@@ -688,6 +688,38 @@ mod tests {
     }
 
     #[test]
+    fn creating_a_ramp_makes_the_parameters_tab_appear() {
+        // Issue #83: ramp is a live parametric object → it reveals the tab and
+        // exposes editable rise/slope/width rows.
+        let mut s = Session::default();
+        run(&mut s, "ramp rise 0.9 slope 1:12 width 1.2");
+        assert!(has_parametric(&s.doc), "a ramp must reveal the Parameters tab");
+        let ramp = parametric_rows(&s.doc)
+            .into_iter()
+            .find(|r| r.generator == itsjustcad_doc::GeneratorKind::Ramp)
+            .expect("a ramp parametric row");
+        for key in ["rise", "slope", "width"] {
+            assert!(ramp.params.contains_key(key), "ramp row exposes '{key}'");
+        }
+    }
+
+    #[test]
+    fn creating_a_stair_makes_the_parameters_tab_appear() {
+        // Issue #83: stair is a live parametric object → editable
+        // rise/width/riser/tread rows.
+        let mut s = Session::default();
+        run(&mut s, "stair rise 3 width 1.2");
+        assert!(has_parametric(&s.doc), "a stair must reveal the Parameters tab");
+        let stair = parametric_rows(&s.doc)
+            .into_iter()
+            .find(|r| r.generator == itsjustcad_doc::GeneratorKind::Stair)
+            .expect("a stair parametric row");
+        for key in ["rise", "width", "riser", "tread"] {
+            assert!(stair.params.contains_key(key), "stair row exposes '{key}'");
+        }
+    }
+
+    #[test]
     fn a_plain_mesh_does_not_reveal_the_parameters_tab() {
         let mut s = Session::default();
         run(&mut s, "box 0,0,0 1,1,1");
