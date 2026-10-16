@@ -519,6 +519,15 @@ pub fn ramp_surface_turning(layout: &RampLayout, start: DVec3, turn: TurnKind) -
                 let out = half + shift;
                 // near-inner, far-inner, far-outer, near-outer → up-facing normal.
                 mb.quad(near, far, b + ldir * out, a + ldir * out);
+                // Start run 2 so it leaves the landing cleanly: switchback folds
+                // back from the NEAR edge `a` (shifted a width below); dogleg exits
+                // the landing's +left edge, centred in the landing depth, so the
+                // perpendicular run sits within the platform (no stick-out).
+                match turn {
+                    TurnKind::Switchback => f.pos = a,
+                    TurnKind::Dogleg => f.pos = (a + b) * 0.5 + ldir * half,
+                    TurnKind::None => {}
+                }
                 // Shift sideways (switchback only), then rotate the heading so the
                 // next run folds back / turns.
                 if shift != 0.0 {
@@ -548,13 +557,23 @@ pub fn ramp_centerline_turning(layout: &RampLayout, start: DVec3, turn: TurnKind
                 pts.push(f.pos);
             }
             RampSegment::Landing { len } => {
+                let a = f.pos;
                 f.advance(len, 0.0);
-                pts.push(f.pos);
-                // Switchback: shift the walk line sideways by one width so the return
-                // run is parallel-offset (matches `ramp_surface_turning`). Record the
-                // shifted point so the drawn centerline follows the real path the
-                // compliance checks read.
+                let b = f.pos;
+                pts.push(b);
+                // Match `ramp_surface_turning`: switchback returns from the NEAR
+                // edge `a` offset a width sideways; dogleg exits the landing's
+                // +left edge centred in its depth. Record the points so the drawn
+                // centerline follows the real path the compliance checks read.
                 let shift = switchback_lateral_offset(turn, layout.width);
+                match turn {
+                    TurnKind::Switchback => f.pos = a,
+                    TurnKind::Dogleg => f.pos = (a + b) * 0.5 + f.left() * (layout.width * 0.5),
+                    TurnKind::None => {}
+                }
+                if turn == TurnKind::Dogleg {
+                    pts.push(f.pos);
+                }
                 if shift != 0.0 {
                     f.shift_left(shift);
                     pts.push(f.pos);
@@ -747,6 +766,17 @@ pub fn stair_mesh_turning(layout: &StairLayout, start: DVec3, turn: TurnKind) ->
         let ldir = f.left();
         let out = half + shift;
         mb.quad(a - ldir * half, b - ldir * half, b + ldir * out, a + ldir * out);
+        // Position the start of run 2 so it leaves the landing cleanly (both runs
+        // aligned to the platform, no stick-out / overlap):
+        //  • Switchback: the NEAR edge `a`, then shifted one width sideways below,
+        //    so the upper run folds straight back beside the lower run.
+        //  • Dogleg: the landing's +left edge, centred in the landing depth, so the
+        //    perpendicular run exits squarely within the platform footprint.
+        match turn {
+            TurnKind::Switchback => f.pos = a,
+            TurnKind::Dogleg => f.pos = (a + b) * 0.5 + ldir * half,
+            TurnKind::None => {}
+        }
         if shift != 0.0 {
             f.shift_left(shift);
         }
@@ -1141,6 +1171,32 @@ mod tests {
     }
 
     #[test]
+    fn stair_dogleg_run2_aligns_within_the_landing() {
+        // Dogleg alignment (#82): the perpendicular upper run must sit WITHIN the
+        // landing's X band and exit from its +Y edge — not centred on the far edge
+        // sticking half a width past the landing (the original bug).
+        let width = 1.2;
+        let l = stair_layout(3.0, width, None, None).unwrap();
+        let mb = stair_mesh_turning(&l, DVec3::ZERO, TurnKind::Dogleg);
+        assert!((top_z(&mb) - 3.0).abs() < 1e-6, "dogleg keeps the rise");
+        let first = l.risers / 2;
+        let x1 = first as f64 * l.tread_depth; // run-1 top x
+        let land_far = x1 + width.max(l.tread_depth); // landing far X edge
+        let run1_half = width * 0.5;
+        // Every run-2 vertex (those beyond run-1's +Y edge) stays inside the
+        // landing's X band.
+        for p in &mb.positions {
+            if p.y > run1_half + 1e-6 {
+                assert!(
+                    p.x >= x1 - 1e-6 && p.x <= land_far + 1e-6,
+                    "run-2 vertex x={} sticks out of the landing band [{x1:.2},{land_far:.2}]",
+                    p.x
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ramp_switchback_centerline_reverses_heading() {
         // After a 180° landing the path travels in −X relative to the first run.
         let l = ramp_layout(1.5, RampSlope::Ratio(RAMP_MAX_SLOPE), 1.2).unwrap();
@@ -1267,3 +1323,10 @@ mod tests {
         let _ = first;
     }
 }
+
+
+
+
+
+
+
