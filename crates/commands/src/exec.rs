@@ -12963,6 +12963,18 @@ fn apply_forward(
             if scale <= 0.0 {
                 return Err(ExecError::Invalid("view scale must be positive".into()));
             }
+            // Empty name → auto-name "Sheet N" with the first unused N, so a bare
+            // `fourviews` (which the chat model often emits) just works. The
+            // resolved name is recorded in the returned command below, keeping
+            // op-log replay deterministic.
+            let name = if name.trim().is_empty() {
+                (1..)
+                    .map(|n| format!("Sheet {n}"))
+                    .find(|cand| doc.sheet(cand).is_none())
+                    .expect("an unused sheet name always exists")
+            } else {
+                name
+            };
             if doc.sheet(&name).is_some() {
                 return Err(ExecError::Invalid(format!(
                     "sheet '{name}' already exists (add views with: sheetview {name} top 1:100)"
@@ -20272,6 +20284,23 @@ mod tests {
         // Duplicate name errors with a hint.
         let err = s.run(parse("fourviews plan").unwrap()).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    /// A bare `fourviews` (no name — what the chat model often emits) auto-names
+    /// the sheet "Sheet N" with the first unused N, and is replay-stable.
+    #[test]
+    fn fourviews_auto_names_when_bare() {
+        let mut s = Session::default();
+        let out = run(&mut s, "fourviews");
+        assert!(out.message.contains("Sheet 1"), "{}", out.message);
+        assert_eq!(s.doc.sheet("Sheet 1").unwrap().views.len(), 4);
+        // A second bare call picks the next unused name, not a collision.
+        run(&mut s, "fourviews");
+        assert!(s.doc.sheet("Sheet 2").is_some());
+        // The recorded op replays to the SAME concrete name (determinism).
+        let json = serde_json::to_string(&s.doc).unwrap();
+        let replayed: itsjustcad_doc::Document = serde_json::from_str(&json).unwrap();
+        assert!(replayed.sheet("Sheet 1").is_some() && replayed.sheet("Sheet 2").is_some());
     }
 
     /// Item 2: delete a view by 1-based index; out-of-range and unknown-sheet

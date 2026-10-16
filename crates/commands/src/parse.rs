@@ -1458,12 +1458,15 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             })
         }
         "fourviews" => {
-            // fourviews <name> [paper] [scale] — paper defaults A3, scale 1:100.
+            // fourviews [name] [paper] [scale] — name optional (auto-named when
+            // omitted, so a bare `fourviews` works); paper defaults A3, scale
+            // 1:100. Empty name is the "auto" sentinel resolved in exec.
             let (name, paper, scale) = match args.as_slice() {
+                [] => ("", PaperSize::A3, 100.0),
                 [name] => (*name, PaperSize::A3, 100.0),
                 [name, paper] => (*name, paper_size(paper)?, 100.0),
                 [name, paper, scale] => (*name, paper_size(paper)?, scale_denominator(scale)?),
-                _ => return wrong("fourviews", "a name and optional paper size and scale", &args),
+                _ => return wrong("fourviews", "an optional name, paper size and scale", &args),
             };
             Ok(Command::FourViews { name: name.to_string(), paper, scale })
         }
@@ -6482,7 +6485,11 @@ mod tests {
             parse("fourviews plan a3 1:50").unwrap(),
             Command::FourViews { paper: PaperSize::A3, scale, .. } if scale == 50.0
         ));
-        assert!(parse("fourviews").unwrap_err().to_string().contains("name"));
+        // Bare `fourviews` is valid now — empty name is the auto-name sentinel.
+        assert_eq!(
+            parse("fourviews").unwrap(),
+            Command::FourViews { name: String::new(), paper: PaperSize::A3, scale: 100.0 }
+        );
         // errors carry hints
         assert!(parse("sheet plan b5").unwrap_err().to_string().contains("a4"));
         assert!(parse("sheetview plan back 100").unwrap_err().to_string().contains("top"));
