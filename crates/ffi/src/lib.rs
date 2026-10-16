@@ -215,12 +215,23 @@ pub struct AppHandle {
 
     /// Cleared by [`ijc_free`] before teardown. In-flight deck tasks check it
     /// (via [`SendCtx`]) before every callback so a callback can never fire on a
-    /// Swift ctx the host has already released (use-after-free of ctx).
+    /// Swift ctx the host has already released (use-after-free of ctx). This is
+    /// the handle-wide barrier: `ijc_free` clears it once, permanently, so even a
+    /// stream task that is mid-flight (or spawned-but-not-yet-tracked) at free
+    /// time becomes a no-op. `ijc_deck_stop`, which does NOT tear the handle down,
+    /// instead flips each stream's own per-task flag (see [`tasks`]) so future
+    /// sends still fire — it must not touch this shared flag.
     alive: Arc<AtomicBool>,
 
-    /// Abort handles for in-flight deck stream tasks, aborted on [`ijc_free`] so
-    /// no detached task outlives the handle it borrows shared state from.
-    tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// Abort handle + per-stream `alive` flag for each in-flight deck stream task.
+    /// The flag is the SAME `Arc` the task's [`SendCtx`] checks in `emit`, so
+    /// clearing it here makes any in-flight or queued callback for that one stream
+    /// a no-op. Aborted on [`ijc_free`] (teardown) and on [`ijc_deck_stop`] (stop
+    /// without teardown); both clear the per-stream flag BEFORE aborting so a
+    /// callback already executing (the `handle_events` closure has no `.await`)
+    /// cannot fire after the stop/free call returns — `abort()` alone is not a
+    /// synchronous barrier.
+    tasks: Arc<Mutex<Vec<(tokio::task::AbortHandle, Arc<AtomicBool>)>>>,
 
     /// When true (the default), deck-emitted commands are applied automatically
     /// as they stream. When false, they are only emitted to the callback (for
@@ -810,7 +821,11 @@ pub unsafe extern "C" fn ijc_free(h: *mut AppHandle) {
             // cleared `alive` even though the owning box is about to drop.
             (*h).alive.store(false, Ordering::Release);
             if let Ok(mut tasks) = (*h).tasks.lock() {
-                for t in tasks.drain(..) {
+                for (t, alive) in tasks.drain(..) {
+                    // Clear this stream's own flag too (belt-and-suspenders with
+                    // the handle-wide flag above) BEFORE aborting, so a callback
+                    // already executing cannot fire after we return.
+                    alive.store(false, Ordering::Release);
                     t.abort();
                 }
             }
@@ -1976,9 +1991,15 @@ unsafe fn deck_send_inner(
     cb: DeckCallback,
     ctx: *mut c_void,
 ) {
+    // Per-stream liveness flag: this stream's `SendCtx` and its tracked abort
+    // handle share THIS `Arc`, so `ijc_deck_stop`/`ijc_free` can turn exactly
+    // this stream's callbacks into no-ops (via `emit`) without affecting other
+    // streams or future sends. Starts live; cleared when the stream is stopped,
+    // aborted, or the handle is freed.
+    let alive = Arc::new(AtomicBool::new(true));
     let ctx = SendCtx {
         ctx,
-        alive: app.alive.clone(),
+        alive: alive.clone(),
     };
     if prompt.is_null() {
         emit(cb, &ctx, CB_ERROR, "null prompt");
@@ -2110,8 +2131,8 @@ unsafe fn deck_send_inner(
     // window where a detached stream fires a callback on a freed ctx / after
     // the handle's shared state is gone (finding #2).
     if let Ok(mut t) = tasks.lock() {
-        t.retain(|a| !a.is_finished());
-        t.push(join.abort_handle());
+        t.retain(|(a, _)| !a.is_finished());
+        t.push((join.abort_handle(), alive));
     }
 }
 
@@ -2130,7 +2151,17 @@ pub unsafe extern "C" fn ijc_deck_stop(h: *mut AppHandle) {
             return;
         };
         if let Ok(mut tasks) = app.tasks.lock() {
-            for t in tasks.drain(..) {
+            for (t, alive) in tasks.drain(..) {
+                // Hard callback barrier: clear this stream's `alive` flag BEFORE
+                // `abort()`. `abort()` is NOT synchronous — the `handle_events`
+                // closure has no `.await`, so an already-running callback could
+                // fire `cb(ctx, …)` after this function returns. `emit` early-
+                // returns when `!alive`, so clearing the flag first makes any in-
+                // flight or queued callback for this stream a no-op. `Release`
+                // pairs with the `Acquire` load in `emit`. Unlike `ijc_free` this
+                // leaves the handle-wide `app.alive` untouched, so later sends
+                // (each with a fresh per-stream flag) still fire normally.
+                alive.store(false, Ordering::Release);
                 t.abort();
             }
         }
