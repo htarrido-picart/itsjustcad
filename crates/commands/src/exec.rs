@@ -15921,6 +15921,46 @@ mod tests {
     }
 
     #[test]
+    fn ramp_turn_reverts_to_straight_via_paramset() {
+        // Bug 1 (#82): editing `turn` switchback → none must re-derive the plain
+        // straight +X ramp, byte-identical to a ramp that never turned. Also
+        // dogleg → none. Regression for a stale/non-reverting enum regen.
+        let straight = {
+            let mut s = Session::default();
+            let id = run(&mut s, "ramp rise 1.5 slope 1:12 width 1.2").created[0];
+            mesh_of(&s, id).clone()
+        };
+        for first in ["switchback", "dogleg"] {
+            let mut s = Session::default();
+            let id = run(&mut s, "ramp rise 1.5 slope 1:12 width 1.2").created[0];
+            run(&mut s, &format!("paramset name:ramp-surface turn={first}"));
+            // Turned geometry differs from straight (sanity: the edit took).
+            assert_ne!(
+                mesh_of(&s, id).positions(),
+                straight.positions(),
+                "turn={first} must change the mesh"
+            );
+            run(&mut s, "paramset name:ramp-surface turn=none");
+            let reverted = mesh_of(&s, id);
+            assert_eq!(
+                reverted.positions().len(),
+                straight.positions().len(),
+                "turn=none after {first} must restore the straight vert count"
+            );
+            assert_eq!(
+                reverted.faces().len(),
+                straight.faces().len(),
+                "turn=none after {first} must restore the straight quad count"
+            );
+            assert_eq!(
+                reverted.positions(),
+                straight.positions(),
+                "turn=none after {first} must be byte-identical to the straight ramp"
+            );
+        }
+    }
+
+    #[test]
     fn dogleg_stair_turns_and_replays_stably() {
         let mut s = Session::default();
         let out = run(&mut s, "stair rise 3 width 1.2 dogleg");

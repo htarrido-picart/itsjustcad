@@ -444,6 +444,26 @@ impl Frame {
     fn turn(&mut self, angle: f64) {
         self.heading += angle;
     }
+    /// Shift the walk-line position sideways by `d` along the current LEFT
+    /// direction (no change in heading or Z). Used at a switchback landing so the
+    /// return run runs PARALLEL to the previous run, offset by one ramp width,
+    /// instead of folding back collinear on top of it.
+    fn shift_left(&mut self, d: f64) {
+        self.pos += self.left() * d;
+    }
+}
+
+/// The lateral offset applied to the walk line at a 180° switchback landing so the
+/// return run sits beside the previous run instead of on top of it. One ramp width
+/// places the two runs' bands edge-to-edge (centres `width` apart), which is the
+/// standard switchback footprint. A 90° dogleg needs no lateral shift — the
+/// perpendicular turn already separates the runs — so this applies to switchbacks
+/// only.
+fn switchback_lateral_offset(turn: TurnKind, width: f64) -> f64 {
+    match turn {
+        TurnKind::Switchback => width,
+        TurnKind::None | TurnKind::Dogleg => 0.0,
+    }
 }
 
 /// Build the ramp walking surface with a turning landing between runs
@@ -478,13 +498,32 @@ pub fn ramp_surface_turning(layout: &RampLayout, start: DVec3, turn: TurnKind) -
                 emit_quad(&mut mb, a, b, &f);
             }
             RampSegment::Landing { len } => {
-                // A square turning platform sized to the ramp width, centred on the
-                // walk line; the run enters one edge and leaves a rotated edge.
+                // Flat turning platform between two runs. The walk line enters along
+                // the current heading and advances `len` across the platform. For a
+                // SWITCHBACK the return run must sit BESIDE the entry run (offset one
+                // width in the lateral/Y direction), so the platform spans BOTH
+                // lateral bands (entry band + the shifted return band) and the walk
+                // line is shifted sideways by `width` before the 180° pivot — the two
+                // runs end up parallel and non-overlapping in plan. A DOGLEG needs no
+                // lateral shift (the 90° turn already separates the runs); its
+                // platform is the single-band square at the corner.
                 let a = f.pos;
                 f.advance(len, 0.0);
                 let b = f.pos;
-                emit_quad(&mut mb, a, b, &f);
-                // Rotate heading so the next run folds back / turns.
+                let shift = switchback_lateral_offset(turn, w);
+                let ldir = f.left(); // constant across the (straight) platform
+                let near = a - ldir * half;
+                let far = b - ldir * half;
+                // Outer lateral edge: half-width for a dogleg, or across both bands
+                // (half + shift) for a switchback so the platform connects the runs.
+                let out = half + shift;
+                // near-inner, far-inner, far-outer, near-outer → up-facing normal.
+                mb.quad(near, far, b + ldir * out, a + ldir * out);
+                // Shift sideways (switchback only), then rotate the heading so the
+                // next run folds back / turns.
+                if shift != 0.0 {
+                    f.shift_left(shift);
+                }
                 f.turn(turn.turn_angle());
             }
         }
@@ -511,6 +550,15 @@ pub fn ramp_centerline_turning(layout: &RampLayout, start: DVec3, turn: TurnKind
             RampSegment::Landing { len } => {
                 f.advance(len, 0.0);
                 pts.push(f.pos);
+                // Switchback: shift the walk line sideways by one width so the return
+                // run is parallel-offset (matches `ramp_surface_turning`). Record the
+                // shifted point so the drawn centerline follows the real path the
+                // compliance checks read.
+                let shift = switchback_lateral_offset(turn, layout.width);
+                if shift != 0.0 {
+                    f.shift_left(shift);
+                    pts.push(f.pos);
+                }
                 f.turn(turn.turn_angle());
             }
         }
@@ -686,13 +734,22 @@ pub fn stair_mesh_turning(layout: &StairLayout, start: DVec3, turn: TurnKind) ->
     for _ in 0..first {
         add_step(&mut mb, &mut f);
     }
-    // Mid landing: a flat square turning platform at the current level.
+    // Mid landing: a flat turning platform at the current level. For a SWITCHBACK
+    // the upper run must run BESIDE the lower run (offset one width laterally) so
+    // the two flights do not stack on top of each other; the platform spans both
+    // lateral bands and the walk line shifts sideways by `width` before the 180°
+    // pivot. A DOGLEG needs no lateral shift (the 90° turn separates the flights).
     {
-        let l = f.left() * half;
         let a = f.pos;
         f.advance(w.max(t), 0.0); // platform at least width-deep
         let b = f.pos;
-        mb.quad(a - l, b - l, b + l, a + l);
+        let shift = switchback_lateral_offset(turn, w);
+        let ldir = f.left();
+        let out = half + shift;
+        mb.quad(a - ldir * half, b - ldir * half, b + ldir * out, a + ldir * out);
+        if shift != 0.0 {
+            f.shift_left(shift);
+        }
         f.turn(turn.turn_angle());
     }
     for _ in first..layout.risers {
@@ -743,12 +800,15 @@ pub fn stair_mesh_spiral(
             point(theta0, r_out, z),
             point(theta0, r_in, z),
         );
-        // Tread wedge (up-facing) at level z, from theta0 to theta1.
+        // Tread wedge (up-facing) at level z, from theta0 to theta1. Wind CCW as
+        // seen from ABOVE (inner→outer at theta0, along the arc to theta1, back
+        // inner) so the normal points +Z — the a→b→c→d order above was CW, which
+        // gave a downward normal (the spiral rendered dark/back-faced from above).
         mb.quad(
             point(theta0, r_in, z),
-            point(theta1, r_in, z),
-            point(theta1, r_out, z),
             point(theta0, r_out, z),
+            point(theta1, r_out, z),
+            point(theta1, r_in, z),
         );
     }
     mb
@@ -1008,6 +1068,78 @@ mod tests {
         );
     }
 
+    /// Collect the per-run plan-Y range of each sloped run in a turning ramp
+    /// surface. Each run contributes exactly one quad (4 verts) emitted in order,
+    /// interleaved with landing quads. We rebuild the run list by re-walking the
+    /// layout the same way the builder does, mapping each run to its quad's Y span.
+    #[test]
+    fn ramp_switchback_runs_are_parallel_and_offset_by_width_no_overlap() {
+        // Bug 2 (#82): the switchback's return run must sit BESIDE the first run,
+        // offset by ~one width in Y, NOT fold back collinear on top of it.
+        let width = 1.2;
+        let l = ramp_layout(1.5, RampSlope::Ratio(RAMP_MAX_SLOPE), width).unwrap();
+        let sw = ramp_surface_turning(&l, DVec3::ZERO, TurnKind::Switchback);
+
+        // Total rise preserved.
+        assert!((top_z(&sw) - 1.5).abs() < 1e-9, "switchback keeps the total rise");
+
+        // Walk the layout to find, for each RUN, the quad's Y range. The builder
+        // emits one quad per segment (run OR landing) in order, 4 verts each.
+        let mut run_y_ranges: Vec<(f64, f64)> = Vec::new();
+        for (quad_i, seg) in l.segments.iter().enumerate() {
+            let base = quad_i * 4;
+            let ys: Vec<f64> = (base..base + 4).map(|i| sw.positions[i].y).collect();
+            let ymin = ys.iter().cloned().fold(f64::MAX, f64::min);
+            let ymax = ys.iter().cloned().fold(f64::MIN, f64::max);
+            if matches!(seg, RampSegment::Run { .. }) {
+                run_y_ranges.push((ymin, ymax));
+            }
+        }
+        assert!(run_y_ranges.len() >= 2, "a switchback has ≥2 runs");
+
+        // Run 1 band ≈ [-half, +half] (centre 0); run 2 band ≈ [+half, +3half]
+        // (centre +width). Their centres differ by ~width and the bands are
+        // disjoint (they may touch at the shared edge but must not overlap).
+        let (r1min, r1max) = run_y_ranges[0];
+        let (r2min, r2max) = run_y_ranges[1];
+        let c1 = 0.5 * (r1min + r1max);
+        let c2 = 0.5 * (r2min + r2max);
+        assert!((c1 - 0.0).abs() < 1e-9, "run 1 centred on the start band, got {c1}");
+        assert!(
+            ((c2 - c1).abs() - width).abs() < 1e-6,
+            "run-2 centre offset must be ~width ({width}); got {}",
+            (c2 - c1).abs()
+        );
+        // Disjoint in plan: run 2's band starts at or above run 1's top edge.
+        assert!(
+            r2min >= r1max - 1e-6,
+            "runs overlap in Y: run1 [{r1min},{r1max}] vs run2 [{r2min},{r2max}]"
+        );
+        // Each run's band is one width wide (not squashed / not doubled).
+        assert!((r1max - r1min - width).abs() < 1e-6, "run 1 band is one width");
+        assert!((r2max - r2min - width).abs() < 1e-6, "run 2 band is one width");
+    }
+
+    #[test]
+    fn stair_switchback_runs_are_offset_laterally_no_overlap() {
+        // Bug 2 (#82) for stairs: the upper flight sits beside the lower flight,
+        // offset ~one width in Y, not stacked on top of it. Verify the overall Y
+        // span exceeds a single width (so the two flights occupy different bands)
+        // and the total rise is preserved.
+        let width = 1.2;
+        let l = stair_layout(3.0, width, None, None).unwrap();
+        let mb = stair_mesh_turning(&l, DVec3::ZERO, TurnKind::Switchback);
+        assert!((top_z(&mb) - 3.0).abs() < 1e-6, "switchback stair keeps the rise");
+        let ymin = mb.positions.iter().map(|p| p.y).fold(f64::MAX, f64::min);
+        let ymax = mb.positions.iter().map(|p| p.y).fold(f64::MIN, f64::max);
+        // Two side-by-side bands of one width (touching) span ~2*width.
+        assert!(
+            (ymax - ymin) > width * 1.5,
+            "switchback flights must occupy two lateral bands (~2 widths), got {}",
+            ymax - ymin
+        );
+    }
+
     #[test]
     fn ramp_switchback_centerline_reverses_heading() {
         // After a 180° landing the path travels in −X relative to the first run.
@@ -1095,6 +1227,26 @@ mod tests {
             assert!(r >= r_in - 1e-6 && r <= r_out + 1e-6, "vertex radius {r} out of band");
         }
         let _ = expected_arc;
+    }
+
+    #[test]
+    fn spiral_stair_tread_normals_point_up() {
+        // Regression: the tread quad was wound CW seen from above → downward
+        // normal → the spiral rendered back-faced (dark) from the top. Each step
+        // emits a riser quad (2 faces) then a tread quad (2 faces); the tread
+        // faces are indices 4*i+2 and 4*i+3 and MUST have a +Z normal.
+        let l = stair_layout(3.0, 1.0, None, None).unwrap();
+        let mb = stair_mesh_spiral(&l, DVec3::ZERO, 1.5, std::f64::consts::PI * 2.0);
+        for i in 0..l.risers {
+            for f in [4 * i + 2, 4 * i + 3] {
+                let [a, b, c] = mb.faces[f];
+                let p0 = mb.positions[a as usize];
+                let p1 = mb.positions[b as usize];
+                let p2 = mb.positions[c as usize];
+                let n = (p1 - p0).cross(p2 - p0);
+                assert!(n.z > 0.0, "tread face {f} normal points down (z={})", n.z);
+            }
+        }
     }
 
     #[test]
