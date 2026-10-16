@@ -3293,11 +3293,26 @@ fn parse_stair(args: &[&str]) -> Result<Command, ParseError> {
 /// Accepts an optional leading `stair` word so both `spiral stair …` and
 /// `spiral …` read naturally.
 fn parse_spiral(args: &[&str]) -> Result<Command, ParseError> {
-    let args: &[&str] = match args.first() {
-        Some(&"stair") => &args[1..],
-        _ => args,
-    };
-    parse_stair_inner(args, true)
+    match args.first() {
+        // Spiral/helical RAMP alias → a curved ramp (the ramp equivalent of a
+        // spiral stair). Delegates to the ramp parser; defaults the slope to the
+        // ADA max (1:12) when the user gives neither slope nor run, so
+        // `spiral ramp rise 3 width 1.5 radius 5` just works.
+        Some(&"ramp") => {
+            let rest = &args[1..];
+            let has_slope = rest.iter().any(|a| *a == "slope" || *a == "run");
+            if has_slope {
+                parse_ramp(rest)
+            } else {
+                let mut v: Vec<&str> = rest.to_vec();
+                v.push("slope");
+                v.push("1:12");
+                parse_ramp(&v)
+            }
+        }
+        Some(&"stair") => parse_stair_inner(&args[1..], true),
+        _ => parse_stair_inner(args, true),
+    }
 }
 
 fn parse_stair_inner(args: &[&str], spiral_default: bool) -> Result<Command, ParseError> {

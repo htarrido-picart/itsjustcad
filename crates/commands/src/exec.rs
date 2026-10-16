@@ -15994,6 +15994,28 @@ mod tests {
     }
 
     #[test]
+    fn spiral_ramp_alias_builds_a_curved_ramp() {
+        // `spiral ramp …` is the ramp equivalent of the spiral-stair alias: it
+        // creates a curved ramp of the given radius, defaulting slope to 1:12.
+        let mut s = Session::default();
+        run(&mut s, "spiral ramp rise 3 width 1.5 radius 5");
+        // The parametric ramp surface carries the radius param.
+        let surf = s
+            .doc
+            .objects()
+            .find(|o| matches!(&o.geometry,
+                itsjustcad_doc::Geometry::Parametric { generator, .. }
+                    if *generator == itsjustcad_doc::GeneratorKind::Ramp))
+            .expect("a parametric ramp surface");
+        match &surf.geometry {
+            itsjustcad_doc::Geometry::Parametric { params, .. } => {
+                assert!((params.get("radius").unwrap().as_f64().unwrap() - 5.0).abs() < 1e-9);
+            }
+            g => panic!("expected parametric ramp, got {g:?}"),
+        }
+    }
+
+    #[test]
     fn curved_ramp_param_edit_regenerates_and_replays() {
         let mut s = Session::default();
         run(&mut s, "ramp rise 0.9 slope 1:12 width 1.2 radius 6");

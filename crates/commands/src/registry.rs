@@ -1327,8 +1327,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "spiral",
-            usage: "spiral [stair] rise <m> width <m> [radius <m>] [rotate <deg>] [riser <m>] [tread <m>]",
-            summary: "Spiral/helical stair (issue #82): a stair wound 'radius <m>' from a center axis through 'rotate <deg>' (default 360°) as it climbs the total RISE (m). Risers/treads are measured along the WALK LINE (the cylinder at `radius`), so the angular step per riser is tread/radius. Same IBC proportioning as `stair`. Shorthand for `stair … spiral`. Example: spiral rise 3 width 1 radius 1.5 rotate 450 · spiral stair rise 3.6 width 1.2 radius 2",
+            usage: "spiral [stair] rise <m> width <m> [radius <m>] [rotate <deg>] [riser <m>] [tread <m>]  |  spiral ramp rise <m> width <m> radius <m> [slope <a:b>]",
+            summary: "Spiral/helical stair OR ramp (issue #82). STAIR (default): wound 'radius <m>' from a center axis through 'rotate <deg>' (default 360°) as it climbs the total RISE (m); risers/treads measured along the WALK LINE (angular step per riser = tread/radius); same IBC proportioning as `stair`; shorthand for `stair … spiral`. RAMP ('spiral ramp'): a curved/helical ramp of the given 'radius <m>' (shorthand for `ramp … radius <m>`); slope defaults to 1:12 (ADA) if omitted. Example: spiral rise 3 width 1 radius 1.5 rotate 450 · spiral ramp rise 3 width 1.5 radius 5",
             category: Category::Structure,
         },
         CommandSpec {
