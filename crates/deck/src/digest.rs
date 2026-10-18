@@ -55,10 +55,41 @@ pub(crate) fn sanitize_name(raw: &str) -> String {
     format!("«{trimmed}»")
 }
 
+/// Narrows which objects [`digest_filtered`] lists. The default lists every
+/// object, so `digest_filtered(doc, &DigestFilter::default())` == `digest(doc)`.
+#[derive(Clone, Debug, Default)]
+pub struct DigestFilter {
+    /// Keep only the N most recently created objects (after the id filter).
+    pub newest: Option<usize>,
+    /// Keep only objects whose id matches one of these: the short id printed
+    /// in the digest, or a longer prefix of the full id (hyphens ignored).
+    pub ids: Option<Vec<String>>,
+}
+
+impl DigestFilter {
+    fn matches_id(&self, id: &itsjustcad_doc::ObjectId) -> bool {
+        let Some(ids) = &self.ids else {
+            return true;
+        };
+        let full = id.0.simple().to_string();
+        ids.iter().any(|want| {
+            let want: String =
+                want.chars().filter(|c| *c != '-').map(|c| c.to_ascii_lowercase()).collect();
+            !want.is_empty() && full.starts_with(&want)
+        })
+    }
+}
+
 /// Compact scene description for the LLM system prompt.
 /// Selected objects are marked `[SELECTED]` and receive a full detail block
 /// (size, centroid) so prompts like "make THIS taller" always resolve correctly.
 pub fn digest(doc: &Document) -> String {
+    digest_filtered(doc, &DigestFilter::default())
+}
+
+/// [`digest`] restricted to the objects `filter` keeps. The layers and
+/// selection header lines describe the whole document either way.
+pub fn digest_filtered(doc: &Document, filter: &DigestFilter) -> String {
     const MAX_LISTED: usize = 40;
     let mut out = String::new();
     // Layers line only mentions "interesting" layers: those with objects, that
@@ -105,9 +136,15 @@ pub fn digest(doc: &Document) -> String {
         out.push_str(&format!("selection: {sel_count} object(s)\n"));
     }
 
-    for (i, obj) in doc.objects().enumerate() {
+    let mut objects: Vec<&itsjustcad_doc::SceneObject> =
+        doc.objects().filter(|o| filter.matches_id(&o.id)).collect();
+    if let Some(n) = filter.newest {
+        objects.drain(..objects.len().saturating_sub(n));
+    }
+    let total = objects.len();
+    for (i, obj) in objects.into_iter().enumerate() {
         if i == MAX_LISTED {
-            out.push_str(&format!("… and {} more objects\n", doc.len() - MAX_LISTED));
+            out.push_str(&format!("… and {} more objects\n", total - MAX_LISTED));
             break;
         }
         let bb = obj.geometry.aabb();
@@ -283,6 +320,61 @@ mod tests {
     #[test]
     fn sanitize_name_collapses_whitespace() {
         assert_eq!(sanitize_name("a  \t\n  b"), "«a b»");
+    }
+
+    fn object_lines(d: &str) -> Vec<&str> {
+        d.lines().filter(|l| l.starts_with("- ")).collect()
+    }
+
+    #[test]
+    fn digest_filtered_default_matches_digest() {
+        let s = session_with(&["box 0,0,0 1,1,1", "box 5,0,0 1,1,1", "select last"]);
+        assert_eq!(digest_filtered(&s.doc, &DigestFilter::default()), digest(&s.doc));
+    }
+
+    #[test]
+    fn digest_filtered_newest_keeps_latest_in_order() {
+        let s = session_with(&["box 0,0,0 1,1,1", "box 5,0,0 1,1,1", "box 9,0,0 1,1,1"]);
+        let f = DigestFilter { newest: Some(2), ..Default::default() };
+        let d = digest_filtered(&s.doc, &f);
+        let lines = object_lines(&d);
+        assert_eq!(lines.len(), 2, "{d}");
+        assert!(lines[0].contains("[5.0,"), "{d}");
+        assert!(lines[1].contains("[9.0,"), "{d}");
+        let all = DigestFilter { newest: Some(10), ..Default::default() };
+        assert_eq!(object_lines(&digest_filtered(&s.doc, &all)).len(), 3);
+    }
+
+    #[test]
+    fn digest_filtered_ids_by_short_and_full_id() {
+        let s = session_with(&["box 0,0,0 1,1,1", "box 5,0,0 1,1,1", "box 9,0,0 1,1,1"]);
+        let ids: Vec<_> = s.doc.objects().map(|o| o.id).collect();
+        let f = DigestFilter {
+            ids: Some(vec![ids[0].to_string(), ids[2].0.hyphenated().to_string().to_uppercase()]),
+            ..Default::default()
+        };
+        let d = digest_filtered(&s.doc, &f);
+        let lines = object_lines(&d);
+        assert_eq!(lines.len(), 2, "{d}");
+        assert!(lines[0].contains(&ids[0].to_string()), "{d}");
+        assert!(lines[1].contains(&ids[2].to_string()), "{d}");
+    }
+
+    #[test]
+    fn digest_filtered_ids_then_newest_and_unknown_ids() {
+        let s = session_with(&["box 0,0,0 1,1,1", "box 5,0,0 1,1,1", "box 9,0,0 1,1,1"]);
+        let ids: Vec<_> = s.doc.objects().map(|o| o.id.to_string()).collect();
+        let f = DigestFilter {
+            newest: Some(1),
+            ids: Some(vec![ids[0].clone(), ids[1].clone()]),
+        };
+        let d = digest_filtered(&s.doc, &f);
+        let lines = object_lines(&d);
+        assert_eq!(lines.len(), 1, "{d}");
+        assert!(lines[0].contains(&ids[1]), "{d}");
+
+        let none = DigestFilter { ids: Some(vec!["zzzz".into(), String::new()]), ..Default::default() };
+        assert!(object_lines(&digest_filtered(&s.doc, &none)).is_empty());
     }
 
     #[test]

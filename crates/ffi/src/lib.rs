@@ -43,8 +43,9 @@ use std::sync::{Arc, Mutex};
 
 use itsjustcad_commands::{Command, Selector, Session, io, parse};
 use itsjustcad_deck::{
-    ChatMessage, ChatRequest, DeckConfig, DeckDelta, DeckKind, ExtractEvent, Extractor, ImagePart,
-    LlmDeck, Role, compact_command_catalog, digest, make_deck, system_prompt,
+    ChatMessage, ChatRequest, DeckConfig, DeckDelta, DeckKind, DigestFilter, ExtractEvent,
+    Extractor, ImagePart, LlmDeck, Role, compact_command_catalog, digest, digest_filtered,
+    make_deck, system_prompt,
 };
 use itsjustcad_render::{
     DEPTH_FORMAT, DisplayMode, LineEntry, OrbitCamera, SceneRenderer, StandardView, Theme,
@@ -3159,6 +3160,55 @@ pub unsafe extern "C" fn ijc_scene_digest(h: *mut AppHandle) -> *mut c_char {
     })
 }
 
+/// [`ijc_scene_digest`] restricted to some objects, so the host need not
+/// re-parse and trim the full digest text. `newest` keeps only the N most
+/// recently created objects (`0` = no limit). `ids` is a comma- or
+/// space-separated list of object ids as the digest prints them (null or empty
+/// = every object). The id filter applies first, then `newest`. Returns an empty
+/// (but non-null) string for a null/invalid handle. Caller must
+/// [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `ids` must be null or a
+/// valid NUL-terminated C string. The returned pointer must be freed exactly
+/// once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_scene_digest_filtered(
+    h: *mut AppHandle,
+    newest: u32,
+    ids: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::new());
+        };
+        let ids = if ids.is_null() {
+            None
+        } else {
+            match (unsafe { CStr::from_ptr(ids) }).to_str() {
+                Ok(s) => parse_id_list(s),
+                Err(_) => return into_c_string(String::new()),
+            }
+        };
+        let filter = DigestFilter {
+            newest: (newest > 0).then_some(newest as usize),
+            ids,
+        };
+        into_c_string(digest_filtered(&app.session.doc, &filter))
+    })
+}
+
+/// Split a host-supplied id list on commas/whitespace. An empty list means
+/// "no id filter", not "match nothing".
+fn parse_id_list(s: &str) -> Option<Vec<String>> {
+    let ids: Vec<String> = s
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
 /// Serialize the current document to ItsJustCAD op-log JSON (the same format
 /// [`ijc_open_json`] reads). For persistence/export on the host side. Returns an
 /// empty (non-null) string for a null/invalid handle. Caller must
@@ -3191,7 +3241,7 @@ pub unsafe extern "C" fn ijc_doc_generation(h: *mut AppHandle) -> u64 {
 }
 
 /// Free a C string returned by [`ijc_command_brief`] / [`ijc_scene_digest`] /
-/// [`ijc_save_json`].
+/// [`ijc_scene_digest_filtered`] / [`ijc_save_json`].
 /// Null-safe; must be called at most once per returned pointer.
 ///
 /// # Safety
@@ -3276,6 +3326,27 @@ mod tests {
         let out = 0.5f32;
         cam2.dolly((1.0 - 1.0 / out) / 0.002);
         assert!(cam2.distance > 100.0, "zoom-out must push the camera away");
+    }
+
+    #[test]
+    fn scene_digest_filtered_is_null_safe() {
+        let nil = std::ptr::null_mut::<AppHandle>();
+        unsafe {
+            let p = ijc_scene_digest_filtered(nil, 3, c"abc".as_ptr());
+            assert!(!p.is_null());
+            assert_eq!(CStr::from_ptr(p).to_str().unwrap(), "");
+            ijc_string_free(p);
+        }
+    }
+
+    #[test]
+    fn id_list_splits_and_empty_means_unfiltered() {
+        assert_eq!(
+            parse_id_list("ab12, cd34  ef56"),
+            Some(vec!["ab12".into(), "cd34".into(), "ef56".into()])
+        );
+        assert_eq!(parse_id_list(""), None);
+        assert_eq!(parse_id_list(" , "), None);
     }
 
     #[test]
