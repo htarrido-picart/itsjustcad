@@ -43,8 +43,9 @@ use std::sync::{Arc, Mutex};
 
 use itsjustcad_commands::{Command, Selector, Session, io, parse};
 use itsjustcad_deck::{
-    ChatMessage, ChatRequest, DeckConfig, DeckDelta, DeckKind, ExtractEvent, Extractor, ImagePart,
-    LlmDeck, Role, compact_command_catalog, digest, make_deck, system_prompt,
+    ChatMessage, ChatRequest, DeckConfig, DeckDelta, DeckKind, DigestFilter, ExtractEvent,
+    Extractor, ImagePart, LlmDeck, Role, compact_command_catalog, digest, digest_filtered,
+    make_deck, system_prompt,
 };
 use itsjustcad_render::{
     DEPTH_FORMAT, DisplayMode, LineEntry, OrbitCamera, SceneRenderer, StandardView, Theme,
@@ -432,6 +433,52 @@ fn side_effect_refusal(cmd: &Command) -> String {
     "refused: filesystem command from the assistant is not allowed".to_string()
 }
 
+/// The side-effect gate shared by every host/model command path: `Some(reason)`
+/// when `op` is a fs/net command that must be refused. The ONE exception is
+/// `underlay`/`trace` of a file that resolves INSIDE the user-granted workdir
+/// (canonicalized, traversal- and symlink-guarded).
+fn gate_refusal(op: &PendingOp) -> Option<String> {
+    match op {
+        PendingOp::Cmd(cmd)
+            if cmd.is_side_effecting()
+                && !itsjustcad_commands::workdir::allows_underlay(cmd)
+                && !itsjustcad_commands::workdir::allows_trace(cmd) =>
+        {
+            Some(side_effect_refusal(cmd))
+        }
+        _ => None,
+    }
+}
+
+/// Everything [`ijc_run_command`] checks before queueing a line, without
+/// queueing it: routing/parsing, then the side-effect gate. On rejection the
+/// error is `(message, usage)`; `usage` is empty when the verb is unknown.
+fn check_line(line: &str) -> Result<PendingOp, (String, String)> {
+    let op = try_route_line(line).map_err(|e| {
+        let usage = match &e {
+            itsjustcad_commands::ParseError::WrongArgs { usage, .. } => usage.to_string(),
+            _ => registry_usage(line),
+        };
+        (e.to_string(), usage)
+    })?;
+    if let Some(reason) = gate_refusal(&op) {
+        return Err((reason, registry_usage(line)));
+    }
+    Ok(op)
+}
+
+/// The registry usage string for the line's verb, or empty if it has none.
+fn registry_usage(line: &str) -> String {
+    let Some(verb) = line.split_whitespace().next() else {
+        return String::new();
+    };
+    itsjustcad_commands::registry()
+        .iter()
+        .find(|spec| spec.name.eq_ignore_ascii_case(verb))
+        .map(|spec| spec.usage.to_string())
+        .unwrap_or_default()
+}
+
 /// Decode the document's underlay into GPU-ready [`UnderlayData`], caching the
 /// decoded pixels by stored path so a large image is decoded only when the path
 /// changes (not on every geometry edit while tracing). The stored portable bare
@@ -495,8 +542,14 @@ fn decode_underlay(
 /// Route a command line to a deferred op: camera verbs go to the camera, every
 /// other verb is parsed as a geometry `Command`. Runs on any thread (pure).
 fn route_line(line: &str) -> Option<PendingOp> {
+    try_route_line(line).ok()
+}
+
+/// [`route_line`], keeping the parse error so callers can report why a line
+/// was rejected.
+fn try_route_line(line: &str) -> Result<PendingOp, itsjustcad_commands::ParseError> {
     let mut it = line.split_whitespace();
-    let verb = it.next()?;
+    let verb = it.next().ok_or(itsjustcad_commands::ParseError::Empty)?;
     let rest: Vec<&str> = it.collect();
 
     // `view <name>` or a bare standard-view name.
@@ -506,19 +559,19 @@ fn route_line(line: &str) -> Option<PendingOp> {
         Some(verb)
     };
     if let Some(v) = view_name.and_then(standard_view) {
-        return Some(PendingOp::Camera(CamOp::SetView(v)));
+        return Ok(PendingOp::Camera(CamOp::SetView(v)));
     }
 
     match verb.to_ascii_lowercase().as_str() {
         "orbit" => {
             let dx = rest.first().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let dy = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            return Some(PendingOp::Camera(CamOp::Orbit(dx, dy)));
+            return Ok(PendingOp::Camera(CamOp::Orbit(dx, dy)));
         }
         "pan" => {
             let dx = rest.first().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let dy = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            return Some(PendingOp::Camera(CamOp::Pan(dx, dy)));
+            return Ok(PendingOp::Camera(CamOp::Pan(dx, dy)));
         }
         "zoom" | "dolly" => {
             let d = match rest.first().copied() {
@@ -527,12 +580,12 @@ fn route_line(line: &str) -> Option<PendingOp> {
                 Some(s) => s.parse().unwrap_or(0.0),
                 None => 0.0,
             };
-            return Some(PendingOp::Camera(CamOp::Dolly(d)));
+            return Ok(PendingOp::Camera(CamOp::Dolly(d)));
         }
         _ => {}
     }
 
-    parse(line).ok().map(PendingOp::Cmd)
+    parse(line).map(PendingOp::Cmd)
 }
 
 /// Reject deck base URLs whose host is a cloud-metadata / link-local / internal
@@ -976,28 +1029,75 @@ pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char)
         let Ok(s) = (unsafe { CStr::from_ptr(line) }).to_str() else {
             return false;
         };
-        let Some(op) = route_line(s) else {
-            return false;
+        // Same routing + side-effect gate as the deck path and
+        // `ijc_validate_command` (see `check_line` / `gate_refusal`).
+        let op = match check_line(s) {
+            Ok(op) => op,
+            Err((reason, _)) => {
+                eprintln!("[ijc] {reason}");
+                return false;
+            }
         };
-        // Gate side-effecting commands (fs/net) exactly as the deck path does.
-        // The ONE exception: `underlay <file>` where <file> resolves INSIDE the
-        // user-granted workdir (canonicalized, traversal- and symlink-guarded).
-        // Everything else (Import/Export/Print, or an underlay escaping the
-        // workdir) stays refused.
-        if let PendingOp::Cmd(cmd) = &op
-            && cmd.is_side_effecting()
-            && !itsjustcad_commands::workdir::allows_underlay(cmd)
-            && !itsjustcad_commands::workdir::allows_trace(cmd)
-        {
-            eprintln!("[ijc] {}", side_effect_refusal(cmd));
-            return false;
-        }
         if let Ok(mut pending) = app.pending.lock() {
             pending.push(op);
             return true;
         }
         false
     })
+}
+
+/// Check a command line exactly as [`ijc_run_command`] would, without queueing
+/// or running it. Returns JSON the host must free via [`ijc_string_free`]:
+/// `{"ok":true}`, or `{"ok":false,"error":"…","usage":"…"}` where `error` is the
+/// core's own parse/refusal message and `usage` is the verb's usage (empty for
+/// an unknown verb). A null or non-UTF-8 `line` is reported as invalid.
+/// Handle-free: parsing and the side-effect gate do not read the document.
+///
+/// # Safety
+/// `line` must be null or a valid NUL-terminated C string. The returned pointer
+/// must be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_validate_command(line: *const c_char) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let checked = if line.is_null() {
+            Err(("no command line".to_string(), String::new()))
+        } else {
+            match (unsafe { CStr::from_ptr(line) }).to_str() {
+                Ok(s) => check_line(s).map(|_| ()),
+                Err(_) => Err(("command line is not valid UTF-8".to_string(), String::new())),
+            }
+        };
+        into_c_string(validation_json(checked))
+    })
+}
+
+/// Serialize a [`check_line`] outcome for [`ijc_validate_command`].
+fn validation_json(checked: Result<(), (String, String)>) -> String {
+    match checked {
+        Ok(()) => String::from("{\"ok\":true}"),
+        Err((error, usage)) => format!(
+            "{{\"ok\":false,\"error\":\"{}\",\"usage\":\"{}\"}}",
+            json_escape(&error),
+            json_escape(&usage),
+        ),
+    }
+}
+
+/// Escape a string for embedding in a hand-built JSON string literal.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2082,12 +2182,8 @@ unsafe fn deck_send_inner(
                                     // symlink-guarded). All other fs/net commands
                                     // — and any underlay escaping the workdir —
                                     // stay refused.
-                                    if let PendingOp::Cmd(cmd) = &op
-                                        && cmd.is_side_effecting()
-                                        && !itsjustcad_commands::workdir::allows_underlay(cmd)
-                                        && !itsjustcad_commands::workdir::allows_trace(cmd)
-                                    {
-                                        emit(cb, &ctx, CB_ERROR, &side_effect_refusal(cmd));
+                                    if let Some(reason) = gate_refusal(&op) {
+                                        emit(cb, &ctx, CB_ERROR, &reason);
                                         continue;
                                     }
                                     // Auto-apply mode: run as it streams. Approval
@@ -3159,6 +3255,55 @@ pub unsafe extern "C" fn ijc_scene_digest(h: *mut AppHandle) -> *mut c_char {
     })
 }
 
+/// [`ijc_scene_digest`] restricted to some objects, so the host need not
+/// re-parse and trim the full digest text. `newest` keeps only the N most
+/// recently created objects (`0` = no limit). `ids` is a comma- or
+/// space-separated list of object ids as the digest prints them (null or empty
+/// = every object). The id filter applies first, then `newest`. Returns an empty
+/// (but non-null) string for a null/invalid handle. Caller must
+/// [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `ids` must be null or a
+/// valid NUL-terminated C string. The returned pointer must be freed exactly
+/// once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_scene_digest_filtered(
+    h: *mut AppHandle,
+    newest: u32,
+    ids: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::new());
+        };
+        let ids = if ids.is_null() {
+            None
+        } else {
+            match (unsafe { CStr::from_ptr(ids) }).to_str() {
+                Ok(s) => parse_id_list(s),
+                Err(_) => return into_c_string(String::new()),
+            }
+        };
+        let filter = DigestFilter {
+            newest: (newest > 0).then_some(newest as usize),
+            ids,
+        };
+        into_c_string(digest_filtered(&app.session.doc, &filter))
+    })
+}
+
+/// Split a host-supplied id list on commas/whitespace. An empty list means
+/// "no id filter", not "match nothing".
+fn parse_id_list(s: &str) -> Option<Vec<String>> {
+    let ids: Vec<String> = s
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
 /// Serialize the current document to ItsJustCAD op-log JSON (the same format
 /// [`ijc_open_json`] reads). For persistence/export on the host side. Returns an
 /// empty (non-null) string for a null/invalid handle. Caller must
@@ -3191,7 +3336,7 @@ pub unsafe extern "C" fn ijc_doc_generation(h: *mut AppHandle) -> u64 {
 }
 
 /// Free a C string returned by [`ijc_command_brief`] / [`ijc_scene_digest`] /
-/// [`ijc_save_json`].
+/// [`ijc_scene_digest_filtered`] / [`ijc_save_json`].
 /// Null-safe; must be called at most once per returned pointer.
 ///
 /// # Safety
@@ -3276,6 +3421,81 @@ mod tests {
         let out = 0.5f32;
         cam2.dolly((1.0 - 1.0 / out) / 0.002);
         assert!(cam2.distance > 100.0, "zoom-out must push the camera away");
+    }
+
+    fn validate(line: &std::ffi::CStr) -> String {
+        unsafe {
+            let p = ijc_validate_command(line.as_ptr());
+            assert!(!p.is_null());
+            let out = CStr::from_ptr(p).to_str().unwrap().to_string();
+            ijc_string_free(p);
+            out
+        }
+    }
+
+    #[test]
+    fn validate_command_accepts_geometry_and_camera_verbs() {
+        assert_eq!(validate(c"box 0,0,0 1,1,1"), r#"{"ok":true}"#);
+        assert_eq!(validate(c"view top"), r#"{"ok":true}"#);
+        assert_eq!(validate(c"orbit 0.1 0.2"), r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn validate_command_reports_core_error_and_usage() {
+        let wrong = validate(c"box 0,0,0");
+        assert!(wrong.starts_with(r#"{"ok":false,"error":"'box' expects"#), "{wrong}");
+        assert!(wrong.ends_with(r#""usage":"box <corner x,y,z> <size x,y,z>"}"#), "{wrong}");
+
+        let unknown = validate(c"floccinaucinihilipilification");
+        assert!(unknown.contains("unknown command"), "{unknown}");
+        assert!(unknown.ends_with(r#""usage":""}"#), "{unknown}");
+
+        let empty = validate(c"   ");
+        assert!(empty.contains(r#""error":"empty command""#), "{empty}");
+    }
+
+    #[test]
+    fn validate_command_applies_side_effect_gate() {
+        let out = validate(c"export /tmp/x.obj");
+        assert!(out.starts_with(r#"{"ok":false,"error":"refused:"#), "{out}");
+        assert!(out.contains(r#""usage":"export"#), "{out}");
+    }
+
+    #[test]
+    fn validate_command_rejects_null_and_bad_utf8() {
+        unsafe {
+            let p = ijc_validate_command(std::ptr::null());
+            assert!(CStr::from_ptr(p).to_str().unwrap().starts_with(r#"{"ok":false"#));
+            ijc_string_free(p);
+        }
+        let bad = validate(c"box \xff");
+        assert!(bad.contains("not valid UTF-8"), "{bad}");
+    }
+
+    #[test]
+    fn json_escape_escapes_quotes_and_controls() {
+        assert_eq!(json_escape("a\"b\\c\nd\u{1}"), "a\\\"b\\\\c\\nd\\u0001");
+    }
+
+    #[test]
+    fn scene_digest_filtered_is_null_safe() {
+        let nil = std::ptr::null_mut::<AppHandle>();
+        unsafe {
+            let p = ijc_scene_digest_filtered(nil, 3, c"abc".as_ptr());
+            assert!(!p.is_null());
+            assert_eq!(CStr::from_ptr(p).to_str().unwrap(), "");
+            ijc_string_free(p);
+        }
+    }
+
+    #[test]
+    fn id_list_splits_and_empty_means_unfiltered() {
+        assert_eq!(
+            parse_id_list("ab12, cd34  ef56"),
+            Some(vec!["ab12".into(), "cd34".into(), "ef56".into()])
+        );
+        assert_eq!(parse_id_list(""), None);
+        assert_eq!(parse_id_list(" , "), None);
     }
 
     #[test]
