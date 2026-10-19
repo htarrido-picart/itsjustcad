@@ -147,28 +147,15 @@ pub fn digest_filtered(doc: &Document, filter: &DigestFilter) -> String {
             out.push_str(&format!("… and {} more objects\n", total - MAX_LISTED));
             break;
         }
-        let bb = obj.geometry.aabb();
-        let kind = match &obj.geometry {
-            Geometry::Mesh(_) => "mesh",
-            Geometry::Curve(_) => "curve",
-            Geometry::Annotation(a) => match a {
-                itsjustcad_doc::Annotation::LinearDim { .. } => "dim",
-                itsjustcad_doc::Annotation::AngularDim { .. } => "angledim",
-                itsjustcad_doc::Annotation::Text { .. } => "text",
-                itsjustcad_doc::Annotation::Field { .. } => "field",
-                itsjustcad_doc::Annotation::Hatch { .. } => "hatch",
-            },
-            Geometry::Instance { block, .. } => {
-                // Show block name in the digest so LLM knows what kind of block.
-                let _ = block; // used in Display below
-                "instance"
+        let bb = doc.geometry_aabb(&obj.geometry);
+        let kind = geometry_kind(&obj.geometry);
+        // Instances name their block (the parametric source for a dynamic
+        // block, whose `block` is only a per-instance bake key).
+        let block = match &obj.geometry {
+            Geometry::Instance { block, source, .. } => {
+                format!(" block {}", sanitize_name(source.as_deref().unwrap_or(block)))
             }
-            Geometry::Points { .. } => "pointcloud",
-            Geometry::Frame { kind, .. } => kind.label(),
-            Geometry::Area { kind, .. } => kind.label(),
-            // Parametric structures report their generator so the LLM knows they
-            // stay editable via `paramset <sel> key=value`.
-            Geometry::Parametric { generator, .. } => generator.token(),
+            _ => String::new(),
         };
         let name = obj
             .name
@@ -186,11 +173,15 @@ pub fn digest_filtered(doc: &Document, filter: &DigestFilter) -> String {
 
         if selected {
             // Full detail for selected objects: size + centroid so the model
-            // can emit precise move/scale/extrude targets.
+            // can emit precise move/scale/extrude targets, plus the current
+            // params of an editable parametric object / dynamic-block instance.
             let size = bb.max - bb.min;
             let center = (bb.min + bb.max) * 0.5;
+            let params = selected_params(doc, &obj.geometry)
+                .map(|p| format!(" params {p}"))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "- {kind} {id}{name}{layer}{hidden}{sel_tag} bbox [{:.3},{:.3},{:.3}]..[{:.3},{:.3},{:.3}] size {:.3}x{:.3}x{:.3} center {:.3},{:.3},{:.3}\n",
+                "- {kind} {id}{block}{name}{layer}{hidden}{sel_tag} bbox [{:.3},{:.3},{:.3}]..[{:.3},{:.3},{:.3}] size {:.3}x{:.3}x{:.3} center {:.3},{:.3},{:.3}{params}\n",
                 bb.min.x, bb.min.y, bb.min.z,
                 bb.max.x, bb.max.y, bb.max.z,
                 size.x, size.y, size.z,
@@ -199,13 +190,86 @@ pub fn digest_filtered(doc: &Document, filter: &DigestFilter) -> String {
             ));
         } else {
             out.push_str(&format!(
-                "- {kind} {id}{name}{layer}{hidden} bbox [{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}]\n",
+                "- {kind} {id}{block}{name}{layer}{hidden} bbox [{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}]\n",
                 bb.min.x, bb.min.y, bb.min.z, bb.max.x, bb.max.y, bb.max.z,
                 id = obj.id,
             ));
         }
     }
     out
+}
+
+/// Short kind token for an object's geometry, as the digest prints it (`mesh`,
+/// `curve`, `dim`, `instance`, a frame/area label, or a parametric generator's
+/// token). Shared with the FFI so hosts see the same names.
+pub fn geometry_kind(geometry: &Geometry) -> &'static str {
+    match geometry {
+        Geometry::Mesh(_) => "mesh",
+        Geometry::Curve(_) => "curve",
+        Geometry::Annotation(a) => match a {
+            itsjustcad_doc::Annotation::LinearDim { .. } => "dim",
+            itsjustcad_doc::Annotation::AngularDim { .. } => "angledim",
+            itsjustcad_doc::Annotation::Text { .. } => "text",
+            itsjustcad_doc::Annotation::Field { .. } => "field",
+            itsjustcad_doc::Annotation::Hatch { .. } => "hatch",
+        },
+        Geometry::Instance { .. } => "instance",
+        Geometry::Points { .. } => "pointcloud",
+        Geometry::Frame { kind, .. } => kind.label(),
+        Geometry::Area { kind, .. } => kind.label(),
+        // Parametric structures report their generator so the LLM knows they
+        // stay editable via `param <sel> key=value`.
+        Geometry::Parametric { generator, .. } => generator.token(),
+    }
+}
+
+/// `k=v, …` for a selected parametric object (every schema field, in schema
+/// order, after sanitize) or dynamic-block instance (definition params resolved
+/// against the instance's overrides). `None` for anything else. Block param
+/// values are free text from the file, so they are sanitized like names.
+fn selected_params(doc: &Document, geometry: &Geometry) -> Option<String> {
+    match geometry {
+        Geometry::Parametric { generator, params, .. } => {
+            let schema = generator.schema();
+            let p = schema.sanitize(params);
+            let parts: Vec<String> = schema
+                .fields
+                .iter()
+                .filter_map(|f| p.get(f.name).map(|v| format!("{}={}", f.name, fmt_param(v))))
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(", "))
+        }
+        Geometry::Instance { source: Some(src), params, .. } => {
+            let def = doc.param_blocks.get(src)?;
+            let vals = def.resolve_values(params);
+            let parts: Vec<String> = def
+                .params
+                .iter()
+                .filter_map(|bp| {
+                    vals.get(&bp.name)
+                        .map(|v| format!("{}={}", sanitize_name(&bp.name), sanitize_name(v)))
+                })
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(", "))
+        }
+        _ => None,
+    }
+}
+
+/// Compact text for one typed param value (trailing zeros trimmed).
+fn fmt_param(v: &itsjustcad_doc::param_schema::ParamValue) -> String {
+    use itsjustcad_doc::param_schema::ParamValue;
+    let num = |x: f64| {
+        let s = format!("{x:.3}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    match v {
+        ParamValue::Float(x) => num(*x),
+        ParamValue::Int(x) => x.to_string(),
+        ParamValue::Bool(b) => b.to_string(),
+        ParamValue::Enum(e) => e.clone(),
+        ParamValue::Vec3(v) => format!("({},{},{})", num(v[0]), num(v[1]), num(v[2])),
+    }
 }
 
 #[cfg(test)]
@@ -375,6 +439,54 @@ mod tests {
 
         let none = DigestFilter { ids: Some(vec!["zzzz".into(), String::new()]), ..Default::default() };
         assert!(object_lines(&digest_filtered(&s.doc, &none)).is_empty());
+    }
+
+    #[test]
+    fn digest_selected_geodesic_lists_all_params() {
+        let s = session_with(&["geodesic 3 5 dome", "select last"]);
+        let d = digest(&s.doc);
+        let line = d.lines().find(|l| l.contains("[SELECTED]")).expect(&d);
+        assert!(line.starts_with("- geodesic "), "{d}");
+        assert!(line.contains("params frequency=3, radius=5, mode=dome"), "{d}");
+    }
+
+    #[test]
+    fn digest_selected_ramp_lists_params_unselected_does_not() {
+        let s = session_with(&["ramp rise 0.9 slope 1:12 width 1.2"]);
+        let d = digest(&s.doc);
+        assert!(!d.contains("params "), "unselected objects carry no params\n{d}");
+        // `ramp` also adds a centerline curve; select the parametric surface.
+        let mut s = session_with(&["ramp rise 0.9 slope 1:12 width 1.2"]);
+        let id = s
+            .doc
+            .objects()
+            .find(|o| matches!(o.geometry, Geometry::Parametric { .. }))
+            .unwrap()
+            .id;
+        s.doc.selection.insert(id);
+        let d = digest(&s.doc);
+        let line = d.lines().find(|l| l.contains("[SELECTED]")).expect(&d);
+        assert!(line.starts_with("- ramp "), "{d}");
+        assert!(line.contains(" params ") && line.contains("rise=0.9"), "{d}");
+    }
+
+    #[test]
+    fn digest_instance_names_block_and_selected_params() {
+        let s = session_with(&["pblock t width=1.5 : rect 0,0,0 {width} 0.1", "insert t 0,0,0"]);
+        let d = digest(&s.doc);
+        let line = object_lines(&d)[0];
+        assert!(line.starts_with("- instance ") && line.contains(" block «t»"), "{d}");
+        // The real block extent, not the ±scale placeholder cube.
+        assert!(line.contains("[0.0,0.0,0.0]..[1.5,0.1,0.0]"), "{d}");
+        assert!(!line.contains("params"), "{d}");
+        let s = session_with(&[
+            "pblock t width=1.5 : rect 0,0,0 {width} 0.1",
+            "insert t 0,0,0 width=2",
+            "select last",
+        ]);
+        let d = digest(&s.doc);
+        let line = d.lines().find(|l| l.contains("[SELECTED]")).expect(&d);
+        assert!(line.contains(" params «width»=«2»"), "{d}");
     }
 
     #[test]

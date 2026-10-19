@@ -30,7 +30,7 @@ pub use config::{is_local_url, CloudProvider, DeckConfig, DeckKind, DecksFile};
 pub use deck::{
     make_deck, ChatMessage, ChatRequest, DeckDelta, DeckError, ImagePart, LlmDeck, Role,
 };
-pub use digest::{digest, digest_filtered, DigestFilter};
+pub use digest::{digest, digest_filtered, geometry_kind, DigestFilter};
 pub use extract::{Extractor, ExtractEvent};
 pub use probe::{probe, warm_model, ProbeInfo, WarmOutcome};
 pub use prompt::{
