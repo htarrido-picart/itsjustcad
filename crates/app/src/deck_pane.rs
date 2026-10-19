@@ -534,6 +534,30 @@ fn attach_copy_menu(response: &egui::Response, raw: Option<String>) {
         });
 }
 
+/// How long a bubble's Copy button shows its checkmark after a click.
+const COPIED_FEEDBACK_SECS: f64 = 1.5;
+
+/// Whether transcript entry `i` was copied within [`COPIED_FEEDBACK_SECS`].
+fn copied_recently(copied: Option<(usize, f64)>, i: usize, now: f64) -> bool {
+    matches!(copied, Some((j, at)) if j == i && now - at < COPIED_FEEDBACK_SECS)
+}
+
+/// A small frameless icon button for the action row under a chat bubble
+/// (Copy / Resend), tinted weak so it stays quieter than the message.
+fn bubble_action(
+    ui: &mut egui::Ui,
+    icons: &crate::icons::Icons,
+    icon: crate::icons::Icon,
+    hover: &str,
+    enabled: bool,
+) -> egui::Response {
+    let size = ui.text_style_height(&egui::TextStyle::Body);
+    let color = ui.visuals().weak_text_color();
+    let img = icons.image(ui.ctx(), icon, size, color);
+    ui.add_enabled(enabled, egui::Button::image(img).frame(false))
+        .on_hover_text(hover)
+}
+
 /// A raised WHITE chip frame with a soft shadow (dark-neutral in dark mode).
 /// Used for the header controls — the "LLM" button and the deck/model selectors
 /// — so they read as raised buttons on the white dock. Wrap a widget in this and
@@ -1418,6 +1442,9 @@ pub struct DeckPane {
     current_response: String,
     /// Streaming chat text of the in-flight deck turn (display only).
     streaming_chat: String,
+    /// Transcript index whose bubble Copy button was last clicked, and when
+    /// (egui time) — the button shows a checkmark for [`COPIED_FEEDBACK_SECS`].
+    copied_entry: Option<(usize, f64)>,
     errors_this_turn: Vec<String>,
     /// `help <verb>` output requested by the model this turn. When non-empty at
     /// turn end (and no errors preempt it), it is threaded back as a follow-up
@@ -1620,6 +1647,7 @@ impl Default for DeckPane {
             extractor: Extractor::default(),
             current_response: String::new(),
             streaming_chat: String::new(),
+            copied_entry: None,
             errors_this_turn: Vec::new(),
             help_output_this_turn: Vec::new(),
             current_commands: Vec::new(),
@@ -4539,6 +4567,10 @@ use QUESTION:)."
 
         let mut open_detail: Option<PaneView> = None;
         let mut chip_fill: Option<String> = None;
+        // A bubble action clicked this frame: Copy (entry index) / Resend (text).
+        let mut copy_clicked: Option<usize> = None;
+        let mut resend: Option<String> = None;
+        let now = ui.input(|i| i.time);
         // A `/`-palette row click this frame: the `/<name> ` string to install.
         let mut slash_pick: Option<String> = None;
         let mut do_send = false;
@@ -5023,9 +5055,10 @@ use QUESTION:)."
                         for (i, entry) in self.transcript.iter().enumerate() {
                             match entry {
                                 Entry::User(t) => {
-                                    // Right-aligned user bubble.
+                                    // Right-aligned user bubble, with a Copy /
+                                    // Resend row beneath it (mirrors iOS).
                                     ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Min),
+                                        egui::Layout::top_down(egui::Align::Max),
                                         |ui| {
                                             let r = egui::Frame::NONE
                                                 .fill(user_bg)
@@ -5046,6 +5079,42 @@ use QUESTION:)."
                                                     );
                                                 });
                                             attach_copy_menu(&r.response, entry_copy_text(entry));
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Min),
+                                                |ui| {
+                                                    let copied = copied_recently(
+                                                        self.copied_entry,
+                                                        i,
+                                                        now,
+                                                    );
+                                                    if bubble_action(
+                                                        ui,
+                                                        icons,
+                                                        if copied {
+                                                            crate::icons::Icon::Check
+                                                        } else {
+                                                            crate::icons::Icon::Copy
+                                                        },
+                                                        "Copy message",
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        copy_clicked = Some(i);
+                                                    }
+                                                    if bubble_action(
+                                                        ui,
+                                                        icons,
+                                                        crate::icons::Icon::Resend,
+                                                        "Resend",
+                                                        !self.busy(),
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        resend = Some(t.clone());
+                                                    }
+                                                },
+                                            );
                                         },
                                     );
                                 }
@@ -5079,9 +5148,10 @@ use QUESTION:)."
                                     );
                                 }
                                 Entry::Deck(t) => {
-                                    // Left-aligned model bubble.
+                                    // Left-aligned model bubble, with a Copy
+                                    // button beneath it (mirrors iOS).
                                     ui.with_layout(
-                                        egui::Layout::left_to_right(egui::Align::Min),
+                                        egui::Layout::top_down(egui::Align::Min),
                                         |ui| {
                                             let r = egui::Frame::NONE
                                                 .fill(deck_bg)
@@ -5100,6 +5170,23 @@ use QUESTION:)."
                                             // Copy yields the RAW markdown, not
                                             // the rendered layout.
                                             attach_copy_menu(&r.response, entry_copy_text(entry));
+                                            let copied =
+                                                copied_recently(self.copied_entry, i, now);
+                                            if bubble_action(
+                                                ui,
+                                                icons,
+                                                if copied {
+                                                    crate::icons::Icon::Check
+                                                } else {
+                                                    crate::icons::Icon::Copy
+                                                },
+                                                "Copy message",
+                                                true,
+                                            )
+                                            .clicked()
+                                            {
+                                                copy_clicked = Some(i);
+                                            }
                                         },
                                     );
                                 }
@@ -5215,6 +5302,33 @@ use QUESTION:)."
 
         if let Some(view) = open_detail {
             self.view = view;
+        }
+        if let Some(i) = copy_clicked
+            && let Some(raw) = self.transcript.get(i).and_then(entry_copy_text)
+        {
+            ui.ctx().copy_text(raw);
+            self.copied_entry = Some((i, now));
+        }
+        // Keep repainting until the checkmark reverts to the copy icon.
+        if let Some((_, at)) = self.copied_entry {
+            let left = COPIED_FEEDBACK_SECS - (now - at);
+            if left > 0.0 {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(left));
+            } else {
+                self.copied_entry = None;
+            }
+        }
+        // Resend re-sends a past user message as a fresh turn, leaving the
+        // composer draft and any pending attachment untouched.
+        if let Some(text) = resend
+            && !self.busy()
+        {
+            let draft = std::mem::replace(&mut self.input, text);
+            let attachment = self.attached_image.take();
+            self.send(session, handle);
+            self.input = draft;
+            self.attached_image = attachment;
         }
         // A tapped example chip seeds the input and focuses it for editing.
         if let Some(text) = chip_fill {
@@ -5609,6 +5723,7 @@ mod side_effect_gate_tests {
             extractor: Extractor::default(),
             current_response: String::new(),
             streaming_chat: String::new(),
+            copied_entry: None,
             errors_this_turn: Vec::new(),
             help_output_this_turn: Vec::new(),
             current_commands: Vec::new(),
@@ -5787,6 +5902,15 @@ mod side_effect_gate_tests {
         };
         snapshot_pane("chat_markdown_table", build(), true, ());
         snapshot_pane("chat_markdown_table_light", build(), false, ());
+    }
+
+    #[test]
+    fn copied_feedback_is_per_entry_and_expires() {
+        let c = Some((3, 10.0));
+        assert!(copied_recently(c, 3, 10.5));
+        assert!(!copied_recently(c, 2, 10.5), "only the clicked bubble");
+        assert!(!copied_recently(c, 3, 10.0 + COPIED_FEEDBACK_SECS));
+        assert!(!copied_recently(None, 3, 10.5));
     }
 
     #[test]
