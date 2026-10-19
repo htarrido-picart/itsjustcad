@@ -2897,7 +2897,7 @@ fn resolve(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
 ///
 /// Deterministic: order follows curve/point order (or the fixed width-then-
 /// height sequence), so op-log replay is byte-identical.
-fn autodim_spans(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
+fn autodim_spans(doc: &Document, geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
     /// Segments shorter than this (meters) are skipped as degenerate.
     const DIM_MIN_SEG: f64 = 1e-6;
 
@@ -2928,7 +2928,7 @@ fn autodim_spans(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
     }
 
     // Extent dims from the AABB: width (X) then height (Y).
-    let bb = geometry.aabb();
+    let bb = doc.geometry_aabb(geometry);
     let z = bb.min.z;
     let mut spans = Vec::new();
     if (bb.max.x - bb.min.x) >= DIM_MIN_SEG {
@@ -10454,7 +10454,7 @@ fn apply_forward(
             let mut spans: Vec<(DVec3, DVec3)> = Vec::new();
             for oid in sel_ids {
                 let Some(obj) = doc.get(oid) else { continue };
-                spans.extend(autodim_spans(&obj.geometry));
+                spans.extend(autodim_spans(doc, &obj.geometry));
             }
             if spans.is_empty() {
                 return Err(ExecError::Invalid(
@@ -19916,6 +19916,22 @@ mod tests {
     /// (including the closing edge), matching the polyline edges; a mesh yields
     /// 2 extent spans (width then height) from its AABB.
     #[test]
+    fn autodim_spans_use_real_instance_extent() {
+        // A 2x1x1 box blocked and inserted rotated 90° at scale 2 spans
+        // x 8..10, y 0..4 — not the placeholder ±scale cube.
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,1,1");
+        run(&mut s, "block last b");
+        let id = run(&mut s, "insert b 10,0,0 90 2").created[0];
+        let geometry = s.doc.get(id).unwrap().geometry.clone();
+        let spans = autodim_spans(&s.doc, &geometry);
+        assert_eq!(spans.len(), 2, "width + height");
+        assert!(((spans[0].1 - spans[0].0).length() - 2.0).abs() < 1e-9, "{spans:?}");
+        assert!(((spans[1].1 - spans[1].0).length() - 4.0).abs() < 1e-9, "{spans:?}");
+        assert!((spans[0].0.x - 8.0).abs() < 1e-9, "{spans:?}");
+    }
+
+    #[test]
     fn autodim_spans_segments_and_extents() {
         // Closed unit-ish rectangle 3 wide x 2 tall at origin.
         let rect = Geometry::Curve(Curve::Polyline {
@@ -19927,7 +19943,8 @@ mod tests {
             ],
             closed: true,
         });
-        let spans = autodim_spans(&rect);
+        let empty = Document::default();
+        let spans = autodim_spans(&empty, &rect);
         assert_eq!(spans.len(), 4, "4 edges incl. closing segment");
         // First span is the bottom edge; last is the closing edge (top-left back
         // to origin).
@@ -19939,13 +19956,13 @@ mod tests {
             points: vec![DVec3::ZERO, DVec3::new(3.0, 0.0, 0.0), DVec3::new(3.0, 2.0, 0.0)],
             closed: false,
         });
-        assert_eq!(autodim_spans(&open).len(), 2);
+        assert_eq!(autodim_spans(&empty, &open).len(), 2);
 
         // A mesh (box) dimensions its extents: width (X) then height (Y).
         let mut s = Session::default();
         run(&mut s, "box 0,0,0 4,3,2");
         let mesh = &s.doc.objects().next().unwrap().geometry;
-        let spans = autodim_spans(mesh);
+        let spans = autodim_spans(&s.doc, mesh);
         assert_eq!(spans.len(), 2, "two extent dims");
         // width span runs along X; height span along Y.
         assert!((spans[0].1.x - spans[0].0.x).abs() > 1e-6 && (spans[0].1.y - spans[0].0.y).abs() < 1e-9);
