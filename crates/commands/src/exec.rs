@@ -3652,9 +3652,9 @@ fn apply_about_center(
     linear: glam::DMat4,
 ) -> (Inverse, usize) {
     let center = center.unwrap_or_else(|| {
-        let mut bb = doc.get(ids[0]).expect("resolved").geometry.aabb();
+        let mut bb = doc.geometry_aabb(&doc.get(ids[0]).expect("resolved").geometry);
         for id in &ids[1..] {
-            bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+            bb = bb.union(doc.geometry_aabb(&doc.get(*id).expect("resolved").geometry));
         }
         bb.center()
     });
@@ -3845,7 +3845,7 @@ fn replace_with_result(
         let boxes: Vec<String> = input_ids
             .iter()
             .map(|id| {
-                let bb = doc.get(*id).expect("resolved").geometry.aabb();
+                let bb = doc.geometry_aabb(&doc.get(*id).expect("resolved").geometry);
                 format!("{id}: {:.2}..{:.2}", bb.min, bb.max)
             })
             .collect();
@@ -7548,7 +7548,7 @@ fn exec_array_curve(
     for src_id in &src {
         let base = doc.get(*src_id).expect("resolved").clone();
         // Reference point that lands on each station: the source's AABB center.
-        let anchor = base.geometry.aabb().center();
+        let anchor = doc.geometry_aabb(&base.geometry).center();
         for &t in &ts {
             let (station, tangent) = polyline_point_tangent(&pts, t);
             let m = if align {
@@ -10088,7 +10088,7 @@ fn apply_forward(
                         let obj = doc.get(oid).ok_or_else(|| {
                             ExecError::Invalid(format!("dim references unknown object {oid}"))
                         })?;
-                        let last = which.extract(&obj.geometry.bound_points(), obj.geometry.aabb());
+                        let last = which.extract(&obj.geometry.bound_points(), doc.geometry_aabb(&obj.geometry));
                         Ok(DimAnchor::Object { id: oid, which: *which, last })
                     }
                 }
@@ -10772,9 +10772,9 @@ fn apply_forward(
             }
             // Combined AABB of the whole selection, then translate so its min
             // corner lands at the world origin. Pure translation → invertible.
-            let mut bb = doc.get(ids[0]).expect("resolved").geometry.aabb();
+            let mut bb = doc.geometry_aabb(&doc.get(ids[0]).expect("resolved").geometry);
             for id in &ids[1..] {
-                bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+                bb = bb.union(doc.geometry_aabb(&doc.get(*id).expect("resolved").geometry));
             }
             let delta = -bb.min;
             for id in &ids {
@@ -11039,7 +11039,7 @@ fn apply_forward(
             let matched: Vec<ObjectId> = doc
                 .objects()
                 .filter(|o| {
-                    let bb = o.geometry.aabb();
+                    let bb = doc.geometry_aabb(&o.geometry);
                     match mode {
                         RegionMode::Window => rect_contains_aabb(rect, bb),
                         RegionMode::Crossing => rect_intersects_aabb(rect, bb),
@@ -11908,9 +11908,9 @@ fn apply_forward(
             }
             let src = resolve(doc, &targets)?;
             let center_pt = center.unwrap_or_else(|| {
-                let mut bb = doc.get(src[0]).expect("resolved").geometry.aabb();
+                let mut bb = doc.geometry_aabb(&doc.get(src[0]).expect("resolved").geometry);
                 for id in &src[1..] {
-                    bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+                    bb = bb.union(doc.geometry_aabb(&doc.get(*id).expect("resolved").geometry));
                 }
                 bb.center()
             });
@@ -13416,9 +13416,9 @@ fn apply_forward(
         }
         Command::Bbox { targets } => {
             let ids = resolve(doc, &targets)?;
-            let mut bb = doc.get(ids[0]).expect("resolved").geometry.aabb();
+            let mut bb = doc.geometry_aabb(&doc.get(ids[0]).expect("resolved").geometry);
             for id in &ids[1..] {
-                bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+                bb = bb.union(doc.geometry_aabb(&doc.get(*id).expect("resolved").geometry));
             }
             let (per_m, label) = doc.units.per_meter();
             let v = |p: DVec3| {
@@ -16563,6 +16563,24 @@ mod tests {
         s.doc.blocks.remove("b");
         let g = &s.doc.get(id).unwrap().geometry;
         assert_eq!(s.doc.geometry_aabb(g), g.aabb());
+    }
+
+    #[test]
+    fn tozero_uses_real_instance_extent() {
+        // `tozero` moves the selection's AABB min corner to the origin. With
+        // the real extent (x∈[8,10], y∈[0,4], z∈[0,2]) the instance shifts by
+        // (-8,0,0); the old ±scale placeholder cube would have given (-8,2,2).
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,1,1");
+        run(&mut s, "block last b");
+        let id = run(&mut s, "insert b 10,0,0 90 2").created[0];
+        run(&mut s, "tozero last");
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Instance { position, .. } => {
+                assert!((*position - DVec3::new(2.0, 0.0, 0.0)).length() < 1e-9, "{position:?}");
+            }
+            g => panic!("expected instance, got {g:?}"),
+        }
     }
 
     #[test]

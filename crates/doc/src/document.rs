@@ -421,7 +421,7 @@ impl Document {
             crate::DimAnchor::Object { id, which, last } => match self.get(*id) {
                 Some(obj) => {
                     let bounds = obj.geometry.bound_points();
-                    which.extract(&bounds, obj.geometry.aabb())
+                    which.extract(&bounds, self.geometry_aabb(&obj.geometry))
                 }
                 None => *last,
             },

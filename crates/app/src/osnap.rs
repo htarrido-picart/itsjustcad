@@ -237,7 +237,7 @@ pub fn candidates_filtered(
         if !obj.visible || !doc.layer_visible(&obj.layer) {
             continue; // invisible geometry must not attract the cursor
         }
-        if !keep(obj.geometry.aabb()) {
+        if !keep(doc.geometry_aabb(&obj.geometry)) {
             continue; // object nowhere near the cursor — skip its points
         }
         match &obj.geometry {

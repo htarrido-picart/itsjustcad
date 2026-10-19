@@ -230,7 +230,7 @@ impl Gumball {
             let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 210, 80));
             for id in &drag.ids {
                 if let Some(obj) = doc.get(*id) {
-                    let bb = obj.geometry.aabb();
+                    let bb = doc.geometry_aabb(&obj.geometry);
                     draw_ghost_box(&painter, project, &m, bb.min, bb.max, stroke);
                 }
             }
@@ -251,9 +251,9 @@ impl Gumball {
 
 /// Combined AABB center of the given (resolved) selection.
 fn selection_center(doc: &Document, ids: &[ObjectId]) -> DVec3 {
-    let mut bb = doc.get(ids[0]).expect("selected exists").geometry.aabb();
+    let mut bb = doc.geometry_aabb(&doc.get(ids[0]).expect("selected exists").geometry);
     for id in &ids[1..] {
-        bb = bb.union(doc.get(*id).expect("selected exists").geometry.aabb());
+        bb = bb.union(doc.geometry_aabb(&doc.get(*id).expect("selected exists").geometry));
     }
     bb.center()
 }
