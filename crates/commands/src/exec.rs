@@ -16528,6 +16528,44 @@ mod tests {
     }
 
     #[test]
+    fn instance_geometry_aabb_uses_block_extent_clip_and_fallback() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,1,1");
+        run(&mut s, "block last b");
+        let id = run(&mut s, "insert b 10,0,0 90 2").created[0];
+        let aabb = |s: &Session| s.doc.geometry_aabb(&s.doc.get(id).unwrap().geometry);
+        // Scale 2, rotate 90° about Z, translate: x∈[8,10], y∈[0,4], z∈[0,2].
+        let bb = aabb(&s);
+        assert!((bb.min - DVec3::new(8.0, 0.0, 0.0)).length() < 1e-9, "{bb:?}");
+        assert!((bb.max - DVec3::new(10.0, 4.0, 2.0)).length() < 1e-9, "{bb:?}");
+
+        // An XCLIP rect narrows the XY extent; one that misses keeps the box.
+        let set_clip = |s: &mut Session, c: Option<itsjustcad_doc::ClipRect>| {
+            if let Geometry::Instance { clip, .. } = &mut s.doc.get_mut(id).unwrap().geometry {
+                *clip = c;
+            }
+        };
+        set_clip(
+            &mut s,
+            Some(itsjustcad_doc::ClipRect::new(glam::DVec2::new(9.0, 1.0), glam::DVec2::new(20.0, 2.0))),
+        );
+        let bb = aabb(&s);
+        assert!((bb.min - DVec3::new(9.0, 1.0, 0.0)).length() < 1e-9, "{bb:?}");
+        assert!((bb.max - DVec3::new(10.0, 2.0, 2.0)).length() < 1e-9, "{bb:?}");
+        set_clip(
+            &mut s,
+            Some(itsjustcad_doc::ClipRect::new(glam::DVec2::new(50.0, 50.0), glam::DVec2::new(60.0, 60.0))),
+        );
+        assert!((aabb(&s).max - DVec3::new(10.0, 4.0, 2.0)).length() < 1e-9);
+        set_clip(&mut s, None);
+
+        // Missing block definition: falls back to the placeholder cube.
+        s.doc.blocks.remove("b");
+        let g = &s.doc.get(id).unwrap().geometry;
+        assert_eq!(s.doc.geometry_aabb(g), g.aabb());
+    }
+
+    #[test]
     fn param_insert_uses_defaults_when_no_override() {
         let mut s = Session::default();
         run(&mut s, "pblock t width=1.5 : rect 0,0,0 {width} 0.1");

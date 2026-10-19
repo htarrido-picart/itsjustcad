@@ -596,7 +596,7 @@ impl Document {
 
     pub fn scene_aabb(&self) -> Option<Aabb> {
         self.objects()
-            .map(|o| o.geometry.aabb())
+            .map(|o| self.geometry_aabb(&o.geometry))
             .reduce(Aabb::union)
     }
 
@@ -605,8 +605,66 @@ impl Document {
     pub fn selection_aabb(&self) -> Option<Aabb> {
         self.objects()
             .filter(|o| self.selection.contains(&o.id))
-            .map(|o| o.geometry.aabb())
+            .map(|o| self.geometry_aabb(&o.geometry))
             .reduce(Aabb::union)
+    }
+
+    /// World AABB of `geometry`, resolving block instances against their
+    /// definition in `blocks` (which [`Geometry::aabb`] cannot see). The
+    /// instance transform matches the render resolution in `render::snapshot`:
+    /// uniform scale, rotate about Z, then translate. An XCLIP rect narrows the
+    /// XY extent. An instance whose block is missing or empty falls back to
+    /// [`Geometry::aabb`]'s placeholder cube around the insertion point.
+    pub fn geometry_aabb(&self, geometry: &crate::Geometry) -> Aabb {
+        let crate::Geometry::Instance { block, position, rotation_deg, scale, clip, .. } =
+            geometry
+        else {
+            return geometry.aabb();
+        };
+        let Some(local) = self
+            .blocks
+            .get(block)
+            .and_then(|defs| defs.iter().map(block_geometry_aabb).reduce(Aabb::union))
+        else {
+            return geometry.aabb();
+        };
+        let m = glam::DMat4::from_translation(*position)
+            * glam::DMat4::from_rotation_z(rotation_deg.to_radians())
+            * glam::DMat4::from_scale(DVec3::splat(*scale));
+        let (lo, hi) = (local.min, local.max);
+        let corners = (0..8).map(|i| {
+            let pick = |bit: usize, a: f64, b: f64| if i & bit == 0 { a } else { b };
+            m.transform_point3(DVec3::new(
+                pick(1, lo.x, hi.x),
+                pick(2, lo.y, hi.y),
+                pick(4, lo.z, hi.z),
+            ))
+        });
+        let mut bb = Aabb::from_points(corners);
+        if let Some(rect) = clip {
+            let min_x = bb.min.x.max(rect.min.x);
+            let min_y = bb.min.y.max(rect.min.y);
+            let max_x = bb.max.x.min(rect.max.x);
+            let max_y = bb.max.y.min(rect.max.y);
+            // A clip window that misses the geometry entirely keeps the
+            // unclipped box rather than an inverted one.
+            if min_x <= max_x && min_y <= max_y {
+                bb.min.x = min_x;
+                bb.min.y = min_y;
+                bb.max.x = max_x;
+                bb.max.y = max_y;
+            }
+        }
+        bb
+    }
+}
+
+/// Local-space AABB of one block-definition entry.
+fn block_geometry_aabb(g: &BlockGeometry) -> Aabb {
+    match g {
+        BlockGeometry::Mesh(m) => m.aabb(),
+        BlockGeometry::Curve(c) => Aabb::from_points(c.points_bound()),
+        BlockGeometry::Annotation(a) => Aabb::from_points(a.points()),
     }
 }
 
