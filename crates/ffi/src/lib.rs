@@ -999,6 +999,55 @@ fn frame_camera(app: &mut AppHandle) {
     }
 }
 
+/// Drain and apply the deferred ops (from typed input and the streaming deck),
+/// in queue order.
+fn apply_pending(app: &mut AppHandle) {
+    let ops: Vec<PendingOp> = match app.pending.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(_) => Vec::new(),
+    };
+    for op in ops {
+        match op {
+            PendingOp::Cmd(cmd) => {
+                let _ = app.session.run(cmd);
+            }
+            PendingOp::Camera(k) => apply_camera(app, k),
+        }
+    }
+}
+
+/// Apply one camera op to the handle's camera.
+fn apply_camera(app: &mut AppHandle, op: CamOp) {
+    match op {
+        CamOp::SetView(v) => app.camera.set_view(v),
+        CamOp::Orbit(dx, dy) => app.camera.orbit(dx, dy),
+        CamOp::Pan(dx, dy) => app.camera.pan(dx, dy),
+        CamOp::Dolly(d) => app.camera.dolly(d),
+        CamOp::Frame => frame_camera(app),
+    }
+}
+
+/// The JSON [`ijc_run_command_result`] returns.
+fn run_result_json(
+    ok: bool,
+    message: Option<&str>,
+    error: Option<&str>,
+    created: &[itsjustcad_doc::ObjectId],
+) -> String {
+    let created: Vec<String> = created.iter().map(|id| id.to_string()).collect();
+    serde_json::json!({ "ok": ok, "message": message, "error": error, "created": created })
+        .to_string()
+}
+
+/// Run a checked document command on `session` now and report the outcome as
+/// [`ijc_run_command_result`] JSON.
+fn run_cmd_json(session: &mut Session, cmd: Command) -> String {
+    match session.run(cmd) {
+        Ok(out) => run_result_json(true, Some(&out.message), None, &out.created),
+        Err(e) => run_result_json(false, None, Some(&e.to_string()), &[]),
+    }
+}
+
 /// Queue a single command line (typed in the chat box). Applied next frame.
 ///
 /// Returns `true` if the line was queued, `false` if it was rejected: a null /
@@ -1043,6 +1092,56 @@ pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char)
             return true;
         }
         false
+    })
+}
+
+/// Run a command line NOW and return its result as JSON, so text output (e.g.
+/// `blocks`, `help`, measurements) reaches the host — [`ijc_run_command`] only
+/// queues the line and returns `bool`. The line goes through the same routing
+/// and side-effect gate as [`ijc_run_command`] (see `check_line`). Ops already
+/// queued are applied first, so ordering with earlier queued lines is kept.
+///
+/// Returns `{"ok":bool,"message":string|null,"error":string|null,"created":[id…]}`:
+/// `message` is the command's result line, `error` the parse/refusal/exec
+/// message, `created` the short ids of objects the command created. A camera
+/// verb (`top`, `orbit …`) is applied to the camera and reports
+/// `{"ok":true,"message":null,…}`. A null/invalid/busy handle or a null or
+/// non-UTF-8 `line` yields `ok:false` with an `error` (still non-null JSON).
+/// Caller must [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `line` must be null or
+/// a valid NUL-terminated C string. The returned pointer must be freed exactly
+/// once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_run_command_result(
+    h: *mut AppHandle,
+    line: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle");
+        };
+        let app: &mut AppHandle = &mut guard;
+        if line.is_null() {
+            return fail("line is null");
+        }
+        let Ok(s) = (unsafe { CStr::from_ptr(line) }).to_str() else {
+            return fail("line is not valid UTF-8");
+        };
+        let op = match check_line(s) {
+            Ok(op) => op,
+            Err((reason, _)) => return fail(&reason),
+        };
+        apply_pending(app);
+        match op {
+            PendingOp::Cmd(cmd) => into_c_string(run_cmd_json(&mut app.session, cmd)),
+            PendingOp::Camera(k) => {
+                apply_camera(app, k);
+                into_c_string(run_result_json(true, None, None, &[]))
+            }
+        }
     })
 }
 
@@ -1819,25 +1918,7 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
         // whole `AppHandle`.
         let app: &mut AppHandle = &mut guard;
 
-        // Drain deferred ops (from typed input and the streaming deck).
-        let ops: Vec<PendingOp> = match app.pending.lock() {
-            Ok(mut g) => std::mem::take(&mut *g),
-            Err(_) => Vec::new(),
-        };
-        for op in ops {
-            match op {
-                PendingOp::Cmd(cmd) => {
-                    let _ = app.session.run(cmd);
-                }
-                PendingOp::Camera(k) => match k {
-                    CamOp::SetView(v) => app.camera.set_view(v),
-                    CamOp::Orbit(dx, dy) => app.camera.orbit(dx, dy),
-                    CamOp::Pan(dx, dy) => app.camera.pan(dx, dy),
-                    CamOp::Dolly(d) => app.camera.dolly(d),
-                    CamOp::Frame => frame_camera(app),
-                },
-            }
-        }
+        apply_pending(app);
 
         // Re-upload geometry only when the document changed.
         let doc_gen = app.session.doc.generation;
@@ -3540,7 +3621,8 @@ pub unsafe extern "C" fn ijc_doc_generation(h: *mut AppHandle) -> u64 {
 
 /// Free a C string returned by [`ijc_command_brief`] / [`ijc_scene_digest`] /
 /// [`ijc_scene_digest_filtered`] / [`ijc_save_json`] / [`ijc_parametric_json`] /
-/// [`ijc_param_blocks_json`] / [`ijc_selection_json`] (or any other `*_json`
+/// [`ijc_param_blocks_json`] / [`ijc_selection_json`] /
+/// [`ijc_run_command_result`] (or any other `*_json`
 /// accessor).
 /// Null-safe; must be called at most once per returned pointer.
 ///
@@ -3701,6 +3783,51 @@ mod tests {
         );
         assert_eq!(parse_id_list(""), None);
         assert_eq!(parse_id_list(" , "), None);
+    }
+
+    #[test]
+    fn run_command_result_is_null_safe() {
+        let nil = std::ptr::null_mut::<AppHandle>();
+        let line = CString::new("box 0,0,0 1,1,1").unwrap();
+        unsafe {
+            for l in [line.as_ptr(), std::ptr::null()] {
+                let p = ijc_run_command_result(nil, l);
+                assert!(!p.is_null());
+                let v: serde_json::Value =
+                    serde_json::from_str(CStr::from_ptr(p).to_str().unwrap()).unwrap();
+                assert_eq!(v["ok"], false);
+                assert!(v["error"].is_string());
+                ijc_string_free(p);
+            }
+        }
+    }
+
+    #[test]
+    fn run_cmd_json_reports_message_and_created_ids() {
+        let mut session = Session::default();
+        let run = |session: &mut Session, line: &str| -> serde_json::Value {
+            let Ok(PendingOp::Cmd(cmd)) = check_line(line) else {
+                panic!("{line} should route to a document command");
+            };
+            serde_json::from_str(&run_cmd_json(session, cmd)).unwrap()
+        };
+        let v = run(&mut session, "box 0,0,0 1,1,1");
+        assert_eq!(v["ok"], true);
+        let created = v["created"].as_array().unwrap();
+        assert_eq!(created.len(), 1);
+        let id = session.doc.objects().last().unwrap().id.to_string();
+        assert_eq!(created[0], id.as_str());
+
+        // A text-output command: the message is the payload the host needs.
+        let v = run(&mut session, "blocks");
+        assert_eq!(v["ok"], true);
+        assert!(!v["message"].as_str().unwrap().is_empty(), "{v}");
+        assert!(v["created"].as_array().unwrap().is_empty());
+
+        // An exec failure is reported, not swallowed.
+        let v = run(&mut session, "insert nosuchblock 0,0,0");
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("nosuchblock"), "{v}");
     }
 
     #[test]
