@@ -4885,26 +4885,6 @@ impl App {
         ) {
             let pane_rect = panes.get(self.active_pane).copied().unwrap_or(full);
             self.empty_document_overlay(ui, pane_rect);
-        } else if !self.preview_no_viewport
-            && show_empty_document_hint(
-                &self.session.doc,
-                self.draw_tool.active() || self.guided.active(),
-                load_onboarding_done(),
-            )
-        {
-            // Returning user, empty doc: no boxed overlay — just a whisper-quiet
-            // centered next-action hint so the viewport is never a blank void.
-            // Weak text, no frame; suppressed in preview/`--shot` snapshots so it
-            // never leaks into chrome-only captures.
-            let pane_rect = panes.get(self.active_pane).copied().unwrap_or(full);
-            let painter = ui.painter_at(pane_rect);
-            painter.text(
-                pane_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "Type a command or describe what to draw",
-                egui::FontId::proportional(14.0),
-                ui.visuals().weak_text_color(),
-            );
         }
     }
 
@@ -10643,20 +10623,6 @@ fn show_empty_document(
     doc.is_empty() && !tool_active && !onboarding_done
 }
 
-/// Whether to paint the SUBTLE empty-document hint (a low-key line of weak text,
-/// no box) over the active viewport. This is the RETURNING-user counterpart to
-/// [`show_empty_document`]: once onboarding is done the boxed first-run overlay
-/// is retired, but a bare grid is still a blank void — so a whisper-quiet
-/// next-action hint fills it. Never shown when the boxed overlay is (`!done`),
-/// nor while a draw tool is mid-flight.
-fn show_empty_document_hint(
-    doc: &itsjustcad_doc::Document,
-    tool_active: bool,
-    onboarding_done: bool,
-) -> bool {
-    doc.is_empty() && !tool_active && onboarding_done
-}
-
 /// Middle-truncate a layer name to `max` chars, inserting an ellipsis so the
 /// head and tail both stay readable (Rhino-style long-name handling).
 fn middle_truncate(s: &str, max: usize) -> String {
@@ -13425,24 +13391,6 @@ mod tests {
         assert!(!show_empty_document(&s.doc, false, true));
         // Confirming: tool active + onboarding done → also suppressed.
         assert!(!show_empty_document(&s.doc, true, true));
-    }
-
-    #[test]
-    fn empty_document_hint_is_returning_user_counterpart() {
-        use itsjustcad_commands::{parse, Session};
-        let mut s = Session::default();
-        assert!(s.doc.is_empty());
-        // Returning user (onboarding done), empty doc, no tool → subtle hint.
-        assert!(show_empty_document_hint(&s.doc, false, true));
-        // First-run (onboarding NOT done) shows the boxed overlay, NOT the hint,
-        // so the two never paint at once.
-        assert!(!show_empty_document_hint(&s.doc, false, false));
-        assert!(show_empty_document(&s.doc, false, false));
-        // A tool mid-flight suppresses the hint.
-        assert!(!show_empty_document_hint(&s.doc, true, true));
-        // Geometry present → no hint.
-        s.run(parse("box 0,0,0 1,1,1").unwrap()).unwrap();
-        assert!(!show_empty_document_hint(&s.doc, false, true));
     }
 
     #[test]
