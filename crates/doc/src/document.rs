@@ -19,14 +19,20 @@ use glam::DVec3;
 
 /// Seed the layer table for a brand-new document: "Default" plus
 /// "Layer 01".."Layer 05" (6 layers total). `order` keeps "Default" first,
-/// then the numbered layers in sequence, in the Layers panel.
+/// then the numbered layers in sequence, in the Layers panel. "Default" keeps
+/// the theme ink (`color: None`); each numbered layer gets its own palette
+/// color so layers read apart at a glance.
 fn seed_default_layers() -> BTreeMap<String, LayerStyle> {
     let mut layers =
         BTreeMap::from([(DEFAULT_LAYER.to_string(), LayerStyle::default())]);
     for i in 1..=5 {
         layers.insert(
             format!("Layer {i:02}"),
-            LayerStyle { order: i, ..LayerStyle::default() },
+            LayerStyle {
+                order: i,
+                color: Some(crate::default_layer_color(i as usize)),
+                ..LayerStyle::default()
+            },
         );
     }
     layers
