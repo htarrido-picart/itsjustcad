@@ -1047,31 +1047,30 @@ fn default_layer() -> String {
 
 /// Curated, distinguishable default palette for auto-assigning colors to new
 /// layers (Rhino-style, but hand-picked to read well on both dark and light
-/// viewport backgrounds). Index 0 is the first/"Default" layer and is BLACK
-/// (matches Rhino); subsequent layers cycle through the palette below. Values
+/// viewport backgrounds). Index 0 is the first/"Default" layer; subsequent
+/// layers cycle through the palette below. Values
 /// are RGBA in 0..1, mirroring `LayerStyle::color`.
 ///
-/// Palette (after black): red, blue, green, purple, orange, teal, brown, pink,
-/// olive, gray — the classic "tab10"-style set, which stays legible against
-/// dark and light backgrounds alike.
+/// Palette: an impressionist set — muted, painterly hues drawn
+/// from Monet, Van Gogh, Cézanne, Renoir, Pissarro and Caillebotte. Mid-value
+/// on purpose so every entry stays legible on dark and light backgrounds.
 const LAYER_COLOR_PALETTE: [[f32; 4]; 11] = [
-    [0.0, 0.0, 0.0, 1.0],                   // 0: black (Default)
-    [0.839_216, 0.152_941, 0.156_863, 1.0], // 1: red     #D62728
-    [0.121_569, 0.466_667, 0.705_882, 1.0], // 2: blue    #1F77B4
-    [0.172_549, 0.627_451, 0.172_549, 1.0], // 3: green   #2CA02C
-    [0.580_392, 0.403_922, 0.741_176, 1.0], // 4: purple  #9467BD
-    [1.0, 0.498_039, 0.054_902, 1.0],       // 5: orange  #FF7F0E
-    [0.090_196, 0.745_098, 0.811_765, 1.0], // 6: teal    #17BECF
-    [0.549_020, 0.337_255, 0.294_118, 1.0], // 7: brown   #8C564B
-    [0.890_196, 0.466_667, 0.760_784, 1.0], // 8: pink    #E377C2
-    [0.737_255, 0.741_176, 0.133_333, 1.0], // 9: olive   #BCBD22
-    [0.498_039, 0.498_039, 0.498_039, 1.0], // 10: gray   #7F7F7F
+    [0.560784, 0.603922, 0.227451, 1.0], // 0: olive #8F9A3A (Van Gogh, Olive Trees)
+    [0.784314, 0.333333, 0.239216, 1.0], // 1: poppy red #C8553D (Monet, Poppies)
+    [0.309804, 0.525490, 0.776471, 1.0], // 2: cerulean #4F86C6 (Monet, Water Lilies)
+    [0.415686, 0.603922, 0.345098, 1.0], // 3: sage green #6A9A58 (Monet, Giverny)
+    [0.556863, 0.435294, 0.709804, 1.0], // 4: violet #8E6FB5 (Monet, Parliament)
+    [0.850980, 0.643137, 0.254902, 1.0], // 5: ochre #D9A441 (Van Gogh, Wheatfield)
+    [0.243137, 0.611765, 0.584314, 1.0], // 6: viridian #3E9C95 (Cézanne, Sainte-Victoire)
+    [0.823529, 0.478431, 0.560784, 1.0], // 7: rose madder #D27A8F (Renoir, Moulin)
+    [0.627451, 0.376471, 0.227451, 1.0], // 8: burnt sienna #A0603A (Pissarro, Red Roofs)
+    [0.611765, 0.537255, 0.721569, 1.0], // 9: lilac #9C89B8 (Monet, Wisteria)
+    [0.364706, 0.427451, 0.494118, 1.0], // 10: slate #5D6D7E (Caillebotte, Rainy Day)
 ];
 
 /// Default display color for the Nth layer created, as RGBA (0..1).
 ///
-/// `index == 0` is BLACK (the first/"Default" layer, matching Rhino). Later
-/// indices cycle through a curated, distinguishable palette and wrap once the
+/// `index == 0` is the first/"Default" layer's color. Later indices cycle through a curated, distinguishable palette and wrap once the
 /// palette is exhausted, so `default_layer_color(n) == default_layer_color(n +
 /// LAYER_COLOR_PALETTE.len())`. Purely index-based → deterministic and
 /// replay-stable for the op-log (no randomness).
@@ -1223,13 +1222,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_layer_color_index_zero_is_black() {
-        assert_eq!(default_layer_color(0), [0.0, 0.0, 0.0, 1.0]);
+    fn default_layer_color_index_zero_is_olive() {
+        assert_eq!(default_layer_color(0), [0.560784, 0.603922, 0.227451, 1.0]);
     }
 
     #[test]
     fn default_layer_color_distinct_for_first_ten() {
-        // Indices 1..=10 must all differ from each other and from black.
+        // Indices 0..=10 must all differ from each other.
         let mut seen: Vec<[f32; 4]> = Vec::new();
         for i in 0..=10 {
             let c = default_layer_color(i);

@@ -146,7 +146,7 @@ pub struct UiPreset {
     pub command_line_pos: CommandLinePos,
     /// Which side the docked tab panel sits on.
     pub panel_side: PanelSide,
-    /// Default viewport count on first show (Rhino → 4-up, others single).
+    /// Default viewport count on first show (4-up for every skin).
     pub default_viewports: u8,
     /// Menu-bar grouping style.
     pub menu_style: MenuStyle,
@@ -269,7 +269,7 @@ pub const AUTOCAD: UiPreset = UiPreset {
     aliases: AUTOCAD_ALIASES,
     command_line_pos: CommandLinePos::Bottom,
     panel_side: PanelSide::Right,
-    default_viewports: 1,
+    default_viewports: 4,
     menu_style: MenuStyle::AutoCAD,
 };
 
@@ -332,7 +332,7 @@ pub const REVIT: UiPreset = UiPreset {
     // but keep it at the bottom and use AutoCAD-style ribbon-ish menus.
     command_line_pos: CommandLinePos::Bottom,
     panel_side: PanelSide::Right,
-    default_viewports: 1,
+    default_viewports: 4,
     menu_style: MenuStyle::AutoCAD,
 };
 
@@ -349,11 +349,10 @@ pub const ITSJUSTCAD_DEFAULT: UiPreset = UiPreset {
     right_click_repeat_last: false,
     aliases: &[],
     // ItsJustCAD default: command line on top, right tab panel, Rhino menu
-    // grouping. Boots to a SINGLE perspective viewport (user preference) — the
-    // 2/4-up split is one `viewports` command / View-menu click away.
+    // grouping. Boots to the Rhino 4-up layout (Top/Front/Right/Perspective).
     command_line_pos: CommandLinePos::Top,
     panel_side: PanelSide::Right,
-    default_viewports: 1,
+    default_viewports: 4,
     menu_style: MenuStyle::Rhino,
 };
 
@@ -722,9 +721,9 @@ mod tests {
     }
 
     #[test]
-    fn autocad_keeps_command_line_bottom_single_viewport() {
+    fn autocad_keeps_command_line_bottom_and_4up() {
         assert_eq!(AUTOCAD.command_line_pos, CommandLinePos::Bottom);
-        assert_eq!(AUTOCAD.default_viewports, 1);
+        assert_eq!(AUTOCAD.default_viewports, 4);
         assert_eq!(AUTOCAD.menu_style, MenuStyle::AutoCAD);
     }
 
@@ -732,8 +731,8 @@ mod tests {
     fn itsjustcad_default_is_rhino_arrangement() {
         // Task M-uilayout: Rhino-default arrangement even for the ItsJustCAD skin.
         assert_eq!(ITSJUSTCAD_DEFAULT.command_line_pos, CommandLinePos::Top);
-        // Boots to a single perspective viewport (user preference).
-        assert_eq!(ITSJUSTCAD_DEFAULT.default_viewports, 1);
+        // Boots to the Rhino 4-up layout.
+        assert_eq!(ITSJUSTCAD_DEFAULT.default_viewports, 4);
         assert_eq!(ITSJUSTCAD_DEFAULT.menu_style, MenuStyle::Rhino);
     }
 

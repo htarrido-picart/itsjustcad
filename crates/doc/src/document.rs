@@ -19,14 +19,21 @@ use glam::DVec3;
 
 /// Seed the layer table for a brand-new document: "Default" plus
 /// "Layer 01".."Layer 05" (6 layers total). `order` keeps "Default" first,
-/// then the numbered layers in sequence, in the Layers panel.
+/// then the numbered layers in sequence, in the Layers panel. Every seeded
+/// layer gets its own palette color so layers read apart at a glance.
 fn seed_default_layers() -> BTreeMap<String, LayerStyle> {
-    let mut layers =
-        BTreeMap::from([(DEFAULT_LAYER.to_string(), LayerStyle::default())]);
+    let mut layers = BTreeMap::from([(
+        DEFAULT_LAYER.to_string(),
+        LayerStyle { color: Some(crate::default_layer_color(0)), ..LayerStyle::default() },
+    )]);
     for i in 1..=5 {
         layers.insert(
             format!("Layer {i:02}"),
-            LayerStyle { order: i, ..LayerStyle::default() },
+            LayerStyle {
+                order: i,
+                color: Some(crate::default_layer_color(i as usize)),
+                ..LayerStyle::default()
+            },
         );
     }
     layers
@@ -822,9 +829,8 @@ mod tests {
         let doc = Document::default();
         assert_eq!(doc.current_layer, DEFAULT_LAYER);
         let style = doc.layers.get(DEFAULT_LAYER).expect("default layer exists");
-        assert_eq!(*style, LayerStyle::default());
         assert!(style.visible);
-        assert!(style.color.is_none());
+        assert_eq!(style.color, Some(crate::default_layer_color(0)));
         assert!(doc.layer_visible(DEFAULT_LAYER));
         assert!(doc.layer_visible("never-created"), "unknown layers read visible");
     }

@@ -85,6 +85,9 @@ pub enum Icon {
     Send,
     ChevronUp,
     ChevronDown,
+    // Chat bubble actions
+    Check,
+    Resend,
     // Panel + viewport controls
     PanelOpen,
     PanelClose,
@@ -98,7 +101,7 @@ impl Icon {
     /// Every icon, for exhaustiveness (embedding + tests). Part of the module's
     /// public surface; exercised by the raster-validation tests.
     #[allow(dead_code)]
-    pub const ALL: [Icon; 61] = [
+    pub const ALL: [Icon; 63] = [
         Icon::New,
         Icon::NewSession,
         Icon::Open,
@@ -154,6 +157,8 @@ impl Icon {
         Icon::Send,
         Icon::ChevronUp,
         Icon::ChevronDown,
+        Icon::Check,
+        Icon::Resend,
         Icon::PanelOpen,
         Icon::PanelClose,
         Icon::Maximize,
@@ -220,6 +225,8 @@ impl Icon {
             Icon::Send => "send",
             Icon::ChevronUp => "chevron-up",
             Icon::ChevronDown => "chevron-down",
+            Icon::Check => "check",
+            Icon::Resend => "refresh-cw",
             Icon::PanelOpen => "panel-right-open",
             Icon::PanelClose => "panel-right-close",
             Icon::Maximize => "maximize-2",
@@ -292,6 +299,8 @@ impl Icon {
             Icon::Send => png!("send"),
             Icon::ChevronUp => png!("chevron-up"),
             Icon::ChevronDown => png!("chevron-down"),
+            Icon::Check => png!("check"),
+            Icon::Resend => png!("refresh-cw"),
             Icon::PanelOpen => png!("panel-right-open"),
             Icon::PanelClose => png!("panel-right-close"),
             Icon::Maximize => png!("maximize-2"),
