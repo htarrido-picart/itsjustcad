@@ -874,7 +874,8 @@ mod tests {
 
         let scene = snapshot(&doc, Theme::Dark);
         assert_eq!(scene.meshes[0].1, red);
-        assert_eq!(scene.meshes[1].1, Theme::Dark.mesh());
+        // The seeded "default" layer carries its own palette color.
+        assert_eq!(scene.meshes[1].1, itsjustcad_doc::default_layer_color(0));
 
         doc.selection.insert(id);
         let scene = snapshot(&doc, Theme::Dark);
@@ -1256,8 +1257,9 @@ mod tests {
         let scene = snapshot_with_mode(&doc, Theme::Dark, cms);
         // First object should be red (object color wins)
         assert_eq!(scene.meshes[0].1, [1.0, 0.0, 0.0, 1.0]);
-        // Second has no color override — falls back to layer then theme
-        assert_eq!(scene.meshes[1].1, Theme::Dark.mesh());
+        // Second has no color override — falls back to its layer's color
+        // (the seeded "default" layer's palette color).
+        assert_eq!(scene.meshes[1].1, itsjustcad_doc::default_layer_color(0));
     }
 
     #[test]
