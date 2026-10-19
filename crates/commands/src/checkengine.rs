@@ -664,13 +664,13 @@ fn exit_positions(doc: &Document, exit_name: &str, band: Option<(f64, f64)>) -> 
         .filter(|o| o.name.as_deref().is_some_and(|n| n.to_lowercase().contains(&needle)))
         .filter(|o| match band {
             Some((lo, hi)) => {
-                let a = o.geometry.aabb();
+                let a = doc.geometry_aabb(&o.geometry);
                 a.max.z >= lo - 1e-9 && a.min.z < hi - 1e-9
             }
             None => true,
         })
         .map(|o| {
-            let a = o.geometry.aabb();
+            let a = doc.geometry_aabb(&o.geometry);
             (a.min + a.max) * 0.5
         })
         .collect()
@@ -858,7 +858,12 @@ fn matches_kind(obj: &SceneObject, kind: &str) -> bool {
     }
 }
 
-fn matches_query(obj: &SceneObject, q: &TargetQuery, band: Option<(f64, f64)>) -> bool {
+fn matches_query(
+    doc: &Document,
+    obj: &SceneObject,
+    q: &TargetQuery,
+    band: Option<(f64, f64)>,
+) -> bool {
     if let Some(layer) = &q.layer
         && &obj.layer != layer
     {
@@ -874,7 +879,7 @@ fn matches_query(obj: &SceneObject, q: &TargetQuery, band: Option<(f64, f64)>) -
         return false;
     }
     if let Some((lo, hi)) = band {
-        let aabb = obj.geometry.aabb();
+        let aabb = doc.geometry_aabb(&obj.geometry);
         if aabb.max.z < lo - 1e-9 || aabb.min.z >= hi - 1e-9 {
             return false;
         }
@@ -935,7 +940,7 @@ pub fn evaluate(
     for rule in rules {
         let targets: Vec<&SceneObject> = doc
             .objects()
-            .filter(|o| matches_query(o, &rule.target, band))
+            .filter(|o| matches_query(doc, o, &rule.target, band))
             .collect();
         // Violations: (object short id, location, measured value).
         let mut violations: Vec<(String, DVec3, f64)> = Vec::new();
@@ -1046,7 +1051,7 @@ pub fn evaluate(
             }
             CheckKind::MinCountPerStory { min } => {
                 let bottoms: Vec<f64> =
-                    targets.iter().map(|o| o.geometry.aabb().min.z).collect();
+                    targets.iter().map(|o| doc.geometry_aabb(&o.geometry).min.z).collect();
                 for (name, elev, count) in count_per_story(&doc.stories, &bottoms) {
                     if story.is_some_and(|s| !name.eq_ignore_ascii_case(s)) {
                         continue;
@@ -1059,7 +1064,7 @@ pub fn evaluate(
             }
             CheckKind::GuardDrop { drop } => {
                 for obj in &targets {
-                    let a = obj.geometry.aabb();
+                    let a = doc.geometry_aabb(&obj.geometry);
                     if !a.max.z.is_finite() {
                         continue;
                     }
@@ -1204,7 +1209,7 @@ pub fn evaluate(
                     // Flag at the centroid of all matched objects.
                     let mut sum = DVec3::ZERO;
                     for o in &targets {
-                        let a = o.geometry.aabb();
+                        let a = doc.geometry_aabb(&o.geometry);
                         sum += (a.min + a.max) * 0.5;
                     }
                     let at = sum / total as f64;

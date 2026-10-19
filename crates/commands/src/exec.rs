@@ -2897,7 +2897,7 @@ fn resolve(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
 ///
 /// Deterministic: order follows curve/point order (or the fixed width-then-
 /// height sequence), so op-log replay is byte-identical.
-fn autodim_spans(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
+fn autodim_spans(doc: &Document, geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
     /// Segments shorter than this (meters) are skipped as degenerate.
     const DIM_MIN_SEG: f64 = 1e-6;
 
@@ -2928,7 +2928,7 @@ fn autodim_spans(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
     }
 
     // Extent dims from the AABB: width (X) then height (Y).
-    let bb = geometry.aabb();
+    let bb = doc.geometry_aabb(geometry);
     let z = bb.min.z;
     let mut spans = Vec::new();
     if (bb.max.x - bb.min.x) >= DIM_MIN_SEG {
@@ -3652,9 +3652,9 @@ fn apply_about_center(
     linear: glam::DMat4,
 ) -> (Inverse, usize) {
     let center = center.unwrap_or_else(|| {
-        let mut bb = doc.get(ids[0]).expect("resolved").geometry.aabb();
+        let mut bb = doc.geometry_aabb(&doc.get(ids[0]).expect("resolved").geometry);
         for id in &ids[1..] {
-            bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+            bb = bb.union(doc.geometry_aabb(&doc.get(*id).expect("resolved").geometry));
         }
         bb.center()
     });
@@ -3845,7 +3845,7 @@ fn replace_with_result(
         let boxes: Vec<String> = input_ids
             .iter()
             .map(|id| {
-                let bb = doc.get(*id).expect("resolved").geometry.aabb();
+                let bb = doc.geometry_aabb(&doc.get(*id).expect("resolved").geometry);
                 format!("{id}: {:.2}..{:.2}", bb.min, bb.max)
             })
             .collect();
@@ -7548,7 +7548,7 @@ fn exec_array_curve(
     for src_id in &src {
         let base = doc.get(*src_id).expect("resolved").clone();
         // Reference point that lands on each station: the source's AABB center.
-        let anchor = base.geometry.aabb().center();
+        let anchor = doc.geometry_aabb(&base.geometry).center();
         for &t in &ts {
             let (station, tangent) = polyline_point_tangent(&pts, t);
             let m = if align {
@@ -10088,7 +10088,7 @@ fn apply_forward(
                         let obj = doc.get(oid).ok_or_else(|| {
                             ExecError::Invalid(format!("dim references unknown object {oid}"))
                         })?;
-                        let last = which.extract(&obj.geometry.bound_points(), obj.geometry.aabb());
+                        let last = which.extract(&obj.geometry.bound_points(), doc.geometry_aabb(&obj.geometry));
                         Ok(DimAnchor::Object { id: oid, which: *which, last })
                     }
                 }
@@ -10454,7 +10454,7 @@ fn apply_forward(
             let mut spans: Vec<(DVec3, DVec3)> = Vec::new();
             for oid in sel_ids {
                 let Some(obj) = doc.get(oid) else { continue };
-                spans.extend(autodim_spans(&obj.geometry));
+                spans.extend(autodim_spans(doc, &obj.geometry));
             }
             if spans.is_empty() {
                 return Err(ExecError::Invalid(
@@ -10772,9 +10772,9 @@ fn apply_forward(
             }
             // Combined AABB of the whole selection, then translate so its min
             // corner lands at the world origin. Pure translation → invertible.
-            let mut bb = doc.get(ids[0]).expect("resolved").geometry.aabb();
+            let mut bb = doc.geometry_aabb(&doc.get(ids[0]).expect("resolved").geometry);
             for id in &ids[1..] {
-                bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+                bb = bb.union(doc.geometry_aabb(&doc.get(*id).expect("resolved").geometry));
             }
             let delta = -bb.min;
             for id in &ids {
@@ -11039,7 +11039,7 @@ fn apply_forward(
             let matched: Vec<ObjectId> = doc
                 .objects()
                 .filter(|o| {
-                    let bb = o.geometry.aabb();
+                    let bb = doc.geometry_aabb(&o.geometry);
                     match mode {
                         RegionMode::Window => rect_contains_aabb(rect, bb),
                         RegionMode::Crossing => rect_intersects_aabb(rect, bb),
@@ -11908,9 +11908,9 @@ fn apply_forward(
             }
             let src = resolve(doc, &targets)?;
             let center_pt = center.unwrap_or_else(|| {
-                let mut bb = doc.get(src[0]).expect("resolved").geometry.aabb();
+                let mut bb = doc.geometry_aabb(&doc.get(src[0]).expect("resolved").geometry);
                 for id in &src[1..] {
-                    bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+                    bb = bb.union(doc.geometry_aabb(&doc.get(*id).expect("resolved").geometry));
                 }
                 bb.center()
             });
@@ -13416,9 +13416,9 @@ fn apply_forward(
         }
         Command::Bbox { targets } => {
             let ids = resolve(doc, &targets)?;
-            let mut bb = doc.get(ids[0]).expect("resolved").geometry.aabb();
+            let mut bb = doc.geometry_aabb(&doc.get(ids[0]).expect("resolved").geometry);
             for id in &ids[1..] {
-                bb = bb.union(doc.get(*id).expect("resolved").geometry.aabb());
+                bb = bb.union(doc.geometry_aabb(&doc.get(*id).expect("resolved").geometry));
             }
             let (per_m, label) = doc.units.per_meter();
             let v = |p: DVec3| {
@@ -16525,6 +16525,62 @@ mod tests {
         run(&mut s, "redo");
         let w3 = baked_width(&s, id);
         assert!((w3 - 4.0).abs() < 1e-6, "redo re-applies footprint, got {w3}");
+    }
+
+    #[test]
+    fn instance_geometry_aabb_uses_block_extent_clip_and_fallback() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,1,1");
+        run(&mut s, "block last b");
+        let id = run(&mut s, "insert b 10,0,0 90 2").created[0];
+        let aabb = |s: &Session| s.doc.geometry_aabb(&s.doc.get(id).unwrap().geometry);
+        // Scale 2, rotate 90° about Z, translate: x∈[8,10], y∈[0,4], z∈[0,2].
+        let bb = aabb(&s);
+        assert!((bb.min - DVec3::new(8.0, 0.0, 0.0)).length() < 1e-9, "{bb:?}");
+        assert!((bb.max - DVec3::new(10.0, 4.0, 2.0)).length() < 1e-9, "{bb:?}");
+
+        // An XCLIP rect narrows the XY extent; one that misses keeps the box.
+        let set_clip = |s: &mut Session, c: Option<itsjustcad_doc::ClipRect>| {
+            if let Geometry::Instance { clip, .. } = &mut s.doc.get_mut(id).unwrap().geometry {
+                *clip = c;
+            }
+        };
+        set_clip(
+            &mut s,
+            Some(itsjustcad_doc::ClipRect::new(glam::DVec2::new(9.0, 1.0), glam::DVec2::new(20.0, 2.0))),
+        );
+        let bb = aabb(&s);
+        assert!((bb.min - DVec3::new(9.0, 1.0, 0.0)).length() < 1e-9, "{bb:?}");
+        assert!((bb.max - DVec3::new(10.0, 2.0, 2.0)).length() < 1e-9, "{bb:?}");
+        set_clip(
+            &mut s,
+            Some(itsjustcad_doc::ClipRect::new(glam::DVec2::new(50.0, 50.0), glam::DVec2::new(60.0, 60.0))),
+        );
+        assert!((aabb(&s).max - DVec3::new(10.0, 4.0, 2.0)).length() < 1e-9);
+        set_clip(&mut s, None);
+
+        // Missing block definition: falls back to the placeholder cube.
+        s.doc.blocks.remove("b");
+        let g = &s.doc.get(id).unwrap().geometry;
+        assert_eq!(s.doc.geometry_aabb(g), g.aabb());
+    }
+
+    #[test]
+    fn tozero_uses_real_instance_extent() {
+        // `tozero` moves the selection's AABB min corner to the origin. With
+        // the real extent (x∈[8,10], y∈[0,4], z∈[0,2]) the instance shifts by
+        // (-8,0,0); the old ±scale placeholder cube would have given (-8,2,2).
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,1,1");
+        run(&mut s, "block last b");
+        let id = run(&mut s, "insert b 10,0,0 90 2").created[0];
+        run(&mut s, "tozero last");
+        match &s.doc.get(id).unwrap().geometry {
+            Geometry::Instance { position, .. } => {
+                assert!((*position - DVec3::new(2.0, 0.0, 0.0)).length() < 1e-9, "{position:?}");
+            }
+            g => panic!("expected instance, got {g:?}"),
+        }
     }
 
     #[test]
@@ -19860,6 +19916,22 @@ mod tests {
     /// (including the closing edge), matching the polyline edges; a mesh yields
     /// 2 extent spans (width then height) from its AABB.
     #[test]
+    fn autodim_spans_use_real_instance_extent() {
+        // A 2x1x1 box blocked and inserted rotated 90° at scale 2 spans
+        // x 8..10, y 0..4 — not the placeholder ±scale cube.
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,1,1");
+        run(&mut s, "block last b");
+        let id = run(&mut s, "insert b 10,0,0 90 2").created[0];
+        let geometry = s.doc.get(id).unwrap().geometry.clone();
+        let spans = autodim_spans(&s.doc, &geometry);
+        assert_eq!(spans.len(), 2, "width + height");
+        assert!(((spans[0].1 - spans[0].0).length() - 2.0).abs() < 1e-9, "{spans:?}");
+        assert!(((spans[1].1 - spans[1].0).length() - 4.0).abs() < 1e-9, "{spans:?}");
+        assert!((spans[0].0.x - 8.0).abs() < 1e-9, "{spans:?}");
+    }
+
+    #[test]
     fn autodim_spans_segments_and_extents() {
         // Closed unit-ish rectangle 3 wide x 2 tall at origin.
         let rect = Geometry::Curve(Curve::Polyline {
@@ -19871,7 +19943,8 @@ mod tests {
             ],
             closed: true,
         });
-        let spans = autodim_spans(&rect);
+        let empty = Document::default();
+        let spans = autodim_spans(&empty, &rect);
         assert_eq!(spans.len(), 4, "4 edges incl. closing segment");
         // First span is the bottom edge; last is the closing edge (top-left back
         // to origin).
@@ -19883,13 +19956,13 @@ mod tests {
             points: vec![DVec3::ZERO, DVec3::new(3.0, 0.0, 0.0), DVec3::new(3.0, 2.0, 0.0)],
             closed: false,
         });
-        assert_eq!(autodim_spans(&open).len(), 2);
+        assert_eq!(autodim_spans(&empty, &open).len(), 2);
 
         // A mesh (box) dimensions its extents: width (X) then height (Y).
         let mut s = Session::default();
         run(&mut s, "box 0,0,0 4,3,2");
         let mesh = &s.doc.objects().next().unwrap().geometry;
-        let spans = autodim_spans(mesh);
+        let spans = autodim_spans(&s.doc, mesh);
         assert_eq!(spans.len(), 2, "two extent dims");
         // width span runs along X; height span along Y.
         assert!((spans[0].1.x - spans[0].0.x).abs() > 1e-6 && (spans[0].1.y - spans[0].0.y).abs() < 1e-9);

@@ -3846,7 +3846,7 @@ impl App {
                         itsjustcad_doc::Geometry::Curve(c) => Some(c),
                         _ => None,
                     };
-                    (obj.id, obj.geometry.aabb(), curve)
+                    (obj.id, self.session.doc.geometry_aabb(&obj.geometry), curve)
                 })
                 .collect();
         let bvh = kernel_mesh::Bvh::build(&pickable.iter().map(|(_, bb, _)| *bb).collect::<Vec<_>>());
@@ -5422,7 +5422,7 @@ impl App {
             sel_layers.push(obj.layer.clone());
             names.push(obj.name.clone());
             colors.push(obj.color);
-            let bb = obj.geometry.aabb();
+            let bb = doc.geometry_aabb(&obj.geometry);
             aabb = Some(match aabb {
                 Some(a) => a.union(bb),
                 None => bb,
@@ -5918,7 +5918,7 @@ impl App {
             .filter(|obj| self.guided_pick_matches(obj.id))
             .filter(|obj| obj_matches_box(&obj.geometry, view_proj, rect, drag, mode))
             .map(|obj| {
-                let bb = obj.geometry.aabb();
+                let bb = self.session.doc.geometry_aabb(&obj.geometry);
                 let d = projected_rect(view_proj, rect, bb.min, bb.max)
                     .map(|r| r.center().distance_sq(target))
                     .unwrap_or(f32::MAX);

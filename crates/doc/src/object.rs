@@ -912,9 +912,9 @@ impl Geometry {
             Geometry::Mesh(m) => m.aabb(),
             Geometry::Curve(c) => Aabb::from_points(c.points_bound()),
             Geometry::Annotation(a) => Aabb::from_points(a.points()),
-            // Approximate AABB: a small sphere around the insertion point.
-            // The real size is only known with the block definition, which lives
-            // on Document; keep it a point so picking still works.
+            // Placeholder: a ±scale cube around the insertion point. The real
+            // extent needs the block definition, which lives on Document — use
+            // `Document::geometry_aabb` wherever a Document is at hand.
             Geometry::Instance { position, scale, .. } => {
                 let s = *scale;
                 Aabb::from_points(vec![*position - DVec3::splat(s), *position + DVec3::splat(s)])

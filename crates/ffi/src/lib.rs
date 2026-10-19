@@ -999,6 +999,55 @@ fn frame_camera(app: &mut AppHandle) {
     }
 }
 
+/// Drain and apply the deferred ops (from typed input and the streaming deck),
+/// in queue order.
+fn apply_pending(app: &mut AppHandle) {
+    let ops: Vec<PendingOp> = match app.pending.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(_) => Vec::new(),
+    };
+    for op in ops {
+        match op {
+            PendingOp::Cmd(cmd) => {
+                let _ = app.session.run(cmd);
+            }
+            PendingOp::Camera(k) => apply_camera(app, k),
+        }
+    }
+}
+
+/// Apply one camera op to the handle's camera.
+fn apply_camera(app: &mut AppHandle, op: CamOp) {
+    match op {
+        CamOp::SetView(v) => app.camera.set_view(v),
+        CamOp::Orbit(dx, dy) => app.camera.orbit(dx, dy),
+        CamOp::Pan(dx, dy) => app.camera.pan(dx, dy),
+        CamOp::Dolly(d) => app.camera.dolly(d),
+        CamOp::Frame => frame_camera(app),
+    }
+}
+
+/// The JSON [`ijc_run_command_result`] returns.
+fn run_result_json(
+    ok: bool,
+    message: Option<&str>,
+    error: Option<&str>,
+    created: &[itsjustcad_doc::ObjectId],
+) -> String {
+    let created: Vec<String> = created.iter().map(|id| id.to_string()).collect();
+    serde_json::json!({ "ok": ok, "message": message, "error": error, "created": created })
+        .to_string()
+}
+
+/// Run a checked document command on `session` now and report the outcome as
+/// [`ijc_run_command_result`] JSON.
+fn run_cmd_json(session: &mut Session, cmd: Command) -> String {
+    match session.run(cmd) {
+        Ok(out) => run_result_json(true, Some(&out.message), None, &out.created),
+        Err(e) => run_result_json(false, None, Some(&e.to_string()), &[]),
+    }
+}
+
 /// Queue a single command line (typed in the chat box). Applied next frame.
 ///
 /// Returns `true` if the line was queued, `false` if it was rejected: a null /
@@ -1043,6 +1092,56 @@ pub unsafe extern "C" fn ijc_run_command(h: *mut AppHandle, line: *const c_char)
             return true;
         }
         false
+    })
+}
+
+/// Run a command line NOW and return its result as JSON, so text output (e.g.
+/// `blocks`, `help`, measurements) reaches the host — [`ijc_run_command`] only
+/// queues the line and returns `bool`. The line goes through the same routing
+/// and side-effect gate as [`ijc_run_command`] (see `check_line`). Ops already
+/// queued are applied first, so ordering with earlier queued lines is kept.
+///
+/// Returns `{"ok":bool,"message":string|null,"error":string|null,"created":[id…]}`:
+/// `message` is the command's result line, `error` the parse/refusal/exec
+/// message, `created` the short ids of objects the command created. A camera
+/// verb (`top`, `orbit …`) is applied to the camera and reports
+/// `{"ok":true,"message":null,…}`. A null/invalid/busy handle or a null or
+/// non-UTF-8 `line` yields `ok:false` with an `error` (still non-null JSON).
+/// Caller must [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `line` must be null or
+/// a valid NUL-terminated C string. The returned pointer must be freed exactly
+/// once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_run_command_result(
+    h: *mut AppHandle,
+    line: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle");
+        };
+        let app: &mut AppHandle = &mut guard;
+        if line.is_null() {
+            return fail("line is null");
+        }
+        let Ok(s) = (unsafe { CStr::from_ptr(line) }).to_str() else {
+            return fail("line is not valid UTF-8");
+        };
+        let op = match check_line(s) {
+            Ok(op) => op,
+            Err((reason, _)) => return fail(&reason),
+        };
+        apply_pending(app);
+        match op {
+            PendingOp::Cmd(cmd) => into_c_string(run_cmd_json(&mut app.session, cmd)),
+            PendingOp::Camera(k) => {
+                apply_camera(app, k);
+                into_c_string(run_result_json(true, None, None, &[]))
+            }
+        }
     })
 }
 
@@ -1320,6 +1419,29 @@ fn ray_aabb(
     (t_max >= t_min.max(0.0)).then_some(t_min.max(0.0))
 }
 
+/// Broad phase of [`ijc_pick`]: the nearest VISIBLE object whose world AABB
+/// the ray crosses. Block instances are tested against their real block extent
+/// (`Document::geometry_aabb`), not a placeholder around the insertion point.
+fn pick_nearest(
+    doc: &itsjustcad_doc::Document,
+    origin: glam::DVec3,
+    dir: glam::DVec3,
+) -> Option<itsjustcad_doc::ObjectId> {
+    let mut best: Option<(f64, itsjustcad_doc::ObjectId)> = None;
+    for obj in doc.objects() {
+        if !(obj.visible && doc.layer_visible(&obj.layer)) {
+            continue;
+        }
+        let bb = doc.geometry_aabb(&obj.geometry);
+        if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
+            && best.is_none_or(|(bt, _)| t < bt)
+        {
+            best = Some((t, obj.id));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 /// Tap-to-select. Builds a pick ray from `(x_px, y_px)` (physical drawable
 /// pixels, the same space as [`ijc_resize`]) and finds the nearest VISIBLE
 /// object whose world AABB the ray crosses (AABB broad-phase only — enough for
@@ -1349,26 +1471,13 @@ pub unsafe extern "C" fn ijc_pick(h: *mut AppHandle, x_px: f32, y_px: f32, addit
             return false;
         };
 
-        // Broad phase: nearest visible object whose world AABB the ray hits.
-        let doc = &app.session.doc;
-        let mut best: Option<(f64, itsjustcad_doc::ObjectId)> = None;
-        for obj in doc.objects() {
-            if !(obj.visible && doc.layer_visible(&obj.layer)) {
-                continue;
-            }
-            let bb = obj.geometry.aabb();
-            if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
-                && best.is_none_or(|(bt, _)| t < bt)
-            {
-                best = Some((t, obj.id));
-            }
-        }
+        let best = pick_nearest(&app.session.doc, origin, dir);
 
         // Apply the selection change and report whether we hit anything. We only
         // bump `generation` (via `get_mut`) when the selection actually changed,
         // so a redundant tap doesn't force a needless re-snapshot.
         match best {
-            Some((_, id)) => {
+            Some(id) => {
                 let doc = &mut app.session.doc;
                 if additive {
                     if !doc.selection.remove(&id) {
@@ -1809,25 +1918,7 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
         // whole `AppHandle`.
         let app: &mut AppHandle = &mut guard;
 
-        // Drain deferred ops (from typed input and the streaming deck).
-        let ops: Vec<PendingOp> = match app.pending.lock() {
-            Ok(mut g) => std::mem::take(&mut *g),
-            Err(_) => Vec::new(),
-        };
-        for op in ops {
-            match op {
-                PendingOp::Cmd(cmd) => {
-                    let _ = app.session.run(cmd);
-                }
-                PendingOp::Camera(k) => match k {
-                    CamOp::SetView(v) => app.camera.set_view(v),
-                    CamOp::Orbit(dx, dy) => app.camera.orbit(dx, dy),
-                    CamOp::Pan(dx, dy) => app.camera.pan(dx, dy),
-                    CamOp::Dolly(d) => app.camera.dolly(d),
-                    CamOp::Frame => frame_camera(app),
-                },
-            }
-        }
+        apply_pending(app);
 
         // Re-upload geometry only when the document changed.
         let doc_gen = app.session.doc.generation;
@@ -2452,6 +2543,199 @@ fn layers_json(doc: &itsjustcad_doc::Document) -> String {
     }
     out.push(']');
     out
+}
+
+/// The document's live parametric objects (`Geometry::Parametric`) as a JSON
+/// array, for a host-side parameter editor:
+/// `[{"id","uuid","name","layer","generator","labelKey","selected","params":{…},"fields":[…]}, …]`.
+/// `id` is the short id the digest and selectors use; `uuid` the full id.
+/// `params` is the stored map completed and clamped by the generator's schema
+/// (floats/ints → numbers, bools, vec3 → `[x,y,z]`, enums → their token). Each
+/// `fields` entry is `{"name","labelKey","kind","widget","unit","min","max","step","default","choices"}`
+/// straight from `ParamSchema` (`min`/`max` are null when unbounded). Edit a
+/// value with `ijc_run_command(h, "param <sel> name=value")`. Returns `"[]"`
+/// (non-null) for a null/invalid handle. Caller must [`ijc_string_free`] the
+/// result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer must
+/// be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_parametric_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::from("[]"));
+        };
+        into_c_string(parametric_json(&app.session.doc))
+    })
+}
+
+/// JSON for one typed parametric value.
+fn param_value_json(v: &itsjustcad_doc::param_schema::ParamValue) -> serde_json::Value {
+    use itsjustcad_doc::param_schema::ParamValue;
+    match v {
+        ParamValue::Float(x) => serde_json::json!(x),
+        ParamValue::Int(x) => serde_json::json!(x),
+        ParamValue::Bool(b) => serde_json::json!(b),
+        ParamValue::Vec3(v) => serde_json::json!(v),
+        ParamValue::Enum(e) => serde_json::json!(e),
+    }
+}
+
+/// Serialize every parametric object with its current params and schema.
+fn parametric_json(doc: &itsjustcad_doc::Document) -> String {
+    let items: Vec<serde_json::Value> = doc
+        .objects()
+        .filter_map(|obj| {
+            let itsjustcad_doc::Geometry::Parametric { generator, params, .. } = &obj.geometry else {
+                return None;
+            };
+            let schema = generator.schema();
+            let current = schema.sanitize(params);
+            let params: serde_json::Map<String, serde_json::Value> = current
+                .iter()
+                .map(|(k, v)| (k.clone(), param_value_json(v)))
+                .collect();
+            let fields: Vec<serde_json::Value> = schema
+                .fields
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "name": f.name,
+                        "labelKey": f.label_key,
+                        "kind": f.kind,
+                        "widget": f.widget,
+                        "unit": f.unit,
+                        "min": f.min,
+                        "max": f.max,
+                        "step": f.step,
+                        "default": param_value_json(&f.default),
+                        "choices": f.choices,
+                    })
+                })
+                .collect();
+            Some(serde_json::json!({
+                "id": obj.id.to_string(),
+                "uuid": obj.id.0.to_string(),
+                "name": obj.name,
+                "layer": obj.layer,
+                "generator": generator.token(),
+                "labelKey": generator.label_key(),
+                "selected": doc.selection.contains(&obj.id),
+                "params": params,
+                "fields": fields,
+            }))
+        })
+        .collect();
+    serde_json::Value::Array(items).to_string()
+}
+
+/// The document's dynamic (parametric) blocks as JSON:
+/// `{"defs":[{"name","params":[{"name","default"}],"body":["<template line>",…]}],
+///   "instances":[{"id","uuid","block","source","position":[x,y,z],"rotationDeg","scale","params":{…},"selected"}]}`.
+/// `defs` are the `pblock` definitions (sorted by name). `instances` lists only
+/// dynamic-block instances (those with a `source`); `block` is the per-instance
+/// bake key, `source` the definition name, and `params` the definition's params
+/// resolved against the instance's overrides (string values, as the template
+/// substitutes them). Edit with `ijc_run_command(h, "param <sel> name=value")`.
+/// Returns `{"defs":[],"instances":[]}` (non-null) for a null/invalid handle.
+/// Caller must [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer must
+/// be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_param_blocks_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::from("{\"defs\":[],\"instances\":[]}"));
+        };
+        into_c_string(param_blocks_json(&app.session.doc))
+    })
+}
+
+/// Serialize the parametric block definitions and their instances.
+fn param_blocks_json(doc: &itsjustcad_doc::Document) -> String {
+    let defs: Vec<serde_json::Value> = doc
+        .param_blocks
+        .iter()
+        .map(|(name, def)| {
+            let params: Vec<serde_json::Value> = def
+                .params
+                .iter()
+                .map(|p| serde_json::json!({ "name": p.name, "default": p.default }))
+                .collect();
+            serde_json::json!({ "name": name, "params": params, "body": def.body })
+        })
+        .collect();
+    let instances: Vec<serde_json::Value> = doc
+        .objects()
+        .filter_map(|obj| {
+            let itsjustcad_doc::Geometry::Instance {
+                block,
+                position,
+                rotation_deg,
+                scale,
+                source: Some(source),
+                params,
+                ..
+            } = &obj.geometry
+            else {
+                return None;
+            };
+            let resolved = match doc.param_blocks.get(source) {
+                Some(def) => def.resolve_values(params),
+                None => params.clone(),
+            };
+            Some(serde_json::json!({
+                "id": obj.id.to_string(),
+                "uuid": obj.id.0.to_string(),
+                "block": block,
+                "source": source,
+                "position": [position.x, position.y, position.z],
+                "rotationDeg": rotation_deg,
+                "scale": scale,
+                "params": resolved,
+                "selected": doc.selection.contains(&obj.id),
+            }))
+        })
+        .collect();
+    serde_json::json!({ "defs": defs, "instances": instances }).to_string()
+}
+
+/// The current selection as a JSON array, in document order:
+/// `[{"id","uuid","kind"}, …]`. `kind` is the digest's kind token (`mesh`,
+/// `curve`, `instance`, a generator token such as `geodesic`, …). Returns `"[]"`
+/// (non-null) for a null/invalid handle. Caller must [`ijc_string_free`] the
+/// result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer must
+/// be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_selection_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::from("[]"));
+        };
+        into_c_string(selection_json(&app.session.doc))
+    })
+}
+
+/// Serialize the selected objects' ids and kinds.
+fn selection_json(doc: &itsjustcad_doc::Document) -> String {
+    let items: Vec<serde_json::Value> = doc
+        .objects()
+        .filter(|o| doc.selection.contains(&o.id))
+        .map(|o| {
+            serde_json::json!({
+                "id": o.id.to_string(),
+                "uuid": o.id.0.to_string(),
+                "kind": itsjustcad_deck::geometry_kind(&o.geometry),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(items).to_string()
 }
 
 /// The document's sheets and sheet sets as JSON, for the iPad Sheets (paper-space)
@@ -3336,7 +3620,10 @@ pub unsafe extern "C" fn ijc_doc_generation(h: *mut AppHandle) -> u64 {
 }
 
 /// Free a C string returned by [`ijc_command_brief`] / [`ijc_scene_digest`] /
-/// [`ijc_scene_digest_filtered`] / [`ijc_save_json`].
+/// [`ijc_scene_digest_filtered`] / [`ijc_save_json`] / [`ijc_parametric_json`] /
+/// [`ijc_param_blocks_json`] / [`ijc_selection_json`] /
+/// [`ijc_run_command_result`] (or any other `*_json`
+/// accessor).
 /// Null-safe; must be called at most once per returned pointer.
 ///
 /// # Safety
@@ -3499,6 +3786,51 @@ mod tests {
     }
 
     #[test]
+    fn run_command_result_is_null_safe() {
+        let nil = std::ptr::null_mut::<AppHandle>();
+        let line = CString::new("box 0,0,0 1,1,1").unwrap();
+        unsafe {
+            for l in [line.as_ptr(), std::ptr::null()] {
+                let p = ijc_run_command_result(nil, l);
+                assert!(!p.is_null());
+                let v: serde_json::Value =
+                    serde_json::from_str(CStr::from_ptr(p).to_str().unwrap()).unwrap();
+                assert_eq!(v["ok"], false);
+                assert!(v["error"].is_string());
+                ijc_string_free(p);
+            }
+        }
+    }
+
+    #[test]
+    fn run_cmd_json_reports_message_and_created_ids() {
+        let mut session = Session::default();
+        let run = |session: &mut Session, line: &str| -> serde_json::Value {
+            let Ok(PendingOp::Cmd(cmd)) = check_line(line) else {
+                panic!("{line} should route to a document command");
+            };
+            serde_json::from_str(&run_cmd_json(session, cmd)).unwrap()
+        };
+        let v = run(&mut session, "box 0,0,0 1,1,1");
+        assert_eq!(v["ok"], true);
+        let created = v["created"].as_array().unwrap();
+        assert_eq!(created.len(), 1);
+        let id = session.doc.objects().last().unwrap().id.to_string();
+        assert_eq!(created[0], id.as_str());
+
+        // A text-output command: the message is the payload the host needs.
+        let v = run(&mut session, "blocks");
+        assert_eq!(v["ok"], true);
+        assert!(!v["message"].as_str().unwrap().is_empty(), "{v}");
+        assert!(v["created"].as_array().unwrap().is_empty());
+
+        // An exec failure is reported, not swallowed.
+        let v = run(&mut session, "insert nosuchblock 0,0,0");
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("nosuchblock"), "{v}");
+    }
+
+    #[test]
     fn layers_json_is_null_safe_and_well_formed() {
         // Null handle yields a non-null, empty JSON array.
         let nil = std::ptr::null_mut::<AppHandle>();
@@ -3519,6 +3851,146 @@ mod tests {
         assert!(json.contains("\"colorRgba\":["));
         assert!(json.contains("\"active\":true"));
         assert!(json.contains("\"linetype\":\"continuous\""));
+    }
+
+    fn session_with(lines: &[&str]) -> Session {
+        let mut s = Session::default();
+        for line in lines {
+            s.run(parse(line).unwrap()).unwrap();
+        }
+        s
+    }
+
+    #[test]
+    fn param_readback_fns_are_null_safe() {
+        let nil = std::ptr::null_mut::<AppHandle>();
+        unsafe {
+            for (p, want) in [
+                (ijc_parametric_json(nil), "[]"),
+                (ijc_param_blocks_json(nil), "{\"defs\":[],\"instances\":[]}"),
+                (ijc_selection_json(nil), "[]"),
+            ] {
+                assert!(!p.is_null());
+                assert_eq!(CStr::from_ptr(p).to_str().unwrap(), want);
+                ijc_string_free(p);
+            }
+        }
+    }
+
+    #[test]
+    fn parametric_json_round_trips_geodesic_and_ramp() {
+        let mut s = session_with(&["geodesic 3 5 dome", "ramp rise 0.9 slope 1:12 width 1.2"]);
+        let geo_id = s.doc.objects().next().unwrap().id;
+        s.doc.selection.insert(geo_id);
+        let v: serde_json::Value = serde_json::from_str(&parametric_json(&s.doc)).unwrap();
+        let items = v.as_array().unwrap();
+        assert_eq!(items.len(), 2, "{v}");
+
+        let geo = &items[0];
+        assert_eq!(geo["generator"], "geodesic");
+        assert_eq!(geo["id"], geo_id.to_string());
+        assert_eq!(geo["selected"], true);
+        assert_eq!(geo["params"]["frequency"], 3);
+        assert_eq!(geo["params"]["radius"], 5.0);
+        assert_eq!(geo["params"]["mode"], "dome");
+        let fields = geo["fields"].as_array().unwrap();
+        let freq = fields.iter().find(|f| f["name"] == "frequency").unwrap();
+        assert_eq!(freq["kind"], "int");
+        assert_eq!(freq["widget"], "slider");
+        assert_eq!(freq["min"], 1.0);
+        assert_eq!(freq["max"], 64.0);
+        let radius = fields.iter().find(|f| f["name"] == "radius").unwrap();
+        assert_eq!(radius["unit"], "meter");
+        assert!(radius["max"].is_null(), "unbounded max is null");
+        let mode = fields.iter().find(|f| f["name"] == "mode").unwrap();
+        assert_eq!(mode["choices"], serde_json::json!(["dome", "full"]));
+
+        let ramp = &items[1];
+        assert_eq!(ramp["generator"], "ramp");
+        assert_eq!(ramp["selected"], false);
+        assert_eq!(ramp["params"]["rise"], 0.9);
+        // Every schema field has a current value.
+        for f in ramp["fields"].as_array().unwrap() {
+            let name = f["name"].as_str().unwrap();
+            assert!(!ramp["params"][name].is_null(), "missing param {name}: {v}");
+        }
+    }
+
+    #[test]
+    fn param_blocks_json_round_trips_pblock_instance() {
+        let mut s = session_with(&[
+            "pblock t width=1.5 : rect 0,0,0 {width} 0.1",
+            "insert t 2,3,0 45 2 width=2",
+        ]);
+        let id = s.doc.objects().last().unwrap().id;
+        s.doc.selection.insert(id);
+        let v: serde_json::Value = serde_json::from_str(&param_blocks_json(&s.doc)).unwrap();
+        // A session also seeds the built-in library pblocks; find ours.
+        let def = v["defs"].as_array().unwrap().iter().find(|d| d["name"] == "t").unwrap();
+        assert_eq!(
+            def,
+            &serde_json::json!({
+                "name": "t",
+                "params": [{ "name": "width", "default": "1.5" }],
+                "body": ["rect 0,0,0 {width} 0.1"],
+            })
+        );
+        let inst = &v["instances"].as_array().unwrap()[0];
+        assert_eq!(inst["id"], id.to_string());
+        assert_eq!(inst["source"], "t");
+        assert_eq!(inst["position"], serde_json::json!([2.0, 3.0, 0.0]));
+        assert_eq!(inst["rotationDeg"], 45.0);
+        assert_eq!(inst["scale"], 2.0);
+        assert_eq!(inst["params"], serde_json::json!({ "width": "2" }));
+        assert_eq!(inst["selected"], true);
+        // Plain (non-dynamic) instances are not listed.
+        let plain = session_with(&["box 0,0,0 1,1,1", "block last b", "insert b 5,0,0"]);
+        let v: serde_json::Value = serde_json::from_str(&param_blocks_json(&plain.doc)).unwrap();
+        assert_eq!(v["instances"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn selection_json_lists_selected_kinds_in_order() {
+        let mut s = session_with(&["box 0,0,0 1,1,1", "geodesic 3 5 dome", "box 5,0,0 1,1,1"]);
+        let ids: Vec<_> = s.doc.objects().map(|o| o.id).collect();
+        s.doc.selection.insert(ids[1]);
+        s.doc.selection.insert(ids[0]);
+        let v: serde_json::Value = serde_json::from_str(&selection_json(&s.doc)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!([
+                { "id": ids[0].to_string(), "uuid": ids[0].0.to_string(), "kind": "mesh" },
+                { "id": ids[1].to_string(), "uuid": ids[1].0.to_string(), "kind": "geodesic" },
+            ])
+        );
+    }
+
+    #[test]
+    fn pick_hits_far_point_of_rotated_scaled_instance() {
+        let mut s = session_with(&["box 0,0,0 2,1,1", "block last b", "insert b 10,0,0 90 2"]);
+        let inst = s
+            .doc
+            .objects()
+            .find(|o| matches!(o.geometry, itsjustcad_doc::Geometry::Instance { .. }))
+            .unwrap()
+            .id;
+        // Hide everything else so only the instance can be hit.
+        for o in s.doc.objects().map(|o| o.id).collect::<Vec<_>>() {
+            if o != inst {
+                s.doc.get_mut(o).unwrap().visible = false;
+            }
+        }
+        // Scaled 2x then rotated 90° about Z: world x∈[8,10], y∈[0,4], z∈[0,2].
+        // (3.5 is far outside the old ±scale placeholder cube around 10,0,0.)
+        let down = glam::DVec3::new(0.0, 0.0, -1.0);
+        let hit = pick_nearest(&s.doc, glam::DVec3::new(8.5, 3.5, 10.0), down);
+        assert_eq!(hit, Some(inst));
+        assert_eq!(pick_nearest(&s.doc, glam::DVec3::new(11.0, 3.5, 10.0), down), None);
+
+        s.doc.selection.insert(inst);
+        let bb = s.doc.selection_aabb().unwrap();
+        assert!((bb.min - glam::DVec3::new(8.0, 0.0, 0.0)).length() < 1e-9, "{bb:?}");
+        assert!((bb.max - glam::DVec3::new(10.0, 4.0, 2.0)).length() < 1e-9, "{bb:?}");
     }
 
     #[test]
