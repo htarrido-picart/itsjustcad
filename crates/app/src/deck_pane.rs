@@ -3590,6 +3590,14 @@ use QUESTION:)."
         for line in batch {
             self.process_command_line(line, session);
         }
+        // Approve is only enabled once the turn has finished, so `finish_turn`
+        // has already run and will not flush these. Record the batch as its
+        // own Commands card now, or it sits unseen until the next turn ends.
+        if !self.busy() && !self.current_commands.is_empty() {
+            self.transcript
+                .push(Entry::Commands(std::mem::take(&mut self.current_commands)));
+            self.persist_chat();
+        }
     }
 
     /// Discard the held batch unrun and record a status line.
@@ -7209,6 +7217,26 @@ mod side_effect_gate_tests {
             "gate open → no more queuing"
         );
         assert!(session.doc.len() > mid, "subsequent geometry auto-ran");
+    }
+
+    #[test]
+    fn firstrun_approve_after_turn_shows_commands_card() {
+        // Approve is only possible once the turn finished, so the approved
+        // batch must land in the transcript as a Commands card right away.
+        let mut pane = blank_pane();
+        pane.deck_run_approved = false;
+        let mut session = Session::default();
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("box 0,0,0 1,1,1".into())],
+            &mut session,
+        );
+        pane.firstrun_approve(&mut session, /* for_session */ false);
+        assert!(pane.current_commands.is_empty(), "batch flushed");
+        assert!(
+            matches!(pane.transcript.last(), Some(Entry::Commands(c))
+                if c.len() == 1 && c[0].line == "box 0,0,0 1,1,1"),
+            "approved batch shows as a Commands card"
+        );
     }
 
     #[test]
