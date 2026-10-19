@@ -1047,15 +1047,15 @@ fn default_layer() -> String {
 
 /// Curated, distinguishable default palette for auto-assigning colors to new
 /// layers (Rhino-style, but hand-picked to read well on both dark and light
-/// viewport backgrounds). Index 0 is the first/"Default" layer and is BLACK
-/// (matches Rhino); subsequent layers cycle through the palette below. Values
+/// viewport backgrounds). Index 0 is the first/"Default" layer; subsequent
+/// layers cycle through the palette below. Values
 /// are RGBA in 0..1, mirroring `LayerStyle::color`.
 ///
-/// Palette (after black): an impressionist set — muted, painterly hues drawn
+/// Palette: an impressionist set — muted, painterly hues drawn
 /// from Monet, Van Gogh, Cézanne, Renoir, Pissarro and Caillebotte. Mid-value
 /// on purpose so every entry stays legible on dark and light backgrounds.
 const LAYER_COLOR_PALETTE: [[f32; 4]; 11] = [
-    [0.0, 0.0, 0.0, 1.0],                   // 0: black (Default)
+    [0.560784, 0.603922, 0.227451, 1.0], // 0: olive #8F9A3A (Van Gogh, Olive Trees)
     [0.784314, 0.333333, 0.239216, 1.0], // 1: poppy red #C8553D (Monet, Poppies)
     [0.309804, 0.525490, 0.776471, 1.0], // 2: cerulean #4F86C6 (Monet, Water Lilies)
     [0.415686, 0.603922, 0.345098, 1.0], // 3: sage green #6A9A58 (Monet, Giverny)
@@ -1070,8 +1070,7 @@ const LAYER_COLOR_PALETTE: [[f32; 4]; 11] = [
 
 /// Default display color for the Nth layer created, as RGBA (0..1).
 ///
-/// `index == 0` is BLACK (the first/"Default" layer, matching Rhino). Later
-/// indices cycle through a curated, distinguishable palette and wrap once the
+/// `index == 0` is the first/"Default" layer's color. Later indices cycle through a curated, distinguishable palette and wrap once the
 /// palette is exhausted, so `default_layer_color(n) == default_layer_color(n +
 /// LAYER_COLOR_PALETTE.len())`. Purely index-based → deterministic and
 /// replay-stable for the op-log (no randomness).
@@ -1223,13 +1222,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_layer_color_index_zero_is_black() {
-        assert_eq!(default_layer_color(0), [0.0, 0.0, 0.0, 1.0]);
+    fn default_layer_color_index_zero_is_olive() {
+        assert_eq!(default_layer_color(0), [0.560784, 0.603922, 0.227451, 1.0]);
     }
 
     #[test]
     fn default_layer_color_distinct_for_first_ten() {
-        // Indices 1..=10 must all differ from each other and from black.
+        // Indices 0..=10 must all differ from each other.
         let mut seen: Vec<[f32; 4]> = Vec::new();
         for i in 0..=10 {
             let c = default_layer_color(i);

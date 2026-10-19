@@ -19276,9 +19276,11 @@ mod tests {
         assert_eq!(wall_pen.color, [1.0, 0.0, 0.0]);
         assert_eq!(wall_pen.weight_mm, 0.5);
 
-        // Unmapped object keeps its base pen (default black + default weight).
+        // Unmapped object keeps its base pen (its layer's seeded palette
+        // color + default weight).
         let def_pen = s.doc.plot_pen(&default_obj, [0.0, 0.0, 0.0]);
-        assert_eq!(def_pen.color, [0.0, 0.0, 0.0]);
+        let [r, g, b, _] = itsjustcad_doc::default_layer_color(0);
+        assert_eq!(def_pen.color, [r, g, b]);
         assert_eq!(def_pen.weight_mm, s.doc.effective_lineweight(&default_obj));
 
         // With no active style, the walls object plots with its base pen —
