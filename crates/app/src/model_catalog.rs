@@ -199,6 +199,23 @@ impl ModelEntry {
     }
 }
 
+/// On-disk files of models REMOVED from the catalog, keyed by their old id, so a
+/// stored `local-<id>` cassette that is pruned on startup also drops its weights.
+/// `qwen2.5-vl-3b-q4km-gguf` was retired because Qwen2.5-VL-3B ships under the
+/// non-commercial Qwen Research License; Qwen3-VL 4B (Apache-2.0) replaced it.
+const RETIRED_MODEL_FILES: &[(&str, &[&str])] = &[(
+    "qwen2.5-vl-3b-q4km-gguf",
+    &["Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf", "mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf"],
+)];
+
+/// Files to delete for a retired catalog id (empty for unknown ids).
+pub fn retired_model_files(id: &str) -> &'static [&'static str] {
+    RETIRED_MODEL_FILES
+        .iter()
+        .find(|(old, _)| *old == id)
+        .map_or(&[], |(_, files)| files)
+}
+
 /// The parsed catalog.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Catalog {
@@ -488,11 +505,24 @@ mod tests {
         // A vision entry is a gguf served with a projector; both artifacts must
         // carry a 64-hex sha and the projector file name derives from its url.
         assert_eq!(v.runtime, Runtime::Gguf, "{}", v.id);
-        assert_eq!(v.mmproj_file_name().as_deref(), Some("mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf"));
+        assert_eq!(v.mmproj_file_name().as_deref(), Some("mmproj-Qwen3VL-4B-Instruct-F16.gguf"));
         let sha = v.mmproj_expected_sha().expect("projector sha present");
         assert_eq!(sha.len(), 64, "{}", v.id);
         assert!(sha.chars().all(|c| c.is_ascii_hexdigit()), "{}", v.id);
         assert!(v.mmproj_size_bytes.is_some_and(|n| n > 0));
+    }
+
+    #[test]
+    fn retired_vision_model_is_gone_and_its_files_are_listed() {
+        let cat = Catalog::load();
+        assert!(cat.get("qwen2.5-vl-3b-q4km-gguf").is_none());
+        assert!(cat.get("qwen3-vl-4b-q4km-gguf").is_some_and(|m| m.is_vision()));
+        assert_eq!(retired_model_files("qwen2.5-vl-3b-q4km-gguf").len(), 2);
+        assert!(retired_model_files("qwen3-vl-4b-q4km-gguf").is_empty());
+        // A retired id must never collide with a live catalog entry.
+        for (id, _) in RETIRED_MODEL_FILES {
+            assert!(cat.get(id).is_none(), "{id} is both retired and live");
+        }
     }
 
     #[test]
