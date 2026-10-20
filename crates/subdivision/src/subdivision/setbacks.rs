@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Setbacks + buildable envelopes (plan §7, §9 Phase 8).
+//! Setbacks + buildable envelopes.
 //!
 //! Given a lot polygon + its edge street-tags, compute the **buildable
 //! envelope** = the lot inset by a per-edge setback:
@@ -23,12 +23,12 @@
 //! rather than the `setback_front` line — so the envelope's front sits exactly on
 //! the build-to line even when it differs from the front setback.
 //!
-//! **Frontage measured at the setback line** (plan §5, Manuel's explicit ask —
+//! **Frontage measured at the setback line** (a client requirement —
 //! the DEFAULT, not an option): [`frontage`] measures each lot's frontage length
 //! along the **setback line** by default (`FrontageAt::Setback`), which differs
 //! from the curb line on cul-de-sac bulbs and curves.
 //!
-//! Untagged lots (a plain lot with no Phase-5 street tags) treat the single
+//! Untagged lots (a plain lot with no road-network street tags) treat the single
 //! **longest** edge as the front — same "usable without a street graph" spirit as
 //! the subdivision methods.
 
@@ -50,11 +50,11 @@ pub enum EdgeRole {
     Side,
 }
 
-/// Where to measure frontage: the default `Setback` line (plan §5) or the raw
+/// Where to measure frontage: the default `Setback` line or the raw
 /// `Curb` (the street-tagged contour edge itself).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontageAt {
-    /// Along the front setback line (DEFAULT — Manuel's explicit ask).
+    /// Along the front setback line (DEFAULT — a client requirement).
     Setback,
     /// Along the curb (the street-tagged contour edge as drawn).
     Curb,
@@ -184,7 +184,7 @@ fn setback_for(role: EdgeRole, settings: &SubdivisionSettings) -> f64 {
     .max(0.0)
 }
 
-/// Compute the buildable envelope for one lot (plan §7 / §9 Phase 8).
+/// Compute the buildable envelope for one lot.
 ///
 /// The envelope is the lot successively clipped by a line parallel to each
 /// contour edge, moved inward by that edge's role setback. `build_to_line > 0`
@@ -247,7 +247,7 @@ pub fn buildable_envelope(lot: &Block, settings: &SubdivisionSettings) -> Envelo
     Envelope { polygon: Some(work), build_to_used: use_build_to }
 }
 
-/// Measure the frontage length of one lot (plan §5). By default
+/// Measure the frontage length of one lot. By default
 /// (`FrontageAt::Setback`) frontage is measured along the **front setback
 /// line** — the length of the envelope's front edge, i.e. the portion of the
 /// front setback line spanned by the buildable envelope. `FrontageAt::Curb`

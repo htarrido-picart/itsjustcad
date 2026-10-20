@@ -50,12 +50,7 @@ pub(crate) static STARTER_BLOCKS: &[(&str, &str)] = &[
 
 /// Returns `~/.config/itsjustcad/blocks/`.
 pub fn blocklib_dir() -> Option<PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
-            .join("blocks"),
-    )
+    Some(crate::config_dir()?.join("blocks"))
 }
 
 /// Seed `~/.config/itsjustcad/blocks/` from the embedded starter blocks if the

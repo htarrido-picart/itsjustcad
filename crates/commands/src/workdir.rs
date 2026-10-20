@@ -14,7 +14,7 @@
 
 use crate::command::Command;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 /// Process-global in-memory workdir grant. Populated by [`set`] the moment a
 /// workdir is granted, and consulted FIRST by [`get`]. This is what makes the
@@ -23,9 +23,21 @@ use std::sync::{Mutex, OnceLock};
 /// container root does not accept a new top-level `.config` directory. On the
 /// desktop it is simply a redundant cache of the same path the file holds, so
 /// behaviour (including cross-run persistence via the file) is unchanged.
+#[cfg(not(test))]
 fn mem_workdir() -> &'static Mutex<Option<PathBuf>> {
-    static CELL: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    static CELL: std::sync::OnceLock<Mutex<Option<PathBuf>>> = std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// Unit tests run in parallel threads of one process, so a process-global grant
+/// set by one test would leak into every other. Under `cfg(test)` each test
+/// thread gets its own cell instead.
+#[cfg(test)]
+fn mem_workdir() -> &'static Mutex<Option<PathBuf>> {
+    thread_local! {
+        static CELL: &'static Mutex<Option<PathBuf>> = Box::leak(Box::new(Mutex::new(None)));
+    }
+    CELL.with(|c| *c)
 }
 
 /// Extensions the substrate can import (kept in sync with the `import` dispatch
@@ -38,11 +50,7 @@ pub const IMPORTABLE_EXTS: &[&str] = &[
 
 /// The file the granted workdir path is persisted in.
 pub fn workdir_config_path() -> Option<PathBuf> {
-    dirs_home().map(|h| h.join(".config").join("itsjustcad").join("workdir.txt"))
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    crate::config_dir().map(|d| d.join("workdir.txt"))
 }
 
 /// The currently-granted workdir, if any (canonicalized on read so comparisons

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Retention-pond placement (plan §9 Phase 9).
+//! Retention-pond placement.
 //!
 //! Place a rounded polygon (a near-circular basin) at a low/selected area. The
 //! pond is sized to `area` when given, else a default fraction of the region,

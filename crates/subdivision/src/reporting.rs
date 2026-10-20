@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Yield reporting (M-intemfit Phase 11).
+//! Yield reporting + option comparison.
 //!
-//! Pure, geometry-free summary math: given the parts of an intemfit layout
+//! Pure, geometry-free summary math: given the parts of a site-planning layout
 //! (lot areas, frontage lengths, gross site area, placed open-space areas and
 //! reserved-block areas, built GFA, building count, footprint areas), compute a
 //! [`YieldReport`] — a decision-grade yield summary that reports on the **net
@@ -15,7 +15,7 @@
 //! layer, `building:mass` GFA); this module never touches the document, so its
 //! math is unit-tested headless (analytic assertions).
 //!
-//! Key derived numbers (§11):
+//! Key derived numbers:
 //! - **net developable area** = gross site − (open-space features + reserved
 //!   blocks). Reported alongside gross so the open-space ratio is visible.
 //! - **FAR** = total GFA / net developable area (the honest FAR: floor area over
@@ -28,7 +28,7 @@
 pub struct YieldInputs {
     /// Area of every subdivided lot (m²), one entry per lot.
     pub lot_areas: Vec<f64>,
-    /// Frontage length of every lot (m), measured at the setback line (§5).
+    /// Frontage length of every lot (m), measured at the setback line.
     /// May be empty when frontage was not measured; then frontage stats are
     /// omitted.
     pub lot_frontages: Vec<f64>,
@@ -47,7 +47,7 @@ pub struct YieldInputs {
     pub building_footprints: Vec<f64>,
 }
 
-/// A computed yield summary (§11). All areas m², FAR/ratios dimensionless.
+/// A computed yield summary. All areas m², FAR/ratios dimensionless.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct YieldReport {
     // ── Lots ────────────────────────────────────────────────────────────
@@ -57,11 +57,11 @@ pub struct YieldReport {
     pub min_lot_area: f64,
     pub max_lot_area: f64,
 
-    // ── Frontage (measured at the setback line, §5) ─────────────────────
+    // ── Frontage (measured at the setback line) ─────────────────────────
     /// `None` when no frontages were supplied.
     pub frontage: Option<FrontageStats>,
 
-    // ── Site: gross vs net-of-open-space (the §11 point) ────────────────
+    // ── Site: gross vs net-of-open-space (the key point) ───────────────
     pub gross_site_area: f64,
     pub open_space_feature_area: f64,
     pub reserved_block_area: f64,
@@ -70,7 +70,7 @@ pub struct YieldReport {
     /// (features + reserved) / gross, in [0, 1]. 0 when no open space / no site.
     pub open_space_ratio: f64,
 
-    // ── Built yield (Phase 10) ──────────────────────────────────────────
+    // ── Built yield (buildings) ─────────────────────────────────────────
     pub building_count: usize,
     /// Σ per-floor building areas.
     pub total_gfa: f64,
@@ -217,7 +217,7 @@ impl YieldReport {
     }
 }
 
-/// A two-run A/B yield comparison (§11 option comparison). `a` is the earlier
+/// A two-run A/B yield comparison (option comparison). `a` is the earlier
 /// run, `b` the later; deltas are `b − a`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct YieldComparison {

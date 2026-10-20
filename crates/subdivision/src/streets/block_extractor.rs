@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Block extraction (plan §7.3 / §5): offset every street centerline by ROW/2
+//! Block extraction: offset every street centerline by ROW/2
 //! into a right-of-way ribbon, boolean-subtract the ROW union from the site,
 //! and tag every resulting block edge with its generating street (id + width +
 //! length). Original-boundary edges that are not streets stay `is_street = false`
-//! — the §5 hard dependency that skeleton/corner/loading/frontage all need.
+//! — the hard dependency that skeleton/corner/loading/frontage all need.
 //!
 //! If `loading == AlleyLoaded`, a second tier of narrower rear lanes is inserted
 //! bisecting each block along its long axis and tagged `is_alley = true`.

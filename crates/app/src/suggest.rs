@@ -436,25 +436,25 @@ mod tests {
     // ── preset alias suggestions ──────────────────────────────────────────────
 
     #[test]
-    fn autocad_alias_l_appears_in_suggestions() {
-        use crate::preset::AUTOCAD_ALIASES;
-        let results = verb_completions("l", 20, AUTOCAD_ALIASES, &[]);
+    fn classic_alias_l_appears_in_suggestions() {
+        use crate::preset::CLASSIC_ALIASES;
+        let results = verb_completions("l", 20, CLASSIC_ALIASES, &[]);
         let completions: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
-        assert!(completions.contains(&"l"), "AutoCAD alias 'l' should appear: {completions:?}");
+        assert!(completions.contains(&"l"), "Classic alias 'l' should appear: {completions:?}");
     }
 
     #[test]
-    fn autocad_alias_e_appears_in_suggestions() {
-        use crate::preset::AUTOCAD_ALIASES;
-        let results = verb_completions("e", 20, AUTOCAD_ALIASES, &[]);
+    fn classic_alias_e_appears_in_suggestions() {
+        use crate::preset::CLASSIC_ALIASES;
+        let results = verb_completions("e", 20, CLASSIC_ALIASES, &[]);
         let completions: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
-        assert!(completions.contains(&"e"), "AutoCAD alias 'e' should appear: {completions:?}");
+        assert!(completions.contains(&"e"), "Classic alias 'e' should appear: {completions:?}");
     }
 
     #[test]
     fn no_duplicates_with_preset_aliases() {
-        use crate::preset::AUTOCAD_ALIASES;
-        let results = verb_completions("", 500, AUTOCAD_ALIASES, &[]);
+        use crate::preset::CLASSIC_ALIASES;
+        let results = verb_completions("", 500, CLASSIC_ALIASES, &[]);
         let mut seen = std::collections::HashSet::new();
         for s in &results {
             assert!(seen.insert(s.completion.clone()), "duplicate: {}", s.completion);

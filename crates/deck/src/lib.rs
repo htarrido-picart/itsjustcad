@@ -56,3 +56,22 @@ pub use tool_loop::{
     ToolCall, ToolDispatch, ToolResult,
 };
 pub use which::{augmented_path_env, resolve_claude_binary};
+
+/// The user's config dir: [`home_config_dir`] of the home directory.
+#[cfg(not(test))]
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| home_config_dir(&h))
+}
+
+/// Tests never read or write the developer's real config: they get a throwaway
+/// dir under the system temp dir instead, one per test process.
+#[cfg(test)]
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    Some(std::env::temp_dir().join(format!("ijc_test_config_{}", std::process::id())))
+}
+
+/// `~/.config/itsjustcad` under `home`, on every platform (CLI-tool convention,
+/// XDG default on Linux; never a macOS-only dir — GitHub issue #26).
+pub fn home_config_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config").join("itsjustcad")
+}

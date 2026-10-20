@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Roofs (plan §7.6, Phase 10).
+//! Roofs.
 //!
 //! Cap a stepped mass with one of four roof forms, built on the TOP floor's
 //! outer ring at the mass height (`base_z + height`):
@@ -16,7 +16,7 @@
 //! `pitch` is the roof slope in degrees; the peak height is derived from the
 //! footprint half-span × tan(pitch). All roofs are emitted as a closed
 //! [`kernel_mesh::Mesh`] sitting on the ring at the eave elevation. Rings are the
-//! rectangular / ring footprints Phase 10 produces, so the gable/hip geometry is
+//! rectangular / ring footprints the building generator produces, so the gable/hip geometry is
 //! built on the ring's bounding rectangle (robust + deterministic).
 
 use crate::geometry::polygon2d::Polygon2d;

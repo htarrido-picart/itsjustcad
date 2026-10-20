@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Orthogonal generator (plan §7.3): recursive minimum-area-OBB split of the
+//! Orthogonal generator: recursive minimum-area-OBB split of the
 //! *site* down to ~block depth. At each split we emit the split line — clipped
 //! to the current sub-polygon — as a **spine** street centerline, then recurse
 //! on both halves while the short OBB extent still exceeds `block_depth`.

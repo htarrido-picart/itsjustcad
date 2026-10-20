@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! §9 Phase-6 validation for the lot rules (width mix, depth, corner, flag,
-//! loading, sliver merge). Run against the §8 sample blocks + a synthetic
-//! alley-loaded block + a Phase-5 generated block.
+//! Validation for the lot rules (width mix, depth, corner, flag,
+//! loading, sliver merge). Run against the sample blocks + a synthetic
+//! alley-loaded block + a road-network generated block.
 //!
-//! Assertions (plan §9 Phase 6):
+//! Assertions:
 //! - width mix hits requested proportions within 5 % on a 500 m frontage;
 //! - alley-loaded blocks have correct two-sided (half) depth;
 //! - corner lots widened + clamped (no self-intersection) on the 15° block #10;
@@ -202,7 +202,7 @@ fn flag_lots_only_when_enabled_and_pole_excluded() {
     assert!((f.gross_area() - f.countable_area() - f.pole.area()).abs() < 1.5);
 }
 
-// ── No slivers remain after merge (all §8 blocks) ─────────────────────────────
+// ── No slivers remain after merge (all sample blocks) ─────────────────────────
 
 #[test]
 fn no_slivers_remain_after_merge_on_all_blocks() {
@@ -296,10 +296,10 @@ fn placeholder_note_appears_when_defaults_used() {
     }];
     let (_out, report) = apply_lot_rules(&block, lots, &s);
     let banner = report.placeholder_banner().expect("placeholder banner expected");
-    assert!(banner.contains("confirm with Manuel"), "banner: {banner}");
+    assert!(banner.contains("verify against local regulations"), "banner: {banner}");
 }
 
-// ── Phase-5 generated block honours the rules ─────────────────────────────────
+// ── Road-network generated block honours the rules ────────────────────────────
 
 #[test]
 fn generated_block_runs_through_lot_rules() {

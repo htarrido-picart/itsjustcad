@@ -21,9 +21,9 @@ The app is not code-signed yet, so your OS shows a one-time "unidentified
 developer" warning on the very first launch. After that it just opens.
 
 On the first run it asks two questions — your **units** (meters / millimeters /
-feet-inches) and which **CAD you came from** (AutoCAD / Rhino / Revit / none).
-The interface adapts its colors, font sizes, and command aliases to match. You
-can change either later; pick *meters* and *none* if you're unsure.
+feet-inches) and which **working style** you prefer (Classic / NURBS / BIM /
+default). The interface adapts its colors, font sizes, and command aliases to
+match. You can change either later; pick *meters* and *default* if you're unsure.
 
 The window opens with an empty document and a **command bar** at the bottom.
 Everything in this tutorial is typed there, one line at a time, Enter to run.

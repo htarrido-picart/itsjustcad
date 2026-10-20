@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `ConsistentIndexing` (plan §12.1) — deterministic lot/block IDs by **spatial
+//! `ConsistentIndexing` — deterministic lot/block IDs by **spatial
 //! order**, not creation order.
 //!
 //! ## Why
@@ -36,7 +36,7 @@
 use crate::geometry::polygon2d::Polygon2d;
 use glam::DVec2;
 
-/// Assigns deterministic spatial indices to lot polygons (plan §12.1). Stateless
+/// Assigns deterministic spatial indices to lot polygons. Stateless
 /// aside from the block-grid quantisation size.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConsistentIndexing {

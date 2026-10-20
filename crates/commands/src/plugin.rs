@@ -334,12 +334,7 @@ impl PluginRegistry {
 
 /// Default on-disk location for plugins: `~/.config/itsjustcad/plugins`.
 pub fn default_dir() -> Option<PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
-            .join("plugins"),
-    )
+    Some(crate::config_dir()?.join("plugins"))
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]

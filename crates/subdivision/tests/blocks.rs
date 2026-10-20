@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! §8 validation cases for recursive OBB subdivision (Phase 3), run against the
+//! Sample-block validation cases for recursive OBB subdivision, run against the
 //! first 10 sample blocks in `samples/blocks/*.json`. (#11 annular / #12 hex /
-//! #13 Voronoi are Phase 5b and intentionally absent.)
+//! #13 Voronoi are non-rectilinear street cases and intentionally absent.)
 //!
-//! Assertions per the plan §8:
+//! Assertions:
 //! - Σ lot area == block area within tolerance (conservation).
 //! - No overlapping lots (pairwise-disjoint interiors).
 //! - No gaps (covered by conservation + disjointness on a partition).

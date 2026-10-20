@@ -202,11 +202,11 @@ pub struct Document {
     /// `serde(default)` keeps pre-compliance checkpoints loading.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub compliance_reports: BTreeMap<String, ComplianceReport>,
-    /// Structured yield summaries (`lotreport`, M-intemfit Phase 11), keyed by
+    /// Structured yield summaries (`lotreport`), keyed by
     /// slot — `lotyield` = latest run, `lotyield_prev` = the previous run kept
     /// for `lotreport compare` (A/B option comparison). Served by the read-only
     /// `report` command alongside the other report planes. Never logged (a query
-    /// only); `serde(default)` keeps pre-Phase-11 checkpoints loading.
+    /// only); `serde(default)` keeps older checkpoints (no yield reports) loading.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub yield_reports: BTreeMap<String, subdivision::YieldReport>,
     /// Sketch constraints created by the logged `constrain` command; solved by
@@ -221,8 +221,8 @@ pub struct Document {
     /// `cutfill` embeds the heights into its own logged op for stability.
     #[serde(skip)]
     pub pregrade_terrain: Option<(ObjectId, Vec<f64>)>,
-    /// Sticky lot-subdivision settings (M-intemfit / `lotsettings`,
-    /// `lotsubdivide`). serde-defaulted so pre-intemfit files load unchanged;
+    /// Sticky lot-subdivision settings (`lotsettings`,
+    /// `lotsubdivide`). serde-defaulted so pre-site-planning files load unchanged;
     /// logged via the settings/subdivide ops so saved files replay identically.
     #[serde(default)]
     pub subdivision_settings: subdivision::SubdivisionSettings,

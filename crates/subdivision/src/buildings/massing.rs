@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Stepped building massing (plan §7.6, Phase 10).
+//! Stepped building massing.
 //!
 //! Extrude a [`Footprint`] into a 3D mass, floor by floor. Height is FIXED:
 //! `height = floor_count × floor_height`. Floors at or above
@@ -11,7 +11,7 @@
 //!
 //! The mass is emitted as an indexed triangle mesh ([`kernel_mesh::Mesh`]) so
 //! the commands crate can bake it directly onto a 3D layer. Per-floor areas are
-//! recorded on [`Massing::floors`] so Phase 11 yield can compute GFA / FAR:
+//! recorded on [`Massing::floors`] so yield reporting can compute GFA / FAR:
 //! **GFA = Σ per-floor (net) areas** (net of step-backs and any courtyard void).
 //!
 //! Determinism: the mesh depends only on the footprint + settings; no seed.
@@ -48,7 +48,7 @@ pub struct Floor {
 pub struct Massing {
     /// The extruded, stepped 3D mass (triangulated).
     pub mesh: Mesh,
-    /// Per-floor records for yield (Phase 11).
+    /// Per-floor records for yield reporting.
     pub floors: Vec<Floor>,
     /// Total mass height = `floors.len() × floor_height`.
     pub height: f64,
@@ -57,7 +57,7 @@ pub struct Massing {
 }
 
 impl Massing {
-    /// Gross floor area = Σ per-floor net areas. This is the value Phase 11 FAR
+    /// Gross floor area = Σ per-floor net areas. This is the value the yield FAR
     /// (GFA / site area) is built from.
     pub fn gfa(&self) -> f64 {
         self.floors.iter().map(|f| f.area).sum()
@@ -124,7 +124,7 @@ pub fn massing(footprint: &Footprint, base_z: f64, settings: &SubdivisionSetting
 
 /// Inset an axis-aligned-ish rectangle by `margin` (shrinking its bbox toward
 /// its centroid). Negative margin grows it. `None` if it collapses. Kept simple
-/// (bbox-based) because Phase-10 footprints are rectangles / rings.
+/// (bbox-based) because generated footprints are rectangles / rings.
 fn inset_rect(poly: &Polygon2d, margin: f64) -> Option<Polygon2d> {
     if margin.abs() < 1e-9 {
         return Some(poly.clone());

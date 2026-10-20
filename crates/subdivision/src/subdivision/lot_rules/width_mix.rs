@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `WidthMixSolver` (plan §7.4, Phase 6) — the width-mix **packing** problem.
+//! `WidthMixSolver` — the width-mix **packing** problem.
 //!
 //! Given a block frontage length and a product list (widths + target
-//! proportions, soft by default per §6b: 6 / 8 / 10 m at 25 / 50 / 25 %), choose
+//! proportions, soft by default: 6 / 8 / 10 m at 25 / 50 / 25 %), choose
 //! a SEQUENCE of lot widths that fits the frontage and respects the proportions.
 //!
 //! Algorithm (per the plan — do NOT spread slack evenly, that defeats fixed
@@ -31,7 +31,7 @@ pub struct WidthProduct {
 }
 
 /// The solver output: the chosen width sequence + the achieved proportions and
-/// leftover frontage, so callers can verify the §9 "within 5 %" requirement.
+/// leftover frontage, so callers can verify the "within 5 %" requirement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WidthMixResult {
     /// The chosen lot widths, in frontage order.
@@ -45,7 +45,7 @@ pub struct WidthMixResult {
 
 impl WidthMixResult {
     /// The largest absolute deviation of any product's achieved share from its
-    /// target share. `< 0.05` satisfies the §9 "within 5 %" test.
+    /// target share. `< 0.05` satisfies the "within 5 %" test.
     pub fn max_proportion_error(&self, targets: &[f64]) -> f64 {
         self.achieved
             .iter()
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn hits_proportions_within_5pct_on_500m() {
-        // Plan §9 hard requirement: within 5 % on a 500 m frontage.
+        // Hard requirement: within 5 % on a 500 m frontage.
         let s = euro_latam();
         let r = s.solve(500.0);
         let err = r.max_proportion_error(s.targets());

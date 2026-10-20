@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Building footprints (plan §7.6, Phase 10).
+//! Building footprints.
 //!
-//! A footprint is a 2D polygon that lives INSIDE the Phase-8 buildable envelope
+//! A footprint is a 2D polygon that lives INSIDE the setback buildable envelope
 //! (`setbacks::buildable_envelope`). The typology drives the shape; the fill
 //! mode drives how much of the envelope the footprint claims:
 //!
@@ -21,7 +21,7 @@
 //! - [`Typology::Slab`] — a single large apartment mass ~= the envelope.
 //!
 //! A [`Footprint`] carries the outer polygon plus an optional inner void
-//! (courtyard). Massing (Phase 10, `massing.rs`) extrudes it; roofs
+//! (courtyard). Massing (`massing.rs`) extrudes it; roofs
 //! (`roof.rs`) cap it.
 //!
 //! Everything here is deterministic: shape depends only on the envelope + lot +

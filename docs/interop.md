@@ -36,9 +36,9 @@ Entities imported: `LINE`, `LWPOLYLINE`, `POLYLINE`, `CIRCLE`, `ARC`, `TEXT`, `M
 
 Triangle meshes are stored verbatim as `MeshLiteral` ops in the op-log, making the file self-contained with no dependency on the source. Collada `.dae` is supported alongside the others.
 
-### 3DM (Rhino / openNURBS)
+### 3DM (Rhino® / openNURBS®)
 
-A pure-Rust openNURBS reader: meshes become `MeshLiteral`, and lines / polylines / NURBS curves become curve ops, each on its original Rhino layer with its name preserved. BREPs and trimmed surfaces are skipped. No opt-in download needed.
+A pure-Rust openNURBS reader: meshes become `MeshLiteral`, and lines / polylines / NURBS curves become curve ops, each on its original layer with its name preserved. BREPs and trimmed surfaces are skipped. No opt-in download needed.
 
 ### STEP / STP (opt-in)
 

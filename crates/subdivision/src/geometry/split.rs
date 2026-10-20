@@ -5,10 +5,10 @@
 //! half-plane pieces, via Sutherland–Hodgman clipping against each half-plane.
 //!
 //! This is all the recursive OBB subdivider needs — it never requires general
-//! polygon boolean ops or offset for Phase 3. For strongly non-convex polygons a
+//! polygon boolean ops or offset. For strongly non-convex polygons a
 //! single line can in principle produce multiple disjoint pieces per side;
 //! Sutherland–Hodgman returns one (possibly zero-area-bridged) ring per side.
-//! Blocks fed to Phase-3 subdivision are convex or mildly concave, where this is
+//! Blocks fed to recursive-OBB subdivision are convex or mildly concave, where this is
 //! exact.
 
 use crate::geometry::polygon2d::Polygon2d;

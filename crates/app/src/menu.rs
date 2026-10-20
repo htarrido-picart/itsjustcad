@@ -484,9 +484,9 @@ pub fn appearance_native_items() -> Vec<(&'static str, &'static str, MenuAction)
 pub fn skin_radio_items() -> [(&'static str, CadOrigin); 4] {
     [
         ("skin_native", CadOrigin::None),
-        ("skin_autocad", CadOrigin::AutoCAD),
-        ("skin_rhino", CadOrigin::Rhino),
-        ("skin_revit", CadOrigin::Revit),
+        ("skin_classic", CadOrigin::Classic),
+        ("skin_nurbs", CadOrigin::Nurbs),
+        ("skin_bim", CadOrigin::Bim),
     ]
 }
 
@@ -1218,7 +1218,7 @@ mod tests {
         // titles are localized; assert against the active-locale catalog values
         // (via `tr`) so the test is language-independent.
         assert_eq!(TOP_TITLES, ["File", "Edit", "View", "Theme", "LLM", "Plugins"]);
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+        for style in [MenuStyle::Modeler, MenuStyle::Drafting] {
             let titles: Vec<String> =
                 native_model(style, true, ViewState::default()).iter().map(|m| m.title.clone()).collect();
             let mut expected = vec![
@@ -1248,7 +1248,7 @@ mod tests {
             "Draw", "Curve", "Solid", "Transform", "Modify", "Dimension", "Annotate",
             "Analyze", "Structure", "Tools", "Format", "Boolean",
         ];
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+        for style in [MenuStyle::Modeler, MenuStyle::Drafting] {
             for m in native_model(style, true, ViewState::default()) {
                 assert!(!banned.contains(&m.title.as_str()), "banned menu {} present", m.title);
             }
@@ -1258,12 +1258,12 @@ mod tests {
     #[test]
     fn menu_bar_identical_across_presets() {
         // The minimal bar ignores the preset style.
-        assert_eq!(native_model(MenuStyle::Rhino, true, ViewState::default()), native_model(MenuStyle::AutoCAD, true, ViewState::default()));
+        assert_eq!(native_model(MenuStyle::Modeler, true, ViewState::default()), native_model(MenuStyle::Drafting, true, ViewState::default()));
     }
 
     #[test]
     fn file_menu_has_curated_items() {
-        let file = native_model(MenuStyle::Rhino, true, ViewState::default())
+        let file = native_model(MenuStyle::Modeler, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == tr("menu.file"))
             .unwrap();
@@ -1288,7 +1288,7 @@ mod tests {
         // M-autoupdate: the Help menu must carry a "Check for Updates…" leaf that
         // dispatches MenuAction::CheckForUpdates (routed by apply_menu_action to
         // open the update popup + start the check).
-        let help = native_model(MenuStyle::Rhino, true, ViewState::default())
+        let help = native_model(MenuStyle::Modeler, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == tr("menu.help"))
             .expect("Help menu present");
@@ -1307,7 +1307,7 @@ mod tests {
         // Regression: macOS previously had NO menu-bar Quit (it was cfg'd out,
         // and the native app menu did not surface one). Quit MUST be in the File
         // menu on every platform, with ⌘Q; Close MUST be present with ⌘W.
-        let file = native_model(MenuStyle::Rhino, true, ViewState::default())
+        let file = native_model(MenuStyle::Modeler, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == tr("menu.file"))
             .unwrap();
@@ -1347,7 +1347,7 @@ mod tests {
 
     #[test]
     fn edit_menu_has_curated_items() {
-        let edit = native_model(MenuStyle::Rhino, true, ViewState::default())
+        let edit = native_model(MenuStyle::Modeler, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == tr("menu.edit"))
             .unwrap();
@@ -1369,7 +1369,7 @@ mod tests {
 
     #[test]
     fn view_menu_has_display_lighting_viewports_views_and_palette() {
-        let view = native_model(MenuStyle::Rhino, true, ViewState::default())
+        let view = native_model(MenuStyle::Modeler, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == tr("menu.view"))
             .unwrap();
@@ -1391,7 +1391,7 @@ mod tests {
 
     #[test]
     fn llm_menu_has_setup_reveal_download_and_toggles() {
-        let llm = native_model(MenuStyle::Rhino, true, ViewState::default())
+        let llm = native_model(MenuStyle::Modeler, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == tr("menu.llm"))
             .expect("LLM menu present at top level");
@@ -1426,7 +1426,7 @@ mod tests {
     fn plugins_menu_is_top_level_and_routes_show() {
         // Owner intent: Plugins is its OWN top-level menu (sibling of LLM), with a
         // single leaf that opens the plugins popup via the existing ShowPlugins.
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+        for style in [MenuStyle::Modeler, MenuStyle::Drafting] {
             let plugins = native_model(style, true, ViewState::default())
                 .into_iter()
                 .find(|m| m.title == tr("menu.plugins"))
@@ -1453,7 +1453,7 @@ mod tests {
 
     #[test]
     fn theme_menu_has_appearance_and_text_size() {
-        let theme = native_model(MenuStyle::Rhino, true, ViewState::default())
+        let theme = native_model(MenuStyle::Modeler, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == tr("menu.theme"))
             .expect("Theme menu present at top level");
@@ -1471,7 +1471,7 @@ mod tests {
 
     /// Helper: collect the (id, checked, action) of Theme-menu Check items.
     fn theme_checks(view: ViewState) -> Vec<(String, bool, MenuAction)> {
-        native_model(MenuStyle::Rhino, true, view)
+        native_model(MenuStyle::Modeler, true, view)
             .into_iter()
             .find(|m| m.title == tr("menu.theme"))
             .expect("Theme menu present")
@@ -1539,13 +1539,13 @@ mod tests {
         // Selecting a Theme skin/language item dispatches the apply+persist action
         // (SetSkin / SetLanguage), the same the app routes through apply_menu_action.
         let checks = theme_checks(ViewState::default());
-        assert!(checks.iter().any(|(_, _, a)| *a == MenuAction::SetSkin(CadOrigin::Rhino)));
+        assert!(checks.iter().any(|(_, _, a)| *a == MenuAction::SetSkin(CadOrigin::Nurbs)));
         assert!(checks.iter().any(|(_, _, a)| *a == MenuAction::SetLanguage(Lang::Es)));
     }
 
     #[test]
     fn help_menu_has_docs_reference_palette_about() {
-        let help = native_model(MenuStyle::AutoCAD, true, ViewState::default())
+        let help = native_model(MenuStyle::Drafting, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == tr("menu.help"))
             .unwrap();
@@ -1563,7 +1563,7 @@ mod tests {
 
     #[test]
     fn native_leaf_ids_are_unique() {
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+        for style in [MenuStyle::Modeler, MenuStyle::Drafting] {
             let ls = leaves(&native_model(style, true, ViewState::default()));
             let ids: HashSet<&String> = ls.iter().map(|(id, _, _)| id).collect();
             assert_eq!(ids.len(), ls.len(), "duplicate native menu id for {style:?}");
@@ -1572,7 +1572,7 @@ mod tests {
 
     #[test]
     fn no_show_tab_bar_item_anywhere() {
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+        for style in [MenuStyle::Modeler, MenuStyle::Drafting] {
             for (_, label, _) in leaves(&native_model(style, true, ViewState::default())) {
                 let l = label.to_lowercase();
                 assert!(!l.contains("tab bar"), "found tab-bar item: {label}");
@@ -1626,8 +1626,8 @@ mod tests {
         // thread), while ids are stable English tokens — so this stays green
         // regardless of the active locale.
         let sel_ids = ["Edit/cut", "Edit/copy", "Edit/delete", "Edit/deselect"];
-        let empty = native_model(MenuStyle::Rhino, false, ViewState::default());
-        let filled = native_model(MenuStyle::Rhino, true, ViewState::default());
+        let empty = native_model(MenuStyle::Modeler, false, ViewState::default());
+        let filled = native_model(MenuStyle::Modeler, true, ViewState::default());
         let enabled_of = |menus: &[NativeMenu], id: &str| -> Option<bool> {
             menus.iter().flat_map(|m| &m.items).find_map(|it| match it {
                 NativeItem::Leaf { id: i, enabled, .. } if i == id => Some(*enabled),
@@ -1647,7 +1647,7 @@ mod tests {
 
     /// Helper: the `checked` flag of a View check leaf by id.
     fn view_check(view: ViewState, id: &str) -> Option<bool> {
-        native_model(MenuStyle::Rhino, true, view)
+        native_model(MenuStyle::Modeler, true, view)
             .into_iter()
             .find(|m| m.title == tr("menu.view"))?
             .items
@@ -1698,7 +1698,7 @@ mod tests {
     fn view_camera_items_fire_camera_verbs() {
         // Each camera radio dispatches the same `camera <mode>` verb the
         // command line / deck use, so the menu stays a thin stateful skin.
-        let view = native_model(MenuStyle::Rhino, true, ViewState::default())
+        let view = native_model(MenuStyle::Modeler, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == tr("menu.view"))
             .unwrap();
@@ -1720,7 +1720,7 @@ mod tests {
     #[test]
     fn view_panel_item_flips_label_and_carries_shortcut() {
         let panel_of = |view: ViewState| -> (String, Option<String>) {
-            native_model(MenuStyle::Rhino, true, view)
+            native_model(MenuStyle::Modeler, true, view)
                 .into_iter()
                 .find(|m| m.title == tr("menu.view"))
                 .unwrap()
@@ -1757,7 +1757,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn window_menu_present_with_standard_items() {
-        let win = native_model(MenuStyle::Rhino, false, ViewState::default())
+        let win = native_model(MenuStyle::Modeler, false, ViewState::default())
             .into_iter()
             .find(|m| m.title == tr("menu.window"))
             .expect("Window menu present");
@@ -1784,7 +1784,7 @@ mod tests {
         assert_eq!(menu_shortcut("redo"), Some("Cmd+Shift+Z"));
         assert_eq!(menu_shortcut("delete"), Some("Delete"));
         assert_eq!(menu_shortcut("line"), None);
-        let file = native_model(MenuStyle::Rhino, true, ViewState::default())
+        let file = native_model(MenuStyle::Modeler, true, ViewState::default())
             .into_iter()
             .find(|m| m.title == tr("menu.file"))
             .unwrap();

@@ -1027,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_params_round_trip() {
+    fn typology_and_floor_params_round_trip() {
         // An enum field (typology) and a usize numeric (floor_count) survive the
         // settings → params → settings round trip, plus a few neighbours.
         let s = SubdivisionSettings {

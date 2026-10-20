@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright © 2026 Hector Tarrido-Picart
 #
-# Pure-Rust 2D subdivision geometry (intemfit / M-intemfit). ZERO egui, doc, or
+# Pure-Rust 2D subdivision geometry (site planning). ZERO egui, doc, or
 # commands deps — plain geometry in, plain geometry out, unit-tested headless.
 [package]
 name = "subdivision"
@@ -15,10 +15,10 @@ serde.workspace = true
 serde_json.workspace = true
 # 2D boolean overlay + polygon OFFSET (OutlineOffset). Pure Rust, MIT OR
 # Apache-2.0 — AGPLv3-compatible. Confirmed on crates.io v8.1.0. Provides the
-# offset/boolean gap Phase 4+ needs; Phase 3 uses only the half-plane clip here.
+# offset/boolean gap perimeter subdivision and block extraction need.
 i_overlay = "8.1"
 # Bowyer-Watson Delaunay (`triangulate`) reused for the Voronoi generator
-# (Phase 5b): Voronoi vertices are the circumcenters of adjacent Delaunay
+# (non-rectilinear streets): Voronoi vertices are the circumcenters of adjacent Delaunay
 # triangles. kernel-mesh depends only on glam+serde (no subdivision dep) → no
 # dependency cycle. AGPLv3 (same workspace crate); no new external dep.
 kernel-mesh = { path = "../kernel-mesh" }

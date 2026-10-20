@@ -2085,9 +2085,9 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
     },
-    /// Subdivide the selected closed block curve(s) into lots (M-intemfit,
-    /// Phase 3). `method` is `grid` (recursive OBB — the only method wired in
-    /// Phases 1–3), `perimeter` (Phase 4) or `streetfollowing` (Phase 7). The
+    /// Subdivide the selected closed block curve(s) into lots. `method` is
+    /// `grid` (recursive OBB, the first method wired), `perimeter`
+    /// (offset/perimeter) or `streetfollowing` (skeleton / street-following). The
     /// numeric args override the sticky `SubdivisionSettings` for this run:
     /// `area` = lot_area_min, `width` = lot_width_min, `irregularity`, `seed`.
     /// Deterministic for a fixed seed → replay recreates identical lots, so the
@@ -2141,8 +2141,8 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prev: Option<bool>,
     },
-    /// Show or set the sticky `SubdivisionSettings` on the document
-    /// (M-intemfit). With no `sets`, the exec message reports the current
+    /// Show or set the sticky `SubdivisionSettings` on the document.
+    /// With no `sets`, the exec message reports the current
     /// settings; otherwise each `key=value` updates one field. Logged so saved
     /// files replay the settings; the inverse restores the prior settings JSON.
     LotSettings {
@@ -2153,8 +2153,8 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prev: Option<String>,
     },
-    /// Generate a road network + blocks from the selected site boundary curve
-    /// (M-intemfit, Phase 5). `pattern` is one of the four rectilinear
+    /// Generate a road network + blocks from the selected site boundary curve.
+    /// `pattern` is one of the four rectilinear
     /// generators (`orthogonal` | `skewed` | `organic` | `culdesac`). Roads bake
     /// onto the `roads` layer, blocks onto the `blocks` layer. The numeric args
     /// override the sticky `SubdivisionSettings` for this run: `roadwidth` =
@@ -2194,7 +2194,7 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
-    /// Set the sticky lot loading mode (M-intemfit Phase 6): `front` (front-
+    /// Set the sticky lot loading mode: `front` (front-
     /// loaded, the euro_latam default) or `alley` (alley-loaded, two-frontage —
     /// takes effect when the block carries an alley edge). A thin convenience
     /// over `lotsettings loading=…`; logged so replay reproduces it. `targets` is
@@ -2209,8 +2209,8 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prev: Option<String>,
     },
-    /// Compute + bake the buildable envelope for the selected lot curve(s)
-    /// (M-intemfit Phase 8). The envelope is the lot inset by per-edge setbacks
+    /// Compute + bake the buildable envelope for the selected lot curve(s).
+    /// The envelope is the lot inset by per-edge setbacks
     /// (front from the street edge, rear opposite, side the rest); `buildto > 0`
     /// pins the front to the build-to line. Envelopes bake onto the `setbacks`
     /// layer (distinct from `lots`). Numeric args override the sticky
@@ -2235,16 +2235,16 @@ pub enum Command {
         ids: Option<Vec<ObjectId>>,
     },
     /// Report each selected lot's frontage length, measured along the setback
-    /// line by DEFAULT (`at=setback`, Manuel's explicit ask) or the curb
+    /// line by DEFAULT (`at=setback`, a client requirement) or the curb
     /// (`at=curb`). A read-only query — never logged; results go to the
-    /// AnalysisReport / `report` plane. (M-intemfit Phase 8.)
+    /// AnalysisReport / `report` plane.
     LotFrontage {
         targets: Selector,
         /// `setback` (default) | `curb`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<String>,
     },
-    /// Place open space (M-intemfit Phase 9). Two modes bake onto the
+    /// Place open space. Two modes bake onto the
     /// `openspace` layer so a later `lotreport` nets them out of gross site
     /// area:
     /// - **Feature placement** (default): `feature` is `park` | `greenway` |
@@ -2271,11 +2271,11 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
-    /// Generate buildings inside each selected lot's buildable envelope
-    /// (M-intemfit Phase 10): a footprint (typology + fill mode), a stepped 3D
+    /// Generate buildings inside each selected lot's buildable envelope:
+    /// a footprint (typology + fill mode), a stepped 3D
     /// mass (floors × floor height, upper floors stepped back), and a roof
     /// (flat / gable / hip / shed). Bakes footprint + mass + roof onto the
-    /// `buildings` layer; per-floor areas are stored so Phase 11 can compute
+    /// `buildings` layer; per-floor areas are stored so the yield report can compute
     /// GFA/FAR. Deterministic → written-back `ids` make replay byte-identical.
     LotBuilding {
         targets: Selector,
@@ -2308,8 +2308,8 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
-    /// Yield report (M-intemfit Phase 11). Builds a yield summary from the
-    /// current intemfit geometry — lot stats, gross-vs-**net-of-open-space**
+    /// Yield report. Builds a yield summary from the
+    /// current site-planning geometry — lot stats, gross-vs-**net-of-open-space**
     /// site area, built GFA, and **FAR = GFA / net developable area** — and
     /// stores it on the AnalysisReport / `report` plane (keyed `lotyield`) so the
     /// deck can read + critique grounded numbers. Read-only query — never logged.

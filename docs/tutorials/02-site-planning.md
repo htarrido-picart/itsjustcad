@@ -1,10 +1,10 @@
-# Tutorial 2 — Site planning with intemfit
+# Tutorial 2 — Site planning
 
 *You will take a raw site boundary, lay out streets and blocks, subdivide it into
 lots, apply setbacks, drop buildings in the buildable envelopes, and read back a
 yield report. About 15 minutes.*
 
-> **Advisory, not zoning.** The intemfit tools are geometry aids for exploring a
+> **Advisory, not zoning.** The site-planning tools are geometry aids for exploring a
 > layout. The `euro_latam` metric defaults used below (setbacks, lot widths,
 > floor heights) are **placeholders** — planning intent, not code. Confirm
 > allowable use, density, coverage, and setbacks with the local zoning authority
@@ -14,7 +14,7 @@ yield report. About 15 minutes.*
 
 ## 1. Draw the site boundary
 
-Every intemfit workflow starts from one closed boundary curve. A rectangle is
+Every site-planning workflow starts from one closed boundary curve. A rectangle is
 the simplest:
 
 ```

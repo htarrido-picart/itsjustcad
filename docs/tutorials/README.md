@@ -7,7 +7,7 @@ top to bottom and end with a real result on screen.
 | # | Tutorial | You end with |
 |---|---|---|
 | 1 | [Getting started](01-getting-started.md) | Your first document — a massing, orbited, saved, and printed to a PDF sheet |
-| 2 | [Site planning with intemfit](02-site-planning.md) | A subdivided site with buildings and a yield report |
+| 2 | [Site planning](02-site-planning.md) | A subdivided site with buildings and a yield report |
 | 3 | [Environmental analysis](03-environmental-analysis.md) | A sun-hours study you can read in numbers and have the deck critique |
 | 4 | [Working with the deck](04-deck.md) | The LLM drawing and analysing with you, in the same commands you type |
 | 5 | [Render a massing with the ray tracer](05-raytrace.md) | A photoreal, physically-based render of your real model — sun shadows and GI, no external tools |

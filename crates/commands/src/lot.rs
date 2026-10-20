@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `lot*` verbs (M-intemfit) — the bridge from document curves to the pure
+//! `lot*` site-planning verbs — the bridge from document curves to the pure
 //! `subdivision` crate and back. Dependency direction: `subdivision` (leaf) ←
 //! `commands`. All conversion (doc `Curve` ↔ `Polygon2d`) lives here; the pure
 //! crate never sees a document.
 //!
-//! Phases 2–4 ship two verbs:
+//! The core verbs:
 //! - `lotsubdivide` — subdivide selected closed block curve(s) into lots on the
-//!   `lots` layer. `method=grid` (recursive OBB, Phase 3), `method=perimeter`
-//!   (offset/perimeter, Phase 4), and `method=streetfollowing` (skeleton /
-//!   street-following, Phase 7 — perpendicular-to-curve lot lines) are all
+//!   `lots` layer. `method=grid` (recursive OBB), `method=perimeter`
+//!   (offset/perimeter), and `method=streetfollowing` (skeleton /
+//!   street-following — perpendicular-to-curve lot lines) are all
 //!   implemented.
 //! - `lotsettings` — show or set the sticky `SubdivisionSettings` on the doc.
 //!
@@ -75,7 +75,7 @@ pub struct LotBake {
     pub polygons: Vec<Polygon2d>,
     pub z: f64,
     pub with_street: usize,
-    /// Lot-rules (Phase 6) summary: total slivers merged + corners widened.
+    /// Lot-rules summary: total slivers merged + corners widened.
     pub slivers_merged: usize,
     pub corners_widened: usize,
     /// The euro_latam placeholder banner, if any rule fell back to defaults.
@@ -85,7 +85,7 @@ pub struct LotBake {
 }
 
 /// Dispatch one block to the subdivider selected by `settings.method`.
-/// `tagged` carries the block's street tags (Phase 5) for the skeleton method;
+/// `tagged` carries the block's street tags (from road-network generation) for the skeleton method;
 /// for a plain `lotsubdivide` on an arbitrary curve it is `Block::untagged`, so
 /// the skeleton treats every contour edge as frontage (same as grid/perimeter).
 fn subdivide_by_method(
@@ -110,7 +110,7 @@ pub fn subdivide_blocks(
 ) -> Result<LotBake, String> {
     // All three methods (grid / perimeter / streetfollowing) are implemented.
 
-    // A width mix turns subdivision into frontage packing (Phase 6). It is
+    // A width mix turns subdivision into frontage packing (lot rules). It is
     // opt-in: set via `lotsubdivide widthmix=...` / `lotsettings`, never forced
     // on a plain `grid` run — so the base recursive/offset behaviour is
     // unchanged unless the user asks for a mix. (The euro_latam default mix is a
@@ -237,7 +237,7 @@ pub fn ensure_lots_layer(doc: &mut Document) -> Option<String> {
 
 /// Insert baked lot curves onto the `lots` layer with the given ids.
 ///
-/// Lot names carry a **stable spatial index** (plan §12.1): each lot is named
+/// Lot names carry a **stable spatial index**: each lot is named
 /// `lot #N` where `N` is its deterministic position in spatial (row-major by
 /// block, then along-street) order via [`subdivision::ConsistentIndexing`] — NOT
 /// its creation order. Re-subdividing the same site keeps every lot's number; a
@@ -266,7 +266,7 @@ pub fn parse_pattern(s: &str) -> Option<StreetPattern> {
         "skewed" | "skew" | "diagonal" => Some(StreetPattern::Skewed),
         "organic" | "free" | "freeform" => Some(StreetPattern::Organic),
         "culdesac" | "cul-de-sac" | "cul" => Some(StreetPattern::CulDeSac),
-        // Phase 5b — owner scope, non-rectilinear.
+        // Non-rectilinear street generators.
         "radial" | "circular" | "ring" => Some(StreetPattern::Radial),
         "hexagonal" | "hex" => Some(StreetPattern::Hexagonal),
         "voronoi" | "voro" => Some(StreetPattern::Voronoi),
@@ -292,8 +292,8 @@ pub struct SiteBake {
 
 /// Core site-generation bridge: generate roads + blocks for `site` with
 /// `settings`. Deterministic — output depends only on the site + settings (seed).
-/// Handles all seven patterns: the four rectilinear (Phase 5) plus the three
-/// non-rectilinear radial/hexagonal/Voronoi generators (Phase 5b — owner scope).
+/// Handles all seven patterns: the four rectilinear plus the three
+/// non-rectilinear radial/hexagonal/Voronoi generators.
 pub fn generate_site(site: &Polygon2d, z: f64, settings: &SubdivisionSettings) -> Result<SiteBake, String> {
     let graph = subdivision::generate_streets(site, settings);
     if graph.is_empty() {
@@ -370,7 +370,7 @@ pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], b
             }),
         });
     }
-    // Blocks carry a stable spatial index too (plan §12.1): row-major order over
+    // Blocks carry a stable spatial index too: row-major order over
     // the block set so a re-generated site keeps each block's number.
     let block_idx = subdivision::ConsistentIndexing::new().assign(&bake.blocks);
     for (k, (poly, id)) in bake.blocks.iter().zip(block_ids).enumerate() {
@@ -388,7 +388,7 @@ pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], b
     }
 }
 
-// ── Phase 8: setbacks + buildable envelopes + frontage-at-setback ───────────
+// ── setbacks + buildable envelopes + frontage-at-setback ────────────────────
 
 use subdivision::{FrontageAt, RegionProfile};
 
@@ -441,10 +441,10 @@ pub fn compute_setbacks(
         ));
     }
     // euro_latam placeholder banner: when the profile is EuroLatam the setback
-    // numbers are §6b placeholders (front 3 / side 0 / rear 3) pending Manuel.
+    // numbers are placeholders (front 3 / side 0 / rear 3) pending client confirmation.
     let placeholder_note = if settings.region == RegionProfile::EuroLatam {
         Some(
-            "using euro_latam setback defaults (placeholder — confirm with Manuel)".to_string(),
+            "using euro_latam setback defaults (placeholder — verify against local regulations)".to_string(),
         )
     } else {
         None
@@ -481,7 +481,7 @@ pub fn insert_setbacks(doc: &mut Document, bake: &SetbackBake, ids: &[ObjectId])
 }
 
 /// Parse a frontage-measurement location string → [`FrontageAt`]. Default (and
-/// Manuel's explicit ask) is the setback line.
+/// a client requirement) is the setback line.
 pub fn parse_frontage_at(s: &str) -> Option<FrontageAt> {
     match s.to_lowercase().as_str() {
         "setback" | "setbackline" | "" => Some(FrontageAt::Setback),
@@ -513,13 +513,13 @@ pub fn measure_frontage(
         .collect()
 }
 
-// ── Phase 11: yield reporting — gather inputs from the document ──────────────
+// ── yield reporting — gather inputs from the document ───────────────────────
 
 use subdivision::YieldInputs;
 
-/// The set of layers intemfit bakes onto that are NOT the site boundary — used
+/// The set of layers site planning bakes onto that are NOT the site boundary — used
 /// to pick the gross-site polygon (the largest closed curve NOT on one of these).
-const INTEMFIT_LAYERS: &[&str] =
+const SITE_LAYERS: &[&str] =
     &[LOTS_LAYER, SETBACKS_LAYER, ROADS_LAYER, BLOCKS_LAYER, OPENSPACE_LAYER, BUILDINGS_LAYER];
 
 /// Parse the GFA + footprint area a `lotbuilding` bake stored on a
@@ -538,19 +538,19 @@ fn parse_mass_name(name: &str) -> Option<(f64, f64)> {
     Some((gfa.unwrap_or(0.0), fp.unwrap_or(0.0)))
 }
 
-/// Gather the yield inputs from the current document (M-intemfit Phase 11).
+/// Gather the yield inputs from the current document.
 ///
 /// - **Lots**: closed curves on the `lots` layer. If `sel_ids` is non-empty,
 ///   only lots inside the selection count (lets a user report a subset).
-/// - **Gross site**: the largest closed curve NOT on an intemfit output layer
+/// - **Gross site**: the largest closed curve NOT on a site-planning output layer
 ///   (the boundary the user drew). Falls back to (lot + open-space) area when no
 ///   such boundary is present, so a bare doc of baked lots still reports.
 /// - **Open space**: `openspace:*` objects on the `openspace` layer — feature
 ///   labels (`park`/`greenway`/`pond`/`treesave`) net out as features, `reserve`
-///   nets out as reserved blocks (the §11 distinction is preserved).
+///   nets out as reserved blocks (the feature-vs-reserve distinction is preserved).
 /// - **Built yield**: GFA + footprint parsed off each `building:mass` object
 ///   name (persisted by `lotbuilding`).
-/// - **Frontage**: measured at the setback line (§5) for each lot.
+/// - **Frontage**: measured at the setback line for each lot.
 pub fn gather_yield_inputs(
     doc: &Document,
     sel_ids: &[ObjectId],
@@ -604,9 +604,9 @@ pub fn gather_yield_inputs(
                 }
             }
             other => {
-                // A closed curve on a non-intemfit layer is a candidate site
+                // A closed curve on a non-site-planning layer is a candidate site
                 // boundary (the user-drawn site).
-                if !INTEMFIT_LAYERS.contains(&other)
+                if !SITE_LAYERS.contains(&other)
                     && let Geometry::Curve(c) = &obj.geometry
                     && c.is_closed()
                     && let Some(p) = curve_to_polygon(c)
@@ -643,13 +643,13 @@ pub fn gather_yield_inputs(
     }
 }
 
-// ── Phase 9: open space — feature placement + blind %-reserve ───────────────
+// ── open space — feature placement + blind %-reserve ────────────────────────
 
 use subdivision::OpenSpaceFeature;
 
 /// The layer baked open-space geometry (parks / greenways / ponds / tree-save /
 /// reserved blocks) lands on. Tagged distinctly so a later `lotreport`
-/// (Phase 11) can net open space out of gross site area.
+/// can net open space out of gross site area.
 pub const OPENSPACE_LAYER: &str = "openspace";
 
 /// The result of an open-space run: the feature/reserved polygons + per-feature
@@ -782,7 +782,7 @@ pub fn reserve_open_space(
     })
 }
 
-/// The no-false-precision advisory for a placed feature (plan §9 advisory).
+/// The no-false-precision advisory for a placed feature (open-space advisory).
 fn open_space_advisory(feature: OpenSpaceFeature) -> String {
     match feature {
         OpenSpaceFeature::RetentionPond =>
@@ -826,18 +826,18 @@ pub fn insert_open_space(doc: &mut Document, bake: &OpenSpaceBake, ids: &[Object
     }
 }
 
-// ── Phase 10: buildings — footprint + stepped massing + roof ────────────────
+// ── buildings — footprint + stepped massing + roof ──────────────────────────
 
 use kernel_mesh::Mesh;
 use subdivision::{FootprintMode, RoofType, Typology};
 
 /// The layer baked building geometry (footprints + 3D mass + roof) lands on.
-/// Tagged distinctly so a later `lotreport` (Phase 11) can total built GFA/FAR.
+/// Tagged distinctly so a later `lotreport` can total built GFA/FAR.
 pub const BUILDINGS_LAYER: &str = "buildings";
 
 /// One baked building: its footprint polygon (2D), the stepped mass mesh (3D,
 /// positioned at the lot z), the roof mesh (3D), and per-floor GFA data
-/// (floor count + per-floor areas) so Phase 11 yield can compute GFA / FAR.
+/// (floor count + per-floor areas) so the yield report can compute GFA / FAR.
 #[derive(Debug)]
 pub struct BuiltBuilding {
     pub footprint: Polygon2d,
@@ -898,7 +898,7 @@ pub fn compute_buildings(
     let mut total_gfa = 0.0;
     let mut total_floors = 0usize;
     for (poly, z) in lots {
-        // Buildings generate INSIDE the Phase-8 buildable envelope. A baked lot
+        // Buildings generate INSIDE the buildable envelope. A baked lot
         // curve carries no street tags → longest edge is the front (same spirit
         // as lotsetbacks).
         let block = Block::untagged(poly.clone());
@@ -939,7 +939,7 @@ pub fn compute_buildings(
     let placeholder_note = if settings.region == RegionProfile::EuroLatam {
         Some(
             "using euro_latam building defaults (floor height 3 m / roof pitch 30° / coverage — \
-             placeholder, confirm with Manuel)"
+             placeholder, verify against local regulations)"
                 .to_string(),
         )
     } else {
@@ -988,7 +988,7 @@ pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId
             geometry: Geometry::Curve(polygon_to_curve(&b.footprint, b.z)),
         });
         // Mass (3D mesh). The name carries the GFA + footprint area so a later
-        // `lotreport` (Phase 11) can read the built yield straight off the
+        // `lotreport` can read the built yield straight off the
         // document — persisted across save/reload, deterministic.
         doc.insert(SceneObject {
             visible: true,
@@ -1069,7 +1069,7 @@ mod tests {
 
     #[test]
     fn perimeter_method_runs_and_conserves_area() {
-        // Phase 4: method=perimeter now runs (no longer the deferral error).
+        // method=perimeter runs (no longer the deferral error).
         let poly = curve_to_polygon(&rect_curve(400.0, 300.0)).unwrap();
         let s = SubdivisionSettings {
             method: SubdivisionMethod::Offset,
@@ -1105,7 +1105,7 @@ mod tests {
 
     #[test]
     fn streetfollowing_method_runs_and_conserves_area() {
-        // Phase 7: method=streetfollowing now runs (skeleton subdivision) rather
+        // method=streetfollowing runs (skeleton subdivision) rather
         // than returning the deferral error.
         let poly = curve_to_polygon(&rect_curve(400.0, 120.0)).unwrap();
         let s = SubdivisionSettings {
@@ -1145,7 +1145,7 @@ mod tests {
         assert_eq!(parse_pattern("skew"), Some(StreetPattern::Skewed));
         assert_eq!(parse_pattern("organic"), Some(StreetPattern::Organic));
         assert_eq!(parse_pattern("culdesac"), Some(StreetPattern::CulDeSac));
-        // Phase 5b non-rectilinear patterns are now accepted.
+        // Non-rectilinear patterns are accepted.
         assert_eq!(parse_pattern("radial"), Some(StreetPattern::Radial));
         assert_eq!(parse_pattern("hex"), Some(StreetPattern::Hexagonal));
         assert_eq!(parse_pattern("voronoi"), Some(StreetPattern::Voronoi));
@@ -1174,7 +1174,7 @@ mod tests {
 
     #[test]
     fn generate_site_nonrectilinear_patterns_produce_output() {
-        // Phase 5b: radial / hexagonal / Voronoi now generate roads + blocks
+        // Non-rectilinear: radial / hexagonal / Voronoi generate roads + blocks
         // through the shared extractor rather than erroring.
         let poly = curve_to_polygon(&rect_curve(400.0, 300.0)).unwrap();
         for p in [
@@ -1311,7 +1311,7 @@ mod tests {
     fn generated_block_subdivides_with_street_access() {
         // A generated block, fed back to recursive-OBB subdivision, must produce
         // lots that keep street frontage — confirming the tagged block geometry
-        // survives into a downstream lotsubdivide (plan Phase 5 requirement).
+        // survives into a downstream lotsubdivide (a road-network requirement).
         let poly = curve_to_polygon(&rect_curve(400.0, 300.0)).unwrap();
         let gs = SubdivisionSettings {
             street_pattern: StreetPattern::Orthogonal,

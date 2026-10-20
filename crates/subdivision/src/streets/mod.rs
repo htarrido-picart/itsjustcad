@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Road-network generation + block extraction (plan §7.3, Phase 5).
+//! Road-network generation + block extraction + street tagging.
 //!
 //! - [`street_graph`] — the `StreetGraph` output type (centerlines + widths +
 //!   hierarchy + adjacency).

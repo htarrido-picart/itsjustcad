@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Tree-save (preserved-vegetation) placement (plan §9 Phase 9).
+//! Tree-save (preserved-vegetation) placement.
 //!
 //! Mark a preserved-vegetation polygon the layout works around. Unlike a park
 //! or pond (a designed shape), a tree-save marks EXISTING vegetation, so it

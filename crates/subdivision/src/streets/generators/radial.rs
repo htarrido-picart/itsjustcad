@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Radial / circular generator (plan §7.3 / §1 owner scope, Phase 5b): a polar
+//! Radial / circular generator (owner scope, non-rectilinear): a polar
 //! road layout — concentric **ring** roads at block-depth spacing plus **radial
 //! spokes** from a center. Unlike the rectilinear generators this does NOT use
 //! recursive-OBB site splitting; it lays out its own polar grid and clips both

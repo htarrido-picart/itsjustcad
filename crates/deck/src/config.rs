@@ -41,7 +41,7 @@ pub enum DeckKind {
 pub enum CloudProvider {
     /// Claude via the Anthropic API (`x-api-key` auth).
     Anthropic,
-    /// ChatGPT via the OpenAI API (served through the OpenAI-compatible adapter).
+    /// OpenAI models via the OpenAI API (served through the OpenAI-compatible adapter).
     OpenAi,
 }
 
@@ -92,8 +92,8 @@ impl CloudProvider {
     /// Human-facing label for the dialog row.
     pub fn label(self) -> &'static str {
         match self {
-            CloudProvider::Anthropic => "Anthropic (Claude)",
-            CloudProvider::OpenAi => "OpenAI (ChatGPT)",
+            CloudProvider::Anthropic => "Anthropic API",
+            CloudProvider::OpenAi => "OpenAI API",
         }
     }
 }
@@ -140,7 +140,7 @@ impl DeckConfig {
     /// NOTE on `grammar`: a grammar-constrained LOCAL model can still be
     /// multimodal — the GBNF grammar constrains the model's OUTPUT text (so it
     /// can only emit real verbs), while vision is an INPUT capability. A local
-    /// Qwen2.5-VL served with `--mmproj` is both grammar-constrained AND able to
+    /// Qwen3-VL served with `--mmproj` is both grammar-constrained AND able to
     /// see images. So we decide vision from the model identity (name / endpoint),
     /// NOT from the grammar flag: a known vision name wins even with grammar on;
     /// an unknown text model is blind whether or not grammar is set.
@@ -159,7 +159,7 @@ impl DeckConfig {
                 // Other OpenAI-compatible endpoints (local llama.cpp, gateways)
                 // host arbitrary models, so allow-list known vision names. This
                 // runs BEFORE any grammar consideration: our local vision model
-                // ("qwen2.5-vl-3b…") carries grammar=true yet is fully multimodal.
+                // ("qwen3-vl-4b…") carries grammar=true yet is fully multimodal.
                 let m = self.model.to_ascii_lowercase();
                 m.contains("vl")
                     || m.contains("vision")
@@ -271,7 +271,7 @@ impl Default for DecksFile {
 
 pub fn config_path() -> Option<std::path::PathBuf> {
     // ~/.config/itsjustcad on every platform — CLI-tool convention, greppable.
-    Some(dirs::home_dir()?.join(".config").join("itsjustcad").join("decks.json"))
+    Some(crate::config_dir()?.join("decks.json"))
 }
 
 impl DecksFile {
@@ -385,10 +385,11 @@ mod tests {
     // so a macOS-only dir can never sneak in (GitHub issue #26).
     #[test]
     fn decks_config_path_is_under_dot_config_itsjustcad() {
-        if let Some(p) = config_path() {
-            let home = dirs::home_dir().expect("home dir");
-            assert_eq!(p, home.join(".config").join("itsjustcad").join("decks.json"));
-        }
+        let home = std::path::Path::new("/home/someone");
+        assert_eq!(crate::home_config_dir(home), home.join(".config").join("itsjustcad"));
+        let p = config_path().expect("config path");
+        assert_eq!(p, crate::config_dir().unwrap().join("decks.json"));
+        assert!(!p.starts_with(dirs::home_dir().expect("home dir")), "tests never use the real config");
     }
 
     #[test]
@@ -448,6 +449,8 @@ mod tests {
         // A LOCAL vision model carries grammar=true (constrains OUTPUT) yet is
         // multimodal (INPUT): the vision name must win over the grammar flag.
         assert!(mk(DeckKind::OpenaiCompat, "qwen2.5-vl-3b", true).supports_vision());
+        // The shipped local vision model (catalog id) is detected too.
+        assert!(mk(DeckKind::OpenaiCompat, "qwen3-vl-4b-q4km-gguf", true).supports_vision());
         // …while a grammar-constrained TEXT model stays blind.
         assert!(!mk(DeckKind::OpenaiCompat, "qwen3", true).supports_vision());
     }

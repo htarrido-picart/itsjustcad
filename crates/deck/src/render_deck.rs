@@ -346,12 +346,7 @@ impl Default for RenderDecksFile {
 }
 
 pub fn render_config_path() -> Option<std::path::PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
-            .join("render_decks.json"),
-    )
+    Some(crate::config_dir()?.join("render_decks.json"))
 }
 
 impl RenderDecksFile {

@@ -47,3 +47,25 @@ pub use exec::{trim_preview, trim_removed_piece, ApplyOutcome, ImportSummary, Se
 pub use parse::parse;
 pub use plugin::{Plugin, PluginError, PluginParam, PluginRegistry};
 pub use registry::{registry, Category, CommandSpec, SELECTOR_HELP};
+
+/// The user's config dir: [`home_config_dir`] of the home directory.
+#[cfg(not(test))]
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| home_config_dir(&h))
+}
+
+/// Tests never read or write the developer's real config: they get a throwaway
+/// dir under the system temp dir instead, one per test thread (unit tests run in parallel threads of one process, and
+/// a workdir grant persisted by one test must not leak into another).
+#[cfg(test)]
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    let thread =
+        format!("{:?}", std::thread::current().id()).replace(|c: char| !c.is_ascii_digit(), "");
+    Some(std::env::temp_dir().join(format!("ijc_test_config_{}_{thread}", std::process::id())))
+}
+
+/// `~/.config/itsjustcad` under `home`, on every platform (CLI-tool convention,
+/// XDG default on Linux; never a macOS-only dir — GitHub issue #26).
+pub fn home_config_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config").join("itsjustcad")
+}

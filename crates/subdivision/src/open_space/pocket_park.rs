@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Pocket park placement (plan §9 Phase 9).
+//! Pocket park placement.
 //!
 //! Place a small green polygon (a compact rounded rectangle) centred in a
 //! region — a selected block or the largest empty block. The park is sized to

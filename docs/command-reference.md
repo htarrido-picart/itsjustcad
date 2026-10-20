@@ -371,13 +371,13 @@ top / bottom / front / back / left / right / persp   standard views
 ze / zoomextents · zs / zoomselected                 fit all / fit selection
 display shaded|wireframe|xray|ghosted|pencil         viewport display mode
 light working|sun|presentation                       lighting model
-sketchup                                             SketchUp look preset
+massing (alias clay)                                 massing look preset (working light, profile edges, sky gradient)
 sketchy on|off · edgefx k=v …                        hand-drawn NPR edges + tuning
 profiles on|off · meshedges on|off                   thick profile / feature edges
 plantsymbols on|off                                  2D top-view planting plan symbols
 gumball on|off|toggle                                transform gizmo
 camera 2point|persp|pano|fisheye [fov]|<n>mm         projection / lens
-camera phone <lens>                                  phone-camera sim (iphone-ultrawide, pixel-tele, galaxy-main, …)
+camera phone <lens>                                  phone-camera sim (phone-main, phone-ultrawide, phone-tele, phone-periscope)
 basemap [osm|sat] [span_m] [opacity] | basemap off   georeferenced site underlay
 reducemotion on|off                                  accessibility: stop animated progress
 chatencryption on|off                                encrypt chat sessions at rest (default OFF, opt-in)
@@ -386,7 +386,7 @@ save [path] · help [verb]                            save document / inline hel
 
 ### Object snap
 
-Rhino-style precision snapping while drawing. A clickable **osnap chip** in the status bar opens a toggle popup; the same set is under **View ▸ Object Snap…**. The `osnap` verb toggles the master switch or any individual snap.
+Precision object snapping while drawing. A clickable **osnap chip** in the status bar opens a toggle popup; the same set is under **View ▸ Object Snap…**. The `osnap` verb toggles the master switch or any individual snap.
 
 ```
 osnap on|off|toggle                                  master snap switch

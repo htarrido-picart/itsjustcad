@@ -5,7 +5,7 @@
 //! ops + polygon OFFSET (buffer), with the float→int scale defined ONCE here so
 //! no raw f64 tolerance choice leaks elsewhere.
 //!
-//! **i_overlay evaluation (Phase-1 gate):** `i_overlay` 8.1 is pure Rust,
+//! **i_overlay evaluation (dependency gate):** `i_overlay` 8.1 is pure Rust,
 //! MIT OR Apache-2.0 (AGPLv3-clean), on crates.io. It ships BOTH:
 //!
 //! - boolean overlay (`SingleFloatOverlay::overlay` — union/intersection/
@@ -13,11 +13,11 @@
 //! - polygon OFFSET via the `OutlineOffset` trait (`OutlineStyle` with
 //!   outer/inner offset + join style).
 //!
-//! So the Phase-1 offset blocker is CLEARED — offset works; no fallback to `geo`
-//! or a vendored Clipper2 is needed. Phase 3 (recursive OBB) does not use any of
+//! So the offset blocker is CLEARED — offset works; no fallback to `geo`
+//! or a vendored Clipper2 is needed. Recursive OBB does not use any of
 //! this — it needs only the half-plane clip in `split.rs`. Boolean/offset here
-//! are wired and smoke-tested now so Phase 4+ (offset/perimeter, block
-//! extraction) can build on them without revisiting the dependency question.
+//! are wired and smoke-tested now so offset/perimeter subdivision and block
+//! extraction can build on them without revisiting the dependency question.
 
 use crate::geometry::polygon2d::Polygon2d;
 use glam::DVec2;
@@ -43,8 +43,8 @@ fn contour_to_polygon(c: &[IPoint]) -> Option<Polygon2d> {
 }
 
 /// Collect the OUTER contours of a `Shapes` result into `Polygon2d`s (holes are
-/// dropped — Phase 3/4 blocks are treated as their outer boundary; hole support
-/// arrives with the retention-pond case in a later phase).
+/// dropped — grid and perimeter blocks are treated as their outer boundary; hole support
+/// arrives with the retention-pond case in open space).
 fn shapes_to_polygons(shapes: &[Vec<Vec<IPoint>>]) -> Vec<Polygon2d> {
     shapes
         .iter()

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Tagged blocks (plan §5 hard dependency): a `Block` = polygon + per-edge
+//! Tagged blocks (a hard dependency of the lot rules): a `Block` = polygon + per-edge
 //! `BlockEdge` street tags, produced by `streets::block_extractor`.
 
 pub mod block;

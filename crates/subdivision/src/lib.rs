@@ -1,24 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `subdivision` — pure-Rust 2D site-planning geometry (intemfit / M-intemfit).
+//! `subdivision` — pure-Rust 2D site-planning geometry.
 //!
 //! ZERO `egui` / `itsjustcad-doc` / `itsjustcad-commands` deps: plain geometry
 //! in, plain geometry out, unit-tested headless. The commands crate owns the
 //! bridge from document curves to these types (dependency direction:
 //! `subdivision` (leaf) ← `commands` ← `app`).
 //!
-//! Phases shipped: 1 (geometry foundation + `i_overlay` bridge), 3 (recursive
-//! OBB subdivision, `method=grid`), 4 (offset/perimeter subdivision,
-//! `method=perimeter`), 5 + 5b (road generation + block extraction + street
-//! tagging), 6 (lot rules — width mix, depth, corner, flag, loading, sliver
-//! merge, on euro_latam placeholder defaults), 7 (skeleton / street-following
-//! subdivision, `method=streetfollowing`, via the approximate straight skeleton
-//! in `straight_skeleton`), 9 (open space — feature placement in `open_space/`:
-//! pocket park, greenway corridor, retention pond, tree-save; plus blind
-//! %-reserve pulling whole central blocks out as open space). Phase 2 (verb/
-//! settings plumbing) lives in the commands crate but the `SubdivisionSettings`
-//! type is here.
+//! Features: geometry foundation (`Polygon2d`, OBB, `i_overlay` bridge);
+//! recursive-OBB (`method=grid`), offset/perimeter (`method=perimeter`) and
+//! skeleton / street-following (`method=streetfollowing`) subdivision; road
+//! generation (rectilinear, radial, hexagonal, Voronoi) + block extraction +
+//! street tagging; lot rules (width mix, depth, corner, flag, loading, sliver
+//! merge, on euro_latam placeholder defaults); setbacks + buildable envelopes;
+//! open space (pocket park, greenway corridor, retention pond, tree-save, plus
+//! blind %-reserve of whole central blocks); buildings (footprints, stepped
+//! massing, roofs); yield reporting + option comparison; consistent indexing.
+//! The verb/settings plumbing lives in the commands crate but the
+//! `SubdivisionSettings` type is here.
 
 pub mod blocks;
 pub mod geometry;

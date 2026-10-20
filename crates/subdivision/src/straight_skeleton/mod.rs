@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Straight-skeleton interface + the Phase-7 approximate implementation.
+//! Straight-skeleton interface + the approximate implementation.
 //!
-//! The plan (§5) builds the skeleton in two stages behind ONE trait:
-//! - **Phase 7 (now):** [`offset_approx::OffsetApproxSkeleton`] — iterated small
+//! The skeleton is built in two stages behind ONE trait:
+//! - **Approximate (default):** [`offset_approx::OffsetApproxSkeleton`] — iterated small
 //!   inward insets (`clip_bridge::offset`, i_overlay) with topology tracking, so
 //!   the medial ridge is approximated to survey tolerance. Robust and fast; good
 //!   at the shapes real parcels take.
-//! - **Phase 12 (later):** a true Felkel & Obdržálek priority-queue skeleton
+//! - **Felkel:** a true Felkel & Obdržálek priority-queue skeleton
 //!   (`felkel.rs`), swapped in behind the SAME [`StraightSkeleton`] trait. NOT
 //!   built now — the trait is defined so it can slot in without touching callers.
 //!
@@ -68,8 +68,8 @@ impl SkeletonFace {
     }
 }
 
-/// The straight-skeleton interface. Phase 7 ships one implementor
-/// ([`offset_approx::OffsetApproxSkeleton`]); Phase 12's Felkel skeleton slots in
+/// The straight-skeleton interface. The approximate implementor
+/// ([`offset_approx::OffsetApproxSkeleton`]) and the Felkel skeleton slot in
 /// behind the same trait.
 pub trait StraightSkeleton {
     /// Compute the skeleton faces of `poly` — one face per contour edge (in

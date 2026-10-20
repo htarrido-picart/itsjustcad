@@ -81,7 +81,7 @@ fn is_spawnable_local(
 }
 
 /// Whether a vision turn should INLINE the image as a request content part
-/// (HTTP multimodal cassettes: local Qwen2.5-VL, Anthropic, OpenAI) rather than
+/// (HTTP multimodal cassettes: local Qwen3-VL, Anthropic, OpenAI) rather than
 /// hand a scoped file path to the claude-code adapter. True only for a
 /// non-claude-code cassette that `supports_vision()`; a blind cassette gets no
 /// image at all (we never send an image to a model that can't see). Pure.
@@ -141,10 +141,10 @@ mod vision_image_tests {
 
     #[test]
     fn inline_only_for_http_vision_cassettes() {
-        // Local Qwen2.5-VL: grammar-constrained yet multimodal → inline.
+        // Local Qwen3-VL: grammar-constrained yet multimodal → inline.
         assert!(inline_vision_image(&cfg(
             DeckKind::OpenaiCompat,
-            "qwen2.5-vl-3b",
+            "qwen3-vl-4b-q4km-gguf",
             true
         )));
         // Local text model → no image inlined (blind).
@@ -616,9 +616,7 @@ fn saved_chat_path(doc_uuid: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
+        crate::config_dir()?
             .join("chats")
             .join(format!("{doc_uuid}.draft.json")),
     )
@@ -628,9 +626,7 @@ fn saved_chat_path(doc_uuid: &str) -> Option<std::path::PathBuf> {
 /// one-time migration into the current document's per-doc draft; deleted after.
 fn legacy_global_chat_path() -> Option<std::path::PathBuf> {
     Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
+        crate::config_dir()?
             .join("deck_chat.json"),
     )
 }
@@ -1623,12 +1619,28 @@ impl Default for DeckPane {
         {
             let catalog = crate::model_catalog::Catalog::load();
             let before = decks.decks.len();
+            let mut retired: Vec<String> = Vec::new();
             decks.decks.retain(|d| {
                 match d.name.strip_prefix("local-") {
-                    Some(id) => catalog.get(id).is_some(), // known model → keep
-                    None => true,                          // not a local cassette → keep
+                    Some(id) if catalog.get(id).is_some() => true, // known model → keep
+                    Some(id) => {
+                        retired.push(id.to_string());
+                        false
+                    }
+                    None => true, // not a local cassette → keep
                 }
             });
+            // A model RETIRED from the catalog (e.g. for its license) left its
+            // weights behind; delete them with the cassette so no multi-GB
+            // orphan stays on disk.
+            if let Some(dir) = crate::download::models_dir() {
+                for id in &retired {
+                    for f in crate::model_catalog::retired_model_files(id) {
+                        let _ = std::fs::remove_file(dir.join(f));
+                        let _ = std::fs::remove_file(dir.join(format!("{f}.part")));
+                    }
+                }
+            }
             if decks.decks.len() != before {
                 if decks.active >= decks.decks.len() {
                     decks.active = decks.decks.len().saturating_sub(1);
@@ -2630,7 +2642,7 @@ impl DeckPane {
                     req.system.push_str(&claude_code_vision_directive(&shot));
                 }
             } else if inline_vision_image(&config) {
-                // HTTP multimodal cassette (local Qwen2.5-VL served with
+                // HTTP multimodal cassette (local Qwen3-VL served with
                 // --mmproj, or a cloud vision model): inline the image as a
                 // base64 content part on the last user message — which
                 // `openai_compat`/`anthropic` turn into a provider-native image

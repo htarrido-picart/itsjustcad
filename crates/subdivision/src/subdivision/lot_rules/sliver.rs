@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `SliverMerger` (plan §7.4, Phase 6) — the single biggest professional-vs-
+//! `SliverMerger` — the single biggest professional-vs-
 //! generated difference. Repeatedly merge any lot below
 //! `sliver_area_frac × lot_area_min` (euro_latam frac 0.5) into its neighbour
 //! with the LARGEST shared edge, until no sliver remains. Deterministic: the

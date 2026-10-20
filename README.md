@@ -54,8 +54,8 @@ that draws with the exact same commands you type.
 - **UI** — Blocks tab (double-click a block to reveal it, search + library "+"),
   a Plugins popup and a root-level Plugins menu, a Sheets tab (per-sheet list +
   preview), reliable Quit / Close menu items, and a **⌘G** gumball toggle.
-- **~40 CAD-parity verbs** — a broad batch of AutoCAD/Rhino/DraftSight-style
-  drafting, selection, annotation, block/xref, sheet-set and interop commands.
+- **~40 CAD-parity verbs** — a broad batch of classic CAD drafting, selection,
+  annotation, block/xref, sheet-set and interop commands.
   See **[CAD-parity commands](#cad-parity-commands)** for the full grouped list;
   highlights below.
 
@@ -98,7 +98,7 @@ which removes this entirely, is planned.)
 
 Testing the beta? Open **[`docs/beta-review.html`](docs/beta-review.html)** in
 your browser — a comprehensive, tickable manual-test checklist covering every
-v0.5.0 area (modeling, expressive & live-parametric structures, intemfit site
+v0.5.0 area (modeling, expressive & live-parametric structures, site
 planning, environmental analysis, compliance pre-check, landscape/planting, DWG
 import, the LLM deck, language/skins, sheets/PDF, interop, the ray tracer + AI
 render, object snap, associative dimensions, the update check, and the UI). Work
@@ -116,10 +116,9 @@ notes are saved in the browser as you go.
 
 ## Why ItsJustCAD
 
-Every CAD tool sits in one corner of the map. **AutoCAD** and **Revit** are
-powerful and closed — subscription-only since 2021, expensive, and tethered to
-Autodesk's cloud. **Rhino** is cheaper but still closed and paid. **FreeCAD** is
-free and open, but perpetually clunky and unfunded. **Shapr3D** is polished but
+Every CAD tool sits in one corner of the map. Commercial CAD (AutoCAD®,
+Revit®, Rhino®) is closed and paid; most of it is now sold by subscription.
+**FreeCAD** is free and open, but perpetually clunky and unfunded. **Shapr3D** is polished but
 proprietary. Nobody occupies the obvious lane: **free, open, LLM-native, and
 built for architects** — and actually funded well enough to be *good*.
 
@@ -151,9 +150,11 @@ cargo run --release
 ```
 
 First run asks two questions — your units (meters / millimeters / feet-inches)
-and which CAD you're coming from (**AutoCAD / Rhino / Revit / none**). The UI
-adapts: background colors, font sizes, and command aliases match the software
-your hands already know. `pl`, `o`, `tr`, `co` all work if you chose AutoCAD.
+and how you like to work (**Classic command line / NURBS modeler / BIM-style /
+default**). The UI adapts its canvas colors, sizes and short command aliases.
+Choose Classic and `pl`, `o`, `tr`, `co` all work, as many long-time CAD users
+expect. (The Classic command-line skin will feel familiar to users of
+AutoCAD®; see [Trademarks](#trademarks).)
 
 The interface is fully localized — **every Romance language** ships in-app:
 English, Spanish (Español), Portuguese (Português), French (Français), Italian
@@ -244,7 +245,7 @@ last *n* commands into a tool the same way.
 ## Feature tour
 
 ![The ItsJustCAD interface — perspective viewport, command line, a status bar with view/snap chips and gumball, and the right dock (Chat, Sessions, Layers, plus contextual Parameters/Sheets/Blocks tabs)](docs/shot-ui.png)
-*A familiar, Rhino-style interface: command line, viewport with view/snap chips, and a docked panel (Chat, Sessions, Layers, and contextual Parameters/Sheets/Blocks) — it adapts to the CAD you came from.*
+*A command-line-first interface: command line, viewport with view/snap chips, and a docked panel (Chat, Sessions, Layers, and contextual Parameters/Sheets/Blocks) — it adapts to how you like to work.*
 
 Every showcase image below is rendered by
 [`docs/examples/render-examples.sh`](docs/examples/render-examples.sh) from a
@@ -333,7 +334,7 @@ Full object snap set — endpoint / midpoint / center / intersection /
 perpendicular / tangent / quadrant / nearest / node / vertex — with a clickable
 status-bar osnap chip, a **View ▸ Object Snap…** panel, and per-snap toggles
 (`osnap end on`) · typed coordinates mid-tool (`5.2,3`, `@2,3` relative, bare
-distances) · Shift ortho lock · window/crossing drag-select (Rhino convention) ·
+distances) · Shift ortho lock · window/crossing drag-select ·
 autosuggest with usage hints as you type · gumball on selection (⌘G to toggle) ·
 a movable **construction plane** (`cplane` / `ucs`: world / origin+normal /
 3-point / save+recall) so typed coordinates land on any drawing plane — logged
@@ -354,9 +355,9 @@ duplicates) · an editable **Properties** panel for the current selection
 ### See
 Perspective, true-ortho plan/elevation views · **two-point perspective**
 (verticals stay vertical) · 360° panorama + fisheye · lens presets 15–85 mm +
-phone-camera sims (iPhone / Pixel / Galaxy) · 1/2/4 viewport layouts · display
+phone-camera sims (ultra-wide / main / tele) · 1/2/4 viewport layouts · display
 modes: shaded / wireframe / x-ray / ghosted / **pencil** (hidden-line on white
-paper) · **sketchy NPR edges** + SketchUp look preset · appearance materials
+paper) · **sketchy NPR edges** + massing look preset (`massing`) · appearance materials
 (glass / metal / concrete / wood) · georeferenced OSM / satellite basemap ·
 color by layer / object / type / random · named views · image underlay for
 tracing scans · **built-in ray tracer** — a Rust path tracer that renders the
@@ -380,7 +381,7 @@ display shaded
 
 *Left: `display shaded` perspective. Right: `display pencil` — hidden-line linework
 on white paper, straight from the model. Other verbs in this family: `camera
-2point` (verticals stay vertical), `camera 24` / `camera phone iphone-ultrawide`
+2point` (verticals stay vertical), `camera 24` / `camera phone phone-ultrawide`
 (lens presets), `top` / `front` (true-ortho views), and `display wireframe` /
 `xray` / `ghosted`.*
 
@@ -514,7 +515,7 @@ dimensions** (`dimangular`), and one-shot `autodim` (batch-dimension a whole
 selection) · **field text** (`field`) bound to a live value — area / length /
 count / layer / units — that auto-updates after edits · text · hatches: solid,
 lines, crosshatch, brick, concrete, insulation, earth, the ANSI31–38 set, and
-custom patterns imported from AutoCAD `.pat` files (`hatchpat`; dash cadence is
+custom patterns imported from `.pat` hatch-pattern files (`hatchpat`; dash cadence is
 read faithfully but rendered approximately) · `boundary` traces a closed region
 from a seed point, and `curvebool` unions / intersects / differences closed
 planar curves into new regions · sheets (A4–A0) with scaled ortho views,
@@ -718,17 +719,18 @@ the source file) updates every instance at once. The rendered scene omits the
 
 | Direction | Formats |
 |---|---|
-| Import | **DWG** (assisted) · DXF · OBJ · STL · glTF/GLB · Collada · **IFC** · **3DM** (Rhino) · GeoJSON · OSM (Overpass export) · LAS / **LAZ** / **E57** point clouds · EPW · STEP† |
-| Export | DXF · OBJ · STL · glTF/GLB · **IFC4** (incl. structural analysis model) · **3DM** · **SAF `.xlsx`** (structural handoff) · SVG · CSV · PDF · **JPG** · **`.ai`** (Adobe Illustrator — SVG-content) · STEP† |
+| Import | **DWG** (assisted) · DXF · OBJ · STL · glTF/GLB · Collada · **IFC** · **3DM** (Rhino®/openNURBS® format) · GeoJSON · OSM (Overpass export) · LAS / **LAZ** / **E57** point clouds · EPW · STEP† |
+| Export | DXF · OBJ · STL · glTF/GLB · **IFC4** (incl. structural analysis model) · **3DM** · **SAF `.xlsx`** (structural handoff) · SVG · CSV · PDF · **JPG** · STEP† |
 
-IFC is the Revit bridge — both directions, hand-written, zero dependencies, and
+IFC4 is the BIM bridge — both directions — for Revit® and other IFC-capable
+tools: hand-written, zero dependencies, and
 includes typed structural members + the `IfcStructuralAnalysisModel` graph. SAF
 2.2.0 exports a genuine `.xlsx` workbook for RFEM / SCIA / AxisVM / FEM-Design.
 Both carry a **geometry+topology-only, no-analysis-results** disclaimer — the app
 never claims to analyse. Native save stays the op-log JSON. †STEP needs the
 opt-in `kernel-occt` feature.
 
-**DWG** is an *assisted* bridge: the AutoCAD `.dwg` importer shells out to a
+**DWG** is an *assisted* bridge: the `.dwg` importer (DWG is the native file format of Autodesk® AutoCAD®) shells out to a
 user-installed `dwg2dxf` (LibreDWG, `brew install libredwg`) to convert to DXF,
 then imports through the hardened DXF path — LibreDWG is GPLv3 and is **never
 linked or bundled**, so the AGPLv3 distribution stays clean. A truncated
@@ -787,7 +789,7 @@ registry exactly — type `help <verb>` for the full text, or see
 | `boundary` | `boundary <seed x,y,z> [from <sel>]` | Trace a closed boundary polyline around a seed point |
 | `curvebool` | `curvebool <union/intersect/difference> <sel>` | Combine closed **planar** curves (aliases `cboolean`, `region`) |
 | `polygon` | `polygon <center> <radius> <sides>` | Regular polygon (also an interactive tool) |
-| `hatchpat` | `hatchpat <path.pat>` | Import AutoCAD `.pat` hatch patterns (dash cadence approximate) |
+| `hatchpat` | `hatchpat <path.pat>` | Import `.pat` hatch-pattern files (dash cadence approximate) |
 
 **Drawings → BIM**
 
@@ -951,7 +953,7 @@ step-by-step walkthroughs a working architect can follow top to bottom:
 | # | Tutorial | You end with |
 |---|---|---|
 | 1 | [Getting started](docs/tutorials/01-getting-started.md) | Your first massing — orbited, saved, printed to a PDF sheet |
-| 2 | [Site planning with intemfit](docs/tutorials/02-site-planning.md) | A subdivided site with buildings and a yield report |
+| 2 | [Site planning](docs/tutorials/02-site-planning.md) | A subdivided site with buildings and a yield report |
 | 3 | [Environmental analysis](docs/tutorials/03-environmental-analysis.md) | A sun-hours study read in numbers and critiqued by the deck |
 | 4 | [Working with the deck](docs/tutorials/04-deck.md) | The LLM drawing and analysing in the same commands you type |
 | 5 | [Render with the ray tracer](docs/tutorials/05-raytrace.md) | A photoreal PBR render of your real model — sun shadows and GI, in-app |
@@ -959,7 +961,7 @@ step-by-step walkthroughs a working architect can follow top to bottom:
 
 There's also a self-contained **[landing page](docs/index.html)** (open it in a
 browser) and **[ready-to-open example documents](examples/)** — a massing, a
-courtyard sheet, and a full intemfit site.
+courtyard sheet, and a full site plan.
 
 | Reference | What |
 |---|---|
@@ -970,7 +972,6 @@ courtyard sheet, and a full intemfit site.
 | [docs/file-format.md](docs/file-format.md) · [FORMAT.md](FORMAT.md) | The op-log file format + stability promise |
 | [docs/plugins.md](docs/plugins.md) | Runtime-authored command macros |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Tests-required, one-substrate rule, minimal deps |
-| [docs/ui-legacy-research.md](docs/ui-legacy-research.md) | The AutoCAD/Rhino/Revit conventions the skins implement |
 
 ## License
 
@@ -986,3 +987,18 @@ open desktop build only. Contributions are welcome under a CLA (see
 [`CONTRIBUTING.md`](CONTRIBUTING.md)).
 
 The file format and command language are documented and stable — build on them.
+
+## Trademarks
+
+ItsJustCAD is an independent product. It is not affiliated with, sponsored by,
+or endorsed by Autodesk, Robert McNeel & Associates, Apple, Anthropic, OpenAI,
+or any other company mentioned. Autodesk, AutoCAD, Revit and DWG are registered
+trademarks or trademarks of Autodesk, Inc. in the USA and/or other countries;
+DWG is the native file format of Autodesk's AutoCAD software. Rhinoceros, Rhino
+and openNURBS are registered trademarks of Robert McNeel & Associates. IFC and
+openBIM are trademarks of buildingSMART International Limited. Apple and macOS
+are trademarks of Apple Inc., registered in the U.S. and other countries and
+regions.
+Claude is a trademark of Anthropic, PBC. OpenAI is a trademark of OpenAI. Other
+names are trademarks of their respective owners and are used only to identify
+compatible files and services.

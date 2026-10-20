@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Greenway / trail-corridor placement (plan §9 Phase 9).
+//! Greenway / trail-corridor placement.
 //!
 //! Route a linear buffered strip along a path (a polyline) or an edge. The
 //! corridor is the path offset by `width/2` on each side into a closed ribbon

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `OffsetApproxSkeleton` (plan §5, Phase 7) — an approximate straight skeleton
+//! `OffsetApproxSkeleton` — an approximate straight skeleton
 //! built from iterated small inward insets with topology tracking.
 //!
 //! ## Idea
@@ -40,7 +40,7 @@ use crate::geometry::polygon2d::Polygon2d;
 use crate::geometry::split::{split_by_line, Line2d};
 use glam::DVec2;
 
-/// The Phase-7 approximate straight skeleton. Stateless.
+/// The approximate straight skeleton. Stateless.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OffsetApproxSkeleton;
 
@@ -56,7 +56,7 @@ impl OffsetApproxSkeleton {
     /// inset empties, never panics.
     ///
     /// Used by the unit tests as the "skeleton meets near centre / medial ridge"
-    /// behaviour proxy (there is no image compare — §9).
+    /// behaviour proxy (there is no image compare).
     pub fn medial_axis_ridge(&self, poly: &Polygon2d) -> Vec<DVec2> {
         let mut out = Vec::new();
         // Step ~ 1/40 of the short extent so we get a handful of samples.
@@ -99,7 +99,7 @@ impl StraightSkeleton for OffsetApproxSkeleton {
 ///
 /// This is exactly what an inward offset wavefront carves — the seam where two
 /// edges' parallel offsets meet is the angle bisector of their supporting lines —
-/// so it is the offset-approximate straight skeleton (plan §5), computed in
+/// so it is the offset-approximate straight skeleton, computed in
 /// closed form per edge rather than by tracking collapsing insets. It tiles the
 /// block exactly for convex polygons (the bisector regions partition the
 /// interior) and is robust on concave / notched blocks (a reflex vertex's face

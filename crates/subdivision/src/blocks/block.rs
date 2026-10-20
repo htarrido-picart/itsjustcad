@@ -2,7 +2,7 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 //! `Block` — a developable polygon carved out of the site by the road network,
-//! plus one [`BlockEdge`] per polygon edge carrying its street tag (plan §5).
+//! plus one [`BlockEdge`] per polygon edge carrying its street tag.
 //! The `edges` are in the same order and winding (CCW) as the polygon, so
 //! `edges[i]` runs from `polygon.verts()[i]` to `verts()[(i+1)%n]`.
 //!
