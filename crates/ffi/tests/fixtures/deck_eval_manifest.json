@@ -1,0 +1,1743 @@
+{
+ "source": "itsjustcad-ios Tests/Shared/OnDeviceEvalManifest.swift",
+ "groups": [
+  "tuning",
+  "heldout",
+  "catalogTuning",
+  "catalogHeldout",
+  "multiTuning",
+  "multiHeldout",
+  "fixHeldout",
+  "followTuning",
+  "followHeldout"
+ ],
+ "prompts": [
+  {
+   "id": "tuning0",
+   "group": "tuning",
+   "prompt": "draw a box 10x10x10 at the origin",
+   "setup": [],
+   "verbs": [
+    "box"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [0.0,0.0,0.0]..[10.0,10.0,10.0]",
+    "count": 1
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning1",
+   "group": "tuning",
+   "prompt": "make a sphere radius 5 at 20,0,0",
+   "setup": [],
+   "verbs": [
+    "geodesic"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning2",
+   "group": "tuning",
+   "prompt": "draw a line from 0,0,0 to 10,5,0",
+   "setup": [],
+   "verbs": [
+    "line"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": "curve"
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning3",
+   "group": "tuning",
+   "prompt": "draw a circle of radius 3 centered at 5,5,0",
+   "setup": [],
+   "verbs": [
+    "circle"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning4",
+   "group": "tuning",
+   "prompt": "draw a rectangle 20 wide and 10 tall at the origin",
+   "setup": [],
+   "verbs": [
+    "rect"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "[20.0,10.0,0.0]",
+    "count": 1
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning5",
+   "group": "tuning",
+   "prompt": "draw a hexagon with radius 4 at the origin",
+   "setup": [],
+   "verbs": [
+    "polygon"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning6",
+   "group": "tuning",
+   "prompt": "draw a closed polyline through 0,0,0 10,0,0 10,10,0 0,10,0",
+   "setup": [],
+   "verbs": [
+    "polyline"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning7",
+   "group": "tuning",
+   "prompt": "add a text label that says Hello at 0,0,0",
+   "setup": [],
+   "verbs": [
+    "text"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning8",
+   "group": "tuning",
+   "prompt": "draw a geodesic dome with radius 8",
+   "setup": [],
+   "verbs": [
+    "geodesic"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning9",
+   "group": "tuning",
+   "prompt": "move it up 5",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "move"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [0.0,0.0,5.0]..[10.0,10.0,15.0]",
+    "count": 1
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning10",
+   "group": "tuning",
+   "prompt": "delete everything",
+   "setup": [
+    "box 0,0,0 10,10,10",
+    "box 20,0,0 5,5,5"
+   ],
+   "verbs": [
+    "delete"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 0
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning11",
+   "group": "tuning",
+   "prompt": "copy the box 15 units along x",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "copy"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 2
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning12",
+   "group": "tuning",
+   "prompt": "rotate the box 45 degrees",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "rotate"
+   ],
+   "check": {
+    "kind": "changed",
+    "count": 1
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning13",
+   "group": "tuning",
+   "prompt": "make the box twice as big",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "scale"
+   ],
+   "check": {
+    "kind": "changed",
+    "count": 1
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning14",
+   "group": "tuning",
+   "prompt": "union the two boxes",
+   "setup": [
+    "box 0,0,0 10,10,10",
+    "box 5,5,5 10,10,10"
+   ],
+   "verbs": [
+    "union"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 1
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning15",
+   "group": "tuning",
+   "prompt": "extrude the rectangle 5 units",
+   "setup": [
+    "rect 0,0,0 10 10"
+   ],
+   "verbs": [
+    "extrude"
+   ],
+   "check": {
+    "kind": "hasMesh"
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning16",
+   "group": "tuning",
+   "prompt": "make a 3 by 3 grid of copies of the box spaced 15 apart",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "array"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 9
+   },
+   "require_verbs": false,
+   "failure_class": "grid"
+  },
+  {
+   "id": "tuning17",
+   "group": "tuning",
+   "prompt": "undo that",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "undo"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 0
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning18",
+   "group": "tuning",
+   "prompt": "draw a 5x5x5 box at the origin and another one at 10,0,0",
+   "setup": [],
+   "verbs": [
+    "box"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 2
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "tuning19",
+   "group": "tuning",
+   "prompt": "draw a circle of radius 2 at the origin and extrude it 10 high",
+   "setup": [],
+   "verbs": [
+    "circle",
+    "extrude"
+   ],
+   "check": {
+    "kind": "hasMesh"
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "heldout0",
+   "group": "heldout",
+   "prompt": "put a cube of side 4 centered at 10,10,2",
+   "setup": [],
+   "verbs": [
+    "box"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [8.0,8.0,0.0]..[12.0,12.0,4.0]",
+    "count": 1
+   },
+   "require_verbs": false,
+   "failure_class": "center"
+  },
+  {
+   "id": "heldout1",
+   "group": "heldout",
+   "prompt": "draw an octagon of radius 6 at 0,0,0",
+   "setup": [],
+   "verbs": [
+    "polygon"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "heldout2",
+   "group": "heldout",
+   "prompt": "make a cylinder with radius 2 and height 8 at the origin",
+   "setup": [],
+   "verbs": [
+    "circle",
+    "extrude"
+   ],
+   "check": {
+    "kind": "hasMesh"
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "heldout3",
+   "group": "heldout",
+   "prompt": "shift the box 3 to the right",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "move"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [3.0,0.0,0.0]..[13.0,10.0,10.0]",
+    "count": 1
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "heldout4",
+   "group": "heldout",
+   "prompt": "remove all objects",
+   "setup": [
+    "box 0,0,0 10,10,10",
+    "box 20,0,0 5,5,5"
+   ],
+   "verbs": [
+    "delete"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 0
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "heldout5",
+   "group": "heldout",
+   "prompt": "make it half the size",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "scale"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [2.5,2.5,2.5]..[7.5,7.5,7.5]",
+    "count": 1
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "heldout6",
+   "group": "heldout",
+   "prompt": "draw a triangle with radius 3 at 5,5,0",
+   "setup": [],
+   "verbs": [
+    "polygon"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "heldout7",
+   "group": "heldout",
+   "prompt": "mirror the box across the yz plane",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "mirror"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "[-10.0,0.0,0.0]..[0.0,10.0,10.0]",
+    "count": null
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "heldout8",
+   "group": "heldout",
+   "prompt": "make a ball of radius 2 at 0,0,10",
+   "setup": [],
+   "verbs": [
+    "geodesic"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": false,
+   "failure_class": null
+  },
+  {
+   "id": "heldout9",
+   "group": "heldout",
+   "prompt": "duplicate it 20 units up",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "copy"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [0.0,0.0,20.0]..[10.0,10.0,30.0]",
+    "count": 2
+   },
+   "require_verbs": false,
+   "failure_class": "copyMove"
+  },
+  {
+   "id": "catalogTuning0",
+   "group": "catalogTuning",
+   "prompt": "a Dieste-style undulating brick vault 6 wide 12 long",
+   "setup": [],
+   "verbs": [
+    "gaussvault"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning1",
+   "group": "catalogTuning",
+   "prompt": "Candela saddle shell",
+   "setup": [],
+   "verbs": [
+    "hypar"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning2",
+   "group": "catalogTuning",
+   "prompt": "Schwedler dome radius 8",
+   "setup": [],
+   "verbs": [
+    "schwedler"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning3",
+   "group": "catalogTuning",
+   "prompt": "hang a chain between 0,0,0 and 10,0,0 and invert it into an arch",
+   "setup": [],
+   "verbs": [
+    "funicular"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning4",
+   "group": "catalogTuning",
+   "prompt": "a 3-strut tensegrity prism",
+   "setup": [],
+   "verbs": [
+    "tensegrity"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning5",
+   "group": "catalogTuning",
+   "prompt": "a geodesic dome by Buckminster Fuller, radius 6",
+   "setup": [],
+   "verbs": [
+    "geodesic"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning6",
+   "group": "catalogTuning",
+   "prompt": "a space frame roof 6 by 4 bays, 3 m bays, 1.5 deep",
+   "setup": [],
+   "verbs": [
+    "spaceframe"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning7",
+   "group": "catalogTuning",
+   "prompt": "a waffle grid with 5 by 8 ribs over 10 by 16, 1 deep",
+   "setup": [],
+   "verbs": [
+    "waffle"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning8",
+   "group": "catalogTuning",
+   "prompt": "a timber gridshell on a hypar 5 by 5",
+   "setup": [],
+   "verbs": [
+    "gridshell"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning9",
+   "group": "catalogTuning",
+   "prompt": "revolve the profile into a vase",
+   "setup": [
+    "polyline 1,0,0 3,0,1 2,0,4 1,0,6 1,0,0 closed"
+   ],
+   "verbs": [
+    "revolve"
+   ],
+   "check": {
+    "kind": "hasMesh"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning10",
+   "group": "catalogTuning",
+   "prompt": "loft the two circles into a solid",
+   "setup": [
+    "circle 0,0,0 3",
+    "circle 0,0,5 2"
+   ],
+   "verbs": [
+    "loft"
+   ],
+   "check": {
+    "kind": "hasMesh"
+   },
+   "require_verbs": true,
+   "failure_class": "leakage"
+  },
+  {
+   "id": "catalogTuning11",
+   "group": "catalogTuning",
+   "prompt": "draw an ellipse 6 by 3 at the origin",
+   "setup": [],
+   "verbs": [
+    "ellipse"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": "missingNumber"
+  },
+  {
+   "id": "catalogTuning12",
+   "group": "catalogTuning",
+   "prompt": "offset the rectangle outward by 1",
+   "setup": [
+    "rect 0,0,0 10 10"
+   ],
+   "verbs": [
+    "offset"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": "missingNumber"
+  },
+  {
+   "id": "catalogTuning13",
+   "group": "catalogTuning",
+   "prompt": "a helix of radius 2, 10 tall with 5 turns at the origin",
+   "setup": [],
+   "verbs": [
+    "helix"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning14",
+   "group": "catalogTuning",
+   "prompt": "make a polar array of 6 copies of it around its center",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "polararray"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 6
+   },
+   "require_verbs": true,
+   "failure_class": "missingNumber"
+  },
+  {
+   "id": "catalogTuning15",
+   "group": "catalogTuning",
+   "prompt": "merge the two circles into one outline",
+   "setup": [
+    "circle 0,0,0 3",
+    "circle 4,0,0 3"
+   ],
+   "verbs": [
+    "curvebool"
+   ],
+   "check": {
+    "kind": "accepted"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning16",
+   "group": "catalogTuning",
+   "prompt": "create a layer called walls",
+   "setup": [],
+   "verbs": [
+    "layer"
+   ],
+   "check": {
+    "kind": "accepted"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning17",
+   "group": "catalogTuning",
+   "prompt": "color it red",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "color"
+   ],
+   "check": {
+    "kind": "accepted"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning18",
+   "group": "catalogTuning",
+   "prompt": "add a dimension between 0,0,0 and 10,0,0",
+   "setup": [],
+   "verbs": [
+    "dim"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning19",
+   "group": "catalogTuning",
+   "prompt": "make a sheet called A101",
+   "setup": [],
+   "verbs": [
+    "sheet"
+   ],
+   "check": {
+    "kind": "accepted"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning20",
+   "group": "catalogTuning",
+   "prompt": "what's the volume of the box",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "volume"
+   ],
+   "check": {
+    "kind": "unchanged"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning21",
+   "group": "catalogTuning",
+   "prompt": "name it tower",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "name"
+   ],
+   "check": {
+    "kind": "accepted"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning22",
+   "group": "catalogTuning",
+   "prompt": "plant an oak at 5,5,0",
+   "setup": [],
+   "verbs": [
+    "plant"
+   ],
+   "check": {
+    "kind": "grew"
+   },
+   "require_verbs": true,
+   "failure_class": "leakage"
+  },
+  {
+   "id": "catalogTuning23",
+   "group": "catalogTuning",
+   "prompt": "show the lineweights in the viewport",
+   "setup": [],
+   "verbs": [
+    "showweights"
+   ],
+   "check": {
+    "kind": "accepted"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogTuning24",
+   "group": "catalogTuning",
+   "prompt": "list the files I can import",
+   "setup": [],
+   "verbs": [
+    "files"
+   ],
+   "check": {
+    "kind": "accepted"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout0",
+   "group": "catalogHeldout",
+   "prompt": "Eladio Dieste gaussian vault, span 8, length 20, rise 3",
+   "setup": [],
+   "verbs": [
+    "gaussvault"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout1",
+   "group": "catalogHeldout",
+   "prompt": "hyperbolic paraboloid shell 4 by 4",
+   "setup": [],
+   "verbs": [
+    "hypar"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout2",
+   "group": "catalogHeldout",
+   "prompt": "ribbed dome with 16 meridians and 8 rings, radius 10",
+   "setup": [],
+   "verbs": [
+    "schwedler"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout3",
+   "group": "catalogHeldout",
+   "prompt": "Gaudí-style hanging chain from -6,0,0 to 6,0,0, flipped into an arch",
+   "setup": [],
+   "verbs": [
+    "funicular"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout4",
+   "group": "catalogHeldout",
+   "prompt": "Frei Otto cable net over corners 0,0,0 8,0,0 8,8,3 0,8,3",
+   "setup": [],
+   "verbs": [
+    "cablenet"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout5",
+   "group": "catalogHeldout",
+   "prompt": "a diagrid 6 by 10 cells over 20 by 40",
+   "setup": [],
+   "verbs": [
+    "diagrid"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout6",
+   "group": "catalogHeldout",
+   "prompt": "a reciprocal frame of 8 members",
+   "setup": [],
+   "verbs": [
+    "reciprocal"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout7",
+   "group": "catalogHeldout",
+   "prompt": "voronoi pattern of 24 cells over 20 by 20",
+   "setup": [],
+   "verbs": [
+    "voronoishell"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout8",
+   "group": "catalogHeldout",
+   "prompt": "a catenary vault 8 span 12 long 4 rise",
+   "setup": [],
+   "verbs": [
+    "catenaryvault"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout9",
+   "group": "catalogHeldout",
+   "prompt": "a staircase rising 3 m, 1.2 m wide",
+   "setup": [],
+   "verbs": [
+    "stair"
+   ],
+   "check": {
+    "kind": "grew"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout10",
+   "group": "catalogHeldout",
+   "prompt": "spiral stair rising 3 m with radius 2",
+   "setup": [],
+   "verbs": [
+    "spiral"
+   ],
+   "check": {
+    "kind": "grew"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout11",
+   "group": "catalogHeldout",
+   "prompt": "hatch the rectangle with brick",
+   "setup": [
+    "rect 0,0,0 10 10"
+   ],
+   "verbs": [
+    "hatch"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": "leakage"
+  },
+  {
+   "id": "catalogHeldout12",
+   "group": "catalogHeldout",
+   "prompt": "how far is it from 0,0,0 to 10,10,0",
+   "setup": [],
+   "verbs": [
+    "distance"
+   ],
+   "check": {
+    "kind": "unchanged"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout13",
+   "group": "catalogHeldout",
+   "prompt": "plant a row of lime trees from 0,0 to 20,0 every 4 m",
+   "setup": [],
+   "verbs": [
+    "plantrow"
+   ],
+   "check": {
+    "kind": "grew"
+   },
+   "require_verbs": true,
+   "failure_class": "leakage"
+  },
+  {
+   "id": "catalogHeldout14",
+   "group": "catalogHeldout",
+   "prompt": "move it so its corner sits at the origin",
+   "setup": [
+    "box 5,5,5 2,2,2"
+   ],
+   "verbs": [
+    "tozero"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [0.0,0.0,0.0]..[2.0,2.0,2.0]",
+    "count": 1
+   },
+   "require_verbs": true,
+   "failure_class": "copyMove"
+  },
+  {
+   "id": "catalogHeldout15",
+   "group": "catalogHeldout",
+   "prompt": "rebuild the curve with 20 points",
+   "setup": [
+    "polyline 0,0,0 5,3,0 10,0,0"
+   ],
+   "verbs": [
+    "rebuild"
+   ],
+   "check": {
+    "kind": "accepted"
+   },
+   "require_verbs": true,
+   "failure_class": "missingNumber"
+  },
+  {
+   "id": "catalogHeldout16",
+   "group": "catalogHeldout",
+   "prompt": "set the sun for New York on June 21 at 14:00",
+   "setup": [],
+   "verbs": [
+    "sun"
+   ],
+   "check": {
+    "kind": "accepted"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "catalogHeldout17",
+   "group": "catalogHeldout",
+   "prompt": "save the current view as entry",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "view"
+   ],
+   "check": {
+    "kind": "accepted"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "multiTuning0",
+   "group": "multiTuning",
+   "prompt": "draw a circle of radius 3 at the origin and extrude it 5 high",
+   "setup": [],
+   "verbs": [
+    "circle",
+    "extrude"
+   ],
+   "check": {
+    "kind": "hasMesh"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "multiTuning1",
+   "group": "multiTuning",
+   "prompt": "make a box 4x4x4 at the origin, then move it up 10",
+   "setup": [],
+   "verbs": [
+    "box",
+    "move"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [0.0,0.0,10.0]..[4.0,4.0,14.0]",
+    "count": 1
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "multiTuning2",
+   "group": "multiTuning",
+   "prompt": "draw a rectangle 10 by 6 at the origin and extrude it 3, then copy it 15 along x",
+   "setup": [],
+   "verbs": [
+    "rect",
+    "extrude",
+    "copy"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "[15.0,0.0,0.0]..[25.0,6.0,3.0]",
+    "count": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "multiHeldout0",
+   "group": "multiHeldout",
+   "prompt": "add a sphere of radius 2 at 0,0,0 and another one at 6,0,0",
+   "setup": [],
+   "verbs": [
+    "geodesic"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 2
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "multiHeldout1",
+   "group": "multiHeldout",
+   "prompt": "draw a hexagon of radius 3 at the origin, extrude it 4 high and then rotate it 30 degrees",
+   "setup": [],
+   "verbs": [
+    "polygon",
+    "extrude",
+    "rotate"
+   ],
+   "check": {
+    "kind": "hasMesh"
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "multiHeldout2",
+   "group": "multiHeldout",
+   "prompt": "make a 2x2x8 box at the origin then mirror it across the yz plane",
+   "setup": [],
+   "verbs": [
+    "box",
+    "mirror"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "[-2.0,0.0,0.0]..[0.0,2.0,8.0]",
+    "count": null
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "multiHeldout3",
+   "group": "multiHeldout",
+   "prompt": "draw a line from 0,0,0 to 5,0,0 and a circle of radius 1 at 5,0,0",
+   "setup": [],
+   "verbs": [
+    "line",
+    "circle"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 2
+   },
+   "require_verbs": true,
+   "failure_class": null
+  },
+  {
+   "id": "fixHeldout0",
+   "group": "fixHeldout",
+   "prompt": "lay out a 4 by 2 grid of the box, 12 apart",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "array"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 8
+   },
+   "require_verbs": true,
+   "failure_class": "grid"
+  },
+  {
+   "id": "fixHeldout1",
+   "group": "fixHeldout",
+   "prompt": "make 2 rows of 5 copies of it with 20 spacing",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "array"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 10
+   },
+   "require_verbs": true,
+   "failure_class": "grid"
+  },
+  {
+   "id": "fixHeldout2",
+   "group": "fixHeldout",
+   "prompt": "arrange copies of the box in a 2 x 3 grid, 18 apart",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "array"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 6
+   },
+   "require_verbs": true,
+   "failure_class": "grid"
+  },
+  {
+   "id": "fixHeldout3",
+   "group": "fixHeldout",
+   "prompt": "a 6x2x2 box centered at 0,0,1",
+   "setup": [],
+   "verbs": [
+    "box"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [-3.0,-1.0,0.0]..[3.0,1.0,2.0]",
+    "count": 1
+   },
+   "require_verbs": true,
+   "failure_class": "center"
+  },
+  {
+   "id": "fixHeldout4",
+   "group": "fixHeldout",
+   "prompt": "make a cube of size 2 with its center at 5,5,5",
+   "setup": [],
+   "verbs": [
+    "box"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [4.0,4.0,4.0]..[6.0,6.0,6.0]",
+    "count": 1
+   },
+   "require_verbs": true,
+   "failure_class": "center"
+  },
+  {
+   "id": "fixHeldout5",
+   "group": "fixHeldout",
+   "prompt": "draw a 4 by 2 rectangle centered at 0,0,0",
+   "setup": [],
+   "verbs": [
+    "rect"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "[-2.0,-1.0,0.0]..[2.0,1.0,0.0]",
+    "count": 1
+   },
+   "require_verbs": true,
+   "failure_class": "center"
+  },
+  {
+   "id": "fixHeldout6",
+   "group": "fixHeldout",
+   "prompt": "make another one 12 to the left",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "copy"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [-12.0,0.0,0.0]..[-2.0,10.0,10.0]",
+    "count": 2
+   },
+   "require_verbs": true,
+   "failure_class": "copyMove"
+  },
+  {
+   "id": "fixHeldout7",
+   "group": "fixHeldout",
+   "prompt": "give me a copy of the box shifted 8 along y",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "copy"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [0.0,8.0,0.0]..[10.0,18.0,10.0]",
+    "count": 2
+   },
+   "require_verbs": true,
+   "failure_class": "copyMove"
+  },
+  {
+   "id": "fixHeldout8",
+   "group": "fixHeldout",
+   "prompt": "bring the box back so it starts at the origin",
+   "setup": [
+    "box 7,3,1 2,2,2"
+   ],
+   "verbs": [
+    "tozero"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [0.0,0.0,0.0]..[2.0,2.0,2.0]",
+    "count": 1
+   },
+   "require_verbs": true,
+   "failure_class": "copyMove"
+  },
+  {
+   "id": "fixHeldout9",
+   "group": "fixHeldout",
+   "prompt": "plant a pine at 2,8",
+   "setup": [],
+   "verbs": [
+    "plant"
+   ],
+   "check": {
+    "kind": "grew"
+   },
+   "require_verbs": true,
+   "failure_class": "leakage"
+  },
+  {
+   "id": "fixHeldout10",
+   "group": "fixHeldout",
+   "prompt": "a row of birch trees from 0,5 to 12,5 spaced 3",
+   "setup": [],
+   "verbs": [
+    "plantrow"
+   ],
+   "check": {
+    "kind": "grew"
+   },
+   "require_verbs": true,
+   "failure_class": "leakage"
+  },
+  {
+   "id": "fixHeldout11",
+   "group": "fixHeldout",
+   "prompt": "hatch the circle with concrete",
+   "setup": [
+    "circle 0,0,0 4"
+   ],
+   "verbs": [
+    "hatch"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": "leakage"
+  },
+  {
+   "id": "fixHeldout12",
+   "group": "fixHeldout",
+   "prompt": "skin the three circles into one solid",
+   "setup": [
+    "circle 0,0,0 4",
+    "circle 0,0,3 3",
+    "circle 0,0,6 2"
+   ],
+   "verbs": [
+    "loft"
+   ],
+   "check": {
+    "kind": "hasMesh"
+   },
+   "require_verbs": true,
+   "failure_class": "leakage"
+  },
+  {
+   "id": "fixHeldout13",
+   "group": "fixHeldout",
+   "prompt": "an ellipse with radii 5 and 2 at 3,3,0",
+   "setup": [],
+   "verbs": [
+    "ellipse"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": "missingNumber"
+  },
+  {
+   "id": "fixHeldout14",
+   "group": "fixHeldout",
+   "prompt": "offset the circle inward by 0.5",
+   "setup": [
+    "circle 0,0,0 3"
+   ],
+   "verbs": [
+    "offset"
+   ],
+   "check": {
+    "kind": "added",
+    "n": 1,
+    "object_kind": null
+   },
+   "require_verbs": true,
+   "failure_class": "missingNumber"
+  },
+  {
+   "id": "fixHeldout15",
+   "group": "fixHeldout",
+   "prompt": "a circular array of 5 copies of the box",
+   "setup": [
+    "box 0,0,0 10,10,10"
+   ],
+   "verbs": [
+    "polararray"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 5
+   },
+   "require_verbs": true,
+   "failure_class": "missingNumber"
+  },
+  {
+   "id": "fixHeldout16",
+   "group": "fixHeldout",
+   "prompt": "resample the polyline to 12 points",
+   "setup": [
+    "polyline 0,0,0 4,2,0 8,0,0"
+   ],
+   "verbs": [
+    "rebuild"
+   ],
+   "check": {
+    "kind": "accepted"
+   },
+   "require_verbs": true,
+   "failure_class": "missingNumber"
+  },
+  {
+   "id": "followTuning0",
+   "group": "followTuning",
+   "prompt": "circle radius 2, then extrude it 10 high",
+   "setup": [
+    "box 8,8,0 4,4,4"
+   ],
+   "verbs": [
+    "circle",
+    "extrude"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [-2.0,-2.0,0.0]..[2.0,2.0,10.0]",
+    "count": 3
+   },
+   "require_verbs": true,
+   "failure_class": "samePlanRef"
+  },
+  {
+   "id": "followTuning1",
+   "group": "followTuning",
+   "prompt": "a 3 by 3 grid of the box spaced 15 apart",
+   "setup": [],
+   "verbs": [
+    "box",
+    "array"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 9
+   },
+   "require_verbs": true,
+   "failure_class": "gridEmpty"
+  },
+  {
+   "id": "followTuning2",
+   "group": "followTuning",
+   "prompt": "a box at the origin and a sphere at 20,0,0",
+   "setup": [],
+   "verbs": [
+    "box",
+    "geodesic"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 2
+   },
+   "require_verbs": true,
+   "failure_class": "unsized"
+  },
+  {
+   "id": "followHeldout0",
+   "group": "followHeldout",
+   "prompt": "draw a 4 by 2 rectangle at the origin, then extrude it 5",
+   "setup": [
+    "box 20,0,0 4,4,4"
+   ],
+   "verbs": [
+    "rect",
+    "extrude"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [0.0,0.0,0.0]..[4.0,2.0,5.0]",
+    "count": 3
+   },
+   "require_verbs": true,
+   "failure_class": "samePlanRef"
+  },
+  {
+   "id": "followHeldout1",
+   "group": "followHeldout",
+   "prompt": "a circle of radius 1 at 5,5,0 and then extrude it 3",
+   "setup": [
+    "box 20,0,0 4,4,4",
+    "box -20,0,0 2,2,2"
+   ],
+   "verbs": [
+    "circle",
+    "extrude"
+   ],
+   "check": {
+    "kind": "contains",
+    "needle": "bbox [4.0,4.0,0.0]..[6.0,6.0,3.0]",
+    "count": 4
+   },
+   "require_verbs": true,
+   "failure_class": "samePlanRef"
+  },
+  {
+   "id": "followHeldout2",
+   "group": "followHeldout",
+   "prompt": "make a 2 by 4 grid of spheres 10 apart",
+   "setup": [],
+   "verbs": [
+    "geodesic",
+    "array"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 8
+   },
+   "require_verbs": true,
+   "failure_class": "gridEmpty"
+  },
+  {
+   "id": "followHeldout3",
+   "group": "followHeldout",
+   "prompt": "a 4 by 1 grid of cubes spaced 6",
+   "setup": [],
+   "verbs": [
+    "box",
+    "array"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 4
+   },
+   "require_verbs": true,
+   "failure_class": "gridEmpty"
+  },
+  {
+   "id": "followHeldout4",
+   "group": "followHeldout",
+   "prompt": "a sphere at 0,0,10 and a cube at 5,5,0",
+   "setup": [],
+   "verbs": [
+    "geodesic",
+    "box"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 2
+   },
+   "require_verbs": true,
+   "failure_class": "unsized"
+  },
+  {
+   "id": "followHeldout5",
+   "group": "followHeldout",
+   "prompt": "add a box at 0,10,0 and a ball at 10,10,0",
+   "setup": [],
+   "verbs": [
+    "box",
+    "geodesic"
+   ],
+   "check": {
+    "kind": "count",
+    "n": 2
+   },
+   "require_verbs": true,
+   "failure_class": "unsized"
+  }
+ ]
+}

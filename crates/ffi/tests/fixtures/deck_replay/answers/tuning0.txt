@@ -1,0 +1,4 @@
+Here is a 10 m box at the origin.
+```draft
+box 0,0,0 10,10,10
+```

@@ -1,0 +1,6 @@
+# id	verdict	why (self-test of the replay scorer)
+tuning0	PASS	correct box
+tuning9	PASS	correct move by `last`
+catalogTuning0	PASS	correct gaussvault (catalog verb, require_verbs)
+catalogTuning20	FAIL	bare id naming no scene object: rejected, "is not a selector"
+heldout1	FAIL	`ze` validates since #107 but draws nothing: expected +1 object(s)

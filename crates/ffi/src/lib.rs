@@ -35,6 +35,8 @@
 //! freed, and buffer pointers must be valid for the given length.
 #![allow(clippy::missing_safety_doc)]
 
+pub mod replay;
+
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
@@ -2181,6 +2183,21 @@ unsafe fn parse_images_json(images_json: *const c_char) -> Vec<ImagePart> {
         .collect()
 }
 
+/// The system prompt and the selector-repair ids of one deck turn on `session`
+/// for `prompt`. The FFI prompt (#105): only the view verbs `route_line`
+/// accepts, the selector forms, and the exact usage of the verbs this request
+/// needs. The ids are the scene's at turn start, for bare-id → `id:<hex>`
+/// repair of emitted lines. Shared with the offline replay eval ([`replay`]).
+fn deck_turn_context(session: &Session, prompt: &str) -> (String, Vec<String>) {
+    let system = ffi_system_prompt(&digest(&session.doc), &session.plugins, prompt);
+    let object_ids = session
+        .doc
+        .objects()
+        .map(|o| o.id.0.simple().to_string())
+        .collect();
+    (system, object_ids)
+}
+
 /// Shared body for [`ijc_deck_send`] / [`ijc_deck_send_image`]: push the user
 /// turn to history, build the request (text + optional images on this turn),
 /// and spawn the streaming task with the full extractor / side-effect gate.
@@ -2219,16 +2236,7 @@ unsafe fn deck_send_inner(
         return;
     };
 
-    // The FFI prompt (#105): only the view verbs `route_line` accepts, the
-    // selector forms, and the exact usage of the verbs this request needs.
-    let system = ffi_system_prompt(&digest(&app.session.doc), &app.session.plugins, prompt);
-    // Scene ids at turn start, for bare-id → `id:<hex>` repair of emitted lines.
-    let object_ids: Vec<String> = app
-        .session
-        .doc
-        .objects()
-        .map(|o| o.id.0.simple().to_string())
-        .collect();
+    let (system, object_ids) = deck_turn_context(&app.session, prompt);
     let messages = {
         let Ok(mut history) = app.history.lock() else {
             emit(cb, &ctx, CB_ERROR, "history unavailable");
