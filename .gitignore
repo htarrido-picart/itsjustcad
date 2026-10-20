@@ -9,3 +9,15 @@ review*.html
 # local LLM runtime logs
 llama.log
 **/llama.log
+
+# tokenade — per-project cache / scaffold flag / dedup refs
+.tokenade/
+
+# tokenade — legacy per-project embedding model cache (now global)
+.fastembed_cache/
+
+# macOS Finder metadata
+.DS_Store
+
+# tokenade — auto-scaffolded agent rules (local tooling, not project docs)
+AGENTS.md
