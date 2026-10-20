@@ -369,7 +369,7 @@ mod tests {
     /// so we assert on the pure model instead — no native handle required.
     #[test]
     fn every_native_leaf_id_routes_to_its_action() {
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+        for style in [MenuStyle::Modeler, MenuStyle::Drafting] {
             let mut expected: HashMap<String, MenuAction> = HashMap::new();
             for top in native_model(style, true, ViewState::default()) {
                 for item in &top.items {
@@ -396,7 +396,7 @@ mod tests {
     /// as they would in the OS.
     #[test]
     fn native_shortcuts_are_unique_per_style() {
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+        for style in [MenuStyle::Modeler, MenuStyle::Drafting] {
             let mut owner: HashMap<String, MenuAction> = HashMap::new(); // accel → action
             for top in native_model(style, true, ViewState::default()) {
                 for item in &top.items {
@@ -420,7 +420,7 @@ mod tests {
     /// menu, so we assert none is malformed.
     #[test]
     fn every_native_shortcut_parses() {
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+        for style in [MenuStyle::Modeler, MenuStyle::Drafting] {
             for top in native_model(style, true, ViewState::default()) {
                 for item in &top.items {
                     if let NativeItem::Leaf { shortcut: Some(s), label, .. } = item {
@@ -442,7 +442,7 @@ mod tests {
     fn theme_skin_language_checks_are_present_and_routed() {
         use crate::i18n::Lang;
         use crate::menu::{lang_radio_items, skin_radio_items};
-        for style in [MenuStyle::Rhino, MenuStyle::AutoCAD] {
+        for style in [MenuStyle::Modeler, MenuStyle::Drafting] {
             let mut checks: std::collections::HashMap<String, MenuAction> =
                 std::collections::HashMap::new();
             for top in native_model(style, true, ViewState::default()) {

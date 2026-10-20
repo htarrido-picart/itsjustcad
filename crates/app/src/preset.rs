@@ -1,24 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Legacy-CAD skin presets — AutoCAD, Rhino, Revit, or ItsJustCAD default.
+//! Working-style skin presets — Classic command line, NURBS modeler, BIM-style,
+//! or ItsJustCAD default.
 //!
 //! Each preset encodes: viewport background, grid colors, ui/cmd font size,
 //! accent color, command-line flavor, right-click repeat-last flag, and
-//! a command alias map.
+//! a command alias map. The palette is ItsJustCAD's own.
 //!
-//! All values sourced from `docs/ui-legacy-research.md`.
 //! Pure module; no egui or wgpu imports — tested standalone.
 
-/// Which CAD origin the user is migrating from.
+/// Which working style (skin) the user picked.
+///
+/// Serialized to `ui.json` as `"classic"` / `"nurbs"` / `"bim"` / `"none"`.
+/// Older builds wrote `"autocad"` / `"rhino"` / `"revit"`; those still
+/// deserialize (silent migration) but are never written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CadOrigin {
-    AutoCAD,
-    Rhino,
-    Revit,
-    /// ItsJustCAD default (no legacy skin).
+    #[serde(alias = "autocad", alias = "acad")]
+    Classic,
+    #[serde(alias = "rhino")]
+    Nurbs,
+    #[serde(alias = "revit")]
+    Bim,
+    /// ItsJustCAD default (no working-style skin).
     #[default]
+    #[serde(alias = "native")]
     None,
 }
 
@@ -29,46 +37,51 @@ impl CadOrigin {
     #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
-            CadOrigin::AutoCAD => "AutoCAD",
-            CadOrigin::Rhino => "Rhino",
-            CadOrigin::Revit => "Revit",
+            CadOrigin::Classic => "Classic command line",
+            CadOrigin::Nurbs => "NURBS modeler",
+            CadOrigin::Bim => "BIM-style",
             CadOrigin::None => "ItsJustCAD default",
         }
     }
 
     /// The i18n key for this skin's onboarding / settings label. Names go through
-    /// the `t()` catalog so the picker localizes (en + es).
+    /// the `t()` catalog so the picker localizes.
     pub fn label_key(self) -> &'static str {
         match self {
-            CadOrigin::AutoCAD => "skin.autocad",
-            CadOrigin::Rhino => "skin.rhino",
-            CadOrigin::Revit => "skin.revit",
+            CadOrigin::Classic => "skin.classic",
+            CadOrigin::Nurbs => "skin.nurbs",
+            CadOrigin::Bim => "skin.bim",
             CadOrigin::None => "skin.native",
         }
     }
 
-    /// The short slug persisted to `ui.json` / accepted by the `skin` verb
-    /// (`"native"`, `"autocad"`, `"rhino"`, `"revit"`). Distinct from the serde
-    /// representation only for `None` → `"native"` (friendlier verb word).
+    /// The short slug accepted by the `skin` verb (`"native"`, `"classic"`,
+    /// `"nurbs"`, `"bim"`). Distinct from the serde representation only for
+    /// `None` → `"native"` (friendlier verb word).
     pub fn code(self) -> &'static str {
         match self {
-            CadOrigin::AutoCAD => "autocad",
-            CadOrigin::Rhino => "rhino",
-            CadOrigin::Revit => "revit",
+            CadOrigin::Classic => "classic",
+            CadOrigin::Nurbs => "nurbs",
+            CadOrigin::Bim => "bim",
             CadOrigin::None => "native",
         }
     }
 
     /// Parse a verb-supplied / persisted skin name back into a [`CadOrigin`].
     /// Accepts common synonyms (`native`/`default`/`itsjustcad`/`none` →
-    /// [`CadOrigin::None`], `acad`→AutoCAD). Case-insensitive. Unknown → `None`
-    /// (caller keeps its current skin and reports usage).
+    /// [`CadOrigin::None`]). Case-insensitive. Unknown → `None` (caller keeps
+    /// its current skin and reports usage). Pre-rename codes are still read so
+    /// existing users and scripts migrate silently; they are not advertised.
     pub fn from_code(s: &str) -> Option<CadOrigin> {
         match s.trim().to_ascii_lowercase().as_str() {
             "native" | "default" | "itsjustcad" | "none" => Some(CadOrigin::None),
-            "autocad" | "acad" => Some(CadOrigin::AutoCAD),
-            "rhino" => Some(CadOrigin::Rhino),
-            "revit" => Some(CadOrigin::Revit),
+            "classic" => Some(CadOrigin::Classic),
+            "nurbs" => Some(CadOrigin::Nurbs),
+            "bim" => Some(CadOrigin::Bim),
+            // Legacy codes (silent migration only).
+            "autocad" | "acad" => Some(CadOrigin::Classic),
+            "rhino" => Some(CadOrigin::Nurbs),
+            "revit" => Some(CadOrigin::Bim),
             _ => None,
         }
     }
@@ -77,9 +90,9 @@ impl CadOrigin {
     pub fn all() -> [CadOrigin; 4] {
         [
             CadOrigin::None,
-            CadOrigin::AutoCAD,
-            CadOrigin::Rhino,
-            CadOrigin::Revit,
+            CadOrigin::Classic,
+            CadOrigin::Nurbs,
+            CadOrigin::Bim,
         ]
     }
 }
@@ -87,9 +100,10 @@ impl CadOrigin {
 /// sRGB color as `[r, g, b, a]` in 0.0–1.0.
 pub type Rgba = [f32; 4];
 
-/// Where the command line docks. Rhino puts it at the top (below the menu
-/// bar), AutoCAD at the bottom. Drives layout order in `app.rs` and the
-/// autosuggest popup direction (down from a top line, up from a bottom line).
+/// Where the command line docks. The NURBS-modeler style puts it at the top
+/// (below the menu bar), the Classic style at the bottom. Drives layout order
+/// in `app.rs` and the autosuggest popup direction (down from a top line, up
+/// from a bottom line).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandLinePos {
     Top,
@@ -99,18 +113,18 @@ pub enum CommandLinePos {
 /// Which side the docked tab panel (Layers/Properties/History/Deck) sits on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelSide {
-    // Left is wired by Layer 2's panel-side logic; kept for AutoCAD-style skins.
+    // Left is wired by Layer 2's panel-side logic; kept for future skins.
     #[allow(dead_code)]
     Left,
     Right,
 }
 
-/// Menu-bar grouping flavor. Rhino and AutoCAD group the same registry verbs
-/// under different top-level menu names (see `crate::menu`).
+/// Menu-bar grouping flavor. Modeler and Drafting group the same registry
+/// verbs under different top-level menu names (see `crate::menu`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuStyle {
-    Rhino,
-    AutoCAD,
+    Modeler,
+    Drafting,
 }
 
 fn hex_to_rgba(hex: u32) -> Rgba {
@@ -137,12 +151,12 @@ pub struct UiPreset {
     pub ui_font_px: f32,
     /// Command-line font size in logical pixels.
     pub cmd_font_px: f32,
-    /// Right-click in viewport repeats last command (Rhino convention).
+    /// Right-click in viewport repeats last command (NURBS-modeler convention).
     pub right_click_repeat_last: bool,
     /// Ordered alias table: (alias, canonical_command).
     /// Aliases are looked up BEFORE the parser, case-insensitively.
     pub aliases: &'static [(&'static str, &'static str)],
-    /// Where the command line docks (top for Rhino, bottom for AutoCAD).
+    /// Where the command line docks (top for NURBS modeler, bottom for Classic).
     pub command_line_pos: CommandLinePos,
     /// Which side the docked tab panel sits on.
     pub panel_side: PanelSide,
@@ -174,16 +188,16 @@ impl UiPreset {
         }
     }
 
-    /// Human label for this preset's menu style (About dialog).
+    /// Localized label for this preset's menu style (About dialog, skin echo).
     pub fn menu_style_label(&self) -> &'static str {
-        match self.menu_style {
-            MenuStyle::Rhino => "Rhino-style menus",
-            MenuStyle::AutoCAD => "AutoCAD-style menus",
-        }
+        crate::i18n::t(match self.menu_style {
+            MenuStyle::Modeler => "menustyle.modeler",
+            MenuStyle::Drafting => "menustyle.drafting",
+        })
     }
 
     /// UI-chrome surface color. This is distinct from the viewport clear color
-    /// (`bg_color`): a Rhino viewport is light gray, but its panel chrome reads
+    /// (`bg_color`): a NURBS-modeler viewport is light gray, but its panel chrome reads
     /// better on a slightly different neutral. For dark skins the two match; for
     /// light skins we nudge the chrome so panels separate from the canvas.
     fn bg_surface(&self) -> Rgba {
@@ -196,13 +210,12 @@ impl UiPreset {
     }
 }
 
-// ── AutoCAD preset ────────────────────────────────────────────────────────────
-//   bg      #212830  (RGB 33,40,48) — dark blue-gray model space
-//   grid major slightly lighter; grid minor barely visible
-//   accent  #00A1F1 (AutoCAD blue)
+// ── Classic command-line preset ────────────────────────────────────────────────
+//   bg      #1E242B — dark slate canvas; grid major slightly lighter, minor faint
+//   accent  #59A6FF — the ItsJustCAD default accent
 
-pub const AUTOCAD_ALIASES: &[(&str, &str)] = &[
-    // Core ACAD.PGP set — muscle memory for the largest CAD user base
+pub const CLASSIC_ALIASES: &[(&str, &str)] = &[
+    // Short one- to three-letter command aliases (classic CAD convention)
     ("a", "arc"),
     ("ar", "array"),
     ("b", "block"),
@@ -257,27 +270,27 @@ pub const AUTOCAD_ALIASES: &[(&str, &str)] = &[
     ("z", "zoom"),
 ];
 
-pub const AUTOCAD: UiPreset = UiPreset {
-    bg_color: [0.129, 0.157, 0.188, 1.0],  // #212830
-    grid_major_color: [0.227, 0.271, 0.314, 1.0], // #3A4550
-    grid_minor_color: [0.165, 0.188, 0.220, 1.0], // #2A3038
+pub const CLASSIC: UiPreset = UiPreset {
+    bg_color: [0.118, 0.141, 0.169, 1.0],  // #1E242B
+    grid_major_color: [0.212, 0.255, 0.302, 1.0], // #36414D
+    grid_minor_color: [0.153, 0.180, 0.212, 1.0], // #272E36
     crosshair_color: [1.0, 1.0, 1.0, 1.0],         // #FFFFFF
-    accent_color: [0.0, 0.631, 0.945, 1.0],         // #00A1F1
+    accent_color: [0.35, 0.65, 1.0, 1.0],          // #59A6FF
     ui_font_px: 13.0,
     cmd_font_px: 13.0,
     right_click_repeat_last: false,
-    aliases: AUTOCAD_ALIASES,
+    aliases: CLASSIC_ALIASES,
     command_line_pos: CommandLinePos::Bottom,
     panel_side: PanelSide::Right,
     default_viewports: 4,
-    menu_style: MenuStyle::AutoCAD,
+    menu_style: MenuStyle::Drafting,
 };
 
-// ── Rhino preset ──────────────────────────────────────────────────────────────
-//   bg      #D4D4D4  (RGB 212,212,212) — light gray wireframe
-//   right-click = repeat last (critical Rhino convention)
+// ── NURBS-modeler preset ───────────────────────────────────────────────────────
+//   bg      #D0D2D4 — light cool-gray canvas
+//   right-click = repeat last command
 
-const RHINO_ALIASES: &[(&str, &str)] = &[
+const NURBS_ALIASES: &[(&str, &str)] = &[
     ("c", "circle"),
     ("l", "line"),
     ("r", "rect"),
@@ -298,42 +311,43 @@ const RHINO_ALIASES: &[(&str, &str)] = &[
     ("exp", "explode"),
 ];
 
-pub const RHINO: UiPreset = UiPreset {
-    bg_color: [0.831, 0.831, 0.831, 1.0],           // #D4D4D4
-    grid_major_color: [0.627, 0.627, 0.627, 1.0],   // #A0A0A0
-    grid_minor_color: [0.784, 0.784, 0.784, 1.0],   // #C8C8C8
-    crosshair_color: [0.251, 0.251, 0.251, 1.0],    // #404040
+pub const NURBS: UiPreset = UiPreset {
+    bg_color: [0.816, 0.824, 0.831, 1.0],           // #D0D2D4
+    grid_major_color: [0.620, 0.631, 0.643, 1.0],   // #9EA1A4
+    grid_minor_color: [0.769, 0.776, 0.784, 1.0],   // #C4C6C8
+    crosshair_color: [0.227, 0.235, 0.247, 1.0],    // #3A3C3F
     accent_color: [0.910, 0.910, 0.910, 1.0],        // #E8E8E8 panel chrome
     ui_font_px: 13.0,
     cmd_font_px: 13.0,
     right_click_repeat_last: true,
-    aliases: RHINO_ALIASES,
+    aliases: NURBS_ALIASES,
     command_line_pos: CommandLinePos::Top,
     panel_side: PanelSide::Right,
     default_viewports: 4,
-    menu_style: MenuStyle::Rhino,
+    menu_style: MenuStyle::Modeler,
 };
 
-// ── Revit preset ──────────────────────────────────────────────────────────────
-//   bg      #FFFFFF — pure white 2D canvas
-//   No command aliases (Revit has no command line)
+// ── BIM-style preset ───────────────────────────────────────────────────────────
+//   bg      #FFFFFF — white 2D canvas, panel-first
+//   accent  #2F6FB2
+//   No command aliases (panel-first workflow)
 
-pub const REVIT: UiPreset = UiPreset {
+pub const BIM: UiPreset = UiPreset {
     bg_color: [1.0, 1.0, 1.0, 1.0],                 // #FFFFFF
     grid_major_color: [0.8, 0.8, 0.8, 1.0],          // light gray (no explicit grid)
     grid_minor_color: [0.9, 0.9, 0.9, 1.0],
     crosshair_color: [0.0, 0.0, 0.0, 1.0],            // #000000
-    accent_color: [0.0, 0.439, 0.753, 1.0],           // #0070C0
+    accent_color: [0.184, 0.435, 0.698, 1.0],         // #2F6FB2
     ui_font_px: 13.0,
     cmd_font_px: 13.0,
     right_click_repeat_last: false,
     aliases: &[],
-    // Revit has no command line; we still dock one (ItsJustCAD is command-first),
-    // but keep it at the bottom and use AutoCAD-style ribbon-ish menus.
+    // Panel-first style; we still dock a command line (ItsJustCAD is
+    // command-first), but keep it at the bottom and use the Drafting menus.
     command_line_pos: CommandLinePos::Bottom,
     panel_side: PanelSide::Right,
     default_viewports: 4,
-    menu_style: MenuStyle::AutoCAD,
+    menu_style: MenuStyle::Drafting,
 };
 
 // ── ItsJustCAD default ─────────────────────────────────────────────────────────
@@ -348,20 +362,20 @@ pub const ITSJUSTCAD_DEFAULT: UiPreset = UiPreset {
     cmd_font_px: 13.0,
     right_click_repeat_last: false,
     aliases: &[],
-    // ItsJustCAD default: command line on top, right tab panel, Rhino menu
-    // grouping. Boots to the Rhino 4-up layout (Top/Front/Right/Perspective).
+    // ItsJustCAD default: command line on top, right tab panel, Modeler menu
+    // grouping. Boots to the 4-up layout (Top/Front/Right/Perspective).
     command_line_pos: CommandLinePos::Top,
     panel_side: PanelSide::Right,
     default_viewports: 4,
-    menu_style: MenuStyle::Rhino,
+    menu_style: MenuStyle::Modeler,
 };
 
 /// Return the static preset for a given origin.
 pub fn preset_for(origin: CadOrigin) -> &'static UiPreset {
     match origin {
-        CadOrigin::AutoCAD => &AUTOCAD,
-        CadOrigin::Rhino => &RHINO,
-        CadOrigin::Revit => &REVIT,
+        CadOrigin::Classic => &CLASSIC,
+        CadOrigin::Nurbs => &NURBS,
+        CadOrigin::Bim => &BIM,
         CadOrigin::None => &ITSJUSTCAD_DEFAULT,
     }
 }
@@ -443,61 +457,61 @@ mod tests {
     // ── preset values ─────────────────────────────────────────────────────────
 
     #[test]
-    fn autocad_is_dark() {
-        assert!(is_dark(&AUTOCAD), "AutoCAD should be dark");
+    fn classic_is_dark() {
+        assert!(is_dark(&CLASSIC), "Classic should be dark");
     }
 
     #[test]
-    fn rhino_is_light() {
-        assert!(!is_dark(&RHINO), "Rhino should be light");
+    fn nurbs_is_light() {
+        assert!(!is_dark(&NURBS), "NURBS should be light");
     }
 
     #[test]
-    fn revit_is_light() {
-        assert!(!is_dark(&REVIT), "Revit should be light");
+    fn bim_is_light() {
+        assert!(!is_dark(&BIM), "BIM should be light");
     }
 
     #[test]
-    fn autocad_bg_is_near_black() {
-        let [r, g, b, _] = AUTOCAD.bg_color;
-        // All channels below 0.2 (hex #212830 ≈ 0.129, 0.157, 0.188)
-        assert!(r < 0.2 && g < 0.2 && b < 0.2, "AutoCAD bg should be very dark: {r},{g},{b}");
+    fn classic_bg_is_near_black() {
+        let [r, g, b, _] = CLASSIC.bg_color;
+        // All channels below 0.2 (hex #1E242B ≈ 0.118, 0.141, 0.169)
+        assert!(r < 0.2 && g < 0.2 && b < 0.2, "Classic bg should be very dark: {r},{g},{b}");
     }
 
     #[test]
-    fn revit_bg_is_white() {
-        let [r, g, b, _] = REVIT.bg_color;
+    fn bim_bg_is_white() {
+        let [r, g, b, _] = BIM.bg_color;
         assert!((r - 1.0).abs() < 0.01 && (g - 1.0).abs() < 0.01 && (b - 1.0).abs() < 0.01);
     }
 
     #[test]
-    fn rhino_bg_is_light_gray() {
-        let [r, g, b, _] = RHINO.bg_color;
-        // #D4D4D4 ≈ 0.831 for all channels
+    fn nurbs_bg_is_light_gray() {
+        let [r, g, b, _] = NURBS.bg_color;
+        // #D0D2D4 ≈ 0.82 average
         let mid = (r + g + b) / 3.0;
-        assert!(mid > 0.7 && mid < 0.95, "Rhino bg should be light gray: {mid}");
+        assert!(mid > 0.7 && mid < 0.95, "NURBS bg should be light gray: {mid}");
     }
 
     #[test]
     #[allow(clippy::assertions_on_constants)] // intentionally verifying compiled preset values
-    fn rhino_right_click_repeat_last() {
-        assert!(RHINO.right_click_repeat_last);
-        assert!(!AUTOCAD.right_click_repeat_last);
-        assert!(!REVIT.right_click_repeat_last);
+    fn nurbs_right_click_repeat_last() {
+        assert!(NURBS.right_click_repeat_last);
+        assert!(!CLASSIC.right_click_repeat_last);
+        assert!(!BIM.right_click_repeat_last);
     }
 
     #[test]
-    fn revit_has_no_aliases() {
-        assert!(REVIT.aliases.is_empty());
+    fn bim_has_no_aliases() {
+        assert!(BIM.aliases.is_empty());
     }
 
     // ── preset_for ────────────────────────────────────────────────────────────
 
     #[test]
     fn preset_for_returns_correct_preset() {
-        assert_eq!(preset_for(CadOrigin::AutoCAD).bg_color, AUTOCAD.bg_color);
-        assert_eq!(preset_for(CadOrigin::Rhino).bg_color, RHINO.bg_color);
-        assert_eq!(preset_for(CadOrigin::Revit).bg_color, REVIT.bg_color);
+        assert_eq!(preset_for(CadOrigin::Classic).bg_color, CLASSIC.bg_color);
+        assert_eq!(preset_for(CadOrigin::Nurbs).bg_color, NURBS.bg_color);
+        assert_eq!(preset_for(CadOrigin::Bim).bg_color, BIM.bg_color);
         assert_eq!(preset_for(CadOrigin::None).bg_color, ITSJUSTCAD_DEFAULT.bg_color);
     }
 
@@ -505,58 +519,58 @@ mod tests {
 
     #[test]
     fn expand_alias_l_to_line() {
-        let result = expand_alias("l", AUTOCAD_ALIASES);
+        let result = expand_alias("l", CLASSIC_ALIASES);
         assert_eq!(result, Some("line".to_string()));
     }
 
     #[test]
     fn expand_alias_l_with_args() {
-        let result = expand_alias("l 0,0,0 5,0,0", AUTOCAD_ALIASES);
+        let result = expand_alias("l 0,0,0 5,0,0", CLASSIC_ALIASES);
         assert_eq!(result, Some("line 0,0,0 5,0,0".to_string()));
     }
 
     #[test]
     fn expand_alias_c_to_circle() {
-        let result = expand_alias("c", AUTOCAD_ALIASES);
+        let result = expand_alias("c", CLASSIC_ALIASES);
         assert_eq!(result, Some("circle".to_string()));
     }
 
     #[test]
     fn expand_alias_e_to_delete() {
-        // Both AutoCAD and Rhino map 'e' to delete
-        let result = expand_alias("e", AUTOCAD_ALIASES);
+        // Both Classic and NURBS map 'e' to delete
+        let result = expand_alias("e", CLASSIC_ALIASES);
         assert_eq!(result, Some("delete".to_string()));
     }
 
     #[test]
     fn expand_alias_pl_to_polyline() {
-        let result = expand_alias("pl", AUTOCAD_ALIASES);
+        let result = expand_alias("pl", CLASSIC_ALIASES);
         assert_eq!(result, Some("polyline".to_string()));
     }
 
     #[test]
     fn expand_alias_no_match_returns_none() {
-        let result = expand_alias("box", AUTOCAD_ALIASES);
+        let result = expand_alias("box", CLASSIC_ALIASES);
         assert_eq!(result, None, "full command names should not alias themselves");
     }
 
     #[test]
     fn expand_alias_case_insensitive() {
-        let result = expand_alias("L", AUTOCAD_ALIASES);
+        let result = expand_alias("L", CLASSIC_ALIASES);
         assert_eq!(result, Some("line".to_string()));
-        let result = expand_alias("PL", AUTOCAD_ALIASES);
+        let result = expand_alias("PL", CLASSIC_ALIASES);
         assert_eq!(result, Some("polyline".to_string()));
     }
 
     #[test]
     fn expand_alias_empty_input() {
-        let result = expand_alias("", AUTOCAD_ALIASES);
+        let result = expand_alias("", CLASSIC_ALIASES);
         assert_eq!(result, None);
     }
 
     #[test]
-    fn expand_alias_rhino_of_to_offset() {
-        let result = expand_alias("of", RHINO_ALIASES);
+    fn expand_alias_nurbs_of_to_offset() {
+        let result = expand_alias("of", NURBS_ALIASES);
         assert_eq!(result, Some("offset".to_string()));
     }
 
@@ -564,7 +578,7 @@ mod tests {
 
     #[test]
     fn alias_suggestions_l_prefix_includes_l_la_la_len() {
-        let suggestions = alias_suggestions("l", AUTOCAD_ALIASES);
+        let suggestions = alias_suggestions("l", CLASSIC_ALIASES);
         let aliases: Vec<_> = suggestions.iter().map(|(a, _)| *a).collect();
         assert!(aliases.contains(&"l"), "{aliases:?}");
         assert!(aliases.contains(&"la"), "{aliases:?}");
@@ -573,13 +587,13 @@ mod tests {
 
     #[test]
     fn alias_suggestions_empty_prefix_returns_all() {
-        let all = alias_suggestions("", AUTOCAD_ALIASES);
-        assert_eq!(all.len(), AUTOCAD_ALIASES.len());
+        let all = alias_suggestions("", CLASSIC_ALIASES);
+        assert_eq!(all.len(), CLASSIC_ALIASES.len());
     }
 
     #[test]
     fn alias_suggestions_no_match_returns_empty() {
-        let result = alias_suggestions("zzz", AUTOCAD_ALIASES);
+        let result = alias_suggestions("zzz", CLASSIC_ALIASES);
         assert!(result.is_empty());
     }
 
@@ -588,9 +602,9 @@ mod tests {
     #[test]
     fn cad_origin_serde_round_trip() {
         for origin in [
-            CadOrigin::AutoCAD,
-            CadOrigin::Rhino,
-            CadOrigin::Revit,
+            CadOrigin::Classic,
+            CadOrigin::Nurbs,
+            CadOrigin::Bim,
             CadOrigin::None,
         ] {
             let json = serde_json::to_string(&origin).unwrap();
@@ -623,10 +637,28 @@ mod tests {
 
     #[test]
     fn cad_origin_json_values() {
-        assert_eq!(serde_json::to_string(&CadOrigin::AutoCAD).unwrap(), r#""autocad""#);
-        assert_eq!(serde_json::to_string(&CadOrigin::Rhino).unwrap(), r#""rhino""#);
-        assert_eq!(serde_json::to_string(&CadOrigin::Revit).unwrap(), r#""revit""#);
+        assert_eq!(serde_json::to_string(&CadOrigin::Classic).unwrap(), r#""classic""#);
+        assert_eq!(serde_json::to_string(&CadOrigin::Nurbs).unwrap(), r#""nurbs""#);
+        assert_eq!(serde_json::to_string(&CadOrigin::Bim).unwrap(), r#""bim""#);
         assert_eq!(serde_json::to_string(&CadOrigin::None).unwrap(), r#""none""#);
+    }
+
+    /// ui.json files written before the rename still load (silent migration),
+    /// and re-saving writes only the new codes.
+    #[test]
+    fn cad_origin_reads_legacy_ui_json_values() {
+        for (old, new, code) in [
+            ("autocad", CadOrigin::Classic, "classic"),
+            ("acad", CadOrigin::Classic, "classic"),
+            ("rhino", CadOrigin::Nurbs, "nurbs"),
+            ("revit", CadOrigin::Bim, "bim"),
+            ("native", CadOrigin::None, "none"),
+        ] {
+            let back: CadOrigin =
+                serde_json::from_value(serde_json::Value::String(old.into())).unwrap();
+            assert_eq!(back, new, "legacy {old}");
+            assert_eq!(serde_json::to_value(back).unwrap(), serde_json::json!(code));
+        }
     }
 
     #[test]
@@ -655,8 +687,12 @@ mod tests {
         assert_eq!(CadOrigin::from_code("default"), Some(CadOrigin::None));
         assert_eq!(CadOrigin::from_code("itsjustcad"), Some(CadOrigin::None));
         assert_eq!(CadOrigin::from_code("none"), Some(CadOrigin::None));
-        assert_eq!(CadOrigin::from_code("acad"), Some(CadOrigin::AutoCAD));
-        assert_eq!(CadOrigin::from_code(" AutoCAD "), Some(CadOrigin::AutoCAD));
+        assert_eq!(CadOrigin::from_code("acad"), Some(CadOrigin::Classic));
+        assert_eq!(CadOrigin::from_code(" Classic "), Some(CadOrigin::Classic));
+        // Legacy codes still parse (silent migration), mapping to the new skins.
+        assert_eq!(CadOrigin::from_code(" AutoCAD "), Some(CadOrigin::Classic));
+        assert_eq!(CadOrigin::from_code("rhino"), Some(CadOrigin::Nurbs));
+        assert_eq!(CadOrigin::from_code("revit"), Some(CadOrigin::Bim));
         // Unknown → None (caller keeps current skin).
         assert_eq!(CadOrigin::from_code("sketchup"), None);
         assert_eq!(CadOrigin::from_code(""), None);
@@ -688,9 +724,9 @@ mod tests {
     #[test]
     fn aliases_never_shadow_a_canonical_verb() {
         for (name, aliases) in [
-            ("autocad", AUTOCAD_ALIASES),
-            ("rhino", RHINO_ALIASES),
-            ("revit", REVIT.aliases),
+            ("classic", CLASSIC_ALIASES),
+            ("nurbs", NURBS_ALIASES),
+            ("bim", BIM.aliases),
         ] {
             for (alias, _canonical) in aliases {
                 assert!(
@@ -705,50 +741,50 @@ mod tests {
     fn canonical_verb_falls_through_when_not_an_alias() {
         // A full canonical name that is not itself an alias key must NOT expand
         // (it flows unchanged to the substrate parser).
-        assert_eq!(expand_alias("box 0,0,0 1,1,1", AUTOCAD_ALIASES), None);
-        assert_eq!(expand_alias("extrude", AUTOCAD_ALIASES), None);
-        // And an unknown token in a skin with no aliases (Revit) never expands.
-        assert_eq!(expand_alias("l", REVIT.aliases), None);
+        assert_eq!(expand_alias("box 0,0,0 1,1,1", CLASSIC_ALIASES), None);
+        assert_eq!(expand_alias("extrude", CLASSIC_ALIASES), None);
+        // And an unknown token in a skin with no aliases (BIM) never expands.
+        assert_eq!(expand_alias("l", BIM.aliases), None);
     }
 
     // ── layout fields ─────────────────────────────────────────────────────────
 
     #[test]
-    fn rhino_defaults_command_line_top_and_4up() {
-        assert_eq!(RHINO.command_line_pos, CommandLinePos::Top);
-        assert_eq!(RHINO.default_viewports, 4);
-        assert_eq!(RHINO.menu_style, MenuStyle::Rhino);
+    fn nurbs_defaults_command_line_top_and_4up() {
+        assert_eq!(NURBS.command_line_pos, CommandLinePos::Top);
+        assert_eq!(NURBS.default_viewports, 4);
+        assert_eq!(NURBS.menu_style, MenuStyle::Modeler);
     }
 
     #[test]
-    fn autocad_keeps_command_line_bottom_and_4up() {
-        assert_eq!(AUTOCAD.command_line_pos, CommandLinePos::Bottom);
-        assert_eq!(AUTOCAD.default_viewports, 4);
-        assert_eq!(AUTOCAD.menu_style, MenuStyle::AutoCAD);
+    fn classic_keeps_command_line_bottom_and_4up() {
+        assert_eq!(CLASSIC.command_line_pos, CommandLinePos::Bottom);
+        assert_eq!(CLASSIC.default_viewports, 4);
+        assert_eq!(CLASSIC.menu_style, MenuStyle::Drafting);
     }
 
     #[test]
-    fn itsjustcad_default_is_rhino_arrangement() {
-        // Task M-uilayout: Rhino-default arrangement even for the ItsJustCAD skin.
+    fn itsjustcad_default_is_modeler_arrangement() {
+        // Task M-uilayout: Modeler-default arrangement even for the ItsJustCAD skin.
         assert_eq!(ITSJUSTCAD_DEFAULT.command_line_pos, CommandLinePos::Top);
-        // Boots to the Rhino 4-up layout.
+        // Boots to the 4-up layout.
         assert_eq!(ITSJUSTCAD_DEFAULT.default_viewports, 4);
-        assert_eq!(ITSJUSTCAD_DEFAULT.menu_style, MenuStyle::Rhino);
+        assert_eq!(ITSJUSTCAD_DEFAULT.menu_style, MenuStyle::Modeler);
     }
 
     // ── token sets ────────────────────────────────────────────────────────────
 
     #[test]
     fn dark_preset_yields_dark_tokens() {
-        let t = AUTOCAD.tokens();
-        assert!(t.dark, "AutoCAD tokens should be dark");
+        let t = CLASSIC.tokens();
+        assert!(t.dark, "Classic tokens should be dark");
         assert!(!crate::theme::is_dark(t.colors.on_surface), "text must be light on dark");
     }
 
     #[test]
     fn light_preset_yields_light_tokens() {
-        let t = RHINO.tokens();
-        assert!(!t.dark, "Rhino tokens should be light");
+        let t = NURBS.tokens();
+        assert!(!t.dark, "NURBS tokens should be light");
         assert!(crate::theme::is_dark(t.colors.on_surface), "text must be dark on light");
     }
 

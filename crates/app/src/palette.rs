@@ -58,7 +58,7 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     // Display + lighting.
     ("display", "Display", "display shaded|wireframe|xray|ghosted|pencil"),
     ("lightmode", "Display", "lightmode working|sun|presentation"),
-    ("sketchup", "Display", ""),
+    ("massing", "Display", ""),
     ("sketchy", "Display", "sketchy [on|off]"),
     ("profileedges", "Display", "profileedges [on|off]"),
     ("shadededges", "Display", "shadededges [on|off]"),

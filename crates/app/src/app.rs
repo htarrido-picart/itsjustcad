@@ -142,7 +142,7 @@ pub(crate) enum DeckBrain {
     /// to `env:ANTHROPIC_API_KEY`) and opens LLM ▸ API Keys… so the user can
     /// paste a key.
     Cloud,
-    /// ChatGPT via the OpenAI API. Creates the `openai` cassette (defaulting to
+    /// OpenAI models via the OpenAI API. Creates the `openai` cassette (defaulting to
     /// `env:OPENAI_API_KEY`) and opens LLM ▸ API Keys… so the user can paste a
     /// key.
     OpenAi,
@@ -158,8 +158,8 @@ pub(crate) enum DeckBrain {
 impl DeckBrain {
     fn label(self) -> &'static str {
         match self {
-            DeckBrain::Cloud => "Claude (Anthropic) — paste an API key",
-            DeckBrain::OpenAi => "OpenAI (ChatGPT) — paste an API key",
+            DeckBrain::Cloud => "Anthropic API (Claude models) — paste an API key",
+            DeckBrain::OpenAi => "OpenAI API — paste an API key",
             DeckBrain::Ollama => "Local via Ollama (http://localhost:11434)",
             DeckBrain::Download => "Download a local model",
             DeckBrain::Skip => "Skip — decide later",
@@ -1374,7 +1374,7 @@ impl App {
         // ← →), which otherwise render as tofu boxes in UI strings and menus.
         install_symbol_fallback(&cc.egui_ctx);
 
-        // Legacy-CAD-informed font sizes (see docs/ui-legacy-research.md):
+        // Legacy-CAD-informed font sizes (see docs/internal/ui-legacy-research.md):
         //   command line / monospace prompt: 13 px  (~10 pt at 96 DPI)
         //   body / panels / status bar:      13 px  (~9–10 pt)
         //   small (autosuggest, hints):      11 px  (~8 pt)
@@ -2270,16 +2270,16 @@ impl App {
                 self.command_line
                     .push_line(format!("smart guides: {}", if on { "on" } else { "off" }));
             }
-            // "SketchUp" display preset: Working hemispheric shading + thick
+            // "Massing" display preset: Working hemispheric shading + thick
             // profile edges + shaded display. Combines the ergonomics of the
             // default lighting with the recognisable profile-edge look.
-            Some("sketchup" | "su") => {
+            Some("massing" | "clay") => {
                 self.light_mode = itsjustcad_render::LightMode::Working;
                 self.profile_edges = true;
                 self.display_modes[self.effective_camera_index(self.active_pane)] =
                     DisplayMode::Shaded;
                 self.command_line
-                    .push_line("preset: sketchup (working light + profile edges)");
+                    .push_line("preset: massing (working light + profile edges)");
             }
             // Toggle hand-drawn "sketchy edges" NPR character.
             Some("sketchy") => {
@@ -2323,7 +2323,7 @@ impl App {
                     }
                 }
             }
-            // Switch the legacy-CAD skin (`skin native|autocad|rhino|revit`).
+            // Switch the working-style skin (`skin native|classic|nurbs|bim`).
             // Applies live (palette/accent/fonts + alias table) and persists to
             // ui.json. Dark/light stays orthogonal. View/session state, never
             // logged. Reuses the onboarding preset machinery.
@@ -2343,7 +2343,7 @@ impl App {
                     }
                     None => {
                         self.command_line
-                            .push_line("usage: skin native|autocad|rhino|revit");
+                            .push_line("usage: skin native|classic|nurbs|bim");
                     }
                 }
             }
@@ -3364,14 +3364,14 @@ impl App {
                 };
                 self.command_line.push_line(format!("camera: fisheye {deg:.0}° fov"));
             }
-            // `camera phone <preset>`: a named real phone lens (iPhone / Pixel /
-            // Galaxy ultra-wide / main / tele). Bare `camera phone` = the iPhone
-            // main wide, matching the shorthand.
+            // `camera phone <preset>`: a named phone lens (ultra-wide / main /
+            // tele / periscope). Bare `camera phone` = the main wide, matching
+            // the shorthand.
             "phone" => {
                 let preset = arg2.and_then(itsjustcad_render::phone_preset);
                 let (focal, label) = match preset {
                     Some(p) => (p.focal_mm, p.label.to_string()),
-                    None if arg2.is_none() => (26.0, "iPhone main wide (26mm eq)".to_string()),
+                    None if arg2.is_none() => (26.0, "Phone main wide (26 mm eq.)".to_string()),
                     None => {
                         let names: Vec<&str> =
                             itsjustcad_render::PHONE_PRESETS.iter().map(|p| p.name).collect();
@@ -4290,7 +4290,7 @@ impl App {
                     ],
                 )
                 .add_filter("DXF", &["dxf"])
-                .add_filter("DWG (assisted)", &["dwg"])
+                .add_filter("DWG drawing (.dwg, via LibreDWG)", &["dwg"])
                 .add_filter("IFC", &["ifc"])
                 .add_filter("OBJ", &["obj"])
                 .add_filter("STL", &["stl"])
@@ -4298,7 +4298,7 @@ impl App {
                 .add_filter("Collada", &["dae"])
                 .add_filter("Point cloud (LAS/LAZ)", &["las", "laz"])
                 .add_filter("E57", &["e57"])
-                .add_filter("Rhino 3DM", &["3dm"])
+                .add_filter("3DM model (.3dm)", &["3dm"])
                 .pick_file()
         });
         let Some(path) = path else { return };
@@ -4318,7 +4318,6 @@ impl App {
             rfd::FileDialog::new()
                 .add_filter("DXF", &["dxf"])
                 .add_filter("SVG", &["svg"])
-                .add_filter("Adobe Illustrator (SVG-content)", &["ai"])
                 .add_filter("JPEG image", &["jpg", "jpeg"])
                 .add_filter("CSV", &["csv"])
                 .add_filter("glTF / GLB", &["gltf", "glb"])
@@ -4327,7 +4326,7 @@ impl App {
                 .add_filter("PDF", &["pdf"])
                 .add_filter("IFC", &["ifc"])
                 .add_filter("SAF (xlsx)", &["xlsx", "saf"])
-                .add_filter("Rhino 3DM", &["3dm"])
+                .add_filter("3DM model (.3dm)", &["3dm"])
                 .set_file_name("export.dxf")
                 .save_file()
         });
@@ -10283,7 +10282,13 @@ fn save_onboarding_done() {
 fn load_cad_origin() -> Option<CadOrigin> {
     let v = load_ui_json();
     let s = v["cad_origin"].as_str()?;
-    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+    let origin: CadOrigin = serde_json::from_value(serde_json::Value::String(s.to_string())).ok()?;
+    // Pre-rename builds wrote "autocad"/"rhino"/"revit"; rewrite once with the
+    // new code so only current codes stay persisted.
+    if serde_json::to_value(origin).ok().and_then(|n| n.as_str().map(|n| n != s)) == Some(true) {
+        save_cad_origin(origin);
+    }
+    Some(origin)
 }
 
 fn save_cad_origin(origin: CadOrigin) {
@@ -11211,6 +11216,12 @@ impl eframe::App for App {
                                 "Preset: {}",
                                 preset::preset_for(self.cad_origin).menu_style_label()
                             ),
+                        );
+                        ui.add_space(crate::theme::Spacing::S);
+                        ui.label(
+                            egui::RichText::new(crate::i18n::t("about.trademarks"))
+                                .small()
+                                .color(crate::theme::to_color32(roles.on_surface)),
                         );
                         ui.add_space(crate::theme::Spacing::M);
                         if ui.button(crate::i18n::t("about.close")).clicked() {
@@ -13398,7 +13409,7 @@ mod tests {
         // The keyboard focus cue egui paints on any focused widget (fields,
         // combos, list rows) is the 2px accent selection stroke.
         let mut style = egui::Style::default();
-        let tokens = crate::preset::preset_for(crate::preset::CadOrigin::Rhino).tokens();
+        let tokens = crate::preset::preset_for(crate::preset::CadOrigin::Nurbs).tokens();
         crate::theme::apply_to_style(&mut style, &tokens);
         assert_eq!(style.visuals.selection.stroke.width, 2.0);
         assert_eq!(
@@ -13858,7 +13869,7 @@ mod tests {
         // The native menu model must carry a Render menu whose Setup leaf is
         // wired to RenderSetup — the reachable entry point for local SD render.
         let menus = crate::menu::native_model(
-            crate::preset::MenuStyle::Rhino,
+            crate::preset::MenuStyle::Modeler,
             true,
             crate::menu::ViewState::default(),
         );

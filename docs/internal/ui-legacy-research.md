@@ -1,5 +1,9 @@
 # Legacy CAD UI Conventions Research
 
+> Internal research note, not product documentation. The shipped working-style
+> skins use ItsJustCAD's own palette and make no claim to match any other product.
+
+
 Research date: 2026-08-24. Drives ItsJustCAD theme presets and alias tables.
 All hex values given as `#RRGGBB` sRGB.
 

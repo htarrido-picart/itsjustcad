@@ -87,7 +87,7 @@ pub enum Weight {
 }
 
 /// Type scale in logical pixels (before the egui zoom factor), mapped onto
-/// egui [`TextStyle`]s. Sizes follow `docs/ui-legacy-research.md`:
+/// egui [`TextStyle`]s. Sizes follow `docs/internal/ui-legacy-research.md`:
 /// command line ~10–11pt, panels ~9pt, status ~8–9pt.
 ///
 /// Each role pairs a size with a [`Weight`]. Sizes are the `*_px` fields (kept

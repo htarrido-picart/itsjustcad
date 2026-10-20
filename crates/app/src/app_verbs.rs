@@ -38,7 +38,7 @@ pub enum AppVerb {
     Display(DisplayMode),
     /// Lighting model (`lightmode working|sun|presentation`).
     Light(LightMode),
-    /// Toggle SketchUp-style thick profile edges (`profileedges [on|off]`).
+    /// Toggle thick profile edges (`profileedges [on|off]`).
     /// `None` means bare toggle.
     ProfileEdges(Option<bool>),
     /// Toggle the thin mesh feature edges drawn in Shaded mode by default
@@ -49,9 +49,9 @@ pub enum AppVerb {
     /// When on, each `plant:<id>` mesh also draws its plan drafting glyph flat
     /// on the ground (reads as a planting plan in the top view).
     PlantSymbols(Option<bool>),
-    /// SketchUp display preset (`sketchup`): working light + profile edges +
-    /// gradient background.
-    SketchUp,
+    /// Massing display preset (`massing`, alias `clay`): working light +
+    /// profile edges + gradient background.
+    Massing,
     /// Toggle hand-drawn "sketchy edges" NPR character (`sketchy [on|off]`).
     /// `None` means bare toggle.
     Sketchy(Option<bool>),
@@ -74,7 +74,7 @@ pub enum AppVerb {
     /// `language` with no/unknown argument is rejected by `classify` (returns
     /// `None`) so the command line reports an error rather than silently no-op.
     Language(crate::i18n::Lang),
-    /// Switch the legacy-CAD skin (`skin native|autocad|rhino|revit`). Carries
+    /// Switch the working-style skin (`skin native|classic|nurbs|bim`). Carries
     /// the parsed [`crate::preset::CadOrigin`]; persisted to ui.json and applied
     /// live (palette/accent/fonts + alias table). A bare `skin` with no/unknown
     /// argument is rejected by `classify` (returns `None`) so the command line
@@ -209,7 +209,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             None => None,
             _ => return None,
         }),
-        "sketchup" | "su" => AppVerb::SketchUp,
+        "massing" | "clay" => AppVerb::Massing,
         "sketchy" => AppVerb::Sketchy(match words.next() {
             Some("on" | "true" | "1") => Some(true),
             Some("off" | "false" | "0") => Some(false),
@@ -324,15 +324,20 @@ mod tests {
     fn classifies_skin_verb() {
         use crate::preset::CadOrigin;
         assert_eq!(classify("skin native"), Some(AppVerb::Skin(CadOrigin::None)));
-        assert_eq!(classify("skin autocad"), Some(AppVerb::Skin(CadOrigin::AutoCAD)));
-        assert_eq!(classify("skin rhino"), Some(AppVerb::Skin(CadOrigin::Rhino)));
-        assert_eq!(classify("skin revit"), Some(AppVerb::Skin(CadOrigin::Revit)));
+        assert_eq!(classify("skin classic"), Some(AppVerb::Skin(CadOrigin::Classic)));
+        assert_eq!(classify("skin nurbs"), Some(AppVerb::Skin(CadOrigin::Nurbs)));
+        assert_eq!(classify("skin bim"), Some(AppVerb::Skin(CadOrigin::Bim)));
         // Synonyms + case-insensitivity.
-        assert_eq!(classify("skin ACAD"), Some(AppVerb::Skin(CadOrigin::AutoCAD)));
+        assert_eq!(classify("skin CLASSIC"), Some(AppVerb::Skin(CadOrigin::Classic)));
+        // Pre-rename codes still map silently (migration for old scripts).
+        assert_eq!(classify("skin autocad"), Some(AppVerb::Skin(CadOrigin::Classic)));
+        assert_eq!(classify("skin ACAD"), Some(AppVerb::Skin(CadOrigin::Classic)));
+        assert_eq!(classify("skin rhino"), Some(AppVerb::Skin(CadOrigin::Nurbs)));
+        assert_eq!(classify("skin revit"), Some(AppVerb::Skin(CadOrigin::Bim)));
         assert_eq!(classify("skin default"), Some(AppVerb::Skin(CadOrigin::None)));
         // Bare or unknown argument falls through → command line reports usage.
         assert_eq!(classify("skin"), None);
-        assert_eq!(classify("skin sketchup"), None);
+        assert_eq!(classify("skin bogus"), None);
     }
 
     #[test]
@@ -353,8 +358,11 @@ mod tests {
         assert_eq!(classify("plantsymbols off"), Some(AppVerb::PlantSymbols(Some(false))));
         assert_eq!(classify("plansymbols"), Some(AppVerb::PlantSymbols(None)));
         assert_eq!(classify("plantsymbols garbage"), None);
-        assert_eq!(classify("sketchup"), Some(AppVerb::SketchUp));
-        assert_eq!(classify("su"), Some(AppVerb::SketchUp));
+        assert_eq!(classify("massing"), Some(AppVerb::Massing));
+        assert_eq!(classify("clay"), Some(AppVerb::Massing));
+        // The old brand-named verb is gone.
+        assert_eq!(classify("sketchup"), None);
+        assert_eq!(classify("su"), None);
     }
 
     #[test]
@@ -511,8 +519,8 @@ mod tests {
         "profileedges", // alias of `profiles`
         "shadededges",  // alias of `meshedges`
         "plansymbols",  // alias of `plantsymbols`
-        "sketchup",     // preset; advertised as `sketchup`, not a standalone canonical token here
-        "su",           // alias of `sketchup`
+        "massing",      // preset; advertised as `massing`, not a standalone canonical token here
+        "clay",         // alias of `massing`
         "gizmo",        // alias of `gumball`
         "skin",         // UI skin switch, not a drawing/view verb the model reframes with
         "theme_skin",   // alias of `skin`
@@ -526,8 +534,8 @@ mod tests {
         // either advertised (in CANONICAL_DECK_APP_VERBS) or explicitly denied
         // (DECK_APP_VERB_DENYLIST). If someone adds a new arm to `classify`
         // without deciding which bucket it belongs to, this fails — forcing an
-        // explicit advertise-or-deny decision. Note: `sketchup`/`su` map to
-        // SketchUp preset advertised inline in VIEW_VERB_HELP; they live on the
+        // explicit advertise-or-deny decision. Note: `massing`/`clay` map to
+        // the Massing preset advertised inline in VIEW_VERB_HELP; they live on the
         // denylist as standalone canonical tokens.
         let all_classify_tokens = [
             "ze",
@@ -543,8 +551,8 @@ mod tests {
             "meshedges",
             "plantsymbols",
             "plansymbols",
-            "sketchup",
-            "su",
+            "massing",
+            "clay",
             "sketchy",
             "edgefx",
             "gumball",
@@ -645,8 +653,8 @@ mod tests {
             "display shaded",
             "display xray",
             "display ghosted",
-            "sketchup",
-            "su",
+            "massing",
+            "clay",
             "light sun",
             "lightmode working",
             "sketchy on",
@@ -658,7 +666,7 @@ mod tests {
             "camera pano",
             "camera fisheye 120",
             "camera 35mm",
-            "camera phone iphone-ultrawide",
+            "camera phone phone-ultrawide",
             "basemap sat 800 0.6",
             "basemap off",
             "render glass pavilion at dusk",
@@ -672,8 +680,8 @@ mod tests {
         assert!(h.contains("sketchy on|off"));
         assert!(h.contains("camera fisheye [fov]"));
         assert!(h.contains("camera phone <lens>"));
-        assert!(h.contains("iphone-ultrawide"));
-        assert!(h.contains("galaxy-tele"));
+        assert!(h.contains("phone-ultrawide"));
+        assert!(h.contains("phone-periscope"));
         assert!(h.contains("zoom to fit"));
     }
 

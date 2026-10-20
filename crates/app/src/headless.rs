@@ -137,7 +137,7 @@ pub struct HeadlessView {
     /// Lighting model, from `lightmode <mode>`.
     pub light: LightMode,
     /// SketchUp-style thick profile edges + gradient background, from
-    /// `profileedges [on|off]` or the `sketchup` preset.
+    /// `profileedges [on|off]` or the `massing` preset.
     pub profile_edges: bool,
     /// Hand-drawn "sketchy edges" NPR character, from `sketchy [on|off]` /
     /// `edgefx …`. Default (disabled) is a clean pass.
@@ -228,7 +228,7 @@ pub fn run_script_lines(
             Some(AppVerb::PlantSymbols(on)) => {
                 view.plant_symbols = on.unwrap_or(!view.plant_symbols)
             }
-            Some(AppVerb::SketchUp) => {
+            Some(AppVerb::Massing) => {
                 view.light = LightMode::Working;
                 view.profile_edges = true;
                 view.display = DisplayMode::Shaded;
@@ -373,7 +373,7 @@ fn apply_camera(view: &mut HeadlessView, arg: Option<&str>, arg2: Option<&str>) 
         "fisheye" | "fish" => {
             view.pano = Some(parse_fisheye(arg2));
         }
-        // `camera phone <preset>`: named real phone lens (bare = iPhone main).
+        // `camera phone <preset>`: named phone lens (bare = main wide).
         "phone" => {
             let focal = arg2
                 .and_then(itsjustcad_render::phone_preset)
@@ -926,13 +926,13 @@ mod tests {
     }
 
     #[test]
-    fn sketchup_preset_sets_working_light_and_profiles() {
+    fn massing_preset_sets_working_light_and_profiles() {
         let session = Session::default();
         // Start from a non-default state to prove the preset overrides it.
         let lines = vec![
             "lightmode presentation".to_owned(),
             "display wireframe".to_owned(),
-            "sketchup".to_owned(),
+            "massing".to_owned(),
         ];
         let (_out, view) = run_script_lines(session, &lines).expect("preset runs");
         assert_eq!(view.light, LightMode::Working);
@@ -976,16 +976,16 @@ mod tests {
         // Named lens resolves to its 35mm-equivalent focal length.
         let (_o, view) = run_script_lines(
             Session::default(),
-            &["camera phone iphone-ultrawide".to_owned()],
+            &["camera phone phone-ultrawide".to_owned()],
         )
         .unwrap();
         assert_eq!(view.focal_mm, Some(13.0));
 
         let (_o, view) =
-            run_script_lines(Session::default(), &["camera phone iphone-tele".to_owned()]).unwrap();
+            run_script_lines(Session::default(), &["camera phone phone-tele".to_owned()]).unwrap();
         assert_eq!(view.focal_mm, Some(77.0));
 
-        // Bare `camera phone` = iPhone main wide (26mm equiv).
+        // Bare `camera phone` = main wide (26mm equiv).
         let (_o, view) =
             run_script_lines(Session::default(), &["camera phone".to_owned()]).unwrap();
         assert_eq!(view.focal_mm, Some(26.0));

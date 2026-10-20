@@ -13142,13 +13142,14 @@ fn apply_forward(
                     let (b, count) = crate::svg::export_svg(doc);
                     (b, format!("SVG, {count}"))
                 }
-                // Adobe Illustrator: modern Illustrator opens SVG-content `.ai`
-                // files directly, so the pragmatic MVP writes the exact same
-                // vector content the SVG writer produces. A true native
-                // .ai/PostScript writer is a follow-up.
+                // `.ai` extension: writes the exact same vector content the SVG
+                // writer produces. Opening in third-party editors is NOT
+                // verified, so the file dialog no longer offers it and the echo
+                // makes no compatibility claim. A native PDF-based writer is a
+                // follow-up.
                 "ai" => {
                     let (b, count) = crate::svg::export_svg(doc);
-                    (b, format!("AI (SVG-content), {count}"))
+                    (b, format!("SVG content (.ai extension), {count}"))
                 }
                 // Raster: no GPU in this crate, so we rasterize the same 2D
                 // projection the SVG writer uses onto a CPU buffer and encode
@@ -20865,12 +20866,11 @@ mod tests {
         run(&mut s, "rect 0,0,0 10 6");
         run(&mut s, "circle 5,3,0 1.5");
 
-        // .ai routes through the SVG writer: the file IS SVG content that
-        // Illustrator opens. Assert non-empty + the SVG signature.
+        // .ai routes through the SVG writer: the file IS SVG content. Assert non-empty + the SVG signature.
         let ai = dir.join("model.ai");
         let _ = std::fs::remove_file(&ai);
         let out = run(&mut s, &format!("export {}", ai.display()));
-        assert!(out.message.contains("exported AI"), "{}", out.message);
+        assert!(out.message.contains("exported SVG content (.ai extension)"), "{}", out.message);
         let ai_text = std::fs::read_to_string(&ai).unwrap();
         assert!(!ai_text.is_empty(), "AI file non-empty");
         assert!(ai_text.contains("<svg"), "AI file carries SVG content:\n{ai_text}");

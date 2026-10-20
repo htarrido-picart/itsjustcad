@@ -41,7 +41,7 @@ pub enum DeckKind {
 pub enum CloudProvider {
     /// Claude via the Anthropic API (`x-api-key` auth).
     Anthropic,
-    /// ChatGPT via the OpenAI API (served through the OpenAI-compatible adapter).
+    /// OpenAI models via the OpenAI API (served through the OpenAI-compatible adapter).
     OpenAi,
 }
 
@@ -92,8 +92,8 @@ impl CloudProvider {
     /// Human-facing label for the dialog row.
     pub fn label(self) -> &'static str {
         match self {
-            CloudProvider::Anthropic => "Anthropic (Claude)",
-            CloudProvider::OpenAi => "OpenAI (ChatGPT)",
+            CloudProvider::Anthropic => "Anthropic API",
+            CloudProvider::OpenAi => "OpenAI API",
         }
     }
 }

@@ -40,8 +40,8 @@ Framing & standard views:
 
 Display mode (how solids are drawn):
   display shaded|wireframe|xray|ghosted|pencil  viewport display mode                                    e.g. display pencil
-  sketchup                                      SketchUp look preset (working light + profile edges +    e.g. sketchup
-                                                gradient background; alias: su)
+  massing                                       Massing look preset (working light + profile edges +     e.g. massing
+                                                sky gradient background; alias: clay)
 
 Lighting:
   light working|sun|presentation                lighting model (alias: lightmode)                        e.g. light sun
@@ -61,7 +61,7 @@ Non-photoreal (NPR) styling:
   sketchy on|off                                hand-drawn 'sketchy edges' character                     e.g. sketchy on
   edgefx jitter=.. extension=.. depthcue=..     tune the sketchy edge effect (key=value tokens)          e.g. edgefx jitter=.05 extension=.1
         endpoints=.. passes=..
-  profiles on|off                               thick SketchUp-style profile edges (alias: profileedges) e.g. profiles on
+  profiles on|off                               thick profile edges (alias: profileedges)                e.g. profiles on
 
 Camera projection & lens:
   camera 2point                                 two-point perspective (verticals stay vertical)          e.g. camera 2point
@@ -69,9 +69,8 @@ Camera projection & lens:
   camera pano                                   360° equirectangular panorama                            e.g. camera pano
   camera fisheye [fov]                          fisheye projection, optional field of view in degrees    e.g. camera fisheye 120
   camera <n>mm                                  lens by focal length: 15mm 24mm 35mm 50mm 85mm           e.g. camera 35mm
-  camera phone <lens>                           phone-camera sim; lenses: iphone-main iphone-ultrawide   e.g. camera phone iphone-ultrawide
-                                                iphone-tele pixel-main pixel-ultrawide pixel-tele
-                                                galaxy-main galaxy-ultrawide galaxy-tele (bare = iphone-main)
+  camera phone <lens>                           phone-camera sim; lenses: phone-main phone-ultrawide     e.g. camera phone phone-ultrawide
+                                                phone-tele phone-periscope (bare = phone-main)
 
 Site context:
   basemap [osm|sat] [span_m] [opacity]          georeferenced satellite/OSM underlay (basemap off        e.g. basemap sat 800 0.6
@@ -554,7 +553,7 @@ Examples:
   panel hide
   split 4
   ```
-  User: "show me a fisheye view / iphone ultrawide camera" ->
+  User: "show me a fisheye view / phone ultra-wide camera" ->
   ```draft
   camera fisheye 120
   ```
@@ -749,10 +748,10 @@ mod tests {
         assert!(p.contains("zoom to fit all geometry"));
         // Standard views.
         assert!(p.contains("top|bottom|front|back|left|right|persp"));
-        // Display modes (all five) + sketchup preset.
+        // Display modes (all five) + massing preset.
         assert!(p.contains("display shaded|wireframe|xray|ghosted|pencil"));
         assert!(p.contains("display pencil"));
-        assert!(p.contains("sketchup"));
+        assert!(p.contains("massing"));
         // Lighting.
         assert!(p.contains("light working|sun|presentation"));
         // NPR.
@@ -765,9 +764,9 @@ mod tests {
         assert!(p.contains("camera fisheye [fov]"));
         assert!(p.contains("camera <n>mm"));
         assert!(p.contains("camera phone <lens>"));
-        assert!(p.contains("iphone-ultrawide"));
-        assert!(p.contains("pixel-main"));
-        assert!(p.contains("galaxy-tele"));
+        assert!(p.contains("phone-ultrawide"));
+        assert!(p.contains("phone-main"));
+        assert!(p.contains("phone-periscope"));
         // Basemap.
         assert!(p.contains("basemap [osm|sat]"));
         // Gumball — must be advertised so the model stops saying it doesn't exist.

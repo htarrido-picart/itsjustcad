@@ -333,25 +333,25 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "hatchpat",
             usage: "hatchpat <path.pat>",
-            summary: "Import all line-based hatch patterns from an AutoCAD .pat file (e.g. USGS geologic pattern libraries) into the drawing, then use them as fills with `hatch <sel> pattern <name>`. Reports how many patterns were imported. Rendering approximates per-family origin phase and multi-length dash cadence (reads faithfully; not pixel-exact). Example: hatchpat /tmp/geology.pat",
+            summary: "Import all line-based hatch patterns from a .pat pattern file (the widely used PAT text format, e.g. USGS geologic pattern libraries) into the drawing, then use them as fills with `hatch <sel> pattern <name>`. Reports how many patterns were imported. Rendering approximates per-family origin phase and multi-length dash cadence (reads faithfully; not pixel-exact). Example: hatchpat /tmp/geology.pat",
             category: Category::Annotate,
         },
         CommandSpec {
             name: "boundary",
             usage: "boundary <seed x,y,z> [from <selector>]",
-            summary: "AutoCAD BOUNDARY: pick a point inside a region enclosed by existing curves and create a closed boundary polyline (then hatch/extrude it). Traces the smallest loop around the seed in the XY plane. `from <selector>` limits the candidate curves; otherwise all curves are used. Example: boundary 5,3 · boundary 5,3 from all",
+            summary: "Pick a point inside a region enclosed by existing curves and create a closed boundary polyline (then hatch/extrude it). Traces the smallest loop around the seed in the XY plane. `from <selector>` limits the candidate curves; otherwise all curves are used. Example: boundary 5,3 · boundary 5,3 from all",
             category: Category::Annotate,
         },
         CommandSpec {
             name: "curvebool",
             usage: "curvebool <union|intersect|difference> <selector>",
-            summary: "Rhino CurveBoolean: combine 2+ closed planar curves into new closed region curve(s). union merges the outer boundary of the combined area; intersect keeps the overlap; difference is the first selected curve minus the rest (selection order). Works in the XY plane (planar assumption; Z carried from the first input). Inputs are consumed and replaced by the result (undoable). Op aliases: or/and/sub. Verb aliases: cboolean/region. Example: curvebool union last 2 · curvebool intersect all · curvebool difference last 2",
+            summary: "Combine 2+ closed planar curves into new closed region curve(s). union merges the outer boundary of the combined area; intersect keeps the overlap; difference is the first selected curve minus the rest (selection order). Works in the XY plane (planar assumption; Z carried from the first input). Inputs are consumed and replaced by the result (undoable). Op aliases: or/and/sub. Verb aliases: cboolean/region. Example: curvebool union last 2 · curvebool intersect all · curvebool difference last 2",
             category: Category::Boolean,
         },
         CommandSpec {
             name: "autodim",
             usage: "autodim <selector> [offset <d>]",
-            summary: "DraftSight AutoDimension: batch-dimension a selection in one command. Each line/polyline gets one linear dimension per straight segment; any other geometry gets two overall extent dims (width along X, height along Y) from its bounding box. offset (default 0.5) sets the dimension-line offset. Alias: autodimension. Examples: autodim last · autodim all offset 0.8",
+            summary: "Batch-dimension a selection in one command. Each line/polyline gets one linear dimension per straight segment; any other geometry gets two overall extent dims (width along X, height along Y) from its bounding box. offset (default 0.5) sets the dimension-line offset. Alias: autodimension. Examples: autodim last · autodim all offset 0.8",
             category: Category::Dimension,
         },
         CommandSpec {
@@ -417,7 +417,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "align",
             usage: "align <selector> <src1> <tgt1> <src2> <tgt2> [scale on|off]",
-            summary: "Orient/align objects (AutoCAD ALIGN / Rhino Orient): move the selection so source reference points match targets. src1→tgt1 sets the translation; the rotation swings the src1→src2 direction onto the tgt1→tgt2 direction (planar, about Z, from the XY headings). 'scale on' also scales uniformly by |tgt2−tgt1|/|src2−src1|; default off. Alias: orient. Example: align last 0,0,0 5,5,0 1,0,0 5,6,0 · align last 0,0,0 0,0,0 1,0,0 2,0,0 scale on",
+            summary: "Orient/align objects by reference points: move the selection so source reference points match targets. src1→tgt1 sets the translation; the rotation swings the src1→src2 direction onto the tgt1→tgt2 direction (planar, about Z, from the XY headings). 'scale on' also scales uniformly by |tgt2−tgt1|/|src2−src1|; default off. Alias: orient. Example: align last 0,0,0 5,5,0 1,0,0 5,6,0 · align last 0,0,0 0,0,0 1,0,0 2,0,0 scale on",
             category: Category::Transform,
         },
         CommandSpec {
@@ -453,7 +453,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "selregion",
             usage: "selregion <min x,y> <max x,y> [window|crossing]",
-            summary: "Select objects by a two-point axis-aligned rectangle (AutoCAD/Rhino window/crossing). window (default) keeps only objects whose whole XY footprint is inside the rect; crossing keeps any that touch or overlap it. Planar in XY (object aabb Z ignored). Aliases: selwindow (=window), selcrossing (=crossing). Example: selregion 0,0 10,10 crossing",
+            summary: "Select objects by a two-point axis-aligned rectangle (window/crossing selection). window (default) keeps only objects whose whole XY footprint is inside the rect; crossing keeps any that touch or overlap it. Planar in XY (object aabb Z ignored). Aliases: selwindow (=window), selcrossing (=crossing). Example: selregion 0,0 10,10 crossing",
             category: Category::Edit,
         },
         CommandSpec {
@@ -483,7 +483,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "trim",
             usage: "trim <cutter selector…> remove <point x,y…>  |  trim <cutter…> extend <point…>",
-            summary: "Rhino two-phase trim: pick cutting curves, then click each piece to remove (the clicked segment between crossings is deleted). 'extend' instead grows the picked curve to the nearest cutter. Example: trim #a #b remove 2,0 8,0",
+            summary: "Two-phase trim: pick cutting curves, then click each piece to remove (the clicked segment between crossings is deleted). 'extend' instead grows the picked curve to the nearest cutter. Example: trim #a #b remove 2,0 8,0",
             category: Category::Curve,
         },
         CommandSpec {
@@ -866,7 +866,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "plotstyle",
             usage: "plotstyle <new <name>|set <name> <layer-or-r,g,b> color <r,g,b> [weight <mm>] [screen <pct>]|list [<name>]|apply <name>|none|delete <name>>",
-            summary: "Plot styles / pen tables (AutoCAD CTB/STB): a named, saved mapping from a SOURCE KEY (a layer name, or an object color token 'r,g,b') to how objects PLOT — pen color, lineweight, screening — applied only at print/export, never changing the model. 'new <name>' creates a table; 'set <name> <key> color <r,g,b> [weight <mm>] [screen <pct>]' adds/replaces a mapping (screening 0..100% lightens the pen toward white); 'apply <name>' makes a table the active print pen (looked up per object by layer then color, unmapped objects plot as today); 'none' clears it; 'list [<name>]' shows tables/entries; 'delete <name>' removes one. new/set/apply/none/delete are logged (undoable); list is a query. Example: plotstyle new mono · plotstyle set mono walls color 0,0,0 weight 0.5 · plotstyle apply mono · print plan /tmp/plan.pdf",
+            summary: "Plot styles / pen tables (color- or name-based): a named, saved mapping from a SOURCE KEY (a layer name, or an object color token 'r,g,b') to how objects PLOT — pen color, lineweight, screening — applied only at print/export, never changing the model. 'new <name>' creates a table; 'set <name> <key> color <r,g,b> [weight <mm>] [screen <pct>]' adds/replaces a mapping (screening 0..100% lightens the pen toward white); 'apply <name>' makes a table the active print pen (looked up per object by layer then color, unmapped objects plot as today); 'none' clears it; 'list [<name>]' shows tables/entries; 'delete <name>' removes one. new/set/apply/none/delete are logged (undoable); list is a query. Example: plotstyle new mono · plotstyle set mono walls color 0,0,0 weight 0.5 · plotstyle apply mono · print plan /tmp/plan.pdf",
             category: Category::File,
         },
         CommandSpec {
@@ -878,13 +878,13 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "sheetset",
             usage: "sheetset <new <name>|add <sheet>|remove <sheet>|order <sheet> <index>|list|publish [<path.pdf>]>",
-            summary: "Manage a sheet set — a named, ordered index over existing sheets (AutoCAD Sheet Set Manager). A set only references sheets by name; it never copies their content. Sheet numbers are positional (1-based = order in the set). Sub-commands act on the ACTIVE set (the most recently created): 'new <name>' creates and activates a set; 'add <sheet>' appends an existing sheet; 'remove <sheet>' drops one; 'order <sheet> <index>' moves a sheet to a 1-based slot (renumbering the rest); 'list' shows every set with numbered sheets; 'publish [<path>]' batch-renders every sheet in the active set to a single multi-page PDF (defaults to <setname>.pdf), reusing the print path. new/add/remove/order are logged (undoable); list/publish are query/I-O. Example: sheetset new plans · sheetset add a-101 · sheetset add a-102 · sheetset order a-102 1 · sheetset publish /tmp/plans.pdf",
+            summary: "Manage a sheet set — a named, ordered index over existing sheets. A set only references sheets by name; it never copies their content. Sheet numbers are positional (1-based = order in the set). Sub-commands act on the ACTIVE set (the most recently created): 'new <name>' creates and activates a set; 'add <sheet>' appends an existing sheet; 'remove <sheet>' drops one; 'order <sheet> <index>' moves a sheet to a 1-based slot (renumbering the rest); 'list' shows every set with numbered sheets; 'publish [<path>]' batch-renders every sheet in the active set to a single multi-page PDF (defaults to <setname>.pdf), reusing the print path. new/add/remove/order are logged (undoable); list/publish are query/I-O. Example: sheetset new plans · sheetset add a-101 · sheetset add a-102 · sheetset order a-102 1 · sheetset publish /tmp/plans.pdf",
             category: Category::File,
         },
         CommandSpec {
             name: "export",
             usage: "export <path.{dxf|stl|obj|gltf|glb|svg|csv|ifc|saf|xlsx|3dm|step|stp}>",
-            summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), OBJ (meshes plus curves as polylines), SVG, CSV, IFC4 openBIM (typed IfcBeam/Column/Slab/Wall plus the IfcStructuralAnalysisModel graph for analysis packages), SAF/XLSX (Structural Analysis Format 2.2.0 — genuine .xlsx workbook with SAF sheet names, for handoff to RFEM/SCIA/AxisVM/FEM-Design; geometry+topology only, never analysis results), Rhino 3DM (openNURBS V5 archive: meshes + curves with names and layers; Rhino 5+ opens it), or STEP/STP (AP242 via OCCT — FACETED, one BREP face per triangle; needs the 'kernel-occt' feature). Example: export /tmp/model.xlsx",
+            summary: "Export the whole document, format chosen by extension: DXF R12 (2D entities, meshes as feature edges), binary STL and glTF/GLB (triangle meshes only), OBJ (meshes plus curves as polylines), SVG, CSV, IFC4 (typed IfcBeam/Column/Slab/Wall plus the IfcStructuralAnalysisModel graph for analysis packages), SAF/XLSX (Structural Analysis Format 2.2.0 — genuine .xlsx workbook with SAF sheet names, for handoff to RFEM/SCIA/AxisVM/FEM-Design; geometry+topology only, never analysis results), 3DM (openNURBS® V5 archive: meshes + curves with names and layers; readable by Rhino® 5 and later), or STEP/STP (AP242 via OCCT — FACETED, one BREP face per triangle; needs the 'kernel-occt' feature). Example: export /tmp/model.xlsx",
             category: Category::File,
         },
         CommandSpec {
@@ -896,7 +896,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "import",
             usage: "import <path.{dwg|dxf|obj|stl|gltf|glb|dae|3dm|step|stp|ifc|epw|geojson|las|laz|e57}>",
-            summary: "Import a file by extension. DWG (assisted: auto-invokes a user-installed dwg2dxf/LibreDWG to convert the referenced file to DXF then imports it; needs 'brew install libredwg'; a truncated conversion is rejected with a clear error, never a silent empty import). A bare file NAME (no path) is resolved inside the granted deck workdir (see 'workdir'). DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT, HATCH, SPLINE, nested block INSERTs → logged ops), OBJ/STL/glTF/GLB meshes, Rhino .3dm (openNURBS: meshes → MeshLiteral, lines/polylines/NURBS curves → Polyline, on their Rhino layer; breps/surfaces skipped), STEP/STP (AP242/AP203/AP214 exact BREP solids via OCCT — read exactly then tessellated to a MeshLiteral with the exact volume reported; needs the 'kernel-occt' feature), IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0.5m marker circle; properties.name → object name; lon/lat projected to local meters when a location is set, else treated as local xy), LAS 1.2–1.4 or compressed LAZ point cloud (formats 0–3; decimated to ≤200k points; stored on layer 'pointcloud'), or E57 point cloud (ASTM E2807; Cartesian + optional RGB/intensity; all sections merged; decimated to ≤200k; stored on layer 'pointcloud'). Example: import /tmp/site.las · import /tmp/scan.e57",
+            summary: "Import a file by extension. DWG (assisted: auto-invokes a user-installed dwg2dxf/LibreDWG to convert the referenced file to DXF then imports it; needs 'brew install libredwg'; a truncated conversion is rejected with a clear error, never a silent empty import). A bare file NAME (no path) is resolved inside the granted deck workdir (see 'workdir'). DXF (LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, TEXT, HATCH, SPLINE, nested block INSERTs → logged ops), OBJ/STL/glTF/GLB meshes, .3dm (openNURBS: meshes → MeshLiteral, lines/polylines/NURBS curves → Polyline, on their source layer; breps/surfaces skipped), STEP/STP (AP242/AP203/AP214 exact BREP solids via OCCT — read exactly then tessellated to a MeshLiteral with the exact volume reported; needs the 'kernel-occt' feature), IFC4/IFC2x3 (meshes → the 'ifc' layer), EPW EnergyPlus weather (sets the document location and reports annual stats), GeoJSON (Polygon → closed polyline, LineString → polyline, Point → 0.5m marker circle; properties.name → object name; lon/lat projected to local meters when a location is set, else treated as local xy), LAS 1.2–1.4 or compressed LAZ point cloud (formats 0–3; decimated to ≤200k points; stored on layer 'pointcloud'), or E57 point cloud (ASTM E2807; Cartesian + optional RGB/intensity; all sections merged; decimated to ≤200k; stored on layer 'pointcloud'). Example: import /tmp/site.las · import /tmp/scan.e57",
             category: Category::File,
         },
         CommandSpec {
@@ -974,7 +974,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "lotopenspace",
             usage: "lotopenspace [selector] type=park|greenway|pond|treesave [area=<>] · OR reserve=<pct>",
-            summary: "Place open space (M-intemfit site planning, Phase 9). Two modes, both baking onto the 'openspace' layer so a later lotreport nets them out of gross site area. DEFAULT is feature placement (Manuel's questionnaire): type picks the amenity the tool PLACES at the selected region (or, absent that, its largest empty block) — park (a small green polygon, a rounded rectangle), greenway (a linear buffered trail corridor along a selected open polyline path, or the region's long axis), pond (a rounded near-circular retention-basin footprint), treesave (a preserved-vegetation polygon following the region outline that the layout works around); area sets the feature area (m²), else a sensible fraction of the region. The SEPARATE blind %-reserve mode is owner opt-in by keyword: reserve=<pct> pulls whole blocks out of subdivision until ~pct of the site is open, biggest-and-most-central first (CityEngine's model: open space = a block you chose not to subdivide), tagging them so yield nets them out and a later lotsubdivide skips them; reserve=0 or absent = off. Advisory: feature placement is design intent, not hydrology/ecology engineering (a pond is a footprint, not a sized detention volume; a tree-save is a marked polygon, not a survey). Deterministic; logged so undo removes the geometry and replay recreates it byte-identically. Example: lotopenspace last type=park area=800 · lotopenspace last type=pond · lotopenspace last reserve=20",
+            summary: "Place open space (site planning). Two modes, both baking onto the 'openspace' layer so a later lotreport nets them out of gross site area. DEFAULT is feature placement: type picks the amenity the tool PLACES at the selected region (or, absent that, its largest empty block) — park (a small green polygon, a rounded rectangle), greenway (a linear buffered trail corridor along a selected open polyline path, or the region's long axis), pond (a rounded near-circular retention-basin footprint), treesave (a preserved-vegetation polygon following the region outline that the layout works around); area sets the feature area (m²), else a sensible fraction of the region. The SEPARATE blind %-reserve mode is owner opt-in by keyword: reserve=<pct> pulls whole blocks out of subdivision until ~pct of the site is open, biggest-and-most-central first (open space = a block left unsubdivided), tagging them so yield nets them out and a later lotsubdivide skips them; reserve=0 or absent = off. Advisory: feature placement is design intent, not hydrology/ecology engineering (a pond is a footprint, not a sized detention volume; a tree-save is a marked polygon, not a survey). Deterministic; logged so undo removes the geometry and replay recreates it byte-identically. Example: lotopenspace last type=park area=800 · lotopenspace last type=pond · lotopenspace last reserve=20",
             category: Category::Tools,
         },
         CommandSpec {
@@ -1070,7 +1070,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "dataextract",
             usage: "dataextract [by count|instance] [to <path.csv>]",
-            summary: "Extract block-instance data (AutoCAD DATAEXTRACTION / BOM): tabulate block instances grouped by definition, with a count and every distinct param/attribute value they carry. `by count` (default) gives one aggregated row per block definition (a param cell shows the shared value, or '(varies)'); `by instance` gives one row per placement. Prints a table, or writes a .csv with `to <path>`. Query only. Aliases: dataextraction, bom. Example: dataextract · dataextract by instance to /tmp/bom.csv",
+            summary: "Extract block-instance data (bill of materials): tabulate block instances grouped by definition, with a count and every distinct param/attribute value they carry. `by count` (default) gives one aggregated row per block definition (a param cell shows the shared value, or '(varies)'); `by instance` gives one row per placement. Prints a table, or writes a .csv with `to <path>`. Query only. Aliases: dataextraction, bom. Example: dataextract · dataextract by instance to /tmp/bom.csv",
             category: Category::Analyze,
         },
         CommandSpec {
@@ -1112,7 +1112,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "camera",
             usage: "camera <2point|persp|pano|fisheye [fov]|phone [lens]|<mm>>",
-            summary: "Set the active viewport's projection (view state, not logged). '2point' = architectural two-point perspective (verticals stay vertical); 'persp' = normal perspective; 'pano'/'360' = equirectangular 360° panorama; 'fisheye [deg]' = equidistant fisheye at the given field of view (default 180°); a focal length like '35' or '35mm' sets a full-frame lens; 'phone [lens]' simulates a real phone lens (iphone-main, iphone-ultrawide, iphone-tele, pixel-main, galaxy-tele, …). Example: camera 2point · camera fisheye 200 · camera phone iphone-ultrawide",
+            summary: "Set the active viewport's projection (view state, not logged). '2point' = architectural two-point perspective (verticals stay vertical); 'persp' = normal perspective; 'pano'/'360' = equirectangular 360° panorama; 'fisheye [deg]' = equidistant fisheye at the given field of view (default 180°); a focal length like '35' or '35mm' sets a full-frame lens; 'phone [lens]' simulates a phone lens (phone-main, phone-ultrawide, phone-tele, phone-periscope). Example: camera 2point · camera fisheye 200 · camera phone phone-ultrawide",
             category: Category::View,
         },
         CommandSpec {
@@ -1172,13 +1172,13 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "ncopy",
             usage: "ncopy <instance-selector> <index>",
-            summary: "Copy ONE nested object out of an xref/block instance into this document as a real, independent object, transformed by the instance's placement; the source instance stays intact (AutoCAD NCOPY). <index> is the 0-based sub-object of the block definition. Example: ncopy last 0",
+            summary: "Copy ONE nested object out of an xref/block instance into this document as a real, independent object, transformed by the instance's placement; the source instance stays intact. <index> is the 0-based sub-object of the block definition. Example: ncopy last 0",
             category: Category::Annotate,
         },
         CommandSpec {
             name: "xclip",
             usage: "xclip <instance-selector> <min x,y> <max x,y> | xclip <instance-selector> off",
-            summary: "Clip a block/xref instance to a rectangular boundary (world XY) so only the geometry inside the rect renders (AutoCAD XCLIP). Give two opposite corners to set the clip; 'off' clears it. Corners may be in any order. Undoable. Example: xclip last 0,0 10,10 · xclip last off",
+            summary: "Clip a block/xref instance to a rectangular boundary (world XY) so only the geometry inside the rect renders. Give two opposite corners to set the clip; 'off' clears it. Corners may be in any order. Undoable. Example: xclip last 0,0 10,10 · xclip last off",
             category: Category::Annotate,
         },
         CommandSpec {
