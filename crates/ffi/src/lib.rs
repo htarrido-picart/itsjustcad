@@ -2697,7 +2697,7 @@ fn layers_json(doc: &itsjustcad_doc::Document) -> String {
 /// (floats/ints → numbers, bools, vec3 → `[x,y,z]`, enums → their token). Each
 /// `fields` entry is `{"name","labelKey","kind","widget","unit","min","max","step","default","choices"}`
 /// straight from `ParamSchema` (`min`/`max` are null when unbounded). Edit a
-/// value with `ijc_run_command(h, "param <sel> name=value")`. Returns `"[]"`
+/// value with `ijc_run_command(h, "paramset <sel> name=value")`. Returns `"[]"`
 /// (non-null) for a null/invalid handle. Caller must [`ijc_string_free`] the
 /// result.
 ///
