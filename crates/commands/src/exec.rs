@@ -273,6 +273,15 @@ enum Inverse {
         prev_plain: Option<Vec<itsjustcad_doc::BlockGeometry>>,
         prev_param: Option<itsjustcad_doc::ParamBlockDef>,
     },
+    /// `freeze`: write back parametric snapshots, delete the objects baked from
+    /// dynamic-block instances, restore those instances and their dropped
+    /// per-instance bakes in `doc.blocks`.
+    Frozen {
+        snapshots: Vec<(ObjectId, Geometry)>,
+        created: Vec<ObjectId>,
+        consumed: Vec<(SceneObject, usize)>,
+        bakes: Vec<(String, Vec<itsjustcad_doc::BlockGeometry>)>,
+    },
     /// Dynamic-block `insert`: remove the created instance object AND its
     /// per-instance baked geometry entry in `doc.blocks`.
     CreatedAndBake {
@@ -1175,6 +1184,23 @@ impl Session {
                 }
                 if let Some(def) = prev_param {
                     self.doc.param_blocks.insert(name.clone(), def.clone());
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::Frozen { snapshots, created, consumed, bakes } => {
+                for id in created.clone() {
+                    self.doc.remove(id);
+                }
+                for (obj, index) in consumed.iter().rev() {
+                    self.doc.restore(obj.clone(), *index);
+                }
+                for (key, def) in bakes {
+                    self.doc.blocks.insert(key.clone(), def.clone());
+                }
+                for (id, geometry) in snapshots.clone() {
+                    if let Some(obj) = self.doc.get_mut(id) {
+                        obj.geometry = geometry;
+                    }
                 }
                 self.doc.generation += 1;
             }
@@ -14132,15 +14158,19 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Freeze { target } => {
+        Command::Freeze { ids: replay_ids, target } => {
             let ids = resolve(doc, &target)?;
             let mut snapshots: Vec<(ObjectId, Geometry)> = Vec::new();
             let mut frozen = 0usize;
+            // Dynamic-block instances to bake, in selection order.
+            let mut instances: Vec<ObjectId> = Vec::new();
             for id in &ids {
-                let is_param = matches!(
-                    doc.get(*id).map(|o| &o.geometry),
-                    Some(Geometry::Parametric { .. })
-                );
+                let geometry = doc.get(*id).map(|o| &o.geometry);
+                if matches!(geometry, Some(Geometry::Instance { source: Some(_), .. })) {
+                    instances.push(*id);
+                    continue;
+                }
+                let is_param = matches!(geometry, Some(Geometry::Parametric { .. }));
                 if !is_param {
                     continue;
                 }
@@ -14166,19 +14196,91 @@ fn apply_forward(
                     frozen += 1;
                 }
             }
-            if frozen == 0 {
+            if frozen == 0 && instances.is_empty() {
                 return Err(ExecError::Invalid(
-                    "freeze: selection has no parametric objects".into(),
+                    "freeze: selection has no parametric objects or dynamic-block instances".into(),
                 ));
             }
+            // Bake each instance's current geometry (its per-instance entry in
+            // `doc.blocks`) to world space under the instance transform: scale,
+            // then rotate about Z, then translate (as `ncopy` and the renderer).
+            let mut baked: Vec<(SceneObject, Vec<Geometry>)> = Vec::new();
+            for id in &instances {
+                let obj = doc.get(*id).expect("resolved");
+                let Geometry::Instance { block, position, rotation_deg, scale, .. } = &obj.geometry
+                else {
+                    unreachable!("collected as an instance");
+                };
+                let defs = doc.blocks.get(block).ok_or_else(|| {
+                    ExecError::Invalid(format!("freeze: block definition '{block}' not found"))
+                })?;
+                let m = glam::DMat4::from_translation(*position)
+                    * glam::DMat4::from_rotation_z(rotation_deg.to_radians())
+                    * glam::DMat4::from_scale(DVec3::splat(*scale));
+                let geometries = defs
+                    .iter()
+                    .map(|sub| {
+                        let mut g = match sub {
+                            itsjustcad_doc::BlockGeometry::Mesh(m) => Geometry::Mesh(m.clone()),
+                            itsjustcad_doc::BlockGeometry::Curve(c) => Geometry::Curve(c.clone()),
+                            itsjustcad_doc::BlockGeometry::Annotation(a) => {
+                                Geometry::Annotation(a.clone())
+                            }
+                        };
+                        g.transform(&m, BOUNDARY_TOL);
+                        g
+                    })
+                    .collect();
+                baked.push((obj.clone(), geometries));
+            }
+            let total: usize = baked.iter().map(|(_, g)| g.len()).sum();
+            // Reuse replay ids when they match the count, else mint fresh ones.
+            let created: Vec<ObjectId> = match replay_ids {
+                Some(ids) if ids.len() == total => ids,
+                _ => (0..total).map(|_| ObjectId::new()).collect(),
+            };
+            let mut consumed = Vec::with_capacity(baked.len());
+            let mut next = created.iter();
+            for (inst, geometries) in baked {
+                // Remove first so the recorded index is the pre-freeze slot.
+                consumed.push(doc.remove(inst.id).expect("resolved"));
+                for geometry in geometries {
+                    let id = *next.next().expect("created ids cover all geometries");
+                    doc.insert(SceneObject {
+                        visible: inst.visible,
+                        id,
+                        name: inst.name.clone(),
+                        layer: inst.layer.clone(),
+                        color: inst.color,
+                        material: inst.material,
+                        lineweight_mm: inst.lineweight_mm,
+                        geometry,
+                    });
+                }
+            }
+            // Drop per-instance bakes no remaining object references.
+            let mut bakes = Vec::new();
+            for (inst, _) in &consumed {
+                let Geometry::Instance { block, .. } = &inst.geometry else { continue };
+                let referenced = doc.objects().any(
+                    |o| matches!(&o.geometry, Geometry::Instance { block: b, .. } if b == block),
+                );
+                if !referenced && let Some(def) = doc.blocks.remove(block) {
+                    bakes.push((block.clone(), def));
+                }
+            }
             doc.generation += 1;
+            let n_inst = consumed.len();
+            let mut message = format!("freeze: flattened {frozen} parametric object(s)");
+            if n_inst > 0 {
+                message = format!(
+                    "{message}, baked {n_inst} dynamic-block instance(s) -> {total} object(s)"
+                );
+            }
             Ok((
-                Command::Freeze { target },
-                Inverse::SetGeometry(snapshots),
-                ApplyOutcome {
-                    created: Vec::new(),
-                    message: format!("freeze: flattened {frozen} parametric object(s)"),
-                },
+                Command::Freeze { ids: Some(created.clone()), target },
+                Inverse::Frozen { snapshots, created: created.clone(), consumed, bakes },
+                ApplyOutcome { created, message },
             ))
         }
         Command::BlockDeleteDef { name } => {
@@ -23399,6 +23501,38 @@ mod tests {
         ));
         run(&mut s, "redo");
         assert!(matches!(&s.doc.get(id).unwrap().geometry, Geometry::Mesh(_)));
+    }
+
+    #[test]
+    fn freeze_bakes_dynamic_block_instance_undo_redo() {
+        let mut s = Session::default();
+        run(&mut s, "pblock t w=1 : box 0,0,0 {w},1,1 ; rect 0,0,0 {w} 0.1");
+        let inst = run(&mut s, "insert t 10,0,0 90 2 w=2").created[0];
+        let key = instance_block_key(&s, inst);
+        let before = s.doc.len();
+        let out = run(&mut s, "freeze last");
+        assert_eq!(out.created.len(), 2, "box + rect baked");
+        assert!(s.doc.get(inst).is_none(), "instance removed");
+        assert!(!s.doc.blocks.contains_key(&key), "per-instance bake dropped");
+        assert_eq!(s.doc.len(), before + 1);
+        assert!(s.doc.objects().all(|o| !matches!(o.geometry, Geometry::Instance { .. })));
+        // Box 2×1×1 at w=2, scaled ×2, rotated 90° about Z, moved to x=10.
+        let bb = mesh_of(&s, out.created[0]).aabb();
+        assert!((bb.min - DVec3::new(8.0, 0.0, 0.0)).length() < 1e-9, "{bb:?}");
+        assert!((bb.max - DVec3::new(10.0, 4.0, 2.0)).length() < 1e-9, "{bb:?}");
+        assert!(matches!(s.doc.get(out.created[1]).unwrap().geometry, Geometry::Curve(_)));
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert!(matches!(
+            &s.doc.get(inst).unwrap().geometry,
+            Geometry::Instance { source: Some(_), .. }
+        ));
+        assert!(s.doc.blocks.contains_key(&key), "undo restores the bake");
+        assert!(out.created.iter().all(|id| s.doc.get(*id).is_none()));
+        assert_eq!(s.doc.len(), before);
+        run(&mut s, "redo");
+        assert!(s.doc.get(inst).is_none());
+        assert!(out.created.iter().all(|id| s.doc.get(*id).is_some()), "redo reuses ids");
     }
 
     #[test]

@@ -1761,8 +1761,15 @@ pub enum Command {
     /// Flatten selected **parametric** objects to plain static meshes
     /// (M-parametric `freeze`/`bake`): keeps the derived geometry but drops the
     /// generator + params, so the object is no longer editable and leaves the
-    /// Parameters tab. Non-parametric objects in the selection are left as-is.
-    Freeze { target: Selector },
+    /// Parameters tab. Dynamic-block instances are baked too: each is replaced
+    /// by plain world-space objects of its current geometry. Other objects in
+    /// the selection are left as-is. `ids` caches the objects created from
+    /// instances so op-log replay reproduces them.
+    Freeze {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        target: Selector,
+    },
     /// Delete a block definition (plain or parametric) by name. Refuses while
     /// instances of it exist in the scene — delete the instances first, so a
     /// definition can never be orphaned out from under live geometry.

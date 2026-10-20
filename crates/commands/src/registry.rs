@@ -1148,7 +1148,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "freeze",
             usage: "freeze <selector>",
-            summary: "Flatten selected parametric structures to plain static meshes (alias: bake): keeps the geometry but drops the generator + params, so they leave the Parameters tab and are no longer editable. Example: freeze last · freeze sel",
+            summary: "Flatten selected parametric structures to plain static meshes (alias: bake): keeps the geometry but drops the generator + params, so they leave the Parameters tab and are no longer editable. Dynamic-block instances are baked to plain objects at their current params. Example: freeze last · freeze sel",
             category: Category::Structure,
         },
         CommandSpec {
