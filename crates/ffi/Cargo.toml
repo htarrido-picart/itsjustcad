@@ -24,4 +24,5 @@ pollster = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
+async-trait.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
