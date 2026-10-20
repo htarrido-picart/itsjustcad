@@ -4001,6 +4001,67 @@ pub unsafe extern "C" fn ijc_save_json(h: *mut AppHandle) -> *mut c_char {
     })
 }
 
+/// Parse a `feedback bug|idea <title> | <description> | <steps>` line (e.g. one
+/// the deck emitted) into draft JSON `{category,title,description,steps}` for
+/// the host's review sheet. Returns an empty string if `line` is not a feedback
+/// line (or null / not UTF-8). Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `line` must be null or a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_feedback_parse(line: *const c_char) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let draft = (!line.is_null())
+            .then(|| (unsafe { CStr::from_ptr(line) }).to_str().ok())
+            .flatten()
+            .and_then(itsjustcad_deck::parse_feedback_line);
+        into_c_string(draft.map_or_else(String::new, |d| {
+            serde_json::to_string(&d).expect("draft serializes")
+        }))
+    })
+}
+
+/// Build the feedback bundle (compact JSON) for the reviewed `draft_json` (as
+/// returned by [`ijc_feedback_parse`], possibly edited). `include_doc` embeds
+/// the document (left out with a `document_omitted` reason over 10 MB);
+/// `include_chat` adds the last 10 deck turns. The host writes the bytes to a
+/// file and hands it to the mail composer — nothing is sent from here. Returns
+/// an empty string for a null handle or invalid draft JSON. Free with
+/// [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `draft_json` must be
+/// null or a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_feedback_bundle(
+    h: *mut AppHandle,
+    draft_json: *const c_char,
+    include_doc: bool,
+    include_chat: bool,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::new());
+        };
+        let draft = (!draft_json.is_null())
+            .then(|| (unsafe { CStr::from_ptr(draft_json) }).to_str().ok())
+            .flatten()
+            .and_then(|s| serde_json::from_str::<itsjustcad_deck::FeedbackDraft>(s).ok());
+        let Some(draft) = draft else {
+            return into_c_string(String::new());
+        };
+        let doc = include_doc.then(|| io::to_json_compact(&app.session));
+        let history = app.history.lock().map(|h| h.clone()).unwrap_or_default();
+        into_c_string(itsjustcad_deck::build_bundle(
+            &draft,
+            env!("CARGO_PKG_VERSION"),
+            &itsjustcad_deck::platform(),
+            include_chat.then_some(history.as_slice()),
+            doc.as_deref(),
+        ))
+    })
+}
+
 /// The document's monotonic generation counter — it bumps on every mutation.
 /// Lets the host cheaply gate work (autosave, cached reads) on actual change
 /// rather than polling. Returns 0 for a null/invalid handle.
@@ -4017,8 +4078,8 @@ pub unsafe extern "C" fn ijc_doc_generation(h: *mut AppHandle) -> u64 {
 /// Free a C string returned by [`ijc_command_brief`] / [`ijc_scene_digest`] /
 /// [`ijc_scene_digest_filtered`] / [`ijc_save_json`] / [`ijc_parametric_json`] /
 /// [`ijc_param_blocks_json`] / [`ijc_selection_json`] /
-/// [`ijc_run_command_result`] (or any other `*_json`
-/// accessor).
+/// [`ijc_run_command_result`] / [`ijc_feedback_parse`] /
+/// [`ijc_feedback_bundle`] (or any other `*_json` accessor).
 /// Null-safe; must be called at most once per returned pointer.
 ///
 /// # Safety
@@ -5244,6 +5305,41 @@ mod headless_tests {
             assert!(ijc_open_json(h, json.as_ptr(), json.len()));
             assert_eq!(count(h), 1);
 
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn feedback_parse_and_bundle_round_trip() {
+        unsafe {
+            assert_eq!(take(ijc_feedback_parse(std::ptr::null())), "");
+            assert_eq!(take(ijc_feedback_parse(c("box 0,0,0 1,1,1").as_ptr())), "");
+            let draft = take(ijc_feedback_parse(c("feedback idea Dark sheets | print on black").as_ptr()));
+            let v: serde_json::Value = serde_json::from_str(&draft).unwrap();
+            assert_eq!(v["category"], "idea");
+            assert_eq!(v["title"], "Dark sheets");
+
+            let d = c(&draft);
+            assert_eq!(take(ijc_feedback_bundle(std::ptr::null_mut(), d.as_ptr(), true, true)), "");
+            let h = ijc_init_headless();
+            assert_eq!(take(ijc_feedback_bundle(h, std::ptr::null(), true, true)), "");
+            assert_eq!(take(ijc_feedback_bundle(h, c("not json").as_ptr(), true, true)), "");
+            assert!(ijc_run_command(h, c("box 0,0,0 1,1,1").as_ptr()));
+            assert!(ijc_flush(h));
+            handle_ref(h).unwrap().history.lock().unwrap().push(ChatMessage {
+                role: itsjustcad_deck::Role::User,
+                content: "make a box".into(),
+            });
+
+            let b: serde_json::Value =
+                serde_json::from_str(&take(ijc_feedback_bundle(h, d.as_ptr(), true, true))).unwrap();
+            assert_eq!(b["title"], "Dark sheets");
+            assert_eq!(b["app_version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(b["document"]["ops"].as_array().unwrap().len(), 1);
+            assert_eq!(b["chat"][0]["content"], "make a box");
+            let b: serde_json::Value =
+                serde_json::from_str(&take(ijc_feedback_bundle(h, d.as_ptr(), false, false))).unwrap();
+            assert!(b.get("document").is_none() && b.get("chat").is_none());
             ijc_free(h);
         }
     }

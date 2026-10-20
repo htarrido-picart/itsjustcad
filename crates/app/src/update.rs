@@ -220,9 +220,58 @@ pub fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
+/// Whether [`open_external_url`] may hand `url` to the OS: only a `mailto:` or
+/// the repo's pre-filled GitHub new-issue page (feedback tickets), with no
+/// whitespace, control characters or quotes (the payload is percent-encoded).
+pub fn is_safe_external_url(url: &str) -> bool {
+    let allowed = url.starts_with("mailto:")
+        || url
+            .strip_prefix(itsjustcad_deck::GITHUB_NEW_ISSUE_URL)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('?'));
+    allowed
+        && !url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "\"'`".contains(c))
+}
+
+/// Open a feedback `mailto:` / GitHub new-issue URL with the OS handler.
+/// Best-effort; never through a shell (`rundll32` on Windows, not `cmd`), and
+/// refuses anything [`is_safe_external_url`] rejects.
+pub fn open_external_url(url: &str) {
+    if !is_safe_external_url(url) {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_url_guard_allows_only_feedback_targets() {
+        let d = itsjustcad_deck::FeedbackDraft { title: "a \"b\" & c".into(), ..Default::default() };
+        assert!(is_safe_external_url(&itsjustcad_deck::mailto_url(&d, "f.json")));
+        assert!(is_safe_external_url(&itsjustcad_deck::github_issue_url(&d, "0.6.7", "macos")));
+        assert!(is_safe_external_url("mailto:x@y.z?subject=a%20b"));
+        // Other schemes / other GitHub pages / look-alike paths are refused.
+        assert!(!is_safe_external_url("https://github.com/htarrido-picart/itsjustcad/releases"));
+        assert!(!is_safe_external_url("https://github.com/htarrido-picart/itsjustcad/issues/newx"));
+        assert!(!is_safe_external_url("https://evil.example/mailto:"));
+        assert!(!is_safe_external_url("file:///etc/passwd"));
+        // Whitespace, control characters and quotes are refused.
+        assert!(!is_safe_external_url("mailto:x@y.z?body=a b"));
+        assert!(!is_safe_external_url("mailto:x@y.z?body=a\nb"));
+        assert!(!is_safe_external_url("mailto:x@y.z?body=\"calc\""));
+        assert!(!is_safe_external_url("mailto:x@y.z?body='a'"));
+    }
 
     #[test]
     fn semver_ordering_patch_minor_major() {

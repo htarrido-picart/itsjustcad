@@ -84,6 +84,10 @@ pub enum AppVerb {
     Save(Option<String>),
     /// Command reference (`help [verb]`).
     Help(Option<String>),
+    /// Draft an alpha feedback ticket (`feedback bug|idea <title> | <description>
+    /// | <steps>`). The GUI opens the review sheet with the draft pre-filled;
+    /// nothing is sent until the user clicks. Headless warns and ignores it.
+    Feedback(itsjustcad_deck::FeedbackDraft),
     /// GUI-only verb with no headless meaning (`template`, `critique`, …).
     /// Carried so the headless runner can warn about the specific name.
     GuiOnly(&'static str),
@@ -270,6 +274,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
         "render" => AppVerb::Render(words.map(str::to_owned).collect()),
         "template" => AppVerb::GuiOnly("template"),
         "critique" => AppVerb::GuiOnly("critique"),
+        "feedback" => AppVerb::Feedback(itsjustcad_deck::parse_feedback_line(line)?),
         "basemap" => AppVerb::Basemap(parse_basemap_args(words)),
         other => AppVerb::View(standard_view(other)?),
     })
@@ -428,6 +433,20 @@ mod tests {
     }
 
     #[test]
+    fn classifies_feedback() {
+        use itsjustcad_deck::{FeedbackCategory, FeedbackDraft};
+        assert_eq!(classify("feedback"), Some(AppVerb::Feedback(FeedbackDraft::default())));
+        match classify("feedback idea Dark sheets | print on black").unwrap() {
+            AppVerb::Feedback(d) => {
+                assert_eq!(d.category, FeedbackCategory::Idea);
+                assert_eq!(d.title, "Dark sheets");
+                assert_eq!(d.description, "print on black");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn classifies_basemap_defaults_and_options() {
         // Bare verb → defaults (osm, 500 m, 0.85).
         let a = match classify("basemap").unwrap() {
@@ -495,6 +514,8 @@ mod tests {
         "persp",
         "basemap",
         "render",
+        // Opens the review sheet only; the user sends (or not).
+        "feedback",
         // `help <verb>` is an ON-DEMAND deck TOOL, not a view verb: the deck
         // emits it to fetch a verb's full syntax + examples (the compact catalog
         // gives only names + one-liners), and the output threads back to the
@@ -570,6 +591,7 @@ mod tests {
             "critique",
             "basemap",
             "render",
+            "feedback",
             // standard-view fall-through arm:
             "top",
             "bottom",
@@ -629,6 +651,7 @@ mod tests {
             "render glass pavilion at dusk",
             "render cancel",
             "help geodesic",
+            "feedback bug Fillet fails | fillet on a box errors | box, then fillet",
         ] {
             assert!(
                 classify(line).is_some(),
@@ -670,6 +693,7 @@ mod tests {
             "basemap off",
             "render glass pavilion at dusk",
             "render cancel",
+            "feedback bug Fillet fails | fillet on a box errors | box, then fillet",
         ] {
             assert!(classify(line).is_some(), "help advertises '{line}' but classify rejects it");
         }

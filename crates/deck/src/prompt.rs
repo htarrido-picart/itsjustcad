@@ -82,6 +82,10 @@ AI diffusion render (only if the user configured a render cassette; ships off):
                                                 A1111 / Draw Things / cloud) and the result opens in a
                                                 window. render cancel aborts. Describe materials, mood
                                                 and light in the prompt; the geometry comes from the view.
+
+Feedback to the developers (ONLY when the user asks to report a problem or wishes for a feature):
+  feedback bug|idea <title> | <description> | <steps>   draft a ticket; opens a review sheet     e.g. feedback bug Fillet fails | fillet on a box errors | box, then fillet
+                                                the user edits and sends — it never sends anything itself
 ";
 
 /// The "UI/session commands" section of the deck system prompt.

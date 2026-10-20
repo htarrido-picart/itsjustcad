@@ -1725,6 +1725,11 @@ impl DeckPane {
                 .unwrap_or(false)
     }
 
+    /// The chat transcript (for the feedback sheet's recent turns).
+    pub fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
     /// Poll+clear the critique button. The app drives the viewport screenshot
     /// (which the pane can't reach) and then calls `send_critique`.
     pub fn take_critique_request(&mut self) -> bool {
@@ -2883,9 +2888,15 @@ impl DeckPane {
                             });
                             return;
                         }
+                        // `feedback` only opens the review sheet; the user sends.
+                        let note = if matches!(verb, crate::app_verbs::AppVerb::Feedback(_)) {
+                            "feedback review sheet opened — nothing sent"
+                        } else {
+                            "applied (view/camera)"
+                        };
                         self.current_commands.push(ExecutedCommand {
                             line: line.clone(),
-                            result: Ok("applied (view/camera)".to_string()),
+                            result: Ok(note.to_string()),
                         });
                         self.pending_app_verbs.push(line);
                         return;

@@ -284,6 +284,9 @@ pub fn run_script_lines(
             Some(AppVerb::GuiOnly(name)) => {
                 eprintln!("warning: '{name}' is GUI-only; ignored in headless mode");
             }
+            Some(AppVerb::Feedback(_)) => {
+                eprintln!("warning: 'feedback' needs the GUI review sheet; ignored in headless mode");
+            }
             Some(AppVerb::Render(_)) => {
                 // Needs the GUI's async job plumbing + a configured diffusion
                 // backend; the substrate never reaches the network.
@@ -1117,7 +1120,11 @@ mod tests {
     #[test]
     fn gui_only_verbs_are_ignored_not_errors() {
         let session = Session::default();
-        let lines = vec!["template".to_owned(), "critique looks off".to_owned()];
+        let lines = vec![
+            "template".to_owned(),
+            "critique looks off".to_owned(),
+            "feedback bug x | y".to_owned(),
+        ];
         // No error: GUI-only verbs are warned-and-ignored.
         assert!(run_script_lines(session, &lines).is_ok());
     }

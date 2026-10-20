@@ -916,6 +916,8 @@ pub struct App {
     reduce_motion: bool,
     /// Whether the Help → About dialog is open.
     show_about: bool,
+    /// The open feedback review sheet (`feedback` / Help ▸ Report a problem…).
+    feedback_sheet: Option<crate::feedback_sheet::FeedbackSheet>,
     /// Whether the Help → "Check for Updates…" popup is open.
     show_update: bool,
     /// The in-flight / finished update check, if the user has run one this
@@ -1546,6 +1548,7 @@ impl App {
             panel_visible: true,
             reduce_motion: load_reduce_motion(),
             show_about: false,
+            feedback_sheet: None,
             show_update: false,
             update_check: None,
             show_history: false,
@@ -2446,6 +2449,13 @@ impl App {
             }
             Some("template") => {
                 self.show_template_picker = true;
+            }
+            // Alpha feedback ticket: open the review sheet pre-filled. Nothing is
+            // written or sent until the user clicks Send / GitHub in it.
+            Some("feedback") => {
+                let draft = itsjustcad_deck::parse_feedback_line(line).unwrap_or_default();
+                let doc_bytes = itsjustcad_commands::io::to_json_compact(&self.session).len();
+                self.feedback_sheet = Some(crate::feedback_sheet::FeedbackSheet::new(draft, doc_bytes));
             }
             // Vision: screenshot the viewport and ask the deck to critique it.
             // The rest of the line (if any) is a user question folded into the
@@ -3430,6 +3440,7 @@ impl App {
     fn early_hotkeys(&mut self, ctx: &egui::Context) {
         let modal = self.show_palette
             || self.show_about
+            || self.feedback_sheet.is_some()
             || self.show_update
             || self.show_history
             || self.show_model_setup
@@ -10480,6 +10491,42 @@ fn model_artifacts_present(
     }
 }
 
+impl App {
+    /// Feedback sheet ▸ Send: write the bundle, reveal it, open the mailto.
+    /// The sheet stays open if the bundle cannot be written.
+    fn send_feedback(&mut self) {
+        let Some(sheet) = self.feedback_sheet.take() else { return };
+        let doc = sheet
+            .attach_doc
+            .then(|| itsjustcad_commands::io::to_json_compact(&self.session));
+        let chat = sheet.include_chat.then(|| self.deck_pane.messages());
+        let bundle = itsjustcad_deck::build_bundle(
+            &sheet.draft,
+            crate::update::APP_VERSION,
+            &itsjustcad_deck::platform(),
+            chat,
+            doc.as_deref(),
+        );
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let name = itsjustcad_deck::bundle_filename(secs);
+        match crate::feedback_sheet::write_bundle(&name, &bundle) {
+            Ok(path) => {
+                reveal_in_file_manager(&path);
+                crate::update::open_external_url(&itsjustcad_deck::mailto_url(&sheet.draft, &name));
+                self.command_line.push_line(
+                    crate::i18n::t("feedback.saved").replace("{0}", &path.display().to_string()),
+                );
+            }
+            Err(e) => {
+                self.command_line.push_line(format!("feedback: could not write {name}: {e}"));
+                self.feedback_sheet = Some(sheet);
+            }
+        }
+    }
+}
+
 /// Reveal a file in the OS file manager, selecting it. Best-effort — a failure
 /// to spawn the helper is silently ignored (nothing to recover).
 fn reveal_in_file_manager(path: &std::path::Path) {
@@ -11222,6 +11269,29 @@ impl eframe::App for App {
             }
         }
 
+        // `feedback` / Help → "Report a problem…" review sheet.
+        if self.feedback_sheet.is_some() {
+            let roles = self.live_roles(ui.visuals().dark_mode);
+            let action = self
+                .feedback_sheet
+                .as_mut()
+                .and_then(|s| s.ui(ui.ctx(), &roles, self.deck_pane.messages()));
+            match action {
+                Some(crate::feedback_sheet::SheetAction::Send) => self.send_feedback(),
+                Some(crate::feedback_sheet::SheetAction::GitHub) => {
+                    if let Some(s) = &self.feedback_sheet {
+                        crate::update::open_external_url(&itsjustcad_deck::github_issue_url(
+                            &s.draft,
+                            crate::update::APP_VERSION,
+                            &itsjustcad_deck::platform(),
+                        ));
+                    }
+                }
+                Some(crate::feedback_sheet::SheetAction::Cancel) => self.feedback_sheet = None,
+                None => {}
+            }
+        }
+
         // Help → "Check for Updates…" popup. Modeless (draggable / X-closable),
         // like About / Model Setup. Polls the shared UpdateState each frame and
         // renders the current phase. HONEST UNSIGNED behaviour: a newer release
@@ -11673,6 +11743,7 @@ impl eframe::App for App {
         // chat input keeps focus because `focused()` is then `Some`).
         let modal_open = self.show_palette
             || self.show_about
+            || self.feedback_sheet.is_some()
             || self.show_update
             || self.show_history
             || self.show_model_setup

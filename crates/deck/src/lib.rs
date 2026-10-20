@@ -14,6 +14,7 @@ mod config;
 mod deck;
 mod digest;
 mod extract;
+mod feedback;
 mod ffi_prompt;
 mod openai_compat;
 mod probe;
@@ -35,6 +36,11 @@ pub use deck::{
 };
 pub use digest::{digest, digest_filtered, geometry_kind, DigestFilter};
 pub use extract::{Extractor, ExtractEvent};
+pub use feedback::{
+    build_bundle, bundle_filename, document_fits, github_issue_url, last_turns, mailto_url,
+    parse_line as parse_feedback_line, platform, FeedbackCategory, FeedbackDraft, FEEDBACK_EMAIL,
+    GITHUB_NEW_ISSUE_URL, MAX_CHAT_TURNS, MAX_DOC_BYTES,
+};
 pub use ffi_prompt::{ffi_system_prompt, FFI_SELECTOR_HELP, FFI_VIEW_HELP};
 pub use probe::{probe, warm_model, ProbeInfo, WarmOutcome};
 pub use prompt::{
