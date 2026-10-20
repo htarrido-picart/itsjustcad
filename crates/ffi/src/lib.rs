@@ -256,6 +256,10 @@ pub struct AppHandle {
     // scene (render-thread only)
     session: Session,
     camera: OrbitCamera,
+    /// Last size passed to [`ijc_resize`] on a headless handle (which has no
+    /// drawable), for [`ijc_camera_state_json`] / [`ijc_screen_to_world`].
+    /// `None` until set; unused on a GPU handle.
+    viewport: Option<(f32, f32)>,
     last_gen: Option<u64>,
     theme: Theme,
     mode: DisplayMode,
@@ -812,6 +816,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         gpu,
         session: Session::default(),
         camera: OrbitCamera::default(),
+        viewport: None,
         last_gen: None,
         theme: Theme::Dark,
         mode: DisplayMode::default(),
@@ -841,8 +846,10 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
 /// Safe no-ops on a headless handle, since there is nothing to draw:
 /// [`ijc_render_frame`] does nothing (it does NOT apply the queue; use
 /// [`ijc_flush`]); [`ijc_resize`] is ignored; [`ijc_pick`] and
-/// [`ijc_project_point`] return false (no drawable). The camera calls only move
-/// the in-memory camera on the next flush. [`ijc_sheet_pdf`] and
+/// [`ijc_project_point`] return false (no drawable); [`ijc_resize`] only records
+/// the viewport. The camera calls only move the in-memory camera on the next
+/// flush; [`ijc_camera_state_json`] reports it, and [`ijc_screen_to_world`]
+/// works once [`ijc_resize`] has set a viewport (false before). [`ijc_sheet_pdf`] and
 /// [`ijc_sheetset_pdf`] draw Shaded viewports as vector line art.
 #[unsafe(no_mangle)]
 pub extern "C" fn ijc_init_headless() -> *mut AppHandle {
@@ -981,7 +988,9 @@ fn clamp_dim(v: u32, device: &wgpu::Device) -> u32 {
 }
 
 /// Resize the drawable to `w`×`h_px` physical pixels.
-/// Headless handle ([`ijc_init_headless`]): ignored.
+/// Headless handle ([`ijc_init_headless`]): only records the size as the
+/// viewport for [`ijc_camera_state_json`] / [`ijc_screen_to_world`]; a zero
+/// dimension is ignored.
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`].
@@ -991,8 +1000,11 @@ pub unsafe extern "C" fn ijc_resize(h: *mut AppHandle, w: u32, h_px: u32) {
         let Some(mut app) = (unsafe { handle_mut(h) }) else {
             return;
         };
-        // Headless: no surface to resize.
+        // Headless: no surface to resize; remember the viewport.
         let Some(g) = app.gpu.as_mut() else {
+            if w > 0 && h_px > 0 {
+                app.viewport = Some((w as f32, h_px as f32));
+            }
             return;
         };
         g.config.width = clamp_dim(w, &g.device);
@@ -1570,33 +1582,91 @@ pub unsafe extern "C" fn ijc_pick(h: *mut AppHandle, x_px: f32, y_px: f32, addit
         };
 
         let best = pick_nearest(&app.session.doc, origin, dir);
+        apply_pick(&mut app.session.doc, best, additive);
+        best.is_some()
+    })
+}
 
-        // Apply the selection change and report whether we hit anything. We only
-        // bump `generation` (via `get_mut`) when the selection actually changed,
-        // so a redundant tap doesn't force a needless re-snapshot.
-        match best {
-            Some(id) => {
-                let doc = &mut app.session.doc;
-                if additive {
-                    if !doc.selection.remove(&id) {
-                        doc.selection.insert(id);
-                    }
-                } else {
-                    doc.selection.clear();
+/// Apply a pick result to the selection, as documented on [`ijc_pick`]. Only
+/// bumps `generation` when the selection actually changed, so a redundant tap
+/// doesn't force a needless re-snapshot.
+fn apply_pick(
+    doc: &mut itsjustcad_doc::Document,
+    best: Option<itsjustcad_doc::ObjectId>,
+    additive: bool,
+) {
+    match best {
+        Some(id) => {
+            if additive {
+                if !doc.selection.remove(&id) {
                     doc.selection.insert(id);
                 }
-                doc.generation += 1;
-                true
+            } else {
+                doc.selection.clear();
+                doc.selection.insert(id);
             }
-            None => {
-                let doc = &mut app.session.doc;
-                if !additive && !doc.selection.is_empty() {
-                    doc.selection.clear();
-                    doc.generation += 1;
-                }
-                false
+            doc.generation += 1;
+        }
+        None => {
+            if !additive && !doc.selection.is_empty() {
+                doc.selection.clear();
+                doc.generation += 1;
             }
         }
+    }
+}
+
+/// Like [`ijc_pick`] (same ray, same hit object, same selection change), but
+/// returns the hit as JSON: `{"hit":true,"id","uuid","kind","point":[x,y,z]}`,
+/// or `{"hit":false}` on a miss. `kind` is the digest's kind token (as in
+/// [`ijc_selection_json`]). `point` is where the ray meets the object: the
+/// exact triangle for meshes, the bounding box for everything else. Caller
+/// must [`ijc_string_free`] the result.
+///
+/// Headless handle ([`ijc_init_headless`]): returns `{"hit":false}` and leaves
+/// the selection alone, as [`ijc_pick`] does. Returns null only on a panic.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer
+/// must be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_pick_json(
+    h: *mut AppHandle,
+    x_px: f32,
+    y_px: f32,
+    additive: bool,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let miss = || into_c_string(String::from(r#"{"hit":false}"#));
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return miss();
+        };
+        let app: &mut AppHandle = &mut app;
+        let Some((w, h)) = drawable_size(app) else {
+            return miss();
+        };
+        let vp = app.camera.view_proj(w / h);
+        let Some((origin, dir)) = screen_ray(vp, w, h, x_px, y_px) else {
+            return miss();
+        };
+        let doc = &mut app.session.doc;
+        let best = pick_nearest(doc, origin, dir);
+        apply_pick(doc, best, additive);
+        let Some(obj) = best.and_then(|id| doc.get(id)) else {
+            return miss();
+        };
+        let t = object_hit(doc, &obj.geometry, origin, dir, true).unwrap_or(0.0);
+        let p = origin + dir * t;
+        into_c_string(
+            serde_json::json!({
+                "hit": true,
+                "id": obj.id.to_string(),
+                "uuid": obj.id.0.to_string(),
+                "kind": itsjustcad_deck::geometry_kind(&obj.geometry),
+                "point": [p.x, p.y, p.z],
+            })
+            .to_string(),
+        )
     })
 }
 
@@ -1683,6 +1753,177 @@ pub unsafe extern "C" fn ijc_project_point(
             *out_xy = x;
             *out_xy.add(1) = y;
         }
+        true
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Camera state + screen-to-world (where "here" is)
+// ---------------------------------------------------------------------------
+
+/// The viewport for camera queries: the drawable on a GPU handle, else the
+/// last size a headless handle got from [`ijc_resize`] (`None` if never set).
+fn viewport_size(app: &AppHandle) -> Option<(f32, f32)> {
+    drawable_size(app).or(app.viewport)
+}
+
+/// Serialize the camera as the [`ijc_camera_state_json`] object. `eye` and
+/// `up` are the ones `view_proj` looks with: two-point perspective uses a
+/// levelled eye with +Z up; the other modes use `eye()` and the same up
+/// reference `view_proj` uses (Y when looking straight down/up, else Z).
+fn camera_state_json(cam: &OrbitCamera, viewport: Option<(f32, f32)>) -> String {
+    let two_point = cam.two_point && !cam.ortho;
+    let (eye, up) = if two_point {
+        let (sy, cy) = cam.yaw.sin_cos();
+        (cam.target + cam.distance * glam::Vec3::new(cy, sy, 0.0), glam::Vec3::Z)
+    } else {
+        let eye = cam.eye();
+        let ref_up = if cam.pitch.abs() > 1.55 { glam::Vec3::Y } else { glam::Vec3::Z };
+        let forward = (cam.target - eye).normalize();
+        let right = forward.cross(ref_up).normalize();
+        (eye, right.cross(forward))
+    };
+    let v3 = |v: glam::Vec3| [v.x, v.y, v.z];
+    serde_json::json!({
+        "eye": v3(eye),
+        "target": v3(cam.target),
+        "up": v3(up),
+        "fovDeg": cam.fov_y.to_degrees(),
+        "projection": if cam.ortho { "ortho" } else { "perspective" },
+        "viewport": viewport.map(|(w, h)| [w, h]),
+    })
+    .to_string()
+}
+
+/// The camera as JSON:
+/// `{"eye":[x,y,z],"target":[x,y,z],"up":[x,y,z],"fovDeg":f,"projection":"perspective"|"ortho","viewport":[w,h]}`.
+/// `fovDeg` is the vertical field of view; in `ortho` it still sets the view's
+/// half-height at the target. `viewport` is the drawable size in pixels (the
+/// space [`ijc_pick`] consumes), or `null` when unknown. Camera calls are
+/// queued, so this reflects them only after the next [`ijc_render_frame`] /
+/// [`ijc_flush`]. Returns null for a null/invalid handle. Caller must
+/// [`ijc_string_free`] the result.
+///
+/// Headless handle ([`ijc_init_headless`]): reports the in-memory camera;
+/// `viewport` is the last size passed to [`ijc_resize`], or `null`.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`] or
+/// [`ijc_init_headless`]. The returned pointer must be freed exactly once via
+/// [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_state_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return std::ptr::null_mut();
+        };
+        into_c_string(camera_state_json(&app.camera, viewport_size(app)))
+    })
+}
+
+/// Ray parameter where an object's surface meets the ray, if it does. Meshes
+/// (and mesh-backed frames, areas, parametrics) are hit on their exact
+/// triangles; block instances on their bounding box. Curves, annotations and
+/// point clouds have no surface: they are hit on their bounding box only when
+/// `boxes_for_all`, else never.
+fn object_hit(
+    doc: &itsjustcad_doc::Document,
+    geom: &itsjustcad_doc::Geometry,
+    origin: glam::DVec3,
+    dir: glam::DVec3,
+    boxes_for_all: bool,
+) -> Option<f64> {
+    use itsjustcad_doc::Geometry as G;
+    let bb = doc.geometry_aabb(geom);
+    let t_box = ray_aabb(origin, dir, bb.min, bb.max)?;
+    let mesh = match geom {
+        G::Mesh(m)
+        | G::Frame { mesh: m, .. }
+        | G::Area { mesh: m, .. }
+        | G::Parametric { mesh: m, .. } => m,
+        G::Instance { .. } => return Some(t_box),
+        _ => return boxes_for_all.then_some(t_box),
+    };
+    let pos = mesh.positions();
+    let tri = |f: &[u32; 3]| {
+        let v = |i: u32| pos[i as usize];
+        kernel_mesh::ray_triangle(origin, dir, v(f[0]), v(f[1]), v(f[2]))
+    };
+    let hit = mesh.faces().iter().filter_map(tri).min_by(f64::total_cmp);
+    // A mesh the ray misses inside its box (or one without triangles) falls
+    // back to its box only when every kind is box-picked, as `ijc_pick` does.
+    hit.or_else(|| boxes_for_all.then_some(t_box))
+}
+
+/// Ray parameter where the ray meets a construction plane, or `None` when the
+/// ray is parallel to it or the plane is behind the ray origin.
+fn ray_plane(plane: &itsjustcad_doc::CPlane, origin: glam::DVec3, dir: glam::DVec3) -> Option<f64> {
+    let denom = dir.dot(plane.normal);
+    if denom.abs() < 1e-9 {
+        return None;
+    }
+    let t = (plane.origin - origin).dot(plane.normal) / denom;
+    (t.is_finite() && t >= 0.0).then_some(t)
+}
+
+/// Where a pick ray lands, for [`ijc_screen_to_world`]: the nearest visible
+/// object surface, else the active construction plane.
+fn ray_to_world(
+    doc: &itsjustcad_doc::Document,
+    origin: glam::DVec3,
+    dir: glam::DVec3,
+) -> Option<glam::DVec3> {
+    let surface = doc
+        .objects()
+        .filter(|o| o.visible && doc.layer_visible(&o.layer))
+        .filter_map(|o| object_hit(doc, &o.geometry, origin, dir, false))
+        .min_by(f64::total_cmp);
+    let t = surface.or_else(|| ray_plane(&doc.cplane, origin, dir))?;
+    Some(origin + dir * t)
+}
+
+/// Cast a ray from a screen point (physical drawable pixels, the space
+/// [`ijc_pick`] consumes) and write the world point it lands on into
+/// `out_xyz` (3 `f64`). The point is the nearest visible object surface (exact
+/// triangles for meshes, the bounding box for block instances; curves,
+/// annotations and point clouds are skipped), else the active construction
+/// plane (world XY, z=0, unless a `cplane` is set). Returns `false`, writing
+/// nothing, when nothing is hit (the ray is parallel to the plane, or the plane
+/// is behind the camera), on a null/invalid handle, or a null `out_xyz`.
+/// Does not change the selection.
+///
+/// Headless handle ([`ijc_init_headless`]): uses the last size passed to
+/// [`ijc_resize`] as the viewport, and returns false if none was set.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`] or
+/// [`ijc_init_headless`]. `out_xyz` must be null or valid for writes of
+/// 3 `f64`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_screen_to_world(
+    h: *mut AppHandle,
+    x_px: f32,
+    y_px: f32,
+    out_xyz: *mut f64,
+) -> bool {
+    guard_ffi(false, || {
+        if out_xyz.is_null() {
+            return false;
+        }
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return false;
+        };
+        let Some((w, h_px)) = viewport_size(app) else {
+            return false;
+        };
+        let vp = app.camera.view_proj(w / h_px);
+        let Some((origin, dir)) = screen_ray(vp, w, h_px, x_px, y_px) else {
+            return false;
+        };
+        let Some(p) = ray_to_world(&app.session.doc, origin, dir) else {
+            return false;
+        };
+        unsafe { std::slice::from_raw_parts_mut(out_xyz, 3) }.copy_from_slice(&[p.x, p.y, p.z]);
         true
     })
 }
@@ -5025,6 +5266,108 @@ mod headless_tests {
         }
     }
 
+    fn camera_state(h: *mut AppHandle) -> serde_json::Value {
+        serde_json::from_str(&unsafe { take(ijc_camera_state_json(h)) }).unwrap()
+    }
+
+    #[test]
+    fn headless_camera_state_follows_orbit_pan_zoom() {
+        let h = ijc_init_headless();
+        unsafe {
+            let s0 = camera_state(h);
+            assert_eq!(s0["projection"], "perspective");
+            assert_eq!(s0["target"], serde_json::json!([0.0, 0.0, 1.0]));
+            assert!((s0["fovDeg"].as_f64().unwrap() - 45.0).abs() < 1e-4);
+            assert!(s0["viewport"].is_null(), "no viewport before ijc_resize");
+            let eye0 = s0["eye"].clone();
+
+            // Queued: nothing changes until the flush.
+            ijc_camera_orbit(h, 100.0, 0.0);
+            assert_eq!(camera_state(h)["eye"], eye0);
+            assert!(ijc_flush(h));
+            let s1 = camera_state(h);
+            assert_ne!(s1["eye"], eye0, "orbit moves the eye");
+            assert_eq!(s1["target"], s0["target"], "orbit keeps the target");
+
+            ijc_camera_pan(h, 50.0, 0.0);
+            assert!(ijc_flush(h));
+            let s2 = camera_state(h);
+            assert_ne!(s2["target"], s1["target"], "pan moves the target");
+
+            let dist = |s: &serde_json::Value| {
+                let v = |k: &str, i: usize| s[k][i].as_f64().unwrap();
+                (0..3).map(|i| (v("eye", i) - v("target", i)).powi(2)).sum::<f64>().sqrt()
+            };
+            ijc_camera_zoom(h, 2.0);
+            assert!(ijc_flush(h));
+            let s3 = camera_state(h);
+            assert!((dist(&s3) - dist(&s2) / 2.0).abs() < 1e-2, "zoom 2x halves the distance");
+
+            // `up` is a unit vector perpendicular to the view direction.
+            let up: Vec<f64> = (0..3).map(|i| s3["up"][i].as_f64().unwrap()).collect();
+            let fwd: Vec<f64> =
+                (0..3).map(|i| s3["target"][i].as_f64().unwrap() - s3["eye"][i].as_f64().unwrap()).collect();
+            assert!((up.iter().map(|x| x * x).sum::<f64>() - 1.0).abs() < 1e-5);
+            assert!(up.iter().zip(&fwd).map(|(a, b)| a * b).sum::<f64>().abs() < 1e-3);
+
+            ijc_resize(h, 800, 600);
+            assert_eq!(camera_state(h)["viewport"], serde_json::json!([800.0, 600.0]));
+            ijc_resize(h, 0, 600); // ignored
+            assert_eq!(camera_state(h)["viewport"], serde_json::json!([800.0, 600.0]));
+
+            ijc_run_command_result(h, c("view top").as_ptr()).pipe_free();
+            assert!(ijc_flush(h));
+            assert_eq!(camera_state(h)["projection"], "ortho");
+            assert!(ijc_camera_state_json(std::ptr::null_mut()).is_null());
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn screen_to_world_hits_box_face_then_ground() {
+        let h = ijc_init_headless();
+        let mut p = [0f64; 3];
+        unsafe {
+            // Straight down over the origin; no viewport yet → false.
+            ijc_run_command_result(h, c("view top").as_ptr()).pipe_free();
+            assert!(ijc_flush(h));
+            assert!(!ijc_screen_to_world(h, 50.0, 50.0, p.as_mut_ptr()));
+            ijc_resize(h, 100, 100);
+
+            // Empty scene: the center ray lands on the ground under the target.
+            assert!(ijc_screen_to_world(h, 50.0, 50.0, p.as_mut_ptr()));
+            assert!(p[0].abs() < 1e-3 && p[1].abs() < 1e-3 && p[2].abs() < 1e-9, "{p:?}");
+
+            // A box under the target: the ray stops on its top face at z=2.
+            ijc_run_command_result(h, c("box -1,-1,0 2,2,2").as_ptr()).pipe_free();
+            assert!(ijc_screen_to_world(h, 50.0, 50.0, p.as_mut_ptr()));
+            assert!((p[2] - 2.0).abs() < 1e-6 && p[0].abs() < 1e-3, "{p:?}");
+
+            // A pixel near the edge misses the box and falls through to the ground.
+            assert!(ijc_screen_to_world(h, 2.0, 50.0, p.as_mut_ptr()));
+            assert!(p[2].abs() < 1e-9 && p[0].abs().max(p[1].abs()) > 1.0, "{p:?}");
+
+            assert!(!ijc_screen_to_world(h, 50.0, 50.0, std::ptr::null_mut()));
+            assert!(!ijc_screen_to_world(std::ptr::null_mut(), 50.0, 50.0, p.as_mut_ptr()));
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn ray_parallel_to_plane_misses() {
+        let doc = itsjustcad_doc::Document::default();
+        let flat = glam::DVec3::X;
+        assert_eq!(ray_to_world(&doc, glam::DVec3::new(0.0, 0.0, 5.0), flat), None);
+        // Plane behind the ray (looking up from above it) also misses.
+        assert_eq!(ray_to_world(&doc, glam::DVec3::new(0.0, 0.0, 5.0), glam::DVec3::Z), None);
+        // A raised construction plane is used instead of the ground.
+        let mut doc = doc;
+        doc.cplane = itsjustcad_doc::CPlane::from_origin_normal(glam::DVec3::new(0.0, 0.0, 3.0), glam::DVec3::Z)
+            .unwrap();
+        let p = ray_to_world(&doc, glam::DVec3::new(1.0, 2.0, 5.0), -glam::DVec3::Z).unwrap();
+        assert!((p - glam::DVec3::new(1.0, 2.0, 3.0)).length() < 1e-12);
+    }
+
     #[test]
     fn headless_render_and_gpu_calls_are_safe() {
         let h = ijc_init_headless();
@@ -5039,6 +5382,7 @@ mod headless_tests {
             ijc_camera_zoom_extents(h);
             assert!(ijc_flush(h));
             assert!(!ijc_pick(h, 10.0, 10.0, false));
+            assert_eq!(take(ijc_pick_json(h, 10.0, 10.0, false)), r#"{"hit":false}"#);
             let (world, mut xy) = ([0.5f64; 3], [0f32; 2]);
             assert!(!ijc_project_point(h, world.as_ptr(), xy.as_mut_ptr()));
 
