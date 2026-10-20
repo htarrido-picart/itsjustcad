@@ -140,12 +140,7 @@ pub struct KeybindingsFile {
 }
 
 pub fn config_path() -> Option<std::path::PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
-            .join("keybindings.json"),
-    )
+    Some(crate::config_dir()?.join("keybindings.json"))
 }
 
 impl KeybindingsFile {

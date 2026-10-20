@@ -137,12 +137,7 @@ impl SdCatalog {
 /// The directory downloaded SD weights live in:
 /// `~/.config/itsjustcad/sdmodels` (parallel to the LLM `models` dir).
 pub fn sd_models_dir() -> Option<std::path::PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
-            .join("sdmodels"),
-    )
+    Some(crate::config_dir()?.join("sdmodels"))
 }
 
 #[cfg(test)]
@@ -254,9 +249,7 @@ mod tests {
 
     #[test]
     fn sd_models_dir_is_under_config() {
-        if let Some(d) = sd_models_dir() {
-            assert!(d.ends_with("sdmodels"), "{d:?}");
-            assert!(d.to_string_lossy().contains("itsjustcad"), "{d:?}");
-        }
+        let d = sd_models_dir().expect("sd models dir");
+        assert_eq!(d, crate::config_dir().unwrap().join("sdmodels"));
     }
 }

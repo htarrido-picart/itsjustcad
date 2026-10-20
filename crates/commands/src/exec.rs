@@ -26850,10 +26850,6 @@ mod tests {
 
     // ── M-dwg-bridge: assisted DWG import + scoped workdir ─────────────────────
 
-    /// Tests here mutate the process `PATH`/`HOME`, so they serialize on one
-    /// mutex to avoid racing each other (cargo runs tests in parallel threads).
-    static DWG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Full flow, converter-independent: `import_dwg`'s conversion+validation is
     /// proven deterministically in `crate::dwg` (stubbed `dwg2dxf` emitting valid
     /// vs truncated DXF), because on a host WITH a real LibreDWG installed the
@@ -26938,11 +26934,11 @@ mod tests {
     }
 
     /// `import <bare-name>` resolves inside the granted workdir; a traversal name
-    /// is refused. Uses an isolated `$HOME` so the persisted grant is hermetic.
+    /// is refused. The grant and its persisted config are per test thread under
+    /// `cfg(test)` (see `workdir::config_dir`), so this stays hermetic.
     #[cfg(unix)]
     #[test]
     fn import_resolves_bare_name_in_workdir_and_guards_traversal() {
-        let _guard = DWG_ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!("ijc_wdhome_{}", std::process::id()));
         let work = home.join("Drawings");
         let _ = std::fs::remove_dir_all(&home);
@@ -26953,9 +26949,6 @@ mod tests {
             "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDSEC\n0\nEOF\n",
         )
         .unwrap();
-
-        let prev_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", &home) };
 
         let result = (|| {
             let mut s = Session::default();
@@ -26972,11 +26965,10 @@ mod tests {
             Ok::<(), ExecError>(())
         })();
 
-        match prev_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
         let _ = std::fs::remove_dir_all(&home);
+        if let Some(cfg) = crate::workdir::workdir_config_path() {
+            let _ = std::fs::remove_dir_all(cfg.parent().unwrap());
+        }
         result.unwrap();
     }
 

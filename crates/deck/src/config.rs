@@ -271,7 +271,7 @@ impl Default for DecksFile {
 
 pub fn config_path() -> Option<std::path::PathBuf> {
     // ~/.config/itsjustcad on every platform — CLI-tool convention, greppable.
-    Some(dirs::home_dir()?.join(".config").join("itsjustcad").join("decks.json"))
+    Some(crate::config_dir()?.join("decks.json"))
 }
 
 impl DecksFile {
@@ -385,10 +385,11 @@ mod tests {
     // so a macOS-only dir can never sneak in (GitHub issue #26).
     #[test]
     fn decks_config_path_is_under_dot_config_itsjustcad() {
-        if let Some(p) = config_path() {
-            let home = dirs::home_dir().expect("home dir");
-            assert_eq!(p, home.join(".config").join("itsjustcad").join("decks.json"));
-        }
+        let home = std::path::Path::new("/home/someone");
+        assert_eq!(crate::home_config_dir(home), home.join(".config").join("itsjustcad"));
+        let p = config_path().expect("config path");
+        assert_eq!(p, crate::config_dir().unwrap().join("decks.json"));
+        assert!(!p.starts_with(dirs::home_dir().expect("home dir")), "tests never use the real config");
     }
 
     #[test]

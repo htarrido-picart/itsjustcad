@@ -40,12 +40,7 @@ pub const MIGRATIONS: &[&str] = &["v1_initial"];
 
 /// App-wide database path: `~/.config/itsjustcad/itsjustcad.db`.
 pub fn db_path() -> Option<PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
-            .join("itsjustcad.db"),
-    )
+    Some(crate::config_dir()?.join("itsjustcad.db"))
 }
 
 /// THE single connection-open seam.

@@ -440,9 +440,7 @@ pub fn store_path(doc_uuid: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
+        crate::config_dir()?
             .join("chats")
             .join(format!("{doc_uuid}.json")),
     )

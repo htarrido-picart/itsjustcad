@@ -209,10 +209,9 @@ pub(crate) fn migrate_legacy_config() {
 /// The directory is created if it does not exist.
 pub(crate) fn private_runtime_dir() -> std::path::PathBuf {
     let candidate = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("itsjustcad");
+        .map(|d| std::path::PathBuf::from(d).join("itsjustcad"))
+        .or_else(crate::config_dir)
+        .unwrap_or_else(|| std::env::temp_dir().join("itsjustcad"));
 
     if !candidate.exists() {
         #[cfg(unix)]
@@ -9965,12 +9964,7 @@ impl App {
 /// keyed to ONE stable uuid across launches so its chat sessions survive (issue
 /// #58). `None` only when there is no home directory.
 fn scratch_doc_uuid_path() -> Option<std::path::PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
-            .join("scratch_doc_uuid"),
-    )
+    Some(crate::config_dir()?.join("scratch_doc_uuid"))
 }
 
 /// Read the persisted scratch document uuid, minting + persisting one on first
@@ -10092,7 +10086,7 @@ fn open_plugins_folder(command_line: &mut crate::command_line::CommandLine) {
 }
 
 fn ui_config_path() -> Option<std::path::PathBuf> {
-    Some(dirs::home_dir()?.join(".config").join("itsjustcad").join("ui.json"))
+    Some(crate::config_dir()?.join("ui.json"))
 }
 
 fn load_ui_json() -> serde_json::Value {
@@ -13958,11 +13952,14 @@ mod tests {
     // All user config lives under `$HOME/.config/itsjustcad/…`. On Linux
     // `dirs::home_dir()` reads `$HOME`, so this is the XDG default; this test
     // pins the layout so a macOS-only dir (e.g. Application Support) can never
-    // sneak in.
+    // sneak in. Under test, `config_dir()` is a temp dir, so the files must
+    // hang off it and the home layout is pinned on `home_config_dir`.
     #[test]
     fn user_config_paths_live_under_dot_config_itsjustcad() {
-        let home = dirs::home_dir().expect("home dir");
-        let base = home.join(".config").join("itsjustcad");
+        let home = std::path::Path::new("/home/someone");
+        assert_eq!(crate::home_config_dir(home), home.join(".config").join("itsjustcad"));
+        let base = crate::config_dir().expect("config dir");
+        assert!(!base.starts_with(dirs::home_dir().expect("home dir")), "tests never use the real config");
 
         let kb = crate::keybindings::config_path().expect("keybindings path");
         assert_eq!(kb, base.join("keybindings.json"));

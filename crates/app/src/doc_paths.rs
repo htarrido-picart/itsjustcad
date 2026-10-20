@@ -68,12 +68,7 @@ impl DocPaths {
 /// Default map path: `~/.config/itsjustcad/doc_paths.json`. `None` only when
 /// there is no home directory.
 pub fn default_path() -> Option<PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
-            .join("doc_paths.json"),
-    )
+    Some(crate::config_dir()?.join("doc_paths.json"))
 }
 
 /// Load the map from the default path, returning an empty map when there is no

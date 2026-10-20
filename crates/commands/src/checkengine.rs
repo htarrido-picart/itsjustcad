@@ -400,7 +400,7 @@ pub fn ada_pack() -> CheckPack {
 /// Default on-disk location for user check packs:
 /// `~/.config/itsjustcad/checks/<name>.checks.json`.
 pub fn default_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".config").join("itsjustcad").join("checks"))
+    Some(crate::config_dir()?.join("checks"))
 }
 
 /// Load every `*.checks.json` pack under `dir` (absent dir = empty). Malformed

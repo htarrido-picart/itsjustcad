@@ -148,7 +148,7 @@ fn write_all(path: &Path, lines: &[String]) -> std::io::Result<()> {
 }
 
 pub fn default_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".config").join("itsjustcad").join("journal"))
+    Some(crate::config_dir()?.join("journal"))
 }
 
 /// How recently a journal must have been untouched to be considered from a

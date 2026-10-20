@@ -616,9 +616,7 @@ fn saved_chat_path(doc_uuid: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
+        crate::config_dir()?
             .join("chats")
             .join(format!("{doc_uuid}.draft.json")),
     )
@@ -628,9 +626,7 @@ fn saved_chat_path(doc_uuid: &str) -> Option<std::path::PathBuf> {
 /// one-time migration into the current document's per-doc draft; deleted after.
 fn legacy_global_chat_path() -> Option<std::path::PathBuf> {
     Some(
-        dirs::home_dir()?
-            .join(".config")
-            .join("itsjustcad")
+        crate::config_dir()?
             .join("deck_chat.json"),
     )
 }
