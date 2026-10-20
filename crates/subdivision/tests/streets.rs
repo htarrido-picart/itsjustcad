@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Phase 5 validation (plan §9): road generators + block extraction + street
+//! Validation: road generators + block extraction + street
 //! tagging. Each of the four rectilinear generators runs on a real rectangular
 //! and an L-shaped site; the emitted blocks must be non-overlapping, cover the
 //! site minus road ROW within tolerance, carry correct street tags, and be
@@ -217,7 +217,7 @@ fn alley_tier_present_only_when_alley_loaded() {
     }
 }
 
-// ─────────────────────────── Phase 5b (owner scope) ───────────────────────────
+// ──────────────────── Non-rectilinear generators (owner scope) ─────────────────
 // Radial / hexagonal / Voronoi generators. Same bar as the rectilinear four:
 // valid graph, non-overlapping blocks that stay inside the site, street-tagged
 // blocks, byte-identical replay. Plus generator-specific geometry checks.
@@ -246,7 +246,7 @@ fn nonrectilinear_generators_produce_blocks_on_rect_and_l() {
 #[test]
 fn nonrectilinear_blocks_carry_street_tags() {
     // Every non-rectilinear generator carves interior streets, so at least some
-    // emitted block edges must be street-tagged (the §5 hard dependency).
+    // emitted block edges must be street-tagged (the hard dependency).
     let site = rect_site();
     for p in NONRECT_PATTERNS {
         let (_g, blocks) = run_generator(&site, p);
@@ -377,7 +377,7 @@ fn nonrectilinear_honor_force_street_access_downstream() {
     use subdivision::{subdivide, SubdivisionMethod};
     // A generated non-rectilinear block, fed to recursive-OBB subdivision with
     // force_street_access=1.0, yields lots that all keep frontage — confirming the
-    // tagged block geometry survives (plan §8 "feed lotsubdivide" requirement).
+    // tagged block geometry survives (the "feed lotsubdivide" requirement).
     let site = rect_site();
     for p in NONRECT_PATTERNS {
         let s = base_settings(p);

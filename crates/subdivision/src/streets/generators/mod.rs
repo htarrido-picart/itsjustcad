@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Road-network generators (plan §7.3). The FOUR rectilinear generators
-//! (Phase 5), each turning a site boundary + `SubdivisionSettings` into a
+//! Road-network generators. The FOUR rectilinear generators,
+//! each turning a site boundary + `SubdivisionSettings` into a
 //! [`StreetGraph`]:
 //!
 //! - [`orthogonal`] — recursive-OBB split of the *site* down to ~2× lot depth;
@@ -13,7 +13,7 @@
 //! - [`culdesac`] — a spine road with perpendicular stubs ending in bulbs,
 //!   spaced by block depth.
 //!
-//! **Three non-rectilinear (owner scope, Phase 5b):**
+//! **Three non-rectilinear (owner scope):**
 //!
 //! - [`radial`] — concentric ring roads at block-depth spacing + radial spokes
 //!   from a center (or centers), clipped to the site; blocks are annular sectors.
@@ -114,8 +114,8 @@ pub(crate) fn effective_road_width(settings: &SubdivisionSettings) -> f64 {
     }
 }
 
-/// Dispatch on `settings.street_pattern` to the matching generator. Phase 5
-/// covers the four rectilinear patterns; Phase 5b adds the three non-rectilinear
+/// Dispatch on `settings.street_pattern` to the matching generator: the
+/// four rectilinear patterns plus the three non-rectilinear
 /// generators (radial / hexagonal / Voronoi). All seven produce a `StreetGraph`
 /// fed to the same `block_extractor`.
 pub fn generate(site: &Polygon2d, settings: &SubdivisionSettings) -> StreetGraph {
@@ -124,7 +124,7 @@ pub fn generate(site: &Polygon2d, settings: &SubdivisionSettings) -> StreetGraph
         StreetPattern::Skewed => skewed::generate(site, settings),
         StreetPattern::Organic => organic::generate(site, settings),
         StreetPattern::CulDeSac => culdesac::generate(site, settings),
-        // Phase 5b — owner scope, non-rectilinear.
+        // Owner scope, non-rectilinear.
         StreetPattern::Radial => radial::generate(site, settings),
         StreetPattern::Hexagonal => hexagonal::generate(site, settings),
         StreetPattern::Voronoi => voronoi::generate(site, settings),

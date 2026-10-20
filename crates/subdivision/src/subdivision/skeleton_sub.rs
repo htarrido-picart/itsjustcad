@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Skeleton (street-following) subdivision (plan §7.5, Phase 7) —
+//! Skeleton (street-following) subdivision —
 //! `method=streetfollowing`.
 //!
 //! This is the method that produces lot lines *perpendicular to the curve* around
-//! cul-de-sac bulbs and curved streets — the visually important case. Steps (§7.5):
+//! cul-de-sac bulbs and curved streets — the visually important case. Steps:
 //!
 //! 1. Straight skeleton of the block → faces, one per contour edge
 //!    ([`crate::straight_skeleton`]).
@@ -25,9 +25,9 @@
 //! for a fixed seed automatically. The `Lot` type + street tagging match the
 //! recursive/offset paths so the bake path is identical.
 //!
-//! Untagged blocks (a plain `lotsubdivide` on an arbitrary curve, no Phase-5
+//! Untagged blocks (a plain `lotsubdivide` on an arbitrary curve, no road-network
 //! street graph) treat EVERY contour edge as frontage — same convention as
-//! `recursive_obb` — so the method is usable on the §8 sample blocks directly.
+//! `recursive_obb` — so the method is usable on the sample blocks directly.
 
 use crate::blocks::block::Block;
 use crate::blocks::block_edge::BlockEdge;
@@ -41,7 +41,7 @@ use crate::subdivision::recursive_obb::Lot;
 use glam::DVec2;
 
 /// Public entry: subdivide a *tagged* `block` into lots using the straight
-/// skeleton (street-following). Deterministic. When the block carries Phase-5
+/// skeleton (street-following). Deterministic. When the block carries road-network
 /// street tags, only street edges seed frontage; an untagged block treats every
 /// contour edge as frontage.
 pub fn subdivide_block(block: &Block, settings: &SubdivisionSettings) -> Vec<Lot> {
@@ -51,8 +51,8 @@ pub fn subdivide_block(block: &Block, settings: &SubdivisionSettings) -> Vec<Lot
     }
 
     // 1. Straight skeleton → one face per contour edge. The backend is selected
-    // by `settings.skeleton_impl` (§12.2): the robust Phase-7 offset-approximate
-    // skeleton (default) or the true Phase-12 Felkel skeleton (convex-exact,
+    // by `settings.skeleton_impl` the robust offset-approximate
+    // skeleton (default) or the true Felkel skeleton (convex-exact,
     // non-convex fallback). Both implement the same `StraightSkeleton` trait, so
     // the rest of the subdivider is unchanged.
     let faces = match settings.skeleton_impl {
@@ -121,7 +121,7 @@ pub fn subdivide_block(block: &Block, settings: &SubdivisionSettings) -> Vec<Lot
     lots
 }
 
-/// Convenience for plain (untagged) blocks / the §8 samples.
+/// Convenience for plain (untagged) blocks / the sample blocks.
 pub fn subdivide(poly: &Polygon2d, settings: &SubdivisionSettings) -> Vec<Lot> {
     subdivide_block(&Block::untagged(poly.clone()), settings)
 }
@@ -183,9 +183,9 @@ fn corner_wins(a: (f64, f64), b: (f64, f64), align: CornerAlignment) -> bool {
 }
 
 /// Group adjacent faces whose street edges have similar curvature into bands
-/// (§7.5 step 2). Non-street faces become singleton groups, EXCEPT a non-street
+/// (step 2). Non-street faces become singleton groups, EXCEPT a non-street
 /// "corner" face wedged between two street bands is annexed by the winning band
-/// per `corner_align` (§7.5 step 3: widest street wins, tie-break on length).
+/// per `corner_align` (step 3: widest street wins, tie-break on length).
 /// Two adjacent street faces join when the turn angle between their base edges is
 /// below a threshold (a curved street reads as one band, not a per-segment fan).
 fn group_faces(
@@ -249,7 +249,7 @@ fn group_faces(
         });
     }
 
-    // §7.5 step 3 — annex non-street "corner" faces to the winning street band.
+    // Step 3 — annex non-street "corner" faces to the winning street band.
     // A corner face is a non-street singleton whose contour neighbours (edge
     // index ±1) are both street bands; it joins whichever wins under corner_align.
     let group_of = |face_idx: usize, groups: &[FaceGroup]| -> Option<usize> {
@@ -296,7 +296,7 @@ fn base_turn(a: &SkeletonFace, b: &SkeletonFace, _poly: &Polygon2d) -> f64 {
 }
 
 /// Slice one face group perpendicular to its street edge(s) at `lot_width_min`
-/// spacing (§7.5 step 4). For a street band the frontage is the concatenated base
+/// spacing (step 4). For a street band the frontage is the concatenated base
 /// edges; we slice along it. For a non-street singleton we still slice its face
 /// along its longer base direction so it does not stay one giant lot.
 fn slice_group(
@@ -557,11 +557,11 @@ fn merge_streetless(mut lots: Vec<Lot>) -> Vec<Lot> {
     lots
 }
 
-/// §7.5 step 5 — merge any lot below `lot_area_min` into a neighbour.
+/// Step 5 — merge any lot below `lot_area_min` into a neighbour.
 ///
-/// Uses the Phase-6 sliver merger, but ONLY on a below-threshold lot that has a
+/// Uses the lot-rules sliver merger, but ONLY on a below-threshold lot that has a
 /// genuinely edge-adjacent neighbour (verified by a conserving union). The
-/// Phase-6 merger keeps the largest ring of a union and would drop area if it
+/// sliver merger keeps the largest ring of a union and would drop area if it
 /// merged two non-adjacent lots; the skeleton produces more such candidates
 /// (curved wedges whose shared edges do not register), so we pre-check adjacency
 /// per lot and keep any lot that has no conserving merge rather than lose it.
@@ -623,7 +623,7 @@ fn merge_small(mut lots: Vec<Lot>, area_min: f64) -> Vec<Lot> {
     lots
 }
 
-/// §7.5 step 6 — merge shallow/triangular lots. A lot is "shallow" when its OBB
+/// Step 6 — merge shallow/triangular lots. A lot is "shallow" when its OBB
 /// short extent is below `shallow_lot_frac × long extent` (a thin sliver / sharp
 /// triangle). Merge those into their largest-shared-edge neighbour.
 fn merge_shallow(lots: Vec<Lot>, frac: f64) -> Vec<Lot> {
@@ -701,7 +701,7 @@ fn shared_boundary_len(a: &Polygon2d, b: &Polygon2d) -> f64 {
     total
 }
 
-/// §7.5 step 7 — Douglas–Peucker vertex reduction on a lot polygon.
+/// Step 7 — Douglas–Peucker vertex reduction on a lot polygon.
 fn simplify_polygon(poly: &Polygon2d, eps: f64) -> Option<Polygon2d> {
     let mut pts = poly.verts().to_vec();
     // Close the ring for DP, simplify, then reopen.

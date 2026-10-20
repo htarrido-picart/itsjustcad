@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Lot rules (plan §7.4, Phase 6) — the bulk of Manuel's asks, applied as a
+//! Lot rules — the bulk of the client's requirements, applied as a
 //! post-pass / mode on subdivision:
 //!
 //! - [`width_mix`] — the packing solver (frontage → width sequence).
@@ -13,7 +13,7 @@
 //! - [`sliver`] — merge sub-threshold lots into their largest-shared-edge
 //!   neighbour until none remain.
 //!
-//! **euro_latam defaults are PLACEHOLDERS** (plan §6b, §1 open questions). When a
+//! **euro_latam defaults are PLACEHOLDERS** (open questions with the client). When a
 //! run resolves a rule from the euro_latam profile because the user gave no
 //! explicit override, [`LotRulesReport::used_placeholder`] is set so the command
 //! can print "using euro_latam defaults (placeholder — verify against local regulations)".
@@ -41,7 +41,7 @@ use glam::DVec2;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LotRulesReport {
     /// True if any rule value came from the euro_latam profile (no user
-    /// override) — surfaces the "placeholder — confirm with Manuel" note.
+    /// override) — surfaces the "placeholder — verify against local regulations" note.
     pub used_placeholder: bool,
     /// Human-readable list of the placeholder values that were applied.
     pub placeholder_notes: Vec<String>,
@@ -228,12 +228,12 @@ fn neighbour_down_dir(lots: &[Lot], corner_idx: usize, dir: DVec2) -> Option<usi
     best.map(|(i, _)| i)
 }
 
-/// Width-mix frontage subdivision (plan §7.4): slice `block` into lots along its
+/// Width-mix frontage subdivision: slice `block` into lots along its
 /// longest street frontage using the width-mix packing solver, at the loading
 /// plan's depth. Falls back to an empty vec if the block has no usable frontage
 /// (caller then uses the recursive/offset path). Deterministic.
 ///
-/// Returns the lots + the achieved width-mix proportion error (for the §9
+/// Returns the lots + the achieved width-mix proportion error (for the
 /// "within 5 %" verification) + whether placeholders were used.
 pub fn subdivide_width_mix(
     block: &Block,
@@ -243,8 +243,8 @@ pub fn subdivide_width_mix(
     let mix = mix?;
     let solver = WidthMixSolver::new(&mix.products)?;
 
-    // Frontage = the longest street edge (Phase 5 tags) or, absent tags, the
-    // longest block edge (Phase 3/4 treat every boundary edge as frontage).
+    // Frontage = the longest street edge (road-network tags) or, absent tags, the
+    // longest block edge (grid/perimeter treat every boundary edge as frontage).
     let (fa, fb) = longest_frontage(block)?;
     let frontage = fa.distance(fb);
     if frontage < solver.min_width() {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Voronoi generator (plan §7.3 / §1 owner scope, Phase 5b): seed points
+//! Voronoi generator (owner scope, non-rectilinear): seed points
 //! (jittered grid, seeded from op data for replay) → Voronoi diagram built as
 //! the **dual of the Delaunay triangulation** — the Voronoi vertices are the
 //! circumcenters of the Delaunay triangles, and a Voronoi edge joins the

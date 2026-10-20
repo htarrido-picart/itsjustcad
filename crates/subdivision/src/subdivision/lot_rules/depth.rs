@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `DepthController` (plan §7.4, Phase 6) — an INDEPENDENT depth target, separate
+//! `DepthController` — an INDEPENDENT depth target, separate
 //! from area. euro_latam default 25 m ±5 (placeholder). A lot's "depth" is its
 //! extent perpendicular to its street frontage; where no frontage edge is known
 //! we use the OBB long extent. The controller does not itself cut geometry (that

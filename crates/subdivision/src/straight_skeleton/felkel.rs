@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `FelkelSkeleton` (plan §5 / §12, Phase 12) — a **true** straight-skeleton
+//! `FelkelSkeleton` — a **true** straight-skeleton
 //! implementation following Felkel & Obdržálek (1998), *"Straight Skeleton
 //! Implementation"*.
 //!
@@ -100,7 +100,7 @@ impl StraightSkeleton for FelkelSkeleton {
             }
         }
         // Non-convex (split events needed) OR degenerate convex run → the robust
-        // Phase-7 approximate skeleton. Documented partial (§12.2).
+        // approximate skeleton. Documented partial.
         OffsetApproxSkeleton::new().faces(poly)
     }
 }

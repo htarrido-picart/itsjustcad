@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Offset / perimeter subdivision (plan §7.2, Phase 4) — `method=perimeter`.
+//! Offset / perimeter subdivision — `method=perimeter`.
 //!
 //! Inward-offset the block by `offset_width` to get an interior **core**; the
 //! ring between the block boundary and the core is the **perimeter strip**. Walk
@@ -12,7 +12,7 @@
 //! `subdivide_core` is set, the interior core is subdivided by `recursive_obb`;
 //! otherwise it stays a single hollow-ring interior lot.
 //!
-//! **Degenerate fallbacks (plan §9 Phase 4):** if `offset_width ≈ 0`, or the
+//! **Degenerate fallbacks:** if `offset_width ≈ 0`, or the
 //! inward offset collapses / empties (a deep inset on a small or thin block), we
 //! fall back to plain `recursive_obb` on the whole block. Never panic, never emit
 //! garbage. Area is conserved either way.
@@ -90,8 +90,8 @@ fn point_on_segment(p: DVec2, a: DVec2, b: DVec2, tol: f64) -> bool {
     p.distance(proj) < tol
 }
 
-/// Whether `lot` touches the original block boundary (its Phase-4 street edge —
-/// like Phase 3, any original block boundary edge counts as frontage).
+/// Whether `lot` touches the original block boundary (its street edge —
+/// like `method=grid`, any original block boundary edge counts as frontage).
 fn touches_boundary(lot: &Polygon2d, block_edges: &[(DVec2, DVec2)]) -> bool {
     for (a, b) in lot.edges() {
         let mid = (a + b) * 0.5;

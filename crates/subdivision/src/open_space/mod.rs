@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Open-space feature placement + blind %-reserve (plan §1, §9 Phase 9).
+//! Open-space feature placement + blind %-reserve.
 //!
 //! Two modes, both baking onto the `openspace` layer so a future `lotreport`
-//! (Phase 11) can subtract them from gross site area (net-of-open-space):
+//! (yield reporting) can subtract them from gross site area (net-of-open-space):
 //!
-//! - **Feature placement** (default, Manuel's questionnaire): the tool PLACES a
+//! - **Feature placement** (default, per the client's questionnaire): the tool PLACES a
 //!   marked amenity — a [`pocket_park`], a [`greenway`] trail corridor, a
 //!   [`retention_pond`], or a [`tree_save`] area — as a valid, non-self-
 //!   intersecting polygon at a selected region (or the largest empty block).
-//! - **Blind %-reserve** (owner opt-in keyword, §1): [`reserve_blocks`] pulls
+//! - **Blind %-reserve** (owner opt-in keyword): [`reserve_blocks`] pulls
 //!   whole blocks out of subdivision, biggest-and-most-central first, until the
 //!   reserved area reaches ~pct of the site (CityEngine's model: open space = a
 //!   block you chose not to subdivide). Reserved blocks are returned tagged so
 //!   yield nets them out and a later `lotsubdivide` skips them.
 //!
-//! **Advisory (plan §9):** these are DESIGN-INTENT placements, not hydrology or
+//! **Advisory:** these are DESIGN-INTENT placements, not hydrology or
 //! ecology engineering. A retention pond here is a rounded polygon of the
 //! requested area, NOT a sized detention basin; a tree-save is a marked polygon,
 //! not a surveyed canopy. The commands layer surfaces this as a no-false-

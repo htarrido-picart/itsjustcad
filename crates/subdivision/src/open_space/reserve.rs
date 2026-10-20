@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Blind %-reserve open space (plan §1, §9 Phase 9) — owner opt-in keyword.
+//! Blind %-reserve open space — owner opt-in keyword.
 //!
 //! `lotopenspace [site-sel] reserve=<pct>` pulls whole BLOCKS out of
 //! subdivision until ~`pct` of the SITE area is open, **biggest-and-most-central

@@ -1,14 +1,14 @@
-# Plan — IntemFit associativity, ChatGPT support, hotkeys
+# Plan — site-planning associativity, ChatGPT support, hotkeys
 
-Branch: `feat/intemfit-and-config`
+Branch: the PR #16 feature branch
 
 ## STATUS (2026-10-09) — W1 + W2 + W4 SHIPPED on this branch (PR #16)
 All three workstreams are implemented, tested, and manually verified; bundled
-into one PR (#16) off `feat/intemfit-and-config`. The sections below are kept as
+into one PR (#16). The sections below are kept as
 the original design record. See "Queued follow-ups" at the bottom for what's next.
 
 What shipped:
-- **W1 IntemFit associativity** — `SubdivLink` (kind Lots|Site) + a per-frame
+- **W1 site-planning associativity** — `SubdivLink` (kind Lots|Site) + a per-frame
   geometry-signature scan → `LotRefresh`; `lotsubdivide` (per block) and
   `lotgeneratesite` record source→output links and auto-recompute on boundary
   edit. Parameters-tab inspector (17 curated `SubdivisionSettings` fields,
@@ -26,7 +26,7 @@ What shipped:
   i18n parity across 8 catalogs.
 
 Original decisions (all honored):
-- **IntemFit (W1):** associative + live params, auto-update on polygon edit,
+- **Site planning (W1):** associative + live params, auto-update on polygon edit,
   with a freeze toggle.
 - **Cloud (W2):** first-class in onboarding AND a menu-bar **LLM ▸ API Keys…**
   dialog covering both Claude (Anthropic) and ChatGPT (OpenAI).
@@ -40,10 +40,10 @@ independent and can land in any order.
 
 ---
 
-## W1 — IntemFit: polygon redraw updates street division + live params
+## W1 — Site planning: polygon redraw updates street division + live params
 
 ### What
-Turn the `M-intemfit` subdivision (`lotgeneratesite` / `lotsubdivide`, in
+Turn the site-planning subdivision (`lotgeneratesite` / `lotsubdivide`, in
 `crates/subdivision`) from baked static geometry into an **associative,
 parametric** result: it remembers its source polygon + settings, exposes live
 params like expressive structures, and recomputes when the source polygon is
@@ -145,7 +145,7 @@ Backend is ~done; this is mostly UI/config wiring:
 
 ---
 
-## W3 — Expressive-structures-style params for IntemFit
+## W3 — Expressive-structures-style params for site planning
 
 This is not a separate deliverable — it's the **pattern W1 adopts**. Reference
 blueprint (already in-tree):
@@ -206,7 +206,7 @@ this branch.**
    Smallest, mostly UI; backend already exists. Unblocks the user fastest.
 2. **W4** — user-definable hotkeys. Self-contained: persistence + keymap
    overlay + editor panel + `bind_hotkey` LLM tool.
-3. **W1 + W3** — IntemFit associative + live params. Largest; reuses the
+3. **W1 + W3** — site planning associative + live params. Largest; reuses the
    expressive-structures pattern. Split into:
    - (a) **derive** — wrap `subdivide()` as a pure `derive_subdivision` + define
      the `SubdivisionParams` schema.

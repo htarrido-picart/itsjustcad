@@ -2820,8 +2820,8 @@ fn parse_lotgeneratesite(args: &[&str]) -> Result<Command, ParseError> {
     })
 }
 
-/// `lotloading [selector] front|alley`. Sets the sticky loading mode (M-intemfit
-/// Phase 6). The mode may be the first bare positional token (`alley`) or a
+/// `lotloading [selector] front|alley`. Sets the sticky loading mode.
+/// The mode may be the first bare positional token (`alley`) or a
 /// `mode=alley` key; a leading selector is optional.
 fn parse_lotloading(args: &[&str]) -> Result<Command, ParseError> {
     const MODES: &[&str] = &["front", "frontloaded", "alley", "alleyloaded"];
@@ -2855,7 +2855,7 @@ fn parse_lotloading(args: &[&str]) -> Result<Command, ParseError> {
 }
 
 /// `lotsetbacks [selector] [front=<> side=<> rear=<> buildto=<> envelope=on|off]`.
-/// Computes + bakes the buildable envelope per selected lot (M-intemfit Phase 8).
+/// Computes + bakes the buildable envelope per selected lot.
 /// A leading selector is optional; otherwise the target defaults to the current
 /// selection. All params are key=value.
 fn parse_lotsetbacks(args: &[&str]) -> Result<Command, ParseError> {
@@ -2916,8 +2916,8 @@ fn parse_lotsetbacks(args: &[&str]) -> Result<Command, ParseError> {
 }
 
 /// `lotfrontage [selector] [at=setback|curb]`. Reports each lot's frontage length
-/// measured along the setback line by default (Manuel's explicit ask) or the
-/// curb (M-intemfit Phase 8). A read-only query.
+/// measured along the setback line by default (a client requirement) or the
+/// curb. A read-only query.
 fn parse_lotfrontage(args: &[&str]) -> Result<Command, ParseError> {
     let is_kv = |s: &str| s.contains('=');
     let (targets, rest): (Selector, &[&str]) = match args.split_first() {
@@ -2945,7 +2945,7 @@ fn parse_lotfrontage(args: &[&str]) -> Result<Command, ParseError> {
 
 /// `lotreport [site-sel]` builds a yield summary (lot stats, net-of-open-space
 /// site area, built GFA, FAR) and stores it on the `report` plane; `lotreport
-/// compare` diffs the two most recent yield snapshots (M-intemfit Phase 11). A
+/// compare` diffs the two most recent yield snapshots. A
 /// read-only query. A bare selector reports a subset of lots; `compare` takes no
 /// selector.
 fn parse_lotreport(args: &[&str]) -> Result<Command, ParseError> {
@@ -2968,11 +2968,11 @@ fn parse_lotreport(args: &[&str]) -> Result<Command, ParseError> {
 }
 
 /// `lotopenspace <sel> type=park|greenway|pond|treesave [area=]`
-///  OR `lotopenspace [site-sel] reserve=<pct>` (M-intemfit Phase 9).
+///  OR `lotopenspace [site-sel] reserve=<pct>`.
 ///
-/// Feature-placement mode is the default (Manuel's questionnaire); the blind
+/// Feature-placement mode is the default (per the client's requirements); the blind
 /// %-reserve mode is a separate mode selected by the `reserve=` keyword (owner
-/// opt-in, §1). A leading non-`k=v` token is an optional selector.
+/// opt-in). A leading non-`k=v` token is an optional selector.
 fn parse_lotopenspace(args: &[&str]) -> Result<Command, ParseError> {
     let is_kv = |s: &str| s.contains('=');
     let (targets, rest): (Selector, &[&str]) = match args.split_first() {
@@ -3021,7 +3021,7 @@ fn parse_lotopenspace(args: &[&str]) -> Result<Command, ParseError> {
 }
 
 /// `lotbuilding [selector] [typology= footprint= floors= floorheight= coverage=
-/// roof= pitch= stepback=]` (M-intemfit Phase 10). Generates a footprint +
+/// roof= pitch= stepback=]`. Generates a footprint +
 /// stepped 3D mass + roof inside each selected lot's buildable envelope. A
 /// leading non-`k=v` token is an optional selector; missing params fall back to
 /// the sticky `lotsettings`.

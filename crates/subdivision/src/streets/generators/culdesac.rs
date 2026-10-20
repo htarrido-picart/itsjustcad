@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Cul-de-sac generator (plan §7.3): one **spine** road down the site long axis
+//! Cul-de-sac generator: one **spine** road down the site long axis
 //! plus perpendicular **stubs** spaced by block depth, each terminating in a
 //! **bulb** (a turnaround) rather than reaching the far edge. Stubs alternate
 //! sides of the spine so blocks form on both flanks.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `CornerLots` (plan §7.4, Phase 6). Where a block's interior angle is below
+//! `CornerLots` (lot rules). Where a block's interior angle is below
 //! `corner_angle_max` (euro_latam 45°), the lot at that corner is WIDENED by
 //! `corner_lot_width_bonus` (euro_latam +15 %, placeholder).
 //!

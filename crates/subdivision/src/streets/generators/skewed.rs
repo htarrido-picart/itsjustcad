@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Skewed generator (plan §7.3): identical to [`orthogonal`](super::orthogonal)
+//! Skewed generator: identical to [`orthogonal`](super::orthogonal)
 //! but with a global rotation applied to the split directions, giving a
 //! diagonal / rotated grid. The rotation is a fixed diagonal offset (a quarter
 //! of a right angle), so the graph stays deterministic for a fixed seed — the

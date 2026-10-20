@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `FlagLots` (plan §7.4, Phase 6) — panhandle lots reached by a narrow pole.
+//! `FlagLots` — panhandle lots reached by a narrow pole.
 //! Built ONLY when `allow_flag_lots` (euro_latam false). The pole width must be
 //! ≥ `flag_pole_width_min` (euro_latam 3 m). **The pole area is EXCLUDED from the
-//! countable lot area** (plan §7.4 open — implemented here as the exclusion; it
-//! is an ASSUMPTION to confirm with Manuel, surfaced by the placeholder note).
+//! countable lot area** (an open question — implemented here as the exclusion; it
+//! is an ASSUMPTION to confirm with the client, surfaced by the placeholder note).
 
 use crate::geometry::polygon2d::Polygon2d;
 use glam::DVec2;
@@ -28,7 +28,7 @@ impl FlagLot {
         self.outline.area()
     }
 
-    /// Countable (net) lot area — the pole is EXCLUDED (§7.4 assumption).
+    /// Countable (net) lot area — the pole is EXCLUDED (an assumption).
     pub fn countable_area(&self) -> f64 {
         (self.outline.area() - self.pole.area()).max(0.0)
     }

@@ -3,7 +3,7 @@
 
 //! `PolylineTools` — resample, simplify (Douglas–Peucker), perpendicular-at-
 //! param, and arc-length for open 2D polylines. Used by offset/skeleton
-//! subdivision (later phases) and by contour snapping in Phase 3.
+//! subdivision and by contour snapping in recursive OBB.
 
 use glam::DVec2;
 

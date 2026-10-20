@@ -1,20 +1,20 @@
-# intemfit — Lot Subdivision for ItsJustCAD (Build Plan)
+# Site Planning — Lot Subdivision for ItsJustCAD (Build Plan)
 
 Working plan. Read first in every session touching this feature.
 
 **What we're building:** a parametric site-planning capability inside ItsJustCAD
 (Rust) that takes a site boundary and produces a road network, blocks, and lots —
 in the vein of CityEngine block subdivision and TestFit yield studies. Verb name
-prefix `lot*`; feature codename **intemfit** (phase `M-intemfit`).
+prefix `lot*`; milestone `M-site-planning`.
 
 **Target decision (2026-09-03):** native **ItsJustCAD Rust feature**, NOT a Rhino
 `.rhp` plugin and NOT an ItsJustCAD JSON macro plugin. Algorithms are ported from
 the Rhino build plan + the Python prototype, but land as a pure-Rust crate +
 registry verbs, deck-callable, replay-stable — same shape as `M-landscape`.
 
-**Requirements source:** a scoping questionnaire completed by Manuel (practicing
-urbanist/architect), summarized in §1. Where this plan conflicts with an
-assumption you'd otherwise make, his answers win.
+**Requirements source:** a scoping questionnaire completed by the client (a
+practicing urbanist/architect), summarized in §1. Where this plan conflicts with an
+assumption you'd otherwise make, the client's answers win.
 
 ---
 
@@ -27,9 +27,9 @@ assumption you'd otherwise make, his answers win.
   deps — plain geometry in, plain geometry out, unit-tested headless in CI. Same rule
   the Rhino plan applied to RhinoCommon: dependency direction is Core ← commands, never
   the reverse.
-- **Every algorithm ships with its §8 validation cases** before moving to the next phase.
-- **Commit at each phase gate.** Phases are ordered so the tool is useful at the end of
-  Phase 3, not only Phase 8.
+- **Every algorithm ships with its §8 validation cases** before moving to the next step.
+- **Commit at each step gate.** Steps are ordered so the tool is useful once
+  Recursive-OBB subdivision lands, not only after setbacks.
 - **Unit tests always** (project rule) — pure-math parts test hard (analytic assertions).
 - **Don't build what §1 rules out.** Scope creep here is measured in months.
 - **Deterministic for a fixed seed** — a hard requirement (replay/undo depend on it).
@@ -44,7 +44,7 @@ assumption you'd otherwise make, his answers win.
 |---|---|
 | Lot patterns | Grid (recursive), Perimeter (offset), Street-following (skeleton). All three. |
 | Lot sizes | Small through large — parameter range, no fixed target |
-| Irregularity | Manuel: uniform to moderate, cap 0.4 (his default). Owner adds a `loose` mode unlocking to 1.0 — see owner-scope note below. |
+| Irregularity | Client: uniform to moderate, cap 0.4 (their default). Owner adds a `loose` mode unlocking to 1.0 — see owner-scope note below. |
 | Automation | Tool generates roads AND lots from a raw boundary |
 | Street patterns | Orthogonal grid, diagonal/skewed, organic/free-form, cul-de-sac clusters |
 | Lot rules | Width **mix**, independent **depth**, front-loaded, **alley-loaded**, wider corner lots, flag/panhandle lots |
@@ -53,11 +53,11 @@ assumption you'd otherwise make, his answers win.
 | Open space | Pocket parks, greenway/trail corridor, retention pond, tree-save — tool places them |
 | Buildings | Footprints **yes**; roofs + 3D massing **yes** |
 
-### Owner-requested — IN the tool, beyond Manuel's scope (Hector, 2026-09-04)
+### Owner-requested — IN the tool, beyond the client's scope (Hector, 2026-09-04)
 
-Manuel's questionnaire scopes *his* defaults; the product owner wants broader tool
-capability. These were "ruled out" by Manuel but are **in scope as tool features**
-(not necessarily Manuel's defaults — ship them, don't force them on his flow):
+The client's questionnaire scopes *their* defaults; the product owner wants broader tool
+capability. These were "ruled out" by the client but are **in scope as tool features**
+(not necessarily the client's defaults — ship them, don't force them on their flow):
 
 - **Radial / circular** street networks — a dedicated polar generator. Note: this
   **breaks the pure-rectilinear assumption**, so recursive-OBB is no longer the *sole*
@@ -65,19 +65,19 @@ capability. These were "ruled out" by Manuel but are **in scope as tool features
   own ring+spoke layout. Block subdivision still runs on whatever blocks it emits.
 - **Hexagonal** street networks — a hex-lattice generator (also non-rectilinear).
 - **Loose / highly irregular** lots — the `irregularity` clamp becomes a *soft default*
-  at 0.4 (Manuel's preference) with a "loose" mode unlocking up to 1.0; loose likely
+  at 0.4 (the client's preference) with a "loose" mode unlocking up to 1.0; loose likely
   needs the organic subdivider (heavy jitter / non-orthogonal splits), not plain OBB.
-- **Voronoi** street networks — owner-requested 2026-09-04 (Manuel had it on "never use";
+- **Voronoi** street networks — owner-requested 2026-09-04 (the client had it on "never use";
   Hector overrides for tool capability). A Voronoi generator: seed points (jittered grid
   or Poisson-disk) → Voronoi diagram → cell edges become streets, cells become blocks.
   Non-rectilinear like radial/hex. **We can derive it as the dual of our existing
   Bowyer-Watson Delaunay** (`kernel-mesh::triangulate`) — circumcenters of adjacent
-  triangles are the Voronoi vertices — so no new geometry dep. Phase 5b with radial/hex.
+  triangles are the Voronoi vertices — so no new geometry dep. Ships with the radial/hex generators.
 - **Blind %-reserve open space** — owner-requested 2026-09-04 as an **opt-in keyword**,
   NOT the default. `lotopenspace reserve=<pct>` pulls whole blocks out of subdivision
   until ~pct of the *site* is open, biggest-and-most-central first (CityEngine's model:
   open space = a block you chose not to subdivide). Default stays feature-placement
-  (`type=park|greenway|pond|treesave`, Manuel's preference); reserve is a separate mode
+  (`type=park|greenway|pond|treesave`, the client's preference); reserve is a separate mode
   a user asks for by keyword. Reserved blocks are tagged so `lotreport` nets them out
   (§11). `reserve=0` (default) = off.
 
@@ -88,18 +88,18 @@ capability. These were "ruled out" by Manuel but are **in scope as tool features
 
 ### Form verified against the real questionnaire (2026-09-03)
 
-The 4-page `subdivision-visual-picker.pdf` (Manuel's marks) confirms every §1 row
+The 4-page `subdivision-visual-picker.pdf` (the client's marks) confirms every §1 row
 above. Notable exacts: Q2 circled **all three** sizes (small/medium/large → full
 parameter range, no fixed target); Q7 marked **all six** lot rules incl. flag/panhandle;
 Q10 marked front/side/rear/build-to/buildable-envelope (not "lot lines are enough");
 Q11 marked park/greenway/pond/tree-save (NOT %-reserve, NOT "I place them"). Q9
 ("anything wrong about lots") and Q14 ("missing on day one") were left blank.
 
-### Open questions — resolve with Manuel before Phase 5/6
+### Open questions — resolve with the client before road networks and lot rules
 
 1. **"What's missing on day one"** (Q14) — left blank on the form. Follow up separately.
-2. **Lot width mix** — the form confirms he wants a width *mix* but not the product list.
-   Need his actual products (e.g. 40/50/60 ft) + proportions, and whether the mix is a
+2. **Lot width mix** — the form confirms they want a width *mix* but not the product list.
+   Need their actual products (e.g. 40/50/60 ft) + proportions, and whether the mix is a
    hard ratio or soft preference. Algorithm shape depends on it. (Not asked on this form.)
 3. **Alley dimensions** — ROW width + whether alleys are required on every block or only
    some. (Not asked on this form.)
@@ -108,26 +108,26 @@ Q11 marked park/greenway/pond/tree-save (NOT %-reserve, NOT "I place them"). Q9
 
 ---
 
-## 2. Phase order
+## 2. Build order
 
-Each phase has a definition of done (§9). Don't start a phase until the previous passes.
+Each step has a definition of done (§9). Don't start a step until the previous passes.
 
-| Phase | Deliverable | Why here |
+| Step | Deliverable | Why here |
 |---|---|---|
 | 1 | `crates/subdivision` foundation: `Polygon2d`, `i_overlay` bridge (offset/boolean/cleanup), `OrientedBox` (min-area rect), `PolylineTools`. **i_overlay AGPLv3-compat + offset support confirmed.** | Everything depends on robust 2D ops |
-| 2 | Verb + settings plumbing: `lotsubdivide` in registry (deck-callable, GBNF), sticky `SubdivisionSettings` in the doc, `Preview` viewport draw | Makes every later phase testable by hand |
+| 2 | Verb + settings plumbing: `lotsubdivide` in registry (deck-callable, GBNF), sticky `SubdivisionSettings` in the doc, `Preview` viewport draw | Makes every later step testable by hand |
 | 3 | **Recursive OBB subdivision** (`lotsubdivide method=grid`) | First genuinely useful tool. Ship-able alone. |
-| 4 | Offset / perimeter subdivision (`method=perimeter`) | Small delta on Phase 3 |
+| 4 | Offset / perimeter subdivision (`method=perimeter`) | Small delta on recursive-OBB subdivision |
 | 5 | Road network generation + block extraction (`lotgeneratesite`) | Unlocks "tool does it all" |
-| 6 | Lot rules: width mix, depth, corner, flag, front/alley loading | Bulk of Manuel's asks |
-| 7 | Skeleton (street-following) subdivision (`method=streetfollowing`) | Hardest; needs Phase 5 street tagging |
+| 6 | Lot rules: width mix, depth, corner, flag, front/alley loading | Bulk of the client's asks |
+| 7 | Skeleton (street-following) subdivision (`method=streetfollowing`) | Hardest; needs road-network generation street tagging |
 | 8 | Setbacks + buildable envelopes (`lotsetbacks`) | Cheap once lots are correct |
 | 9 | Open-space feature placement (`lotopenspace`) | Pocket park, greenway, pond, tree-save |
 | 10 | Building footprints + roof massing | Second product; do not start early |
 | 11 | Yield reporting + option comparison (via `report` plane) | Makes it a decision tool — ✅ DONE |
 | 12 | Consistent indexing, true straight skeleton, optimization | Polish |
 
-**Phase 3 is the first shippable milestone.** Get it to Manuel before starting Phase 5.
+**Recursive-OBB subdivision is the first shippable milestone.** Get it to the client before starting road networks.
 
 ---
 
@@ -150,16 +150,16 @@ crates/
         block.rs               # polygon + BlockEdge[] with street tags
         block_edge.rs          # is_street, street_id, width, length, is_alley
       subdivision/
-        recursive_obb.rs       # Phase 3
-        offset_sub.rs          # Phase 4
-        skeleton_sub.rs        # Phase 7
+        recursive_obb.rs       # recursive OBB
+        offset_sub.rs          # offset / perimeter
+        skeleton_sub.rs        # skeleton subdivision
         lot_rules/             # width_mix, depth, corner, flag, loading, sliver_merge
-        setbacks.rs            # Phase 8 incl. buildable envelope
-      open_space/              # Phase 9
-      buildings/               # Phase 10
+        setbacks.rs            # setbacks incl. buildable envelope
+      open_space/              # open space
+      buildings/               # buildings
       straight_skeleton/
-        offset_approx.rs       # Phase 7 — build first
-        felkel.rs              # Phase 12 — swap in later, same trait
+        offset_approx.rs       # skeleton subdivision — build first
+        felkel.rs              # polish — swap in later, same trait
       reporting.rs             # YieldReport -> ItsJustCAD AnalysisReport plane
       settings.rs              # SubdivisionSettings
     tests/                     # §8 validation cases
@@ -179,7 +179,7 @@ references doc/egui — the bridge in `commands/src/lot.rs` does all conversion.
 
 ---
 
-## 4. Existing prototype — read before Phase 3/4
+## 4. Existing prototype — read before recursive-OBB / offset subdivision
 
 A working **Python prototype** (`/prototype/python`, Shapely) already implements
 `recursive_obb()`, `offset_subdivision()`, `street_following()`, `clip_corners()` and
@@ -189,7 +189,7 @@ edge-case handling was earned. Two known limits to fix in the port:
 1. `offset_subdivision` builds lots by outward ray-cast quads — robust but approximate
    at sharp corners. Replace with proper ring splitting once `i_overlay` offset is in.
 2. `street_following` slices perpendicular to a supplied frontage curve — fine for a
-   single-frontage block, wrong for multi-frontage. Phase 7 replaces it with a skeleton.
+   single-frontage block, wrong for multi-frontage. Skeleton subdivision replaces it with a skeleton.
 
 ---
 
@@ -198,10 +198,10 @@ edge-case handling was earned. Two known limits to fix in the port:
 ### 2D ops: `i_overlay` (pure Rust) — replaces Clipper2
 
 Clipper2 was the Rhino plan's choice; the Rust equivalent is **`i_overlay`** (MIT, pure
-Rust — no C/FFI, AGPLv3-compatible) for every offset and boolean. **Phase-1 blocker:
+Rust — no C/FFI, AGPLv3-compatible) for every offset and boolean. **Geometry-foundation blocker:
 confirm `i_overlay` ships polygon *offset* (outward/inward buffering), not just boolean
 overlay — if offset is weak, evaluate `geo` + a buffer impl, or vendor a Clipper2 port.
-Resolve in Phase 1, not Phase 5.**
+Resolve in the geometry foundation, not at road networks.**
 - **Do not use naive per-edge offset for block insets** — fails on non-convex /
   near-self-intersecting contours, which is what real parcels look like.
 - **Work in integer coords.** Pick scale `1000`, define it once in `clip_bridge.rs`,
@@ -213,10 +213,10 @@ Resolve in Phase 1, not Phase 5.**
 ### Straight skeleton — build/port
 
 No production straight skeleton exists ready-made. Same strategy as the Rhino plan:
-1. **Phase 7 (DONE):** `offset_approx.rs` — iterated small `i_overlay` insets with
+1. **Skeleton subdivision (DONE):** `offset_approx.rs` — iterated small `i_overlay` insets with
    topology tracking. Approximate medial axis, robust, fast. Good at survey
    tolerances. Remains the **default** backend.
-2. **Phase 12 (DONE, convex-exact partial):** `felkel.rs` — Felkel & Obdržálek
+2. **Polish (DONE, convex-exact partial):** `felkel.rs` — Felkel & Obdržálek
    (1998) priority-queue **edge-event** algorithm behind the same
    `StraightSkeleton` trait. Exact on convex polygons (no reflex vertices ⇒ no
    split events); falls back to `offset_approx` on non-convex input (split events
@@ -249,12 +249,12 @@ Everything Rhino-specific in the source plan is **dropped and replaced**:
 
 Every `BlockEdge` carries `{ is_street, street_id, street_width, street_length,
 is_alley }`. Skeleton subdivision, corner-lot assignment, front/alley loading, and
-frontage measurement are all unimplementable without it. Build correctly in Phase 5;
+frontage measurement are all unimplementable without it. Build correctly in road-network generation;
 do not defer.
 
 ### Frontage measured at the setback line (default, not an option)
 
-Manuel explicitly requested this. Differs enormously from curb-line on cul-de-sac bulbs
+The client explicitly requested this. Differs enormously from curb-line on cul-de-sac bulbs
 and tight curves, and is the most common reason automated layouts get rejected by
 reviewers.
 
@@ -269,7 +269,7 @@ reference). serde-defaulted so old docs load; stored on the document.
 pub enum SubdivisionMethod { Recursive, Offset, Skeleton }
 pub enum LoadingType       { FrontLoaded, AlleyLoaded, Mixed }
 pub enum CornerAlignment   { StreetWidth, StreetLength }
-pub enum StreetPattern     { Orthogonal, Skewed, Organic, CulDeSac, Radial, Hexagonal, Voronoi } // Radial/Hexagonal/Voronoi = owner scope (Phase 5b)
+pub enum StreetPattern     { Orthogonal, Skewed, Organic, CulDeSac, Radial, Hexagonal, Voronoi } // Radial/Hexagonal/Voronoi = owner scope (non-rectilinear street generators)
 
 pub struct SubdivisionSettings {
     pub method: SubdivisionMethod, // = Recursive
@@ -280,7 +280,7 @@ pub struct SubdivisionSettings {
     pub lot_area_min: f64,         // = 5000
     pub lot_area_max: f64,         // = 9000
     pub lot_width_min: f64,        // = 50
-    pub irregularity: f64,         // soft default clamp [0.0, 0.4] (Manuel); `loose` unlocks up to 1.0
+    pub irregularity: f64,         // soft default clamp [0.0, 0.4] (the client); `loose` unlocks up to 1.0
     pub loose: bool,               // owner scope: unlock irregularity >0.4, route to organic subdivider
     pub corner_angle_max: f64,     // = 45
     pub corner_width: f64,
@@ -294,7 +294,7 @@ pub struct SubdivisionSettings {
     pub corner_align: CornerAlignment,
     pub simplify: f64,
 
-    // Lot rules (Phase 6)
+    // Lot rules
     pub width_mix: Option<LotWidthMix>, // None = single target width
     pub lot_depth_target: f64,          // independent of area
     pub lot_depth_tolerance: f64,
@@ -307,14 +307,14 @@ pub struct SubdivisionSettings {
     pub sliver_area_frac: f64,          // = 0.5 (× lot_area_min)
     pub frontage_at_setback: bool,      // = true
 
-    // Setbacks (Phase 8)
+    // Setbacks
     pub setback_front: f64,  // 25
     pub setback_side: f64,   // 5
     pub setback_rear: f64,   // 20
     pub build_to_line: f64,  // 0 = disabled
     pub draw_buildable_envelope: bool, // true
 
-    // Open space (Phase 9)
+    // Open space
     pub open_space_reserve_frac: f64,  // 0.0 = off (feature-placement default); >0 = blind %-reserve mode (owner opt-in)
 }
 
@@ -336,13 +336,13 @@ pub struct LotWidthMix {
 
 Keep separate internal fields; expose the shared names only in the verb args.
 
-### 6b. Default profile — metric, European / Latin-American (placeholder until Manuel confirms)
+### 6b. Default profile — metric, European / Latin-American (placeholder until the client confirms)
 
-**Units are metres / m².** Manuel works in Cali + Guayaquil; defaults follow
+**Units are metres / m².** The client works in Cali + Guayaquil; defaults follow
 European + LatAm urban form (party-wall `medianería` lots, deep narrow `solares`,
 continuous street-wall / build-to tradition, the Law-of-the-Indies gridiron), NOT US
 suburban feet. **Every number below is a placeholder** sourced from typical Euro/LatAm
-practice — flag it in output and swap when Manuel answers the §1 open questions.
+practice — flag it in output and swap when the client answers the §1 open questions.
 
 | Setting | Default (m / m² / %) | Rationale |
 |---|---|---|
@@ -359,9 +359,9 @@ practice — flag it in output and swap when Manuel answers the §1 open questio
 | `corner_angle_max` | 45° | as US |
 | `allow_flag_lots` | false | uncommon in the formal grid; pole 3 m + excluded area if enabled |
 | `sliver_area_frac` | 0.5 | as US |
-| road ROW (Phase 5) | 12 m | residential `calle` |
-| block depth (Phase 5) | ~2× lot depth (~50 m); LatAm `cuadra` option ~84–100 m | double-loaded block; the classic 100-vara ≈ 84 m block |
-| `irregularity` | 0.0 (formal grid); cap 0.4 (Manuel); `loose` → 1.0 (owner) | grid regularity by default |
+| road ROW (road-network generation) | 12 m | residential `calle` |
+| block depth (road-network generation) | ~2× lot depth (~50 m); LatAm `cuadra` option ~84–100 m | double-loaded block; the classic 100-vara ≈ 84 m block |
+| `irregularity` | 0.0 (formal grid); cap 0.4 (the client); `loose` → 1.0 (owner) | grid regularity by default |
 
 Ship this as a named **`region` profile** (`euro_latam` default; a `us_suburban` profile
 with feet-derived numbers can be added later). The §6 struct defaults should carry the
@@ -371,7 +371,7 @@ metric `euro_latam` values, not the imperial examples shown in the field comment
 
 ## 7. Algorithm notes (portable — port from Python/Rhino plan)
 
-### 7.1 Recursive OBB (Phase 3)
+### 7.1 Recursive OBB
 Min-area OBB. Split line along the OBB **short** direction, pivoted on the **long** axis
 midpoint. Recurse while area > `lot_area_min`. Four modifiers:
 - **Street access** — if a child would lose its street edge, use the orthogonal
@@ -383,21 +383,21 @@ midpoint. Recurse while area > `lot_area_min`. Four modifiers:
 Terminate when `area < lot_area_min` or any child side < `lot_width_min`. A high
 `lot_width_min` can force lots *larger* than `lot_area_max` — correct, don't "fix" it.
 
-### 7.2 Offset / perimeter (Phase 4)
+### 7.2 Offset / perimeter
 Inward-offset the block by `offset_width`. Sample the ring at spacing from target
 area/depth, jittered by `irregularity`. Split the strip with lines orthogonal to the
 offset curve. If `subdivide_core`, run recursive OBB on the interior. Fall back to
 recursive OBB when `offset_width ≈ 0` or the offset polygon collapses.
 
-### 7.3 Road network (Phase 5, + radial/hex in Phase 5b — owner scope)
-Generators → a `StreetGraph` of centerlines with widths. **Four rectilinear (Manuel):**
+### 7.3 Road network (+ radial/hex — owner scope)
+Generators → a `StreetGraph` of centerlines with widths. **Four rectilinear (the client):**
 - **Orthogonal** — recursive OBB of the *site* to ~2× lot depth; spine roads along splits.
 - **Skewed** — same with a global rotation on split directions.
 - **Organic** — spline spines fitted to the site long axis with controlled sinusoidal
   deviation, then secondary connectors.
 - **Cul-de-sac** — a spine plus perpendicular stubs ending in bulbs, spaced by block depth.
 
-**Two non-rectilinear (owner-requested, Phase 5b — do after the four above work):**
+**Two non-rectilinear (owner-requested, non-rectilinear street generators — do after the four above work):**
 - **Radial / circular** — a center (or centers) with ring roads at block-depth spacing +
   radial spokes; blocks are annular-sector polygons. Does NOT use OBB site-splitting;
   its own polar layout. Feed the sector blocks into offset/skeleton subdivision (not
@@ -414,23 +414,23 @@ every resulting block edge with its generating street. Snap to existing boundary
 points. If `AlleyLoaded`, insert a second tier of narrower rear lanes bisecting each
 block along its long axis, tagged `is_alley`.
 
-### 7.4 Lot rules (Phase 6)
+### 7.4 Lot rules
 - **Width mix is the hard one** — turns division into *packing*: given a frontage length
   and a product list with proportions, choose a *sequence* of widths that fits and
   respects the ratios. Greedy fill weighted by running proportion deficit, then a local
   swap pass to absorb the remainder. Do NOT spread slack evenly across all lots — that
   defeats fixed products.
 - **Alley-loaded** — depth becomes a two-frontage problem; requires the alley in the
-  street graph (hence after Phase 5).
+  street graph (hence after road-network generation).
 - **Corner lots** — interior angle < `corner_angle_max` → widen by
   `corner_lot_width_bonus`; auto-clamp width to avoid self-intersection.
 - **Flag lots** — only if `allow_flag_lots`; pole width ≥ `flag_pole_width_min`; pole
-  area excluded from countable area (**confirm with Manuel**).
+  area excluded from countable area (**confirm with the client**).
 - **Sliver merging** — repeatedly merge any lot below `sliver_area_frac × lot_area_min`
   into its largest-shared-edge neighbor until none remain. Single biggest difference
   between professional-looking and generated-looking output.
 
-### 7.5 Skeleton subdivision (Phase 7)
+### 7.5 Skeleton subdivision
 1. Straight skeleton of the block → faces, one per contour edge.
 2. Group adjacent faces whose street edges have **similar curvature** (a run of lots
    along a curved street reads as one band, not a per-segment fan).
@@ -442,10 +442,10 @@ block along its long axis, tagged `is_alley`.
 Produces the perpendicular-to-curve lot lines around cul-de-sac bulbs. ~60% of total
 subdivision effort — why it's late despite being visually important.
 
-### 7.6 Buildings — footprint + stepped massing + roof (Phase 10)
+### 7.6 Buildings — footprint + stepped massing + roof
 
-Buildings generate INSIDE the Phase-8 buildable envelope (`setbacks::buildable_envelope`).
-Owner scope resolved 2026-09-05 (all options, no Manuel gate): every footprint mode,
+Buildings generate INSIDE the buildable envelope from setbacks (`setbacks::buildable_envelope`).
+Owner scope resolved 2026-09-05 (all options, no client gate): every footprint mode,
 typology, roof, and stepped massing. `crates/subdivision/src/buildings/`:
 
 1. **Footprint** (`footprint.rs`) — a 2D polygon inside the envelope. Four **fill modes**:
@@ -459,7 +459,7 @@ typology, roof, and stepped massing. `crates/subdivision/src/buildings/`:
    `floor_count × floor_height`. Floors at/above `stepback_start_floor` inset cumulatively by
    `stepback_depth` per floor (stepped / wedding-cake massing). Emits an indexed triangle
    `Mesh` (side walls + ground slab + top cap + courtyard inner walls) and records **per-floor
-   net areas** so Phase 11 yield computes **GFA = Σ per-floor areas** (net of step-backs and
+   net areas** so yield reporting yield computes **GFA = Σ per-floor areas** (net of step-backs and
    any void) and **FAR = GFA / site area**.
 3. **Roof** (`roof.rs`) — cap the top floor's ring at the mass top: `flat` (slab), `gable`
    (two-slope ridge along the long axis), `hip` (four faces to a central ridge), `shed`
@@ -469,7 +469,7 @@ typology, roof, and stepped massing. `crates/subdivision/src/buildings/`:
 **Settings** (SubdivisionSettings, serde-default): `typology`, `footprint_mode`,
 `coverage_frac`, `footprint_inset`, `floor_height`, `floor_count`, `stepback_start_floor`,
 `stepback_depth`, `roof_type`, `roof_pitch`. euro_latam placeholders (floor_height ~3 m,
-coverage 0.5, roof_pitch 30°) flagged "confirm with Manuel" in verb output.
+coverage 0.5, roof_pitch 30°) flagged "confirm with the client" in verb output.
 
 **Verb** `lotbuilding <sel> [typology= footprint= floors= floorheight= coverage= roof= pitch=
 stepback=]` → for each selected lot: compute envelope (reuse setbacks) → footprint → stepped
@@ -508,43 +508,43 @@ Every subdivision algorithm must pass these block shapes:
 
 ---
 
-## 9. Phase definitions of done
+## 9. Definitions of done
 
-- **Phase 1** — ✅ **DONE (2026-09-04).** `crates/subdivision` pure-Rust leaf crate
+- **Geometry foundation** — ✅ **DONE (2026-09-04).** `crates/subdivision` pure-Rust leaf crate
   (no egui/doc/commands deps): `Polygon2d` (CCW, shoelace, point-in-poly, centroid),
   `OrientedBox` (min-area rect via rotating calipers on the monotone-chain hull —
   rotated-rectangle tests recover correct long/short axes), `PolylineTools` (resample,
   Douglas–Peucker simplify, perpendicular-at-param, arc-length), `split_by_line`
-  (Sutherland–Hodgman half-plane clip — all Phase 3 needs), and `clip_bridge` (the sole
+  (Sutherland–Hodgman half-plane clip — all recursive-OBB subdivision needs), and `clip_bridge` (the sole
   `i_overlay` touch-point, int-scale ×1000 = `CLIP_SCALE` defined once). **i_overlay
   offset support + AGPLv3 compatibility CONFIRMED** (see §12.1). Offset round-trips with
   no drift; boolean union/intersection/difference pass. 10 sample blocks in
-  `samples/blocks/*.json` (§8 cases 1–10; #11/#12/#13 deferred to Phase 5b). 31 unit +
+  `samples/blocks/*.json` (§8 cases 1–10; #11/#12/#13 deferred to non-rectilinear street generators). 31 unit +
   7 §8 integration tests green; clippy clean.
-- **Phase 2** — ✅ **DONE (2026-09-04).** `lotsubdivide` + `lotsettings` run from the
+- **Verb + settings plumbing** — ✅ **DONE (2026-09-04).** `lotsubdivide` + `lotsettings` run from the
   command line + deck (registry-registered → GBNF auto-derives + palette). Settings are
   sticky across save/reload (`Document::subdivision_settings`, serde-default so
-  pre-intemfit files load; logged so replay reproduces them). The bridge
+  pre-site-planning files load; logged so replay reproduces them). The bridge
   (`commands/src/lot.rs`) converts closed doc curves ↔ `Polygon2d`; `perimeter`/
-  `streetfollowing` return a clear "not yet implemented (Phase 4/7)" error, never a
+  `streetfollowing` return a clear "not yet implemented (perimeter / streetfollowing)" error, never a
   panic. Runs fully headless. **Preview overlay: SKIPPED for this milestone** — the verb
   bakes on run (acceptable per the plan's "bake-on-run is acceptable"); results bake as a
   logged op with written-back ids (contours precedent) so undo is one `CreatedOnLayer`
   inverse and replay is byte-identical. A viewport-overlay preview is a cheap later
   follow-up (draw the same lot polygons before commit).
-- **Phase 3** — ✅ **DONE (2026-09-04).** Recursive OBB (`method=grid`) in
+- **Recursive OBB** — ✅ **DONE (2026-09-04).** Recursive OBB (`method=grid`) in
   `subdivision/src/subdivision/recursive_obb.rs`: min-area OBB → cut along the short axis
   pivoted on the long-axis midpoint → recurse while area > `lot_area_min`; terminates when
   area < min OR any child side < `lot_width_min` (a high `lot_width_min` forcing lots
   above `lot_area_max` is left correct, not "fixed"). Four modifiers: street-access
-  fallback (orthogonal split; every original block edge counts as frontage in Phase 3 —
+  fallback (orthogonal split; every original block edge counts as frontage in recursive-OBB subdivision —
   no street graph yet), snap-to-contour-vertex, edge-alignment (OBB hull-edge reference),
   seed-before-recurse. **Deterministic for a fixed seed** (splitmix64 seeded from a
   quantized block hash + `settings.seed`) — replay byte-identical (verified by a Session
   replay test). All §8 assertions pass on all 10 base blocks (`tests/blocks.rs`): area
   conserved, no overlaps, every lot has a street edge under `force_street_access=1.0`,
-  widths ≥ `lot_width_min` where guaranteed, determinism. **Send a build to Manuel here.**
-- **Phase 4** — ✅ **DONE (2026-09-04).** Offset / perimeter subdivision
+  widths ≥ `lot_width_min` where guaranteed, determinism. **Send a build to the client here.**
+- **Offset / perimeter** — ✅ **DONE (2026-09-04).** Offset / perimeter subdivision
   (`method=perimeter`) in `subdivision/src/subdivision/offset_sub.rs`: inward-offset
   the block by `offset_width` via `clip_bridge::offset` (i_overlay) to get the
   interior **core**; walk the boundary sampling at a spacing derived from
@@ -564,7 +564,7 @@ Every subdivision algorithm must pass these block shapes:
   (replaces the deferral) with the same bake path as grid: logged op, written-back
   ids on the `lots` layer, undo, replay byte-identical (verified by a Session replay
   test).
-- **Phase 5** — ✅ **DONE (2026-09-04).** Road-network generation + block
+- **Road network + block extraction** — ✅ **DONE (2026-09-04).** Road-network generation + block
   extraction + street tagging via `lotgeneratesite`. `crates/subdivision/src/streets/`:
   `street_graph.rs` (`StreetGraph` = centerlines + widths + hierarchy tier
   {Spine/Connector/Stub/Alley} + endpoint adjacency) and the FOUR rectilinear
@@ -589,7 +589,7 @@ Every subdivision algorithm must pass these block shapes:
   ids written back; undo `CreatedOnLayer` removes both; **seeded-deterministic →
   replay byte-identical**). `StreetPattern` + `road_width` + `block_depth` added to
   `SubdivisionSettings` (serde-default). radial/hex/Voronoi return a clean
-  "Phase 5b" error, never a panic. **Confirmed the tagged block geometry survives
+  "non-rectilinear street generators" error, never a panic. **Confirmed the tagged block geometry survives
   into the bake** so a downstream `lotsubdivide` on a generated block honours
   `force_street_access` (test `generated_block_subdivides_with_street_access`). Tests
   (all green): `tests/streets.rs` — the 4 generators on a rectangular + L-shaped site
@@ -598,11 +598,11 @@ Every subdivision algorithm must pass these block shapes:
   fronts exactly 2 roads with the right id/width; outer edges `is_street=false`),
   alley tier present iff `AlleyLoaded`, byte-identical for a fixed seed; plus
   street_graph/block_extractor unit tests + `lotgeneratesite` exec (bake/undo/replay)
-  + `lot.rs` bridge tests. Phase 5b (radial/hex/Voronoi) and Phase 6 (lot rules) pick
+  + `lot.rs` bridge tests. Non-rectilinear street generators (radial/hex/Voronoi) and lot rules pick
   up from here.
-- **Phase 5b** — ✅ **DONE (2026-09-04).** The three NON-rectilinear street
+- **Non-rectilinear street generators** — ✅ **DONE (2026-09-04).** The three NON-rectilinear street
   generators (owner scope), each emitting a `StreetGraph` fed into the SAME
-  `block_extractor` + street-tagging path as Phase 5:
+  `block_extractor` + street-tagging path as road-network generation:
   - **Radial / circular** (`streets/generators/radial.rs`): its own polar layout —
     a center (site centroid; N centers spread along the long axis for large sites)
     → concentric ring roads (Connector tier) at block-depth spacing + radial spokes
@@ -632,15 +632,15 @@ Every subdivision algorithm must pass these block shapes:
   that pairwise-overlap (rectilinear blocks are ~block_depth², untouched). Sample
   blocks #11 annular-sector / #12 hex-cell / #13 Voronoi-cell added to
   `samples/blocks/` and run through the shared §8 subdivision assertions.
-  **Tests:** `tests/streets.rs` grew 6 Phase-5b tests — the three generators on a
+  **Tests:** `tests/streets.rs` grew 6 non-rectilinear street generators tests — the three generators on a
   rectangular + L-shaped site (valid graph, non-overlapping blocks inside the site),
   street-tagged blocks, byte-identical fixed-seed replay, radial ring/spoke
   geometry, hexagonal interior-cell size, Voronoi cell-count-tracks-seeds + the
   **Delaunay-dual correctness on a known square seed set** (dual vertex = center),
   and downstream `lotsubdivide` honouring force_street_access; plus per-generator
-  unit tests + updated `lot.rs`/`exec.rs` bridge tests. Phase 6 (lot rules: width
+  unit tests + updated `lot.rs`/`exec.rs` bridge tests. Lot rules (width
   mix, depth, corner, flag, front/alley loading) picks up here.
-- **Phase 6** — ✅ **DONE (2026-09-04, on euro_latam placeholder defaults).** Lot
+- **Lot rules** — ✅ **DONE (2026-09-04, on euro_latam placeholder defaults).** Lot
   rules in `crates/subdivision/src/subdivision/lot_rules/`, applied as a post-pass /
   mode on subdivision. **WidthMixSolver** (`width_mix.rs`) — the packing problem:
   greedy fill weighted by running proportion deficit (pick the product whose count
@@ -654,9 +654,9 @@ Every subdivision algorithm must pass these block shapes:
   to available slack (no self-intersection; verified on the 15° acute block #10).
   **FlagLots** (`flag.rs`) — only if `allow_flag_lots` (euro_latam false); pole width ≥
   `flag_pole_width_min` (3 m); **pole area excluded from countable lot area** (§7.4 open —
-  implemented as the exclusion; ASSUMPTION to confirm with Manuel, surfaced in the note).
+  implemented as the exclusion; ASSUMPTION to confirm with the client, surfaced in the note).
   **LoadingStrategy** (`loading.rs`) — FrontLoaded (full depth) vs AlleyLoaded (two-
-  frontage street→alley half depth; requires an `is_alley` block edge from Phase 5's
+  frontage street→alley half depth; requires an `is_alley` block edge from road-network generation's
   alley tier; degrades to front-loaded when absent). **SliverMerger** (`sliver.rs`) —
   repeatedly merge any lot below `sliver_area_frac × lot_area_min` (0.5) into its
   largest-shared-edge neighbour until none remain (biggest professional-vs-generated
@@ -664,18 +664,18 @@ Every subdivision algorithm must pass these block shapes:
   placeholders; `us_suburban` stub) + `LotWidthMix` added to `SubdivisionSettings`
   (serde-default); `effective_*` accessors return `(value, used_placeholder)` so any run
   resolving a rule from the profile prints **"using euro_latam defaults (placeholder —
-  confirm with Manuel)"**. Wired into `lotsubdivide` (width-mix is opt-in frontage packing;
+  verify against local regulations)"**. Wired into `lotsubdivide` (width-mix is opt-in frontage packing;
   `apply_lot_rules` = corner + sliver runs on every subdivide) + new `lotsettings` keys
   (region/loading/widthmix/depth/corner/flag/mergeslivers/…) + a `lotloading [sel]
   front|alley` verb (sticky, logged, undoable, replay-stable). All Σ-area-conserved,
   seeded-deterministic (byte-identical replay). Tests: 30 unit + 9 §8/§9 integration
-  (`tests/lot_rules.rs`) + 6 commands exec. **Placeholders IN USE — swap when Manuel
+  (`tests/lot_rules.rs`) + 6 commands exec. **Placeholders IN USE — swap when the client
   answers §1:** width mix 6/8/10 m @ 25/50/25%, depth 25±5, corner +15%, alley 5 m, flag
-  pole 3 m + pole-area exclusion. Phase 7 (skeleton) picks up from here.
-- **Phase 7** — ✅ **DONE (2026-09-04).** Skeleton / street-following subdivision
+  pole 3 m + pole-area exclusion. Skeleton subdivision picks up from here.
+- **Skeleton subdivision** — ✅ **DONE (2026-09-04).** Skeleton / street-following subdivision
   (`method=streetfollowing`). New `crates/subdivision/src/straight_skeleton/`: a
   `StraightSkeleton` trait (interface) + `offset_approx.rs` = **OffsetApproxSkeleton**,
-  the Phase-7 approximate straight skeleton. It partitions the block into one
+  the skeleton subdivision approximate straight skeleton. It partitions the block into one
   **face per contour edge** as the *nearest-edge* region (each face = the block
   clipped by the perpendicular bisector between that edge's supporting line and
   every other edge's — exactly the seam an inward offset wavefront carves, i.e.
@@ -683,7 +683,7 @@ Every subdivision algorithm must pass these block shapes:
   is robust and never panics on non-convex/notched blocks; coverage-checked with a
   centroid-fan fallback). `medial_axis_ridge` (iterated `clip_bridge::offset`
   insets) gives the ridge the unit tests assert on (square → meets near centre;
-  rectangle → medial ridge). Felkel (`felkel.rs`) stays **Phase 12** — the trait is
+  rectangle → medial ridge). Felkel (`felkel.rs`) stays **Polish** — the trait is
   left so it slots in later. `subdivision/skeleton_sub.rs` (SkeletonSubdivision)
   runs the §7.5 steps: (1) straight skeleton → faces; (2) group adjacent faces
   along runs of similar-curvature street edges into bands (curvature turn < 40° →
@@ -713,9 +713,9 @@ Every subdivision algorithm must pass these block shapes:
   curved cases** (each lot's inward side aligns with the local street normal within
   30°, ≥60% of lots — the §9 visual claim as a structural proxy), lot count in a
   sane range, deterministic byte-identical; plus `lot.rs`/`exec.rs` bridge tests
-  (method runs, bakes, undo + byte-identical replay). Phase 8 (setbacks +
-  buildable envelopes) picks up from here.
-- **Phase 8** — ✅ **DONE (2026-09-05).** Setbacks + buildable envelopes +
+  (method runs, bakes, undo + byte-identical replay). Setbacks (+ buildable
+  envelopes) picks up from here.
+- **Setbacks** — ✅ **DONE (2026-09-05).** Setbacks + buildable envelopes +
   frontage-at-setback. `crates/subdivision/src/subdivision/setbacks.rs`:
   `classify_edges` tags each lot edge **Front** (street-tagged; the longest edge
   on an untagged lot) / **Rear** (edge whose outward normal is most anti-parallel
@@ -728,7 +728,7 @@ Every subdivision algorithm must pass these block shapes:
   the build-to distance instead of `setback_front` (a continuous street wall).
   side = 0 (euro_latam party-wall / `medianería`) → no side inset, envelope spans
   the full width. **Frontage measured at the setback line by DEFAULT** (§5,
-  Manuel's explicit ask — not an option): `frontage(at=setback|curb)` — setback =
+  the client's explicit ask — not an option): `frontage(at=setback|curb)` — setback =
   the buildable envelope's front-edge extent (the front setback line inside the
   lot), curb = the raw street-tagged contour edge(s); the two differ on cul-de-sac
   bulbs and curved streets where the inset arc is shorter than the outer curb.
@@ -739,7 +739,7 @@ Every subdivision algorithm must pass these block shapes:
   geometry). Per-run args override the sticky settings (`setback_*` /
   `build_to_line` already in `SubdivisionSettings`); under the euro_latam profile
   the setback numbers are §6b placeholders and the run prints "using euro_latam
-  setback defaults (placeholder — confirm with Manuel)". `lotfrontage <sel>
+  setback defaults (placeholder — verify against local regulations)". `lotfrontage <sel>
   [at=setback|curb]` reports each lot's frontage via the `AnalysisReport` /
   `report` plane (keyed `lotfrontage`: count, min/avg/max, distribution, extreme
   lots) — read-only, never logged. Tests: 7 setbacks unit (rect area ==
@@ -751,11 +751,11 @@ Every subdivision algorithm must pass these block shapes:
   `lot.rs` bridge (envelope area + collapse, frontage default-is-setback) +
   `exec.rs` (bake/undo/byte-identical replay, euro_latam placeholder note,
   collapse reported not panicked, envelope=off reports without baking, frontage
-  report + setback ≠ curb + lotfrontage-not-logged). **Phase 9 (open space) picks
-  up from here; Phase 10 (buildings) is the explicit re-scope-with-Manuel gate.**
-- **Phase 9** — ✅ **DONE (2026-09-05).** Open space — feature placement + blind
+  report + setback ≠ curb + lotfrontage-not-logged). **Open space picks
+  up from here; buildings is the explicit re-scope-with-the-client gate.**
+- **Open space** — ✅ **DONE (2026-09-05).** Open space — feature placement + blind
   %-reserve. `crates/subdivision/src/open_space/`: **feature placement** (default,
-  Manuel's questionnaire) — `pocket_park` (a rounded-rectangle green polygon sized to
+  the client's questionnaire) — `pocket_park` (a rounded-rectangle green polygon sized to
   `area` or a region fraction, clipped inside the region so it never crosses a street),
   `greenway` (a linear buffered trail corridor: the path — a selected open polyline, or
   the region's long-axis spine — offset by width/2 into a closed simple ribbon; `area`
@@ -772,7 +772,7 @@ Every subdivision algorithm must pass these block shapes:
   **Verb `lotopenspace`** (registry-registered → GBNF/deck): `lotopenspace [sel]
   type=park|greenway|pond|treesave [area=]` OR `lotopenspace [site-sel] reserve=<pct>`.
   Both bake onto the `openspace` layer (each object named `openspace:{park|greenway|pond|
-  treesave|reserve}` so Phase 11 `lotreport` can net them out) as one logged op with
+  treesave|reserve}` so yield reporting `lotreport` can net them out) as one logged op with
   written-back ids; undo removes the geometry + layer; **deterministic → replay
   byte-identical** (verified). `SubdivisionSettings.open_space_reserve_frac` already
   present (serde-default 0, §6b). Reserve derives a sensible `block_depth` from the site
@@ -785,8 +785,8 @@ Every subdivision algorithm must pass these block shapes:
   blocks); reserved blocks larger + more central than developable; developable excludes
   reserved and subdivides; reserve=0 = feature mode; deterministic same-seed; undo removes
   geometry; replay byte-identical (feature + reserve).
-- **Phase 10** — ✅ **DONE (2026-09-05).** Buildings — footprint + stepped massing + roofs
-  (§7.6; owner scope, re-scope resolved in `docs/intemfit-phase10-scope.md`, now folded
+- **Buildings** — ✅ **DONE (2026-09-05).** Buildings — footprint + stepped massing + roofs
+  (§7.6; owner scope, re-scope resolved in `docs/site-planning-buildings-scope.md`, now folded
   into §7.6). `crates/subdivision/src/buildings/` (`footprint.rs`, `massing.rs`, `roof.rs`,
   `mod.rs` orchestration `build_on_envelope`) + verb `lotbuilding` (exec + parse + registry,
   deck-callable/GBNF). All 4 fill modes + 4 typologies + 4 roofs + stepped massing with
@@ -795,9 +795,9 @@ Every subdivision algorithm must pass these block shapes:
   each roof a valid mesh, full pipeline, determinism, collapse→None) + 8 exec (bakes
   footprint+mass+roof on `buildings` layer, undo removes, byte-identical replay, deterministic,
   euro_latam placeholder note, collapsed envelope reported not panicked, GFA stored, is-logged).
-  `lotsettings` extended with sticky setback + building keys so they replay. **Phase 11
-  (yield reporting) picks up: read per-floor areas / built GFA for FAR = GFA / net site.**
-- **Phase 11** — ✅ **DONE (2026-09-05).** Yield reporting + option comparison.
+  `lotsettings` extended with sticky setback + building keys so they replay. **Yield reporting
+  picks up: read per-floor areas / built GFA for FAR = GFA / net site.**
+- **Yield reporting** — ✅ **DONE (2026-09-05).** Yield reporting + option comparison.
   `crates/subdivision/src/reporting.rs`: pure `YieldInputs` → `YieldReport::compute`
   (geometry-free summary math, unit-tested headless) — lot count + total/avg/min/max
   lot area, frontage stats (at the setback line, §5), GROSS vs **NET developable
@@ -813,12 +813,12 @@ Every subdivision algorithm must pass these block shapes:
   into features vs `reserve` on the `openspace` layer, GFA + footprint parsed off each
   `building:mass gfa=… fp=…` object name (`lotbuilding` now persists both onto the mass
   object so yield reads it straight off the doc), gross site = the largest closed curve
-  NOT on an intemfit output layer (else lots + open space). Stored on a new
+  NOT on a site-planning output layer (else lots + open space). Stored on a new
   `Document::yield_reports` map keyed `lotyield` and served by the existing `report`
   verb (`report` / `report lotyield`); **read-only, never logged** (like
   `lotfrontage`/`report`), deterministic. **`lotreport compare`** rotates the prior
   snapshot into `lotyield_prev` and diffs the two (minimal 2-slot A/B store per §11).
-  Empty / no-intemfit-geometry site → clean "nothing to report", never a panic. Deck
+  Empty / no-site-planning-geometry site → clean "nothing to report", never a panic. Deck
   prompt gains a `YIELD_CRITIQUE_HELP` section (judge FAR against NET, not gross).
   **Tests (all green):** 11 pure `reporting` unit tests (lot/area stats; net == gross
   when no open space + ratio 0; net = gross − open when present; FAR = GFA / net;
@@ -826,9 +826,9 @@ Every subdivision algorithm must pass these block shapes:
   deterministic; 2-run compare deltas; markdown rows) + 9 `lotreport` exec tests (yields
   match baked lots + total area within tol; net == gross no-open-space; nets out open
   space; FAR = GFA/net on real buildings; served through `report`; not-logged +
-  deterministic; empty-doc clean error; compare diff; compare needs two runs). Phase 12
-  (polish) picks up from here.
-- **Phase 12** — ✅ **DONE (2026-09-05). M-intemfit COMPLETE.** Polish cart, three
+  deterministic; empty-doc clean error; compare diff; compare needs two runs). Polish
+  picks up from here.
+- **Polish** — ✅ **DONE (2026-09-05). M-site-planning COMPLETE.** Polish cart, three
   pieces:
   1. **Consistent indexing** (`crates/subdivision/src/indexing.rs`,
      `ConsistentIndexing`) — deterministic lot/block IDs by **spatial** order, not
@@ -867,7 +867,7 @@ Every subdivision algorithm must pass these block shapes:
      Felkel-vs-Offset agreement on 3 convex blocks, **no-panic on all §8 blocks**,
      area-conservation + street-access + byte-identical determinism on the
      conservation-safe §8 set (#1/#4/#5/#7 — the notch is excluded from the
-     conservation assertion for both backends, the same Phase-7 limit), and the
+     conservation assertion for both backends, the same skeleton subdivision limit), and the
      default offset backend unchanged; + 2 exec (`skeleton_felkel_setting_bakes_lots`,
      `skeleton_setting_rejects_unknown_impl`).
   3. **Optimization** — deliberately **skipped** (plan §12: "optional, skip if 1+2
@@ -875,7 +875,7 @@ Every subdivision algorithm must pass these block shapes:
      tested sites; a speculative hot-path rewrite risked the replay-determinism
      invariant for no measured need. Left as a clean future follow-up.
   `cargo test -p subdivision` 162 lib + all integration green; `cargo clippy -p
-  subdivision` clean (0 new warnings). **M-intemfit is COMPLETE (Phases 1–12).**
+  subdivision` clean (0 new warnings). **M-site-planning is COMPLETE.**
 
 ---
 
@@ -905,16 +905,16 @@ registry-registered, deck-callable, GBNF-grammared, logged + undoable.
   `lotsubdivide grid width=50 loading=alley`. Yield critique via `lotreport` + the
   `report` plane, grounded like the M-enviro critique hooks.
 - **Later (optional)**: a dynamic **Site tab** (reuse `M-dyntabs`) listing blocks/lots
-  with counts + re-lot buttons. Not required for Phase 3.
+  with counts + re-lot buttons. Not required for recursive-OBB subdivision.
 
 ---
 
 ## 11. Scope warning
 
-Manuel marked ~90% of the questionnaire — full road generation, building footprints,
+The client marked ~90% of the questionnaire — full road generation, building footprints,
 roof massing. Literally that's CityEngine + TestFit + a massing generator. **Do not
-attempt Phases 10–12 in the first release.** Phases 1–8 are a real, useful, defensible
-tool. Get Phase 3 into his hands early and let his reaction reorder everything after it.
+attempt buildings, yield reporting or polish in the first release.** Everything through setbacks is a real, useful, defensible
+tool. Get recursive-OBB subdivision into the client's hands early and let their reaction reorder everything after it.
 
 ---
 
@@ -927,23 +927,23 @@ tool. Get Phase 3 into his hands early and let his reaction reorder everything a
    outer/inner offset + Miter/Round/Bevel joins; `outline_fixed_scale` pins the
    float→int scale we control). Verified in `clip_bridge.rs` tests: inward offset shrinks
    area, outward grows it, a deep inset collapses to empty, and boolean ops give the
-   expected areas. **No fallback to `geo` or a vendored Clipper2 needed.** Phase 3
+   expected areas. **No fallback to `geo` or a vendored Clipper2 needed.** recursive-OBB subdivision
    (recursive OBB) does not use offset at all — it uses only the half-plane clip — so the
-   bridge is wired + smoke-tested now for Phase 4+ but is not on the Phase-3 critical path.
+   bridge is wired + smoke-tested now for offset/perimeter subdivision+ but is not on the recursive-OBB subdivision critical path.
 2. **Locate the Python prototype** — the plan references `/prototype/python`; it is not
-   yet in this repo. Get it from Manuel/source before Phase 3 (port target).
-3. **Manuel's §1 open questions** (width-mix products, alley dims, day-one, flag-lot
-   area accounting). Voronoi is now an owner-requested Phase-5b generator (dual of our
-   Delaunay), not ruled out. ✅ **Phase 5b SHIPPED 2026-09-04** — radial/hexagonal/
+   yet in this repo. Get it from the client/source before recursive-OBB subdivision (port target).
+3. **The client's §1 open questions** (width-mix products, alley dims, day-one, flag-lot
+   area accounting). Voronoi is now an owner-requested non-rectilinear street generators generator (dual of our
+   Delaunay), not ruled out. ✅ **Non-rectilinear street generators SHIPPED 2026-09-04** — radial/hexagonal/
    Voronoi all built; Voronoi reuses `kernel_mesh::triangulate` (no new external dep,
    no cycle). See §9.
-4. ⚠️ **Phase 6 SHIPPED 2026-09-04 ON PLACEHOLDER DEFAULTS.** The lot rules are built
+4. ⚠️ **Lot rules SHIPPED 2026-09-04 ON PLACEHOLDER DEFAULTS.** The lot rules are built
    and tested, but they run on the metric **euro_latam** profile (§6b) because the §1
-   open questions are still unanswered. **Still needed from Manuel to finalize the
-   defaults:** (2) his real width-mix product list + whether the mix is a hard ratio
+   open questions are still unanswered. **Still needed from the client to finalize the
+   defaults:** (2) their real width-mix product list + whether the mix is a hard ratio
    or soft preference (currently soft 6/8/10 m @ 25/50/25%); (3) alley ROW width +
    whether alleys are required on every block or only some (currently 5 m); (4) whether
    the flag-lot pole area is excluded from countable area (currently EXCLUDED — the
    assumption implemented). Every euro_latam value is flagged at runtime as
-   "placeholder — confirm with Manuel"; swap the `euro_latam` profile numbers in
-   `settings.rs` once he answers.
+   "placeholder — verify against local regulations"; swap the `euro_latam` profile numbers in
+   `settings.rs` once they answer.

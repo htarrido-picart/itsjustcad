@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! §8 validation cases for OFFSET / perimeter subdivision (Phase 4), run against
-//! the 10 sample blocks in `samples/blocks/*.json` (the same set Phase 3 uses).
+//! Sample-block validation cases for OFFSET / perimeter subdivision, run against
+//! the 10 sample blocks in `samples/blocks/*.json` (the same set recursive OBB uses).
 //!
-//! Assertions per the plan §8:
+//! Assertions:
 //! - Σ lot area == block area within tolerance (conservation) — even when the
 //!   algorithm degenerately falls back to recursive OBB.
 //! - No overlapping lots (pairwise-disjoint interiors).
@@ -12,7 +12,7 @@
 //!   floating sliver) — checked as "the lot's OBB has positive extent".
 //! - Deterministic for a fixed seed (byte-identical on re-run).
 //!
-//! Plus the Phase-4-specific degenerate cases the plan §9 requires verified:
+//! Plus the perimeter-specific degenerate cases that must be verified:
 //! - `offset_width = 0` → falls back to recursive OBB.
 //! - `offset_width` huge (interior collapses) → falls back cleanly, no panic.
 //! - thin rectangle (#1) where the inset self-collapses.
@@ -65,7 +65,7 @@ fn test_settings() -> SubdivisionSettings {
 }
 
 /// Overlap area of two lots by interior grid sampling (same cheap disjoint test
-/// as the Phase-3 suite).
+/// as the recursive-OBB suite).
 fn overlap_area(a: &Polygon2d, b: &Polygon2d) -> f64 {
     let (lo_a, hi_a) = a.aabb();
     let (lo_b, hi_b) = b.aabb();
@@ -158,7 +158,7 @@ fn deterministic_for_fixed_seed() {
     }
 }
 
-// ── Degenerate cases the plan §9 Phase 4 requires verified ──────────────────
+// ── Degenerate cases that must be verified ──────────────────────────────────
 
 #[test]
 fn zero_offset_falls_back_to_recursive_obb() {

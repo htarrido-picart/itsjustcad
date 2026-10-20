@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `LoadingStrategy` (plan §7.4, Phase 6) — FrontLoaded (euro_latam default) vs
+//! `LoadingStrategy` — FrontLoaded (euro_latam default) vs
 //! AlleyLoaded. Front-loaded lots front a street and back onto the interior of
 //! the block. Alley-loaded lots front a street on one side and an ALLEY on the
 //! other: a two-frontage arrangement, so each lot's depth runs street→alley (the
 //! block half-depth), which requires the alley to already be in the street graph
-//! (Phase 5's alley tier tags block edges `is_alley`).
+//! (the road network's alley tier tags block edges `is_alley`).
 //!
 //! Uses the block-edge `is_street` / `is_alley` tags. This module reports the
 //! per-side depth a downstream slicer should use; it does not itself cut lots.

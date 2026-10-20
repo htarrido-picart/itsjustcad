@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `SubdivisionSettings` — the parameter object (plan §6). serde-defaulted so old
+//! `SubdivisionSettings` — the parameter object. serde-defaulted so old
 //! documents load; stored on the Document by the commands crate. Mirrors
 //! CityEngine attribute names where they exist.
 //!
-//! **Semantic trap (plan §6):** `lot_area_min`, `lot_width_min`, `irregularity`
-//! mean different things per method. Phase 3 uses only the Recursive
+//! **Semantic trap:** `lot_area_min`, `lot_width_min`, `irregularity`
+//! mean different things per method. `method=grid` uses only the Recursive
 //! interpretation (recursion stop / min side length / split-pivot deviation).
 
 use serde::{Deserialize, Serialize};
@@ -28,19 +28,19 @@ pub enum LoadingType {
 }
 
 /// Which straight-skeleton implementation the skeleton subdivider uses
-/// (plan §12.2). `Offset` = the Phase-7 [`crate::straight_skeleton::
+/// `Offset` = the approximate [`crate::straight_skeleton::
 /// OffsetApproxSkeleton`] (robust on any polygon) — the DEFAULT for safety.
-/// `Felkel` = the Phase-12 [`crate::straight_skeleton::FelkelSkeleton`] (a true
+/// `Felkel` = the [`crate::straight_skeleton::FelkelSkeleton`] (a true
 /// straight skeleton, exact on convex polygons via the priority-queue event loop,
 /// falling back to the approximate skeleton on non-convex input). Opt-in via
 /// `lotsettings skeleton=felkel|offset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SkeletonImpl {
-    /// Offset-approximate skeleton (Phase 7). Robust; the safe default.
+    /// Offset-approximate skeleton. Robust; the safe default.
     #[default]
     Offset,
-    /// True Felkel skeleton (Phase 12), convex-exact + non-convex fallback.
+    /// True Felkel skeleton, convex-exact + non-convex fallback.
     Felkel,
 }
 
@@ -69,15 +69,15 @@ pub enum StreetPattern {
     Skewed,
     Organic,
     CulDeSac,
-    /// Owner scope (Phase 5b).
+    /// Owner scope (non-rectilinear).
     Radial,
-    /// Owner scope (Phase 5b).
+    /// Owner scope (non-rectilinear).
     Hexagonal,
-    /// Owner scope (Phase 5b).
+    /// Owner scope (non-rectilinear).
     Voronoi,
 }
 
-/// A width-mix product list for Phase 6 (packing). Unused in Phase 3.
+/// A width-mix product list for the lot rules (packing). Unused by `method=grid`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LotWidthMix {
     /// `(width, proportion)` pairs, e.g. `[(40,0.3),(50,0.5),(60,0.2)]`.
@@ -86,8 +86,8 @@ pub struct LotWidthMix {
 }
 
 impl LotWidthMix {
-    /// The euro_latam default width mix (plan §6b): 6 / 8 / 10 m at 25 / 50 /
-    /// 25 %, SOFT (not a hard ratio). **Placeholder** until Manuel confirms his
+    /// The euro_latam default width mix: 6 / 8 / 10 m at 25 / 50 /
+    /// 25 %, SOFT (not a hard ratio). **Placeholder** until the client confirms their
     /// real product list — flag it in command output.
     pub fn euro_latam_default() -> LotWidthMix {
         LotWidthMix {
@@ -97,7 +97,7 @@ impl LotWidthMix {
     }
 }
 
-/// Building typology (plan §7.6, Phase 10) — drives the footprint shape inside
+/// Building typology — drives the footprint shape inside
 /// the buildable envelope. All owner-scoped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -127,7 +127,7 @@ impl Typology {
     }
 }
 
-/// Footprint fill mode (plan §7.6, Phase 10) — how much of the buildable
+/// Footprint fill mode — how much of the buildable
 /// envelope the footprint claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -157,7 +157,7 @@ impl FootprintMode {
     }
 }
 
-/// Roof form (plan §7.6, Phase 10). `PerTypology` picks a sensible default from
+/// Roof form. `PerTypology` picks a sensible default from
 /// the typology (detached/row → gable, courtyard/slab → flat).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -189,21 +189,21 @@ impl RoofType {
     }
 }
 
-/// A named default profile (plan §6b). `EuroLatam` carries the metric European /
+/// A named default profile. `EuroLatam` carries the metric European /
 /// Latin-American placeholder numbers; `UsSuburban` is a stub for later. **Every
-/// EuroLatam value is a placeholder** pending Manuel's §1 answers — surfaced in
+/// EuroLatam value is a placeholder** pending the client's answers — surfaced in
 /// command output whenever a lot-rules run falls back to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RegionProfile {
-    /// European / Latin-American metric urban form (plan §6b) — the default.
+    /// European / Latin-American metric urban form — the default.
     #[default]
     EuroLatam,
     /// US suburban (feet-derived). Reserved; not yet populated.
     UsSuburban,
 }
 
-/// Upper clamp on `irregularity`: Manuel's soft default is 0.4; `loose` unlocks
-/// to 1.0 (Phase 3: loose ONLY raises the cap — no organic subdivider yet).
+/// Upper clamp on `irregularity`: the client's soft default is 0.4; `loose` unlocks
+/// to 1.0 (loose ONLY raises the cap — no organic subdivider yet).
 pub const IRREGULARITY_CAP_TIGHT: f64 = 0.4;
 pub const IRREGULARITY_CAP_LOOSE: f64 = 1.0;
 
@@ -214,8 +214,8 @@ pub struct SubdivisionSettings {
     /// Deterministic output seed (combined with a block hash at run time).
     pub seed: u64,
 
-    /// Named default profile (plan §6b). Drives the lot-rules (Phase 6)
-    /// placeholder defaults; `EuroLatam` numbers are placeholders until Manuel
+    /// Named default profile. Drives the lot-rules
+    /// placeholder defaults; `EuroLatam` numbers are placeholders until the client
     /// confirms — flagged in output when used.
     pub region: RegionProfile,
 
@@ -230,34 +230,34 @@ pub struct SubdivisionSettings {
     /// Split-pivot deviation from the OBB midpoint (Recursive). Clamped to
     /// `[0, 0.4]` unless `loose`, which raises the cap to 1.0.
     pub irregularity: f64,
-    /// Owner scope: unlock `irregularity` > 0.4. Phase 3 only widens the clamp.
+    /// Owner scope: unlock `irregularity` > 0.4. It only widens the clamp.
     pub loose: bool,
     pub corner_angle_max: f64,
     pub corner_width: f64,
 
-    // ── Offset (Phase 4) ──
+    // ── Offset / perimeter ──
     pub offset_width: f64,
     pub subdivide_core: bool,
 
-    // ── Road network (Phase 5, `lotgeneratesite`) ──
-    /// Which of the road generators to run (four rectilinear in Phase 5;
-    /// radial/hex/Voronoi are Phase 5b owner scope).
+    // ── Road network (`lotgeneratesite`) ──
+    /// Which of the road generators to run (four rectilinear;
+    /// radial/hex/Voronoi are owner scope).
     pub street_pattern: StreetPattern,
     /// Road right-of-way width (full, curb to curb). 0 = generator default.
     pub road_width: f64,
     /// Target block depth used to space roads. 0 = derive from lot depth.
     pub block_depth: f64,
 
-    // ── Skeleton (Phase 7 / 12) ──
+    // ── Skeleton / street-following ──
     pub shallow_lot_frac: f64,
     pub corner_align: CornerAlignment,
     pub simplify: f64,
-    /// Which straight-skeleton backend `method=streetfollowing` uses (plan §12.2).
-    /// Default `Offset` (the robust Phase-7 approximate skeleton); `Felkel` opts
-    /// into the true Phase-12 skeleton (convex-exact, non-convex fallback).
+    /// Which straight-skeleton backend `method=streetfollowing` uses.
+    /// Default `Offset` (the robust approximate skeleton); `Felkel` opts
+    /// into the true Felkel skeleton (convex-exact, non-convex fallback).
     pub skeleton_impl: SkeletonImpl,
 
-    // ── Lot rules (Phase 6) ──
+    // ── Lot rules ──
     pub width_mix: Option<LotWidthMix>,
     pub lot_depth_target: f64,
     pub lot_depth_tolerance: f64,
@@ -270,29 +270,29 @@ pub struct SubdivisionSettings {
     pub sliver_area_frac: f64,
     pub frontage_at_setback: bool,
 
-    // ── Setbacks (Phase 8) ──
+    // ── Setbacks + buildable envelopes ──
     pub setback_front: f64,
     pub setback_side: f64,
     pub setback_rear: f64,
     pub build_to_line: f64,
     pub draw_buildable_envelope: bool,
 
-    // ── Open space (Phase 9) ──
+    // ── Open space ──
     /// 0.0 = off (feature-placement default); > 0 = blind %-reserve (owner).
     pub open_space_reserve_frac: f64,
 
-    // ── Buildings (Phase 10) ──
+    // ── Buildings ──
     /// Building typology (drives the footprint shape). Default `Detached`.
     pub typology: Typology,
     /// Footprint fill mode. Default `TypologyDriven`.
     pub footprint_mode: FootprintMode,
     /// Lot-coverage fraction for `FootprintMode::CoverageRatio` (0..1).
-    /// **euro_latam placeholder** (0.5) — confirm with Manuel.
+    /// **euro_latam placeholder** (0.5) — confirm with the client.
     pub coverage_frac: f64,
     /// Fixed inset (metres) for `FootprintMode::Inset`.
     pub footprint_inset: f64,
     /// Storey height (metres). **euro_latam placeholder** (~3 m) — confirm with
-    /// Manuel. Height = `floor_count × floor_height`.
+    /// the client. Height = `floor_count × floor_height`.
     pub floor_height: f64,
     /// Number of storeys. Default 2.
     pub floor_count: usize,
@@ -305,7 +305,7 @@ pub struct SubdivisionSettings {
     /// Roof form. Default `PerTypology`.
     pub roof_type: RoofType,
     /// Roof pitch (degrees) for gable / hip / shed. **euro_latam placeholder**
-    /// (30°) — confirm with Manuel.
+    /// (30°) — confirm with the client.
     pub roof_pitch: f64,
 }
 
@@ -349,7 +349,7 @@ impl Default for SubdivisionSettings {
             build_to_line: 0.0,
             draw_buildable_envelope: true,
             open_space_reserve_frac: 0.0,
-            // Buildings (Phase 10). euro_latam placeholders flagged in-verb.
+            // Buildings. euro_latam placeholders flagged in-verb.
             typology: Typology::Detached,
             footprint_mode: FootprintMode::FullEnvelope,
             coverage_frac: 0.5,
@@ -379,10 +379,10 @@ impl SubdivisionSettings {
         self.irregularity.clamp(0.0, self.irregularity_cap())
     }
 
-    /// A fully-metric **euro_latam** settings object (plan §6b). Every value is a
-    /// placeholder pending Manuel's confirmation. Use this when the user selects
+    /// A fully-metric **euro_latam** settings object. Every value is a
+    /// placeholder pending the client's confirmation. Use this when the user selects
     /// the metric profile explicitly; the struct `Default` keeps the legacy
-    /// imperial example numbers so pre-Phase-6 tests/files are unchanged.
+    /// imperial example numbers so pre-lot-rules tests/files are unchanged.
     pub fn euro_latam() -> SubdivisionSettings {
         SubdivisionSettings {
             region: RegionProfile::EuroLatam,
@@ -408,12 +408,12 @@ impl SubdivisionSettings {
         }
     }
 
-    // ── Lot-rules (Phase 6) effective values + placeholder tracking ──────────
+    // ── Lot-rules effective values + placeholder tracking ─────────────────────
     //
     // Each accessor returns `(value, used_placeholder)`. `used_placeholder` is
     // true when the value came from the euro_latam profile because the user gave
     // no explicit override — the signal the command surfaces as
-    // "using euro_latam defaults (placeholder — confirm with Manuel)".
+    // "using euro_latam defaults (placeholder — verify against local regulations)".
 
     /// Effective width mix for the lot-rules pass. When `width_mix` is unset and
     /// the region is EuroLatam, fall back to the placeholder 6/8/10 m mix.

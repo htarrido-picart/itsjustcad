@@ -5384,7 +5384,7 @@ impl App {
     /// Editable Properties panel for the current selection. Every field routes
     /// its mutation through an EXISTING verb via `execute_line`, so the edit is
     /// op-logged, undoable and replay-stable — the panel never touches `doc`.
-    /// Compact labeled rows (Manuel: AutoCAD's is too big, Rhino's is simple).
+    /// Compact labeled rows (reviewer feedback: AutoCAD's is too big, Rhino's is simple).
     /// Multi-selection shows a shared value, or "—" / a mixed hint when the
     /// selected objects disagree; a commit then applies to the whole selection.
     fn properties_panel(&mut self, ui: &mut egui::Ui) {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Recursive OBB subdivision (plan §7.1, Phase 3) — `method=grid`.
+//! Recursive OBB subdivision — `method=grid`.
 //!
 //! Compute the minimum-area OBB of the block. Cut it with a line along the OBB
 //! **short** direction, pivoted on the **long** axis midpoint (so the cut runs
@@ -13,7 +13,7 @@
 //! - **Street access** — if a child would lose its street edge, cut along the
 //!   orthogonal (long-axis) direction instead. With `force_street_access == 1.0`
 //!   a split that still orphans a child is rejected (the parent stays a lot).
-//!   For Phase 3 there is no street graph, so **every original block boundary
+//!   Without a street graph, so **every original block boundary
 //!   edge counts as frontage**.
 //! - **Snap to contour vertices** — if the pivot lands near an original block
 //!   vertex, move it onto that vertex.
@@ -35,7 +35,7 @@ use glam::DVec2;
 pub struct Lot {
     pub polygon: Polygon2d,
     /// True if the lot touches the original block boundary (its "street" in
-    /// Phase 3, where any block edge counts as frontage).
+    /// `method=grid`, where any block edge counts as frontage).
     pub has_street: bool,
 }
 
@@ -176,7 +176,7 @@ fn recurse(
     // block is already at/below 2× min width in its short dimension, splitting it
     // further would create sub-width lots — leave it whole. This also produces
     // the CORRECT behaviour when a high lot_width_min forces lots above
-    // lot_area_max (plan §7.1): we simply stop.
+    // lot_area_max: we simply stop.
     if ob.short_len() < settings.lot_width_min * 2.0 && ob.long_len() < settings.lot_width_min * 2.0
     {
         emit(poly, block_edges, out);

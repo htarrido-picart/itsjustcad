@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! §9 Phase 8 validation for **setbacks + buildable envelopes**.
+//! Validation for **setbacks + buildable envelopes**.
 //!
-//! Hard assertions (plan §9 Phase 8):
+//! Hard assertions:
 //! - Buildable envelope on a rectangular lot with known setbacks → area ==
 //!   (w−2·side)(d−front−rear) within tol (covered as a unit test; re-checked
 //!   here through the public API); side=0 (euro_latam) → envelope spans full width.
@@ -75,7 +75,7 @@ fn rect_side_zero_spans_full_width() {
     assert!((ep.area() - 648.0).abs() < 2.0, "area {} vs 648", ep.area());
 }
 
-/// Irregular / skeleton-shaped lot (§8 #3 re-entrant notch): the envelope stays
+/// Irregular / skeleton-shaped lot (sample block #3, re-entrant notch): the envelope stays
 /// inside, is a valid simple polygon, and does not panic.
 #[test]
 fn irregular_lot_envelope_inside_and_valid() {

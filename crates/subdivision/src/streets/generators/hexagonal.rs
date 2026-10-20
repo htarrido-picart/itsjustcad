@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Hexagonal generator (plan §7.3 / §1 owner scope, Phase 5b): a pointy-top hex
+//! Hexagonal generator (owner scope, non-rectilinear): a pointy-top hex
 //! lattice sized so each cell is roughly one block deep, tiled over the site
 //! bounding box and clipped to the site. Every distinct hex-cell **edge** is
 //! emitted once as a street centerline; block extraction then carves the hex

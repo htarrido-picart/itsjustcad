@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Organic generator (plan §7.3): spline spines fitted to the site long axis
+//! Organic generator: spline spines fitted to the site long axis
 //! with controlled **sinusoidal deviation**, then secondary connectors.
 //!
 //! We run one gently-curving spine down the site's long axis (amplitude driven

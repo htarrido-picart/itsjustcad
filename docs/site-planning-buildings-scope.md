@@ -1,9 +1,10 @@
-# intemfit Phase 10 — Buildings: re-scope answers (owner, 2026-09-05)
+# Site planning buildings — re-scope answers (owner, 2026-09-05)
 
-The Phase-10 "re-scope with Manuel before buildings" gate was resolved by the
-**product owner (Hector)**, unblocking Phase 10 without waiting on Manuel. These
-answers are the Phase-10 spec — fold into `docs/intemfit-plan.md` §7/§9 when the
-Phase-10 cart launches. Buildings generate INSIDE the Phase-8 buildable envelope.
+The "re-scope with the client before buildings" gate was resolved by the
+**product owner (Hector)**, unblocking buildings without waiting on the client.
+These answers are the buildings spec — fold into `docs/site-planning-plan.md`
+§7/§9 when the buildings cart launches. Buildings generate INSIDE the buildable
+envelope from setbacks.
 
 ## Answers
 
@@ -18,7 +19,7 @@ Phase-10 cart launches. Buildings generate INSIDE the Phase-8 buildable envelope
    step back (setback per floor above a threshold) — a stepped massing.
 4. **Roof — ALL.** flat / gable / hip / shed, per-typology or per-arg.
 5. **Detail — footprint AND mass, with floors for FAR.** Emit the footprint
-   polygon AND the extruded 3D mass, divided into floors so Phase 11 yield can
+   polygon AND the extruded 3D mass, divided into floors so yield reporting can
    compute GFA / FAR (floor_count × floor_area, net of step-backs).
 
 ## Implications for the build
@@ -33,14 +34,15 @@ Phase-10 cart launches. Buildings generate INSIDE the Phase-8 buildable envelope
 - Verb `lotbuilding <sel> [typology= footprint= floors= floorheight= roof= …]` →
   bakes footprints + mass onto `buildings` layer (mass on a 3D layer), logged,
   undo, replay-stable, deterministic.
-- FAR/GFA (floor areas net of step-backs) flow into Phase 11 `lotreport` — report
+- FAR/GFA (floor areas net of step-backs) flow into the yield report (`lotreport`) — report
   gross site, net developable (minus open space), and built GFA / FAR.
 - euro_latam placeholder floor_height ~3 m, coverage defaults, etc. — flagged
-  "confirm with Manuel" like Phase 6/8.
+  "confirm with the client" like the lot-rule and setback numbers.
 
 ## Train position
 
-Owner directive: Phase 10 unblocked → the intemfit train now runs
-8 → 9 → 10 → 11 → 12 (no halt at 10). **M-dwg-bridge after the last train cart
-(Phase 12) lands.** Manuel still gets the Phase 1–9 build for feedback in
-parallel; his answers refine the euro_latam placeholders (Phase 6/8/10 numbers).
+Owner directive: buildings unblocked → the site-planning train now runs
+setbacks → open space → buildings → yield reporting → polish (no halt at
+buildings). **M-dwg-bridge after the last train cart (polish) lands.** The client
+still gets the build through open space for feedback in parallel; their answers
+refine the euro_latam placeholders (lot-rule, setback and building numbers).

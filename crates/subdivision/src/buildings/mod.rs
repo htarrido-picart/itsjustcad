@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Buildings (plan §7.6, M-intemfit Phase 10) — footprints + stepped massing +
-//! roofs, generated INSIDE the Phase-8 buildable envelope.
+//! Buildings — footprints + stepped massing +
+//! roofs, generated INSIDE the setback buildable envelope.
 //!
 //! Pipeline, all deterministic:
 //! 1. [`footprint::footprint`] — typology + fill mode → a 2D footprint polygon
 //!    (optionally with a courtyard void) inside the envelope.
 //! 2. [`massing::massing`] — extrude the footprint by floors, stepping upper
-//!    floors back, recording per-floor areas for GFA / FAR (Phase 11).
+//!    floors back, recording per-floor areas for GFA / FAR (yield reporting).
 //! 3. [`roof::roof`] — cap the top floor's ring with flat / gable / hip / shed.
 //!
 //! [`build_on_envelope`] runs the whole pipeline for one lot and returns a
@@ -28,7 +28,7 @@ use crate::settings::{RoofType, SubdivisionSettings, Typology};
 use kernel_mesh::Mesh;
 
 /// The full result of building on one lot: the 2D footprint + 3D stepped mass +
-/// roof mesh + per-floor GFA data (for Phase 11 yield / FAR).
+/// roof mesh + per-floor GFA data (for yield / FAR).
 #[derive(Debug, Clone)]
 pub struct BuildingResult {
     /// The footprint outer polygon (bake as a 2D curve).
@@ -39,7 +39,7 @@ pub struct BuildingResult {
     pub mass: Mesh,
     /// The roof mesh (bake as a mesh; a flat roof is a slab).
     pub roof: Mesh,
-    /// Per-floor records (index, base z, area) for yield reporting (Phase 11).
+    /// Per-floor records (index, base z, area) for yield reporting.
     pub floors: Vec<Floor>,
     /// Fixed mass height = floors × floor_height.
     pub height: f64,

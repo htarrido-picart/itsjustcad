@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `BlockEdge` — one edge of a block polygon carrying its street tag (plan §5,
-//! the **hard dependency**). Every block edge records whether it lies on a
+//! `BlockEdge` — one edge of a block polygon carrying its street tag
+//! (a **hard dependency** of the lot rules). Every block edge records whether it lies on a
 //! generated street ROW and, if so, which street (id + width + length). An
 //! original-boundary edge that is not a street has `is_street == false`. The
 //! rear-lane (alley) tier tags its edges `is_alley == true`.
 //!
 //! Skeleton subdivision, corner-lot assignment, front/alley loading, and
-//! frontage measurement (all later phases) are unimplementable without this,
+//! frontage measurement are unimplementable without this,
 //! so it is built now and carried through the bake so a downstream
 //! `lotsubdivide` on a generated block sees the same tags.
 
@@ -29,7 +29,7 @@ pub struct BlockEdge {
     pub street_width: f64,
     /// The generating street centerline length when `is_street`; `0.0` otherwise.
     pub street_length: f64,
-    /// True if this edge is a rear-lane (alley) edge (§ alley tier).
+    /// True if this edge is a rear-lane (alley) edge (alley tier).
     pub is_alley: bool,
 }
 

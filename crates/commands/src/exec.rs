@@ -5397,7 +5397,7 @@ fn terrain_surface(doc: &Document) -> Result<(ObjectId, &kernel_mesh::Mesh), Exe
         })
 }
 
-/// `lotsubdivide` (M-intemfit Phase 3): subdivide the selected closed block
+/// `lotsubdivide`: subdivide the selected closed block
 /// curve(s) into lots on the `lots` layer via the pure `subdivision` crate.
 /// Numeric args override the sticky settings for THIS run (they are baked into
 /// the logged op so replay is self-contained). Deterministic for a fixed seed →
@@ -5689,10 +5689,10 @@ fn regenerate_by_kind(
             // Deterministic, so replay reuses `ids` sliced by the recomputed
             // counts (same pattern as the Site arm).
 
-            // Phase 1: streets + blocks.
+            // Step 1: streets + blocks.
             let site = crate::lot::generate_site(poly, z, settings)?;
 
-            // Phase 2: subdivide EACH block (skip a block that fails — too
+            // Step 2: subdivide EACH block (skip a block that fails — too
             // small, etc. — never abort the whole plan).
             let mut lot_polys: Vec<subdivision::Polygon2d> = Vec::new();
             for b in &site.blocks {
@@ -5703,7 +5703,7 @@ fn regenerate_by_kind(
             let lots_z: Vec<(subdivision::Polygon2d, f64)> =
                 lot_polys.iter().map(|p| (p.clone(), site.z)).collect();
 
-            // Phase 3 + 4 (robust: empty on failure, never abort the plan).
+            // Steps 3 + 4: setbacks + buildings (robust: empty on failure, never abort the plan).
             let setbacks = crate::lot::compute_setbacks(&lots_z, settings).ok();
             let buildings = crate::lot::compute_buildings(&lots_z, settings).ok();
 
@@ -5906,7 +5906,7 @@ fn parse_width_mix(v: &str) -> Result<subdivision::LotWidthMix, ExecError> {
     })
 }
 
-/// `lotsettings` (M-intemfit): show or set the sticky `SubdivisionSettings`.
+/// `lotsettings`: show or set the sticky `SubdivisionSettings`.
 /// With no `sets`, reports the current settings. Logged; the prior settings JSON
 /// is captured into the op on first exec so replay + undo are self-contained.
 fn exec_lot_settings(
@@ -5959,7 +5959,7 @@ fn exec_lot_settings(
                     .parse::<u64>()
                     .map_err(|_| ExecError::Invalid(format!("bad seed '{v}'")))?
             }
-            // ── Phase 6 lot rules ──
+            // ── lot rules ──
             "region" => {
                 s.region = match v.to_lowercase().as_str() {
                     "euro_latam" | "eurolatam" | "metric" => {
@@ -6014,12 +6014,12 @@ fn exec_lot_settings(
             }
             "sliver_frac" | "sliver_area_frac" => s.sliver_area_frac = num()?,
             "alley_width" | "alleywidth" => s.alley_width = num()?,
-            // Setbacks (Phase 8) — sticky so they replay + feed lotbuilding.
+            // Setbacks — sticky so they replay + feed lotbuilding.
             "front" | "setback_front" => s.setback_front = num()?,
             "side" | "setback_side" => s.setback_side = num()?,
             "rear" | "setback_rear" => s.setback_rear = num()?,
             "buildto" | "build_to" | "build_to_line" => s.build_to_line = num()?,
-            // Buildings (Phase 10).
+            // Buildings.
             "typology" | "typ" => {
                 s.typology = subdivision::Typology::parse(v).ok_or_else(|| {
                     ExecError::Invalid(format!(
@@ -6049,7 +6049,7 @@ fn exec_lot_settings(
             "stepback_start" | "stepback_start_floor" => {
                 s.stepback_start_floor = (num()?.max(0.0)) as usize
             }
-            // Skeleton backend (Phase 12) — `skeleton=felkel|offset`. Default
+            // Skeleton backend — `skeleton=felkel|offset`. Default
             // offset (robust). felkel = true straight skeleton (convex-exact,
             // non-convex fallback to offset).
             "skeleton" | "skeleton_impl" => {
@@ -6081,7 +6081,7 @@ fn exec_lot_settings(
     ))
 }
 
-/// `lotloading [sel] front|alley` (M-intemfit Phase 6): set the sticky loading
+/// `lotloading [sel] front|alley`: set the sticky loading
 /// mode. A thin convenience over `lotsettings loading=…`; logged so replay + undo
 /// reproduce it. `targets` is advisory (loading is sticky doc state applied on the
 /// next subdivide, not a per-object attribute).
@@ -6114,7 +6114,7 @@ fn exec_lot_loading(
     ))
 }
 
-/// `lotgeneratesite` (M-intemfit Phase 5): generate a road network + blocks from
+/// `lotgeneratesite`: generate a road network + blocks from
 /// the selected site boundary curve. Roads bake onto the `roads` layer, blocks
 /// onto the `blocks` layer, as one logged op. Per-run args override the sticky
 /// settings and are baked into the op so replay is self-contained. Deterministic
@@ -6390,7 +6390,7 @@ fn exec_site_plan(
     ))
 }
 
-/// `lotsetbacks` (M-intemfit Phase 8): compute + bake the buildable envelope per
+/// `lotsetbacks`: compute + bake the buildable envelope per
 /// selected lot curve onto the `setbacks` layer. The envelope is the lot inset by
 /// per-edge setbacks (front from the street edge, rear opposite, side the rest);
 /// `buildto > 0` pins the front to the build-to line. Per-run args override the
@@ -6528,9 +6528,9 @@ fn exec_lot_setbacks(
     ))
 }
 
-/// `lotfrontage` (M-intemfit Phase 8): report each selected lot's frontage
-/// length, measured along the setback line by DEFAULT (`at=setback`, Manuel's
-/// explicit ask) or the curb (`at=curb`). Read-only query — stored on the
+/// `lotfrontage`: report each selected lot's frontage
+/// length, measured along the setback line by DEFAULT (`at=setback`, a client
+/// requirement) or the curb (`at=curb`). Read-only query — stored on the
 /// AnalysisReport plane (`lotfrontage`) + rendered so `report` can re-show it and
 /// the deck can critique. Never logged.
 fn exec_lot_frontage(
@@ -6597,8 +6597,8 @@ fn exec_lot_frontage(
     ))
 }
 
-/// `lotreport` (M-intemfit Phase 11): build a yield summary from the current
-/// intemfit geometry (lots on the `lots` layer, `openspace:*` features/reserved
+/// `lotreport`: build a yield summary from the current
+/// site-planning geometry (lots on the `lots` layer, `openspace:*` features/reserved
 /// blocks, `building:mass` GFA) and store it on the `report` plane keyed
 /// `lotyield`. Reports on the **net developable area** (gross site − open space),
 /// not the gross site — a gross number lies once open space exists — plus built
@@ -6662,7 +6662,7 @@ fn exec_lot_report(
     ))
 }
 
-/// `lotopenspace` (M-intemfit Phase 9): place an open-space feature
+/// `lotopenspace`: place an open-space feature
 /// (`type=park|greenway|pond|treesave`) at the selected region / largest empty
 /// block, OR run the blind `reserve=<pct>` mode that pulls whole central blocks
 /// out of subdivision as open space. Both bake onto the `openspace` layer as one
@@ -6759,12 +6759,12 @@ fn exec_lot_openspace(
     ))
 }
 
-/// `lotbuilding` (M-intemfit Phase 10): generate a footprint + stepped 3D mass +
+/// `lotbuilding`: generate a footprint + stepped 3D mass +
 /// roof inside each selected lot's buildable envelope, baking footprint (2D) +
 /// mass (3D mesh) + roof (3D mesh) onto the `buildings` layer. Per-run args
 /// override the sticky settings and are baked into the op so replay is
 /// self-contained; written-back ids make replay byte-identical. Per-floor areas
-/// are stored on the buildings so Phase 11 yield can compute GFA/FAR. A lot with
+/// are stored on the buildings so the yield report can compute GFA/FAR. A lot with
 /// a collapsed buildable envelope is reported (no building), never a panic.
 #[allow(clippy::too_many_arguments)]
 fn exec_lot_building(
@@ -13504,7 +13504,7 @@ fn apply_forward(
                     msg.push_str(&format_compliance_report(r));
                 }
             }
-            // Yield reports (M-intemfit Phase 11) ride the same plane: bare
+            // Yield reports ride the same plane: bare
             // `report` includes the latest; `report lotyield` filters to it.
             // `lotyield_prev` (the compare A-slot) is only shown when asked for
             // by exact key so bare `report` stays uncluttered.
@@ -25698,7 +25698,7 @@ mod tests {
         assert!(old.compliance_reports.is_empty(), "pre-compliance snapshots load empty");
     }
 
-    // ── M-intemfit: lotsubdivide / lotsettings (Phase 2/3) ──────────────────
+    // ── site planning: lotsubdivide / lotsettings ─────────────────────────────
 
     fn lot_count(s: &Session) -> usize {
         s.doc.all_ids()
@@ -25756,7 +25756,7 @@ mod tests {
         assert_eq!(before, after, "replay recreated identical lot geometry");
     }
 
-    // ── Phase 12: consistent indexing + felkel skeleton ─────────────────────
+    // ── consistent indexing + felkel skeleton ───────────────────────────────
 
     /// Helper: lot names on the lots layer, in a stable (sorted) order.
     fn lot_names(s: &Session) -> Vec<String> {
@@ -25774,7 +25774,7 @@ mod tests {
 
     #[test]
     fn lots_carry_stable_spatial_index_in_name() {
-        // Phase 12.1 — baked lots are named `lot #N` with a spatial index, and the
+        // Baked lots are named `lot #N` with a spatial index, and the
         // set of indices is exactly 1..=count (a permutation, no gaps/dupes).
         let mut s = Session::default();
         run(&mut s, "rect 0,0,0 400 120");
@@ -25791,7 +25791,7 @@ mod tests {
 
     #[test]
     fn resubdivide_same_site_keeps_indices() {
-        // Phase 12.1 — a re-run on the identical site produces the identical set
+        // A re-run on the identical site produces the identical set
         // of spatial indices (the replay/stability invariant).
         let mut a = Session::default();
         run(&mut a, "rect 0,0,0 400 120");
@@ -25807,7 +25807,7 @@ mod tests {
 
     #[test]
     fn skeleton_felkel_setting_bakes_lots() {
-        // Phase 12.2 — `lotsettings skeleton=felkel` then a streetfollowing
+        // `lotsettings skeleton=felkel` then a streetfollowing
         // subdivide runs the Felkel backend and bakes lots (no panic, non-empty).
         let mut s = Session::default();
         run(&mut s, "lotsettings skeleton=felkel");
@@ -25826,7 +25826,7 @@ mod tests {
 
     #[test]
     fn perimeter_method_runs_and_bakes_lots() {
-        // Phase 4: method=perimeter now runs (no longer the deferral error).
+        // method=perimeter runs (no longer the deferral error).
         let mut s = Session::default();
         run(&mut s, "rect 0,0,0 400 300");
         let out = run(&mut s, "lotsubdivide last perimeter area=4000 width=20 seed=7");
@@ -25870,7 +25870,7 @@ mod tests {
 
     #[test]
     fn streetfollowing_method_runs_and_bakes_lots() {
-        // Phase 7: method=streetfollowing runs (skeleton subdivision) instead of
+        // method=streetfollowing runs (skeleton subdivision) instead of
         // the deferral error.
         let mut s = Session::default();
         run(&mut s, "rect 0,0,0 400 120");
@@ -25911,7 +25911,7 @@ mod tests {
         assert_eq!(before, after, "replay recreated identical skeleton lots");
     }
 
-    // ── M-intemfit: lotgeneratesite (Phase 5) ───────────────────────────────
+    // ── site planning: lotgeneratesite ───────────────────────────────────────
 
     fn layer_count(s: &Session, layer: &str) -> usize {
         s.doc.all_ids()
@@ -26100,8 +26100,8 @@ mod tests {
 
     #[test]
     fn lotgeneratesite_nonrectilinear_patterns_bake() {
-        // Phase 5b: radial / hexagonal / voronoi now generate roads + blocks
-        // (they were clean-error stubs in Phase 5). Each bakes onto the roads +
+        // Non-rectilinear patterns: radial / hexagonal / voronoi generate
+        // roads + blocks (they were clean-error stubs at first). Each bakes onto the roads +
         // blocks layers with no panic.
         for pattern in ["radial", "hexagonal", "voronoi"] {
             let mut s = Session::default();
@@ -26128,10 +26128,10 @@ mod tests {
         }
     }
 
-    // ── M-intemfit: lot rules (Phase 6) ──────────────────────────────────────
+    // ── site planning: lot rules ─────────────────────────────────────────────
 
     #[test]
-    fn lotsettings_accepts_phase6_keys() {
+    fn lotsettings_accepts_lot_rule_keys() {
         let mut s = Session::default();
         run(
             &mut s,
@@ -26243,7 +26243,7 @@ mod tests {
         let json = serde_json::to_string(&s.doc).unwrap();
         let back: Document = serde_json::from_str(&json).unwrap();
         assert_eq!(back.subdivision_settings, s.doc.subdivision_settings);
-        // Pre-intemfit snapshots (no field) load with defaults.
+        // Snapshots from before site planning (no field) load with defaults.
         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
         v.as_object_mut().unwrap().remove("subdivision_settings");
         let old: Document = serde_json::from_value(v).unwrap();
@@ -26260,7 +26260,7 @@ mod tests {
         assert_eq!(s.doc.subdivision_settings.lot_area_min, 6500.0);
     }
 
-    // ── M-intemfit: setbacks + buildable envelopes + frontage (Phase 8) ──────
+    // ── site planning: setbacks + buildable envelopes + frontage ─────────────
 
     fn setback_count(s: &Session) -> usize {
         s.doc
@@ -26322,8 +26322,8 @@ mod tests {
 
     #[test]
     fn lotsetbacks_euro_latam_placeholder_note_appears() {
-        // Under the euro_latam default profile the setback numbers are §6b
-        // placeholders → the run surfaces the "confirm with Manuel" note.
+        // Under the euro_latam default profile the setback numbers are
+        // placeholders → the run surfaces the "verify against local regulations" note.
         let mut s = Session::default();
         run(&mut s, "rect 0,0,0 30 40");
         // Explicit setbacks that leave an envelope, but region stays euro_latam.
@@ -26396,7 +26396,7 @@ mod tests {
         assert!(parse("lotsetbacks last front=5").unwrap().is_logged(), "lotsetbacks is logged");
     }
 
-    // ── M-intemfit: lotopenspace (Phase 9) ──────────────────────────────────
+    // ── site planning: lotopenspace ──────────────────────────────────────────
 
     fn openspace_count(s: &Session) -> usize {
         s.doc
@@ -26537,7 +26537,7 @@ mod tests {
         assert!(parse("lotopenspace last reserve=20").unwrap().is_logged());
     }
 
-    // ── M-intemfit: lotbuilding (Phase 10) ───────────────────────────────────
+    // ── site planning: lotbuilding ───────────────────────────────────────────
 
     fn buildings_count(s: &Session) -> usize {
         s.doc
@@ -26684,7 +26684,7 @@ mod tests {
         let b = subdivision::build_on_envelope(&env, &env, 0.0, &st).unwrap();
         let naive = 5.0 * env.area();
         assert!(b.gfa < naive, "stepped GFA {} < naive {}", b.gfa, naive);
-        // Per-floor areas are stored (Phase 11 reads these).
+        // Per-floor areas are stored (the yield report reads these).
         assert_eq!(b.floors.len(), 5);
         assert!(b.floors[0].area > b.floors[4].area, "upper floor stepped back");
     }
@@ -26694,7 +26694,7 @@ mod tests {
         assert!(parse("lotbuilding last typology=detached").unwrap().is_logged());
     }
 
-    // ── M-intemfit: lotreport — yield + net-of-open-space + compare (Phase 11) ─
+    // ── site planning: lotreport — yield + net-of-open-space + compare ───────
 
     /// Build a site rect, subdivide it into lots. Returns the session; the site
     /// boundary lives on the Default layer, lots on the `lots` layer.

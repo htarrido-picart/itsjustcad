@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! `StreetGraph` — the output of a road-network generator (plan §7.3): a set of
+//! `StreetGraph` — the output of a road-network generator: a set of
 //! street **centerlines**, each with a ROW **width** and a **hierarchy** tier
 //! (spine / connector / stub / alley), plus adjacency (which streets meet at a
 //! shared endpoint). Block extraction (`block_extractor`) offsets each
@@ -15,7 +15,7 @@
 use glam::DVec2;
 
 /// Where a street sits in the road hierarchy. Determines default ROW width and
-/// draw order; the alley tier is inserted last (plan § alley tier).
+/// draw order; the alley tier is inserted last (the alley tier).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreetTier {
     /// Primary through-road (the site spine).

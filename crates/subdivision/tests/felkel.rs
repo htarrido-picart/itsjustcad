@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Phase 12 (§12.2) — the true **Felkel** straight skeleton, and skeleton
+//! The true **Felkel** straight skeleton, and skeleton
 //! subdivision driven by it (`skeleton_impl = Felkel`).
 //!
-//! Scope shipped is convex-exact Felkel with a robust fallback to the Phase-7
+//! Scope shipped is convex-exact Felkel with a robust fallback to the
 //! offset-approximate skeleton on non-convex blocks (where split events would be
 //! required). These tests assert:
 //! - Felkel correctness where it is exact: square → single centre node; rectangle
 //!   → medial ridge segment; L-shape (non-convex) → no exact nodes but a covering
 //!   face partition via fallback.
 //! - Felkel and OffsetApprox agree within tolerance on convex polygons.
-//! - Felkel-backed `method=streetfollowing` still passes the §8 subdivision
+//! - Felkel-backed `method=streetfollowing` still passes the sample-block subdivision
 //!   assertions (area conservation, no gaps, street access, determinism) on the
 //!   blocks that matter — i.e. swapping the backend never ships a broken skeleton.
 
@@ -112,7 +112,7 @@ fn felkel_agrees_with_offset_approx_on_convex() {
     }
 }
 
-// ── Felkel-backed subdivision on §8 blocks ──────────────────────────────────
+// ── Felkel-backed subdivision on the sample blocks ──────────────────────────
 
 fn felkel_settings() -> SubdivisionSettings {
     SubdivisionSettings {
@@ -130,7 +130,7 @@ fn felkel_settings() -> SubdivisionSettings {
     }
 }
 
-/// The full §8 set — used for the no-panic fragility guard (the skeleton must
+/// The full sample-block set — used for the no-panic fragility guard (the skeleton must
 /// never panic on ANY block, whatever its convexity).
 fn all_blocks() -> Vec<(&'static str, Polygon2d)> {
     vec![
@@ -146,9 +146,9 @@ fn all_blocks() -> Vec<(&'static str, Polygon2d)> {
 }
 
 /// The blocks the skeleton subdivider guarantees area-conservation on — the same
-/// set the Phase-7 suite (`skeleton_blocks.rs`) asserts on. The approximate
+/// set the approximate-skeleton suite (`skeleton_blocks.rs`) asserts on. The approximate
 /// skeleton's nearest-edge fan does NOT conserve area on the deep re-entrant
-/// notch (a known Phase-7 limit, hence its exclusion there too); the Felkel
+/// notch (a known approximate-skeleton limit, hence its exclusion there too); the Felkel
 /// backend inherits that fallback on the non-convex notch, so it is excluded from
 /// the conservation assertion here as well — it is still covered by the no-panic
 /// guard above.
@@ -207,7 +207,7 @@ fn felkel_backend_deterministic_byte_identical() {
     }
 }
 
-/// The DEFAULT (offset) backend still passes — swapping does not regress Phase 7.
+/// The DEFAULT (offset) backend still passes — swapping does not regress the approximate skeleton.
 #[test]
 fn default_offset_backend_unchanged() {
     let mut s = felkel_settings();

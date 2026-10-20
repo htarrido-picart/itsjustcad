@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! §8 / §9 validation for **skeleton (street-following) subdivision** (Phase 7,
-//! `method=streetfollowing`). Run on the blocks that matter for it (plan §8/§9):
+//! Validation for **skeleton (street-following) subdivision**
+//! (`method=streetfollowing`). Run on the blocks that matter for it:
 //!
 //! - #1 long thin rectangle → one double-loaded row
 //! - #4 cul-de-sac bulb (near-circular, single street edge)
 //! - #5 curved-street block, varying radius
 //! - #7 one short street edge + 3 long non-street edges
 //!
-//! Assertions (plan §8):
+//! Assertions:
 //! - Σ lot area == block area within tolerance (conservation).
 //! - No overlapping lots (pairwise-disjoint interiors).
 //! - No gaps (conservation + disjointness on a partition).
 //! - Every lot has a street edge (`force_street_access == 1.0`).
 //! - Lots roughly PERPENDICULAR to the street on the curved/bulb cases — the
-//!   visual claim (§9): each lot's inward (non-street) side aligns with the local
+//!   visual claim: each lot's inward (non-street) side aligns with the local
 //!   street normal within a tolerance.
 //! - Deterministic same-seed → byte-identical (also the ItsJustCAD replay
 //!   invariant).
-//! - lot count in a sane range (§9 structural proxy for "matches the reference").
+//! - lot count in a sane range (structural proxy for "matches the reference").
 
 use glam::DVec2;
 use std::path::PathBuf;
@@ -195,7 +195,7 @@ fn deterministic_byte_identical() {
 
 #[test]
 fn lot_count_in_sane_range() {
-    // §9 structural proxy for "matches the reference": each block should yield a
+    // Structural proxy for "matches the reference": each block should yield a
     // handful-to-many lots, not 1 (undivided) and not thousands (runaway).
     let s = skel_settings();
     for (name, block) in matters() {
@@ -208,7 +208,7 @@ fn lot_count_in_sane_range() {
     }
 }
 
-/// The visual claim (§9): on the curved-street and cul-de-sac-bulb blocks the lot
+/// The visual claim: on the curved-street and cul-de-sac-bulb blocks the lot
 /// lines run PERPENDICULAR to the street. We verify the structural proxy: for
 /// each lot, its longest "inward" side (the side running away from the street)
 /// aligns with the local street NORMAL — i.e. is perpendicular to the nearest

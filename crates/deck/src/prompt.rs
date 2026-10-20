@@ -159,8 +159,8 @@ Then verify: `codecheck ada2010` (ramps) / `codecheck ibc2021` (stairs) → `rep
 If you MUST hand-build from primitives, honor the defaults (not legal advice — verify with the AHJ): ramp running slope ≤ 1:12; a level landing ≥ 60 in long (and ≥ ramp width) wherever a run would rise > 30 in, plus at top/bottom and every turn. Stair riser 4–7 in and CONSISTENT (equalize = rise / ceil(rise/7in), variation ≤ 3/8 in); tread ≥ 11 in with 2R+T ≈ 24–25 in; add a landing every ≤ 12 ft of rise.
 ";
 
-/// The "Yield critique" section: teaches the intemfit yield workflow
-/// (M-intemfit Phase 11). Like [`ENVIRO_CRITIQUE_HELP`] this is interpretation
+/// The "Yield critique" section: teaches the site-planning yield workflow.
+/// Like [`ENVIRO_CRITIQUE_HELP`] this is interpretation
 /// guidance — the `lotreport`/`report` verbs are advertised through the
 /// registry — carrying the key honesty rule: judge FAR against NET developable
 /// area, never gross, once open space exists.
