@@ -1,0 +1,4 @@
+A Dieste-style undulating vault, 6 wide and 12 long.
+```draft
+gaussvault 6 12 3 undulate
+```
