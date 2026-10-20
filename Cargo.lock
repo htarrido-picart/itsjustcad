@@ -2821,6 +2821,7 @@ dependencies = [
 name = "itsjustcad-ffi"
 version = "0.6.5"
 dependencies = [
+ "async-trait",
  "glam 0.30.10",
  "image",
  "itsjustcad-commands",

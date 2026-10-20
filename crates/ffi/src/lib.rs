@@ -31,8 +31,8 @@
 //!   pointer is caught (best-effort) instead of dereferencing freed memory.
 //!
 //! The caller must still uphold the parts Rust cannot check: a non-null
-//! `AppHandle` must be a pointer previously returned by [`ijc_init`] and not yet
-//! freed, and buffer pointers must be valid for the given length.
+//! `AppHandle` must be a pointer previously returned by [`ijc_init`] or
+//! [`ijc_init_headless`] and not yet freed, and buffer pointers must be valid for the given length.
 #![allow(clippy::missing_safety_doc)]
 
 pub mod replay;
@@ -247,13 +247,11 @@ pub struct AppHandle {
     /// [`ijc_run_command`]. Set via [`ijc_deck_set_auto_apply`].
     deck_auto_apply: Arc<AtomicBool>,
 
-    // GPU (render-thread only)
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
-    renderer: SceneRenderer,
-    depth_view: wgpu::TextureView,
+    /// GPU, surface and swapchain state (render-thread only). `Some` for a
+    /// handle from [`ijc_init`]; `None` for a headless handle from
+    /// [`ijc_init_headless`], where every render/GPU entry point is a safe no-op
+    /// or returns false/empty.
+    gpu: Option<Gpu>,
 
     // scene (render-thread only)
     session: Session,
@@ -280,6 +278,17 @@ pub struct AppHandle {
     deck_config: Option<DeckConfig>,
     pending: Arc<Mutex<Vec<PendingOp>>>,
     history: Arc<Mutex<Vec<ChatMessage>>>,
+}
+
+/// The wgpu device, the `CAMetalLayer` surface and its swapchain config, and the
+/// on-screen renderer. Absent on a headless handle.
+struct Gpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    renderer: SceneRenderer,
+    depth_view: wgpu::TextureView,
 }
 
 /// Run `body` catching any panic (a panic across `extern "C"` is UB), returning
@@ -770,45 +779,97 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
         let renderer = SceneRenderer::new(&device, format);
         let depth_view = make_depth(&device, config.width, config.height);
 
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(_) => return std::ptr::null_mut(),
-        };
-
-        let handle = AppHandle {
-            guard: GUARD_LIVE,
-            busy: AtomicBool::new(false),
-            freeing: AtomicBool::new(false),
-            alive: Arc::new(AtomicBool::new(true)),
-            tasks: Arc::new(Mutex::new(Vec::new())),
-            deck_auto_apply: Arc::new(AtomicBool::new(true)),
+        let gpu = Gpu {
             device,
             queue,
             surface,
             config,
             renderer,
             depth_view,
-            session: Session::default(),
-            camera: OrbitCamera::default(),
-            last_gen: None,
-            theme: Theme::Dark,
-            mode: DisplayMode::default(),
-            underlay_cache: None,
-            gumball_preview: None,
-            runtime,
-            deck: None,
-            deck_config: None,
-            pending: Arc::new(Mutex::new(Vec::new())),
-            history: Arc::new(Mutex::new(Vec::new())),
         };
-        Box::into_raw(Box::new(handle))
+        new_handle(Some(gpu))
     })
 }
 
-/// Destroy a handle created by [`ijc_init`]. Null-safe and safe against a
+/// Box a fresh handle around `gpu` (`None` = headless). Null if the tokio
+/// runtime cannot be built.
+fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let handle = AppHandle {
+        guard: GUARD_LIVE,
+        busy: AtomicBool::new(false),
+        freeing: AtomicBool::new(false),
+        alive: Arc::new(AtomicBool::new(true)),
+        tasks: Arc::new(Mutex::new(Vec::new())),
+        deck_auto_apply: Arc::new(AtomicBool::new(true)),
+        gpu,
+        session: Session::default(),
+        camera: OrbitCamera::default(),
+        last_gen: None,
+        theme: Theme::Dark,
+        mode: DisplayMode::default(),
+        underlay_cache: None,
+        gumball_preview: None,
+        runtime,
+        deck: None,
+        deck_config: None,
+        pending: Arc::new(Mutex::new(Vec::new())),
+        history: Arc::new(Mutex::new(Vec::new())),
+    };
+    Box::into_raw(Box::new(handle))
+}
+
+/// Create a headless engine: a `Session`, camera, tokio runtime and deck, with
+/// no view, surface, GPU device or swapchain. For UI-less tools (eval CLIs,
+/// tests). Returns null only if the tokio runtime cannot be built. Free with
+/// [`ijc_free`].
+///
+/// Works as on an [`ijc_init`] handle: [`ijc_run_command_result`],
+/// [`ijc_run_command`] (queued; apply with [`ijc_flush`]), [`ijc_scene_digest`],
+/// [`ijc_scene_digest_filtered`], [`ijc_new_document`], [`ijc_open_json`],
+/// [`ijc_save_json`], [`ijc_export`], the deck functions (auto-applied deck
+/// commands are queued; apply with [`ijc_flush`]), selection and gumball
+/// edits, and the JSON accessors.
+///
+/// Safe no-ops on a headless handle, since there is nothing to draw:
+/// [`ijc_render_frame`] does nothing (it does NOT apply the queue; use
+/// [`ijc_flush`]); [`ijc_resize`] is ignored; [`ijc_pick`] and
+/// [`ijc_project_point`] return false (no drawable). The camera calls only move
+/// the in-memory camera on the next flush. [`ijc_sheet_pdf`] and
+/// [`ijc_sheetset_pdf`] draw Shaded viewports as vector line art.
+#[unsafe(no_mangle)]
+pub extern "C" fn ijc_init_headless() -> *mut AppHandle {
+    guard_ffi(std::ptr::null_mut(), || new_handle(None))
+}
+
+/// Apply every queued op now (lines from [`ijc_run_command`], camera calls,
+/// auto-applied deck commands), in queue order, without rendering. This is what
+/// [`ijc_render_frame`] does before it draws, and the way to drain the queue on
+/// a headless handle ([`ijc_init_headless`]). Returns false on a null, invalid
+/// or busy handle, true otherwise (also when the queue was empty). Errors from
+/// single queued commands are not reported, as with [`ijc_render_frame`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`] or [`ijc_init_headless`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_flush(h: *mut AppHandle) -> bool {
+    guard_ffi(false, || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        apply_pending(&mut app);
+        true
+    })
+}
+
+/// Destroy a handle created by [`ijc_init`] or [`ijc_init_headless`]. Null-safe and safe against a
 /// concurrent / re-entrant / double `ijc_free`, and against a free racing an
 /// in-flight `*_mut` mutator.
 ///
@@ -919,6 +980,9 @@ fn clamp_dim(v: u32, device: &wgpu::Device) -> u32 {
     v.clamp(1, device.limits().max_texture_dimension_2d)
 }
 
+/// Resize the drawable to `w`×`h_px` physical pixels.
+/// Headless handle ([`ijc_init_headless`]): ignored.
+///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`].
 #[unsafe(no_mangle)]
@@ -927,11 +991,14 @@ pub unsafe extern "C" fn ijc_resize(h: *mut AppHandle, w: u32, h_px: u32) {
         let Some(mut app) = (unsafe { handle_mut(h) }) else {
             return;
         };
-        let app: &mut AppHandle = &mut app;
-        app.config.width = clamp_dim(w, &app.device);
-        app.config.height = clamp_dim(h_px, &app.device);
-        app.surface.configure(&app.device, &app.config);
-        app.depth_view = make_depth(&app.device, app.config.width, app.config.height);
+        // Headless: no surface to resize.
+        let Some(g) = app.gpu.as_mut() else {
+            return;
+        };
+        g.config.width = clamp_dim(w, &g.device);
+        g.config.height = clamp_dim(h_px, &g.device);
+        g.surface.configure(&g.device, &g.config);
+        g.depth_view = make_depth(&g.device, g.config.width, g.config.height);
     })
 }
 
@@ -1058,7 +1125,8 @@ fn run_cmd_json(session: &mut Session, cmd: Command) -> String {
     }
 }
 
-/// Queue a single command line (typed in the chat box). Applied next frame.
+/// Queue a single command line (typed in the chat box). Applied next frame, or
+/// by [`ijc_flush`] (the only way on a headless handle).
 ///
 /// Returns `true` if the line was queued, `false` if it was rejected: a null /
 /// non-UTF-8 string, an unparseable verb, or — per the side-effect gate below —
@@ -1281,6 +1349,9 @@ pub unsafe extern "C" fn ijc_get_workdir(h: *mut AppHandle) -> *mut c_char {
 /// incremental finger translation; the core scales them to radians (≈0.29°/px),
 /// so pass raw pixel deltas. Applied on the next `ijc_render_frame`.
 ///
+/// Headless handle ([`ijc_init_headless`]): moves only the in-memory camera,
+/// on the next [`ijc_flush`]; nothing is drawn.
+///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`].
 #[unsafe(no_mangle)]
@@ -1298,6 +1369,9 @@ pub unsafe extern "C" fn ijc_camera_orbit(h: *mut AppHandle, dx: f32, dy: f32) {
 /// Pan the camera by a screen-space delta in points. `dx`/`dy` are incremental
 /// finger translation; the core scales them by the view distance so the point
 /// under the fingers stays roughly fixed. Applied on the next `ijc_render_frame`.
+///
+/// Headless handle ([`ijc_init_headless`]): moves only the in-memory camera,
+/// on the next [`ijc_flush`]; nothing is drawn.
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`].
@@ -1318,6 +1392,9 @@ pub unsafe extern "C" fn ijc_camera_pan(h: *mut AppHandle, dx: f32, dy: f32) {
 /// takes an additive scroll amount where `distance *= 1 - scroll * 0.002`; we
 /// map the pinch ratio to that scroll so a pinch-apart moves the camera nearer.
 /// Applied on the next `ijc_render_frame`.
+///
+/// Headless handle ([`ijc_init_headless`]): moves only the in-memory camera,
+/// on the next [`ijc_flush`]; nothing is drawn.
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`].
@@ -1346,6 +1423,9 @@ pub unsafe extern "C" fn ijc_camera_zoom(h: *mut AppHandle, factor: f32) {
 /// camera off to show everything). No-op on an empty scene. Applied on the next
 /// [`ijc_render_frame`].
 ///
+/// Headless handle ([`ijc_init_headless`]): moves only the in-memory camera,
+/// on the next [`ijc_flush`]; nothing is drawn.
+///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`].
 #[unsafe(no_mangle)]
@@ -1373,9 +1453,11 @@ pub unsafe extern "C" fn ijc_camera_zoom_extents(h: *mut AppHandle) {
 // `ray_aabb` / `project` (crates/app/src/app.rs) in pure glam, so the FFI does
 // not depend on the desktop crate.
 
-/// The camera's current aspect ratio from the configured drawable size.
-fn aspect_of(app: &AppHandle) -> f32 {
-    app.config.width as f32 / app.config.height.max(1) as f32
+/// The drawable size in pixels (height at least 1), or `None` on a headless
+/// handle.
+fn drawable_size(app: &AppHandle) -> Option<(f32, f32)> {
+    let c = &app.gpu.as_ref()?.config;
+    Some((c.width as f32, c.height.max(1) as f32))
 }
 
 /// Build a world-space pick ray from a pixel coordinate, mirroring the desktop
@@ -1465,6 +1547,9 @@ fn pick_nearest(
 /// Bumps `doc.generation` on any selection change so the renderer recolors the
 /// highlight on the next [`ijc_render_frame`]. Returns whether an object was hit.
 ///
+/// Headless handle ([`ijc_init_headless`]): returns false and leaves the
+/// selection alone, since there is no drawable to pick in.
+///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`].
 #[unsafe(no_mangle)]
@@ -1475,8 +1560,11 @@ pub unsafe extern "C" fn ijc_pick(h: *mut AppHandle, x_px: f32, y_px: f32, addit
         };
         let app: &mut AppHandle = &mut app;
 
-        let vp = app.camera.view_proj(aspect_of(app));
-        let (w, h) = (app.config.width as f32, app.config.height as f32);
+        // Headless: no drawable to pick in.
+        let Some((w, h)) = drawable_size(app) else {
+            return false;
+        };
+        let vp = app.camera.view_proj(w / h);
         let Some((origin, dir)) = screen_ray(vp, w, h, x_px, y_px) else {
             return false;
         };
@@ -1556,6 +1644,8 @@ pub unsafe extern "C" fn ijc_selection_bbox(
 /// null/invalid handle or null `world`/`out_xy`. Compact reimplementation of the
 /// desktop `project`.
 ///
+/// Headless handle ([`ijc_init_headless`]): returns false (no drawable).
+///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`]. `world` must be null or
 /// valid for reads of 3 `f64`s; `out_xy` must be null or valid for writes of
@@ -1574,8 +1664,11 @@ pub unsafe extern "C" fn ijc_project_point(
             return false;
         };
         let p = unsafe { std::slice::from_raw_parts(world, 3) };
-        let (w, h_px) = (app.config.width as f32, app.config.height.max(1) as f32);
-        let vp = app.camera.view_proj(aspect_of(app));
+        // Headless: no drawable to project onto.
+        let Some((w, h_px)) = drawable_size(app) else {
+            return false;
+        };
+        let vp = app.camera.view_proj(w / h_px);
         let clip = vp * glam::Vec4::new(p[0] as f32, p[1] as f32, p[2] as f32, 1.0);
         if clip.w.is_nan() || clip.w <= 0.0 {
             return false; // behind the camera / clipped (NaN also fails)
@@ -1914,8 +2007,12 @@ pub unsafe extern "C" fn ijc_bytes_free(ptr: *mut u8, len: usize) {
 // Render
 // ---------------------------------------------------------------------------
 
+/// Apply the queued ops, then draw one frame to the view's surface.
+/// Headless handle ([`ijc_init_headless`]): a no-op that does not apply the
+/// queue either; use [`ijc_flush`].
+///
 /// # Safety
-/// `h` must be null or a live handle from [`ijc_init`].
+/// `h` must be null or a live handle from [`ijc_init`] or [`ijc_init_headless`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
     guard_ffi((), || {
@@ -1927,8 +2024,15 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
         // `Deref` through the guard would treat every access as borrowing the
         // whole `AppHandle`.
         let app: &mut AppHandle = &mut guard;
+        // Headless: nothing to draw. The queue is left for `ijc_flush`.
+        if app.gpu.is_none() {
+            return;
+        }
 
         apply_pending(app);
+        let Some(gpu) = app.gpu.as_mut() else {
+            return;
+        };
 
         // Re-upload geometry only when the document changed.
         let doc_gen = app.session.doc.generation;
@@ -1939,8 +2043,8 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
             // `App::decode_underlay`. Without this a granted underlay applies to
             // the doc but never draws on device.
             scene.underlay = decode_underlay(&app.session.doc, &mut app.underlay_cache);
-            app.renderer
-                .set_scene(&app.device, &app.queue, &scene, doc_gen);
+            gpu.renderer
+                .set_scene(&gpu.device, &gpu.queue, &scene, doc_gen);
             app.last_gen = Some(doc_gen);
         }
 
@@ -1973,32 +2077,32 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
                     Some((pts, GHOST_COLOR, 0.0))
                 })
                 .collect();
-            app.renderer.set_ghost_lines(&app.device, &ghost);
+            gpu.renderer.set_ghost_lines(&gpu.device, &ghost);
         } else {
-            app.renderer.clear_ghost_lines();
+            gpu.renderer.clear_ghost_lines();
         }
 
         // Camera uniform.
-        let aspect = app.config.width as f32 / app.config.height.max(1) as f32;
+        let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
         let vp = app.camera.view_proj(aspect);
         let eye = app.camera.eye();
         let cam = camera_uniform_with_mode(vp, eye, app.mode);
-        app.renderer.write_camera(&app.device, &app.queue, 0, &cam);
+        gpu.renderer.write_camera(&gpu.device, &gpu.queue, 0, &cam);
 
-        let frame = match app.surface.get_current_texture() {
+        let frame = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => {
                 // Timeout / Occluded / Outdated / Lost / OutOfMemory: reconfigure
                 // and skip this frame.
-                app.surface.configure(&app.device, &app.config);
+                gpu.surface.configure(&gpu.device, &gpu.config);
                 return;
             }
         };
         let view = frame.texture.create_view(&Default::default());
         let [r, g, b, a] = app.theme.background();
 
-        let mut encoder = app.device.create_command_encoder(&Default::default());
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
         {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ijc_pass"),
@@ -2017,7 +2121,7 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &app.depth_view,
+                    view: &gpu.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -2029,9 +2133,9 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
                 multiview_mask: None,
             });
             let mut pass = pass.forget_lifetime();
-            app.renderer.paint(&mut pass, 0, app.mode, true);
+            gpu.renderer.paint(&mut pass, 0, app.mode, true);
         }
-        app.queue.submit([encoder.finish()]);
+        gpu.queue.submit([encoder.finish()]);
         frame.present();
     })
 }
@@ -2095,7 +2199,8 @@ pub unsafe extern "C" fn ijc_deck_configure(
 }
 
 /// Send a chat prompt. Streams deltas to `cb`; parsed commands are queued and
-/// applied on the next `ijc_render_frame`.
+/// applied on the next `ijc_render_frame` or [`ijc_flush`] (headless handle:
+/// only [`ijc_flush`] or the next [`ijc_run_command_result`]).
 ///
 /// # Safety
 /// `h` must be null or a live handle; `prompt` must be null or a valid
@@ -3293,8 +3398,8 @@ fn sheet_ortho_view_proj(
 /// slot) at [`pdf::SHADED_DPI`]. A fresh [`SceneRenderer`] isolates this pass
 /// from the on-screen renderer. Returns an empty vec when no view is Shaded.
 ///
-/// GPU-dependent: in a headless CI without an adapter, `ijc_init` would already
-/// have failed, so this is only reached with a live device. The non-GPU parts
+/// GPU-dependent: a headless handle ([`ijc_init_headless`]) has no device and
+/// gets an empty vec, so its Shaded views draw as vector. The non-GPU parts
 /// (rect→pixel math, PDF embed) are unit-tested separately in `commands`.
 fn render_shaded_view_rasters(
     app: &AppHandle,
@@ -3324,8 +3429,12 @@ fn render_shaded_view_rasters(
     let auto_w = if n > 0 { (area_w - GUTTER_MM * (n as f64 - 1.0)) / n as f64 } else { area_w };
     let auto_h = sheet.paper.landscape_mm().1 - MARGIN_MM - TITLE_MM - MARGIN_MM;
 
-    let device = &app.device;
-    let queue = &app.queue;
+    // Headless: no device, so no rasters (Shaded views stay vector-only).
+    let Some(gpu) = app.gpu.as_ref() else {
+        return Vec::new();
+    };
+    let device = &gpu.device;
+    let queue = &gpu.queue;
     const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
     let scene = snapshot(&app.session.doc, app.theme);
     let [br, bg, bb_c, ba] = app.theme.background();
@@ -3459,6 +3568,9 @@ fn render_shaded_view_rasters(
 /// Shaded-mode viewports are rendered to rasters (via the GPU) and embedded; all
 /// other viewports draw as vector line art (wireframe / hidden-line).
 ///
+/// Headless handle ([`ijc_init_headless`]): no GPU, so Shaded viewports draw
+/// as vector line art like the others.
+///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`]. `name` must be a valid
 /// NUL-terminated C string. `out_len` must be null or a writable `usize*`.
@@ -3509,6 +3621,9 @@ pub unsafe extern "C" fn ijc_sheet_pdf(
 /// null `name`, an unknown set, or a set that resolves to no sheets. Mirrors
 /// [`ijc_export`]'s allocation/return path. Caller MUST free the buffer with
 /// [`ijc_bytes_free`].
+///
+/// Headless handle ([`ijc_init_headless`]): no GPU, so Shaded viewports draw
+/// as vector line art like the others.
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`]. `name` must be a valid
@@ -4826,5 +4941,169 @@ mod tests {
         assert!(base_url_is_allowed("https://api.openai.com/v1"));
         // Empty = provider default (safe).
         assert!(base_url_is_allowed(""));
+    }
+}
+
+/// Headless handle (`ijc_init_headless`, #109): no view, surface or GPU.
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn c(s: &str) -> CString {
+        CString::new(s).unwrap()
+    }
+
+    /// Take ownership of an FFI string and free it.
+    unsafe fn take(p: *mut c_char) -> String {
+        assert!(!p.is_null());
+        let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned();
+        unsafe { ijc_string_free(p) };
+        s
+    }
+
+    fn count(h: *mut AppHandle) -> usize {
+        unsafe { handle_ref(h) }.unwrap().session.doc.objects().count()
+    }
+
+    #[test]
+    fn headless_runs_commands_and_digests() {
+        let h = ijc_init_headless();
+        assert!(!h.is_null());
+        unsafe {
+            let r = take(ijc_run_command_result(h, c("box 0,0,0 1,1,1").as_ptr()));
+            let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+            assert_eq!(v["ok"], true, "{r}");
+            assert_eq!(v["created"].as_array().unwrap().len(), 1);
+            let id = v["created"][0].as_str().unwrap().to_owned();
+
+            let d = take(ijc_scene_digest(h));
+            assert!(d.contains(&id[..8]), "box {id} missing from digest: {d}");
+            let f = take(ijc_scene_digest_filtered(h, 0, std::ptr::null()));
+            assert!(f.contains(&id[..8]), "{f}");
+
+            // Save, reset, reopen round-trips the box.
+            let json = take(ijc_save_json(h));
+            ijc_new_document(h);
+            assert_eq!(count(h), 0);
+            assert!(ijc_open_json(h, json.as_ptr(), json.len()));
+            assert_eq!(count(h), 1);
+
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn headless_flush_applies_queued_commands() {
+        let h = ijc_init_headless();
+        unsafe {
+            assert!(ijc_run_command(h, c("box 0,0,0 1,1,1").as_ptr()));
+            assert!(ijc_run_command(h, c("top").as_ptr()));
+            assert_eq!(count(h), 0, "queued, not applied yet");
+            // Headless render does not draw and does not drain the queue.
+            ijc_render_frame(h);
+            assert_eq!(count(h), 0);
+            assert!(ijc_flush(h));
+            assert_eq!(count(h), 1);
+            assert!(ijc_flush(h), "empty queue is fine");
+            assert!(!ijc_flush(std::ptr::null_mut()));
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn headless_render_and_gpu_calls_are_safe() {
+        let h = ijc_init_headless();
+        unsafe {
+            ijc_run_command_result(h, c("box 0,0,0 1,1,1").as_ptr()).pipe_free();
+            ijc_resize(h, 800, 600);
+            ijc_resize(h, 0, u32::MAX);
+            ijc_render_frame(h);
+            ijc_camera_orbit(h, 1.0, 2.0);
+            ijc_camera_pan(h, 1.0, 2.0);
+            ijc_camera_zoom(h, 1.5);
+            ijc_camera_zoom_extents(h);
+            assert!(ijc_flush(h));
+            assert!(!ijc_pick(h, 10.0, 10.0, false));
+            let (world, mut xy) = ([0.5f64; 3], [0f32; 2]);
+            assert!(!ijc_project_point(h, world.as_ptr(), xy.as_mut_ptr()));
+
+            // Selection + gumball are document state and still work.
+            ijc_run_command_result(h, c("select all").as_ptr()).pipe_free();
+            let (mut ctr, mut sz) = ([0f64; 3], [0f64; 3]);
+            assert!(ijc_selection_bbox(h, ctr.as_mut_ptr(), sz.as_mut_ptr()));
+            assert!(ijc_gumball_preview_move(h, 1.0, 0.0, 0.0));
+            ijc_render_frame(h);
+            assert!(ijc_gumball_cancel(h));
+
+            // Sheet PDF needs no GPU headless.
+            let r = take(ijc_run_command_result(h, c("sheet A").as_ptr()));
+            assert!(r.contains("\"ok\":true"), "{r}");
+            let mut len = 0usize;
+            let pdf = ijc_sheet_pdf(h, c("A").as_ptr(), &mut len);
+            assert!(!pdf.is_null() && len > 0);
+            ijc_bytes_free(pdf, len);
+
+            ijc_free(h);
+        }
+    }
+
+    trait PipeFree {
+        unsafe fn pipe_free(self);
+    }
+    impl PipeFree for *mut c_char {
+        unsafe fn pipe_free(self) {
+            unsafe { ijc_string_free(self) };
+        }
+    }
+
+    /// Replies with one draft-fenced `box` and ends the turn.
+    struct BoxDeck;
+    #[async_trait::async_trait]
+    impl LlmDeck for BoxDeck {
+        fn name(&self) -> String {
+            "box".into()
+        }
+        async fn stream_chat(
+            &self,
+            _req: ChatRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<DeckDelta>,
+        ) {
+            let _ = tx.send(DeckDelta::Text("ok\n```draft\nbox 0,0,0 1,1,1\n```\n".into()));
+            let _ = tx.send(DeckDelta::Done);
+        }
+    }
+
+    extern "C" fn record(ctx: *mut c_void, kind: u32, _text: *const c_char) {
+        let seen = unsafe { &*(ctx as *const Mutex<Vec<u32>>) };
+        seen.lock().unwrap().push(kind);
+    }
+
+    #[test]
+    fn headless_deck_auto_apply_queues_for_flush() {
+        let h = ijc_init_headless();
+        let seen: Box<Mutex<Vec<u32>>> = Box::default();
+        let ctx = &*seen as *const _ as *mut c_void;
+        unsafe {
+            let url = c("https://api.example.com/v1");
+            assert!(ijc_deck_configure(h, 0, url.as_ptr(), c("m").as_ptr(), std::ptr::null()));
+            handle_mut(h).unwrap().deck = Some(Arc::new(BoxDeck));
+            ijc_deck_set_auto_apply(h, true);
+            ijc_deck_send(h, c("make a box").as_ptr(), record, ctx);
+
+            let t0 = Instant::now();
+            while !seen.lock().unwrap().contains(&CB_DONE) {
+                assert!(t0.elapsed() < Duration::from_secs(10), "deck never finished");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(seen.lock().unwrap().contains(&CB_COMMAND));
+            assert_eq!(count(h), 0, "auto-applied deck command waits in the queue");
+            assert!(ijc_flush(h));
+            assert_eq!(count(h), 1);
+
+            ijc_deck_stop(h);
+            ijc_free(h);
+        }
+        drop(seen);
     }
 }
