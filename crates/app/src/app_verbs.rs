@@ -329,11 +329,10 @@ mod tests {
         assert_eq!(classify("skin bim"), Some(AppVerb::Skin(CadOrigin::Bim)));
         // Synonyms + case-insensitivity.
         assert_eq!(classify("skin CLASSIC"), Some(AppVerb::Skin(CadOrigin::Classic)));
-        // Pre-rename codes still map silently (migration for old scripts).
-        assert_eq!(classify("skin autocad"), Some(AppVerb::Skin(CadOrigin::Classic)));
-        assert_eq!(classify("skin ACAD"), Some(AppVerb::Skin(CadOrigin::Classic)));
-        assert_eq!(classify("skin rhino"), Some(AppVerb::Skin(CadOrigin::Nurbs)));
-        assert_eq!(classify("skin revit"), Some(AppVerb::Skin(CadOrigin::Bim)));
+        // Pre-rename codes are rejected (fall through → usage).
+        for old in ["skin autocad", "skin ACAD", "skin rhino", "skin revit"] {
+            assert_eq!(classify(old), None, "{old}");
+        }
         assert_eq!(classify("skin default"), Some(AppVerb::Skin(CadOrigin::None)));
         // Bare or unknown argument falls through → command line reports usage.
         assert_eq!(classify("skin"), None);

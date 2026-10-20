@@ -13,20 +13,14 @@
 /// Which working style (skin) the user picked.
 ///
 /// Serialized to `ui.json` as `"classic"` / `"nurbs"` / `"bim"` / `"none"`.
-/// Older builds wrote `"autocad"` / `"rhino"` / `"revit"`; those still
-/// deserialize (silent migration) but are never written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CadOrigin {
-    #[serde(alias = "autocad", alias = "acad")]
     Classic,
-    #[serde(alias = "rhino")]
     Nurbs,
-    #[serde(alias = "revit")]
     Bim,
     /// ItsJustCAD default (no working-style skin).
     #[default]
-    #[serde(alias = "native")]
     None,
 }
 
@@ -70,18 +64,13 @@ impl CadOrigin {
     /// Parse a verb-supplied / persisted skin name back into a [`CadOrigin`].
     /// Accepts common synonyms (`native`/`default`/`itsjustcad`/`none` →
     /// [`CadOrigin::None`]). Case-insensitive. Unknown → `None` (caller keeps
-    /// its current skin and reports usage). Pre-rename codes are still read so
-    /// existing users and scripts migrate silently; they are not advertised.
+    /// its current skin and reports usage).
     pub fn from_code(s: &str) -> Option<CadOrigin> {
         match s.trim().to_ascii_lowercase().as_str() {
             "native" | "default" | "itsjustcad" | "none" => Some(CadOrigin::None),
             "classic" => Some(CadOrigin::Classic),
             "nurbs" => Some(CadOrigin::Nurbs),
             "bim" => Some(CadOrigin::Bim),
-            // Legacy codes (silent migration only).
-            "autocad" | "acad" => Some(CadOrigin::Classic),
-            "rhino" => Some(CadOrigin::Nurbs),
-            "revit" => Some(CadOrigin::Bim),
             _ => None,
         }
     }
@@ -643,21 +632,20 @@ mod tests {
         assert_eq!(serde_json::to_string(&CadOrigin::None).unwrap(), r#""none""#);
     }
 
-    /// ui.json files written before the rename still load (silent migration),
-    /// and re-saving writes only the new codes.
+    /// Only the current codes deserialize; the pre-rename skin codes are
+    /// rejected (no migration path).
     #[test]
-    fn cad_origin_reads_legacy_ui_json_values() {
-        for (old, new, code) in [
-            ("autocad", CadOrigin::Classic, "classic"),
-            ("acad", CadOrigin::Classic, "classic"),
-            ("rhino", CadOrigin::Nurbs, "nurbs"),
-            ("revit", CadOrigin::Bim, "bim"),
-            ("native", CadOrigin::None, "none"),
-        ] {
+    fn cad_origin_rejects_old_ui_json_values() {
+        for code in ["classic", "nurbs", "bim", "none"] {
             let back: CadOrigin =
-                serde_json::from_value(serde_json::Value::String(old.into())).unwrap();
-            assert_eq!(back, new, "legacy {old}");
+                serde_json::from_value(serde_json::Value::String(code.into())).unwrap();
             assert_eq!(serde_json::to_value(back).unwrap(), serde_json::json!(code));
+        }
+        for old in ["autocad", "acad", "rhino", "revit", "sketchup", "native"] {
+            assert!(
+                serde_json::from_value::<CadOrigin>(serde_json::Value::String(old.into())).is_err(),
+                "{old} must not deserialize"
+            );
         }
     }
 
@@ -687,14 +675,12 @@ mod tests {
         assert_eq!(CadOrigin::from_code("default"), Some(CadOrigin::None));
         assert_eq!(CadOrigin::from_code("itsjustcad"), Some(CadOrigin::None));
         assert_eq!(CadOrigin::from_code("none"), Some(CadOrigin::None));
-        assert_eq!(CadOrigin::from_code("acad"), Some(CadOrigin::Classic));
         assert_eq!(CadOrigin::from_code(" Classic "), Some(CadOrigin::Classic));
-        // Legacy codes still parse (silent migration), mapping to the new skins.
-        assert_eq!(CadOrigin::from_code(" AutoCAD "), Some(CadOrigin::Classic));
-        assert_eq!(CadOrigin::from_code("rhino"), Some(CadOrigin::Nurbs));
-        assert_eq!(CadOrigin::from_code("revit"), Some(CadOrigin::Bim));
+        // Pre-rename codes are unknown now (no migration).
+        for old in ["autocad", " AutoCAD ", "acad", "rhino", "revit", "sketchup"] {
+            assert_eq!(CadOrigin::from_code(old), None, "{old}");
+        }
         // Unknown → None (caller keeps current skin).
-        assert_eq!(CadOrigin::from_code("sketchup"), None);
         assert_eq!(CadOrigin::from_code(""), None);
     }
 

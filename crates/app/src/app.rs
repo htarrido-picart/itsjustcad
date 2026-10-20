@@ -10282,13 +10282,7 @@ fn save_onboarding_done() {
 fn load_cad_origin() -> Option<CadOrigin> {
     let v = load_ui_json();
     let s = v["cad_origin"].as_str()?;
-    let origin: CadOrigin = serde_json::from_value(serde_json::Value::String(s.to_string())).ok()?;
-    // Pre-rename builds wrote "autocad"/"rhino"/"revit"; rewrite once with the
-    // new code so only current codes stay persisted.
-    if serde_json::to_value(origin).ok().and_then(|n| n.as_str().map(|n| n != s)) == Some(true) {
-        save_cad_origin(origin);
-    }
-    Some(origin)
+    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
 }
 
 fn save_cad_origin(origin: CadOrigin) {

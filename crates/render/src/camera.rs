@@ -245,27 +245,8 @@ pub const PHONE_PRESETS: &[PhonePreset] = &[
     PhonePreset { name: "phone-periscope", focal_mm: 112.0, label: "Phone periscope telephoto (112 mm eq.)" },
 ];
 
-/// Lens tokens from older builds that named phone makers. Still accepted
-/// (silent back-compat for saved scripts) but never advertised; each maps to
-/// the nearest generic preset.
-const LEGACY_PHONE_NAMES: &[(&str, &str)] = &[
-    ("iphone-ultrawide", "phone-ultrawide"),
-    ("iphone-main", "phone-main"),
-    ("iphone-tele", "phone-tele"),
-    ("pixel-ultrawide", "phone-ultrawide"),
-    ("pixel-main", "phone-main"),
-    ("pixel-tele", "phone-periscope"),
-    ("galaxy-ultrawide", "phone-ultrawide"),
-    ("galaxy-main", "phone-main"),
-    ("galaxy-tele", "phone-tele"),
-];
-
 /// Look up a named phone-lens preset (case-sensitive; callers lower-case first).
 pub fn phone_preset(name: &str) -> Option<PhonePreset> {
-    let name = LEGACY_PHONE_NAMES
-        .iter()
-        .find(|(old, _)| *old == name)
-        .map_or(name, |(_, new)| *new);
     PHONE_PRESETS.iter().copied().find(|p| p.name == name)
 }
 
@@ -369,8 +350,11 @@ mod tests {
         let uw = phone_preset("phone-ultrawide").unwrap().focal_mm;
         let main = phone_preset("phone-main").unwrap().focal_mm;
         let tele = phone_preset("phone-tele").unwrap().focal_mm;
-        // Legacy maker-named tokens still resolve (silent back-compat).
-        assert_eq!(phone_preset("iphone-tele").map(|p| p.focal_mm), Some(tele));
+        // Maker-named tokens from older builds are unknown now.
+        for old in ["iphone-main", "iphone-tele", "pixel-tele", "galaxy-ultrawide"] {
+            assert_eq!(phone_preset(old), None, "{old}");
+            assert_eq!(preset_focal_mm(old), None, "{old}");
+        }
         assert!(uw < main && main < tele);
         assert!(fov_for_focal_mm(uw) > fov_for_focal_mm(main));
         assert!(fov_for_focal_mm(main) > fov_for_focal_mm(tele));
