@@ -1374,7 +1374,7 @@ impl App {
         // ← →), which otherwise render as tofu boxes in UI strings and menus.
         install_symbol_fallback(&cc.egui_ctx);
 
-        // Legacy-CAD-informed font sizes (see docs/internal/ui-legacy-research.md):
+        // Legacy-CAD-informed font sizes (see the UI conventions research, kept in a private repo):
         //   command line / monospace prompt: 13 px  (~10 pt at 96 DPI)
         //   body / panels / status bar:      13 px  (~9–10 pt)
         //   small (autosuggest, hints):      11 px  (~8 pt)
