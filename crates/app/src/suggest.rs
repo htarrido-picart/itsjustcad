@@ -436,19 +436,19 @@ mod tests {
     // ── preset alias suggestions ──────────────────────────────────────────────
 
     #[test]
-    fn autocad_alias_l_appears_in_suggestions() {
+    fn classic_alias_l_appears_in_suggestions() {
         use crate::preset::CLASSIC_ALIASES;
         let results = verb_completions("l", 20, CLASSIC_ALIASES, &[]);
         let completions: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
-        assert!(completions.contains(&"l"), "AutoCAD alias 'l' should appear: {completions:?}");
+        assert!(completions.contains(&"l"), "Classic alias 'l' should appear: {completions:?}");
     }
 
     #[test]
-    fn autocad_alias_e_appears_in_suggestions() {
+    fn classic_alias_e_appears_in_suggestions() {
         use crate::preset::CLASSIC_ALIASES;
         let results = verb_completions("e", 20, CLASSIC_ALIASES, &[]);
         let completions: Vec<_> = results.iter().map(|s| s.completion.as_str()).collect();
-        assert!(completions.contains(&"e"), "AutoCAD alias 'e' should appear: {completions:?}");
+        assert!(completions.contains(&"e"), "Classic alias 'e' should appear: {completions:?}");
     }
 
     #[test]

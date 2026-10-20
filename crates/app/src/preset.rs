@@ -504,6 +504,27 @@ mod tests {
         assert_eq!(preset_for(CadOrigin::None).bg_color, ITSJUSTCAD_DEFAULT.bg_color);
     }
 
+    /// Each skin, selected by its new code, applies its own palette and alias
+    /// table end to end (code → origin → preset).
+    #[test]
+    fn new_skin_codes_apply_palette_and_aliases() {
+        for (code, want) in [
+            ("classic", &CLASSIC),
+            ("nurbs", &NURBS),
+            ("bim", &BIM),
+            ("native", &ITSJUSTCAD_DEFAULT),
+        ] {
+            let p = preset_for(CadOrigin::from_code(code).expect(code));
+            assert_eq!(p.bg_color, want.bg_color, "{code}");
+            assert_eq!(p.aliases, want.aliases, "{code}");
+        }
+        let classic = preset_for(CadOrigin::from_code("classic").unwrap()).aliases;
+        assert_eq!(expand_alias("l 0,0 1,1", classic).as_deref(), Some("line 0,0 1,1"));
+        assert_eq!(expand_alias("su", classic).as_deref(), Some("subtract"));
+        let nurbs = preset_for(CadOrigin::from_code("nurbs").unwrap()).aliases;
+        assert!(expand_alias("of", nurbs).is_some_and(|e| e.starts_with("offset")));
+    }
+
     // ── expand_alias ──────────────────────────────────────────────────────────
 
     #[test]

@@ -302,6 +302,12 @@ pub fn run_script_lines(
                     .map_err(|e| (line.clone(), e))?;
             }
             None => {
+                // `skin` with an unknown or retired code (e.g. the pre-rename
+                // names): reject with the usage line instead of falling through
+                // to the core parser's generic "unknown command".
+                if matches!(line.split_whitespace().next(), Some("skin" | "theme_skin")) {
+                    return Err((line.clone(), "usage: skin native|classic|nurbs|bim".into()));
+                }
                 // `controlimages <prefix>` needs the GPU view; the substrate
                 // exec can't render, so intercept it here and drive the wgpu
                 // control-image path against the accumulated headless view.
@@ -383,6 +389,10 @@ fn apply_camera(view: &mut HeadlessView, arg: Option<&str>, arg2: Option<&str>) 
                 view.focal_mm = Some(f);
                 view.pano = None;
                 view.two_point = Some(false);
+            } else {
+                let names: Vec<&str> =
+                    itsjustcad_render::PHONE_PRESETS.iter().map(|p| p.name).collect();
+                eprintln!("warning: camera phone: unknown lens; try {}", names.join(", "));
             }
         }
         _ => {
@@ -941,6 +951,34 @@ mod tests {
     }
 
     #[test]
+    fn clay_alias_runs_the_massing_preset() {
+        let lines = vec!["display wireframe".to_owned(), "clay".to_owned()];
+        let (_out, view) = run_script_lines(Session::default(), &lines).expect("clay runs");
+        assert_eq!(view.light, LightMode::Working);
+        assert_eq!(view.display, DisplayMode::Shaded);
+        assert!(view.profile_edges);
+    }
+
+    #[test]
+    fn skin_accepts_new_codes_and_rejects_old_ones_with_usage() {
+        for code in ["native", "classic", "nurbs", "bim"] {
+            run_script_lines(Session::default(), &[format!("skin {code}")])
+                .unwrap_or_else(|e| panic!("skin {code}: {e:?}"));
+        }
+        for old in ["autocad", "acad", "rhino", "revit", "sketchup", "bogus"] {
+            let line = format!("skin {old}");
+            let Err(err) = run_script_lines(Session::default(), std::slice::from_ref(&line)) else {
+                panic!("{line} must be rejected");
+            };
+            assert_eq!(err, (line, "usage: skin native|classic|nurbs|bim".to_owned()));
+        }
+        // The retired massing verb names are unknown commands, not panics.
+        for old in ["sketchup", "su"] {
+            assert!(run_script_lines(Session::default(), &[old.to_owned()]).is_err(), "{old}");
+        }
+    }
+
+    #[test]
     fn camera_pano_and_fisheye_set_projection() {
         let session = Session::default();
         let lines = vec!["camera pano".to_owned()];
@@ -984,6 +1022,24 @@ mod tests {
         let (_o, view) =
             run_script_lines(Session::default(), &["camera phone phone-tele".to_owned()]).unwrap();
         assert_eq!(view.focal_mm, Some(77.0));
+
+        // Every named lens sets its documented 35mm-equivalent focal length.
+        for (name, mm) in [
+            ("phone-ultrawide", 13.0),
+            ("phone-main", 26.0),
+            ("phone-tele", 77.0),
+            ("phone-periscope", 112.0),
+        ] {
+            let (_o, view) =
+                run_script_lines(Session::default(), &[format!("camera phone {name}")]).unwrap();
+            assert_eq!(view.focal_mm, Some(mm), "{name}");
+        }
+        // Maker-named tokens from older builds are unknown: focal stays unset.
+        for old in ["iphone-main", "pixel-tele", "galaxy-ultrawide"] {
+            let (_o, view) =
+                run_script_lines(Session::default(), &[format!("camera phone {old}")]).unwrap();
+            assert_eq!(view.focal_mm, None, "{old}");
+        }
 
         // Bare `camera phone` = main wide (26mm equiv).
         let (_o, view) =
