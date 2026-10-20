@@ -2828,6 +2828,7 @@ dependencies = [
  "itsjustcad-deck",
  "itsjustcad-doc",
  "itsjustcad-render",
+ "kernel-mesh",
  "pollster",
  "raw-window-handle",
  "serde_json",
