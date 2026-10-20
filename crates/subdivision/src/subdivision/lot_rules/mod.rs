@@ -16,7 +16,7 @@
 //! **euro_latam defaults are PLACEHOLDERS** (plan §6b, §1 open questions). When a
 //! run resolves a rule from the euro_latam profile because the user gave no
 //! explicit override, [`LotRulesReport::used_placeholder`] is set so the command
-//! can print "using euro_latam defaults (placeholder — confirm with Manuel)".
+//! can print "using euro_latam defaults (placeholder — verify against local regulations)".
 
 pub mod corner;
 pub mod depth;
@@ -58,7 +58,7 @@ impl LotRulesReport {
     pub fn placeholder_banner(&self) -> Option<String> {
         if self.used_placeholder {
             Some(format!(
-                "using euro_latam defaults (placeholder — confirm with Manuel): {}",
+                "using euro_latam defaults (placeholder — verify against local regulations): {}",
                 self.placeholder_notes.join(", ")
             ))
         } else {
@@ -446,6 +446,6 @@ mod tests {
         };
         let (_lots, report) = apply_lot_rules(&block, lots, &s);
         assert!(report.used_placeholder);
-        assert!(report.placeholder_banner().unwrap().contains("confirm with Manuel"));
+        assert!(report.placeholder_banner().unwrap().contains("verify against local regulations"));
     }
 }

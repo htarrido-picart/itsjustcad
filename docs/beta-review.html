@@ -104,7 +104,7 @@
   <h2>Checklist</h2>
   <a href="#model">1 &middot; Drawing &amp; Modeling</a>
   <a href="#expressive">2 &middot; Expressive Structures</a>
-  <a href="#intemfit">3 &middot; intemfit (Site Planning)</a>
+  <a href="#siteplanning">3 &middot; Site Planning</a>
   <a href="#analysis">4 &middot; Environmental Analysis</a>
   <a href="#comply">5 &middot; Compliance (pre-check)</a>
   <a href="#land">6 &middot; Landscape &amp; Planting</a>
@@ -153,7 +153,7 @@
 <h2 class="sec">Honest limits <span class="tag warn">read first</span></h2>
 <p class="lead">Known, deliberate limits in v0.5.8. None of these block testing &mdash; they explain results you might otherwise flag as bugs:</p>
 <ul>
-  <li><b>intemfit euro_latam profile is placeholder.</b> Any run that resolves a rule from the <code>euro_latam</code> region prints <b>"using euro_latam defaults (placeholder &mdash; confirm with Manuel)"</b>. That banner is expected, not an error.</li>
+  <li><b>The euro_latam site-planning profile is placeholder.</b> Any run that resolves a rule from the <code>euro_latam</code> region prints <b>"using euro_latam defaults (placeholder &mdash; verify against local regulations)"</b>. That banner is expected, not an error.</li>
   <li><b>Compliance is name-match + straight-line.</b> Guard/handrail/ceiling checks match by object name (no geometric modeling); travel distance is straight-line room-centroid &rarr; nearest exit, not a routed egress path. Advisory pre-check only &mdash; verify with a licensed professional / AHJ.</li>
   <li><b>Straight-skeleton (Felkel) is convex-exact only.</b> <code>skeleton=felkel</code> falls back to the offset-approximation on non-convex blocks (never a broken skeleton). The robust <code>skeleton=offset</code> is the default.</li>
   <li><b>DWG import is only as good as the installed LibreDWG.</b> 0.13.3 is too old for modern AutoCAD-2013+ files &mdash; those fail loudly (truncation detected), never a silent empty import. 0.14+ or an ODA converter is needed for them.</li>
@@ -251,12 +251,12 @@
 </details>
 </section>
 
-<!-- ============ 3 INTEMFIT ============ -->
-<section id="intemfit">
+<!-- ============ 3 SITE PLANNING ============ -->
+<section id="siteplanning">
 <details>
-<summary>3 &middot; intemfit &mdash; Site Planning &amp; Lot Subdivision <span class="tag ok">Phases 1&ndash;12 shipped</span></summary>
+<summary>3 &middot; Site Planning &amp; Lot Subdivision <span class="tag ok">shipped</span></summary>
 <p class="lead">Parametric site planning (roads &rarr; blocks &rarr; lots &rarr; setbacks &rarr; open space &rarr; buildings &rarr; yield), CityEngine/TestFit-style. Results bake onto the <code>roads</code>, <code>blocks</code>, <code>lots</code>, <code>setbacks</code>, <code>openspace</code>, <code>buildings</code> layers. All geometry verbs are undoable and replay byte-identical for a fixed seed.</p>
-<div class="callout warn">The <b>euro_latam</b> profile runs on <b>placeholder defaults</b>. Any run resolving a rule from it prints <b>"using euro_latam defaults (placeholder &mdash; confirm with Manuel)"</b>. Confirm that banner appears where noted.</div>
+<div class="callout warn">The <b>euro_latam</b> profile runs on <b>placeholder defaults</b>. Any run resolving a rule from it prints <b>"using euro_latam defaults (placeholder &mdash; verify against local regulations)"</b>. Confirm that banner appears where noted.</div>
 
 <figure class="shot">
   <img src="screenshots/site-plan.png" alt="Irregular site boundary subdivided into blocks and lots, with a road network and detached houses filling the lots, top view">
@@ -292,7 +292,7 @@
 <div class="grp-title">Undo &amp; replay</div>
 <div class="chk"><input type="checkbox" id="if25"><label for="if25">Undo a <code>lot*</code> op; then save, reload, and replay the pipeline <span class="exp"><b>Expect:</b> undo removes baked geometry cleanly; reloaded settings + ops replay byte-identical.</span></label></div>
 
-<div class="notes-wrap"><label for="note-intemfit">Notes for this section</label><textarea class="notes" id="note-intemfit" data-section="3 · intemfit (Site Planning)" placeholder="Notes..."></textarea></div>
+<div class="notes-wrap"><label for="note-siteplanning">Notes for this section</label><textarea class="notes" id="note-siteplanning" data-section="3 · Site Planning" placeholder="Notes..."></textarea></div>
 </details>
 </section>
 

@@ -6582,7 +6582,7 @@ fn exec_lot_frontage(
         .map(|(m, z)| (m.length, DVec3::new(m.at.x, m.at.y, *z), at_label.to_string()))
         .collect();
     let context = format!(
-        "measured at the {at_label} (default: setback line — plan §5); {} lot(s)",
+        "measured at the {at_label} (default: setback line); {} lot(s)",
         measures.len()
     );
     let report = build_analysis_report("lotfrontage", context, "m", samples);
@@ -6641,7 +6641,7 @@ fn exec_lot_report(
 
     if report.is_empty() {
         return Err(ExecError::Invalid(
-            "nothing to report — no intemfit geometry found (run lotsubdivide / \
+            "nothing to report — no site-planning geometry found (run lotsubdivide / \
              lotgeneratesite / lotbuilding first, or draw a site boundary)"
                 .into(),
         ));
@@ -26185,7 +26185,7 @@ mod tests {
         run(&mut s, "rect 0,0,0 400 120");
         let out = run(&mut s, "lotsubdivide last grid area=6500 width=50");
         assert!(
-            out.message.contains("placeholder — confirm with Manuel"),
+            out.message.contains("placeholder — verify against local regulations"),
             "message should surface the euro_latam placeholder note: {}",
             out.message
         );
@@ -26329,7 +26329,7 @@ mod tests {
         // Explicit setbacks that leave an envelope, but region stays euro_latam.
         let out = run(&mut s, "lotsetbacks last front=3 side=0 rear=3");
         assert!(
-            out.message.contains("placeholder — confirm with Manuel"),
+            out.message.contains("placeholder — verify against local regulations"),
             "message should carry the euro_latam placeholder note: {}",
             out.message
         );
@@ -26640,7 +26640,7 @@ mod tests {
         run(&mut s, "lotsettings front=3 side=0 rear=3");
         let out = run(&mut s, "lotbuilding last typology=row floors=3");
         assert!(
-            out.message.contains("confirm with Manuel"),
+            out.message.contains("verify against local regulations"),
             "message should carry the euro_latam placeholder note: {}",
             out.message
         );

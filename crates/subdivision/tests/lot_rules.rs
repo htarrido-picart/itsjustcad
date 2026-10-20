@@ -296,7 +296,7 @@ fn placeholder_note_appears_when_defaults_used() {
     }];
     let (_out, report) = apply_lot_rules(&block, lots, &s);
     let banner = report.placeholder_banner().expect("placeholder banner expected");
-    assert!(banner.contains("confirm with Manuel"), "banner: {banner}");
+    assert!(banner.contains("verify against local regulations"), "banner: {banner}");
 }
 
 // ── Phase-5 generated block honours the rules ─────────────────────────────────

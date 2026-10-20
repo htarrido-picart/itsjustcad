@@ -98,7 +98,7 @@ which removes this entirely, is planned.)
 
 Testing the beta? Open **[`docs/beta-review.html`](docs/beta-review.html)** in
 your browser — a comprehensive, tickable manual-test checklist covering every
-v0.5.0 area (modeling, expressive & live-parametric structures, intemfit site
+v0.5.0 area (modeling, expressive & live-parametric structures, site
 planning, environmental analysis, compliance pre-check, landscape/planting, DWG
 import, the LLM deck, language/skins, sheets/PDF, interop, the ray tracer + AI
 render, object snap, associative dimensions, the update check, and the UI). Work
@@ -953,7 +953,7 @@ step-by-step walkthroughs a working architect can follow top to bottom:
 | # | Tutorial | You end with |
 |---|---|---|
 | 1 | [Getting started](docs/tutorials/01-getting-started.md) | Your first massing — orbited, saved, printed to a PDF sheet |
-| 2 | [Site planning with intemfit](docs/tutorials/02-site-planning.md) | A subdivided site with buildings and a yield report |
+| 2 | [Site planning](docs/tutorials/02-site-planning.md) | A subdivided site with buildings and a yield report |
 | 3 | [Environmental analysis](docs/tutorials/03-environmental-analysis.md) | A sun-hours study read in numbers and critiqued by the deck |
 | 4 | [Working with the deck](docs/tutorials/04-deck.md) | The LLM drawing and analysing in the same commands you type |
 | 5 | [Render with the ray tracer](docs/tutorials/05-raytrace.md) | A photoreal PBR render of your real model — sun shadows and GI, in-app |
@@ -961,7 +961,7 @@ step-by-step walkthroughs a working architect can follow top to bottom:
 
 There's also a self-contained **[landing page](docs/index.html)** (open it in a
 browser) and **[ready-to-open example documents](examples/)** — a massing, a
-courtyard sheet, and a full intemfit site.
+courtyard sheet, and a full site plan.
 
 | Reference | What |
 |---|---|

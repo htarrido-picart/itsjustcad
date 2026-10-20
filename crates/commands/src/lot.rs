@@ -444,7 +444,7 @@ pub fn compute_setbacks(
     // numbers are §6b placeholders (front 3 / side 0 / rear 3) pending Manuel.
     let placeholder_note = if settings.region == RegionProfile::EuroLatam {
         Some(
-            "using euro_latam setback defaults (placeholder — confirm with Manuel)".to_string(),
+            "using euro_latam setback defaults (placeholder — verify against local regulations)".to_string(),
         )
     } else {
         None
@@ -939,7 +939,7 @@ pub fn compute_buildings(
     let placeholder_note = if settings.region == RegionProfile::EuroLatam {
         Some(
             "using euro_latam building defaults (floor height 3 m / roof pitch 30° / coverage — \
-             placeholder, confirm with Manuel)"
+             placeholder, verify against local regulations)"
                 .to_string(),
         )
     } else {

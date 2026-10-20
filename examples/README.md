@@ -16,7 +16,7 @@ ItsJustCAD examples/massing.itsjustcad.json
 |---|---|
 | `massing.itsjustcad.json` | A podium-and-tower massing — a few boxes. Orbit it (right-mouse drag). |
 | `courtyard.itsjustcad.json` | A courtyard building with a plan cut, a dimensioned A3 sheet, ready to `print`. |
-| `site-plan.itsjustcad.json` | A full intemfit site: streets, blocks, lots, setbacks, row buildings, and a `lotreport` yield. |
+| `site-plan.itsjustcad.json` | A full site plan: streets, blocks, lots, setbacks, row buildings, and a `lotreport` yield. |
 
 ## Rebuild from a script
 
