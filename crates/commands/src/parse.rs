@@ -2189,7 +2189,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         // freeze/bake <selector> — flatten parametric objects to static mesh.
         "freeze" | "bake" => {
             let (sel, _rest) = selector(&args, "freeze")?;
-            Ok(Command::Freeze { target: sel })
+            Ok(Command::Freeze { ids: None, target: sel })
         }
         // -- sketch constraints --
         "constrain" => {

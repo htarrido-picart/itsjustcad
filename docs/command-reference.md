@@ -95,7 +95,7 @@ Built-in parametric structures (geodesic, hypar, gaussvault, gridshell, funicula
 | Command | Usage |
 |---|---|
 | `paramset` | `paramset <selector> <key=value …>` — edit a parameter of a selected parametric structure; its mesh re-derives immediately. E.g. `paramset last frequency=4` · `paramset last rise=5` |
-| `freeze` | `freeze <selector>` (alias `bake`) — flatten a parametric structure to a plain static mesh: keeps the geometry but drops the generator + params, so it leaves the Parameters tab and is no longer editable |
+| `freeze` | `freeze <selector>` (alias `bake`) — flatten a parametric structure to a plain static mesh: keeps the geometry but drops the generator + params, so it leaves the Parameters tab and is no longer editable. A dynamic-block instance (`insert` of a `pblock`) is replaced by plain objects of its current geometry |
 
 ---
 

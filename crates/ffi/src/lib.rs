@@ -4116,6 +4116,20 @@ mod tests {
     }
 
     #[test]
+    fn param_blocks_json_drops_frozen_instance() {
+        let mut s = session_with(&["pblock t width=1.5 : rect 0,0,0 {width} 0.1", "insert t 2,3,0"]);
+        let count = |s: &Session| {
+            let v: serde_json::Value = serde_json::from_str(&param_blocks_json(&s.doc)).unwrap();
+            v["instances"].as_array().unwrap().len()
+        };
+        assert_eq!(count(&s), 1);
+        s.run(parse("freeze last").unwrap()).unwrap();
+        assert_eq!(count(&s), 0, "frozen instance leaves the list");
+        s.run(parse("undo").unwrap()).unwrap();
+        assert_eq!(count(&s), 1, "undo restores it");
+    }
+
+    #[test]
     fn param_blocks_json_round_trips_pblock_instance() {
         let mut s = session_with(&[
             "pblock t width=1.5 : rect 0,0,0 {width} 0.1",
