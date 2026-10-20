@@ -14,10 +14,13 @@ mod config;
 mod deck;
 mod digest;
 mod extract;
+mod ffi_prompt;
 mod openai_compat;
 mod probe;
 mod prompt;
 mod render_deck;
+mod retrieve;
+mod selectors;
 mod tool_loop;
 mod which;
 
@@ -32,6 +35,7 @@ pub use deck::{
 };
 pub use digest::{digest, digest_filtered, geometry_kind, DigestFilter};
 pub use extract::{Extractor, ExtractEvent};
+pub use ffi_prompt::{ffi_system_prompt, FFI_SELECTOR_HELP, FFI_VIEW_HELP};
 pub use probe::{probe, warm_model, ProbeInfo, WarmOutcome};
 pub use prompt::{
     compact_command_catalog, compact_system_prompt, language_directive, select_prompt,
@@ -45,6 +49,8 @@ pub use render_deck::{
     RenderConfig, RenderDeck, RenderDeckError, RenderDecksFile, RenderKind, RenderRequest,
     RenderedImage, UnconfiguredRenderDeck, NO_BACKEND_MESSAGE, NO_SD_BINARY_MESSAGE,
 };
+pub use retrieve::{estimate_tokens, retrieve, retrieved_block, Match, CORE_VERBS, GATED_VERBS};
+pub use selectors::normalize_selectors;
 pub use tool_loop::{
     run_plan_loop, run_tool_loop, AgentCassette, LoopOutcome, PlanOutcome, StepDecision,
     ToolCall, ToolDispatch, ToolResult,

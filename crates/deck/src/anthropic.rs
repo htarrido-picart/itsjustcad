@@ -118,6 +118,7 @@ impl AnthropicDeck {
         }
 
         let mut events = response.bytes_stream().eventsource();
+        let mut usage = (0u64, 0u64);
         while let Some(event) = events.next().await {
             let event = event.map_err(|e| DeckError::Stream(e.to_string()))?;
             match event.event.as_str() {
@@ -130,12 +131,44 @@ impl AnthropicDeck {
                         let _ = tx.send(DeckDelta::Text(text.to_string()));
                     }
                 }
+                "message_start" | "message_delta" => {
+                    if let Ok(value) = serde_json::from_str::<Value>(&event.data) {
+                        accumulate_usage(&value, &mut usage);
+                    }
+                }
                 "message_stop" => break,
                 "error" => return Err(DeckError::Stream(event.data)),
                 _ => {}
             }
         }
+        if usage != (0, 0) {
+            let _ = tx.send(DeckDelta::Usage {
+                input_tokens: usage.0,
+                output_tokens: usage.1,
+            });
+        }
         Ok(())
+    }
+}
+
+/// Fold one `message_start` / `message_delta` event's usage into `(input,
+/// output)`. Input counts include prompt-cache reads and writes; output is
+/// cumulative in `message_delta`, so the latest value wins.
+fn accumulate_usage(value: &Value, usage: &mut (u64, u64)) {
+    let u = if value["message"]["usage"].is_object() {
+        &value["message"]["usage"]
+    } else {
+        &value["usage"]
+    };
+    let input: u64 = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+        .iter()
+        .filter_map(|k| u[*k].as_u64())
+        .sum();
+    if input > 0 {
+        usage.0 = input;
+    }
+    if let Some(out) = u["output_tokens"].as_u64() {
+        usage.1 = usage.1.max(out);
     }
 }
 
@@ -282,5 +315,16 @@ mod tests {
             on.contains("web_search"),
             "on wire missing web_search: {on}"
         );
+    }
+
+    #[test]
+    fn usage_folds_message_start_and_delta() {
+        let mut u = (0, 0);
+        accumulate_usage(
+            &serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":1200,"cache_read_input_tokens":300,"output_tokens":1}}}),
+            &mut u,
+        );
+        accumulate_usage(&serde_json::json!({"type":"message_delta","usage":{"output_tokens":87}}), &mut u);
+        assert_eq!(u, (1500, 87));
     }
 }

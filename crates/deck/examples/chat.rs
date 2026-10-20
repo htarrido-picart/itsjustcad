@@ -29,6 +29,9 @@ async fn main() {
         match delta {
             DeckDelta::Text(t) => print!("{t}"),
             DeckDelta::Session(sid) => eprintln!("session: {sid}"),
+            DeckDelta::Usage { input_tokens, output_tokens } => {
+                eprintln!("usage: {input_tokens} in, {output_tokens} out")
+            }
             DeckDelta::Done => {
                 println!("\n--- done");
                 break;

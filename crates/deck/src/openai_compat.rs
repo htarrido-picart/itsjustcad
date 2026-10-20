@@ -181,6 +181,16 @@ impl OpenAiCompatDeck {
             {
                 let _ = tx.send(DeckDelta::Text(text.to_string()));
             }
+            // Servers that report usage put it on a (usually final) chunk.
+            if let (Some(input), Some(output)) = (
+                value["usage"]["prompt_tokens"].as_u64(),
+                value["usage"]["completion_tokens"].as_u64(),
+            ) {
+                let _ = tx.send(DeckDelta::Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                });
+            }
         }
         Ok(())
     }

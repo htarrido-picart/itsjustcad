@@ -288,7 +288,7 @@ pub fn with_language(prompt: String, english_name: &str) -> String {
 /// Order the [`Category`] taxonomy is rendered in the compact catalog. Solid /
 /// Structure / Analyze lead because that is where the deck spends most turns and
 /// where the old brief prompt's omissions (geodesic, hypar, funicular, …) bit.
-const CATEGORY_ORDER: &[Category] = &[
+pub(crate) const CATEGORY_ORDER: &[Category] = &[
     Category::Solid,
     Category::Structure,
     Category::Analyze,
@@ -305,7 +305,7 @@ const CATEGORY_ORDER: &[Category] = &[
 ];
 
 /// Human label for a category header in the compact catalog.
-fn category_label(c: Category) -> &'static str {
+pub(crate) fn category_label(c: Category) -> &'static str {
     match c {
         Category::File => "File",
         Category::Edit => "Edit",

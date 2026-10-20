@@ -2263,7 +2263,7 @@ impl DeckPane {
                         let _ = tx.send(None);
                         return;
                     }
-                    DeckDelta::Session(_) => {}
+                    DeckDelta::Session(_) | DeckDelta::Usage { .. } => {}
                 }
             }
             let _ = tx.send(parse_title_summary(&text));
@@ -3264,6 +3264,9 @@ use QUESTION:)."
                 DeckDelta::Session(sid) => {
                     self.session_id = Some(sid);
                     session_changed = true;
+                }
+                DeckDelta::Usage { input_tokens, output_tokens } => {
+                    tracing::info!("deck usage: {input_tokens} in, {output_tokens} out");
                 }
                 DeckDelta::Done => {
                     tracing::info!("deck turn done");

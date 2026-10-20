@@ -118,6 +118,9 @@ pub enum DeckDelta {
     Text(String),
     /// Provider-side session handle to reuse on the next turn.
     Session(String),
+    /// Provider token usage for the turn, sent once before `Done` when the
+    /// provider reports it.
+    Usage { input_tokens: u64, output_tokens: u64 },
     Done,
     Error(String),
 }

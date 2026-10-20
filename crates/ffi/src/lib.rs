@@ -45,7 +45,7 @@ use itsjustcad_commands::{Command, Selector, Session, io, parse};
 use itsjustcad_deck::{
     ChatMessage, ChatRequest, DeckConfig, DeckDelta, DeckKind, DigestFilter, ExtractEvent,
     Extractor, ImagePart, LlmDeck, Role, compact_command_catalog, digest, digest_filtered,
-    make_deck, system_prompt,
+    ffi_system_prompt, make_deck, normalize_selectors,
 };
 use itsjustcad_render::{
     DEPTH_FORMAT, DisplayMode, LineEntry, OrbitCamera, SceneRenderer, StandardView, Theme,
@@ -572,6 +572,14 @@ fn try_route_line(line: &str) -> Result<PendingOp, itsjustcad_commands::ParseErr
             let dx = rest.first().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let dy = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
             return Ok(PendingOp::Camera(CamOp::Pan(dx, dy)));
+        }
+        // Zoom to fit (the desktop `ze` app verb), which models add to frame
+        // their work; unrouted it was "unknown command 'ze'" (#105).
+        "ze" | "zoomextents" | "zea" | "zoomall" => {
+            return Ok(PendingOp::Camera(CamOp::Frame));
+        }
+        "zoom" if matches!(rest.first().copied(), Some("extents" | "all" | "fit")) => {
+            return Ok(PendingOp::Camera(CamOp::Frame));
         }
         "zoom" | "dolly" => {
             let d = match rest.first().copied() {
@@ -2211,7 +2219,16 @@ unsafe fn deck_send_inner(
         return;
     };
 
-    let system = system_prompt(&digest(&app.session.doc), &app.session.plugins);
+    // The FFI prompt (#105): only the view verbs `route_line` accepts, the
+    // selector forms, and the exact usage of the verbs this request needs.
+    let system = ffi_system_prompt(&digest(&app.session.doc), &app.session.plugins, prompt);
+    // Scene ids at turn start, for bare-id → `id:<hex>` repair of emitted lines.
+    let object_ids: Vec<String> = app
+        .session
+        .doc
+        .objects()
+        .map(|o| o.id.0.simple().to_string())
+        .collect();
     let messages = {
         let Ok(mut history) = app.history.lock() else {
             emit(cb, &ctx, CB_ERROR, "history unavailable");
@@ -2238,6 +2255,7 @@ unsafe fn deck_send_inner(
 
             let mut ex = Extractor::default();
             let mut assistant = String::new();
+            let mut usage: Option<(u64, u64)> = None;
 
             // Process a batch of extractor events. This closure contains NO
             // `.await` and does all the panic-prone work (Extractor output,
@@ -2255,6 +2273,7 @@ unsafe fn deck_send_inner(
                                 emit(cb, &ctx, CB_CHAT, &c);
                             }
                             ExtractEvent::Command(line) => {
+                                let line = normalize_selectors(&line, &object_ids);
                                 emit(cb, &ctx, CB_COMMAND, &line);
                                 if let Some(op) = route_line(&line) {
                                     // Side-effect containment (finding #6): the
@@ -2301,6 +2320,10 @@ unsafe fn deck_send_inner(
                         handle_events(events, &mut assistant)
                     }
                     DeckDelta::Session(_) => true,
+                    DeckDelta::Usage { input_tokens, output_tokens } => {
+                        usage = Some((input_tokens, output_tokens));
+                        true
+                    }
                     DeckDelta::Done => break,
                     DeckDelta::Error(e) => {
                         catch_unwind(AssertUnwindSafe(|| emit(cb, &ctx, CB_ERROR, &e))).is_ok()
@@ -2316,7 +2339,10 @@ unsafe fn deck_send_inner(
             if let Ok(mut hist) = history.lock() {
                 hist.push(ChatMessage { role: Role::Assistant, content: assistant });
             }
-            let _ = catch_unwind(AssertUnwindSafe(|| emit(cb, &ctx, CB_DONE, "")));
+            // Additive (#105): the done text carries the provider's token usage
+            // as JSON when it reported any, else stays empty as before.
+            let done = usage.map(done_usage_json).unwrap_or_default();
+            let _ = catch_unwind(AssertUnwindSafe(|| emit(cb, &ctx, CB_DONE, &done)));
         });
 
     // Track the task so `ijc_free` can abort it before teardown, closing the
@@ -2326,6 +2352,11 @@ unsafe fn deck_send_inner(
         t.retain(|(a, _)| !a.is_finished());
         t.push((join.abort_handle(), alive));
     }
+}
+
+/// The `CB_DONE` payload when the provider reported token usage.
+fn done_usage_json((input, output): (u64, u64)) -> String {
+    format!("{{\"input_tokens\":{input},\"output_tokens\":{output}}}")
 }
 
 /// Stop any in-flight deck stream: abort the streaming task(s) without tearing
@@ -3644,6 +3675,51 @@ pub unsafe extern "C" fn ijc_string_free(s: *mut c_char) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, AtomicU64};
+
+    #[test]
+    fn zoom_extents_routes_to_frame_and_validates() {
+        for line in ["ze", "ZE", "zoomextents", "zoom extents", "zoom fit"] {
+            assert!(
+                matches!(route_line(line), Some(PendingOp::Camera(CamOp::Frame))),
+                "{line}"
+            );
+            assert!(check_line(line).is_ok(), "{line} must validate");
+        }
+    }
+
+    #[test]
+    fn every_ffi_prompt_view_verb_validates() {
+        // Each `e.g.` example in the FFI deck's view section must pass the
+        // same check the host runs (`ijc_validate_command`).
+        for l in itsjustcad_deck::FFI_VIEW_HELP.lines() {
+            if let Some((_, ex)) = l.split_once("e.g. ") {
+                assert!(check_line(ex.trim()).is_ok(), "advertised `{}` rejected", ex.trim());
+            }
+        }
+        for v in ["top", "bottom", "front", "back", "left", "right", "persp", "zoom in", "zoom out"] {
+            assert!(check_line(v).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn deck_prompt_examples_with_ids_validate_once_normalized() {
+        let mut session = Session::default();
+        session.run(parse("box 0,0,0 10,10,10").unwrap()).unwrap();
+        let ids: Vec<String> = session.doc.objects().map(|o| o.id.0.simple().to_string()).collect();
+        let short = &ids[0][..8];
+        for bare in [format!("volume {short}"), format!("copy {short} -12,0,0"), format!("array {short} 4,2,1 12,12,0")] {
+            let fixed = normalize_selectors(&bare, &ids);
+            assert!(fixed.contains(&format!("id:{short}")), "{fixed}");
+            assert!(check_line(&fixed).is_ok(), "{fixed} must validate");
+        }
+    }
+
+    #[test]
+    fn done_usage_payload_is_json() {
+        let v: serde_json::Value = serde_json::from_str(&done_usage_json((1500, 87))).unwrap();
+        assert_eq!(v["input_tokens"], 1500);
+        assert_eq!(v["output_tokens"], 87);
+    }
 
     #[test]
     fn camera_verbs_route_to_camera() {
