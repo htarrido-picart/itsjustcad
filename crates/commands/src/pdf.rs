@@ -102,42 +102,49 @@ fn project(dir: ViewDirection, p: DVec3) -> DVec2 {
 /// * `Top` looks straight down (+Z toward −Z): higher z is nearer → depth = −z.
 /// * `Front` looks along +Y: smaller y is nearer → depth = y.
 /// * `Right` looks along +X: smaller x is nearer → depth = x.
-/// * `Iso` is a 30° axonometric; the camera recedes up-and-back, so a point is
-///   nearer when x, y are larger and z is larger. depth = −(x + y + z) is a
-///   serviceable monotone approximation for this axonometric (iso HLR is
-///   inherently approximate here).
+/// * `Iso` is the 30° axonometric of [`project`], which collapses the direction
+///   (1, 1, −1): the camera sits at (−x, −y, +z) looking along it, so a point is
+///   nearer when x, y are smaller and z is larger. depth = x + y − z.
 fn view_depth(dir: ViewDirection, p: DVec3) -> f64 {
     match dir {
         ViewDirection::Top => -p.z,
         ViewDirection::Front => p.y,
         ViewDirection::Right => p.x,
-        ViewDirection::Iso => -(p.x + p.y + p.z),
+        ViewDirection::Iso => p.x + p.y - p.z,
     }
 }
 
-/// Is 2D point `pt` inside triangle `a,b,c` (barycentric sign test)? Points on
-/// an edge count as inside. Degenerate (zero-area) triangles never contain
-/// anything.
-fn point_in_tri(pt: DVec2, a: DVec2, b: DVec2, c: DVec2) -> bool {
-    let d1 = (pt - b).perp_dot(a - b);
-    let d2 = (pt - c).perp_dot(b - c);
-    let d3 = (pt - a).perp_dot(c - a);
-    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-    !(has_neg && has_pos)
+/// The occluder's view depth at 2D point `pt`, or `None` when `pt` is outside
+/// the projected triangle. Points on an edge count as inside. Degenerate
+/// (zero-area, edge-on) triangles never contain anything. Depth is linear over
+/// a planar facet under a parallel projection, so barycentric interpolation of
+/// the corner depths is exact.
+fn tri_depth_at(t: &OccTri, pt: DVec2) -> Option<f64> {
+    let area = (t.b - t.a).perp_dot(t.c - t.a);
+    if area.abs() < 1e-12 {
+        return None;
+    }
+    let wa = (t.b - pt).perp_dot(t.c - pt) / area;
+    let wb = (t.c - pt).perp_dot(t.a - pt) / area;
+    let wc = 1.0 - wa - wb;
+    const IN: f64 = -1e-6;
+    (wa >= IN && wb >= IN && wc >= IN).then_some(wa * t.da + wb * t.db + wc * t.dc)
 }
 
 /// A projected mesh triangle for the hidden-line occlusion pass: the three
-/// corners in projected view-plane meters plus the triangle's maximum depth
-/// (its farthest corner). An edge sample is occluded when it lies inside a
-/// triangle whose *every* corner is nearer than the sample (max depth < sample
-/// depth − eps), i.e. the whole facet is unambiguously in front.
+/// corners in projected view-plane meters plus each corner's view depth. An
+/// edge sample is occluded when it lies inside a triangle whose plane, at that
+/// sample, is nearer than the sample (see [`tri_depth_at`]). Comparing against
+/// the plane rather than the nearest corner keeps a facet from hiding the edges
+/// it shares (a silhouette edge lies on the boundary of a face that also has a
+/// corner nearer the camera).
 struct OccTri {
     a: DVec2,
     b: DVec2,
     c: DVec2,
-    /// Depth of the NEAREST corner (smallest `view_depth`).
-    near: f64,
+    da: f64,
+    db: f64,
+    dc: f64,
 }
 
 /// Gather occluder triangles for a view: every visible mesh face, projected to
@@ -167,9 +174,9 @@ fn gather_occluders(doc: &Document, dir: ViewDirection) -> Vec<OccTri> {
                 a: project(dir, p0),
                 b: project(dir, p1),
                 c: project(dir, p2),
-                near: view_depth(dir, p0)
-                    .min(view_depth(dir, p1))
-                    .min(view_depth(dir, p2)),
+                da: view_depth(dir, p0),
+                db: view_depth(dir, p1),
+                dc: view_depth(dir, p2),
             });
         }
     }
@@ -178,20 +185,20 @@ fn gather_occluders(doc: &Document, dir: ViewDirection) -> Vec<OccTri> {
 
 /// Hidden-line occlusion test (CONSERVATIVE, SAMPLED — not a full HLR solve):
 /// returns true when the segment `wa→wb` should be HIDDEN because its midpoint,
-/// projected to the view plane, falls inside at least one mesh triangle that is
-/// entirely nearer the camera than the segment's nearest endpoint. This removes
+/// projected to the view plane, falls inside at least one mesh triangle whose
+/// surface there is nearer the camera than the midpoint itself. This removes
 /// edges buried behind solids (the common case: back faces, interior creases,
 /// geometry behind a wall) without splitting partially-occluded edges. Edges
 /// that are only partly hidden are kept whole, so the result under-removes
 /// rather than over-removes — honest and safe, never deleting a visible edge.
 fn edge_occluded(occ: &[OccTri], dir: ViewDirection, wa: DVec3, wb: DVec3) -> bool {
-    let mid = project(dir, (wa + wb) * 0.5);
-    // The segment's own nearest depth; an occluder must beat this to hide it.
-    let seg_near = view_depth(dir, wa).min(view_depth(dir, wb));
+    let mid3 = (wa + wb) * 0.5;
+    let mid = project(dir, mid3);
+    let mid_depth = view_depth(dir, mid3);
     // Bias so an edge lying ON its own triangle (coplanar) is not self-hidden.
     const EPS: f64 = 1e-4;
     occ.iter()
-        .any(|t| t.near < seg_near - EPS && point_in_tri(mid, t.a, t.b, t.c))
+        .any(|t| tri_depth_at(t, mid).is_some_and(|d| d < mid_depth - EPS))
 }
 
 /// World-space line segments worth drawing for one object.
@@ -2085,6 +2092,77 @@ mod tests {
         );
     }
 
+    /// Hidden-line visible edges for a scene, in world space, for one view.
+    fn hidden_line_visible(cmds: &[&str], dir: &str) -> Vec<(DVec3, DVec3)> {
+        use crate::{parse, Session};
+        let mut s = Session::default();
+        for c in cmds {
+            s.run(parse(c).unwrap()).unwrap();
+        }
+        s.run(parse("sheet s1 a3").unwrap()).unwrap();
+        s.run(parse(&format!("sheetview s1 {dir} 200")).unwrap()).unwrap();
+        s.run(parse("sheetviewset s1 1 mode hiddenline").unwrap()).unwrap();
+        let sheet = s.doc.sheet("s1").unwrap().clone();
+        let view = &sheet.views[0];
+        let fit = collect_view_fit(&s.doc, view, (DVec2::ZERO, DVec2::splat(400.0))).unwrap();
+        let visible: Vec<_> = fit
+            .weighted
+            .into_iter()
+            .filter(|&(_, _, a, b)| !edge_occluded(&fit.occ, view.direction, a, b))
+            .map(|(_, _, a, b)| (a, b))
+            .collect();
+        // The PDF path draws exactly these (none clip at this scale).
+        assert_eq!(sheet_pdf(&s.doc, &sheet).1, visible.len());
+        visible
+    }
+
+    /// Regression (#110): a box in the perspective (iso) view shows its 9
+    /// visible edges; only the 3 meeting at the far corner (10,10,0) are hidden.
+    #[test]
+    fn hidden_line_persp_box_shows_nine_edges() {
+        let vis = hidden_line_visible(&["box 0,0,0 10,10,10"], "persp");
+        assert_eq!(vis.len(), 9, "{vis:?}");
+        let far = DVec3::new(10.0, 10.0, 0.0);
+        assert!(vis.iter().all(|&(a, b)| a != far && b != far), "{vis:?}");
+    }
+
+    /// Regression (#110): a faceted cylinder in perspective keeps its whole top
+    /// ring, about half its bottom ring and about half its seams.
+    #[test]
+    fn hidden_line_persp_cylinder() {
+        let cyl = ["circle 0,0,0 3", "name last prof", "extrude last 6", "delete prof"];
+        let vis = hidden_line_visible(&cyl, "persp");
+        // Top view sees the whole top ring and nothing else: n ring segments.
+        let n = hidden_line_visible(&cyl, "top").len();
+        let top = vis.iter().filter(|(a, b)| a.z > 5.9 && b.z > 5.9).count();
+        let bottom = vis.iter().filter(|(a, b)| a.z < 0.1 && b.z < 0.1).count();
+        let seams = vis.len() - top - bottom;
+        assert_eq!(top, n, "whole top ring visible");
+        let half = n as i64 / 2;
+        assert!((bottom as i64 - half).abs() <= 2, "bottom={bottom} n={n}");
+        assert!((seams as i64 - half).abs() <= 2, "seams={seams} n={n}");
+    }
+
+    /// Regression (#110): box A in front of box B in perspective. A shows its 9
+    /// edges; B loses its 3 far-corner edges plus the 3 that run behind A.
+    #[test]
+    fn hidden_line_persp_two_boxes_occlude() {
+        let vis = hidden_line_visible(&["box 0,0,0 10,10,10", "box 12,12,0 10,10,10"], "persp");
+        let in_a = |p: DVec3| p.max_element() <= 10.0;
+        assert_eq!(vis.iter().filter(|(a, b)| in_a(*a) && in_a(*b)).count(), 9, "{vis:?}");
+        assert_eq!(vis.len(), 15, "{vis:?}");
+        let behind_a = (DVec3::new(12.0, 12.0, 0.0), DVec3::new(12.0, 12.0, 10.0));
+        assert!(!vis.contains(&behind_a), "{vis:?}");
+    }
+
+    /// Orthographic hidden-line counts for a box stay as before the #110 fix.
+    #[test]
+    fn hidden_line_ortho_box_unchanged() {
+        for dir in ["top", "front", "right"] {
+            assert_eq!(hidden_line_visible(&["box 0,0,0 10,10,10"], dir).len(), 4, "{dir}");
+        }
+    }
+
     /// Wireframe (the default) is byte-identical whether or not the display_mode
     /// field is touched — proving the new routing adds nothing to legacy output.
     #[test]
@@ -2104,3 +2182,4 @@ mod tests {
         assert_eq!(build(false), build(true), "explicit wireframe == default");
     }
 }
+
