@@ -60,27 +60,19 @@ pub enum IoError {
     Io(#[from] std::io::Error),
 }
 
-fn file_format(session: &Session) -> FileFormat {
+pub fn to_json(session: &Session) -> String {
     let branches = session.branches().clone();
     // Only record the current branch marker when there are branches; a
     // branchless file stays byte-identical to the pre-branch format.
     let branch = (!branches.is_empty()).then(|| session.current_branch().to_string());
-    FileFormat {
+    let file = FileFormat {
         itsjustcad: FORMAT_VERSION,
         uuid: session.doc_uuid().map(str::to_string),
         ops: session.save_log(),
         branches,
         branch,
-    }
-}
-
-pub fn to_json(session: &Session) -> String {
-    serde_json::to_string_pretty(&file_format(session)).expect("op-log serializes")
-}
-
-/// [`to_json`] without whitespace: the same file, smaller (feedback bundles).
-pub fn to_json_compact(session: &Session) -> String {
-    serde_json::to_string(&file_format(session)).expect("op-log serializes")
+    };
+    serde_json::to_string_pretty(&file).expect("op-log serializes")
 }
 
 pub fn from_json(json: &str) -> Result<Session, IoError> {
@@ -220,10 +212,6 @@ mod tests {
         let json2 = to_json(&loaded);
         assert_eq!(json1, json2);
         assert_eq!(s.doc.len(), loaded.doc.len());
-        // The compact form is the same file, minus whitespace.
-        let compact = to_json_compact(&s);
-        assert!(compact.len() < json1.len() && !compact.contains('\n'));
-        assert_eq!(to_json(&from_json(&compact).unwrap()), json1);
     }
 
     #[test]

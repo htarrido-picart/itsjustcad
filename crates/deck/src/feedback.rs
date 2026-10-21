@@ -3,37 +3,43 @@
 
 //! Alpha feedback tickets (GitHub issue #123). The deck (or the user) drafts a
 //! `feedback bug|idea | <key>: <value> | …` line; the host shows a review sheet
-//! and only on an explicit click writes the bundle and hands off to mail /
-//! GitHub. Everything here is pure: no I/O, no network.
+//! and only on an explicit click opens a pre-filled web form in the browser,
+//! where the user reviews and submits. Tickets are text only. Everything here
+//! is pure: no I/O, no network.
 //!
 //! The per-category [`TemplateField`] tables are the single source of truth:
-//! the deck prompt ([`prompt_help`]), the review sheet, the bundle, the mailto
-//! summary and the GitHub body all derive from them.
-//!
-//! PRIVACY: the repo is public. The document and chat travel only in the bundle
-//! file (email); [`github_issue_url`] carries the typed text plus version info.
+//! the deck prompt ([`prompt_help`]), the review sheet and the ticket text
+//! ([`google_form_url`]) all derive from them.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
-use crate::deck::ChatMessage;
+/// Prefix of every Google Form URL the hosts may open.
+pub const GOOGLE_FORM_URL_PREFIX: &str = "https://docs.google.com/forms/d/e/";
+/// Cap on each percent-encoded ticket body (URL length limits).
+const BODY_MAX: usize = 6000;
+/// Cap on the percent-encoded title.
+const TITLE_MAX: usize = 300;
 
-/// Where feedback email goes. Placeholder alias — the one place to change it.
-pub const FEEDBACK_EMAIL: &str = "feedback@itsjustcad.app";
-/// Pre-filled "new issue" page; the only GitHub URL the hosts may open.
-pub const GITHUB_NEW_ISSUE_URL: &str = "https://github.com/htarrido-picart/itsjustcad/issues/new";
-/// Documents larger than this (compact JSON bytes) are left out of the bundle.
-pub const MAX_DOC_BYTES: usize = 10 * 1024 * 1024;
-/// Chat turns included in the bundle (the most recent ones).
-pub const MAX_CHAT_TURNS: usize = 10;
-/// Cap on the percent-encoded mailto body; mail clients choke on long URLs.
-pub const MAILTO_BODY_MAX: usize = 1500;
-/// Cap on the percent-encoded GitHub issue body (URL length limits).
-const GITHUB_BODY_MAX: usize = 6000;
+/// The feedback Google Form, pre-filled through its
+/// `entry.N` field ids (⋮ ▸ "Get pre-filled link" in the form editor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GoogleForm {
+    /// `https://docs.google.com/forms/d/e/<FORM_ID>/viewform`.
+    pub prefill_base: &'static str,
+    /// Short-answer "Title" field.
+    pub title_entry: &'static str,
+    /// Multiple-choice "Category" field with the options `Bug` / `Idea`.
+    pub category_entry: &'static str,
+    /// Paragraph "Details" field.
+    pub details_entry: &'static str,
+}
 
-/// How a template field is entered.
+/// The feedback form — the one place to configure it. While `None` the sheet's
+/// send button is disabled ("not configured in this build").
+pub const GOOGLE_FORM: Option<GoogleForm> = None;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldKind {
     /// One line of text.
@@ -49,9 +55,9 @@ pub enum FieldKind {
 /// One field of a ticket template.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TemplateField {
-    /// Label on the verb line and key in the bundle / draft JSON.
+    /// Label on the verb line and key in the draft JSON.
     pub key: &'static str,
-    /// English heading (mailto, GitHub body); the sheet localizes by `key`.
+    /// English heading in the ticket text; the sheet localizes by `key`.
     pub label: &'static str,
     /// What the field holds (taught to the deck).
     pub hint: &'static str,
@@ -133,6 +139,14 @@ impl FeedbackCategory {
         match self {
             Self::Bug => "bug",
             Self::Idea => "idea",
+        }
+    }
+
+    /// The form's multiple-choice option (`Bug` / `Idea`), matched exactly.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bug => "Bug",
+            Self::Idea => "Idea",
         }
     }
 
@@ -271,7 +285,7 @@ pub fn prompt_help() -> String {
     format!(
         "
 Feedback to the developers (ONLY when the user asks to report a problem or wishes for a feature):
-  feedback bug|idea | <field>: <value> | …   draft a ticket; opens a review sheet the user edits and sends — it NEVER sends anything itself
+  feedback bug|idea | <field>: <value> | …   draft a ticket; opens a review sheet, then a web form in the browser for the user to review and submit — it NEVER submits anything itself
   bug fields:  {}
   idea fields: {}
   e.g. {EXAMPLE_LINE}
@@ -287,85 +301,9 @@ pub fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Bundle file name for a moment in Unix seconds.
-pub fn bundle_filename(unix_secs: u64) -> String {
-    format!("itsjustcad-feedback-{unix_secs}.json")
-}
-
-/// Whether a document of this compact-JSON size fits in the bundle.
-pub fn document_fits(doc_json: &str) -> bool {
-    doc_json.len() <= MAX_DOC_BYTES
-}
-
-/// The most recent [`MAX_CHAT_TURNS`] turns.
-pub fn last_turns(chat: &[ChatMessage]) -> &[ChatMessage] {
-    &chat[chat.len().saturating_sub(MAX_CHAT_TURNS)..]
-}
-
-/// The bundle file (compact JSON). `chat`/`doc_json` are `None` when the user
-/// unticked them. A document over [`MAX_DOC_BYTES`] (or not JSON) is left out
-/// and `document_omitted` says why.
-pub fn build_bundle(
-    draft: &FeedbackDraft,
-    app_version: &str,
-    platform: &str,
-    chat: Option<&[ChatMessage]>,
-    doc_json: Option<&str>,
-) -> String {
-    let mut b = json!({ "category": draft.category });
-    for f in draft.category.template() {
-        b[f.key] = match f.kind {
-            FieldKind::Steps => json!(draft.steps()),
-            _ => json!(draft.get(f.key)),
-        };
-    }
-    b["app_version"] = json!(app_version);
-    b["platform"] = json!(platform);
-    if let Some(chat) = chat {
-        b["chat"] = json!(last_turns(chat));
-    }
-    if let Some(doc) = doc_json {
-        if !document_fits(doc) {
-            b["document_omitted"] = json!(format!(
-                "document is {:.1} MB, over the {} MB cap",
-                doc.len() as f64 / (1024.0 * 1024.0),
-                MAX_DOC_BYTES / (1024 * 1024)
-            ));
-        } else {
-            match serde_json::from_str::<Value>(doc) {
-                Ok(v) => b["document"] = v,
-                Err(e) => b["document_omitted"] = json!(format!("document is not JSON: {e}")),
-            }
-        }
-    }
-    b.to_string()
-}
-
-/// `mailto:` to [`FEEDBACK_EMAIL`] with a short summary; the full details live
-/// in the attached bundle (mailto cannot attach, so the body names the file).
-pub fn mailto_url(draft: &FeedbackDraft, attachment_filename: &str) -> String {
-    let subject = format!(
-        "[itsjustcad {}] {}",
-        draft.category.as_str(),
-        draft.get("title")
-    );
-    let summary: String = draft
-        .summary()
-        .into_iter()
-        .map(|(label, v)| format!("{label}:\n{v}\n\n"))
-        .collect();
-    let footer = encode(&format!(
-        "Attached: {attachment_filename}\n(Please attach this file; it was just revealed in your file manager.)"
-    ));
-    let body = encode_capped(&summary, MAILTO_BODY_MAX.saturating_sub(footer.len())) + &footer;
-    format!(
-        "mailto:{FEEDBACK_EMAIL}?subject={}&body={body}",
-        encode_capped(&subject, 300)
-    )
-}
-
-/// Pre-filled GitHub "new issue" URL. Text only — never chat or the document.
-pub fn github_issue_url(draft: &FeedbackDraft, version: &str, platform: &str) -> String {
+/// The ticket text: category, version, platform and the template fields — the
+/// form's Details field.
+fn issue_body(draft: &FeedbackDraft, version: &str, platform: &str) -> String {
     let mut body = format!(
         "**Category:** {}\n**Version:** {version}\n**Platform:** {platform}\n",
         draft.category.as_str()
@@ -373,19 +311,30 @@ pub fn github_issue_url(draft: &FeedbackDraft, version: &str, platform: &str) ->
     for (label, v) in draft.summary() {
         body.push_str(&format!("\n### {label}\n{v}\n"));
     }
+    body
+}
+
+/// Pre-filled Google Form URL — the only submit route.
+pub fn google_form_url(
+    form: &GoogleForm,
+    draft: &FeedbackDraft,
+    version: &str,
+    platform: &str,
+) -> String {
     format!(
-        "{GITHUB_NEW_ISSUE_URL}?title={}&body={}&labels=alpha-feedback",
-        encode_capped(draft.get("title"), 300),
-        encode_capped(&body, GITHUB_BODY_MAX)
+        "{}?usp=pp_url&{}={}&{}={}&{}={}",
+        form.prefill_base,
+        form.title_entry,
+        encode_capped(draft.get("title"), TITLE_MAX),
+        form.category_entry,
+        draft.category.label(),
+        form.details_entry,
+        encode_capped(&issue_body(draft, version, platform), BODY_MAX)
     )
 }
 
-/// RFC 3986 percent-encoding: everything but unreserved characters.
-fn encode(s: &str) -> String {
-    encode_capped(s, usize::MAX)
-}
-
-/// Percent-encode `s`, stopping before the char whose escape would exceed
+/// RFC 3986 percent-encoding (everything but unreserved characters) of `s`,
+/// stopping before the char whose escape would exceed
 /// `max` bytes — truncation lands on a char boundary, never mid-escape.
 fn encode_capped(s: &str, max: usize) -> String {
     let mut out = String::new();
@@ -410,19 +359,9 @@ fn encode_capped(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deck::Role;
 
     fn draft() -> FeedbackDraft {
         parse_line(EXAMPLE_LINE).unwrap()
-    }
-
-    fn chat(n: usize) -> Vec<ChatMessage> {
-        (0..n)
-            .map(|i| ChatMessage {
-                role: Role::User,
-                content: format!("turn {i}"),
-            })
-            .collect()
     }
 
     #[test]
@@ -504,145 +443,70 @@ mod tests {
         }
         assert!(p.contains(EXAMPLE_LINE));
         assert!(p.contains("at most 3 questions") && p.contains("just send it"));
-        assert!(p.contains("NEVER sends anything itself"));
+        assert!(p.contains("NEVER submits anything itself"));
     }
 
-    #[test]
-    fn bundle_has_template_fields_version_platform() {
-        let v: Value = serde_json::from_str(&build_bundle(
-            &draft(),
-            "0.6.7",
-            "macos-aarch64",
-            None,
-            None,
-        ))
-        .unwrap();
-        assert_eq!(v["category"], "bug");
-        assert_eq!(v["title"], "Fillet fails");
-        assert_eq!(v["steps"], json!(["box 0,0,0 1,1,1", "fillet last 0.2"]));
-        assert_eq!(v["expected"], "rounded edges");
-        assert_eq!(v["actual"], "error \"no edges\"");
-        assert_eq!(v["freq"], "always");
-        assert_eq!(v["app_version"], "0.6.7");
-        assert_eq!(v["platform"], "macos-aarch64");
-        assert!(
-            v.get("chat").is_none()
-                && v.get("document").is_none()
-                && v.get("document_omitted").is_none()
-        );
-        assert!(platform().contains(std::env::consts::OS));
+    const FORM: GoogleForm = GoogleForm {
+        prefill_base: "https://docs.google.com/forms/d/e/FORMID/viewform",
+        title_entry: "entry.1",
+        category_entry: "entry.2",
+        details_entry: "entry.3",
+    };
 
-        // Only the current category's template goes in the bundle.
-        let mut idea = draft();
-        idea.category = FeedbackCategory::Idea;
-        idea.field_mut("goal").push_str("print");
-        let v: Value = serde_json::from_str(&build_bundle(&idea, "v", "p", None, None)).unwrap();
+    #[test]
+    fn form_url_is_prefilled_encoded_and_capped() {
+        let url = google_form_url(&FORM, &draft(), "0.6.7", "macos-aarch64");
+        let details = encode_capped(&issue_body(&draft(), "0.6.7", "macos-aarch64"), BODY_MAX);
         assert_eq!(
-            (v["goal"].as_str(), v["why"].as_str()),
-            (Some("print"), Some(""))
+            url,
+            format!(
+                "https://docs.google.com/forms/d/e/FORMID/viewform?usp=pp_url&entry.1=Fillet%20fails&entry.2=Bug&entry.3={details}"
+            )
         );
-        assert!(v.get("steps").is_none() && v.get("freq").is_none());
-    }
-
-    #[test]
-    fn bundle_attach_and_chat_toggles() {
-        let doc = r#"{"itsjustcad":1,"ops":[]}"#;
-        let c = chat(14);
-        let v: Value =
-            serde_json::from_str(&build_bundle(&draft(), "v", "p", Some(&c), Some(doc))).unwrap();
-        assert_eq!(v["document"]["itsjustcad"], 1);
-        let turns = v["chat"].as_array().unwrap();
-        assert_eq!(turns.len(), MAX_CHAT_TURNS);
-        assert_eq!(turns[0]["content"], "turn 4");
-        assert_eq!(turns[9]["role"], "user");
-
-        let v: Value =
-            serde_json::from_str(&build_bundle(&draft(), "v", "p", Some(&chat(2)), None)).unwrap();
-        assert!(v.get("document").is_none());
-        assert_eq!(v["chat"].as_array().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn bundle_omits_document_over_cap() {
-        let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(MAX_DOC_BYTES));
-        assert!(!document_fits(&big));
-        let v: Value =
-            serde_json::from_str(&build_bundle(&draft(), "v", "p", None, Some(&big))).unwrap();
-        assert!(v.get("document").is_none());
         assert!(
-            v["document_omitted"]
-                .as_str()
-                .unwrap()
-                .contains("10 MB cap")
+            url.contains("%23%23%23%20Expected%0Arounded%20edges") && url.contains("macos-aarch64")
         );
+        let mut idea = FeedbackDraft {
+            category: FeedbackCategory::Idea,
+            ..Default::default()
+        };
+        assert!(google_form_url(&FORM, &idea, "v", "p").contains("&entry.2=Idea&"));
+
+        // Long text is capped on a char boundary: only whole `%C3%A9` escapes.
+        idea.field_mut("goal").push_str(&"é".repeat(5000));
+        *idea.field_mut("title") = "é".repeat(500);
+        let url = google_form_url(&FORM, &idea, "v", "p");
+        let title = url
+            .split("&entry.1=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
+        assert_eq!(title.len(), TITLE_MAX / 6 * 6);
+        let details = url.split("&entry.3=").nth(1).unwrap();
+        assert!(details.len() <= BODY_MAX && details.ends_with("%C3%A9"));
     }
 
     #[test]
-    fn mailto_is_encoded_and_capped() {
-        let url = mailto_url(&draft(), "itsjustcad-feedback-1.json");
-        assert!(url.starts_with(
-            "mailto:feedback@itsjustcad.app?subject=%5Bitsjustcad%20bug%5D%20Fillet%20fails&body="
-        ));
-        let body = url.split("&body=").nth(1).unwrap();
+    fn form_url_carries_template_text_only() {
+        let url = google_form_url(&FORM, &draft(), "0.6.7", "linux-x86_64");
         for part in [
-            "Steps%3A%0A1.%20box",
-            "2.%20fillet%20last%200.2",
-            "Expected%3A%0Arounded%20edges",
-            "Actual%3A",
-            "Frequency%3A%0Aalways",
-        ] {
-            assert!(body.contains(part), "{part} missing from {body}");
-        }
-        assert!(url.contains("itsjustcad-feedback-1.json"));
-        assert!(!url.chars().any(|c| c.is_whitespace() || c == '"'));
-
-        let mut long = FeedbackDraft::default();
-        *long.field_mut("actual") = "é".repeat(5000);
-        let url = mailto_url(&long, "f.json");
-        let body = url.split("&body=").nth(1).unwrap();
-        assert!(body.len() <= MAILTO_BODY_MAX, "{}", body.len());
-        assert!(body.ends_with(&encode(
-            "Attached: f.json\n(Please attach this file; it was just revealed in your file manager.)"
-        )));
-        // Truncated on a char boundary: only whole `%C3%A9` escapes before the footer.
-        let head = body.strip_prefix("Actual%3A%0A").unwrap();
-        assert!(
-            head.starts_with("%C3%A9")
-                && head
-                    .split("Attached")
-                    .next()
-                    .unwrap()
-                    .len()
-                    .is_multiple_of(6)
-        );
-    }
-
-    #[test]
-    fn github_url_carries_template_text_only() {
-        let d = draft();
-        let url = github_issue_url(&d, "0.6.7", "linux-x86_64");
-        assert!(url.starts_with(GITHUB_NEW_ISSUE_URL));
-        assert!(url.ends_with("&labels=alpha-feedback"));
-        assert!(url.contains("title=Fillet%20fails"));
-        assert!(url.contains("0.6.7") && url.contains("linux-x86_64"));
-        for part in [
+            "Category%3A%2A%2A%20bug",
+            "0.6.7",
+            "linux-x86_64",
             "%23%23%23%20Steps%0A1.%20box",
-            "%23%23%23%20Expected",
+            "2.%20fillet%20last%200.2",
             "%23%23%23%20Actual",
             "%23%23%23%20Frequency%0Aalways",
         ] {
             assert!(url.contains(part), "{part} missing from {url}");
         }
-        // The signature has no chat or document input, and the bundle's chat
-        // and document never leak into it.
-        let bundle = build_bundle(
-            &d,
-            "0.6.7",
-            "linux-x86_64",
-            Some(&chat(3)),
-            Some(r#"{"secret_doc":1}"#),
-        );
-        assert!(bundle.contains("turn 2") && bundle.contains("secret_doc"));
-        assert!(!url.contains("turn") && !url.contains("secret_doc"));
+        assert!(!url.chars().any(|c| c.is_whitespace() || c == '"'));
+        // The builder takes no chat or document: only the draft's own text and
+        // the version info reach the URL.
+        for leak in ["chat", "document", "turn"] {
+            assert!(!url.contains(leak), "{leak} in {url}");
+        }
     }
 }

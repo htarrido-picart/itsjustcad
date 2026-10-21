@@ -220,21 +220,17 @@ pub fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
-/// Whether [`open_external_url`] may hand `url` to the OS: only a `mailto:` or
-/// the repo's pre-filled GitHub new-issue page (feedback tickets), with no
-/// whitespace, control characters or quotes (the payload is percent-encoded).
+/// Whether [`open_external_url`] may hand `url` to the OS: only a Google Form
+/// (the feedback web form), with no whitespace, control characters or quotes
+/// (the pre-filled payload is percent-encoded).
 pub fn is_safe_external_url(url: &str) -> bool {
-    let allowed = url.starts_with("mailto:")
-        || url
-            .strip_prefix(itsjustcad_deck::GITHUB_NEW_ISSUE_URL)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('?'));
-    allowed
+    url.starts_with(itsjustcad_deck::GOOGLE_FORM_URL_PREFIX)
         && !url
             .chars()
             .any(|c| c.is_whitespace() || c.is_control() || "\"'`".contains(c))
 }
 
-/// Open a feedback `mailto:` / GitHub new-issue URL with the OS handler.
+/// Open the pre-filled feedback form with the OS handler (the default browser).
 /// Best-effort; never through a shell (`rundll32` on Windows, not `cmd`), and
 /// refuses anything [`is_safe_external_url`] rejects.
 pub fn open_external_url(url: &str) {
@@ -256,21 +252,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn external_url_guard_allows_only_feedback_targets() {
+    fn external_url_guard_allows_only_the_feedback_form() {
+        let form = itsjustcad_deck::GoogleForm {
+            prefill_base: "https://docs.google.com/forms/d/e/FORMID/viewform",
+            title_entry: "entry.1",
+            category_entry: "entry.2",
+            details_entry: "entry.3",
+        };
         let d = itsjustcad_deck::parse_feedback_line("feedback | title: a \"b\" & c | actual: 'x'\ty").unwrap();
-        assert!(is_safe_external_url(&itsjustcad_deck::mailto_url(&d, "f.json")));
-        assert!(is_safe_external_url(&itsjustcad_deck::github_issue_url(&d, "0.6.7", "macos")));
-        assert!(is_safe_external_url("mailto:x@y.z?subject=a%20b"));
-        // Other schemes / other GitHub pages / look-alike paths are refused.
-        assert!(!is_safe_external_url("https://github.com/htarrido-picart/itsjustcad/releases"));
-        assert!(!is_safe_external_url("https://github.com/htarrido-picart/itsjustcad/issues/newx"));
-        assert!(!is_safe_external_url("https://evil.example/mailto:"));
+        assert!(is_safe_external_url(&itsjustcad_deck::google_form_url(&form, &d, "0.6.7", "macos")));
+        // Other schemes, other hosts and look-alike prefixes are refused.
+        assert!(!is_safe_external_url("https://docs.google.com/document/d/x"));
+        assert!(!is_safe_external_url("https://github.com/htarrido-picart/itsjustcad/issues/new"));
+        assert!(!is_safe_external_url("mailto:x@y.z"));
+        assert!(!is_safe_external_url("https://evil.example/https://docs.google.com/forms/d/e/"));
         assert!(!is_safe_external_url("file:///etc/passwd"));
         // Whitespace, control characters and quotes are refused.
-        assert!(!is_safe_external_url("mailto:x@y.z?body=a b"));
-        assert!(!is_safe_external_url("mailto:x@y.z?body=a\nb"));
-        assert!(!is_safe_external_url("mailto:x@y.z?body=\"calc\""));
-        assert!(!is_safe_external_url("mailto:x@y.z?body='a'"));
+        let base = "https://docs.google.com/forms/d/e/F/viewform?entry.1=";
+        for bad in ["a b", "a\nb", "\"calc\"", "'a'", "`a`"] {
+            assert!(!is_safe_external_url(&format!("{base}{bad}")), "{bad:?}");
+        }
     }
 
     #[test]
