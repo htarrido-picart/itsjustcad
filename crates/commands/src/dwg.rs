@@ -203,11 +203,23 @@ pub fn convert_dwg_to_dxf_with(bin: &Path, input: &str) -> Result<Converted, Str
     let input_abs = std::fs::canonicalize(input).unwrap_or_else(|_| PathBuf::from(input));
 
     // FIXED args — no shell, no interpolation, no model-controlled flags.
-    let status = std::process::Command::new(bin)
-        .arg("-o")
-        .arg(&out_dxf)
-        .arg(&input_abs)
-        .output();
+    // Linux refuses to exec a file another process still holds open for
+    // writing (ETXTBSY) — e.g. a converter just installed, or a test stub whose
+    // write fd leaked into a concurrently forked child. Transient: retry briefly.
+    let mut status = Err(std::io::ErrorKind::ExecutableFileBusy.into());
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        status = std::process::Command::new(bin)
+            .arg("-o")
+            .arg(&out_dxf)
+            .arg(&input_abs)
+            .output();
+        if !matches!(&status, Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy) {
+            break;
+        }
+    }
 
     let result = (|| {
         let output = status.map_err(|e| format!("failed to run dwg2dxf: {e}"))?;
