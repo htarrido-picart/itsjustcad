@@ -38,8 +38,9 @@ pub use digest::{digest, digest_filtered, geometry_kind, DigestFilter};
 pub use extract::{Extractor, ExtractEvent};
 pub use feedback::{
     build_bundle, bundle_filename, document_fits, github_issue_url, last_turns, mailto_url,
-    parse_line as parse_feedback_line, platform, FeedbackCategory, FeedbackDraft, FEEDBACK_EMAIL,
-    GITHUB_NEW_ISSUE_URL, MAX_CHAT_TURNS, MAX_DOC_BYTES,
+    parse_line as parse_feedback_line, platform, FeedbackCategory, FeedbackDraft, FieldKind,
+    TemplateField, BUG_TEMPLATE, EXAMPLE_LINE as FEEDBACK_EXAMPLE_LINE, FEEDBACK_EMAIL,
+    FREQ_OPTIONS, GITHUB_NEW_ISSUE_URL, IDEA_TEMPLATE, MAX_CHAT_TURNS, MAX_DOC_BYTES,
 };
 pub use ffi_prompt::{ffi_system_prompt, FFI_SELECTOR_HELP, FFI_VIEW_HELP};
 pub use probe::{probe, warm_model, ProbeInfo, WarmOutcome};

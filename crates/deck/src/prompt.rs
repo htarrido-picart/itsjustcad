@@ -82,10 +82,6 @@ AI diffusion render (only if the user configured a render cassette; ships off):
                                                 A1111 / Draw Things / cloud) and the result opens in a
                                                 window. render cancel aborts. Describe materials, mood
                                                 and light in the prompt; the geometry comes from the view.
-
-Feedback to the developers (ONLY when the user asks to report a problem or wishes for a feature):
-  feedback bug|idea <title> | <description> | <steps>   draft a ticket; opens a review sheet     e.g. feedback bug Fillet fails | fillet on a box errors | box, then fillet
-                                                the user edits and sends — it never sends anything itself
 ";
 
 /// The "UI/session commands" section of the deck system prompt.
@@ -425,7 +421,7 @@ The form-finding generators (geodesic, spaceframe, hypar, gaussvault, gridshell,
 ## You can also change the VIEW and UI, not just geometry
 You are NOT geometry-only. Besides drawing, you can reframe the viewport, orbit to standard views, zoom, switch display/render styles, change lighting, pick a camera lens/projection (including fisheye and phone-camera sims), and rearrange the window (panels, docking, viewport split, workspace, theme). Emit these in the SAME ```draft block, one per line — they run exactly like the human's command line and never touch the drawing or op-log. When the user asks for a look, a view, a camera, or a layout change, DO IT — never reply that you "only emit geometry commands".
 
-{view_verbs}
+{view_verbs}{feedback}
 {ui_verbs}
 {enviro}
 {codecheck}
@@ -456,6 +452,8 @@ box 10,0,0 4,4,3
         selectors = SELECTOR_HELP,
         plugin_block = plugin_block,
         view_verbs = VIEW_VERB_HELP,
+        // Generated from the ticket templates (single source of truth).
+        feedback = crate::feedback::prompt_help(),
         ui_verbs = UI_VERB_HELP,
         enviro = ENVIRO_CRITIQUE_HELP,
         codecheck = CODECHECK_HELP,
@@ -562,7 +560,7 @@ Examples:
   camera fisheye 120
   ```
 
-{view_verbs}
+{view_verbs}{feedback}
 {ui_verbs}
 {enviro}
 {codecheck}
@@ -600,6 +598,8 @@ box 10,0,0 4,4,3
         selectors = SELECTOR_HELP,
         plugin_block = plugin_block,
         view_verbs = VIEW_VERB_HELP,
+        // Generated from the ticket templates (single source of truth).
+        feedback = crate::feedback::prompt_help(),
         ui_verbs = UI_VERB_HELP,
         enviro = ENVIRO_CRITIQUE_HELP,
         codecheck = CODECHECK_HELP,

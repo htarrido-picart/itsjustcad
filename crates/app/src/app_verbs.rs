@@ -84,8 +84,8 @@ pub enum AppVerb {
     Save(Option<String>),
     /// Command reference (`help [verb]`).
     Help(Option<String>),
-    /// Draft an alpha feedback ticket (`feedback bug|idea <title> | <description>
-    /// | <steps>`). The GUI opens the review sheet with the draft pre-filled;
+    /// Draft an alpha feedback ticket (`feedback bug|idea | title: … | <field>:
+    /// …`, fields from the deck's ticket templates). The GUI opens the review sheet with the draft pre-filled;
     /// nothing is sent until the user clicks. Headless warns and ignores it.
     Feedback(itsjustcad_deck::FeedbackDraft),
     /// GUI-only verb with no headless meaning (`template`, `critique`, …).
@@ -436,11 +436,11 @@ mod tests {
     fn classifies_feedback() {
         use itsjustcad_deck::{FeedbackCategory, FeedbackDraft};
         assert_eq!(classify("feedback"), Some(AppVerb::Feedback(FeedbackDraft::default())));
-        match classify("feedback idea Dark sheets | print on black").unwrap() {
+        match classify("feedback idea | goal: print | title: Dark sheets").unwrap() {
             AppVerb::Feedback(d) => {
                 assert_eq!(d.category, FeedbackCategory::Idea);
-                assert_eq!(d.title, "Dark sheets");
-                assert_eq!(d.description, "print on black");
+                assert_eq!(d.get("title"), "Dark sheets");
+                assert_eq!(d.get("goal"), "print");
             }
             other => panic!("{other:?}"),
         }
@@ -651,7 +651,7 @@ mod tests {
             "render glass pavilion at dusk",
             "render cancel",
             "help geodesic",
-            "feedback bug Fillet fails | fillet on a box errors | box, then fillet",
+            itsjustcad_deck::FEEDBACK_EXAMPLE_LINE,
         ] {
             assert!(
                 classify(line).is_some(),
@@ -693,7 +693,7 @@ mod tests {
             "basemap off",
             "render glass pavilion at dusk",
             "render cancel",
-            "feedback bug Fillet fails | fillet on a box errors | box, then fillet",
+            itsjustcad_deck::FEEDBACK_EXAMPLE_LINE,
         ] {
             assert!(classify(line).is_some(), "help advertises '{line}' but classify rejects it");
         }

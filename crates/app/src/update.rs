@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn external_url_guard_allows_only_feedback_targets() {
-        let d = itsjustcad_deck::FeedbackDraft { title: "a \"b\" & c".into(), ..Default::default() };
+        let d = itsjustcad_deck::parse_feedback_line("feedback | title: a \"b\" & c | actual: 'x'\ty").unwrap();
         assert!(is_safe_external_url(&itsjustcad_deck::mailto_url(&d, "f.json")));
         assert!(is_safe_external_url(&itsjustcad_deck::github_issue_url(&d, "0.6.7", "macos")));
         assert!(is_safe_external_url("mailto:x@y.z?subject=a%20b"));

@@ -8,7 +8,8 @@
 //! `itsjustcad_deck::feedback`; this module is only the window + the file write.
 
 use itsjustcad_deck::{
-    ChatMessage, FeedbackCategory, FeedbackDraft, MAX_DOC_BYTES, Role, last_turns,
+    ChatMessage, FREQ_OPTIONS, FeedbackCategory, FeedbackDraft, FieldKind, MAX_DOC_BYTES, Role,
+    last_turns,
 };
 
 use crate::i18n::t;
@@ -70,23 +71,56 @@ impl FeedbackSheet {
                             t("feedback.idea"),
                         );
                     });
-                    dialog_text(ui, roles, t("feedback.field_title"));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.draft.title)
-                            .desired_width(f32::INFINITY),
-                    );
-                    dialog_text(ui, roles, t("feedback.description"));
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.draft.description)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY),
-                    );
-                    dialog_text(ui, roles, t("feedback.steps"));
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.draft.steps)
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY),
-                    );
+                    // The category's template drives the fields; values typed
+                    // for the other category stay in the draft.
+                    for f in self.draft.category.template() {
+                        dialog_text(ui, roles, t(&format!("feedback.field.{}", f.key)));
+                        let hint = t(&format!("feedback.hint.{}", f.key));
+                        let value = self.draft.field_mut(f.key);
+                        match f.kind {
+                            FieldKind::Line => {
+                                ui.add(
+                                    egui::TextEdit::singleline(value)
+                                        .id_salt(f.key)
+                                        .hint_text(hint)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            }
+                            FieldKind::Text | FieldKind::Steps => {
+                                ui.add(
+                                    egui::TextEdit::multiline(value)
+                                        .id_salt(f.key)
+                                        .hint_text(hint)
+                                        .desired_rows(3)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            }
+                            FieldKind::Freq => {
+                                let shown = if value.is_empty() {
+                                    hint.to_string()
+                                } else {
+                                    t(&format!("feedback.freq.{value}")).to_string()
+                                };
+                                egui::ComboBox::from_id_salt(f.key)
+                                    .selected_text(shown)
+                                    .show_ui(ui, |ui| {
+                                        for o in FREQ_OPTIONS {
+                                            ui.selectable_value(
+                                                value,
+                                                o.to_string(),
+                                                t(&format!("feedback.freq.{o}")),
+                                            );
+                                        }
+                                    });
+                            }
+                        }
+                        // Steps read back as the numbered list that gets sent.
+                        if f.kind == FieldKind::Steps {
+                            for (i, step) in self.draft.steps().iter().enumerate() {
+                                ui.weak(format!("{}. {step}", i + 1));
+                            }
+                        }
+                    }
                     ui.add_space(crate::theme::Spacing::S);
                     ui.checkbox(&mut self.attach_doc, t("feedback.attach_doc"));
                     if self.attach_doc && self.doc_bytes > MAX_DOC_BYTES {
@@ -153,4 +187,31 @@ pub fn write_bundle(name: &str, bundle: &str) -> std::io::Result<std::path::Path
         }
     }
     Err(last)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::i18n::{Lang, lookup};
+
+    /// Every template field (and freq option) has a sheet label and hint.
+    #[test]
+    fn every_template_field_is_localized() {
+        let keys = itsjustcad_deck::BUG_TEMPLATE
+            .iter()
+            .chain(itsjustcad_deck::IDEA_TEMPLATE)
+            .flat_map(|f| {
+                [
+                    format!("feedback.field.{}", f.key),
+                    format!("feedback.hint.{}", f.key),
+                ]
+            })
+            .chain(
+                itsjustcad_deck::FREQ_OPTIONS
+                    .iter()
+                    .map(|o| format!("feedback.freq.{o}")),
+            );
+        for k in keys {
+            assert!(lookup(Lang::En, &k).is_some(), "missing i18n key {k}");
+        }
+    }
 }

@@ -4001,9 +4001,11 @@ pub unsafe extern "C" fn ijc_save_json(h: *mut AppHandle) -> *mut c_char {
     })
 }
 
-/// Parse a `feedback bug|idea <title> | <description> | <steps>` line (e.g. one
-/// the deck emitted) into draft JSON `{category,title,description,steps}` for
-/// the host's review sheet. Returns an empty string if `line` is not a feedback
+/// Parse a `feedback bug|idea | <field>: <value> | …` line (e.g. one the deck
+/// emitted) into flat draft JSON for the host's review sheet:
+/// `{"category":"bug","title":…,"steps":"one\nper\nline",…}`, keyed by the
+/// template field keys (bug: title steps expected actual freq; idea: title
+/// goal proposal why). Returns an empty string if `line` is not a feedback
 /// line (or null / not UTF-8). Free with [`ijc_string_free`].
 ///
 /// # Safety
@@ -5314,7 +5316,7 @@ mod headless_tests {
         unsafe {
             assert_eq!(take(ijc_feedback_parse(std::ptr::null())), "");
             assert_eq!(take(ijc_feedback_parse(c("box 0,0,0 1,1,1").as_ptr())), "");
-            let draft = take(ijc_feedback_parse(c("feedback idea Dark sheets | print on black").as_ptr()));
+            let draft = take(ijc_feedback_parse(c("feedback idea | why: speed | title: Dark sheets | goal: print").as_ptr()));
             let v: serde_json::Value = serde_json::from_str(&draft).unwrap();
             assert_eq!(v["category"], "idea");
             assert_eq!(v["title"], "Dark sheets");
@@ -5333,7 +5335,8 @@ mod headless_tests {
 
             let b: serde_json::Value =
                 serde_json::from_str(&take(ijc_feedback_bundle(h, d.as_ptr(), true, true))).unwrap();
-            assert_eq!(b["title"], "Dark sheets");
+            assert_eq!((b["title"].as_str(), b["goal"].as_str()), (Some("Dark sheets"), Some("print")));
+            assert_eq!(b["proposal"], "");
             assert_eq!(b["app_version"], env!("CARGO_PKG_VERSION"));
             assert_eq!(b["document"]["ops"].as_array().unwrap().len(), 1);
             assert_eq!(b["chat"][0]["content"], "make a box");
