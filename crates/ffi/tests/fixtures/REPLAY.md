@@ -25,6 +25,8 @@ app would send.
    - inside it, one command per line, all the commands the request needs, in
      order, using only verbs and argument orders from the system prompt.
    No other wrapper, no explanation of your reasoning, no notes to the eval.
+   If the system prompt tells you to ask a question instead, the reply is that
+   one `QUESTION: …` line, with no block.
 5. Save it as plain text to `answers/<id>.txt` (UTF-8, ending with a newline).
 
 ## Example
@@ -52,4 +54,8 @@ and `EvalJudge`. Object ids are random per document, so `score` maps the ids
 the dumped prompt showed (`<dir>/scenes.json`, or `--scenes <json>`) to this
 run's ids before replaying. Add `--only id1,id2` to score a subset. The manifest
 (`deck_eval_manifest.json`) is generated from the iOS manifest with
-`scripts/eval_manifest_to_json.py`.
+`scripts/eval_manifest_to_json.py`. The core-only `here` cases (#128) live in
+`deck_here_manifest.json`: each has the host `context` that
+`ijc_deck_set_context` would hold, and a `near` (the new object is at an `x,y`
+point) or `question` (a `QUESTION:` and no commands) check. Without
+`--manifest`, both files are used.

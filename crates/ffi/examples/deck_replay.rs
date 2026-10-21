@@ -24,6 +24,12 @@ const DEFAULT_MANIFEST: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/deck_eval_manifest.json"
 );
+/// Core-only cases with a host "here" context (#128), dumped and scored after
+/// the iOS manifest unless `--manifest` is given.
+const HERE_MANIFEST: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/deck_here_manifest.json"
+);
 const GUIDE: &str = include_str!("../tests/fixtures/REPLAY.md");
 
 fn main() -> ExitCode {
@@ -39,17 +45,26 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     };
-    let manifest = flag("--manifest").unwrap_or_else(|| DEFAULT_MANIFEST.to_string());
-    let (groups, entries) = match std::fs::read_to_string(&manifest)
-        .map_err(|e| format!("{manifest}: {e}"))
-        .and_then(|s| replay::load_manifest(&s))
-    {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
-        }
+    let manifests = match flag("--manifest") {
+        Some(m) => vec![m],
+        None => vec![DEFAULT_MANIFEST.to_string(), HERE_MANIFEST.to_string()],
     };
+    let (mut groups, mut entries) = (Vec::new(), Vec::new());
+    for manifest in &manifests {
+        match std::fs::read_to_string(manifest)
+            .map_err(|e| format!("{manifest}: {e}"))
+            .and_then(|s| replay::load_manifest(&s))
+        {
+            Ok((g, e)) => {
+                groups.extend(g);
+                entries.extend(e);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
     let only: Option<Vec<String>> =
         flag("--only").map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
     let entries: Vec<Entry> = entries

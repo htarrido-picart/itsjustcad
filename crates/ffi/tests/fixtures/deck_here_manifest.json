@@ -1,0 +1,58 @@
+{
+ "source": "itsjustcad #128: host 'here' context (ijc_deck_set_context); core-only, not from the iOS manifest",
+ "groups": [
+  "here"
+ ],
+ "prompts": [
+  {
+   "id": "here0",
+   "group": "here",
+   "prompt": "put a box here",
+   "setup": [],
+   "verbs": ["box"],
+   "context": {"here": {"tap": [4, 2, 0]}},
+   "check": {"kind": "near", "point": [4, 2]},
+   "require_verbs": true
+  },
+  {
+   "id": "here1",
+   "group": "here",
+   "prompt": "put a box here",
+   "setup": ["circle 10,3,0 0.3", "extrude last 3", "select last"],
+   "verbs": ["box"],
+   "context": {"here": {"selection": [10, 3, 1.5]}},
+   "check": {"kind": "near", "point": [10, 3]},
+   "require_verbs": true
+  },
+  {
+   "id": "here2",
+   "group": "here",
+   "prompt": "put a box here",
+   "setup": [],
+   "verbs": ["box"],
+   "context": {"here": {"camera": [-6, 8, 0]}},
+   "check": {"kind": "near", "point": [-6, 8]},
+   "require_verbs": true
+  },
+  {
+   "id": "here3",
+   "group": "here",
+   "prompt": "put a box here",
+   "setup": ["circle 10,3,0 0.3", "extrude last 3", "select last"],
+   "verbs": [],
+   "context": {"here": {"tap": [4, 2, 0], "selection": [10, 3, 1.5], "camera": [0, 0, 0]}},
+   "check": {"kind": "question"},
+   "require_verbs": false
+  },
+  {
+   "id": "here4",
+   "group": "here",
+   "prompt": "put a box here",
+   "setup": ["circle 4.5,2.5,0 0.3", "extrude last 3", "select last"],
+   "verbs": ["box"],
+   "context": {"here": {"tap": [4, 2, 0], "selection": [4.5, 2.5, 1.5], "camera": [0, 0, 0]}},
+   "check": {"kind": "near", "point": [4, 2]},
+   "require_verbs": true
+  }
+ ]
+}

@@ -35,7 +35,7 @@ pub use deck::{
 };
 pub use digest::{digest, digest_filtered, geometry_kind, DigestFilter};
 pub use extract::{Extractor, ExtractEvent};
-pub use ffi_prompt::{ffi_system_prompt, FFI_SELECTOR_HELP, FFI_VIEW_HELP};
+pub use ffi_prompt::{ffi_system_prompt, HereContext, FFI_SELECTOR_HELP, FFI_VIEW_HELP};
 pub use probe::{probe, warm_model, ProbeInfo, WarmOutcome};
 pub use prompt::{
     compact_command_catalog, compact_system_prompt, language_directive, select_prompt,

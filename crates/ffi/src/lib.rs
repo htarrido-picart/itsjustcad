@@ -46,8 +46,8 @@ use std::sync::{Arc, Mutex};
 use itsjustcad_commands::{Command, Selector, Session, io, parse};
 use itsjustcad_deck::{
     ChatMessage, ChatRequest, DeckConfig, DeckDelta, DeckKind, DigestFilter, ExtractEvent,
-    Extractor, ImagePart, LlmDeck, Role, compact_command_catalog, digest, digest_filtered,
-    ffi_system_prompt, make_deck, normalize_selectors,
+    Extractor, HereContext, ImagePart, LlmDeck, Role, compact_command_catalog, digest,
+    digest_filtered, ffi_system_prompt, make_deck, normalize_selectors,
 };
 use itsjustcad_render::{
     DEPTH_FORMAT, DisplayMode, LineEntry, OrbitCamera, SceneRenderer, StandardView, Theme,
@@ -280,6 +280,8 @@ pub struct AppHandle {
     runtime: tokio::runtime::Runtime,
     deck: Option<Arc<dyn LlmDeck>>,
     deck_config: Option<DeckConfig>,
+    /// Host "here" context for the next deck turns ([`ijc_deck_set_context`]).
+    deck_context: Option<HereContext>,
     pending: Arc<Mutex<Vec<PendingOp>>>,
     history: Arc<Mutex<Vec<ChatMessage>>>,
 }
@@ -825,6 +827,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         runtime,
         deck: None,
         deck_config: None,
+        deck_context: None,
         pending: Arc::new(Mutex::new(Vec::new())),
         history: Arc::new(Mutex::new(Vec::new())),
     };
@@ -2496,6 +2499,60 @@ pub unsafe extern "C" fn ijc_deck_send_image(
     })
 }
 
+/// Set the host "here" context for the following deck turns (#128), so the
+/// cloud deck can resolve "here", "there" and "where I'm looking" to real
+/// coordinates. `json` has this schema, every field optional, points in
+/// meters as `[x, y, z]`:
+///
+/// ```json
+/// {"here": {"tap": [x,y,z], "selection": [x,y,z], "camera": [x,y,z]}}
+/// ```
+///
+/// - `tap`: the last long-press or tap point (the host drops it after 2 min);
+/// - `selection`: the centroid of the selection;
+/// - `camera`: the camera target.
+///
+/// With at least one point set, the system prompt of every following
+/// [`ijc_deck_send`] / [`ijc_deck_send_image`] carries a
+/// `here: tap 4.0,2.0,0.0 | selection 10.0,3.0,0.0 | camera 0.0,0.0,0.0` line
+/// under `## Current scene`, plus the rules for using it. The context is kept
+/// until the next call; [`ijc_new_document`] does not clear it.
+///
+/// A null or empty (or all-whitespace) `json`, `{}`, `{"here": null}` or a
+/// `here` with no point clears the context: the prompt is then exactly as
+/// without one. Returns true when the context was set or cleared. Returns
+/// false, and keeps the previous context, on invalid UTF-8, invalid JSON, a
+/// shape other than the schema (e.g. a point without 3 numbers), a null or
+/// invalid handle, or a concurrent call. Unknown fields are ignored. Works on
+/// headless handles too.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`] or [`ijc_init_headless`];
+/// `json` must be null or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_deck_set_context(h: *mut AppHandle, json: *const c_char) -> bool {
+    guard_ffi(false, || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let text = if json.is_null() {
+            ""
+        } else {
+            match unsafe { CStr::from_ptr(json) }.to_str() {
+                Ok(t) => t,
+                Err(_) => return false,
+            }
+        };
+        match HereContext::from_json(text) {
+            Ok(here) => {
+                app.deck_context = here;
+                true
+            }
+            Err(_) => false,
+        }
+    })
+}
+
 /// Parse the `images_json` C string into `Vec<ImagePart>`. Null, invalid UTF-8,
 /// JSON parse failure, or an empty array all yield an empty vec (no images).
 /// The wire shape is `[{"mime": "...", "data": "<base64>"}]`; `data` maps to
@@ -2533,9 +2590,14 @@ unsafe fn parse_images_json(images_json: *const c_char) -> Vec<ImagePart> {
 /// for `prompt`. The FFI prompt (#105): only the view verbs `route_line`
 /// accepts, the selector forms, and the exact usage of the verbs this request
 /// needs. The ids are the scene's at turn start, for bare-id → `id:<hex>`
-/// repair of emitted lines. Shared with the offline replay eval ([`replay`]).
-fn deck_turn_context(session: &Session, prompt: &str) -> (String, Vec<String>) {
-    let system = ffi_system_prompt(&digest(&session.doc), &session.plugins, prompt);
+/// repair of emitted lines. `here` is the host context ([`ijc_deck_set_context`]).
+/// Shared with the offline replay eval ([`replay`]).
+fn deck_turn_context(
+    session: &Session,
+    here: Option<&HereContext>,
+    prompt: &str,
+) -> (String, Vec<String>) {
+    let system = ffi_system_prompt(&digest(&session.doc), &session.plugins, prompt, here);
     let object_ids = session
         .doc
         .objects()
@@ -2582,7 +2644,7 @@ unsafe fn deck_send_inner(
         return;
     };
 
-    let (system, object_ids) = deck_turn_context(&app.session, prompt);
+    let (system, object_ids) = deck_turn_context(&app.session, app.deck_context.as_ref(), prompt);
     let messages = {
         let Ok(mut history) = app.history.lock() else {
             emit(cb, &ctx, CB_ERROR, "history unavailable");
@@ -5246,6 +5308,57 @@ mod headless_tests {
 
             ijc_free(h);
         }
+    }
+
+    #[test]
+    fn deck_context_sets_clears_and_keeps_on_invalid_json() {
+        let h = ijc_init_headless();
+        let ctx = |h: *mut AppHandle| unsafe { handle_ref(h) }.unwrap().deck_context;
+        let system = |h: *mut AppHandle| {
+            let app = unsafe { handle_ref(h) }.unwrap();
+            deck_turn_context(&app.session, app.deck_context.as_ref(), "put a box here").0
+        };
+        unsafe {
+            let plain = system(h);
+            assert!(!plain.contains("here:"));
+
+            let set = c(r#"{"here":{"tap":[4,2,0],"selection":[10,3,0],"camera":[0,0,0]}}"#);
+            assert!(ijc_deck_set_context(h, set.as_ptr()));
+            let here = ctx(h).expect("set");
+            assert_eq!(here.tap, Some([4.0, 2.0, 0.0]));
+            assert!(system(h).contains(
+                "here: tap 4.0,2.0,0.0 | selection 10.0,3.0,0.0 | camera 0.0,0.0,0.0\n"
+            ));
+
+            for bad in ["{", "[1,2,3]", r#"{"here":{"tap":[4,2]}}"#] {
+                assert!(!ijc_deck_set_context(h, c(bad).as_ptr()), "{bad}");
+                assert_eq!(ctx(h), Some(here), "{bad} kept the previous context");
+            }
+
+            assert!(ijc_deck_set_context(h, c("").as_ptr()));
+            assert_eq!(ctx(h), None);
+            assert_eq!(system(h), plain, "cleared: prompt as without context");
+            assert!(ijc_deck_set_context(h, set.as_ptr()));
+            assert!(ijc_deck_set_context(h, std::ptr::null()));
+            assert_eq!(ctx(h), None, "null clears");
+
+            assert!(!ijc_deck_set_context(std::ptr::null_mut(), set.as_ptr()));
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn deck_send_abi_is_unchanged() {
+        let _: unsafe extern "C" fn(*mut AppHandle, *const c_char, DeckCallback, *mut c_void) =
+            ijc_deck_send;
+        let _: unsafe extern "C" fn(
+            *mut AppHandle,
+            *const c_char,
+            *const c_char,
+            DeckCallback,
+            *mut c_void,
+        ) = ijc_deck_send_image;
+        let _: unsafe extern "C" fn(*mut AppHandle, *const c_char) -> bool = ijc_deck_set_context;
     }
 
     #[test]
