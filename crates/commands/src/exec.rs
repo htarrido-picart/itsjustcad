@@ -1379,6 +1379,13 @@ impl Session {
         )
     }
 
+    /// The op-log cursor alone: `history().1` without describing every op.
+    /// Undo lowers it by one, redo raises it, a new logged op leaves it at the
+    /// tip. Hosts tag their own rows with it to mirror undo state.
+    pub fn undo_cursor(&self) -> usize {
+        self.pending_log.as_ref().map_or(self.cursor, Vec::len)
+    }
+
     /// Move the cursor to `step` by running undo/redo through `run` — no new
     /// mutation path, so the log stays consistent. Returns ops executed.
     pub fn jump_to(&mut self, step: usize) -> Result<usize, ExecError> {
