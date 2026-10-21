@@ -12,6 +12,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+url = "2"
 eventsource-stream.workspace = true
 futures.workspace = true
 async-trait.workspace = true
