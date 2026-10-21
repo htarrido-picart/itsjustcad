@@ -180,6 +180,27 @@ pub fn convert_dwg_to_dxf(input: &str) -> Result<Converted, String> {
     convert_dwg_to_dxf_with(&bin, input)
 }
 
+/// Run `cmd` to completion, retrying briefly on `ExecutableFileBusy`.
+///
+/// Linux refuses to exec a file another process still holds open for writing
+/// (ETXTBSY) — e.g. a binary just installed, or a test stub whose write fd
+/// leaked into a concurrently forked child. Transient: retry up to 5 times,
+/// 50 ms apart.
+pub fn output_retrying_busy(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    let mut attempt = 0;
+    loop {
+        match cmd.output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 4 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            r => return r,
+        }
+    }
+}
+
 /// Core conversion against an explicit converter binary — lets a test inject a
 /// stub `dwg2dxf` that writes a known (valid or truncated) DXF.
 pub fn convert_dwg_to_dxf_with(bin: &Path, input: &str) -> Result<Converted, String> {
@@ -203,23 +224,12 @@ pub fn convert_dwg_to_dxf_with(bin: &Path, input: &str) -> Result<Converted, Str
     let input_abs = std::fs::canonicalize(input).unwrap_or_else(|_| PathBuf::from(input));
 
     // FIXED args — no shell, no interpolation, no model-controlled flags.
-    // Linux refuses to exec a file another process still holds open for
-    // writing (ETXTBSY) — e.g. a converter just installed, or a test stub whose
-    // write fd leaked into a concurrently forked child. Transient: retry briefly.
-    let mut status = Err(std::io::ErrorKind::ExecutableFileBusy.into());
-    for attempt in 0..5 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        status = std::process::Command::new(bin)
+    let status = output_retrying_busy(
+        std::process::Command::new(bin)
             .arg("-o")
             .arg(&out_dxf)
-            .arg(&input_abs)
-            .output();
-        if !matches!(&status, Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy) {
-            break;
-        }
-    }
+            .arg(&input_abs),
+    );
 
     let result = (|| {
         let output = status.map_err(|e| format!("failed to run dwg2dxf: {e}"))?;

@@ -1038,10 +1038,10 @@ impl RenderDeck for LocalSdRenderDeck {
             std::fs::write(&ctrl_png, &depth)
                 .map_err(|e| RenderDeckError::Other(format!("cannot stage control image: {e}")))?;
             // FIXED args — no shell, no interpolation.
-            let output = std::process::Command::new(&bin)
-                .args(&args)
-                .output()
-                .map_err(|e| RenderDeckError::Other(format!("failed to run sd: {e}")))?;
+            let output = itsjustcad_commands::dwg::output_retrying_busy(
+                std::process::Command::new(&bin).args(&args),
+            )
+            .map_err(|e| RenderDeckError::Other(format!("failed to run sd: {e}")))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(RenderDeckError::Other(format!(
