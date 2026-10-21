@@ -47,7 +47,7 @@ use itsjustcad_commands::{Command, Selector, Session, io, parse};
 use itsjustcad_deck::{
     ChatMessage, ChatRequest, DeckConfig, DeckDelta, DeckKind, DigestFilter, ExtractEvent,
     Extractor, HereContext, ImagePart, LlmDeck, Role, compact_command_catalog, digest,
-    digest_filtered, ffi_system_prompt, make_deck, normalize_selectors,
+    digest_filtered, ffi_system_prompt, make_deck_with_client, normalize_selectors,
 };
 use itsjustcad_render::{
     DEPTH_FORMAT, DisplayMode, LineEntry, OrbitCamera, SceneRenderer, StandardView, Theme,
@@ -613,64 +613,19 @@ fn try_route_line(line: &str) -> Result<PendingOp, itsjustcad_commands::ParseErr
     parse(line).map(PendingOp::Cmd)
 }
 
-/// Reject deck base URLs whose host is a cloud-metadata / link-local / internal
-/// address. The FFI attaches the configured API key as a bearer / `x-api-key`
-/// header on every request (and a second `list_models` probe on error), so a
-/// hostile or synced-from-untrusted config pointing `base_url` at an internal
-/// endpoint would both SSRF *and* leak the key. The desktop `local_only` gate
-/// never runs on this path, so we enforce credential/SSRF containment here:
-/// block the well-known dangerous hosts. Public API origins are unaffected.
+/// Reject deck base URLs whose host is internal: loopback, private, link-local
+/// (cloud metadata), CGNAT, unique-local, internal names — in any spelling
+/// (IPv4-mapped IPv6, decimal/hex/short IPv4, userinfo, trailing dots). The FFI
+/// attaches the configured API key as a bearer / `x-api-key` header on every
+/// request (and a second `list_models` probe on error), so a hostile or
+/// synced-from-untrusted config pointing `base_url` at an internal endpoint
+/// would both SSRF *and* leak the key. The desktop `local_only` gate never runs
+/// on this path. Names that RESOLVE to internal addresses are caught at connect
+/// time by the deck's public-only client (see [`ijc_deck_configure`]).
 ///
 /// Returns `true` when the URL is safe to send to.
 fn base_url_is_allowed(url: &str) -> bool {
-    // Empty base_url = provider default (safe); Anthropic/OpenAI defaults are
-    // public hosts. Only inspect an explicitly-supplied host.
-    if url.is_empty() {
-        return true;
-    }
-    let host_part = url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split('/')
-        .next()
-        .unwrap_or(url);
-    let host = if let Some(bracket_end) = host_part.find(']') {
-        &host_part[..=bracket_end] // IPv6 literal like [fd00::1]:443
-    } else {
-        host_part.split(':').next().unwrap_or(host_part)
-    };
-    let host = host.trim().to_ascii_lowercase();
-
-    // Block the cloud metadata endpoint and link-local range explicitly.
-    if host == "169.254.169.254" || host.starts_with("169.254.") {
-        return false;
-    }
-    // Block obvious internal/loopback names and RFC1918 / unique-local ranges.
-    // (Loopback is pointless on-device and a common SSRF pivot.)
-    if host == "localhost"
-        || host == "metadata"
-        || host.ends_with(".internal")
-        || host.ends_with(".local")
-        || host == "0.0.0.0"
-        || host.starts_with("127.")
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host == "[::1]"
-        || host == "::1"
-        || host.starts_with("[fd")
-        || host.starts_with("[fe80")
-    {
-        return false;
-    }
-    // 172.16.0.0/12
-    if let Some(rest) = host.strip_prefix("172.")
-        && let Some(second) = rest.split('.').next()
-        && let Ok(oct) = second.parse::<u8>()
-        && (16..=31).contains(&oct)
-    {
-        return false;
-    }
-    true
+    itsjustcad_deck::base_url_is_public(url)
 }
 
 fn standard_view(name: &str) -> Option<StandardView> {
@@ -2436,7 +2391,14 @@ pub unsafe extern "C" fn ijc_deck_configure(
             eprintln!("[ijc] refused deck base_url (internal/metadata host blocked)");
             return false;
         }
-        app.deck = Some(Arc::from(make_deck(&config)));
+        // Public-only DNS (blocks names resolving to internal addresses, incl.
+        // DNS rebinding), no redirects (reqwest would carry `x-api-key` along),
+        // no proxy.
+        let Ok(client) = itsjustcad_deck::public_only_client() else {
+            eprintln!("[ijc] refused deck: HTTP client init failed");
+            return false;
+        };
+        app.deck = Some(Arc::from(make_deck_with_client(&config, client)));
         app.deck_config = Some(config);
         true
     })
@@ -5300,6 +5262,9 @@ mod tests {
         assert!(!base_url_is_allowed("http://localhost:11434/v1"));
         assert!(!base_url_is_allowed("http://127.0.0.1/v1"));
         assert!(!base_url_is_allowed("http://[::1]:8080/v1"));
+        // IPv4-mapped IPv6 loopback (the confirmed bypass) and userinfo.
+        assert!(!base_url_is_allowed("http://[::ffff:127.0.0.1]/v1"));
+        assert!(!base_url_is_allowed("http://api.openai.com@127.0.0.1/v1"));
         assert!(!base_url_is_allowed("http://metadata/computeMetadata"));
         assert!(!base_url_is_allowed("http://foo.internal/v1"));
         // RFC1918 private ranges.

@@ -12,6 +12,7 @@ mod claude_code;
 mod claude_spawn;
 mod config;
 mod deck;
+mod net_guard;
 mod digest;
 mod extract;
 mod feedback;
@@ -32,8 +33,9 @@ pub use agent::{
 pub use claude_code::{scoped_allowed_tools, turn_allowed_tools};
 pub use config::{is_local_url, CloudProvider, DeckConfig, DeckKind, DecksFile};
 pub use deck::{
-    make_deck, ChatMessage, ChatRequest, DeckDelta, DeckError, ImagePart, LlmDeck, Role,
+    make_deck, make_deck_with_client, ChatMessage, ChatRequest, DeckDelta, DeckError, ImagePart, LlmDeck, Role,
 };
+pub use net_guard::{base_url_is_public, ip_is_public, public_only_client, PublicOnlyResolver};
 pub use digest::{digest, digest_filtered, geometry_kind, DigestFilter};
 pub use extract::{Extractor, ExtractEvent};
 pub use feedback::{

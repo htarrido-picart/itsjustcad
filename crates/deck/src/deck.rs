@@ -151,3 +151,15 @@ pub fn make_deck(config: &DeckConfig) -> Box<dyn LlmDeck> {
         DeckKind::ClaudeCode => Box::new(crate::claude_code::ClaudeCodeDeck::new(config)),
     }
 }
+
+/// [`make_deck`] with a caller-built HTTP client for the HTTP decks. The
+/// `ClaudeCode` kind spawns a local CLI and makes no requests of its own.
+pub fn make_deck_with_client(config: &DeckConfig, client: reqwest::Client) -> Box<dyn LlmDeck> {
+    match config.kind {
+        DeckKind::OpenaiCompat => {
+            Box::new(crate::openai_compat::OpenAiCompatDeck::with_client(config, client))
+        }
+        DeckKind::Anthropic => Box::new(crate::anthropic::AnthropicDeck::with_client(config, client)),
+        DeckKind::ClaudeCode => Box::new(crate::claude_code::ClaudeCodeDeck::new(config)),
+    }
+}

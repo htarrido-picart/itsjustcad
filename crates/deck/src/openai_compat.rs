@@ -23,13 +23,19 @@ pub struct OpenAiCompatDeck {
 
 impl OpenAiCompatDeck {
     pub fn new(config: &DeckConfig) -> Self {
+        Self::with_client(config, reqwest::Client::new())
+    }
+
+    /// Like [`Self::new`] with a caller-built HTTP client (e.g. the FFI's
+    /// public-only client, see [`crate::public_only_client`]).
+    pub fn with_client(config: &DeckConfig, client: reqwest::Client) -> Self {
         Self {
             name: config.name.clone(),
             base_url: config.base_url.trim_end_matches('/').to_string(),
             model: config.model.clone(),
             api_key: config.resolved_key(),
             grammar: config.grammar,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 
