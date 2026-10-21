@@ -30,6 +30,11 @@ const HERE_MANIFEST: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/deck_here_manifest.json"
 );
+/// Core-only cases with a stale chat history (#133), after the "here" cases.
+const HISTORY_MANIFEST: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/deck_history_manifest.json"
+);
 const GUIDE: &str = include_str!("../tests/fixtures/REPLAY.md");
 
 fn main() -> ExitCode {
@@ -47,7 +52,11 @@ fn main() -> ExitCode {
     };
     let manifests = match flag("--manifest") {
         Some(m) => vec![m],
-        None => vec![DEFAULT_MANIFEST.to_string(), HERE_MANIFEST.to_string()],
+        None => vec![
+            DEFAULT_MANIFEST.to_string(),
+            HERE_MANIFEST.to_string(),
+            HISTORY_MANIFEST.to_string(),
+        ],
     };
     let (mut groups, mut entries) = (Vec::new(), Vec::new());
     for manifest in &manifests {

@@ -166,6 +166,10 @@ impl HereContext {
     }
 }
 
+/// `## Current scene` beats a stale chat history (#133): the host's thread may
+/// predate edits made outside the chat.
+const SCENE_RULE: &str = "- `## Current scene` is the live scene at this turn. It overrides anything earlier in the conversation about what exists or is selected. Objects may have been added, frozen, selected or deleted outside the chat.\n";
+
 /// The rules for the `here:` line, added to `## Rules` only when it is set.
 const HERE_RULES: &str = "\
 - \"here\"/\"there\" mean the `here:` point under Current scene; \"where I'm looking\"/\"in front of me\" mean its `camera`. Write its real coordinates, never a `here` token.
@@ -224,7 +228,7 @@ One short sentence of chat, then a ```draft fenced block with ONE command per li
 - After a command that creates an object, that object is `last`; `last N` is the N newest. Create every object BEFORE you reference it.
 - Edit objects that are already in the scene by selector (`last`, `id:<hex>`, a name) — never recreate them.
 - To make a solid from a profile: draw a closed curve, then `extrude last <height>`.
-{here_rules}
+{scene_rule}{here_rules}
 ## Example
 User: a 4x4x3 tower, then a 5 by 2 grid of it 8 apart
 ```draft
@@ -236,6 +240,7 @@ array last 5,2,1 8,8,0
 {here_line}{scene}
 "#,
         selectors = FFI_SELECTOR_HELP,
+        scene_rule = SCENE_RULE,
         core = core_block(),
         retrieved = retrieved,
         catalog = usage_catalog(),
@@ -309,11 +314,20 @@ mod tests {
         let line = "here: tap 4.0,2.0,0.0 | selection 10.0,3.0,0.0 | camera 0.0,0.0,0.0\n";
         assert!(with.contains(&format!("selectors)\n{line}- mesh 59d76a88")));
         let rules_at = with.find(HERE_RULES).expect("rules");
-        assert!(with[..rules_at].ends_with("`extrude last <height>`.\n"));
+        assert!(with[..rules_at].ends_with(SCENE_RULE));
         assert!(rules_at < with.find("## Example").unwrap());
         // Without context the prompt is byte-identical: removing the two
         // additions gives it back exactly.
         assert_eq!(with.replacen(HERE_RULES, "", 1).replacen(line, "", 1), none);
+    }
+
+    #[test]
+    fn current_scene_overrides_history_rule() {
+        let s = p("can you see the selection?");
+        let rules = s.find("## Rules").unwrap();
+        let at = s.find(SCENE_RULE).expect("rule");
+        assert!(rules < at && at < s.find("## Example").unwrap());
+        assert!(SCENE_RULE.contains("overrides anything earlier in the conversation"));
     }
 
     #[test]
