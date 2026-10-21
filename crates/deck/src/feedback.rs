@@ -38,7 +38,12 @@ pub struct GoogleForm {
 
 /// The feedback form — the one place to configure it. While `None` the sheet's
 /// send button is disabled ("not configured in this build").
-pub const GOOGLE_FORM: Option<GoogleForm> = None;
+pub const GOOGLE_FORM: Option<GoogleForm> = Some(GoogleForm {
+    prefill_base: "https://docs.google.com/forms/d/e/1FAIpQLSeoJsy98ji1SIxK7uQR8p_COEqaI2-Aw5gVfDACSZMONX_T_w/viewform",
+    title_entry: "entry.580096760",
+    category_entry: "entry.1431494796",
+    details_entry: "entry.1516408728",
+});
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldKind {

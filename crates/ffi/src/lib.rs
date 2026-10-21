@@ -5316,8 +5316,10 @@ mod headless_tests {
             assert_eq!(v["category"], "idea");
             assert_eq!((v["title"].as_str(), v["goal"].as_str()), (Some("Dark sheets"), Some("print")));
 
-            // This build ships without a form: the accessor yields "".
-            assert_eq!(take(ijc_feedback_form_url(c(&draft).as_ptr())), "");
+            // The compiled-in form: a pre-filled URL on its prefill base.
+            let url = take(ijc_feedback_form_url(c(&draft).as_ptr()));
+            let base = itsjustcad_deck::GOOGLE_FORM.map_or("", |f| f.prefill_base);
+            assert!(url.is_empty() == base.is_empty() && url.starts_with(base), "{url}");
             assert_eq!(take(ijc_feedback_form_url(std::ptr::null())), "");
         }
         let form = itsjustcad_deck::GoogleForm {
