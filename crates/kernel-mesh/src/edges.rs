@@ -4,7 +4,7 @@
 //! Feature-edge extraction, shared by the DXF/PDF exporters and the viewport
 //! wireframe/x-ray display modes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use glam::DVec3;
 
@@ -41,6 +41,14 @@ fn qkey(p: DVec3) -> (i64, i64, i64) {
 /// Degenerate/sliver triangles (near-zero area → unreliable normal) are excluded
 /// from grouping so they cannot inject spurious boundary edges.
 pub fn feature_edges(mesh: &Mesh) -> Vec<(DVec3, DVec3)> {
+    merge_collinear(boundary_segments(mesh))
+        .into_iter()
+        .map(|[a, b]| (a, b))
+        .collect()
+}
+
+/// Planar-region boundary segments of `mesh`, before the collinear merge.
+fn boundary_segments(mesh: &Mesh) -> Vec<[DVec3; 2]> {
     type Key = (i64, i64, i64);
     // A plane identity: quantized unit normal + quantized signed offset. Both a
     // normal and its negation name the same plane, so we canonicalize the normal
@@ -89,9 +97,7 @@ pub fn feature_edges(mesh: &Mesh) -> Vec<(DVec3, DVec3)> {
         }
     }
 
-    let segments: Vec<[DVec3; 2]> = boundary.into_values().collect();
-    let merged = merge_collinear(segments);
-    merged.into_iter().map(|[a, b]| (a, b)).collect()
+    boundary.into_values().collect()
 }
 
 /// Minimum length of a triangle's edge-cross-product (i.e. 2× area) for it to be
@@ -167,7 +173,84 @@ fn plane_key(n: DVec3, p0: DVec3) -> (i64, i64, i64, i64) {
 /// and we take it. (The donut can't reach its 144 ideal without a tolerance that
 /// also erases a 48-gon's real corners — the remaining ~32 cap edges are genuine
 /// geometry the boolean introduced, not merge failures, so we keep the corners.)
+///
+/// Fuse order — the result is order-dependent (a fuse at a junction can preempt
+/// another), and the shipped behavior is "repeatedly fuse the lexicographically
+/// first fusable pair `(i, j)`, `i < j`, writing the span into `i` and
+/// `swap_remove`-ing `j`". The original implementation found that pair by
+/// rescanning all O(n²) pairs after every fuse (~O(n³); a frozen geodesic dome
+/// hung the render thread, #120). We keep the exact same sequence of fuses, but
+/// track the fusable pairs incrementally: only segments sharing a welded vertex
+/// can fuse, and a fuse only changes the slots `i`, `j` and the moved last
+/// segment, so only their pairs are re-evaluated. Cost is
+/// O((n + fuses) · valence · log n).
 fn merge_collinear(mut segs: Vec<[DVec3; 2]>) -> Vec<[DVec3; 2]> {
+    type Key = (i64, i64, i64);
+    // Slots incident to each welded vertex, and every currently fusable pair.
+    let mut at: HashMap<Key, Vec<usize>> = HashMap::new();
+    let mut ready: BTreeSet<(usize, usize)> = BTreeSet::new();
+
+    fn keys(s: [DVec3; 2]) -> [Key; 2] {
+        [qkey(s[0]), qkey(s[1])]
+    }
+    fn attach(
+        id: usize,
+        segs: &[[DVec3; 2]],
+        at: &mut HashMap<Key, Vec<usize>>,
+        ready: &mut BTreeSet<(usize, usize)>,
+    ) {
+        for k in keys(segs[id]) {
+            let ids = at.entry(k).or_default();
+            for &x in ids.iter() {
+                let (i, j) = if x < id { (x, id) } else { (id, x) };
+                if fuse(segs[i], segs[j]).is_some() {
+                    ready.insert((i, j));
+                }
+            }
+            // A segment with both ends on one weld cell is listed once.
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    fn detach(
+        id: usize,
+        segs: &[[DVec3; 2]],
+        at: &mut HashMap<Key, Vec<usize>>,
+        ready: &mut BTreeSet<(usize, usize)>,
+    ) {
+        for k in keys(segs[id]) {
+            let Some(ids) = at.get_mut(&k) else { continue };
+            ids.retain(|&x| x != id);
+            for &x in ids.iter() {
+                ready.remove(&(x.min(id), x.max(id)));
+            }
+        }
+    }
+
+    for id in 0..segs.len() {
+        attach(id, &segs, &mut at, &mut ready);
+    }
+    while let Some((i, j)) = ready.pop_first() {
+        let fused = fuse(segs[i], segs[j]).expect("ready pairs are fusable");
+        let last = segs.len() - 1;
+        for id in [i, j, last] {
+            detach(id, &segs, &mut at, &mut ready);
+        }
+        segs[i] = fused;
+        segs.swap_remove(j);
+        attach(i, &segs, &mut at, &mut ready);
+        if j < segs.len() {
+            attach(j, &segs, &mut at, &mut ready);
+        }
+    }
+    segs
+}
+
+/// The merged span of `a` and `b` if they share an endpoint and are collinear
+/// enough to fuse (see [`merge_collinear`]), else `None`. The first shared
+/// endpoint found, in the order below, decides the outer endpoints `p`, `r`.
+fn fuse(a: [DVec3; 2], b: [DVec3; 2]) -> Option<[DVec3; 2]> {
     // Collinearity tolerance on the sine of the angle between the two directions
     // (|u × v| for unit u, v). ~0.06° — tight enough not to fuse real corners.
     const SIN_TOL: f64 = 1e-3;
@@ -179,60 +262,44 @@ fn merge_collinear(mut segs: Vec<[DVec3; 2]>) -> Vec<[DVec3; 2]> {
     // Endpoints are welded on the 1µm grid; two share a vertex when their keys match.
     let shares = |p: DVec3, q: DVec3| qkey(p) == qkey(q);
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        'outer: for i in 0..segs.len() {
-            for j in (i + 1)..segs.len() {
-                let [a0, a1] = segs[i];
-                let [b0, b1] = segs[j];
-                // Find the shared vertex `m` and the two outer endpoints `p`, `r`.
-                let (p, m, r) = if shares(a1, b0) {
-                    (a0, a1, b1)
-                } else if shares(a1, b1) {
-                    (a0, a1, b0)
-                } else if shares(a0, b0) {
-                    (a1, a0, b1)
-                } else if shares(a0, b1) {
-                    (a1, a0, b0)
-                } else {
-                    continue;
-                };
-                // The merged segment must not collapse (outer endpoints distinct).
-                if shares(p, r) {
-                    continue;
-                }
-                // Criterion 1: angle between the two segment directions.
-                let ua = (segs[i][1] - segs[i][0]).normalize_or_zero();
-                let ub = (segs[j][1] - segs[j][0]).normalize_or_zero();
-                if ua == DVec3::ZERO || ub == DVec3::ZERO {
-                    continue;
-                }
-                let angle_ok = ua.cross(ub).length() <= SIN_TOL;
-
-                // Criterion 2: perpendicular distance of the mid vertex `m` from
-                // the line p..r. dist = |(m − p) × (r − p)| / |r − p|.
-                let span = r - p;
-                let span_len = span.length();
-                let perp_dist = if span_len > 0.0 {
-                    (m - p).cross(span).length() / span_len
-                } else {
-                    f64::INFINITY
-                };
-                let dist_ok = perp_dist <= REL_EPS * span_len + ABS_EPS;
-
-                if !(angle_ok || dist_ok) {
-                    continue;
-                }
-                // Fuse: replace i with the span p..r, remove j.
-                segs[i] = [p, r];
-                segs.swap_remove(j);
-                changed = true;
-                break 'outer;
-            }
-        }
+    let [a0, a1] = a;
+    let [b0, b1] = b;
+    // Find the shared vertex `m` and the two outer endpoints `p`, `r`.
+    let (p, m, r) = if shares(a1, b0) {
+        (a0, a1, b1)
+    } else if shares(a1, b1) {
+        (a0, a1, b0)
+    } else if shares(a0, b0) {
+        (a1, a0, b1)
+    } else if shares(a0, b1) {
+        (a1, a0, b0)
+    } else {
+        return None;
+    };
+    // The merged segment must not collapse (outer endpoints distinct).
+    if shares(p, r) {
+        return None;
     }
-    segs
+    // Criterion 1: angle between the two segment directions.
+    let ua = (a1 - a0).normalize_or_zero();
+    let ub = (b1 - b0).normalize_or_zero();
+    if ua == DVec3::ZERO || ub == DVec3::ZERO {
+        return None;
+    }
+    let angle_ok = ua.cross(ub).length() <= SIN_TOL;
+
+    // Criterion 2: perpendicular distance of the mid vertex `m` from the line
+    // p..r. dist = |(m − p) × (r − p)| / |r − p|.
+    let span = r - p;
+    let span_len = span.length();
+    let perp_dist = if span_len > 0.0 {
+        (m - p).cross(span).length() / span_len
+    } else {
+        f64::INFINITY
+    };
+    let dist_ok = perp_dist <= REL_EPS * span_len + ABS_EPS;
+
+    (angle_ok || dist_ok).then_some([p, r])
 }
 
 /// Orthographic projection of `p` onto the plane through `point` with unit
@@ -295,6 +362,76 @@ mod tests {
 
     const TOL: f64 = 1e-6;
 
+    /// The pre-#120 merge (restart-after-every-fuse pair scan, ~O(n³)), kept
+    /// verbatim as the oracle the indexed merge is checked against.
+    pub(super) fn merge_collinear_reference(mut segs: Vec<[DVec3; 2]>) -> Vec<[DVec3; 2]> {
+        // Collinearity tolerance on the sine of the angle between the two directions
+        // (|u × v| for unit u, v). ~0.06° — tight enough not to fuse real corners.
+        const SIN_TOL: f64 = 1e-3;
+        // Perpendicular-distance simplification: fuse if the mid vertex is within
+        // REL_EPS of the span length off the outer chord, plus a small absolute floor.
+        // 3 % is the largest value that still preserves a 48-gon's corners (see above).
+        const REL_EPS: f64 = 3e-2;
+        const ABS_EPS: f64 = 1e-6; // 1 µm floor — matches the vertex weld grid.
+        // Endpoints are welded on the 1µm grid; two share a vertex when their keys match.
+        let shares = |p: DVec3, q: DVec3| qkey(p) == qkey(q);
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            'outer: for i in 0..segs.len() {
+                for j in (i + 1)..segs.len() {
+                    let [a0, a1] = segs[i];
+                    let [b0, b1] = segs[j];
+                    // Find the shared vertex `m` and the two outer endpoints `p`, `r`.
+                    let (p, m, r) = if shares(a1, b0) {
+                        (a0, a1, b1)
+                    } else if shares(a1, b1) {
+                        (a0, a1, b0)
+                    } else if shares(a0, b0) {
+                        (a1, a0, b1)
+                    } else if shares(a0, b1) {
+                        (a1, a0, b0)
+                    } else {
+                        continue;
+                    };
+                    // The merged segment must not collapse (outer endpoints distinct).
+                    if shares(p, r) {
+                        continue;
+                    }
+                    // Criterion 1: angle between the two segment directions.
+                    let ua = (segs[i][1] - segs[i][0]).normalize_or_zero();
+                    let ub = (segs[j][1] - segs[j][0]).normalize_or_zero();
+                    if ua == DVec3::ZERO || ub == DVec3::ZERO {
+                        continue;
+                    }
+                    let angle_ok = ua.cross(ub).length() <= SIN_TOL;
+
+                    // Criterion 2: perpendicular distance of the mid vertex `m` from
+                    // the line p..r. dist = |(m − p) × (r − p)| / |r − p|.
+                    let span = r - p;
+                    let span_len = span.length();
+                    let perp_dist = if span_len > 0.0 {
+                        (m - p).cross(span).length() / span_len
+                    } else {
+                        f64::INFINITY
+                    };
+                    let dist_ok = perp_dist <= REL_EPS * span_len + ABS_EPS;
+
+                    if !(angle_ok || dist_ok) {
+                        continue;
+                    }
+                    // Fuse: replace i with the span p..r, remove j.
+                    segs[i] = [p, r];
+                    segs.swap_remove(j);
+                    changed = true;
+                    break 'outer;
+                }
+            }
+        }
+        segs
+    }
+
     /// Approximate a cylinder as an `n`-gon prism centered at (cx, cy), extruded
     /// from `base_z` upward by `height`.
     fn make_cylinder(cx: f64, cy: f64, r: f64, base_z: f64, height: f64, n: usize) -> Mesh {
@@ -339,6 +476,65 @@ mod tests {
         for (a, c) in &proj {
             assert!(a.y.abs() < TOL && c.y.abs() < TOL, "flattened to y=0");
         }
+    }
+
+    #[test]
+    fn indexed_merge_matches_reference_scan_exactly() {
+        // #120: the indexed merge must replay the old restart-scan's fuse
+        // sequence, so its output (segments, endpoints and order) is identical on
+        // every fixture — including the boolean cases whose t-junction overlaps
+        // make the result order-dependent.
+        let hole = |s: f64| {
+            let slab = make_box(DVec3::ZERO, DVec3::new(8.0 * s, 8.0 * s, 3.0 * s));
+            let void = make_box(
+                DVec3::new(2.0 * s, 2.0 * s, -s),
+                DVec3::new(4.0 * s, 4.0 * s, 5.0 * s),
+            );
+            crate::csg_difference(&slab, &void)
+        };
+        let donut = crate::csg_difference(
+            &make_cylinder(0.0, 0.0, 4.0, 0.0, 3.0, 24),
+            &make_cylinder(0.0, 0.0, 2.0, -1.0, 5.0, 24),
+        );
+        let mut meshes = vec![
+            make_box(DVec3::ZERO, DVec3::new(2.0, 1.0, 3.0)),
+            Mesh::new(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![[0, 1, 2]]),
+            hole(1.0),
+            hole(1000.0),
+            donut,
+        ];
+        meshes.extend([6, 12, 24, 36, 48, 96].map(|n| make_cylinder(0.0, 0.0, 1.0, 0.0, 1.0, n)));
+        for (k, m) in meshes.iter().enumerate() {
+            let segs = boundary_segments(m);
+            let fast = merge_collinear(segs.clone());
+            assert_eq!(fast, merge_collinear_reference(segs.clone()), "fixture {k}");
+            // Fixtures that actually exercise fusing, not just pass through.
+            if (2..=4).contains(&k) {
+                assert!(fast.len() < segs.len(), "fixture {k} fuses something");
+            }
+        }
+    }
+
+    /// A straight run cut into `n` pieces, listed in a scrambled order.
+    fn split_line(n: usize) -> Vec<[DVec3; 2]> {
+        (0..n)
+            .map(|i| (i * 7919) % n) // 7919 is prime, so this permutes 0..n
+            .map(|i| [DVec3::new(i as f64, 0.0, 0.0), DVec3::new(i as f64 + 1.0, 0.0, 0.0)])
+            .collect()
+    }
+
+    #[test]
+    fn long_collinear_chain_fuses_to_one_segment_quickly() {
+        let small = split_line(300);
+        assert_eq!(merge_collinear(small.clone()), merge_collinear_reference(small));
+        // n − 1 fuses: the old restart-scan was cubic here.
+        let t = std::time::Instant::now();
+        let merged = merge_collinear(split_line(20_000));
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        let [a, b] = merged[0];
+        assert_eq!(a.x.min(b.x), 0.0);
+        assert_eq!(a.x.max(b.x), 20_000.0);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
     }
 
     #[test]
