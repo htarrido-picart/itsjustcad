@@ -14,6 +14,7 @@ mod config;
 mod deck;
 mod digest;
 mod extract;
+mod feedback;
 mod ffi_prompt;
 mod openai_compat;
 mod probe;
@@ -35,6 +36,12 @@ pub use deck::{
 };
 pub use digest::{digest, digest_filtered, geometry_kind, DigestFilter};
 pub use extract::{Extractor, ExtractEvent};
+pub use feedback::{
+    google_form_url, parse_line as parse_feedback_line, platform, FeedbackCategory,
+    FeedbackDraft, FieldKind, GoogleForm, TemplateField, BUG_TEMPLATE,
+    EXAMPLE_LINE as FEEDBACK_EXAMPLE_LINE, FREQ_OPTIONS, GOOGLE_FORM, GOOGLE_FORM_URL_PREFIX,
+    IDEA_TEMPLATE,
+};
 pub use ffi_prompt::{ffi_system_prompt, HereContext, FFI_SELECTOR_HELP, FFI_VIEW_HELP};
 pub use probe::{probe, warm_model, ProbeInfo, WarmOutcome};
 pub use prompt::{

@@ -945,6 +945,13 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                 enabled: true,
             },
             NativeItem::Leaf {
+                id: "Help/feedback".into(),
+                label: tr("menu.help.feedback").into(),
+                action: MenuAction::Execute("feedback".into()),
+                shortcut: None,
+                enabled: true,
+            },
+            NativeItem::Leaf {
                 id: "Help/about".into(),
                 label: tr("menu.help.about").into(),
                 action: MenuAction::About,
@@ -986,7 +993,7 @@ fn leaf_icon(id: &str, _label: &str) -> Icon {
         "undo" => return Icon::Undo,
         "redo" => return Icon::Redo,
         "history" => return Icon::History,
-        "reference" | "docs" => return Icon::Help,
+        "reference" | "docs" | "feedback" => return Icon::Help,
         "updates" => return Icon::About,
         "about" => return Icon::About,
         _ => {}
