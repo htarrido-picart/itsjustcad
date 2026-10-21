@@ -2883,9 +2883,15 @@ impl DeckPane {
                             });
                             return;
                         }
+                        // `feedback` only opens the review sheet; the user sends.
+                        let note = if matches!(verb, crate::app_verbs::AppVerb::Feedback(_)) {
+                            "feedback review sheet opened — nothing submitted"
+                        } else {
+                            "applied (view/camera)"
+                        };
                         self.current_commands.push(ExecutedCommand {
                             line: line.clone(),
-                            result: Ok("applied (view/camera)".to_string()),
+                            result: Ok(note.to_string()),
                         });
                         self.pending_app_verbs.push(line);
                         return;

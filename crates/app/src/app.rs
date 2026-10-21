@@ -916,6 +916,8 @@ pub struct App {
     reduce_motion: bool,
     /// Whether the Help → About dialog is open.
     show_about: bool,
+    /// The open feedback review sheet (`feedback` / Help ▸ Report a problem…).
+    feedback_sheet: Option<crate::feedback_sheet::FeedbackSheet>,
     /// Whether the Help → "Check for Updates…" popup is open.
     show_update: bool,
     /// The in-flight / finished update check, if the user has run one this
@@ -1546,6 +1548,7 @@ impl App {
             panel_visible: true,
             reduce_motion: load_reduce_motion(),
             show_about: false,
+            feedback_sheet: None,
             show_update: false,
             update_check: None,
             show_history: false,
@@ -2446,6 +2449,12 @@ impl App {
             }
             Some("template") => {
                 self.show_template_picker = true;
+            }
+            // Alpha feedback ticket: open the review sheet pre-filled. Nothing is
+            // opened until the user clicks Send via web form in it.
+            Some("feedback") => {
+                let draft = itsjustcad_deck::parse_feedback_line(line).unwrap_or_default();
+                self.feedback_sheet = Some(crate::feedback_sheet::FeedbackSheet::new(draft));
             }
             // Vision: screenshot the viewport and ask the deck to critique it.
             // The rest of the line (if any) is a user question folded into the
@@ -3430,6 +3439,7 @@ impl App {
     fn early_hotkeys(&mut self, ctx: &egui::Context) {
         let modal = self.show_palette
             || self.show_about
+            || self.feedback_sheet.is_some()
             || self.show_update
             || self.show_history
             || self.show_model_setup
@@ -11222,6 +11232,30 @@ impl eframe::App for App {
             }
         }
 
+        // `feedback` / Help → "Report a problem…" review sheet.
+        if self.feedback_sheet.is_some() {
+            let roles = self.live_roles(ui.visuals().dark_mode);
+            let action = self.feedback_sheet.as_mut().and_then(|s| s.ui(ui.ctx(), &roles));
+            let url = match (action, &self.feedback_sheet, itsjustcad_deck::GOOGLE_FORM) {
+                (Some(crate::feedback_sheet::SheetAction::Form), Some(s), Some(form)) => {
+                    Some(itsjustcad_deck::google_form_url(
+                        &form,
+                        &s.draft,
+                        crate::update::APP_VERSION,
+                        &itsjustcad_deck::platform(),
+                    ))
+                }
+                _ => None,
+            };
+            if let Some(url) = url {
+                crate::update::open_external_url(&url);
+                self.command_line.push_line(crate::i18n::t("feedback.opened"));
+            }
+            if action.is_some() {
+                self.feedback_sheet = None;
+            }
+        }
+
         // Help → "Check for Updates…" popup. Modeless (draggable / X-closable),
         // like About / Model Setup. Polls the shared UpdateState each frame and
         // renders the current phase. HONEST UNSIGNED behaviour: a newer release
@@ -11673,6 +11707,7 @@ impl eframe::App for App {
         // chat input keeps focus because `focused()` is then `Some`).
         let modal_open = self.show_palette
             || self.show_about
+            || self.feedback_sheet.is_some()
             || self.show_update
             || self.show_history
             || self.show_model_setup

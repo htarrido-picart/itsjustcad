@@ -53,6 +53,7 @@ pub const APP_VERBS: &[&str] = &[
     "view",
     "template",
     "critique",
+    "feedback",
     "copyselection",
     "pasteselection",
     "reducemotion",

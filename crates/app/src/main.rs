@@ -14,6 +14,7 @@ mod deck_pane;
 mod diffusion;
 mod doc_paths;
 mod download;
+mod feedback_sheet;
 mod draw_tool;
 mod dyntabs;
 mod filewatch;

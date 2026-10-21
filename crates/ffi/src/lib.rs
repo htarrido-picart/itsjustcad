@@ -4001,6 +4001,62 @@ pub unsafe extern "C" fn ijc_save_json(h: *mut AppHandle) -> *mut c_char {
     })
 }
 
+/// Parse a `feedback bug|idea | <field>: <value> | …` line (e.g. one the deck
+/// emitted) into flat draft JSON for the host's review sheet:
+/// `{"category":"bug","title":…,"steps":"one\nper\nline",…}`, keyed by the
+/// template field keys (bug: title steps expected actual freq; idea: title
+/// goal proposal why). Returns an empty string if `line` is not a feedback
+/// line (or null / not UTF-8). Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `line` must be null or a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_feedback_parse(line: *const c_char) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let draft = (!line.is_null())
+            .then(|| (unsafe { CStr::from_ptr(line) }).to_str().ok())
+            .flatten()
+            .and_then(itsjustcad_deck::parse_feedback_line);
+        into_c_string(draft.map_or_else(String::new, |d| {
+            serde_json::to_string(&d).expect("draft serializes")
+        }))
+    })
+}
+
+/// The pre-filled feedback web form URL for the reviewed `draft_json` (as
+/// returned by [`ijc_feedback_parse`], possibly edited). The host opens it in
+/// the browser, where the user reviews and submits — nothing is sent from here.
+/// Text only: never the document or chat. Returns an empty string when this
+/// build has no form configured (`GOOGLE_FORM` is `None`), or for null /
+/// invalid draft JSON. Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `draft_json` must be null or a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_feedback_form_url(draft_json: *const c_char) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let json = (!draft_json.is_null())
+            .then(|| (unsafe { CStr::from_ptr(draft_json) }).to_str().ok())
+            .flatten();
+        into_c_string(feedback_form_url(itsjustcad_deck::GOOGLE_FORM, json))
+    })
+}
+
+/// [`ijc_feedback_form_url`] with the form passed in (testable while the
+/// build ships without one).
+fn feedback_form_url(form: Option<itsjustcad_deck::GoogleForm>, draft_json: Option<&str>) -> String {
+    let draft = draft_json.and_then(|s| serde_json::from_str::<itsjustcad_deck::FeedbackDraft>(s).ok());
+    match (form, draft) {
+        (Some(form), Some(draft)) => itsjustcad_deck::google_form_url(
+            &form,
+            &draft,
+            env!("CARGO_PKG_VERSION"),
+            &itsjustcad_deck::platform(),
+        ),
+        _ => String::new(),
+    }
+}
+
 /// The document's monotonic generation counter — it bumps on every mutation.
 /// Lets the host cheaply gate work (autosave, cached reads) on actual change
 /// rather than polling. Returns 0 for a null/invalid handle.
@@ -4017,8 +4073,8 @@ pub unsafe extern "C" fn ijc_doc_generation(h: *mut AppHandle) -> u64 {
 /// Free a C string returned by [`ijc_command_brief`] / [`ijc_scene_digest`] /
 /// [`ijc_scene_digest_filtered`] / [`ijc_save_json`] / [`ijc_parametric_json`] /
 /// [`ijc_param_blocks_json`] / [`ijc_selection_json`] /
-/// [`ijc_run_command_result`] (or any other `*_json`
-/// accessor).
+/// [`ijc_run_command_result`] / [`ijc_feedback_parse`] /
+/// [`ijc_feedback_form_url`] (or any other `*_json` accessor).
 /// Null-safe; must be called at most once per returned pointer.
 ///
 /// # Safety
@@ -5246,6 +5302,41 @@ mod headless_tests {
 
             ijc_free(h);
         }
+    }
+
+    #[test]
+    fn feedback_parse_and_form_url_round_trip() {
+        unsafe {
+            assert_eq!(take(ijc_feedback_parse(std::ptr::null())), "");
+            assert_eq!(take(ijc_feedback_parse(c("box 0,0,0 1,1,1").as_ptr())), "");
+            let draft = take(ijc_feedback_parse(
+                c("feedback idea | why: speed | title: Dark sheets | goal: print").as_ptr(),
+            ));
+            let v: serde_json::Value = serde_json::from_str(&draft).unwrap();
+            assert_eq!(v["category"], "idea");
+            assert_eq!((v["title"].as_str(), v["goal"].as_str()), (Some("Dark sheets"), Some("print")));
+
+            // The compiled-in form: a pre-filled URL on its prefill base.
+            let url = take(ijc_feedback_form_url(c(&draft).as_ptr()));
+            let base = itsjustcad_deck::GOOGLE_FORM.map_or("", |f| f.prefill_base);
+            assert!(url.is_empty() == base.is_empty() && url.starts_with(base), "{url}");
+            assert_eq!(take(ijc_feedback_form_url(std::ptr::null())), "");
+        }
+        let form = itsjustcad_deck::GoogleForm {
+            prefill_base: "https://docs.google.com/forms/d/e/FORMID/viewform",
+            title_entry: "entry.1",
+            category_entry: "entry.2",
+            details_entry: "entry.3",
+        };
+        let draft = r#"{"category":"idea","title":"Dark sheets","goal":"print"}"#;
+        let url = feedback_form_url(Some(form), Some(draft));
+        assert!(url.starts_with(
+            "https://docs.google.com/forms/d/e/FORMID/viewform?usp=pp_url&entry.1=Dark%20sheets&entry.2=Idea&entry.3="
+        ), "{url}");
+        assert!(url.contains(env!("CARGO_PKG_VERSION")) && url.contains("print"));
+        assert_eq!(feedback_form_url(Some(form), Some("not json")), "");
+        assert_eq!(feedback_form_url(Some(form), None), "");
+        assert_eq!(feedback_form_url(None, Some(draft)), "");
     }
 
     #[test]
