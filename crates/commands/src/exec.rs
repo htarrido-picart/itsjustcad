@@ -4447,8 +4447,70 @@ fn ensure_layer(doc: &mut Document, layer: &str, weight_mm: f64, created: &mut V
     }
 }
 
-/// Slice every mesh among `target_ids` with the plane, inserting each closed
-/// loop as a closed polyline on "sections", plus the feature edges of geometry
+/// World-space instance transform: uniform scale, rotate about Z, then
+/// translate (matches the render resolution in `render::snapshot`).
+fn instance_matrix(position: DVec3, rotation_deg: f64, scale: f64) -> glam::DMat4 {
+    glam::DMat4::from_translation(position)
+        * glam::DMat4::from_rotation_z(rotation_deg.to_radians())
+        * glam::DMat4::from_scale(DVec3::splat(scale))
+}
+
+/// The solid mesh of a parametric object, as `freeze` bakes it. Surface and
+/// normal kinds carry it as their display mesh. Strut-lattice kinds render as
+/// member lines (empty display mesh), so their strut-tube solid is re-derived
+/// and `placement` re-applied.
+fn parametric_solid<'a>(
+    generator: itsjustcad_doc::param_schema::GeneratorKind,
+    params: &itsjustcad_doc::param_schema::ParamMap,
+    placement: &glam::DMat4,
+    mesh: &'a kernel_mesh::Mesh,
+) -> Result<std::borrow::Cow<'a, kernel_mesh::Mesh>, ExecError> {
+    if !generator.renders_as_segments() {
+        return Ok(std::borrow::Cow::Borrowed(mesh));
+    }
+    let mut m = itsjustcad_doc::derive_mesh(generator, params)
+        .map_err(|e| ExecError::Invalid(e.to_string()))?;
+    m.transform(*placement);
+    Ok(std::borrow::Cow::Owned(m))
+}
+
+/// The world-space meshes a section cuts for one object, without modifying
+/// it: a plain mesh; a parametric object's solid (see [`parametric_solid`]);
+/// or a block instance's mesh entries under the instance transform. Empty for
+/// geometry with no surface (curves, annotations, points, frames, areas).
+fn section_sources<'a>(
+    doc: &'a Document,
+    geometry: &'a Geometry,
+) -> Result<Vec<std::borrow::Cow<'a, kernel_mesh::Mesh>>, ExecError> {
+    use std::borrow::Cow;
+    Ok(match geometry {
+        Geometry::Mesh(m) => vec![Cow::Borrowed(m)],
+        Geometry::Parametric { generator, params, placement, mesh, .. } => {
+            vec![parametric_solid(*generator, params, placement, mesh)?]
+        }
+        Geometry::Instance { block, position, rotation_deg, scale, .. } => {
+            let m = instance_matrix(*position, *rotation_deg, *scale);
+            doc.blocks
+                .get(block)
+                .into_iter()
+                .flatten()
+                .filter_map(|sub| match sub {
+                    itsjustcad_doc::BlockGeometry::Mesh(local) => {
+                        let mut world = local.clone();
+                        world.transform(m);
+                        Some(Cow::Owned(world))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    })
+}
+
+/// Slice every mesh, parametric object and block instance among `target_ids`
+/// with the plane, inserting each cut as a polyline on "sections" (closed loops
+/// for solids, open polylines for open surfaces such as vaults), plus the feature edges of geometry
 /// behind the plane (below a plan cut / beyond a section) projected onto the
 /// plane as open polylines on "sections-proj" (thin lineweight). Returns the
 /// created ids, the layers this call created (for undo), and the mesh count.
@@ -4466,8 +4528,12 @@ fn section_meshes(
     let mut proj_edges: Vec<(DVec3, DVec3)> = Vec::new();
     let mut meshes = 0usize;
     for id in target_ids {
-        if let Geometry::Mesh(m) = &doc.get(*id).expect("resolved").geometry {
-            meshes += 1;
+        let sources = section_sources(doc, &doc.get(*id).expect("resolved").geometry)?;
+        if sources.is_empty() {
+            continue;
+        }
+        meshes += 1;
+        for m in &sources {
             loops.extend(kernel_mesh::slice(m, point, normal, PROFILE_TOL));
             proj_edges.extend(kernel_mesh::project_edges_behind(m, point, normal, PROFILE_TOL));
         }
@@ -4495,7 +4561,7 @@ fn section_meshes(
         ensure_layer(doc, SECTIONS_PROJ_LAYER, PROJ_WEIGHT_MM, &mut layers_created);
     }
     let mut id_iter = new_ids.iter();
-    for points in loops {
+    for kernel_mesh::SliceCurve { points, closed } in loops {
         doc.insert(SceneObject {
             visible: true,
             id: *id_iter.next().expect("id per loop"),
@@ -4504,7 +4570,7 @@ fn section_meshes(
             color: None,
             material: None,
             lineweight_mm: None,
-            geometry: Geometry::Curve(Curve::Polyline { points, closed: true }),
+            geometry: Geometry::Curve(Curve::Polyline { points, closed }),
         });
     }
     for (a, b) in proj_edges {
@@ -14181,14 +14247,7 @@ fn apply_forward(
                     // render as member LINES (empty display mesh), so freeze re-
                     // derives their solid strut-tube mesh (via `derive_mesh`) and
                     // re-applies `placement`, giving a real solid to keep.
-                    let baked = if generator.renders_as_segments() {
-                        let mut m = itsjustcad_doc::derive_mesh(*generator, params)
-                            .map_err(|e| ExecError::Invalid(e.to_string()))?;
-                        m.transform(*placement);
-                        m
-                    } else {
-                        mesh.clone()
-                    };
+                    let baked = parametric_solid(*generator, params, placement, mesh)?.into_owned();
                     if let Some(o) = doc.get_mut(*id) {
                         o.geometry = Geometry::Mesh(baked);
                     }
@@ -14214,9 +14273,7 @@ fn apply_forward(
                 let defs = doc.blocks.get(block).ok_or_else(|| {
                     ExecError::Invalid(format!("freeze: block definition '{block}' not found"))
                 })?;
-                let m = glam::DMat4::from_translation(*position)
-                    * glam::DMat4::from_rotation_z(rotation_deg.to_radians())
-                    * glam::DMat4::from_scale(DVec3::splat(*scale));
+                let m = instance_matrix(*position, *rotation_deg, *scale);
                 let geometries = defs
                     .iter()
                     .map(|sub| {
@@ -14523,10 +14580,7 @@ fn apply_forward(
                 itsjustcad_doc::BlockGeometry::Curve(c) => Geometry::Curve(c.clone()),
                 itsjustcad_doc::BlockGeometry::Annotation(a) => Geometry::Annotation(a.clone()),
             };
-            let m = glam::DMat4::from_translation(position)
-                * glam::DMat4::from_rotation_z(rotation_deg.to_radians())
-                * glam::DMat4::from_scale(DVec3::splat(scale));
-            geometry.transform(&m, BOUNDARY_TOL);
+            geometry.transform(&instance_matrix(position, rotation_deg, scale), BOUNDARY_TOL);
             let new_id = id.unwrap_or_default();
             doc.insert(SceneObject {
                 visible: true,
@@ -23469,6 +23523,146 @@ mod tests {
             }
             g => panic!("expected parametric, got {g:?}"),
         }
+    }
+
+    /// The cut polylines (`points`, `closed`) a section put on "sections".
+    fn cut_curves(s: &Session, out: &ApplyOutcome) -> Vec<(Vec<DVec3>, bool)> {
+        out.created
+            .iter()
+            .map(|id| s.doc.get(*id).unwrap())
+            .filter(|o| o.layer == SECTIONS_LAYER)
+            .map(|o| match &o.geometry {
+                Geometry::Curve(Curve::Polyline { points, closed }) => (points.clone(), *closed),
+                g => panic!("unexpected cut geometry {g:?}"),
+            })
+            .collect()
+    }
+
+    /// (min, max) of `axis` over every cut point.
+    fn cut_range(curves: &[(Vec<DVec3>, bool)], axis: fn(&DVec3) -> f64) -> (f64, f64) {
+        curves
+            .iter()
+            .flat_map(|(pts, _)| pts.iter().map(axis))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)))
+    }
+
+    /// Section `line` on the parametric object, check it stays untouched,
+    /// then on a frozen copy (same derived mesh): both cuts must match.
+    fn section_live_and_frozen(make: &str, line: &str) -> Vec<(Vec<DVec3>, bool)> {
+        let mut s = Session::default();
+        let id = run(&mut s, make).created[0];
+        let before = s.doc.get(id).unwrap().geometry.clone();
+        let out = run(&mut s, line);
+        assert!(matches!(before, Geometry::Parametric { .. }));
+        assert_eq!(s.doc.get(id).unwrap().geometry, before, "section must not modify it");
+        let live = cut_curves(&s, &out);
+        assert!(!live.is_empty(), "{make} / {line}: no cut");
+        assert_replay_stable(&s);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.len(), 1);
+
+        let mut f = Session::default();
+        run(&mut f, make);
+        run(&mut f, "freeze last");
+        let out = run(&mut f, line);
+        let frozen = cut_curves(&f, &out);
+        assert_eq!(live, frozen, "{make} / {line}: parametric vs frozen cut");
+        live
+    }
+
+    #[test]
+    fn section_gaussvault_cross_axis_is_arch_profile() {
+        // Issue #131 repro: plane y=6 across an 8 x 12 vault, rise 3.
+        let cut = section_live_and_frozen("gaussvault 8 12 3 undulate", "section last 4,6,1 0,1,0");
+        assert_eq!(cut.len(), 1, "{cut:?}");
+        let (pts, closed) = &cut[0];
+        assert!(!closed, "open surface gives an open polyline");
+        assert!(pts.len() > 3, "curved arch keeps its vertices: {pts:?}");
+        assert!(pts.iter().all(|p| (p.y - 6.0).abs() < 1e-6));
+        let (x0, x1) = cut_range(&cut, |p| p.x);
+        assert!(x0.abs() < 1e-6 && (x1 - 8.0).abs() < 1e-6, "spans the vault width {x0}..{x1}");
+        let (z0, z1) = cut_range(&cut, |p| p.z);
+        assert!(z0.abs() < 1e-6, "springings on the ground, got {z0}");
+        // Undulation is zero at mid-length, so the crown is the plain rise.
+        assert!((z1 - 3.0).abs() < 0.05, "crown at the rise, got {z1}");
+    }
+
+    #[test]
+    fn section_gaussvault_along_axis_follows_undulating_crown() {
+        let cut = section_live_and_frozen("gaussvault 8 12 3 undulate", "section last 4,6,1 1,0,0");
+        assert_eq!(cut.len(), 1, "{cut:?}");
+        assert!(!cut[0].1);
+        assert!(cut[0].0.iter().all(|p| (p.x - 4.0).abs() < 1e-6));
+        let (y0, y1) = cut_range(&cut, |p| p.y);
+        assert!(y0.abs() < 1e-6 && (y1 - 12.0).abs() < 1e-6, "full length {y0}..{y1}");
+        // Crown = rise ± 25 % undulation.
+        let (z0, z1) = cut_range(&cut, |p| p.z);
+        assert!((z1 - 3.75).abs() < 0.05 && (z0 - 2.25).abs() < 0.05, "crown {z0}..{z1}");
+    }
+
+    #[test]
+    fn section_hypar_cross_and_along_axis() {
+        // z = x*y/c over [-4,4] x [-3,3], c=2: every plane cut is a straight ruling.
+        let cut = section_live_and_frozen("hypar 4 3 2", "section last 0,1.5,0 0,1,0");
+        assert_eq!(cut.len(), 1, "{cut:?}");
+        assert!(!cut[0].1);
+        assert_eq!(cut[0].0.len(), 2, "straight ruling: {cut:?}");
+        let (x0, x1) = cut_range(&cut, |p| p.x);
+        assert!((x0 + 4.0).abs() < 1e-6 && (x1 - 4.0).abs() < 1e-6, "{x0}..{x1}");
+        let (z0, z1) = cut_range(&cut, |p| p.z);
+        assert!((z0 + 3.0).abs() < 1e-6 && (z1 - 3.0).abs() < 1e-6, "{z0}..{z1}");
+
+        let cut = section_live_and_frozen("hypar 4 3 2", "section last 2,0,0 1,0,0");
+        assert_eq!(cut.len(), 1, "{cut:?}");
+        assert!(!cut[0].1);
+        let (y0, y1) = cut_range(&cut, |p| p.y);
+        assert!((y0 + 3.0).abs() < 1e-6 && (y1 - 3.0).abs() < 1e-6, "{y0}..{y1}");
+    }
+
+    #[test]
+    fn section_geodesic_cuts_strut_solid() {
+        // Strut lattice (frequency 3, radius 5): the cut goes through the
+        // strut tubes freeze bakes, giving one small loop per crossed strut.
+        for line in ["section last 0,0,1 0,1,0", "section last 0,0,1 1,0,0"] {
+            let cut = section_live_and_frozen("geodesic 3 5 dome", line);
+            assert!(cut.len() > 4, "{line}: many strut crossings, got {}", cut.len());
+            assert!(cut.iter().all(|(_, closed)| *closed), "strut tubes are closed solids");
+            let r = cut.iter().flat_map(|(p, _)| p).map(|p| p.length()).fold(0.0, f64::max);
+            assert!(r < 5.2, "{line}: inside the dome radius, got {r}");
+            let (z0, z1) = cut_range(&cut, |p| p.z);
+            assert!(z0 > -0.2 && z1 > 4.5, "{line}: dome profile {z0}..{z1}");
+        }
+    }
+
+    #[test]
+    fn section_dynamic_block_instance_without_baking() {
+        let mut s = Session::default();
+        run(&mut s, "pblock t w=1 : box 0,0,0 {w},1,1 ; rect 0,0,0 {w} 0.1");
+        let inst = run(&mut s, "insert t 10,0,0 90 2 w=2").created[0];
+        let before = s.doc.get(inst).unwrap().clone();
+        // World box spans x 8..10, y 0..4, z 0..2 (see the freeze test).
+        let out = run(&mut s, "section last 9,2,1 0,1,0");
+        assert_eq!(s.doc.get(inst).unwrap(), &before, "instance untouched");
+        let cut = cut_curves(&s, &out);
+        assert_eq!(cut.len(), 1, "{cut:?}");
+        assert!(cut[0].1);
+        assert_eq!(cut_range(&cut, |p| p.x), (8.0, 10.0));
+        assert_eq!(cut_range(&cut, |p| p.z), (0.0, 2.0));
+        assert_replay_stable(&s);
+    }
+
+    #[test]
+    fn section_closed_box_unchanged() {
+        // Issue #131 control: 1 cut loop + 4 projected edges.
+        let mut s = Session::default();
+        run(&mut s, "box 20,0,0 2,2,2");
+        let out = run(&mut s, "section last 21,1,1 0,1,0");
+        assert_eq!(out.created.len(), 5);
+        let cut = cut_curves(&s, &out);
+        assert_eq!(cut.len(), 1);
+        assert!(cut[0].1 && cut[0].0.len() == 4, "{cut:?}");
+        let proj = |id: &&ObjectId| s.doc.get(**id).unwrap().layer == SECTIONS_PROJ_LAYER;
+        assert_eq!(out.created.iter().filter(proj).count(), 4);
     }
 
     #[test]

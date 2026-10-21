@@ -41,7 +41,7 @@ pub use formfind::{
 };
 pub use mesh::{Mesh, RenderMesh};
 pub use primitives::{extrude_profile, make_box};
-pub use section::slice;
+pub use section::{slice, SliceCurve};
 pub use stairs::{
     ramp_centerline, ramp_centerline_curved, ramp_centerline_turning, ramp_layout,
     ramp_layout_opts, ramp_mesh, ramp_plan_length, ramp_surface, ramp_surface_curved,
