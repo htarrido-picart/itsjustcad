@@ -4182,6 +4182,17 @@ pub unsafe extern "C" fn ijc_undo_cursor(h: *mut AppHandle) -> u64 {
     })
 }
 
+/// The op-log length (`Session::undo_len`): ops between [`ijc_undo_cursor`] and
+/// this are redoable. A new op after an undo truncates it to the cursor + 1.
+/// Returns 0 for a null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_undo_len(h: *mut AppHandle) -> u64 {
+    guard_ffi(0, || (unsafe { handle_ref(h) }).map_or(0, |app| app.session.undo_len() as u64))
+}
+
 /// The document's monotonic generation counter — it bumps on every mutation.
 /// Lets the host cheaply gate work (autosave, cached reads) on actual change
 /// rather than polling. Returns 0 for a null/invalid handle.
@@ -5539,7 +5550,7 @@ mod headless_tests {
     }
 
     #[test]
-    fn undo_cursor_tracks_undo_and_redo_but_not_selection() {
+    fn undo_cursor_and_len_track_undo_redo_but_not_selection() {
         let h = ijc_init_headless();
         unsafe {
             assert_eq!(ijc_undo_cursor(h), 0);
@@ -5553,10 +5564,16 @@ mod headless_tests {
             assert!(ijc_run_command(h, c("undo").as_ptr()));
             assert!(ijc_flush(h));
             assert_eq!(ijc_undo_cursor(h), 1);
+            assert_eq!(ijc_undo_len(h), 2, "undone op stays redoable");
             assert!(ijc_run_command(h, c("redo").as_ptr()));
             assert!(ijc_flush(h));
             assert_eq!(ijc_undo_cursor(h), 2);
+            assert!(ijc_run_command(h, c("undo").as_ptr()));
+            assert!(ijc_run_command(h, c("box 4,0,0 5,1,1").as_ptr()));
+            assert!(ijc_flush(h));
+            assert_eq!((ijc_undo_cursor(h), ijc_undo_len(h)), (2, 2), "new op drops redo");
             assert_eq!(ijc_undo_cursor(std::ptr::null_mut()), 0);
+            assert_eq!(ijc_undo_len(std::ptr::null_mut()), 0);
             ijc_free(h);
         }
     }

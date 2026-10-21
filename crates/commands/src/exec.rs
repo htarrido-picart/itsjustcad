@@ -1386,6 +1386,11 @@ impl Session {
         self.pending_log.as_ref().map_or(self.cursor, Vec::len)
     }
 
+    /// The op-log length: ops past `undo_cursor()` are redoable.
+    pub fn undo_len(&self) -> usize {
+        self.pending_log.as_ref().map_or(self.log.len(), Vec::len)
+    }
+
     /// Move the cursor to `step` by running undo/redo through `run` — no new
     /// mutation path, so the log stays consistent. Returns ops executed.
     pub fn jump_to(&mut self, step: usize) -> Result<usize, ExecError> {
