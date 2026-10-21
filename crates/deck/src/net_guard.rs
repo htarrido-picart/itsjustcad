@@ -79,7 +79,12 @@ fn ipv6_is_public(ip: Ipv6Addr) -> bool {
         || (s[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
         || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
         || (s[0] & 0xffc0) == 0xfec0 // site-local fec0::/10 (deprecated)
-        || (s[0] == 0x2001 && s[1] == 0x0db8)) // documentation
+        || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
+        // Transition prefixes a relay may translate to a private IPv4 host:
+        // 6to4 2002::/16, Teredo 2001::/32, local-use NAT64 64:ff9b:1::/48.
+        || s[0] == 0x2002
+        || (s[0] == 0x2001 && s[1] == 0)
+        || s[..3] == [0x64, 0xff9b, 1])
 }
 
 fn domain_is_public(domain: &str) -> bool {
@@ -154,6 +159,10 @@ mod tests {
             // Unique-local / link-local IPv6.
             "http://[fd00::1]/",
             "http://[fe80::1]/",
+            // 6to4 / Teredo / local-use NAT64.
+            "http://[2002:7f00:1::]/",
+            "http://[2001:0:4136:e378::1]/",
+            "http://[64:ff9b:1::a00:1]/",
             // Userinfo hiding the real host, or carrying credentials.
             "http://api.openai.com@127.0.0.1/v1",
             "https://user:pw@api.openai.com/v1",
