@@ -11,7 +11,7 @@
 //! `crates/ffi/tests/fixtures/REPLAY.md`.
 
 use itsjustcad_commands::Session;
-use itsjustcad_deck::{ExtractEvent, Extractor, digest, normalize_selectors};
+use itsjustcad_deck::{ExtractEvent, Extractor, HereContext, digest, normalize_selectors};
 use serde_json::Value;
 
 use crate::{PendingOp, check_line, deck_turn_context};
@@ -27,7 +27,15 @@ pub enum Check {
     HasMesh,
     Unchanged,
     Accepted,
+    /// The reply asks a `QUESTION:` and emits no commands (#128).
+    Question,
+    /// Exactly one object added, its plan bbox (grown by [`NEAR_TOLERANCE`])
+    /// containing this `x,y` point (#128).
+    Near([f64; 2]),
 }
+
+/// How far (m) a [`Check::Near`] point may lie outside the new object's bbox.
+pub const NEAR_TOLERANCE: f64 = 0.25;
 
 /// One manifest prompt (iOS `EvalPrompt`), tagged `<group><index>`.
 #[derive(Debug, Clone)]
@@ -40,6 +48,8 @@ pub struct Entry {
     pub check: Check,
     /// Catalog sets also require the expected verbs (not tuning / heldout).
     pub require_verbs: bool,
+    /// The host context `ijc_deck_set_context` would hold for this turn.
+    pub here: Option<HereContext>,
 }
 
 /// Parse `deck_eval_manifest.json` (from `scripts/eval_manifest_to_json.py`).
@@ -83,6 +93,10 @@ pub fn load_manifest(json: &str) -> Result<(Vec<String>, Vec<Entry>), String> {
             "hasMesh" => Check::HasMesh,
             "unchanged" => Check::Unchanged,
             "accepted" => Check::Accepted,
+            "question" => Check::Question,
+            "near" => Check::Near(
+                serde_json::from_value(c["point"].clone()).map_err(|_| "near lacks point")?,
+            ),
             k => return Err(format!("unknown check kind {k:?}")),
         };
         out.push(Entry {
@@ -93,6 +107,11 @@ pub fn load_manifest(json: &str) -> Result<(Vec<String>, Vec<Entry>), String> {
             verbs: strs(&p["verbs"]),
             check,
             require_verbs: p["require_verbs"].as_bool().unwrap_or(false),
+            here: match &p["context"] {
+                Value::Null => None,
+                c => HereContext::from_json(&c.to_string())
+                    .map_err(|e| format!("{}: context: {e}", p["id"]))?,
+            },
         });
     }
     Ok((groups, out))
@@ -140,7 +159,7 @@ pub struct Turn {
 
 pub fn turn(entry: &Entry) -> Turn {
     let session = setup_session(entry);
-    let (system, ids) = deck_turn_context(&session, &entry.prompt);
+    let (system, ids) = deck_turn_context(&session, entry.here.as_ref(), &entry.prompt);
     Turn {
         system,
         user: entry.prompt.clone(),
@@ -265,8 +284,39 @@ pub fn judge_scene(check: &Check, before: &[String], after: &[String]) -> Option
             (!after.iter().any(|l| l.contains("- mesh "))).then(|| "no mesh produced".into())
         }
         Check::Unchanged => (before != after).then(|| "a query changed the scene".into()),
-        Check::Accepted => None,
+        Check::Accepted | Check::Question => None,
+        Check::Near(p) => {
+            let id = |l: &String| l.split_whitespace().nth(2).map(String::from);
+            let old: Vec<_> = before.iter().filter_map(id).collect();
+            let added: Vec<&String> = after
+                .iter()
+                .filter(|l| id(l).is_some_and(|i| !old.contains(&i)))
+                .collect();
+            if added.len() != 1 || after.len() != before.len() + 1 {
+                return Some(format!("expected +1 object, got {}", added.len()));
+            }
+            let [lo, hi] = bbox(added[0])?;
+            let inside = (0..2).all(|i| {
+                p[i] >= lo[i] - NEAR_TOLERANCE && p[i] <= hi[i] + NEAR_TOLERANCE
+            });
+            (!inside).then(|| format!("{:?} is not at {p:?}", added[0]))
+        }
     }
+}
+
+/// The `bbox [x,y,z]..[x,y,z]` of a digest object line.
+fn bbox(line: &str) -> Option<[[f64; 3]; 2]> {
+    let (lo, hi) = line.split_once("bbox ")?.1.split_once("..")?;
+    let point = |s: &str| -> Option<[f64; 3]> {
+        let v: Vec<f64> = s
+            .trim()
+            .trim_matches(['[', ']'])
+            .split(',')
+            .map(|n| n.trim().parse().ok())
+            .collect::<Option<_>>()?;
+        v.try_into().ok()
+    };
+    Some([point(lo)?, point(hi.split_whitespace().next()?)?])
 }
 
 /// The verdict on one reply.
@@ -299,7 +349,7 @@ pub const CHUNKS: &[usize] = &[1, 2, 3, 7, 16, 64];
 pub fn score(entry: &Entry, reply: &str, dumped_ids: Option<&[String]>) -> Verdict {
     let mut session = setup_session(entry);
     let before = objects(&session);
-    let (_, ids) = deck_turn_context(&session, &entry.prompt);
+    let (_, ids) = deck_turn_context(&session, entry.here.as_ref(), &entry.prompt);
     let reply = match dumped_ids {
         Some(old) => remap_ids(reply, old, &ids),
         None => reply.to_string(),
@@ -331,7 +381,16 @@ pub fn score(entry: &Entry, reply: &str, dumped_ids: Option<&[String]>) -> Verdi
     if split_mismatch {
         problems.push("chunked extraction differs from whole".into());
     }
-    if commands.is_empty() && rejected.is_empty() {
+    let asks = reply
+        .lines()
+        .any(|l| l.trim_start().starts_with("QUESTION:"));
+    if entry.check == Check::Question {
+        if !lines.is_empty() {
+            problems.push("expected a question, got commands".into());
+        } else if !asks {
+            problems.push("no QUESTION".into());
+        }
+    } else if commands.is_empty() && rejected.is_empty() {
         problems.push("no commands".into());
     }
     let emitted: std::collections::BTreeSet<&str> = commands
@@ -377,6 +436,7 @@ mod tests {
             verbs: verbs.iter().map(|s| s.to_string()).collect(),
             check,
             require_verbs: require,
+            here: None,
         }
     }
 

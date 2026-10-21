@@ -105,3 +105,68 @@ fn every_prompt_dumps_the_ffi_request() {
         assert!(t.system.contains("## Current scene"), "{}", e.id);
     }
 }
+
+const HERE_MANIFEST: &str = include_str!("fixtures/deck_here_manifest.json");
+
+fn here(id: &str) -> Entry {
+    replay::load_manifest(HERE_MANIFEST)
+        .expect("here manifest parses")
+        .1
+        .into_iter()
+        .find(|e| e.id == id)
+        .unwrap_or_else(|| panic!("no {id}"))
+}
+
+fn draft(chat: &str, lines: &[&str]) -> String {
+    format!("{chat}\n```draft\n{}\n```\n", lines.join("\n"))
+}
+
+#[test]
+fn here_cases_carry_their_context_line() {
+    let (groups, entries) = replay::load_manifest(HERE_MANIFEST).unwrap();
+    assert_eq!(groups, ["here"]);
+    assert_eq!(entries.len(), 5);
+    for (id, line) in [
+        ("here0", "here: tap 4.0,2.0,0.0\n"),
+        ("here1", "here: selection 10.0,3.0,1.5\n"),
+        ("here2", "here: camera -6.0,8.0,0.0\n"),
+        (
+            "here3",
+            "here: tap 4.0,2.0,0.0 | selection 10.0,3.0,1.5 | camera 0.0,0.0,0.0\n",
+        ),
+    ] {
+        let s = replay::turn(&here(id)).system;
+        assert!(s.contains(&format!("selectors)\n{line}")), "{id}");
+        assert!(s.contains("more than 2 m apart"), "{id}");
+    }
+    // The iOS manifest has no context: no `here` line or rules.
+    let s = replay::turn(&entry("tuning0")).system;
+    assert!(!s.contains("here:") && !s.contains("more than 2 m apart"));
+}
+
+#[test]
+fn here_cases_score_placement_and_the_question() {
+    let at = |x: f64, y: f64| format!("box {},{},0 1,1,1", x - 0.5, y - 0.5);
+    let pass = |id: &str, reply: &str| replay::score(&here(id), reply, None);
+    for (id, x, y) in [
+        ("here0", 4.0, 2.0),
+        ("here1", 10.0, 3.0),
+        ("here2", -6.0, 8.0),
+        ("here4", 4.0, 2.0),
+    ] {
+        let v = pass(id, &draft("A box there.", &[&at(x, y)]));
+        assert!(v.pass, "{id}: {v:?}");
+    }
+    // Away from the tap.
+    let v = pass("here4", &draft("A box.", &[&at(8.0, 6.0)]));
+    assert!(!v.pass && v.problems[0].contains("is not at"), "{v:?}");
+    // At the origin instead of the tap.
+    assert!(!pass("here0", &draft("A box.", &["box 0,0,0 1,1,1"])).pass);
+
+    // Far candidates: a question, and no command.
+    let q = "QUESTION: At the point you pressed, or at the selected column?\n";
+    assert!(pass("here3", q).pass);
+    let v = pass("here3", &draft("A box.", &[&at(4.0, 2.0)]));
+    assert_eq!(v.problems, ["expected a question, got commands"]);
+    assert_eq!(pass("here3", "Where?\n").problems, ["no QUESTION"]);
+}

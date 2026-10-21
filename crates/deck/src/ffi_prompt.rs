@@ -119,6 +119,60 @@ fn guidance_for(request: &str) -> String {
     out
 }
 
+/// Host "here" context for the FFI deck (#128): the points the host knows
+/// when the user says "here", "there" or "where I'm looking". Set through
+/// `ijc_deck_set_context`; every field is optional.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Deserialize)]
+pub struct HereContext {
+    /// The last long-press or tap point (the host drops it after 2 min).
+    pub tap: Option<[f64; 3]>,
+    /// The centroid of the selection.
+    pub selection: Option<[f64; 3]>,
+    /// The camera target.
+    pub camera: Option<[f64; 3]>,
+}
+
+impl HereContext {
+    /// Parse `{"here": {"tap": [x,y,z], "selection": [x,y,z], "camera": [x,y,z]}}`.
+    /// `Ok(None)` clears: blank text, or no point set. `Err` on anything else
+    /// that is not that shape.
+    pub fn from_json(json: &str) -> Result<Option<Self>, String> {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            here: Option<HereContext>,
+        }
+        if json.trim().is_empty() {
+            return Ok(None);
+        }
+        let v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        if !v.is_object() || !(v["here"].is_object() || v["here"].is_null()) {
+            return Err("expected {\"here\": {…}}".into());
+        }
+        let wire: Wire = serde_json::from_value(v).map_err(|e| e.to_string())?;
+        Ok(wire.here.filter(|h| *h != Self::default()))
+    }
+
+    /// The prompt line, e.g. `here: tap 4.0,2.0,0.0 | camera 0.0,0.0,0.0`.
+    fn line(&self) -> String {
+        let parts: Vec<String> = [
+            ("tap", self.tap),
+            ("selection", self.selection),
+            ("camera", self.camera),
+        ]
+        .into_iter()
+        .filter_map(|(k, p)| p.map(|[x, y, z]| format!("{k} {x:.1},{y:.1},{z:.1}")))
+        .collect();
+        format!("here: {}\n", parts.join(" | "))
+    }
+}
+
+/// The rules for the `here:` line, added to `## Rules` only when it is set.
+const HERE_RULES: &str = "\
+- \"here\"/\"there\" mean the `here:` point under Current scene; \"where I'm looking\"/\"in front of me\" mean its `camera`. Write its real coordinates, never a `here` token.
+- `tap` and `selection` are the candidates: with exactly one, use it; with both within 2 m, use `tap`. With only `camera`, use it, and say in the chat where you placed the object.
+- With `tap` and `selection` more than 2 m apart, emit NO commands: reply with one QUESTION naming both options, e.g. `QUESTION: At the point you pressed, or at the selected column?`
+";
+
 fn plugin_block(plugins: &PluginRegistry) -> String {
     if plugins.is_empty() {
         return String::new();
@@ -140,8 +194,14 @@ fn plugin_block(plugins: &PluginRegistry) -> String {
     out
 }
 
-/// The FFI deck's system prompt for one request.
-pub fn ffi_system_prompt(scene_digest: &str, plugins: &PluginRegistry, request: &str) -> String {
+/// The FFI deck's system prompt for one request. `here` adds the `here:` line
+/// and its rules; with `None` the prompt has neither.
+pub fn ffi_system_prompt(
+    scene_digest: &str,
+    plugins: &PluginRegistry,
+    request: &str,
+    here: Option<&HereContext>,
+) -> String {
     let retrieved = retrieved_block(request, RETRIEVE_LIMIT, RETRIEVE_TOKEN_BUDGET);
     format!(
         r#"You are the drafting companion inside ItsJustCAD, a CAD program for architects. You model by emitting commands — the same commands the human types. Coordinates are meters, Z is up, the ground plane is z=0.
@@ -164,7 +224,7 @@ One short sentence of chat, then a ```draft fenced block with ONE command per li
 - After a command that creates an object, that object is `last`; `last N` is the N newest. Create every object BEFORE you reference it.
 - Edit objects that are already in the scene by selector (`last`, `id:<hex>`, a name) — never recreate them.
 - To make a solid from a profile: draw a closed curve, then `extrude last <height>`.
-
+{here_rules}
 ## Example
 User: a 4x4x3 tower, then a 5 by 2 grid of it 8 apart
 ```draft
@@ -173,7 +233,7 @@ array last 5,2,1 8,8,0
 ```
 
 ## Current scene (ids are for `id:<hex>` selectors)
-{scene}
+{here_line}{scene}
 "#,
         selectors = FFI_SELECTOR_HELP,
         core = core_block(),
@@ -185,6 +245,8 @@ array last 5,2,1 8,8,0
         clarify = CLARIFY_HELP,
         plan = PLAN_HELP,
         tables = TABLE_HELP,
+        here_rules = if here.is_some() { HERE_RULES } else { "" },
+        here_line = here.map(HereContext::line).unwrap_or_default(),
         scene = if scene_digest.trim().is_empty() {
             "(empty)"
         } else {
@@ -203,7 +265,55 @@ mod tests {
             "- mesh 59d76a88 bbox [0.0,0.0,0.0]..[10.0,10.0,10.0]\n",
             &PluginRegistry::new(),
             request,
+            None,
         )
+    }
+
+    #[test]
+    fn here_context_parses_clears_and_rejects() {
+        let h = HereContext::from_json(r#"{"here":{"tap":[4,2,0],"camera":[0,0,0]}}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.tap, Some([4.0, 2.0, 0.0]));
+        assert_eq!(h.selection, None);
+        assert_eq!(h.line(), "here: tap 4.0,2.0,0.0 | camera 0.0,0.0,0.0\n");
+        for clear in ["", "  ", "{}", r#"{"here":null}"#, r#"{"here":{}}"#] {
+            assert_eq!(HereContext::from_json(clear), Ok(None), "{clear:?}");
+        }
+        for bad in [
+            "{",
+            "[]",
+            r#"{"here":[[1,2,3]]}"#,
+            r#"{"here":{"tap":[1,2]}}"#,
+            r#"{"here":{"tap":"4,2,0"}}"#,
+        ] {
+            assert!(HereContext::from_json(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn here_context_adds_only_its_line_and_rules() {
+        let none = p("put a box here");
+        assert!(!none.contains("here:") && !none.contains("QUESTION naming"));
+        let here = HereContext {
+            tap: Some([4.0, 2.0, 0.0]),
+            selection: Some([10.0, 3.0, 0.0]),
+            camera: Some([0.0, 0.0, 0.0]),
+        };
+        let with = ffi_system_prompt(
+            "- mesh 59d76a88 bbox [0.0,0.0,0.0]..[10.0,10.0,10.0]\n",
+            &PluginRegistry::new(),
+            "put a box here",
+            Some(&here),
+        );
+        let line = "here: tap 4.0,2.0,0.0 | selection 10.0,3.0,0.0 | camera 0.0,0.0,0.0\n";
+        assert!(with.contains(&format!("selectors)\n{line}- mesh 59d76a88")));
+        let rules_at = with.find(HERE_RULES).expect("rules");
+        assert!(with[..rules_at].ends_with("`extrude last <height>`.\n"));
+        assert!(rules_at < with.find("## Example").unwrap());
+        // Without context the prompt is byte-identical: removing the two
+        // additions gives it back exactly.
+        assert_eq!(with.replacen(HERE_RULES, "", 1).replacen(line, "", 1), none);
     }
 
     #[test]
