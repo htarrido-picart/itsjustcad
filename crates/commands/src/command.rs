@@ -692,8 +692,9 @@ pub enum Command {
         b_size: DVec3,
     },
     // -- sections (mesh/plane cuts -> polylines on layer "sections") --
-    /// Cut meshes with a plane; each closed intersection loop becomes a
-    /// closed polyline on layer "sections".
+    /// Cut meshes, parametric objects and block instances with a plane; each
+    /// intersection becomes a polyline on layer "sections" (closed for a loop
+    /// on a solid, open where it ends on an open surface's boundary).
     Section {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
