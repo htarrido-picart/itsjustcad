@@ -9,11 +9,13 @@ app would send.
 1. Read **only** `prompts/<id>.md`. Do not read other prompt files, other
    answers, the manifest, the eval code or the repository. The model sees only
    this request.
-2. The file has two parts:
+2. The file has these parts:
    - `=== SYSTEM PROMPT ===`: the system prompt. The current scene, with the
      object ids, is its last section ("Current scene").
-   - `=== USER MESSAGE ===`: the user's request. It is the only message in the
-     conversation.
+   - Sometimes `=== EARLIER USER MESSAGE ===` and
+     `=== EARLIER ASSISTANT MESSAGE ===` parts: the earlier turns of the
+     conversation, oldest first.
+   - `=== USER MESSAGE ===`: the user's request, the last message.
    Ignore the `<!-- … -->` comment on the first line.
 3. Act as the deck model. Follow the system prompt exactly, as a careful model
    would on this one turn. Use your own judgment, but do not use any knowledge
@@ -57,5 +59,8 @@ run's ids before replaying. Add `--only id1,id2` to score a subset. The manifest
 `scripts/eval_manifest_to_json.py`. The core-only `here` cases (#128) live in
 `deck_here_manifest.json`: each has the host `context` that
 `ijc_deck_set_context` would hold, and a `near` (the new object is at an `x,y`
-point) or `question` (a `QUESTION:` and no commands) check. Without
-`--manifest`, both files are used.
+point) or `question` (a `QUESTION:` and no commands) check. The core-only
+`history` cases (#133) live in `deck_history_manifest.json`: each has the chat
+`history` that `ijc_deck_set_history` would hold, and a `says` check (the chat
+contains one of `any` and none of `not`, ignoring case) or a scene check.
+Without `--manifest`, all three files are used.

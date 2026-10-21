@@ -170,3 +170,52 @@ fn here_cases_score_placement_and_the_question() {
     assert_eq!(v.problems, ["expected a question, got commands"]);
     assert_eq!(pass("here3", "Where?\n").problems, ["no QUESTION"]);
 }
+
+const HISTORY_MANIFEST: &str = include_str!("fixtures/deck_history_manifest.json");
+
+fn history(id: &str) -> Entry {
+    replay::load_manifest(HISTORY_MANIFEST)
+        .expect("history manifest parses")
+        .1
+        .into_iter()
+        .find(|e| e.id == id)
+        .unwrap_or_else(|| panic!("no {id}"))
+}
+
+#[test]
+fn history_cases_dump_the_stale_thread_and_the_live_scene() {
+    let (groups, entries) = replay::load_manifest(HISTORY_MANIFEST).unwrap();
+    assert_eq!(groups, ["history"]);
+    assert_eq!(entries.len(), 2);
+    for e in &entries {
+        let t = replay::turn(e);
+        let md = replay::prompt_markdown(e, &t);
+        let stale = format!(
+            "{}\nNo — the scene is empty and nothing is selected.\n{}\n",
+            replay::EARLIER_ASSISTANT_HEADER,
+            replay::USER_HEADER
+        );
+        assert!(md.contains(&stale), "{}: {md}", e.id);
+        assert!(md.contains("2 earlier message(s)"), "{}", e.id);
+        assert!(t.system.contains("selection: 1 object(s)"), "{}", e.id);
+        assert!(t.system.contains("[SELECTED]"), "{}", e.id);
+        assert!(t.system.contains("It overrides anything earlier"), "{}", e.id);
+    }
+    // The iOS cases have no history.
+    let md = replay::prompt_markdown(&entry("tuning0"), &replay::turn(&entry("tuning0")));
+    assert!(!md.contains("EARLIER") && md.contains("single turn"));
+}
+
+#[test]
+fn history_cases_score_the_live_selection() {
+    let says = |reply: &str| replay::score(&history("history0"), reply, None);
+    assert!(says("Yes — one box is selected.\n").pass);
+    let v = says("No — the scene is empty and nothing is selected.\n");
+    assert!(!v.pass, "{v:?}");
+    assert!(says("I see nothing.\n").problems[0].contains("says none of"));
+
+    let up = |reply: &str| replay::score(&history("history1"), reply, None);
+    assert!(up(&draft("Moving it up.", &["move sel 0,0,1"])).pass);
+    let v = up("The scene is empty; there is nothing to move.\n");
+    assert_eq!(v.problems, ["no commands"]);
+}

@@ -2553,6 +2553,91 @@ pub unsafe extern "C" fn ijc_deck_set_context(h: *mut AppHandle, json: *const c_
     })
 }
 
+/// Parse a host chat thread for [`ijc_deck_set_history`]:
+/// `[{"role":"user"|"assistant","text":"…"}]`. Blank text or `[]` is an empty
+/// thread; anything else that is not that shape is an error.
+pub(crate) fn history_from_json(json: &str) -> Result<Vec<ChatMessage>, String> {
+    if json.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let turns: Vec<serde_json::Value> = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    turns
+        .iter()
+        .map(|t| {
+            let role: Role =
+                serde_json::from_value(t["role"].clone()).map_err(|e| format!("role: {e}"))?;
+            let text = t["text"].as_str().ok_or("text: not a string")?;
+            Ok(ChatMessage {
+                role,
+                content: text.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Replace the deck chat history (#133), the earlier turns every following
+/// [`ijc_deck_send`] / [`ijc_deck_send_image`] sends before its prompt. Call it
+/// on New chat (clear) and when restoring or switching a thread (seed), so a
+/// stale thread no longer rides along. `json` has this schema, oldest first:
+///
+/// ```json
+/// [{"role": "user", "text": "a box"}, {"role": "assistant", "text": "Done."}]
+/// ```
+///
+/// `role` is `"user"` or `"assistant"`; `text` is the turn's text, as the host
+/// shows it. Unknown fields are ignored. A null or empty (or all-whitespace)
+/// `json`, or `[]`, clears the history. [`ijc_open_json`] and
+/// [`ijc_new_document`] still clear it too; the "here" context
+/// ([`ijc_deck_set_context`]) is not touched.
+///
+/// Returns true when the history was replaced or cleared. Returns false, and
+/// keeps the previous history, on invalid UTF-8, invalid JSON, a shape other
+/// than the schema (an unknown role, a missing or non-string `text`), a null
+/// or invalid handle, or a concurrent call. Works on headless handles too.
+/// A turn still streaming appends its reply when it ends: call
+/// [`ijc_deck_stop`] first to drop it.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`] or [`ijc_init_headless`];
+/// `json` must be null or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_deck_set_history(h: *mut AppHandle, json: *const c_char) -> bool {
+    guard_ffi(false, || {
+        let Some(app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let text = if json.is_null() {
+            ""
+        } else {
+            match unsafe { CStr::from_ptr(json) }.to_str() {
+                Ok(t) => t,
+                Err(_) => return false,
+            }
+        };
+        let Ok(turns) = history_from_json(text) else {
+            return false;
+        };
+        match app.history.lock() {
+            Ok(mut hist) => {
+                *hist = turns;
+                true
+            }
+            Err(_) => false,
+        }
+    })
+}
+
+/// Clear the deck chat history (#133): [`ijc_deck_set_history`] with a null
+/// `json`. Returns false only on a null or invalid handle or a concurrent
+/// call. Works on headless handles too.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`] or [`ijc_init_headless`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_deck_clear_history(h: *mut AppHandle) -> bool {
+    unsafe { ijc_deck_set_history(h, std::ptr::null()) }
+}
+
 /// Parse the `images_json` C string into `Vec<ImagePart>`. Null, invalid UTF-8,
 /// JSON parse failure, or an empty array all yield an empty vec (no images).
 /// The wire shape is `[{"mime": "...", "data": "<base64>"}]`; `data` maps to
@@ -5415,6 +5500,8 @@ mod headless_tests {
             *mut c_void,
         ) = ijc_deck_send_image;
         let _: unsafe extern "C" fn(*mut AppHandle, *const c_char) -> bool = ijc_deck_set_context;
+        let _: unsafe extern "C" fn(*mut AppHandle, *const c_char) -> bool = ijc_deck_set_history;
+        let _: unsafe extern "C" fn(*mut AppHandle) -> bool = ijc_deck_clear_history;
     }
 
     #[test]
@@ -5639,6 +5726,98 @@ mod headless_tests {
     extern "C" fn record(ctx: *mut c_void, kind: u32, _text: *const c_char) {
         let seen = unsafe { &*(ctx as *const Mutex<Vec<u32>>) };
         seen.lock().unwrap().push(kind);
+    }
+
+    /// Each request's messages, as `(role, text)`.
+    type Sent = Arc<Mutex<Vec<Vec<(Role, String)>>>>;
+
+    /// Records each request's messages and replies with one chat line.
+    struct CaptureDeck(Sent);
+    #[async_trait::async_trait]
+    impl LlmDeck for CaptureDeck {
+        fn name(&self) -> String {
+            "capture".into()
+        }
+        async fn stream_chat(
+            &self,
+            req: ChatRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<DeckDelta>,
+        ) {
+            let msgs = req.messages.into_iter().map(|m| (m.role, m.content)).collect();
+            self.0.lock().unwrap().push(msgs);
+            let _ = tx.send(DeckDelta::Text("Yes.\n".into()));
+            let _ = tx.send(DeckDelta::Done);
+        }
+    }
+
+    #[test]
+    fn deck_history_seeds_clears_and_keeps_on_invalid_json() {
+        let h = ijc_init_headless();
+        let sent: Sent = Arc::default();
+        let hist = |h: *mut AppHandle| -> Vec<(Role, String)> {
+            let app = unsafe { handle_ref(h) }.unwrap();
+            let v = app.history.lock().unwrap();
+            v.iter().map(|m| (m.role, m.content.clone())).collect()
+        };
+        let turn = |h: *mut AppHandle, prompt: &str| -> Vec<(Role, String)> {
+            let seen: Box<Mutex<Vec<u32>>> = Box::default();
+            let ctx = &*seen as *const _ as *mut c_void;
+            unsafe { ijc_deck_send(h, c(prompt).as_ptr(), record, ctx) };
+            let t0 = Instant::now();
+            while !seen.lock().unwrap().contains(&CB_DONE) {
+                assert!(t0.elapsed() < Duration::from_secs(10), "deck never finished");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            sent.lock().unwrap().last().cloned().unwrap()
+        };
+        let u = |t: &str| (Role::User, t.to_string());
+        let a = |t: &str| (Role::Assistant, t.to_string());
+        unsafe {
+            let url = c("https://api.example.com/v1");
+            assert!(ijc_deck_configure(h, 0, url.as_ptr(), c("m").as_ptr(), std::ptr::null()));
+            handle_mut(h).unwrap().deck = Some(Arc::new(CaptureDeck(sent.clone())));
+
+            // A stale thread from an earlier chat.
+            turn(h, "Can u see the selection?");
+            assert_eq!(hist(h).len(), 2);
+
+            // Seed: the next turn carries only the seeded thread, then the prompt.
+            let seed = c(r#"[{"role":"user","text":"a box"},{"role":"assistant","text":"Done.","at":1}]"#);
+            assert!(ijc_deck_set_history(h, seed.as_ptr()));
+            assert_eq!(hist(h), [u("a box"), a("Done.")]);
+            assert_eq!(turn(h, "taller"), [u("a box"), a("Done."), u("taller")]);
+
+            // Invalid input keeps the history.
+            let kept = hist(h);
+            for bad in [
+                "{",
+                r#"{"role":"user","text":"x"}"#,
+                r#"[{"role":"system","text":"x"}]"#,
+                r#"[{"role":"user"}]"#,
+                r#"[{"role":"user","text":1}]"#,
+                "[1]",
+            ] {
+                assert!(!ijc_deck_set_history(h, c(bad).as_ptr()), "{bad}");
+                assert_eq!(hist(h), kept, "{bad} kept the history");
+            }
+
+            // Clear (New chat): the next turn sends only its prompt.
+            assert!(ijc_deck_clear_history(h));
+            assert!(hist(h).is_empty());
+            assert_eq!(turn(h, "Can u see the selection?"), [u("Can u see the selection?")]);
+            let blanks = [c(""), c(" "), c("[]")];
+            let clears = blanks.iter().map(|b| b.as_ptr()).chain([std::ptr::null()]);
+            for clear in clears {
+                assert!(ijc_deck_set_history(h, seed.as_ptr()));
+                assert!(ijc_deck_set_history(h, clear));
+                assert!(hist(h).is_empty());
+            }
+
+            assert!(!ijc_deck_set_history(std::ptr::null_mut(), seed.as_ptr()));
+            assert!(!ijc_deck_clear_history(std::ptr::null_mut()));
+            ijc_deck_stop(h);
+            ijc_free(h);
+        }
     }
 
     #[test]

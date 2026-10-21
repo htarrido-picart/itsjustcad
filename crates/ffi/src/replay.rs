@@ -11,10 +11,12 @@
 //! `crates/ffi/tests/fixtures/REPLAY.md`.
 
 use itsjustcad_commands::Session;
-use itsjustcad_deck::{ExtractEvent, Extractor, HereContext, digest, normalize_selectors};
+use itsjustcad_deck::{
+    ChatMessage, ExtractEvent, Extractor, HereContext, Role, digest, normalize_selectors,
+};
 use serde_json::Value;
 
-use crate::{PendingOp, check_line, deck_turn_context};
+use crate::{PendingOp, check_line, deck_turn_context, history_from_json};
 
 /// What the scene must look like after the turn (iOS `EvalPrompt.Check`).
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +34,9 @@ pub enum Check {
     /// Exactly one object added, its plan bbox (grown by [`NEAR_TOLERANCE`])
     /// containing this `x,y` point (#128).
     Near([f64; 2]),
+    /// The reply's chat contains one of `any` and none of `not`, ignoring
+    /// case (#133); commands are optional.
+    Says { any: Vec<String>, not: Vec<String> },
 }
 
 /// How far (m) a [`Check::Near`] point may lie outside the new object's bbox.
@@ -50,6 +55,8 @@ pub struct Entry {
     pub require_verbs: bool,
     /// The host context `ijc_deck_set_context` would hold for this turn.
     pub here: Option<HereContext>,
+    /// The chat thread `ijc_deck_set_history` would hold before this turn.
+    pub history: Vec<ChatMessage>,
 }
 
 /// Parse `deck_eval_manifest.json` (from `scripts/eval_manifest_to_json.py`).
@@ -97,6 +104,10 @@ pub fn load_manifest(json: &str) -> Result<(Vec<String>, Vec<Entry>), String> {
             "near" => Check::Near(
                 serde_json::from_value(c["point"].clone()).map_err(|_| "near lacks point")?,
             ),
+            "says" => Check::Says {
+                any: strs(&c["any"]),
+                not: strs(&c["not"]),
+            },
             k => return Err(format!("unknown check kind {k:?}")),
         };
         out.push(Entry {
@@ -111,6 +122,11 @@ pub fn load_manifest(json: &str) -> Result<(Vec<String>, Vec<Entry>), String> {
                 Value::Null => None,
                 c => HereContext::from_json(&c.to_string())
                     .map_err(|e| format!("{}: context: {e}", p["id"]))?,
+            },
+            history: match &p["history"] {
+                Value::Null => Vec::new(),
+                h => history_from_json(&h.to_string())
+                    .map_err(|e| format!("{}: history: {e}", p["id"]))?,
             },
         });
     }
@@ -148,10 +164,12 @@ pub fn objects(session: &Session) -> Vec<String> {
 }
 
 /// The request [`crate::ijc_deck_send`] sends for `entry` on a fresh handle:
-/// the system prompt (the scene digest is its last section) and the single
-/// user message (history is cleared by `ijc_new_document`).
+/// the system prompt (the scene digest is its last section), the seeded
+/// history (`ijc_deck_set_history`; empty after `ijc_new_document`) and the
+/// user message.
 pub struct Turn {
     pub system: String,
+    pub history: Vec<ChatMessage>,
     pub user: String,
     /// The scene's full object ids, in document order (for `score`).
     pub ids: Vec<String>,
@@ -162,6 +180,7 @@ pub fn turn(entry: &Entry) -> Turn {
     let (system, ids) = deck_turn_context(&session, entry.here.as_ref(), &entry.prompt);
     Turn {
         system,
+        history: entry.history.clone(),
         user: entry.prompt.clone(),
         ids,
     }
@@ -169,17 +188,49 @@ pub fn turn(entry: &Entry) -> Turn {
 
 pub const SYSTEM_HEADER: &str = "=== SYSTEM PROMPT ===";
 pub const USER_HEADER: &str = "=== USER MESSAGE ===";
+/// The headers of the earlier turns, before [`USER_HEADER`].
+pub const EARLIER_USER_HEADER: &str = "=== EARLIER USER MESSAGE ===";
+pub const EARLIER_ASSISTANT_HEADER: &str = "=== EARLIER ASSISTANT MESSAGE ===";
 
 /// The prompt file an answering agent reads.
 pub fn prompt_markdown(entry: &Entry, t: &Turn) -> String {
+    let turns = match t.history.len() {
+        0 => "single turn".to_string(),
+        n => format!("{n} earlier message(s)"),
+    };
+    let earlier: String = t
+        .history
+        .iter()
+        .map(|m| {
+            let header = match m.role {
+                Role::User => EARLIER_USER_HEADER,
+                Role::Assistant => EARLIER_ASSISTANT_HEADER,
+            };
+            format!("{header}\n{}\n", m.content)
+        })
+        .collect();
     format!(
-        "<!-- deck replay {id}: exact ijc_deck_send request (max_tokens 4096, single turn). \
+        "<!-- deck replay {id}: exact ijc_deck_send request (max_tokens 4096, {turns}). \
          The current scene is the last section of the system prompt. -->\n\
-         {SYSTEM_HEADER}\n{system}\n{USER_HEADER}\n{user}\n",
+         {SYSTEM_HEADER}\n{system}\n{earlier}{USER_HEADER}\n{user}\n",
         id = entry.id,
         system = t.system.trim_end(),
         user = t.user,
     )
+}
+
+/// The chat text of `reply` (everything outside the draft block).
+fn chat_text(reply: &str) -> String {
+    let mut ex = Extractor::default();
+    let mut events = ex.push(reply);
+    events.extend(ex.finish());
+    events
+        .into_iter()
+        .filter_map(|ev| match ev {
+            ExtractEvent::Chat(c) => Some(c),
+            ExtractEvent::Command(_) => None,
+        })
+        .collect()
 }
 
 /// Feed `reply` through the FFI stream path: the [`Extractor`] in chunks of
@@ -284,7 +335,7 @@ pub fn judge_scene(check: &Check, before: &[String], after: &[String]) -> Option
             (!after.iter().any(|l| l.contains("- mesh "))).then(|| "no mesh produced".into())
         }
         Check::Unchanged => (before != after).then(|| "a query changed the scene".into()),
-        Check::Accepted | Check::Question => None,
+        Check::Accepted | Check::Question | Check::Says { .. } => None,
         Check::Near(p) => {
             let id = |l: &String| l.split_whitespace().nth(2).map(String::from);
             let old: Vec<_> = before.iter().filter_map(id).collect();
@@ -390,6 +441,15 @@ pub fn score(entry: &Entry, reply: &str, dumped_ids: Option<&[String]>) -> Verdi
         } else if !asks {
             problems.push("no QUESTION".into());
         }
+    } else if let Check::Says { any, not } = &entry.check {
+        let chat = chat_text(reply).to_lowercase();
+        let has = |n: &String| chat.contains(&n.to_lowercase());
+        if !any.iter().any(has) {
+            problems.push(format!("chat says none of {any:?}"));
+        }
+        if let Some(n) = not.iter().find(|n| has(n)) {
+            problems.push(format!("chat says {n:?}"));
+        }
     } else if commands.is_empty() && rejected.is_empty() {
         problems.push("no commands".into());
     }
@@ -437,6 +497,7 @@ mod tests {
             check,
             require_verbs: require,
             here: None,
+            history: Vec::new(),
         }
     }
 

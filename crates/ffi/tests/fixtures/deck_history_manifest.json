@@ -1,0 +1,71 @@
+{
+  "groups": [
+    "history"
+  ],
+  "prompts": [
+    {
+      "check": {
+        "any": [
+          "yes",
+          "selected",
+          "selection"
+        ],
+        "kind": "says",
+        "not": [
+          "empty",
+          "nothing is selected",
+          "no objects",
+          "don't see",
+          "can't see",
+          "cannot see"
+        ]
+      },
+      "group": "history",
+      "history": [
+        {
+          "role": "user",
+          "text": "Can u see the selection?"
+        },
+        {
+          "role": "assistant",
+          "text": "No — the scene is empty and nothing is selected."
+        }
+      ],
+      "id": "history0",
+      "prompt": "Can u see the selection?",
+      "require_verbs": false,
+      "setup": [
+        "box 0,0,0 2,2,2",
+        "select last"
+      ]
+    },
+    {
+      "check": {
+        "count": 1,
+        "kind": "changed"
+      },
+      "group": "history",
+      "history": [
+        {
+          "role": "user",
+          "text": "Can u see the selection?"
+        },
+        {
+          "role": "assistant",
+          "text": "No — the scene is empty and nothing is selected."
+        }
+      ],
+      "id": "history1",
+      "prompt": "move the selection up 1 m",
+      "require_verbs": true,
+      "setup": [
+        "box 0,0,0 2,2,2",
+        "select last"
+      ],
+      "verbs": [
+        "move"
+      ]
+    }
+  ],
+  "source": "itsjustcad #133: a stale chat history (ijc_deck_set_history) against the live scene; core-only, not from the iOS manifest"
+}
