@@ -804,8 +804,10 @@ impl Session {
                 // undo the entry before the cursor is NOT "what just happened",
                 // so merging across it would skip the state the user returned to.
                 let at_tip = self.cursor == self.log.len();
+                let selection: Vec<ObjectId> = self.doc.selection.iter().copied().collect();
                 let (op, inverse, outcome) = apply_forward(&mut self.doc, cmd)?;
                 if logged {
+                    let op = freeze_selected(op, &selection);
                     self.log.truncate(self.cursor);
                     if !(at_tip && self.coalesce_lot_refresh(&op, &inverse)) {
                         self.log.push(AppliedOp { op, inverse });
@@ -1377,6 +1379,18 @@ impl Session {
             self.log.iter().map(|a| describe(&a.op).to_string()).collect(),
             self.cursor,
         )
+    }
+
+    /// The op-log cursor alone: `history().1` without describing every op.
+    /// Undo lowers it by one, redo raises it, a new logged op leaves it at the
+    /// tip. Hosts tag their own rows with it to mirror undo state.
+    pub fn undo_cursor(&self) -> usize {
+        self.pending_log.as_ref().map_or(self.cursor, Vec::len)
+    }
+
+    /// The op-log length: ops past `undo_cursor()` are redoable.
+    pub fn undo_len(&self) -> usize {
+        self.pending_log.as_ref().map_or(self.log.len(), Vec::len)
     }
 
     /// Move the cursor to `step` by running undo/redo through `run` — no new
@@ -2876,6 +2890,37 @@ impl Session {
         }
         Ok(session)
     }
+}
+
+/// Pin every `Selector::Selected` in a logged op to the ids it meant when it
+/// ran. The selection is live state, not logged, so redo and replay would
+/// otherwise re-read whatever is selected then: after an undo, usually nothing
+/// ("selector matched no objects"). Generic over all ops via serde, since the
+/// selector sits in many variants; an op without one comes back unchanged.
+fn freeze_selected(op: Command, selection: &[ObjectId]) -> Command {
+    fn pin(v: &mut serde_json::Value, ids: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(map) => {
+                if map.get("sel").and_then(|s| s.as_str()) == Some("selected") {
+                    *v = serde_json::json!({ "sel": "ids", "ids": ids });
+                    return true;
+                }
+                map.values_mut().fold(false, |hit, x| pin(x, ids) | hit)
+            }
+            serde_json::Value::Array(xs) => xs.iter_mut().fold(false, |hit, x| pin(x, ids) | hit),
+            _ => false,
+        }
+    }
+    if selection.is_empty() {
+        return op; // a Selected op on an empty selection failed before logging
+    }
+    let (Ok(mut v), Ok(ids)) = (serde_json::to_value(&op), serde_json::to_value(selection)) else {
+        return op;
+    };
+    if !pin(&mut v, &ids) {
+        return op;
+    }
+    serde_json::from_value(v).unwrap_or(op)
 }
 
 fn resolve(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
@@ -18014,6 +18059,25 @@ mod tests {
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap()
         );
+    }
+
+    #[test]
+    fn selection_ops_redo_and_replay_after_the_selection_changes() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 1,1,1");
+        run(&mut s, "box 2,0,0 3,1,1");
+        run(&mut s, "select all");
+        run(&mut s, "move sel 0,0,5");
+        run(&mut s, "delete sel");
+        assert_eq!(s.doc.len(), 0);
+        run(&mut s, "undo"); // selection is now empty
+        run(&mut s, "undo");
+        run(&mut s, "redo");
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 0, "redo deletes the same objects");
+        let log = s.save_log();
+        assert!(matches!(&log[2], Command::Move { targets: Selector::Ids { ids }, .. } if ids.len() == 2));
+        assert_eq!(Session::replay(log).unwrap().doc.len(), 0);
     }
 
     #[test]

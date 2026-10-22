@@ -4166,6 +4166,33 @@ fn feedback_form_url(form: Option<itsjustcad_deck::GoogleForm>, draft_json: Opti
     }
 }
 
+/// The op-log cursor (`Session::undo_cursor`): the number of applied, undoable
+/// ops. Undo lowers it by one and redo raises it; a selection change leaves it
+/// alone, unlike [`ijc_doc_generation`]. The host tags each command row with
+/// the cursor after it ran, so a row is undone exactly when the cursor drops
+/// below its tag. Queued ops count once applied (`ijc_flush` / a render
+/// frame). Returns 0 for a null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_undo_cursor(h: *mut AppHandle) -> u64 {
+    guard_ffi(0, || {
+        (unsafe { handle_ref(h) }).map_or(0, |app| app.session.undo_cursor() as u64)
+    })
+}
+
+/// The op-log length (`Session::undo_len`): ops between [`ijc_undo_cursor`] and
+/// this are redoable. A new op after an undo truncates it to the cursor + 1.
+/// Returns 0 for a null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_undo_len(h: *mut AppHandle) -> u64 {
+    guard_ffi(0, || (unsafe { handle_ref(h) }).map_or(0, |app| app.session.undo_len() as u64))
+}
+
 /// The document's monotonic generation counter — it bumps on every mutation.
 /// Lets the host cheaply gate work (autosave, cached reads) on actual change
 /// rather than polling. Returns 0 for a null/invalid handle.
@@ -5518,6 +5545,35 @@ mod headless_tests {
             assert_eq!(count(h), 1);
             assert!(ijc_flush(h), "empty queue is fine");
             assert!(!ijc_flush(std::ptr::null_mut()));
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn undo_cursor_and_len_track_undo_redo_but_not_selection() {
+        let h = ijc_init_headless();
+        unsafe {
+            assert_eq!(ijc_undo_cursor(h), 0);
+            assert!(ijc_run_command(h, c("box 0,0,0 1,1,1").as_ptr()));
+            assert!(ijc_run_command(h, c("box 2,0,0 3,1,1").as_ptr()));
+            assert!(ijc_flush(h));
+            assert_eq!(ijc_undo_cursor(h), 2);
+            assert!(ijc_run_command(h, c("select all").as_ptr()));
+            assert!(ijc_flush(h));
+            assert_eq!(ijc_undo_cursor(h), 2, "selection is not an undoable op");
+            assert!(ijc_run_command(h, c("undo").as_ptr()));
+            assert!(ijc_flush(h));
+            assert_eq!(ijc_undo_cursor(h), 1);
+            assert_eq!(ijc_undo_len(h), 2, "undone op stays redoable");
+            assert!(ijc_run_command(h, c("redo").as_ptr()));
+            assert!(ijc_flush(h));
+            assert_eq!(ijc_undo_cursor(h), 2);
+            assert!(ijc_run_command(h, c("undo").as_ptr()));
+            assert!(ijc_run_command(h, c("box 4,0,0 5,1,1").as_ptr()));
+            assert!(ijc_flush(h));
+            assert_eq!((ijc_undo_cursor(h), ijc_undo_len(h)), (2, 2), "new op drops redo");
+            assert_eq!(ijc_undo_cursor(std::ptr::null_mut()), 0);
+            assert_eq!(ijc_undo_len(std::ptr::null_mut()), 0);
             ijc_free(h);
         }
     }
