@@ -3589,6 +3589,31 @@ pub unsafe extern "C" fn ijc_set_render_mode(h: *mut AppHandle, mode: *const c_c
     })
 }
 
+/// Switch the live viewport between the dark and light drafting palettes
+/// ([`Theme::Dark`] / [`Theme::Light`]): background, default mesh, curve and
+/// edge ink, and selection highlight. A handle starts dark, so a host that never
+/// calls this keeps the dark look. The change takes effect on the next
+/// [`ijc_render_frame`] (the scene is re-snapshotted in the new palette).
+/// Shaded sheet rasters keep their own fixed palette, so printed output does not
+/// follow the device appearance. Returns false on a null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_set_appearance(h: *mut AppHandle, dark: bool) -> bool {
+    guard_ffi(false, || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let theme = if dark { Theme::Dark } else { Theme::Light };
+        if app.theme != theme {
+            app.theme = theme;
+            app.last_gen = None; // force re-snapshot next frame
+        }
+        true
+    })
+}
+
 /// Return the live viewport's current render style as its label
 /// (e.g. "Shaded", "Wireframe", "X-Ray", "Ghosted", "Pencil") in a
 /// heap-allocated C string the caller owns, or null on a null/invalid handle.
@@ -3742,6 +3767,9 @@ fn sheet_ortho_view_proj(
     (proj * viewm, eye)
 }
 
+/// Palette for Shaded sheet rasters (the handle's historical default).
+const PRINT_THEME: Theme = Theme::Dark;
+
 /// Render every Shaded-mode view of `sheet` to an RGBA raster via an offscreen
 /// wgpu pass, reusing the app's `device`/`queue` (no second adapter). Each
 /// raster is sized from the view's paper rect (explicit `rect` or the auto-grid
@@ -3786,8 +3814,10 @@ fn render_shaded_view_rasters(
     let device = &gpu.device;
     let queue = &gpu.queue;
     const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let scene = snapshot(&app.session.doc, app.theme);
-    let [br, bg, bb_c, ba] = app.theme.background();
+    // Printed output: a fixed palette, independent of the device appearance
+    // set by `ijc_set_appearance`.
+    let scene = snapshot(&app.session.doc, PRINT_THEME);
+    let [br, bg, bb_c, ba] = PRINT_THEME.background();
 
     let mut out = Vec::new();
     for (i, view) in sheet.views.iter().enumerate() {
@@ -5529,6 +5559,29 @@ mod headless_tests {
         assert_eq!(feedback_form_url(Some(form), Some("not json")), "");
         assert_eq!(feedback_form_url(Some(form), None), "");
         assert_eq!(feedback_form_url(None, Some(draft)), "");
+    }
+
+    #[test]
+    fn set_appearance_switches_theme_and_forces_resnapshot() {
+        let h = ijc_init_headless();
+        let theme = |h: *mut AppHandle| unsafe { handle_ref(h) }.unwrap().theme;
+        unsafe {
+            // Null-safe.
+            assert!(!ijc_set_appearance(std::ptr::null_mut(), true));
+            // Starts dark (the default look for hosts that never call this).
+            assert_eq!(theme(h), Theme::Dark);
+            handle_mut(h).unwrap().last_gen = Some(7);
+            assert!(ijc_set_appearance(h, false));
+            assert_eq!(theme(h), Theme::Light);
+            assert_eq!(handle_ref(h).unwrap().last_gen, None, "light must re-snapshot");
+            // Same theme again: no forced re-upload.
+            handle_mut(h).unwrap().last_gen = Some(7);
+            assert!(ijc_set_appearance(h, false));
+            assert_eq!(handle_ref(h).unwrap().last_gen, Some(7));
+            assert!(ijc_set_appearance(h, true));
+            assert_eq!(theme(h), Theme::Dark);
+            ijc_free(h);
+        }
     }
 
     #[test]
