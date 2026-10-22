@@ -1193,6 +1193,49 @@ pub unsafe extern "C" fn ijc_run_command_result(
     })
 }
 
+/// Import a CAD file the host copied into the granted workdir
+/// ([`ijc_set_workdir`]), by bare file name. Host-typed `import` stays behind
+/// the side-effect gate ([`ijc_run_command`]); this is the host's one import
+/// path, and it reads only inside the workdir: absolute paths, separators and
+/// `..` are refused, as for the deck. Runs now (queued ops first) and returns
+/// [`ijc_run_command_result`] JSON, whose `created` lists the imported objects;
+/// the import is one undoable op. Refused when no workdir is granted.
+///
+/// # Safety
+/// `h` must be null or a live handle; `name` must be null or a valid
+/// NUL-terminated C string. The returned pointer must be freed exactly once via
+/// [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_import_file(h: *mut AppHandle, name: *const c_char) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle");
+        };
+        if name.is_null() {
+            return fail("name is null");
+        }
+        let Ok(s) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+            return fail("name is not valid UTF-8");
+        };
+        let Some(dir) = itsjustcad_commands::workdir::get() else {
+            return fail("no workdir set");
+        };
+        into_c_string(import_in(&mut guard, &dir, s))
+    })
+}
+
+/// [`ijc_import_file`] against an explicit workdir (testable without the
+/// process-wide grant).
+fn import_in(app: &mut AppHandle, dir: &std::path::Path, name: &str) -> String {
+    let path = match itsjustcad_commands::workdir::resolve_within_dir(dir, name) {
+        Ok(p) => p,
+        Err(e) => return run_result_json(false, None, Some(&e), &[]),
+    };
+    apply_pending(app);
+    run_cmd_json(&mut app.session, Command::Import { path: path.to_string_lossy().into_owned() })
+}
+
 /// Check a command line exactly as [`ijc_run_command`] would, without queueing
 /// or running it. Returns JSON the host must free via [`ijc_string_free`]:
 /// `{"ok":true}`, or `{"ok":false,"error":"…","usage":"…"}` where `error` is the
@@ -5629,6 +5672,32 @@ mod headless_tests {
             assert_eq!(ijc_undo_len(std::ptr::null_mut()), 0);
             ijc_free(h);
         }
+    }
+
+    #[test]
+    fn import_in_reads_only_inside_the_workdir() {
+        let dir = std::env::temp_dir().join(format!("ijc-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tri.obj"), "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+        let h = ijc_init_headless();
+        let mut guard = unsafe { handle_mut(h) }.unwrap();
+        let json = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+
+        let ok = json(import_in(&mut guard, &dir, "tri.obj"));
+        assert_eq!(ok["ok"], true, "{ok}");
+        assert!(!ok["created"].as_array().unwrap().is_empty(), "{ok}");
+        assert_eq!(guard.session.undo_cursor(), 1, "one undoable op");
+
+        for bad in ["../tri.obj", "/etc/passwd", "sub/tri.obj", "missing.obj"] {
+            assert_eq!(json(import_in(&mut guard, &dir, bad))["ok"], false, "{bad}");
+        }
+        drop(guard);
+        unsafe {
+            let r = json(take(ijc_import_file(std::ptr::null_mut(), c("tri.obj").as_ptr())));
+            assert_eq!(r["ok"], false);
+            ijc_free(h);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn camera_state(h: *mut AppHandle) -> serde_json::Value {
