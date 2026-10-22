@@ -35,6 +35,7 @@
 //! [`ijc_init_headless`] and not yet freed, and buffer pointers must be valid for the given length.
 #![allow(clippy::missing_safety_doc)]
 
+mod boxsel;
 pub mod replay;
 
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -1586,6 +1587,66 @@ pub unsafe extern "C" fn ijc_pick(h: *mut AppHandle, x_px: f32, y_px: f32, addit
         apply_pick(&mut app.session.doc, best, additive);
         best.is_some()
     })
+}
+
+/// Drag-box select in drawable pixels (y down), the desktop's Rhino
+/// convention: a drag ending right of where it started (`x1 >= x0`) is a
+/// window (objects fully inside), one ending left of it a crossing (anything
+/// the box touches). Curves test their tessellated line, other geometry its
+/// projected bounds; hidden objects and layers are skipped. Replaces the
+/// selection unless `additive`. Returns how many objects matched, or -1 on a
+/// null/invalid handle or a headless one (no drawable).
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_box_select(
+    h: *mut AppHandle,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    additive: bool,
+) -> i32 {
+    guard_ffi(-1, || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return -1;
+        };
+        let app: &mut AppHandle = &mut app;
+        let Some((w, h)) = drawable_size(app) else {
+            return -1;
+        };
+        let vp = app.camera.view_proj(w / h);
+        box_select_in(&mut app.session.doc, vp, w, h, glam::Vec2::new(x0, y0), glam::Vec2::new(x1, y1), additive)
+            as i32
+    })
+}
+
+/// [`ijc_box_select`] against an explicit camera and drawable (testable headless).
+fn box_select_in(
+    doc: &mut itsjustcad_doc::Document,
+    vp: glam::Mat4,
+    w: f32,
+    h: f32,
+    start: glam::Vec2,
+    end: glam::Vec2,
+    additive: bool,
+) -> usize {
+    let mode = boxsel::mode(start, end);
+    let drag = boxsel::Rect::from_points(start, end);
+    let ids: Vec<_> = doc
+        .objects()
+        .filter(|o| o.visible && doc.layer_visible(&o.layer))
+        .filter(|o| boxsel::matches(&o.geometry, vp, w, h, drag, mode))
+        .map(|o| o.id)
+        .collect();
+    if !additive {
+        doc.selection.clear();
+    }
+    let n = ids.len();
+    doc.selection.extend(ids);
+    doc.generation += 1; // recolor the selection
+    n
 }
 
 /// Apply a pick result to the selection, as documented on [`ijc_pick`]. Only
@@ -5698,6 +5759,43 @@ mod headless_tests {
             ijc_free(h);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn box_select_window_needs_the_whole_object_crossing_a_touch() {
+        let h = ijc_init_headless();
+        let mut guard = unsafe { handle_mut(h) }.unwrap();
+        let app: &mut AppHandle = &mut guard;
+        for line in ["box 0,0,0 1,1,1", "box 3,0,0 4,1,1", "ze"] {
+            let op = check_line(line).unwrap();
+            match op {
+                PendingOp::Cmd(cmd) => { app.session.run(cmd).unwrap(); }
+                PendingOp::Camera(k) => apply_camera(app, k),
+            }
+        }
+        let (w, hh) = (800.0, 600.0);
+        let vp = app.camera.view_proj(w / hh);
+        let all = (glam::Vec2::new(0.0, 0.0), glam::Vec2::new(w, hh));
+        // Window over the whole view takes both boxes.
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, all.0, all.1, false), 2);
+        assert_eq!(app.session.doc.selection.len(), 2);
+        // A tiny box at the centre: a window holds nothing, a crossing (drawn
+        // right→left) touches whatever projects there.
+        let c = glam::Vec2::new(w / 2.0, hh / 2.0);
+        let d = glam::Vec2::new(2.0, 2.0);
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, c - d, c + d, false), 0);
+        assert!(app.session.doc.selection.is_empty(), "a window replaces the selection");
+        // The whole view drawn right→left is a crossing: still both.
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, all.1, all.0, false), 2);
+        // Additive keeps what was there.
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, c - d, c + d, true), 0);
+        assert_eq!(app.session.doc.selection.len(), 2);
+        drop(guard);
+        unsafe {
+            assert_eq!(ijc_box_select(h, 0.0, 0.0, 1.0, 1.0, false), -1, "headless has no drawable");
+            assert_eq!(ijc_box_select(std::ptr::null_mut(), 0.0, 0.0, 1.0, 1.0, false), -1);
+            ijc_free(h);
+        }
     }
 
     fn camera_state(h: *mut AppHandle) -> serde_json::Value {
