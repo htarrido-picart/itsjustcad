@@ -12676,6 +12676,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(square(40.0)),
         });
         doc.subdivision_links.insert(

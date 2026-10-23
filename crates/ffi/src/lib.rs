@@ -3298,6 +3298,46 @@ pub unsafe extern "C" fn ijc_subdivision_yield_json(h: *mut AppHandle, source: *
     })
 }
 
+/// The stored per-edge street tags of object `id` (#143) — a baked lot or block
+/// curve from `siteplan` / `lotgeneratesite` / `lotsubdivide` on a tagged block:
+/// `[{"is_street"?,"street_id"?,"street_width"?,"is_alley"?,"role"?,"length"}, …]`,
+/// one entry per edge, edge `i` running from curve point `i` to `i + 1`.
+/// Absent keys mean false / none / 0. `role` is `front` | `street_side` |
+/// `side` | `rear` (lots only). `id` is the object's short id or full uuid.
+/// Returns `null` for an unknown id, an untagged object, tags invalidated by
+/// a geometry edit, or a null/invalid handle. Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `id` must be null or a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_edge_tags_json(h: *mut AppHandle, id: *const c_char) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let null = || into_c_string(String::from("null"));
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return null();
+        };
+        if id.is_null() {
+            return null();
+        }
+        let Ok(id) = (unsafe { CStr::from_ptr(id) }).to_str() else {
+            return null();
+        };
+        let tags = app
+            .session
+            .doc
+            .objects()
+            .find(|o| o.id.to_string() == id || o.id.0.to_string() == id)
+            .and_then(|o| o.valid_edge_tags());
+        match tags {
+            Some(tags) => {
+                into_c_string(serde_json::to_string(tags).unwrap_or_else(|_| String::from("null")))
+            }
+            None => null(),
+        }
+    })
+}
+
 /// The subdivision source with short id `source`, if it has a link.
 fn subdivision_source(doc: &itsjustcad_doc::Document, source: &str) -> Option<itsjustcad_doc::ObjectId> {
     doc.subdivision_links.keys().find(|id| id.to_string() == source).copied()
@@ -5981,6 +6021,45 @@ mod headless_tests {
         unsafe {
             assert_eq!(ijc_box_select(h, 0.0, 0.0, 1.0, 1.0, false), -1, "headless has no drawable");
             assert_eq!(ijc_box_select(std::ptr::null_mut(), 0.0, 0.0, 1.0, 1.0, false), -1);
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn edge_tags_json_round_trip() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            for line in ["rect 0,0,0 600 450", "siteplan last"] {
+                let out = r(ijc_run_command_result(h, c(line).as_ptr()));
+                assert_eq!(out["ok"], true, "{line}: {out}");
+            }
+            let guard = handle_mut(h).unwrap();
+            let lot = guard
+                .session
+                .doc
+                .objects()
+                .find(|o| o.layer == "lots" && o.valid_edge_tags().is_some())
+                .expect("a tagged lot");
+            let (id, want) = (lot.id, serde_json::to_value(lot.valid_edge_tags()).unwrap());
+            drop(guard);
+            for key in [id.to_string(), id.0.to_string()] {
+                let tags = r(ijc_edge_tags_json(h, c(&key).as_ptr()));
+                assert_eq!(tags, want);
+                assert!(
+                    tags.as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["is_street"] == true && t["role"] == "front")
+                );
+            }
+            let null = serde_json::Value::Null;
+            assert_eq!(r(ijc_edge_tags_json(h, c("nope").as_ptr())), null);
+            assert_eq!(r(ijc_edge_tags_json(h, std::ptr::null())), null);
+            assert_eq!(
+                r(ijc_edge_tags_json(std::ptr::null_mut(), c("x").as_ptr())),
+                null
+            );
             ijc_free(h);
         }
     }

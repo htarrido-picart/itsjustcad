@@ -8,8 +8,10 @@
 //!
 //! The tags are carried in memory through `siteplan` / `lotgeneratesite` into
 //! subdivision, setbacks and frontage (lots inherit them via [`Block::inherit`]).
-//! They are NOT stored on the baked curves: a later `lotsubdivide` /
-//! `lotsetbacks` on a baked block or lot curve sees an untagged polygon.
+//! The baked block and lot curves store them as `SceneObject::edge_tags`, so
+//! `lotsetbacks` / `lotfrontage` / `lotbuilding` / the yield report on a baked
+//! curve read them back (`lot::doc_block`). `lotsubdivide` on a baked block
+//! still sees an untagged polygon.
 
 use crate::blocks::block_edge::BlockEdge;
 use crate::geometry::polygon2d::Polygon2d;

@@ -1189,6 +1189,26 @@ impl Default for LayerStyle {
     }
 }
 
+/// Street tag of one edge of a baked lot or block curve (#143). Edge `i` of a
+/// closed polyline runs from point `i` to point `i + 1` (wrapping).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EdgeTag {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_street: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub street_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub street_width: f64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_alley: bool,
+    /// Setback role from `classify_edges` (lots only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<subdivision::EdgeRole>,
+    /// Edge length at bake time: the fingerprint [`SceneObject::valid_edge_tags`]
+    /// checks the current curve against.
+    pub length: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SceneObject {
     pub id: ObjectId,
@@ -1214,12 +1234,88 @@ pub struct SceneObject {
     /// JSON loading (old files have no field → None).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineweight_mm: Option<f64>,
+    /// Per-edge street tags of a baked lot/block curve (#143). Read them through
+    /// [`SceneObject::valid_edge_tags`]. Serde default keeps old JSON loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_tags: Option<Vec<EdgeTag>>,
     pub geometry: Geometry,
+}
+
+impl SceneObject {
+    /// The stored edge tags, if they still describe the geometry: a closed
+    /// polyline with one edge per tag whose edge lengths are the baked ones up
+    /// to a single scale factor. Move/rotate/mirror/uniform scale keep the
+    /// vertex order and so keep the tags; any other edit (vertex edit, offset,
+    /// non-uniform scale, rebuild) breaks the fingerprint and the tags read as
+    /// absent. Undo restores the geometry and so the tags.
+    pub fn valid_edge_tags(&self) -> Option<&[EdgeTag]> {
+        let tags = self.edge_tags.as_deref()?;
+        let Geometry::Curve(Curve::Polyline {
+            points,
+            closed: true,
+        }) = &self.geometry
+        else {
+            return None;
+        };
+        let n = points.len();
+        if n != tags.len() || n < 3 {
+            return None;
+        }
+        let len = |i: usize| {
+            points[i]
+                .truncate()
+                .distance(points[(i + 1) % n].truncate())
+        };
+        let scale = (0..n).map(len).sum::<f64>() / tags.iter().map(|t| t.length).sum::<f64>();
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        let same =
+            (0..n).all(|i| (len(i) - tags[i].length * scale).abs() <= 1e-6 * len(i).max(1.0));
+        same.then_some(tags)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_tags_load_absent_and_follow_similar_geometry() {
+        let square = |k: f64| {
+            Geometry::Curve(Curve::Polyline {
+                points: [(0.0, 0.0), (k, 0.0), (k, 2.0 * k), (0.0, 2.0 * k)]
+                    .map(|(x, y)| DVec3::new(x, y, 0.0))
+                    .to_vec(),
+                closed: true,
+            })
+        };
+        let json = serde_json::json!({
+            "id": ObjectId::new(), "name": null, "geometry": square(1.0)
+        });
+        let mut obj: SceneObject = serde_json::from_value(json).unwrap();
+        assert_eq!(obj.edge_tags, None, "pre-#143 JSON loads untagged");
+        assert!(!serde_json::to_string(&obj).unwrap().contains("edge_tags"));
+
+        let tag = |length| EdgeTag {
+            is_street: false,
+            street_id: None,
+            street_width: 0.0,
+            is_alley: false,
+            role: None,
+            length,
+        };
+        obj.edge_tags = Some([1.0, 2.0, 1.0, 2.0].map(tag).to_vec());
+        assert!(obj.valid_edge_tags().is_some());
+        obj.geometry = square(3.0);
+        assert!(obj.valid_edge_tags().is_some(), "uniform scale keeps tags");
+        obj.geometry
+            .transform(&glam::DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0)), 0.01);
+        assert!(
+            obj.valid_edge_tags().is_none(),
+            "non-uniform scale drops tags"
+        );
+    }
 
     #[test]
     fn default_layer_color_index_zero_is_olive() {

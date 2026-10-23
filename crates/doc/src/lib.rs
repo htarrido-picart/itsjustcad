@@ -31,7 +31,7 @@ pub use object::{
     angle_degrees, angular_arc_points, angular_dim_segments, Annotation, AreaKind, BlockGeometry,
     ClipRect, DimAnchor,
     default_layer_color,
-    EndpointRef, FieldExpr, FrameKind, Geometry,
+    EdgeTag, EndpointRef, FieldExpr, FrameKind, Geometry,
     HatchPattern, HatchPatternDef, LayerStyle, LineType, MaterialPreset, ObjectId, ObjectMaterial,
     ParamBlockDef, ParamBlockParam, PatLine, SceneObject, DEFAULT_LAYER,
 };

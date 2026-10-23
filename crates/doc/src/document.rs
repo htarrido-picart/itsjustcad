@@ -770,6 +770,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Mesh(mesh),
         }
     }
@@ -784,6 +785,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(Curve::Line { a, b }),
         }
     }
@@ -857,6 +859,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Annotation(Annotation::LinearDim {
                 a: DimAnchor::Object { id: lid, which: EndpointRef::Start, last: DVec3::ZERO },
                 b: DimAnchor::Object {

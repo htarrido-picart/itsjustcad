@@ -19,10 +19,10 @@
 //! byte-identical lots (the subdivider is deterministic for a fixed seed).
 
 use glam::{DVec2, DVec3};
-use itsjustcad_doc::{Document, Geometry, LayerStyle, ObjectId, SceneObject};
+use itsjustcad_doc::{Document, EdgeTag, Geometry, LayerStyle, ObjectId, SceneObject};
 use kernel_curve::Curve;
 use subdivision::{
-    Block, Polygon2d, StreetPattern, SubdivisionMethod, SubdivisionSettings,
+    Block, BlockEdge, Polygon2d, StreetPattern, SubdivisionMethod, SubdivisionSettings,
 };
 
 /// Chord tolerance for tessellating a block boundary curve to a polygon.
@@ -55,6 +55,65 @@ pub fn polygon_to_curve(poly: &Polygon2d, z: f64) -> Curve {
     Curve::Polyline {
         points: poly.verts().iter().map(|v| DVec3::new(v.x, v.y, z)).collect(),
         closed: true,
+    }
+}
+
+/// The stored edge tags for a baked `block` (#143), in its polygon edge order
+/// (= the baked curve's point order, see [`polygon_to_curve`]). `None` when no
+/// edge is a street or alley, so untagged bakes store nothing. `roles` (lots
+/// only) records each edge's setback role.
+fn edge_tags_of(block: &Block, roles: bool) -> Option<Vec<EdgeTag>> {
+    if !block.edges.iter().any(|e| e.is_street || e.is_alley) {
+        return None;
+    }
+    let roles = roles.then(|| subdivision::classify_edges(block));
+    Some(
+        block
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(i, e)| EdgeTag {
+                is_street: e.is_street,
+                street_id: e.street_id,
+                street_width: e.street_width,
+                is_alley: e.is_alley,
+                role: roles.as_ref().and_then(|r| r.get(i).copied()),
+                length: e.length(),
+            })
+            .collect(),
+    )
+}
+
+/// A baked lot/block curve as a [`Block`]: `poly` (from [`curve_to_polygon`])
+/// tagged from the object's stored edge tags while they are valid, else
+/// untagged (the longest edge fronts, as before #143 phase 3).
+pub fn doc_block(obj: &SceneObject, poly: Polygon2d) -> Block {
+    let (Some(tags), Geometry::Curve(Curve::Polyline { points, .. })) =
+        (obj.valid_edge_tags(), &obj.geometry)
+    else {
+        return Block::untagged(poly);
+    };
+    let n = points.len();
+    let curve_edge = |i: usize| (points[i].truncate(), points[(i + 1) % n].truncate());
+    // Match by endpoints: `poly` runs the other way after a mirror.
+    let edges = poly
+        .edges()
+        .map(|(a, b)| {
+            let plain = BlockEdge::boundary(a, b);
+            (0..n)
+                .find(|&i| matches!(curve_edge(i), (p, q) if (p, q) == (a, b) || (p, q) == (b, a)))
+                .map_or(plain, |i| BlockEdge {
+                    is_street: tags[i].is_street,
+                    street_id: tags[i].street_id,
+                    street_width: tags[i].street_width,
+                    is_alley: tags[i].is_alley,
+                    ..plain
+                })
+        })
+        .collect();
+    Block {
+        polygon: poly,
+        edges,
     }
 }
 
@@ -271,6 +330,7 @@ pub fn insert_lots(doc: &mut Document, bake: &LotBake, ids: &[ObjectId]) {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: bake.lots.get(k).and_then(|l| edge_tags_of(l, true)),
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -381,6 +441,7 @@ pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], b
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(Curve::Polyline {
                 points: pts.iter().map(|v| DVec3::new(v.x, v.y, bake.z)).collect(),
                 closed: *closed,
@@ -391,7 +452,7 @@ pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], b
     // the block set so a re-generated site keeps each block's number.
     let polys: Vec<Polygon2d> = bake.blocks.iter().map(|b| b.polygon.clone()).collect();
     let block_idx = subdivision::ConsistentIndexing::new().assign(&polys);
-    for (k, (poly, id)) in polys.iter().zip(block_ids).enumerate() {
+    for (k, ((poly, block), id)) in polys.iter().zip(&bake.blocks).zip(block_ids).enumerate() {
         let idx = block_idx.get(k).copied().unwrap_or(k + 1);
         doc.insert(SceneObject {
             visible: true,
@@ -401,6 +462,7 @@ pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], b
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: edge_tags_of(block, false),
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -491,6 +553,7 @@ pub fn insert_setbacks(doc: &mut Document, bake: &SetbackBake, ids: &[ObjectId])
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -583,7 +646,7 @@ pub fn gather_yield_inputs(
 ) -> YieldInputs {
     let in_sel = |id: &ObjectId| sel_ids.is_empty() || sel_ids.contains(id);
 
-    let mut lot_polys: Vec<Polygon2d> = Vec::new();
+    let mut lots: Vec<Block> = Vec::new();
     let mut open_space_feature_areas: Vec<f64> = Vec::new();
     let mut reserved_block_areas: Vec<f64> = Vec::new();
     let mut building_gfas: Vec<f64> = Vec::new();
@@ -598,7 +661,7 @@ pub fn gather_yield_inputs(
                     && c.is_closed()
                     && let Some(p) = curve_to_polygon(c)
                 {
-                    lot_polys.push(p);
+                    lots.push(doc_block(obj, p));
                 }
             }
             OPENSPACE_LAYER => {
@@ -642,7 +705,7 @@ pub fn gather_yield_inputs(
         }
     }
 
-    let lot_area_sum: f64 = lot_polys.iter().map(|p| p.area()).sum();
+    let lot_area_sum: f64 = lots.iter().map(Block::area).sum();
     let open_space_sum: f64 =
         open_space_feature_areas.iter().chain(&reserved_block_areas).sum::<f64>();
     // Gross site: the largest user-drawn boundary when one exists (open space
@@ -652,14 +715,13 @@ pub fn gather_yield_inputs(
     let boundary = site_candidates.iter().copied().fold(0.0f64, f64::max);
     let gross_site_area = if boundary > 0.0 { boundary } else { lot_area_sum + open_space_sum };
 
-    let lots: Vec<Block> = lot_polys.iter().cloned().map(Block::untagged).collect();
     let lot_frontages: Vec<f64> = measure_frontage(&lots, subdivision::FrontageAt::Setback, settings)
         .into_iter()
         .map(|m| m.length)
         .collect();
 
     YieldInputs {
-        lot_areas: lot_polys.iter().map(|p| p.area()).collect(),
+        lot_areas: lots.iter().map(Block::area).collect(),
         lot_frontages,
         gross_site_area,
         open_space_feature_areas,
@@ -847,6 +909,7 @@ pub fn insert_open_space(doc: &mut Document, bake: &OpenSpaceBake, ids: &[Object
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -1011,6 +1074,7 @@ pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(polygon_to_curve(&b.footprint, b.z)),
         });
         // Mass (3D mesh). The name carries the GFA + footprint area so a later
@@ -1028,6 +1092,7 @@ pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Mesh(b.mass.clone()),
         });
         // Roof (3D mesh).
@@ -1039,6 +1104,7 @@ pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Mesh(b.roof.clone()),
         });
     }

@@ -698,6 +698,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Mesh(mesh),
         };
         let id = obj.id;
@@ -744,6 +745,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Parametric {
                 generator: cn,
                 params: cn_params.clone(),
@@ -766,6 +768,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Parametric {
                 generator: gd,
                 params: gd_params.clone(),
@@ -811,6 +814,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Mesh(kernel_mesh::make_box(
                 DVec3::ZERO,
                 DVec3::new(2.0, 1.0, 3.0),
@@ -841,6 +845,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Mesh(kernel_mesh::make_box(
                 DVec3::ZERO,
                 DVec3::new(2.0, 1.0, 3.0),
@@ -899,6 +904,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Hatch {
                 boundary: square.clone(),
                 pattern: itsjustcad_doc::HatchPattern::Solid,
@@ -917,6 +923,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Hatch {
                 boundary: square,
                 pattern: itsjustcad_doc::HatchPattern::Lines { angle_deg: 0.0, spacing: 0.5 },
@@ -943,6 +950,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::LinearDim {
                 a: itsjustcad_doc::DimAnchor::Free(DVec3::ZERO),
                 b: itsjustcad_doc::DimAnchor::Free(DVec3::X),
@@ -963,6 +971,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Text {
                 pos: DVec3::ZERO,
                 text: "note".into(),
@@ -1097,6 +1106,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Instance {
                 block: "tri".to_string(),
                 position: DVec3::new(5.0, 0.0, 0.0),
@@ -1131,6 +1141,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Instance {
                 block: "tri".to_string(),
                 position: DVec3::new(5.0, 0.0, 0.0),
@@ -1219,6 +1230,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Instance {
                 block: "quad".into(),
                 position: DVec3::ZERO,
@@ -1275,6 +1287,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
                 points: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
                 closed: true,
@@ -1308,6 +1321,7 @@ mod tests {
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
                     points: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
                     closed: false,

@@ -3032,6 +3032,7 @@ fn insert_curve(
         color: None,
         material: None,
         lineweight_mm: None,
+        edge_tags: None,
         geometry: Geometry::Curve(curve),
     });
     let outcome = ApplyOutcome {
@@ -3600,6 +3601,7 @@ fn mesh_object(doc: &mut Document, id: Option<ObjectId>, mesh: kernel_mesh::Mesh
         color: None,
         material: None,
         lineweight_mm: None,
+        edge_tags: None,
         geometry: Geometry::Mesh(mesh),
     });
     id
@@ -3639,6 +3641,7 @@ fn parametric_object(
         color: None,
         material: None,
         lineweight_mm: None,
+        edge_tags: None,
         geometry: Geometry::Parametric {
             generator,
             params,
@@ -3941,6 +3944,7 @@ fn replace_with_result(
         color: None,
         material: None,
         lineweight_mm: None,
+        edge_tags: None,
         geometry: Geometry::Mesh(result),
     });
     Ok((
@@ -4615,6 +4619,7 @@ fn section_meshes(
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(Curve::Polyline { points, closed }),
         });
     }
@@ -4627,6 +4632,7 @@ fn section_meshes(
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -4703,6 +4709,7 @@ fn exec_curvature_graph(
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(c),
         });
     };
@@ -5186,6 +5193,7 @@ fn exec_codecheck(
             color: Some(severity.marker_color()),
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(Curve::Polyline { points: circle, closed: true }),
         });
     }
@@ -5318,6 +5326,7 @@ fn exec_shadow_study(
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(Curve::Polyline { points: poly.pts.clone(), closed: true }),
         });
     }
@@ -5482,6 +5491,7 @@ fn exec_radiation(
             color: Some(color),
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Mesh(mesh),
         });
     }
@@ -5872,7 +5882,7 @@ fn regenerate_by_kind(
             crate::lot::ensure_lots_layer(doc);
             let lot_bake = crate::lot::LotBake {
                 polygons: lot_polys.clone(),
-                lots: Vec::new(),
+                lots: lots_z.iter().map(|(l, _)| l.clone()).collect(),
                 z: site.z,
                 with_street: 0,
                 slivers_merged: 0,
@@ -6570,7 +6580,7 @@ fn exec_lot_setbacks(
 
     // Gather closed lot polygons from the selection.
     let sel_ids = resolve(doc, &targets)?;
-    let mut lots: Vec<(subdivision::Polygon2d, f64)> = Vec::new();
+    let mut lots: Vec<(subdivision::Block, f64)> = Vec::new();
     for id in &sel_ids {
         if let Some(obj) = doc.get(*id)
             && let Geometry::Curve(c) = &obj.geometry
@@ -6583,7 +6593,7 @@ fn exec_lot_setbacks(
             } else {
                 pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
             };
-            lots.push((poly, z));
+            lots.push((crate::lot::doc_block(obj, poly), z));
         }
     }
     if lots.is_empty() {
@@ -6592,11 +6602,7 @@ fn exec_lot_setbacks(
         ));
     }
 
-    // Baked lot curves carry no street tags (yet): untagged → longest edge fronts.
-    let lots: Vec<(subdivision::Block, f64)> = lots
-        .into_iter()
-        .map(|(p, z)| (subdivision::Block::untagged(p), z))
-        .collect();
+    // Stored street tags (#143) pick the front; untagged → longest edge fronts.
     let bake = crate::lot::compute_setbacks(&lots, &settings).map_err(ExecError::Invalid)?;
 
     // envelope=off: report only, bake nothing (no logged geometry).
@@ -6706,7 +6712,7 @@ fn exec_lot_frontage(
 
     let settings = doc.subdivision_settings.clone();
     let sel_ids = resolve(doc, &targets)?;
-    let mut lots: Vec<subdivision::Polygon2d> = Vec::new();
+    let mut lots: Vec<subdivision::Block> = Vec::new();
     let mut zs: Vec<f64> = Vec::new();
     for id in &sel_ids {
         if let Some(obj) = doc.get(*id)
@@ -6720,7 +6726,7 @@ fn exec_lot_frontage(
             } else {
                 pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
             };
-            lots.push(poly);
+            lots.push(crate::lot::doc_block(obj, poly));
             zs.push(z);
         }
     }
@@ -6730,8 +6736,6 @@ fn exec_lot_frontage(
         ));
     }
 
-    let lots: Vec<subdivision::Block> =
-        lots.into_iter().map(subdivision::Block::untagged).collect();
     let measures = crate::lot::measure_frontage(&lots, at_enum, &settings);
     let at_label = match at_enum {
         subdivision::FrontageAt::Setback => "setback line",
@@ -6982,7 +6986,7 @@ fn exec_lot_building(
 
     // Gather closed lot polygons from the selection.
     let sel_ids = resolve(doc, &targets)?;
-    let mut lots: Vec<(subdivision::Polygon2d, f64)> = Vec::new();
+    let mut lots: Vec<(subdivision::Block, f64)> = Vec::new();
     for id in &sel_ids {
         if let Some(obj) = doc.get(*id)
             && let Geometry::Curve(c) = &obj.geometry
@@ -6995,7 +6999,7 @@ fn exec_lot_building(
             } else {
                 pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
             };
-            lots.push((poly, z));
+            lots.push((crate::lot::doc_block(obj, poly), z));
         }
     }
     if lots.is_empty() {
@@ -7004,10 +7008,6 @@ fn exec_lot_building(
         ));
     }
 
-    let lots: Vec<(subdivision::Block, f64)> = lots
-        .into_iter()
-        .map(|(p, z)| (subdivision::Block::untagged(p), z))
-        .collect();
     let bake = crate::lot::compute_buildings(&lots, &settings).map_err(ExecError::Invalid)?;
 
     // 3 objects per building (footprint + mass + roof).
@@ -7128,6 +7128,7 @@ fn exec_contours(
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(Curve::Polyline {
                 points: line.points.clone(),
                 closed: line.closed,
@@ -7335,6 +7336,7 @@ fn exec_flow_arrows(
             color: Some([0.15, 0.45, 0.9]),
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(Curve::Polyline { points: pts, closed: false }),
         });
     }
@@ -7426,6 +7428,7 @@ fn exec_ponding(
             color: Some([0.1, 0.35, 0.85]),
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(Curve::Polyline { points: circle, closed: true }),
         });
     }
@@ -7536,6 +7539,7 @@ fn exec_site_path(
         color: None,
         material: None,
         lineweight_mm: None,
+        edge_tags: None,
         geometry: Geometry::Mesh(kernel_mesh::Mesh::new(positions, faces)),
     });
     doc.generation += 1;
@@ -7847,6 +7851,7 @@ fn exec_sun_path(
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(Curve::Polyline {
                 points: line.pts.clone(),
                 closed: line.closed,
@@ -8004,6 +8009,7 @@ fn exec_sun_hours(
             color: Some(color),
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Mesh(mesh),
         });
     }
@@ -8168,6 +8174,7 @@ fn exec_face_sun_hours(
             color: Some(color),
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Mesh(mesh),
         });
     }
@@ -8275,6 +8282,7 @@ fn elevation_meshes(
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -9031,6 +9039,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Mesh(kernel_mesh::make_box(corner, size)),
             });
             Ok((
@@ -9071,6 +9080,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Mesh(extrude_profile(&profile2d, base_z, height)),
             });
             Ok((
@@ -9117,6 +9127,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -9180,6 +9191,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Mesh(mesh),
             });
             let message = if n_guides > 0 {
@@ -9228,6 +9240,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -9267,6 +9280,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -9303,6 +9317,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -9346,6 +9361,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -9384,6 +9400,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -10222,6 +10239,7 @@ fn apply_forward(
                 color: obj.color,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Curve(rebuilt),
             });
             Ok((
@@ -10276,6 +10294,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Annotation(Annotation::LinearDim {
                     a: anchor_a,
                     b: anchor_b,
@@ -10315,6 +10334,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Annotation(Annotation::AngularDim {
                     vertex,
                     p1,
@@ -10347,6 +10367,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Annotation(Annotation::Text {
                     pos,
                     text: text.clone(),
@@ -10379,6 +10400,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Annotation(Annotation::Field {
                     pos,
                     expr: expr.clone(),
@@ -10470,6 +10492,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Annotation(Annotation::Hatch {
                     boundary,
                     pattern: pattern.clone(),
@@ -10598,6 +10621,7 @@ fn apply_forward(
                     color: None,
                     material: None,
                     lineweight_mm: None,
+                    edge_tags: None,
                     geometry: Geometry::Curve(Curve::Polyline { points, closed: true }),
                 });
             }
@@ -10640,6 +10664,7 @@ fn apply_forward(
                     color: None,
                     material: None,
                     lineweight_mm: None,
+                    edge_tags: None,
                     geometry: Geometry::Annotation(Annotation::LinearDim {
                         a: DimAnchor::Free(*a),
                         b: DimAnchor::Free(*b),
@@ -10764,6 +10789,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Mesh(mesh),
             });
             let path = if exact {
@@ -11035,6 +11061,7 @@ fn apply_forward(
                         color: e.obj.color,
                         material: e.obj.material,
                         lineweight_mm: e.obj.lineweight_mm,
+                        edge_tags: None,
                         geometry: Geometry::Curve(seg),
                     });
                 }
@@ -11270,6 +11297,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Annotation(Annotation::LinearDim {
                     a: anchor_a,
                     b: anchor_b,
@@ -11355,6 +11383,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Points { positions },
             });
             Ok((
@@ -11396,6 +11425,7 @@ fn apply_forward(
                     color: None,
                     material: None,
                     lineweight_mm: None,
+                    edge_tags: None,
                     geometry: Geometry::Curve(piece),
                 });
             }
@@ -11505,6 +11535,7 @@ fn apply_forward(
                         color: None,
                         material: None,
                         lineweight_mm: None,
+                        edge_tags: None,
                         geometry: Geometry::Curve(cur),
                     });
                     extended += 1;
@@ -11555,6 +11586,7 @@ fn apply_forward(
                         color: None,
                         material: None,
                         lineweight_mm: None,
+                        edge_tags: None,
                         geometry: Geometry::Curve(piece.clone()),
                     });
                 }
@@ -11646,6 +11678,7 @@ fn apply_forward(
                     color: None,
                     material: None,
                     lineweight_mm: None,
+                    edge_tags: None,
                     geometry: Geometry::Curve(piece.clone()),
                 });
             }
@@ -11725,7 +11758,17 @@ fn apply_forward(
                 }
             }
             let id = id.unwrap_or_default();
-            doc.insert(SceneObject { id, name, layer, visible: true, color: None, material: None, lineweight_mm: None, geometry: Geometry::Curve(joined) });
+            doc.insert(SceneObject {
+                id,
+                name,
+                layer,
+                visible: true,
+                color: None,
+                material: None,
+                lineweight_mm: None,
+                edge_tags: None,
+                geometry: Geometry::Curve(joined),
+            });
             Ok((
                 Command::Join { id: Some(id), targets },
                 Inverse::Replace { created: vec![id], consumed },
@@ -11808,6 +11851,7 @@ fn apply_forward(
                     color: None,
                     material: None,
                     lineweight_mm: None,
+                    edge_tags: None,
                     geometry: Geometry::Curve(joined),
                 });
                 return Ok((
@@ -11846,6 +11890,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Curve(arc),
             });
             Ok((
@@ -11905,6 +11950,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Curve(bevel),
             });
             Ok((
@@ -11974,6 +12020,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Curve(offset),
             });
             Ok((
@@ -13948,6 +13995,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -13978,6 +14026,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Points { positions: positions.clone() },
             });
             Ok((
@@ -14071,6 +14120,7 @@ fn apply_forward(
                     color: None,
                     material: None,
                     lineweight_mm: None,
+                    edge_tags: None,
                     geometry: Geometry::Instance {
                         block: key.clone(),
                         position,
@@ -14105,6 +14155,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Instance {
                     block: name.clone(),
                     position,
@@ -14384,6 +14435,7 @@ fn apply_forward(
                         color: inst.color,
                         material: inst.material,
                         lineweight_mm: inst.lineweight_mm,
+                        edge_tags: None,
                         geometry,
                     });
                 }
@@ -14500,6 +14552,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Instance {
                     block: name.clone(),
                     position: pos,
@@ -14663,6 +14716,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry,
             });
             doc.generation += 1;
@@ -15024,6 +15078,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Frame {
                     kind,
                     a,
@@ -15086,6 +15141,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Area {
                     kind,
                     boundary: boundary.clone(),
@@ -15167,6 +15223,7 @@ fn apply_forward(
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Curve(Curve::Polyline { points: centerline, closed: false }),
             });
             let runs = layout
@@ -15369,6 +15426,7 @@ fn apply_forward(
                     color: None,
                     material: None,
                     lineweight_mm: None,
+                    edge_tags: None,
                     geometry: Geometry::Area {
                         kind: AreaKind::Wall,
                         boundary,
@@ -26516,6 +26574,220 @@ mod tests {
         for id in &new_ids {
             assert!(s.doc.get(*id).is_none(), "refreshed object {id:?} removed by undo");
         }
+    }
+
+    /// #143 phase 3: a siteplan's baked lots and blocks store per-edge street
+    /// tags; they survive save/load and replay byte-for-byte.
+    #[test]
+    fn siteplan_stores_edge_tags_through_save_load_and_replay() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        run(&mut s, "siteplan last");
+        let on = |layer: &str| -> Vec<&SceneObject> {
+            s.doc.objects().filter(|o| o.layer == layer).collect()
+        };
+        let lots = on(crate::lot::LOTS_LAYER);
+        let tagged: Vec<_> = lots.iter().filter_map(|o| o.valid_edge_tags()).collect();
+        assert!(!tagged.is_empty(), "baked lots carry tags");
+        for tags in &tagged {
+            assert!(
+                tags.iter().any(|t| t.is_street),
+                "a stored lot fronts a street"
+            );
+            for t in tags.iter() {
+                assert!(t.role.is_some(), "lots record each edge's role");
+                if t.role == Some(subdivision::EdgeRole::Front) {
+                    assert!(t.is_street, "only a street edge is a front");
+                }
+            }
+        }
+        assert!(
+            on(crate::lot::BLOCKS_LAYER)
+                .iter()
+                .any(|o| o.valid_edge_tags().is_some()),
+            "baked blocks carry tags"
+        );
+
+        let json = serde_json::to_string(&s.doc).unwrap();
+        let loaded: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            serde_json::to_string(&loaded).unwrap(),
+            json,
+            "byte-stable round trip"
+        );
+        assert_eq!(
+            s.doc.objects().collect::<Vec<_>>(),
+            loaded.objects().collect::<Vec<_>>()
+        );
+
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(
+            s.doc.objects().collect::<Vec<_>>(),
+            replayed.doc.objects().collect::<Vec<_>>()
+        );
+    }
+
+    /// The baked siteplan lot whose stored street tags pick a different front
+    /// than the untagged longest-edge rule (so the read path is observable).
+    fn lot_where_tags_matter(s: &Session) -> (ObjectId, subdivision::Block, subdivision::Block) {
+        let settings = &s.doc.subdivision_settings;
+        s.doc
+            .objects()
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER && o.valid_edge_tags().is_some())
+            .find_map(|o| {
+                let Geometry::Curve(c) = &o.geometry else {
+                    return None;
+                };
+                let poly = crate::lot::curve_to_polygon(c)?;
+                let tagged = crate::lot::doc_block(o, poly.clone());
+                let plain = subdivision::Block::untagged(poly);
+                let at = subdivision::FrontageAt::Curb;
+                let f = |b: &subdivision::Block| subdivision::frontage(b, at, settings);
+                ((f(&tagged) - f(&plain)).abs() > 1e-6).then_some((o.id, tagged, plain))
+            })
+            .expect("a lot whose street front is not its longest edge")
+    }
+
+    /// lotsetbacks / lotfrontage / yield on baked siteplan lots read the stored
+    /// tags: the front is the street edge, not a boundary-only longest edge.
+    #[test]
+    fn baked_lot_commands_read_stored_street_tags() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        run(&mut s, "siteplan last");
+        let (id, tagged, plain) = lot_where_tags_matter(&s);
+        assert!(tagged.has_street() && !plain.has_street());
+        let settings = s.doc.subdivision_settings.clone();
+        let z = 0.0;
+
+        let out = s
+            .run(Command::LotSetbacks {
+                targets: Selector::Ids { ids: vec![id] },
+                front: None,
+                side: None,
+                streetside: None,
+                rear: None,
+                buildto: None,
+                envelope: None,
+                ids: None,
+            })
+            .expect("lotsetbacks");
+        let env = crate::lot::compute_setbacks(&[(tagged.clone(), z)], &settings).unwrap();
+        let untagged = crate::lot::compute_setbacks(&[(plain.clone(), z)], &settings).unwrap();
+        assert_ne!(
+            env.envelopes, untagged.envelopes,
+            "tags change the envelope"
+        );
+        let Geometry::Curve(baked) = &s.doc.get(out.created[0]).unwrap().geometry else {
+            panic!("envelope curve")
+        };
+        assert_eq!(
+            crate::lot::curve_to_polygon(baked).unwrap().verts(),
+            env.envelopes[0].verts(),
+            "lotsetbacks used the stored tags"
+        );
+
+        let yi = crate::lot::gather_yield_inputs(&s.doc, &[id], &settings);
+        let at = subdivision::FrontageAt::Setback;
+        let want = crate::lot::measure_frontage(&[tagged], at, &settings)[0].length;
+        assert_eq!(
+            yi.lot_frontages,
+            vec![want],
+            "yield frontage from the street edge"
+        );
+
+        s.run(Command::LotFrontage {
+            targets: Selector::Ids { ids: vec![id] },
+            at: None,
+        })
+        .expect("lotfrontage");
+        let report = &s.doc.analysis_reports["lotfrontage"];
+        assert!(
+            (report.max - want).abs() < 1e-9,
+            "lotfrontage on the street edge"
+        );
+    }
+
+    /// Rigid transforms keep the tags (mirror included); a vertex edit drops
+    /// them; undo restores them, as does undoing a delete.
+    #[test]
+    fn edge_tags_follow_transforms_drop_on_edits_and_undo() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        run(&mut s, "siteplan last");
+        let (id, tagged, _) = lot_where_tags_matter(&s);
+        let settings = s.doc.subdivision_settings.clone();
+        let at = subdivision::FrontageAt::Curb;
+        let front = subdivision::frontage(&tagged, at, &settings);
+        let target = || Selector::Ids { ids: vec![id] };
+        let reread = |s: &Session| {
+            let o = s.doc.get(id).unwrap();
+            let Geometry::Curve(c) = &o.geometry else {
+                unreachable!()
+            };
+            crate::lot::doc_block(o, crate::lot::curve_to_polygon(c).unwrap())
+        };
+
+        s.run(Command::Move {
+            targets: target(),
+            delta: DVec3::new(7.0, -3.0, 0.0),
+        })
+        .unwrap();
+        s.run(Command::Mirror {
+            targets: target(),
+            plane: MirrorPlane::Yz,
+        })
+        .unwrap();
+        assert!(
+            s.doc.get(id).unwrap().valid_edge_tags().is_some(),
+            "kept by move + mirror"
+        );
+        let b = reread(&s);
+        assert!(
+            (subdivision::frontage(&b, at, &settings) - front).abs() < 1e-6,
+            "same front"
+        );
+
+        let Geometry::Curve(Curve::Polyline { points, .. }) = &s.doc.get(id).unwrap().geometry
+        else {
+            panic!("polyline lot")
+        };
+        let p = points[0] + DVec3::new(1.5, 0.7, 0.0);
+        s.run(Command::SetPoint {
+            target: target(),
+            index: 0,
+            position: p,
+        })
+        .unwrap();
+        assert!(
+            s.doc.get(id).unwrap().valid_edge_tags().is_none(),
+            "vertex edit drops tags"
+        );
+        assert!(!reread(&s).has_street(), "edited lot reads untagged");
+
+        run(&mut s, "undo");
+        assert!(
+            s.doc.get(id).unwrap().valid_edge_tags().is_some(),
+            "undo restores tags"
+        );
+
+        s.run(Command::Delete { targets: target() }).unwrap();
+        run(&mut s, "undo");
+        assert!(
+            s.doc.get(id).unwrap().valid_edge_tags().is_some(),
+            "undo delete keeps tags"
+        );
+    }
+
+    /// Untagged bakes store nothing, and an old object without the field loads
+    /// and behaves as before (longest edge fronts).
+    #[test]
+    fn untagged_lotsubdivide_stores_no_edge_tags() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0,0 40,0,0 40,30,0 0,30,0 close");
+        run(&mut s, "lotsubdivide last area=200 width=10");
+        assert!(s.doc.objects().all(|o| o.edge_tags.is_none()));
+        assert!(!serde_json::to_string(&s.doc).unwrap().contains("edge_tags"));
     }
 
     #[test]

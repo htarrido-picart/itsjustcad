@@ -43,7 +43,8 @@ use crate::settings::SubdivisionSettings;
 use glam::DVec2;
 
 /// The role a lot edge plays for setback purposes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EdgeRole {
     /// Fronts the primary street (or, for an untagged lot, the longest edge).
     Front,
