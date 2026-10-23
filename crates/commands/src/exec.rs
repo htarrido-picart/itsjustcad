@@ -27791,11 +27791,17 @@ mod tests {
                     unreachable!()
                 };
                 let p = m.positions();
-                let (lo, hi) = p.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
-                    (a.min(v.z), b.max(v.z))
-                });
                 let c = p.iter().map(|v| v.truncate()).sum::<glam::DVec2>() / p.len() as f64;
-                (c, ((hi - lo) / 3.0).round() as usize)
+                // Floors from the name's GFA / footprint (no step-backs or
+                // courtyard here); the mesh height now includes the roof.
+                let val = |key: &str| -> f64 {
+                    let name = o.name.as_deref().unwrap();
+                    name.split_whitespace()
+                        .find_map(|t| t.strip_prefix(key))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap()
+                };
+                (c, (val("gfa=") / val("fp=")).round() as usize)
             })
             .collect()
     }
