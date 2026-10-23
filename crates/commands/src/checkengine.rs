@@ -1477,6 +1477,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Mesh(mesh),
         }
     }

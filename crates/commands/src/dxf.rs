@@ -2317,6 +2317,7 @@ mod tests {
                 color: None,
                 material: None,
                 lineweight_mm: None,
+                edge_tags: None,
                 geometry: Geometry::Instance {
                     block: "seg".into(),
                     position: DVec3::ZERO,

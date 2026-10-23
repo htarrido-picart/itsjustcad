@@ -154,6 +154,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Mesh(kernel_mesh::make_box(
                 DVec3::ZERO,
                 DVec3::new(1.0, 1.0, 1.0),
@@ -231,6 +232,7 @@ mod tests {
             color: None,
             material: None,
             lineweight_mm: None,
+            edge_tags: None,
             geometry: Geometry::Instance {
                 block: "blk".to_string(),
                 position: origin,

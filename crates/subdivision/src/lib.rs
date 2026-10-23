@@ -97,7 +97,7 @@ pub use subdivision::offset_sub::{
     subdivide as subdivide_offset, subdivide_block as subdivide_offset_block,
 };
 pub use subdivision::setbacks::{
-    buildable_envelope, frontage, EdgeRole, Envelope, FrontageAt,
+    EdgeRole, Envelope, FrontageAt, buildable_envelope, classify_edges, frontage,
 };
 pub use subdivision::skeleton_sub::{
     subdivide as subdivide_skeleton, subdivide_block as subdivide_skeleton_block,
