@@ -305,7 +305,7 @@ pub fn subdivide_width_mix(
         pieces = next;
     }
 
-    let block_edges: Vec<(DVec2, DVec2)> = block.polygon.edges().collect();
+    let block_edges = block.frontage_edges();
     let lots: Vec<Lot> = pieces
         .into_iter()
         .map(|p| {

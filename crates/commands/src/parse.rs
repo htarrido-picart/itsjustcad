@@ -2878,6 +2878,7 @@ fn parse_lotsetbacks(args: &[&str]) -> Result<Command, ParseError> {
 
     let mut front = None;
     let mut side = None;
+    let mut streetside = None;
     let mut rear = None;
     let mut buildto = None;
     let mut envelope = None;
@@ -2885,20 +2886,21 @@ fn parse_lotsetbacks(args: &[&str]) -> Result<Command, ParseError> {
         let Some((k, v)) = tok.split_once('=') else {
             return wrong(
                 "lotsetbacks",
-                "front/side/rear/buildto/envelope params",
+                "front/side/streetside/rear/buildto/envelope params",
                 args,
             );
         };
         match k.to_lowercase().as_str() {
             "front" | "setback_front" => front = Some(number(v)?),
             "side" | "setback_side" => side = Some(number(v)?),
+            "streetside" | "setback_street_side" => streetside = Some(number(v)?),
             "rear" | "setback_rear" => rear = Some(number(v)?),
             "buildto" | "build_to" | "build_to_line" | "buildtoline" => buildto = Some(number(v)?),
             "envelope" | "env" => envelope = Some(parse_bool(v)?),
             _ => {
                 return wrong(
                     "lotsetbacks",
-                    "front/side/rear/buildto/envelope params",
+                    "front/side/streetside/rear/buildto/envelope params",
                     args,
                 )
             }
@@ -2908,6 +2910,7 @@ fn parse_lotsetbacks(args: &[&str]) -> Result<Command, ParseError> {
         targets,
         front,
         side,
+        streetside,
         rear,
         buildto,
         envelope,

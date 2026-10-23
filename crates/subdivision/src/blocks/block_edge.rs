@@ -8,9 +8,10 @@
 //! rear-lane (alley) tier tags its edges `is_alley == true`.
 //!
 //! Skeleton subdivision, corner-lot assignment, front/alley loading, and
-//! frontage measurement are unimplementable without this,
-//! so it is built now and carried through the bake so a downstream
-//! `lotsubdivide` on a generated block sees the same tags.
+//! frontage measurement are unimplementable without this. The tags travel in
+//! memory from site generation through subdivision, setbacks and frontage
+//! (`siteplan`); they are not yet stored on baked curves, so a later
+//! `lotsubdivide` on a baked block sees it untagged.
 
 use glam::DVec2;
 

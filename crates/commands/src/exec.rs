@@ -5831,14 +5831,17 @@ fn regenerate_by_kind(
 
             // Step 2: subdivide EACH block (skip a block that fails — too
             // small, etc. — never abort the whole plan).
+            // Lots keep their block's street tags so setbacks front the roads.
             let mut lot_polys: Vec<subdivision::Polygon2d> = Vec::new();
+            let mut lots_z: Vec<(subdivision::Block, f64)> = Vec::new();
             for b in &site.blocks {
-                if let Ok(lb) = crate::lot::subdivide_blocks(&[(b.clone(), site.z)], settings) {
+                if let Ok(lb) =
+                    crate::lot::subdivide_tagged_blocks(&[(b.clone(), site.z)], settings)
+                {
                     lot_polys.extend(lb.polygons);
+                    lots_z.extend(lb.lots.into_iter().map(|l| (l, site.z)));
                 }
             }
-            let lots_z: Vec<(subdivision::Polygon2d, f64)> =
-                lot_polys.iter().map(|p| (p.clone(), site.z)).collect();
 
             // Steps 3 + 4: setbacks + buildings (robust: empty on failure, never abort the plan).
             let setbacks = crate::lot::compute_setbacks(&lots_z, settings).ok();
@@ -5869,6 +5872,7 @@ fn regenerate_by_kind(
             crate::lot::ensure_lots_layer(doc);
             let lot_bake = crate::lot::LotBake {
                 polygons: lot_polys.clone(),
+                lots: Vec::new(),
                 z: site.z,
                 with_street: 0,
                 slivers_merged: 0,
@@ -6154,6 +6158,7 @@ fn exec_lot_settings(
             // Setbacks — sticky so they replay + feed lotbuilding.
             "front" | "setback_front" => s.setback_front = num()?,
             "side" | "setback_side" => s.setback_side = num()?,
+            "streetside" | "setback_street_side" => s.setback_street_side = Some(num()?),
             "rear" | "setback_rear" => s.setback_rear = num()?,
             "buildto" | "build_to" | "build_to_line" => s.build_to_line = num()?,
             // Buildings.
@@ -6480,13 +6485,11 @@ fn exec_site_plan(
     let n_roads = site.roads.len();
     let n_blocks = site.blocks.len();
     let mut n_lots = 0usize;
-    let mut lots_z: Vec<(subdivision::Polygon2d, f64)> = Vec::new();
+    let mut lots_z: Vec<(subdivision::Block, f64)> = Vec::new();
     for b in &site.blocks {
-        if let Ok(lb) = crate::lot::subdivide_blocks(&[(b.clone(), site.z)], &settings) {
+        if let Ok(lb) = crate::lot::subdivide_tagged_blocks(&[(b.clone(), site.z)], &settings) {
             n_lots += lb.polygons.len();
-            for p in lb.polygons {
-                lots_z.push((p, site.z));
-            }
+            lots_z.extend(lb.lots.into_iter().map(|l| (l, site.z)));
         }
     }
     let n_env = crate::lot::compute_setbacks(&lots_z, &settings)
@@ -6540,6 +6543,7 @@ fn exec_lot_setbacks(
     targets: Selector,
     front: Option<f64>,
     side: Option<f64>,
+    streetside: Option<f64>,
     rear: Option<f64>,
     buildto: Option<f64>,
     envelope: Option<bool>,
@@ -6552,6 +6556,9 @@ fn exec_lot_setbacks(
     }
     if let Some(s) = side {
         settings.setback_side = s;
+    }
+    if streetside.is_some() {
+        settings.setback_street_side = streetside;
     }
     if let Some(r) = rear {
         settings.setback_rear = r;
@@ -6585,6 +6592,11 @@ fn exec_lot_setbacks(
         ));
     }
 
+    // Baked lot curves carry no street tags (yet): untagged → longest edge fronts.
+    let lots: Vec<(subdivision::Block, f64)> = lots
+        .into_iter()
+        .map(|(p, z)| (subdivision::Block::untagged(p), z))
+        .collect();
     let bake = crate::lot::compute_setbacks(&lots, &settings).map_err(ExecError::Invalid)?;
 
     // envelope=off: report only, bake nothing (no logged geometry).
@@ -6609,7 +6621,16 @@ fn exec_lot_setbacks(
         // Not baked → nothing to undo; report through a no-op logged op with no
         // created ids (envelope=off with ids=None means replay recomputes only).
         return Ok((
-            Command::LotSetbacks { targets, front, side, rear, buildto, envelope, ids: Some(Vec::new()) },
+            Command::LotSetbacks {
+                targets,
+                front,
+                side,
+                streetside,
+                rear,
+                buildto,
+                envelope,
+                ids: Some(Vec::new()),
+            },
             Inverse::CreatedOnLayer { created: Vec::new(), layers_created: Vec::new() },
             ApplyOutcome { message: msg, created: Vec::new() },
         ));
@@ -6633,6 +6654,7 @@ fn exec_lot_setbacks(
             targets,
             front,
             side,
+            streetside,
             rear,
             buildto,
             envelope,
@@ -6708,6 +6730,8 @@ fn exec_lot_frontage(
         ));
     }
 
+    let lots: Vec<subdivision::Block> =
+        lots.into_iter().map(subdivision::Block::untagged).collect();
     let measures = crate::lot::measure_frontage(&lots, at_enum, &settings);
     let at_label = match at_enum {
         subdivision::FrontageAt::Setback => "setback line",
@@ -6980,6 +7004,10 @@ fn exec_lot_building(
         ));
     }
 
+    let lots: Vec<(subdivision::Block, f64)> = lots
+        .into_iter()
+        .map(|(p, z)| (subdivision::Block::untagged(p), z))
+        .collect();
     let bake = crate::lot::compute_buildings(&lots, &settings).map_err(ExecError::Invalid)?;
 
     // 3 objects per building (footprint + mass + roof).
@@ -12996,8 +13024,8 @@ fn apply_forward(
             doc, targets, pattern, roadwidth, blockdepth, alleys, seed, road_ids, block_ids,
         ),
         Command::SitePlan { targets, ids } => exec_site_plan(doc, targets, ids),
-        Command::LotSetbacks { targets, front, side, rear, buildto, envelope, ids } => {
-            exec_lot_setbacks(doc, targets, front, side, rear, buildto, envelope, ids)
+        Command::LotSetbacks { targets, front, side, streetside, rear, buildto, envelope, ids } => {
+            exec_lot_setbacks(doc, targets, front, side, streetside, rear, buildto, envelope, ids)
         }
         Command::LotFrontage { targets, at } => exec_lot_frontage(doc, targets, at),
         Command::LotReport { targets, compare } => exec_lot_report(doc, targets, compare),

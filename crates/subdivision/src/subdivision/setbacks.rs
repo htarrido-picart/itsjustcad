@@ -6,8 +6,11 @@
 //! Given a lot polygon + its edge street-tags, compute the **buildable
 //! envelope** = the lot inset by a per-edge setback:
 //!
-//! - **front** setback from the STREET-tagged edge(s),
-//! - **rear** from the edge opposite the front,
+//! - **front** setback from the PRIMARY street edge(s): the widest street the
+//!   lot touches (ties → the longer edge),
+//! - **street side** setback (`setback_street_side`) from any other street edge
+//!   (the flank of a corner lot),
+//! - **rear** from the edge opposite the primary front,
 //! - **side** from every remaining edge (euro_latam side = 0 → party-wall
 //!   / `medianería`: no side inset by default, envelope spans the full width).
 //!
@@ -42,8 +45,10 @@ use glam::DVec2;
 /// The role a lot edge plays for setback purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeRole {
-    /// Fronts a street (or, for an untagged lot, the longest edge).
+    /// Fronts the primary street (or, for an untagged lot, the longest edge).
     Front,
+    /// Fronts a secondary street (the flank of a corner lot).
+    StreetSide,
     /// Opposite the front.
     Rear,
     /// A side edge (party-wall in euro_latam: side setback 0).
@@ -85,10 +90,14 @@ impl Envelope {
 /// Classify every contour edge of `lot` (using its street tags) as
 /// Front / Rear / Side. Returns one role per polygon edge, in CCW edge order.
 ///
-/// - Street-tagged edges → Front.
+/// - The primary street edge (widest street; ties → longest edge) → Front,
+///   together with the other edges of that same street facing the same way
+///   (within 60°, e.g. a curb split by a lot vertex or a gentle bulb).
+/// - Every other street-tagged edge → StreetSide.
 /// - If the lot is untagged, the single **longest** edge → Front.
-/// - The edge whose outward normal is most anti-parallel to the front's outward
-///   normal → Rear (the "opposite" edge).
+/// - The non-street edge whose outward normal is most anti-parallel to the
+///   front's outward normal → Rear (the "opposite" edge); any non-front edge
+///   when every other edge is a street.
 /// - Everything else → Side.
 pub fn classify_edges(lot: &Block) -> Vec<EdgeRole> {
     let poly = &lot.polygon;
@@ -97,13 +106,30 @@ pub fn classify_edges(lot: &Block) -> Vec<EdgeRole> {
         return Vec::new();
     }
     let verts = poly.verts();
-    let has_tags = lot.edges.iter().any(|e| e.is_street);
+    let tags: Vec<Option<&BlockEdge>> = (0..n).map(|i| street_tag(&lot.edges, poly, i)).collect();
+
+    // Primary front: the street edge on the widest street, ties → the longer
+    // edge (deterministic: first on ties).
+    let mut primary: Option<(usize, f64, f64)> = None;
+    for (i, tag) in tags.iter().enumerate() {
+        let Some(t) = tag else { continue };
+        let len = verts[i].distance(verts[(i + 1) % n]);
+        let better = primary.is_none_or(|(_, w, l)| {
+            t.street_width > w + 1e-9 || ((t.street_width - w).abs() <= 1e-9 && len > l + 1e-12)
+        });
+        if better {
+            primary = Some((i, t.street_width, len));
+        }
+    }
 
     // Front edges.
     let mut is_front = vec![false; n];
-    if has_tags {
+    if let Some((p, _, _)) = primary {
+        let (p_id, p_normal) = (tags[p].and_then(|t| t.street_id), outward_normal(verts, p));
         for (i, front) in is_front.iter_mut().enumerate() {
-            *front = edge_is_street(&lot.edges, poly, i);
+            *front = tags[i].is_some_and(|t| {
+                t.street_id == p_id && outward_normal(verts, i).dot(p_normal) > 0.5
+            });
         }
     } else {
         // Longest edge is the front (deterministic: first on ties).
@@ -132,12 +158,14 @@ pub fn classify_edges(lot: &Block) -> Vec<EdgeRole> {
         outward_normal(verts, 0)
     };
 
-    // Rear: the non-front edge whose outward normal is most anti-parallel to the
-    // front normal (dot most negative). None if no non-front edge exists.
+    // Rear: the non-street edge whose outward normal is most anti-parallel to
+    // the front normal (dot most negative); any non-front edge when every other
+    // edge is a street. None if no non-front edge exists.
+    let all_streets = (0..n).all(|i| is_front[i] || tags[i].is_some());
     let mut rear = None;
     let mut rear_dot = f64::INFINITY;
     for (i, &front) in is_front.iter().enumerate() {
-        if front {
+        if front || (tags[i].is_some() && !all_streets) {
             continue;
         }
         let d = outward_normal(verts, i).dot(front_normal);
@@ -153,6 +181,8 @@ pub fn classify_edges(lot: &Block) -> Vec<EdgeRole> {
                 EdgeRole::Front
             } else if Some(i) == rear {
                 EdgeRole::Rear
+            } else if tags[i].is_some() {
+                EdgeRole::StreetSide
             } else {
                 EdgeRole::Side
             }
@@ -180,6 +210,7 @@ fn setback_for(role: EdgeRole, settings: &SubdivisionSettings) -> f64 {
         EdgeRole::Front => settings.setback_front,
         EdgeRole::Rear => settings.setback_rear,
         EdgeRole::Side => settings.setback_side,
+        EdgeRole::StreetSide => settings.street_side_setback(),
     }
     .max(0.0)
 }
@@ -338,14 +369,15 @@ fn front_setback_extent(
     total
 }
 
-/// Whether contour edge `i` of `poly` is street-tagged in `edges` (matched by
-/// endpoint geometry, robust to reordering). Mirrors `skeleton_sub`.
-fn edge_is_street(edges: &[BlockEdge], poly: &Polygon2d, i: usize) -> bool {
+/// The street tag of contour edge `i` of `poly`, if it is street-tagged in
+/// `edges` (matched by endpoint geometry, robust to reordering). Mirrors
+/// `skeleton_sub`.
+fn street_tag<'a>(edges: &'a [BlockEdge], poly: &Polygon2d, i: usize) -> Option<&'a BlockEdge> {
     let verts = poly.verts();
     let n = verts.len();
     let a = verts[i];
     let b = verts[(i + 1) % n];
-    edges.iter().any(|e| {
+    edges.iter().find(|e| {
         e.is_street
             && ((e.a.distance(a) < 1e-6 && e.b.distance(b) < 1e-6)
                 || (e.a.distance(b) < 1e-6 && e.b.distance(a) < 1e-6))
@@ -550,5 +582,57 @@ mod tests {
             a.polygon.map(|p| p.verts().to_vec()),
             b.polygon.map(|p| p.verts().to_vec())
         );
+    }
+
+    /// A `w × d` rect lot whose edges listed in `streets` (edge index, street
+    /// id, street width) are street-tagged. Edges: 0 bottom, 1 right, 2 top, 3 left.
+    fn rect_tagged(w: f64, d: f64, streets: &[(usize, u32, f64)]) -> Block {
+        let mut lot = Block::untagged(rect(w, d));
+        for &(i, id, width) in streets {
+            let e = &mut lot.edges[i];
+            e.is_street = true;
+            e.street_id = Some(id);
+            e.street_width = width;
+        }
+        lot
+    }
+
+    #[test]
+    fn corner_lot_gets_one_front_and_a_street_side() {
+        use EdgeRole::*;
+        // Bottom (30 m) on a 20 m street, left (40 m) on a 12 m street: the wider
+        // street is the primary front, the other a street side, the rear opposite.
+        let lot = rect_tagged(30.0, 40.0, &[(0, 1, 20.0), (3, 2, 12.0)]);
+        assert_eq!(classify_edges(&lot), vec![Front, Side, Rear, StreetSide]);
+        // Equal widths → the longer edge (left, 40 m) is the front.
+        let lot = rect_tagged(30.0, 40.0, &[(0, 1, 12.0), (3, 2, 12.0)]);
+        assert_eq!(classify_edges(&lot), vec![StreetSide, Rear, Side, Front]);
+        // Street side uses `setback_street_side`: front 5 (left), street side 4
+        // (bottom), side 1 (top), rear 2 (right) → (30-5-2) * (40-4-1) = 805.
+        let s = SubdivisionSettings {
+            setback_street_side: Some(4.0),
+            ..settings(5.0, 1.0, 2.0)
+        };
+        assert!((buildable_envelope(&lot, &s).area() - 805.0).abs() < 1e-6);
+        // Frontage counts the primary front only (the 40 m curb).
+        assert!((frontage(&lot, FrontageAt::Curb, &s) - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn boundary_edge_is_not_front_when_tags_exist() {
+        use EdgeRole::*;
+        // Only the short top edge is a street: it is the front even though the
+        // untagged-boundary bottom/sides are longer.
+        let lot = rect_tagged(10.0, 40.0, &[(2, 1, 12.0)]);
+        assert_eq!(classify_edges(&lot), vec![Rear, Side, Front, Side]);
+    }
+
+    #[test]
+    fn untagged_lot_fronts_its_longest_edge() {
+        use EdgeRole::*;
+        let lot = Block::untagged(rect(30.0, 40.0));
+        assert_eq!(classify_edges(&lot), vec![Side, Front, Side, Rear]);
+        // Street side falls back to the side setback when unset.
+        assert_eq!(settings(5.0, 3.0, 7.0).street_side_setback(), 3.0);
     }
 }

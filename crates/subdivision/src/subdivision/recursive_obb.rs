@@ -13,8 +13,8 @@
 //! - **Street access** — if a child would lose its street edge, cut along the
 //!   orthogonal (long-axis) direction instead. With `force_street_access == 1.0`
 //!   a split that still orphans a child is rejected (the parent stays a lot).
-//!   Without a street graph, so **every original block boundary
-//!   edge counts as frontage**.
+//!   Frontage is the block's street-tagged edges; an untagged block (no street
+//!   graph) treats **every original block boundary edge as frontage**.
 //! - **Snap to contour vertices** — if the pivot lands near an original block
 //!   vertex, move it onto that vertex.
 //! - **Edge alignment** — the OBB already aligns cuts to a hull edge direction.
@@ -24,6 +24,7 @@
 //! Determinism: all randomness comes from a splitmix64 stream seeded from a hash
 //! of the block geometry + `settings.seed`. Same input → byte-identical output.
 
+use crate::blocks::block::Block;
 use crate::geometry::oriented_box::OrientedBox;
 use crate::geometry::polygon2d::Polygon2d;
 use crate::geometry::split::{split_by_line, Line2d};
@@ -34,8 +35,8 @@ use glam::DVec2;
 #[derive(Debug, Clone)]
 pub struct Lot {
     pub polygon: Polygon2d,
-    /// True if the lot touches the original block boundary (its "street" in
-    /// `method=grid`, where any block edge counts as frontage).
+    /// True if the lot touches a street edge of its block (any block edge when
+    /// the block is untagged).
     pub has_street: bool,
 }
 
@@ -82,8 +83,8 @@ fn block_seed(block: &Polygon2d, seed: u64) -> u64 {
     h | 1
 }
 
-/// Whether `lot` touches the original block boundary. A lot is on the frontage
-/// if any of its edges lies (mostly) on a block boundary edge.
+/// Whether `lot` touches the block frontage. A lot is on the frontage if any of
+/// its edges lies (mostly) on a frontage edge.
 fn touches_boundary(lot: &Polygon2d, block_edges: &[(DVec2, DVec2)]) -> bool {
     // Sample edge midpoints of the lot; if a midpoint sits on any block edge,
     // the lot has frontage. Robust to clip-introduced extra vertices.
@@ -138,7 +139,14 @@ fn snap_pivot(pivot: DVec2, block: &Polygon2d, snap_dist: f64) -> DVec2 {
 /// Public entry: subdivide `block` into lots using the Recursive OBB method.
 /// Deterministic for a fixed `settings.seed`.
 pub fn subdivide(block: &Polygon2d, settings: &SubdivisionSettings) -> Vec<Lot> {
-    let block_edges: Vec<(DVec2, DVec2)> = block.edges().collect();
+    subdivide_block(&Block::untagged(block.clone()), settings)
+}
+
+/// Subdivide a tagged `block`: street access is judged against its street
+/// edges ([`Block::frontage_edges`]). Deterministic for a fixed `settings.seed`.
+pub fn subdivide_block(tagged: &Block, settings: &SubdivisionSettings) -> Vec<Lot> {
+    let block = &tagged.polygon;
+    let block_edges = tagged.frontage_edges();
     let mut rng = SplitMix64::new(block_seed(block, settings.seed));
     let irregularity = settings.clamped_irregularity();
     let mut out = Vec::new();

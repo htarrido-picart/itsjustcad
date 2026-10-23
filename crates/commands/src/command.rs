@@ -2231,6 +2231,9 @@ pub enum Command {
         front: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         side: Option<f64>,
+        /// Setback from a corner lot's secondary street edge(s).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        streetside: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rear: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

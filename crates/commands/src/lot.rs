@@ -73,6 +73,9 @@ pub fn parse_method(s: &str) -> Option<SubdivisionMethod> {
 #[derive(Debug)]
 pub struct LotBake {
     pub polygons: Vec<Polygon2d>,
+    /// The same lots with the street tags inherited from their block's edges
+    /// (parallel to `polygons`). All plain boundary edges for an untagged block.
+    pub lots: Vec<Block>,
     pub z: f64,
     pub with_street: usize,
     /// Lot-rules summary: total slivers merged + corners widened.
@@ -85,27 +88,38 @@ pub struct LotBake {
 }
 
 /// Dispatch one block to the subdivider selected by `settings.method`.
-/// `tagged` carries the block's street tags (from road-network generation) for the skeleton method;
-/// for a plain `lotsubdivide` on an arbitrary curve it is `Block::untagged`, so
-/// the skeleton treats every contour edge as frontage (same as grid/perimeter).
-fn subdivide_by_method(
-    block: &Polygon2d,
-    tagged: &Block,
-    settings: &SubdivisionSettings,
-) -> Vec<subdivision::Lot> {
+/// `tagged` carries the block's street tags (from road-network generation), so
+/// street access means touching a real street edge; for a plain `lotsubdivide`
+/// on an arbitrary curve it is `Block::untagged`, so every contour edge counts
+/// as frontage.
+fn subdivide_by_method(tagged: &Block, settings: &SubdivisionSettings) -> Vec<subdivision::Lot> {
     match settings.method {
-        SubdivisionMethod::Offset => subdivision::subdivide_offset(block, settings),
+        SubdivisionMethod::Offset => subdivision::subdivide_offset_block(tagged, settings),
         SubdivisionMethod::Skeleton => subdivision::subdivide_skeleton_block(tagged, settings),
-        SubdivisionMethod::Recursive => subdivision::subdivide(block, settings),
+        SubdivisionMethod::Recursive => subdivision::subdivide_block(tagged, settings),
     }
 }
 
 /// Core bridge: run the subdivider selected by `settings.method`
-/// (grid/perimeter/streetfollowing) on `blocks` (already tessellated + validated
-/// closed) with `settings`. Deterministic — output depends only on the blocks +
-/// settings.
+/// (grid/perimeter/streetfollowing) on untagged `blocks` (already tessellated +
+/// validated closed) with `settings`. Deterministic — output depends only on the
+/// blocks + settings.
 pub fn subdivide_blocks(
     blocks: &[(Polygon2d, f64)],
+    settings: &SubdivisionSettings,
+) -> Result<LotBake, String> {
+    let tagged: Vec<(Block, f64)> = blocks
+        .iter()
+        .map(|(p, z)| (Block::untagged(p.clone()), *z))
+        .collect();
+    subdivide_tagged_blocks(&tagged, settings)
+}
+
+/// [`subdivide_blocks`] on street-tagged blocks (from [`generate_site`]): street
+/// access is judged against real street edges and each lot inherits its
+/// block's edge tags ([`LotBake::lots`]).
+pub fn subdivide_tagged_blocks(
+    blocks: &[(Block, f64)],
     settings: &SubdivisionSettings,
 ) -> Result<LotBake, String> {
     // All three methods (grid / perimeter / streetfollowing) are implemented.
@@ -121,6 +135,7 @@ pub fn subdivide_blocks(
         && settings.method == SubdivisionMethod::Recursive;
 
     let mut polygons = Vec::new();
+    let mut tagged_lots = Vec::new();
     let mut with_street = 0usize;
     let mut slivers_merged = 0usize;
     let mut corners_widened = 0usize;
@@ -128,25 +143,25 @@ pub fn subdivide_blocks(
     let mut width_mix_error: Option<f64> = None;
     let mut z_acc = 0.0;
     let mut z_n = 0usize;
-    for (block, z) in blocks {
-        let tagged = Block::untagged(block.clone());
+    for (tagged, z) in blocks {
+        let block = &tagged.polygon;
         // Base lots: width-mix frontage packing when requested + it applies,
         // else the recursive/offset subdivider.
         let base_lots = if use_width_mix {
-            match subdivision::subdivision::lot_rules::subdivide_width_mix(&tagged, settings) {
+            match subdivision::subdivision::lot_rules::subdivide_width_mix(tagged, settings) {
                 Some((lots, err, _ph)) if !lots.is_empty() => {
                     width_mix_error = Some(width_mix_error.map_or(err, |e: f64| e.max(err)));
                     lots
                 }
                 // Frontage too short / no usable street → fall back to the method.
-                _ => subdivide_by_method(block, &tagged, settings),
+                _ => subdivide_by_method(tagged, settings),
             }
         } else {
-            subdivide_by_method(block, &tagged, settings)
+            subdivide_by_method(tagged, settings)
         };
 
         // Lot-rules post-pass: corner widening + sliver merge (+ placeholder note).
-        let (lots, report) = subdivision::apply_lot_rules(&tagged, base_lots, settings);
+        let (lots, report) = subdivision::apply_lot_rules(tagged, base_lots, settings);
         slivers_merged += report.slivers_merged;
         corners_widened += report.corners_widened;
         if placeholder_note.is_none() {
@@ -179,6 +194,7 @@ pub fn subdivide_blocks(
                 if has_street {
                     with_street += 1;
                 }
+                tagged_lots.push(Block::inherit(poly.clone(), tagged));
                 polygons.push(poly);
             }
         }
@@ -193,6 +209,7 @@ pub fn subdivide_blocks(
     let z = if z_n > 0 { z_acc / z_n as f64 } else { 0.0 };
     Ok(LotBake {
         polygons,
+        lots: tagged_lots,
         z,
         with_street,
         slivers_merged,
@@ -282,8 +299,8 @@ pub struct SiteBake {
     pub roads: Vec<Vec<DVec2>>,
     /// Whether each road centerline is a closed loop (cul-de-sac bulb).
     pub road_closed: Vec<bool>,
-    /// Block boundary polygons.
-    pub blocks: Vec<Polygon2d>,
+    /// Blocks with their per-edge street tags.
+    pub blocks: Vec<Block>,
     /// How many block edges are street-tagged (frontage) / alley-tagged.
     pub street_edges: usize,
     pub alley_edges: usize,
@@ -320,7 +337,7 @@ pub fn generate_site(site: &Polygon2d, z: f64, settings: &SubdivisionSettings) -
     Ok(SiteBake {
         roads,
         road_closed,
-        blocks: blocks.into_iter().map(|b| b.polygon).collect(),
+        blocks,
         street_edges,
         alley_edges,
         z,
@@ -372,8 +389,9 @@ pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], b
     }
     // Blocks carry a stable spatial index too: row-major order over
     // the block set so a re-generated site keeps each block's number.
-    let block_idx = subdivision::ConsistentIndexing::new().assign(&bake.blocks);
-    for (k, (poly, id)) in bake.blocks.iter().zip(block_ids).enumerate() {
+    let polys: Vec<Polygon2d> = bake.blocks.iter().map(|b| b.polygon.clone()).collect();
+    let block_idx = subdivision::ConsistentIndexing::new().assign(&polys);
+    for (k, (poly, id)) in polys.iter().zip(block_ids).enumerate() {
         let idx = block_idx.get(k).copied().unwrap_or(k + 1);
         doc.insert(SceneObject {
             visible: true,
@@ -407,12 +425,12 @@ pub struct SetbackBake {
     pub placeholder_note: Option<String>,
 }
 
-/// Compute the buildable envelope for each lot polygon in `lots` under
-/// `settings`. Deterministic. A lot whose envelope collapses is counted, not
+/// Compute the buildable envelope for each lot in `lots` under `settings`; its
+/// street tags (if any) pick the front / street side. Deterministic. A lot whose envelope collapses is counted, not
 /// baked (reported to the user). The `setbacks` are read from `settings`
 /// (front/side/rear/build-to), already overridden per-run by the verb.
 pub fn compute_setbacks(
-    lots: &[(Polygon2d, f64)],
+    lots: &[(Block, f64)],
     settings: &SubdivisionSettings,
 ) -> Result<SetbackBake, String> {
     let mut envelopes = Vec::new();
@@ -420,12 +438,10 @@ pub fn compute_setbacks(
     let mut build_to_used = false;
     let mut z_acc = 0.0;
     let mut z_n = 0usize;
-    for (poly, z) in lots {
-        // Preserve any street tags the source curve carries by treating the lot
-        // as untagged (a baked lot curve has no tags) — the longest edge is the
-        // front, matching the subdivision "usable without a street graph" spirit.
-        let block = Block::untagged(poly.clone());
-        let env = subdivision::buildable_envelope(&block, settings);
+    for (block, z) in lots {
+        // An untagged lot (a baked lot curve has no tags) fronts its longest
+        // edge, matching the subdivision "usable without a street graph" spirit.
+        let env = subdivision::buildable_envelope(block, settings);
         build_to_used |= env.build_to_used;
         match env.polygon {
             Some(p) => envelopes.push(p),
@@ -497,18 +513,17 @@ pub struct FrontageMeasure {
     pub at: DVec2,
 }
 
-/// Measure the frontage of each lot polygon under `at` (default: setback line).
-/// Returns one [`FrontageMeasure`] per lot. Deterministic.
+/// Measure the frontage of each lot under `at` (default: setback line), on its
+/// primary front only. Returns one [`FrontageMeasure`] per lot. Deterministic.
 pub fn measure_frontage(
-    lots: &[Polygon2d],
+    lots: &[Block],
     at: FrontageAt,
     settings: &SubdivisionSettings,
 ) -> Vec<FrontageMeasure> {
     lots.iter()
-        .map(|poly| {
-            let block = Block::untagged(poly.clone());
-            let length = subdivision::frontage(&block, at, settings);
-            FrontageMeasure { length, at: poly.centroid() }
+        .map(|lot| {
+            let length = subdivision::frontage(lot, at, settings);
+            FrontageMeasure { length, at: lot.centroid() }
         })
         .collect()
 }
@@ -637,7 +652,8 @@ pub fn gather_yield_inputs(
     let boundary = site_candidates.iter().copied().fold(0.0f64, f64::max);
     let gross_site_area = if boundary > 0.0 { boundary } else { lot_area_sum + open_space_sum };
 
-    let lot_frontages: Vec<f64> = measure_frontage(&lot_polys, subdivision::FrontageAt::Setback, settings)
+    let lots: Vec<Block> = lot_polys.iter().cloned().map(Block::untagged).collect();
+    let lot_frontages: Vec<f64> = measure_frontage(&lots, subdivision::FrontageAt::Setback, settings)
         .into_iter()
         .map(|m| m.length)
         .collect();
@@ -900,19 +916,19 @@ pub fn parse_roof_type(s: &str) -> Option<RoofType> {
 /// counted (not built) and reported. `settings` already carries the per-run
 /// building overrides (typology / mode / floors / roof / …).
 pub fn compute_buildings(
-    lots: &[(Polygon2d, f64)],
+    lots: &[(Block, f64)],
     settings: &SubdivisionSettings,
 ) -> Result<BuildingBake, String> {
     let mut buildings = Vec::new();
     let mut collapsed = 0usize;
     let mut total_gfa = 0.0;
     let mut total_floors = 0usize;
-    for (poly, z) in lots {
+    for (block, z) in lots {
         // Buildings generate INSIDE the buildable envelope. A baked lot
         // curve carries no street tags → longest edge is the front (same spirit
         // as lotsetbacks).
-        let block = Block::untagged(poly.clone());
-        let env = subdivision::buildable_envelope(&block, settings);
+        let poly = &block.polygon;
+        let env = subdivision::buildable_envelope(block, settings);
         let Some(envelope) = env.polygon else {
             collapsed += 1;
             continue;
@@ -1282,7 +1298,7 @@ mod tests {
             region: RegionProfile::UsSuburban,
             ..SubdivisionSettings::default()
         };
-        let bake = compute_setbacks(&[(poly, 0.0)], &s).unwrap();
+        let bake = compute_setbacks(&[(Block::untagged(poly), 0.0)], &s).unwrap();
         assert_eq!(bake.envelopes.len(), 1);
         assert!((bake.envelopes[0].area() - 952.0).abs() < 1.0, "area {}", bake.envelopes[0].area());
         assert_eq!(bake.collapsed, 0);
@@ -1290,7 +1306,7 @@ mod tests {
 
         // Tiny lot + huge setbacks → all collapse → error, not a panic.
         let tiny = curve_to_polygon(&rect_curve(6.0, 6.0)).unwrap();
-        assert!(compute_setbacks(&[(tiny, 0.0)], &s).is_err());
+        assert!(compute_setbacks(&[(Block::untagged(tiny), 0.0)], &s).is_err());
     }
 
     #[test]
@@ -1303,8 +1319,9 @@ mod tests {
             region: RegionProfile::UsSuburban,
             ..SubdivisionSettings::default()
         };
-        let m_setback = measure_frontage(std::slice::from_ref(&poly), FrontageAt::Setback, &s);
-        let m_curb = measure_frontage(&[poly], FrontageAt::Curb, &s);
+        let lot = Block::untagged(poly);
+        let m_setback = measure_frontage(std::slice::from_ref(&lot), FrontageAt::Setback, &s);
+        let m_curb = measure_frontage(&[lot], FrontageAt::Curb, &s);
         // Curb (40) vs setback (40 − 2*side = 32): they differ.
         assert!((m_curb[0].length - 40.0).abs() < 0.5, "curb {}", m_curb[0].length);
         assert!(
@@ -1345,9 +1362,69 @@ mod tests {
             force_street_access: 1.0,
             ..SubdivisionSettings::default()
         };
-        let out = subdivide_blocks(&[(block, 0.0)], &ss).unwrap();
+        let out = subdivide_tagged_blocks(&[(block, 0.0)], &ss).unwrap();
         assert!(!out.polygons.is_empty());
-        // With force_street_access, every lot keeps a boundary (street) edge.
+        // With force_street_access, every lot keeps a real street edge.
         assert_eq!(out.with_street, out.polygons.len(), "all lots must front a street");
+        assert!(out.lots.iter().all(|l| l.has_street()), "lots inherit the street tags");
+    }
+
+    #[test]
+    fn siteplan_lot_fronts_face_generated_roads() {
+        // The siteplan chain on a rectangle (streets → tagged blocks → lots →
+        // setbacks): every lot front lies on a generated road, never on the bare
+        // site boundary, and corner lots get one front plus a street side.
+        use subdivision::EdgeRole;
+        let poly = curve_to_polygon(&rect_curve(400.0, 300.0)).unwrap();
+        let s = SubdivisionSettings {
+            street_pattern: StreetPattern::Orthogonal,
+            road_width: 12.0,
+            block_depth: 80.0,
+            seed: 7,
+            lot_area_min: 1500.0,
+            lot_width_min: 15.0,
+            region: RegionProfile::UsSuburban,
+            ..SubdivisionSettings::default()
+        };
+        let site = generate_site(&poly, 0.0, &s).unwrap();
+        let near_road = |p: DVec2| {
+            site.roads.iter().any(|road| {
+                road.windows(2).any(|w| {
+                    let ab = w[1] - w[0];
+                    let t = ((p - w[0]).dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
+                    p.distance(w[0] + ab * t) < s.road_width * 0.5 + 0.1
+                })
+            })
+        };
+        let (mut fronted, mut corners) = (0, 0);
+        for b in &site.blocks {
+            let Ok(lb) = subdivide_tagged_blocks(&[(b.clone(), 0.0)], &s) else {
+                continue;
+            };
+            for lot in lb.lots.iter().filter(|l| l.has_street()) {
+                let roles = subdivision::subdivision::setbacks::classify_edges(lot);
+                let v = lot.polygon.verts();
+                for (i, role) in roles.iter().enumerate() {
+                    if *role == EdgeRole::Front {
+                        let mid = (v[i] + v[(i + 1) % v.len()]) * 0.5;
+                        assert!(near_road(mid), "front edge at {mid:?} does not face a road");
+                    }
+                }
+                fronted += 1;
+                if roles.contains(&EdgeRole::StreetSide) {
+                    corners += 1;
+                }
+            }
+        }
+        assert!(fronted > 0, "siteplan produced street-fronting lots");
+        assert!(corners > 0, "the street grid has corner lots");
+        // Setbacks run on the tagged lots without collapsing everything.
+        let lots: Vec<(Block, f64)> = site
+            .blocks
+            .iter()
+            .filter_map(|b| subdivide_tagged_blocks(&[(b.clone(), 0.0)], &s).ok())
+            .flat_map(|lb| lb.lots.into_iter().map(|l| (l, 0.0)))
+            .collect();
+        assert!(compute_setbacks(&lots, &s).is_ok());
     }
 }
