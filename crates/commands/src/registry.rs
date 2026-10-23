@@ -974,7 +974,13 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "lotheight",
             usage: "lotheight [selector] floors=<n>|clear",
-            summary: "Pin the building floor count of the selected lot(s) of a siteplan — select lots or the buildings on them. The pin is stored on the plan, keyed by the lot centroid, and wins over floor_count and the height variation (floors_min/floors_max, height_mix, height_falloff), so lotrefresh and lotsetparams keep it; after a change that moves the lot centroid more than 1 m the pin is dropped and reported. clear removes the pin. One undo step. Example: lotheight selected floors=12",
+            summary: "Alias for lotset floors=<n> (clear = lotset clear floors). Pin the building floor count of the selected lot(s) of a siteplan — select lots or the buildings on them. The pin is stored on the plan, keyed by the lot centroid, and wins over floor_count and the height variation (floors_min/floors_max, height_mix, height_falloff), so lotrefresh and lotsetparams keep it; after a change that moves the lot centroid more than 1 m the pin is dropped and reported. clear removes the pin. One undo step. Example: lotheight selected floors=12",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "lotset",
+            usage: "lotset [selector] [floors=<n>] [typology=<name>] [setback_front=<m>] [setback_side=<m>] [setback_street_side=<m>] [setback_rear=<m>] [clear [field…]]",
+            summary: "Override the rules of the selected lot(s) of a siteplan — select lots or the buildings on them (CityEngine-style per-lot attributes). floors wins over floor_count and the height variation; typology (detached, row, courtyard, slab; midrise = slab) picks that lot's footprint shape and per-typology roof; setbacks move that lot's buildable envelope. Only the targeted buildings change, and the yield (GFA, FAR, coverage) follows. The overrides are stored on the plan, keyed by the lot centroid, so lotrefresh and lotsetparams (seed, lot_area, height_seed, …) keep them; after a change that moves the lot centroid more than 1 m an override is dropped and reported. clear resets every field to the rule, clear <field…> (or <field>=clear) resets those. Several lots are edited together as one undo step. Example: lotset selected floors=12 typology=midrise",
             category: Category::Tools,
         },
         CommandSpec {

@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use itsjustcad_doc::{
-    Document, EdgeRoleOverride, FieldKind, Geometry, LotHeightOverride, ObjectId, StreetEdit,
+    Document, EdgeRoleOverride, FieldKind, Geometry, LotOverride, ObjectId, StreetEdit,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -259,13 +259,13 @@ fn lot_fronts(plan: &SitePlanBake, settings: &SubdivisionSettings) -> Fronts {
 }
 
 /// A site plan's hand edits that a re-derive re-applies: `streetset` street
-/// edits and `edgerole` overrides. A boundary's existing plan lends its edits
+/// edits and `edgerole` / `lotset` overrides. A boundary's existing plan lends its edits
 /// to the search, so a scored plan is the plan `siteoptimize apply` bakes.
 #[derive(Debug, Clone, Default)]
 pub struct PlanEdits {
     pub streets: BTreeMap<u32, StreetEdit>,
     pub edge_roles: Vec<EdgeRoleOverride>,
-    pub lot_heights: Vec<LotHeightOverride>,
+    pub lot_overrides: Vec<LotOverride>,
 }
 
 /// Evaluate one site plan off-document: run the chain, compute the yield,
@@ -277,7 +277,7 @@ pub fn evaluate(
     req: &OptimizeRequest,
 ) -> Result<Evaluation, String> {
     let mut roles = edits.edge_roles.clone();
-    let mut heights = edits.lot_heights.clone();
+    let mut heights = edits.lot_overrides.clone();
     let plan = lot::plan_site(site, 0.0, settings, &edits.streets, &mut roles, &mut heights)?;
     if plan.lots.polygons.is_empty() {
         return Err("the plan has no lots".into());
@@ -894,7 +894,7 @@ pub fn base_plan(doc: &Document, source: ObjectId) -> (SubdivisionSettings, Plan
             PlanEdits {
                 streets: l.streets.clone(),
                 edge_roles: l.edge_roles.clone(),
-                lot_heights: l.lot_heights.clone(),
+                lot_overrides: l.lot_overrides.clone(),
             },
         ),
         _ => (doc.subdivision_settings.clone(), PlanEdits::default()),

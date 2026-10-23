@@ -74,21 +74,48 @@ pub struct SubdivLink {
     /// it matches (see [`EdgeRoleOverride`]) and dropped when none does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edge_roles: Vec<EdgeRoleOverride>,
- /// Hand-pinned building floor counts (`lotheight`). Inputs to a SitePlan
- /// re-derive: each pins the regenerated lot it matches (see
- /// [`LotHeightOverride`]) and is dropped when none does.
- #[serde(default, skip_serializing_if = "Vec::is_empty")]
- pub lot_heights: Vec<LotHeightOverride>,
+ /// Per-lot rule overrides (`lotset`, `lotheight`). Inputs to a SitePlan
+ /// re-derive: each applies to the regenerated lot it matches (see
+ /// [`LotOverride`]) and is dropped when none does. Files written before
+ /// #158 stored floor pins as `lot_heights`; they load through the alias.
+ #[serde(default, alias = "lot_heights", skip_serializing_if = "Vec::is_empty")]
+ pub lot_overrides: Vec<LotOverride>,
 }
 
-/// A hand-pinned floor count for the building on one lot of a SitePlan link.
-/// Keyed geometrically like [`EdgeRoleOverride`]: the lot centroid (rounded to
-/// mm). A regenerated lot matches when its centroid lies within
-/// `LOT_HEIGHT_TOL` (commands crate); the nearest wins and re-keys it.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct LotHeightOverride {
- pub centroid: glam::DVec2,
- pub floors: u32,
+/// Hand-set rule values for the building on one lot of a SitePlan link
+/// (CityEngine's per-shape attribute override). Keyed geometrically like
+/// [`EdgeRoleOverride`]: the lot centroid (rounded to mm). A regenerated lot
+/// matches when its centroid lies within `LOT_OVERRIDE_TOL` (commands crate);
+/// the nearest wins and re-keys it. `None` fields follow the plan's rules.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LotOverride {
+    pub centroid: glam::DVec2,
+    /// Floor count (wins over `floor_count` and the height variation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floors: Option<u32>,
+    /// Building typology (footprint shape, per-typology roof).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typology: Option<subdivision::Typology>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setback_front: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setback_side: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setback_street_side: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setback_rear: Option<f64>,
+}
+
+impl LotOverride {
+    /// True when no field is overridden (the record can be dropped).
+    pub fn is_empty(&self) -> bool {
+        self.floors.is_none()
+            && self.typology.is_none()
+            && self.setback_front.is_none()
+            && self.setback_side.is_none()
+            && self.setback_street_side.is_none()
+            && self.setback_rear.is_none()
+    }
 }
 
 /// A hand-set role for one lot edge of a link. Lots are regenerated, so the
@@ -761,7 +788,7 @@ mod tests {
                 kind: SubdivKind::Lots,
                 streets: Default::default(),
                 edge_roles: Vec::new(),
-                lot_heights: Vec::new(),
+                lot_overrides: Vec::new(),
             },
         );
         assert_eq!(doc.subdiv_source_of(lot_b), Some(source));
@@ -799,12 +826,44 @@ mod tests {
                 kind: SubdivKind::Site,
                 streets: Default::default(),
                 edge_roles: Vec::new(),
-                lot_heights: Vec::new(),
+                lot_overrides: Vec::new(),
             },
         );
         let json = serde_json::to_string(&doc).unwrap();
         let back: Document = serde_json::from_str(&json).unwrap();
         assert_eq!(back.subdiv_link(site_src).unwrap().kind, SubdivKind::Site);
+    }
+
+    /// A pre-#158 link stored floor pins as `lot_heights: [{centroid, floors}]`;
+    /// it loads as `lot_overrides` with only `floors` set, and saves back under
+    /// the new name.
+    #[test]
+    fn legacy_lot_heights_load_as_overrides() {
+        let mut v = serde_json::to_value(SubdivLink {
+            settings: subdivision::SubdivisionSettings::default(),
+            produced: vec![],
+            source_z: 0.0,
+            frozen: false,
+            kind: SubdivKind::SitePlan,
+            streets: Default::default(),
+            edge_roles: Vec::new(),
+            lot_overrides: Vec::new(),
+        })
+        .unwrap();
+        v["lot_heights"] = serde_json::json!([{ "centroid": [12.5, 40.0], "floors": 9 }]);
+        let link: SubdivLink = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            link.lot_overrides,
+            vec![LotOverride {
+                centroid: glam::DVec2::new(12.5, 40.0),
+                floors: Some(9),
+                ..LotOverride::default()
+            }]
+        );
+        let out = serde_json::to_value(&link).unwrap();
+        assert!(out.get("lot_heights").is_none());
+        assert_eq!(out["lot_overrides"][0]["floors"], 9);
+        assert!(out["lot_overrides"][0].get("typology").is_none());
     }
 
     fn obj_at(name: Option<&str>, origin: DVec3) -> SceneObject {
