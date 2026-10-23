@@ -8448,7 +8448,8 @@ impl App {
         if link.kind != itsjustcad_doc::SubdivKind::Site {
             let roles = self.live_roles(ui.visuals().dark_mode);
             let labels = [t("param.subdivision.controls"), t("param.subdivision.yield")];
-            if let Some(i) = crate::widgets::segmented(ui, &roles, &labels, self.subdiv_segment) {
+            if let Some(i) = crate::widgets::segmented_full(ui, &roles, &labels, self.subdiv_segment)
+            {
                 self.subdiv_segment = i;
             }
             ui.add_space(4.0);
@@ -8599,17 +8600,26 @@ impl App {
             ),
             (t("param.subdivision.yield.coverage"), opt(r.lot_coverage, &pct)),
         ]);
-        egui::Grid::new(("subdiv_yield", source))
-            .num_columns(2)
-            .striped(true)
+        // Side padding so the table doesn't run edge to edge with the panel.
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::M as i8, 4))
             .show(ui, |ui| {
-                for (label, value) in rows {
-                    ui.label(label);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.monospace(value);
+                egui::Grid::new(("subdiv_yield", source))
+                    .num_columns(2)
+                    .striped(true)
+                    .spacing([crate::theme::Spacing::L, 6.0])
+                    .show(ui, |ui| {
+                        for (label, value) in rows {
+                            ui.label(label);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.monospace(value);
+                                },
+                            );
+                            ui.end_row();
+                        }
                     });
-                    ui.end_row();
-                }
             });
     }
 

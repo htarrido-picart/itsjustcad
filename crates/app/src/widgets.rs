@@ -205,6 +205,26 @@ pub fn segmented(
     labels: &[&str],
     selected: usize,
 ) -> Option<usize> {
+    segmented_impl(ui, roles, labels, selected, false)
+}
+
+/// [`segmented`] stretched to the full available width.
+pub fn segmented_full(
+    ui: &mut egui::Ui,
+    roles: &ColorRoles,
+    labels: &[&str],
+    selected: usize,
+) -> Option<usize> {
+    segmented_impl(ui, roles, labels, selected, true)
+}
+
+fn segmented_impl(
+    ui: &mut egui::Ui,
+    roles: &ColorRoles,
+    labels: &[&str],
+    selected: usize,
+    full: bool,
+) -> Option<usize> {
     if labels.is_empty() {
         return None;
     }
@@ -213,8 +233,9 @@ pub fn segmented(
     let font = egui::TextStyle::Button.resolve(ui.style());
     let h = (ui.text_style_height(&egui::TextStyle::Button) + pad.y * 2.0)
         .max(ui.spacing().interact_size.y);
-    // Equal width = widest label + padding, applied to every segment.
-    let seg_w = labels
+    // Equal width = widest label + padding (or an equal share of the row when
+    // `full`), applied to every segment.
+    let label_w = labels
         .iter()
         .map(|l| {
             ui.painter()
@@ -224,6 +245,11 @@ pub fn segmented(
         })
         .fold(0.0_f32, f32::max)
         + pad.x * 2.0;
+    let seg_w = if full {
+        (ui.available_width() / labels.len() as f32).max(label_w)
+    } else {
+        label_w
+    };
     let total_w = seg_w * labels.len() as f32;
     let (rect, _resp) = ui.allocate_exact_size(egui::vec2(total_w, h), egui::Sense::hover());
     let radius = ui.visuals().widgets.inactive.corner_radius;
